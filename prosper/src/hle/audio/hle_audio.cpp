@@ -12,6 +12,7 @@
 #include "hle/audio/audio.hpp"
 #include "hle/audio/ajm_decoder.hpp"     // optional host codecs (MP3); core retains AJM ABI + guest copies
 #include "hle/audio/atrac9_decode.hpp"    // vendored LibAtrac9 glue — AJM ATRAC9 batch decode (Blasphemous 2)
+#include "hle/audio/ngs2_waveform.hpp"    // libSceNgs2 waveform parse/calc/reset-option contracts
 #include "hle/dispatch/callback_fs.hpp"      // recover the caller's guest %fs for firing guest callbacks
 #include <memory>
 #include "host/platform/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
@@ -4381,6 +4382,27 @@ HLE(ngs2_rack_unlock) {
     return 0;
 }
 
+// --- Ngs2 waveform parsing + block calc + system-option reset -------------------------------
+// The contracts (re-derived from libSceNgs2.native.sprx, the module PS5 titles bind) live in
+// ngs2_waveform.cpp; these entry points only trace and widen the module's 32-bit result.
+HLE(ngs2_parse_waveform_data) {
+    NGS2_LOG("sceNgs2ParseWaveformData");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::parse_waveform_data(a0, a1, a2);
+}
+
+// Sample position and count are u32: the module reads only %esi/%edx (0x12070/0x12081), and the
+// SysV ABI leaves the upper halves of those registers undefined.
+HLE(ngs2_calc_waveform_block) {
+    NGS2_LOG("sceNgs2CalcWaveformBlock");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::calc_waveform_block(a0, (uint32_t)a1,
+                                                                          (uint32_t)a2, a3);
+}
+
+HLE(ngs2_system_reset_option) {
+    NGS2_LOG("sceNgs2SystemResetOption");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::system_reset_option(a0);
+}
+
 // PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
 // Ngs2VoiceParamHead { uint16 size; int16 next; uint32 id; payload... } (Sony's documented
 // voice-param list shape). This is capture-first RE for the real sampler implementation —
@@ -4770,6 +4792,9 @@ void register_audio_hle() {
                      "sceNgs2RackCreateWithAllocator");
     Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
     Hle::register_fn("++YZ7P9e87U", ngs2_rack_unlock, "sceNgs2RackUnlock");
+    Hle::register_fn("hyVLT2VlOYk", ngs2_parse_waveform_data, "sceNgs2ParseWaveformData");
+    Hle::register_fn("3pCNbVM11UA", ngs2_calc_waveform_block, "sceNgs2CalcWaveformBlock");
+    Hle::register_fn("AQkj7C0f3PY", ngs2_system_reset_option, "sceNgs2SystemResetOption");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
 #if defined(__linux__)

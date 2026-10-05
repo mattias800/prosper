@@ -1208,6 +1208,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_lifecycle.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 waveform surface: container parsing, block calculation, option reset.
+  # Pure, no game dump.
+  prosper_add_gtest(test_ngs2_waveform
+    SOURCES tests/hle/test_ngs2_waveform.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
