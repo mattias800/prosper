@@ -27,6 +27,7 @@ public:
     int sample_rate() const { return sample_rate_; }
     int frame_samples() const { return frame_samples_; }             // per channel, per ATRAC9 frame
     int superframe_bytes() const { return superframe_bytes_; }        // compressed bytes per superframe
+    int frames_per_superframe() const { return frames_per_superframe_; }
     int superframe_samples() const { return frame_samples_ * frames_per_superframe_; }  // per channel
 
     // Decode ONE superframe (`superframe_bytes()` compressed bytes at `in`) into `out`, which must hold
