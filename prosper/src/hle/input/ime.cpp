@@ -573,9 +573,9 @@ HLE(s_imedlg_abort) {
 // The PANEL itself does not exist headless (no OSK UI to show), but the session around it is
 // real state: open/closed, the text set on it, the caret. Setters validate against the open
 // session and refuse when closed; display-only hints (geometry) acknowledge once their pointer
-// is usable. Panel geometry answers "no panel" (0x0) rather than Sony's panel constants, which
-// prosper cannot verify and which would lay the title's UI out around a panel that never
-// appears. Position/form stays out: its struct has no size arg, so it cannot be filled safely.
+// is usable. GetPanelSize answers the shipped library's panel constants even though no panel is
+// drawn, so a title lays its UI out exactly as on the console. Position/form stays out: its struct
+// has no size arg, so it cannot be filled safely.
 // Signatures agree between shadPS4 and portps5; ParamInit, GetPanelSize and KeyboardSetMode are
 // re-derived from the shipped libSceIme (see each handler). Metaphor (PPSA20800) calls ParamInit,
 // Open, Close, SetText, SetCaret and GetPanelSize at its name entry. CONFIDENCE: MED on the other
