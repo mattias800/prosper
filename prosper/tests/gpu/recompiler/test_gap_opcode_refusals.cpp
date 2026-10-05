@@ -327,7 +327,7 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 }
 
 // Unlowered end-of-program variants must refuse fail-visibly. Only the exact
-// s_endpgm word terminates a stream (rdna2_decode.hpp S_ENDPGM); the saved
+// s_endpgm word terminates a stream (rdna2_decode.cpp S_ENDPGM); the saved
 // and ordered forms fall through to the SOPP reject. Accepting either as a
 // plain terminator would silently drop its ordering/save semantics. All words
 // below are llvm-mc gfx1030 round-tripped. The control is s_endpgm in the
@@ -346,18 +346,13 @@ TEST(GapOpcodeRefusals, EndpgmVariantRefuse) {
     EXPECT_EQ(rdna2_decode_one(saved, 1).opcode, 0x1bu);
     EXPECT_EQ(rdna2_decode_one(ordered, 1).opcode, 0x1eu);
 
-    auto terminated = [&](std::vector<uint32_t> inst) {
-        std::vector<uint32_t> code = kVop3Prologue;
-        code.insert(code.end(), inst.begin(), inst.end());
-        code.push_back(kEndpgm);
-        return code;
-    };
     static const uint32_t endpgm[1] = {0xbf810000u};
-    expect_compiles(terminated({endpgm[0]}), 0xA0F0ull,
+    EXPECT_TRUE(rdna2_decode_one(endpgm, 1).is_end) << "the control is the real terminator";
+    expect_compiles(program(kVop3Prologue, {endpgm[0]}), 0xA120ull,
                     "control: s_endpgm terminates in the variant slot");
-    expect_gap_refusal(terminated({saved[0]}), 0xA0F1ull, 4, {saved[0]},
+    expect_gap_refusal(program(kVop3Prologue, {saved[0]}), 0xA121ull, 4, {saved[0]},
                        Rdna2Format::SOPP, 0x1bu);
-    expect_gap_refusal(terminated({ordered[0]}), 0xA0F2ull, 4, {ordered[0]},
+    expect_gap_refusal(program(kVop3Prologue, {ordered[0]}), 0xA122ull, 4, {ordered[0]},
                        Rdna2Format::SOPP, 0x1eu);
 }
 
