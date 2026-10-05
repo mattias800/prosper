@@ -79,6 +79,14 @@ struct Symbol {
     uint8_t     elf_type = STT_NOTYPE;  // ELF64_ST_TYPE(st_info)
     std::string lib_name;  // resolved from lib_id
 };
+// True for a symbol that has a local body (non-zero value) but whose library id names a declared
+// IMPORT library: the module ships a fallback for a function it also imports. Callers must have
+// seen a GLOB_DAT/JUMP_SLOT relocation against it before treating it as an import.
+inline bool is_relocated_local_fallback_import(const Symbol& s,
+                                               const std::map<int, std::string>& import_libs) {
+    return !s.is_import && !s.nid.empty() && s.raw.find('#') != std::string::npos &&
+           import_libs.find(s.lib_id) != import_libs.end();
+}
 struct Import {            // one unresolved external symbol
     std::string nid, lib_name;
     uint32_t    sym_index = 0;

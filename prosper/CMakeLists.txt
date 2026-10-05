@@ -2170,6 +2170,11 @@ if(TARGET prosper_core)
   # host filesystem) must resolve to the real on-disk entry instead of being dropped as absent.
   # Pure std::filesystem against a temp tree; no game dump needed.
   # Includes a shared fixture, which resolves from the `tests` root.
+  # A module's local fallback body for a function it also imports must not satisfy the import.
+  prosper_add_gtest(test_local_fallback_import
+    SOURCES tests/self/test_local_fallback_import.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_module_path_case
     SOURCES tests/host/image/test_module_path_case.cpp
     INCLUDES tests

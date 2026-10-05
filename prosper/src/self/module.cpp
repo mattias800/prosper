@@ -264,6 +264,20 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     };
     read_relocs(m.rela_va, m.rela_sz, false);
     read_relocs(m.jmprel_va, m.jmprel_sz, true);
+    // A module can ship a local fallback body for a function it also imports (for example a
+    // `xor eax,eax; ret` placeholder): the symbol then has a section index and a non-zero value, so
+    // the undefined-symbol test above calls it an export. Its library id still names a declared
+    // IMPORT library and a GOT/PLT relocation binds it, so it is an import whose body must not
+    // satisfy it. Binding the fallback made Tales of Graces' sceKernelSyncOnAddressWait return
+    // immediately and its worker threads spin.
+    for (const auto& r : m.relocs) {
+        if (r.type != R_X86_64_GLOB_DAT && r.type != R_X86_64_JUMP_SLOT) continue;
+        if (!r.sym || r.sym >= m.symbols.size()) continue;
+        Symbol& sym = m.symbols[r.sym];
+        if (!is_relocated_local_fallback_import(sym, m.import_libs)) continue;
+        sym.is_import = true;
+        m.imports.push_back({sym.nid, sym.lib_name, r.sym, sym.elf_type});
+    }
     return m;
 }
 
