@@ -28,6 +28,7 @@
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/committed_section.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "host/memory/host_address_layout.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -6354,11 +6355,11 @@ namespace {
             }
             if (!acquired.address) {  // band contended/undersized: anywhere in the legacy huge band
                 acquired = acquire_placeholder_window_locked(kGuestHugeReserveBase, len, align);
-                if (acquired.address)
-                    MLOG("reserve(huge) top band unavailable -- whole-window fallback -> 0x%llx\n",
-                         (unsigned long long)(uintptr_t)acquired.address);
+                if (!acquired.address)   // fatal to the title: say what stands in the band (#4426)
+                    return host::report_unplaceable(len, kGuestHugeReserveBase, kGuestAutoMapLimit);
+                MLOG("reserve(huge) top band unavailable -- whole-window fallback -> 0x%llx\n",
+                     (unsigned long long)(uintptr_t)acquired.address);
             }
-            if (!acquired.address) return nullptr;
             const uint64_t base =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(acquired.address));
             remember_guest_placeholder_locked(base, len);

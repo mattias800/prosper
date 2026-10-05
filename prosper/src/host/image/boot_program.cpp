@@ -4,6 +4,7 @@
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/memory/host_address_layout.hpp"
 #include "host/symbols/il2cpp_symbols.hpp"
 
 #include <algorithm>
@@ -353,6 +354,10 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     // Diagnostics: record boot start.
     diagnostics::record_boot_phase(diagnostics::BootPhase::PROCESS_START);
+
+    // Before anything the guest can see is allocated: keep the host's later allocations (guest
+    // thread stacks among them) above 4 GiB and out of the guest's range (#4426). Windows only.
+    host::confine_host_allocations_above_4gib();
 
     // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
     std::vector<LinkInput> in = boot_link_inputs(d);

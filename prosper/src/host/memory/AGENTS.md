@@ -39,6 +39,15 @@ whatever ended up mapped, without any opinion on why.
   guest *moved* the data or *consumed* it, which need opposite fixes. Its pure half owns the chunking
   and overlap and is unit-tested; only the `/proc/self/maps` enumeration is POSIX-specific.
 
+- **`host_address_layout.{hpp,cpp}`** — where the HOST's own memory sits relative to the guest's
+  range, which on Windows is something prosper has to arrange (#4426). Two halves: the boot-time
+  reservation that keeps the process's later allocations — guest thread stacks included — above
+  4 GiB, and "what is standing in this part of the guest's range?", the query behind the report a
+  huge guest reservation now makes when it cannot be placed. The third piece is not code: an
+  executable that boots a guest must be linked through `prosper_hosts_a_guest()` in
+  `prosper/CMakeLists.txt`, or Windows scatters its stacks and heaps across the guest's range and
+  neither half here can undo that.
+
 **What belongs here:** anything that reads or classifies guest memory from the host side and has no
 guest-facing ABI of its own. **What does not:** the allocators and mappers themselves
 (`src/hle/memory`), the fault handler and image mapping (`src/host/image`), and anything that
