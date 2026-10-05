@@ -2884,10 +2884,10 @@ bool emit_cfg_state_machine(
                         return false;
                 return true;
             };
-            bool scalar_sources = true;
+            bool scalar_sources = true;   // not asked of a relative read: see the predicate
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const uint32_t width = scalar_alu_source_words(in, source);
-                if (width != UINT32_MAX)
+                if (width != UINT32_MAX && !s_movrels_b32_result_is_scalar_data(in))
                     scalar_sources &= source_is_scalar_range(in.src[source], width);
             }
             bool implicit_scalar_source = true;

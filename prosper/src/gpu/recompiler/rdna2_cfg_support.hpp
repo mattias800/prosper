@@ -92,6 +92,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
     // so the relaxation would silently become "reads are fine", which is not a proof of anything.
     if (proof == ScalarMergeProof::MaskDomainOnly && R != 106 && R != 107)
         return false;
+    // M0 has readers that never name it: the relative moves, v_movrels_b32, the LDS and
+    // append/consume forms, s_sendmsg. The operand scan below sees none of them, and a walk
+    // that reached s_endpgm used to answer "dead" for it.
+    if (R == 124) return false;
     const bool data_read_ok = proof == ScalarMergeProof::MaskDomainOnly;
     // Prove liveness over the actual scalar CFG, not just lexical order. UE4 commonly places another
     // forward EXECZ after an if/merge and only then overwrites the scratch SGPR/VCC value. A linear
@@ -1367,10 +1371,41 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
     }
     return out;
 }
+// Whether `in` is an s_movrels_b32 the lowering can emit (rdna2_movrels.cpp). What it writes is
+// then a scalar word: the select over what each candidate holds. A candidate in another domain (a
+// saved mask half, an entry-M0 token) refuses the whole instruction. A candidate with no tracked
+// value does NOT refuse; it contributes the zero placeholder every scalar read uses, so the
+// result is exactly as good as the candidate M0 selects, and wrong when that one was untracked.
+//
+// The dispatcher's scalar-word transfer asks this INSTEAD of charging the candidates, and the
+// reason is what failing that transfer means. It is not a refusal: the destination is dropped
+// from the words a case boundary reloads, and reads the zero placeholder afterwards. So dropping
+// can only turn a right result into zero, never a wrong one into a refusal. Charged the base
+// alone, a table whose first register was never written lost its result at the next join.
+// Charged the whole range s[base..105], every result did, since almost no program defines all of
+// those words. The read range below is for proofs that refuse; this is for the one that drops.
+inline bool s_movrels_b32_result_is_scalar_data(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovrelsB32 &&
+           in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 105 &&
+           in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 && in.src[0].value <= 105;
+}
 inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
             if (in.opcode == kSop1OpcodeGetpcB64) return UINT32_MAX; // s_getpc has no source
+            // S_MOVRELS reads SGPR[src + M0], not SGPR[src] (#4538). The b32 form is lowered as a
+            // select over every register from the encoded source up to s105 (rdna2_movrels.cpp),
+            // so that whole range is what the instruction may read. Every consumer takes the
+            // answer as a COUNT of consecutive words starting at the operand, and all but one
+            // refuse when the count overlaps something they care about; the exception is the
+            // dispatcher transfer the predicate above exists for. Charging the read one register
+            // let a register above the base be proven dead across a merge. The b64 form is not
+            // lowered; it gets the same range so nothing reasons about it as one fixed pair.
+            // A source that is not an SGPR is refused by the emitter and keeps the default.
+            if ((in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64) &&
+                source == 0 && in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+                in.src[0].value <= 105)
+                return static_cast<uint32_t>(106 - in.src[0].value);
             if (in.opcode == kSop1OpcodeBitreplicateB64B32) return 1u; // 32-bit source replicated to 64-bit dst
             if (in.opcode == kSop1OpcodeBcnt1I32B64 ||
                 in.opcode == kSop1OpcodeFf1I32B64 ||
@@ -1761,6 +1796,9 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 // reads SCC). The explicit operand alone cannot prove their result uniform.
                 if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
                     scalar_implicit_destination_read_width(in)) return false;
+                // Which register a relative move reads depends on M0, which no operand names.
+                if (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64)
+                    return false;
                 const Operand& op = in.src[0];
                 const uint32_t words = scalar_alu_source_words(in, 0);
                 if (op.kind == OperandKind::Special && op.value == 125) return true;
@@ -1851,6 +1889,9 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 // reads SCC). The explicit operand alone cannot prove their result uniform.
                 if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
                     scalar_implicit_destination_read_width(in)) return false;
+                // Which register a relative move reads depends on M0, which no operand names.
+                if (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64)
+                    return false;
                 return uniform_operand(in.src[0], scalar_alu_source_words(in, 0), w, depth);
             case Rdna2Format::SOP2: {
                 // Carry and cselect forms consume SCC as well as their decoded operands; the mask
