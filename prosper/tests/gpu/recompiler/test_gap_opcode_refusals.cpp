@@ -327,16 +327,20 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 }
 
 // Unlowered arithmetic x2 MUBUF atomics must refuse fail-visibly. sub/inc/
-// dec_x2 need a true qword RMW like the add/and_x2 family (previous arm).
-// All words below are llvm-mc gfx1030 round-tripped with the idxen form.
-// (cmpswap_x2 assembles on no tried operand shape; it gets its arm once
-// verified words exist.) WHEN an x2 lowering lands, ITS CASE GOES RED;
-// replace it with an execution test of the new lowering.
+// dec_x2 need a true qword RMW like the add/and_x2 family pinned in
+// BufferAtomicX2Refuse. All words below are llvm-mc gfx1030 round-tripped in
+// the idxen form (VDATA v[0:1], VADDR v2), and the control is the same-shape
+// 32-bit buffer_atomic_add that BufferAtomicX2Refuse already proves compiles,
+// so each pair differs only in the opcode. (cmpswap_x2, 0x51, also refuses but
+// carries a four-VGPR data operand -- `buffer_atomic_cmpswap_x2 v[0:3], v4,
+// s[8:11], 0 idxen` = {0xe1442000, 0x80020004} -- so it needs its own arm.)
+// WHEN an x2 lowering lands, ITS CASE GOES RED; replace it with an execution
+// test of the new lowering.
 TEST(GapOpcodeRefusals, BufferAtomicX2ArithmeticRefuse) {
     static const uint32_t subx2[2] = {0xe14c2000u, 0x80020002u};
     static const uint32_t incx2[2] = {0xe1702000u, 0x80020002u};
     static const uint32_t decx2[2] = {0xe1742000u, 0x80020002u};
-    static const uint32_t add[2] = {0xe0c80000u, 0x80020100u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};   // atomic_add v0, v2 idxen
     for (const uint32_t* words : {subx2, incx2, decx2, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
@@ -361,17 +365,16 @@ TEST(GapOpcodeRefusals, BufferAtomicX2ArithmeticRefuse) {
     ComputeShaderConfig config;
     config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
     const std::vector<uint32_t> prologue = {
-        0x7e000280u,   // v_mov_b32 v0, 0 (address)
-        0x7e020283u,   // v_mov_b32 v1, 3 (value)
-        0x7e040280u,   // v_mov_b32 v2, 0
+        0x7e000280u,   // v_mov_b32 v0, 0 (data, low dword)
+        0x7e020283u,   // v_mov_b32 v1, 3 (data, high dword)
+        0x7e040280u,   // v_mov_b32 v2, 0 (VADDR: the idxen element index)
     };
-    // NOTE: swap_x2 was tried as the same-shape control first, but its
-    // separately guarded lowering needs fuller backing than this bare entry
-    // provides, so it cannot serve as a control here. The 32-bit add (proven
-    // compiling over this exact entry shape in the previous arm) proves the
-    // harness instead; the x2-ness is what the refusals discriminate.
+    // swap_x2 was tried as the same-shape control first, but its separately
+    // guarded lowering needs fuller backing than this bare entry provides. The
+    // idxen 32-bit add -- the control BufferAtomicX2Refuse compiles over this
+    // same table and prologue -- proves the harness instead.
     expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F5ull,
-                    "control: 32-bit add over the same entry", &rt, config);
+                    "control: same-shape 32-bit add over the same entry", &rt, config);
     expect_gap_refusal(program(prologue, {subx2[0], subx2[1]}), 0xA0F6ull, 3,
                        {subx2[0], subx2[1]}, Rdna2Format::MUBUF, 0x53u, &rt,
                        config);
