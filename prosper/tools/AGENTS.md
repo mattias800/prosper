@@ -413,6 +413,9 @@ capture/replay without requiring an importable system Python module.
   published with and the 36 that is correct (#2070). There is no platform-independent answer to give,
   and `s_ok` is a case where the platform-blind count is wrong on *every* platform, so the tool
   refuses to pick for you. See `re/README.md`.
+- **`progress/progress.py`** — static HLE coverage census per registered Sony NID (real handler vs
+  placeholder-only), grouped by `src/hle/<area>/`, built on `re/hle_handler_map.py`'s parser. See
+  `progress/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,

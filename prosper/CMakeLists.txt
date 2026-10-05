@@ -428,6 +428,10 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_hle_handler_map.py")
   # ...and reconciled against the registry the compiled binary actually builds, so a registration
   # SHAPE the parser does not recognise fails loudly instead of quietly shrinking the census.
+  # The HLE progress census counts per registered NID on top of hle_handler_map's parser; its
+  # fixtures are the registration shapes an HLE()-regex census miscounted (#4532).
+  add_test(NAME progress_census
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/progress/test_progress.py")
   add_test(NAME re_hle_handler_map_reconcile
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/re/test_hle_registry_reconcile.py"
