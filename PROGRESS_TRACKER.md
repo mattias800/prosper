@@ -153,6 +153,7 @@ of its manifest.
 | Hi-Fi RUSH | `PPSA17168` | 2 | `12----` | **0.5** fps · 9% active · 4K · title screen, default launch, no pad · tools/screenshot · 2026-08-21 | - | none | - | [#2891](https://github.com/mattias800/prosper/issues/2891) | - |
 | Kena: Bridge of Spirits | `PPSA01802` | 2 | `12----` | - | - | - | [#2147](https://github.com/mattias800/prosper/issues/2147) | [#3787](https://github.com/mattias800/prosper/issues/3787) | [`KENA_STATUS.md`](prosper/docs/games/KENA_STATUS.md) |
 | Little Nightmares III | `PPSA05143` | 2 | `12----` | - | - | none | [#2014](https://github.com/mattias800/prosper/issues/2014), [#2022](https://github.com/mattias800/prosper/issues/2022), [#2028](https://github.com/mattias800/prosper/issues/2028), [#1977](https://github.com/mattias800/prosper/issues/1977) | [#1893](https://github.com/mattias800/prosper/issues/1893) | [`LITTLE_NIGHTMARES_3_STATUS.md`](prosper/docs/games/LITTLE_NIGHTMARES_3_STATUS.md) |
+| MOUSE: P.I. For Hire | `PPSA26578` | 2 | `12----` | - | - | - | [#4553](https://github.com/mattias800/prosper/issues/4553), [#4554](https://github.com/mattias800/prosper/issues/4554), [#4555](https://github.com/mattias800/prosper/issues/4555) | [#4556](https://github.com/mattias800/prosper/issues/4556) | - |
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/games/NIKODERIKO_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/games/SONIC_FRONTIERS_STATUS.md) |
 | Sonic Origins | `PPSA05325` | 2 | `12----` | **4.7** fps · 47% active · 4K · default launch to the boot auto-save modal · tools/screenshot · 2026-08-22 | - | none | [#2919](https://github.com/mattias800/prosper/issues/2919), [#2920](https://github.com/mattias800/prosper/issues/2920), [#2267](https://github.com/mattias800/prosper/issues/2267), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/games/GRIS_SONIC_COBRA_BRINGUP.md) |
@@ -194,10 +195,10 @@ of its manifest.
 | 5 -- PS5 hardware-oracle comparison | 1 |
 | 4 -- manual visual verification | 3 |
 | 3 -- gameplay with the scene rendering | 11 |
-| 2 -- title screen | 20 |
+| 2 -- title screen | 21 |
 | 1 -- any real graphics | 5 |
 | 0 -- not started | 16 |
 
-**4 of 70** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 9 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 71** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 10 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
