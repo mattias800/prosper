@@ -194,7 +194,7 @@ file-size|prosper/src/hle/kernel/hle_kernel.cpp 5561
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
 # same-origin mapping windows under
 # the private HLE ledger lock; neither VMA remainder nor physical allocation size grants bytes.
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8774  # +17: the fixed-direct-map replacement gate exists once per backing half (POSIX and Windows each own their registries); lowered again when the halves are split
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8757
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.

@@ -171,7 +171,7 @@ static void test_automatic_placement() {
         CHECK(have_fixed && done == 1, "exact later fixed arena map succeeds after automatic startup maps");
         if (bulk_occupant)
             CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xC0111DE5u,
-                  "refused fixed map preserves the bulk occupant at the exact fixed target");
+                  "a later fixed arena never lands inside the automatic bulk backing");
         if (have_fixed && have_automatic)
             CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xD1AEC771u,
                   "the fixed view aliases the earlier automatic direct view");

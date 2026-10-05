@@ -18,6 +18,8 @@
 //   TitleShapedCarveHeadOfLiveView       the title's smaller fixed map over a live view's head is refused
 //   CarveKeepsLivePrefixAndSuffix        a partial replace damages the untouched prefix or suffix
 //   FixedMapOverFlexibleMemoryIsRefused  flexible memory is replaced, or wiped by a failing retry
+//   RangeSpanningDirectAndFlexibleIsRefused  a range accepted after its FIRST direct cover clobbers the flexible page
+//   RangeSpanningTwoDirectViewsIsReplaced    a range spanning two old views replaces only the first
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -41,6 +43,8 @@ protected:
         map_ = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
         release_ = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
         flex_ = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
+        reserve_ = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
+        ASSERT_NE(reserve_, nullptr);
         ASSERT_NE(allocate_, nullptr);
         ASSERT_NE(map_, nullptr);
         ASSERT_NE(release_, nullptr);
@@ -59,11 +63,21 @@ protected:
         EXPECT_NE(addr, 0u);
         return addr;
     }
+    uint64_t reserve(uint64_t pages) {
+        uint64_t addr = 0;
+        EXPECT_EQ(reserve_((uint64_t)(uintptr_t)&addr, pages * kPage, 0, kPage, 0, 0), 0u);
+        EXPECT_NE(addr, 0u);
+        return addr;
+    }
+    uint64_t map_fixed(uint64_t addr, uint64_t pages, uint64_t phys) {
+        uint64_t at_addr = addr;
+        return map_((uint64_t)(uintptr_t)&at_addr, pages * kPage, 3, kFixed, phys, kPage);
+    }
     static volatile uint8_t* at(uint64_t addr, uint64_t page = 0) {
         return reinterpret_cast<volatile uint8_t*>(addr + page * kPage);
     }
 
-    HleFn allocate_ = nullptr, map_ = nullptr, release_ = nullptr, flex_ = nullptr;
+    HleFn allocate_ = nullptr, map_ = nullptr, release_ = nullptr, flex_ = nullptr, reserve_ = nullptr;
 };
 
 }  // namespace
@@ -134,4 +148,39 @@ TEST_F(DmemFixedRemap, FixedMapOverFlexibleMemoryIsRefused) {
     for (uint64_t i = 0; i < 4; ++i)
         EXPECT_EQ(*at(flex, i), static_cast<uint8_t>(0x50 + i))
             << "a refused map must leave the flexible memory intact and accessible (page " << i << ")";
+}
+
+TEST_F(DmemFixedRemap, RangeSpanningDirectAndFlexibleIsRefused) {
+    const uint64_t base = reserve(2);
+    const uint64_t a = alloc(1);
+    ASSERT_EQ(map_fixed(base, 1, a), 0u);
+    uint64_t flex = base + kPage;
+    ASSERT_EQ(flex_((uint64_t)(uintptr_t)&flex, kPage, 3, kFixed, (uint64_t)(uintptr_t)"flex", 0), 0u);
+    *at(base) = 0xD1;
+    *at(base, 1) = 0xF1;
+
+    const uint64_t b = alloc(2);
+    EXPECT_EQ(map_fixed(base, 2, b), kEnomem)
+        << "a range that spans direct AND flexible memory must be refused as a whole";
+    EXPECT_EQ(*at(base), 0xD1) << "the direct page keeps its contents";
+    EXPECT_EQ(*at(base, 1), 0xF1) << "the flexible page must not be clobbered";
+}
+
+TEST_F(DmemFixedRemap, RangeSpanningTwoDirectViewsIsReplaced) {
+    const uint64_t base = reserve(2);
+    const uint64_t a = alloc(1);
+    const uint64_t b = alloc(1);
+    ASSERT_EQ(map_fixed(base, 1, a), 0u);
+    ASSERT_EQ(map_fixed(base + kPage, 1, b), 0u);
+    *at(base) = 0x11;
+    *at(base, 1) = 0x22;
+
+    const uint64_t c = alloc(2);
+    const uint64_t c_addr = map_anywhere(2, c);
+    *at(c_addr) = 0xC0;
+    *at(c_addr, 1) = 0xC1;
+
+    ASSERT_EQ(map_fixed(base, 2, c), 0u) << "one fixed map across two direct views must replace both";
+    EXPECT_EQ(*at(base), 0xC0);
+    EXPECT_EQ(*at(base, 1), 0xC1) << "the second view must be replaced too";
 }

@@ -1467,23 +1467,30 @@ namespace {
         }
         return true;
     }
-    // Is [base, base+len) entirely covered by tracked DIRECT-memory mappings? A fixed direct map replaces
-    // them, as mmap(MAP_FIXED) does on the PS5's kernel (the guest keeps what is there with
-    // SCE_KERNEL_MAP_NO_OVERWRITE, which is unverified and unhonoured, #3819). Flexible memory, images and
-    // untracked host ranges stay refused (#137): a gap or any non-direct byte answers false.
+    // May a fixed direct map replace [base, base+len)? Every byte must be a tracked mapping and at least
+    // one direct; direct mappings and uncommitted reservations are replaced (as on Windows, where
+    // placeholders are claimed too), committed flexible memory, images and untracked host ranges stay
+    // refused (#137). A fixed map replaces what it lands on under mmap(2) MAP_FIXED, and the guest keeps
+    // what is there with SCE_KERNEL_MAP_NO_OVERWRITE, whose value is unverified and unhonoured (#3819).
+    // CONFIDENCE: MED. FreeBSD mmap(2) MAP_FIXED is published; the PPSA28183 MEMLOG trace (a 0x630000 view,
+    // then a 0x70000 FIXED map at the same VA, abort on ENOMEM) shows what the guest expects, not what the
+    // PS5 kernel does for direct-over-direct.
     bool range_is_replaceable_direct(uint64_t base, uint64_t len) {
         if (!len || base > UINT64_MAX - len) return false;
         std::lock_guard<std::mutex> lk(g_mx);
         uint64_t cur = base;
         const uint64_t end = base + len;
+        bool any_direct = false;
         while (cur < end) {
             const Mapping* cover = nullptr;
             for (const Mapping& m : g_maps)
                 if (cur >= m.base && cur < m.base + m.size) { cover = &m; break; }
-            if (!cover || !(cover->query_flags & kVirtualQueryDirect)) return false;
+            if (!cover) return false;
+            if (cover->query_flags & kVirtualQueryDirect) any_direct = true;
+            else if (cover->committed) return false;
             cur = cover->base + cover->size;
         }
-        return true;
+        return any_direct;
     }
     // Smallest mapping base strictly greater than addr (0 if none) — for hole reporting.
     uint64_t next_base(uint64_t addr) {
@@ -1766,7 +1773,7 @@ namespace {
     // if the memfd is unavailable (still boots; loses aliasing). A zero-hint mapping honors the
     // caller's requested VA alignment; the old host-page-aligned mmap violated that ABI contract.
     void* map_phys_at_impl(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align,
-                           bool fixed) {
+                           bool fixed, bool replace_direct) {
         int fd = dmem_fd();
         if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
             if (!hint) {
@@ -1781,7 +1788,7 @@ namespace {
                 // PROT_NONE placeholder is safe even when MAP_FIXED was not requested.
                 void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
-            } else if (fixed && range_is_replaceable_direct(hint, len)) {
+            } else if (fixed && replace_direct && range_is_replaceable_direct(hint, len)) {
                 // MAP_FIXED replaces direct memory (see range_is_replaceable_direct).
                 void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
@@ -1824,9 +1831,11 @@ namespace {
     // the VA<->phys alias from one place — it can then arm every VA that maps a watched physical page,
     // rather than only the ones a specific high-level API remembered to report (review B3). `prot` is
     // host protection whose bits (READ=1/WRITE=2/EXEC=4) coincide with the Sony bits the watch decodes.
+    // `replace_direct` is opt-in: only sceKernelMapDirectMemory / BatchMap MAP_DIRECT with MAP_FIXED
+    // replace direct memory. Ampr and AMM maps keep refusing any occupied target (#88 / #107).
     void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0,
-                      bool fixed = true) {
-        void* p = map_phys_at_impl(hint, len, prot, phys, align, fixed);
+                      bool fixed = true, bool replace_direct = false) {
+        void* p = map_phys_at_impl(hint, len, prot, phys, align, fixed, replace_direct);
         if (p) {
             host::guest_write_watch_notify_direct_mapping_added(
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)), len, phys,
@@ -2336,7 +2345,7 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
-    void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed);
+    void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed, fixed);
     const int map_errno = p ? 0 : errno;
     // PROSPER_MAPWATCH=0xADDR[:SIZE] (#2998): report every direct-memory map whose RESULT overlaps
     // one guest range, with the physical offset and whether the placement was fixed. The question it
@@ -3784,7 +3793,7 @@ HLE(k_batch_map) {
         int map_errno = 0;
         switch (op) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
-                void* p = map_phys_at(start, len, host_prot(prot), phys);
+                void* p = map_phys_at(start, len, host_prot(prot), phys, 0, true, true);
                 ok = (p != nullptr);
                 if (!ok) map_errno = errno;
                 int32_t memory_type = 0;
@@ -6065,6 +6074,10 @@ namespace {
         const uint64_t end = base + len;
         bool any = false;
         std::lock_guard<std::mutex> lk(g_dview_mx);
+        // A range that also holds a direct view is range_direct_views_replaceable's business: it refuses
+        // committed non-direct memory, which this private-views-only test would otherwise let through.
+        for (const DmemView& view : g_dviews)
+            if (base < view.guest_base + view.guest_size && end > view.guest_base) return false;
         for (const PrivatePlaceholderView& view : g_private_placeholder_views) {
             if (!(view.base < end && base < view.base + view.size)) continue;
             if (view.base < base || view.base + view.size > end) return false;
@@ -6139,11 +6152,11 @@ namespace {
                     const unsigned n = seen.fetch_add(1, std::memory_order_relaxed);
                     if (n < 4)
                         std::fprintf(stderr,
-                                     "[memhle] fixed MAP_DIRECT 0x%llx +0x%llx replaced private pages "
-                                     "prosper had committed in the guest reservation (#3812)\n",
+                                     "[memhle] fixed MAP_DIRECT 0x%llx +0x%llx replaced guest-owned "
+                                     "mappings (private pages or direct views)\n",
                                      (unsigned long long)hint, (unsigned long long)len);
                     else if (n == 4)
-                        std::fprintf(stderr, "[memhle] further #3812 replacements not logged\n");
+                        std::fprintf(stderr, "[memhle] further fixed MAP_DIRECT replacements not logged\n");
                     return p;
                 };
                 if (void* p = map_section_view(hint, len, hp, phys, align)) return announce(p);
@@ -6850,7 +6863,7 @@ namespace {
     // overlaps and every byte is owned by a direct view, a placeholder or a private view wholly inside the
     // range. Anything else answers false BEFORE any mutation: win_unmap's registry-less fallback is a
     // blind MEM_DECOMMIT (plain flexible memory), and a partly covered view that cannot be split fails
-    // inside win_unmap with nothing changed.
+    // inside win_unmap with nothing changed. CONFIDENCE: MED, evidence as for the POSIX predicate.
     bool range_direct_views_replaceable(uint64_t base, uint64_t len) {
         if (!len || base > UINT64_MAX - len) return false;
         const uint64_t end = base + len;
@@ -6877,8 +6890,14 @@ namespace {
         }
         if (!direct) return false;
         normalize_spans(covered);
-        return span_is_covered(base, end, covered) &&
-               tracked_mappings_covered_by_spans(base, end, covered);
+        if (!span_is_covered(base, end, covered) ||
+            !tracked_mappings_covered_by_spans(base, end, covered)) return false;
+        // Committed non-direct memory (flexible) is never replaced, whatever registry holds its pages.
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (const Mapping& m : g_maps)
+            if (m.committed && !(m.query_flags & kVirtualQueryDirect) && base < m.base + m.size &&
+                end > m.base) return false;
+        return true;
     }
 
     // Shared section views must be released with the view APIs. Placeholder-backed views can be
