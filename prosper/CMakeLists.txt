@@ -1550,6 +1550,13 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # sceSaveDataLoadIcon (#2081): unregistered, it answered SCE_OK over an unwritten icon
+  # buffer. Round-trips through the real SaveIcon/LoadIcon NIDs, with refusal arms.
+  prosper_add_gtest(test_savedata_icon
+    SOURCES tests/hle/test_savedata_icon.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   # #3654: the mount wrappers carry the requested blocks into a per-save allocation record, and
   # GetMountInfo reports blocks / freeBlocks from that record and the files in the save. Includes a
   # re-exec of itself to prove the allocation survives a new process.
