@@ -1162,6 +1162,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_streaming.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 allocator-create/destroy/grain/lock lifecycle: tagged handles validate,
+  # destroy reclaims, grain records. Pure, no game dump.
+  prosper_add_gtest(test_ngs2_lifecycle
+    SOURCES tests/hle/test_ngs2_lifecycle.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
@@ -1204,6 +1210,11 @@ if(TARGET prosper_core)
   # pass vacuously.
   prosper_add_gtest(test_h264_sps
     SOURCES tests/hle/video/test_h264_sps.cpp
+    LIBRARIES prosper_core)
+
+  # AvPlayer trick speed and bandwidth window, from the shipped sprx. Pure, no game dump.
+  prosper_add_gtest(test_avplayer_misc
+    SOURCES tests/hle/video/test_avplayer_misc.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_json2 tests/hle/test_json2.cpp)
@@ -1462,6 +1473,12 @@ if(TARGET prosper_core)
   # Pure, no game dump.
   prosper_add_gtest(test_ult_semantics
     SOURCES tests/hle/test_ult_semantics.cpp
+    LIBRARIES prosper_core Threads::Threads)
+
+  # Fiber/Ult remainder: context-size checks ack, frame-pointer address is zeroed,
+  # try-lock/signal-all/try-join/yield behave against real objects. Pure, no game dump.
+  prosper_add_gtest(test_fiber_ult_misc
+    SOURCES tests/hle/sync/test_fiber_ult_misc.cpp
     LIBRARIES prosper_core Threads::Threads)
 
   prosper_add_gtest(test_posix_sem
