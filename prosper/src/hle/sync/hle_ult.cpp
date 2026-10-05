@@ -116,6 +116,7 @@
 #include <pthread.h>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -173,32 +174,40 @@ constexpr uint64_t kUltNotImplemented = hle::kSceKernelErrorENOSYS;   // the leg
 // generic unimplemented-import path, which logs it — add it here when that happens.
 // ---------------------------------------------------------------------------------------------
 enum class UltRet : uint8_t { Status, Size };   // #1618: what the contract's return value MEANS
-struct UltEntry { const char* nid; const char* name; UltRet ret; };
+struct UltEntry {
+    const char* nid;
+    const char* name;
+    UltRet ret;
+};
 constexpr UltEntry kUlt[] = {
-    { "jw9FkZBXo-g", "_sceUltUlthreadRuntimeCreate",                  UltRet::Status },
-    { "grs2pbc2awM", "sceUltUlthreadRuntimeGetWorkAreaSize",          UltRet::Size   },
-    { "znI3q8S7KQ4", "_sceUltUlthreadCreate",                         UltRet::Status },
-    { "gCeAI57LGgI", "sceUltUlthreadJoin",                            UltRet::Status },
-    { "mmt8Sa6tL6c", "_sceUltMutexCreate",                            UltRet::Status },
-    { "8hEGkR1pfr8", "sceUltMutexLock",                               UltRet::Status },
-    { "h0XebKiMBtk", "sceUltMutexUnlock",                             UltRet::Status },
-    { "jW+HnafeS3Y", "sceUltMutexDestroy",                            UltRet::Status },
-    { "jnKaHGkrxZ4", "_sceUltConditionVariableCreate",                UltRet::Status },
-    { "5xGAHCxA8M0", "sceUltConditionVariableWait",                   UltRet::Status },
-    { "JTw1cAVkuc0", "sceUltConditionVariableSignal",                 UltRet::Status },
-    { "xrmmI832R4U", "sceUltConditionVariableDestroy",                UltRet::Status },
-    { "YiHujOG9vXY", "_sceUltWaitingQueueResourcePoolCreate",         UltRet::Status },
-    { "WIWV1Qd7PFU", "sceUltWaitingQueueResourcePoolGetWorkAreaSize", UltRet::Size   },
-    { "hZIg1EWGsHM", "sceUltInitialize",                              UltRet::Status },
-    { "d-kSG2fLrvI", "sceUltFinalize",                                UltRet::Status },
+    {"jw9FkZBXo-g", "_sceUltUlthreadRuntimeCreate", UltRet::Status},
+    {"grs2pbc2awM", "sceUltUlthreadRuntimeGetWorkAreaSize", UltRet::Size},
+    {"znI3q8S7KQ4", "_sceUltUlthreadCreate", UltRet::Status},
+    {"gCeAI57LGgI", "sceUltUlthreadJoin", UltRet::Status},
+    {"mmt8Sa6tL6c", "_sceUltMutexCreate", UltRet::Status},
+    {"8hEGkR1pfr8", "sceUltMutexLock", UltRet::Status},
+    {"h0XebKiMBtk", "sceUltMutexUnlock", UltRet::Status},
+    {"jW+HnafeS3Y", "sceUltMutexDestroy", UltRet::Status},
+    {"jnKaHGkrxZ4", "_sceUltConditionVariableCreate", UltRet::Status},
+    {"5xGAHCxA8M0", "sceUltConditionVariableWait", UltRet::Status},
+    {"JTw1cAVkuc0", "sceUltConditionVariableSignal", UltRet::Status},
+    {"xrmmI832R4U", "sceUltConditionVariableDestroy", UltRet::Status},
+    {"YiHujOG9vXY", "_sceUltWaitingQueueResourcePoolCreate", UltRet::Status},
+    {"WIWV1Qd7PFU", "sceUltWaitingQueueResourcePoolGetWorkAreaSize", UltRet::Size},
+    {"hZIg1EWGsHM", "sceUltInitialize", UltRet::Status},
+    {"d-kSG2fLrvI", "sceUltFinalize", UltRet::Status},
+    {"jOsUG0BJI-Y", "sceUltMutexTryLock", UltRet::Status},
+    {"byiceqcMvV0", "sceUltConditionVariableSignalAll", UltRet::Status},
+    {"DsW+3FTXL0Q", "sceUltUlthreadTryJoin", UltRet::Status},
+    {"HFd-lpjGxJA", "sceUltUlthreadYield", UltRet::Status},
 };
 constexpr size_t kUltCount = sizeof(kUlt) / sizeof(kUlt[0]);
-constexpr size_t kIdxRuntimeCreate = 0,  kIdxRuntimeSize = 1,  kIdxUlthreadCreate = 2,
-                 kIdxUlthreadJoin  = 3,  kIdxMutexCreate = 4,  kIdxMutexLock      = 5,
-                 kIdxMutexUnlock   = 6,  kIdxMutexDestroy = 7, kIdxCondCreate     = 8,
-                 kIdxCondWait      = 9,  kIdxCondSignal  = 10, kIdxCondDestroy    = 11,
-                 kIdxPoolCreate    = 12, kIdxPoolSize    = 13, kIdxInitialize     = 14,
-                 kIdxFinalize      = 15;
+constexpr size_t kIdxRuntimeCreate = 0, kIdxRuntimeSize = 1, kIdxUlthreadCreate = 2,
+                 kIdxUlthreadJoin = 3, kIdxMutexCreate = 4, kIdxMutexLock = 5, kIdxMutexUnlock = 6,
+                 kIdxMutexDestroy = 7, kIdxCondCreate = 8, kIdxCondWait = 9, kIdxCondSignal = 10,
+                 kIdxCondDestroy = 11, kIdxPoolCreate = 12, kIdxPoolSize = 13, kIdxInitialize = 14,
+                 kIdxFinalize = 15, kIdxMutexTryLock = 16, kIdxCondSignalAll = 17,
+                 kIdxUlthreadTryJoin = 18, kIdxUlthreadYield = 19;
 
 std::atomic<uint64_t> g_calls[kUltCount];
 std::atomic<uint64_t> g_next_report[kUltCount];   // 0 = "report the next call"
@@ -901,6 +910,41 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_unlock(uint64_t a0, uint64_t, uint64_t, uint
     return kUltOk;
 }
 
+// sceUltMutexTryLock(mutex): the non-blocking sibling of sceUltMutexLock. Same self-relock
+// diagnosis, but a held-by-someone-else mutex answers EAGAIN rather than waiting: that is the
+// whole difference between the two entry points, and the watchdog path must not run here.
+// CONFIDENCE: MED — the try/EBUSY shape is standard; the EAGAIN code (rather than a Ult-
+// specific busy code) is inferred from the errno family this file already reports.
+PROSPER_SYSV_ABI uint64_t ult_mutex_trylock(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                            uint64_t) {
+    HostTcbScope host_tcb;
+    uint64_t out = 0;
+    if (!implement(kIdxMutexTryLock, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Mutex, "sceUltMutexTryLock");
+    if (!o) return kUltErrSrch;
+    const uint64_t me = self_thread();
+    o->lock_calls.fetch_add(1, std::memory_order_relaxed);
+    if (o->owner.load(std::memory_order_relaxed) == me) {
+        if (!o->warned_deadlock.exchange(true))
+            log_line("SELF-DEADLOCK: sceUltMutexTryLock on \"%s\" (0x%llx) by the thread that "
+                     "already holds it (non-recursive) -- refusing",
+                     o->name.c_str(), (unsigned long long)o->guest_addr);
+        return kUltErrDeadlk;
+    }
+    const int rc = pthread_mutex_trylock(&o->mtx);
+    if (rc == EBUSY) {
+        o->contended.fetch_add(1, std::memory_order_relaxed);
+        return kUltErrAgain;
+    }
+    if (rc == EDEADLK) return kUltErrDeadlk;
+    if (rc != 0) {
+        log_line("sceUltMutexTryLock on \"%s\" failed: pthread rc=%d", o->name.c_str(), rc);
+        return kUltErrInval;
+    }
+    o->owner.store(me, std::memory_order_relaxed);
+    return kUltOk;
+}
+
 PROSPER_SYSV_ABI uint64_t ult_mutex_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                             uint64_t) {
     uint64_t out = 0;
@@ -1108,13 +1152,14 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_create(uint64_t a0, uint64_t a1, uint64_t
     rt->live_ulthreads.fetch_add(1, std::memory_order_acq_rel);
     GuestThreadHooks hooks;
     hooks.on_enter = ulthread_on_enter;
-    hooks.on_exit  = ulthread_on_exit;
-    hooks.opaque   = o;
+    hooks.on_exit = ulthread_on_exit;
+    hooks.opaque = o;
     uint64_t thread = 0;
     const int rc = guest_thread_spawn(a2, a3, o->name.empty() ? "ulthread" : o->name.c_str(),
                                       (void*)(uintptr_t)a4, (size_t)a5, &hooks, &thread);
     if (rc != 0) {
-        log_line("_sceUltUlthreadCreate(\"%s\"): guest thread spawn failed (%d)", o->name.c_str(), rc);
+        log_line("_sceUltUlthreadCreate(\"%s\"): guest thread spawn failed (%d)", o->name.c_str(),
+                 rc);
         rt->live_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
         runtime_release_slot(rt, id);
         unpublish_object(a0);
@@ -1132,17 +1177,55 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_create(uint64_t a0, uint64_t a1, uint64_t
 
 // sceUltUlthreadJoin(ulthread, int32_t* status). The status out-param is 4 bytes: the call site at
 // eboot+0x9f1e passes `lea rsi,[rbp-0xc]`, a 4-byte local below the stack canary at [rbp-0x8].
+// Shared join completion: status write-back, slot release, unpublish. Runs after the caller has
+// claimed the join (claim_ulthread_join) and the host thread is reaped.
+uint64_t complete_ulthread_join(UltObject* o, uint64_t guest_addr, uint64_t status_out,
+                                const char* fn) {
+    // The ulthread entry is int32_t(*)(uint64_t); its return travels in eax.
+    const uint32_t status = o->exit_status.load(std::memory_order_relaxed);
+    if (status_out) {
+        if (!gpu::guest_readable(status_out, sizeof(int32_t))) {
+            log_line("%s: status out-param 0x%llx is unusable -- not writing it", fn,
+                     (unsigned long long)status_out);
+        } else {
+            *(int32_t*)(uintptr_t)status_out = (int32_t)status;
+        }
+    }
+    g_last_join_stack_used.store(o->stack_used.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+    g_last_join_context_size.store(o->context_size, std::memory_order_relaxed);
+    log_line("%s(\"%s\") -> status %d, guest stack high-water %s%llu of %llu bytes", fn,
+             o->name.c_str(), (int)status,
+             o->stack_exact.load(std::memory_order_relaxed) ? "" : "<=",
+             (unsigned long long)o->stack_used.load(), (unsigned long long)o->context_size);
+
+    UltObject* rt = object_from_id(o->runtime_id, UltType::Runtime);
+    if (rt) {
+        runtime_release_slot(rt, make_id(o->slot, o->generation));
+        rt->live_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    unpublish_object(guest_addr);
+    o->alive.store(false, std::memory_order_release);
+    return kUltOk;
+}
+
+// Claim the join BEFORE any pthread_join: a second Join or TryJoin is refused at once rather than
+// joining the same host thread twice (undefined under POSIX). The shipped libSceUlt likewise claims
+// "joined" (a state CAS) before it waits.
+bool claim_ulthread_join(UltObject* o, uint64_t guest_addr, const char* fn) {
+    if (!o->joined.exchange(true, std::memory_order_acq_rel)) return true;
+    log_line("%s: ulthread \"%s\" (0x%llx) was already joined", fn, o->name.c_str(),
+             (unsigned long long)guest_addr);
+    return false;
+}
+
 PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
                                             uint64_t) {
     uint64_t out = 0;
     if (!implement(kIdxUlthreadJoin, &out)) return out;
     UltObject* o = resolve(a0, UltType::Ulthread, "sceUltUlthreadJoin");
     if (!o) return kUltErrSrch;
-    if (o->joined.exchange(true, std::memory_order_acq_rel)) {
-        log_line("sceUltUlthreadJoin: ulthread \"%s\" (0x%llx) was already joined", o->name.c_str(),
-                 (unsigned long long)a0);
-        return kUltErrInval;
-    }
+    if (!claim_ulthread_join(o, a0, "sceUltUlthreadJoin")) return kUltErrInval;
 
     // Watchdog: the guest frees the context buffer right after join returns, so a join that never
     // returns is both a hang AND the reason a later use-after-free would look inexplicable.
@@ -1170,31 +1253,36 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, 
         pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
     }
 
-    // The ulthread entry is int32_t(*)(uint64_t); its return travels in eax.
-    const uint32_t status = o->exit_status.load(std::memory_order_relaxed);
-    if (a1) {
-        if (!gpu::guest_readable(a1, sizeof(int32_t))) {
-            log_line("sceUltUlthreadJoin: status out-param 0x%llx is unusable -- not writing it",
-                     (unsigned long long)a1);
-        } else {
-            *(int32_t*)(uintptr_t)a1 = (int32_t)status;
-        }
-    }
-    g_last_join_stack_used.store(o->stack_used.load(std::memory_order_relaxed),
-                                 std::memory_order_relaxed);
-    g_last_join_context_size.store(o->context_size, std::memory_order_relaxed);
-    log_line("sceUltUlthreadJoin(\"%s\") -> status %d, guest stack high-water %s%llu of %llu bytes",
-             o->name.c_str(), (int)status,
-             o->stack_exact.load(std::memory_order_relaxed) ? "" : "<=",
-             (unsigned long long)o->stack_used.load(), (unsigned long long)o->context_size);
+    return complete_ulthread_join(o, a0, a1, "sceUltUlthreadJoin");
+}
 
-    UltObject* rt = object_from_id(o->runtime_id, UltType::Runtime);
-    if (rt) {
-        runtime_release_slot(rt, make_id(o->slot, o->generation));
-        rt->live_ulthreads.fetch_sub(1, std::memory_order_acq_rel);
-    }
-    unpublish_object(a0);
-    o->alive.store(false, std::memory_order_release);
+// sceUltUlthreadTryJoin(ulthread, status*): Join that refuses instead of waiting. A live
+// ulthread answers EAGAIN; a finished one completes exactly like Join (status write-back,
+// slot release, unpublish), so TryJoin-then-Join double-completes are refused by the same
+// joined flag. The (ulthread, status*) shape mirrors Join; no second source pins more.
+// CONFIDENCE: MED.
+PROSPER_SYSV_ABI uint64_t ult_ulthread_tryjoin(uint64_t a0, uint64_t a1, uint64_t, uint64_t,
+                                               uint64_t, uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxUlthreadTryJoin, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Ulthread, "sceUltUlthreadTryJoin");
+    if (!o) return kUltErrSrch;
+    if (!o->finished.load(std::memory_order_acquire)) return kUltErrAgain;
+    if (!claim_ulthread_join(o, a0, "sceUltUlthreadTryJoin")) return kUltErrInval;
+    // Finished but the host thread is not yet reaped: reap it before completing, or the
+    // completion below would report a join the pthread layer never performed.
+    pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
+    return complete_ulthread_join(o, a0, a1, "sceUltUlthreadTryJoin");
+}
+
+// sceUltUlthreadYield(): surrender the remainder of this ulthread's timeslice. Ulthreads run
+// 1:1 on host threads, so yielding the host thread is the faithful primitive; it is harmless
+// when called outside an ulthread. Takes no arguments (name shape only). CONFIDENCE: LOW.
+PROSPER_SYSV_ABI uint64_t ult_ulthread_yield(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                             uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxUlthreadYield, &out)) return out;
+    std::this_thread::yield();
     return kUltOk;
 }
 
@@ -1355,6 +1443,30 @@ PROSPER_SYSV_ABI uint64_t ult_cond_signal(uint64_t a0, uint64_t, uint64_t, uint6
     return kUltOk;
 }
 
+// sceUltConditionVariableSignalAll(cond): release EVERY un-woken waiter, not just one.
+// Same ticket accounting as Signal, advanced to the issued count; the broadcast below is the
+// one Signal already performs. An empty wait set advances nothing and still answers Ok.
+// CONFIDENCE: MED — the all-vs-one shape is the name; the accounting mirrors Signal.
+PROSPER_SYSV_ABI uint64_t ult_cond_signal_all(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                              uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxCondSignalAll, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableSignalAll");
+    if (!o) return kUltErrSrch;
+    // Advance wake_seq to the issued count, never backwards: a plain store could undo a concurrent
+    // Signal's increment and strand a waiter that took its ticket in between.
+    uint64_t woken = o->wake_seq.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t issued = o->wait_seq.load(std::memory_order_acquire);
+        if (woken >= issued) return kUltOk;             // no waiter to release
+        if (o->wake_seq.compare_exchange_weak(woken, issued, std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+            break;
+    }
+    pthread_cond_broadcast(&o->cond);
+    return kUltOk;
+}
+
 PROSPER_SYSV_ABI uint64_t ult_cond_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                            uint64_t) {
     uint64_t out = 0;
@@ -1390,18 +1502,29 @@ void register_ult_hle() {
     Hle::register_fn(kUlt[kIdxRuntimeCreate].nid, (HleFn)ult_runtime_create,
                      kUlt[kIdxRuntimeCreate].name);
     Hle::register_fn(kUlt[kIdxMutexCreate].nid,  (HleFn)ult_mutex_create,  kUlt[kIdxMutexCreate].name);
-    Hle::register_fn(kUlt[kIdxMutexLock].nid,    (HleFn)ult_mutex_lock,    kUlt[kIdxMutexLock].name);
-    Hle::register_fn(kUlt[kIdxMutexUnlock].nid,  (HleFn)ult_mutex_unlock,  kUlt[kIdxMutexUnlock].name);
-    Hle::register_fn(kUlt[kIdxMutexDestroy].nid, (HleFn)ult_mutex_destroy, kUlt[kIdxMutexDestroy].name);
+    Hle::register_fn(kUlt[kIdxMutexLock].nid, (HleFn)ult_mutex_lock, kUlt[kIdxMutexLock].name);
+    Hle::register_fn(kUlt[kIdxMutexUnlock].nid, (HleFn)ult_mutex_unlock,
+                     kUlt[kIdxMutexUnlock].name);
+    Hle::register_fn(kUlt[kIdxMutexDestroy].nid, (HleFn)ult_mutex_destroy,
+                     kUlt[kIdxMutexDestroy].name);
+    Hle::register_fn(kUlt[kIdxMutexTryLock].nid, (HleFn)ult_mutex_trylock,
+                     kUlt[kIdxMutexTryLock].name);
 
     Hle::register_fn(kUlt[kIdxUlthreadCreate].nid, (HleFn)ult_ulthread_create,
                      kUlt[kIdxUlthreadCreate].name);
-    Hle::register_fn(kUlt[kIdxUlthreadJoin].nid,   (HleFn)ult_ulthread_join,
+    Hle::register_fn(kUlt[kIdxUlthreadJoin].nid, (HleFn)ult_ulthread_join,
                      kUlt[kIdxUlthreadJoin].name);
-    Hle::register_fn(kUlt[kIdxCondCreate].nid,  (HleFn)ult_cond_create,  kUlt[kIdxCondCreate].name);
-    Hle::register_fn(kUlt[kIdxCondWait].nid,    (HleFn)ult_cond_wait,    kUlt[kIdxCondWait].name);
-    Hle::register_fn(kUlt[kIdxCondSignal].nid,  (HleFn)ult_cond_signal,  kUlt[kIdxCondSignal].name);
-    Hle::register_fn(kUlt[kIdxCondDestroy].nid, (HleFn)ult_cond_destroy, kUlt[kIdxCondDestroy].name);
+    Hle::register_fn(kUlt[kIdxUlthreadTryJoin].nid, (HleFn)ult_ulthread_tryjoin,
+                     kUlt[kIdxUlthreadTryJoin].name);
+    Hle::register_fn(kUlt[kIdxUlthreadYield].nid, (HleFn)ult_ulthread_yield,
+                     kUlt[kIdxUlthreadYield].name);
+    Hle::register_fn(kUlt[kIdxCondCreate].nid, (HleFn)ult_cond_create, kUlt[kIdxCondCreate].name);
+    Hle::register_fn(kUlt[kIdxCondWait].nid, (HleFn)ult_cond_wait, kUlt[kIdxCondWait].name);
+    Hle::register_fn(kUlt[kIdxCondSignal].nid, (HleFn)ult_cond_signal, kUlt[kIdxCondSignal].name);
+    Hle::register_fn(kUlt[kIdxCondSignalAll].nid, (HleFn)ult_cond_signal_all,
+                     kUlt[kIdxCondSignalAll].name);
+    Hle::register_fn(kUlt[kIdxCondDestroy].nid, (HleFn)ult_cond_destroy,
+                     kUlt[kIdxCondDestroy].name);
 }
 
 uint64_t ult_call_count(const char* nid) {

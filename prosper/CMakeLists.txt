@@ -1470,6 +1470,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ult_semantics.cpp
     LIBRARIES prosper_core Threads::Threads)
 
+  # Fiber/Ult remainder: context-size checks ack, frame-pointer address is zeroed,
+  # try-lock/signal-all/try-join/yield behave against real objects. Pure, no game dump.
+  prosper_add_gtest(test_fiber_ult_misc
+    SOURCES tests/hle/sync/test_fiber_ult_misc.cpp
+    LIBRARIES prosper_core Threads::Threads)
+
   prosper_add_gtest(test_posix_sem
     SOURCES tests/hle/test_posix_sem.cpp
     LIBRARIES prosper_core)
