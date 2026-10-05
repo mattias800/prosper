@@ -326,16 +326,18 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered 64-bit scalar bitfield-extract and FP-mode setters must refuse
-// fail-visibly. s_bfe_i64 needs a signed 64-bit extract lowering;
-// s_denorm_mode/s_round_mode need FP-environment modeling the per-invocation
-// model does not have. (s_bfe_u64 needs no pin: it compiles today via the
-// Int64 path. The 32-bit BFE forms are lowered.) All words below are llvm-mc
-// gfx1030 round-tripped. Controls are s_mov_b32 (SOP1, lowered) and s_nop
-// (SOPP no-op). WHEN a lowering lands for any of the three, ITS CASE GOES
-// RED; replace it with an execution test of the new lowering.
+// Unlowered signed scalar bitfield-extracts and FP-mode setters must refuse
+// fail-visibly. s_bfe_i64 and s_bfe_i32 need a signed extract lowering (only
+// the unsigned s_bfe_u64 and s_bfe_u32 are lowered); s_denorm_mode and
+// s_round_mode need in-shader FP-mode changes, which are not modeled (only the
+// dispatch-time PGM_RSRC1 mode is). All words below are llvm-mc gfx1030
+// round-tripped. Controls are the unsigned SOP2 siblings (same operand fields,
+// only the opcode differs) and s_nop (SOPP no-op, same SIMM16). WHEN a
+// lowering lands for any of the four, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
 TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
-    static const uint32_t bfei[1] = {0x95000402u};
+    static const uint32_t bfei[1] = {0x95000402u};   // s_bfe_i64 s[0:1], s[2:3], s4
+    static const uint32_t bfei32[1] = {0x94000402u};   // s_bfe_i32 s0, s2, s4
     static const uint32_t denorm[1] = {0xbfa50000u};
     static const uint32_t round[1] = {0xbfa40000u};
     {
@@ -344,6 +346,8 @@ TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
         EXPECT_EQ(dec.len_dwords, 1u);
     }
     EXPECT_EQ(rdna2_decode_one(bfei, 1).opcode, 0x2au);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).fmt, Rdna2Format::SOP2);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).opcode, 0x28u);
     for (const uint32_t* words : {denorm, round}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 1);
         EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
@@ -359,18 +363,23 @@ TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
         0xbe830301u,   // s_mov_b32 s3, s1
         0xbe840301u,   // s_mov_b32 s4, s1
     };
-    static const uint32_t movb[1] = {0xbe800301u};
-    expect_compiles(program(sprologue, {movb[0]}), 0xA0E8ull,
-                    "control: s_mov_b32 in the bfe64 slot");
-    expect_gap_refusal(program(sprologue, {bfei[0]}), 0xA0E9ull, 5, {bfei[0]},
+    static const uint32_t bfeu[1] = {0x94800402u};     // s_bfe_u64 s[0:1], s[2:3], s4 (lowered)
+    static const uint32_t bfeu32[1] = {0x93800402u};   // s_bfe_u32 s0, s2, s4 (lowered)
+    expect_compiles(program(sprologue, {bfeu[0]}), 0xA110ull,
+                    "control: s_bfe_u64 in the bfe_i64 slot");
+    expect_gap_refusal(program(sprologue, {bfei[0]}), 0xA111ull, 5, {bfei[0]},
                        Rdna2Format::SOP2, 0x2au);
+    expect_compiles(program(sprologue, {bfeu32[0]}), 0xA112ull,
+                    "control: s_bfe_u32 in the bfe_i32 slot");
+    expect_gap_refusal(program(sprologue, {bfei32[0]}), 0xA116ull, 5, {bfei32[0]},
+                       Rdna2Format::SOP2, 0x28u);
 
     static const uint32_t nop[1] = {0xbf800000u};
-    expect_compiles(program(kVop3Prologue, {nop[0]}), 0xA0EBull,
+    expect_compiles(program(kVop3Prologue, {nop[0]}), 0xA113ull,
                     "control: s_nop in the mode slot");
-    expect_gap_refusal(program(kVop3Prologue, {denorm[0]}), 0xA0ECull, 4,
+    expect_gap_refusal(program(kVop3Prologue, {denorm[0]}), 0xA114ull, 4,
                        {denorm[0]}, Rdna2Format::SOPP, 0x25u);
-    expect_gap_refusal(program(kVop3Prologue, {round[0]}), 0xA0EDull, 4,
+    expect_gap_refusal(program(kVop3Prologue, {round[0]}), 0xA115ull, 4,
                        {round[0]}, Rdna2Format::SOPP, 0x24u);
 }
 
