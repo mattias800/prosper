@@ -1552,6 +1552,15 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # sceSaveDataDelete (#2081): unregistered, it answered SCE_OK while deleting nothing
+  # (37-title reach). Drives the real NIDs -- Mount3 creates, Umount2 releases, Delete removes --
+  # with a persistence arm (gone from disk) and refusal arms (null/traversal/live-mount).
+  prosper_add_gtest(test_savedata_delete
+    SOURCES tests/hle/test_savedata_delete.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
+
   # sceSaveDataLoadIcon (#2081): unregistered, it answered SCE_OK over an unwritten icon
   # buffer. Round-trips through the real SaveIcon/LoadIcon NIDs, with refusal arms.
   prosper_add_gtest(test_savedata_icon
