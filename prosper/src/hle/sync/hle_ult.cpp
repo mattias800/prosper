@@ -200,6 +200,8 @@ constexpr UltEntry kUlt[] = {
     {"byiceqcMvV0", "sceUltConditionVariableSignalAll", UltRet::Status},
     {"DsW+3FTXL0Q", "sceUltUlthreadTryJoin", UltRet::Status},
     {"HFd-lpjGxJA", "sceUltUlthreadYield", UltRet::Status},
+    {"or55417wcDk", "sceUltWaitingQueueResourcePoolDestroy", UltRet::Status},
+    {"-gxcs521SvA", "sceUltUlthreadRuntimeDestroy", UltRet::Status},
 };
 constexpr size_t kUltCount = sizeof(kUlt) / sizeof(kUlt[0]);
 constexpr size_t kIdxRuntimeCreate = 0, kIdxRuntimeSize = 1, kIdxUlthreadCreate = 2,
@@ -207,7 +209,8 @@ constexpr size_t kIdxRuntimeCreate = 0, kIdxRuntimeSize = 1, kIdxUlthreadCreate 
                  kIdxMutexDestroy = 7, kIdxCondCreate = 8, kIdxCondWait = 9, kIdxCondSignal = 10,
                  kIdxCondDestroy = 11, kIdxPoolCreate = 12, kIdxPoolSize = 13, kIdxInitialize = 14,
                  kIdxFinalize = 15, kIdxMutexTryLock = 16, kIdxCondSignalAll = 17,
-                 kIdxUlthreadTryJoin = 18, kIdxUlthreadYield = 19;
+                 kIdxUlthreadTryJoin = 18, kIdxUlthreadYield = 19, kIdxPoolDestroy = 20,
+                 kIdxRuntimeDestroy = 21;
 
 std::atomic<uint64_t> g_calls[kUltCount];
 std::atomic<uint64_t> g_next_report[kUltCount];   // 0 = "report the next call"
@@ -668,6 +671,27 @@ PROSPER_SYSV_ABI uint64_t ult_pool_create(uint64_t a0, uint64_t a1, uint64_t a2,
     return kUltOk;
 }
 
+// sceUltWaitingQueueResourcePoolDestroy(pool): unpublish and retire the pool. Objects bound
+// from it keep working: they resolve their pool through the generation-guarded id, which
+// misses once this clears it, exactly like a mutex outliving nothing. A pool with bound
+// objects still destroys (reported, like mutex_destroy's held-mutex warning) rather than
+// stranding the guest's teardown path on an order it was never promised.
+PROSPER_SYSV_ABI uint64_t ult_pool_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxPoolDestroy, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Pool, "sceUltWaitingQueueResourcePoolDestroy");
+    if (!o) return kUltErrSrch;
+    const uint32_t bound = o->bound_sync_objects.load(std::memory_order_relaxed);
+    if (bound != 0)
+        log_line("sceUltWaitingQueueResourcePoolDestroy on \"%s\" (0x%llx) with %u sync "
+                 "object(s) still bound -- they keep working, the pool does not",
+                 o->name.c_str(), (unsigned long long)a0, bound);
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
+    return kUltOk;
+}
+
 // =============================================================================================
 // Ulthread runtime
 // =============================================================================================
@@ -742,6 +766,27 @@ PROSPER_SYSV_ABI uint64_t ult_runtime_create(uint64_t a0, uint64_t a1, uint64_t 
              "numWorkerThread=%u workArea=0x%llx(%llu B) apiVersion=0x%x -> ok",
              o->name.c_str(), (unsigned long long)a0, num_max, num_worker,
              (unsigned long long)a4, (unsigned long long)need, o->api_version);
+    return kUltOk;
+}
+
+// sceUltUlthreadRuntimeDestroy(runtime): unpublish and retire the runtime. Live ulthreads
+// keep running to their own join: they resolve the runtime through the generation-guarded
+// id, which misses once this clears it, so the join path skips the release it can no
+// longer perform instead of touching a dead object. A runtime with live ulthreads still
+// destroys (reported, like the pool above) rather than stranding teardown.
+PROSPER_SYSV_ABI uint64_t ult_runtime_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                              uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxRuntimeDestroy, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Runtime, "sceUltUlthreadRuntimeDestroy");
+    if (!o) return kUltErrSrch;
+    const uint32_t live = o->live_ulthreads.load(std::memory_order_relaxed);
+    if (live != 0)
+        log_line("sceUltUlthreadRuntimeDestroy on \"%s\" (0x%llx) with %u ulthread(s) still "
+                 "live -- they join on their own, the runtime does not",
+                 o->name.c_str(), (unsigned long long)a0, live);
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
     return kUltOk;
 }
 
@@ -1497,10 +1542,14 @@ void register_ult_hle() {
     Hle::register_fn(kUlt[kIdxFinalize].nid,     (HleFn)ult_finalize,     kUlt[kIdxFinalize].name);
     Hle::register_fn(kUlt[kIdxPoolSize].nid,     (HleFn)ult_pool_work_area_size, kUlt[kIdxPoolSize].name);
     Hle::register_fn(kUlt[kIdxPoolCreate].nid,   (HleFn)ult_pool_create,  kUlt[kIdxPoolCreate].name);
+    Hle::register_fn(kUlt[kIdxPoolDestroy].nid, (HleFn)ult_pool_destroy,
+                     kUlt[kIdxPoolDestroy].name);
     Hle::register_fn(kUlt[kIdxRuntimeSize].nid,  (HleFn)ult_runtime_work_area_size,
                      kUlt[kIdxRuntimeSize].name);
     Hle::register_fn(kUlt[kIdxRuntimeCreate].nid, (HleFn)ult_runtime_create,
                      kUlt[kIdxRuntimeCreate].name);
+    Hle::register_fn(kUlt[kIdxRuntimeDestroy].nid, (HleFn)ult_runtime_destroy,
+                     kUlt[kIdxRuntimeDestroy].name);
     Hle::register_fn(kUlt[kIdxMutexCreate].nid,  (HleFn)ult_mutex_create,  kUlt[kIdxMutexCreate].name);
     Hle::register_fn(kUlt[kIdxMutexLock].nid, (HleFn)ult_mutex_lock, kUlt[kIdxMutexLock].name);
     Hle::register_fn(kUlt[kIdxMutexUnlock].nid, (HleFn)ult_mutex_unlock,
