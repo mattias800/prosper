@@ -1162,6 +1162,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_streaming.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 allocator-create/destroy/grain/lock lifecycle: tagged handles validate,
+  # destroy reclaims, grain records. Pure, no game dump.
+  prosper_add_gtest(test_ngs2_lifecycle
+    SOURCES tests/hle/test_ngs2_lifecycle.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
@@ -2486,6 +2492,12 @@ if(TARGET prosper_core)
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   prosper_add_gtest(test_dmem
     SOURCES tests/host/test_dmem.cpp
+    LIBRARIES prosper_core)
+
+  # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
+  prosper_add_gtest(test_dmem_fixed_remap
+    SOURCES tests/hle/memory/test_dmem_fixed_remap.cpp
+    INCLUDES src
     LIBRARIES prosper_core)
 
   # A refused fixed direct-memory map must preserve the allocation for a later retry.
