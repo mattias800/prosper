@@ -757,8 +757,9 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             : (consumers1.sampled_exact && !consumers1.feedback);
         // Keep intermediate scanout spans GPU-resident too: they cannot publish until the
         // final callback, where the cache is materialized on demand if no later scanout
-        // pass already requested CPU pixels. A same-submit DMA asks its producer span for
-        // authoritative readback, and compute consumers use the lazy target reader above.
+        // pass already requested CPU pixels. A same-submit DMA that touches a colour target of
+        // its producer span asks that span for authoritative readback (dma_span_authority.hpp);
+        // other copies, and compute consumers, use the lazy target reader above.
         // A pending one-shot capture reads back every pass's colour0 for its one
         // submit, so the publish candidates (front / scanout / last) that become the
         // capsule's output oracle are exactly the readback path's (#3895).

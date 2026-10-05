@@ -8,6 +8,7 @@
 #include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/dma_span_authority.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
@@ -9927,7 +9928,7 @@ OrderedSubmitResult execute_ordered_items_impl(
             } else
                 read_points.dependencies_ok = false;
         } else {
-            flush_span(true);
+            flush_span(dma_flush_authoritative(span, dma_copies[operation.item]));
             read_points.advance();
             execute_dma(dma_copies[operation.item]);
             // This legacy callback reports no completion outcome. Do not turn its return into
@@ -12198,9 +12199,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                 break;
             }
             case RetainedSubmitKind::DmaCopy: {
-                flush_span(true);
-                retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                flush_span(dma_flush_authoritative(span, copy));
+                retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 // Source and destination are distinct ordered consumers: a disjoint source must not
                 // hide an overlapping destination (or vice versa).
                 const bool source_gds = ((copy.sels >> 8u) & 0xffu) == 1u;

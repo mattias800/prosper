@@ -336,14 +336,55 @@ TEST_F(OrderedRenderFinality, DeclinedDeferredDispatchStillRetiresBeforeFinalPub
 
 TEST_F(OrderedRenderFinality, DmaTailRetainsAuthoritativeReadbackBeforeFinalizing) {
     auto state = two_draws();
-    uint32_t source = 0x4280u, destination = 0;
-    state.dma_copies.push_back({reinterpret_cast<uint64_t>(&destination),
-                                reinterpret_cast<uint64_t>(&source), sizeof(source), 0, 300, 0});
+    // #4439: the tail copy lands inside the span's 16x8 RGBA8 colour target, so the span before
+    // it must still be published authoritatively. The target gets its own direct allocation: the
+    // owned snapshot refuses an output that shares the allocation of its scalar inputs.
+    struct TargetPage {
+        uint64_t physical = 0, address = 0;
+        ~TargetPage() {
+            if (address)
+                prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"))(address, page_, 0, 0, 0, 0);
+            if (physical)
+                prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"))(
+                    physical, page_, 0, 0, 0, 0);
+        }
+    } page;
+    ASSERT_EQ(prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"))(
+                  0, 0x200000000ull, page_, page_, 0, reinterpret_cast<uint64_t>(&page.physical)),
+              0u);
+    ASSERT_EQ(prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"))(
+                  reinterpret_cast<uint64_t>(&page.address), page_, 3, 0, page.physical, page_),
+              0u);
+    const uint64_t rt = page.address;
+    state.cx[P::CB_COLOR0_BASE] = static_cast<uint32_t>(rt >> 8u);
+    state.cx[P::CB_COLOR0_BASE_EXT] = static_cast<uint32_t>(rt >> 40u);
+    state.cx[P::CB_COLOR0_INFO] = 0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT;
+    state.cx[P::CB_COLOR0_ATTRIB2] = (15u << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) | 7u;
+    state.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    uint32_t source = 0x4280u;
+    auto* destination = reinterpret_cast<uint32_t*>(rt + 16u);
+    *destination = 0;
+    state.dma_copies.push_back({rt + 16u, reinterpret_cast<uint64_t>(&source), sizeof(source),
+                                0, 300, 0});
     execute(state);
     ASSERT_EQ(observations_.size(), 3u);
     EXPECT_TRUE(observations_[1].phase.authoritative_readback);
     EXPECT_TRUE(observations_[2].draws.empty());
     EXPECT_FALSE(observations_[2].phase.authoritative_readback);
+    EXPECT_EQ(*destination, source);
+}
+
+// #4439: the span renders no colour target, so a tail copy can neither observe nor overwrite
+// rendered bytes: the span flushes without the authoritative readback and the copy still lands.
+TEST_F(OrderedRenderFinality, DmaTailTouchingNoTargetSkipsAuthoritativeReadback) {
+    auto state = two_draws();
+    uint32_t source = 0x4439u, destination = 0;
+    state.dma_copies.push_back({reinterpret_cast<uint64_t>(&destination),
+                                reinterpret_cast<uint64_t>(&source), sizeof(source), 0, 300, 0});
+    execute(state);
+    ASSERT_EQ(observations_.size(), 3u);
+    EXPECT_FALSE(observations_[1].phase.authoritative_readback);
+    EXPECT_TRUE(observations_[2].draws.empty());
     EXPECT_EQ(destination, source);
 }
 

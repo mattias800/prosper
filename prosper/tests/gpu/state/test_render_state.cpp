@@ -1253,3 +1253,119 @@ TEST(RenderState, Contract) {
 
     EXPECT_EQ(fails, 0);
 }
+
+// #4457: an unproved colour extent says which check refused it, in check order, so a caller that
+// pays for the unproved case (the ordered-DMA readback) can name the missing shape.
+TEST(RenderState, ColorExtentRefusalNamesTheFirstFailingCheck) {
+    ColorTargetState proved;
+    proved.base = 0x100000;
+    proved.format = 0xAu;   // COLOR_8_8_8_8
+    proved.has_extent = true;
+    proved.has_attrib3 = true;
+    proved.width = 64;
+    proved.height = 64;
+    proved.resource_type = 1u;
+    ColorExtentRefusal why = ColorExtentRefusal::Count;
+    EXPECT_GT(color_target_physical_bytes(proved, &why), 0u);
+    EXPECT_EQ(why, ColorExtentRefusal::None);
+
+    const auto refusal = [&](auto mutate) {
+        ColorTargetState target = proved;
+        mutate(target);
+        ColorExtentRefusal reason = ColorExtentRefusal::None;
+        EXPECT_EQ(color_target_physical_bytes(target, &reason), 0u);
+        EXPECT_EQ(color_target_physical_bytes(target), 0u);   // the reason is optional
+        return reason;
+    };
+    using R = ColorExtentRefusal;
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.base = 0; }), R::Unbound);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.has_extent = false; }), R::NoExtent);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.has_attrib3 = false; }), R::NoAttrib3);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.width = 16385; }), R::Dimensions);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.format = 0; }), R::Format);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.mip_level = 1; }), R::MipLevel);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.in_mip_tail = true; }), R::MipTail);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.resource_type = 2u; }), R::VolumeView);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.slice_max = 3; }), R::ArrayOrLayered);
+    const auto volume = [](ColorTargetState& t) {
+        t.resource_type = 2u;
+        t.has_view = true;
+        t.mip0_depth = 3u;   // four slices, all in view
+        t.slice_max = 3u;
+        t.color_sw_mode = 27u;   // SW_64KB_R_X, which has a volume layout
+    };
+    EXPECT_EQ(refusal([&](ColorTargetState& t) {
+                  volume(t);
+                  t.log2_samples = 1u;
+              }),
+              R::VolumeMsaa);
+    EXPECT_EQ(refusal([&](ColorTargetState& t) {
+                  volume(t);
+                  t.color_sw_mode = 2u;
+              }),
+              R::VolumeTileMode);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.log2_samples = 4; }), R::Msaa);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.color_sw_mode = 2; }), R::TileMode);
+    // Check order: the earlier refusal wins when two apply.
+    EXPECT_EQ(refusal([](ColorTargetState& t) {
+                  t.mip_level = 1;
+                  t.color_sw_mode = 2;
+              }),
+              R::MipLevel);
+    for (size_t r = 0; r < static_cast<size_t>(R::Count); ++r)
+        EXPECT_STRNE(color_extent_refusal_name(static_cast<R>(r)), "?");
+}
+
+// #4457: the footprint bound is the exact extent where one is proved, a block-class bound where
+// only the sample count or swizzle mode lacks an exact size, and nothing for any other refusal.
+TEST(RenderState, ColorFootprintBoundExtendsOnlyTheSizeRefusals) {
+    ColorTargetState target;
+    target.base = 0x100000;
+    target.format = 0xAu;   // COLOR_8_8_8_8
+    target.has_extent = true;
+    target.has_attrib3 = true;
+    target.width = 3840;
+    target.height = 2160;
+    target.resource_type = 1u;
+    target.color_sw_mode = 27u;   // SW_64KB_R_X
+    EXPECT_EQ(color_target_footprint_bound_bytes(target), color_target_physical_bytes(target));
+
+    target.log2_samples = 2u;   // 4xaa: no exact size for R_X, so only the bound answers
+    ColorExtentRefusal why = ColorExtentRefusal::None;
+    EXPECT_EQ(color_target_physical_bytes(target, &why), 0u);
+    EXPECT_EQ(why, ColorExtentRefusal::Msaa);
+    EXPECT_GE(color_target_footprint_bound_bytes(target), uint64_t{60} * 34u * 65536u);
+
+    ColorTargetState z = target;
+    z.color_sw_mode = 24u;   // SW_64KB_Z_X 4xaa has an exact size, and the bound is that size
+    EXPECT_GT(color_target_physical_bytes(z), 0u);
+    EXPECT_EQ(color_target_footprint_bound_bytes(z), color_target_physical_bytes(z));
+
+    ColorTargetState other = target;
+    other.color_sw_mode = 26u;   // SW_64KB_D_X, single-sample: a tile-mode refusal, also bounded
+    other.log2_samples = 0u;
+    EXPECT_EQ(color_target_physical_bytes(other, &why), 0u);
+    EXPECT_EQ(why, ColorExtentRefusal::TileMode);
+    EXPECT_GE(color_target_footprint_bound_bytes(other), uint64_t{30} * 17u * 65536u);
+
+    ColorTargetState mip = target;
+    mip.mip_level = 1u;   // an earlier refusal: the bound must not paper over it
+    EXPECT_EQ(color_target_footprint_bound_bytes(mip), 0u);
+    // A level-0 view of a mip-chained allocation in an unmodelled mode: `base` is still the
+    // allocation origin and level 0 sits above the smaller levels, so no level-0-sized bound from
+    // `base` is safe (#4464 review).
+    ColorTargetState chained = other;
+    chained.max_mip = 1u;
+    EXPECT_EQ(color_target_physical_bytes(chained, &why), 0u);
+    EXPECT_EQ(why, ColorExtentRefusal::TileMode);
+    EXPECT_EQ(color_target_footprint_bound_bytes(chained), 0u);
+    ColorTargetState many_samples = target;
+    many_samples.log2_samples = 31u;   // hand-built only: the live decode masks the field to 3 bits
+    EXPECT_EQ(color_target_footprint_bound_bytes(many_samples), 0u);
+    ColorTargetState layered = target;
+    layered.slice_max = 1u;
+    EXPECT_EQ(color_target_footprint_bound_bytes(layered), 0u);
+    ColorTargetState unknown = target;
+    unknown.color_sw_mode = 12u;   // VAR: no block class
+    EXPECT_EQ(color_target_footprint_bound_bytes(unknown), 0u);
+}
