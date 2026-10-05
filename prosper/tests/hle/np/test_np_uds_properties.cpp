@@ -14,6 +14,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
+#include <string>
 
 using namespace prosper;
 
@@ -95,6 +97,131 @@ TEST(NpUdsProperties, DestroyFreesExactlyOnce) {
     EXPECT_EQ(u.destroy_array(array, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(u.array_set_string(array, ptr("x"), 0, 0, 0, 0), kInvalidArgument)
         << "a destroyed handle is no longer accepted";
+}
+
+// Scalar setters across both containers: a live handle of the right kind plus a pointer-like
+// key (objects) succeed; stale handles, swapped kinds and null keys/buffers are refused. The
+// value itself travels by register, so there is nothing further to validate about it.
+TEST(NpUdsProperties, ScalarSettersValidateHandles) {
+    const Uds u = registered();
+    ASSERT_TRUE(u.all());
+    register_builtin_hle();
+    HleFn arr_i32 = Hle::lookup("BypQuF113-k");
+    HleFn arr_bool = Hle::lookup("0+l4QSWCM4E");
+    HleFn arr_bin = Hle::lookup("IEdUCV9j2Cw");
+    HleFn arr_obj = Hle::lookup("XY14n3jNIpE");
+    HleFn arr_arr = Hle::lookup("rdi9BAfDLq8");
+    HleFn obj_bool = Hle::lookup("Fidd8vWgyVE");
+    HleFn obj_i64 = Hle::lookup("56QLTqx911s");
+    HleFn obj_bin = Hle::lookup("wAcxBDLHj1M");
+    HleFn obj_obj = Hle::lookup("74ASEqxSnkM");
+    for (HleFn f :
+         {arr_i32, arr_bool, arr_bin, arr_obj, arr_arr, obj_bool, obj_i64, obj_bin, obj_obj})
+        ASSERT_NE(f, nullptr) << "every scalar setter must be registered";
+
+    uint64_t object = 0, array = 0, second = 0;
+    ASSERT_EQ(u.create_object(ptr(&object), 0, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(u.create_array(ptr(&array), 0, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(u.create_object(ptr(&second), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(arr_i32(array, 7, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(arr_bool(array, 1, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(arr_bin(array, ptr("blob"), 4, 0, 0, 0), 0u);
+    EXPECT_EQ(obj_bool(object, ptr("k"), 1, 0, 0, 0), 0u);
+    EXPECT_EQ(obj_i64(object, ptr("k"), 0x123456789ull, 0, 0, 0), 0u);
+    EXPECT_EQ(obj_bin(object, ptr("k"), ptr("blob"), 4, 0, 0), 0u);
+    // Stale handles, swapped kinds, null keys and null buffers are all refused.
+    EXPECT_EQ(arr_i32(0x7c0000000ull, 7, 0, 0, 0, 0), kInvalidArgument);
+    EXPECT_EQ(arr_i32(object, 7, 0, 0, 0, 0), kInvalidArgument) << "object is not an array";
+    EXPECT_EQ(obj_bool(array, ptr("k"), 1, 0, 0, 0), kInvalidArgument) << "array is not an object";
+    EXPECT_EQ(obj_bool(object, 0, 1, 0, 0, 0), kInvalidArgument) << "null key";
+    EXPECT_EQ(arr_bin(array, 0, 4, 0, 0, 0), kInvalidArgument) << "null buffer";
+    EXPECT_EQ(obj_bin(object, ptr("k"), 0, 4, 0, 0), kInvalidArgument);
+    // Object/array attach: value of the wrong kind refused. *out is the INSERTED element, never
+    // the caller's own value, so it survives the caller destroying its value (module +0x51c7).
+    EXPECT_EQ(arr_obj(array, array, 0, 0, 0, 0), kInvalidArgument)
+        << "an array value is not an object";
+    uint64_t inserted = 0;
+    EXPECT_EQ(arr_obj(array, second, ptr(&inserted), 0, 0, 0), 0u);
+    EXPECT_NE(inserted, 0u);
+    EXPECT_NE(inserted, second) << "*out is the inserted copy, not the caller's value";
+    uint64_t fresh = 0;
+    EXPECT_EQ(arr_obj(array, 0, ptr(&fresh), 0, 0, 0), 0u);
+    EXPECT_NE(fresh, 0u) << "null value allocates";
+    EXPECT_EQ(u.destroy_object(fresh, 0, 0, 0, 0, 0), 0u);
+    uint64_t inserted2 = 0;
+    EXPECT_EQ(obj_obj(object, ptr("k"), second, ptr(&inserted2), 0, 0), 0u);
+    EXPECT_NE(inserted2, second) << "*out is the inserted copy, not the caller's value";
+    uint64_t inserted_arr = 0;
+    EXPECT_EQ(arr_arr(array, array, ptr(&inserted_arr), 0, 0, 0), 0u);
+    EXPECT_NE(inserted_arr, array) << "*out is the inserted copy, not the caller's value";
+    EXPECT_EQ(obj_obj(object, ptr("k"), array, 0, 0, 0), kInvalidArgument);
+    EXPECT_EQ(arr_arr(array, object, 0, 0, 0, 0), kInvalidArgument);
+    // The caller destroys its own value; sets through the inserted handles still succeed.
+    EXPECT_EQ(u.destroy_object(second, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(obj_bool(inserted, ptr("k"), 1, 0, 0, 0), 0u)
+        << "the inserted element outlives the caller's value";
+    EXPECT_EQ(obj_bool(inserted2, ptr("k"), 1, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_object(inserted, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_object(inserted2, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_array(inserted_arr, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_object(object, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_array(array, 0, 0, 0, 0, 0), 0u);
+}
+
+// Handle/context teardown validates against the only id in circulation; Terminate always
+// succeeds; stats/strings report the empty offline state without touching caller memory
+// they have no data for.
+TEST(NpUdsProperties, HandleContextLifecycle) {
+    register_builtin_hle();
+    HleFn abort = Hle::lookup("jZCqWFgMehE");
+    HleFn destroy_ctx = Hle::lookup("wB7IWzGp2v0");
+    HleFn term = Hle::lookup("47UAEuQl+iI");
+    ASSERT_NE(abort, nullptr);
+    ASSERT_NE(destroy_ctx, nullptr);
+    ASSERT_NE(term, nullptr);
+    EXPECT_EQ(abort(1, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(abort(2, 0, 0, 0, 0, 0), kInvalidArgument) << "foreign id refused";
+    EXPECT_EQ(abort(0, 0, 0, 0, 0, 0), kInvalidArgument);
+    EXPECT_EQ(destroy_ctx(1, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy_ctx(0xDEADu, 0, 0, 0, 0, 0), kInvalidArgument);
+    EXPECT_EQ(term(0, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(NpUdsProperties, StatsAndStringsReportEmpty) {
+    register_builtin_hle();
+    HleFn estimate = Hle::lookup("+s14jq-KGYw");
+    HleFn to_string = Hle::lookup("vj6CQGWtEBg");
+    HleFn mem_stat = Hle::lookup("su7jW3VDDb4");
+    HleFn storage_stat = Hle::lookup("KmN62tT4U8A");
+    for (HleFn f : {estimate, to_string, mem_stat, storage_stat}) ASSERT_NE(f, nullptr);
+    EXPECT_EQ(estimate(0, 0, 0, 0, 0, 0), kInvalidArgument) << "null event";
+    uint64_t size = 0xDEADu;
+    // Events are counter ids, not pointers: any nonzero id estimates.
+    EXPECT_EQ(estimate(1, ptr(&size), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(size, 3u) << "an empty event serializes to 3 bytes";
+    EXPECT_EQ(to_string(0, 0, 0, 0, 0, 0), kInvalidArgument) << "null event";
+    char buf[16];
+    std::memset(buf, 0xAA, sizeof buf);
+    uint64_t str_size = 0xDEADu;
+    EXPECT_EQ(to_string(1, ptr(buf), sizeof buf, ptr(&str_size), 0, 0), 0u);
+    EXPECT_EQ(str_size, 3u);
+    EXPECT_EQ(std::string(buf), "{}") << "an empty event stringifies to {}";
+    EXPECT_EQ(to_string(1, 0, 16, 0, 0, 0), kInvalidArgument)
+        << "neither a buffer nor a size pointer: nowhere to answer (module +0x599d)";
+    uint8_t mem[24];
+    std::memset(mem, 0xAA, sizeof mem);
+    EXPECT_EQ(mem_stat(ptr(mem), 0, 0, 0, 0, 0), 0u);
+    for (uint8_t b : mem) EXPECT_EQ(b, 0u) << "memory stats zeroed: nothing stored";
+    EXPECT_EQ(mem_stat(0, 0, 0, 0, 0, 0), kInvalidArgument);
+    uint8_t storage[56];
+    std::memset(storage, 0xAA, sizeof storage);
+    EXPECT_EQ(storage_stat(1, ptr(storage), 0, 0, 0, 0), 0u);
+    for (uint8_t b : storage) EXPECT_EQ(b, 0u) << "storage stats zeroed";
+    EXPECT_EQ(storage_stat(1, 0, 0, 0, 0, 0), kInvalidArgument);
+    std::memset(storage, 0xAA, sizeof storage);
+    EXPECT_EQ(storage_stat(2, ptr(storage), 0, 0, 0, 0), kInvalidArgument)
+        << "a context no CreateContext produced is refused";
+    EXPECT_EQ(storage[0], 0xAA) << "and the buffer is untouched";
 }
 
 TEST(NpUdsProperties, SessionSignalingInitialize) {
