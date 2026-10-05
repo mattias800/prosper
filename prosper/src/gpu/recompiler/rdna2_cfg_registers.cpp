@@ -112,4 +112,15 @@ void loop_scalar_may_writes(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint
         });
     }
 }
+
+void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
+    for (int reg : sregs) {
+        rs.sreg_written.insert(reg);
+        rs.sreg_input.erase(reg);
+        rs.sreg_srt.erase(reg);
+        // A loop body that may write this register must not leave a copy alias standing: the alias
+        // was established on one iteration's path and says nothing about the next one (#1773).
+        rs.sreg_ud_alias.erase(reg);
+    }
+}
 }   // namespace prosper::gpu
