@@ -1212,6 +1212,11 @@ if(TARGET prosper_core)
     SOURCES tests/hle/video/test_h264_sps.cpp
     LIBRARIES prosper_core)
 
+  # AvPlayer trick speed and bandwidth window, from the shipped sprx. Pure, no game dump.
+  prosper_add_gtest(test_avplayer_misc
+    SOURCES tests/hle/video/test_avplayer_misc.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_json2 tests/hle/test_json2.cpp)
   target_link_libraries(test_json2 PRIVATE prosper_core)
   add_test(NAME json2_hle COMMAND test_json2)

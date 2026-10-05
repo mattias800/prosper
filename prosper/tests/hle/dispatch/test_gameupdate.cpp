@@ -23,6 +23,9 @@ static constexpr uint64_t kAlreadyInitialized = 0x80412802ull;
 static constexpr uint64_t kTooManyRequests = 0x80412806ull;
 static constexpr uint64_t kAborted = 0x80412807ull;
 
+static uint64_t call_nid(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0,
+                         uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0);
+
 // Each TEST starts from "not initialized"; the library state is process-global.
 static void reset() {
     register_builtin_hle();
@@ -46,8 +49,8 @@ static GuStruct make_result() {
     return r;
 }
 
-static uint64_t call_nid(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0,
-                         uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
+static uint64_t call_nid(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5) {
     HleFn fn = Hle::lookup(nid_hash(nid));
     EXPECT_NE(fn, nullptr) << nid << " is not registered";
     if (!fn) return ~0ull;
