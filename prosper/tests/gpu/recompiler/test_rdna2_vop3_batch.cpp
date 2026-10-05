@@ -5,12 +5,13 @@
 //
 // The invariant that makes the move checkable is the executed-assertion count. main() records
 // the count before calling run_vop3_batch_checks() and requires the delta to be exactly 4, so
-// a block that failed to arrive fails the test instead of quietly shrinking the suite. Verified
-// by mutation: an empty run_vop3_batch_checks() exits 1 with "contributed 0 checks, expected 4".
+// a block that failed to arrive fails the test instead of quietly shrinking the suite: linked
+// against an empty run_vop3_batch_checks(), main() exits 1 with "contributed 0 checks,
+// expected 4".
 //
-// The declarations below this comment are the original file's preamble, replicated so this
-// translation unit compiles. Most of it is unused here and is kept identical rather than pruned,
-// so the two files' shared prologue stays comparable.
+// Below this comment is only what the moved block needs: the includes, `extern` declarations of
+// main()'s `fails` and `checks` counters, and the same `CHECK` macro text main() uses. The original
+// file's static helpers are not copied.
 
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
