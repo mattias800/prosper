@@ -53,29 +53,8 @@
   invariant, same refusal.) Refusing, rather than mapping the surviving prefix and zero-filling the
   rest, is the format's own reading: the gABI defines `p_filesz` as the bytes of the segment *present
   in the file image*, so a short file does not contain the segment at all.
-- **Ruled out — "some real dump depends on the lenient reading":** it does not. Measured across the 44
-  local dumps (589 modules, 2,945 `PT_LOAD` segments — **exactly five per module**, with no spread):
-  **0** whose file bytes run past EOF (none even *ends* at EOF), **0** that do not fit their own mapped
-  image, **0** with `filesz > memsz`, **0** excluded from the extent by an overflowing `memsz`, and
-  **2,945 of 2,945** SELF data segments whose own `file_size` equals the phdr's `p_filesz` exactly.
-  Independently re-derived from the format by a second parser sharing no code with prosper (review of
-  #2689): every figure identical.
-- **Two traps around that measurement, both of which cost time to find.**
-  1. The SELF *header's* `file_size` (container offset `0x10`) is **not** a truncation oracle, and it
-     fails in **both** directions. It differs from the physical file in 517 of 589 modules: **452
-     smaller** (signature/metadata follow it), **65 larger** — over-declaring by 4 bytes (25 modules),
-     8 (32), 12 (6) and 64 (2) — and only **72 equal**. Hand-verified outside the scanner:
-     `PPSA01826-app0/prx/akaudioinput.prx` is 10,172 bytes physically and declares `0x27c0` = 10,176.
-     An oracle built on this field would flag 65 working modules as truncated and be blind on 72 more.
-     *The 517 was first recorded here as "smaller in 517", which is a `!=` count reported as `<` — the
-     kind of error this section exists to stop, so it is left visible rather than quietly corrected.*
-  2. **"No dump does this" is true of `PT_LOAD`, not of segments generally.** The corpus does contain
-     trailing-trimmed content: besides the 65 over-declaring headers, two copies of
-     `sce_sys/about/right.sprx` (12,448 bytes, in `PPSA15552` and `PPSA02101`) carry a SELF data
-     segment declaring 64 bytes at a file offset *equal to* EOF — zero bytes present. It keys program
-     header 10, whose `p_type` is `0x6fffff00` (`SCE_COMMENT`, per `tools/self_dump`), so it is
-     neither a `PT_LOAD` nor in `m.loads` and nothing reads it. Extending this refusal past `PT_LOAD`
-     — the natural follow-on, and what #2686 gestures at — would reject those two modules on day one.
+- The measurement that rules out a lenient reading, and two traps around it, are under
+  [Ruled out](#ruled-out).
 
 ### 2. NID resolution & HLE dispatch (`src/hle`)
 - A registry maps `(libraryName, NID)` → host function pointer.
@@ -163,3 +142,29 @@ host we prioritize.
 - **Build:** CMake + Ninja. Toolchain: gcc/mingw or clang on Windows, gcc/clang on Linux.
 - **Deps (later):** SDL3 (window/input/audio), Vulkan-Headers + volk, SPIRV-Tools, ffmpeg.
 - **No external deps for M0–M2** (loader + stub framework are self-contained).
+
+## Ruled out
+
+- **Ruled out — "some real dump depends on the lenient reading":** it does not. Measured across the 44
+  local dumps (589 modules, 2,945 `PT_LOAD` segments — **exactly five per module**, with no spread):
+  **0** whose file bytes run past EOF (none even *ends* at EOF), **0** that do not fit their own mapped
+  image, **0** with `filesz > memsz`, **0** excluded from the extent by an overflowing `memsz`, and
+  **2,945 of 2,945** SELF data segments whose own `file_size` equals the phdr's `p_filesz` exactly.
+  Independently re-derived from the format by a second parser sharing no code with prosper (review of
+  #2689): every figure identical.
+- **Two traps around that measurement, both of which cost time to find.**
+  1. The SELF *header's* `file_size` (container offset `0x10`) is **not** a truncation oracle, and it
+     fails in **both** directions. It differs from the physical file in 517 of 589 modules: **452
+     smaller** (signature/metadata follow it), **65 larger** — over-declaring by 4 bytes (25 modules),
+     8 (32), 12 (6) and 64 (2) — and only **72 equal**. Hand-verified outside the scanner:
+     `PPSA01826-app0/prx/akaudioinput.prx` is 10,172 bytes physically and declares `0x27c0` = 10,176.
+     An oracle built on this field would flag 65 working modules as truncated and be blind on 72 more.
+     *The 517 was first recorded here as "smaller in 517", which is a `!=` count reported as `<` — the
+     kind of error this section exists to stop, so it is left visible rather than quietly corrected.*
+  2. **"No dump does this" is true of `PT_LOAD`, not of segments generally.** The corpus does contain
+     trailing-trimmed content: besides the 65 over-declaring headers, two copies of
+     `sce_sys/about/right.sprx` (12,448 bytes, in `PPSA15552` and `PPSA02101`) carry a SELF data
+     segment declaring 64 bytes at a file offset *equal to* EOF — zero bytes present. It keys program
+     header 10, whose `p_type` is `0x6fffff00` (`SCE_COMMENT`, per `tools/self_dump`), so it is
+     neither a `PT_LOAD` nor in `m.loads` and nothing reads it. Extending this refusal past `PT_LOAD`
+     — the natural follow-on, and what #2686 gestures at — would reject those two modules on day one.

@@ -52,6 +52,7 @@ testpaths = [
     "prosper/tests/tools/test_dump_hygiene.py",
     "prosper/tools/ci",
     "prosper/tools/doctor/test_doctor.py",
+    "prosper/tools/docs/test_check_arch_docs.py",
     "prosper/tools/perf/test_compare_capture_pair.py",
     "prosper/tools/perf/test_perf_caller_report.py",
     "prosper/tools/perf/test_perf_f8_gap.py",
@@ -71,6 +72,7 @@ testpaths = [
 # --import-mode=importlib does not put a test's folder on sys.path, and these tests import their
 # sibling tool by bare name.
 pythonpath = [
+    "prosper/tools/docs",
     "prosper/tools/doctor",
     "prosper/tools/perf",
     "prosper/tools/pixel_history",

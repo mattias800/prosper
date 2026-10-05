@@ -568,6 +568,12 @@ capture/replay without requiring an importable system Python module.
   the file `unbroken` (#2108). What it does **not** cover, stated so silence is not read as
   coverage: HTML tables, delimiter-less pipe blocks (no header to measure against), whether an
   escaped pipe was what the author meant, and fenced regions, which are skipped deliberately.
+- **`docs/check_arch_docs.py`** — keeps `prosper/docs/spec/` and `prosper/docs/adr/` live: every spec
+  rule carries a `Status:` and an `Enforcement:` whose `ratchet:`/`adr:` references resolve, every
+  `check_arch_ratchet.py` rule is cited by some spec rule, the layer table in `spec/layers.md` matches
+  `LAYER_ORDER` (`--write` regenerates it), and with `--base` an accepted ADR is never edited or
+  deleted, only superseded. It proves references are live, not that a rule is true. Runs in the
+  `Docs` CI job; tests are `docs/test_check_arch_docs.py` (pytest).
 - **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
   reference in the repository must name a row that exists. `check_numbered_table.py` validates the
   TABLE and has no idea anything cites it, so until this existed a reference to a row that never
