@@ -1162,6 +1162,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_streaming.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 allocator-create/destroy/grain/lock lifecycle: tagged handles validate,
+  # destroy reclaims, grain records. Pure, no game dump.
+  prosper_add_gtest(test_ngs2_lifecycle
+    SOURCES tests/hle/test_ngs2_lifecycle.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
@@ -1210,6 +1216,11 @@ if(TARGET prosper_core)
   # pass vacuously.
   prosper_add_gtest(test_h264_sps
     SOURCES tests/hle/video/test_h264_sps.cpp
+    LIBRARIES prosper_core)
+
+  # AvPlayer trick speed and bandwidth window, from the shipped sprx. Pure, no game dump.
+  prosper_add_gtest(test_avplayer_misc
+    SOURCES tests/hle/video/test_avplayer_misc.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_json2 tests/hle/test_json2.cpp)
@@ -1350,6 +1361,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # libSceGameUpdate request lifecycle pinned to the shipped sprx: argument-check order, 0x30-byte
+  # param/result structs, 8 request slots, a no-update write-back of `found` only. Pure, no game dump.
+  prosper_add_gtest(test_gameupdate
+    SOURCES tests/hle/dispatch/test_gameupdate.cpp
+    LIBRARIES prosper_core)
+
   # #2185: reallocalign was unregistered, so the dispatcher's 0 reached the guest as a NULL
   # allocation — a false FAILURE (reads as OOM), the mirror of the #2081 family below. Asserts the
   # extended alignment survives a resize, which plain realloc never promised. Pure, no game dump.
@@ -1470,6 +1487,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ult_semantics.cpp
     LIBRARIES prosper_core Threads::Threads)
 
+  # Fiber/Ult remainder: context-size checks ack, frame-pointer address is zeroed,
+  # try-lock/signal-all/try-join/yield behave against real objects. Pure, no game dump.
+  prosper_add_gtest(test_fiber_ult_misc
+    SOURCES tests/hle/sync/test_fiber_ult_misc.cpp
+    LIBRARIES prosper_core Threads::Threads)
+
   prosper_add_gtest(test_posix_sem
     SOURCES tests/hle/test_posix_sem.cpp
     LIBRARIES prosper_core)
@@ -1527,6 +1550,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
+  # libSceNpManager remainder: local request ids, SIGNED_OUT account/premium answers,
+  # acknowledged callbacks/setters. PollAsync/CreateAsyncRequest stay deliberately out.
+  prosper_add_gtest(test_np_manager
+    SOURCES tests/hle/np/test_np_manager.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.
@@ -1546,6 +1575,12 @@ if(TARGET prosper_core)
   # are divisors, so titles died in their own arithmetic far from the cause.
   prosper_add_gtest(test_audio_spatial
     SOURCES tests/hle/audio/test_audio_spatial.cpp
+    LIBRARIES prosper_core)
+
+  # libSceVoice: no capture backend, so Init reports unavailable and the port surface
+  # agrees with it instead of handing out contradicting handles (GTA V, #1158).
+  prosper_add_gtest(test_voice
+    SOURCES tests/hle/audio/test_voice.cpp
     LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
@@ -2127,10 +2162,21 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_signin_dialog.cpp
     LIBRARIES prosper_core)
 
+  # libSceMouse (device-with-no-input + close completing the 4-call set).
+  prosper_add_gtest(test_mouse
+    SOURCES tests/hle/service/test_mouse.cpp
+    LIBRARIES prosper_core)
+
   # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
   # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
   prosper_add_gtest(test_login_dialog
     SOURCES tests/hle/service/test_login_dialog.cpp
+    LIBRARIES prosper_core)
+
+  # Remaining SystemService/UserService getters: flags round-trip, tick acknowledged,
+  # privacy reads a deterministic default.
+  prosper_add_gtest(test_syssvc_usersvc
+    SOURCES tests/hle/service/test_syssvc_usersvc.cpp
     LIBRARIES prosper_core)
 
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -2464,6 +2510,12 @@ if(TARGET prosper_core)
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   prosper_add_gtest(test_dmem
     SOURCES tests/host/test_dmem.cpp
+    LIBRARIES prosper_core)
+
+  # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
+  prosper_add_gtest(test_dmem_fixed_remap
+    SOURCES tests/hle/memory/test_dmem_fixed_remap.cpp
+    INCLUDES src
     LIBRARIES prosper_core)
 
   # A refused fixed direct-memory map must preserve the allocation for a later retry.
@@ -3036,6 +3088,11 @@ if(TARGET prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)
   prosper_add_gtest(test_raw_wide_flat_read_effects
     SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
+  prosper_add_gtest(test_raw_wide_vop3_source_width
+    SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)

@@ -217,6 +217,15 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // overran a single-entry mouse buffer, and the game consumed a phantom mouse event every call. No
 // mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
+// sceMouseClose(handle). The firmware validates (module VA 0xaf0): 0x80DF0005 before
+// sceMouseInit, and 0x80DF0003 for a zero, unknown or already-closed handle after scanning its 8
+// open slots. s_open does not track handles, so prosper accepts every close. CONFIDENCE: MED. This
+// matches the dispatcher's previous answer for every well-formed close; tracking handles would
+// change what 52 importing titles (13 snapshot-guarded) see, so it belongs in its own change.
+HLE(s_mouse_close) {
+    (void)a0;
+    return 0;
+}
 
 // --- app content ---
 namespace {
@@ -1269,8 +1278,146 @@ HLE(s_errdialog_status) {
 // their live args before being given behavior. CONFIDENCE: MED (init-succeeds is the real-console
 // offline behavior; arg shapes intentionally not guessed).
 HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_init) { svc_log("sceGameUpdateInitialize",          a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3,a4,a5); return 0; }
+// --- libSceGameUpdate request lifecycle ------------------------------------------------------
+// Contracts re-derived from the shipped plaintext libSceGameUpdate.sprx (PS5 3.20, testdata/sprx):
+//   Initialize       already initialized -> 0x80412802.
+//   Terminate        not initialized -> 0x80412801.
+//   CreateRequest    not initialized -> 0x80412801; 8 fixed request slots, a 9th -> 0x80412806;
+//                    ids are minted from 0x20000000 up to 0x2fffffff, then wrap back.
+//   Check(id, param*, result*)
+//                    id <= 0 -> 0x80412805; NULL param/result -> 0x80412803; each struct leads with a
+//                    u64 size that must be 0x30 -> 0x80412804; param's reserved words (+0xc..+0x2c)
+//                    must be zero and its check type 0 (1 only in a PS4 process) -> 0x80412803;
+//                    then not initialized ->
+//                    0x80412801, unknown id -> 0x80412805, aborted request -> 0x80412807.
+//                    The result write-back touches only `found` (+8), one byte at +9, and 11 version
+//                    bytes at +0xc when found.
+//   AbortRequest / DeleteRequest
+//                    id <= 0 -> 0x80412805, then not initialized -> 0x80412801, unknown id ->
+//                    0x80412805. Abort marks the request so a later Check answers 0x80412807.
+//   GetAddcontLatestVersion(serviceLabel, label*, info*)
+//                    NULL label/info -> 0x80412803, then not initialized -> 0x80412801; writes only
+//                    `found` (+8) and, when found, 11 version bytes at +9.
+// prosper has no update service. The library itself answers "no update" (found = 0, return 0) when
+// its patch-check service reports 0x80412883; prosper models that path. What a real offline console's
+// service returns is not established, so CONFIDENCE: MED on the offline answer and HIGH on the
+// argument checks above. This is a platform query about patches -- it reports nothing about
+// ownership and unlocks no content.
+namespace {
+constexpr uint64_t GAME_UPDATE_ERROR_NOT_INITIALIZED = 0x80412801ull;
+constexpr uint64_t GAME_UPDATE_ERROR_ALREADY_INITIALIZED = 0x80412802ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_ARG = 0x80412803ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_SIZE = 0x80412804ull;
+constexpr uint64_t GAME_UPDATE_ERROR_REQUEST_NOT_FOUND = 0x80412805ull;
+constexpr uint64_t GAME_UPDATE_ERROR_TOO_MANY_REQUESTS = 0x80412806ull;
+constexpr uint64_t GAME_UPDATE_ERROR_ABORTED = 0x80412807ull;
+// Zero-extension matches this file's own error style (0x817D facility above), not a claim
+// about firmware sign-extension.
+constexpr int32_t kGameUpdateFirstId = 0x20000000;
+constexpr int32_t kGameUpdateLastId = 0x2ffffffe;
+struct GameUpdateSlot {
+    int32_t id = 0;   // 0 = free
+    bool aborted = false;
+};
+std::mutex g_gameupdate_mx;
+bool g_gameupdate_ready = false;
+int32_t g_gameupdate_next_id = kGameUpdateFirstId;
+GameUpdateSlot g_gameupdate_slots[8];
+GameUpdateSlot* gameupdate_find(int32_t id) {
+    for (GameUpdateSlot& slot : g_gameupdate_slots)
+        if (slot.id != 0 && slot.id == id) return &slot;
+    return nullptr;
+}
+}   // namespace
+HLE(s_gameupdate_init) {
+    svc_log("sceGameUpdateInitialize", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (g_gameupdate_ready) return GAME_UPDATE_ERROR_ALREADY_INITIALIZED;
+    g_gameupdate_ready = true;
+    return 0;
+}
+HLE(s_gameupdate_term) {
+    svc_log("sceGameUpdateTerminate", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    g_gameupdate_ready = false;
+    for (GameUpdateSlot& slot : g_gameupdate_slots) slot = {};
+    return 0;
+}
+HLE(s_gameupdate_create) {
+    svc_log("sceGameUpdateCreateRequest", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    for (GameUpdateSlot& slot : g_gameupdate_slots) {
+        if (slot.id != 0) continue;
+        const int32_t id = g_gameupdate_next_id;
+        g_gameupdate_next_id = id > kGameUpdateLastId ? kGameUpdateFirstId : id + 1;
+        slot = {id, false};
+        return (uint64_t)id;
+    }
+    return GAME_UPDATE_ERROR_TOO_MANY_REQUESTS;
+}
+HLE(s_gameupdate_check) {
+    svc_log("sceGameUpdateCheck", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    if (!a1 || !a2) return GAME_UPDATE_ERROR_INVALID_ARG;
+    uint64_t param_size = 0, result_size = 0;
+    if (!svc_copy_bytes(a1, &param_size, sizeof(param_size)) ||
+        !svc_copy_bytes(a2, &result_size, sizeof(result_size)))
+        return GAME_UPDATE_ERROR_INVALID_ARG;
+    if (param_size != 0x30 || result_size != 0x30) return GAME_UPDATE_ERROR_INVALID_SIZE;
+    uint32_t param[12] = {};
+    if (!svc_copy_bytes(a1, param, sizeof(param))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    // Check type at +8: the firmware allows type 1 only in a PS4 process (sceKernelIsPs4Process),
+    // so a PS5 title may pass only 0.
+    if (param[2] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;
+    for (int i = 3; i < 12; ++i)
+        if (param[i] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;   // reserved +0xc..+0x2c
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+        const GameUpdateSlot* slot = gameupdate_find(id);
+        if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+        if (slot->aborted) return GAME_UPDATE_ERROR_ABORTED;
+    }
+    const uint8_t no_update[2] = {0, 0};   // found (+8) and the byte at +9
+    if (!svc_write_bytes(a2 + 8, no_update, sizeof(no_update))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return 0;
+}
+HLE(s_gameupdate_abort) {
+    svc_log("sceGameUpdateAbortRequest", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    GameUpdateSlot* slot = gameupdate_find(id);
+    if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    slot->aborted = true;
+    return 0;
+}
+HLE(s_gameupdate_delete) {
+    svc_log("sceGameUpdateDeleteRequest", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    GameUpdateSlot* slot = gameupdate_find(id);
+    if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    *slot = {};
+    return 0;
+}
+HLE(s_gameupdate_addcont_version) {
+    svc_log("sceGameUpdateGetAddcontLatestVersion", a0, a1, a2, a3, a4, a5);
+    if (!a1 || !a2) return GAME_UPDATE_ERROR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    }
+    const uint8_t not_found = 0;
+    if (!svc_write_bytes(a2 + 8, &not_found, 1)) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return 0;
+}
 // The entitlement follow-ups DOLL's main menu fires once the flow is unblocked (live-captured
 // after the #306 gate fell). ABI pinned from the live capture (r8):
 //   GetAddcontEntitlementInfoList(SceNpServiceLabel serviceLabel, Info* list, u32 listNum,
@@ -1363,9 +1510,42 @@ HLE(s_npent_skuflag) {
 // (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
 // 3 adjacent stack bytes. 0 = "no skip" is the inert default a retail console with no
 // notice-screen state reports. CONFIDENCE: MED (byte-sized out pinned live; value semantics LOW).
+// The Set/DisableAutoSet siblings below store into the same flag so a title round-trips what
+// it set instead of reading a hardwired 0 after asking for skip (read-your-writes).
+// CONFIDENCE: LOW on that read-back model -- not established against the module. The shipped
+// Set takes no arguments (it always requests skip), and g_noticeskip_autoset is recorded but
+// never read: nothing here models the auto-set behaviour it disables.
+namespace {
+std::atomic<bool> g_noticeskip{false};
+std::atomic<bool> g_noticeskip_autoset{true};
+}   // namespace
 HLE(s_syss_noticeskip) {
     svc_log("sceSystemServiceGetNoticeScreenSkipFlag", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = 0;
+    if (!svc_ptrish(a0)) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER, as the module
+    *(uint8_t*)PW(a0) = g_noticeskip.load() ? 1 : 0;
+    return 0;
+}
+HLE(s_syss_set_noticeskip) {
+    svc_log("sceSystemServiceSetNoticeScreenSkipFlag", a0, a1, a2, a3, a4, a5);
+    g_noticeskip.store(true);
+    return 0;
+}
+HLE(s_syss_noticeskip_noautoset) {
+    svc_log("sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", a0, a1, a2, a3, a4, a5);
+    g_noticeskip_autoset.store(false);
+    return 0;
+}
+HLE(s_syss_powertick) {
+    svc_log("sceSystemServicePowerTick", a0, a1, a2, a3, a4, a5);
+    return 0;   // keep-awake hint; nothing sleeps headless
+}
+// sceUserServiceGetPlatformPrivacyWs1(userId, int32_t* out): the shipped module writes 0/1
+// (setting 0x89c, (v & ~2) == 1) and returns 0x80960005 for a NULL out. 0 = the consent-free
+// default; a user setting is not derivable from the dump. CONFIDENCE: MED.
+HLE(s_user_privacy_ws1) {
+    svc_log("sceUserServiceGetPlatformPrivacyWs1", a0, a1, a2, a3, a4, a5);
+    if (!svc_ptrish(a1)) return 0x80960005ull;
+    *(int32_t*)PW(a1) = 0;
     return 0;
 }
 
@@ -1505,11 +1685,20 @@ void register_service_hle() {
     R("sceWebBrowserDialogInitialize", s_ok);
     R("sceWebBrowserDialogTerminate", s_ok);
     R("sceUserServiceInitialize", s_ok);
+    R("sceUserServiceInitialize2", s_ok);
     R("sceUserServiceTerminate", s_ok);
+    // PlatformPrivacyWs1 (userId, int* out): a deterministic default with a NULL check, like the
+    // module (s_user_privacy_ws1). Not in the 3.20 list: it lives in the newer
+    // libSceUserServicePlatformPrivacyWs1 sub-library that the shipped libSceUserService.sprx
+    // exports; nid_hash("sceUserServiceGetPlatformPrivacyWs1") is D-CzAxQL0XI, and three local
+    // dumps import it (PPSA03671, PPSA05684, PPSA21564).
+    Hle::register_fn("D-CzAxQL0XI", (HleFn)s_user_privacy_ws1,
+                     "sceUserServiceGetPlatformPrivacyWs1");
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
     R("sceMouseRead", s_mouse_read);
+    R("sceMouseClose", s_mouse_close);
     // app content / dialogs
     R("sceAppContentInitialize", s_ok);
     R("sceAppContentAppParamGetInt", s_appcontent_int);
@@ -1578,12 +1767,24 @@ void register_service_hle() {
     Hle::register_fn("t2FvHRXzgqk", (HleFn)s_errdialog_status, "sceErrorDialogGetStatus");
     Hle::register_fn("WWiGuh9XfgQ", (HleFn)s_errdialog_status, "sceErrorDialogUpdateStatus");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
+    Hle::register_fn("Q3utJvma4Mo", (HleFn)s_syss_set_noticeskip,
+                     "sceSystemServiceSetNoticeScreenSkipFlag");
+    Hle::register_fn("8Lo6Zv94aho", (HleFn)s_syss_noticeskip_noautoset,
+                     "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet");
+    Hle::register_fn("XbbJC3E+L5M", (HleFn)s_syss_powertick, "sceSystemServicePowerTick");
     Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
     // libSceNpEntitlementAccess / libSceGameUpdate — observability (svc_log) with the real-console
     // "local init succeeds offline" return; follow-ups deliberately left unimplemented (see above).
     Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
     Hle::register_fn("YJtKLttI9fM", (HleFn)s_gameupdate_init, "sceGameUpdateInitialize");
     Hle::register_fn("NSH-C-OmoNI", (HleFn)s_gameupdate_term, "sceGameUpdateTerminate");
+    // GameUpdate request lifecycle: init-gated ids, offline "no update" checks.
+    Hle::register_fn("UvcvKaFvupA", (HleFn)s_gameupdate_create, "sceGameUpdateCreateRequest");
+    Hle::register_fn("LYVV9z8+owM", (HleFn)s_gameupdate_check, "sceGameUpdateCheck");
+    Hle::register_fn("d1CNGEOaK28", (HleFn)s_gameupdate_abort, "sceGameUpdateAbortRequest");
+    Hle::register_fn("bcCyjHN5sn0", (HleFn)s_gameupdate_delete, "sceGameUpdateDeleteRequest");
+    Hle::register_fn("0g0+Oq9xcI0", (HleFn)s_gameupdate_addcont_version,
+                     "sceGameUpdateGetAddcontLatestVersion");
     // Post-gate follow-ups (fire from DOLL's now-reachable main menu; NIDs from PS5 3.20 tables).
     Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfoList");

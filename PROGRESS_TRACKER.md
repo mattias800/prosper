@@ -173,7 +173,7 @@ of its manifest.
 | FINAL FANTASY TACTICS - The Ivalice Chronicles | `PPSA21783` | 0 | `------` | - | - | - | - | [#3498](https://github.com/mattias800/prosper/issues/3498) | - |
 | Hades II | `PPSA36082` | 0 | `------` | - | - | none | [#4079](https://github.com/mattias800/prosper/issues/4079) | [#4023](https://github.com/mattias800/prosper/issues/4023) | - |
 | Judgment | `PPSA02739` | 0 | `------` | none | - | none | [#2923](https://github.com/mattias800/prosper/issues/2923) | [#2880](https://github.com/mattias800/prosper/issues/2880) | [`YAKUZA_JUDGMENT_BRINGUP.md`](prosper/docs/games/YAKUZA_JUDGMENT_BRINGUP.md) |
-| Marvel's Wolverine | `PPSA03671` | 0 | `------` | - | - | none | [#4036](https://github.com/mattias800/prosper/issues/4036), [#3951](https://github.com/mattias800/prosper/issues/3951) | [#4019](https://github.com/mattias800/prosper/issues/4019) | - |
+| Marvel's Wolverine | `PPSA03671` | 0 | `------` | - | - | none | [#4036](https://github.com/mattias800/prosper/issues/4036) | [#4019](https://github.com/mattias800/prosper/issues/4019) | - |
 | NINJA GAIDEN 4 | `PPSA25258` | 0 | `------` | - | - | - | - | [#3500](https://github.com/mattias800/prosper/issues/3500) | - |
 | Onimusha: Way of the Sword | `PPSA27836` | 0 | `------` | - | - | none | - | [#4022](https://github.com/mattias800/prosper/issues/4022) | - |
 | PGA TOUR 2K25 | `PPSA17952` | 0 | `------` | none | - | none | - | [#2895](https://github.com/mattias800/prosper/issues/2895) | [`PGA_TOUR_2K25_STATUS.md`](prosper/docs/games/PGA_TOUR_2K25_STATUS.md) |
