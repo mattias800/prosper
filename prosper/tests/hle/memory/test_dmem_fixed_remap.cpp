@@ -20,6 +20,8 @@
 //   FixedMapOverFlexibleMemoryIsRefused  flexible memory is replaced, or wiped by a failing retry
 //   RangeSpanningDirectAndFlexibleIsRefused  a range accepted after its FIRST direct cover clobbers the flexible page
 //   RangeSpanningTwoDirectViewsIsReplaced    a range spanning two old views replaces only the first
+//   AmprMapOverLiveDirectMemoryIsRefused     a placement that never asked for MAP_FIXED (the Ampr push-map)
+//                                            replaces a live direct view and zeroes it (#88 / #107 class)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -183,4 +185,18 @@ TEST_F(DmemFixedRemap, RangeSpanningTwoDirectViewsIsReplaced) {
     ASSERT_EQ(map_fixed(base, 2, c), 0u) << "one fixed map across two direct views must replace both";
     EXPECT_EQ(*at(base), 0xC0);
     EXPECT_EQ(*at(base, 1), 0xC1) << "the second view must be replaced too";
+}
+
+TEST_F(DmemFixedRemap, AmprMapOverLiveDirectMemoryIsRefused) {
+    // sceAmprCommandBufferSetBuffer's map flavor places a physical range at a guest VA without
+    // MAP_FIXED and zeroes it after a successful map. Over a live direct view it must keep refusing
+    // (#88 / #107; docs/games/KHAZAN_STATUS.md), whatever a guest MAP_FIXED direct map may replace.
+    HleFn set_buffer = Hle::lookup("N-FSPA4S3nI");   // sceAmprCommandBufferSetBuffer
+    ASSERT_NE(set_buffer, nullptr);
+    const uint64_t a = alloc(1);
+    const uint64_t addr = map_anywhere(1, a);
+    *(volatile uint64_t*)(uintptr_t)addr = 0x5eedfacecafe01ull;
+    set_buffer(0x7f0000ab0000ull, addr, kPage, addr + 8, 0xffffffffull, 0);
+    EXPECT_EQ(*(volatile uint64_t*)(uintptr_t)addr, 0x5eedfacecafe01ull)
+        << "the Ampr map flavor must not replace (and zero) a live direct view";
 }
