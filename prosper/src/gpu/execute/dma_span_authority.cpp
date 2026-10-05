@@ -18,8 +18,9 @@ bool ranges_overlap(uint64_t a, uint64_t a_bytes, uint64_t b, uint64_t b_bytes) 
 enum class Reason { Plain, SourceOverlap, DestinationOverlap, UnprovedExtent, NamedBase, Count };
 
 // Why each copy did or did not take the readback, printed once at exit (opt-out
-// PROSPER_NO_DMA_AUTHORITY_CENSUS). Without it a title still paying for the readback cannot say
-// whether its copies really touch rendered targets or only look like they might.
+// PROSPER_NO_DMA_AUTHORITY_CENSUS, a diagnostic). Without it a title still paying for the readback
+// cannot say whether its copies really touch rendered targets or only look like they might.
+// `plain` means "no readback requested", which includes copies with no pending span at all.
 struct Census {
     std::atomic<uint64_t> counts[static_cast<size_t>(Reason::Count)]{};
 };

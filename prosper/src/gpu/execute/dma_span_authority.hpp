@@ -6,22 +6,25 @@
 #include <vector>
 
 namespace prosper::gpu {
-// A DMA copy reads its source and writes its destination in guest memory. Before it runs, the
-// executor flushes the pending render span; an AUTHORITATIVE flush also reads every colour target
-// that span rendered back to guest memory. That readback is what a copy needs when one of its
-// ranges overlaps such a target -- the source would otherwise be read stale, or the destination
-// would land under a target whose other bytes are still only on the GPU -- and nothing else.
-// A copy that touches no span target gains nothing from it (#4439: ~48 MB per flip on Alex Kidd).
+// What the authoritative flush actually does (#4459 review): the renderer synchronously reads every
+// colour target the pending span rendered back into its own CPU cache (g_rtt[...].rgba) -- not into
+// guest memory -- and declines any volume (3D) producer pass in that span. A DMA copy does not
+// depend on either for correctness: its source is served by the live-target reader, which reads a
+// GPU-only target back on demand, and its destination write calls notify_guest_gpu_write, which
+// invalidates an overlapped renderer image and its CPU copy whatever the flush did. The eager
+// readback only spares the reader that on-demand readback, and makes a failed one impossible.
 //
-// Conservative by construction: a colour target whose physical extent is unproved counts as
-// overlapping, and so does a named color0/color1 base that disagrees with its slot binding. A GDS
-// operand (selector 1) names an offset in GDS, not guest memory, and is ignored.
+// So keep it, conservatively, only for a copy that touches a colour target the span renders --
+// there the old ordering is preserved exactly -- and skip it for every other copy (#4439: ~48 MB
+// per flip on Alex Kidd for copies that touch none). An unproved target extent, or a named
+// color0/color1 base its slot binding does not prove, counts as touched. A GDS operand (selector
+// 1) is an offset, not guest memory, and is ignored.
 bool dma_needs_authoritative_span(const std::vector<DrawItem>& span, uint64_t dst, uint64_t src,
                                   uint32_t bytes, uint32_t sels);
 
-// The executor's decision. PROSPER_DMA_ALWAYS_AUTHORITATIVE=1 restores the unconditional readback
-// as the same-binary A/B control (guest-behaviour selector: it moves when span bytes reach guest
-// memory, not what a correct copy reads or writes).
+// The executor's decision. PROSPER_DMA_ALWAYS_AUTHORITATIVE (set, any value) restores the
+// unconditional readback as the same-binary A/B control. It is a guest-behaviour selector because
+// authoritative mode declines volume producer passes in the span, which changes what renders.
 // Any copy record with dst/src/bytes/sels (the live GpuState::DmaCopy and the replay copy).
 template <class Copy>
 bool dma_flush_authoritative(const std::vector<DrawItem>& span, const Copy& copy) {
