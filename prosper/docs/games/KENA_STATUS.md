@@ -178,7 +178,7 @@ in 5 dies 5-10 s in with `0xC0000005` and nothing in stderr
    got it refused with ENOMEM; the title then re-entered `FMemory::GCreateMalloc` with `GMalloc` null and
    blocked forever on that function's own `__cxa_guard`, before its first print. 6 of 28 launches as built,
    0 of 12 with only that header bit cleared in the same binary. Executables that boot a guest are now linked
-   without the flag and confine their later allocations to `[4 GiB, 16 GiB)`
+   without the flag and steer their later allocations into `[4 GiB, 16 GiB)`, best effort
    (`docs/platforms/WINDOWS_PORT_HANDOFF.md` § Gotchas); the refusal is reported (`[memhle] reserve FAILED …`)
    instead of silent. This applies to every UE4 title, not this one.
 

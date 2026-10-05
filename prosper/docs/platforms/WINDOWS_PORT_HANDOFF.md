@@ -416,18 +416,33 @@ that thread waits on becomes the focus, so matching signals from other threads a
   The fix has two halves, and the second exists because of the first. **(1)** An executable that
   boots a guest is linked through `prosper_hosts_a_guest()` (`prosper/CMakeLists.txt`), which
   clears the flag; its bottom-up allocations then start below 16 MiB and the guest's range starts
-  out empty. **(2)** `boot_program()` first reserves whatever is still free below 4 GiB
-  (`host::confine_host_allocations_above_4gib`), so everything allocated from then on — guest
-  thread stacks are host allocations — lands in `[4 GiB, 16 GiB)`: above the values that code
-  taking guest addresses reads as immediates, below everything the guest places.
-  What to keep in mind. The symptom that should send you here is *placement that varies between
-  launches of the same binary* — an arena at `0x7c00000000` on one run and `0x2000000000` on the
-  next was this, one notch short of fatal. What stays below 4 GiB is whatever existed before the
-  boot: the main thread's stack and the frontend's own early allocations. And the host has 12 GiB
-  of room before it would spill upward into the guest's range; nobody has measured a long session
-  against that. The instrument for "what is standing in the guest's range" is
-  `host::query_guest_range_occupancy`; a huge reservation that cannot be placed now prints it
-  (`[memhle] reserve FAILED …` with the occupants).
+  out empty. **(2)** `boot_program()` first reserves whatever is free below 4 GiB at that moment
+  (`host::confine_host_allocations_above_4gib`), so an allocation that needs fresh address space
+  from then on — a new thread's stack above all, and guest thread stacks are host allocations —
+  lands in `[4 GiB, 16 GiB)`: above the values that code taking guest addresses reads as
+  immediates, below what the guest places.
+  What to keep in mind.
+  - The symptom that should send you here is *placement that varies between launches of the same
+    binary* — an arena at `0x7c00000000` on one run and `0x2000000000` on the next was this, one
+    notch short of fatal.
+  - **(2) is best effort, not a floor.** What existed before the boot stays below 4 GiB: the main
+    thread's stack, the frontend's early allocations, and any heap segment already there, which
+    keeps serving small allocations. It runs once, so low address space freed later is not
+    reserved again. Measured on Kena: 15-16 thread stacks stayed below 4 GiB and 93-126 landed in
+    `[4, 16)` GiB; which threads the 15-16 are was not traced.
+  - **Low host memory is live memory.** A truncated or byte-shifted guest pointer in
+    `[64 KiB, 4 GiB)` can now land on the host's pre-boot stacks and heap instead of faulting, where
+    on Linux that range is unmapped. Keep it in mind when a corruption shows up only on Windows.
+  - **The guest cannot map below 4 GiB any more**: a fixed guest mapping there fails and a hinted
+    one is placed elsewhere. No title is known to ask.
+  - **The host has `[4, 16)` GiB, 12 GiB, to itself.** prosper's own SSE4a chain cache is a fixed
+    allocation just under 16 GiB and fails soft if the host got there first. Past 16 GiB the host's
+    lowest-first allocations spill into the gaps of the guest's FIXED map — between module bases,
+    then the import-stub window, then the runtime-PRX pool — not into the automatic window. Nobody
+    has measured a long session against that (3 GiB at 14 s of a Kena boot); reserving the guest's
+    range up front is #4513.
+  - The instrument for "what is in the guest's range" is `host::query_guest_range_occupancy`; a
+    huge reservation that cannot be placed now prints it (`[memhle] reserve FAILED …`).
 
 ## Ruled out
 

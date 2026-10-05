@@ -355,8 +355,8 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // Diagnostics: record boot start.
     diagnostics::record_boot_phase(diagnostics::BootPhase::PROCESS_START);
 
-    // Before anything the guest can see is allocated: keep the host's later allocations (guest
-    // thread stacks among them) above 4 GiB and out of the guest's range (#4426). Windows only.
+    // Before anything the guest can see is allocated: steer the host's later allocations (guest
+    // thread stacks among them) above 4 GiB (#4426). Windows only, best effort — see the header.
     host::confine_host_allocations_above_4gib();
 
     // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.

@@ -9,20 +9,30 @@ namespace prosper::host {
 // The guest owns [16 GiB, 1008 GiB): fixed module bases from 16 GiB, automatic maps above 64 GiB.
 // Code that takes a guest address also assumes, in places, that anything at or below 4 GiB is not
 // one. So the host's own allocations belong in [4 GiB, 16 GiB) — above the values the guest's
-// consumers read as immediates, below everything the guest places. Linux gets this for free (the
-// kernel maps top-down from the far end); on Windows it takes the two halves below plus a link
-// flag (`prosper_hosts_a_guest` in prosper/CMakeLists.txt).
+// consumers read as immediates, below what the guest places. (prosper's own SSE4a chain cache is
+// a fixed allocation just under 16 GiB, exec_image_win.cpp; it fails soft if the host got there
+// first.) Linux gets this for free (the kernel maps top-down from the far end); on Windows it
+// takes the two halves below plus a link flag (`prosper_hosts_a_guest` in prosper/CMakeLists.txt).
 
-// Reserve whatever is still free in [64 KiB, 4 GiB), so the process's later bottom-up allocations
-// — heaps, and every thread stack created from here on, guest threads' included — start at 4 GiB.
-// What already lives below 4 GiB stays there: with high-entropy ASLR off that is the main thread's
-// stack and whatever the process allocated before this call. Idempotent; returns the bytes this
-// call reserved, and 0 on a host that needs none of this.
+// Reserve whatever is free in [64 KiB, 4 GiB) at the moment of the call, so that an allocation
+// which needs FRESH address space from here on — a new thread's stack, a new heap segment, a
+// VirtualAlloc(NULL) — starts at 4 GiB. Guest thread stacks are the case this exists for.
+//
+// Best effort, and it says so rather than promising a floor:
+//  - what already lives below 4 GiB stays there (with high-entropy ASLR off: the main thread's
+//    stack and everything the process allocated before this call), and a heap segment that is
+//    already there keeps serving small allocations from it;
+//  - it runs once, so address space below 4 GiB that is FREED later is not reserved again;
+//  - a free region another thread allocates into between the query and the reserve is skipped
+//    (two passes narrow that; nothing reports a miss).
+// Returns the bytes this call reserved: 0 on a repeat call and on a host that needs none of this.
 uint64_t confine_host_allocations_above_4gib();
 
-// "What is standing in this part of the guest's range?" — every host allocation that overlaps
-// [lo, hi), and the largest free gap between them. An allocation is identified by its allocation
-// base, so one host allocation is one occupant however many regions it is split into.
+// "What is standing in this part of the guest's range?" — every allocation that overlaps
+// [lo, hi), and the largest free gap between them. NOT only the host's: the guest's own mappings
+// and prosper's placeholders are allocations too, and the walk cannot tell them apart. An
+// allocation is identified by its allocation base, so it is one occupant however many regions it
+// is split into, and `size` is its extent inside the span.
 //
 // The result carries its own scope, as every answer from this folder must: `available` is false on
 // a host that cannot enumerate its address space this way (nothing was looked at), and `complete`
@@ -44,9 +54,10 @@ GuestRangeOccupancy query_guest_range_occupancy(uint64_t lo, uint64_t hi);
 // A reservation of `len` bytes that could not be placed anywhere in [lo, hi) is fatal to the title
 // and used to be silent: UE4 receives a null allocator, re-enters FMemory::GCreateMalloc from
 // inside its own initializer and blocks forever on that function's __cxa_guard, before its first
-// print. This names the cause on stderr — the room the range has and what is standing in it — once
-// per process, and returns nullptr so the refusing call site can return it directly. Always on: it
-// is the report of a guest-visible ENOMEM, not a trace.
+// print. This reports it on stderr — the room the range has and what is in it — once per process,
+// and returns nullptr so the refusing call site can return it directly. It does not diagnose: the
+// caller refuses for other reasons too, and when the largest gap would have held the request the
+// line says occupancy is not the cause. Always on: a guest-visible ENOMEM, not a trace.
 void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi);
 
 } // namespace prosper::host

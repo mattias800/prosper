@@ -1,7 +1,8 @@
 # `src/host/memory` — what the HOST knows about the guest's address space
 
 This folder holds the host-side view of guest memory: which ranges are mapped and readable, which
-pages are being watched for writes, and how to look through the whole space for something. It is
+pages are being watched for writes, how to look through the whole space for something, and — on
+Windows — where the host's OWN memory sits relative to the guest's range. It is
 deliberately *below* `src/hle/memory`, which is the opposite direction — that folder implements the
 guest-facing `sceKernel*` memory API and decides what gets mapped; this one answers questions about
 whatever ended up mapped, without any opinion on why.
@@ -41,9 +42,11 @@ whatever ended up mapped, without any opinion on why.
 
 - **`host_address_layout.{hpp,cpp}`** — where the HOST's own memory sits relative to the guest's
   range, which on Windows is something prosper has to arrange (#4426). Two halves: the boot-time
-  reservation that keeps the process's later allocations — guest thread stacks included — above
-  4 GiB, and "what is standing in this part of the guest's range?", the query behind the report a
-  huge guest reservation now makes when it cannot be placed. The third piece is not code: an
+  reservation that steers the process's later allocations — guest thread stacks above all — to
+  4 GiB and up (best effort; the header lists what it cannot move), and "what is in this part of
+  the guest's range?", the query behind the report a huge guest reservation now makes when it
+  cannot be placed. That query counts every allocation, the guest's own included. The third piece
+  is not code: an
   executable that boots a guest must be linked through `prosper_hosts_a_guest()` in
   `prosper/CMakeLists.txt`, or Windows scatters its stacks and heaps across the guest's range and
   neither half here can undo that.

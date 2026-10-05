@@ -67,11 +67,15 @@ GuestRangeOccupancy query_guest_range_occupancy(uint64_t lo, uint64_t hi) {
             const uint64_t allocation =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.AllocationBase));
             if (allocation != last_allocation) {
+                // `base` is the allocation's own base unless it starts below `lo`.
                 if (result.occupants < GuestRangeOccupancy::kMaxShown)
-                    result.shown[result.occupants] = {base, mbi.RegionSize, mbi.State, mbi.Type};
+                    result.shown[result.occupants] = {base, 0, mbi.State, mbi.Type};
                 ++result.occupants;
                 last_allocation = allocation;
             }
+            // Regions of one allocation are contiguous: its size is their sum within the span.
+            if (result.occupants <= GuestRangeOccupancy::kMaxShown)
+                result.shown[result.occupants - 1].size += end - std::max(base, lo);
         }
         cur = end;
     }
@@ -89,19 +93,23 @@ void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi) {
     const GuestRangeOccupancy o = query_guest_range_occupancy(lo, hi);
     if (!o.available) {
         fprintf(stderr,
-                "[memhle] reserve FAILED: a %llu GiB guest reservation does not fit the guest "
-                "range [0x%llx, 0x%llx). The guest gets ENOMEM (#4426).\n",
+                "[memhle] reserve FAILED: a %llu GiB guest reservation could not be placed in "
+                "the guest range [0x%llx, 0x%llx). The guest gets ENOMEM (#4426).\n",
                 (unsigned long long)(len >> 30), (unsigned long long)lo, (unsigned long long)hi);
         return nullptr;
     }
+    // The gap is printed beside the request because this is called for every refusal of the huge
+    // path, not only for a range that is too crowded: when the gap is large enough, the cause is
+    // something else (alignment, a host without placeholder support) and the line says so.
     fprintf(stderr,
-            "[memhle] reserve FAILED: a %llu GiB guest reservation does not fit the guest range "
-            "[0x%llx, 0x%llx) -- its largest free gap is %llu GiB, with %d allocation(s) standing "
-            "in it%s. The guest gets ENOMEM; a UE4 title then hangs in its allocator bootstrap "
-            "(#4426).\n",
+            "[memhle] reserve FAILED: a %llu GiB guest reservation could not be placed in the "
+            "guest range [0x%llx, 0x%llx) -- its largest free gap is %llu GiB%s, with %d "
+            "allocation(s) in the range%s. The guest gets ENOMEM; a UE4 title then hangs in its "
+            "allocator bootstrap (#4426).\n",
             (unsigned long long)(len >> 30), (unsigned long long)lo, (unsigned long long)hi,
-            (unsigned long long)(o.largest_free_gap >> 30), o.occupants,
-            o.complete ? "" : " (walk incomplete: both figures are lower bounds)");
+            (unsigned long long)(o.largest_free_gap >> 30),
+            o.largest_free_gap >= len ? " (large enough: occupancy is NOT the cause)" : "",
+            o.occupants, o.complete ? "" : " (walk incomplete: both figures are lower bounds)");
     const int shown = std::min(o.occupants, GuestRangeOccupancy::kMaxShown);
     for (int i = 0; i < shown; ++i)
         fprintf(stderr, "[memhle]   occupant base=0x%llx size=0x%llx state=0x%lx type=0x%lx\n",
@@ -111,4 +119,4 @@ void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi) {
     return nullptr;
 }
 
-} // namespace prosper::host
+}   // namespace prosper::host

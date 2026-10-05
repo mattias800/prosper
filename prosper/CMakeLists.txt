@@ -45,9 +45,10 @@ endif()
 # __cxa_guard before printing anything.
 #
 # Without the flag the same randomisation spans the first 16 MiB, so the guest's range starts out
-# empty on every launch. boot_program() then reserves what is still free below 4 GiB
-# (host::confine_host_allocations_above_4gib), so everything the host allocates from there on --
-# guest thread stacks included -- stays above 4 GiB as it did before, and below the guest's range.
+# empty on every launch. boot_program() then reserves what is free below 4 GiB at that moment
+# (host::confine_host_allocations_above_4gib), so what the host allocates fresh from there on --
+# a guest thread's stack above all -- lands above 4 GiB as it did before, and below the guest's
+# range. Best effort: that header lists what it cannot move.
 #
 # Per target, NOT global: tests hand host stack and heap buffers to code that takes guest addresses,
 # and that code tells an address from an immediate by "above 4 GiB" in places. A global flag put
@@ -57,10 +58,14 @@ endif()
 # code natively.
 function(prosper_hosts_a_guest target)
   if(WIN32)
-    if(MSVC)
-      target_link_options(${target} PRIVATE /HIGHENTROPYVA:NO)
+    # LINKER: lets CMake spell the pass-through for whichever driver is in use. The MSVC-style
+    # spelling covers cl and any Clang driver that links with link.exe / lld-link; it is written
+    # from the linker's documentation and has NOT been built here -- prosper's Windows toolchains
+    # are MinGW GCC and GNU-ABI Clang, both of which take the second form (verified on each).
+    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+      target_link_options(${target} PRIVATE "LINKER:/HIGHENTROPYVA:NO")
     else()
-      target_link_options(${target} PRIVATE -Wl,--disable-high-entropy-va)
+      target_link_options(${target} PRIVATE "LINKER:--disable-high-entropy-va")
     endif()
   endif()
 endfunction()
@@ -6734,6 +6739,11 @@ if(WIN32 AND TARGET test_windows_guest_window)
       string(APPEND _prosper_guest_host_files "$<TARGET_FILE:${_host}>|")
     endif()
   endforeach()
-  target_compile_definitions(test_windows_guest_window PRIVATE
-    "PROSPER_GUEST_HOST_FILES=\"${_prosper_guest_host_files}\"")
+  # Written to an include file rather than passed as a -D: a path list on a compiler command line
+  # depends on every generator's quoting rules, and a file does not.
+  file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/windows_guest_host_files.inc"
+    CONTENT "R\"prosperpaths(${_prosper_guest_host_files})prosperpaths\"\n")
+  target_include_directories(test_windows_guest_window PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host")
 endif()
