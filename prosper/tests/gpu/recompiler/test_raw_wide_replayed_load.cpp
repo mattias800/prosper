@@ -13,9 +13,11 @@
 // the ground, rocks and deck were dropped.
 //
 // The load, the compare, the mask move and the v_readfirstlane are the live instruction words.
-// The fetch is the live opcode with an immediate offset where the shader uses vcc_lo, which the
-// classifier does not look at. Each refusal arm changes exactly one property the admission
-// depends on, and names the blocker it expects, so an arm cannot pass for another arm's reason.
+// The fetch is the live opcode with an immediate offset where the shader uses vcc_lo. The
+// classifier does read a fetch's offset register, as a possible numeric use of a loaded word;
+// vcc_lo is not a loaded word here, so the substitution changes nothing it decides. Each refusal
+// arm changes exactly one property the admission depends on, and names the blocker it expects,
+// so an arm cannot pass for another arm's reason.
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
@@ -34,8 +36,10 @@ struct Shape {
     uint32_t first_word = 0x7e020280u;   // v_mov_b32 v1, 0: above the loop, never walked
     uint32_t load_offset_word = 0xfa0000f0u;   // SOFFSET null, immediate 0xf0
     std::vector<uint32_t> in_loop;   // extra instructions between the fetch and the mask
+    bool compare = true;   // v_cmp_*_sdwa s[16:17], 0, s10: recycles the pair as a mask
     bool move_mask_to_vcc = true;   // s_mov_b64 vcc, s[16:17] after the compare
     std::vector<uint32_t> after_mask;   // extra instructions after the compare (and move)
+    std::vector<uint32_t> after_exit;   // extra instructions past the loop, before the end
 };
 
 //  0  v_mov_b32 v1, 0
@@ -53,13 +57,15 @@ std::vector<Rdna2Inst> program(const Shape& shape) {
         shape.first_word, 0xf408040eu, shape.load_offset_word, 0xf4280208u, 0xfa0000c0u,
     };
     code.insert(code.end(), shape.in_loop.begin(), shape.in_loop.end());
-    code.insert(code.end(), {0x7c1a14f9u, 0x86869080u});
+    if (shape.compare) code.insert(code.end(), {0x7c1a14f9u, 0x86869080u});
     if (shape.move_mask_to_vcc) code.push_back(0xbeea0410u);
     code.insert(code.end(), shape.after_mask.begin(), shape.after_mask.end());
     code.push_back(0xbf860001u);
     const uint32_t branch_pc = static_cast<uint32_t>(code.size());
     const uint32_t back = (kLoadPc - (branch_pc + 1u)) & 0xffffu;
-    code.insert(code.end(), {0xbf820000u | back, 0x7ed40501u, 0xbf810000u});
+    code.push_back(0xbf820000u | back);
+    code.insert(code.end(), shape.after_exit.begin(), shape.after_exit.end());
+    code.insert(code.end(), {0x7ed40501u, 0xbf810000u});
     std::vector<Rdna2Inst> instructions;
     EXPECT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
     return instructions;
@@ -79,6 +85,17 @@ std::string numeric_blocker(const std::vector<Rdna2Inst>& instructions, uint32_t
             if (pc) *pc = row.numeric_pc;
             return row.numeric_kind;
         }
+    return {};
+}
+
+// The load's diagnosis row; `found` is false when the classifier cleared the load.
+RawWideLoadDiagnosis diagnosis(const std::vector<Rdna2Inst>& instructions, bool* found = nullptr) {
+    for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions))
+        if (row.load_pc == kLoadPc) {
+            if (found) *found = true;
+            return row;
+        }
+    if (found) *found = false;
     return {};
 }
 
@@ -163,22 +180,142 @@ TEST(RawWideReplayedLoad, GuestMemoryWriteReplayStaysUncertain) {
     EXPECT_EQ(numeric_blocker(instructions), "load-re-executed");
 }
 
-TEST(RawWideReplayedLoad, CallsAndRelativeMovesKeepReplayUncertain) {
-    // Both sit ABOVE the loop, where neither walk ever goes, so only the whole-program condition
-    // can refuse them. A call may run code that was never decoded; an M0-relative move writes a
-    // register its encoding does not name. Either could change the base pair between executions.
-    const auto call = program({.first_word = 0xbb3c0000u});   // s_call_b64 s[60:61], +0
-    ASSERT_EQ(at(call, 0).fmt, Rdna2Format::SOPK);
-    ASSERT_EQ(at(call, 0).opcode, kSopkOpcodeCallB64);
-    EXPECT_TRUE(flagged(call));
-    EXPECT_EQ(numeric_blocker(call), "load-re-executed");
+namespace {
+struct Escape {
+    const char* name;
+    uint32_t word;
+    Rdna2Format fmt;
+    uint32_t opcode;
+    // False for the two source-relative moves: they read through M0 and write a named register.
+    bool writes_unnamed_or_leaves_cfg = true;
+};
+// One encoding of every instruction rdna2_escapes_decoded_effects names.
+constexpr Escape kEscapes[] = {
+    {"s_setpc_b64 s[60:61]", 0xbe80203cu, Rdna2Format::SOP1, kSop1OpcodeSetpcB64},
+    {"s_swappc_b64 s[60:61], s[40:41]", 0xbebc2128u, Rdna2Format::SOP1, kSop1OpcodeSwappcB64},
+    {"s_rfe_b64 s[60:61]", 0xbe80223cu, Rdna2Format::SOP1, kSop1OpcodeRfeB64},
+    {"s_movrels_b32 s60, s40", 0xbebc2e28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB32, false},
+    {"s_movrels_b64 s[60:61], s[40:41]", 0xbebc2f28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB64,
+     false},
+    {"s_movreld_b32 s60, s40", 0xbebc3028u, Rdna2Format::SOP1, kSop1OpcodeMovreldB32},
+    {"s_movreld_b64 s[60:61], s[40:41]", 0xbebc3128u, Rdna2Format::SOP1, kSop1OpcodeMovreldB64},
+    {"s_movrelsd_2_b32 s60, s40", 0xbebc4928u, Rdna2Format::SOP1, kSop1OpcodeMovrelsd2B32},
+    {"s_call_b64 s[60:61], +0", 0xbb3c0000u, Rdna2Format::SOPK, kSopkOpcodeCallB64},
+    {"s_subvector_loop_begin s60, +0", 0xbdbc0000u, Rdna2Format::SOPK,
+     kSopkOpcodeSubvectorLoopBegin},
+    {"s_subvector_loop_end s60, +0", 0xbe3c0000u, Rdna2Format::SOPK, kSopkOpcodeSubvectorLoopEnd},
+};
+}   // namespace
 
-    const auto relative = program({.first_word = 0xbebc3028u});   // s_movreld_b32 s60, s40
-    ASSERT_EQ(at(relative, 0).fmt, Rdna2Format::SOP1);
-    ASSERT_EQ(at(relative, 0).opcode, kSop1OpcodeMovreldB32);
-    ASSERT_EQ(at(relative, 0).dst.value, 60) << "not the base pair: only M0 could make it one";
-    EXPECT_TRUE(flagged(relative));
-    EXPECT_EQ(numeric_blocker(relative), "load-re-executed");
+TEST(RawWideReplayedLoad, EscapeListIsTheOneTheDecoderNames) {
+    for (const Escape& escape : kEscapes) {
+        const Rdna2Inst in = rdna2_decode_one(&escape.word, 1);
+        ASSERT_EQ(in.fmt, escape.fmt) << escape.name;
+        ASSERT_EQ(in.opcode, escape.opcode) << escape.name;
+        EXPECT_TRUE(rdna2_escapes_decoded_effects(in)) << escape.name;
+        EXPECT_EQ(rdna2_may_write_unnamed_register_or_leave_cfg(in),
+                  escape.writes_unnamed_or_leaves_cfg)
+            << escape.name;
+    }
+    // The range three guards used to call "relative SGPR write" is B64 saveexec, and stays out.
+    for (uint32_t opcode = kSop1OpcodeAndSaveexecB64; opcode <= kSop1OpcodeXnorSaveexecB64;
+         ++opcode) {
+        const uint32_t word = 0xbea800c1u | (opcode << 8u);   // s_*_saveexec_b64 s[40:41], -1
+        const Rdna2Inst in = rdna2_decode_one(&word, 1);
+        ASSERT_EQ(in.fmt, Rdna2Format::SOP1);
+        ASSERT_EQ(in.opcode, opcode);
+        EXPECT_FALSE(rdna2_escapes_decoded_effects(in)) << "opcode 0x" << std::hex << opcode;
+        EXPECT_FALSE(rdna2_may_write_unnamed_register_or_leave_cfg(in))
+            << "opcode 0x" << std::hex << opcode;
+    }
+}
+
+TEST(RawWideReplayedLoad, AWriterOrTransferAnywhereInTheProgramKeepsReplayUncertain) {
+    // Each sits ABOVE the loop, where neither walk ever goes, so only the whole-program condition
+    // can refuse it. A transfer may run code that was never decoded; an M0-relative DESTINATION
+    // move writes a register its encoding does not name. Either could change the base pair
+    // between executions. A source-relative move cannot, and must not cost the load its proof:
+    // s_movrels_b32 is an instruction the emitter lowers.
+    for (const Escape& escape : kEscapes) {
+        const auto instructions = program({.first_word = escape.word});
+        ASSERT_EQ(at(instructions, 0).opcode, escape.opcode) << escape.name;
+        if (escape.writes_unnamed_or_leaves_cfg) {
+            EXPECT_TRUE(flagged(instructions)) << escape.name;
+            EXPECT_EQ(numeric_blocker(instructions), "load-re-executed") << escape.name;
+        } else {
+            EXPECT_FALSE(flagged(instructions))
+                << escape.name << ": " << numeric_blocker(instructions);
+        }
+    }
+}
+
+TEST(RawWideReplayedLoad, AnEscapeOnTheWalkedPathStopsBothWalks) {
+    // In the loop body, with the loaded words live. Every escape stops here, the source-relative
+    // moves included: SGPR[src + M0] may be one of those words. Before #4529 only the transfers
+    // and the call stopped the numeric walk, and only the transfers stopped the cheap one.
+    for (const Escape& escape : kEscapes) {
+        const auto instructions = program({.in_loop = {escape.word}});
+        ASSERT_EQ(at(instructions, 5).opcode, escape.opcode) << escape.name;
+        bool found = false;
+        const RawWideLoadDiagnosis row = diagnosis(instructions, &found);
+        ASSERT_TRUE(found) << escape.name;
+        // Each walk is asserted on its own: the cheap one would otherwise go unnoticed, because
+        // without its guard it steps over the escape and stops at the s_mov_b64 at pc 8 instead,
+        // and the load is flagged either way.
+        EXPECT_STREQ(row.backing_kind, "unknown-or-indirect-control") << escape.name;
+        EXPECT_EQ(row.backing_pc, 5u) << escape.name;
+        EXPECT_STREQ(row.numeric_kind, "unmodelled-control-or-relative-sgpr") << escape.name;
+        EXPECT_EQ(row.numeric_pc, 5u) << escape.name;
+    }
+}
+
+TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
+    // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
+    // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it
+    // is a proven immediate load: it gets real bytes. The prefix sits before the load, where no
+    // walk goes.
+    const auto proven = [](uint32_t prefix_word) {
+        const std::vector<uint32_t> code{prefix_word, 0xf408040eu, 0xfa0000f0u, 0x7e000212u,
+                                         0xbf810000u};
+        std::vector<Rdna2Inst> instructions;
+        EXPECT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
+        return rdna2_proven_raw_immediate_wide_data_loads(instructions);
+    };
+    const std::vector<uint32_t> kept{kLoadPc};
+    EXPECT_EQ(proven(0x7e020280u), kept) << "control: v_mov_b32 v1, 0";
+    for (const Escape& escape : kEscapes) {
+        if (escape.writes_unnamed_or_leaves_cfg)
+            EXPECT_TRUE(proven(escape.word).empty()) << escape.name;
+        else
+            EXPECT_EQ(proven(escape.word), kept)
+                << escape.name << " reads through M0; it cannot move the entry pointer";
+    }
+}
+
+TEST(RawWideReplayedLoad, SaveexecFromAnIndependentMaskDoesNotStopTheWalk) {
+    // s_orn2/s_nand/s_nor_saveexec_b64 s[40:41], -1 (SOP1 0x28..0x2a). They were refused as
+    // "relative SGPR write". They are ordinary mask transfers, and from an independent source
+    // they leave EXEC independent, so the loop is still cleared.
+    for (uint32_t opcode : {0x28u, 0x29u, 0x2au}) {
+        const auto instructions = program({.in_loop = {0xbea800c1u | (opcode << 8u)}});
+        ASSERT_EQ(at(instructions, 5).fmt, Rdna2Format::SOP1);
+        ASSERT_EQ(at(instructions, 5).opcode, opcode);
+        EXPECT_FALSE(flagged(instructions))
+            << "opcode 0x" << std::hex << opcode << ": " << numeric_blocker(instructions);
+    }
+}
+
+TEST(RawWideReplayedLoad, AnSmemThatIsNotAPlainLoadKeepsReplayUncertain) {
+    // SMEM opcode 0x05 is not one of the ten loads, so the writer inventory says nothing about
+    // it. Placed past the loop with operands clear of the loaded words, neither walk objects to
+    // it; only the whole-program condition can.
+    const auto instructions = program({.after_exit = {0xf414000eu, 0xfa000000u}});
+    const Rdna2Inst& odd = at(instructions, 10);
+    ASSERT_EQ(odd.fmt, Rdna2Format::SMEM);
+    ASSERT_EQ(odd.opcode, 0x5u);
+    ASSERT_FALSE(rdna2_may_write_guest_memory(odd)) << "else the guest-write arm covers it";
+    EXPECT_TRUE(flagged(instructions));
+    EXPECT_EQ(numeric_blocker(instructions), "load-re-executed");
 }
 
 TEST(RawWideReplayedLoad, CopyCarriedRoundTheBackEdgeReachesItsReader) {

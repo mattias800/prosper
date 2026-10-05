@@ -73,7 +73,7 @@ public:
             if (!visited.insert(key).second) continue;
             const Rdna2Inst& in = ins[state.index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
-                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u))
+                rdna2_escapes_decoded_effects(in))
                 return blocked(in.pc, "unknown-or-indirect-control");
             if (in.is_end) continue;
             if (reads_data(in, state.live)) return blocked(in.pc, "data-read");
@@ -171,11 +171,11 @@ public:
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords)
                 return blocked(in.pc, "unknown-instruction");
             if (in.is_end) continue;
-            if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
-                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64) ||
-                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u &&
-                 in.opcode <= 0x2au))   // indirect control/relative SGPR write
-                return blocked(in.pc, "indirect-control");
+            // Indirect control, a subvector loop, or an M0-relative move. The range this used
+            // to test for the last of those, 0x28..0x2a, is three B64 saveexec forms: they were
+            // refused here for nothing, and the real relative moves were not refused at all.
+            if (rdna2_escapes_decoded_effects(in))
+                return blocked(in.pc, "unmodelled-control-or-relative-sgpr");
 
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04u || in.opcode == 0x05u))
@@ -415,11 +415,14 @@ private:
     // later iteration an earlier iteration's descriptor. A register SOFFSET never qualifies,
     // whatever its value: the offset is exactly what a loop changes.
     //
-    // "No instruction ever writes" is only as good as the writer inventory, so the three kinds of
-    // instruction for_each_scalar_write cannot see through refuse outright, wherever they sit:
-    // a call or indirect transfer (code this walk never decodes may run), and the M0-relative
-    // destination moves, whose target register is not in the encoding. The immediate-load proof
-    // below refuses the first group program-wide for the same reason.
+    // "No instruction ever writes" is only as good as the writer inventory, so everything that
+    // inventory is known not to see through refuses outright, wherever it sits in the program:
+    // rdna2_may_write_unnamed_register_or_leave_cfg (calls, indirect transfers, subvector loops,
+    // M0-relative DESTINATION moves) and any SMEM instruction other than a plain load. A
+    // source-relative move reads through M0 and cannot change the base pair, so it is not on
+    // this list; the walks stop at it instead. That is the known list, not a
+    // proof of completeness; an instruction for_each_scalar_write misreports and this does not
+    // name would be a hole here.
     bool replay_observes_same_bytes() const {
         const Rdna2Inst& load = ins[start];
         if (load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
@@ -428,12 +431,11 @@ private:
             return false;
         for (const Rdna2Inst& in : ins) {
             if (in.fmt == Rdna2Format::Unknown || rdna2_may_write_guest_memory(in)) return false;
-            if ((in.fmt == Rdna2Format::SOP1 &&
-                 ((in.opcode >= 0x20u && in.opcode <= 0x22u) ||   // s_setpc/s_swappc/s_rfe
-                  in.opcode == kSop1OpcodeMovreldB32 || in.opcode == kSop1OpcodeMovreldB64 ||
-                  in.opcode == kSop1OpcodeMovrelsd2B32)) ||
-                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64))
-                return false;
+            if (rdna2_may_write_unnamed_register_or_leave_cfg(in)) return false;
+            // An SMEM instruction that is not one of the ten plain loads has no entry in the
+            // writer inventory at all (scalar_write_width answers 0), s_memtime's SDATA pair
+            // included. None compiles today; refuse rather than rely on that.
+            if (in.fmt == Rdna2Format::SMEM && !scalar_write_width(in)) return false;
             bool writes_base = false;
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 if (base <= load.src[0].value + 1 &&
@@ -455,9 +457,8 @@ private:
             if (!reached[index]) continue;
             const auto& in = ins[index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
-                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
-                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u && in.opcode <= 0x2au) ||
-                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return {};
+                rdna2_may_write_unnamed_register_or_leave_cfg(in))
+                return {};
             auto masks = incoming[index];
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
@@ -671,8 +672,7 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(
         if (ins[i].fmt == Rdna2Format::Unknown || !ins[i].len_dwords ||
             !by_pc.emplace(ins[i].pc, i).second) return proven;
     for (const Rdna2Inst& in : ins) {
-        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16u)) return proven;
+        if (rdna2_may_write_unnamed_register_or_leave_cfg(in)) return proven;
         if (in.fmt != Rdna2Format::SOPP || in.is_end) continue;
         if (sopp_opcode_is_direct_branch(in.opcode)) {
             const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
@@ -829,8 +829,7 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                     if (rdna2_may_write_guest_memory(before) ||
                         (before.fmt == Rdna2Format::SOPP &&
                          sopp_opcode_is_direct_branch(before.opcode)) ||
-                        (before.fmt == Rdna2Format::SOP1 && before.opcode >= 0x28u &&
-                         before.opcode <= 0x2au)) {
+                        rdna2_may_write_unnamed_register_or_leave_cfg(before)) {
                         entry_at_read = false;
                         break;
                     }
@@ -975,7 +974,7 @@ rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& ins) {
             in.fmt == Rdna2Format::DS || !by_pc.emplace(in.pc, i).second ||
             (i && ins[i - 1].pc + ins[i - 1].len_dwords != in.pc))
             return {};
-        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+        if (rdna2_may_write_unnamed_register_or_leave_cfg(in))
             return {};   // indirect control cannot be represented by the complete edge inventory
     }
     for (size_t i = 0; i < ins.size(); ++i) {
