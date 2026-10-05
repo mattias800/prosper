@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-05
 
+### Summer Sports Games' track is terracotta again
+
+The running track and the grass in Summer Sports Games look as they did before late September again; they had been rendering pale pink and washed out ([issue #4496](https://github.com/mattias800/prosper/issues/4496)).
+
+<p align="center"><img src="assets/screenshots/summer-sports-ground-4496-before.webp" alt="Summer Sports Games javelin run-up before the fix: the track is pale pink with white speckles; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-ground-4496-after.webp" alt="Summer Sports Games javelin run-up after the fix: a terracotta track with white lane lines, HUD unchanged; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+
 ### Unity menus, HUDs and story art are back in three titles
 
 Greak, Alex Kidd in Miracle World DX and Summer Sports Games have their UI again: menu panels and logos, HUDs, dialogue boxes, intro text and Greak's hand-drawn story art ([issue #4429](https://github.com/mattias800/prosper/issues/4429)).
