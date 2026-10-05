@@ -325,17 +325,21 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// IMAGE_STORE_MIP on a genuinely multi-level resource must refuse fail-visibly.
-// Words below are the live GTA V NSA 2D packet (test_dynfetch_fold.cpp): the
-// mip VGPR is v5 (word2 byte1), T# s[12:19]. NSA packets (len > 2) record
-// their terminal reason on the MIMG-address line rather than the straight-line
-// one (rdna2_emit_cfg.cpp), so the pin asserts that record shape. The control
-// is the proven consecutive IMAGE_STORE form (test_game_compute.cpp GTA V
-// chain: `0xf0200108, 0x00020004`, coords [v4,v5], T# s[8:15]) against a fully
-// backed storage entry in the same table -- it compiling proves the harness,
-// the table and the storage path work, so the NSA refusal is about the mip
-// path. WHEN the multi-level guest upload infra (#2818) lands, THIS ARM GOES
-// RED; replace it with an execution test of the new lowering.
+// IMAGE_STORE_MIP on a genuinely multi-level storage image must refuse
+// fail-visibly. Words below are the live GTA V NSA 2D packet
+// (test_dynfetch_fold.cpp): x = v4, y = v3, mip = v5, T# s[12:19]. That packet
+// is admitted against a single-level, proven-zero-mip entry (it compiles and
+// executes in test_game_compute.cpp), so this arm holds proven_zero_mip fixed
+// and its primary control is the identical STORE_MIP against the same entry at
+// one level: the refusal is the `declared_mip_levels != 1u` term of the
+// storage-image STORE_MIP gate in rdna2_emit_alu.cpp, nothing else. NSA packets
+// (len > 2) record their terminal reason on the MIMG-address line rather than
+// the straight-line one (rdna2_emit_cfg.cpp), so the pin asserts that record
+// shape. A second control, the consecutive plain IMAGE_STORE (GTA V chain
+// `0xf0200108, 0x00020004`, coords [v4,v5], T# s[8:15]), shows the storage path
+// itself works. WHEN a multi-level storage-image binding lets the guest mip
+// reach the image write, THIS ARM GOES RED; replace it with an execution test.
+// (The load-side analogue landed as #3048; no store-side route exists yet.)
 TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
     static const uint32_t w[3] = {0xf024310au, 0x00030004u, 0x00000503u};
     {
@@ -366,6 +370,7 @@ TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
         image.sample_count = 1;
         image.sgpr_base = 12;   // STORE_MIP word1 names s12 as the T# base
         image.declared_mip_levels = 2u;
+        image.proven_zero_mip = true;   // held fixed: only the level count varies
         image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
         image.size = static_cast<uint32_t>(backing.size());
         rt.resources.push_back(image);
@@ -389,11 +394,11 @@ TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
     config.user_sgprs.resize(20);   // s8..s19 T#s are entry-time user data
     const std::vector<uint32_t> prologue = {
         0x7e0002f0u,   // v_mov_b32 v0, 0.5 (store data)
-        0x7e080281u,   // v_mov_b32 v4, 1 (store x)
-        0x7e0a0280u,   // v_mov_b32 v5, 0 (store y; STORE_MIP nonzero mip lives in v5 too)
+        0x7e080281u,   // v_mov_b32 v4, 1 (x)
+        0x7e0a0280u,   // v_mov_b32 v5, 0 (STORE_MIP mip; plain IMAGE_STORE y)
         0x7e0202f0u,   // v_mov_b32 v1, 0.5
         0x7e040280u,   // v_mov_b32 v2, 0
-        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5 (STORE_MIP y)
     };
     const std::vector<uint32_t> refused =
         compile(program(prologue, {w[0], w[1], w[2]}), 0xA070ull, &rt, config);
@@ -404,7 +409,12 @@ TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
         EXPECT_EQ(r.fields["pc"], "6") << "the reject must name the gap pc";
         EXPECT_EQ(r.fields["extra"], "1") << "one extra address dword";
     }
-    expect_compiles(program(prologue, {plain[0], plain[1]}), 0xA071ull,
+    ShaderResourceTable single_rt = rt;
+    single_rt.resources[0].declared_mip_levels = 1u;
+    expect_compiles(program(prologue, {w[0], w[1], w[2]}), 0xA071ull,
+                    "control: identical IMAGE_STORE_MIP, single-level proven-zero-mip entry",
+                    &single_rt, config);
+    expect_compiles(program(prologue, {plain[0], plain[1]}), 0xA072ull,
                     "control: consecutive IMAGE_STORE with backed storage entry",
                     &rt, config);
 }
