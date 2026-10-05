@@ -543,6 +543,9 @@ class Scan:
     def __init__(self):
         self.regs = []
         self.unresolved = []        # (file, line, shape, raw nid expression)
+        # The same sites with their full argument list and API, for a caller that can evaluate the
+        # expression (`tools/progress` resolves constant tables and index_sequence expansions).
+        self.unresolved_sites = []  # (file, line, shape, api, [raw argument expressions])
         self.unclaimed = []         # (file, line, why, text)     <- the load-bearing residual
         self.uncertain_conds = []   # (file, line, directive)
         self.wrappers = []
@@ -550,6 +553,27 @@ class Scan:
         self.files = []
         self.skipped_lines = 0
         self.out_of_scope = 0       # `NAME(` outside the wrapper's #define..#undef span
+
+
+def platform_text(raw, platform):
+    """Comment-stripped `raw` with every line of an inactive `#if` arm blanked for `platform`.
+
+    Returns (text, skipped line count, undecided conditions). Inactive lines become spaces, so the
+    scanners see only the chosen platform arm while character offsets — and therefore reported line
+    numbers — stay exact. Exposed so a tool composed on this parser (`tools/progress`) reads a file
+    exactly the way the registration scan did.
+    """
+    text = strip_comments(raw)
+    active, unc = active_lines(text, platform)
+    chars = list(text)
+    pos = skipped = 0
+    for i, line in enumerate(text.split("\n"), 1):
+        if not active[i]:
+            skipped += 1
+            for j in range(pos, pos + len(line)):
+                chars[j] = " "
+        pos += len(line) + 1
+    return "".join(chars), skipped, unc
 
 
 def scan_tree(src_hle, platform):
@@ -584,22 +608,10 @@ def scan_tree(src_hle, platform):
     for fn in paths:
         path = os.path.join(src_hle, fn)
         raw = open(path, errors="ignore").read()
-        text = strip_comments(raw)
-        active, unc = active_lines(text, platform)
+        text, skipped, unc = platform_text(raw, platform)
         sc.uncertain_conds += [(fn, ln, d) for ln, d in unc]
+        sc.skipped_lines += skipped
         sc.files.append(fn)
-
-        # Blank every inactive line so the scanners below see only the chosen platform arm, while
-        # character offsets — and therefore reported line numbers — stay exact.
-        chars = list(text)
-        pos = 0
-        for i, line in enumerate(text.split("\n"), 1):
-            if not active[i]:
-                sc.skipped_lines += 1
-                for j in range(pos, pos + len(line)):
-                    chars[j] = " "
-            pos += len(line) + 1
-        text = "".join(chars)
 
         wrappers = discover_wrappers(text, sc.apis, fn)
 
@@ -730,6 +742,7 @@ def _record(sc, args, fn, line, shape, api):
     name = resolve_string(args[2])
     if nid is None:
         sc.unresolved.append((fn, line, shape, how))
+        sc.unresolved_sites.append((fn, line, shape, api, [a.strip() for a in args]))
         return
     sc.regs.append(Registration(nid, how, name, handler, fn, line, shape, api))
 
