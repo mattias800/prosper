@@ -19,7 +19,6 @@ from pathlib import Path
 
 DEFINITION = re.compile(r"\bHLE\((\w+)\)")
 PLACEHOLDER_REG = re.compile(r"register_placeholder\s*\(\s*[^,]+,\s*\(HleFn\)\s*&?(\w+)")
-REAL_REG = re.compile(r"(?<!register_placeholder\()(?:::)?register_fn\s*\(")
 STUB_MARK = "prosper_on_unimpl"
 
 
@@ -165,13 +164,15 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.compare:
-        base = json.loads(args.compare[0].read_text())
-        head = json.loads(args.compare[1].read_text())
+        # Local dev tool: operator-supplied paths are the whole job (precedent:
+        # new_probe/verify_report.py). NOSONAR marks the taint-accepted lines.
+        base = json.loads(args.compare[0].read_text())  # NOSONAR
+        head = json.loads(args.compare[1].read_text())  # NOSONAR
         print(compare(base, head), end="")
         return
     data = collect(args.root)
     if args.output:
-        args.output.mkdir(parents=True, exist_ok=True)
+        args.output.mkdir(parents=True, exist_ok=True)  # NOSONAR
         (args.output / "progress.json").write_text(json.dumps(data, indent=2) + "\n")
     print(text(data), end="")
 
