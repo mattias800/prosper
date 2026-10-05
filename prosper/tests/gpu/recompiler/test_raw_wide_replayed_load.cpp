@@ -186,7 +186,8 @@ struct Escape {
     uint32_t word;
     Rdna2Format fmt;
     uint32_t opcode;
-    // False for the two source-relative moves: they read through M0 and write a named register.
+    // False for s_movrels_b32 alone: it writes the register it names, and what it reads through
+    // M0 is inventoried as a range (#4538). Its pair form is not lowered and stays refused.
     bool writes_unnamed_or_leaves_cfg = true;
 };
 // One encoding of every instruction rdna2_escapes_decoded_effects names.
@@ -195,8 +196,7 @@ constexpr Escape kEscapes[] = {
     {"s_swappc_b64 s[60:61], s[40:41]", 0xbebc2128u, Rdna2Format::SOP1, kSop1OpcodeSwappcB64},
     {"s_rfe_b64 s[60:61]", 0xbe80223cu, Rdna2Format::SOP1, kSop1OpcodeRfeB64},
     {"s_movrels_b32 s60, s40", 0xbebc2e28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB32, false},
-    {"s_movrels_b64 s[60:61], s[40:41]", 0xbebc2f28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB64,
-     false},
+    {"s_movrels_b64 s[60:61], s[40:41]", 0xbebc2f28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB64},
     {"s_movreld_b32 s60, s40", 0xbebc3028u, Rdna2Format::SOP1, kSop1OpcodeMovreldB32},
     {"s_movreld_b64 s[60:61], s[40:41]", 0xbebc3128u, Rdna2Format::SOP1, kSop1OpcodeMovreldB64},
     {"s_movrelsd_2_b32 s60, s40", 0xbebc4928u, Rdna2Format::SOP1, kSop1OpcodeMovrelsd2B32},
@@ -234,8 +234,8 @@ TEST(RawWideReplayedLoad, AWriterOrTransferAnywhereInTheProgramKeepsReplayUncert
     // Each sits ABOVE the loop, where neither walk ever goes, so only the whole-program condition
     // can refuse it. A transfer may run code that was never decoded; an M0-relative DESTINATION
     // move writes a register its encoding does not name. Either could change the base pair
-    // between executions. A source-relative move cannot, and must not cost the load its proof:
-    // s_movrels_b32 is an instruction the emitter lowers.
+    // between executions. s_movrels_b32 cannot, and must not cost the load its proof: it is an
+    // instruction the emitter lowers.
     for (const Escape& escape : kEscapes) {
         const auto instructions = program({.first_word = escape.word});
         ASSERT_EQ(at(instructions, 0).opcode, escape.opcode) << escape.name;
@@ -250,10 +250,11 @@ TEST(RawWideReplayedLoad, AWriterOrTransferAnywhereInTheProgramKeepsReplayUncert
 }
 
 TEST(RawWideReplayedLoad, AnEscapeOnTheWalkedPathStopsBothWalks) {
-    // In the loop body, with the loaded words live. Every escape stops here, the source-relative
-    // moves included: SGPR[src + M0] may be one of those words. Before #4529 only the transfers
-    // and the call stopped the numeric walk, and only the transfers stopped the cheap one.
+    // In the loop body, with the loaded words live. Before #4529 only the transfers and the call
+    // stopped the numeric walk, and only the transfers stopped the cheap one. s_movrels_b32 is
+    // the one escape a walk now steps through; ARelativeReadIsChargedItsWholeRange has its arms.
     for (const Escape& escape : kEscapes) {
+        if (!escape.writes_unnamed_or_leaves_cfg) continue;
         const auto instructions = program({.in_loop = {escape.word}});
         ASSERT_EQ(at(instructions, 5).opcode, escape.opcode) << escape.name;
         bool found = false;
@@ -266,6 +267,124 @@ TEST(RawWideReplayedLoad, AnEscapeOnTheWalkedPathStopsBothWalks) {
         EXPECT_EQ(row.backing_pc, 5u) << escape.name;
         EXPECT_STREQ(row.numeric_kind, "unmodelled-control-or-relative-sgpr") << escape.name;
         EXPECT_EQ(row.numeric_pc, 5u) << escape.name;
+    }
+}
+
+TEST(RawWideReplayedLoad, ARelativeReadIsChargedItsWholeRange) {
+    // s_movrels_b32 s60, sS; v_mov_b32 v0, s60 in the loop body. The loaded words are s16..s19,
+    // and the relative read may return any register from sS up to s105.
+    const uint32_t reader = 0x7e00023cu;   // v_mov_b32 v0, s60
+    {
+        // Base above the loaded words: none of them is a candidate, so s60 carries nothing the
+        // load produced and the loop is still cleared. Stopping at the instruction, as both
+        // walks did, flagged this.
+        const auto above = program({.in_loop = {0xbebc2e28u, reader}});   // s_movrels_b32 s60, s40
+        ASSERT_EQ(at(above, 5).opcode, kSop1OpcodeMovrelsB32);
+        ASSERT_EQ(at(above, 5).src[0].value, 40);
+        ASSERT_EQ(at(above, 6).src[0].value, 60);
+        EXPECT_FALSE(flagged(above)) << numeric_blocker(above);
+    }
+    {
+        // Base below them: s16..s19 are candidates. The relative read is a scalar derivation, and
+        // the v_mov that consumes its result is the numeric reader -- at its own pc, which a walk
+        // that charged the relative read s12 alone never reports.
+        const auto below = program({.in_loop = {0xbebc2e0cu, reader}});   // s_movrels_b32 s60, s12
+        ASSERT_EQ(at(below, 5).opcode, kSop1OpcodeMovrelsB32);
+        ASSERT_EQ(at(below, 5).src[0].value, 12);
+        bool found = false;
+        const RawWideLoadDiagnosis row = diagnosis(below, &found);
+        ASSERT_TRUE(found);
+        EXPECT_STREQ(row.backing_kind, "data-read");
+        EXPECT_EQ(row.backing_pc, 5u);
+        EXPECT_STREQ(row.numeric_kind, "numeric-reader");
+        EXPECT_EQ(row.numeric_pc, 6u);
+    }
+    {
+        // The same relative read with nobody consuming its result is a derivation and nothing
+        // more, exactly as s_mov_b32 s60, s16 would be.
+        const auto unread = program({.in_loop = {0xbebc2e0cu}});
+        ASSERT_EQ(at(unread, 5).opcode, kSop1OpcodeMovrelsB32);
+        EXPECT_FALSE(flagged(unread)) << numeric_blocker(unread);
+    }
+}
+
+TEST(RawWideReplayedLoad, ALoadedWordThatReachesM0IsANumericUse) {
+    // s_mov_b32 m0, s18; s_movrels_b32 s60, s40; v_mov_b32 v0, s60. No loaded word is in the
+    // relative read's range, but one is its INDEX. Nothing names M0 as an operand, here or in
+    // v_movrels_b32 or the LDS forms, so the walk counts the use where the word enters M0.
+    const uint32_t relative = 0xbebc2e28u, reader = 0x7e00023cu;
+    const auto indexed = program({.in_loop = {0xbefc0312u, relative, reader}});
+    ASSERT_EQ(at(indexed, 5).opcode, kSop1OpcodeMovB32);
+    ASSERT_EQ(at(indexed, 5).dst.value, 124);
+    ASSERT_EQ(at(indexed, 5).src[0].value, 18);
+    ASSERT_EQ(at(indexed, 6).opcode, kSop1OpcodeMovrelsB32);
+    EXPECT_TRUE(flagged(indexed));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(indexed, &pc), "derived-value-enters-m0");
+    EXPECT_EQ(pc, 5u);
+    // Through a copy, and through arithmetic: s_mov_b32 s20, s18; s_add_i32 m0, s20, 1.
+    const auto computed = program({.in_loop = {0xbe940312u, 0x817c8114u}});
+    ASSERT_EQ(at(computed, 6).fmt, Rdna2Format::SOP2);
+    ASSERT_EQ(at(computed, 6).dst.value, 124);
+    ASSERT_EQ(at(computed, 6).src[0].value, 20);
+    EXPECT_EQ(numeric_blocker(computed, &pc), "derived-value-enters-m0");
+    EXPECT_EQ(pc, 6u);
+    // Control: writing M0 is not the objection. s_mov_b32 m0, s12 moves a register the load
+    // never produced, and the same relative read and reader are then cleared.
+    const auto unrelated = program({.in_loop = {0xbefc030cu, relative, reader}});
+    ASSERT_EQ(at(unrelated, 5).dst.value, 124);
+    ASSERT_EQ(at(unrelated, 5).src[0].value, 12);
+    EXPECT_FALSE(flagged(unrelated)) << numeric_blocker(unrelated);
+}
+
+TEST(RawWideReplayedLoad, OnlyARealSccWriterEndsACompareOnALoadedWord) {
+    // s_cmp_eq_u32 s18, 0; (one instruction); s_cbranch_scc1. The compare puts a loaded word's
+    // truth value in SCC and the branch consumes it, so the load is numeric data unless the
+    // instruction in between REPLACES SCC. The walk used to treat every SOP1 that is not on the
+    // short leaves-SCC-unmodified list, and two SOP2 packs, as a replacement. These three leave
+    // SCC alone and all three are lowered (rdna2_movrels.cpp; rdna2_emit_alu.cpp for S_FF1 and
+    // the pack family).
+    const uint32_t compare = 0xbf068012u, branch = 0xbf850000u;
+    struct Between {
+        const char* name;
+        uint32_t word;
+        Rdna2Format fmt;
+        uint32_t opcode;
+        bool replaces_scc;
+    };
+    const Between cases[] = {
+        {"s_movrels_b32 s60, s40", 0xbebc2e28u, Rdna2Format::SOP1, kSop1OpcodeMovrelsB32, false},
+        {"s_ff1_i32_b32 s60, s40", 0xbebc1328u, Rdna2Format::SOP1, 0x13u, false},
+        {"s_pack_lh_b32_b16 s60, s40, s41", 0x99bc2928u, Rdna2Format::SOP2, 0x33u, false},
+        // Controls: these do write SCC, from registers the load never produced, so the branch no
+        // longer depends on the loaded word and the loop is cleared.
+        {"s_not_b32 s60, s40", 0xbebc0728u, Rdna2Format::SOP1, 0x07u, true},
+        {"s_cmp_eq_i32 s5, 0", 0xbf008005u, Rdna2Format::SOPC, 0x00u, true},
+    };
+    {
+        const auto direct = program({.in_loop = {compare, branch}});
+        ASSERT_EQ(at(direct, 5).fmt, Rdna2Format::SOPC);
+        ASSERT_EQ(at(direct, 5).src[0].value, 18);
+        ASSERT_EQ(at(direct, 6).fmt, Rdna2Format::SOPP);
+        ASSERT_EQ(at(direct, 6).opcode, 0x05u);
+        uint32_t pc = 0;
+        EXPECT_EQ(numeric_blocker(direct, &pc), "scc-branch-on-derived-value");
+        EXPECT_EQ(pc, 6u);
+    }
+    for (const Between& between : cases) {
+        const auto instructions = program({.in_loop = {compare, between.word, branch}});
+        ASSERT_EQ(at(instructions, 6).fmt, between.fmt) << between.name;
+        ASSERT_EQ(at(instructions, 6).opcode, between.opcode) << between.name;
+        ASSERT_EQ(at(instructions, 7).opcode, 0x05u) << between.name;
+        if (between.replaces_scc) {
+            EXPECT_FALSE(flagged(instructions))
+                << between.name << ": " << numeric_blocker(instructions);
+            continue;
+        }
+        uint32_t pc = 0;
+        EXPECT_EQ(numeric_blocker(instructions, &pc), "scc-branch-on-derived-value")
+            << between.name;
+        EXPECT_EQ(pc, 7u) << between.name;
     }
 }
 
@@ -288,7 +407,7 @@ TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
             EXPECT_TRUE(proven(escape.word).empty()) << escape.name;
         else
             EXPECT_EQ(proven(escape.word), kept)
-                << escape.name << " reads through M0; it cannot move the entry pointer";
+                << escape.name << " writes s60 alone; it cannot move the entry pointer";
     }
 }
 
