@@ -19,6 +19,24 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-06
+
+### Rayman 30th Anniversary Edition plays its first level on the first try
+
+A title nobody had launched before boots to its game carousel and plays the first level of the original Rayman at a steady 60 frames per second ([tracker #4552](https://github.com/mattias800/prosper/issues/4552)). These frames come from an unscripted run driven from a controller.
+
+<p align="center"><img src="assets/screenshots/rayman30-health-warning.webp" alt="Rayman 30th Anniversary Edition health warning screen; Linux prosper-app, RADV, unscripted run driven from a controller, flip 300"></p>
+<p align="center"><img src="assets/screenshots/rayman30-game-carousel.webp" alt="Rayman 30th Anniversary Edition game carousel on Rayman, PlayStation 1995, with Enhancements and Play Game prompts; same run, flip 1500"></p>
+<p align="center"><img src="assets/screenshots/rayman30-choose-a-game.webp" alt="Rayman's Choose a Game save-slot menu with three empty slots; same run, flip 2700"></p>
+<p align="center"><img src="assets/screenshots/rayman30-dream-forest-intro.webp" alt="Rayman level intro: The Dream Forest, Pink Plant Woods, seen through binoculars; same run, flip 3300"></p>
+<p align="center"><img src="assets/screenshots/rayman30-pink-plant-woods-gameplay.webp" alt="Rayman on a vine in Pink Plant Woods with lives and ting counters drawn; same run, flip 3900"></p>
+
+### MOUSE: P.I. For Hire reaches gameplay, in the dark
+
+MOUSE: P.I. For Hire gets through its menus into first-person gameplay with a complete HUD, but most of the world is black and it runs at about 6 frames per second ([tracker #4556](https://github.com/mattias800/prosper/issues/4556)). The darkness is the defect, not the game's look.
+
+<p align="center"><img src="assets/screenshots/mouse-pi-first-gameplay-dark.webp" alt="MOUSE: P.I. For Hire in gameplay: objective, compass and health badge over a scene that is black except for two wall lamps and a lit patch of floor; Linux prosper-app, RADV, interactive play by the owner, F9 grab"></p>
+
 ## 2026-10-05
 
 ### Space Adventure Cobra's world is back in gameplay

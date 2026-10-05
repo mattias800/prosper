@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-10-05
+Last updated: 2026-10-06
 
 ## Summary
 
@@ -88,6 +88,8 @@ Last updated: 2026-10-05
 | *Hades II* | `PPSA36082` | — | 🔬 Rung 0 — startup requests an approximately 32 GiB guest allocation, which is rejected; the main guest thread then faults at a null address, before any frame | [#4023](https://github.com/mattias800/prosper/issues/4023) |
 | *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — the owner previously selected New Game. A fresh normal rerun renders first-boot setup through settings-saved Continue, then retains that image while host presents advance; correct title-background rendering remains unverified. The earlier later-sequence GPU timeout is separate ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
 | *Hollow Knight: Silksong* | `PPSA12544` | Unity 6 | 🚧 Opening Moss Grotto gameplay, played and confirmed by eye by the owner; every menu and in-game string renders since #4120 | [#4121](https://github.com/mattias800/prosper/issues/4121) |
+| *Rayman 30th Anniversary Edition* | `PPSA33016` | Custom (libretro front end) | 🚧 The first level of *Rayman* (1995) in play at 60 fps on the title's very first launch: health warning, game carousel, save-slot menu, level intro and Pink Plant Woods with its HUD. Reached by hand from a controller; no input route and no guard yet | [#4552](https://github.com/mattias800/prosper/issues/4552) |
+| *MOUSE: P.I. For Hire* | `PPSA26578` | Unity / IL2CPP | 🔬 Rung 2 — menus and first-person gameplay are reached and the HUD draws, but the world is mostly black (two lamps and a patch of floor) and the game runs at about 6 fps; one compute program is skipped every frame, fragment draws are dropped, and oversized buffers are cut at 64 MiB ([#4553](https://github.com/mattias800/prosper/issues/4553), [#4555](https://github.com/mattias800/prosper/issues/4555), [#4554](https://github.com/mattias800/prosper/issues/4554)) | [#4556](https://github.com/mattias800/prosper/issues/4556) |
 
 ## At a glance
 
@@ -101,12 +103,12 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 29 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 19 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 30 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 20 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
 | **Boots, but no frame with content** (rung 0) | 12 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 62 |
+| Total tracked | 64 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -855,6 +857,24 @@ The owner plays the opening in Moss Grotto and confirms it by eye; nine of the o
 that session replay as the `silksong` guard (`tools/snapshot/snaps.py check silksong`). See the
 [tracker](https://github.com/mattias800/prosper/issues/4121) and
 [`prosper/docs/games/SILKSONG_STATUS.md`](prosper/docs/games/SILKSONG_STATUS.md).
+
+## Rayman 30th Anniversary Edition — `PPSA33016`
+
+<p align="center"><img src="assets/screenshots/rayman30-pink-plant-woods-gameplay.webp" alt="Rayman 30th Anniversary Edition: Rayman on a vine in Pink Plant Woods, lives and ting counters drawn, CRT filter on; Linux prosper-app, RADV, unscripted run driven from a controller, flip 3900"></p>
+<p align="center"><img src="assets/screenshots/rayman30-game-carousel.webp" alt="Rayman 30th Anniversary Edition: the collection's game carousel on Rayman, PlayStation 1995; Linux prosper-app, RADV, same run, flip 1500"></p>
+
+The collection boots and plays the first level of the original *Rayman* at its full 60 frames per
+second, with no draw dropped, on the first launch anyone made of it. The path was taken by hand on a
+controller, so there is no input route yet. See the
+[tracker](https://github.com/mattias800/prosper/issues/4552).
+
+## MOUSE: P.I. For Hire — `PPSA26578`
+
+<p align="center"><img src="assets/screenshots/mouse-pi-first-gameplay-dark.webp" alt="MOUSE: P.I. For Hire in first-person gameplay: objective, compass and health badge drawn over a scene that is black except for two wall lamps and a patch of lit floor; Linux prosper-app, RADV, interactive play by the owner, F9 grab"></p>
+
+Gameplay is reached and the HUD is complete, but most of the world is dark and the game runs at
+about 6 frames per second. The picture above is the defect, not the game's look. See the
+[tracker](https://github.com/mattias800/prosper/issues/4556).
 
 ## Reproducible routes
 
