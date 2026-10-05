@@ -325,12 +325,11 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered 64-bit DS (LDS) operations must refuse fail-visibly. ds_add_u64
-// and ds_or_b32's 64-bit form need the workgroup/LDS wave model that only the
-// mbcnt/readlane path has begun to build -- accepting them would silently
-// compute over the wrong lane set. Words below are llvm-mc gfx1030
-// round-tripped (assembled, disassembled, same mnemonic back). The control is
-// ds_add_u32 in the same slot, the 32-bit sibling the recompiler lowers.
+// Unlowered 64-bit DS (LDS) atomics must refuse fail-visibly. ds_add_u64 (0x40) and ds_or_b64
+// (0x4a) are outside the compute DS opcode allowlist in rdna2_emit_alu.cpp; the LDS model is a
+// Workgroup uint32 array, so a lowering needs a 64-bit atomic view (Int64Atomics) or a two-dword
+// compare-exchange loop. Words below are llvm-mc gfx1030 round-tripped. The control is ds_add_u32
+// (0x00) with identical operand fields, which the recompiler lowers as an LDS atomic add.
 // WHEN a 64-bit LDS lowering lands, ITS CASE GOES RED; replace it with an
 // execution test of the new lowering.
 TEST(GapOpcodeRefusals, Ds64Refuse) {
