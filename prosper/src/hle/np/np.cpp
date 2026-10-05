@@ -282,6 +282,80 @@ HLE(s_np_has_signed_up) {
     *(uint8_t*)PW(a1) = 0;
     return 0;
 }
+// --- libSceNpManager remainder (14 exports) -------------------------------------------------
+// An offline signed-out console: request ids are local, account/premium answers are SIGNED_OUT
+// with out-params untouched (matching the sibling getters above), callbacks register nowhere
+// and setters acknowledge. Shapes from the firmware stub interface as re-derived in a secondary
+// implementation; CONFIDENCE: MED on arities, HIGH on the offline posture, which is this
+// file's established contract. Premium deserves a word: Plus/premium status is not on this
+// machine, and answering it positively would manufacture an entitlement (charter); answering
+// SIGNED_OUT routes titles to the same offline branch as every other account query.
+// PollAsync/CreateAsyncRequest stay deliberately unregistered (in-file note at s_np_check_avail:
+// their completion flow needs a live capture).
+namespace {
+std::atomic<int32_t> g_np_request_id{1};
+}   // namespace
+HLE(s_np_create_request) {
+    svc_log("sceNpCreateRequest", a0, a1, a2, a3, a4, a5);
+    int32_t id = g_np_request_id.fetch_add(1);
+    if (id <= 0) {   // wrapped: restart rather than hand out a non-positive id (cf. s_np_ctx)
+        g_np_request_id.store(2);
+        id = 1;
+    }
+    return (uint64_t)(uint32_t)id;
+}
+HLE(s_np_abort_request) {
+    svc_log("sceNpAbortRequest", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_delete_request) {
+    svc_log("sceNpDeleteRequest", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_get_account_age) {
+    svc_log("sceNpGetAccountAge", a0, a1, a2, a3, a4, a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_np_get_account_language2) {
+    svc_log("sceNpGetAccountLanguage2", a0, a1, a2, a3, a4, a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_np_check_premium) {
+    svc_log("sceNpCheckPremium", a0, a1, a2, a3, a4, a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_np_notify_premium_feature) {
+    svc_log("sceNpNotifyPremiumFeature", a0, a1, a2, a3, a4, a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_np_register_game_presence_callback) {
+    svc_log("sceNpRegisterGamePresenceCallback", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_register_np_reachability_callback) {
+    svc_log("sceNpRegisterNpReachabilityStateCallback", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_register_plus_event_callback) {
+    svc_log("sceNpRegisterPlusEventCallback", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_register_premium_event_callback) {
+    svc_log("sceNpRegisterPremiumEventCallback", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_set_content_restriction) {
+    svc_log("sceNpSetContentRestriction", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_set_np_title_id) {
+    svc_log("sceNpSetNpTitleId", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+HLE(s_np_unregister_state_callback) {
+    svc_log("sceNpUnregisterStateCallback", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
 
 // --- app content ---
 namespace {
@@ -1127,6 +1201,30 @@ void register_np_hle() {
     Hle::register_fn("Oad3rvY-NJQ", (HleFn)s_np_has_signed_up, "sceNpHasSignedUp");
     Hle::register_fn("a8R9-75u4iM", (HleFn)s_np_accountid, "sceNpGetAccountId");  // non-A variant: zero id + SIGNED_OUT
     R("sceNpRegisterStateCallback", s_np_ok);
+    // libSceNpManager remainder: local request ids, SIGNED_OUT account/premium answers with
+    // untouched outs, acknowledged callbacks/setters. PollAsync/CreateAsyncRequest stay
+    // deliberately unregistered (completion flow needs a live capture — see s_np_check_avail).
+    Hle::register_fn("GpLQDNKICac", (HleFn)s_np_create_request, "sceNpCreateRequest");
+    Hle::register_fn("OzKvTvg3ZYU", (HleFn)s_np_abort_request, "sceNpAbortRequest");
+    Hle::register_fn("S7QTn72PrDw", (HleFn)s_np_delete_request, "sceNpDeleteRequest");
+    Hle::register_fn("+4DegjBqV1g", (HleFn)s_np_get_account_age, "sceNpGetAccountAge");
+    Hle::register_fn("3Tcz5bNCfZQ", (HleFn)s_np_get_account_language2, "sceNpGetAccountLanguage2");
+    Hle::register_fn("O80NrhUOPGY", (HleFn)s_np_check_premium, "sceNpCheckPremium");
+    Hle::register_fn("P6piso307SE", (HleFn)s_np_notify_premium_feature,
+                     "sceNpNotifyPremiumFeature");
+    Hle::register_fn("uFJpaKNBAj4", (HleFn)s_np_register_game_presence_callback,
+                     "sceNpRegisterGamePresenceCallback");
+    Hle::register_fn("hw5KNqAAels", (HleFn)s_np_register_np_reachability_callback,
+                     "sceNpRegisterNpReachabilityStateCallback");
+    Hle::register_fn("GImICnh+boA", (HleFn)s_np_register_plus_event_callback,
+                     "sceNpRegisterPlusEventCallback");
+    Hle::register_fn("+yqjab2fUJA", (HleFn)s_np_register_premium_event_callback,
+                     "sceNpRegisterPremiumEventCallback");
+    Hle::register_fn("A2CQ3kgSopQ", (HleFn)s_np_set_content_restriction,
+                     "sceNpSetContentRestriction");
+    Hle::register_fn("Ec63y59l9tw", (HleFn)s_np_set_np_title_id, "sceNpSetNpTitleId");
+    Hle::register_fn("mjjTXh+NHWY", (HleFn)s_np_unregister_state_callback,
+                     "sceNpUnregisterStateCallback");
     // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
     Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
     Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");
