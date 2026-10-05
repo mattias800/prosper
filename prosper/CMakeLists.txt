@@ -2028,6 +2028,12 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core
     PROPERTIES TIMEOUT 60)
 
+  # libSceRtc calendar arithmetic (22 exports): pure functions of their inputs against the
+  # host clock — validated against fixed dates, never the live clock, plus refusal arms.
+  prosper_add_gtest(test_rtc
+    SOURCES tests/hle/kernel/test_rtc.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_agc_shader
     SOURCES tests/gpu/test_agc_shader.cpp
     LIBRARIES prosper_core)
