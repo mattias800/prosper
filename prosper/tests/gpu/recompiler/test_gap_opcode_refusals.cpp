@@ -324,3 +324,40 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
+// v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
+// exist (f16/f32 siblings are lowered); accepting them would silently compute
+// in the wrong precision. All words below are llvm-mc gfx1030 round-tripped.
+// The control is v_rcp_f32 in the same slot, which is lowered. WHEN an f64
+// lowering lands, ITS CASE GOES RED; replace it with an execution test of
+// the new lowering.
+TEST(GapOpcodeRefusals, VopF64TranscendentalRefuse) {
+    static const uint32_t rcp[1] = {0x7e005f02u};
+    static const uint32_t rsq[1] = {0x7e006302u};
+    static const uint32_t sqrt[1] = {0x7e006902u};
+    static const uint32_t control[1] = {0x7e005501u};
+    for (const uint32_t* words : {rcp, rsq, sqrt, control}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::VOP1);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(rcp, 1).opcode, 0x2fu);
+    EXPECT_EQ(rdna2_decode_one(rsq, 1).opcode, 0x31u);
+    EXPECT_EQ(rdna2_decode_one(sqrt, 1).opcode, 0x34u);
+    EXPECT_EQ(rdna2_decode_one(control, 1).opcode, 0x2au);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0402f0u,   // v_mov_b32 v2, 0.5 (f64 source low)
+        0x7e060280u,   // v_mov_b32 v3, 0 (f64 source high)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5 (f32 control source)
+    };
+    expect_compiles(program(prologue, {control[0]}), 0xA0C0ull,
+                    "control: v_rcp_f32 in the f64 slot");
+    expect_gap_refusal(program(prologue, {rcp[0]}), 0xA0C1ull, 3, {rcp[0]},
+                       Rdna2Format::VOP1, 0x2fu);
+    expect_gap_refusal(program(prologue, {rsq[0]}), 0xA0C2ull, 3, {rsq[0]},
+                       Rdna2Format::VOP1, 0x31u);
+    expect_gap_refusal(program(prologue, {sqrt[0]}), 0xA0C3ull, 3, {sqrt[0]},
+                       Rdna2Format::VOP1, 0x34u);
+}
