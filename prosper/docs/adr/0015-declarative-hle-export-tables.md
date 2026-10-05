@@ -15,6 +15,17 @@ fifteen Sony libraries in one file). The NID is derived from the function name b
 registration needs only the name. There is no single place that says which functions of a library
 prosper implements, and finding a handler means grepping.
 
+The calling-convention half already exists and is generated, not hand-written: `register_fn` stores
+`abi::signature_of(fn)` for every NID (`src/hle/dispatch/dispatch.hpp`), a `CallSignature` deduced
+from the handler's own C++ declaration (`src/host/abi/call_signature.hpp`), and on Windows each import
+stub is emitted from it by `abi::emit_sysv_to_ms_bridge`, the signature-driven SysV-to-MS x64 bridge
+of #2955, with variadic calls on the generic `guest_varargs` path (#3246; `src/host/abi/AGENTS.md`).
+Call tracing exists in pieces: `tools/hle_calls` histograms calls, return values (`--values`, #2075)
+and the bytes behind a pointer argument (`--out-bytes N`), and `PROSPER_SVCLOG` logs at the
+`svc_log` call sites. What does not exist is a generic, typed trace of every call's decoded
+arguments, because a deduced signature knows an argument's C++ type but not what a pointer refers
+to or how large it is.
+
 Wine declares every DLL's exports in a `.spec` file from which the build generates the export
 table, the calling-convention thunks and the `+relay` trace; an unimplemented export is declared as
 a stub that fails loudly. Structural reference only.
@@ -29,22 +40,22 @@ a stub that fails loudly. Structural reference only.
 3. Libraries move out of `hle_service.cpp` into `src/hle/<library>/` one at a time, each move a
    move-only commit with its table.
 4. ADR 0007's coverage report reads the tables and the registry, so "implemented" has one source.
-5. Each entry also declares the function's signature (argument and return types, with guest
-   pointers as `GuestPtr`/`GuestSpan`, ADR 0018). From one table the build then generates four
-   things, as Wine's `winebuild` does from a `.spec` file: registration; argument decoding into the
-   typed handler; a relay trace that logs every call with its decoded arguments and return code
-   behind one logging channel (ADR 0017); and, on Windows, the System V to Microsoft x64 thunk,
-   replacing hand-written bridging in `host/abi` for table-declared handlers. A handler whose
-   convention the generator cannot express keeps a hand-written thunk, listed in the table as such.
+5. A table entry may declare argument semantics the C++ type cannot carry: which arguments are
+   guest pointers, what they point to, and their sizes (`GuestPtr`/`GuestSpan`, ADR 0018). The
+   existing `CallSignature` deduction and `emit_sysv_to_ms_bridge` keep generating the Windows
+   bridge; the table does not replace them. From the declared semantics, one relay trace logs every
+   call with its decoded arguments and return code behind one logging channel (ADR 0017), the way
+   Wine's `+relay` does from its `.spec` files; it supersedes the partial views `tools/hle_calls
+   --values` / `--out-bytes` and `PROSPER_SVCLOG` give today.
 
 Adds spec rule `HLE-3`.
 
 ## Consequences
 
 Finding a handler becomes opening its library's table; a duplicate or misspelt registration becomes
-a build-time or startup error rather than a silent miss. Argument-level call tracing, which today
-does not exist (`tools/hle_calls` counts calls but sees no arguments), comes for every declared
-function at no per-function cost. The tables also make the per-library
+a build-time or startup error rather than a silent miss. A typed trace of decoded arguments, which
+today's tools approximate from registers and return values, comes for every declared function at no
+per-function cost. The tables also make the per-library
 surface reviewable in one diff. Registrations that are genuinely computed (loops, aliases) need a
 table form that expresses them, and `nid_census` documents that such registrations exist.
 

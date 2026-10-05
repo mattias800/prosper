@@ -200,9 +200,10 @@ Enforcement: runtime:hle-blocking-wait, adr:0013
 ### HLE-3 -- each library declares its exports in one table
 
 A reimplemented library lists the functions it implements in one declaration table of names,
-signatures and handlers; NIDs are derived from names, so no firmware symbol data is committed.
-Registration, argument decoding, the relay trace and the Windows calling-convention thunk are
-generated from the table rather than written per function.
+handlers and the argument semantics a C++ type cannot carry; NIDs are derived from names, so no
+firmware symbol data is committed. Registration and a typed relay trace of every call's decoded
+arguments are generated from the table. The Windows calling-convention bridge is already generated
+from each handler's deduced signature and stays so.
 Status: proposed (adr:0015)
 Enforcement: adr:0015
 

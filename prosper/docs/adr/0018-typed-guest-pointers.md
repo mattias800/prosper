@@ -41,7 +41,10 @@ every access pattern fits the types: handlers that walk guest linked structures 
 ## Alternatives considered
 
 - Validate pointers inside each handler: repeated and inconsistent, which is the status quo.
-- Always-on validation: a map lookup on hot HLE paths conflicts with `PERF-P4`.
+- Always-on validation: the readable-mapping registry is guarded by the process-global
+  `guest_mapping_mutex` (`src/host/memory/guest_memory_map.hpp`), so checking every access against
+  it on hot HLE paths would take that lock per call, which `PERF-P4` forbids. A lock-free lookup
+  structure could change that and would need its own per-call cost measurement first.
 
 ## Approval
 

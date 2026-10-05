@@ -20,10 +20,12 @@ issue body overstated how. **Its own corrections, which this ADR follows, say:**
   `hits=1` moves the number (28-29 GB), and that value arms a watch before any validation has run.
   #3158, which lowered the default to 2, was closed for changing a default with no measured benefit.
 - The reason the threshold cannot matter: the stability counter that gates promotion lives on the
-  **cache entry**, advances only on a matching full compare, and is zeroed by every storage
-  writeback and every changed acquisition. `PROSPER_WATCH_PROMOTE_CENSUS` found **94.8% of promotion
-  decisions taken against a counter of 0**. With high texture turnover, an entry is evicted or
-  rewritten before it ever earns credit, so the credit dies with the entry. "Three scans, then the
+  **cache entry** and advances only on a matching full compare, so an entry must survive to a second
+  compare before it has any credit. `PROSPER_WATCH_PROMOTE_CENSUS` found **94.8% of promotion
+  decisions taken against a counter of 0**: with high texture turnover the entry dies before its
+  second compare, so the credit dies with it. (The counter is also zeroed by every storage writeback,
+  and that reset still exists on `main`, but #3155 retracted it as the cause: fixing it changed
+  nothing. The cause is entry turnover.) "Three scans, then the
   watch" is not what happens; for the dominant population the watch never arms.
 - #3440 fixed a demonstrated buffer case (result baselines evicting primary buffers, and unchanged
   publication resetting progress), after which a *Sonic* buffer population validates through the
