@@ -1350,6 +1350,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # libSceGameUpdate request lifecycle: init-gated ids, offline "no update" checks with
+  # caller-sized zeroed results, request-not-found refusals. Pure, no game dump.
+  prosper_add_gtest(test_gameupdate
+    SOURCES tests/hle/dispatch/test_gameupdate.cpp
+    LIBRARIES prosper_core)
+
   # #2185: reallocalign was unregistered, so the dispatcher's 0 reached the guest as a NULL
   # allocation — a false FAILURE (reads as OOM), the mirror of the #2081 family below. Asserts the
   # extended alignment survives a resize, which plain realloc never promised. Pure, no game dump.

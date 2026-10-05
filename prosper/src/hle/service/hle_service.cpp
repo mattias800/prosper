@@ -1278,8 +1278,107 @@ HLE(s_errdialog_status) {
 // their live args before being given behavior. CONFIDENCE: MED (init-succeeds is the real-console
 // offline behavior; arg shapes intentionally not guessed).
 HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_init) { svc_log("sceGameUpdateInitialize",          a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3,a4,a5); return 0; }
+// --- libSceGameUpdate request lifecycle ------------------------------------------------------
+// Shapes and the 0x804128xx error facility agree between two independently written secondary
+// implementations (request ids from 1, init-gated lifecycle, size-led param/result structs).
+// prosper keeps no update server and holds no downloaded updates, so every Check answers the
+// one honest thing an offline console can say: nothing available. The caller owns the result
+// SIZE (first u32, agreed by both sources): prosper zeroes exactly that many bytes (bounded),
+// then restores the size field, so `found` reads false wherever it lives without prosper
+// pretending to know its offset. A caller size above one page is garbage, not a struct
+// (real ones are tens of bytes) -- and zeroing a garbage length would hang on the memset --
+// so it fails instead. CONFIDENCE: MED on shapes/IDs/errors (secondary agreement, no live
+// caller); LOW on the size bound, which is prosper's own safety rail, not a Sony contract.
+// The entitlement Request/Poll/Consume/TransactionId family stays out: no consulted source
+// pins their argument/result shapes, and the file's standing rule above is to capture live
+// args before inventing those contracts.
+namespace {
+constexpr uint64_t GAME_UPDATE_ERROR_NOT_INITIALIZED = 0x80412801ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_ARG = 0x80412803ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_SIZE = 0x80412804ull;
+constexpr uint64_t GAME_UPDATE_ERROR_REQUEST_NOT_FOUND = 0x80412805ull;
+// Zero-extension matches this file's own error style (0x817D facility above), not a claim
+// about firmware sign-extension. CONFIDENCE: LOW on the width, MED on the values.
+constexpr uint32_t kGameUpdateResultCap = 4096;
+std::mutex g_gameupdate_mx;
+bool g_gameupdate_ready = false;
+int g_gameupdate_next_id = 1;
+std::set<int> g_gameupdate_requests;
+// Zero `size` bytes at `dst`, then restore the size field the caller led with. All-or-nothing:
+// a partially writable buffer fails rather than reporting a half-zeroed "no update".
+uint64_t gameupdate_zero_result(uint64_t dst, uint32_t size) {
+    if (size > kGameUpdateResultCap) return GAME_UPDATE_ERROR_INVALID_SIZE;
+    std::vector<uint8_t> zeros(size, 0);
+    if (!svc_write_bytes(dst, zeros.data(), size)) return GAME_UPDATE_ERROR_INVALID_ARG;
+    if (!svc_write_bytes(dst, &size, sizeof(size))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return 0;
+}
+}   // namespace
+HLE(s_gameupdate_init) {
+    svc_log("sceGameUpdateInitialize", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    g_gameupdate_ready = true;
+    return 0;
+}
+HLE(s_gameupdate_term) {
+    svc_log("sceGameUpdateTerminate", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    g_gameupdate_ready = false;
+    g_gameupdate_requests.clear();
+    return 0;
+}
+HLE(s_gameupdate_create) {
+    svc_log("sceGameUpdateCreateRequest", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    const int id = g_gameupdate_next_id++;
+    g_gameupdate_requests.insert(id);
+    return (uint64_t)id;
+}
+HLE(s_gameupdate_check) {
+    svc_log("sceGameUpdateCheck", a0, a1, a2, a3, a4, a5);
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+        if (g_gameupdate_requests.count((int)a0) == 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    }
+    if (!svc_ptrish(a1) || !svc_ptrish(a2)) return GAME_UPDATE_ERROR_INVALID_ARG;
+    uint32_t param_size = 0, result_size = 0;
+    if (!svc_copy_bytes(a1, &param_size, sizeof(param_size)) ||
+        !svc_copy_bytes(a2, &result_size, sizeof(result_size)))
+        return GAME_UPDATE_ERROR_INVALID_ARG;
+    // The param selects what to check for; the offline answer does not vary with it.
+    (void)param_size;
+    return gameupdate_zero_result(a2, result_size);
+}
+HLE(s_gameupdate_abort) {
+    svc_log("sceGameUpdateAbortRequest", a0, a1, a2, a3, a4, a5);
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+        if (g_gameupdate_requests.count((int)a0) == 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    }
+    // Nothing is ever in flight, so aborting is vacuous -- but only for a live id.
+    return 0;
+}
+HLE(s_gameupdate_delete) {
+    svc_log("sceGameUpdateDeleteRequest", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    if (g_gameupdate_requests.erase((int)a0) == 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    return 0;
+}
+HLE(s_gameupdate_addcont_version) {
+    svc_log("sceGameUpdateGetAddcontLatestVersion", a0, a1, a2, a3, a4, a5);
+    // (service_label, entitlement_label*, info*). The label selects whose update to check, but
+    // with no update service the answer is uniformly "none", so it is logged, not read.
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    if (!svc_ptrish(a2)) return GAME_UPDATE_ERROR_INVALID_ARG;
+    uint32_t info_size = 0;
+    if (!svc_copy_bytes(a2, &info_size, sizeof(info_size))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return gameupdate_zero_result(a2, info_size);
+}
 // The entitlement follow-ups DOLL's main menu fires once the flow is unblocked (live-captured
 // after the #306 gate fell). ABI pinned from the live capture (r8):
 //   GetAddcontEntitlementInfoList(SceNpServiceLabel serviceLabel, Info* list, u32 listNum,
@@ -1640,6 +1739,13 @@ void register_service_hle() {
     Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
     Hle::register_fn("YJtKLttI9fM", (HleFn)s_gameupdate_init, "sceGameUpdateInitialize");
     Hle::register_fn("NSH-C-OmoNI", (HleFn)s_gameupdate_term, "sceGameUpdateTerminate");
+    // GameUpdate request lifecycle: init-gated ids, offline "no update" checks.
+    Hle::register_fn("UvcvKaFvupA", (HleFn)s_gameupdate_create, "sceGameUpdateCreateRequest");
+    Hle::register_fn("LYVV9z8+owM", (HleFn)s_gameupdate_check, "sceGameUpdateCheck");
+    Hle::register_fn("d1CNGEOaK28", (HleFn)s_gameupdate_abort, "sceGameUpdateAbortRequest");
+    Hle::register_fn("bcCyjHN5sn0", (HleFn)s_gameupdate_delete, "sceGameUpdateDeleteRequest");
+    Hle::register_fn("0g0+Oq9xcI0", (HleFn)s_gameupdate_addcont_version,
+                     "sceGameUpdateGetAddcontLatestVersion");
     // Post-gate follow-ups (fire from DOLL's now-reachable main menu; NIDs from PS5 3.20 tables).
     Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
