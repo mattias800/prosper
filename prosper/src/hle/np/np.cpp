@@ -440,9 +440,11 @@ HLE(s_npuds_destroy_property_array) {
 // the Create calls above actually handed out. CONFIDENCE: MED on arities (single secondary
 // source), HIGH on the validation discipline (in-tree, live-tested by Silksong/Metaphor).
 //
-// Scalar setters take their value by register (int/bool/float/double travel in a0-a2 with
-// the handle and key); only the handle and key pointers are validated. Binary takes
-// (container, data*, size) like the SetString sibling.
+// Scalar setters: arrays take (array, value), objects take (object, key, value). Integer/bool
+// values arrive in the next integer register (a1 for arrays, a2 for objects); Float32/Float64
+// values arrive in xmm0 and appear in none of a0-a5 (module: ArraySetFloat32 spills xmm0 at
+// +0x4fab). Only the container and key are validated, so no value register is read here.
+// Binary takes (container, [key,] data*, size) like the SetString sibling.
 HLE(s_npuds_array_set_int32) {
     svc_log("sceNpUniversalDataSystemEventPropertyArraySetInt32", a0, a1, a2, a3, a4, a5);
     if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
@@ -487,30 +489,20 @@ HLE(s_npuds_array_set_object) {
     svc_log("sceNpUniversalDataSystemEventPropertyArraySetObject", a0, a1, a2, a3, a4, a5);
     if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
     if (a1 && !uds_is(a1, UdsKind::Object)) return kUdsInvalidArgument;
-    // value_ptr echoes a supplied value or allocates a fresh object, mirroring the reference:
-    // a non-null out-pointer is never left unwritten on success.
-    if (a2) {
-        if (a1) {
-            if (!svc_ptrish(a2)) return kUdsInvalidArgument;
-            *(uint64_t*)PW(a2) = a1;
-        } else {
-            return uds_create(a2, UdsKind::Object);
-        }
-    }
+    // The module copies the value (or an empty one when it is null) into the container and
+    // writes the INSERTED element to *out, never the caller's own value (module +0x5110 /
+    // +0x51c7, ObjectSetObject +0x5e70). So the caller may destroy its value afterwards and
+    // still use *out, as Unity does. prosper hands out a fresh free-standing handle: the
+    // console's element belongs to its container, which this model does not track (a
+    // never-destroyed one leaks one block). CONFIDENCE: MED.
+    if (a2) return uds_create(a2, UdsKind::Object);
     return 0;
 }
 HLE(s_npuds_array_set_array) {
     svc_log("sceNpUniversalDataSystemEventPropertyArraySetArray", a0, a1, a2, a3, a4, a5);
     if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
     if (a1 && !uds_is(a1, UdsKind::Array)) return kUdsInvalidArgument;
-    if (a2) {
-        if (a1) {
-            if (!svc_ptrish(a2)) return kUdsInvalidArgument;
-            *(uint64_t*)PW(a2) = a1;
-        } else {
-            return uds_create(a2, UdsKind::Array);
-        }
-    }
+    if (a2) return uds_create(a2, UdsKind::Array);   // the inserted element, as ArraySetObject
     return 0;
 }
 HLE(s_npuds_object_set_binary) {
@@ -543,14 +535,7 @@ HLE(s_npuds_object_set_object) {
     svc_log("sceNpUniversalDataSystemEventPropertyObjectSetObject", a0, a1, a2, a3, a4, a5);
     if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
     if (a2 && !uds_is(a2, UdsKind::Object)) return kUdsInvalidArgument;
-    if (a3) {
-        if (a2) {
-            if (!svc_ptrish(a3)) return kUdsInvalidArgument;
-            *(uint64_t*)PW(a3) = a2;
-        } else {
-            return uds_create(a3, UdsKind::Object);
-        }
-    }
+    if (a3) return uds_create(a3, UdsKind::Object);   // the inserted element, as ArraySetObject
     return 0;
 }
 HLE(s_npuds_object_set_uint32) {
@@ -576,12 +561,18 @@ HLE(s_npuds_destroy_context) {
 }
 HLE(s_npuds_terminate) {
     svc_log("sceNpUniversalDataSystemTerminate", a0, a1, a2, a3, a4, a5);
+    // The module answers 0x80553117 when not initialised and clears its init flag, so a second
+    // Terminate fails there. prosper tracks no init state, so Terminate always succeeds.
     return 0;
 }
-// Event sizing/strings/stats. An empty event serializes to "{}", so EstimateSize answers 3
-// and ToString writes it (size 3 includes the NUL); stats structs are zeroed — nothing is
-// stored or transmitted offline. Struct sizes (24/56 bytes) from the single stub-interface
-// source: MED. Events themselves are counter ids, not pointers, so only null is refused.
+// Event sizing/strings/stats. EstimateSize answers 3 and ToString writes "{}" (size 3 includes
+// the NUL). CONFIDENCE: LOW on that answer: the module delegates serialisation to
+// libSceNpCommon and a real event carries at least its CreateEvent name, so a console never
+// produces "{}"; Unity only logs the string. Stats structs are zeroed: nothing is stored or
+// transmitted offline. Struct sizes CONFIDENCE: HIGH from the module: GetMemoryStat writes 24
+// bytes (+0x4b09..0x4b17, and the Unity caller's 24-byte buffer sits below its stack canary);
+// GetStorageStat forwards an output length of 0x38 = 56 (+0x99ae). Events themselves are
+// counter ids, not pointers, so only null is refused.
 HLE(s_npuds_event_estimate_size) {
     svc_log("sceNpUniversalDataSystemEventEstimateSize", a0, a1, a2, a3, a4, a5);
     if (!a0 || !svc_ptrish(a1)) return kUdsInvalidArgument;
@@ -591,6 +582,7 @@ HLE(s_npuds_event_estimate_size) {
 HLE(s_npuds_event_to_string) {
     svc_log("sceNpUniversalDataSystemEventToString", a0, a1, a2, a3, a4, a5);
     if (!a0) return kUdsInvalidArgument;
+    if (!a1 && !a3) return kUdsInvalidArgument;   // module +0x599d: nowhere to answer
     if (a3 && (!svc_ptrish(a3))) return kUdsInvalidArgument;
     if (a3) *(uint64_t*)PW(a3) = 3;
     if (a1 && a2) {
@@ -607,8 +599,9 @@ HLE(s_npuds_get_memory_stat) {
 }
 HLE(s_npuds_get_storage_stat) {
     svc_log("sceNpUniversalDataSystemGetStorageStat", a0, a1, a2, a3, a4, a5);
-    (void)a0;   // context ignored: nothing is stored, so every context reports zeros
-    if (!svc_ptrish(a1)) return kUdsInvalidArgument;
+    // The module refuses -1 and unregistered contexts (+0x6542, +0x6588); as DestroyContext,
+    // the only context in circulation is id 1. Nothing is stored, so it reports zeros.
+    if ((uint32_t)a0 != 1 || !svc_ptrish(a1)) return kUdsInvalidArgument;
     memset(PW(a1), 0, 56);
     return 0;
 }
