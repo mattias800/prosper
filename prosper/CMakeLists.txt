@@ -1782,6 +1782,13 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_texture_source_snapshot.cpp
     INCLUDES frontends)
 
+  # The per-level native BC mip-chain audit (#4496): a pure comparison, no Vulkan device.
+  prosper_add_gtest(test_native_bc_chain_audit
+    SOURCES tests/shared/live/test_native_bc_chain_audit.cpp
+            frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
   # Actual tracked mappings and direct comparison/window observations; no Vulkan device.
   add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
   target_include_directories(test_texture_direct_validation PRIVATE frontends)
@@ -3996,6 +4003,7 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
@@ -4404,6 +4412,7 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
