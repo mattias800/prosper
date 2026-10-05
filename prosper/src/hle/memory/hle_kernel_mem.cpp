@@ -4126,6 +4126,8 @@ void register_kernel_mem_hle() {
     #undef R
     // sync_on_address futex — registered by raw NID (names not in any public DB yet).
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
+    Hle::register_fn("zlqfTyrQSPk", (HleFn)k_wait_on_address, "PS5Util semaphore wait?");
+    Hle::register_fn("dZGYu5wObJs", (HleFn)k_wake_by_address, "PS5Util semaphore wake?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
     // libSceAmpr command-buffer trio. NID names recovered by brute-forcing nid_hash() over a
     // generated libSceAmpr corpus (see hle_file.cpp block comment above f_apr_read_submit).
@@ -8327,6 +8329,8 @@ void register_kernel_mem_hle() {
     R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
     #undef R
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
+    Hle::register_fn("zlqfTyrQSPk", (HleFn)k_wait_on_address, "PS5Util semaphore wait?");
+    Hle::register_fn("dZGYu5wObJs", (HleFn)k_wake_by_address, "PS5Util semaphore wake?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
     // libSceAmpr / APR command-buffer trio + teardown — no-op stubs on Windows (area:ue4).
     Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init, "sceAmprCommandBufferConstructor");

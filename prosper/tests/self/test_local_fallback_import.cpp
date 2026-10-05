@@ -4,6 +4,7 @@
 // Tales of Graces f's sceKernelSyncOnAddressWait returned at once and every waiting thread spun.
 // The classifier must keep such a symbol an import when it names a declared import library, and
 // must leave real exports (export-library id, or no NID encoding) alone.
+#include "loader/linker.hpp"
 #include "self/module.hpp"
 #include <gtest/gtest.h>
 
@@ -42,6 +43,57 @@ TEST(LocalFallbackImport, AlreadyImportOrUnencodedSymbolIsUntouched) {
     plain.value = 0x10;
     plain.lib_id = 1;
     EXPECT_FALSE(prosper::is_relocated_local_fallback_import(plain, kImportLibs));
+}
+
+// One LOAD segment mapping va 0.. onto `bytes`.
+prosper::Module module_with(std::vector<uint8_t> bytes) {
+    prosper::Module m;
+    m.file = std::move(bytes);
+    prosper::Segment seg;
+    seg.type = 1;
+    seg.vaddr = 0;
+    seg.filesz = seg.memsz = m.file.size();
+    seg.file_off = 0;
+    m.loads.push_back(seg);
+    return m;
+}
+
+TEST(ReturnZeroPlaceholder, DirectAndTrampolinedBodiesAreRecognised) {
+    // 0x00: xor eax,eax; ret    0x10: jmp 0x00    0x20: jmp 0x10
+    std::vector<uint8_t> b(0x30, 0xcc);
+    b[0] = 0x31;
+    b[1] = 0xc0;
+    b[2] = 0xc3;
+    b[0x10] = 0xe9;
+    b[0x11] = 0xeb;
+    b[0x12] = 0xff;
+    b[0x13] = 0xff;
+    b[0x14] = 0xff;   // -0x15
+    b[0x20] = 0xe9;
+    b[0x21] = 0xeb;
+    b[0x22] = 0xff;
+    b[0x23] = 0xff;
+    b[0x24] = 0xff;   // 0x25-0x15=0x10
+    auto m = module_with(b);
+    EXPECT_TRUE(prosper::is_return_zero_placeholder(m, 0x00));
+    EXPECT_TRUE(prosper::is_return_zero_placeholder(m, 0x10));
+    EXPECT_TRUE(prosper::is_return_zero_placeholder(m, 0x20));
+}
+
+TEST(ReturnZeroPlaceholder, RealBodiesAndLoopsAreNot) {
+    std::vector<uint8_t> b(0x30, 0xcc);
+    b[0] = 0xb8;
+    b[1] = 0x01;
+    b[5] = 0xc3;   // mov eax,1; ret
+    b[0x10] = 0xe9;
+    b[0x11] = 0xfb;
+    b[0x12] = 0xff;
+    b[0x13] = 0xff;
+    b[0x14] = 0xff;   // jmp self
+    auto m = module_with(b);
+    EXPECT_FALSE(prosper::is_return_zero_placeholder(m, 0x00));
+    EXPECT_FALSE(prosper::is_return_zero_placeholder(m, 0x10));
+    EXPECT_FALSE(prosper::is_return_zero_placeholder(m, 0x1000));   // unmapped
 }
 
 }   // namespace

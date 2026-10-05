@@ -170,6 +170,9 @@ struct Program {
 // NID-bearing symbols with a nonzero value. Kept as one helper so the collision check and the table
 // build below cannot drift apart — if they disagreed, a module could be accepted as collision-free
 // and then still alias someone else's NID.
+// True when the code at `va` only returns 0 (`xor eax,eax; ret`, behind up to three `jmp rel32`).
+bool is_return_zero_placeholder(const Module& m, uint64_t va);
+
 std::vector<std::string> module_export_nids(const Module& m);
 
 // First NID of `m` already present in `claimed` (NID -> owning module path), or an empty `nid` when

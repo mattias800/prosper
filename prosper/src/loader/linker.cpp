@@ -15,6 +15,24 @@ static bool is_exported_symbol(const Symbol& s) {
     return !s.is_import && !s.nid.empty() && s.value != 0;
 }
 
+// True when the code at `va` is a placeholder that does nothing but return 0: `xor eax,eax; ret`,
+// reached through at most three `jmp rel32` trampolines (a stub library's export and its PLT slot).
+// Real function bodies never look like this, and binding an import to one answers SCE_OK to a call
+// that was meant to block, which made Tales of Graces f's semaphore waits spin (#4485).
+bool is_return_zero_placeholder(const Module& m, uint64_t va) {
+    for (int hops = 0; hops < 4; hops++) {
+        const int64_t fo = m.va2foff(va);
+        if (fo < 0 || (uint64_t)fo + 5 > m.file.size()) return false;
+        const uint8_t* p = &m.file[(size_t)fo];
+        if (p[0] == 0x31 && p[1] == 0xc0 && p[2] == 0xc3) return true;
+        if (p[0] != 0xe9) return false;
+        int32_t rel;
+        memcpy(&rel, p + 1, 4);
+        va = va + 5 + (int64_t)rel;
+    }
+    return false;
+}
+
 std::vector<std::string> module_export_nids(const Module& m) {
     std::vector<std::string> nids;
     for (const auto& s : m.symbols) if (is_exported_symbol(s)) nids.push_back(s.nid);
@@ -124,12 +142,16 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
     // --- Global export table: NID -> guest address (first definition wins). Retained in
     // out.exports so sceKernelDlsym can resolve exported symbols by name post-link. ---
     std::unordered_map<std::string, uint64_t>& exports = out.exports;
+    std::unordered_set<std::string>
+        placeholder_exports;   // NIDs whose first definition is a placeholder
     for (size_t i = 0; i < out.mods.size(); i++) {
         const Module& m = *out.mods[i];
         uint64_t base = out.imgs[i].base;
         Program::ModuleExports me; me.path = m.path;
         for (auto& s : m.symbols)
             if (!s.is_import && !s.nid.empty() && s.value != 0) {
+                if (!exports.count(s.nid) && is_return_zero_placeholder(m, s.value))
+                    placeholder_exports.insert(s.nid);
                 // emplace() is a NO-OP on an existing key, so first-wins — intended, but it was also
                 // silent (#1635). Record every alias: which NID, who won, who lost, and both
                 // addresses. Behaviour is unchanged; only the reporting is new.
@@ -171,6 +193,9 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
         for (auto& imp : m.imports) {
             out.total_imports++;
             auto ex = exports.find(imp.nid);
+            // A placeholder body (`xor eax,eax; ret`) satisfies nothing: let the import fall through to
+            // the stub aperture so an HLE handler, or the loud unimplemented path, answers it.
+            if (ex != exports.end() && placeholder_exports.count(imp.nid)) ex = exports.end();
             if (ex != exports.end()) {
                 img.import_addr[imp.sym_index] = ex->second;     // real cross-module target
                 out.resolved_cross_module++;
