@@ -4054,6 +4054,101 @@ HLE(ngs2_rack_get_voice) {
     return a2_store_u64(a2, kNgs2VoiceTag | (rack_slot << 8) | a1) ? 0 : kNgs2ErrInvalidOut;
 }
 
+// --- Ngs2 lifecycle remainder: allocator creates, destroy, grain, locks ----------------------
+// These follow the table/tag/error model directly above (slots, kNgs2*Tag validation, the
+// 0x804a facility), so no new contract is invented: CreateWithAllocator allocates exactly like
+// Create (the allocator pointer is required input, but its callbacks are never invoked —
+// prosper keeps its own slot table and reads guest memory directly, so there is no
+// allocation to perform; documented MED); SystemDestroy frees the system slot plus the
+// racks it owns and their voices (mirroring RackDestroy's cascade) and zeroes the
+// released-context OUT block; SetGrainSamples records
+// into the shared grain word within Create's sane range; Lock/Unlock validate and acknowledge
+// (uncontended headless). NIDs via nid_hash; System/RackCreateWithAllocator reproduce the
+// firmware set. The DSP quartet (PanInit/PanGetVolumeMatrix/ParseWaveformData/CalcWaveformBlock)
+// and SystemGetInfo stay out: their struct layouts are unpinned by any local caller and no
+// touch backend exists to compute against.
+HLE(ngs2_system_create_with_allocator) {
+    NGS2_LOG("sceNgs2SystemCreateWithAllocator");
+    // (option?, allocator, handle*): the allocator is required input like SystemCreate's
+    // buffer_info, but its callbacks are never invoked — prosper keeps its own slot table and
+    // reads guest memory directly, so there is no allocation to perform. CONFIDENCE: MED.
+    if (!a1 || !a2) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    // Optional SystemOption grain at +0x70, same as SystemCreate.
+    if (a0) {
+        uint32_t g = 0;
+        if (audio_read_bytes(a0 + 0x70, &g, 4) && g >= 64 && g <= 8192) g_ngs2_grain = g;
+    }
+    for (uint64_t i = 0; i < 4; ++i) {
+        if (g_ngs2_systems[i]) continue;
+        g_ngs2_systems[i] = true;
+        if (!a2_store_u64(a2, kNgs2SystemTag | (i + 1))) {
+            g_ngs2_systems[i] = false;
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidSystem;
+}
+HLE(ngs2_system_destroy) {
+    NGS2_LOG("sceNgs2SystemDestroy");
+    // (system, buffer_info*): the info block is the released-context OUT param, so on success it
+    // is zeroed like RackDestroy's (prosper owns no returned host buffer). a1 == 0 is accepted
+    // (no info wanted back). Outputs stay untouched on failure.
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    const uint64_t slot = a0 & 0xff;
+    if ((a0 & kNgs2TagMask) != kNgs2SystemTag || slot < 1 || slot > 4 || !g_ngs2_systems[slot - 1])
+        return kNgs2ErrInvalidSystem;
+    if (a1 && !a2_store_zeros(a1, 0x40)) return kNgs2ErrInvalidOut;
+    g_ngs2_systems[slot - 1] = false;
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (!g_ngs2_racks[i].used || g_ngs2_racks[i].system != a0) continue;
+        g_ngs2_racks[i] = {};
+        for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end();) {
+            it = ((it->first >> 8) == i + 1) ? g_ngs2_voices.erase(it) : std::next(it);
+        }
+    }
+    return 0;
+}
+HLE(ngs2_system_set_grain_samples) {
+    NGS2_LOG("sceNgs2SystemSetGrainSamples");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    const uint32_t g = (uint32_t)a1;
+    if (g >= 64 && g <= 8192) g_ngs2_grain = g;
+    return 0;
+}
+HLE(ngs2_rack_create_with_allocator) {
+    NGS2_LOG("sceNgs2RackCreateWithAllocator");
+    // (system, rack_id, option?, allocator, handle*): allocator required, callbacks uninvoked,
+    // same model as the system allocator create above.
+    if (!a3 || !a4) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (g_ngs2_racks[i].used) continue;
+        g_ngs2_racks[i] = {true, a0, (uint32_t)a1, ngs2_max_voices(a2)};
+        if (!a2_store_u64(a4, kNgs2RackTag | (i + 1))) {
+            g_ngs2_racks[i] = {};
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidRack;
+}
+HLE(ngs2_rack_lock) {
+    NGS2_LOG("sceNgs2RackLock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
+    return 0;
+}
+HLE(ngs2_rack_unlock) {
+    NGS2_LOG("sceNgs2RackUnlock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
+    return 0;
+}
+
 // PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
 // Ngs2VoiceParamHead { uint16 size; int16 next; uint32 id; payload... } (Sony's documented
 // voice-param list shape). This is capture-first RE for the real sampler implementation —
@@ -4367,6 +4462,14 @@ void register_audio_hle() {
     Hle::register_fn("-TOuuAQ-buE", ngs2_voice_get_state, "sceNgs2VoiceGetState");
     Hle::register_fn("rEh728kXk3w", ngs2_voice_get_state_flags, "sceNgs2VoiceGetStateFlags");
     Hle::register_fn("lCqD7oycmIM", ngs2_rack_destroy, "sceNgs2RackDestroy");
+    Hle::register_fn("mPYgU4oYpuY", ngs2_system_create_with_allocator,
+                     "sceNgs2SystemCreateWithAllocator");
+    Hle::register_fn("u-WrYDaJA3k", ngs2_system_destroy, "sceNgs2SystemDestroy");
+    Hle::register_fn("l4Q2dWEH6UM", ngs2_system_set_grain_samples, "sceNgs2SystemSetGrainSamples");
+    Hle::register_fn("U546k6orxQo", ngs2_rack_create_with_allocator,
+                     "sceNgs2RackCreateWithAllocator");
+    Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
+    Hle::register_fn("++YZ7P9e87U", ngs2_rack_unlock, "sceNgs2RackUnlock");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
 #if defined(__linux__)

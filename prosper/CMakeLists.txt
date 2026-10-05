@@ -1162,6 +1162,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_streaming.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 allocator-create/destroy/grain/lock lifecycle: tagged handles validate,
+  # destroy reclaims, grain records. Pure, no game dump.
+  prosper_add_gtest(test_ngs2_lifecycle
+    SOURCES tests/hle/test_ngs2_lifecycle.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
