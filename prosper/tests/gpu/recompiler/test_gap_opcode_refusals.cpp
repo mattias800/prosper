@@ -330,13 +330,15 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 // (only swap_x2/or_x2 have separately guarded lowerings, and widening a
 // 32-bit atomic in place would be a different operation). All words below
 // are llvm-mc gfx1030 round-tripped with the idxen form. The control is the
-// 32-bit buffer_atomic_add over the same table entry, which is lowered.
+// 32-bit buffer_atomic_add with the x2 words' operand fields (idxen, VADDR v2,
+// data v0) over the same table entry -- only the opcode differs -- and it is
+// lowered.
 // WHEN an x2 lowering lands, ITS CASE GOES RED; replace it with an execution
 // test of the new lowering.
 TEST(GapOpcodeRefusals, BufferAtomicX2Refuse) {
     static const uint32_t addx2[2] = {0xe1482000u, 0x80020002u};
     static const uint32_t andx2[2] = {0xe1642000u, 0x80020002u};
-    static const uint32_t add[2] = {0xe0c80000u, 0x80020100u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};   // add v0, v2, idxen
     for (const uint32_t* words : {addx2, andx2, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
@@ -360,9 +362,9 @@ TEST(GapOpcodeRefusals, BufferAtomicX2Refuse) {
     ComputeShaderConfig config;
     config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
     const std::vector<uint32_t> prologue = {
-        0x7e000280u,   // v_mov_b32 v0, 0 (address)
-        0x7e020283u,   // v_mov_b32 v1, 3 (value)
-        0x7e040280u,   // v_mov_b32 v2, 0
+        0x7e000280u,   // v_mov_b32 v0, 0 (data, low dword)
+        0x7e020283u,   // v_mov_b32 v1, 3 (data, high dword of the x2 forms)
+        0x7e040280u,   // v_mov_b32 v2, 0 (idxen element index)
     };
     expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F0ull,
                     "control: 32-bit buffer_atomic_add over the same entry",
