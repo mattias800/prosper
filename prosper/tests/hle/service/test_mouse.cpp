@@ -28,5 +28,6 @@ TEST(Mouse, CloseCompletesLifecycle) {
     EXPECT_EQ(init(0, 0, 0, 0, 0, 0), 0u);
     const uint64_t handle = open(0, 0, 0, 0, 0, 0);
     EXPECT_EQ(close(handle, 0, 0, 0, 0, 0), 0u);
-    EXPECT_EQ(close(handle, 0, 0, 0, 0, 0), 0u) << "handles are fire-and-forget counters";
+    // A second close of the same handle is deliberately not asserted: the firmware returns
+    // 0x80DF0003 there, while prosper (which does not track handles) accepts it.
 }

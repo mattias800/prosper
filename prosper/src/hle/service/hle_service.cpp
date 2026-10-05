@@ -217,8 +217,11 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // overran a single-entry mouse buffer, and the game consumed a phantom mouse event every call. No
 // mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
-// sceMouseClose(handle): handles are fire-and-forget counter values (s_open), so there is
-// nothing to free or validate — closing always succeeds, completing the 4-call firmware set.
+// sceMouseClose(handle). The firmware validates (module VA 0xaf0): 0x80DF0005 before
+// sceMouseInit, and 0x80DF0003 for a zero, unknown or already-closed handle after scanning its 8
+// open slots. s_open does not track handles, so prosper accepts every close. CONFIDENCE: MED. This
+// matches the dispatcher's previous answer for every well-formed close; tracking handles would
+// change what 52 importing titles (13 snapshot-guarded) see, so it belongs in its own change.
 HLE(s_mouse_close) {
     (void)a0;
     return 0;

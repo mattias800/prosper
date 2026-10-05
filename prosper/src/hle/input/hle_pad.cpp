@@ -664,8 +664,11 @@ void register_pad_hle() {
     R("scePadSetLightBar", pad_ok);
     R("scePadResetOrientation", pad_ok);
     R("scePadSetVibrationMode", pad_ok);       // vibration-mode config (output) — accept, no-op
-    R("scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse",
-      pad_ok);   // weak-mic vibration quirk: accept, no-op (same class as the mode above)  // weak-mic vibration quirk: accept, no-op (same class as the mode above)
+    // scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enable): a process-wide output
+    // preference forwarded to the system (no handle; module VA 0x9560). No host effector -- accept,
+    // no-op. The firmware's 0x80920005 before scePadInit is not modelled, like its vibration
+    // siblings. CONFIDENCE: MED.
+    R("scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse", pad_ok);
     R("scePadSetTriggerEffect", pad_ok);       // DualSense adaptive-trigger effect (output) — accept, no-op
     R("scePadDeviceClassParseData", pad_class_parse);   // raw device-class report -> "no valid data"
     R("scePadGetTriggerEffectState", pad_trigger_state);// adaptive-trigger state -> zeroed/neutral
