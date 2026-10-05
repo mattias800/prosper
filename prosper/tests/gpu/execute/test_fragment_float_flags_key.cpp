@@ -1,68 +1,105 @@
+// test_fragment_float_flags_key — the fragment shader cache key must carry every piece of
+// float-mode authority as a DISTINCT producing input.
+//
+// A cache key that folds two of these states together does not return a wrong image: it returns the
+// other image, from a compile the guest never asked for, which is why this is a key-identity test and
+// not a rendering one. Unknown FLOAT_MODE stays independent of known flag authority, so the fixtures
+// cover flags-known/mode-unknown and the reverse.
+//
+// Every key here holds equal code bytes, deliberately in different immutable allocations, so a
+// "reused key" verdict can only come from the flags and never from pointer identity or code bytes.
 #include "gpu/execute/shader_cache_internal.hpp"
 
+#include <gtest/gtest.h>
+
 #include <array>
-#include <cstdio>
+#include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <unordered_map>
+#include <vector>
 
 using namespace prosper::gpu;
 
 namespace {
-unsigned checks = 0;
-unsigned failures = 0;
+struct FlagState {
+    FragmentFloatFlags flags;
+    FragmentLaunchRsrc1 raw;
+};
+constexpr std::array<FlagState, 8> kStates{{
+    {{}, {}},
+    {{true, false, false}, {}},
+    {{true, true, false}, {}},
+    {{true, false, true}, {}},
+    {{true, true, true}, {}},
+    {{}, {true, 0}},
+    {{}, {true, 1u << 29}},
+    {{}, {true, (1u << 29) | (1u << 22)}},
+}};
 
-void check(bool condition, const char* message, unsigned first = 0, unsigned second = 0) {
-    ++checks;
-    if (!condition) {
-        ++failures;
-        std::fprintf(stderr, "[FAIL] %s (states=%u,%u)\n", message, first, second);
-    }
-}
-}
-
-int main() {
-    struct State { FragmentFloatFlags flags; FragmentLaunchRsrc1 raw; };
-    constexpr std::array<State,8> states{{
-        {{},{}}, {{true,false,false},{}}, {{true,true,false},{}},
-        {{true,false,true},{}}, {{true,true,true},{}},
-        {{},{true,0}}, {{},{true,1u<<29}}, {{},{true,(1u<<29)|(1u<<22)}}}};
-    std::array<ShaderCompileKey, states.size()> keys;
-    for (unsigned i = 0; i < states.size(); ++i) {
+std::array<ShaderCompileKey, kStates.size()> build_keys() {
+    std::array<ShaderCompileKey, kStates.size()> keys;
+    for (unsigned i = 0; i < kStates.size(); ++i) {
         auto& key = keys[i];
         key.stage = ShaderProgramStage::Fragment;
-        key.fragment_float_flags = states[i].flags;
-        key.fragment_launch_rsrc1 = states[i].raw;
-        // Unknown FLOAT_MODE remains independent of known flag authority. Every key
-        // uses equal code bytes, deliberately held in different immutable allocations.
+        key.fragment_float_flags = kStates[i].flags;
+        key.fragment_launch_rsrc1 = kStates[i].raw;
         key.code = std::make_shared<const std::vector<uint32_t>>(
             std::initializer_list<uint32_t>{0xbf810000u});
         key.code_hash = hash_shader_code(*key.code);
         key.cached_hash = ShaderCompileKeyHash::compute(key);
-        check(key.fragment_float_flags.canonical(), "canonical independent flag state", i);
-        check(key.fragment_launch_rsrc1.canonical(), "canonical independent raw evidence state",i);
     }
-    for (unsigned i = 0; i < states.size(); ++i) {
-        for (unsigned j = 0; j < states.size(); ++j) {
-            check((keys[i] == keys[j]) == (i == j), "exact key equality includes all flags", i, j);
-            const auto word_i = ShaderCompileKeyHash::compute_impl<true>(keys[i]);
-            const auto word_j = ShaderCompileKeyHash::compute_impl<true>(keys[j]);
-            const auto byte_i = ShaderCompileKeyHash::compute_impl<false>(keys[i]);
-            const auto byte_j = ShaderCompileKeyHash::compute_impl<false>(keys[j]);
-            // Specific fixture sensitivity only, not a claim that hashes never collide.
-            check((word_i == word_j) == (i == j), "word hash includes this flag fixture", i, j);
-            check((byte_i == byte_j) == (i == j), "byte hash includes this flag fixture", i, j);
+    return keys;
+}
+}   // namespace
+
+TEST(FragmentFloatFlagsKey, EveryFixtureStateIsCanonical) {
+    const auto keys = build_keys();
+    for (unsigned i = 0; i < kStates.size(); ++i) {
+        EXPECT_TRUE(keys[i].fragment_float_flags.canonical())
+            << "canonical independent flag state, fixture " << i;
+        EXPECT_TRUE(keys[i].fragment_launch_rsrc1.canonical())
+            << "canonical independent raw evidence state, fixture " << i;
+    }
+}
+
+TEST(FragmentFloatFlagsKey, KeyEqualityIncludesEveryFlagState) {
+    const auto keys = build_keys();
+    for (unsigned i = 0; i < kStates.size(); ++i) {
+        for (unsigned j = 0; j < kStates.size(); ++j) {
+            EXPECT_EQ(keys[i] == keys[j], i == j)
+                << "exact key equality includes all flags, fixtures " << i << " and " << j;
+            EXPECT_EQ(ShaderCompileKeyHash::compute_impl<true>(keys[i]) ==
+                          ShaderCompileKeyHash::compute_impl<true>(keys[j]),
+                      i == j)
+                << "word hash includes this flag fixture, fixtures " << i << " and " << j;
+            EXPECT_EQ(ShaderCompileKeyHash::compute_impl<false>(keys[i]) ==
+                          ShaderCompileKeyHash::compute_impl<false>(keys[j]),
+                      i == j)
+                << "byte hash includes this flag fixture, fixtures " << i << " and " << j;
         }
     }
+}
+
+TEST(FragmentFloatFlagsKey, EightProducingIdentitiesCoexistInOneMap) {
+    const auto keys = build_keys();
     std::unordered_map<ShaderCompileKey, unsigned, ShaderCompileKeyHash> entries;
-    for (unsigned i = 0; i < states.size(); ++i) entries.emplace(keys[i], i);
-    check(entries.size() == states.size(), "eight flag/raw producing identities coexist");
-    for (unsigned i = 0; i < states.size(); ++i) {
+    for (unsigned i = 0; i < kStates.size(); ++i) entries.emplace(keys[i], i);
+    EXPECT_EQ(entries.size(), kStates.size()) << "eight flag/raw producing identities coexist";
+}
+
+TEST(FragmentFloatFlagsKey, AnEqualByteIdentityReusesItsOwnKey) {
+    const auto keys = build_keys();
+    std::unordered_map<ShaderCompileKey, unsigned, ShaderCompileKeyHash> entries;
+    for (unsigned i = 0; i < kStates.size(); ++i) entries.emplace(keys[i], i);
+    for (unsigned i = 0; i < kStates.size(); ++i) {
+        // Same bytes, a DIFFERENT allocation: the point is that the reuse comes from the hash and not
+        // from the shared code pointer.
         auto repeated = keys[i];
         repeated.code = std::make_shared<const std::vector<uint32_t>>(*keys[i].code);
         repeated.cached_hash = ShaderCompileKeyHash::compute(repeated);
         const auto hit = entries.find(repeated);
-        check(hit != entries.end() && hit->second == i, "equal byte identity reuses its own key", i);
+        ASSERT_NE(hit, entries.end()) << "equal byte identity finds its key, fixture " << i;
+        EXPECT_EQ(hit->second, i) << "equal byte identity reuses its OWN key, fixture " << i;
     }
-    std::printf("fragment_float_flags_key: %u checks, %u failures; eight flag/evidence states\n",
-                checks, failures);
-    return failures ? 1 : 0;
 }
