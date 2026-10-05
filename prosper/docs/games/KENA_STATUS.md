@@ -150,9 +150,8 @@ anchors are pad reads — see `prosper/scripts/kena/README.md`. `tools/dump_hygi
 `_original_files/` (the untouched encrypted originals) is retained and never read.
 
 The launch hang before the first frame (no raw scanout either; recorded here as "about 2 in 12", measured
-6 of 28 on 2026-10-05) is fixed on Windows — see item 4 below. A separate boot-time crash remains: about 1 launch
-in 5 dies 5-10 s in with `0xC0000005` and nothing in stderr
-([#4504](https://github.com/mattias800/prosper/issues/4504)); relaunch.
+6 of 28 on 2026-10-05) is fixed on Windows — see item 4 below. So is the boot-time crash that took about 1 launch
+in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## What was fixed to get here
 
@@ -181,6 +180,15 @@ in 5 dies 5-10 s in with `0xC0000005` and nothing in stderr
    without the flag and steer their later allocations into `[4 GiB, 16 GiB)`, best effort
    (`docs/platforms/WINDOWS_PORT_HANDOFF.md` § Gotchas); the refusal is reported (`[memhle] reserve FAILED …`)
    instead of silent. This applies to every UE4 title, not this one.
+5. **The boot crash: prosper delivered an APR completion counter below one already delivered**
+   ([#4504](https://github.com/mattias800/prosper/issues/4504)). UE4's listener walks `last+1 ..= cnt` and then
+   stores `last := cnt` unconditionally, so a late lower counter rewinds it and the next event completes a token
+   a second time; its tracking entry is gone and the guest dereferences null (`eboot+0x16bd26b`). Two deferred
+   posts could read the ring's high-water mark as N and N+1 and post them in the opposite order. Reading the
+   mark and posting it are now one step. Before: 12 of 64 launches died this way (the 64 include launches that
+   hung first, so the rate among booted launches was higher). With the fix: 0 of 21 booted launches faulted, and
+   a detector built for that measurement (not in the tree) saw no out-of-order post in any of them, against 4 of
+   12 with the ordering removed. Shared code: any UE4 title using this listener.
 
 ## Ruled out
 
@@ -200,7 +208,7 @@ in 5 dies 5-10 s in with `0xC0000005` and nothing in stderr
 - **`PROSPER_DBG=1` stalls this title at startup** — false. In an interleaved series the stall and the crash
   both occur without it (control 1 stall + 1 crash of 8; `PROSPER_DBG=1` 2 + 2 of 8), and the stall happens
   before any code that reads the variable runs. The three consecutive stalls that prompted #4426 were a small
-  sample of two unrelated intermittent defects (item 4 above, and #4504).
+  sample of two unrelated intermittent defects (items 4 and 5 above).
 - **The UE4 arena landing at `0x2000000000` instead of `0x7c00000000` is caused by `PROSPER_DBG`** — false.
   Control runs land at both. It is the reservation's whole-window fallback, taken when a host allocation
   occupies the top band; the same cause as the launch hang, one notch less severe (#4426).

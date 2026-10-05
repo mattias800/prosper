@@ -2183,6 +2183,21 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         n, (unsigned long long)a0, prosper::guest_module_name((uint64_t)__builtin_return_address(0)),
         (unsigned long long)prosper::guest_module_offset((uint64_t)__builtin_return_address(0)),
         (long long)(ev ? ev[0].ident : 0), (int)(ev ? ev[0].filter : 0));
+    // Each APR completion the guest is about to read, in the order it reads them. A counter-dialect
+    // listener walks `last+1 ..= cnt` and then stores `last := cnt` unconditionally, so a `cnt`
+    // LOWER than an earlier one on the same ring is not a harmless duplicate — it rewinds the
+    // guest's bookkeeping and the next event completes a token twice (#4504). This is the only
+    // place that order can be observed: the post side logs what was scheduled, not what arrived.
+    // ring/cnt are the counter dialect's reading of `data`; for a pointer or zero tag they are
+    // just its top 6 and low 58 bits, which is why the raw value is printed beside them.
+    if (evlog() && ev)
+        for (int i = 0; i < n; i++)
+            if (ev[i].filter == EVFILT_AMPR)
+                fprintf(stderr,
+                        "[ev]   apr-delivered eq=0x%llx ident=%lld data=0x%llx ring=%u cnt=%llu\n",
+                        (unsigned long long)a0, (long long)ev[i].ident,
+                        (unsigned long long)ev[i].data, (unsigned)((uint64_t)ev[i].data >> 58),
+                        (unsigned long long)((uint64_t)ev[i].data & ((1ull << 58) - 1)));
     // Timed wait that expired with nothing: the real API distinguishes this from success (Kyty
     // EventQueue.cpp:310 KERNEL_ERROR_ETIMEDOUT). Only reachable with a timeout arg — the infinite
     // wait can only exit with events or a delete.
@@ -2252,6 +2267,9 @@ namespace {
     // the macOS __DATA cluster affected by #707.
     struct AprTokenState {
         std::mutex mx;
+        // Held across "read a ring's high-water mark, then post it" (post_apr_counter). Outermost:
+        // taken with no other lock held, and nothing that holds g_eq_mx or `mx` ever waits for it.
+        std::mutex counter_post_mx;
         std::vector<AprEqReg> eq_regs;
         uint64_t ring_seq[64] = {};
         std::unordered_map<uint64_t, uint64_t> tag_hwm;
@@ -2279,6 +2297,11 @@ namespace {
     }
 }
 namespace {
+// Test seam (#4504): called by a counter-dialect deferred post after it has read the high-water
+// mark and before it posts it — the one interleaving point that decides delivery order. Null in
+// every shipped run.
+std::atomic<void (*)(uint64_t)> g_apr_counter_post_hook{nullptr};
+
 // RequestPointer dialect. The tag is the guest's own request/batch pointer, delivered exactly,
 // one distinct queued event per submit, never coalesced.
 //
@@ -2377,6 +2400,21 @@ void post_apr_constant_zero(uint64_t eq, uint64_t eq_identity, int64_t id, uint6
 // at post time, not the captured token: two deferred posts can run out of order, and the
 // coalesced knote must never regress the counter. Only this dialect feeds the high-water mark;
 // a pointer or zero tag on the same (eq, ring) must not poison it.
+//
+// Reading the mark and posting it are ONE step, under counter_post_mx (#4504). Reading it under
+// the state mutex and posting after releasing that mutex is not enough: two deferred threads can
+// read N and N+1 and post them in the opposite order. If the listener consumes N+1 in between,
+// the late N is not a harmless duplicate — the listener stores `last := cnt` unconditionally, so
+// it rewinds to N, the next event walks N+1 a second time, its tracking entry is already erased,
+// and the handler dereferences the null it gets back. Measured on Kena (PPSA01802): 12 of 64
+// launches died there, 5-10 s into the boot. The mark only ever rises, so holding one mutex across
+// read-then-post makes the posted sequence non-decreasing for every (queue, ring).
+//
+// What that does NOT cover: the mark is keyed by (queue, ring) but a pending event is keyed by
+// ident = id + ring, so two DIFFERENT counter ids bound to one ring would own two pending events.
+// The queue is read in order, so if the OLDER event is refreshed in place to a higher value it is
+// read first, and the newer event's lower value after it (7, then 6).
+// UE4 registers exactly one id per ring (0x74fe + ring), which is what delivery order relies on.
 // CONFIDENCE: HIGH (both ends live-captured and disassembled; see the block comment above).
 void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
     const unsigned ring = (unsigned)(token >> 58) & 0x3f;
@@ -2395,21 +2433,27 @@ void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t to
     std::thread([eq, eq_identity, id, ring, hwm_key] {
         struct timespec ts{0, 2000000};   // 2 ms
         nanosleep(&ts, nullptr);
+        AprTokenState& state = apr_token_state();
+        std::lock_guard post(state.counter_post_mx);
         uint64_t hwm;
         {
-            AprTokenState& state = apr_token_state();
             std::lock_guard lk(state.mx);
             hwm = state.tag_hwm[hwm_key];
         }
-        // Resolved BEFORE the post: apr_post runs with no APR lock held on purpose.
+        if (auto hook = g_apr_counter_post_hook.load(std::memory_order_acquire)) hook(hwm);
+        // Resolved BEFORE the post: apr_post runs with the state mutex released on purpose
+        // (eq_post takes g_eq_mx, and registration takes g_eq_mx before the state mutex).
         apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, /*coalesce=*/true,
                  prosper_eq_apr_udata(eq, id));
     }).detach();
 }
 }   // namespace
 // Post the completion for a bound command buffer, delivered per the binding's DIALECT (classified
-// once at bind time, apr_event_dialect.hpp). Deferred ~2 ms so the guest finishes installing its
-// tracking slot/hash entry first (real DMA latency the submitter's bookkeeping never races).
+// once at bind time, apr_event_dialect.hpp). Deferred ~2 ms as modelled DMA latency. It was
+// introduced so that a guest could finish installing its tracking slot/hash entry first; do NOT
+// read it as an ordering or readiness guarantee. Kena's listener installs its entry before it
+// submits (from that title's disassembly, #4504), and what it needed was order, which the counter
+// dialect now provides by construction. Whether any title needs the delay itself is unmeasured.
 void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token,
                                AprDialect dialect) {
     if (!eq_identity || prosper_eq_identity(eq) != eq_identity) return;
@@ -2420,6 +2464,9 @@ void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id, ui
         case AprDialect::ConstantZero: post_apr_constant_zero(eq, eq_identity, id, token); return;
         case AprDialect::Counter: post_apr_counter(eq, eq_identity, id, token); return;
     }
+}
+void prosper_apr_counter_post_hook_for_test(void (*hook)(uint64_t hwm)) {
+    g_apr_counter_post_hook.store(hook, std::memory_order_release);
 }
 // Dialect-less entry for callers that hold only the bind arguments (tests, the deferred tail).
 void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
