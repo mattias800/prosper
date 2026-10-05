@@ -266,6 +266,7 @@ HLE(s_savedlg_progress_set) {
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
+static constexpr uint64_t SAVE_DATA_ERR_BUSY = 0x809F0003ull;     // the save is mounted / in use
 static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
 // From the same published table this file's other savedata codes come from. Spelled out rather than
@@ -1004,6 +1005,53 @@ HLE(s_savedata_saveicon) {
     return 0;
 }
 
+// sceSaveDataLoadIcon(const SceSaveDataMountPoint* mp, SceSaveDataIcon* icon) (cGjO3wM3V28,
+// #2081: "returns success over an unwritten buffer").
+// The inverse of SaveIcon above: icon is { void* buf @+0x00, size_t bufSize @+0x08, size_t
+// dataSize @+0x10, reserved }, and the file is the `<save dir>/sce_sys/icon0.png` SaveIcon wrote.
+// dataSize reports the FULL file size while at most bufSize bytes are copied, so a small caller
+// buffer learns the real size instead of receiving a truncated silent success.
+//   null/wrong mount point, null icon, null buffer  -> PARAMETER
+//   nothing mounted                                 -> NOT_MOUNTED
+//   icon file missing                               -> NOT_FOUND (buffer untouched)
+//   host read failed                                -> INTERNAL
+// CONFIDENCE: HIGH for the struct and the refusal shape (shadPS4 behavior + the merged SaveIcon
+// contract it inverts); MED on NOT_FOUND vs success-for-missing, which follows Mount3's
+// nonexistent-save answer in this file.
+HLE(s_savedata_loadicon) {
+    svc_log("sceSaveDataLoadIcon", a0,a1,a2,a3,a4,a5);
+    if (!savedata_mount_point_ok(a0) || !svc_ptrish(a1)) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* icon = (const uint8_t*)PW(a1);
+    uint64_t buf = 0, buf_size = 0;
+    memcpy(&buf, icon + 0x00, sizeof buf);
+    memcpy(&buf_size, icon + 0x08, sizeof buf_size);
+    if (!svc_ptrish(buf) || !buf_size) return SAVE_DATA_ERR_PARAMETER;
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    const std::filesystem::path icon_path = std::filesystem::path(dir) / "sce_sys" / "icon0.png";
+    std::error_code ec;
+    const uint64_t file_size = std::filesystem::file_size(icon_path, ec);
+    if (ec) return SAVE_DATA_ERR_NOT_FOUND;
+    const size_t n = (size_t)(file_size < buf_size ? file_size : buf_size);
+    bool ok = false;
+    if (FILE* f = fopen(icon_path.string().c_str(), "rb")) {
+        ok = n == 0 || fread(PW(buf), 1, n, f) == n;
+        ok = (fclose(f) == 0) && ok;
+    }
+    if (!ok) {
+        fprintf(stderr, "[svc] sceSaveDataLoadIcon: could not read \"%s\"\n",
+                icon_path.string().c_str());
+        return SAVE_DATA_ERR_INTERNAL;
+    }
+    uint64_t data_size = file_size;
+    memcpy((uint8_t*)PW(a1) + 0x10, &data_size, sizeof data_size);
+    if (svclog())
+        fprintf(stderr, "[svc]   LoadIcon %llu/%llu bytes <- %s\n",
+                (unsigned long long)n, (unsigned long long)file_size,
+                icon_path.string().c_str());
+    return 0;
+}
+
 HLE(s_savedata_getparam) {
     svc_log("sceSaveDataGetParam", a0,a1,a2,a3,a4,a5);
     const uint32_t type = (uint32_t)a1;
@@ -1307,6 +1355,59 @@ HLE(s_savedata_dirname_search_ps4) {
 }
 
 
+// sceSaveDataDelete(const SceSaveDataDelete* del) (S1GkePI17zQ, libSceSaveData_native).
+// OrbisSaveDataDelete { u32 userId @0; u32 pad; const TitleId* titleId @8; const DirName*
+// dirName @16; u32 unused; u8 reserved[32]; s32 pad } — 64 bytes (shadPS4 savedata.cpp;
+// MED on the layout, HIGH on the single-struct-pointer shape). Unregistered, it answered
+// SCE_OK while deleting nothing (#2081: 37-title reach — "reports a deletion that did not
+// happen").
+//
+// prosper runs single-identity, so userId/titleId select nothing: the delete keys on dirName
+// under the current title namespace (save_paths, #2734). titleId is never dereferenced, so a
+// stale pointer cannot fault; dirName is range-gated before the bounded 32-byte name read.
+//   null del, unreadable del/dirName, empty or traversal dirName  -> PARAMETER
+//   dirName filling all 32 bytes with no terminator              -> PARAMETER (never truncated:
+//      a truncated name would delete a different save)
+//   dirName of the live mount                                     -> BUSY 0x809F0003 (the
+//      library's in-use code; PPSA03839 already const-compares this value from
+//      sceSaveDataTransferringMountPs4). MED.
+//   dir present                                                  -> removed, 0
+//   dir absent                                                   -> 0 (idempotent; shadPS4-compatible;
+//      the postcondition "absent" holds either way). MED.
+// The save's allocation record (.prosper-capacity/<dirName>, #3654) goes with it, so a later save
+// of the same name starts from its own request instead of adopting the deleted one's.
+// Follow-ups, not handled here: titleId is ignored (single-identity), so a delete naming another
+// title's save of the same dirName removes this title's; and the live-mount comparison is
+// case-sensitive, which differs from a case-insensitive host filesystem (Windows).
+HLE(s_savedata_delete) {
+    svc_log("sceSaveDataDelete", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !svc_ptrish(a0)) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* del = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(del + 0x10);
+    if (!dirname || !svc_ptrish((uint64_t)(uintptr_t)dirname)) return SAVE_DATA_ERR_PARAMETER;
+    char name[33]{};
+    size_t n = 0;
+    while (n < 32 && dirname[n]) { name[n] = dirname[n]; n++; }
+    if (n == 32) return SAVE_DATA_ERR_PARAMETER;   // no terminator within the 32-byte field
+    if (!savedata_dirname_ok(name)) return SAVE_DATA_ERR_PARAMETER;
+    const std::string mounted = savedata0_mounted_dir();
+    if (!mounted.empty() && std::filesystem::path(mounted).filename() == name)
+        return SAVE_DATA_ERR_BUSY;
+    const std::string target = savedata0_dir() + "/" + name;
+    std::error_code ec;
+    if (std::filesystem::is_directory(target, ec)) {
+        std::filesystem::remove_all(target, ec);
+        if (ec) {
+            fprintf(stderr, "[svc] sceSaveDataDelete: could not remove \"%s\": %s\n",
+                    target.c_str(), ec.message().c_str());
+            return SAVE_DATA_ERR_INTERNAL;
+        }
+    }
+    const auto record = std::filesystem::path(savedata0_dir()) / kSaveCapacityDirName / name;
+    std::filesystem::remove(record, ec);   // best effort: an absent record is the common case
+    return 0;
+}
+
 // Registration for this library, called by register_builtin_hle(). One entry point per
 // Sony library keeps every handler `static` to the translation unit implementing it (#3735).
 void register_savedata_hle() {
@@ -1347,7 +1448,11 @@ void register_savedata_hle() {
     // #2786: both were unregistered, so both answered SCE_OK while storing and reading nothing.
     Hle::register_fn("85zul--eGXs", (HleFn)s_savedata_setparam,  "sceSaveDataSetParam");
     Hle::register_fn("c88Yy54Mx0w", (HleFn)s_savedata_saveicon,  "sceSaveDataSaveIcon");
+    // #2081: unregistered, this answered SCE_OK over an unwritten icon buffer.
+    Hle::register_fn("cGjO3wM3V28", (HleFn)s_savedata_loadicon,  "sceSaveDataLoadIcon");
     Hle::register_fn("XgvSuIdnMlw", (HleFn)s_savedata_getparam,  "sceSaveDataGetParam");
+    // #2081: unregistered, this answered SCE_OK while deleting nothing (37-title reach).
+    Hle::register_fn("S1GkePI17zQ", (HleFn)s_savedata_delete,   "sceSaveDataDelete");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space
     Hle::register_fn("j8xKtiFj0SY", (HleFn)s_savedata_get_event, "sceSaveDataGetEventResult");

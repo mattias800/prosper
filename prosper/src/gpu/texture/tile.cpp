@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <unordered_map>
 #include <functional>
@@ -1572,6 +1573,37 @@ size_t tiled_msaa_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_m
     const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
     if (blocks_x && blocks_y > SIZE_MAX / blocks_x / 65536u) return 0;
     return static_cast<size_t>(blocks_x * blocks_y * 65536u);
+}
+
+size_t thin_surface_bytes_upper_bound(uint32_t width, uint32_t height, uint32_t tile_mode,
+                                      uint32_t bytes_per_texel, uint32_t sample_count) {
+    uint32_t block_log2 = 0;
+    if (tile_mode >= 1u && tile_mode <= 3u)
+        block_log2 = 8u;
+    else if ((tile_mode >= 4u && tile_mode <= 7u) || (tile_mode >= 20u && tile_mode <= 23u))
+        block_log2 = 12u;
+    else if ((tile_mode >= 8u && tile_mode <= 11u) || (tile_mode >= 16u && tile_mode <= 19u) ||
+             (tile_mode >= 24u && tile_mode <= 27u))
+        block_log2 = 16u;
+    else
+        return 0;
+    if (!width || !height || !std::has_single_bit(bytes_per_texel) ||
+        !std::has_single_bit(sample_count))
+        return 0;
+    const auto element_log2 =
+        static_cast<uint32_t>(std::countr_zero(bytes_per_texel) + std::countr_zero(sample_count));
+    if (element_log2 > block_log2) return 0;
+    const uint32_t element_bits = block_log2 - element_log2;
+    uint64_t worst_blocks = 0;
+    for (uint32_t width_bits = 0; width_bits <= element_bits; ++width_bits) {
+        const uint32_t height_bits = element_bits - width_bits;
+        if (width_bits > height_bits + 4u || height_bits > width_bits + 4u) continue;
+        const uint64_t blocks_x = ((static_cast<uint64_t>(width) - 1u) >> width_bits) + 1u;
+        const uint64_t blocks_y = ((static_cast<uint64_t>(height) - 1u) >> height_bits) + 1u;
+        worst_blocks = std::max(worst_blocks, blocks_x * blocks_y);
+    }
+    if (worst_blocks > (SIZE_MAX >> block_log2)) return 0;
+    return static_cast<size_t>(worst_blocks << block_log2);
 }
 
 namespace {

@@ -139,6 +139,132 @@ HLE(s_npweb_create_user_context) {
     svc_log("sceNpWebApi2CreateUserContext", a0,a1,a2,a3,a4,a5);
     return (uint64_t)(uint32_t)g_npweb_user_context_id.fetch_add(1);
 }
+// --- libSceNpWebApi2 request + push-event surface (22 of the library's 39 exports) -------------
+// The PSN web API has no service behind it on this signed-out console, so handles are created
+// locally but every call that would reach PSN answers SCE_NP_ERROR_SIGNED_OUT -- the same answer
+// NpManager and the NP sub-libraries give (#4417), so no library tells the guest a different
+// story. Arity and out-param placement are confirmed from guest call sites (The Messenger,
+// Alex Kidd: CreateRequest writes its id through a5; Worms PPSA20052: the push-event
+// constructors RETURN their ids and a negative return is the failure). CONFIDENCE: HIGH on that
+// lifecycle shape. The INVALID_ARGUMENT value 0x80553402 is not in the 3.20 stub dump (it holds
+// no error constants); it comes from a secondary implementation, CONFIDENCE: MED.
+//   Create*/PushEventCreate*/RegisterCallback*  -> local id (positive, never 0)
+//   Abort/Delete/Terminate/Unregister           -> 0 (nothing to tear down offline)
+//   Send/ReadData/HeaderValue/HeaderLength      -> SIGNED_OUT, out-params untouched
+//   CheckTimeout (void)                         -> 0 (no timeouts pending offline)
+//   CreatePushContext / StartPushContextCallback -> SIGNED_OUT (no push service to host or
+//                                                   start), out-params untouched
+namespace {
+constexpr uint64_t kWebApiErrInvalidArgument = 0x80553402ull;
+std::atomic<int64_t> g_npweb_request_id{1};
+std::atomic<int32_t> g_npweb_push_id{1};
+// Positive ids only: a negative return is the guest's failure test, so a wrapped counter would
+// read as an error. Same guard as s_np_ctx.
+uint64_t next_npweb_push_id() {
+    int32_t id = g_npweb_push_id.fetch_add(1);
+    if (id <= 0) {
+        g_npweb_push_id.store(2);
+        id = 1;
+    }
+    return (uint64_t)(uint32_t)id;
+}
+}  // namespace
+HLE(s_npweb_create_request) {
+    svc_log("sceNpWebApi2CreateRequest", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a5)) return kWebApiErrInvalidArgument;
+    *(int64_t*)PW(a5) = g_npweb_request_id.fetch_add(1);
+    return 0;
+}
+HLE(s_npweb_abort_request) {
+    svc_log("sceNpWebApi2AbortRequest", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_add_header) {
+    svc_log("sceNpWebApi2AddHttpRequestHeader", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_delete_request) {
+    svc_log("sceNpWebApi2DeleteRequest", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_delete_user_context) {
+    svc_log("sceNpWebApi2DeleteUserContext", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_send_request) {
+    svc_log("sceNpWebApi2SendRequest", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_read_data) {
+    svc_log("sceNpWebApi2ReadData", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_get_header_value) {
+    svc_log("sceNpWebApi2GetHttpResponseHeaderValue", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_get_header_length) {
+    svc_log("sceNpWebApi2GetHttpResponseHeaderValueLength", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_check_timeout) {
+    svc_log("sceNpWebApi2CheckTimeout", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_terminate) {
+    svc_log("sceNpWebApi2Terminate", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_create_filter) {
+    svc_log("sceNpWebApi2PushEventCreateFilter", a0,a1,a2,a3,a4,a5);
+    return next_npweb_push_id();
+}
+HLE(s_npweb_push_create_handle) {
+    svc_log("sceNpWebApi2PushEventCreateHandle", a0,a1,a2,a3,a4,a5);
+    return next_npweb_push_id();
+}
+HLE(s_npweb_push_create_pushctx) {
+    svc_log("sceNpWebApi2PushEventCreatePushContext", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_push_delete_filter) {
+    svc_log("sceNpWebApi2PushEventDeleteFilter", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_delete_handle) {
+    svc_log("sceNpWebApi2PushEventDeleteHandle", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_delete_pushctx) {
+    svc_log("sceNpWebApi2PushEventDeletePushContext", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_register_callback) {
+    svc_log("sceNpWebApi2PushEventRegisterCallback", a0,a1,a2,a3,a4,a5);
+    // Stored handle, never called: no push service exists offline. A null callback is refused
+    // (secondary implementation; CONFIDENCE: MED on the code).
+    if (!svc_ptrish(a2)) return kWebApiErrInvalidArgument;
+    return next_npweb_push_id();
+}
+HLE(s_npweb_push_register_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventRegisterPushContextCallback", a0,a1,a2,a3,a4,a5);
+    // (userCtx, filterId, cb, arg) at the Worms call site; null cb refused as above.
+    if (!svc_ptrish(a2)) return kWebApiErrInvalidArgument;
+    return next_npweb_push_id();
+}
+HLE(s_npweb_push_start_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventStartPushContextCallback", a0,a1,a2,a3,a4,a5);
+    // Start is the call that would begin service delivery; there is no context to start.
+    return NP_ERR_SIGNED_OUT;
+}
+HLE(s_npweb_push_unregister_callback) {
+    svc_log("sceNpWebApi2PushEventUnregisterCallback", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_unregister_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventUnregisterPushContextCallback", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
 HLE(s_netctl_getresult) {
     svc_log("sceNetCtlGetResult", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a1)) return 0x80412103ull; // SCE_NET_CTL_ERROR_INVALID_ADDR
@@ -432,6 +558,199 @@ HLE(s_npuds_destroy_property_object) {
 HLE(s_npuds_destroy_property_array) {
     svc_log("sceNpUniversalDataSystemDestroyEventPropertyArray", a0,a1,a2,a3,a4,a5);
     return uds_destroy(a0, UdsKind::Array);
+}
+// --- libSceNpUniversalDataSystem scalar setters, handle/context lifecycle, stats ------------
+// The remaining 25 exports. Shapes (arity, out-param placement, null validation) from the
+// firmware stub interface as re-derived in a secondary implementation; the validation itself
+// reuses this file's uds_is/uds_create/uds_destroy model, so a handle accepted here is one
+// the Create calls above actually handed out. CONFIDENCE: MED on arities (single secondary
+// source), HIGH on the validation discipline (in-tree, live-tested by Silksong/Metaphor).
+//
+// Scalar setters: arrays take (array, value), objects take (object, key, value). Integer/bool
+// values arrive in the next integer register (a1 for arrays, a2 for objects); Float32/Float64
+// values arrive in xmm0 and appear in none of a0-a5 (module: ArraySetFloat32 spills xmm0 at
+// +0x4fab). Only the container and key are validated, so no value register is read here.
+// Binary takes (container, [key,] data*, size) like the SetString sibling.
+HLE(s_npuds_array_set_int32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetInt32", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_uint32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetUInt32", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_int64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetInt64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_uint64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetUInt64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_float32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetFloat32", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_float64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetFloat64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_bool) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetBool", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_binary) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetBinary", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_array_set_object) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetObject", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    if (a1 && !uds_is(a1, UdsKind::Object)) return kUdsInvalidArgument;
+    // The module copies the value (or an empty one when it is null) into the container and
+    // writes the INSERTED element to *out, never the caller's own value (module +0x5110 /
+    // +0x51c7, ObjectSetObject +0x5e70). So the caller may destroy its value afterwards and
+    // still use *out, as Unity does. prosper hands out a fresh free-standing handle: the
+    // console's element belongs to its container, which this model does not track (a
+    // never-destroyed one leaks one block). CONFIDENCE: MED.
+    if (a2) return uds_create(a2, UdsKind::Object);
+    return 0;
+}
+HLE(s_npuds_array_set_array) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetArray", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Array)) return kUdsInvalidArgument;
+    if (a1 && !uds_is(a1, UdsKind::Array)) return kUdsInvalidArgument;
+    if (a2) return uds_create(a2, UdsKind::Array);   // the inserted element, as ArraySetObject
+    return 0;
+}
+HLE(s_npuds_object_set_binary) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetBinary", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1) || !svc_ptrish(a2))
+        return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_bool) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetBool", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_float32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetFloat32", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_float64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetFloat64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_int64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetInt64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_object) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetObject", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    if (a2 && !uds_is(a2, UdsKind::Object)) return kUdsInvalidArgument;
+    if (a3) return uds_create(a3, UdsKind::Object);   // the inserted element, as ArraySetObject
+    return 0;
+}
+HLE(s_npuds_object_set_uint32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetUInt32", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_uint64) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetUInt64", a0, a1, a2, a3, a4, a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+// Handle/context teardown: CreateHandle/CreateContext hand out id 1 with no table behind
+// them (s_npuds_create), so Abort/Destroy validate against the only id in circulation,
+// exactly like DestroyHandle does. A garbage handle reads as success if left unregistered.
+HLE(s_npuds_abort_handle) {
+    svc_log("sceNpUniversalDataSystemAbortHandle", a0, a1, a2, a3, a4, a5);
+    return (uint32_t)a0 == 1 ? 0 : kUdsInvalidArgument;
+}
+HLE(s_npuds_destroy_context) {
+    svc_log("sceNpUniversalDataSystemDestroyContext", a0, a1, a2, a3, a4, a5);
+    return (uint32_t)a0 == 1 ? 0 : kUdsInvalidArgument;
+}
+HLE(s_npuds_terminate) {
+    svc_log("sceNpUniversalDataSystemTerminate", a0, a1, a2, a3, a4, a5);
+    // The module answers 0x80553117 when not initialised and clears its init flag, so a second
+    // Terminate fails there. prosper tracks no init state, so Terminate always succeeds.
+    return 0;
+}
+// Event sizing/strings/stats. EstimateSize answers 3 and ToString writes "{}" (size 3 includes
+// the NUL). CONFIDENCE: LOW on that answer: the module delegates serialisation to
+// libSceNpCommon and a real event carries at least its CreateEvent name, so a console never
+// produces "{}"; Unity only logs the string. Stats structs are zeroed: nothing is stored or
+// transmitted offline. Struct sizes CONFIDENCE: HIGH from the module: GetMemoryStat writes 24
+// bytes (+0x4b09..0x4b17, and the Unity caller's 24-byte buffer sits below its stack canary);
+// GetStorageStat forwards an output length of 0x38 = 56 (+0x99ae). Events themselves are
+// counter ids, not pointers, so only null is refused.
+HLE(s_npuds_event_estimate_size) {
+    svc_log("sceNpUniversalDataSystemEventEstimateSize", a0, a1, a2, a3, a4, a5);
+    if (!a0 || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    *(uint64_t*)PW(a1) = 3;
+    return 0;
+}
+HLE(s_npuds_event_to_string) {
+    svc_log("sceNpUniversalDataSystemEventToString", a0, a1, a2, a3, a4, a5);
+    if (!a0) return kUdsInvalidArgument;
+    if (!a1 && !a3) return kUdsInvalidArgument;   // module +0x599d: nowhere to answer
+    if (a3 && (!svc_ptrish(a3))) return kUdsInvalidArgument;
+    if (a3) *(uint64_t*)PW(a3) = 3;
+    if (a1 && a2) {
+        if (!svc_ptrish(a1)) return kUdsInvalidArgument;
+        snprintf((char*)PW(a1), (size_t)a2, "{}");
+    }
+    return 0;
+}
+HLE(s_npuds_get_memory_stat) {
+    svc_log("sceNpUniversalDataSystemGetMemoryStat", a0, a1, a2, a3, a4, a5);
+    if (!svc_ptrish(a0)) return kUdsInvalidArgument;
+    memset(PW(a0), 0, 24);
+    return 0;
+}
+HLE(s_npuds_get_storage_stat) {
+    svc_log("sceNpUniversalDataSystemGetStorageStat", a0, a1, a2, a3, a4, a5);
+    // The module refuses -1 and unregistered contexts (+0x6542, +0x6588); as DestroyContext,
+    // the only context in circulation is id 1. Nothing is stored, so it reports zeros.
+    if ((uint32_t)a0 != 1 || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    memset(PW(a1), 0, 56);
+HLE(s_npuds_destroy_handle) {
+    svc_log("sceNpUniversalDataSystemDestroyHandle", a0,a1,a2,a3,a4,a5);
+    // CreateHandle hands out id 1 with no table behind it (s_npuds_create), so DestroyHandle
+    // validates against the only id in circulation: 1 succeeds, anything else is a handle no
+    // create ever produced. Unregistered, the dispatcher answered 0 for both — and Uncharted
+    // forwards this result (#3630 bucket D), so a garbage handle read as success here.
+    // NID AUIHb7jUX3I resolved via nid_hash against the firmware stub export list.
+    // CONFIDENCE: LOW -- rests on s_npuds_create's guessed handle layout (id 1 written through
+    // the first argument); if CreateHandle's real shape differs, so does the id to accept.
+    return (uint32_t)a0 == 1 ? 0 : kUdsInvalidArgument;
+}
+HLE(s_npuds_object_set_int32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetInt32", a0,a1,a2,a3,a4,a5);
+    // (Object*, key*, int32): the same validation as the SetArray sibling — a live object
+    // (event-owned objects included) and a pointer-like key. The value travels by register.
+    // NID YE4dbtbz6OE resolved via nid_hash against the firmware stub export list; Dreaming
+    // Sarah imports it, and so does Dead Cells' eboot (a snapshot-guarded title: a refusal here
+    // reaches it). CONFIDENCE: LOW on the object model it validates against. Note the older
+    // ObjectSetString sibling below still accepts any object; the two should converge on the
+    // uds_is model once a live trace confirms what Dead Cells passes.
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
 }
 
 // sceNpSessionSignalingInitialize(const InitParam*): Silksong passes an input-only parameter block
@@ -734,10 +1053,49 @@ void register_np_hle() {
     Hle::register_fn("+o9816YQhqQ", (HleFn)s_npweb_init, "sceNpWebApi2Initialize");
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
+    // libSceNpWebApi2 request + push-event surface: handles are created, every network
+    // call that would reach PSN answers SIGNED_OUT instead of blocking (see the handlers above).
+    Hle::register_fn("3EI-OSJ65Xc", (HleFn)s_npweb_create_request, "sceNpWebApi2CreateRequest");
+    Hle::register_fn("zpiPsH7dbFQ", (HleFn)s_npweb_abort_request, "sceNpWebApi2AbortRequest");
+    Hle::register_fn("egOOvrnF6mI", (HleFn)s_npweb_add_header, "sceNpWebApi2AddHttpRequestHeader");
+    Hle::register_fn("vvzWO-DvG1s", (HleFn)s_npweb_delete_request, "sceNpWebApi2DeleteRequest");
+    Hle::register_fn("9X9+cneTGUU", (HleFn)s_npweb_delete_user_context,
+                     "sceNpWebApi2DeleteUserContext");
+    Hle::register_fn("lQOCF84lvzw", (HleFn)s_npweb_send_request, "sceNpWebApi2SendRequest");
+    Hle::register_fn("OOY9+ObfKec", (HleFn)s_npweb_read_data, "sceNpWebApi2ReadData");
+    Hle::register_fn("hksbskNToEA", (HleFn)s_npweb_get_header_value,
+                     "sceNpWebApi2GetHttpResponseHeaderValue");
+    Hle::register_fn("HwP3aM+c85c", (HleFn)s_npweb_get_header_length,
+                     "sceNpWebApi2GetHttpResponseHeaderValueLength");
+    Hle::register_fn("3Tt9zL3tkoc", (HleFn)s_npweb_check_timeout, "sceNpWebApi2CheckTimeout");
+    Hle::register_fn("bEvXpcEk200", (HleFn)s_npweb_terminate, "sceNpWebApi2Terminate");
+    Hle::register_fn("MsaFhR+lPE4", (HleFn)s_npweb_push_create_filter,
+                     "sceNpWebApi2PushEventCreateFilter");
+    Hle::register_fn("WV1GwM32NgY", (HleFn)s_npweb_push_create_handle,
+                     "sceNpWebApi2PushEventCreateHandle");
+    Hle::register_fn("NNVf18SlbT8", (HleFn)s_npweb_push_create_pushctx,
+                     "sceNpWebApi2PushEventCreatePushContext");
+    Hle::register_fn("KJdPcOGmK58", (HleFn)s_npweb_push_delete_filter,
+                     "sceNpWebApi2PushEventDeleteFilter");
+    Hle::register_fn("fIATVMo4Y1w", (HleFn)s_npweb_push_delete_handle,
+                     "sceNpWebApi2PushEventDeleteHandle");
+    Hle::register_fn("QafxeZM3WK4", (HleFn)s_npweb_push_delete_pushctx,
+                     "sceNpWebApi2PushEventDeletePushContext");
+    Hle::register_fn("fY3QqeNkF8k", (HleFn)s_npweb_push_register_callback,
+                     "sceNpWebApi2PushEventRegisterCallback");
+    Hle::register_fn("lxtHJMwBsaU", (HleFn)s_npweb_push_register_pushctx_callback,
+                     "sceNpWebApi2PushEventRegisterPushContextCallback");
+    Hle::register_fn("AAj9X+4aGYA", (HleFn)s_npweb_push_start_pushctx_callback,
+                     "sceNpWebApi2PushEventStartPushContextCallback");
+    Hle::register_fn("hOnIlcGrO6g", (HleFn)s_npweb_push_unregister_callback,
+                     "sceNpWebApi2PushEventUnregisterCallback");
+    Hle::register_fn("PmyrbbJSFz0", (HleFn)s_npweb_push_unregister_pushctx_callback,
+                     "sceNpWebApi2PushEventUnregisterPushContextCallback");
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
-    // ALL FIVE of the library's info queries must answer here, not just the two that a title
-    // happened to crash on. Each writes its result through a caller-supplied out-struct, so any one
-    // of them left unregistered returns the dispatcher's 0 — SCE_OK — over memory nothing wrote,
+    // ALL of the library's info queries, and the four icon getters below, must answer here --
+    // not just the two that a title happened to crash on. Each writes its result through a
+    // caller-supplied out-struct, so any one of them left unregistered returns the dispatcher's
+    // 0 — SCE_OK — over memory nothing wrote,
     // which is the failure #213 diagnosed (a heap-garbage trophy count sized a 34 GB array). The
     // singular/plural pairs are the trap: registering `…TrophyInfoArray` and not `…TrophyInfo`
     // leaves the identical shape live behind a name that looks covered. #1956, swept under #2081.
@@ -745,7 +1103,14 @@ void register_np_hle() {
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
     Hle::register_fn("EwNylPdWUTM", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfo");
     Hle::register_fn("DoZWauG8mu0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfo");
-    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfoArray");
+    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable,
+                     "sceNpTrophy2GetGroupInfoArray");
+    // The icon getters fill caller-supplied out-structs with PNG bytes — the same #213 shape as
+    // the info queries above, one name-variant away. NIDs via nid_hash over the canonical names.
+    Hle::register_fn("2QgUy+xJqS0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameIcon");
+    Hle::register_fn("6IjXJUy6ZnA", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupIcon");
+    Hle::register_fn("-9LLVU0uvs8", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyIcon");
+    R("sceNpTrophy2GetRewardIcon", s_nptrophy2_unavailable);   // BsE-m8JxIOg, the fourth getter
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
     // libSceNpManager stub table AND shadPS4's PS4 registrations (identical).
     R("sceNpGetState", s_np_state);
@@ -998,6 +1363,59 @@ void register_np_hle() {
     Hle::register_fn("W-0xwY0ZMjw", (HleFn)s_npuds_destroy_property_array, "sceNpUniversalDataSystemDestroyEventPropertyArray");
     Hle::register_fn("Hm7qubT3b70", (HleFn)s_npuds_create_property_array, "sceNpUniversalDataSystemCreateEventPropertyArray");
     Hle::register_fn("s6W4Zl4Slgk", (HleFn)s_npuds_create_property_object, "sceNpUniversalDataSystemCreateEventPropertyObject");
+    // Scalar setters, lifecycle, stats: same validation model as above. NIDs via nid_hash over
+    // the firmware stub export names (spot-verified against three registered siblings).
+    Hle::register_fn("BypQuF113-k", (HleFn)s_npuds_array_set_int32,
+                     "sceNpUniversalDataSystemEventPropertyArraySetInt32");
+    Hle::register_fn("yMi0xAOpmXM", (HleFn)s_npuds_array_set_uint32,
+                     "sceNpUniversalDataSystemEventPropertyArraySetUInt32");
+    Hle::register_fn("viVXAwmmYrY", (HleFn)s_npuds_array_set_int64,
+                     "sceNpUniversalDataSystemEventPropertyArraySetInt64");
+    Hle::register_fn("Qo9qR7v5zO4", (HleFn)s_npuds_array_set_uint64,
+                     "sceNpUniversalDataSystemEventPropertyArraySetUInt64");
+    Hle::register_fn("JmgwKm96Lq4", (HleFn)s_npuds_array_set_float32,
+                     "sceNpUniversalDataSystemEventPropertyArraySetFloat32");
+    Hle::register_fn("sbSYZLR5AiE", (HleFn)s_npuds_array_set_float64,
+                     "sceNpUniversalDataSystemEventPropertyArraySetFloat64");
+    Hle::register_fn("0+l4QSWCM4E", (HleFn)s_npuds_array_set_bool,
+                     "sceNpUniversalDataSystemEventPropertyArraySetBool");
+    Hle::register_fn("IEdUCV9j2Cw", (HleFn)s_npuds_array_set_binary,
+                     "sceNpUniversalDataSystemEventPropertyArraySetBinary");
+    Hle::register_fn("XY14n3jNIpE", (HleFn)s_npuds_array_set_object,
+                     "sceNpUniversalDataSystemEventPropertyArraySetObject");
+    Hle::register_fn("rdi9BAfDLq8", (HleFn)s_npuds_array_set_array,
+                     "sceNpUniversalDataSystemEventPropertyArraySetArray");
+    Hle::register_fn("wAcxBDLHj1M", (HleFn)s_npuds_object_set_binary,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetBinary");
+    Hle::register_fn("Fidd8vWgyVE", (HleFn)s_npuds_object_set_bool,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetBool");
+    Hle::register_fn("lbPlT4+QVcE", (HleFn)s_npuds_object_set_float32,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetFloat32");
+    Hle::register_fn("4Fu8tHW+u-k", (HleFn)s_npuds_object_set_float64,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetFloat64");
+    Hle::register_fn("56QLTqx911s", (HleFn)s_npuds_object_set_int64,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
+    Hle::register_fn("74ASEqxSnkM", (HleFn)s_npuds_object_set_object,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetObject");
+    Hle::register_fn("AzD4irAcKE4", (HleFn)s_npuds_object_set_uint32,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetUInt32");
+    Hle::register_fn("xvsP5Yz6FmY", (HleFn)s_npuds_object_set_uint64,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetUInt64");
+    Hle::register_fn("jZCqWFgMehE", (HleFn)s_npuds_abort_handle,
+                     "sceNpUniversalDataSystemAbortHandle");
+    Hle::register_fn("wB7IWzGp2v0", (HleFn)s_npuds_destroy_context,
+                     "sceNpUniversalDataSystemDestroyContext");
+    Hle::register_fn("47UAEuQl+iI", (HleFn)s_npuds_terminate, "sceNpUniversalDataSystemTerminate");
+    Hle::register_fn("+s14jq-KGYw", (HleFn)s_npuds_event_estimate_size,
+                     "sceNpUniversalDataSystemEventEstimateSize");
+    Hle::register_fn("vj6CQGWtEBg", (HleFn)s_npuds_event_to_string,
+                     "sceNpUniversalDataSystemEventToString");
+    Hle::register_fn("su7jW3VDDb4", (HleFn)s_npuds_get_memory_stat,
+                     "sceNpUniversalDataSystemGetMemoryStat");
+    Hle::register_fn("KmN62tT4U8A", (HleFn)s_npuds_get_storage_stat,
+                     "sceNpUniversalDataSystemGetStorageStat");
+    Hle::register_fn("AUIHb7jUX3I", (HleFn)s_npuds_destroy_handle, "sceNpUniversalDataSystemDestroyHandle");
+    Hle::register_fn("YE4dbtbz6OE", (HleFn)s_npuds_object_set_int32, "sceNpUniversalDataSystemEventPropertyObjectSetInt32");
 #ifndef _WIN32
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
     // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.

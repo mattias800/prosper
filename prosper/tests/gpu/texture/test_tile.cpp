@@ -4,6 +4,7 @@
 #include "gpu/texture/tile.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -1345,4 +1346,47 @@ TEST(Tile, Contract) {
     }
 
     EXPECT_EQ(fails, 0);
+}
+
+// #4457: the thin-surface bound is never below an exact size helper's answer for any mode, element
+// size or sample count those helpers cover -- an independently written size path, so a bound that
+// under-counts a block row or column fails here -- and stays close to it on a real 4K MSAA target.
+TEST(Tile, ThinSurfaceUpperBoundCoversExactSizes) {
+    constexpr std::array<uint32_t, 10> kDims{1, 7, 63, 64, 65, 100, 1080, 1920, 2160, 3840};
+    // Every dimension pair for one (mode, element size, sample count) against an exact helper.
+    const auto covers = [&](uint32_t mode, uint32_t bpe, uint32_t samples, auto exact_size) {
+        for (const uint32_t w : kDims)
+            for (const uint32_t h : kDims)
+                EXPECT_GE(thin_surface_bytes_upper_bound(w, h, mode, bpe, samples),
+                          exact_size(w, h))
+                    << "mode " << mode << " bpe " << bpe << " samples " << samples << " " << w
+                    << "x" << h;
+    };
+    constexpr std::array<TileMode, 5> kModes{TileMode::Sw256BS, TileMode::Sw4KbS, TileMode::Sw64KbS,
+                                             TileMode::Sw64KbZX, TileMode::Sw64KbRX};
+    for (const TileMode tile : kModes) {
+        const auto mode = static_cast<uint32_t>(tile);
+        for (const uint32_t bpe : {1u, 2u, 4u, 8u, 16u})
+            covers(mode, bpe, 1u,
+                   [&](uint32_t w, uint32_t h) { return tiled_surface_bytes(w, h, mode, 0, bpe); });
+    }
+    const auto zx = static_cast<uint32_t>(TileMode::Sw64KbZX);
+    for (const uint32_t bpe : {1u, 2u, 4u, 8u})
+        covers(zx, bpe, 4u,
+               [&](uint32_t w, uint32_t h) { return tiled_msaa_surface_bytes(w, h, zx, bpe, 4); });
+    // Summer Sports' target: 3840x2160, 4 samples, 4-byte texels, SW_64KB_R_X. 64x64-element
+    // blocks give 60 x 34 = 2,040 of them; the bound may add edge blocks but not a second surface.
+    const size_t blocks_64x64 = size_t{60} * 34u * 65536u;
+    const size_t bound =
+        thin_surface_bytes_upper_bound(3840, 2160, (uint32_t)TileMode::Sw64KbRX, 4, 4);
+    EXPECT_GE(bound, blocks_64x64);
+    EXPECT_LE(bound, blocks_64x64 + blocks_64x64 / 10u);
+    // No bound: linear, VAR and reserved modes, non-power-of-two elements, an element larger
+    // than its block.
+    for (const uint32_t mode : {0u, 12u, 15u, 28u, 31u})
+        EXPECT_EQ(thin_surface_bytes_upper_bound(64, 64, mode, 4, 1), 0u) << mode;
+    EXPECT_EQ(thin_surface_bytes_upper_bound(64, 64, (uint32_t)TileMode::Sw64KbRX, 12, 1), 0u);
+    EXPECT_EQ(thin_surface_bytes_upper_bound(64, 64, (uint32_t)TileMode::Sw64KbRX, 4, 3), 0u);
+    EXPECT_EQ(thin_surface_bytes_upper_bound(64, 64, (uint32_t)TileMode::Sw256BS, 16, 32), 0u);
+    EXPECT_EQ(thin_surface_bytes_upper_bound(0, 64, (uint32_t)TileMode::Sw64KbRX, 4, 1), 0u);
 }
