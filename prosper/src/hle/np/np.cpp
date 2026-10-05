@@ -745,7 +745,13 @@ void register_np_hle() {
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
     Hle::register_fn("EwNylPdWUTM", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfo");
     Hle::register_fn("DoZWauG8mu0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfo");
-    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupInfoArray");
+    Hle::register_fn("+PDSI6WgPRc", (HleFn)s_nptrophy2_unavailable,
+                     "sceNpTrophy2GetGroupInfoArray");
+    // The icon getters fill caller-supplied out-structs with PNG bytes — the same #213 shape as
+    // the info queries above, one name-variant away. NIDs via nid_hash over the canonical names.
+    Hle::register_fn("2QgUy+xJqS0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameIcon");
+    Hle::register_fn("6IjXJUy6ZnA", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupIcon");
+    Hle::register_fn("-9LLVU0uvs8", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyIcon");
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
     // libSceNpManager stub table AND shadPS4's PS4 registrations (identical).
     R("sceNpGetState", s_np_state);
