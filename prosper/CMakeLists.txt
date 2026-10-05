@@ -1579,7 +1579,6 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
-
   # sceSaveDataLoadIcon (#2081): unregistered, it answered SCE_OK over an unwritten icon
   # buffer. Round-trips through the real SaveIcon/LoadIcon NIDs, with refusal arms.
   prosper_add_gtest(test_savedata_icon
@@ -2138,24 +2137,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_mouse.cpp
     LIBRARIES prosper_core)
 
-
   # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
   # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
   prosper_add_gtest(test_login_dialog
     SOURCES tests/hle/service/test_login_dialog.cpp
     LIBRARIES prosper_core)
-
 
   # Remaining SystemService/UserService getters: flags round-trip, tick acknowledged,
   # privacy reads a deterministic default.
   prosper_add_gtest(test_syssvc_usersvc
     SOURCES tests/hle/service/test_syssvc_usersvc.cpp
-    LIBRARIES prosper_core)
-
-  # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
-  # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
-  prosper_add_gtest(test_login_dialog
-    SOURCES tests/hle/service/test_login_dialog.cpp
     LIBRARIES prosper_core)
 
   # Includes a shared fixture, which resolves from the `tests` root.
