@@ -1177,15 +1177,10 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_create(uint64_t a0, uint64_t a1, uint64_t
 
 // sceUltUlthreadJoin(ulthread, int32_t* status). The status out-param is 4 bytes: the call site at
 // eboot+0x9f1e passes `lea rsi,[rbp-0xc]`, a 4-byte local below the stack canary at [rbp-0x8].
-// Shared join completion: double-join refusal, status write-back, slot release, unpublish.
-// Runs after the waiter is known to be done (Join waited; TryJoin observed `finished`).
+// Shared join completion: status write-back, slot release, unpublish. Runs after the caller has
+// claimed the join (claim_ulthread_join) and the host thread is reaped.
 uint64_t complete_ulthread_join(UltObject* o, uint64_t guest_addr, uint64_t status_out,
                                 const char* fn) {
-    if (o->joined.exchange(true, std::memory_order_acq_rel)) {
-        log_line("%s: ulthread \"%s\" (0x%llx) was already joined", fn, o->name.c_str(),
-                 (unsigned long long)guest_addr);
-        return kUltErrInval;
-    }
     // The ulthread entry is int32_t(*)(uint64_t); its return travels in eax.
     const uint32_t status = o->exit_status.load(std::memory_order_relaxed);
     if (status_out) {
@@ -1214,12 +1209,23 @@ uint64_t complete_ulthread_join(UltObject* o, uint64_t guest_addr, uint64_t stat
     return kUltOk;
 }
 
+// Claim the join BEFORE any pthread_join: a second Join or TryJoin is refused at once rather than
+// joining the same host thread twice (undefined under POSIX). The shipped libSceUlt likewise claims
+// "joined" (a state CAS) before it waits.
+bool claim_ulthread_join(UltObject* o, uint64_t guest_addr, const char* fn) {
+    if (!o->joined.exchange(true, std::memory_order_acq_rel)) return true;
+    log_line("%s: ulthread \"%s\" (0x%llx) was already joined", fn, o->name.c_str(),
+             (unsigned long long)guest_addr);
+    return false;
+}
+
 PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
                                             uint64_t) {
     uint64_t out = 0;
     if (!implement(kIdxUlthreadJoin, &out)) return out;
     UltObject* o = resolve(a0, UltType::Ulthread, "sceUltUlthreadJoin");
     if (!o) return kUltErrSrch;
+    if (!claim_ulthread_join(o, a0, "sceUltUlthreadJoin")) return kUltErrInval;
 
     // Watchdog: the guest frees the context buffer right after join returns, so a join that never
     // returns is both a hang AND the reason a later use-after-free would look inexplicable.
@@ -1262,6 +1268,7 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_tryjoin(uint64_t a0, uint64_t a1, uint64_
     UltObject* o = resolve(a0, UltType::Ulthread, "sceUltUlthreadTryJoin");
     if (!o) return kUltErrSrch;
     if (!o->finished.load(std::memory_order_acquire)) return kUltErrAgain;
+    if (!claim_ulthread_join(o, a0, "sceUltUlthreadTryJoin")) return kUltErrInval;
     // Finished but the host thread is not yet reaped: reap it before completing, or the
     // completion below would report a join the pthread layer never performed.
     pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
@@ -1446,7 +1453,16 @@ PROSPER_SYSV_ABI uint64_t ult_cond_signal_all(uint64_t a0, uint64_t, uint64_t, u
     if (!implement(kIdxCondSignalAll, &out)) return out;
     UltObject* o = resolve(a0, UltType::Cond, "sceUltConditionVariableSignalAll");
     if (!o) return kUltErrSrch;
-    o->wake_seq.store(o->wait_seq.load(std::memory_order_acquire), std::memory_order_release);
+    // Advance wake_seq to the issued count, never backwards: a plain store could undo a concurrent
+    // Signal's increment and strand a waiter that took its ticket in between.
+    uint64_t woken = o->wake_seq.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t issued = o->wait_seq.load(std::memory_order_acquire);
+        if (woken >= issued) return kUltOk;             // no waiter to release
+        if (o->wake_seq.compare_exchange_weak(woken, issued, std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+            break;
+    }
     pthread_cond_broadcast(&o->cond);
     return kUltOk;
 }

@@ -1,5 +1,5 @@
-// test_fiber_ult_misc — the Fiber/Ult remainder: context-size checks, thread frame-pointer
-// address, mutex try-lock, condvar signal-all, ulthread try-join and yield.
+// test_fiber_ult_misc — the Fiber/Ult remainder: context-size checks, mutex try-lock, condvar
+// signal-all, ulthread try-join and yield, and the join claim order they share with Join.
 //
 // Each export below was unregistered, so the dispatcher answered `0`: a try-lock that never
 // tried, a signal-all that woke nobody, a try-join that never joined. Every TEST drives the
@@ -53,13 +53,15 @@ TEST(FiberUltMisc, AllNidsBound) {
     register_builtin_hle();
     static const char* table[] = {
         "sceFiberStartContextSizeCheck", "sceFiberStopContextSizeCheck",
-        "_sceFiberGetThreadFramePointerAddress", "sceUltMutexTryLock",
-        "sceUltConditionVariableSignalAll", "sceUltUlthreadTryJoin", "sceUltUlthreadYield",
+        "sceUltMutexTryLock", "sceUltConditionVariableSignalAll", "sceUltUlthreadTryJoin",
+        "sceUltUlthreadYield",
     };
-    static_assert(sizeof(table) / sizeof(table[0]) == 7, "the 7 remainder exports");
+    static_assert(sizeof(table) / sizeof(table[0]) == 6, "the 6 remainder exports");
     for (const char* name : table) {
         EXPECT_NE(Hle::lookup(nid_hash(name)), nullptr) << name << " is not registered";
     }
+    // Deliberately unbound: prosper cannot produce the saved sceFiberRun frame pointer it returns.
+    EXPECT_EQ(Hle::lookup(nid_hash("_sceFiberGetThreadFramePointerAddress")), nullptr);
 }
 
 TEST(FiberUltMisc, NidsResolveToStubValues) {
@@ -79,14 +81,6 @@ TEST(FiberUltMisc, ContextSizeChecksAck) {
     register_builtin_hle();
     EXPECT_EQ(call_nid("Lcqty+QNWFc", 0), 0u) << "StartContextSizeCheck acknowledges";
     EXPECT_EQ(call_nid("Kj4nXMpnM8Y"), 0u) << "StopContextSizeCheck acknowledges";
-}
-
-TEST(FiberUltMisc, ThreadFramePointerAddress) {
-    register_builtin_hle();
-    EXPECT_EQ(call_nid("0dy4JtMUcMQ", 0), 0x80590001u) << "null out-param is refused";
-    uint64_t fp = 0xDEADBEEFull;
-    EXPECT_EQ(call_nid("0dy4JtMUcMQ", addr(&fp)), 0u);
-    EXPECT_EQ(fp, 0u) << "no frame address is known, so zero is written, not garbage";
 }
 
 // Sony's Ult objects are 256-byte caller-owned blobs; match the shape the semantics test
@@ -154,6 +148,35 @@ TEST(FiberUltMisc, CondSignalAll) {
     std::memset(&never_created, 0, sizeof(never_created));
     EXPECT_EQ(call_nid("byiceqcMvV0", addr(&never_created)), hle::kSceKernelErrorESRCH)
         << "signal-all on a never-created condvar is refused";
+
+    // Two waiters, one SignalAll: both must be released (a do-nothing or single-wake SignalAll
+    // leaves at least one blocked). Each waiter holds the bound mutex until it is inside Wait, so
+    // once the main thread can take the mutex after both have announced, both are waiting.
+    const uint64_t m = addr(&g_mutex), c = addr(&g_cond);
+    std::atomic<int> announced{0}, released{0};
+    auto waiter = [&] {
+        EXPECT_EQ(call_nid("8hEGkR1pfr8", m), 0u);
+        announced.fetch_add(1);
+        EXPECT_EQ(call_nid("5xGAHCxA8M0", c), 0u);
+        released.fetch_add(1);
+        EXPECT_EQ(call_nid("h0XebKiMBtk", m), 0u);
+    };
+    std::thread w1(waiter);
+    while (announced.load() < 1) std::this_thread::yield();
+    std::thread w2(waiter);
+    while (announced.load() < 2) std::this_thread::yield();
+    ASSERT_EQ(call_nid("8hEGkR1pfr8", m), 0u);   // both waiters are now inside Wait
+    ASSERT_EQ(call_nid("h0XebKiMBtk", m), 0u);
+    EXPECT_EQ(call_nid("byiceqcMvV0", c), 0u);
+    for (int i = 0; i < 200 && released.load() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(released.load(), 2) << "SignalAll must release every waiter";
+    while (released.load() < 2) {   // unblock a stranded waiter so the test can finish
+        call_nid("JTw1cAVkuc0", c);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    w1.join();
+    w2.join();
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -212,4 +235,50 @@ TEST(FiberUltMisc, UlthreadTryJoinAndYield) {
     EXPECT_EQ(status, 0x51) << "try-join writes the entry's int32 return into *status";
     EXPECT_EQ(call_nid("DsW+3FTXL0Q", addr(&ult), 0), hle::kSceKernelErrorESRCH)
         << "a second try-join finds the unpublished object refused, not joined twice";
+}
+
+// A second Join on an ulthread that another thread is already joining must be refused at once,
+// not wait for the ulthread and pthread_join the same host thread twice (undefined under POSIX).
+// The claim happens before the wait, so the refusal arrives while the ulthread is still gated.
+TEST(FiberUltMisc, SecondJoinIsRefusedWhileTheFirstWaits) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_runtime, 0, sizeof(g_runtime));
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    const uint64_t rt_bytes = call_nid("grs2pbc2awM", 16, 3);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    std::vector<unsigned char> rt_work((size_t)rt_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    ASSERT_EQ(call7_nid("jw9FkZBXo-g", addr(&g_runtime), 0, 16, 3, addr(rt_work.data()), 0,
+                        0x12000000ull),
+              0u);
+
+    g_gate.store(0);
+    UltBlob ult;
+    std::memset(&ult, 0, sizeof(ult));
+    std::vector<unsigned char> ctx(64 * 1024);
+    ASSERT_EQ(call9_nid("znI3q8S7KQ4", addr(&ult), 0, addr((const void*)&gated_probe_entry),
+                        0x52, addr(ctx.data()), (uint64_t)ctx.size(), addr(&g_runtime), 0,
+                        0x12000000ull),
+              0u);
+
+    int32_t status = -1;
+    std::atomic<uint64_t> first_rc{~0ull};
+    std::thread first([&] { first_rc.store(call_nid("gCeAI57LGgI", addr(&ult), addr(&status))); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // first Join is now waiting
+
+    std::atomic<uint64_t> second_rc{~0ull};
+    std::thread second([&] { second_rc.store(call_nid("gCeAI57LGgI", addr(&ult), 0)); });
+    for (int i = 0; i < 100 && second_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(second_rc.load(), hle::kSceKernelErrorEINVAL)
+        << "the second Join must be refused while the ulthread is still running";
+    g_gate.store(1);
+    first.join();
+    second.join();
+    EXPECT_EQ(first_rc.load(), 0u);
+    EXPECT_EQ(status, 0x52);
 }

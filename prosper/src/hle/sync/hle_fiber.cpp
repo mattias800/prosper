@@ -688,10 +688,11 @@ uint64_t fiber_get_self(GuestFiber** out) {
 // Signatures agree between Kyty and portps5, and neither takes an out-param, so the ack is
 // the whole contract. A title relying on an actual overflow trap would need the checker
 // itself, which no local caller has asked for.
-// _sceFiberGetThreadFramePointerAddress(out*): writes 0 ("no frame address known") after a
-// null check. That is the single secondary implementation's exact behavior; prosper tracks
-// no per-thread frame pointer, so any nonzero address would be fabricated. CONFIDENCE: LOW.
 // Deliberately NOT here, with reasons rather than silence:
+//   * _sceFiberGetThreadFramePointerAddress -- the shipped libSceFiber answers 0x80590005 outside
+//     sceFiberRun and otherwise writes the saved RBP of the thread's sceFiberRun frame. prosper does
+//     not record that frame, and writing 0 would hand a guest frame walker a NULL frame pointer.
+//     No local title imports it, so it stays unbound (the unimplemented-call alarm stays live).
 //   * sceFiberGetInfo — the FiberInfo layout is unpinned (no live caller, no second
 //     implementation consulted exposes offsets prosper can verify), and writing an unknown
 //     struct is worse than leaving the NID unbound.
@@ -702,11 +703,6 @@ uint64_t fiber_start_context_size_check(uint32_t) {
     return 0;
 }
 uint64_t fiber_stop_context_size_check() {
-    return 0;
-}
-uint64_t fiber_get_thread_frame_pointer_address(uint64_t* out) {
-    if (!out) return kErrNull;
-    *out = 0;
     return 0;
 }
 
@@ -761,8 +757,6 @@ void register_fiber_hle() {
                      "sceFiberStartContextSizeCheck");
     Hle::register_fn("Kj4nXMpnM8Y", (HleFn)fiber_stop_context_size_check,
                      "sceFiberStopContextSizeCheck");
-    Hle::register_fn("0dy4JtMUcMQ", (HleFn)fiber_get_thread_frame_pointer_address,
-                     "_sceFiberGetThreadFramePointerAddress");
 }
 
 }   // namespace prosper
