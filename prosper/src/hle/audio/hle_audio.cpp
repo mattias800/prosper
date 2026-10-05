@@ -3772,12 +3772,13 @@ constexpr uint64_t kNgs2RackTag   = 0x4e47533252000000ull; // "NGS2R"
 constexpr uint64_t kNgs2VoiceTag  = 0x4e47533256000000ull; // "NGS2V"
 constexpr uint64_t kNgs2TagMask   = 0xffffffffffffff00ull;
 constexpr uint64_t kNgs2VoiceMask = 0xffffffffff000000ull;
-constexpr uint64_t kNgs2ErrInvalidOut    = (uint64_t)(int64_t)(int32_t)0x804a0053;
+constexpr uint64_t kNgs2ErrInvalidOut = (uint64_t)(int64_t)(int32_t)0x804a0053;
 constexpr uint64_t kNgs2ErrInvalidSystem = (uint64_t)(int64_t)(int32_t)0x804a0230;
-constexpr uint64_t kNgs2ErrInvalidRack   = (uint64_t)(int64_t)(int32_t)0x804a0261;
-constexpr uint64_t kNgs2ErrInvalidVoice  = (uint64_t)(int64_t)(int32_t)0x804a0302;
+constexpr uint64_t kNgs2ErrInvalidRack = (uint64_t)(int64_t)(int32_t)0x804a0261;
+constexpr uint64_t kNgs2ErrInvalidVoice = (uint64_t)(int64_t)(int32_t)0x804a0302;
 constexpr uint64_t kNgs2ErrInvalidAllocator = (uint64_t)(int64_t)(int32_t)0x804a020a;
-constexpr uint64_t kNgs2ErrInvalidGrain     = (uint64_t)(int64_t)(int32_t)0x804a0051;
+constexpr uint64_t kNgs2ErrInvalidGrain = (uint64_t)(int64_t)(int32_t)0x804a0051;
+constexpr uint64_t kNgs2ErrInvalidRate = (uint64_t)(int64_t)(int32_t)0x804a0201;
 
 struct Ngs2RackState {
     bool used = false;
@@ -3788,6 +3789,11 @@ struct Ngs2RackState {
 
 std::mutex g_ngs2_mx;
 bool g_ngs2_systems[4]{};
+// Per-system sample rate. Nothing downstream consumes it yet (voices carry their own rate
+// from the waveform setup and the sink runs at the host rate); it is stored so the setter
+// below round-trips instead of acknowledging into the void. Default is the 48 kHz the
+// waveform and voice paths assume.
+uint32_t g_ngs2_rates[4]{48000, 48000, 48000, 48000};
 // NGS2 produces num_grain_samples frames per SystemRender; the guest hands us a buffer that can be far
 // larger (Dead Cells passes 37888 frames) and only consumes one grain, streaming one grain-sized block
 // per render. We fill only this many frames of an oversized buffer — filling the whole capacity makes a
@@ -4311,6 +4317,36 @@ HLE(ngs2_rack_unlock) {
     if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
     return 0;
 }
+// --- Ngs2 system controls: lock/unlock + sample rate ----------------------------------------
+// sceNgs2SystemLock/Unlock(system): validate-only acknowledgements (uncontended headless),
+// same model as the rack locks above. The reference implementation validates the handle and
+// nothing else, so there is no deeper contract to miss.
+// sceNgs2SystemSetSampleRate(system, rate): records the rate after range validation
+// (8000..192000 refused otherwise, per the reference contract). Stored per system; nothing
+// downstream reads it yet (see g_ngs2_rates). CONFIDENCE: MED on shapes/range (single
+// secondary + stub NIDs); LOW on the 0x804a0201 error, which extends this file's own
+// 0x804a00xx family rather than a firmware-observed value.
+HLE(ngs2_system_lock) {
+    NGS2_LOG("sceNgs2SystemLock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    return 0;
+}
+HLE(ngs2_system_unlock) {
+    NGS2_LOG("sceNgs2SystemUnlock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    return 0;
+}
+HLE(ngs2_system_set_sample_rate) {
+    NGS2_LOG("sceNgs2SystemSetSampleRate");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    const uint32_t rate = (uint32_t)a1;
+    if (rate < 8000 || rate > 192000) return kNgs2ErrInvalidRate;
+    g_ngs2_rates[(a0 & 0xff) - 1] = rate;
+    return 0;
+}
 
 // PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
 // Ngs2VoiceParamHead { uint16 size; int16 next; uint32 id; payload... } (Sony's documented
@@ -4673,6 +4709,9 @@ void register_audio_hle() {
     Hle::register_fn("l4Q2dWEH6UM", ngs2_system_set_grain_samples, "sceNgs2SystemSetGrainSamples");
     Hle::register_fn("U546k6orxQo", ngs2_rack_create_with_allocator,
                      "sceNgs2RackCreateWithAllocator");
+    Hle::register_fn("gThZqM5PYlQ", ngs2_system_lock, "sceNgs2SystemLock");
+    Hle::register_fn("JXRC5n0RQls", ngs2_system_unlock, "sceNgs2SystemUnlock");
+    Hle::register_fn("-tbc2SxQD60", ngs2_system_set_sample_rate, "sceNgs2SystemSetSampleRate");
     Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
     Hle::register_fn("++YZ7P9e87U", ngs2_rack_unlock, "sceNgs2RackUnlock");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");

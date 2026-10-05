@@ -101,3 +101,34 @@ TEST(Ngs2Lifecycle, SystemCreateDestroyReclaimsRacks) {
     EXPECT_EQ(lock(rack2, 0, 0, 0, 0, 0), 0u) << "another system's rack survives the destroy";
     EXPECT_EQ(destroy(sys2, 0, 0, 0, 0, 0), 0u);
 }
+
+TEST(Ngs2Lifecycle, SystemLockUnlockAndSampleRate) {
+    register_builtin_hle();
+    HleFn create = Hle::lookup(nid_hash("sceNgs2SystemCreateWithAllocator"));
+    HleFn destroy = Hle::lookup(nid_hash("sceNgs2SystemDestroy"));
+    HleFn lock = Hle::lookup(nid_hash("sceNgs2SystemLock"));
+    HleFn unlock = Hle::lookup(nid_hash("sceNgs2SystemUnlock"));
+    HleFn rate = Hle::lookup(nid_hash("sceNgs2SystemSetSampleRate"));
+    for (HleFn f : {create, destroy, lock, unlock, rate}) ASSERT_NE(f, nullptr);
+    EXPECT_EQ(nid_hash("sceNgs2SystemLock"), "gThZqM5PYlQ");
+    EXPECT_EQ(nid_hash("sceNgs2SystemUnlock"), "JXRC5n0RQls");
+    EXPECT_EQ(nid_hash("sceNgs2SystemSetSampleRate"), "-tbc2SxQD60");
+
+    uint64_t alloc[3] = {0x1000, 0x2000, 0};
+    uint64_t sys = 0;
+    ASSERT_EQ(create(0, addr(alloc), addr(&sys), 0, 0, 0), 0u);
+    EXPECT_EQ(lock(sys, 0, 0, 0, 0, 0), 0u) << "lock validates and acknowledges";
+    EXPECT_EQ(unlock(sys, 0, 0, 0, 0, 0), 0u) << "unlock validates and acknowledges";
+    EXPECT_EQ(lock(0xDEADu, 0, 0, 0, 0, 0), kInvalidSystem) << "foreign system refused";
+    EXPECT_EQ(unlock(0xDEADu, 0, 0, 0, 0, 0), kInvalidSystem) << "foreign system refused";
+
+    static constexpr uint64_t kInvalidRate = sx(0x804a0201u);
+    EXPECT_EQ(rate(sys, 48000, 0, 0, 0, 0), 0u) << "in-range rate records";
+    EXPECT_EQ(rate(sys, 8000, 0, 0, 0, 0), 0u) << "lower bound records";
+    EXPECT_EQ(rate(sys, 192000, 0, 0, 0, 0), 0u) << "upper bound records";
+    EXPECT_EQ(rate(sys, 7999, 0, 0, 0, 0), kInvalidRate) << "below range refused";
+    EXPECT_EQ(rate(sys, 192001, 0, 0, 0, 0), kInvalidRate) << "above range refused";
+    EXPECT_EQ(rate(sys, 0, 0, 0, 0, 0), kInvalidRate) << "zero rate refused";
+    EXPECT_EQ(rate(0xDEADu, 48000, 0, 0, 0, 0), kInvalidSystem) << "foreign system refused";
+    EXPECT_EQ(destroy(sys, 0, 0, 0, 0, 0), 0u);
+}
