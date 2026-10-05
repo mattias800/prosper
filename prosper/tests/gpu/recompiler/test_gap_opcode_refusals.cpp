@@ -325,11 +325,11 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered scalar miscellany must refuse fail-visibly. s_cmovk_i32,
-// s_getreg_b32 and s_call_b64 (SOPK) and s_rfe_b64 (SOP1) have no lowering: a
-// driver-register read, a call and an exception return cannot be modeled as
-// ordinary scalar ALU, and accepting any of them would silently invent
-// register contents or control flow. All words below are llvm-mc gfx1030
+// Unlowered scalar miscellany must refuse fail-visibly. s_cmovk_i32 (an SCC-conditional move,
+// D = SCC ? sext(SIMM16) : D -- ordinary scalar ALU that simply has no case in the SOPK switch
+// yet), s_getreg_b32 (a hardware-register read), s_call_b64 (a call) and s_rfe_b64 (an
+// exception return) all reach the emitter's default arm; the last three are control flow or
+// driver state that accepting would invent. All words below are llvm-mc gfx1030
 // round-tripped. Controls are s_movk_i32 (SOPK, lowered) and s_mov_b32
 // (SOP1, lowered) in matching slots. WHEN a lowering lands for any of the
 // four, ITS CASE GOES RED; replace it with an execution test of the new
@@ -369,7 +369,7 @@ TEST(GapOpcodeRefusals, ScalarMiscRefuse) {
     // arm once that shape is decided, not an assertion on an artifact.
     const std::vector<Case> cases = {
         {{0xb1001234u}, Rdna2Format::SOPK, 0x02u, 0xA0B2ull},   // s_cmovk_i32 s0, 0x1234
-        {{0xb9000000u}, Rdna2Format::SOPK, 0x12u, 0xA0B3ull},   // s_getreg_b32 s0, hwreg(0,0,1)
+        {{0xb900f801u}, Rdna2Format::SOPK, 0x12u, 0xA0B3ull},   // s_getreg_b32 s0, hwreg(MODE)
         {{0xbb001234u}, Rdna2Format::SOPK, 0x16u, 0xA0B5ull},   // s_call_b64 s[0:1], 4660
         {{0xbe802200u}, Rdna2Format::SOP1, 0x22u, 0xA0B6ull},   // s_rfe_b64 s[0:1]
     };
