@@ -33,7 +33,8 @@ defects of one shape, each assuming the host thread entering an HLE call is the 
    decoding and return codes (spec `HLE-1`, `LAY-4`). APR is the first extraction (move 12), after
    the seam migration of its platform calls.
 5. Every engine ships a replay test that feeds a recorded command stream and asserts what the
-   guest observes, on both hosts (target-tree Standard 3).
+   guest observes, on both hosts (target-tree Standard 3). `CONFIDENCE: LOW` on how practical
+   this is for large streams: it has not been tried.
 
 ## Consequences
 
