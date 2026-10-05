@@ -413,6 +413,50 @@ struct CountedLoop {
 };
 inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
 
+// The compare that decides a bottom-tested SCC loop (`do { ... s_cmp ... } while (SCC)`), or
+// UINT32_MAX when it cannot be named. The back-edge reads SCC, so the loop's continue predicate is
+// whatever SCC holds when control reaches it. That is exactly one compare only when the walk back
+// from the back-edge to it is straight-line: every instruction in between is one that cannot write
+// SCC, none is a branch, and no branch anywhere lands strictly after the compare (a landing there
+// could arrive with another SCC). The writer must be an SOPC; other scalar ALU may write SCC as a
+// side effect (carry, nonzero result) and is refused rather than modeled.
+// Kena's (PPSA01802) blur fragment programs put `s_cmp_lt_u32 vcc_lo, 5` twenty dwords above the
+// back-edge, with vector ALU, a waitcnt and an image sample in between (#4518).
+inline uint32_t scc_do_while_condition_pc(const std::vector<Rdna2Inst>& ins,
+                                          uint32_t header_pc, uint32_t backedge_pc) {
+    auto is_branch = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+               in.opcode != 0x03;
+    };
+    size_t back = ins.size();
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (ins[i].pc == backedge_pc) { back = i; break; }
+    if (back == ins.size()) return UINT32_MAX;
+    uint32_t writer = UINT32_MAX;
+    for (size_t j = back; j-- > 0;) {
+        const Rdna2Inst& p = ins[j];
+        if (p.pc < header_pc) return UINT32_MAX;
+        if (p.fmt == Rdna2Format::SOPC) { writer = p.pc; break; }
+        const bool cannot_write_scc =
+            (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||
+            p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 ||
+            p.fmt == Rdna2Format::VOP3 || p.fmt == Rdna2Format::VOP3P ||
+            p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::VINTRP ||
+            p.fmt == Rdna2Format::SMEM || p.fmt == Rdna2Format::DS ||
+            p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
+            p.fmt == Rdna2Format::MIMG || p.fmt == Rdna2Format::FLAT || sopp_is_noop(p);
+        if (!cannot_write_scc) return UINT32_MAX;   // a branch, or a possible SCC side effect
+    }
+    if (writer == UINT32_MAX) return UINT32_MAX;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (!is_branch(in)) continue;
+        const uint32_t target = branch_target(in);
+        if (target > writer && target <= backedge_pc) return UINT32_MAX;
+    }
+    return writer;
+}
+
 inline CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     CountedLoop L;
     // The single backward branch that closes the loop. A conditional scc0/scc1 back-edge is a
@@ -495,15 +539,16 @@ struct DivLoop {
     enum class Condition : uint8_t { Exec, Vcc, Scc };
     uint32_t header_pc = 0;        // back-edge target; condition region = [header_pc, exit_branch_pc)
     uint32_t exit_branch_pc = 0;   // canonical forward execz/vccz/scc branch whose target is exit_pc
-    uint32_t backedge_pc = 0;      // backward s_branch (unconditional) or s_cbranch_execnz
+    uint32_t backedge_pc = 0;      // backward s_branch, s_cbranch_execnz or s_cbranch_scc0/scc1
     uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
     bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
     bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
-    bool bottom_tested = false;        // s_cbranch_execnz back-edge is the condition (do-while)
+    bool bottom_tested = false;        // the execnz/scc back-edge is the condition (do-while)
     Condition condition = Condition::Exec;
     // EXECZ/VCCZ and SCC0 all continue while their represented predicate is set. SCC1 is the one
-    // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set.
+    // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set. A bottom-tested
+    // SCC loop reads its back-edge instead: scc1 continues while SCC is set, scc0 while it is clear.
     bool continue_on_set = true;
 };
 
@@ -768,13 +813,18 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
     };
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
-    // Pass 1: each backward s_branch / s_cbranch_execnz is a candidate back-edge.
-    std::vector<bool> backedge_execnz;
+    // Pass 1: each backward s_branch / s_cbranch_execnz / s_cbranch_scc0/scc1 is a candidate
+    // back-edge. A backward SCC branch closes a bottom-tested do-while unless it is a waterfall's
+    // once-through branch, which the linearizer consumes (waterfall_branches).
+    const std::unordered_set<uint32_t> waterfalls = waterfall_branches(ins);
+    std::vector<uint32_t> backedge_op;
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
-        if ((in.opcode != 0x02 && in.opcode != 0x09) || in.simm16 >= 0) continue;
+        const bool scc_backedge = in.opcode == 0x04 || in.opcode == 0x05;
+        if ((in.opcode != 0x02 && in.opcode != 0x09 && !scc_backedge) || in.simm16 >= 0) continue;
         if (safe.count(in.pc)) continue;
+        if (scc_backedge && waterfalls.count(in.pc)) continue;
         DivLoop L;
         L.header_pc = branch_target(in);
         L.backedge_pc = in.pc;
@@ -785,7 +835,7 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         for (const auto& h : ins) { if (h.pc == L.header_pc) { hdr_ok = true; break; } if (h.pc > L.header_pc) break; }
         if (!hdr_ok) return divloop_reject("header-pc-is-not-an-instruction", L.header_pc);
         out.push_back(L);
-        backedge_execnz.push_back(in.opcode == 0x09);
+        backedge_op.push_back(in.opcode);
     }
     if (out.empty()) return out;
     // Loops may be strictly DISJOINT (sequential) or PROPERLY NESTED (#590 — DOLL's post-process
@@ -800,10 +850,10 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         for (size_t i = 0; i < order.size(); i++) order[i] = i;
         std::sort(order.begin(), order.end(),
                   [&](size_t a, size_t c) { return out[a].header_pc < out[c].header_pc; });
-        std::vector<DivLoop> sorted_loops; std::vector<bool> sorted_execnz;
-        sorted_loops.reserve(out.size()); sorted_execnz.reserve(out.size());
-        for (size_t i : order) { sorted_loops.push_back(out[i]); sorted_execnz.push_back(backedge_execnz[i]); }
-        out.swap(sorted_loops); backedge_execnz.swap(sorted_execnz);
+        std::vector<DivLoop> sorted_loops; std::vector<uint32_t> sorted_op;
+        sorted_loops.reserve(out.size()); sorted_op.reserve(out.size());
+        for (size_t i : order) { sorted_loops.push_back(out[i]); sorted_op.push_back(backedge_op[i]); }
+        out.swap(sorted_loops); backedge_op.swap(sorted_op);
     }
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++) {
@@ -825,7 +875,8 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
     };
     for (size_t li = 0; li < out.size(); li++) {
         DivLoop& L = out[li];
-        const bool execnz = backedge_execnz[li];
+        const bool execnz = backedge_op[li] == 0x09;
+        const bool scc_do_while = backedge_op[li] == 0x04 || backedge_op[li] == 0x05;
         for (const auto& in : ins) {
             if (in.is_end || in.pc >= L.backedge_pc) break;
             if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
@@ -842,6 +893,9 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
                 continue;                                       // (validated by detect_forward_ifs)
             }
             if (tgt > L.exit_pc) return divloop_reject("conditional-branch-past-loop", in.pc);      // conditional jumping past the loop
+            // An SCC do-while's only exit is falling through its back-edge. A second, interior
+            // exit is a break this lowering does not model (CountedLoop refuses it the same way).
+            if (scc_do_while && tgt == L.exit_pc) return divloop_reject("scc-do-while-interior-exit", in.pc);
             if (tgt == L.exit_pc) {                             // an exit test
                 if (!L.exit_branch_pc) {                        // first one = the canonical exit
                     if (in.opcode == 0x08) {                    // execz -> EXIT
@@ -890,6 +944,17 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
                 }
             }
             // (tgt <= backedge_pc: an interior forward if — validated by detect_forward_ifs.)
+        }
+        if (!L.exit_branch_pc && scc_do_while) {
+            // Bottom-tested SCC loop: `s_cbranch_scc1 HEADER` continues while SCC is set, scc0
+            // while it is clear. The whole body runs before the first test, so it is emitted as
+            // the condition region, and the test must read one compare on every path.
+            if (scc_do_while_condition_pc(ins, L.header_pc, L.backedge_pc) == UINT32_MAX)
+                return divloop_reject("scc-do-while-condition-not-a-straight-line-compare", L.backedge_pc);
+            L.exit_branch_pc = L.backedge_pc;
+            L.condition = DivLoop::Condition::Scc;
+            L.continue_on_set = backedge_op[li] == 0x05;
+            L.bottom_tested = true;
         }
         if (!L.exit_branch_pc) {
             // Bottom-tested EXEC loop: the back-edge itself is `s_cbranch_execnz HEADER`, so the
