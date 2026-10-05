@@ -1519,6 +1519,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
+  # libSceNpWebApi2 (24 exports): handles are created, every network round-trip fails fast
+  # with UNAVAILABLE instead of blocking. Unregistered, the dispatcher answered SCE_OK while
+  # writing nothing — request ids and response buffers the guest sizes by.
+  prosper_add_gtest(test_np_webapi
+    SOURCES tests/hle/np/test_np_webapi.cpp
+    LIBRARIES prosper_core)
+
   # NP sub-libraries on the honest signed-out console: libSceNpTrophy (v1), libSceNpTus,
   # libSceNpScore and libSceNpCommerce — valid local ids, no PSN data, headless store dialog.
   prosper_add_gtest(test_np_sublibs

@@ -139,6 +139,115 @@ HLE(s_npweb_create_user_context) {
     svc_log("sceNpWebApi2CreateUserContext", a0,a1,a2,a3,a4,a5);
     return (uint64_t)(uint32_t)g_npweb_user_context_id.fetch_add(1);
 }
+// --- libSceNpWebApi2 request + push-event surface (22 exports) ---------------------------------
+// The PSN web API has no service behind it on this console, so handles are created but every
+// network round-trip fails fast instead of blocking. Shapes (arity, out-param placement, the
+// 0x80553402/0x80553406 facility) mirror the firmware stub export interface as re-derived in a
+// secondary implementation; CONFIDENCE: MED on the facility values, HIGH on the lifecycle shape,
+// which matches the already-merged Initialize/CreateUserContext pair above and the Auth batch's
+// request lifecycle (local ids out, zero-cost teardown, loud data-path failure).
+//   Create*/PushEventCreate*/RegisterCallback*  -> local id (positive, never 0)
+//   Abort/Delete/Terminate/Unregister/Start     -> 0 (nothing to tear down or deliver offline)
+//   Send/ReadData/HeaderValue/HeaderLength      -> UNAVAILABLE, out-params untouched
+//   CheckTimeout (void)                         -> 0 (no timeouts pending offline)
+//   CreatePushContext                           -> UNAVAILABLE (no push service to host it)
+namespace {
+constexpr uint64_t kWebApiErrInvalidArgument = 0x80553402ull;
+constexpr uint64_t kWebApiErrUnavailable = 0x80553406ull;
+std::atomic<int64_t> g_npweb_request_id{1};
+std::atomic<int32_t> g_npweb_push_id{1};
+}  // namespace
+HLE(s_npweb_create_request) {
+    svc_log("sceNpWebApi2CreateRequest", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a5)) return kWebApiErrInvalidArgument;
+    *(int64_t*)PW(a5) = g_npweb_request_id.fetch_add(1);
+    return 0;
+}
+HLE(s_npweb_abort_request) {
+    svc_log("sceNpWebApi2AbortRequest", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_add_header) {
+    svc_log("sceNpWebApi2AddHttpRequestHeader", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_delete_request) {
+    svc_log("sceNpWebApi2DeleteRequest", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_delete_user_context) {
+    svc_log("sceNpWebApi2DeleteUserContext", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_send_request) {
+    svc_log("sceNpWebApi2SendRequest", a0,a1,a2,a3,a4,a5);
+    return kWebApiErrUnavailable;
+}
+HLE(s_npweb_read_data) {
+    svc_log("sceNpWebApi2ReadData", a0,a1,a2,a3,a4,a5);
+    return kWebApiErrUnavailable;
+}
+HLE(s_npweb_get_header_value) {
+    svc_log("sceNpWebApi2GetHttpResponseHeaderValue", a0,a1,a2,a3,a4,a5);
+    return kWebApiErrUnavailable;
+}
+HLE(s_npweb_get_header_length) {
+    svc_log("sceNpWebApi2GetHttpResponseHeaderValueLength", a0,a1,a2,a3,a4,a5);
+    return kWebApiErrUnavailable;
+}
+HLE(s_npweb_check_timeout) {
+    svc_log("sceNpWebApi2CheckTimeout", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_terminate) {
+    svc_log("sceNpWebApi2Terminate", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_create_filter) {
+    svc_log("sceNpWebApi2PushEventCreateFilter", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+}
+HLE(s_npweb_push_create_handle) {
+    svc_log("sceNpWebApi2PushEventCreateHandle", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+}
+HLE(s_npweb_push_create_pushctx) {
+    svc_log("sceNpWebApi2PushEventCreatePushContext", a0,a1,a2,a3,a4,a5);
+    return kWebApiErrUnavailable;
+}
+HLE(s_npweb_push_delete_filter) {
+    svc_log("sceNpWebApi2PushEventDeleteFilter", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_delete_handle) {
+    svc_log("sceNpWebApi2PushEventDeleteHandle", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_delete_pushctx) {
+    svc_log("sceNpWebApi2PushEventDeletePushContext", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_register_callback) {
+    svc_log("sceNpWebApi2PushEventRegisterCallback", a0,a1,a2,a3,a4,a5);
+    // Stored handle, never called: no push service exists offline.
+    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+}
+HLE(s_npweb_push_register_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventRegisterPushContextCallback", a0,a1,a2,a3,a4,a5);
+    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+}
+HLE(s_npweb_push_start_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventStartPushContextCallback", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_unregister_callback) {
+    svc_log("sceNpWebApi2PushEventUnregisterCallback", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npweb_push_unregister_pushctx_callback) {
+    svc_log("sceNpWebApi2PushEventUnregisterPushContextCallback", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
 HLE(s_netctl_getresult) {
     svc_log("sceNetCtlGetResult", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a1)) return 0x80412103ull; // SCE_NET_CTL_ERROR_INVALID_ADDR
@@ -734,6 +843,44 @@ void register_np_hle() {
     Hle::register_fn("+o9816YQhqQ", (HleFn)s_npweb_init, "sceNpWebApi2Initialize");
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
+    // libSceNpWebApi2 request + push-event surface: handles are created, every network
+    // round-trip fails fast with UNAVAILABLE instead of blocking (see the handlers above).
+    Hle::register_fn("3EI-OSJ65Xc", (HleFn)s_npweb_create_request, "sceNpWebApi2CreateRequest");
+    Hle::register_fn("zpiPsH7dbFQ", (HleFn)s_npweb_abort_request, "sceNpWebApi2AbortRequest");
+    Hle::register_fn("egOOvrnF6mI", (HleFn)s_npweb_add_header, "sceNpWebApi2AddHttpRequestHeader");
+    Hle::register_fn("vvzWO-DvG1s", (HleFn)s_npweb_delete_request, "sceNpWebApi2DeleteRequest");
+    Hle::register_fn("9X9+cneTGUU", (HleFn)s_npweb_delete_user_context,
+                     "sceNpWebApi2DeleteUserContext");
+    Hle::register_fn("lQOCF84lvzw", (HleFn)s_npweb_send_request, "sceNpWebApi2SendRequest");
+    Hle::register_fn("OOY9+ObfKec", (HleFn)s_npweb_read_data, "sceNpWebApi2ReadData");
+    Hle::register_fn("hksbskNToEA", (HleFn)s_npweb_get_header_value,
+                     "sceNpWebApi2GetHttpResponseHeaderValue");
+    Hle::register_fn("HwP3aM+c85c", (HleFn)s_npweb_get_header_length,
+                     "sceNpWebApi2GetHttpResponseHeaderValueLength");
+    Hle::register_fn("3Tt9zL3tkoc", (HleFn)s_npweb_check_timeout, "sceNpWebApi2CheckTimeout");
+    Hle::register_fn("bEvXpcEk200", (HleFn)s_npweb_terminate, "sceNpWebApi2Terminate");
+    Hle::register_fn("MsaFhR+lPE4", (HleFn)s_npweb_push_create_filter,
+                     "sceNpWebApi2PushEventCreateFilter");
+    Hle::register_fn("WV1GwM32NgY", (HleFn)s_npweb_push_create_handle,
+                     "sceNpWebApi2PushEventCreateHandle");
+    Hle::register_fn("NNVf18SlbT8", (HleFn)s_npweb_push_create_pushctx,
+                     "sceNpWebApi2PushEventCreatePushContext");
+    Hle::register_fn("KJdPcOGmK58", (HleFn)s_npweb_push_delete_filter,
+                     "sceNpWebApi2PushEventDeleteFilter");
+    Hle::register_fn("fIATVMo4Y1w", (HleFn)s_npweb_push_delete_handle,
+                     "sceNpWebApi2PushEventDeleteHandle");
+    Hle::register_fn("QafxeZM3WK4", (HleFn)s_npweb_push_delete_pushctx,
+                     "sceNpWebApi2PushEventDeletePushContext");
+    Hle::register_fn("fY3QqeNkF8k", (HleFn)s_npweb_push_register_callback,
+                     "sceNpWebApi2PushEventRegisterCallback");
+    Hle::register_fn("lxtHJMwBsaU", (HleFn)s_npweb_push_register_pushctx_callback,
+                     "sceNpWebApi2PushEventRegisterPushContextCallback");
+    Hle::register_fn("AAj9X+4aGYA", (HleFn)s_npweb_push_start_pushctx_callback,
+                     "sceNpWebApi2PushEventStartPushContextCallback");
+    Hle::register_fn("hOnIlcGrO6g", (HleFn)s_npweb_push_unregister_callback,
+                     "sceNpWebApi2PushEventUnregisterCallback");
+    Hle::register_fn("PmyrbbJSFz0", (HleFn)s_npweb_push_unregister_pushctx_callback,
+                     "sceNpWebApi2PushEventUnregisterPushContextCallback");
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
     // ALL FIVE of the library's info queries must answer here, not just the two that a title
     // happened to crash on. Each writes its result through a caller-supplied out-struct, so any one
