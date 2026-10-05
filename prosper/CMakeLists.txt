@@ -889,9 +889,9 @@ if(TARGET prosper_core)
     SOURCES tests/hle/dispatch/test_import_data_seed.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_hle_registered tests/hle/test_hle_registered.cpp)
-  target_link_libraries(test_hle_registered PRIVATE prosper_core)
-  add_test(NAME hle_functions_registered COMMAND test_hle_registered)
+  prosper_add_gtest(test_hle_registered
+    SOURCES tests/hle/test_hle_registered.cpp
+    LIBRARIES prosper_core)
 
   # No NID registered twice with a DIFFERENT handler (the #330 shadow class): a later register_*()
   # silently overwriting a real impl with a stub returns garbage to the guest. Pure, no game dump.
@@ -1432,14 +1432,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/net/test_net_socket.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
-  target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
-  add_test(NAME guard_recursion COMMAND test_guard_recursion)
-  set_tests_properties(guard_recursion PROPERTIES TIMEOUT 30)
+  prosper_add_gtest(test_guard_recursion
+    SOURCES tests/hle/test_guard_recursion.cpp
+    LIBRARIES prosper_core Threads::Threads
+    PROPERTIES TIMEOUT 30)
 
-  add_executable(test_font tests/hle/test_font.cpp)
-  target_link_libraries(test_font PRIVATE prosper_core)
-  add_test(NAME font_hle COMMAND test_font)
+  prosper_add_gtest(test_font
+    SOURCES tests/hle/test_font.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_font_render tests/hle/test_font_render.cpp)
   target_link_libraries(test_font_render PRIVATE prosper_core)
@@ -2097,9 +2097,10 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
-  add_executable(test_service_logging tests/hle/test_service_logging.cpp)
-  target_link_libraries(test_service_logging PRIVATE prosper_core)
-  add_test(NAME service_logging_unmapped_args COMMAND test_service_logging)
+  prosper_add_gtest(test_service_logging
+    SOURCES tests/hle/test_service_logging.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   if(WIN32)
     add_executable(test_win_exception_delivery tests/misc/test_win_exception_delivery.cpp)
