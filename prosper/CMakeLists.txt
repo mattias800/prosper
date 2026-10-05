@@ -5008,6 +5008,13 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A fragment loop whose body recycles VCC as scalar scratch, compiled and executed (#4508:
+      # Space Adventure Cobra's per-pixel light loop).
+      prosper_add_gtest(test_fragment_loop_vcc_scratch
+        SOURCES tests/gpu/recompiler/test_fragment_loop_vcc_scratch.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       add_executable(test_fragment_loop_mask_exec tests/gpu/execute/test_fragment_loop_mask_exec.cpp)
       target_include_directories(test_fragment_loop_mask_exec PRIVATE tests frontends)
       target_link_libraries(test_fragment_loop_mask_exec PRIVATE prosper_core Vulkan::Vulkan)

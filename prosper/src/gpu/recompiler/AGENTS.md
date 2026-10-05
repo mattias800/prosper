@@ -9,6 +9,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
+- `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
+  it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
+  the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
   votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,
