@@ -1005,6 +1005,53 @@ HLE(s_savedata_saveicon) {
     return 0;
 }
 
+// sceSaveDataLoadIcon(const SceSaveDataMountPoint* mp, SceSaveDataIcon* icon) (cGjO3wM3V28,
+// #2081: "returns success over an unwritten buffer").
+// The inverse of SaveIcon above: icon is { void* buf @+0x00, size_t bufSize @+0x08, size_t
+// dataSize @+0x10, reserved }, and the file is the `<save dir>/sce_sys/icon0.png` SaveIcon wrote.
+// dataSize reports the FULL file size while at most bufSize bytes are copied, so a small caller
+// buffer learns the real size instead of receiving a truncated silent success.
+//   null/wrong mount point, null icon, null buffer  -> PARAMETER
+//   nothing mounted                                 -> NOT_MOUNTED
+//   icon file missing                               -> NOT_FOUND (buffer untouched)
+//   host read failed                                -> INTERNAL
+// CONFIDENCE: HIGH for the struct and the refusal shape (shadPS4 behavior + the merged SaveIcon
+// contract it inverts); MED on NOT_FOUND vs success-for-missing, which follows Mount3's
+// nonexistent-save answer in this file.
+HLE(s_savedata_loadicon) {
+    svc_log("sceSaveDataLoadIcon", a0,a1,a2,a3,a4,a5);
+    if (!savedata_mount_point_ok(a0) || !svc_ptrish(a1)) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* icon = (const uint8_t*)PW(a1);
+    uint64_t buf = 0, buf_size = 0;
+    memcpy(&buf, icon + 0x00, sizeof buf);
+    memcpy(&buf_size, icon + 0x08, sizeof buf_size);
+    if (!svc_ptrish(buf) || !buf_size) return SAVE_DATA_ERR_PARAMETER;
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    const std::filesystem::path icon_path = std::filesystem::path(dir) / "sce_sys" / "icon0.png";
+    std::error_code ec;
+    const uint64_t file_size = std::filesystem::file_size(icon_path, ec);
+    if (ec) return SAVE_DATA_ERR_NOT_FOUND;
+    const size_t n = (size_t)(file_size < buf_size ? file_size : buf_size);
+    bool ok = false;
+    if (FILE* f = fopen(icon_path.string().c_str(), "rb")) {
+        ok = n == 0 || fread(PW(buf), 1, n, f) == n;
+        ok = (fclose(f) == 0) && ok;
+    }
+    if (!ok) {
+        fprintf(stderr, "[svc] sceSaveDataLoadIcon: could not read \"%s\"\n",
+                icon_path.string().c_str());
+        return SAVE_DATA_ERR_INTERNAL;
+    }
+    uint64_t data_size = file_size;
+    memcpy((uint8_t*)PW(a1) + 0x10, &data_size, sizeof data_size);
+    if (svclog())
+        fprintf(stderr, "[svc]   LoadIcon %llu/%llu bytes <- %s\n",
+                (unsigned long long)n, (unsigned long long)file_size,
+                icon_path.string().c_str());
+    return 0;
+}
+
 HLE(s_savedata_getparam) {
     svc_log("sceSaveDataGetParam", a0,a1,a2,a3,a4,a5);
     const uint32_t type = (uint32_t)a1;
@@ -1401,6 +1448,8 @@ void register_savedata_hle() {
     // #2786: both were unregistered, so both answered SCE_OK while storing and reading nothing.
     Hle::register_fn("85zul--eGXs", (HleFn)s_savedata_setparam,  "sceSaveDataSetParam");
     Hle::register_fn("c88Yy54Mx0w", (HleFn)s_savedata_saveicon,  "sceSaveDataSaveIcon");
+    // #2081: unregistered, this answered SCE_OK over an unwritten icon buffer.
+    Hle::register_fn("cGjO3wM3V28", (HleFn)s_savedata_loadicon,  "sceSaveDataLoadIcon");
     Hle::register_fn("XgvSuIdnMlw", (HleFn)s_savedata_getparam,  "sceSaveDataGetParam");
     // #2081: unregistered, this answered SCE_OK while deleting nothing (37-title reach).
     Hle::register_fn("S1GkePI17zQ", (HleFn)s_savedata_delete,   "sceSaveDataDelete");

@@ -4,7 +4,11 @@
 // winpthreads calls its destructor with nullptr in that case, while POSIX requires no callback.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+
+#include <gtest/gtest.h>
+
 #include <pthread.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -30,9 +34,9 @@ std::atomic<bool> g_release_delete{false};
 pthread_key_t g_exit_key{};
 std::atomic<unsigned> g_exit_dtor_calls{0};
 std::atomic<bool> g_exit_worker_ran{false};
-// Resolved ONCE from main, not inside the destructor. A sysv_abi function that also contains a
-// C++ call with an exception region makes MinGW's assembler reject the object outright with
-// ".seh_handlerdata used outside of .seh_proc block" -- so the guest-ABI callback below must
+// Resolved ONCE from the case body, not inside the destructor. A sysv_abi function that also
+// contains a C++ call with an exception region makes MinGW's assembler reject the object outright
+// with ".seh_handlerdata used outside of .seh_proc block" -- so the guest-ABI callback below must
 // stay free of anything needing unwind data. Hle::lookup is not safe to call from there.
 HleFn g_exit_fn = nullptr;
 
@@ -71,113 +75,158 @@ extern "C" __attribute__((sysv_abi)) void* guest_exiting_worker(void*) {
     return nullptr;
 }
 
-}
-
-int main() {
+// The four entry points under test. ctest runs each case in its own process, but a direct run or
+// --gtest_repeat shares one, so every destructor-counting case resets the counters it reads.
+struct KeyFamily {
+    HleFn key_create = nullptr, key_delete = nullptr, thread_create = nullptr,
+          thread_join = nullptr, thread_exit = nullptr;
+};
+KeyFamily key_family() {
     register_builtin_hle();
-    HleFn key_create = Hle::lookup(nid_hash("scePthreadKeyCreate"));
-    HleFn key_delete = Hle::lookup(nid_hash("scePthreadKeyDelete"));
-    HleFn thread_create = Hle::lookup(nid_hash("scePthreadCreate"));
-    HleFn thread_join = Hle::lookup(nid_hash("scePthreadJoin"));
-    if (!key_create || !key_delete || !thread_create || !thread_join) return 1;
-
-    uint32_t key = 0;
-    if (key_create((uint64_t)(uintptr_t)&key,
-                   (uint64_t)(uintptr_t)&guest_destructor, 0, 0, 0, 0) != 0)
-        return 1;
-    g_key = (pthread_key_t)key;
-
-    uint64_t thread = 0;
-    if (thread_create((uint64_t)(uintptr_t)&thread, 0,
-                      (uint64_t)(uintptr_t)&guest_worker, 0, 0, 0) != 0)
-        return 1;
-    void* worker_result = (void*)1;
-    const uint64_t join_result = thread_join(
-        thread, (uint64_t)(uintptr_t)&worker_result, 0, 0, 0, 0);
-    const uint64_t delete_result = key_delete(key, 0, 0, 0, 0, 0);
-
-    // --- #1020 -----------------------------------------------------------------------------
-    // Reaching the line after the join IS the assertion. A regression does not fail a check --
-    // it terminates the process (exit ~0xC00000FF, no output).
-    g_exit_fn = Hle::lookup(nid_hash("scePthreadExit"));
-    uint32_t exit_key = 0;
-    bool exit_arm_ok = key_create((uint64_t)(uintptr_t)&exit_key,
-                                  (uint64_t)(uintptr_t)&guest_exiting_destructor,
-                                  0, 0, 0, 0) == 0;
-    if (exit_arm_ok) {
-        g_exit_key = (pthread_key_t)exit_key;
-        uint64_t exit_thread = 0;
-        exit_arm_ok = thread_create((uint64_t)(uintptr_t)&exit_thread, 0,
-                                    (uint64_t)(uintptr_t)&guest_exiting_worker, 0, 0, 0) == 0;
-        if (exit_arm_ok) exit_arm_ok = thread_join(exit_thread, 0, 0, 0, 0, 0) == 0;
-        key_delete(exit_key, 0, 0, 0, 0, 0);
-    }
-    const bool exit_dtor_ok = exit_arm_ok &&
-        g_exit_worker_ran.load(std::memory_order_acquire) &&
-        g_exit_dtor_calls.load(std::memory_order_relaxed) >= 1;
-    if (!exit_dtor_ok)
-        std::fprintf(stderr, "#1020: armed=%d worker_ran=%d dtor_calls=%u\n",
-                     (int)exit_arm_ok, (int)g_exit_worker_ran.load(std::memory_order_acquire),
-                     g_exit_dtor_calls.load(std::memory_order_relaxed));
-
-    const bool ok = join_result == 0 && worker_result == nullptr && delete_result == 0 &&
-                    g_calls.load(std::memory_order_relaxed) == 2 &&
-                    g_values[0].load(std::memory_order_relaxed) == kFirstValue &&
-                    g_values[1].load(std::memory_order_relaxed) == kSecondValue &&
-                    exit_dtor_ok;
-    if (!ok) {
-        std::fprintf(stderr,
-                     "pthread key destructor mismatch: join=%llu worker=%p delete=%llu "
-                     "calls=%u values=%llx,%llx\n",
-                     (unsigned long long)join_result, worker_result,
-                     (unsigned long long)delete_result,
-                     g_calls.load(std::memory_order_relaxed),
-                     (unsigned long long)g_values[0].load(std::memory_order_relaxed),
-                     (unsigned long long)g_values[1].load(std::memory_order_relaxed));
-        return 1;
-    }
-
+    KeyFamily family;
+    family.key_create = Hle::lookup(nid_hash("scePthreadKeyCreate"));
+    family.key_delete = Hle::lookup(nid_hash("scePthreadKeyDelete"));
+    family.thread_create = Hle::lookup(nid_hash("scePthreadCreate"));
+    family.thread_join = Hle::lookup(nid_hash("scePthreadJoin"));
+    family.thread_exit = Hle::lookup(nid_hash("scePthreadExit"));
+    return family;
+}
+uint64_t addr(void* p) {
+    return reinterpret_cast<uint64_t>(p);
+}
+// The guest-ABI callbacks below carry the SysV attribute, so their address is not convertible to
+// void* without the cast. One template serves both the void destructors and the void* workers.
+template <class Fn>
+uint64_t fn_addr(Fn fn) {
+    return reinterpret_cast<uint64_t>(reinterpret_cast<void*>(fn));
+}
+void reset_destructor_counters() {
     g_calls.store(0, std::memory_order_relaxed);
     g_values[0].store(0, std::memory_order_relaxed);
     g_values[1].store(0, std::memory_order_relaxed);
-    if (key_create((uint64_t)(uintptr_t)&key,
-                   (uint64_t)(uintptr_t)&guest_destructor, 0, 0, 0, 0) != 0)
-        return 1;
+    g_exit_dtor_calls.store(0, std::memory_order_relaxed);
+}
+}  // namespace
+
+TEST(WinPthreadKeyDestructor, TheKeyAndThreadEntryPointsAreRegistered) {
+    const KeyFamily family = key_family();
+    EXPECT_NE(family.key_create, nullptr) << "scePthreadKeyCreate is registered";
+    EXPECT_NE(family.key_delete, nullptr) << "scePthreadKeyDelete is registered";
+    EXPECT_NE(family.thread_create, nullptr) << "scePthreadCreate is registered";
+    EXPECT_NE(family.thread_join, nullptr) << "scePthreadJoin is registered";
+}
+
+TEST(WinPthreadKeyDestructor, TheGuestDestructorRunsWithThePs5AbiAndIsRetriedForItsOwnNewValue) {
+    const KeyFamily family = key_family();
+    reset_destructor_counters();
+    ASSERT_NE(family.key_create, nullptr);
+    ASSERT_NE(family.key_delete, nullptr);
+    ASSERT_NE(family.thread_create, nullptr);
+    ASSERT_NE(family.thread_join, nullptr);
+    uint32_t key = 0;
+    ASSERT_EQ(family.key_create(addr(&key), fn_addr(&guest_destructor), 0, 0, 0, 0), 0u);
     g_key = (pthread_key_t)key;
 
-    thread = 0;
-    if (thread_create((uint64_t)(uintptr_t)&thread, 0,
-                      (uint64_t)(uintptr_t)&guest_clear_worker, 0, 0, 0) != 0)
-        return 1;
-    worker_result = (void*)1;
-    const uint64_t clear_join_result = thread_join(
-        thread, (uint64_t)(uintptr_t)&worker_result, 0, 0, 0, 0);
-    const uint64_t clear_delete_result = key_delete(key, 0, 0, 0, 0, 0);
-    if (clear_join_result != 0 || worker_result != nullptr || clear_delete_result != 0 ||
-        g_calls.load(std::memory_order_relaxed) != 0) {
-        std::fprintf(stderr,
-                     "cleared pthread key invoked destructor: join=%llu worker=%p delete=%llu "
-                     "calls=%u\n",
-                     (unsigned long long)clear_join_result, worker_result,
-                     (unsigned long long)clear_delete_result,
-                     g_calls.load(std::memory_order_relaxed));
-        return 1;
-    }
+    uint64_t thread = 0;
+    ASSERT_EQ(family.thread_create(addr(&thread), 0, fn_addr(&guest_worker), 0, 0, 0), 0u);
+    void* worker_result = (void*)1;
+    const uint64_t join_result = family.thread_join(thread, addr(&worker_result), 0, 0, 0, 0);
+    const uint64_t delete_result = family.key_delete(key, 0, 0, 0, 0, 0);
 
-    if (win_key_destructor_thunk_count_for_test() != 0) return 1;
+    EXPECT_EQ(join_result, 0u) << "scePthreadJoin reports success";
+    EXPECT_EQ(worker_result, nullptr) << "the guest worker's pthread_setspecific returned 0";
+    EXPECT_EQ(delete_result, 0u) << "scePthreadKeyDelete reports success";
+    // POSIX requires the destructor to be called again for the value the first call installed, which
+    // is why the count is 2 and the second argument is the callback's OWN new value rather than the
+    // original one. A shim that ran the destructor once, or passed the stale value both times, lands
+    // here.
+    EXPECT_EQ(g_calls.load(std::memory_order_relaxed), 2u)
+        << "the destructor ran once per non-null value it was handed";
+    EXPECT_EQ(g_values[0].load(std::memory_order_relaxed), kFirstValue)
+        << "first destructor call received the worker's value";
+    EXPECT_EQ(g_values[1].load(std::memory_order_relaxed), kSecondValue)
+        << "the retry received the value the first call installed";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
+}
 
+TEST(WinPthreadKeyDestructor, ADestructorCallingScePthreadExitDoesNotTakeTheProcessDown) {
+    // Reaching the assertions below IS the arm. A regression does not fail a check here -- it
+    // terminates the process (exit ~0xC00000FF, no output), which is the death #997 removed for the
+    // normal worker path and #1020 removed for the destructor path.
+    const KeyFamily family = key_family();
+    reset_destructor_counters();
+    ASSERT_NE(family.key_create, nullptr);
+    ASSERT_NE(family.key_delete, nullptr);
+    ASSERT_NE(family.thread_create, nullptr);
+    ASSERT_NE(family.thread_join, nullptr);
+    ASSERT_NE(family.thread_exit, nullptr)
+        << "scePthreadExit is registered, or the #1020 arm is vacuous";
+    g_exit_fn = family.thread_exit;
+    uint32_t exit_key = 0;
+    ASSERT_EQ(family.key_create(addr(&exit_key), fn_addr(&guest_exiting_destructor), 0, 0, 0, 0),
+              0u);
+    g_exit_key = (pthread_key_t)exit_key;
+    uint64_t exit_thread = 0;
+    ASSERT_EQ(family.thread_create(addr(&exit_thread), 0, fn_addr(&guest_exiting_worker), 0, 0, 0),
+              0u);
+    EXPECT_EQ(family.thread_join(exit_thread, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(family.key_delete(exit_key, 0, 0, 0, 0, 0), 0u);
+    EXPECT_TRUE(g_exit_worker_ran.load(std::memory_order_acquire))
+        << "#1020: the worker that installed the exiting key ran";
+    EXPECT_GE(g_exit_dtor_calls.load(std::memory_order_relaxed), 1u)
+        << "#1020: the destructor that calls scePthreadExit was reached";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
+}
+
+TEST(WinPthreadKeyDestructor, AClearedValueInvokesNoDestructor) {
+    // winpthreads calls the destructor with nullptr when a value is cleared, while POSIX requires no
+    // callback at all. The HLE has to filter the nullptr case, or every guest that clears a key pays
+    // a destructor call it never asked for.
+    const KeyFamily family = key_family();
+    reset_destructor_counters();
+    ASSERT_NE(family.key_create, nullptr);
+    ASSERT_NE(family.key_delete, nullptr);
+    ASSERT_NE(family.thread_create, nullptr);
+    ASSERT_NE(family.thread_join, nullptr);
+    uint32_t key = 0;
+    ASSERT_EQ(family.key_create(addr(&key), fn_addr(&guest_destructor), 0, 0, 0, 0), 0u);
+    g_key = (pthread_key_t)key;
+
+    uint64_t thread = 0;
+    ASSERT_EQ(family.thread_create(addr(&thread), 0, fn_addr(&guest_clear_worker), 0, 0, 0), 0u);
+    void* worker_result = (void*)1;
+    const uint64_t join_result = family.thread_join(thread, addr(&worker_result), 0, 0, 0, 0);
+    const uint64_t delete_result = family.key_delete(key, 0, 0, 0, 0, 0);
+    EXPECT_EQ(join_result, 0u) << "scePthreadJoin reports success";
+    EXPECT_EQ(worker_result, nullptr) << "the guest worker cleared its value and reported 0";
+    EXPECT_EQ(delete_result, 0u) << "scePthreadKeyDelete reports success";
+    EXPECT_EQ(g_calls.load(std::memory_order_relaxed), 0u)
+        << "a cleared pthread key invoked no destructor";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
+}
+
+TEST(WinPthreadKeyDestructor, KeyDeleteAndTheReuseOfItsNumberCannotOverlap) {
+    const KeyFamily family = key_family();
+    ASSERT_NE(family.key_create, nullptr);
+    ASSERT_NE(family.key_delete, nullptr);
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "no key destructor thunk is installed before this case arms one";
     uint32_t old_key = 0;
-    if (key_create((uint64_t)(uintptr_t)&old_key,
-                   (uint64_t)(uintptr_t)&guest_destructor, 0, 0, 0, 0) != 0)
-        return 1;
+    ASSERT_EQ(family.key_create(addr(&old_key), fn_addr(&guest_destructor), 0, 0, 0, 0), 0u);
 
+    // Park the delete inside the HLE, after its host-side pthread_key_delete and before it installs
+    // the destructor thunk. A create that lands in that window reuses a key number whose destructor
+    // state is already gone -- or installs a thunk onto a key another thread is about to destroy.
     g_delete_host_done.store(false, std::memory_order_relaxed);
     g_release_delete.store(false, std::memory_order_relaxed);
     win_set_key_delete_after_host_hook_for_test(&delete_after_host_hook);
 
     std::atomic<uint64_t> raced_delete_result{UINT64_MAX};
     std::thread deleter([&] {
-        raced_delete_result.store(key_delete(old_key, 0, 0, 0, 0, 0),
+        raced_delete_result.store(family.key_delete(old_key, 0, 0, 0, 0, 0),
                                   std::memory_order_release);
     });
 
@@ -189,7 +238,7 @@ int main() {
         g_release_delete.store(true, std::memory_order_release);
         deleter.join();
         win_set_key_delete_after_host_hook_for_test(nullptr);
-        return 1;
+        FAIL() << "the delete never reached the post-host hook, so this case proved nothing";
     }
 
     uint32_t reused_key = UINT32_MAX;
@@ -197,15 +246,13 @@ int main() {
     std::atomic<bool> create_done{false};
     std::thread creator([&] {
         raced_create_result.store(
-            key_create((uint64_t)(uintptr_t)&reused_key,
-                       (uint64_t)(uintptr_t)&guest_destructor, 0, 0, 0, 0),
+            family.key_create(addr(&reused_key), fn_addr(&guest_destructor), 0, 0, 0, 0),
             std::memory_order_release);
         create_done.store(true, std::memory_order_release);
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const bool create_escaped_delete_transition =
-        create_done.load(std::memory_order_acquire);
+    const bool create_escaped_delete_transition = create_done.load(std::memory_order_acquire);
     g_release_delete.store(true, std::memory_order_release);
     deleter.join();
     creator.join();
@@ -214,19 +261,14 @@ int main() {
     const uint64_t create_result = raced_create_result.load(std::memory_order_acquire);
     const uint64_t delete_race_result = raced_delete_result.load(std::memory_order_acquire);
     const uint64_t reused_delete_result =
-        create_result == 0 ? key_delete(reused_key, 0, 0, 0, 0, 0) : UINT64_MAX;
-    if (create_escaped_delete_transition || delete_race_result != 0 || create_result != 0 ||
-        reused_key != old_key || reused_delete_result != 0 ||
-        win_key_destructor_thunk_count_for_test() != 0) {
-        std::fprintf(stderr,
-                     "pthread key reuse race: escaped=%d old=%u new=%u delete=%llu "
-                     "create=%llu cleanup=%llu tracked=%zu\n",
-                     create_escaped_delete_transition, old_key, reused_key,
-                     (unsigned long long)delete_race_result,
-                     (unsigned long long)create_result,
-                     (unsigned long long)reused_delete_result,
-                     win_key_destructor_thunk_count_for_test());
-        return 1;
-    }
-    return 0;
+        create_result == 0 ? family.key_delete(reused_key, 0, 0, 0, 0, 0) : UINT64_MAX;
+    EXPECT_FALSE(create_escaped_delete_transition)
+        << "the create escaped the parked delete's transition window";
+    EXPECT_EQ(delete_race_result, 0u) << "the racing delete reports success";
+    EXPECT_EQ(create_result, 0u) << "the racing create reports success";
+    EXPECT_EQ(reused_key, old_key) << "the reused key number is the one just deleted";
+    EXPECT_EQ(reused_delete_result, 0u) << "the reused key is deletable again";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "the destructor thunk was uninstalled (tracked="
+        << win_key_destructor_thunk_count_for_test() << ")";
 }
