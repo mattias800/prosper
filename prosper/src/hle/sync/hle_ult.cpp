@@ -159,6 +159,7 @@ constexpr uint64_t kUltErrDeadlk      = hle::kSceKernelErrorEDEADLK;  // self-re
 constexpr uint64_t kUltErrNoMem       = hle::kSceKernelErrorENOMEM;
 constexpr uint64_t kUltErrInval       = hle::kSceKernelErrorEINVAL;
 constexpr uint64_t kUltErrAgain       = hle::kSceKernelErrorEAGAIN;   // runtime is at numMaxUlthread
+constexpr uint64_t kUltErrBusy        = hle::kSceKernelErrorEBUSY;    // runtime destroy with live ulthreads
 constexpr uint64_t kUltNotImplemented = hle::kSceKernelErrorENOSYS;   // the legacy/Phase 1 policy
 
 // A size-returning contract has no error channel (#1618): whatever these return is read as a byte
@@ -673,9 +674,18 @@ PROSPER_SYSV_ABI uint64_t ult_pool_create(uint64_t a0, uint64_t a1, uint64_t a2,
 
 // sceUltWaitingQueueResourcePoolDestroy(pool): unpublish and retire the pool. Objects bound
 // from it keep working: they resolve their pool through the generation-guarded id, which
-// misses once this clears it, exactly like a mutex outliving nothing. A pool with bound
-// objects still destroys (reported, like mutex_destroy's held-mutex warning) rather than
-// stranding the guest's teardown path on an order it was never promised.
+// misses once this clears it.
+//
+// What the firmware actually checks is NOT the number of bound objects. libSceUlt.sprx
+// (or55417wcDk, file offset 0x46c0) refuses with busy (0x80810006, at 0x473a) only while the
+// pool's waiting-queue resource counters differ (pool+0xb8 free != pool+0xbc capacity), i.e.
+// while some thread is currently WAITING on a pool-backed object -- only the contended slow
+// path of sceUltMutexLock (body 0x15330) takes one of those resources. Bound but idle objects
+// do not block destroy on hardware, so a bound mutex here is reported, not refused.
+// prosper has no per-wait resource accounting and cannot observe a waiting thread, so it
+// cannot model that busy refusal, nor the 0x80810007 a contended lock gets after the pool is
+// gone; both cases answer OK here. bound_sync_objects is diagnostic only.
+// CONFIDENCE: HIGH for idle-bound -> OK; LOW for the waiting-thread case (unmodelled).
 PROSPER_SYSV_ABI uint64_t ult_pool_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                            uint64_t) {
     uint64_t out = 0;
@@ -769,22 +779,34 @@ PROSPER_SYSV_ABI uint64_t ult_runtime_create(uint64_t a0, uint64_t a1, uint64_t 
     return kUltOk;
 }
 
-// sceUltUlthreadRuntimeDestroy(runtime): unpublish and retire the runtime. Live ulthreads
-// keep running to their own join: they resolve the runtime through the generation-guarded
-// id, which misses once this clears it, so the join path skips the release it can no
-// longer perform instead of touching a dead object. A runtime with live ulthreads still
-// destroys (reported, like the pool above) rather than stranding teardown.
+// sceUltUlthreadRuntimeDestroy(runtime): unpublish and retire the runtime -- but only once
+// every ulthread created on it has been joined. The firmware enforces that order:
+// libSceUlt.sprx's -gxcs521SvA is a thunk at file offset 0x1cf60 that jumps to the body at
+// 0x2bcb0, which loads runtime+0x30 (0x2bcf0) and, if it is above zero, returns 0x80810006
+// (busy, at 0x2be65) leaving the runtime untouched; otherwise it CASes the field to -1 and
+// tears the workers down. runtime+0x30 is the count of created-and-not-yet-joined ulthreads:
+// _sceUltUlthreadCreate increments it (0x2e1a4..0x2e1bb, bounded by runtime+0x34 =
+// numMaxUlthread), and Join (body 0x2e440, at 0x2e73a) and TryJoin (0x2e8c0, at 0x2e9aa)
+// decrement it. live_ulthreads is prosper's model of that field (incremented by create,
+// decremented by complete_ulthread_join).
+//
+// The refusal uses this file's libkernel-errno convention (EBUSY) rather than the raw
+// 0x80810006, like every other Ult error here. A second destroy answers ESRCH, where the
+// firmware would not refuse (-1 is not > 0); refusing is the safer answer for a dead object.
+// CONFIDENCE: HIGH that live ulthreads refuse and leave the runtime alive; LOW on the value.
 PROSPER_SYSV_ABI uint64_t ult_runtime_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
                                               uint64_t) {
     uint64_t out = 0;
     if (!implement(kIdxRuntimeDestroy, &out)) return out;
     UltObject* o = resolve(a0, UltType::Runtime, "sceUltUlthreadRuntimeDestroy");
     if (!o) return kUltErrSrch;
-    const uint32_t live = o->live_ulthreads.load(std::memory_order_relaxed);
-    if (live != 0)
-        log_line("sceUltUlthreadRuntimeDestroy on \"%s\" (0x%llx) with %u ulthread(s) still "
-                 "live -- they join on their own, the runtime does not",
+    const uint32_t live = o->live_ulthreads.load(std::memory_order_acquire);
+    if (live != 0) {
+        log_line("sceUltUlthreadRuntimeDestroy on \"%s\" (0x%llx) with %u ulthread(s) not yet "
+                 "joined -- refusing busy, the runtime stays alive",
                  o->name.c_str(), (unsigned long long)a0, live);
+        return kUltErrBusy;
+    }
     unpublish_object(a0);
     o->alive.store(false, std::memory_order_release);
     return kUltOk;

@@ -304,7 +304,10 @@ TEST(FiberUltMisc, PoolDestroyRetiresThePool) {
         << "destroy on a never-created pool is refused";
 }
 
-TEST(FiberUltMisc, RuntimeDestroyReleasesLiveUlthreads) {
+TEST(FiberUltMisc, RuntimeDestroyRefusesWhileUlthreadsAreUnjoined) {
+    // Firmware contract (libSceUlt.sprx, body 0x2bcb0): runtime+0x30 counts created-and-not-yet-
+    // joined ulthreads, and a destroy while it is above zero returns busy (0x80810006 at 0x2be65)
+    // and leaves the runtime untouched. Join decrements it, after which destroy succeeds.
     register_builtin_hle();
     EXPECT_NE(Hle::lookup(nid_hash("sceUltUlthreadRuntimeDestroy")), nullptr);
     EXPECT_EQ(nid_hash("sceUltUlthreadRuntimeDestroy"), "-gxcs521SvA");
@@ -322,8 +325,6 @@ TEST(FiberUltMisc, RuntimeDestroyReleasesLiveUlthreads) {
                         0x12000000ull),
               0u);
 
-    // A runtime with a RUNNING ulthread still destroys; the join afterwards must find the
-    // ulthread (not the dead runtime) and complete normally instead of faulting on it.
     g_gate.store(0);
     UltBlob ult;
     std::memset(&ult, 0, sizeof(ult));
@@ -331,15 +332,20 @@ TEST(FiberUltMisc, RuntimeDestroyReleasesLiveUlthreads) {
     ASSERT_EQ(call9_nid("znI3q8S7KQ4", addr(&ult), 0, addr((const void*)&gated_probe_entry), 0x53,
                         addr(ctx.data()), (uint64_t)ctx.size(), addr(&g_runtime), 0, 0x12000000ull),
               0u);
-    EXPECT_EQ(call_nid("-gxcs521SvA", addr(&g_runtime)), 0u)
-        << "runtime destroy succeeds with a live ulthread";
-    EXPECT_EQ(call_nid("-gxcs521SvA", addr(&g_runtime)), hle::kSceKernelErrorESRCH)
-        << "destroy frees exactly once";
+    EXPECT_EQ(call_nid("-gxcs521SvA", addr(&g_runtime)), hle::kSceKernelErrorEBUSY)
+        << "destroy with a live (unjoined) ulthread is refused busy";
+
+    // Join drops the runtime's unjoined count to zero. (The join alone would succeed even with the
+    // runtime gone; the destroy-returns-0 assertion below is what proves the refusal left it alive.)
     g_gate.store(1);
     int32_t status = -1;
-    EXPECT_EQ(call_nid("gCeAI57LGgI", addr(&ult), addr(&status)), 0u)
-        << "join completes after its runtime is gone";
+    EXPECT_EQ(call_nid("gCeAI57LGgI", addr(&ult), addr(&status)), 0u);
     EXPECT_EQ(status, 0x53);
+
+    EXPECT_EQ(call_nid("-gxcs521SvA", addr(&g_runtime)), 0u)
+        << "destroy succeeds once every ulthread is joined";
+    EXPECT_EQ(call_nid("-gxcs521SvA", addr(&g_runtime)), hle::kSceKernelErrorESRCH)
+        << "a second destroy is refused";
     UltBlob never_created;
     std::memset(&never_created, 0, sizeof(never_created));
     EXPECT_EQ(call_nid("-gxcs521SvA", addr(&never_created)), hle::kSceKernelErrorESRCH)
