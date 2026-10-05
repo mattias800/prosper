@@ -1467,6 +1467,24 @@ namespace {
         }
         return true;
     }
+    // Is [base, base+len) entirely covered by tracked DIRECT-memory mappings? A fixed direct map replaces
+    // them, as mmap(MAP_FIXED) does on the PS5's kernel (the guest keeps what is there with
+    // SCE_KERNEL_MAP_NO_OVERWRITE, which is unverified and unhonoured, #3819). Flexible memory, images and
+    // untracked host ranges stay refused (#137): a gap or any non-direct byte answers false.
+    bool range_is_replaceable_direct(uint64_t base, uint64_t len) {
+        if (!len || base > UINT64_MAX - len) return false;
+        std::lock_guard<std::mutex> lk(g_mx);
+        uint64_t cur = base;
+        const uint64_t end = base + len;
+        while (cur < end) {
+            const Mapping* cover = nullptr;
+            for (const Mapping& m : g_maps)
+                if (cur >= m.base && cur < m.base + m.size) { cover = &m; break; }
+            if (!cover || !(cover->query_flags & kVirtualQueryDirect)) return false;
+            cur = cover->base + cover->size;
+        }
+        return true;
+    }
     // Smallest mapping base strictly greater than addr (0 if none) — for hole reporting.
     uint64_t next_base(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -1763,6 +1781,11 @@ namespace {
                 // PROT_NONE placeholder is safe even when MAP_FIXED was not requested.
                 void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
+            } else if (fixed && range_is_replaceable_direct(hint, len)) {
+                // MAP_FIXED replaces direct memory (see range_is_replaceable_direct).
+                void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
+                if (p != MAP_FAILED) return p;
+                return nullptr;
             } else if (fixed) {
                 // Same no-clobber discipline as map_at (#137): NOREPLACE first, MAP_FIXED replace
                 // only over our own uncommitted reservation, else refuse rather than destroy a live
@@ -6025,6 +6048,7 @@ namespace {
     }
 
     bool win_unmap(uint64_t addr, uint64_t len);   // defined below
+    bool range_direct_views_replaceable(uint64_t base, uint64_t len);   // defined below
 
     // Does [base, base+len) hold private pages prosper put into a guest placeholder, and could a
     // release make the range replaceable? Those are the lazy-commit pages the VEH creates on first
@@ -6081,6 +6105,8 @@ namespace {
         // Normalize only ranges whose complete ownership the registries prove, then retry once.
         if (fixed && normalize_fragmented_guest_placeholder_range(hint, len))
             if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
+        // FIXED MAP_DIRECT over direct views takes the same release-then-retry route, gated by
+        // range_direct_views_replaceable so flexible memory and partial private views are refused untouched.
         // FIXED MAP_DIRECT over private pages inside the guest's own reservation (#3812). A fixed
         // map REPLACES whatever is mapped there -- on PS5 (a non-overwriting map has to ask for
         // SCE_KERNEL_MAP_NO_OVERWRITE) and on Linux, where mmap(MAP_FIXED) discards the anonymous
@@ -6103,7 +6129,8 @@ namespace {
         // untracked (below): its old contents are gone, as after a failed Linux MAP_FIXED.
         //
         // Not honoured here or anywhere else yet: SCE_KERNEL_MAP_NO_OVERWRITE (#3819).
-        if (fixed && hint && len && range_private_views_replaceable(hint, len)) {
+        if (fixed && hint && len &&
+            (range_private_views_replaceable(hint, len) || range_direct_views_replaceable(hint, len))) {
             if (win_unmap(hint, len)) {
                 // Announced rather than silent (capped, and the cap says so): this path discards
                 // pages, and a log that cannot show it ran cannot show it was the fix either.
@@ -6817,6 +6844,41 @@ namespace {
             if (!span_is_covered(overlap_begin, overlap_end, covered)) return false;
         }
         return true;
+    }
+
+    // May a fixed direct map replace [base, base+len)? Only when the registries prove it: a direct view
+    // overlaps and every byte is owned by a direct view, a placeholder or a private view wholly inside the
+    // range. Anything else answers false BEFORE any mutation: win_unmap's registry-less fallback is a
+    // blind MEM_DECOMMIT (plain flexible memory), and a partly covered view that cannot be split fails
+    // inside win_unmap with nothing changed.
+    bool range_direct_views_replaceable(uint64_t base, uint64_t len) {
+        if (!len || base > UINT64_MAX - len) return false;
+        const uint64_t end = base + len;
+        std::vector<PlaceholderSpan> covered;
+        bool direct = false;
+        {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            auto add = [&](uint64_t b, uint64_t sz) {
+                const uint64_t lo = std::max(base, b), hi = std::min(end, b + sz);
+                if (lo < hi) covered.push_back({lo, hi - lo});
+            };
+            for (const DmemView& view : g_dviews)
+                if (base < view.guest_base + view.guest_size && end > view.guest_base) {
+                    direct = true;
+                    add(view.guest_base, view.guest_size);
+                }
+            for (const PrivatePlaceholderView& view : g_private_placeholder_views) {
+                if (!(view.base < end && base < view.base + view.size)) continue;
+                if (view.base < base || view.base + view.size > end) return false;
+                add(view.base, view.size);
+            }
+            for (const PlaceholderSpan& span : g_guest_placeholders) add(span.base, span.size);
+            for (const PlaceholderSpan& span : g_free_placeholders) add(span.base, span.size);
+        }
+        if (!direct) return false;
+        normalize_spans(covered);
+        return span_is_covered(base, end, covered) &&
+               tracked_mappings_covered_by_spans(base, end, covered);
     }
 
     // Shared section views must be released with the view APIs. Placeholder-backed views can be
