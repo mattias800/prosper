@@ -5012,6 +5012,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
+      # positives/negatives, plus the program rendered with both back-edge polarities.
+      prosper_add_gtest(test_scc_do_while_loops
+        SOURCES tests/gpu/execute/test_scc_do_while_loops.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
