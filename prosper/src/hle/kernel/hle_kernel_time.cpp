@@ -391,18 +391,21 @@ HLE(k_rtc_set_tick) {   // (SceRtcDateTime* dt, const SceRtcTick* tick)
     fill_rtc_datetime(P(a0), tmv, (uint32_t)rem);
     return 0;
 }
+namespace {
+int64_t rtc_utc_seconds_carrying(int year, int month, int day, int hour, int minute, int second);
+}
 // sceRtcGetTick(const SceRtcDateTime* dt, SceRtcTick* tick): the inverse (datetime assumed UTC).
+// The seconds come from rtc_utc_seconds_carrying, not from the C library, whose range depends
+// on the host (#4502, from main's CI): glibc's timegm converts every year this handler can be
+// given; macOS's returns -1 for year 1 (it converts year 9999); Windows' _mkgmtime64 returns -1
+// for year 1 and for year 9999. A -1 made this handler answer "one second before 1970". The
+// fields are still not validated and the null error is still the old facility; #4462 tracks
+// both, because changing them changes what a guest sees.
 HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
     if (!a0 || !a1) return 0x80250001ull;
     const uint16_t* d = (const uint16_t*)P(a0);
-    struct tm tmv {};
-    tmv.tm_year = (int)d[0] - 1900; tmv.tm_mon = (int)d[1] - 1; tmv.tm_mday = (int)d[2];
-    tmv.tm_hour = (int)d[3]; tmv.tm_min = (int)d[4]; tmv.tm_sec = (int)d[5];
-#ifdef _WIN32
-    int64_t secs = _mkgmtime64(&tmv);
-#else
-    int64_t secs = (int64_t)timegm(&tmv);
-#endif
+    const int64_t secs =
+        rtc_utc_seconds_carrying((int)d[0], (int)d[1], (int)d[2], (int)d[3], (int)d[4], (int)d[5]);
     *(uint64_t*)P(a1) = (uint64_t)(secs * 1000000ll + (int64_t)*(const uint32_t*)(d + 6)
                                    + (int64_t)kRtcUnixEpochOffsetUs);
     return 0;
@@ -463,8 +466,9 @@ uint64_t rtc_check_valid_dt(const uint16_t* d) {
 // Used INSTEAD of gmtime/timegm here: those need a per-OS spelling (#ifdef _WIN32), and new
 // platform branches in shared code trip the arch ratchet. Pure arithmetic has no branches at
 // all, handles pre-1970 dates identically on every host, and is verified below against fixed
-// dates rather than against libc. The pre-existing handlers above keep their libc conversions
-// untouched; these helpers mirror their results (same epoch offset, same field layout).
+// dates rather than against libc. sceRtcGetTick above uses them too since #4502; sceRtcSetTick
+// still converts through gmtime. The helpers mirror those handlers' results (same epoch offset,
+// same field layout).
 static int64_t rtc_days_from_civil(int y, int m, int d) {
     y -= m <= 2 ? 1 : 0;
     const int64_t era = (y >= 0 ? y : y - 399) / 400;
@@ -484,6 +488,20 @@ static void rtc_civil_from_days(int64_t z, int& y, int& m, int& d) {
     d = (int)(doy - (153u * mp + 2u) / 5u + 1);
     m = (int)(mp + (mp < 10 ? 3 : -9));
     y += m <= 2 ? 1 : 0;
+}
+// Seconds since 1970-01-01T00:00:00Z for a broken-down UTC datetime whose fields may be out of
+// range, carried the way timegm carries them: months into years, then days, hours, minutes and
+// seconds linearly. So month 13 is January of the next year, month 0 is December of the previous
+// one, and February 31 is early March. test_rtc checks fixed answers on every host and, on
+// glibc, 20,000 arbitrary field tuples against timegm itself.
+int64_t rtc_utc_seconds_carrying(int year, int month, int day, int hour, int minute, int second) {
+    // rtc_days_from_civil wants month 1..12 and counts the day in unsigned arithmetic, so carry
+    // the month first and add the day outside it.
+    const int month0 = month - 1;
+    const int carry = (month0 >= 0 ? month0 : month0 - 11) / 12;   // floor(month0 / 12)
+    const int64_t days =
+        rtc_days_from_civil(year + carry, month0 - carry * 12 + 1, 1) + (int64_t)day - 1;
+    return days * 86400ll + (int64_t)hour * 3600ll + (int64_t)minute * 60ll + (int64_t)second;
 }
 // Tick -> broken-down UTC datetime. Mirrors k_rtc_set_tick's conversion (not shared: that
 // handler's exact body stays untouched).
@@ -1098,7 +1116,7 @@ HLE(k_getpid)   { return 0xbad1; }
 
 // sceKernelGettimezone(struct timezone* tz) = { int tz_minuteswest; int tz_dsttime }. Was MISSING -> the
 // generic stub left the out-struct uninitialized (the #82/#190 uninit-out class). We present a UTC clock
-// (the RTC path uses timegm), so report {0, 0} deterministically.
+// (the RTC path converts as UTC), so report {0, 0} deterministically.
 HLE(k_gettimezone) { if (a0) { int* tz = (int*)P(a0); tz[0] = 0; tz[1] = 0; } return 0; }
 // sceKernelClockGetres(clockid, struct timespec* res): our time source is nanosecond-resolution. Was
 // MISSING -> left *res uninitialized. Report 1 ns for every clock.
