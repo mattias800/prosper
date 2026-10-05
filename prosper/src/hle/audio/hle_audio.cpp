@@ -3628,6 +3628,8 @@ constexpr uint64_t kNgs2ErrInvalidOut    = (uint64_t)(int64_t)(int32_t)0x804a005
 constexpr uint64_t kNgs2ErrInvalidSystem = (uint64_t)(int64_t)(int32_t)0x804a0230;
 constexpr uint64_t kNgs2ErrInvalidRack   = (uint64_t)(int64_t)(int32_t)0x804a0261;
 constexpr uint64_t kNgs2ErrInvalidVoice  = (uint64_t)(int64_t)(int32_t)0x804a0302;
+constexpr uint64_t kNgs2ErrInvalidAllocator = (uint64_t)(int64_t)(int32_t)0x804a020a;
+constexpr uint64_t kNgs2ErrInvalidGrain     = (uint64_t)(int64_t)(int32_t)0x804a0051;
 
 struct Ngs2RackState {
     bool used = false;
@@ -4067,12 +4069,20 @@ HLE(ngs2_rack_get_voice) {
 // firmware set. The DSP quartet (PanInit/PanGetVolumeMatrix/ParseWaveformData/CalcWaveformBlock)
 // and SystemGetInfo stay out: their struct layouts are unpinned by any local caller and no
 // touch backend exists to compute against.
+// The allocator struct's first word is its allocHandler; the library refuses a missing one.
+static bool ngs2_allocator_valid(uint64_t allocator) {
+    uint64_t handler = 0;
+    return allocator && audio_read_bytes(allocator, &handler, 8) && handler;
+}
 HLE(ngs2_system_create_with_allocator) {
     NGS2_LOG("sceNgs2SystemCreateWithAllocator");
-    // (option?, allocator, handle*): the allocator is required input like SystemCreate's
-    // buffer_info, but its callbacks are never invoked — prosper keeps its own slot table and
-    // reads guest memory directly, so there is no allocation to perform. CONFIDENCE: MED.
-    if (!a1 || !a2) return kNgs2ErrInvalidOut;
+    // (option?, allocator, handle*): the allocator's callbacks are never invoked — prosper keeps
+    // its own slot table and reads guest memory directly, so there is no allocation to perform.
+    // CONFIDENCE: MED. Argument checks follow the shipped libSceNgs2.sprx (export mPYgU4oYpuY): a
+    // NULL allocator or a NULL allocHandler (+0) answers 0x804a020a, and only then does a NULL
+    // handle out answer 0x804a0053.
+    if (!ngs2_allocator_valid(a1)) return kNgs2ErrInvalidAllocator;
+    if (!a2) return kNgs2ErrInvalidOut;
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     // Optional SystemOption grain at +0x70, same as SystemCreate.
     if (a0) {
@@ -4114,15 +4124,20 @@ HLE(ngs2_system_set_grain_samples) {
     NGS2_LOG("sceNgs2SystemSetGrainSamples");
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    // The shipped library (export l4Q2dWEH6UM) answers 0x804a0051 for a count that is not a
+    // multiple of 64 or lies outside the system's limits, and stores only a valid one. The limits
+    // used here are SystemCreate's sane range. CONFIDENCE: MED on the exact bounds.
     const uint32_t g = (uint32_t)a1;
-    if (g >= 64 && g <= 8192) g_ngs2_grain = g;
+    if (g < 64 || g > 8192 || (g & 63)) return kNgs2ErrInvalidGrain;
+    g_ngs2_grain = g;
     return 0;
 }
 HLE(ngs2_rack_create_with_allocator) {
     NGS2_LOG("sceNgs2RackCreateWithAllocator");
-    // (system, rack_id, option?, allocator, handle*): allocator required, callbacks uninvoked,
-    // same model as the system allocator create above.
-    if (!a3 || !a4) return kNgs2ErrInvalidOut;
+    // (system, rack_id, option?, allocator, handle*): callbacks uninvoked, same model and the
+    // same allocator-then-out check order (export U546k6orxQo) as the system create above.
+    if (!ngs2_allocator_valid(a3)) return kNgs2ErrInvalidAllocator;
+    if (!a4) return kNgs2ErrInvalidOut;
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
     for (uint64_t i = 0; i < 32; ++i) {
