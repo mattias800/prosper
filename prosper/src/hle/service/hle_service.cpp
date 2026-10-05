@@ -734,6 +734,55 @@ HLE(s_dialog_result) {
     return 0;
 }
 
+// --- LoginDialog + WebBrowserDialog lifecycles; MsgDialog progress bars ----------------------
+// LoginDialog: Sonic imports only Initialize today, but the other five entry points sit in the
+// firmware table with NIDs resolving by hash, and they read as the same headless lifecycle as
+// MsgDialog above (no platform_ui route exists for login — headless only). Initialize is
+// upgraded from a bare s_ok to store INITIALIZED (still returns 0); Open auto-dismisses to
+// FINISHED; Close/Terminate clear to NONE. GetResult stays UNREGISTERED on purpose — same
+// rationale as SigninDialog GetResult (np.cpp): its layout is unpinned by any local call site,
+// and writing a guessed struct is worse than the fail-visible unimplemented line.
+// WebBrowserDialog: the firmware table carries just Initialize/Terminate — a two-state stub.
+// MsgDialog progress bars: display-only setters with no out-parameters; acknowledged, since a
+// guest cannot observe anything but the return and the observed callers do not branch on it.
+// NIDs via nid_hash (LoginDialogInitialize reproduces the registered qP-EvQRl2Hc).
+namespace {
+std::atomic<int> g_logindialog_status{0 /*NONE*/};
+}
+namespace {
+std::atomic<int> g_webbrowserdialog_status{0 /*NONE*/};
+}
+HLE(s_login_dialog_init) {
+    g_logindialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_login_dialog_open) {
+    g_logindialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    return 0;
+}
+HLE(s_login_dialog_status) {
+    return (uint64_t)(unsigned)g_logindialog_status.load();
+}
+HLE(s_login_dialog_close) {
+    g_logindialog_status.store(0 /*NONE*/);
+    return 0;
+}
+HLE(s_login_dialog_term) {
+    g_logindialog_status.store(0 /*NONE*/);
+    return 0;
+}
+HLE(s_dialog_progress) {
+    return 0;
+}   // ProgressBarInc/SetMsg/SetValue: nothing to show headless
+HLE(s_webbrowser_dialog_init) {
+    g_webbrowserdialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_webbrowser_dialog_term) {
+    g_webbrowserdialog_status.store(0 /*NONE*/);
+    return 0;
+}
+
 // ===== Issue #232: the Sony services DOLL's level-load flow polls (PlayGo / SaveData / =========
 // ===== NpTrophy2 lifecycle / Share). All NID<->name pairs verified against the PS5 3.20 ========
 // ===== library stub tables (PS5-3.20_Libs/libSce{PlayGo,SaveData.native,NpTrophy2,Share}.c). ===
@@ -1416,7 +1465,20 @@ void register_service_hle() {
     Hle::register_fn("qbwy0Ub8b3M", (HleFn)s_user_number, "sceUserServiceGetUserNumber");
     // Sonic imports LoginDialog only to initialize the service at startup.  There is no UI to show
     // until Open is requested, so initialization is a truthful successful no-op in the headless HLE.
-    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_ok, "sceLoginDialogInitialize");
+    // The rest of the lifecycle (auto-dismiss to FINISHED, NONE after close) mirrors MsgDialog.
+    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_login_dialog_init, "sceLoginDialogInitialize");
+    R("sceLoginDialogOpen", s_login_dialog_open);
+    R("sceLoginDialogClose", s_login_dialog_close);
+    R("sceLoginDialogTerminate", s_login_dialog_term);
+    R("sceLoginDialogUpdateStatus", s_login_dialog_status);
+    R("sceLoginDialogGetStatus", s_login_dialog_status);
+    // MsgDialog progress bars: display-only setters with no out-parameters.
+    R("sceMsgDialogProgressBarInc", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetMsg", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetValue", s_dialog_progress);
+    // WebBrowserDialog: two-state stub (Initialize/Terminate are the whole firmware surface).
+    R("sceWebBrowserDialogInitialize", s_webbrowser_dialog_init);
+    R("sceWebBrowserDialogTerminate", s_webbrowser_dialog_term);
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
