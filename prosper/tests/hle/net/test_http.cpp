@@ -426,3 +426,88 @@ TEST(Http, Contract) {
 
     EXPECT_EQ(fails, 0);
 }
+
+// Option setters + epoll lifecycle + Https acknowledgement. Every NID below was unregistered,
+// so the dispatcher answered SCE_OK while recording nothing and allocating nothing: a setter
+// the guest believes took effect, and an epoll handle nobody allocated. The arms demand
+// recorded-or-refused behavior through the real NIDs — positive ids/handles for good calls,
+// the library's INVALID_ID for ids nobody handed out.
+TEST(Http, OptionSettersRecord) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn nonblock = Hle::lookup("s2-NPIvz+iA");
+    HleFn auto_redirect = Hle::lookup("T-mGo9f3Pu4");
+    HleFn auth_enabled = Hle::lookup("qFg2SuyTJJY");
+    HleFn resolve_timeout = Hle::lookup("Tc-hAYDKtQc");
+    HleFn resolve_retry = Hle::lookup("K1d1LqZRQHQ");
+    HleFn connect_timeout = Hle::lookup("0S9tTH0uqTU");
+    HleFn send_timeout = Hle::lookup("xegFfZKBVlw");
+    HleFn recv_timeout = Hle::lookup("yigr4V0-HTM");
+    for (HleFn f : {init, term, nonblock, auto_redirect, auth_enabled, resolve_timeout,
+                    resolve_retry, connect_timeout, send_timeout, recv_timeout})
+        ASSERT_NE(f, nullptr) << "every option setter must be registered";
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+    EXPECT_EQ(nonblock(ctx, 1, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(auto_redirect(ctx, 1, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(auth_enabled(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(resolve_timeout(ctx, 5000000, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(resolve_retry(ctx, 3, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(connect_timeout(ctx, 5000000, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(send_timeout(ctx, 5000000, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(recv_timeout(ctx, 5000000, 0, 0, 0, 0), 0u);
+    constexpr uint64_t kInvalidId = http::kErrorInvalidId;
+    EXPECT_EQ(nonblock(9999, 1, 0, 0, 0, 0), kInvalidId) << "unknown id is refused";
+    EXPECT_EQ(auto_redirect(0, 1, 0, 0, 0, 0), kInvalidId) << "id 0 is never valid";
+    EXPECT_EQ(resolve_timeout(9999, 1, 0, 0, 0, 0), kInvalidId);
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Http, EpollLifecycle) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn create = Hle::lookup("6381dWF+xsQ");
+    HleFn destroy = Hle::lookup("wYhXVfS2Et4");
+    HleFn set = Hle::lookup("-xm7kZQNpHI");
+    HleFn unset = Hle::lookup("59tL1AQBb8U");
+    for (HleFn f : {init, term, create, destroy, set, unset}) ASSERT_NE(f, nullptr);
+    constexpr uint64_t kInvalidId = http::kErrorInvalidId;
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+
+    uint64_t eh = 0;
+    EXPECT_EQ(create(9999, (uint64_t)&eh, 0, 0, 0, 0), kInvalidId) << "bad context is refused";
+    EXPECT_EQ(eh, 0u) << "refused create writes no handle";
+    EXPECT_EQ(create(ctx, 0, 0, 0, 0, 0), kInvalidId) << "null out-pointer is refused";
+    ASSERT_EQ(create(ctx, (uint64_t)&eh, 0, 0, 0, 0), 0u);
+    EXPECT_NE(eh, 0u) << "CreateEpoll writes a real handle";
+    EXPECT_EQ(set(9999, eh, 0, 0, 0, 0), kInvalidId) << "unknown id cannot bind";
+    EXPECT_EQ(set(ctx, 0xDEADu, 0, 0, 0, 0), kInvalidId) << "foreign handle cannot bind";
+    EXPECT_EQ(set(ctx, eh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(unset(9999, 0, 0, 0, 0, 0), kInvalidId);
+    EXPECT_EQ(unset(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), kInvalidId) << "destroy frees exactly once";
+    EXPECT_EQ(set(ctx, eh, 0, 0, 0, 0), kInvalidId) << "a destroyed handle no longer binds";
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Https, CallbacksAcknowledged) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn set_cb = Hle::lookup("htyBOoWeS58");
+    HleFn disable = Hle::lookup("mSQCxzWTwVI");
+    for (HleFn f : {init, term, set_cb, disable}) ASSERT_NE(f, nullptr);
+    // Pure setters with no out-parameters: acknowledged, never stored-or-called headless.
+    // Uncharted's single SetSslCallback site drops the answer, so 0 changes nothing observable.
+    EXPECT_EQ(set_cb(1, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(disable(1, 0, 0, 0, 0, 0), 0u);
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+    EXPECT_EQ(set_cb(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(disable(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}

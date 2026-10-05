@@ -18,10 +18,12 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -396,6 +398,20 @@ struct HttpObject {
     uint32_t send_error = 0;
     int32_t last_errno = 0;
     bool aborted = false;
+
+    // Option state recorded by the setters below (all default zero/false), so a setter's
+    // SCE_OK means the state really is recorded. Nothing here is ever handed back as a
+    // network answer.
+    bool nonblock = false;
+    bool auto_redirect = false;
+    bool auth_enabled = false;
+    uint64_t resolve_timeout_us = 0;
+    uint64_t connect_timeout_us = 0;
+    uint64_t send_timeout_us = 0;
+    uint64_t recv_timeout_us = 0;
+    int32_t resolve_retry = 0;
+    uint64_t epoll_handle = 0;   // live host block, or 0 when unbound
+    uint64_t epoll_arg = 0;
 };
 
 constexpr int kMaxHttpObjects = 128;
@@ -735,6 +751,165 @@ HLE(h_http_get_last_errno) {
     *reinterpret_cast<int32_t*>(a1) = req->last_errno;
     return 0;
 }
+
+// --- option setters + epoll lifecycle (firmware 3.20 set) ----------------------------------
+// All take a live id first (this file's one shape assumption) and record the value, so SCE_OK
+// means recorded; an id nobody handed out fails InvalidId. NIDs from the firmware set
+// (verified by nid_hash round-trip); arities from the stub interface (MED on exact meanings,
+// HIGH on id-first). The epoll wait itself has no firmware export to implement — Create hands
+// out a real zeroed host block (the UDS-handle precedent) so a title can bind, poll and tear
+// down through the full lifecycle with nothing ever firing headless.
+HLE(h_http_set_nonblock) {   // (id, enable)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->nonblock = a1 != 0;
+    return 0;
+}
+HLE(h_http_set_auto_redirect) {   // (id, enable)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->auto_redirect = a1 != 0;
+    return 0;
+}
+HLE(h_http_set_auth_enabled) {   // (id, enable)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->auth_enabled = a1 != 0;
+    return 0;
+}
+HLE(h_http_set_resolve_timeout) {   // (id, usec)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->resolve_timeout_us = a1;
+    return 0;
+}
+HLE(h_http_set_resolve_retry) {   // (id, retry)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->resolve_retry = (int32_t)a1;
+    return 0;
+}
+HLE(h_http_set_connect_timeout) {   // (id, usec)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->connect_timeout_us = a1;
+    return 0;
+}
+HLE(h_http_set_send_timeout) {   // (id, usec)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->send_timeout_us = a1;
+    return 0;
+}
+HLE(h_http_set_recv_timeout) {   // (id, usec)
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->recv_timeout_us = a1;
+    return 0;
+}
+
+namespace {
+// Epoll handles are opaque host blocks (HttpEpollHandle is a pointer type), recorded live so
+// Set/Unset/Destroy validate against what Create handed out. Caller holds g_http_mx.
+constexpr size_t kHttpEpollBlockBytes = 64;
+std::unordered_set<uint64_t>& http_epolls() {
+    static std::unordered_set<uint64_t> live;
+    return live;
+}
+bool http_epoll_live(uint64_t handle) {
+    return http_epolls().count(handle) != 0;
+}
+}   // namespace
+
+HLE(h_http_create_epoll) {   // (ctxId, HttpEpollHandle* out) -> SCE_OK, handle written
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    if (!http_live(a0, Kind::Ctx) || !a1) return http_err(http::kErrorInvalidId);
+    void* block = std::calloc(1, kHttpEpollBlockBytes);
+    if (!block) return http_err(http::kErrorOutOfMemory);
+    const uint64_t handle = (uint64_t)(uintptr_t)block;
+    http_epolls().insert(handle);
+    *(uint64_t*)a1 = handle;
+    return 0;
+}
+HLE(h_http_destroy_epoll) {   // (ctxId, handle) -> SCE_OK
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    if (!http_live(a0, Kind::Ctx) || !http_epoll_live(a1)) return http_err(http::kErrorInvalidId);
+    http_epolls().erase(a1);
+    std::free((void*)(uintptr_t)a1);
+    return 0;
+}
+HLE(h_http_set_epoll) {   // (id, handle, user_arg) -> SCE_OK, binding recorded
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj || !http_epoll_live(a1)) return http_err(http::kErrorInvalidId);
+    obj->epoll_handle = a1;
+    obj->epoll_arg = a2;
+    return 0;
+}
+HLE(h_http_unset_epoll) {   // (id) -> SCE_OK, binding cleared
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_http_mx);
+    HttpObject* obj = http_live_any(a0);
+    if (!obj) return http_err(http::kErrorInvalidId);
+    obj->epoll_handle = 0;
+    obj->epoll_arg = 0;
+    return 0;
+}
 } // namespace
 
 void register_http_hle() {
@@ -769,6 +944,20 @@ void register_http_hle() {
                      "sceHttpRemoveRequestHeader");
     Hle::register_fn("PTiFIUxCpJc", (HleFn)h_http_set_request_content_length,
                      "sceHttpSetRequestContentLength");
+    // Option setters: validated against the live-id table, values recorded.
+    Hle::register_fn("s2-NPIvz+iA", (HleFn)h_http_set_nonblock, "sceHttpSetNonblock");
+    Hle::register_fn("T-mGo9f3Pu4", (HleFn)h_http_set_auto_redirect, "sceHttpSetAutoRedirect");
+    Hle::register_fn("qFg2SuyTJJY", (HleFn)h_http_set_auth_enabled, "sceHttpSetAuthEnabled");
+    Hle::register_fn("Tc-hAYDKtQc", (HleFn)h_http_set_resolve_timeout, "sceHttpSetResolveTimeOut");
+    Hle::register_fn("K1d1LqZRQHQ", (HleFn)h_http_set_resolve_retry, "sceHttpSetResolveRetry");
+    Hle::register_fn("0S9tTH0uqTU", (HleFn)h_http_set_connect_timeout, "sceHttpSetConnectTimeOut");
+    Hle::register_fn("xegFfZKBVlw", (HleFn)h_http_set_send_timeout, "sceHttpSetSendTimeOut");
+    Hle::register_fn("yigr4V0-HTM", (HleFn)h_http_set_recv_timeout, "sceHttpSetRecvTimeOut");
+    // Epoll lifecycle: real host-block handles; nothing ever fires headless.
+    Hle::register_fn("6381dWF+xsQ", (HleFn)h_http_create_epoll, "sceHttpCreateEpoll");
+    Hle::register_fn("wYhXVfS2Et4", (HleFn)h_http_destroy_epoll, "sceHttpDestroyEpoll");
+    Hle::register_fn("-xm7kZQNpHI", (HleFn)h_http_set_epoll, "sceHttpSetEpoll");
+    Hle::register_fn("59tL1AQBb8U", (HleFn)h_http_unset_epoll, "sceHttpUnsetEpoll");
     // The network boundary.
     Hle::register_fn("1e2BNwI-XzE", (HleFn)h_http_send_request, "sceHttpSendRequest");
     Hle::register_fn("P5pdoykPYTk", (HleFn)h_http_read_data, "sceHttpReadData");
