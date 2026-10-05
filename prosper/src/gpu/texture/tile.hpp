@@ -165,6 +165,17 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
 // fail-closed outside the observed/published SW_64KB_Z_X 4xaa contract; zero/false means unsupported.
 size_t tiled_msaa_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode,
                                 uint32_t bytes_per_texel, uint32_t sample_count);
+// An UPPER BOUND on the bytes a 2D (thin) swizzled surface occupies, for overlap tests that must be
+// conservative rather than for any layout (#4457). It needs only the swizzle mode's block-size class
+// from the GFX10 SW_MODE encoding -- 256 B (1-3), 4 KiB (4-7, 20-23) or 64 KiB (8-11, 16-19, 24-27);
+// LINEAR, the VAR modes and anything else return 0 -- because a surface is a whole number of blocks
+// whatever the in-block pattern. A block holds 2^n elements of bytes_per_texel * sample_count bytes,
+// split near-square between X and Y; rather than depend on which split AddrLib picks for a given
+// (mode, element size, samples), this takes the worst whole-block count over every power-of-two
+// split within four bits of square. So it is never below the real size for any of those splits, but
+// may exceed it by edge blocks. Power-of-two element sizes only; zero means no bound.
+size_t thin_surface_bytes_upper_bound(uint32_t width, uint32_t height, uint32_t tile_mode,
+                                      uint32_t bytes_per_texel, uint32_t sample_count);
 bool detile_msaa_surface(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                          uint32_t width, uint32_t height, uint32_t tile_mode,
                          uint32_t bytes_per_texel, uint32_t sample_count);
