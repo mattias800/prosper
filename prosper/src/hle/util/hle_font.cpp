@@ -125,7 +125,21 @@ uint8_t g_ft_selection[64]{};
 // blob, because the two are distinct editions and a title is entitled to tell them apart.
 uint8_t g_ft_renderer_selection[64]{};
 struct FontString { uint64_t magic = kStringMagic; uint32_t terminate_code = 0; };
-struct FontGlyph { uint64_t magic = kFontMagic; };
+struct FontGlyph {
+    uint64_t magic = kFontMagic;
+    int32_t glyph_form = 0;
+    int32_t metrics_form = 0;
+    float scale_x = 1.0f;
+    float base_scale = 1.0f;
+};
+
+struct FontKerning {
+    float offsetX;
+    float offsetY;
+    float positionX;
+    float positionY;
+};
+static_assert(sizeof(FontKerning) == 0x10);
 
 struct GlyphMetrics {
     float width, height;
@@ -591,6 +605,52 @@ int32_t font_delete_glyph(const FontMemory*, void** glyph) {
     return 0;
 }
 
+FontGlyph* glyph(void* handle) {
+    auto* g = static_cast<FontGlyph*>(handle);
+    return g && g->magic == kFontMagic ? g : nullptr;
+}
+
+int32_t font_get_resolution_dpi(void* handle, uint32_t* h_dpi, uint32_t* v_dpi) {
+    const auto* f = face(handle);
+    if (h_dpi) *h_dpi = f ? 96u : 0u;
+    if (v_dpi) *v_dpi = f ? 96u : 0u;
+    if (!f) return static_cast<int32_t>(0x80460005u);
+    return (!h_dpi && !v_dpi) ? static_cast<int32_t>(0x80460002u) : 0;
+}
+
+int32_t font_glyph_get_glyph_form(void* handle) {
+    const auto* g = glyph(handle);
+    if (!g) return static_cast<int32_t>(0x80460005u);
+    return g->glyph_form;
+}
+
+int32_t font_glyph_get_metrics_form(void* handle) {
+    const auto* g = glyph(handle);
+    if (!g) return static_cast<int32_t>(0x80460005u);
+    return g->metrics_form;
+}
+
+int32_t font_glyph_get_scale_pixel(void* handle, float* out_w, float* out_h) {
+    const auto* g = glyph(handle);
+    if (out_w) *out_w = g ? g->scale_x : 0.0f;
+    if (out_h) *out_h = g ? g->base_scale : 0.0f;
+    if (!g) return static_cast<int32_t>(0x80460005u);
+    return (!out_w && !out_h) ? static_cast<int32_t>(0x80460002u) : 0;
+}
+
+int32_t font_get_render_scaled_kerning(void* handle, uint32_t, uint32_t, FontKerning* out) {
+    const auto* f = face(handle);
+    if (out) {
+        out->offsetX = 0.0f;
+        out->offsetY = 0.0f;
+        out->positionX = 0.0f;
+        out->positionY = 0.0f;
+    }
+    if (f && !f->renderer) return static_cast<int32_t>(0x80460061u);
+    if (!f) return static_cast<int32_t>(0x80460005u);
+    return out ? 0 : static_cast<int32_t>(0x80460002u);
+}
+
 void font_surface_init(RenderSurface* out, void* buffer, int width_bytes, int pixel_size,
                        int width, int height) {
     if (!out) return;
@@ -992,6 +1052,11 @@ void register_font_hle() {
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
     R("8-zmgsxkBek", (HleFn)font_ok, "sceFontGlyphDefineAttribute");
+    R("8REoLjNGCpM", (HleFn)font_get_resolution_dpi, "sceFontGetResolutionDpi");
+    R("PXlA0M8ax40", (HleFn)font_glyph_get_glyph_form, "sceFontGlyphGetGlyphForm");
+    R("XUfSWpLhrUw", (HleFn)font_glyph_get_metrics_form, "sceFontGlyphGetMetricsForm");
+    R("lNnUqa1zA-M", (HleFn)font_glyph_get_scale_pixel, "sceFontGlyphGetScalePixel");
+    R("ryPlnDDI3rU", (HleFn)font_get_render_scaled_kerning, "sceFontGetRenderScaledKerning");
 }
 
 } // namespace prosper

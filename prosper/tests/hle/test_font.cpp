@@ -363,3 +363,97 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
         << "DestroyString returns success";
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
+
+struct FontGlyphQueries {
+    HleFn create_library = nullptr, open_font_set = nullptr, close_font = nullptr,
+          get_dpi = nullptr, glyph_form = nullptr, metrics_form = nullptr, glyph_scale = nullptr,
+          scaled_kerning = nullptr, generate_glyph = nullptr, delete_glyph = nullptr;
+    bool registered() const {
+        return create_library && open_font_set && close_font && get_dpi && glyph_form &&
+               metrics_form && glyph_scale && scaled_kerning && generate_glyph && delete_glyph;
+    }
+};
+FontGlyphQueries font_glyph_queries() {
+    register_builtin_hle();
+    FontGlyphQueries font;
+    font.create_library = Hle::lookup("nWrfPI4Okmg");
+    font.open_font_set = Hle::lookup("cKYtVmeSTcw");
+    font.close_font = Hle::lookup("vzHs3C8lWJk");
+    font.get_dpi = Hle::lookup("8REoLjNGCpM");
+    font.glyph_form = Hle::lookup("PXlA0M8ax40");
+    font.metrics_form = Hle::lookup("XUfSWpLhrUw");
+    font.glyph_scale = Hle::lookup("lNnUqa1zA-M");
+    font.scaled_kerning = Hle::lookup("ryPlnDDI3rU");
+    font.generate_glyph = Hle::lookup("C-4Qw5Srlyw");
+    font.delete_glyph = Hle::lookup("LHDoRWVFGqk");
+    return font;
+}
+
+TEST(Font, GlyphQuerySurfaceIsRegistered) {
+    EXPECT_TRUE(font_glyph_queries().registered()) << "font glyph-query surface is registered";
+}
+
+TEST(Font, GlyphQueryNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontGetResolutionDpi"), "8REoLjNGCpM");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetGlyphForm"), "PXlA0M8ax40");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetMetricsForm"), "XUfSWpLhrUw");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetScalePixel"), "lNnUqa1zA-M");
+    EXPECT_EQ(nid_hash("sceFontGetRenderScaledKerning"), "ryPlnDDI3rU");
+    EXPECT_NE(nid_hash("sceFontGetResolutionDpi"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+TEST(Font, GetResolutionDpiWritesNonZeroDpi) {
+    const FontGlyphQueries font = font_glyph_queries();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    ASSERT_NE(handle, nullptr);
+    uint32_t h_dpi = 0, v_dpi = 0;
+    EXPECT_EQ(font.get_dpi(addr(handle), addr(&h_dpi), addr(&v_dpi), 0, 0, 0), 0u)
+        << "GetResolutionDpi returns success";
+    EXPECT_EQ(h_dpi, 96u) << "GetResolutionDpi writes horizontal DPI";
+    EXPECT_EQ(v_dpi, 96u) << "GetResolutionDpi writes vertical DPI";
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+}
+
+TEST(Font, GlyphFormQueriesReturnDefaults) {
+    const FontGlyphQueries font = font_glyph_queries();
+    ASSERT_TRUE(font.registered());
+    void* glyph = nullptr;
+    ASSERT_EQ(font.generate_glyph(0, 'A', 0, addr(&glyph), 0, 0), 0u);
+    ASSERT_NE(glyph, nullptr);
+    EXPECT_EQ(font.glyph_form(addr(glyph), 0, 0, 0, 0, 0), 0u)
+        << "GlyphGetGlyphForm returns the default form";
+    EXPECT_EQ(font.metrics_form(addr(glyph), 0, 0, 0, 0, 0), 0u)
+        << "GlyphGetMetricsForm returns the default form";
+    float w = 0.0f, h = 0.0f;
+    EXPECT_EQ(font.glyph_scale(addr(glyph), addr(&w), addr(&h), 0, 0, 0), 0u)
+        << "GlyphGetScalePixel returns success";
+    EXPECT_EQ(w, 1.0f) << "GlyphGetScalePixel writes horizontal scale";
+    EXPECT_EQ(h, 1.0f) << "GlyphGetScalePixel writes vertical scale";
+    uint8_t mem[64]{};
+    EXPECT_EQ(font.delete_glyph(addr(mem), addr(&glyph), 0, 0, 0, 0), 0u)
+        << "DeleteGlyph releases the glyph";
+}
+
+TEST(Font, RenderScaledKerningReturnsSuccess) {
+    const FontGlyphQueries font = font_glyph_queries();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    ASSERT_NE(handle, nullptr);
+    float kerning[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    EXPECT_EQ(font.scaled_kerning(addr(handle), 'A', 'V', addr(kerning), 0, 0), 0x80460061u)
+        << "GetRenderScaledKerning refuses without a bound renderer";
+    EXPECT_EQ(kerning[0], 0.0f) << "scaled kerning still zeroes the out-block on refusal";
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+}
