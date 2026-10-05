@@ -2782,6 +2782,10 @@ struct AjmDecJob {
     uint64_t in_addr[4] = {0, 0, 0, 0};
     uint32_t in_size[4] = {0, 0, 0, 0};
     uint32_t num_in = 0;
+    // Bytes the guest gave for the result sideband. The decode sideband is 32 bytes; a job that
+    // was handed less (the direct Run/RunSplit shapes pass an explicit size) gets a truncated
+    // write rather than an overflow. Builders that pass no size keep the full 32.
+    uint32_t result_size = 32;
 };
 // SCE_AJM_ERROR_INVALID_PARAMETER — the AJM error space (see the constants above); -1 is not a value
 // the guest's error mapping recognizes.
@@ -3117,15 +3121,15 @@ namespace {
 //   SceAjmSidebandMFrame { u32 numFrames; u32 reserved; }            (codec frames decoded by this job)
 // uiTotalDecodedSamples is load-bearing, not padding: with it left zero the guest's mixer (FMOD) stops
 // after a single batch, so it carries the instance's running sample-frame total.
-bool ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
-                       uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
-    if (!result_addr) return true;
+bool ajm2_write_result(uint64_t result_addr, uint32_t result_size, int32_t err, uint32_t consumed,
+                       uint32_t produced, uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
+    if (!result_addr || !result_size) return true;
     struct Sideband { int32_t iResult; int32_t iCodecResult; uint32_t iSizeConsumed;
                       uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples;
                       uint32_t numFrames; uint32_t reserved; };
     static_assert(sizeof(Sideband) == 32, "AJM decode sideband must include the MFrame result");
     Sideband sb{ err, 0, consumed, produced, total_samples, decoded_frames, 0 };
-    return audio_store_bytes(result_addr, &sb, sizeof sb);
+    return audio_store_bytes(result_addr, &sb, std::min<size_t>(sizeof sb, result_size));
 }
 
 // Decode a batch's queued jobs. Jobs sharing an instance are consecutive stream blocks whose input
@@ -3153,7 +3157,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             for (size_t k = ji; k < je; ++k) {
                 AjmDecJob& job = jobs[k];
                 if (!instance.host_dec->valid()) {
-                    ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                    ajm2_write_result(job.result_addr, job.result_size, kAjm2ErrDecode, 0, 0,
                                       instance.decoded_samples);
                     continue;
                 }
@@ -3233,7 +3237,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
                 const bool result_published = ajm2_write_result(
-                    job.result_addr, err, consumed, produced, instance.decoded_samples,
+                    job.result_addr, job.result_size, err, consumed, produced, instance.decoded_samples,
                     err ? 0 : decoded.decoded_frames);
                 if (!result_published) {
                     // The codec and guest PCM may already have advanced, but the guest did not
@@ -3257,7 +3261,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
         if (it != g_ajm2_inst.end() && it->second.host_dec) {
             for (size_t k = ji; k < je; ++k)
-                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0,
+                ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0,
                                   it->second.decoded_samples);
             if (getenv("PROSPER_AUDIOLOG"))
                 fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu host_dec INVALID\n",
@@ -3273,7 +3277,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                                             : it->second.decoded_samples)
                 : 0;
             for (size_t k = ji; k < je; ++k)
-                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0, total);
+                ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0, total);
             if (getenv("PROSPER_AUDIOLOG"))
                 fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu no at9/host (inst_%s)\n",
                         inst_id, je - ji,
@@ -3285,7 +3289,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         const int sfb = dec->superframe_bytes();
         const int sfs = dec->superframe_samples();
         if (ch <= 0 || sfb <= 0 || sfs <= 0) {
-            for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0); ji = je; continue; }
+            for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0); ji = je; continue; }
         const uint32_t frame_bytes = (uint32_t)ch * sizeof(int16_t);   // one interleaved sample-frame
         const uint32_t sf_out_bytes = (uint32_t)sfs * frame_bytes;
         std::vector<int16_t> pcm((size_t)sfs * ch);
@@ -3300,7 +3304,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             // Such an instance is terminal: later jobs must report zero progress instead of
             // decoding against state the guest could not observe.
             if (!dec) {
-                ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                ajm2_write_result(job.result_addr, job.result_size, kAjm2ErrDecode, 0, 0,
                                   I.total_samples ? I.gapless_delivered : I.decoded_samples);
                 continue;
             }
@@ -3387,7 +3391,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             }
             I.decoded_samples += produced / frame_bytes;
             const bool result_published = ajm2_write_result(
-                job.result_addr, err, in_cur, produced,
+                job.result_addr, job.result_size, err, in_cur, produced,
                 prog ? I.gapless_delivered : I.decoded_samples, decoded_codec_frames);
             if (!result_published) {
                 // Decoder/trim/carry state and guest PCM may already have advanced, but the guest
@@ -3570,6 +3574,150 @@ HLE10(ajm_batch_job_set_resample_ex) { return 0; } // resample params: the host 
 // CONFIDENCE: LOW that returning success-without-writes is safe beyond GRIS.
 HLE10(ajm_batch_job_get_resample_info) { return 0; }
 HLE10(ajm_batch_job_get_statistics) { return 0; }
+
+// --- AJM direct-job shapes: queue onto the batch like the builders above ----------------------
+// These take raw/single buffers (not Ra builders) but the same (info, instance, ...) prefix, so each
+// queues one AjmDecJob onto g_ajm2_jobs[batchInfo] for BatchStart to execute through the real decode
+// pipeline -- the uniform model of this file, not a parallel implementation. Validation mirrors
+// sceAjmBatchJobDecode above: a NULL batch, input or output is INVALID_PARAMETER and sizes are capped,
+// but a zero size is accepted (Tactics Ogre's input size reaches 0 at end of stream).
+// Argument orders were checked against live call sites: DecodeSingle in PPSA03839 (eboot+0x55863f),
+// RunSplit in PPSA26414 (eboot+0x22a0c3, sideband size 0x20). CONFIDENCE: HIGH on the queueing model,
+// MED on each arity, LOW on the sideband layout for Run/RunSplit: the firmware sizes the sideband by
+// the run flags, which this model does not record, so the 32-byte decode sideband is written,
+// truncated to the size the guest passed.
+// Not registered, deliberately: Encode (no encoder exists; queueing PCM through a decoder can produce
+// decoded noise reported as success), Control and SetResampleParameters (their payloads would be
+// dropped), and GetCodecInfo/GetGaplessDecode/GetInfo/DecMp3ParseFrame (they have outputs prosper
+// does not compute). Unregistered, they still answer 0 but stay visible to the unimplemented-call alarm.
+HLE10(ajm_batch_job_decode_single) {
+    // (info, instance, in, inSize, out, outSize, result): one-fragment decode job.
+    if (!a0 || !a2 || !a4) return AJM_ERR_INVALID_PARAMETER;
+    if (a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a6;
+    job.out_addr = a4;
+    job.out_size = (uint32_t)a5;
+    job.num_in = 1;
+    job.in_addr[0] = a2;
+    job.in_size[0] = (uint32_t)a3;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run) {
+    // (info, instance, flags, data_in, in_size, data_out, out_size, sideband_out, sideband_size).
+    if (!a0 || !a3 || !a5) return AJM_ERR_INVALID_PARAMETER;
+    if (a4 > AJM_MAX_BUILDER_BYTES || a6 > AJM_MAX_BUILDER_BYTES || a8 > UINT32_MAX)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    job.result_size = (uint32_t)a8;
+    job.out_addr = a5;
+    job.out_size = (uint32_t)a6;
+    job.num_in = 1;
+    job.in_addr[0] = a3;
+    job.in_size[0] = (uint32_t)a4;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run_split) {
+    // (info, instance, flags, in_bufs, in_num, out_bufs, out_num, sideband_out, sideband_size):
+    // multi-fragment variant; caps mirror DecodeSplit's structural 4-in/2-out job limits, which also
+    // bound the host-stack descriptor arrays below.
+    if (!a0 || !a3 || !a5 || a4 < 1 || a4 > 4 || a6 < 1 || a6 > 2 || a8 > UINT32_MAX)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    job.result_size = (uint32_t)a8;
+    uint64_t in_desc[2 * 4] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (audio_read_bytes_partial(a3, in_desc, sizeof(uint64_t) * 2 * (size_t)a4) !=
+        sizeof(uint64_t) * 2 * (size_t)a4)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.num_in = (uint32_t)a4;
+    for (uint32_t f = 0; f < job.num_in; ++f) {
+        job.in_addr[f] = in_desc[2 * f];
+        const uint64_t sz = in_desc[2 * f + 1];
+        if (!job.in_addr[f] || sz > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+        job.in_size[f] = (uint32_t)sz;
+    }
+    uint64_t out_desc[2 * 2] = {0, 0, 0, 0};
+    if (audio_read_bytes_partial(a5, out_desc, sizeof(uint64_t) * 2 * (size_t)a6) !=
+        sizeof(uint64_t) * 2 * (size_t)a6)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.out_addr = out_desc[0];
+    job.out_size = (uint32_t)std::min<uint64_t>(out_desc[1], AJM_MAX_BUILDER_BYTES);
+    if (!job.out_addr || !job.out_size) return AJM_ERR_INVALID_PARAMETER;
+    if (a6 > 1) {
+        job.out2_addr = out_desc[2];
+        job.out2_size = (uint32_t)std::min<uint64_t>(out_desc[3], AJM_MAX_BUILDER_BYTES);
+        if (!job.out2_addr || !job.out2_size) return AJM_ERR_INVALID_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE(ajm_memory_register) {   // (context, ptr, pages): the reference acknowledges unconditionally
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+HLE(ajm_memory_unregister) {   // (context, ptr): likewise acknowledged
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+// sceAjmDecAt9ParseConfigData(config_data*, info*) -> 0; info is five u32s:
+// {channels, sample_rate, frame_samples, superframe_samples, superframe_bytes}. The 20-byte layout
+// fits PPSA26414's call site (eboot+0x22a303), which uses fields 3 and 4 as a samples/bytes pair.
+// CONFIDENCE: MED.
+// Parsed for real through the vendored ATRAC9 decoder (same init path the B2 decode path
+// drives); a bad config fails INVALID_PARAMETER rather than filling plausible numbers.
+HLE(ajm_dec_at9_parse_config) {
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (!a0 || !a1) return AJM_ERR_INVALID_PARAMETER;
+    uint8_t config[4]{};
+    if (!audio_read_bytes(a0, config, sizeof config)) return AJM_ERR_INVALID_PARAMETER;
+    Atrac9Decoder dec;
+    if (!dec.init(config)) return AJM_ERR_INVALID_PARAMETER;
+    uint32_t info[5]{};
+    info[0] = (uint32_t)dec.channels();
+    info[1] = (uint32_t)dec.sample_rate();
+    info[2] = (uint32_t)dec.frame_samples();
+    info[3] = (uint32_t)dec.superframe_samples();
+    info[4] = (uint32_t)dec.superframe_bytes();
+    if (!audio_store_bytes(a1, info, sizeof info)) return AJM_ERR_INVALID_PARAMETER;
+    return 0;
+}
+// sceAjmStrError(error) -> a readable string. The system libSceAjm.sprx carries per-code message
+// strings, but their code mapping is not yet derived, so this answers one static string for every
+// input (log-only use) rather than a guessed table -- and never null, which a %s formatter may not
+// survive. CONFIDENCE: LOW on the text, HIGH on never returning null.
+HLE(ajm_str_error) {
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    static const char kMsg[] = "unknown AJM error";
+    return (uint64_t)(uintptr_t)kMsg;
+}
 HLE10(ajm_batch_start2) {
     // Run every decode job queued on this batchInfo (a1), in order, then clear it. Synchronous:
     // BatchWait then just returns success. GTA V passes its u32 batch-id output in a4 and immediately
@@ -4498,6 +4646,16 @@ void register_audio_hle() {
     R("sceAjmBatchJobGetResampleInfo", ajm_batch_job_get_resample_info);
     R("sceAjmBatchJobGetStatistics", ajm_batch_job_get_statistics);
     R("sceAjmBatchJobSetGaplessDecode", ajm_batch_job_gapless);
+    // Direct-job shapes: queue onto the batch like the builders above for BatchStart to execute.
+    // Encode/Control/GetCodecInfo/GetGaplessDecode/GetInfo/SetResampleParameters and
+    // DecMp3ParseFrame stay unregistered (see the comment above ajm_batch_job_decode_single).
+    R("sceAjmBatchJobDecodeSingle", ajm_batch_job_decode_single);
+    R("sceAjmBatchJobRun", ajm_batch_job_run);
+    R("sceAjmBatchJobRunSplit", ajm_batch_job_run_split);
+    R("sceAjmMemoryRegister", ajm_memory_register);
+    R("sceAjmMemoryUnregister", ajm_memory_unregister);
+    R("sceAjmDecAt9ParseConfigData", ajm_dec_at9_parse_config);
+    R("sceAjmStrError", ajm_str_error);
     R("sceAjmBatchStart", ajm_batch_start2);
     Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
     Hle::register_fn("koBbCMvOKWw", ngs2_system_create, "sceNgs2SystemCreate");

@@ -1174,6 +1174,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ajm.cpp
     LIBRARIES prosper_core)
 
+  # AJM direct-job shapes: DecodeSingle, Run and RunSplit queue onto the batch for BatchStart to
+  # execute; plus ATRAC9 config parse, memory ack and StrError.
+  prosper_add_gtest(test_ajm_jobs
+    SOURCES tests/hle/test_ajm_jobs.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_avplayer
     SOURCES tests/gpu/texture/test_avplayer.cpp
     LIBRARIES prosper_core)
@@ -1210,6 +1216,11 @@ if(TARGET prosper_core)
   # pass vacuously.
   prosper_add_gtest(test_h264_sps
     SOURCES tests/hle/video/test_h264_sps.cpp
+    LIBRARIES prosper_core)
+
+  # AvPlayer trick speed and bandwidth window, from the shipped sprx. Pure, no game dump.
+  prosper_add_gtest(test_avplayer_misc
+    SOURCES tests/hle/video/test_avplayer_misc.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_json2 tests/hle/test_json2.cpp)
@@ -1348,6 +1359,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_service_getters
     SOURCES tests/hle/dispatch/test_service_getters.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+
+  # libSceGameUpdate request lifecycle pinned to the shipped sprx: argument-check order, 0x30-byte
+  # param/result structs, 8 request slots, a no-update write-back of `found` only. Pure, no game dump.
+  prosper_add_gtest(test_gameupdate
+    SOURCES tests/hle/dispatch/test_gameupdate.cpp
     LIBRARIES prosper_core)
 
   # #2185: reallocalign was unregistered, so the dispatcher's 0 reached the guest as a NULL
@@ -1776,6 +1793,13 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_texture_source_snapshot
     SOURCES frontends/shared/tests/test_texture_source_snapshot.cpp
     INCLUDES frontends)
+
+  # The per-level native BC mip-chain audit (#4496): a pure comparison, no Vulkan device.
+  prosper_add_gtest(test_native_bc_chain_audit
+    SOURCES tests/shared/live/test_native_bc_chain_audit.cpp
+            frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
 
   # Actual tracked mappings and direct comparison/window observations; no Vulkan device.
   add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
@@ -3080,6 +3104,11 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
+  prosper_add_gtest(test_raw_wide_vop3_source_width
+    SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data
     SOURCES tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp
     LIBRARIES prosper_core)
@@ -3986,6 +4015,7 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
@@ -4394,6 +4424,7 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
@@ -4604,6 +4635,11 @@ endif()
       add_test(NAME native_bc_upload_decoder_control COMMAND test_native_bc_upload --decoder)
       set_tests_properties(native_bc_upload_decoder_control PROPERTIES
         ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
+      # BC6H keeps the clamping decoder by default (#4496); this arm opts back into native HDR so
+      # the BC6H upload path stays covered until the linear pipeline of #263 makes it the default.
+      add_test(NAME native_bc_upload_bc6h_hdr COMMAND test_native_bc_upload --bc6h-hdr)
+      set_tests_properties(native_bc_upload_bc6h_hdr PROPERTIES
+        ENVIRONMENT "PROSPER_NATIVE_BC6H_HDR=1")
       add_executable(test_texture_preparation tests/shared/live/test_texture_preparation.cpp)
       target_include_directories(test_texture_preparation PRIVATE frontends src tests)
       target_link_libraries(test_texture_preparation PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

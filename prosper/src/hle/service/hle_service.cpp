@@ -1278,8 +1278,146 @@ HLE(s_errdialog_status) {
 // their live args before being given behavior. CONFIDENCE: MED (init-succeeds is the real-console
 // offline behavior; arg shapes intentionally not guessed).
 HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_init) { svc_log("sceGameUpdateInitialize",          a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3,a4,a5); return 0; }
+// --- libSceGameUpdate request lifecycle ------------------------------------------------------
+// Contracts re-derived from the shipped plaintext libSceGameUpdate.sprx (PS5 3.20, testdata/sprx):
+//   Initialize       already initialized -> 0x80412802.
+//   Terminate        not initialized -> 0x80412801.
+//   CreateRequest    not initialized -> 0x80412801; 8 fixed request slots, a 9th -> 0x80412806;
+//                    ids are minted from 0x20000000 up to 0x2fffffff, then wrap back.
+//   Check(id, param*, result*)
+//                    id <= 0 -> 0x80412805; NULL param/result -> 0x80412803; each struct leads with a
+//                    u64 size that must be 0x30 -> 0x80412804; param's reserved words (+0xc..+0x2c)
+//                    must be zero and its check type 0 (1 only in a PS4 process) -> 0x80412803;
+//                    then not initialized ->
+//                    0x80412801, unknown id -> 0x80412805, aborted request -> 0x80412807.
+//                    The result write-back touches only `found` (+8), one byte at +9, and 11 version
+//                    bytes at +0xc when found.
+//   AbortRequest / DeleteRequest
+//                    id <= 0 -> 0x80412805, then not initialized -> 0x80412801, unknown id ->
+//                    0x80412805. Abort marks the request so a later Check answers 0x80412807.
+//   GetAddcontLatestVersion(serviceLabel, label*, info*)
+//                    NULL label/info -> 0x80412803, then not initialized -> 0x80412801; writes only
+//                    `found` (+8) and, when found, 11 version bytes at +9.
+// prosper has no update service. The library itself answers "no update" (found = 0, return 0) when
+// its patch-check service reports 0x80412883; prosper models that path. What a real offline console's
+// service returns is not established, so CONFIDENCE: MED on the offline answer and HIGH on the
+// argument checks above. This is a platform query about patches -- it reports nothing about
+// ownership and unlocks no content.
+namespace {
+constexpr uint64_t GAME_UPDATE_ERROR_NOT_INITIALIZED = 0x80412801ull;
+constexpr uint64_t GAME_UPDATE_ERROR_ALREADY_INITIALIZED = 0x80412802ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_ARG = 0x80412803ull;
+constexpr uint64_t GAME_UPDATE_ERROR_INVALID_SIZE = 0x80412804ull;
+constexpr uint64_t GAME_UPDATE_ERROR_REQUEST_NOT_FOUND = 0x80412805ull;
+constexpr uint64_t GAME_UPDATE_ERROR_TOO_MANY_REQUESTS = 0x80412806ull;
+constexpr uint64_t GAME_UPDATE_ERROR_ABORTED = 0x80412807ull;
+// Zero-extension matches this file's own error style (0x817D facility above), not a claim
+// about firmware sign-extension.
+constexpr int32_t kGameUpdateFirstId = 0x20000000;
+constexpr int32_t kGameUpdateLastId = 0x2ffffffe;
+struct GameUpdateSlot {
+    int32_t id = 0;   // 0 = free
+    bool aborted = false;
+};
+std::mutex g_gameupdate_mx;
+bool g_gameupdate_ready = false;
+int32_t g_gameupdate_next_id = kGameUpdateFirstId;
+GameUpdateSlot g_gameupdate_slots[8];
+GameUpdateSlot* gameupdate_find(int32_t id) {
+    for (GameUpdateSlot& slot : g_gameupdate_slots)
+        if (slot.id != 0 && slot.id == id) return &slot;
+    return nullptr;
+}
+}   // namespace
+HLE(s_gameupdate_init) {
+    svc_log("sceGameUpdateInitialize", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (g_gameupdate_ready) return GAME_UPDATE_ERROR_ALREADY_INITIALIZED;
+    g_gameupdate_ready = true;
+    return 0;
+}
+HLE(s_gameupdate_term) {
+    svc_log("sceGameUpdateTerminate", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    g_gameupdate_ready = false;
+    for (GameUpdateSlot& slot : g_gameupdate_slots) slot = {};
+    return 0;
+}
+HLE(s_gameupdate_create) {
+    svc_log("sceGameUpdateCreateRequest", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    for (GameUpdateSlot& slot : g_gameupdate_slots) {
+        if (slot.id != 0) continue;
+        const int32_t id = g_gameupdate_next_id;
+        g_gameupdate_next_id = id > kGameUpdateLastId ? kGameUpdateFirstId : id + 1;
+        slot = {id, false};
+        return (uint64_t)id;
+    }
+    return GAME_UPDATE_ERROR_TOO_MANY_REQUESTS;
+}
+HLE(s_gameupdate_check) {
+    svc_log("sceGameUpdateCheck", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    if (!a1 || !a2) return GAME_UPDATE_ERROR_INVALID_ARG;
+    uint64_t param_size = 0, result_size = 0;
+    if (!svc_copy_bytes(a1, &param_size, sizeof(param_size)) ||
+        !svc_copy_bytes(a2, &result_size, sizeof(result_size)))
+        return GAME_UPDATE_ERROR_INVALID_ARG;
+    if (param_size != 0x30 || result_size != 0x30) return GAME_UPDATE_ERROR_INVALID_SIZE;
+    uint32_t param[12] = {};
+    if (!svc_copy_bytes(a1, param, sizeof(param))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    // Check type at +8: the firmware allows type 1 only in a PS4 process (sceKernelIsPs4Process),
+    // so a PS5 title may pass only 0.
+    if (param[2] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;
+    for (int i = 3; i < 12; ++i)
+        if (param[i] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;   // reserved +0xc..+0x2c
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+        const GameUpdateSlot* slot = gameupdate_find(id);
+        if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+        if (slot->aborted) return GAME_UPDATE_ERROR_ABORTED;
+    }
+    const uint8_t no_update[2] = {0, 0};   // found (+8) and the byte at +9
+    if (!svc_write_bytes(a2 + 8, no_update, sizeof(no_update))) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return 0;
+}
+HLE(s_gameupdate_abort) {
+    svc_log("sceGameUpdateAbortRequest", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    GameUpdateSlot* slot = gameupdate_find(id);
+    if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    slot->aborted = true;
+    return 0;
+}
+HLE(s_gameupdate_delete) {
+    svc_log("sceGameUpdateDeleteRequest", a0, a1, a2, a3, a4, a5);
+    const int32_t id = (int32_t)a0;
+    if (id <= 0) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+    if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    GameUpdateSlot* slot = gameupdate_find(id);
+    if (!slot) return GAME_UPDATE_ERROR_REQUEST_NOT_FOUND;
+    *slot = {};
+    return 0;
+}
+HLE(s_gameupdate_addcont_version) {
+    svc_log("sceGameUpdateGetAddcontLatestVersion", a0, a1, a2, a3, a4, a5);
+    if (!a1 || !a2) return GAME_UPDATE_ERROR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(g_gameupdate_mx);
+        if (!g_gameupdate_ready) return GAME_UPDATE_ERROR_NOT_INITIALIZED;
+    }
+    const uint8_t not_found = 0;
+    if (!svc_write_bytes(a2 + 8, &not_found, 1)) return GAME_UPDATE_ERROR_INVALID_ARG;
+    return 0;
+}
 // The entitlement follow-ups DOLL's main menu fires once the flow is unblocked (live-captured
 // after the #306 gate fell). ABI pinned from the live capture (r8):
 //   GetAddcontEntitlementInfoList(SceNpServiceLabel serviceLabel, Info* list, u32 listNum,
@@ -1640,6 +1778,13 @@ void register_service_hle() {
     Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
     Hle::register_fn("YJtKLttI9fM", (HleFn)s_gameupdate_init, "sceGameUpdateInitialize");
     Hle::register_fn("NSH-C-OmoNI", (HleFn)s_gameupdate_term, "sceGameUpdateTerminate");
+    // GameUpdate request lifecycle: init-gated ids, offline "no update" checks.
+    Hle::register_fn("UvcvKaFvupA", (HleFn)s_gameupdate_create, "sceGameUpdateCreateRequest");
+    Hle::register_fn("LYVV9z8+owM", (HleFn)s_gameupdate_check, "sceGameUpdateCheck");
+    Hle::register_fn("d1CNGEOaK28", (HleFn)s_gameupdate_abort, "sceGameUpdateAbortRequest");
+    Hle::register_fn("bcCyjHN5sn0", (HleFn)s_gameupdate_delete, "sceGameUpdateDeleteRequest");
+    Hle::register_fn("0g0+Oq9xcI0", (HleFn)s_gameupdate_addcont_version,
+                     "sceGameUpdateGetAddcontLatestVersion");
     // Post-gate follow-ups (fire from DOLL's now-reachable main menu; NIDs from PS5 3.20 tables).
     Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
                      "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
