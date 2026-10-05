@@ -326,6 +326,66 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
+// Unlowered compare-swap MIMG atomic must refuse fail-visibly.
+// image_atomic_fcmpswap (0x1c) needs a float-compare-and-swap lowering, which
+// does not exist (only plain add over R32_UINT is lowered); accepting it as
+// the add would silently drop the comparison. The opcode comes from the same
+// llvm-mc disassembly sweep that mapped fmin/fmax; the add words are the
+// byte-exact Astro Bot packet. The control is image_atomic_add over the same
+// Uint32 entry, which is lowered. WHEN a fcmpswap lowering lands, THIS ARM
+// GOES RED; replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageAtomicFCmpswapRefuse) {
+    static const uint32_t fcs[2] = {0xf0702108u, 0x00000900u};
+    static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
+    for (const uint32_t* words : {fcs, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1cu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    // NOTE: prosper classifies fcmpswap as sampled-only (like fmin/fmax), so
+    // the refusal entry is a Texture: against a storage entry the descriptor
+    // never resolves and the pin would assert a table miss rather than the
+    // missing lowering (no [mimg-unresolved] line with the Texture entry).
+    auto table = [&](DataFormat format, ResourceClass cls) {
+        ShaderResourceTable rt;
+        ShaderResource image{};
+        image.cls = cls;
+        image.format = format;
+        image.num_components = 1;
+        image.binding = 4;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 0;
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+        return rt;
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(8);   // s0..s7 T# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (coord)
+        0x7e020280u,   // v_mov_b32 v1, 0 (coord)
+        0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
+    };
+    const ShaderResourceTable float_rt =
+        table(DataFormat::Float32, ResourceClass::Texture);
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA0E9ull, 3,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1cu, &float_rt,
+                       config);
+    const ShaderResourceTable uint_rt =
+        table(DataFormat::Uint32, ResourceClass::StorageImage);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0E8ull,
+                    "control: image_atomic_add over the Uint32 entry", &uint_rt,
+                    config);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
