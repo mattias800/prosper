@@ -2429,10 +2429,29 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                                       vcount_hint, float_transport, raw_context,
                                                       owned_waves, owned_indices, refusal)) {
             if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
-            report_dropped_draw_target(rs.color0_base,
-                                       vertex_chain ? "owned-wave-chained-stage-unimplemented"
-                                                    : refusal.c_str(),
-                                       rs.cb_target_mask, rs.cb_shader_mask);
+            const char* const reason =
+                vertex_chain ? "owned-wave-chained-stage-unimplemented" : refusal.c_str();
+            report_dropped_draw_target(rs.color0_base, reason, rs.cb_target_mask,
+                                       rs.cb_shader_mask);
+            // The drop is counted under the same label as a recompile reject, but no recompile
+            // ran, so nothing kept the program. Keep it here: the owned stage is the one whose
+            // classification and gate somebody has to look at next (#4555).
+            note_refused_draw_shaders(
+                {{},
+                 {},
+                 checked_fragment ? checked_graphics_source_analysis(checked_fragment.get())
+                                  : SharedShaderAnalysis{},
+                 vs_program_addr,
+                 rs.ps_addr,
+                 rs.es_addr,
+                 draw ? draw->command_order : 0,
+                 max_shader_dwords,
+                 0,
+                 0,
+                 0,
+                 owned_vertex,
+                 owned_fragment,
+                 reason});
             prosper::diagnostics::perf::drop_draw_at_realization(
                 owned_vertex ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
                              : prosper::diagnostics::perf::DropReason::ShaderRecompileFragment);
