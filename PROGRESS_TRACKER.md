@@ -139,6 +139,7 @@ of its manifest.
 | Beneath | `PPSA27640` | 3 | `123---` | - | - | none | [#2813](https://github.com/mattias800/prosper/issues/2813), [#2815](https://github.com/mattias800/prosper/issues/2815) | [#1898](https://github.com/mattias800/prosper/issues/1898) | [`BENEATH_STATUS.md`](prosper/docs/games/BENEATH_STATUS.md) |
 | Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | - | none | [#3407](https://github.com/mattias800/prosper/issues/3407), [#2542](https://github.com/mattias800/prosper/issues/2542), [#2690](https://github.com/mattias800/prosper/issues/2690), [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md) |
 | R-Type Delta: HD Boosted | `PPSA26414` | 3 | `123---` | - | - | none | [#1746](https://github.com/mattias800/prosper/issues/1746), [#1591](https://github.com/mattias800/prosper/issues/1591) | [#1810](https://github.com/mattias800/prosper/issues/1810) | [`R_TYPE_DELTA_STATUS.md`](prosper/docs/games/R_TYPE_DELTA_STATUS.md) |
+| Rayman 30th Anniversary Edition | `PPSA33016` | 3 | `123---` | - | - | - | - | [#4552](https://github.com/mattias800/prosper/issues/4552) | - |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/games/SYBERIA_STATUS.md) |
 | Tactics Ogre: Reborn | `PPSA03839` | 3 | `123---` | - | - | none | [#1913](https://github.com/mattias800/prosper/issues/1913), [#1784](https://github.com/mattias800/prosper/issues/1784) | [#1892](https://github.com/mattias800/prosper/issues/1892) | - |
 | The House of the Dead 2: Remake | `PPSA24203` | 3 | `123---` | - | - | none | [#1907](https://github.com/mattias800/prosper/issues/1907) | [#1896](https://github.com/mattias800/prosper/issues/1896) | - |
@@ -192,11 +193,11 @@ of its manifest.
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 5 -- PS5 hardware-oracle comparison | 1 |
 | 4 -- manual visual verification | 3 |
-| 3 -- gameplay with the scene rendering | 10 |
+| 3 -- gameplay with the scene rendering | 11 |
 | 2 -- title screen | 20 |
 | 1 -- any real graphics | 5 |
 | 0 -- not started | 16 |
 
-**4 of 69** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 8 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 70** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 9 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
