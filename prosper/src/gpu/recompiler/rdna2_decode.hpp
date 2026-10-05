@@ -95,6 +95,8 @@ inline constexpr uint32_t kSop2OpcodeAddU32 = 0x00;
 inline constexpr uint32_t kSop2OpcodeAddI32 = 0x02;
 inline constexpr uint32_t kSop2OpcodeAddcU32 = 0x04;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
+inline constexpr uint32_t kSop1OpcodeMovrelsB32 = 0x2e;
+inline constexpr uint32_t kSop1OpcodeMovrelsB64 = 0x2f;
 inline constexpr uint32_t kSop1OpcodeMovreldB32 = 0x30;
 inline constexpr uint32_t kSop1OpcodeMovreldB64 = 0x31;
 inline constexpr uint32_t kSop1OpcodeMovrelsd2B32 = 0x49;
@@ -524,6 +526,37 @@ struct Rdna2Inst {
     uint8_t vop3p_opsel = 0, vop3p_opsel_hi = 0;
     uint8_t vop3p_neg_hi = 0;   // packed add/mul: per-source negate for the HIGH f16 result
 };
+// Instructions whose register or control effects the decoded operands do not describe. A liveness
+// or lifetime walk over a guest program must STOP at one, never step over it:
+//   - s_setpc / s_swappc / s_rfe and s_call_b64 send control where the direct CFG does not go;
+//   - a subvector loop re-enters a region under a different EXEC;
+//   - the M0-relative moves read (s_movrels_*) or write (s_movreld_*, s_movrelsd_2_b32)
+//     SGPR[field + M0], a register the encoding does not name.
+// One list on purpose. Two had already drifted apart: rdna2_raw_wide_data.cpp refused SOP1
+// 0x28..0x2a under the comment "relative SGPR write", and those are B64 saveexec forms, so the
+// real relative moves walked straight through three of its proofs (#4529).
+inline bool rdna2_escapes_decoded_effects(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::SOP1)
+        return (in.opcode >= kSop1OpcodeSetpcB64 && in.opcode <= kSop1OpcodeRfeB64) ||
+               (in.opcode >= kSop1OpcodeMovrelsB32 && in.opcode <= kSop1OpcodeMovreldB64) ||
+               in.opcode == kSop1OpcodeMovrelsd2B32;
+    if (in.fmt == Rdna2Format::SOPK)
+        return in.opcode == kSopkOpcodeCallB64 || in.opcode == kSopkOpcodeSubvectorLoopBegin ||
+               in.opcode == kSopkOpcodeSubvectorLoopEnd;
+    return false;
+}
+
+// The subset that can CHANGE a register its operands do not name, or run code off the direct CFG:
+// everything above except the source-relative moves. s_movrels_b32/b64 read SGPR[src + M0] and
+// write the destination they name, so a proof about "nothing writes register R" or "control stays
+// on the decoded edges" is unaffected by one -- only a walk that tracks who READS a register has
+// to stop at it. The distinction is not academic: s_movrels_b32 is lowered (rdna2_movrels.cpp),
+// so refusing on its mere presence would take a proof away from a shader that compiles.
+inline bool rdna2_may_write_unnamed_register_or_leave_cfg(const Rdna2Inst& in) {
+    return rdna2_escapes_decoded_effects(in) &&
+           !(in.fmt == Rdna2Format::SOP1 &&
+             (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64));
+}
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
 // encoding, returns fmt=Unknown with len_dwords clamped so a walker still terminates.

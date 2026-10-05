@@ -241,7 +241,7 @@ A row with `needs-backing=1` also says **what** made the classifier call the loa
     bytes again (reported at the load);
   - `register-offset-with-guest-memory-write`: no reader was found, but the load has a register
     offset in a program that may write guest memory (reported at the load);
-  - `unknown-instruction`, `indirect-control`, `unmodelled-control`,
+  - `unknown-instruction`, `unmodelled-control-or-relative-sgpr`, `unmodelled-control`,
     `branch-target-out-of-range`, `branch-target-mid-instruction`, `walk-budget`: the walk could
     not follow the program.
 
