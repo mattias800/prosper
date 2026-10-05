@@ -8,6 +8,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -7908,6 +7909,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : conds) conds_val[r] = sget(r);
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
+            LoopVccCarry vcc_carry(rs);   // #4508: a body may recycle VCC as scalar scratch
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec
                                : L.condition == DivLoop::Condition::Vcc ? rs.vcc : rs.scc;
             if (!loop_cond) return false;
@@ -7957,6 +7959,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                if (!nv && pr.dom == 3)
+                    nv = vcc_carry.backedge_value(b, ins, L.header_pc,
+                                                  L.direct_exec_breaks || L.direct_wave_breaks);
                 if (!nv && pr.dom == 3) return false;
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
@@ -7965,7 +7970,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             b.emit_label(merge);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
             for (auto& pr : phis) {
-                if (pr.dom == 3 && (!vcc_chk || !rs.vcc)) return false;
+                if (pr.dom == 3 && !vcc_carry.merge_has_mask(b, vcc_chk, rs.vcc, L.header_pc))
+                    return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
                                    : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
@@ -7990,6 +7996,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
+            vcc_carry.finish_exit(rs);
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
