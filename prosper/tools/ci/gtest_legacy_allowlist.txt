@@ -140,9 +140,7 @@ tests/gpu/timeline/test_guest_log_capture_miss.cpp
 tests/hle/audio/test_audio.cpp
 tests/hle/dispatch/test_nid.cpp
 tests/hle/kernel/test_ampr_udata.cpp
-tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp
 tests/hle/kernel/test_kernel_nanosleep.cpp
-tests/hle/kernel/test_kernel_sem_timedwait.cpp
 tests/hle/kernel/test_sce_errno.cpp
 tests/hle/kernel/test_select_sleep.cpp
 tests/hle/memory/test_dmem_caller_attribution_alloc_dmem.cpp
@@ -153,7 +151,6 @@ tests/hle/sync/test_sync_destroy_lifetime.cpp
 tests/hle/sync/test_sync_ring.cpp
 tests/hle/test_agc_submit_multi.cpp
 tests/hle/test_c11_thread_slots.cpp
-tests/hle/test_cond_clock.cpp
 tests/hle/test_fiber.cpp
 tests/hle/test_file_sync.cpp
 tests/hle/test_font.cpp
