@@ -1166,6 +1166,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ajm.cpp
     LIBRARIES prosper_core)
 
+  # libSceCesCs (single-character CP1252<->UTF-8) and libScePngDec (PNG to 8-bit
+  # RGBA/BGRA): pure codecs with no backend. Unregistered, both answered SCE_OK while
+  # writing nothing into 1-3 byte text buffers and pixel rasters respectively.
+  prosper_add_gtest(test_cescs
+    SOURCES tests/hle/test_cescs.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_pngdec
+    SOURCES tests/hle/test_pngdec.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_avplayer
     SOURCES tests/gpu/texture/test_avplayer.cpp
     LIBRARIES prosper_core)
