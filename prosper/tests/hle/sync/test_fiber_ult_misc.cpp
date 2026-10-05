@@ -282,3 +282,185 @@ TEST(FiberUltMisc, SecondJoinIsRefusedWhileTheFirstWaits) {
     EXPECT_EQ(first_rc.load(), 0u);
     EXPECT_EQ(status, 0x52);
 }
+
+TEST(FiberUltMisc, QueueSemNidsBound) {
+    register_builtin_hle();
+    static const char* table[] = {
+        "_sceUltQueueDataResourcePoolCreate",
+        "sceUltQueueDataResourcePoolGetWorkAreaSize",
+        "sceUltQueueDataResourcePoolDestroy",
+        "_sceUltQueueCreate",
+        "sceUltQueuePush",
+        "sceUltQueueTryPush",
+        "sceUltQueuePop",
+        "sceUltQueueTryPop",
+        "sceUltQueueDestroy",
+        "_sceUltSemaphoreCreate",
+        "sceUltSemaphoreAcquire",
+        "sceUltSemaphoreTryAcquire",
+        "sceUltSemaphoreRelease",
+        "sceUltSemaphoreDestroy",
+    };
+    static_assert(sizeof(table) / sizeof(table[0]) == 14, "the 14 queue/semaphore exports");
+    for (const char* name : table) {
+        EXPECT_NE(Hle::lookup(nid_hash(name)), nullptr) << name << " is not registered";
+    }
+    EXPECT_EQ(nid_hash("sceUltQueuePush"), "dUwpX3e5NDE");
+    EXPECT_EQ(nid_hash("sceUltSemaphoreAcquire"), "QAH1ofI97vU");
+    EXPECT_EQ(nid_hash("_sceUltSemaphoreCreate"), "h5QlIYj+Ro8");
+    EXPECT_NE(nid_hash("sceUltQueuePush"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+static UltBlob g_dpool, g_queue, g_sem;
+
+static void make_data_pool_and_queue(uint64_t item_bytes) {
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    ASSERT_GT(pool_bytes, 0u);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t dp_bytes = call_nid("evj9YPkS8s4", 32, item_bytes, 4);
+    ASSERT_GT(dp_bytes, 0u);
+    ASSERT_LT(dp_bytes, 1024u * 1024u);
+    std::vector<unsigned char> dp_work((size_t)dp_bytes, 0);
+    ASSERT_EQ(call9_nid("TFHm6-N6vks", addr(&g_dpool), 0, 32, item_bytes, 4, addr(&g_pool),
+                        addr(dp_work.data()), 0, 0x12000000ull),
+              0u);
+    ASSERT_EQ(call7_nid("9Y5keOvb6ok", addr(&g_queue), 0, item_bytes, addr(&g_pool), addr(&g_dpool),
+                        0, 0x12000000ull),
+              0u);
+}
+
+TEST(FiberUltMisc, QueueDataPoolLifecycle) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    make_data_pool_and_queue(16);
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&g_dpool)), 0u) << "data pool destroy succeeds";
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&g_dpool)), hle::kSceKernelErrorESRCH)
+        << "destroy frees exactly once";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&never_created)), hle::kSceKernelErrorESRCH)
+        << "destroy on a never-created pool is refused";
+    // The size answer follows the documented formula: 128 + queues * 64.
+    EXPECT_EQ(call_nid("evj9YPkS8s4", 0, 16, 4), 128u + 4u * 64u)
+        << "size query answers prosper's own requirement";
+}
+
+TEST(FiberUltMisc, QueuePushPopRoundTrip) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(16);
+    const uint64_t q = addr(&g_queue);
+
+    uint8_t out[16];
+    std::memset(out, 0xAB, sizeof(out));
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), hle::kSceKernelErrorEAGAIN)
+        << "try-pop on an empty queue answers EAGAIN instead of blocking";
+    uint8_t in[16];
+    for (int i = 0; i < 16; ++i) in[i] = (uint8_t)(0xC0 + i);
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, addr(in)), 0u) << "push succeeds";
+    EXPECT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(in)), 0u) << "try-push succeeds";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), 0u) << "pop succeeds";
+    EXPECT_EQ(std::memcmp(out, in, sizeof(out)), 0)
+        << "pop delivers exactly the pushed bytes, in order";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), 0u) << "second pop takes the second item";
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), hle::kSceKernelErrorEAGAIN)
+        << "queue is empty again afterwards";
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, 0), hle::kSceKernelErrorEINVAL)
+        << "push through a null pointer is refused";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, 0), hle::kSceKernelErrorEINVAL)
+        << "pop through a null pointer is refused";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", addr(&never_created), addr(in)), hle::kSceKernelErrorESRCH)
+        << "push on a never-created queue is refused";
+    EXPECT_EQ(call_nid("PP9nZxpSKLY", q), 0u) << "queue destroy succeeds";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), hle::kSceKernelErrorESRCH)
+        << "pop on a destroyed queue is refused";
+}
+
+TEST(FiberUltMisc, QueuePopBlocksUntilPush) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    const uint64_t q = addr(&g_queue);
+
+    uint8_t got[8];
+    std::memset(got, 0, sizeof(got));
+    std::atomic<uint64_t> pop_rc{~0ull};
+    std::thread popper([&] { pop_rc.store(call_nid("RVSq2tsm2yw", q, addr(got))); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // popper is now waiting
+    uint8_t sent[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, addr(sent)), 0u);
+    for (int i = 0; i < 100 && pop_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    popper.join();
+    EXPECT_EQ(pop_rc.load(), 0u) << "the blocked pop completes once an item arrives";
+    EXPECT_EQ(std::memcmp(got, sent, sizeof(got)), 0) << "it delivers that item";
+}
+
+TEST(FiberUltMisc, SemaphoreCountsResources) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_sem, 0, sizeof(g_sem));
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t s = addr(&g_sem);
+    ASSERT_EQ(call_nid("h5QlIYj+Ro8", s, 0, 3, addr(&g_pool), 0, 0x12000000ull), 0u);
+
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), 0u) << "try-acquire within the count succeeds";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), hle::kSceKernelErrorEAGAIN)
+        << "try-acquire past the count answers EAGAIN";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 1), 0u) << "blocking acquire takes the last unit";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 1), hle::kSceKernelErrorEAGAIN)
+        << "empty semaphore refuses";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 0), hle::kSceKernelErrorEINVAL)
+        << "acquiring zero units is refused";
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 2), 0u) << "release restores";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), 0u) << "the released units are acquirable";
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 0), hle::kSceKernelErrorEINVAL)
+        << "releasing zero units is refused";
+    EXPECT_EQ(call_nid("izXyehpoZGo", s), 0u) << "semaphore destroy succeeds";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 1), hle::kSceKernelErrorESRCH)
+        << "acquire on a destroyed semaphore is refused";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("lbtk5X1mecw", addr(&never_created), 1), hle::kSceKernelErrorESRCH)
+        << "release on a never-created semaphore is refused";
+}
+
+TEST(FiberUltMisc, SemaphoreAcquireBlocksUntilRelease) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_sem, 0, sizeof(g_sem));
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t s = addr(&g_sem);
+    ASSERT_EQ(call_nid("h5QlIYj+Ro8", s, 0, 0, addr(&g_pool), 0, 0x12000000ull), 0u);
+
+    std::atomic<uint64_t> acq_rc{~0ull};
+    std::thread waiter([&] { acq_rc.store(call_nid("QAH1ofI97vU", s, 1)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // waiter is now parked
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 1), 0u);
+    for (int i = 0; i < 100 && acq_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    waiter.join();
+    EXPECT_EQ(acq_rc.load(), 0u) << "the blocked acquire completes once released";
+}
