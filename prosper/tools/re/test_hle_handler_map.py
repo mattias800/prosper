@@ -538,10 +538,11 @@ def test_real_tree():
         # between handlers rather than a file having been split.
         # 13 since #4458: sceLoginDialogInitialize left s_ok for its real handler (-1) and the two
         # WebBrowserDialog Initialize/Terminate stubs, previously unregistered, joined it (+2).
-        check("[%s] s_ok serves 13" % platform, s.get("s_ok"), 13)
+        # 14 since #4478: sceUserServiceInitialize2, previously unregistered, joined it (+1).
+        check("[%s] s_ok serves 14" % platform, s.get("s_ok"), 14)
         check("[%s] s_np_ok serves the other 2" % platform, s.get("s_np_ok"), 2)
-        check("[%s] the two trivial stubs still serve 15 between them" % platform,
-              s.get("s_ok", 0) + s.get("s_np_ok", 0), 15)
+        check("[%s] the two trivial stubs still serve 16 between them" % platform,
+              s.get("s_ok", 0) + s.get("s_np_ok", 0), 16)
         # The five handlers the platform-blind extraction promoted to "shared" (#2070). Each is
         # registered once per `#if` arm of hle_kernel_mem.cpp and answers exactly ONE Sony function.
         for h in ("k_dmem_size", "k_virtual_query", "k_alloc_dmem", "k_mtypeprotect", "k_mprotect"):
