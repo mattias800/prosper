@@ -326,36 +326,40 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered integer-decrement MIMG atomic must refuse fail-visibly.
-// image_atomic_dec (0x1c) needs an integer-decrement lowering, which does not
-// exist (only plain add over R32_UINT is lowered). The opcode is verified
-// against the LLVM checkout's gfx10_asm_mimg.s -- an earlier revision of this
-// arm mislabeled these words fcmpswap from a stale disassembler table; the
-// current suite encodes dec/fcmpswap/fmin/fmax at byte2 0x70/0x74/0x78/0x7c
-// (ops 0x1c/0x1d/0x1e/0x1f). The add words are the byte-exact Astro Bot
-// packet. The control is image_atomic_add over a Uint32 entry in its own
-// table, which is lowered. WHEN a dec lowering lands, THIS ARM GOES RED;
+// Unlowered float MIMG atomics must refuse fail-visibly. image_atomic_fmin
+// (0x1e) and image_atomic_fmax (0x1f) need float-typed atomic lowering, which
+// does not exist (only the integer/R32_UINT atomic path is lowered); forcing
+// them through it would silently reinterpret float bits as integers. Words are
+// llvm-mc gfx1030 round-tripped (an earlier revision of this arm mislabeled
+// them by one opcode). The add words are the byte-exact Astro Bot packet from
+// test_game_compute.cpp; fmin/fmax differ from them only in the opcode field.
+// The refusals use StorageImage entries -- the control's own Uint32 table, and
+// the realistic R32_FLOAT storage target -- because a real float lowering must
+// make these storage ops (#4211); today the op is classified sampled-only, so
+// a storage entry does not resolve and the arm refuses. A Texture entry would
+// keep refusing at the sampled-op allowlist after that lowering lands, so it
+// could never go red. image_atomic_fcmpswap (0x1d) is pinned separately
+// (ImageAtomicFCmpswapRefuse). WHEN a float lowering lands, ITS CASE GOES RED;
 // replace it with an execution test of the new lowering.
-TEST(GapOpcodeRefusals, ImageAtomicDecRefuse) {
-    static const uint32_t dec[2] = {0xf0702108u, 0x00000900u};
+TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
+    // image_atomic_{fmin,fmax,add} v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t fmin[2] = {0xf0782108u, 0x00000900u};
+    static const uint32_t fmax[2] = {0xf07c2108u, 0x00000900u};
     static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
-    for (const uint32_t* words : {dec, add}) {
+    for (const uint32_t* words : {fmin, fmax, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
         EXPECT_EQ(dec.len_dwords, 2u);
     }
-    EXPECT_EQ(rdna2_decode_one(dec, 2).opcode, 0x1cu);
+    EXPECT_EQ(rdna2_decode_one(fmin, 2).opcode, 0x1eu);
+    EXPECT_EQ(rdna2_decode_one(fmax, 2).opcode, 0x1fu);
     EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
 
     std::vector<uint8_t> backing(8u * 8u * 4u, 0);
-    // NOTE: prosper classifies dec as sampled-only, so the refusal entry is
-    // a Texture: against a storage entry the descriptor never resolves and
-    // the pin would assert a table miss rather than the missing lowering (no
-    // [mimg-unresolved] line with the Texture entry).
-    auto table = [&](DataFormat format, ResourceClass cls) {
+    auto table = [&](DataFormat format) {
         ShaderResourceTable rt;
         ShaderResource image{};
-        image.cls = cls;
+        image.cls = ResourceClass::StorageImage;
         image.format = format;
         image.num_components = 1;
         image.binding = 4;
@@ -376,16 +380,393 @@ TEST(GapOpcodeRefusals, ImageAtomicDecRefuse) {
         0x7e020280u,   // v_mov_b32 v1, 0 (coord)
         0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
     };
-    const ShaderResourceTable int_rt =
-        table(DataFormat::Uint32, ResourceClass::Texture);
-    expect_gap_refusal(program(prologue, {dec[0], dec[1]}), 0xA0E9ull, 3,
-                       {dec[0], dec[1]}, Rdna2Format::MIMG, 0x1cu, &int_rt,
-                       config);
-    const ShaderResourceTable uint_rt =
-        table(DataFormat::Uint32, ResourceClass::StorageImage);
-    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0E8ull,
-                    "control: image_atomic_add over the Uint32 entry", &uint_rt,
+    const ShaderResourceTable uint_rt = table(DataFormat::Uint32);
+    const ShaderResourceTable float_rt = table(DataFormat::Float32);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA010ull,
+                    "control: image_atomic_add over the Uint32 storage entry", &uint_rt,
                     config);
+    // Same table as the control: only the opcode differs.
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA011ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &uint_rt, config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA012ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &uint_rt, config);
+    // The realistic R32_FLOAT storage target; a float lowering must turn these red too.
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA013ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt, config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA014ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &float_rt, config);
+}
+
+// Unlowered float compare-swap MIMG atomic must refuse fail-visibly.
+// image_atomic_fcmpswap (0x1d) needs a float compare-and-swap lowering, which
+// does not exist: the lowered image atomics are integer swap, add, sub,
+// min/max and and/or/xor over R32_UINT. Accepting it as one of those would
+// silently drop the comparison. The word is the canonical llvm-mc gfx1030
+// encoding; a compare-swap carries a data pair (v9 data, v10 compare), so it
+// requires dmask 0x3. The control is image_atomic_add (the byte-exact Astro
+// Bot packet); lowered image atomics require dmask 0x1, so the control
+// differs from the refused word in the opcode AND the dmask field. Both refuse
+// against the control's own Uint32 StorageImage entry, plus the realistic
+// R32_FLOAT storage target: today fcmpswap is classified sampled-only, so a
+// storage entry does not resolve and the arm refuses; a real lowering must make
+// it a storage op (#4211), at which point this arm goes red. A Texture entry
+// would keep refusing at the sampled-op allowlist and could never go red.
+// fmin/fmax are pinned in ImageAtomicFloatRefuse. Integer image_atomic_dec
+// (0x1c) is also unlowered and is pinned on the same Uint32 storage entry; its
+// word differs from the add control only in the opcode field. WHEN a fcmpswap
+// or dec lowering lands, ITS CASE GOES RED; replace it with an execution test.
+TEST(GapOpcodeRefusals, ImageAtomicFCmpswapRefuse) {
+    // image_atomic_fcmpswap v[9:10], v[0:1], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t fcs[2] = {0xf0742308u, 0x00000900u};
+    // image_atomic_dec v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t dcr[2] = {0xf0702108u, 0x00000900u};
+    // image_atomic_add v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
+    for (const uint32_t* words : {fcs, dcr, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1du);
+    EXPECT_EQ(rdna2_decode_one(dcr, 2).opcode, 0x1cu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    auto table = [&](DataFormat format) {
+        ShaderResourceTable rt;
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.format = format;
+        image.num_components = 1;
+        image.binding = 4;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 0;
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+        return rt;
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(8);   // s0..s7 T# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (coord)
+        0x7e020280u,   // v_mov_b32 v1, 0 (coord)
+        0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
+        0x7e140281u,   // v_mov_b32 v10, 1 (fcmpswap compare value)
+    };
+    const ShaderResourceTable uint_rt = table(DataFormat::Uint32);
+    const ShaderResourceTable float_rt = table(DataFormat::Float32);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA018ull,
+                    "control: image_atomic_add over the Uint32 storage entry", &uint_rt,
+                    config);
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA019ull, 4,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &uint_rt, config);
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA01Aull, 4,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &float_rt, config);
+    expect_gap_refusal(program(prologue, {dcr[0], dcr[1]}), 0xA01Bull, 4,
+                       {dcr[0], dcr[1]}, Rdna2Format::MIMG, 0x1cu, &uint_rt, config);
+}
+
+// Unlowered arithmetic x2 MUBUF atomics must refuse fail-visibly. sub/inc/
+// dec_x2 need a true qword RMW like the add/and_x2 family pinned in
+// BufferAtomicX2Refuse. All words below are llvm-mc gfx1030 round-tripped in
+// the idxen form (VDATA v[0:1], VADDR v2), and the control is the same-shape
+// 32-bit buffer_atomic_add that BufferAtomicX2Refuse already proves compiles,
+// so each pair differs only in the opcode. (cmpswap_x2, 0x51, also refuses but
+// carries a four-VGPR data operand -- `buffer_atomic_cmpswap_x2 v[0:3], v4,
+// s[8:11], 0 idxen` = {0xe1442000, 0x80020004} -- so it needs its own arm.)
+// WHEN an x2 lowering lands, ITS CASE GOES RED; replace it with an execution
+// test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicX2ArithmeticRefuse) {
+    static const uint32_t subx2[2] = {0xe14c2000u, 0x80020002u};
+    static const uint32_t incx2[2] = {0xe1702000u, 0x80020002u};
+    static const uint32_t decx2[2] = {0xe1742000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};   // atomic_add v0, v2 idxen
+    for (const uint32_t* words : {subx2, incx2, decx2, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(subx2, 2).opcode, 0x53u);
+    EXPECT_EQ(rdna2_decode_one(incx2, 2).opcode, 0x5cu);
+    EXPECT_EQ(rdna2_decode_one(decx2, 2).opcode, 0x5du);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (data, low dword)
+        0x7e020283u,   // v_mov_b32 v1, 3 (data, high dword)
+        0x7e040280u,   // v_mov_b32 v2, 0 (VADDR: the idxen element index)
+    };
+    // swap_x2 was tried as the same-shape control first, but its separately
+    // guarded lowering needs fuller backing than this bare entry provides. The
+    // idxen 32-bit add -- the control BufferAtomicX2Refuse compiles over this
+    // same table and prologue -- proves the harness instead.
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F5ull,
+                    "control: same-shape 32-bit add over the same entry", &rt, config);
+    expect_gap_refusal(program(prologue, {subx2[0], subx2[1]}), 0xA0F6ull, 3,
+                       {subx2[0], subx2[1]}, Rdna2Format::MUBUF, 0x53u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {incx2[0], incx2[1]}), 0xA0F7ull, 3,
+                       {incx2[0], incx2[1]}, Rdna2Format::MUBUF, 0x5cu, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {decx2[0], decx2[1]}), 0xA0F8ull, 3,
+                       {decx2[0], decx2[1]}, Rdna2Format::MUBUF, 0x5du, &rt,
+                       config);
+}
+
+// Unlowered program-counter and code-end operations must refuse fail-visibly.
+// s_swappc_b64 swaps the program counter with a register pair -- control flow
+// prosper cannot model straight-line. s_code_end raises an illegal-instruction
+// trap if executed; it is end-of-buffer padding for debug tools, normally
+// placed after s_endpgm where the walk never reaches it. Reached in
+// straight-line code, dropping it as a no-op would silently run past a trap,
+// so it must refuse. All words below are llvm-mc gfx1030 round-tripped.
+// Controls are s_mov_b32 (SOP1, lowered) with swappc's SDST/SSRC0 fields, and
+// s_nop (SOPP no-op) with code_end's SIMM16. WHEN a lowering lands for either,
+// ITS CASE GOES RED; replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SwapPcCodeEndRefuse) {
+    static const uint32_t swappc[1] = {0xbe802102u};
+    static const uint32_t codeend[1] = {0xbf9f0000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(swappc, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOP1);
+        EXPECT_EQ(dec.opcode, 0x21u);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    {
+        const Rdna2Inst dec = rdna2_decode_one(codeend, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, 0x1fu);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+        0xbe820301u,   // s_mov_b32 s2, s1 (swappc source pair base)
+        0xbe830301u,   // s_mov_b32 s3, s1
+    };
+    static const uint32_t movb[1] = {0xbe800302u};   // s_mov_b32 s0, s2: swappc's fields
+    expect_compiles(program(sprologue, {movb[0]}), 0xA0D8ull,
+                    "control: s_mov_b32 in the swappc slot");
+    expect_gap_refusal(program(sprologue, {swappc[0]}), 0xA0D9ull, 4,
+                       {swappc[0]}, Rdna2Format::SOP1, 0x21u);
+    expect_compiles(program(kVop3Prologue, {0xbf800000u}), 0xA0DAull,
+                    "control: s_nop in the code-end slot");
+    expect_gap_refusal(program(kVop3Prologue, {codeend[0]}), 0xA0DBull, 4,
+                       {codeend[0]}, Rdna2Format::SOPP, 0x1fu);
+}
+
+// Unlowered signed scalar bitfield-extracts and FP-mode setters must refuse
+// fail-visibly. s_bfe_i64 and s_bfe_i32 need a signed extract lowering (only
+// the unsigned s_bfe_u64 and s_bfe_u32 are lowered); s_denorm_mode and
+// s_round_mode need in-shader FP-mode changes, which are not modeled (only the
+// dispatch-time PGM_RSRC1 mode is). All words below are llvm-mc gfx1030
+// round-tripped. Controls are the unsigned SOP2 siblings (same operand fields,
+// only the opcode differs) and s_nop (SOPP no-op, same SIMM16). WHEN a
+// lowering lands for any of the four, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
+    static const uint32_t bfei[1] = {0x95000402u};   // s_bfe_i64 s[0:1], s[2:3], s4
+    static const uint32_t bfei32[1] = {0x94000402u};   // s_bfe_i32 s0, s2, s4
+    static const uint32_t denorm[1] = {0xbfa50000u};
+    static const uint32_t round[1] = {0xbfa40000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(bfei, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOP2);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(bfei, 1).opcode, 0x2au);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).fmt, Rdna2Format::SOP2);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).opcode, 0x28u);
+    for (const uint32_t* words : {denorm, round}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(denorm, 1).opcode, 0x25u);
+    EXPECT_EQ(rdna2_decode_one(round, 1).opcode, 0x24u);
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+        0xbe820301u,   // s_mov_b32 s2, s1
+        0xbe830301u,   // s_mov_b32 s3, s1
+        0xbe840301u,   // s_mov_b32 s4, s1
+    };
+    static const uint32_t bfeu[1] = {0x94800402u};     // s_bfe_u64 s[0:1], s[2:3], s4 (lowered)
+    static const uint32_t bfeu32[1] = {0x93800402u};   // s_bfe_u32 s0, s2, s4 (lowered)
+    expect_compiles(program(sprologue, {bfeu[0]}), 0xA110ull,
+                    "control: s_bfe_u64 in the bfe_i64 slot");
+    expect_gap_refusal(program(sprologue, {bfei[0]}), 0xA111ull, 5, {bfei[0]},
+                       Rdna2Format::SOP2, 0x2au);
+    expect_compiles(program(sprologue, {bfeu32[0]}), 0xA112ull,
+                    "control: s_bfe_u32 in the bfe_i32 slot");
+    expect_gap_refusal(program(sprologue, {bfei32[0]}), 0xA116ull, 5, {bfei32[0]},
+                       Rdna2Format::SOP2, 0x28u);
+
+    static const uint32_t nop[1] = {0xbf800000u};
+    expect_compiles(program(kVop3Prologue, {nop[0]}), 0xA113ull,
+                    "control: s_nop in the mode slot");
+    expect_gap_refusal(program(kVop3Prologue, {denorm[0]}), 0xA114ull, 4,
+                       {denorm[0]}, Rdna2Format::SOPP, 0x25u);
+    expect_gap_refusal(program(kVop3Prologue, {round[0]}), 0xA115ull, 4,
+                       {round[0]}, Rdna2Format::SOPP, 0x24u);
+}
+
+// Unlowered end-of-program variants must refuse fail-visibly. Only the exact
+// s_endpgm word terminates a stream (rdna2_decode.cpp S_ENDPGM); the saved
+// and ordered forms fall through to the SOPP reject. Accepting either as a
+// plain terminator would silently drop its ordering/save semantics. All words
+// below are llvm-mc gfx1030 round-tripped. The control is s_endpgm in the
+// same slot, which terminates cleanly. WHEN a lowering lands for either
+// variant, ITS CASE GOES RED; replace it with an execution test of the new
+// lowering.
+TEST(GapOpcodeRefusals, EndpgmVariantRefuse) {
+    static const uint32_t saved[1] = {0xbf9b0000u};
+    static const uint32_t ordered[1] = {0xbf9e0000u};
+    for (const uint32_t* words : {saved, ordered}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.len_dwords, 1u);
+        EXPECT_FALSE(dec.is_end) << "variants must not terminate the walk";
+    }
+    EXPECT_EQ(rdna2_decode_one(saved, 1).opcode, 0x1bu);
+    EXPECT_EQ(rdna2_decode_one(ordered, 1).opcode, 0x1eu);
+
+    static const uint32_t endpgm[1] = {0xbf810000u};
+    EXPECT_TRUE(rdna2_decode_one(endpgm, 1).is_end) << "the control is the real terminator";
+    expect_compiles(program(kVop3Prologue, {endpgm[0]}), 0xA120ull,
+                    "control: s_endpgm terminates in the variant slot");
+    expect_gap_refusal(program(kVop3Prologue, {saved[0]}), 0xA121ull, 4, {saved[0]},
+                       Rdna2Format::SOPP, 0x1bu);
+    expect_gap_refusal(program(kVop3Prologue, {ordered[0]}), 0xA122ull, 4, {ordered[0]},
+                       Rdna2Format::SOPP, 0x1eu);
+}
+
+// Unlowered SOPK immediate-hardware-register write must refuse fail-visibly.
+// s_setreg_imm32_b32 (SOPK 0x15) has no lowering: the SOPK switch admits only
+// the s_setreg_b32 full flat-scratch-base form (0x13). Accepting it would
+// silently drop a hardware-register write. The refused word names the same
+// hwreg as the control (HW_REG_FLAT_SCR_LO, offset 0, width 32), so only the
+// opcode differs -- plus the data dword 0x15 requires -- and a lowering that
+// extends the flat-scratch admission to 0x15 turns this arm red. The record's
+// words field prints the trailing literal as 00000000 (#4483), so only its
+// first word is asserted. WHEN a lowering lands, THIS ARM GOES RED; replace
+// it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SetregImm32Refuse) {
+    // s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1
+    static const uint32_t setimm[2] = {0xba80f814u, 0x00000001u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(setimm, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x15u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    // s_setreg_b32 s0, hwreg(20,0,31): full FLAT_SCRATCH_LO base write,
+    // the exact form sopk_sets_full_flat_scratch_base admits (id 20,
+    // offset 0, width-1 31 -> simm 0xF814).
+    static const uint32_t setreg[1] = {0xb980f814u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(setreg, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x13u);
+    }
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+    };
+    expect_compiles(program(sprologue, {setreg[0]}), 0xA130ull,
+                    "control: s_setreg_b32 full flat-scratch base");
+    const std::vector<uint32_t> refused_code = program(sprologue, {setimm[0], setimm[1]});
+    const std::vector<uint32_t> refused = compile(refused_code, 0xA131ull);
+    EXPECT_TRUE(refused.empty()) << "s_setreg_imm32_b32 must refuse";
+    {
+        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA131ull));
+        EXPECT_EQ(r.tag, "recompile-reject");
+        EXPECT_EQ(r.fields["mode"], "unresolved-operand");
+        EXPECT_EQ(r.fields["pc"], "2") << "the reject must name the gap pc";
+        EXPECT_EQ(r.fields["fmt"], std::to_string(static_cast<int>(Rdna2Format::SOPK)));
+        EXPECT_EQ(r.fields["op"], "0x15");
+        EXPECT_EQ(r.fields["len"], "2");
+        EXPECT_EQ(r.fields["words"].substr(0, 8), hex(setimm[0], false))
+            << "the record names the refused word (its literal prints as 0, #4483)";
+        EXPECT_EQ(r.fields["sh"],
+                  hex(refused_code[0], false) + "/" + std::to_string(refused_code.size()));
+    }
+}
+
+// Deferred 32-bit MUBUF atomics must refuse fail-visibly. csub/dec/inc do
+// mem = mem OP VDATA with wrap/conditional semantics the generic atomic shape
+// does not cover (rdna2_emit_alu.cpp names all three as deferred). All words
+// below are llvm-mc gfx1030 round-tripped in the same idxen form (VDATA v0,
+// VADDR v2). The control is buffer_atomic_add with those same fields over the
+// same entry (lowered); each pair differs only in the opcode. WHEN a
+// lowering lands for any of the three, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicDeferred32Refuse) {
+    // buffer_atomic_{csub,dec,inc,add} v0, v2, s[8:11], 0 idxen
+    static const uint32_t csub[2] = {0xe0d02000u, 0x80020002u};
+    static const uint32_t dec[2] = {0xe0f42000u, 0x80020002u};
+    static const uint32_t inc[2] = {0xe0f02000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};
+    for (const uint32_t* words : {csub, dec, inc, add}) {
+        const Rdna2Inst d = rdna2_decode_one(words, 2);
+        EXPECT_EQ(d.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(d.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(csub, 2).opcode, 0x34u);
+    EXPECT_EQ(rdna2_decode_one(dec, 2).opcode, 0x3du);
+    EXPECT_EQ(rdna2_decode_one(inc, 2).opcode, 0x3cu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (VDATA: the atomic's data)
+        0x7e020283u,   // v_mov_b32 v1, 3 (unused; keeps the gap at pc 3)
+        0x7e040280u,   // v_mov_b32 v2, 0 (VADDR: the idxen element index)
+    };
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA100ull,
+                    "control: buffer_atomic_add with the refused words' fields",
+                    &rt, config);
+    expect_gap_refusal(program(prologue, {csub[0], csub[1]}), 0xA101ull, 3,
+                       {csub[0], csub[1]}, Rdna2Format::MUBUF, 0x34u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {dec[0], dec[1]}), 0xA102ull, 3,
+                       {dec[0], dec[1]}, Rdna2Format::MUBUF, 0x3du, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {inc[0], inc[1]}), 0xA103ull, 3,
+                       {inc[0], inc[1]}, Rdna2Format::MUBUF, 0x3cu, &rt,
+                       config);
 }
 
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
