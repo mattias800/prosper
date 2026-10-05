@@ -57,7 +57,6 @@ tests/gpu/execute/test_float_transport_render.cpp
 tests/gpu/execute/test_fold_capture.cpp
 tests/gpu/execute/test_fold_control_plan.cpp
 tests/gpu/execute/test_fragment_compile_case.cpp
-tests/gpu/execute/test_fragment_float_flags_key.cpp
 tests/gpu/execute/test_fragment_float_mode_capture.cpp
 tests/gpu/execute/test_fragment_loop_mask_exec.cpp
 tests/gpu/execute/test_fragment_numeric_mbcnt.cpp
@@ -121,7 +120,6 @@ tests/gpu/recompiler/test_wave_width_independent.cpp
 tests/gpu/state/test_backend_timestamp_pool.cpp
 tests/gpu/state/test_compute_overwrite_eviction.cpp
 tests/gpu/state/test_descriptor_array_render.cpp
-tests/gpu/state/test_fragment_float_flags.cpp
 tests/gpu/state/test_render_buffer_residency.cpp
 tests/gpu/state/test_vulkan_triangle.cpp
 tests/gpu/test_capture_trigger_file.cpp

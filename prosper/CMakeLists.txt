@@ -3513,17 +3513,17 @@ endif()
   add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
   target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
   add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
-  add_executable(test_fragment_float_flags tests/gpu/state/test_fragment_float_flags.cpp)
-  target_link_libraries(test_fragment_float_flags PRIVATE prosper_core)
-  add_test(NAME fragment_float_flags COMMAND test_fragment_float_flags)
+  prosper_add_gtest(test_fragment_float_flags
+    SOURCES tests/gpu/state/test_fragment_float_flags.cpp
+    LIBRARIES prosper_core)
   # #3549: a storage-image or format-fetch DST_SEL is part of the compiled-shader key.
   prosper_add_gtest(test_shader_key_dst_sel
     SOURCES tests/gpu/execute/test_shader_key_dst_sel.cpp
     INCLUDES src
     LIBRARIES prosper_core)
-  add_executable(test_fragment_float_flags_key tests/gpu/execute/test_fragment_float_flags_key.cpp)
-  target_link_libraries(test_fragment_float_flags_key PRIVATE prosper_core)
-  add_test(NAME fragment_float_flags_key COMMAND test_fragment_float_flags_key)
+  prosper_add_gtest(test_fragment_float_flags_key
+    SOURCES tests/gpu/execute/test_fragment_float_flags_key.cpp
+    LIBRARIES prosper_core)
   add_executable(test_float_transport_capture tests/gpu/execute/test_float_transport_capture.cpp)
   target_link_libraries(test_float_transport_capture PRIVATE prosper_core)
   add_test(NAME float_transport_capture COMMAND test_float_transport_capture)
