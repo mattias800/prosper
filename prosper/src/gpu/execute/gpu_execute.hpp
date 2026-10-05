@@ -206,6 +206,9 @@ struct DrawItem {
         uint64_t raw_snapshot_footprint_bytes = 0;
         // Why that extent is zero, for the diagnostics that pay for an unproved one (#4457).
         ColorExtentRefusal footprint_refusal = ColorExtentRefusal::None;
+        // Conservative upper bound on the same bytes, for overlap tests only (never a snapshot
+        // extent): the exact extent when proved, else color_target_footprint_bound_bytes().
+        uint64_t footprint_bound_bytes = 0;
 
         constexpr void mirror_named_identity(uint64_t named_base, uint32_t named_width,
                                              uint32_t named_height) {
@@ -2156,6 +2159,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             binding.native_layout_known = rs.color_targets[slot].has_attrib3;
             binding.raw_snapshot_footprint_bytes =
                 color_target_physical_bytes(rs.color_targets[slot], &binding.footprint_refusal);
+            binding.footprint_bound_bytes =
+                binding.raw_snapshot_footprint_bytes
+                    ? binding.raw_snapshot_footprint_bytes
+                    : color_target_footprint_bound_bytes(rs.color_targets[slot]);
         }
         failure->color_targets[0].mirror_named_identity(
             failure->color0_base, failure->color0_width, failure->color0_height);
@@ -3363,6 +3370,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         binding.native_layout_known = rs.color_targets[slot].has_attrib3;
         binding.raw_snapshot_footprint_bytes =
             color_target_physical_bytes(rs.color_targets[slot], &binding.footprint_refusal);
+        binding.footprint_bound_bytes =
+            binding.raw_snapshot_footprint_bytes
+                ? binding.raw_snapshot_footprint_bytes
+                : color_target_footprint_bound_bytes(rs.color_targets[slot]);
     }
     // Preserve direct/synthetic callers that still populate only the named aliases.
     out.color_targets[0].mirror_named_identity(out.color0_base, out.color0_width,
