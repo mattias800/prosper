@@ -75,8 +75,8 @@ extern "C" __attribute__((sysv_abi)) void* guest_exiting_worker(void*) {
     return nullptr;
 }
 
-// The four entry points under test. Each case is its own process, so the per-process counters above
-// start at zero for every one of them.
+// The four entry points under test. ctest runs each case in its own process, but a direct run or
+// --gtest_repeat shares one, so every destructor-counting case resets the counters it reads.
 struct KeyFamily {
     HleFn key_create = nullptr, key_delete = nullptr, thread_create = nullptr,
           thread_join = nullptr, thread_exit = nullptr;
@@ -95,10 +95,16 @@ uint64_t addr(void* p) {
     return reinterpret_cast<uint64_t>(p);
 }
 // The guest-ABI callbacks below carry the SysV attribute, so their address is not convertible to
-// void* without the cast. Two overloads, because the destructors return void and the workers void*.
+// void* without the cast. One template serves both the void destructors and the void* workers.
 template <class Fn>
 uint64_t fn_addr(Fn fn) {
     return reinterpret_cast<uint64_t>(reinterpret_cast<void*>(fn));
+}
+void reset_destructor_counters() {
+    g_calls.store(0, std::memory_order_relaxed);
+    g_values[0].store(0, std::memory_order_relaxed);
+    g_values[1].store(0, std::memory_order_relaxed);
+    g_exit_dtor_calls.store(0, std::memory_order_relaxed);
 }
 }  // namespace
 
@@ -112,6 +118,7 @@ TEST(WinPthreadKeyDestructor, TheKeyAndThreadEntryPointsAreRegistered) {
 
 TEST(WinPthreadKeyDestructor, TheGuestDestructorRunsWithThePs5AbiAndIsRetriedForItsOwnNewValue) {
     const KeyFamily family = key_family();
+    reset_destructor_counters();
     ASSERT_NE(family.key_create, nullptr);
     ASSERT_NE(family.key_delete, nullptr);
     ASSERT_NE(family.thread_create, nullptr);
@@ -139,6 +146,8 @@ TEST(WinPthreadKeyDestructor, TheGuestDestructorRunsWithThePs5AbiAndIsRetriedFor
         << "first destructor call received the worker's value";
     EXPECT_EQ(g_values[1].load(std::memory_order_relaxed), kSecondValue)
         << "the retry received the value the first call installed";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
 }
 
 TEST(WinPthreadKeyDestructor, ADestructorCallingScePthreadExitDoesNotTakeTheProcessDown) {
@@ -146,10 +155,13 @@ TEST(WinPthreadKeyDestructor, ADestructorCallingScePthreadExitDoesNotTakeTheProc
     // terminates the process (exit ~0xC00000FF, no output), which is the death #997 removed for the
     // normal worker path and #1020 removed for the destructor path.
     const KeyFamily family = key_family();
+    reset_destructor_counters();
     ASSERT_NE(family.key_create, nullptr);
     ASSERT_NE(family.key_delete, nullptr);
     ASSERT_NE(family.thread_create, nullptr);
     ASSERT_NE(family.thread_join, nullptr);
+    ASSERT_NE(family.thread_exit, nullptr)
+        << "scePthreadExit is registered, or the #1020 arm is vacuous";
     g_exit_fn = family.thread_exit;
     uint32_t exit_key = 0;
     ASSERT_EQ(family.key_create(addr(&exit_key), fn_addr(&guest_exiting_destructor), 0, 0, 0, 0),
@@ -164,6 +176,8 @@ TEST(WinPthreadKeyDestructor, ADestructorCallingScePthreadExitDoesNotTakeTheProc
         << "#1020: the worker that installed the exiting key ran";
     EXPECT_GE(g_exit_dtor_calls.load(std::memory_order_relaxed), 1u)
         << "#1020: the destructor that calls scePthreadExit was reached";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
 }
 
 TEST(WinPthreadKeyDestructor, AClearedValueInvokesNoDestructor) {
@@ -171,6 +185,7 @@ TEST(WinPthreadKeyDestructor, AClearedValueInvokesNoDestructor) {
     // callback at all. The HLE has to filter the nullptr case, or every guest that clears a key pays
     // a destructor call it never asked for.
     const KeyFamily family = key_family();
+    reset_destructor_counters();
     ASSERT_NE(family.key_create, nullptr);
     ASSERT_NE(family.key_delete, nullptr);
     ASSERT_NE(family.thread_create, nullptr);
@@ -189,6 +204,8 @@ TEST(WinPthreadKeyDestructor, AClearedValueInvokesNoDestructor) {
     EXPECT_EQ(delete_result, 0u) << "scePthreadKeyDelete reports success";
     EXPECT_EQ(g_calls.load(std::memory_order_relaxed), 0u)
         << "a cleared pthread key invoked no destructor";
+    EXPECT_EQ(win_key_destructor_thunk_count_for_test(), 0u)
+        << "every deleted key released its destructor thunk";
 }
 
 TEST(WinPthreadKeyDestructor, KeyDeleteAndTheReuseOfItsNumberCannotOverlap) {
