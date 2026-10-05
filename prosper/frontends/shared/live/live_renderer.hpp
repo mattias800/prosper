@@ -151,10 +151,15 @@ bool native_r11_sampled_upload_supported(const prosper::gpu::ShaderResource& res
 // `allow_declared_mips`: the backend cannot blit-generate levels for a block format, so the renderer
 // passes it only when the guest's OWN chain can be placed and uploaded
 // (shader_resource_block_mip_chain_plan); any other chain keeps the decoder's generated levels. Views stay UNORM even for sRGB T#s (NOTE(#263) in
-// render_runner.h). BC6H UF16 maps to BC6H_UFLOAT and therefore keeps its HDR range, where the
-// decoder clamps to UNORM8. Signed variants never reach the renderer (gen5_image_format skips them).
+// render_runner.h). BC6H UF16 returns 0 by default and so keeps the decoder, which clamps to
+// UNORM8: its HDR range over-brightens in a gamma-space pipeline (#4496). With
+// PROSPER_NATIVE_BC6H_HDR it maps to BC6H_UFLOAT. Signed variants never reach the renderer
+// (gen5_image_format skips them).
 uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
                                   bool allow_declared_mips);
+// Whether BC6H takes the native HDR upload (PROSPER_NATIVE_BC6H_HDR). Off by default; see the
+// definition for why.
+bool native_bc6h_hdr_enabled();
 
 // Reconstruct the independently addressable CB_COLOR identities belonging to a sampled thin-2D
 // mip chain. Tiled allocations are tail-first/reverse: level zero is generally not the allocation

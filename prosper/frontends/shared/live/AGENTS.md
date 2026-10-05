@@ -161,7 +161,13 @@ compute -- keeps `bc_decode`. Because the decoded path is still the fallback, a 
 bytes are blocks: diagnostics that read texels must go through `inspection_rgba8`, which decodes
 them. `PROSPER_NO_NATIVE_BC=1` restores the decoder everywhere; `PROSPER_NO_NATIVE_BC_MIP_CHAIN=1`
 only for chains. `PROSPER_NATIVE_BC_LOG=1` prints one coverage line per BC identity and
-`PROSPER_NATIVE_BC_CHAIN_AUDIT=1` checks that level 1 really is the 2x2 box of level 0.
+`PROSPER_NATIVE_BC_CHAIN_AUDIT=1` checks every level of a chain against the 2x2 box of the level
+above it (`native_bc_chain_audit.cpp`).
+
+**BC6H is the exception: it keeps the decoder by default.** Native BC6H is HDR, and a lightmap
+value above 1.0 multiplying a gamma-encoded albedo over-brightens in this renderer's gamma-space
+pipeline (#263, #4496). The decoder's UNORM8 clamp is what every capture before #3883 shows.
+`PROSPER_NATIVE_BC6H_HDR=1` opts back in for work on the linear pipeline.
 
 ## Encoded decoder snapshots
 
