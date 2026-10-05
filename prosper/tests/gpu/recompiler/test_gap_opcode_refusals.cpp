@@ -330,18 +330,24 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 // 0x14-0x19 family is lowered in rdna2_dot.cpp); accepting it as the integer
 // form would silently compute garbage. All words below are llvm-mc gfx1030
 // round-tripped. The control is v_dot2_i32_i16 in the same slot, which is
-// lowered. (V_FMA_MIX_F32/MIXLO/HI need no pins: already lowered, #273.
-// V_INTERP_P1LL/P1LV/P2_F16 and V_SUB_CO_U32 assemble on no gfx1030 form
-// tried -- GCN-era names, not RDNA2 instructions -- so there is nothing to
-// pin. WHEN a float-dot lowering lands, THIS ARM GOES RED; replace it with
-// an execution test of the new lowering.)
+// lowered. Both use op_sel_hi:[0,0,0] so neither touches the decoder's VOP3P
+// modifier gate and the refusal is the missing lowering itself; the
+// realistic default-op_sel_hi encoding of 0x13 is refused earlier, by that
+// gate in rdna2_decode.cpp, so a float-dot lowering also has to model it.
+// V_FMA_MIX_F32/MIXLO/HI need no pins: already lowered, #273. V_SUB_CO_U32 (VOP3 0x310) is
+// lowered too. V_INTERP_P1LL/P1LV/P2_F16 (VOP3 0x342/0x343/0x35a) are RDNA2 instructions with
+// no lowering yet; they are fragment-stage and want their own arm. WHEN a float-dot lowering
+// lands, THIS ARM GOES RED; replace it with an execution test of the new lowering.
 TEST(GapOpcodeRefusals, Dot2F32Refuse) {
-    static const uint32_t dotf[2] = {0xcc134000u, 0x1c0e0501u};
-    static const uint32_t doti[2] = {0xcc144000u, 0x1c0e0501u};
+    // v_dot2_{f32_f16,i32_i16} v0, v1, v2, v3 op_sel_hi:[0,0,0]
+    static const uint32_t dotf[2] = {0xcc130000u, 0x040e0501u};
+    static const uint32_t doti[2] = {0xcc140000u, 0x040e0501u};
     for (const uint32_t* words : {dotf, doti}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::VOP3P);
         EXPECT_EQ(dec.len_dwords, 2u);
+        EXPECT_FALSE(dec.has_modifier)
+            << "the refusal must come from the missing lowering, not the modifier gate";
     }
     EXPECT_EQ(rdna2_decode_one(dotf, 2).opcode, 0x13u);
     EXPECT_EQ(rdna2_decode_one(doti, 2).opcode, 0x14u);
