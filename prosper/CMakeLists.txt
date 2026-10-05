@@ -1174,8 +1174,8 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ajm.cpp
     LIBRARIES prosper_core)
 
-  # AJM direct-job shapes: queue onto the batch for BatchStart to execute (DecodeSingle,
-  # Run, RunSplit, Encode), plus config parse, memory ack, StrError and info getters.
+  # AJM direct-job shapes: DecodeSingle, Run and RunSplit queue onto the batch for BatchStart to
+  # execute; plus ATRAC9 config parse, memory ack and StrError.
   prosper_add_gtest(test_ajm_jobs
     SOURCES tests/hle/test_ajm_jobs.cpp
     LIBRARIES prosper_core)
