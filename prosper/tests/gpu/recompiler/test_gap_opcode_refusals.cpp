@@ -328,40 +328,37 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 // Unlowered float MIMG atomics must refuse fail-visibly. image_atomic_fmin
 // (0x1e) and image_atomic_fmax (0x1f) need float-typed atomic lowering, which
 // does not exist (only the integer/R32_UINT atomic path is lowered); forcing
-// them through it would silently reinterpret float bits as integers.
-// image_atomic_fcmpswap (0x1d) needs a float compare-swap lowering. Opcodes
-// verified against the LLVM checkout's gfx10_asm_mimg.s (an earlier revision
-// of this arm mislabeled all three by one from a stale disassembler table --
-// the numbers below are what the current suite's CHECK lines encode). The add
-// words are the byte-exact Astro Bot packet from test_game_compute.cpp. The
-// control is image_atomic_add over a Uint32 entry in its own table, which is
-// lowered. WHEN a lowering lands for any of the three, ITS CASE GOES RED;
+// them through it would silently reinterpret float bits as integers. Words are
+// llvm-mc gfx1030 round-tripped (an earlier revision of this arm mislabeled
+// them by one opcode). The add words are the byte-exact Astro Bot packet from
+// test_game_compute.cpp; fmin/fmax differ from them only in the opcode field.
+// The refusals use StorageImage entries -- the control's own Uint32 table, and
+// the realistic R32_FLOAT storage target -- because a real float lowering must
+// make these storage ops (#4211); today the op is classified sampled-only, so
+// a storage entry does not resolve and the arm refuses. A Texture entry would
+// keep refusing at the sampled-op allowlist after that lowering lands, so it
+// could never go red. image_atomic_fcmpswap (0x1d) is pinned separately
+// (ImageAtomicFCmpswapRefuse). WHEN a float lowering lands, ITS CASE GOES RED;
 // replace it with an execution test of the new lowering.
 TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
-    static const uint32_t fcs[2] = {0xf0742108u, 0x00000900u};
+    // image_atomic_{fmin,fmax,add} v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
     static const uint32_t fmin[2] = {0xf0782108u, 0x00000900u};
     static const uint32_t fmax[2] = {0xf07c2108u, 0x00000900u};
     static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
-    for (const uint32_t* words : {fcs, fmin, fmax, add}) {
+    for (const uint32_t* words : {fmin, fmax, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
         EXPECT_EQ(dec.len_dwords, 2u);
     }
-    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1du);
     EXPECT_EQ(rdna2_decode_one(fmin, 2).opcode, 0x1eu);
     EXPECT_EQ(rdna2_decode_one(fmax, 2).opcode, 0x1fu);
     EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
 
     std::vector<uint8_t> backing(8u * 8u * 4u, 0);
-    // NOTE: the float-atomics entry is a Texture, not a StorageImage: prosper
-    // classifies fmin/fmax as sampled-only, so a storage entry can never
-    // resolve and the pin would assert a table miss rather than the missing
-    // lowering. Against a sampled float entry the descriptor resolves and the
-    // refusal lands at the absent lowering -- the honest gate.
-    auto table = [&](DataFormat format, ResourceClass cls) {
+    auto table = [&](DataFormat format) {
         ShaderResourceTable rt;
         ShaderResource image{};
-        image.cls = cls;
+        image.cls = ResourceClass::StorageImage;
         image.format = format;
         image.num_components = 1;
         image.binding = 4;
@@ -382,20 +379,19 @@ TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
         0x7e020280u,   // v_mov_b32 v1, 0 (coord)
         0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
     };
-    const ShaderResourceTable float_rt =
-        table(DataFormat::Float32, ResourceClass::Texture);
-    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA0E0ull, 3,
-                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &float_rt,
-                       config);
-    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA0E1ull, 3,
-                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt,
-                       config);
-    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA0E3ull, 3,
-                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &float_rt,
-                       config);
-    const ShaderResourceTable uint_rt =
-        table(DataFormat::Uint32, ResourceClass::StorageImage);
-    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0E2ull,
-                    "control: image_atomic_add over a Uint32 entry", &uint_rt,
+    const ShaderResourceTable uint_rt = table(DataFormat::Uint32);
+    const ShaderResourceTable float_rt = table(DataFormat::Float32);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA010ull,
+                    "control: image_atomic_add over the Uint32 storage entry", &uint_rt,
                     config);
+    // Same table as the control: only the opcode differs.
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA011ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &uint_rt, config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA012ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &uint_rt, config);
+    // The realistic R32_FLOAT storage target; a float lowering must turn these red too.
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA013ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt, config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA014ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &float_rt, config);
 }
