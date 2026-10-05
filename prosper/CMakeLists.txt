@@ -2089,6 +2089,11 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_signin_dialog.cpp
     LIBRARIES prosper_core)
 
+  # libSceMouse (device-with-no-input + close completing the 4-call set).
+  prosper_add_gtest(test_mouse
+    SOURCES tests/hle/service/test_mouse.cpp
+    LIBRARIES prosper_core)
+
   # Includes a shared fixture, which resolves from the `tests` root.
   prosper_add_gtest(test_translate_sandbox
     SOURCES tests/hle/test_translate_sandbox.cpp
