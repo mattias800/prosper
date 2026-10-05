@@ -1322,7 +1322,8 @@ HLE(s_savedata_dirname_search_ps4) {
 //   dirName filling all 32 bytes with no terminator              -> PARAMETER (never truncated:
 //      a truncated name would delete a different save)
 //   dirName of the live mount                                     -> BUSY 0x809F0003 (the
-//      library's in-use code; PPSA03839 retries on exactly this value). MED.
+//      library's in-use code; PPSA03839 already const-compares this value from
+//      sceSaveDataTransferringMountPs4). MED.
 //   dir present                                                  -> removed, 0
 //   dir absent                                                   -> 0 (idempotent; shadPS4-compatible;
 //      the postcondition "absent" holds either way). MED.
