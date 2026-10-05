@@ -226,35 +226,81 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
 }
 }  // namespace
 
-uint64_t color_target_physical_bytes(const ColorTargetState& target) {
+const char* color_extent_refusal_name(ColorExtentRefusal refusal) {
+    switch (refusal) {
+        case ColorExtentRefusal::None: return "none";
+        case ColorExtentRefusal::Unbound: return "unbound";
+        case ColorExtentRefusal::NoExtent: return "no-extent";
+        case ColorExtentRefusal::NoAttrib3: return "no-attrib3";
+        case ColorExtentRefusal::Dimensions: return "dimensions";
+        case ColorExtentRefusal::Format: return "format";
+        case ColorExtentRefusal::MipLevel: return "mip-level";
+        case ColorExtentRefusal::MipTail: return "mip-tail";
+        case ColorExtentRefusal::VolumeView: return "volume-view";
+        case ColorExtentRefusal::VolumeMsaa: return "volume-msaa";
+        case ColorExtentRefusal::VolumeTileMode: return "volume-tile-mode";
+        case ColorExtentRefusal::ArrayOrLayered: return "array-or-layered";
+        case ColorExtentRefusal::Msaa: return "msaa";
+        case ColorExtentRefusal::TileMode: return "tile-mode";
+        case ColorExtentRefusal::Count: break;
+    }
+    return "?";
+}
+
+uint64_t color_target_physical_bytes(const ColorTargetState& target, ColorExtentRefusal* why) {
+    ColorExtentRefusal ignored;
+    ColorExtentRefusal& refusal = why ? *why : ignored;
+    const auto refuse = [&](ColorExtentRefusal reason) {
+        refusal = reason;
+        return uint64_t{0};
+    };
+    // A size helper can still decline a shape the checks above admitted.
+    const auto sized = [&](uint64_t bytes, ColorExtentRefusal reason) {
+        return bytes ? bytes : refuse(reason);
+    };
+    refusal = ColorExtentRefusal::None;
     const uint32_t bpp = color_format_bytes_per_texel(target.format, target.number_type,
                                                      target.comp_swap);
-    if (!target.base || !target.has_extent || !target.has_attrib3 || !target.width ||
-        !target.height || target.width > 16384u || target.height > 16384u || !bpp ||
-        target.mip_level || target.in_mip_tail) return 0;
+    if (!target.base) return refuse(ColorExtentRefusal::Unbound);
+    if (!target.has_extent) return refuse(ColorExtentRefusal::NoExtent);
+    if (!target.has_attrib3) return refuse(ColorExtentRefusal::NoAttrib3);
+    if (!target.width || !target.height || target.width > 16384u || target.height > 16384u)
+        return refuse(ColorExtentRefusal::Dimensions);
+    if (!bpp) return refuse(ColorExtentRefusal::Format);
+    if (target.mip_level) return refuse(ColorExtentRefusal::MipLevel);
+    if (target.in_mip_tail) return refuse(ColorExtentRefusal::MipTail);
     if (target.resource_type == 2u) {
         const auto view = color_target_volume_view(target);
-        if (!view.slice_count || target.log2_samples ||
-            !tile_mode_supports_volume(target.color_sw_mode)) return 0;
-        return tiled_volume_bytes(target.width, target.height, view.selected_mip_depth,
-                                  target.color_sw_mode, bpp);
+        if (!view.slice_count) return refuse(ColorExtentRefusal::VolumeView);
+        if (target.log2_samples) return refuse(ColorExtentRefusal::VolumeMsaa);
+        if (!tile_mode_supports_volume(target.color_sw_mode))
+            return refuse(ColorExtentRefusal::VolumeTileMode);
+        return sized(tiled_volume_bytes(target.width, target.height, view.selected_mip_depth,
+                                        target.color_sw_mode, bpp),
+                     ColorExtentRefusal::VolumeTileMode);
     }
+    // No complete array/1D producer contract here.
     if (target.resource_type != 1u || target.mip0_depth || target.slice_start || target.slice_max)
-        return 0; // no complete array/1D producer contract here
+        return refuse(ColorExtentRefusal::ArrayOrLayered);
     if (target.log2_samples) {
-        if (target.log2_samples > 3u) return 0;
-        return tiled_msaa_surface_bytes(target.width, target.height, target.color_sw_mode,
-                                        bpp, 1u << target.log2_samples);
+        if (target.log2_samples > 3u) return refuse(ColorExtentRefusal::Msaa);
+        return sized(tiled_msaa_surface_bytes(target.width, target.height, target.color_sw_mode,
+                                              bpp, 1u << target.log2_samples),
+                     ColorExtentRefusal::Msaa);
     }
     switch (static_cast<TileMode>(target.color_sw_mode)) {
-        case TileMode::Linear: return linear_sampled_surface_bytes(target.width, target.height, bpp);
+        case TileMode::Linear:
+            return sized(linear_sampled_surface_bytes(target.width, target.height, bpp),
+                         ColorExtentRefusal::Dimensions);
         case TileMode::Sw256BS:
         case TileMode::Sw4KbS:
         case TileMode::Sw64KbS:
         case TileMode::Sw64KbZX:
         case TileMode::Sw64KbRX:
-            return tiled_surface_bytes(target.width, target.height, target.color_sw_mode, 0, bpp);
-        default: return 0;
+            return sized(
+                tiled_surface_bytes(target.width, target.height, target.color_sw_mode, 0, bpp),
+                ColorExtentRefusal::TileMode);
+        default: return refuse(ColorExtentRefusal::TileMode);
     }
 }
 

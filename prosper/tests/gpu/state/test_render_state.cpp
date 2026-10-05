@@ -1253,3 +1253,65 @@ TEST(RenderState, Contract) {
 
     EXPECT_EQ(fails, 0);
 }
+
+// #4457: an unproved colour extent says which check refused it, in check order, so a caller that
+// pays for the unproved case (the ordered-DMA readback) can name the missing shape.
+TEST(RenderState, ColorExtentRefusalNamesTheFirstFailingCheck) {
+    ColorTargetState proved;
+    proved.base = 0x100000;
+    proved.format = 0xAu;   // COLOR_8_8_8_8
+    proved.has_extent = true;
+    proved.has_attrib3 = true;
+    proved.width = 64;
+    proved.height = 64;
+    proved.resource_type = 1u;
+    ColorExtentRefusal why = ColorExtentRefusal::Count;
+    EXPECT_GT(color_target_physical_bytes(proved, &why), 0u);
+    EXPECT_EQ(why, ColorExtentRefusal::None);
+
+    const auto refusal = [&](auto mutate) {
+        ColorTargetState target = proved;
+        mutate(target);
+        ColorExtentRefusal reason = ColorExtentRefusal::None;
+        EXPECT_EQ(color_target_physical_bytes(target, &reason), 0u);
+        EXPECT_EQ(color_target_physical_bytes(target), 0u);   // the reason is optional
+        return reason;
+    };
+    using R = ColorExtentRefusal;
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.base = 0; }), R::Unbound);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.has_extent = false; }), R::NoExtent);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.has_attrib3 = false; }), R::NoAttrib3);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.width = 16385; }), R::Dimensions);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.format = 0; }), R::Format);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.mip_level = 1; }), R::MipLevel);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.in_mip_tail = true; }), R::MipTail);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.resource_type = 2u; }), R::VolumeView);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.slice_max = 3; }), R::ArrayOrLayered);
+    const auto volume = [](ColorTargetState& t) {
+        t.resource_type = 2u;
+        t.has_view = true;
+        t.mip0_depth = 3u;   // four slices, all in view
+        t.slice_max = 3u;
+        t.color_sw_mode = 27u;   // SW_64KB_R_X, which has a volume layout
+    };
+    EXPECT_EQ(refusal([&](ColorTargetState& t) {
+                  volume(t);
+                  t.log2_samples = 1u;
+              }),
+              R::VolumeMsaa);
+    EXPECT_EQ(refusal([&](ColorTargetState& t) {
+                  volume(t);
+                  t.color_sw_mode = 2u;
+              }),
+              R::VolumeTileMode);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.log2_samples = 4; }), R::Msaa);
+    EXPECT_EQ(refusal([](ColorTargetState& t) { t.color_sw_mode = 2; }), R::TileMode);
+    // Check order: the earlier refusal wins when two apply.
+    EXPECT_EQ(refusal([](ColorTargetState& t) {
+                  t.mip_level = 1;
+                  t.color_sw_mode = 2;
+              }),
+              R::MipLevel);
+    for (size_t r = 0; r < static_cast<size_t>(R::Count); ++r)
+        EXPECT_STRNE(color_extent_refusal_name(static_cast<R>(r)), "?");
+}
