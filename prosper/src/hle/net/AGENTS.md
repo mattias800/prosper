@@ -8,7 +8,11 @@ v2 library, split the same way, between a local object graph (contexts, template
 boxes, and the settings recorded on them) and an honest offline failure on everything from
 `sceHttp2SendRequest` onwards. **libSceNet** (`hle_net.cpp`): the socket layer underneath both,
 split the same way -- byte-order helpers and AF_INET/AF_INET6 text conversion computed for real, a
-local socket-id table, and an honest offline failure on every operation that would move a packet.
+local socket-id table, and an honest offline failure on every operation that would move a packet. It
+also covers the epoll set (local ids; a wait answers 0 events after a bounded sleep), the resolver
+(local ids with a real create/destroy lifecycle; a lookup fails with ENETUNREACH), and the hardware
+introspection calls (refused rather than fabricated). **libSceRudp** (`hle_rudp.cpp`): the
+reliable-UDP setup calls, acknowledged with nothing stored; `sceRudpInit` is not yet modelled.
 
 ## The policy this folder exists to hold
 
@@ -36,7 +40,7 @@ live in `hle_http.cpp` with comments saying which is which.
 ## Where the evidence comes from
 
 Contracts here are read off the shipped modules rather than guessed. `<DUMP_ROOT>/sprx/` carries
-`libSceHttp.sprx` and `libSceHttp2.sprx` as **plain ELF** — nothing is decrypted to read them — so
+`libSceHttp.sprx`, `libSceHttp2.sprx`, `libSceNet.sprx` and `libSceRudp.sprx` as **plain ELF** — nothing is decrypted to read them — so
 argument shapes, per-component length caps, emission order and error constants can be derived
 directly, and a claim in this folder should cite the offset it came from. Two facts worth not
 re-deriving: **libSceHttp2's error facility is `0x817b____`, not v1's `0x8043____`** (the low code
