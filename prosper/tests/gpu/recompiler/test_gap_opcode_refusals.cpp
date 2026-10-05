@@ -326,6 +326,47 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
+// Unlowered program-counter and code-end operations must refuse fail-visibly
+// (or terminate cleanly, where the ISA says they do). s_swappc_b64 swaps the
+// program counter with a register pair -- control flow prosper cannot model
+// straight-line. s_code_end marks the end of a code block without the
+// end-of-program semantics. All words below are llvm-mc gfx1030
+// round-tripped. Controls are s_mov_b32 (SOP1, lowered) and s_nop (SOPP
+// no-op). WHEN a lowering lands for either, ITS CASE GOES RED; replace it
+// with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SwapPcCodeEndRefuse) {
+    static const uint32_t swappc[1] = {0xbe802102u};
+    static const uint32_t codeend[1] = {0xbf9f0000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(swappc, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOP1);
+        EXPECT_EQ(dec.opcode, 0x21u);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    {
+        const Rdna2Inst dec = rdna2_decode_one(codeend, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, 0x1fu);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+        0xbe820301u,   // s_mov_b32 s2, s1 (swappc source pair base)
+        0xbe830301u,   // s_mov_b32 s3, s1
+    };
+    static const uint32_t movb[1] = {0xbe800301u};
+    expect_compiles(program(sprologue, {movb[0]}), 0xA0D8ull,
+                    "control: s_mov_b32 in the swappc slot");
+    expect_gap_refusal(program(sprologue, {swappc[0]}), 0xA0D9ull, 4,
+                       {swappc[0]}, Rdna2Format::SOP1, 0x21u);
+    expect_compiles(program(kVop3Prologue, {0xbf800000u}), 0xA0DAull,
+                    "control: s_nop in the code-end slot");
+    expect_gap_refusal(program(kVop3Prologue, {codeend[0]}), 0xA0DBull, 4,
+                       {codeend[0]}, Rdna2Format::SOPP, 0x1fu);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
