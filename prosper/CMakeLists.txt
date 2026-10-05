@@ -979,22 +979,22 @@ if(TARGET prosper_core)
 
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
-  add_executable(test_va2foff tests/test_va2foff.cpp)
-  target_link_libraries(test_va2foff PRIVATE prosper_core)
-  add_test(NAME va2foff_load_priority COMMAND test_va2foff)
+  prosper_add_gtest(test_va2foff
+    SOURCES tests/test_va2foff.cpp
+    LIBRARIES prosper_core)
 
   # SELF/ELF/loader parsing must handle a malformed/truncated dump without an out-of-bounds read:
   # overflow-safe rd() bounds (self_read_ok), NUL-terminated str_at, and the linker init-array p+8
   # guard. Pure, no game dump.
-  add_executable(test_self_bounds tests/test_self_bounds.cpp)
-  target_link_libraries(test_self_bounds PRIVATE prosper_core)
-  add_test(NAME self_bounds COMMAND test_self_bounds)
+  prosper_add_gtest(test_self_bounds
+    SOURCES tests/test_self_bounds.cpp
+    LIBRARIES prosper_core)
 
   # SELF data-segment key masks flag bits >= 32 (#339): the SCE segment id is bits [31:20]; without
   # the mask a data segment keys the map wrong and every phdr lookup misses. Pure, no game dump.
-  add_executable(test_self_segment_key tests/test_self_segment_key.cpp)
-  target_link_libraries(test_self_segment_key PRIVATE prosper_core)
-  add_test(NAME self_segment_key COMMAND test_self_segment_key)
+  prosper_add_gtest(test_self_segment_key
+    SOURCES tests/test_self_segment_key.cpp
+    LIBRARIES prosper_core)
 
   # sceKernelNanosleep's GUEST timespec contract (#3013). Registered OUTSIDE the if(UNIX) block
   # below ON PURPOSE: what it pins is a WINDOWS defect -- MinGW-w64 declares a 32-bit `long tv_nsec`
@@ -1003,10 +1003,8 @@ if(TARGET prosper_core)
   # except the platform it is about. The second property, that a malformed tv_nsec returns promptly
   # rather than sleeping ~2 s or ~292 years, is platform-independent. Asserts promptness, not
   # accuracy: sleep precision belongs to host::sleep_until_steady_ns and a wall-clock assertion on
-  # it would flake on a loaded host.
-  add_executable(test_kernel_nanosleep tests/hle/kernel/test_kernel_nanosleep.cpp)
-  target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
-  add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
+  # it would flake on a loaded host. The TIMEOUT that bounds the ~292-year arm is set on the
+  # registration next to the reason it is needed.
 
   # sceKernelRaiseException under a stop-the-world burst (#4324). POSIX only: Windows delivers
   # through its own suspend/redirect path (test_win_exception_delivery). The macOS pending table
@@ -1074,7 +1072,10 @@ if(TARGET prosper_core)
   # Bounded because arm 3 guards a ~292-YEAR sleep: without a timeout a regression there presents as
   # CTest hanging for its default 1500 s rather than as a failure, and a hang is the one outcome nobody
   # reads as a red test. Generous against a loaded host -- what it catches is seconds-to-forever.
-  set_tests_properties(kernel_nanosleep PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_kernel_nanosleep
+    SOURCES tests/hle/kernel/test_kernel_nanosleep.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
 
   # LABEL: `timing-margin` -- the two tests above whose green verdict rests on a MEASURED wall-clock
   # margin, and which print that margin on stdout so it can be quoted.
@@ -1462,9 +1463,9 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ult_semantics.cpp
     LIBRARIES prosper_core Threads::Threads)
 
-  add_executable(test_posix_sem tests/hle/test_posix_sem.cpp)
-  target_link_libraries(test_posix_sem PRIVATE prosper_core)
-  add_test(NAME posix_sem_hle COMMAND test_posix_sem)
+  prosper_add_gtest(test_posix_sem
+    SOURCES tests/hle/test_posix_sem.cpp
+    LIBRARIES prosper_core)
 
   # FreeBSD errno numbering across the libkernel 0x80020000|errno family (#1612). Pins the encoding
   # vocabulary, the host->FreeBSD table, and the guest-observable values on the paths a Linux/macOS
@@ -1595,9 +1596,10 @@ if(TARGET prosper_core)
 
   # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
   # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
-  add_executable(test_pthread_sched_getters tests/hle/test_pthread_sched_getters.cpp)
-  target_link_libraries(test_pthread_sched_getters PRIVATE prosper_core)
-  add_test(NAME pthread_sched_getters COMMAND test_pthread_sched_getters)
+  prosper_add_gtest(test_pthread_sched_getters
+    SOURCES tests/hle/test_pthread_sched_getters.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   prosper_add_gtest(test_pthread_names
     SOURCES tests/hle/test_pthread_names.cpp
@@ -3215,9 +3217,9 @@ endif()
     SOURCES tests/host/memory/test_guest_memory_copy.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_guest_read_cache_disabled tests/host/memory/test_guest_read_cache_disabled.cpp)
-  target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
-  add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
+  prosper_add_gtest(test_guest_read_cache_disabled
+    SOURCES tests/host/memory/test_guest_read_cache_disabled.cpp
+    LIBRARIES prosper_core)
   # #2387: guest_writable's range cache. The first case is the one that matters -- a read-only
   # mapping, deliberately warmed into the READABLE cache first, must still be refused for write.
   # A shared cache (or a writable path that consulted the readable registry) passes every other
@@ -3734,9 +3736,9 @@ endif()
 
   # The init-fault report must survive a wild/null faulting RIP (#128). On Windows this also drives
   # the VEH recovery thunk and asserts its compiled-helper call obeys the Microsoft-x64 ABI (#633).
-  add_executable(test_initfault_dump tests/host/image/test_initfault_dump.cpp)
-  target_link_libraries(test_initfault_dump PRIVATE prosper_core)
-  add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
+  prosper_add_gtest(test_initfault_dump
+    SOURCES tests/host/image/test_initfault_dump.cpp
+    LIBRARIES prosper_core)
 
   if(WIN32)
     prosper_add_gtest(test_win_recovery
