@@ -30,6 +30,7 @@
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/apr_event_dialect.hpp"
 #include "hle/kernel/kernel_event_filters.hpp"
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -42,6 +43,11 @@ using namespace prosper;
 namespace prosper {
 // Test seam (hle_kernel_mem.cpp): the dialect recorded on a command buffer's binding at bind time.
 bool prosper_apr_binding_dialect_for_test(uint64_t cb, AprDialect* out);
+// The counter dialect's posting entry and its lifetime key (hle_kernel_time.cpp).
+uint64_t prosper_eq_identity(uint64_t eq);
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token);
+// Test seam (#4504): runs in a counter post after it reads the high-water mark, before it posts.
+void prosper_apr_counter_post_hook_for_test(void (*hook)(uint64_t hwm));
 }   // namespace prosper
 
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
@@ -274,4 +280,96 @@ TEST(AprEqueueCompletion, Contract) {
         CHECK(out == 2 && ptr_ok, "the pointer completion carries its own pointer");
         CHECK(ctr_ok, "the counter completion still carries its own counter, not the pointer");
     }
+}
+
+// --- #4504: a counter completion must never be delivered BELOW one already delivered. ---------
+//
+// The UE4 listener walks `last+1 ..= cnt` and then stores `last := cnt` unconditionally, including
+// when `cnt` is lower than `last`. So a counter that arrives after a higher one is not a harmless
+// duplicate: it rewinds the listener, the next event walks the higher token a second time, that
+// token's tracking entry is already erased, and the guest dereferences null. Kena (PPSA01802) died
+// that way on roughly one launch in five, 5-10 s into its boot.
+//
+// prosper produced the late counter itself. Each counter post is a detached thread that sleeps,
+// reads the ring's high-water mark and posts it; the read was under a mutex the post was not, so
+// two threads could read N and N+1 and post N+1 first. The seam below parks the FIRST post between
+// its read and its post, which is that interleaving held open: the second post then has all the
+// time it wants to overtake. It must not be able to.
+namespace {
+std::atomic<int> g_counter_hook_calls{0};
+std::atomic<bool> g_first_post_parked{false};
+std::atomic<bool> g_release_first_post{false};
+void park_first_counter_post(uint64_t) {
+    if (g_counter_hook_calls.fetch_add(1) != 0) return;   // only the first post parks
+    g_first_post_parked.store(true);
+    while (!g_release_first_post.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+}   // namespace
+
+TEST(AprEqueueCompletion, CounterPostsNeverRegress) {
+    register_builtin_hle();
+    auto create = Hle::lookup(nid_hash("sceKernelCreateEqueue"));
+    auto wait = Hle::lookup(nid_hash("sceKernelWaitEqueue"));
+    ASSERT_TRUE(create && wait);
+    uint64_t eq = 0;
+    create((uint64_t)(uintptr_t)&eq, 0, 0, 0, 0, 0);
+    ASSERT_NE(eq, 0u);
+    const uint64_t identity = prosper_eq_identity(eq);
+    ASSERT_NE(identity, 0u);
+
+    constexpr int64_t kListenerId = 0x74fe;   // UE4's ring-0 registration id
+    // The listener's counters are dense from 1000.
+    constexpr uint64_t kFirst = 1000, kSecond = 1001;
+    static_assert(classify_apr_dialect(kListenerId, kFirst) == AprDialect::Counter &&
+                      classify_apr_dialect(kListenerId, kSecond) == AprDialect::Counter,
+                  "both tags must take the counter dialect or this test has no subject");
+
+    // Every counter the guest would read, in the order it would read them.
+    std::vector<uint64_t> delivered;
+    const auto collect_for = [&](int ms) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < until) {
+            KEvent ev[8]{};
+            int32_t out = 0;
+            uint32_t cap = 5000;   // 5 ms
+            wait(eq, (uint64_t)(uintptr_t)ev, 8, (uint64_t)(uintptr_t)&out,
+                 (uint64_t)(uintptr_t)&cap, 0);
+            for (int i = 0; i < out && i < 8; i++)
+                if (ev[i].filter == kAprFilter) delivered.push_back((uint64_t)ev[i].data);
+        }
+    };
+
+    g_counter_hook_calls = 0;
+    g_first_post_parked = false;
+    g_release_first_post = false;
+    prosper_apr_counter_post_hook_for_test(park_first_counter_post);
+
+    prosper_eq_post_apr_token(eq, identity, kListenerId, kFirst);
+    for (int i = 0; i < 2000 && !g_first_post_parked.load(); i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ASSERT_TRUE(g_first_post_parked.load())
+        << "the seam never fired: the first post was not parked, so nothing below is tested";
+
+    // The first post now holds the mark it read (1000) and has not posted it. Submit the next
+    // token and give its post a hundred times its 2 ms latency to get ahead.
+    prosper_eq_post_apr_token(eq, identity, kListenerId, kSecond);
+    collect_for(250);
+    const std::vector<uint64_t> while_parked = delivered;
+
+    g_release_first_post = true;
+    collect_for(250);
+    prosper_apr_counter_post_hook_for_test(nullptr);
+
+    EXPECT_TRUE(while_parked.empty())
+        << "a later counter (" << (while_parked.empty() ? 0 : while_parked.front())
+        << ") was delivered while an earlier post was still between its read and its post";
+    ASSERT_FALSE(delivered.empty()) << "no counter completion was delivered at all";
+    for (size_t i = 1; i < delivered.size(); i++)
+        EXPECT_GE(delivered[i], delivered[i - 1])
+            << "counter " << delivered[i] << " was delivered after " << delivered[i - 1]
+            << ": the listener rewinds to it and completes a token twice (#4504)";
+    EXPECT_EQ(delivered.back(), kSecond) << "the final level must be the highest token submitted";
+    // Positive control for the seam: both posts went through it, so the second one really did
+    // reach the point where it could have overtaken.
+    EXPECT_EQ(g_counter_hook_calls.load(), 2);
 }
