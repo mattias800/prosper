@@ -41,6 +41,7 @@ void set_env(const char* name, const char* value) {
 }
 
 constexpr uint64_t kParameter = 0x809F0000ull;
+constexpr uint64_t kBusy = 0x809F0003ull;
 
 struct MountPoint {
     char data[16]{};
@@ -123,6 +124,17 @@ uint64_t delete_save(const Api& api, const char* name) {
     return api.del(ptr(&del), 0, 0, 0, 0, 0);
 }
 
+// Whether `rel` (a save dir, or a path under a title's save dir such as its allocation record)
+// exists under any title namespace in the scratch save root -- read from disk, not from prosper.
+bool on_disk(const fs::path& rel) {
+    std::error_code ec;
+    const fs::path root = fs::path(getenv("PROSPER_SAVE0"));
+    for (const auto& title : fs::directory_iterator(root, ec)) {
+        if (title.is_directory() && fs::exists(title.path() / rel, ec)) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 TEST(SaveDataDelete, NidResolves) {
@@ -140,19 +152,15 @@ TEST(SaveDataDelete, RemovesAnExistingSave) {
     use_scratch("savedata-delete");
     ASSERT_EQ(mount_save(api, "SLOT0"), 0u);
     ASSERT_EQ(umount_save(api), 0u);
+    // Precondition, so a delete that does nothing cannot pass the "gone" arm below.
+    ASSERT_TRUE(on_disk("SLOT0")) << "the CREATE mount left SLOT0 on disk";
+    const fs::path record = fs::path(".prosper-capacity") / "SLOT0";
+    ASSERT_TRUE(on_disk(record)) << "the CREATE mount recorded SLOT0's allocation";
     ASSERT_EQ(delete_save(api, "SLOT0"), 0u);
     // Gone from DISK, not just from a process-global map: re-listing the save root must not
     // find it, which is what a save browser reads after a restart.
-    std::error_code ec;
-    bool any_slot0 = false;
-    const fs::path root = fs::path(getenv("PROSPER_SAVE0"));
-    for (const auto& title : fs::directory_iterator(root, ec)) {
-        if (!title.is_directory()) continue;
-        for (const auto& slot : fs::directory_iterator(title.path(), ec)) {
-            if (slot.path().filename() == "SLOT0") any_slot0 = true;
-        }
-    }
-    EXPECT_FALSE(any_slot0) << "SLOT0 must be gone from the save root";
+    EXPECT_FALSE(on_disk("SLOT0")) << "SLOT0 must be gone from the save root";
+    EXPECT_FALSE(on_disk(record)) << "the deleted save's allocation record goes with it";
 }
 
 TEST(SaveDataDelete, AbsentSaveIsSuccess) {
@@ -174,11 +182,22 @@ TEST(SaveDataDelete, Refusals) {
     EXPECT_EQ(api.del(ptr(&del), 0, 0, 0, 0, 0), kParameter) << "null dirName is refused";
     EXPECT_EQ(delete_save(api, ""), kParameter) << "empty dirName is refused";
     EXPECT_EQ(delete_save(api, "../escape"), kParameter) << "traversal is refused";
+    EXPECT_EQ(delete_save(api, ".."), kParameter) << "\"..\" would remove every title's saves";
+    EXPECT_EQ(delete_save(api, "."), kParameter) << "\".\" would remove this title's save root";
     EXPECT_EQ(delete_save(api, ".dotdir"), 0u) << "dotted names are ordinary saves";
+    // The dirName field is 32 bytes. 32 non-NUL bytes carry no terminator, so the name is
+    // refused rather than truncated (a truncated name would delete a different save); 31 is fine.
+    char full[33];
+    std::memset(full, 'A', 32);
+    full[32] = '\0';
+    EXPECT_EQ(delete_save(api, full), kParameter) << "an unterminated 32-byte dirName is refused";
+    full[31] = '\0';
+    EXPECT_EQ(delete_save(api, full), 0u) << "control: a 31-byte dirName is an ordinary name";
 
     // The live mount's backing dir cannot be removed from under it.
     ASSERT_EQ(mount_save(api, "LIVE"), 0u);
-    EXPECT_EQ(delete_save(api, "LIVE"), kParameter) << "deleting the live mount is refused";
+    EXPECT_EQ(delete_save(api, "LIVE"), kBusy) << "deleting the live mount answers BUSY";
+    EXPECT_TRUE(on_disk("LIVE")) << "the refused delete left the live save in place";
     ASSERT_EQ(umount_save(api), 0u);
     EXPECT_EQ(delete_save(api, "LIVE"), 0u) << "after unmount the same delete succeeds";
 }

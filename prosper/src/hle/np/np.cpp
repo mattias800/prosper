@@ -440,6 +440,8 @@ HLE(s_npuds_destroy_handle) {
     // create ever produced. Unregistered, the dispatcher answered 0 for both — and Uncharted
     // forwards this result (#3630 bucket D), so a garbage handle read as success here.
     // NID AUIHb7jUX3I resolved via nid_hash against the firmware stub export list.
+    // CONFIDENCE: LOW -- rests on s_npuds_create's guessed handle layout (id 1 written through
+    // the first argument); if CreateHandle's real shape differs, so does the id to accept.
     return (uint32_t)a0 == 1 ? 0 : kUdsInvalidArgument;
 }
 HLE(s_npuds_object_set_int32) {
@@ -447,7 +449,10 @@ HLE(s_npuds_object_set_int32) {
     // (Object*, key*, int32): the same validation as the SetArray sibling — a live object
     // (event-owned objects included) and a pointer-like key. The value travels by register.
     // NID YE4dbtbz6OE resolved via nid_hash against the firmware stub export list; Dreaming
-    // Sarah imports it.
+    // Sarah imports it, and so does Dead Cells' eboot (a snapshot-guarded title: a refusal here
+    // reaches it). CONFIDENCE: LOW on the object model it validates against. Note the older
+    // ObjectSetString sibling below still accepts any object; the two should converge on the
+    // uds_is model once a live trace confirms what Dead Cells passes.
     if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
     return 0;
 }

@@ -266,6 +266,7 @@ HLE(s_savedlg_progress_set) {
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
+static constexpr uint64_t SAVE_DATA_ERR_BUSY = 0x809F0003ull;     // the save is mounted / in use
 static constexpr uint64_t SAVE_DATA_ERR_EXISTS = 0x809F0007ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
 // From the same published table this file's other savedata codes come from. Spelled out rather than
@@ -1318,11 +1319,18 @@ HLE(s_savedata_dirname_search_ps4) {
 // under the current title namespace (save_paths, #2734). titleId is never dereferenced, so a
 // stale pointer cannot fault; dirName is range-gated before the bounded 32-byte name read.
 //   null del, unreadable del/dirName, empty or traversal dirName  -> PARAMETER
-//   dirName of the live mount                                     -> PARAMETER (LOW: the facility
-//      has no BUSY code; removing a live mount's backing dir is what is being refused)
+//   dirName filling all 32 bytes with no terminator              -> PARAMETER (never truncated:
+//      a truncated name would delete a different save)
+//   dirName of the live mount                                     -> BUSY 0x809F0003 (the
+//      library's in-use code; PPSA03839 retries on exactly this value). MED.
 //   dir present                                                  -> removed, 0
 //   dir absent                                                   -> 0 (idempotent; shadPS4-compatible;
 //      the postcondition "absent" holds either way). MED.
+// The save's allocation record (.prosper-capacity/<dirName>, #3654) goes with it, so a later save
+// of the same name starts from its own request instead of adopting the deleted one's.
+// Follow-ups, not handled here: titleId is ignored (single-identity), so a delete naming another
+// title's save of the same dirName removes this title's; and the live-mount comparison is
+// case-sensitive, which differs from a case-insensitive host filesystem (Windows).
 HLE(s_savedata_delete) {
     svc_log("sceSaveDataDelete", a0,a1,a2,a3,a4,a5);
     if (!a0 || !svc_ptrish(a0)) return SAVE_DATA_ERR_PARAMETER;
@@ -1332,10 +1340,11 @@ HLE(s_savedata_delete) {
     char name[33]{};
     size_t n = 0;
     while (n < 32 && dirname[n]) { name[n] = dirname[n]; n++; }
+    if (n == 32) return SAVE_DATA_ERR_PARAMETER;   // no terminator within the 32-byte field
     if (!savedata_dirname_ok(name)) return SAVE_DATA_ERR_PARAMETER;
     const std::string mounted = savedata0_mounted_dir();
     if (!mounted.empty() && std::filesystem::path(mounted).filename() == name)
-        return SAVE_DATA_ERR_PARAMETER;
+        return SAVE_DATA_ERR_BUSY;
     const std::string target = savedata0_dir() + "/" + name;
     std::error_code ec;
     if (std::filesystem::is_directory(target, ec)) {
@@ -1346,6 +1355,8 @@ HLE(s_savedata_delete) {
             return SAVE_DATA_ERR_INTERNAL;
         }
     }
+    const auto record = std::filesystem::path(savedata0_dir()) / kSaveCapacityDirName / name;
+    std::filesystem::remove(record, ec);   // best effort: an absent record is the common case
     return 0;
 }
 
