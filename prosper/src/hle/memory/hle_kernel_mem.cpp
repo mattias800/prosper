@@ -1467,11 +1467,9 @@ namespace {
         }
         return true;
     }
-    // May a fixed direct map replace [base, base+len)? Every byte must be a tracked mapping and at least
-    // one direct; direct mappings and uncommitted reservations are replaced (as on Windows, where
-    // placeholders are claimed too), committed flexible memory, images and untracked host ranges stay
-    // refused (#137). A fixed map replaces what it lands on under mmap(2) MAP_FIXED, and the guest keeps
-    // what is there with SCE_KERNEL_MAP_NO_OVERWRITE, whose value is unverified and unhonoured (#3819).
+    // May a fixed direct map replace [base, base+len)? Every byte must be a tracked mapping, at least one
+    // direct; direct mappings and uncommitted reservations are replaced (as on Windows), committed flexible
+    // memory, images and untracked host ranges stay refused (#137). MAP_NO_OVERWRITE is unhonoured (#3819).
     // CONFIDENCE: MED. FreeBSD mmap(2) MAP_FIXED is published; the PPSA28183 MEMLOG trace (a 0x630000 view,
     // then a 0x70000 FIXED map at the same VA, abort on ENOMEM) shows what the guest expects, not what the
     // PS5 kernel does for direct-over-direct.
@@ -6074,8 +6072,7 @@ namespace {
         const uint64_t end = base + len;
         bool any = false;
         std::lock_guard<std::mutex> lk(g_dview_mx);
-        // A range that also holds a direct view is range_direct_views_replaceable's business: it refuses
-        // committed non-direct memory, which this private-views-only test would otherwise let through.
+        // A range holding a direct view belongs to range_direct_views_replaceable (it refuses flexible memory).
         for (const DmemView& view : g_dviews)
             if (base < view.guest_base + view.guest_size && end > view.guest_base) return false;
         for (const PrivatePlaceholderView& view : g_private_placeholder_views) {
