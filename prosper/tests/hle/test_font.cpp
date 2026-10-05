@@ -220,10 +220,39 @@ TEST(Font, ScaleSlantWeightRoundTrip) {
     ASSERT_EQ(font.get_weight(addr(handle), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
     EXPECT_EQ(x, 1.5f) << "GetEffectWeight reports the stored x scale";
     EXPECT_EQ(y, 2.0f) << "GetEffectWeight reports the stored y scale";
-    EXPECT_EQ(mode, 7u) << "GetEffectWeight round-trips the stored mode";
+    EXPECT_EQ(mode, 0u) << "the firmware getter always reports mode 0; the mode is never stored";
+    mode = 9;
     ASSERT_EQ(font.get_render_weight(addr(handle), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
-    EXPECT_EQ(mode, 7u) << "GetRenderEffectWeight agrees";
-    EXPECT_NE(font.get_scale(addr(handle), 0, 0, 0, 0, 0), 0u) << "null outs are refused";
+    EXPECT_EQ(mode, 0u) << "GetRenderEffectWeight agrees";
+
+    // Each non-NULL output is written; only an all-NULL call is refused (0x80460002).
+    w = h = -1.0f;
+    EXPECT_EQ(font.get_scale(addr(handle), addr(&w), 0, 0, 0, 0), 0u) << "one NULL output is legal";
+    EXPECT_EQ(w, 30.0f);
+    EXPECT_EQ(font.get_scale(addr(handle), 0, addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(h, 40.0f);
+    x = -1.0f;
+    EXPECT_EQ(font.get_weight(addr(handle), addr(&x), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(x, 1.5f);
+    EXPECT_EQ(font.get_scale(addr(handle), 0, 0, 0, 0, 0), 0x80460002u) << "all outputs NULL";
+    EXPECT_EQ(font.get_slant(addr(handle), 0, 0, 0, 0, 0), 0x80460002u);
+    EXPECT_EQ(font.get_weight(addr(handle), 0, 0, 0, 0, 0), 0x80460002u);
+
+    // A foreign handle fails with 0x80460005 and zeroes the outputs (weight: 1.0, 1.0, 0). Valid
+    // memory with the wrong magic, since face() dereferences the pointer.
+    uint8_t decoy[64]{};
+    w = h = slant = 5.0f;
+    EXPECT_EQ(font.get_scale(addr(decoy), addr(&w), addr(&h), 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(w, 0.0f);
+    EXPECT_EQ(h, 0.0f);
+    EXPECT_EQ(font.get_slant(addr(decoy), addr(&slant), 0, 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(slant, 0.0f);
+    x = y = 5.0f;
+    mode = 9;
+    EXPECT_EQ(font.get_weight(addr(decoy), addr(&x), addr(&y), addr(&mode), 0, 0), 0x80460005u);
+    EXPECT_EQ(x, 1.0f);
+    EXPECT_EQ(y, 1.0f);
+    EXPECT_EQ(mode, 0u);
     EXPECT_EQ(astro.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
 }
 

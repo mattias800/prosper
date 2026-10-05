@@ -89,10 +89,6 @@ struct FontFace {
     float slant = 0.0f;
     float weight_x = 1.0f;
     float weight_y = 1.0f;
-    // The weight mode the guest passed to sceFontSetEffectWeight, round-tripped back by
-    // sceFontGetEffectWeight. Stored, never interpreted: no rendering effect in this file
-    // keys off it, and inventing semantics for an unobserved enum would be worse than echoing.
-    uint32_t weight_mode = 0;
     void* renderer = nullptr;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
@@ -515,12 +511,8 @@ int32_t font_set_slant(void* handle, float slant) {
     if (auto* f = face(handle)) f->slant = slant;
     return 0;
 }
-int32_t font_set_weight(void* handle, float x, float y, uint32_t mode) {
-    if (auto* f = face(handle)) {
-        f->weight_x = x;
-        f->weight_y = y;
-        f->weight_mode = mode;
-    }
+int32_t font_set_weight(void* handle, float x, float y, uint32_t) {
+    if (auto* f = face(handle)) { f->weight_x = x; f->weight_y = y; }
     return 0;
 }
 
@@ -735,20 +727,26 @@ int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code, Ren
 }
 
 // --- Font render-state remainder: vertical render, plain create/rebind, state getters ---------
-// sceFontRenderCharGlyphImageVertical: the same renderer as the Horizontal twin (signature
-// symmetric across the SDK surface). Vertical-writing layouts are unobserved in any local
-// title, so this runs the horizontal placement the renderer implements. CONFIDENCE: HIGH on
-// the signature, MED on orientation behavior.
+// sceFontRenderCharGlyphImageVertical: the same signature as the Horizontal twin. The firmware export
+// sets an orientation word (2) and its shared core then places the glyph with the VERTICAL bearings
+// (metrics +0x14/+0x18) instead of the horizontal ones; prosper's renderer has no vertical placement,
+// so this draws with horizontal placement. No local title imports it. CONFIDENCE: HIGH on the
+// signature, LOW on placement.
 // sceFontCreateLibrary / sceFontCreateRenderer: the plain variants delegate to the WithEdition
 // bodies with edition 0 (delegation confirmed on the reference surface), so these wrappers only
 // shift the out-pointer from a2 to a3 — aliasing the WithEdition handler directly would read a
 // garbage fourth register as the out-pointer.
 // sceFontRebindRenderer(handle): re-attaches the face's own renderer after renderer-side state
 // changed; prosper holds the pointer on the face already, so validating the face IS the work.
-// The scale/effect getters below report exactly what the setters store (weight mode included),
-// which is why they are reads of prosper's own fields rather than new contracts. The Render-
-// prefixed twins read the same fields: prosper keeps no separate render-effect state (same
-// rationale as font_get_metrics), and splitting them would invent one.
+// The scale/effect getters follow the shipped libSceFont.sprx: a NULL or invalid handle answers
+// 0x80460005 and zeroes every non-NULL output (weight: 1.0, 1.0, mode 0); otherwise each non-NULL
+// output is written and 0x80460002 is answered only when ALL outputs are NULL. The weight mode
+// always reads back 0 (the firmware setter rejects a non-zero mode and never stores it). These use
+// the firmware's 0x8046xxxx codes; the rest of this file still answers 0x8054xxxx (#4498).
+// The Render-prefixed twins read the same fields: the firmware keeps a separate render-state block
+// (handle+0x68) behind a bound renderer, which prosper simplifies to the face state.
+// The *ScalePoint aliases are exact only because prosper never registers sceFontSetResolutionDpi:
+// the firmware converts points to pixels by dpi/72 and a new face starts at 72x72 dpi.
 int32_t font_render_char_glyph_image_vertical(void* handle, uint32_t code, RenderSurface* surface,
                                               float x, float y, GlyphMetrics* metrics,
                                               RenderResult* result) {
@@ -764,35 +762,28 @@ int32_t font_rebind_renderer(void* handle) {
     if (!face(handle)) return static_cast<int32_t>(0x80540002u);
     return 0;
 }
+constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
+constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
 int32_t font_get_scale(void* handle, float* out_w, float* out_h) {
-    if (!out_w || !out_h) return static_cast<int32_t>(0x80540002u);
-    if (const auto* f = face(handle)) {
-        *out_w = f->width;
-        *out_h = f->height;
-    } else {
-        *out_w = 16.0f;
-        *out_h = 16.0f;
-    }
-    return 0;
+    const auto* f = face(handle);
+    if (out_w) *out_w = f ? f->width : 0.0f;
+    if (out_h) *out_h = f ? f->height : 0.0f;
+    if (!f) return kFontErrInvalidHandle;
+    return (!out_w && !out_h) ? kFontErrInvalidParam : 0;
 }
 int32_t font_get_slant(void* handle, float* out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
     const auto* f = face(handle);
-    *out = f ? f->slant : 0.0f;
-    return 0;
+    if (out) *out = f ? f->slant : 0.0f;
+    if (!f) return kFontErrInvalidHandle;
+    return out ? 0 : kFontErrInvalidParam;
 }
 int32_t font_get_weight(void* handle, float* out_x, float* out_y, uint32_t* out_mode) {
-    if (!out_x || !out_y || !out_mode) return static_cast<int32_t>(0x80540002u);
-    if (const auto* f = face(handle)) {
-        *out_x = f->weight_x;
-        *out_y = f->weight_y;
-        *out_mode = f->weight_mode;
-    } else {
-        *out_x = 1.0f;
-        *out_y = 1.0f;
-        *out_mode = 0;
-    }
-    return 0;
+    const auto* f = face(handle);
+    if (out_x) *out_x = f ? f->weight_x : 1.0f;
+    if (out_y) *out_y = f ? f->weight_y : 1.0f;
+    if (out_mode) *out_mode = 0;
+    if (!f) return kFontErrInvalidHandle;
+    return (!out_x && !out_y && !out_mode) ? kFontErrInvalidParam : 0;
 }
 
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
