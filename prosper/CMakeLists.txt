@@ -1521,6 +1521,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
+  # libSceNpManager remainder: local request ids, SIGNED_OUT account/premium answers,
+  # acknowledged callbacks/setters. PollAsync/CreateAsyncRequest stay deliberately out.
+  prosper_add_gtest(test_np_manager
+    SOURCES tests/hle/np/test_np_manager.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.
@@ -1540,6 +1546,12 @@ if(TARGET prosper_core)
   # are divisors, so titles died in their own arithmetic far from the cause.
   prosper_add_gtest(test_audio_spatial
     SOURCES tests/hle/audio/test_audio_spatial.cpp
+    LIBRARIES prosper_core)
+
+  # libSceVoice: no capture backend, so Init reports unavailable and the port surface
+  # agrees with it instead of handing out contradicting handles (GTA V, #1158).
+  prosper_add_gtest(test_voice
+    SOURCES tests/hle/audio/test_voice.cpp
     LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
@@ -2126,6 +2138,19 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_mouse.cpp
     LIBRARIES prosper_core)
 
+
+  # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
+  # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
+  prosper_add_gtest(test_login_dialog
+    SOURCES tests/hle/service/test_login_dialog.cpp
+    LIBRARIES prosper_core)
+
+
+  # Remaining SystemService/UserService getters: flags round-trip, tick acknowledged,
+  # privacy reads a deterministic default.
+  prosper_add_gtest(test_syssvc_usersvc
+    SOURCES tests/hle/service/test_syssvc_usersvc.cpp
+    LIBRARIES prosper_core)
 
   # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
   # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
