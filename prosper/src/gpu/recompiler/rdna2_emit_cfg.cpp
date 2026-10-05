@@ -3144,18 +3144,12 @@ bool emit_cfg_state_machine(
                         (mask_write < 0 ||
                          (b.is_compute && b32_vcc_complete_scalar_pair));
             } else if (in.fmt == Rdna2Format::SOP1) {
-                const bool preserves_scc =
-                    in.opcode == kSop1OpcodeMovB32 ||
-                    in.opcode == kSop1OpcodeMovB64 ||
-                    in.opcode == kSop1OpcodeCmovB32 ||
-                    in.opcode == kSop1OpcodeCmovB64 ||
-                    in.opcode == kSop1OpcodeBrevB32 ||
-                    in.opcode == kSop1OpcodeFf1I32B64 ||
-                    in.opcode == kSop1OpcodeFlbitI32B32 ||
-                    in.opcode == kSop1OpcodeFlbitI32B64 ||
-                    in.opcode == kSop1OpcodeBitset0B32 ||
-                    in.opcode == kSop1OpcodeBitset1B32 ||
-                    in.opcode == kSop1OpcodeGetpcB64;
+                // The shared list, less S_BITREPLICATE (this transfer never carried it), plus the
+                // relative read: rdna2_movrels.cpp lowers it without touching SCC, and leaving it
+                // out poisoned the SCC of a compare that ran before it (#4559).
+                const bool preserves_scc = (sop1_opcode_leaves_scc_unmodified(in.opcode) &&
+                                            in.opcode != kSop1OpcodeBitreplicateB64B32) ||
+                                           in.opcode == kSop1OpcodeMovrelsB32;
                 const bool saveexec =
                     (in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                      in.opcode <= kSop1OpcodeXnorSaveexecB64) ||

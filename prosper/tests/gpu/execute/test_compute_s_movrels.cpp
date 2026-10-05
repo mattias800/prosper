@@ -140,6 +140,35 @@ TEST(ComputeSMovrelsExecution, ResultSurvivesABranchJoinWhenTheBaseWasNeverWritt
     }
 }
 
+TEST(ComputeSMovrelsExecution, AnSccBranchAfterTheReadFollowsTheCompareBeforeIt) {
+    // s_cmp ... ; s_movrels_b32 s0, s4 ; (block boundary) ; s_cbranch_scc1 over a rewrite of s0.
+    // The relative read leaves SCC alone, so the branch is the compare's. The boundary matters:
+    // within one block the branch consumes the compare's SCC directly, and only an SCC that
+    // crosses into another dispatcher case is reloaded on the strength of the transfer that did
+    // not know the relative read keeps it (#4559).
+    const auto code = [](uint32_t compare, bool boundary) {
+        std::vector<uint32_t> words = kSeed;
+        words.insert(words.end(), {0xbefc0381u, compare, 0xbe802e04u});   // m0 = 1; cmp; s0 = s5
+        if (boundary) words.push_back(0xbf880000u);   // s_cbranch_execz +0: the next pc is a target
+        words.insert(words.end(), {
+                                      0xbf850002u,   // s_cbranch_scc1 +2
+                                      0xbe8003ffu,
+                                      0x00000309u,   // s_mov_b32 s0, 0x309
+                                      0x7e000200u,   // v_mov_b32 v0, s0
+                                      0xbf810000u,   // s_endpgm
+                                  });
+        return words;
+    };
+    for (const bool force_dispatcher : {false, true})
+        for (const bool boundary : {false, true}) {
+            SCOPED_TRACE((force_dispatcher ? 10 : 0) + (boundary ? 1 : 0));
+            // s_cmp_lg_i32 s5, 0: SCC = 1, the rewrite is skipped and the relative read survives.
+            expect_every_lane(run(code(0xbf018005u, boundary), 0u, force_dispatcher), 200u);
+            // s_cmp_eq_i32 s5, 0: SCC = 0, the rewrite runs.
+            expect_every_lane(run(code(0xbf008005u, boundary), 0u, force_dispatcher), 0x309u);
+        }
+}
+
 TEST(ComputeSMovrelsExecution, ConstantM0FoldsToOneRegister) {
     // The lane input is ignored here; a stray dependence on it would show up as a wrong value.
     {
