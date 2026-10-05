@@ -327,17 +327,18 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 }
 
 // Unlowered SOPK immediate-hardware-register write must refuse fail-visibly.
-// s_setreg_imm32_b32 (SOPK 0x15) writes a 32-bit literal to a hardware
-// register, which prosper's private scratch model does not expose; accepting
-// it would silently drop a hardware-state write. The walk stores the trailing
-// literal outside in.words, so the terminal record's words field cannot name
-// the literal dword -- this arm asserts every other record field (tag, mode,
-// pc, fmt, op, len, shader identity) and documents the words quirk instead of
-// asserting on it. The control is s_setreg_b32 with a full flat-scratch base
-// (SOPK 0x13, admitted) in the same slot. WHEN a lowering lands, THIS ARM
-// GOES RED; replace it with an execution test of the new lowering.
+// s_setreg_imm32_b32 (SOPK 0x15) has no lowering: the SOPK switch admits only
+// the s_setreg_b32 full flat-scratch-base form (0x13). Accepting it would
+// silently drop a hardware-register write. The refused word names the same
+// hwreg as the control (HW_REG_FLAT_SCR_LO, offset 0, width 32), so only the
+// opcode differs -- plus the data dword 0x15 requires -- and a lowering that
+// extends the flat-scratch admission to 0x15 turns this arm red. The record's
+// words field prints the trailing literal as 00000000 (#4483), so only its
+// first word is asserted. WHEN a lowering lands, THIS ARM GOES RED; replace
+// it with an execution test of the new lowering.
 TEST(GapOpcodeRefusals, SetregImm32Refuse) {
-    static const uint32_t setimm[2] = {0xba801234u, 0x00000001u};
+    // s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1
+    static const uint32_t setimm[2] = {0xba80f814u, 0x00000001u};
     {
         const Rdna2Inst dec = rdna2_decode_one(setimm, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
@@ -358,27 +359,23 @@ TEST(GapOpcodeRefusals, SetregImm32Refuse) {
         0xbe810387u,   // s_mov_b32 s1, 7
         0xbe800301u,   // s_mov_b32 s0, s1
     };
-    auto sprog = [&](std::vector<uint32_t> inst) {
-        std::vector<uint32_t> code = sprologue;
-        code.insert(code.end(), inst.begin(), inst.end());
-        code.push_back(kEndpgm);
-        return code;
-    };
-    expect_compiles(sprog({setreg[0]}), 0xA0F0ull,
+    expect_compiles(program(sprologue, {setreg[0]}), 0xA130ull,
                     "control: s_setreg_b32 full flat-scratch base");
-    const std::vector<uint32_t> refused =
-        compile(sprog({setimm[0], setimm[1]}), 0xA0F1ull);
+    const std::vector<uint32_t> refused_code = program(sprologue, {setimm[0], setimm[1]});
+    const std::vector<uint32_t> refused = compile(refused_code, 0xA131ull);
     EXPECT_TRUE(refused.empty()) << "s_setreg_imm32_b32 must refuse";
     {
-        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA0F1ull));
+        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA131ull));
         EXPECT_EQ(r.tag, "recompile-reject");
         EXPECT_EQ(r.fields["mode"], "unresolved-operand");
         EXPECT_EQ(r.fields["pc"], "2") << "the reject must name the gap pc";
         EXPECT_EQ(r.fields["fmt"], std::to_string(static_cast<int>(Rdna2Format::SOPK)));
         EXPECT_EQ(r.fields["op"], "0x15");
         EXPECT_EQ(r.fields["len"], "2");
-        EXPECT_EQ(r.fields["sh"], hex(sprog({setimm[0], setimm[1]})[0], false) + "/" +
-                                      std::to_string(sprog({setimm[0], setimm[1]}).size()));
+        EXPECT_EQ(r.fields["words"].substr(0, 8), hex(setimm[0], false))
+            << "the record names the refused word (its literal prints as 0, #4483)";
+        EXPECT_EQ(r.fields["sh"],
+                  hex(refused_code[0], false) + "/" + std::to_string(refused_code.size()));
     }
 }
 
