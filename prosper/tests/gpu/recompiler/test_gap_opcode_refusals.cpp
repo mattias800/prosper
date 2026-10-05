@@ -1,6 +1,6 @@
-// test_gap_opcode_refusals — fail-visible refusal guards of lowerings that stay fail-visible
-// for inputs they cannot represent (s_movrels_b32). Every opcode it once pinned as an unlowered
-// gap is now lowered. The image_gather4 arm below checks where 0x40 is admitted.
+// test_gap_opcode_refusals — fail-visible refusal pins: instructions the recompiler decodes but
+// does not lower, and guards of lowerings that stay fail-visible for inputs they cannot represent
+// (s_movrels_b32). The image_gather4 arm checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
 // backstop. These arms pin that backstop: the guest word decodes to the right instruction, the
@@ -34,6 +34,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -540,4 +541,36 @@ TEST(GapOpcodeRefusals, BufferAtomicX2Refuse) {
     expect_gap_refusal(program(prologue, {andx2[0], andx2[1]}), 0xA0F2ull, 3,
                        {andx2[0], andx2[1]}, Rdna2Format::MUBUF, 0x59u, &rt,
                        config);
+}
+
+// Unlowered SOPP halt/kill terminators must refuse fail-visibly. s_sethalt 1
+// (debug halt), s_setkill 1 (kill the wave) and s_sendmsghalt (message + halt,
+// regardless of its immediate) have no lowering in the per-invocation model --
+// accepting any of them as a no-op would silently execute past a guest-visible
+// termination. The imm-0 forms of s_sethalt/s_setkill (resume / do not kill)
+// ARE hardware no-ops, so the terminating imm-1 forms are pinned instead
+// (llvm-mc gfx1030: 0xbf8d0001 = s_sethalt 1, 0xbf8b0001 = s_setkill 1). The
+// control is s_nop in the same slot, which is a documented no-op and compiles.
+// WHEN a lowering lands for any of the three, ITS CASE GOES RED; replace it
+// with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SoppHaltKillRefuse) {
+    static const uint32_t kNop = 0xbf800000u;
+    {
+        const Rdna2Inst dec = rdna2_decode_one(&kNop, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, 0x00u);
+    }
+    expect_compiles(program(kVop3Prologue, {kNop}), 0xA080ull,
+                    "control: s_nop in the halt slot");
+    for (const auto [word, opcode, addr] :
+         {std::tuple<uint32_t, uint32_t, uint64_t>{0xbf8d0001u, 0x0du, 0xA081ull},
+          {0xbf8b0001u, 0x0bu, 0xA082ull},
+          {0xbf910000u, 0x11u, 0xA083ull}}) {
+        const Rdna2Inst dec = rdna2_decode_one(&word, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, opcode);
+        EXPECT_EQ(dec.len_dwords, 1u);
+        expect_gap_refusal(program(kVop3Prologue, {word}), addr, 4, {word},
+                           Rdna2Format::SOPP, opcode);
+    }
 }
