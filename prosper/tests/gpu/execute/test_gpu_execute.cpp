@@ -320,6 +320,29 @@ int main() {
               "realized draw carries Kena's bounded 3D view and native layout proof");
     }
     {
+        // #4457: a 4xaa SW_64KB_R_X colour target (Summer Sports) has no exact extent -- only Z_X
+        // 4xaa has one -- so the realized binding must carry that refusal and the conservative
+        // footprint bound the ordered-DMA predicate decides against.
+        GpuState msaa = st;
+        msaa.cx[P::CB_COLOR0_BASE] = 0x400000u;   // 0x40000000: registers only, never dereferenced
+        msaa.cx[P::CB_COLOR0_BASE_EXT] = 0u;
+        msaa.cx[P::CB_COLOR0_INFO] = 0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT;
+        msaa.cx[P::CB_COLOR0_ATTRIB2] = (63u << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) | 63u;
+        msaa.cx[P::CB_COLOR0_ATTRIB3] = (1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT) |
+                                        (27u << P::CB_COLOR0_ATTRIB3_COLOR_SW_MODE_SHIFT);
+        msaa.cx[P::CB_COLOR0_ATTRIB] = 2u << P::CB_COLOR0_ATTRIB_NUM_SAMPLES_SHIFT;
+        DrawItem msaa_draw;
+        const bool made = realize_draw_item(msaa, &msaa.draws[0], msaa.draws[0].index_count,
+                                            0x10000u, false, msaa_draw);
+        const ColorTargetState state = extract_render_state(msaa).color_targets[0];
+        const auto& binding = msaa_draw.color_targets[0];
+        CHECK(made && binding.raw_snapshot_footprint_bytes == 0u &&
+                  binding.footprint_refusal == ColorExtentRefusal::Msaa &&
+                  binding.footprint_bound_bytes >= 65536u &&   // at least the one 64 KiB block
+                  binding.footprint_bound_bytes == color_target_footprint_bound_bytes(state),
+              "realized draw carries an unproved MSAA target's refusal and footprint bound");
+    }
+    {
         // The live draw path must acquire one exact fragment version and share it across metadata
         // and compilation, then acquire again for the next draw. Besides detecting a stale
         // address-only shortcut, the acquisition count distinguishes the production fast path from
@@ -780,6 +803,10 @@ int main() {
         DrawItem first, second;
         first.draw_index = 0;
         second.draw_index = 1;
+        // #4439: the span before the copy renders the copy's destination, so its targets must be
+        // published first. (A copy touching no span target skips that readback; block below.)
+        first.color0_base = first.color_targets[0].base = (uint64_t)(uintptr_t)&target;
+        first.color_targets[0].raw_snapshot_footprint_bytes = 1;
         std::vector<uint8_t> observed;
         std::vector<LiveRenderPhase> dma_phases;
         LiveRenderFn consume = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
@@ -799,6 +826,43 @@ int main() {
         CHECK(!dma_phases[0].allows_deferred_scanout_readback() &&
               !dma_phases[1].allows_deferred_scanout_readback(),
               "DMA producers and final spans cannot defer scanout readback");
+    }
+
+    // #4439: the same ordered copy, but the span before it renders a target elsewhere. The copy
+    // can neither observe nor overwrite those bytes, so the span flushes without the
+    // authoritative readback -- and the copy and its ordering are unchanged.
+    {
+        uint8_t source = 0x5a;
+        uint8_t target = 0x21;
+        uint8_t unrelated[64] = {};
+        GpuState mixed;
+        GpuState::Draw before, after;
+        before.command_order = 100;
+        after.command_order = 300;
+        mixed.draws = {before, after};
+        mixed.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            1, 0, 200, 0});
+        const auto operations = plan_submit_operations(mixed);
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        first.color0_base = first.color_targets[0].base = (uint64_t)(uintptr_t)unrelated;
+        first.color_targets[0].raw_snapshot_footprint_bytes = sizeof(unrelated);
+        std::vector<uint8_t> observed;
+        std::vector<LiveRenderPhase> dma_phases;
+        LiveRenderFn consume = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (size_t i = 0; i < items.size(); ++i) observed.push_back(target);
+            dma_phases.push_back(live_render_phase());
+            return std::vector<uint8_t>(4, target);
+        };
+        const OrderedSubmitResult result = execute_ordered_items(
+            operations, {first, second}, {}, mixed.dma_copies, consume, {}, 1, 1);
+        CHECK(observed == std::vector<uint8_t>({0x21, 0x5a}) && target == source,
+              "a disjoint ordered DMA still exposes old bytes before and new bytes after");
+        CHECK(result.render_spans == 2, "a disjoint ordered DMA still splits the span");
+        CHECK(dma_phases.size() == 2 && !dma_phases[0].authoritative_readback,
+              "a DMA that touches no span target does not request the authoritative readback");
     }
 
     // A rendered target's authoritative bytes can live only in the backend cache. Resolve the
@@ -2255,9 +2319,17 @@ int main() {
             bad.command_order = 300;
             ordered.draws = {good, bad};
         }
-        ordered.dma_copies.push_back({
-            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
-            sizeof(target), 0, 200, 0});
+        // #4439: the copy lands inside the span's colour target, so the span before it must be
+        // published -- the requirement the terminal callback has to preserve.
+        alignas(256) static uint8_t rendered[16u * 8u * 4u] = {};
+        const uint64_t rt = (uint64_t)(uintptr_t)rendered;
+        ordered.cx[P::CB_COLOR0_BASE] = uint32_t(rt >> 8u);
+        ordered.cx[P::CB_COLOR0_BASE_EXT] = uint32_t(rt >> 40u);
+        ordered.cx[P::CB_COLOR0_INFO] = 0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT;
+        ordered.cx[P::CB_COLOR0_ATTRIB2] = (15u << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) | 7u;
+        ordered.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+        ordered.dma_copies.push_back({rt + 16u, (uint64_t)(uintptr_t)&source,
+                                      sizeof(target), 0, 200, 0});
         std::vector<LiveRenderPhase> phases;
         size_t realized_callbacks = 0, terminal_callbacks = 0;
         set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {

@@ -426,3 +426,155 @@ TEST(Http, Contract) {
 
     EXPECT_EQ(fails, 0);
 }
+
+// Option setters + epoll lifecycle + epoll wait + Https setup. Every NID below was unregistered
+// (or, for the wait pair, registered against a request-id contract), so the dispatcher answered
+// SCE_OK while recording nothing and allocating nothing. The arms pin the contracts read from the
+// shipped libSceHttp module: INVALID_ID for ids nobody handed out, INVALID_VALUE for null
+// pointers and out-of-range arguments.
+//
+// What a setter records is not observable through the guest ABI (nothing hands it back), so these
+// arms pin that each setter validates its id and argument -- not the recorded value.
+TEST(Http, OptionSettersValidateTheirId) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn nonblock = Hle::lookup("s2-NPIvz+iA");
+    HleFn auto_redirect = Hle::lookup("T-mGo9f3Pu4");
+    HleFn auth_enabled = Hle::lookup("qFg2SuyTJJY");
+    HleFn resolve_timeout = Hle::lookup("Tc-hAYDKtQc");
+    HleFn resolve_retry = Hle::lookup("K1d1LqZRQHQ");
+    HleFn connect_timeout = Hle::lookup("0S9tTH0uqTU");
+    HleFn send_timeout = Hle::lookup("xegFfZKBVlw");
+    HleFn recv_timeout = Hle::lookup("yigr4V0-HTM");
+    const HleFn setters[] = {nonblock,       auto_redirect,   auth_enabled, resolve_timeout,
+                             resolve_retry,  connect_timeout, send_timeout, recv_timeout};
+    ASSERT_NE(init, nullptr);
+    ASSERT_NE(term, nullptr);
+    for (HleFn f : setters) ASSERT_NE(f, nullptr) << "every option setter must be registered";
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+    constexpr uint64_t kInvalidId = http::kErrorInvalidId;
+    constexpr uint64_t kInvalidValue = http::kErrorInvalidValue;
+    for (size_t i = 0; i < std::size(setters); i++) {
+        EXPECT_EQ(setters[i](ctx, 1, 0, 0, 0, 0), 0u) << "setter " << i << " accepts a live id";
+        EXPECT_EQ(setters[i](9999, 1, 0, 0, 0, 0), kInvalidId)
+            << "setter " << i << " refuses an id nobody handed out";
+        EXPECT_EQ(setters[i](0, 1, 0, 0, 0, 0), kInvalidId) << "setter " << i << ": id 0";
+    }
+    // A timeout whose upper register bits are garbage is still a valid 32-bit payload.
+    EXPECT_EQ(resolve_timeout(ctx, 0xDEADBEEF00000000ull | 5000000u, 0, 0, 0, 0), 0u);
+    // sceHttpSetResolveRetry refuses a negative retry before it looks at the id.
+    EXPECT_EQ(resolve_retry(ctx, (uint64_t)(int64_t)-1, 0, 0, 0, 0), kInvalidValue);
+    EXPECT_EQ(resolve_retry(9999, (uint64_t)(int64_t)-1, 0, 0, 0, 0), kInvalidValue)
+        << "the retry check comes before the id check";
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Http, EpollLifecycle) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn create = Hle::lookup("6381dWF+xsQ");
+    HleFn destroy = Hle::lookup("wYhXVfS2Et4");
+    HleFn set = Hle::lookup("-xm7kZQNpHI");
+    HleFn unset = Hle::lookup("59tL1AQBb8U");
+    for (HleFn f : {init, term, create, destroy, set, unset}) ASSERT_NE(f, nullptr);
+    constexpr uint64_t kInvalidId = http::kErrorInvalidId;
+    constexpr uint64_t kInvalidValue = http::kErrorInvalidValue;
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+
+    uint64_t eh = 0;
+    EXPECT_EQ(create(9999, (uint64_t)&eh, 0, 0, 0, 0), kInvalidId) << "bad context is refused";
+    EXPECT_EQ(eh, 0u) << "refused create writes no handle";
+    EXPECT_EQ(create(9999, 0, 0, 0, 0, 0), kInvalidId) << "the context is checked first";
+    EXPECT_EQ(create(ctx, 0, 0, 0, 0, 0), kInvalidValue) << "null out-pointer is INVALID_VALUE";
+    ASSERT_EQ(create(ctx, (uint64_t)&eh, 0, 0, 0, 0), 0u);
+    EXPECT_NE(eh, 0u) << "CreateEpoll writes a real handle";
+    EXPECT_EQ(set(9999, eh, 0, 0, 0, 0), kInvalidId) << "unknown id cannot bind";
+    EXPECT_EQ(set(ctx, 0, 0, 0, 0, 0), kInvalidValue) << "a null handle is INVALID_VALUE";
+    EXPECT_EQ(set(ctx, 0xDEADu, 0, 0, 0, 0), kInvalidId) << "foreign handle cannot bind";
+    EXPECT_EQ(set(ctx, eh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(unset(9999, 0, 0, 0, 0, 0), kInvalidId);
+    EXPECT_EQ(unset(ctx, 0, 0, 0, 0, 0), 0u);
+
+    EXPECT_EQ(destroy(9999, eh, 0, 0, 0, 0), kInvalidId) << "destroy checks the context";
+    EXPECT_EQ(destroy(ctx, 0, 0, 0, 0, 0), kInvalidValue) << "a null handle is INVALID_VALUE";
+    const uint64_t other = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)other, 0);
+    EXPECT_EQ(destroy(other, eh, 0, 0, 0, 0), kInvalidId)
+        << "a handle created under another context is refused";
+    EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), kInvalidId) << "destroy frees exactly once";
+    EXPECT_EQ(set(ctx, eh, 0, 0, 0, 0), kInvalidId) << "a destroyed handle no longer binds";
+
+    // sceHttpTerm releases the context's handles: one created under `other` is gone afterwards.
+    uint64_t eh2 = 0;
+    ASSERT_EQ(create(other, (uint64_t)&eh2, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(set(ctx, eh2, 0, 0, 0, 0), 0u) << "a handle binds before its context terms";
+    EXPECT_EQ(term(other, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set(ctx, eh2, 0, 0, 0, 0), kInvalidId) << "term released the context's handle";
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Http, EpollWaitReportsNoEventsOffline) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn create = Hle::lookup("6381dWF+xsQ");
+    HleFn destroy = Hle::lookup("wYhXVfS2Et4");
+    HleFn wait = Hle::lookup("qISjDHrxONc");
+    HleFn abort_wait = Hle::lookup("sWQiqKvYTVA");
+    for (HleFn f : {init, term, create, destroy, wait, abort_wait}) ASSERT_NE(f, nullptr);
+    EXPECT_STREQ(Hle::name_of("qISjDHrxONc"), "sceHttpWaitRequest");
+    EXPECT_STREQ(Hle::name_of("sWQiqKvYTVA"), "sceHttpAbortWaitRequest");
+    const uint64_t kInvalidValue = (uint64_t)(int64_t)(int32_t)http::kErrorInvalidValue;
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+    uint64_t eh = 0;
+    ASSERT_EQ(create(ctx, (uint64_t)&eh, 0, 0, 0, 0), 0u);
+
+    std::array<uint8_t, 0x18> ev{};
+    ev.fill(0xA5);
+    EXPECT_EQ(wait(0, (uint64_t)ev.data(), 1, 1, 0, 0), kInvalidValue) << "null eh";
+    EXPECT_EQ(wait(eh, 0, 1, 1, 0, 0), kInvalidValue) << "null event buffer";
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 0, 1, 0, 0), kInvalidValue) << "maxevents == 0";
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), (uint64_t)(int64_t)-1, 1, 0, 0), kInvalidValue)
+        << "negative maxevents";
+    EXPECT_EQ(wait(0xDEADu, (uint64_t)ev.data(), 1, 1, 0, 0), kInvalidValue)
+        << "a handle nobody handed out";
+    // The Oregon Trail shape: WaitRequest(eh, &ev, 1, 1). No request is ever in flight offline,
+    // so no event is pending: 0 events, and the event buffer is left untouched.
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 1, 1, 0, 0), 0u);
+    for (uint8_t b : ev) EXPECT_EQ(b, 0xA5) << "no event record was written";
+
+    EXPECT_EQ(abort_wait(0, 0, 0, 0, 0, 0), (uint64_t)http::kErrorInvalidValue);
+    EXPECT_EQ(abort_wait(eh, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 1, 1, 0, 0), kInvalidValue)
+        << "a destroyed handle can no longer be waited on";
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Https, SetupValidatesItsId) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("A9cVMUtEp4Y");
+    HleFn term = Hle::lookup("Ik-KpLTlf7Q");
+    HleFn set_cb = Hle::lookup("htyBOoWeS58");
+    HleFn disable = Hle::lookup("mSQCxzWTwVI");
+    for (HleFn f : {init, term, set_cb, disable}) ASSERT_NE(f, nullptr);
+    constexpr uint64_t kInvalidId = http::kErrorInvalidId;
+    constexpr uint64_t kInvalidValue = http::kErrorInvalidValue;
+    EXPECT_EQ(set_cb(9999, 0, 0, 0, 0, 0), kInvalidId) << "an id nobody handed out is refused";
+    EXPECT_EQ(disable(9999, 0, 0, 0, 0, 0), kInvalidId);
+    const uint64_t ctx = init(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)ctx, 0);
+    EXPECT_EQ(set_cb(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(disable(ctx, 0x20ffu, 0, 0, 0, 0), 0u) << "every documented flag bit is accepted";
+    EXPECT_EQ(disable(ctx, 0x100u, 0, 0, 0, 0), kInvalidValue) << "an undocumented flag bit";
+    EXPECT_EQ(disable(9999, 0x100u, 0, 0, 0, 0), kInvalidValue)
+        << "the flag check comes before the id check";
+    EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set_cb(ctx, 0, 0, 0, 0, 0), kInvalidId) << "a termed context is no longer live";
+}
