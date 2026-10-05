@@ -52,7 +52,10 @@ representation with deterministic passes (ADR 0011, `GPU-2`); an SSA IR inside t
 (ADR 0012, `GPU-3`); one guest sync and scheduling model with no thread-identity assumptions
 (ADR 0013, `SYNC-1`); pipeline compilation off the submit thread from a persistent cache (ADR 0014,
 `PERF-P7`); declarative per-library HLE export tables (ADR 0015, `HLE-3`); and a release gate on the
-reference workloads (ADR 0016, `PERF-G1`). Profile-guided and AI-assisted optimisation are deferred
+reference workloads (ADR 0016, `PERF-G1`). Engineering-infrastructure proposals follow the same pattern: logging
+channels and typed configuration (ADR 0017, `CFG-2`), typed guest pointers (ADR 0018, `HLE-4`),
+fuzzed parsers (ADR 0019, `VER-2`), per-library conformance suites (ADR 0020, `VER-3`) and a
+bug-report bundle (ADR 0021, `OPS-1`). Profile-guided and AI-assisted optimisation are deferred
 until those instruments exist (`performance.md`).
 
 Deliberately not part of the target: a CPU translation layer or relinker (the guest runs natively),
@@ -195,7 +198,47 @@ Enforcement: runtime:hle-blocking-wait, adr:0013
 
 ### HLE-3 -- each library declares its exports in one table
 
-A reimplemented library lists the functions it implements in one declaration table of names and
-handlers; NIDs are derived from names, so no firmware symbol data is committed.
+A reimplemented library lists the functions it implements in one declaration table of names,
+signatures and handlers; NIDs are derived from names, so no firmware symbol data is committed.
+Registration, argument decoding, the relay trace and the Windows calling-convention thunk are
+generated from the table rather than written per function.
 Status: proposed (adr:0015)
 Enforcement: adr:0015
+
+### CFG-2 -- diagnostics are log channels; settings are typed configuration
+
+Diagnostic output goes through named channels with levels, enabled by one variable. Host
+capabilities and user settings are declared once in a typed schema, read from file, flags and
+environment, and validated at start-up. Only temporary selectors remain individual switches.
+Status: proposed (adr:0017)
+Enforcement: adr:0017
+
+### HLE-4 -- guest memory crosses the HLE boundary as a typed pointer
+
+A handler argument that refers to guest memory is a `GuestPtr<T>` or `GuestSpan<T>`, which compiles
+to a raw access in release builds and is checked against the guest memory map in diagnostic builds.
+Status: proposed (adr:0018)
+Enforcement: adr:0018
+
+### VER-2 -- every parser of untrusted bytes is fuzzed
+
+SELF/ELF, PM4, RDNA2 decode and capture deserialisation each have a coverage-guided fuzz target
+under sanitizers, seeded from synthetic inputs only, and every crash it finds becomes a regression
+test before the fix merges.
+Status: proposed (adr:0019)
+Enforcement: adr:0019
+
+### VER-3 -- each library has a conformance suite that names its evidence
+
+HLE tests live per library, and each states the evidence its expectation rests on: a trace of the
+real guest, a published contract, firmware symbol data, or guest disassembly.
+Status: proposed (adr:0020)
+Enforcement: adr:0020
+
+### OPS-1 -- one command produces a complete bug report
+
+`--report`, and any fatal fault, writes a versioned bundle with build, host, driver, configuration,
+alarms, unimplemented calls, recent log lines and backtraces, and never game bytes or absolute host
+paths.
+Status: proposed (adr:0021)
+Enforcement: adr:0021

@@ -16,7 +16,8 @@ registration needs only the name. There is no single place that says which funct
 prosper implements, and finding a handler means grepping.
 
 Wine declares every DLL's exports in a `.spec` file from which the build generates the export
-table; an unimplemented export is declared as a stub that fails loudly. Structural reference only.
+table, the calling-convention thunks and the `+relay` trace; an unimplemented export is declared as
+a stub that fails loudly. Structural reference only.
 
 ## Decision
 
@@ -28,13 +29,22 @@ table; an unimplemented export is declared as a stub that fails loudly. Structur
 3. Libraries move out of `hle_service.cpp` into `src/hle/<library>/` one at a time, each move a
    move-only commit with its table.
 4. ADR 0007's coverage report reads the tables and the registry, so "implemented" has one source.
+5. Each entry also declares the function's signature (argument and return types, with guest
+   pointers as `GuestPtr`/`GuestSpan`, ADR 0018). From one table the build then generates four
+   things, as Wine's `winebuild` does from a `.spec` file: registration; argument decoding into the
+   typed handler; a relay trace that logs every call with its decoded arguments and return code
+   behind one logging channel (ADR 0017); and, on Windows, the System V to Microsoft x64 thunk,
+   replacing hand-written bridging in `host/abi` for table-declared handlers. A handler whose
+   convention the generator cannot express keeps a hand-written thunk, listed in the table as such.
 
 Adds spec rule `HLE-3`.
 
 ## Consequences
 
 Finding a handler becomes opening its library's table; a duplicate or misspelt registration becomes
-a build-time or startup error rather than a silent miss. The tables also make the per-library
+a build-time or startup error rather than a silent miss. Argument-level call tracing, which today
+does not exist (`tools/hle_calls` counts calls but sees no arguments), comes for every declared
+function at no per-function cost. The tables also make the per-library
 surface reviewable in one diff. Registrations that are genuinely computed (loops, aliases) need a
 table form that expresses them, and `nid_census` documents that such registrations exist.
 
