@@ -682,9 +682,37 @@ uint64_t fiber_get_self(GuestFiber** out) {
     return 0;
 }
 
+// --- Fiber remainder: context-size checks + thread frame-pointer address ----------------------
+// sceFiberStartContextSizeCheck(flags) / sceFiberStopContextSizeCheck(): prosper has no
+// stack-usage checking machinery, so there is nothing to arm or disarm; both acknowledge.
+// Signatures agree between Kyty and portps5, and neither takes an out-param, so the ack is
+// the whole contract. A title relying on an actual overflow trap would need the checker
+// itself, which no local caller has asked for.
+// _sceFiberGetThreadFramePointerAddress(out*): writes 0 ("no frame address known") after a
+// null check. That is the single secondary implementation's exact behavior; prosper tracks
+// no per-thread frame pointer, so any nonzero address would be fabricated. CONFIDENCE: LOW.
+// Deliberately NOT here, with reasons rather than silence:
+//   * sceFiberGetInfo — the FiberInfo layout is unpinned (no live caller, no second
+//     implementation consulted exposes offsets prosper can verify), and writing an unknown
+//     struct is worse than leaving the NID unbound.
+//   * _sceFiberAttachContextAnd[Switch|Run], _sceFiberInitializeWithInternalOptionImpl —
+//     signatures unknown to every consulted source; binding them would be guessing arg
+//     positions for context-switching machinery, the most dangerous place to guess.
+uint64_t fiber_start_context_size_check(uint32_t) {
+    return 0;
+}
+uint64_t fiber_stop_context_size_check() {
+    return 0;
+}
+uint64_t fiber_get_thread_frame_pointer_address(uint64_t* out) {
+    if (!out) return kErrNull;
+    *out = 0;
+    return 0;
+}
+
 #ifndef _WIN32
-extern "C" uint64_t fiber_run_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                 uint64_t, uint64_t, uint64_t, uint64_t entry_rsp) {
+extern "C" uint64_t fiber_run_c(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t, uint64_t, uint64_t,
+                                uint64_t entry_rsp) {
     return fiber_run_impl((GuestFiber*)(uintptr_t)a0, a1, (uint64_t*)(uintptr_t)a2, entry_rsp);
 }
 PROSPER_ASM_TRAMPOLINE(fiber_run_entry, fiber_run_c)
@@ -729,6 +757,12 @@ void register_fiber_hle() {
     Hle::register_fn("B0ZX2hx9DMw", (HleFn)fiber_return_to_thread_win, "sceFiberReturnToThread");
 #endif
     Hle::register_fn("p+zLIOg27zU", (HleFn)fiber_get_self, "sceFiberGetSelf");
+    Hle::register_fn("Lcqty+QNWFc", (HleFn)fiber_start_context_size_check,
+                     "sceFiberStartContextSizeCheck");
+    Hle::register_fn("Kj4nXMpnM8Y", (HleFn)fiber_stop_context_size_check,
+                     "sceFiberStopContextSizeCheck");
+    Hle::register_fn("0dy4JtMUcMQ", (HleFn)fiber_get_thread_frame_pointer_address,
+                     "_sceFiberGetThreadFramePointerAddress");
 }
 
-} // namespace prosper
+}   // namespace prosper
