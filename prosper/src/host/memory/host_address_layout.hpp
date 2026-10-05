@@ -32,7 +32,8 @@ uint64_t confine_host_allocations_above_4gib();
 // [lo, hi), and the largest free gap between them. NOT only the host's: the guest's own mappings
 // and prosper's placeholders are allocations too, and the walk cannot tell them apart. An
 // allocation is identified by its allocation base, so it is one occupant however many regions it
-// is split into, and `size` is its extent inside the span.
+// is split into; `base` and `size` are its start and extent INSIDE the span, so an allocation
+// that begins below `lo` is reported from `lo`.
 //
 // The result carries its own scope, as every answer from this folder must: `available` is false on
 // a host that cannot enumerate its address space this way (nothing was looked at), and `complete`
@@ -56,8 +57,8 @@ GuestRangeOccupancy query_guest_range_occupancy(uint64_t lo, uint64_t hi);
 // inside its own initializer and blocks forever on that function's __cxa_guard, before its first
 // print. This reports it on stderr — the room the range has and what is in it — once per process,
 // and returns nullptr so the refusing call site can return it directly. It does not diagnose: the
-// caller refuses for other reasons too, and when the largest gap would have held the request the
-// line says occupancy is not the cause. Always on: a guest-visible ENOMEM, not a trace.
+// caller refuses for other reasons too, and when the largest gap is as long as the request the
+// line says so (before alignment) and stops there. Always on: a guest-visible ENOMEM, not a trace.
 void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi);
 
 } // namespace prosper::host

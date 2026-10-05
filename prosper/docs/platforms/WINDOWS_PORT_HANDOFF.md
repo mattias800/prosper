@@ -432,9 +432,18 @@ that thread waits on becomes the focus, so matching signals from other threads a
     `[4, 16)` GiB; which threads the 15-16 are was not traced.
   - **Low host memory is live memory.** A truncated or byte-shifted guest pointer in
     `[64 KiB, 4 GiB)` can now land on the host's pre-boot stacks and heap instead of faulting, where
-    on Linux that range is unmapped. Keep it in mind when a corruption shows up only on Windows.
-  - **The guest cannot map below 4 GiB any more**: a fixed guest mapping there fails and a hinted
-    one is placed elsewhere. No title is known to ask.
+    a position-independent Linux build has nothing mapped there. Keep it in mind when a corruption
+    shows up only on Windows.
+  - **Guest requests below 4 GiB meet the host's reservation.** A fixed guest reservation there
+    fails and a hinted one is placed elsewhere; a path that commits at the hint without reserving
+    (`sceKernelBatchMap`'s flexible op, through `win_commit`) can still commit pages INSIDE that
+    reservation. No title is known to ask for any of these.
+  - **Host-placed guest memory is now always low.** The few guest-visible allocations prosper
+    places with an unconstrained host call (the primary guest stack, `win_commit(0, …)`, the legacy
+    reserve fallback) land in `[4, 16)` GiB on every launch instead of at a random point of the low
+    terabyte. Two consumers have address floors above that and would ignore such a pointer:
+    `hle_audio.cpp` drops a waveform block pointer below 8 GiB, and `agc_shader_layout.cpp` skips a
+    buffer descriptor whose base is below 64 GiB. Neither is known to be handed such memory.
   - **The host has `[4, 16)` GiB, 12 GiB, to itself.** prosper's own SSE4a chain cache is a fixed
     allocation just under 16 GiB and fails soft if the host got there first. Past 16 GiB the host's
     lowest-first allocations spill into the gaps of the guest's FIXED map — between module bases,

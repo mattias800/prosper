@@ -19,6 +19,9 @@ uint64_t confine_host_allocations_above_4gib() {
     static std::atomic<bool> done{false};
     if (done.exchange(true)) return 0;
     constexpr uint64_t kLo = 0x10000, kHi = 0x100000000ull, kGranule = 0x10000;
+    // CONFIDENCE: MED. That a later allocation then lands at the lowest free address at or above
+    // 4 GiB is the observed placement policy of the host (measured: the test, and 93-126 thread
+    // stacks per Kena launch), not a documented contract.
     // Two passes: another thread can allocate inside a free region between the query and the
     // reserve, which fails that whole reserve and leaves the rest of the region free.
     for (int pass = 0; pass < 2; ++pass) {
@@ -51,13 +54,13 @@ uint64_t confine_host_allocations_above_4gib() {
 GuestRangeOccupancy query_guest_range_occupancy(uint64_t lo, uint64_t hi) {
     GuestRangeOccupancy result;
 #ifdef _WIN32
-    constexpr int kMaxRegions = 1 << 20; // bounds the walk; a live range has a few thousand
+    constexpr int kMaxRegions = 1 << 20;   // bounds the walk; a live range has a few thousand
     result.available = true;
     uint64_t cur = lo, last_allocation = UINT64_MAX;
     for (int i = 0; cur < hi && i < kMaxRegions; ++i) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(cur)), &mbi, sizeof mbi))
-            return result; // incomplete: `complete` stays false
+            return result;   // incomplete: `complete` stays false
         const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
         const uint64_t end = std::min<uint64_t>(base + mbi.RegionSize, hi);
         if (end <= cur) return result;
@@ -67,9 +70,9 @@ GuestRangeOccupancy query_guest_range_occupancy(uint64_t lo, uint64_t hi) {
             const uint64_t allocation =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.AllocationBase));
             if (allocation != last_allocation) {
-                // `base` is the allocation's own base unless it starts below `lo`.
+                // The allocation's own base, clamped to the span it is being reported for.
                 if (result.occupants < GuestRangeOccupancy::kMaxShown)
-                    result.shown[result.occupants] = {base, 0, mbi.State, mbi.Type};
+                    result.shown[result.occupants] = {std::max(base, lo), 0, mbi.State, mbi.Type};
                 ++result.occupants;
                 last_allocation = allocation;
             }
@@ -99,8 +102,9 @@ void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi) {
         return nullptr;
     }
     // The gap is printed beside the request because this is called for every refusal of the huge
-    // path, not only for a range that is too crowded: when the gap is large enough, the cause is
-    // something else (alignment, a host without placeholder support) and the line says so.
+    // path, not only for a range that is too crowded. A gap at least as long as the request does
+    // not prove occupancy innocent (the request also has an alignment), so the line only says the
+    // gap is long enough and leaves the conclusion to the reader.
     fprintf(stderr,
             "[memhle] reserve FAILED: a %llu GiB guest reservation could not be placed in the "
             "guest range [0x%llx, 0x%llx) -- its largest free gap is %llu GiB%s, with %d "
@@ -108,8 +112,8 @@ void* report_unplaceable(uint64_t len, uint64_t lo, uint64_t hi) {
             "allocator bootstrap (#4426).\n",
             (unsigned long long)(len >> 30), (unsigned long long)lo, (unsigned long long)hi,
             (unsigned long long)(o.largest_free_gap >> 30),
-            o.largest_free_gap >= len ? " (large enough: occupancy is NOT the cause)" : "",
-            o.occupants, o.complete ? "" : " (walk incomplete: both figures are lower bounds)");
+            o.largest_free_gap >= len ? " (long enough for it, before alignment)" : "", o.occupants,
+            o.complete ? "" : " (walk incomplete: both figures are lower bounds)");
     const int shown = std::min(o.occupants, GuestRangeOccupancy::kMaxShown);
     for (int i = 0; i < shown; ++i)
         fprintf(stderr, "[memhle]   occupant base=0x%llx size=0x%llx state=0x%lx type=0x%lx\n",

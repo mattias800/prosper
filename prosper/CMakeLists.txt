@@ -58,11 +58,11 @@ endif()
 # code natively.
 function(prosper_hosts_a_guest target)
   if(WIN32)
-    # LINKER: lets CMake spell the pass-through for whichever driver is in use. The MSVC-style
-    # spelling covers cl and any Clang driver that links with link.exe / lld-link; it is written
-    # from the linker's documentation and has NOT been built here -- prosper's Windows toolchains
-    # are MinGW GCC and GNU-ABI Clang, both of which take the second form (verified on each).
-    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    # LINKER: lets CMake spell the pass-through for whichever driver is in use. MSVC is set for cl
+    # and for every Clang driver that targets the MSVC ABI. That branch is written from the linker's
+    # documentation and has NOT been built here -- prosper's Windows toolchains are MinGW GCC and
+    # GNU-ABI Clang, both of which take the second form (verified on each).
+    if(MSVC)
       target_link_options(${target} PRIVATE "LINKER:/HIGHENTROPYVA:NO")
     else()
       target_link_options(${target} PRIVATE "LINKER:--disable-high-entropy-va")
@@ -6741,9 +6741,12 @@ if(WIN32 AND TARGET test_windows_guest_window)
   endforeach()
   # Written to an include file rather than passed as a -D: a path list on a compiler command line
   # depends on every generator's quoting rules, and a file does not.
+  # $<CONFIG> in the path keeps a multi-config generator from writing one file per configuration
+  # to the same place (the content names per-configuration executables).
   file(GENERATE
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/windows_guest_host_files.inc"
+    OUTPUT
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/$<CONFIG>/windows_guest_host_files.inc"
     CONTENT "R\"prosperpaths(${_prosper_guest_host_files})prosperpaths\"\n")
   target_include_directories(test_windows_guest_window PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host")
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/$<CONFIG>")
 endif()

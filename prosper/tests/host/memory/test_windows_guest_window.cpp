@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -55,10 +56,11 @@ using namespace prosper;
 
 namespace {
 
-// Mirrors boot_program.hpp / hle_kernel_mem.cpp. The lowest fixed guest address is the direct-memory
-// aperture at 16 GiB (below the module bases at 0x410000000); the range ends at the guest libc's
-// accepted ceiling. Spelled out rather than included so a silent change to either constant cannot
-// move this test's subject without somebody reading it.
+// Mirrors boot_program.hpp / hle_kernel_mem.cpp. The guest's range starts at the direct-memory
+// aperture at 16 GiB (below the module bases at 0x410000000) and ends at the guest libc's accepted
+// ceiling. One prosper mapping sits just under it: the SSE4a chain cache, a fixed allocation that
+// only a booting title makes. Spelled out rather than included so a silent change to either
+// constant cannot move this test's subject without somebody reading it.
 constexpr uint64_t kFourGiB = 0x100000000ull;
 constexpr uint64_t kGuestRangeLo = 0x400000000ull;   // 16 GiB
 constexpr uint64_t kGuestRangeHi = 0xfc00000000ull;   // 1008 GiB, exclusive
@@ -126,7 +128,9 @@ TEST(WindowsGuestWindow, GuestHostingExecutablesOptOutOfHighEntropyVa) {
     ASSERT_GE(hosts.size(), 1u) << "no guest-hosting executable was named: an empty list passes "
                                    "nothing, and must not read as every executable passing";
     for (const std::string& path : hosts) {
-        std::ifstream f(path, std::ios::binary);
+        // CMake wrote the list as UTF-8; a narrow open would read it in the active code page.
+        std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())),
+                        std::ios::binary);
         ASSERT_TRUE(f.good()) << "cannot open " << path;
         std::vector<uint8_t> head(0x1000);
         f.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
@@ -174,9 +178,15 @@ TEST(WindowsGuestWindow, BootConfinesHostAllocationsAbove4GiB) {
     ASSERT_LT(reinterpret_cast<uintptr_t>(before), kFourGiB)
         << "precondition: without the confinement this process allocates below 4 GiB";
 
+    // Beside this executable, so the answer does not depend on the working directory.
+    wchar_t self[MAX_PATH];
+    ASSERT_NE(GetModuleFileNameW(nullptr, self, MAX_PATH), 0u);
+    const std::filesystem::path no_such_root =
+        std::filesystem::path(self).parent_path() / "prosper-test-no-such-app0-4426";
+    ASSERT_FALSE(std::filesystem::exists(no_such_root));
     Program program;
     std::string err;
-    EXPECT_FALSE(boot_program("prosper-test-no-such-app0-4426", program, &err, {}))
+    EXPECT_FALSE(boot_program(no_such_root.string(), program, &err, {}))
         << "a root with no eboot must not boot";
     EXPECT_FALSE(err.empty());
 
