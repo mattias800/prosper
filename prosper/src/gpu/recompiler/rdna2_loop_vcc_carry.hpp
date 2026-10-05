@@ -92,18 +92,33 @@ struct LoopVccCarry {
         return false;
     }
 
-    // After the merge phis. The scalar halves were loop-carried, so the merge just installed their
-    // HEADER phi -- the scratch the previous iteration left. On the canonical exit that is stale
-    // wherever the check block overwrote the half with a mask: every mask write erases the scalar
-    // value it clobbers (`mask_write_clobbers_pair`), and operand_bits serves a tracked rs.sreg
-    // entry before it considers the mask. Left in place, a later `s_mov_b32 s0, vcc_lo` would read
-    // last iteration's scratch instead of the exit mask. Untracked, it takes the exact ballot or
-    // rejects loudly, as it does after a compare in straight-line code.
+    // The counted-loop emitter keeps its own, older VCC phi and still refuses a body that leaves
+    // VCC as scalar data: no title has needed it, and its exit state differs (it hands on the
+    // header phi, not the check block's mask). This only gives that refusal a name, so the caller
+    // does not `return false` in silence.
+    static bool reject_counted_backedge(SpirvCompute& b, uint32_t header_pc) {
+        log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                 "counted-loop body leaves VCC as scalar data at the back-edge "
+                                 "(header pc=%u)",
+                                 header_pc);
+        return false;
+    }
+
+    // After the merge phis. A VCC half that the loop writes as scalar data is loop-carried, so the
+    // merge just installed its HEADER phi -- the scratch the previous iteration left. On the
+    // canonical exit that is stale wherever the check block overwrote the half with a mask: every
+    // mask write erases the scalar value it clobbers (`mask_write_clobbers_pair`), and
+    // operand_bits serves a tracked rs.sreg entry before it considers the mask. Left in place, a
+    // later `s_mov_b32 s1, vcc_lo` reads last iteration's scratch where hardware reads the exit
+    // mask's dword. Untracked, it takes the exact ballot or rejects loudly, exactly as it does
+    // after a compare in straight-line code.
     //
-    // Only the placeholder path does this, so a loop that already compiled keeps its merge state
-    // exactly as it was.
+    // This runs for every loop, not only the placeholder path (#4526). Whether the back-edge
+    // carried a real mask, a placeholder, or no VCC phi at all (no mask live before the loop)
+    // makes no difference to what the check block did to the half on the way out. A direct break
+    // can reach the merge with the half still scalar; a value that is a mask on one edge and data
+    // on the other has no scalar representation either, so it is dropped there too.
     void finish_exit(RegState& rs) const {
-        if (!placeholder_backedge) return;
         for (int half : {106, 107}) {
             if (check_tracks_half[half - 106]) continue;
             rs.sreg.erase(half);

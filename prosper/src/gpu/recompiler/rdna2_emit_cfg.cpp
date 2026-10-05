@@ -7229,7 +7229,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         : pr.dom == 1 ? sget(pr.reg)
                         : pr.dom == 2 ? rs.scc
                         : pr.dom == 3 ? rs.vcc : rs.exec;
-            if (!nv && pr.dom == 3) return false;
+            if (!nv && pr.dom == 3) return LoopVccCarry::reject_counted_backedge(b, L.header_pc);
             if (!nv && pr.dom == 2)
                 nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);

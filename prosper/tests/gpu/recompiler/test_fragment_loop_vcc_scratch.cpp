@@ -85,6 +85,35 @@ constexpr uint32_t kDataReadAfterLoop[] = {
     0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
 };
 
+//  #4526: the same post-loop data read after two loops that compiled before #4508's fix, so they
+//  never took its placeholder path. Their exit state has the same stale scratch in vcc_lo.
+//  (a) No VCC mask is live before the loop, so the loop has no VCC header phi at all.
+constexpr uint32_t kDataReadNoMaskBefore[] = {
+    0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u,
+    0x7D020200u,   //  4  HEADER: v_cmp_lt_i32 vcc, s0, v1
+    0xBF860006u,   //  5  s_cbranch_vccz 12
+    0x816A8100u, 0x876B8300u, 0x060000FFu, 0x3E000000u, 0xBE80036Au,
+    0xBF82FFF8u,   // 11  s_branch 4
+    0xBE81036Au,   // 12  s_mov_b32 s1, vcc_lo        <<< the exit mask, as data
+    0x7E020201u,   // 13  v_mov_b32 v1, s1
+    0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
+};
+//  (b) The body ends with a compare, so the back-edge carries a real mask and needs no placeholder.
+constexpr uint32_t kDataReadAfterMaskBackEdge[] = {
+    0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u,
+    0x7D020200u,   //  4  v_cmp_lt_i32 vcc, s0, v1
+    0x7D020200u,   //  5  HEADER: v_cmp_lt_i32 vcc, s0, v1
+    0xBF860007u,   //  6  s_cbranch_vccz 14
+    0x816A8100u,   //  7  s_add_i32 vcc_lo, s0, 1
+    0x876B8300u,   //  8  s_and_b32 vcc_hi, s0, 3
+    0x060000FFu, 0x3E000000u,   //  9  v_add_f32 v0, 0.125, v0
+    0xBE80036Au,   // 11  s_mov_b32 s0, vcc_lo
+    0x7D020200u,   // 12  v_cmp_lt_i32 vcc, s0, v1    VCC is a mask again before the back-edge
+    0xBF82FFF7u,   // 13  s_branch 5
+    0xBE81036Au,   // 14  s_mov_b32 s1, vcc_lo        <<< the exit mask, as data
+    0x7E020201u, 0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
+};
+
 //  A zero-trip twin for the exit state. The mask before the loop is SET (0 < 4) and the header's
 //  is CLEAR (0 < 0), so the loop leaves at once and green is selected by whichever mask the merge
 //  hands on: the header's (green) or one that leaked from the entry edge of the phi (black). Both
@@ -272,6 +301,30 @@ TEST(FragmentLoopVccScratch, DataReadAfterTheLoopIsNotServedFromScratch) {
     EXPECT_TRUE(loop.spirv.empty())
         << "compiled a data read of the exit mask; it can only have come from loop scratch";
     EXPECT_NE(loop.reason.find("pc=13"), std::string::npos) << loop.reason;
+}
+
+TEST(FragmentLoopVccScratch, DataReadAfterLoopsThatNeededNoPlaceholderIsNotServedFromScratch) {
+    // Both loops compiled before the placeholder existed, and both then compiled this read from
+    // the scratch the loop left in vcc_lo. Each must name the read as the reject.
+    const Compiled no_mask = compile(kDataReadNoMaskBefore, 0x4526A001ull);
+    EXPECT_TRUE(no_mask.spirv.empty()) << "no VCC mask before the loop";
+    EXPECT_NE(no_mask.reason.find("pc=12"), std::string::npos) << no_mask.reason;
+
+    const Compiled mask_edge = compile(kDataReadAfterMaskBackEdge, 0x4526A002ull);
+    EXPECT_TRUE(mask_edge.spirv.empty()) << "a real mask on the back-edge";
+    EXPECT_NE(mask_edge.reason.find("pc=14"), std::string::npos) << mask_edge.reason;
+
+    // Control: without the read, both loops still compile -- the cleanup removed a stale value,
+    // not the loop.
+    uint32_t no_read[std::size(kDataReadNoMaskBefore)];
+    std::copy(std::begin(kDataReadNoMaskBefore), std::end(kDataReadNoMaskBefore), no_read);
+    no_read[12] = 0xBE810380u;   // s_mov_b32 s1, 0
+    EXPECT_FALSE(compile(no_read, 0x4526A003ull).spirv.empty());
+    uint32_t no_read_edge[std::size(kDataReadAfterMaskBackEdge)];
+    std::copy(std::begin(kDataReadAfterMaskBackEdge), std::end(kDataReadAfterMaskBackEdge),
+              no_read_edge);
+    no_read_edge[14] = 0xBE810380u;   // s_mov_b32 s1, 0
+    EXPECT_FALSE(compile(no_read_edge, 0x4526A004ull).spirv.empty());
 }
 
 TEST(FragmentLoopVccScratch, MaskReadAfterTheLoopSeesTheExitMask) {
