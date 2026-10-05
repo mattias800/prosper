@@ -101,6 +101,8 @@ std::vector<uint8_t> tile_blocks(const std::vector<uint8_t>& linear, uint32_t bw
 
 int main(int argc, char** argv) {
     const bool decoder_arm = argc == 2 && std::strcmp(argv[1], "--decoder") == 0;
+    // --bc6h-hdr (ctest sets PROSPER_NATIVE_BC6H_HDR=1): BC6H opts back into the native upload.
+    const bool bc6h_hdr_arm = argc == 2 && std::strcmp(argv[1], "--bc6h-hdr") == 0;
     prosper::register_builtin_hle();
     const uint32_t vs_rdna[] = {
         0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u, 0x10020B01u,
@@ -119,9 +121,16 @@ int main(int argc, char** argv) {
         check(prosper::frontend::native_bc_sampled_format(r, false) == VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
               "BC1 maps to the RGBA (punch-through alpha) variant the decoder implements");
         r.format = DataFormat::Bc6;
-        check(prosper::frontend::native_bc_sampled_format(r, false) == VK_FORMAT_BC6H_UFLOAT_BLOCK,
-              "BC6H UF16 maps to BC6H_UFLOAT");
+        check(prosper::frontend::native_bc6h_hdr_enabled() == bc6h_hdr_arm,
+              "the BC6H HDR opt-in follows PROSPER_NATIVE_BC6H_HDR");
+        check(prosper::frontend::native_bc_sampled_format(r, false) ==
+                  (bc6h_hdr_arm ? VK_FORMAT_BC6H_UFLOAT_BLOCK : 0u),
+              "BC6H UF16 keeps the clamping decoder unless HDR is opted into (#4496)");
+        // The chain half of the same rule: allowing declared mips must not make BC6H native.
         r.declared_mip_levels = 4;
+        check((prosper::frontend::native_bc_sampled_format(r, true) != 0u) == bc6h_hdr_arm,
+              "a BC6H mip chain keeps the decoder too unless HDR is opted into (#4496)");
+        r.format = DataFormat::Bc7;
         check(prosper::frontend::native_bc_sampled_format(r, false) == 0u &&
                   prosper::frontend::native_bc_sampled_format(r, true) != 0u,
               "a declared mip chain keeps the decoder unless explicitly allowed");
@@ -231,13 +240,98 @@ int main(int argc, char** argv) {
             check(worst <= f.tolerance, "sampled texels match the CPU decoder within tolerance");
             const uint64_t native_bytes = uint64_t(BW) * BH * bb;
             const uint64_t decoded_bytes = uint64_t(W) * H * 4;
-            if (expect_native)
+            // BC6H stays on the decoder by default even where the device samples it (#4496).
+            if (expect_native && (f.format != DataFormat::Bc6 || bc6h_hdr_arm))
                 check(stats.upload_bytes == native_bytes,
                       "native path uploads ceil(w/4)*ceil(h/4) blocks, not decoded texels");
             else
                 check(stats.upload_bytes == decoded_bytes,
                       "decoder path uploads w*h RGBA8 texels");
         }
+    }
+    // #4496: by default a BC6H texel is clamped BEFORE the shader multiplies it, the interim rule
+    // while this renderer is gamma-space end to end (#263). Every texel of this texture saturates
+    // the clamping decoder on all three channels, and the fragment program halves the sample:
+    // clamped it writes 0.5, unclamped it writes min(value / 2, 1), which is brighter for any
+    // value above 1.0.
+    {
+        const uint32_t half_ps[] = {
+            0x100000ffu, std::bit_cast<uint32_t>(1.0f / W),
+            0x100202ffu, std::bit_cast<uint32_t>(1.0f / H),
+            0xf0800f08u, 0x00820000u,
+            0x100000ffu, std::bit_cast<uint32_t>(0.5f),   // v_mul_f32 v0, 0.5, v0
+            0x100202ffu, std::bit_cast<uint32_t>(0.5f),   // v_mul_f32 v1, 0.5, v1
+            0x100404ffu, std::bit_cast<uint32_t>(0.5f),   // v_mul_f32 v2, 0.5, v2
+            0xf800000fu, 0x03020100u,
+            0xbf810000u,
+        };
+        const uint32_t bb = bc_block_bytes(DataFormat::Bc6);
+        std::vector<uint8_t> bright(size_t(BW) * BH * bb);
+        for (size_t i = 0; i < size_t(BW) * BH; ++i) {
+            uint8_t* block = bright.data() + i * bb;
+            for (unsigned attempt = 0; attempt < 100000; ++attempt) {
+                for (uint32_t b = 0; b < bb; ++b) block[b] = next_byte();
+                block[0] &= static_cast<uint8_t>(~0x02u);
+                uint8_t texels[16 * 4];
+                bc_decode_surface(texels, block, bb, 4, 4, DataFormat::Bc6);
+                unsigned saturated = 0;
+                for (unsigned t = 0; t < 16; ++t)
+                    for (unsigned c = 0; c < 3; ++c) saturated += texels[t * 4 + c] == 255;
+                if (saturated == 48) break;
+            }
+            // The search must have succeeded, or the arm below compares nothing.
+            uint8_t texels[16 * 4];
+            bc_decode_surface(texels, block, bb, 4, 4, DataFormat::Bc6);
+            unsigned saturated = 0;
+            for (unsigned t = 0; t < 16; ++t)
+                for (unsigned c = 0; c < 3; ++c) saturated += texels[t * 4 + c] == 255;
+            if (saturated != 48) check(false, "every BC6H fixture block saturates the decoder");
+        }
+        ShaderResource r{};
+        r.cls = ResourceClass::Texture;
+        r.format = DataFormat::Bc6;
+        r.num_components = 3;
+        r.binding = 4;
+        r.sgpr_base = 8;
+        r.img_dim = 1;
+        r.depth = 1;
+        r.declared_mip_levels = 1;
+        r.width = W;
+        r.height = H;
+        r.mag_filter = r.min_filter = 0;
+        r.gpu_addr = 0x7b000000;   // not shared with the chain arms below
+        r.size = static_cast<uint32_t>(bright.size());
+        r.host_data = bright.data();
+        r.host_data_size = bright.size();
+        auto table = std::make_shared<ShaderResourceTable>();
+        table->resources.push_back(r);
+        DrawItem draw;
+        draw.vs = recompile_vertex(vs_rdna, std::size(vs_rdna));
+        const PixelSystemInputMapping positions{0x300u, 0x300u};
+        draw.fs = recompile_fragment(half_ps, std::size(half_ps), table.get(), &positions);
+        draw.prt = table;
+        draw.vertex_count = 3;
+        draw.ps.topology = 3;
+        draw.ps.color_write_mask = 15;
+        draw.color0_base = 0x7c000000;
+        draw.color0_width = W;
+        draw.color0_height = H;
+        const auto actual = render_submit_items({draw}, W, H);
+        check(actual.size() == size_t(W) * H * 4, "the halved BC6H draw renders a complete image");
+        unsigned clamped = 0, brighter = 0, channels = 0;
+        for (size_t i = 0; i + 3 < actual.size(); i += 4)
+            for (unsigned c = 0; c < 3; ++c, ++channels) {
+                clamped += actual[i + c] >= 125 && actual[i + c] <= 130;   // 0.5 of a clamped 1.0
+                brighter += actual[i + c] > 140;   // half of an HDR value
+            }
+        std::printf("  bc6h-hdr-clamp: channels=%u at-half=%u brighter=%u native-arm=%d\n",
+                    channels, clamped, brighter, bc6h_hdr_arm && expect_native);
+        if (bc6h_hdr_arm && expect_native)
+            check(channels && brighter * 10u >= channels * 9u,
+                  "opted-in native BC6H delivers values above 1.0 to the shader");
+        else
+            check(channels && clamped == channels,
+                  "BC6H values above 1.0 are clamped before the shader multiplies them (#4496)");
     }
     // Guest mip chain (#3873): a tiled BC texture declaring a chain uploads the guest's OWN levels,
     // because a block format cannot be blit-generated. Each level holds different random blocks, so

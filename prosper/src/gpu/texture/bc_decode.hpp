@@ -2,7 +2,8 @@
 //
 // PS5 art textures are commonly stored block-compressed (BC1/BC2/BC3 = DXT1/3/5). Since #3873 a plain
 // 2D sampled BC texture uploads NATIVELY (VK_FORMAT_BC*) when the device can sample it -- see
-// native_bc_sampled_format() in live_renderer. This decoder remains the path for every other shape
+// native_bc_sampled_format() in live_renderer -- except BC6H, which keeps this decoder and its
+// UNORM8 clamp by default (#4496). This decoder remains the path for every other shape
 // (cube, volume, array, a declared mip chain the backend must generate, compute), for devices that
 // do not advertise BC sampling, for PROSPER_NO_NATIVE_BC=1, and for inspection/dump diagnostics of a
 // native texture, whose texels are blocks. Pure + deterministic + testable:

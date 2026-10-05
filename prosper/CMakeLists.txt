@@ -4623,6 +4623,11 @@ endif()
       add_test(NAME native_bc_upload_decoder_control COMMAND test_native_bc_upload --decoder)
       set_tests_properties(native_bc_upload_decoder_control PROPERTIES
         ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
+      # BC6H keeps the clamping decoder by default (#4496); this arm opts back into native HDR so
+      # the BC6H upload path stays covered until the linear pipeline of #263 makes it the default.
+      add_test(NAME native_bc_upload_bc6h_hdr COMMAND test_native_bc_upload --bc6h-hdr)
+      set_tests_properties(native_bc_upload_bc6h_hdr PROPERTIES
+        ENVIRONMENT "PROSPER_NATIVE_BC6H_HDR=1")
       add_executable(test_texture_preparation tests/shared/live/test_texture_preparation.cpp)
       target_include_directories(test_texture_preparation PRIVATE frontends src tests)
       target_link_libraries(test_texture_preparation PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
