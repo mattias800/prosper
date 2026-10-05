@@ -20,8 +20,8 @@ Measured on 61557f29 with `grep`:
 - 11 lines include `gpu/diagnostics/diagnostic_selectors.hpp`.
 
 The cache is already outside it (`recompile_graphics_shader_cached_shared` in
-`gpu/execute/gpu_execute.hpp`), which is the right placement. The sibling project compared in the
-architecture review exposes one `Recompile(request) -> result` entry point and documents the
+`gpu/execute/gpu_execute.hpp`), which is the right placement. AnyPS5, the sibling PS5 project compared in the
+architecture review, exposes one `Recompile(request) -> result` entry point and documents the
 recompiler as isolated and a pure function of its input; its own CMake target still links its cache
 and runtime, so that is a direction to take, not a finished example to copy.
 
@@ -47,7 +47,7 @@ build enforces. Switches that today change recompiler output are guest-behaviour
 
 - Leave the entry points and only add a facade: rejected, a facade over impure code reproduces
   nothing.
-- Move the cache inside the recompiler as the sibling project does: rejected, the cache's key is a
+- Move the cache inside the recompiler as AnyPS5 does: rejected, the cache's key is a
   policy of the executor, and keeping it outside is what makes the function pure.
 
 ## Approval

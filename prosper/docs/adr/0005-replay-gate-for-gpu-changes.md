@@ -21,9 +21,9 @@ fragment subgroup, so even a corpus it could hold would cover a smaller domain t
 replay hash covers the translation path only -- recompiler, decode, state resolve, executor
 ordering, detile -- not live residency (#1103).
 
-The proposal this answers came from a comparison with a sibling project, which suggested replay
-second in the refactor order so the later restructures (submit worker, resource identity, command
-representation, shader IR) land behind a safety net. That ordering is adopted here; the hosted-CI
+The proposal this answers came from an architecture review comparing prosper with AnyPS5, a sibling
+PS5 project. It suggested replay second in the refactor order, so the later restructures (submit
+worker, resource identity, command representation, shader IR) land behind a safety net. That ordering is adopted here; the hosted-CI
 form it assumed is not possible for the reasons above.
 
 ## Decision

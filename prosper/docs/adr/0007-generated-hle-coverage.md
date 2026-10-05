@@ -16,7 +16,7 @@ succeeded that never ran -- the false-success class (#2081). Two instruments alr
 and the runtime registry (not a source grep), and the always-on `unimplemented-hle-calls` perf alarm
 reports it for each run.
 
-The sibling project compared in the architecture review publishes a generated per-library progress
+AnyPS5, the sibling PS5 project compared in the architecture review, publishes a generated per-library progress
 report (`tools/progress.py`), counting a function done when its body no longer calls the stub
 helper, and a shader instruction done when its decoder recognises it. Generating the number rather
 than estimating it is the idea worth taking. Its definition of "done" is not: in prosper a handler
