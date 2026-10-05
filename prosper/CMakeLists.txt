@@ -5005,6 +5005,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A wave-empty EXEC guard around a counted loop in UE4's save-then-v_cmpx form (#4427):
+      # compile-level positives/negatives plus two executed kernels.
+      prosper_add_gtest(test_counted_loop_cmpx_guard
+        SOURCES tests/gpu/recompiler/test_counted_loop_cmpx_guard.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
