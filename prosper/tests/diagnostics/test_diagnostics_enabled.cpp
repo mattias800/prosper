@@ -58,10 +58,13 @@ TEST(DiagnosticsEnabled, AnEventBusSubscriberReceivesTheEventAndUnsubscribeStops
         event_bus().subscribe([&received](const BootEvent& ev) { received.push_back(ev); });
 
     record_boot_phase(BootPhase::MODULES_MAPPED);
+    // Unsubscribe before asserting: an early ASSERT return must not leave a subscriber on the
+    // process-wide bus holding a reference to this destroyed local.
+    event_bus().unsubscribe(sub_handle);
     ASSERT_EQ(received.size(), 1u) << "subscriber received 1 event";
     EXPECT_EQ(received[0].phase, BootPhase::MODULES_MAPPED) << "correct phase in subscriber";
-
-    event_bus().unsubscribe(sub_handle);
+    record_boot_phase(BootPhase::BOOT_COMPLETE);
+    EXPECT_EQ(received.size(), 1u) << "unsubscribe stops delivery";
 }
 
 TEST(DiagnosticsEnabled, RecordingStopsWhileDisabledAndClearResetsTheCount) {

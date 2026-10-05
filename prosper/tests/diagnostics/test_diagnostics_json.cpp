@@ -55,7 +55,7 @@ TEST(DiagnosticsJson, SeveralEventsBecomeAnArrayWithSeparatorsBetweenElements) {
     EXPECT_GE(comma_count, 2u) << "commas present between elements";
 }
 
-TEST(DiagnosticsJson, EveryKnownPhaseHasItsHumanReadableName) {
+TEST(DiagnosticsJson, PhaseNamesAreHumanReadableAndOutOfRangeIsUnknown) {
     EXPECT_EQ(std::string(phase_name(BootPhase::PROCESS_START)), "PROCESS_START");
     EXPECT_EQ(std::string(phase_name(BootPhase::LINKING)), "LINKING");
     EXPECT_EQ(std::string(phase_name(BootPhase::_COUNT)), "UNKNOWN") << "_COUNT -> UNKNOWN";
