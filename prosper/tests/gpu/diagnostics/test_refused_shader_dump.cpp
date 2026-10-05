@@ -9,6 +9,7 @@
 //   ConcurrentOwnerObservedOnce competing workers all hashing/writing the same original version
 #include "gpu/diagnostics/refused_shader_dump.hpp"
 #include "fixtures/test_scratch.h"
+#include "host/platform/file_stdio.hpp"
 
 #include <gtest/gtest.h>
 
@@ -21,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <algorithm>
 
 using namespace prosper::gpu;
 namespace fs = std::filesystem;
@@ -28,7 +30,7 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path fresh_root(const char* name) {
-    const fs::path root = prosper_test::test_scratch_dir() / name;
+    const fs::path root = fs::absolute(prosper_test::test_scratch_dir() / name).lexically_normal();
     std::error_code ec;
     fs::remove_all(root, ec);
     fs::create_directories(root, ec);
@@ -50,6 +52,74 @@ struct OwnedCode {
 
 RefusedShaderSource original(const std::shared_ptr<OwnedCode>& owner) {
     return {{owner, &owner->words}, &owner->memo};
+}
+
+fs::path native_path(const fs::path& path) {
+    std::error_code error;
+    const auto native = prosper::host::native_file_path(path, error);
+    EXPECT_FALSE(error) << error.message();
+    return native;
+}
+
+// Every component stays far below the component limit; only total path length is stressed.
+fs::path deep_root(const char* name, size_t minimum) {
+    fs::path root = fs::absolute(prosper_test::test_scratch_path(name)).lexically_normal();
+    while (root.native().size() < minimum) root /= std::string(40, 'r');
+    return root;
+}
+
+struct DeepRootCleanup {
+    fs::path root;
+    ~DeepRootCleanup() {
+        std::error_code error;
+        const auto native = prosper::host::native_file_path(root, error);
+        if (!error && !native.empty()) fs::remove_all(native, error);
+    }
+};
+
+std::string read_text(const fs::path& path) {
+    std::ifstream input(native_path(path), std::ios::binary);
+    EXPECT_TRUE(input.is_open());
+    return {(std::istreambuf_iterator<char>(input)), {}};
+}
+
+fs::path only_bin(const fs::path& directory) {
+    fs::path result;
+    size_t count = 0;
+    for (const auto& entry : fs::directory_iterator(native_path(directory))) {
+        if (entry.path().extension() != ".bin") continue;
+        EXPECT_TRUE(entry.is_regular_file());
+        result = directory / entry.path().filename();
+        ++count;
+    }
+    EXPECT_EQ(count, 1u);
+    return result;
+}
+
+void expect_original_artifacts(const fs::path& root, const fs::path& expected_root,
+                               const std::shared_ptr<OwnedCode>& owner) {
+    reset_refused_shader_dump_for_test(root.string());
+    EXPECT_TRUE(refused_shader_dump_directory().empty());
+    ASSERT_TRUE(note_refused_shader("ps", 0x7000, original(owner), "long-path-proof"));
+    ASSERT_FALSE(note_refused_shader("ps", 0x7001, original(owner), "not-a-second-index-line"));
+    const fs::path directory = refused_shader_dump_directory();
+    ASSERT_FALSE(directory.empty());
+    EXPECT_EQ(directory.parent_path(), expected_root);
+    const auto bin = only_bin(directory);
+    ASSERT_FALSE(bin.empty());
+    const auto bytes = read_text(bin);
+    ASSERT_EQ(bytes.size(), owner->words.size() * sizeof(uint32_t));
+    EXPECT_EQ(std::memcmp(bytes.data(), owner->words.data(), bytes.size()), 0);
+    const auto text = read_text(directory / "index.txt");
+    EXPECT_EQ(std::count(text.begin(), text.end(), '\n'), 1);
+    EXPECT_NE(text.find("ps addr=0x7000 dwords=2"), std::string::npos);
+    EXPECT_NE(text.find(bin.filename().string()), std::string::npos);
+    EXPECT_NE(text.find("long-path-proof"), std::string::npos);
+    EXPECT_EQ(text.find("not-a-second-index-line"), std::string::npos);
+    const auto stats = refused_shader_dump_stats();
+    EXPECT_EQ(stats.content_records, 1u);
+    EXPECT_EQ(stats.hash_evaluations, 1u);
+    EXPECT_EQ(stats.hashed_dwords, owner->words.size());
 }
 
 }  // namespace
@@ -169,4 +239,146 @@ TEST(RefusedShaderDump, ConcurrentOwnerObservedOnce) {
     EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 1u);
     EXPECT_EQ(refused_shader_dump_stats().content_records, 1u);
     EXPECT_EQ(bin_files(refused_shader_dump_directory()), 1u);
+}
+
+TEST(RefusedShaderDump, LongCaptureRootKeepsRawIndexAndOncePerOwnerWork) {
+    const auto short_root =
+        fs::absolute(prosper_test::test_scratch_path("refused-path-short")).lexically_normal();
+    const auto long_root = deep_root("refused-path-long", 340);
+    DeepRootCleanup cleanup{long_root};
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    expect_original_artifacts(short_root, short_root, owner);
+    expect_original_artifacts(long_root, long_root, owner);
+    const fs::path directory = refused_shader_dump_directory();
+    ASSERT_FALSE(directory.empty());
+    EXPECT_GT(directory.native().size(), 260u);
+    EXPECT_GT((directory / "index.txt").native().size(), 260u);
+    EXPECT_GT(only_bin(directory).native().size(), 260u);
+}
+
+TEST(RefusedShaderDump, RelativeLongRootIsResolvedBeforeNativeDirectoryAndFileOperations) {
+    const auto cwd = fs::current_path();
+    auto root = deep_root("refused-path-relative", 340);
+    auto relative = root.lexically_relative(cwd);
+    ASSERT_FALSE(relative.empty())
+        << "real relative-path IO requires PROSPER_TEST_SCRATCH_DIR on the cwd volume; "
+           "configure a same-volume scratch root for this case";
+    for (size_t step = 0; relative.native().size() < 320 && step != 8; ++step) {
+        root /= std::string(40, 'r');
+        relative = root.lexically_relative(cwd);
+    }
+    ASSERT_FALSE(relative.empty());
+    ASSERT_GE(relative.native().size(), 320u) << "bounded long-relative fixture construction";
+    ASSERT_FALSE(relative.is_absolute());
+    ASSERT_GT(relative.native().size(), 260u);
+    DeepRootCleanup cleanup{root};
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    expect_original_artifacts(relative, root, owner);
+    EXPECT_EQ(fs::current_path(), cwd);
+}
+
+TEST(RefusedShaderDump, RawOpenFailureIsActionableAndNotRetriedForTheOwner) {
+    fresh_root("refused-path-raw-error");
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    ASSERT_TRUE(note_refused_shader("vs", 0x8000, original(owner), "original"));
+    const fs::path directory = refused_shader_dump_directory();
+    const auto original_bin = only_bin(directory);
+    ASSERT_FALSE(original_bin.empty());
+    auto name = original_bin.filename().string();
+    ASSERT_EQ(name.substr(0, 3), "vs_");
+    name.replace(0, 2, "ps");   // Same real hash/address, different observed stage.
+    std::error_code error;
+    ASSERT_TRUE(fs::create_directory(native_path(directory / name), error)) << error.message();
+    testing::internal::CaptureStderr();
+    const bool written = note_refused_shader("ps", 0x8000, original(owner), "blocked-raw");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(written);
+    EXPECT_NE(log.find("raw-open failed:"), std::string::npos) << log;
+    EXPECT_NE(log.find("error="), std::string::npos) << log;
+    EXPECT_NE(log.find("refusal evidence is incomplete"), std::string::npos) << log;
+    EXPECT_TRUE(refused_shader_already_noted("ps", original(owner)));
+    const auto before = refused_shader_dump_stats();
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(note_refused_shader("ps", 0x8001, original(owner), "repeat"));
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, before.hash_evaluations);
+    EXPECT_EQ(refused_shader_dump_stats().content_records, 2u);
+    EXPECT_TRUE(fs::is_directory(native_path(directory / name)));
+}
+
+TEST(RefusedShaderDump, IndexOpenFailureDoesNotPretendRawEvidenceIsAnIndex) {
+    fresh_root("refused-path-index-error");
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    ASSERT_TRUE(note_refused_shader("vs", 0x9000, original(owner), "original"));
+    const fs::path directory = refused_shader_dump_directory();
+    std::error_code error;
+    fs::rename(native_path(directory / "index.txt"), native_path(directory / "saved-index.txt"),
+               error);
+    ASSERT_FALSE(error) << error.message();
+    ASSERT_TRUE(fs::create_directory(native_path(directory / "index.txt"), error));
+    testing::internal::CaptureStderr();
+    const bool written = note_refused_shader("ps", 0x9000, original(owner), "blocked-index");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_TRUE(written) << "the established return value describes the raw file, not the index";
+    EXPECT_NE(log.find("index-open failed:"), std::string::npos) << log;
+    EXPECT_NE(log.find("error="), std::string::npos) << log;
+    EXPECT_NE(log.find("refusal evidence is incomplete"), std::string::npos) << log;
+    auto raw = fs::path{};
+    for (const auto& entry : fs::directory_iterator(native_path(directory))) {
+        if (entry.path().filename().string().starts_with("ps_")) raw = entry.path();
+    }
+    ASSERT_FALSE(raw.empty());
+    const auto bytes = read_text(raw);
+    ASSERT_EQ(bytes.size(), owner->words.size() * sizeof(uint32_t));
+    EXPECT_EQ(std::memcmp(bytes.data(), owner->words.data(), bytes.size()), 0);
+    EXPECT_TRUE(refused_shader_already_noted("ps", original(owner)));
+    EXPECT_EQ(refused_shader_dump_stats().content_records, 2u);
+}
+
+TEST(RefusedShaderDump, DirectoryFailureIsVisibleAndBounded) {
+    const auto root = prosper_test::test_scratch_path("refused-path-directory-file");
+    {
+        std::ofstream file(root);
+        ASSERT_TRUE(file.is_open());
+        file << "not a directory";
+    }
+    reset_refused_shader_dump_for_test(root.string());
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    testing::internal::CaptureStderr();
+    const bool written = note_refused_shader("cs", 0xa000, original(owner), "blocked-root");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(written);
+    EXPECT_NE(log.find("directory-create failed:"), std::string::npos) << log;
+    EXPECT_NE(log.find("error="), std::string::npos) << log;
+    EXPECT_TRUE(refused_shader_dump_directory().empty());
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(note_refused_shader("cs", 0xa001, original(owner), "repeat"));
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_EQ(refused_shader_dump_stats().content_records, 1u);
+    EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 1u);
+    EXPECT_EQ(read_text(root), "not a directory");
+}
+
+TEST(RefusedShaderDump, RootResolutionFailureNamesTheConfiguredRootAndIsBounded) {
+    const std::string prefix = "refused-invalid-configured-root";
+    const std::string root = prefix + std::string(1, '\0') + "not-a-directory-name";
+    reset_refused_shader_dump_for_test(root);
+    auto owner = std::make_shared<OwnedCode>(std::vector<uint32_t>{0xBE800380u, 0xBF810000u});
+    testing::internal::CaptureStderr();
+    const bool written = note_refused_shader("ps", 0xb000, original(owner), "invalid-root");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(written);
+    EXPECT_NE(log.find("root-resolve failed: " + prefix + "\\0not-a-directory-name"),
+              std::string::npos)
+        << log;
+    EXPECT_EQ(log.find("directory-create failed:"), std::string::npos) << log;
+    EXPECT_EQ(log.find("refused_shaders_"), std::string::npos) << log;
+    EXPECT_NE(log.find("error="), std::string::npos) << log;
+    EXPECT_TRUE(refused_shader_dump_directory().empty());
+    EXPECT_TRUE(refused_shader_already_noted("ps", original(owner)));
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(note_refused_shader("ps", 0xb001, original(owner), "repeat"));
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_EQ(refused_shader_dump_stats().content_records, 1u);
+    EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 1u);
 }

@@ -2,6 +2,7 @@
 
 #include "diagnostics/env_cache.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"   // recompile_coverage: the first unsupported instruction
+#include "host/platform/file_stdio.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <set>
 #include <utility>
+#include <cerrno>
 
 namespace prosper::gpu {
 namespace {
@@ -19,7 +21,7 @@ namespace {
 struct DumpState {
     std::mutex mutex;
     std::string root;            // empty: derive from PROSPER_CAPTURE_DIR on first use
-    std::string directory;       // created lazily on the first refusal
+    std::filesystem::path directory;   // logical path, created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
     bool dir_failure_announced = false;
     std::atomic<bool> full{false};
@@ -52,12 +54,42 @@ uint64_t stage_bit(const char* stage) {
                                        : 0u;
 }
 
-std::string make_directory(DumpState& s) {
+std::error_code stdio_error() {
+    return errno ? std::error_code(errno, std::generic_category())
+                 : std::make_error_code(std::errc::io_error);
+}
+
+void report_io_error(const char* operation, const std::filesystem::path& path,
+                     const std::error_code& error) {
+    // A rejected embedded NUL must not truncate the configured root in the error message.
+    std::string spelling = path.string();
+    size_t offset = 0;
+    while ((offset = spelling.find('\0', offset)) != std::string::npos) {
+        spelling.replace(offset, 1, "\\0");
+        offset += 2;
+    }
+    std::fprintf(stderr,
+                 "[refused-shader] %s failed: %s (error=%d: %s); "
+                 "refusal evidence is incomplete\n",
+                 operation, spelling.c_str(), error.value(), error.message().c_str());
+}
+
+std::filesystem::path make_directory(DumpState& s) {
     if (!s.directory.empty()) return s.directory;
     std::string root = s.root;
     if (root.empty()) {
         const char* capture = PROSPER_ENV_VALUE("PROSPER_CAPTURE_DIR");
         root = capture && *capture ? capture : ".";
+    }
+    std::error_code ec;
+    const std::filesystem::path configured_root(root);
+    const auto absolute_root = host::absolute_file_path(configured_root, ec);
+    if (ec) {
+        if (!s.dir_failure_announced) {
+            s.dir_failure_announced = true;
+            report_io_error("root-resolve", configured_root, ec);
+        }
+        return {};
     }
     // UTC from std::chrono's calendar: no localtime (not thread-safe) and no platform #if.
     const auto now = std::chrono::system_clock::now();
@@ -71,18 +103,18 @@ std::string make_directory(DumpState& s) {
                   (int)ymd.year(), (unsigned)ymd.month(), (unsigned)ymd.day(),
                   (int)hms.hours().count(), (int)hms.minutes().count(),
                   (int)hms.seconds().count(), (unsigned long long)(ns % 1000000));
-    std::error_code ec;
-    const std::filesystem::path dir = std::filesystem::path(root) / name;
-    std::filesystem::create_directories(dir, ec);
+    // Retain the logical absolute name, not a narrow round trip of the native extended name.
+    const std::filesystem::path dir = absolute_root / name;
+    const auto native = host::native_file_path(dir, ec);
+    if (!ec) std::filesystem::create_directories(native, ec);
     if (ec) {
         if (!s.dir_failure_announced) {
             s.dir_failure_announced = true;
-            std::fprintf(stderr, "[refused-shader] cannot create %s (%s); refused shaders are not "
-                                 "dumped this run\n", dir.string().c_str(), ec.message().c_str());
+            report_io_error("directory-create", dir, ec);
         }
         return {};
     }
-    s.directory = dir.string();
+    s.directory = dir;
     return s.directory;
 }
 
@@ -105,26 +137,43 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
                      "are not dumped (set PROSPER_SHADER_DUMP for an unbounded dump)\n",
                      kRefusedShaderDumpMaxPrograms);
     }
-    const std::string dir = make_directory(s);
+    const std::filesystem::path dir = make_directory(s);
     if (dir.empty()) return false;
     char file[64];
     std::snprintf(file, sizeof file, "%s_%llx_%016llx.bin", stage, (unsigned long long)address,
                   (unsigned long long)hash);
-    const std::filesystem::path path = std::filesystem::path(dir) / file;
+    const std::filesystem::path path = dir / file;
     bool written = false;
-    if (FILE* f = std::fopen(path.string().c_str(), "wb")) {
+    std::error_code error;
+    if (FILE* f = host::open_native_file(path, host::FileOpenMode::WriteBinary, error)) {
+        errno = 0;
         written = std::fwrite(code, sizeof(uint32_t), dwords, f) == dwords;
-        written = (std::fclose(f) == 0) && written;
-    }
+        if (!written) report_io_error("raw-write", path, stdio_error());
+        errno = 0;
+        const bool closed = std::fclose(f) == 0;
+        if (!closed) report_io_error("raw-close", path, stdio_error());
+        written = closed && written;
+    } else
+        report_io_error("raw-open", path, error);
     const RecompileCoverage coverage = recompile_coverage(code, dwords);
-    if (FILE* index = std::fopen((std::filesystem::path(dir) / "index.txt").string().c_str(), "a")) {
-        std::fprintf(index, "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
-                            "first_bad_op=0x%x unsupported=%u file=%s %s\n",
-                     stage, (unsigned long long)address, dwords, (unsigned long long)hash,
-                     coverage.first_bad_fmt, coverage.first_bad_op, coverage.unsupported, file,
-                     detail.c_str());
-        std::fclose(index);
-    }
+    const auto index_path = dir / "index.txt";
+    if (FILE* index = host::open_native_file(index_path, host::FileOpenMode::AppendText, error)) {
+        errno = 0;
+        const int result =
+            std::fprintf(index,
+                         "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
+                         "first_bad_op=0x%x unsupported=%u file=%s %s\n",
+                         stage, (unsigned long long)address, dwords, (unsigned long long)hash,
+                         coverage.first_bad_fmt, coverage.first_bad_op, coverage.unsupported, file,
+                         detail.c_str());
+        const auto write_error = stdio_error();
+        // A positive UCRT formatter result does not prove the stream accepted the write (#4147).
+        if (result < 0 || std::ferror(index))
+            report_io_error("index-write", index_path, write_error);
+        errno = 0;
+        if (std::fclose(index) != 0) report_io_error("index-close", index_path, stdio_error());
+    } else
+        report_io_error("index-open", index_path, error);
     std::fprintf(stderr, "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
                          "op=0x%x) -> %s%s\n",
                  stage, (unsigned long long)address, dwords, coverage.first_bad_fmt,
@@ -183,7 +232,7 @@ RefusedShaderDumpStats refused_shader_dump_stats() {
 std::string refused_shader_dump_directory() {
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
-    return s.directory;
+    return s.directory.string();
 }
 
 void reset_refused_shader_dump_for_test(const std::string& root) {

@@ -143,8 +143,10 @@ prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOU
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(WIN32)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_unavailable\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/file_stdio_posix\\.cpp$")
 else()
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_win\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/file_stdio_win\\.cpp$")
 endif()
 if(PROSPER_NATIVE_CLANG_TLS)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
@@ -2970,6 +2972,11 @@ if(TARGET prosper_core)
   # #4273: each distinct refused shader is kept by default, bounded and deduplicated.
   prosper_add_gtest(test_refused_shader_dump
     SOURCES tests/gpu/diagnostics/test_refused_shader_dump.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_file_stdio
+    SOURCES tests/host/platform/test_file_stdio.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
 
