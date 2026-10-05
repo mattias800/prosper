@@ -64,6 +64,7 @@ struct ServiceLogPages {
             return;
         if (!VirtualProtect(guard_page, kPageSize, PAGE_READWRITE | PAGE_GUARD, &old_protect))
             return;
+        ready = true;
     }
     ~ServiceLogPages() {
         VirtualFree(reserved, 0, MEM_RELEASE);
@@ -89,6 +90,7 @@ struct ServiceLogPages {
         if (mprotect(static_cast<uint8_t*>(boundary) + page_size, page_size, PROT_NONE) != 0)
             return;
         guard_page = protected_page;   // PROT_NONE already faults the access, as a guard page would
+        ready = true;
     }
     ~ServiceLogPages() {
         if (reserved != MAP_FAILED) munmap(reserved, page_size);
@@ -97,13 +99,10 @@ struct ServiceLogPages {
     }
     void* boundary_value() const { return static_cast<uint8_t*>(boundary) + page_size - 8; }
 #endif
-    bool complete() const {
-#ifdef _WIN32
-        return reserved && protected_page && boundary && guard_page;
-#else
-        return reserved != MAP_FAILED && protected_page != MAP_FAILED && boundary != MAP_FAILED;
-#endif
-    }
+    // Set only as the constructor's last statement: any early return (a failed allocation OR a
+    // failed protect) leaves the fixture not ready, so a case cannot pass without its guard pages.
+    bool ready = false;
+    bool complete() const { return ready; }
 };
 
 prosper::HleFn ime_keyboard_open() {

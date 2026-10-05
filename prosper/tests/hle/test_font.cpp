@@ -76,9 +76,9 @@ TEST(Font, GlyphMetricsAreDeterministicAndNonZero) {
     float glyph[8]{};
     EXPECT_EQ(font.metrics(addr(handle), 'A', addr(glyph), 0, 0, 0), 0u)
         << "metrics returns success";
-    EXPECT_GT(glyph[0], 0.0f) << "glyph advance is non-zero";
-    EXPECT_GT(glyph[1], 0.0f) << "glyph bearing is non-zero";
-    EXPECT_GT(glyph[4], 0.0f) << "glyph height is non-zero";
+    EXPECT_GT(glyph[0], 0.0f) << "glyph width is non-zero";
+    EXPECT_GT(glyph[1], 0.0f) << "glyph height is non-zero";
+    EXPECT_GT(glyph[4], 0.0f) << "glyph horizontal advance is non-zero";
 }
 
 TEST(Font, TextSourceInitializesThePublicSourceLayout) {
