@@ -326,30 +326,32 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered compare-swap MIMG atomic must refuse fail-visibly.
-// image_atomic_fcmpswap (0x1c) needs a float-compare-and-swap lowering, which
-// does not exist (only plain add over R32_UINT is lowered); accepting it as
-// the add would silently drop the comparison. The opcode comes from the same
-// llvm-mc disassembly sweep that mapped fmin/fmax; the add words are the
-// byte-exact Astro Bot packet. The control is image_atomic_add over the same
-// Uint32 entry, which is lowered. WHEN a fcmpswap lowering lands, THIS ARM
-// GOES RED; replace it with an execution test of the new lowering.
-TEST(GapOpcodeRefusals, ImageAtomicFCmpswapRefuse) {
-    static const uint32_t fcs[2] = {0xf0702108u, 0x00000900u};
+// Unlowered integer-decrement MIMG atomic must refuse fail-visibly.
+// image_atomic_dec (0x1c) needs an integer-decrement lowering, which does not
+// exist (only plain add over R32_UINT is lowered). The opcode is verified
+// against the LLVM checkout's gfx10_asm_mimg.s -- an earlier revision of this
+// arm mislabeled these words fcmpswap from a stale disassembler table; the
+// current suite encodes dec/fcmpswap/fmin/fmax at byte2 0x70/0x74/0x78/0x7c
+// (ops 0x1c/0x1d/0x1e/0x1f). The add words are the byte-exact Astro Bot
+// packet. The control is image_atomic_add over a Uint32 entry in its own
+// table, which is lowered. WHEN a dec lowering lands, THIS ARM GOES RED;
+// replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageAtomicDecRefuse) {
+    static const uint32_t dec[2] = {0xf0702108u, 0x00000900u};
     static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
-    for (const uint32_t* words : {fcs, add}) {
+    for (const uint32_t* words : {dec, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
         EXPECT_EQ(dec.len_dwords, 2u);
     }
-    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1cu);
+    EXPECT_EQ(rdna2_decode_one(dec, 2).opcode, 0x1cu);
     EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
 
     std::vector<uint8_t> backing(8u * 8u * 4u, 0);
-    // NOTE: prosper classifies fcmpswap as sampled-only (like fmin/fmax), so
-    // the refusal entry is a Texture: against a storage entry the descriptor
-    // never resolves and the pin would assert a table miss rather than the
-    // missing lowering (no [mimg-unresolved] line with the Texture entry).
+    // NOTE: prosper classifies dec as sampled-only, so the refusal entry is
+    // a Texture: against a storage entry the descriptor never resolves and
+    // the pin would assert a table miss rather than the missing lowering (no
+    // [mimg-unresolved] line with the Texture entry).
     auto table = [&](DataFormat format, ResourceClass cls) {
         ShaderResourceTable rt;
         ShaderResource image{};
@@ -374,10 +376,10 @@ TEST(GapOpcodeRefusals, ImageAtomicFCmpswapRefuse) {
         0x7e020280u,   // v_mov_b32 v1, 0 (coord)
         0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
     };
-    const ShaderResourceTable float_rt =
-        table(DataFormat::Float32, ResourceClass::Texture);
-    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA0E9ull, 3,
-                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1cu, &float_rt,
+    const ShaderResourceTable int_rt =
+        table(DataFormat::Uint32, ResourceClass::Texture);
+    expect_gap_refusal(program(prologue, {dec[0], dec[1]}), 0xA0E9ull, 3,
+                       {dec[0], dec[1]}, Rdna2Format::MIMG, 0x1cu, &int_rt,
                        config);
     const ShaderResourceTable uint_rt =
         table(DataFormat::Uint32, ResourceClass::StorageImage);
