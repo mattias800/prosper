@@ -4390,11 +4390,22 @@ HLE(ngs2_geom_calc_listener) {
 // a faithful null-backend voice implementation (init succeeds, ports return valid silent parameters)
 // is the alternative if a title ever needs working voice (tracked separately).
 HLE(voice_init_unavailable) {   // sceVoiceInit / sceVoiceInitHQ -> report voice unavailable
-    // Negative SCE_VOICE-class error (facility 0x8041; the guest only sign-checks the return via `js`).
-    // Chosen as a HARD, non-retryable init failure: it is NOT the ALREADY_INITIALIZED code (0x80410004,
-    // which some engines treat as success), so the guest takes its "voice off" branch and does not retry.
+    // Negative error (facility 0x8041; the guest only sign-checks the return via `js`), chosen as a
+    // HARD, non-retryable init failure so the guest takes its "voice off" branch and does not retry.
+    // It is not a libSceVoice code: the shipped module's facility is 0x804E08xx, and its real
+    // already-initialised code is 0x804E0802 (Init with a live context, module VA 0x14517) -- not
+    // 0x80410004 as this comment used to say.
     return (uint64_t)(int64_t)(int32_t)0x80410002;
 }
+
+// libSceVoice.sprx: every port/lifecycle entry point checks the library context first and returns
+// SCE_VOICE_ERROR_LIBVOICE_NOT_INIT (0x804E0801) before touching any argument -- which is the state
+// the real module is in after sceVoiceInit failed (e.g. Start 0x146e0 -> 0x14764, CreatePort
+// 0x15d90 -> 0x15e1f, GetPortInfo 0x161b0 -> 0x161dc). CONFIDENCE: HIGH (read from the shipped module).
+// Do not make Init succeed while these keep refusing: GTA V's success path retries
+// sceVoiceGetPortInfo forever on any negative return (eboot+0x2604348: usleep(100000), then a `js`
+// back-edge), so a half-change would hang it.
+HLE(voice_not_initialized) { return (uint64_t)(int64_t)(int32_t)0x804E0801; }
 
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -4405,6 +4416,27 @@ void register_audio_hle() {
     // standard and HQ init entry points get the same "unavailable" answer.
     R("sceVoiceInit", voice_init_unavailable);
     R("sceVoiceInitHQ", voice_init_unavailable);
+    // The port surface answers not-initialised, as the real module does after a failed Init
+    // (voice_not_initialized): handing out working port handles would contradict Init, and any
+    // title that proceeds past a failed Init anyway lands on error branches instead of dividing by
+    // unwritten voice parameters. No handles, no state, no out-param writes. sceVoiceEnd,
+    // sceVoiceGetMuteFlag and sceVoiceSetMuteFlag (imported by GTA V / Uncharted) are NOT
+    // registered here and still fall to the dispatcher's 0; the module answers 0x804E0801 for them
+    // too when not initialised.
+    R("sceVoiceCreatePort", voice_not_initialized);
+    R("sceVoiceDeletePort", voice_not_initialized);
+    R("sceVoiceStart", voice_not_initialized);
+    R("sceVoiceStop", voice_not_initialized);
+    R("sceVoiceConnectIPortToOPort", voice_not_initialized);
+    R("sceVoiceDisconnectIPortFromOPort", voice_not_initialized);
+    R("sceVoiceGetBitRate", voice_not_initialized);
+    R("sceVoiceGetPortAttr", voice_not_initialized);
+    R("sceVoiceGetPortInfo", voice_not_initialized);
+    R("sceVoiceGetVolume", voice_not_initialized);
+    R("sceVoiceSetVolume", voice_not_initialized);
+    R("sceVoiceSetThreadsParams", voice_not_initialized);
+    R("sceVoiceReadFromOPort", voice_not_initialized);
+    R("sceVoiceWriteToIPort", voice_not_initialized);
     R("sceAudioOutOutput", audio_output);
     R("sceAudioOutOutputs", audio_outputs);
     R("sceAudioOutSetVolume", audio_set_volume);
