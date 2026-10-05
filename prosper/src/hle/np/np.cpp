@@ -139,23 +139,35 @@ HLE(s_npweb_create_user_context) {
     svc_log("sceNpWebApi2CreateUserContext", a0,a1,a2,a3,a4,a5);
     return (uint64_t)(uint32_t)g_npweb_user_context_id.fetch_add(1);
 }
-// --- libSceNpWebApi2 request + push-event surface (22 exports) ---------------------------------
-// The PSN web API has no service behind it on this console, so handles are created but every
-// network round-trip fails fast instead of blocking. Shapes (arity, out-param placement, the
-// 0x80553402/0x80553406 facility) mirror the firmware stub export interface as re-derived in a
-// secondary implementation; CONFIDENCE: MED on the facility values, HIGH on the lifecycle shape,
-// which matches the already-merged Initialize/CreateUserContext pair above and the Auth batch's
-// request lifecycle (local ids out, zero-cost teardown, loud data-path failure).
+// --- libSceNpWebApi2 request + push-event surface (22 of the library's 39 exports) -------------
+// The PSN web API has no service behind it on this signed-out console, so handles are created
+// locally but every call that would reach PSN answers SCE_NP_ERROR_SIGNED_OUT -- the same answer
+// NpManager and the NP sub-libraries give (#4417), so no library tells the guest a different
+// story. Arity and out-param placement are confirmed from guest call sites (The Messenger,
+// Alex Kidd: CreateRequest writes its id through a5; Worms PPSA20052: the push-event
+// constructors RETURN their ids and a negative return is the failure). CONFIDENCE: HIGH on that
+// lifecycle shape. The INVALID_ARGUMENT value 0x80553402 is not in the 3.20 stub dump (it holds
+// no error constants); it comes from a secondary implementation, CONFIDENCE: MED.
 //   Create*/PushEventCreate*/RegisterCallback*  -> local id (positive, never 0)
-//   Abort/Delete/Terminate/Unregister/Start     -> 0 (nothing to tear down or deliver offline)
-//   Send/ReadData/HeaderValue/HeaderLength      -> UNAVAILABLE, out-params untouched
+//   Abort/Delete/Terminate/Unregister           -> 0 (nothing to tear down offline)
+//   Send/ReadData/HeaderValue/HeaderLength      -> SIGNED_OUT, out-params untouched
 //   CheckTimeout (void)                         -> 0 (no timeouts pending offline)
-//   CreatePushContext                           -> UNAVAILABLE (no push service to host it)
+//   CreatePushContext / StartPushContextCallback -> SIGNED_OUT (no push service to host or
+//                                                   start), out-params untouched
 namespace {
 constexpr uint64_t kWebApiErrInvalidArgument = 0x80553402ull;
-constexpr uint64_t kWebApiErrUnavailable = 0x80553406ull;
 std::atomic<int64_t> g_npweb_request_id{1};
 std::atomic<int32_t> g_npweb_push_id{1};
+// Positive ids only: a negative return is the guest's failure test, so a wrapped counter would
+// read as an error. Same guard as s_np_ctx.
+uint64_t next_npweb_push_id() {
+    int32_t id = g_npweb_push_id.fetch_add(1);
+    if (id <= 0) {
+        g_npweb_push_id.store(2);
+        id = 1;
+    }
+    return (uint64_t)(uint32_t)id;
+}
 }  // namespace
 HLE(s_npweb_create_request) {
     svc_log("sceNpWebApi2CreateRequest", a0,a1,a2,a3,a4,a5);
@@ -181,19 +193,19 @@ HLE(s_npweb_delete_user_context) {
 }
 HLE(s_npweb_send_request) {
     svc_log("sceNpWebApi2SendRequest", a0,a1,a2,a3,a4,a5);
-    return kWebApiErrUnavailable;
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_read_data) {
     svc_log("sceNpWebApi2ReadData", a0,a1,a2,a3,a4,a5);
-    return kWebApiErrUnavailable;
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_get_header_value) {
     svc_log("sceNpWebApi2GetHttpResponseHeaderValue", a0,a1,a2,a3,a4,a5);
-    return kWebApiErrUnavailable;
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_get_header_length) {
     svc_log("sceNpWebApi2GetHttpResponseHeaderValueLength", a0,a1,a2,a3,a4,a5);
-    return kWebApiErrUnavailable;
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_check_timeout) {
     svc_log("sceNpWebApi2CheckTimeout", a0,a1,a2,a3,a4,a5);
@@ -205,15 +217,15 @@ HLE(s_npweb_terminate) {
 }
 HLE(s_npweb_push_create_filter) {
     svc_log("sceNpWebApi2PushEventCreateFilter", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+    return next_npweb_push_id();
 }
 HLE(s_npweb_push_create_handle) {
     svc_log("sceNpWebApi2PushEventCreateHandle", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+    return next_npweb_push_id();
 }
 HLE(s_npweb_push_create_pushctx) {
     svc_log("sceNpWebApi2PushEventCreatePushContext", a0,a1,a2,a3,a4,a5);
-    return kWebApiErrUnavailable;
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_push_delete_filter) {
     svc_log("sceNpWebApi2PushEventDeleteFilter", a0,a1,a2,a3,a4,a5);
@@ -229,16 +241,21 @@ HLE(s_npweb_push_delete_pushctx) {
 }
 HLE(s_npweb_push_register_callback) {
     svc_log("sceNpWebApi2PushEventRegisterCallback", a0,a1,a2,a3,a4,a5);
-    // Stored handle, never called: no push service exists offline.
-    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+    // Stored handle, never called: no push service exists offline. A null callback is refused
+    // (secondary implementation; CONFIDENCE: MED on the code).
+    if (!svc_ptrish(a2)) return kWebApiErrInvalidArgument;
+    return next_npweb_push_id();
 }
 HLE(s_npweb_push_register_pushctx_callback) {
     svc_log("sceNpWebApi2PushEventRegisterPushContextCallback", a0,a1,a2,a3,a4,a5);
-    return (uint64_t)(uint32_t)g_npweb_push_id.fetch_add(1);
+    // (userCtx, filterId, cb, arg) at the Worms call site; null cb refused as above.
+    if (!svc_ptrish(a2)) return kWebApiErrInvalidArgument;
+    return next_npweb_push_id();
 }
 HLE(s_npweb_push_start_pushctx_callback) {
     svc_log("sceNpWebApi2PushEventStartPushContextCallback", a0,a1,a2,a3,a4,a5);
-    return 0;
+    // Start is the call that would begin service delivery; there is no context to start.
+    return NP_ERR_SIGNED_OUT;
 }
 HLE(s_npweb_push_unregister_callback) {
     svc_log("sceNpWebApi2PushEventUnregisterCallback", a0,a1,a2,a3,a4,a5);
@@ -844,7 +861,7 @@ void register_np_hle() {
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
     // libSceNpWebApi2 request + push-event surface: handles are created, every network
-    // round-trip fails fast with UNAVAILABLE instead of blocking (see the handlers above).
+    // call that would reach PSN answers SIGNED_OUT instead of blocking (see the handlers above).
     Hle::register_fn("3EI-OSJ65Xc", (HleFn)s_npweb_create_request, "sceNpWebApi2CreateRequest");
     Hle::register_fn("zpiPsH7dbFQ", (HleFn)s_npweb_abort_request, "sceNpWebApi2AbortRequest");
     Hle::register_fn("egOOvrnF6mI", (HleFn)s_npweb_add_header, "sceNpWebApi2AddHttpRequestHeader");
