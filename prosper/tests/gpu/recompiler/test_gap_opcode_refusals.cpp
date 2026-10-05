@@ -324,3 +324,61 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered scalar miscellany must refuse fail-visibly. s_cmovk_i32,
+// s_getreg_b32 and s_call_b64 (SOPK) and s_rfe_b64 (SOP1) have no lowering: a
+// driver-register read, a call and an exception return cannot be modeled as
+// ordinary scalar ALU, and accepting any of them would silently invent
+// register contents or control flow. All words below are llvm-mc gfx1030
+// round-tripped. Controls are s_movk_i32 (SOPK, lowered) and s_mov_b32
+// (SOP1, lowered) in matching slots. WHEN a lowering lands for any of the
+// four, ITS CASE GOES RED; replace it with an execution test of the new
+// lowering.
+TEST(GapOpcodeRefusals, ScalarMiscRefuse) {
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+    };
+    auto sprog = [&](std::vector<uint32_t> inst) {
+        std::vector<uint32_t> code = sprologue;
+        code.insert(code.end(), inst.begin(), inst.end());
+        code.push_back(kEndpgm);
+        return code;
+    };
+    // Controls first: the lowering siblings compile in these exact slots.
+    static const uint32_t movk[1] = {0xb0001234u};   // s_movk_i32 s0, 0x1234
+    {
+        const Rdna2Inst dec = rdna2_decode_one(movk, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x00u);
+    }
+    expect_compiles(sprog({movk[0]}), 0xA0B0ull, "control: s_movk_i32");
+    static const uint32_t movb[1] = {0xbe800301u};   // s_mov_b32 s0, s1
+    expect_compiles(sprog({movb[0]}), 0xA0B1ull, "control: s_mov_b32");
+
+    struct Case {
+        std::vector<uint32_t> words;
+        Rdna2Format fmt;
+        uint32_t opcode;
+        uint64_t addr;
+    };
+    // s_setreg_imm32_b32 (SOPK 0x15, words 0xba801234 + literal) is deliberately
+    // NOT pinned here: the walk stores its trailing literal outside in.words,
+    // so the terminal record prints a zero second dword and the shared
+    // word-exact harness cannot assert it. It gets its own record-shape-aware
+    // arm once that shape is decided, not an assertion on an artifact.
+    const std::vector<Case> cases = {
+        {{0xb1001234u}, Rdna2Format::SOPK, 0x02u, 0xA0B2ull},   // s_cmovk_i32 s0, 0x1234
+        {{0xb9000000u}, Rdna2Format::SOPK, 0x12u, 0xA0B3ull},   // s_getreg_b32 s0, hwreg(0,0,1)
+        {{0xbb001234u}, Rdna2Format::SOPK, 0x16u, 0xA0B5ull},   // s_call_b64 s[0:1], 4660
+        {{0xbe802200u}, Rdna2Format::SOP1, 0x22u, 0xA0B6ull},   // s_rfe_b64 s[0:1]
+    };
+    for (const auto& c : cases) {
+        const Rdna2Inst dec =
+            rdna2_decode_one(c.words.data(), c.words.size());
+        EXPECT_EQ(dec.fmt, c.fmt);
+        EXPECT_EQ(dec.opcode, c.opcode);
+        EXPECT_EQ(dec.len_dwords, (uint32_t)c.words.size());
+        expect_gap_refusal(sprog(c.words), c.addr, 2, c.words, c.fmt, c.opcode);
+    }
+}
