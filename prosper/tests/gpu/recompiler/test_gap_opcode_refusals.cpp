@@ -324,3 +324,70 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered float MIMG atomics must refuse fail-visibly. image_atomic_fmin
+// (0x1d) and image_atomic_fmax (0x1e) need float-typed atomic lowering, which
+// does not exist (only the integer/R32_UINT atomic path is lowered); forcing
+// them through it would silently reinterpret float bits as integers. Opcodes
+// mapped by llvm-mc gfx1030 disassembly sweep; the add words are the
+// byte-exact Astro Bot packet from test_game_compute.cpp. The control is
+// image_atomic_add over a Uint32 entry in its own table, which is lowered.
+// WHEN a float-atomic lowering lands, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
+    static const uint32_t fmin[2] = {0xf0742108u, 0x00000900u};
+    static const uint32_t fmax[2] = {0xf0782108u, 0x00000900u};
+    static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
+    for (const uint32_t* words : {fmin, fmax, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fmin, 2).opcode, 0x1du);
+    EXPECT_EQ(rdna2_decode_one(fmax, 2).opcode, 0x1eu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    // NOTE: the float-atomics entry is a Texture, not a StorageImage: prosper
+    // classifies fmin/fmax as sampled-only, so a storage entry can never
+    // resolve and the pin would assert a table miss rather than the missing
+    // lowering. Against a sampled float entry the descriptor resolves and the
+    // refusal lands at the absent lowering -- the honest gate.
+    auto table = [&](DataFormat format, ResourceClass cls) {
+        ShaderResourceTable rt;
+        ShaderResource image{};
+        image.cls = cls;
+        image.format = format;
+        image.num_components = 1;
+        image.binding = 4;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 0;
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+        return rt;
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(8);   // s0..s7 T# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (coord)
+        0x7e020280u,   // v_mov_b32 v1, 0 (coord)
+        0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
+    };
+    const ShaderResourceTable float_rt =
+        table(DataFormat::Float32, ResourceClass::Texture);
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA0E0ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1du, &float_rt,
+                       config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA0E1ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt,
+                       config);
+    const ShaderResourceTable uint_rt =
+        table(DataFormat::Uint32, ResourceClass::StorageImage);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0E2ull,
+                    "control: image_atomic_add over a Uint32 entry", &uint_rt,
+                    config);
+}
