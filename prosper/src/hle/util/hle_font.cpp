@@ -89,6 +89,10 @@ struct FontFace {
     float slant = 0.0f;
     float weight_x = 1.0f;
     float weight_y = 1.0f;
+    // The weight mode the guest passed to sceFontSetEffectWeight, round-tripped back by
+    // sceFontGetEffectWeight. Stored, never interpreted: no rendering effect in this file
+    // keys off it, and inventing semantics for an unobserved enum would be worse than echoing.
+    uint32_t weight_mode = 0;
     void* renderer = nullptr;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
@@ -511,8 +515,12 @@ int32_t font_set_slant(void* handle, float slant) {
     if (auto* f = face(handle)) f->slant = slant;
     return 0;
 }
-int32_t font_set_weight(void* handle, float x, float y, uint32_t) {
-    if (auto* f = face(handle)) { f->weight_x = x; f->weight_y = y; }
+int32_t font_set_weight(void* handle, float x, float y, uint32_t mode) {
+    if (auto* f = face(handle)) {
+        f->weight_x = x;
+        f->weight_y = y;
+        f->weight_mode = mode;
+    }
     return 0;
 }
 
@@ -720,10 +728,71 @@ int32_t font_render_char_glyph_image(void* handle, uint32_t code, RenderSurface*
 // implementation is the same honest renderer. CONFIDENCE: HIGH on the signature (four call sites
 // in two independent functions); MED that Astro never exercises more than it (one glyph per
 // surface, like Metaphor; vertical-writing layouts are unobserved here).
-int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code,
-                                                RenderSurface* surface, float x, float y,
-                                                GlyphMetrics* metrics, RenderResult* result) {
+int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code, RenderSurface* surface,
+                                                float x, float y, GlyphMetrics* metrics,
+                                                RenderResult* result) {
     return render_glyph(handle, code, surface, x, y, /*have_pen=*/true, metrics, result);
+}
+
+// --- Font render-state remainder: vertical render, plain create/rebind, state getters ---------
+// sceFontRenderCharGlyphImageVertical: the same renderer as the Horizontal twin (signature
+// symmetric across the SDK surface). Vertical-writing layouts are unobserved in any local
+// title, so this runs the horizontal placement the renderer implements. CONFIDENCE: HIGH on
+// the signature, MED on orientation behavior.
+// sceFontCreateLibrary / sceFontCreateRenderer: the plain variants delegate to the WithEdition
+// bodies with edition 0 (delegation confirmed on the reference surface), so these wrappers only
+// shift the out-pointer from a2 to a3 — aliasing the WithEdition handler directly would read a
+// garbage fourth register as the out-pointer.
+// sceFontRebindRenderer(handle): re-attaches the face's own renderer after renderer-side state
+// changed; prosper holds the pointer on the face already, so validating the face IS the work.
+// The scale/effect getters below report exactly what the setters store (weight mode included),
+// which is why they are reads of prosper's own fields rather than new contracts. The Render-
+// prefixed twins read the same fields: prosper keeps no separate render-effect state (same
+// rationale as font_get_metrics), and splitting them would invent one.
+int32_t font_render_char_glyph_image_vertical(void* handle, uint32_t code, RenderSurface* surface,
+                                              float x, float y, GlyphMetrics* metrics,
+                                              RenderResult* result) {
+    return render_glyph(handle, code, surface, x, y, /*have_pen=*/true, metrics, result);
+}
+int32_t font_create_library_plain(const FontMemory* memory, const void* params, void** out) {
+    return font_create_library(memory, params, 0, out);
+}
+int32_t font_create_renderer_plain(const FontMemory* memory, const void* params, void** out) {
+    return font_create_renderer(memory, params, 0, out);
+}
+int32_t font_rebind_renderer(void* handle) {
+    if (!face(handle)) return static_cast<int32_t>(0x80540002u);
+    return 0;
+}
+int32_t font_get_scale(void* handle, float* out_w, float* out_h) {
+    if (!out_w || !out_h) return static_cast<int32_t>(0x80540002u);
+    if (const auto* f = face(handle)) {
+        *out_w = f->width;
+        *out_h = f->height;
+    } else {
+        *out_w = 16.0f;
+        *out_h = 16.0f;
+    }
+    return 0;
+}
+int32_t font_get_slant(void* handle, float* out) {
+    if (!out) return static_cast<int32_t>(0x80540002u);
+    const auto* f = face(handle);
+    *out = f ? f->slant : 0.0f;
+    return 0;
+}
+int32_t font_get_weight(void* handle, float* out_x, float* out_y, uint32_t* out_mode) {
+    if (!out_x || !out_y || !out_mode) return static_cast<int32_t>(0x80540002u);
+    if (const auto* f = face(handle)) {
+        *out_x = f->weight_x;
+        *out_y = f->weight_y;
+        *out_mode = f->weight_mode;
+    } else {
+        *out_x = 1.0f;
+        *out_y = 1.0f;
+        *out_mode = 0;
+    }
+    return 0;
 }
 
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
@@ -830,6 +899,17 @@ void register_font_hle() {
     R("vzHs3C8lWJk", (HleFn)font_close, "sceFontCloseFont");
     R("3OdRkSjOcog", (HleFn)font_bind_renderer, "sceFontBindRenderer");
     R("1QjhKxrsOB8", (HleFn)font_unbind_renderer, "sceFontUnbindRenderer");
+    R("Z2cdsqJH+5k", (HleFn)font_rebind_renderer, "sceFontRebindRenderer");
+    R("nWrfPI4Okmg", (HleFn)font_create_library_plain, "sceFontCreateLibrary");
+    R("u5fZd3KZcs0", (HleFn)font_create_renderer_plain, "sceFontCreateRenderer");
+    R("CkVmLoCNN-8", (HleFn)font_get_scale, "sceFontGetScalePixel");
+    R("GoF2bhB7LYk", (HleFn)font_get_scale, "sceFontGetScalePoint");
+    R("EY38A01lq2k", (HleFn)font_get_scale, "sceFontGetRenderScalePixel");
+    R("FEafYUcxEGo", (HleFn)font_get_scale, "sceFontGetRenderScalePoint");
+    R("ynSqYL8VpoA", (HleFn)font_get_slant, "sceFontGetEffectSlant");
+    R("Gqa5Pp7y4MU", (HleFn)font_get_slant, "sceFontGetRenderEffectSlant");
+    R("d7dDgRY+Bzw", (HleFn)font_get_weight, "sceFontGetEffectWeight");
+    R("woOjHrkjIYg", (HleFn)font_get_weight, "sceFontGetRenderEffectWeight");
     Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
     Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
     Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");
@@ -847,6 +927,9 @@ void register_font_hle() {
     Hle::register_typed("3G4zhgKuxE8", font_render_char_glyph_image, "sceFontRenderCharGlyphImage");
     Hle::register_typed("kAenWy1Zw5o", font_render_char_glyph_image_horizontal,
                         "sceFontRenderCharGlyphImageHorizontal");
+    Hle::register_typed("i6UNdSig1uE", font_render_char_glyph_image_vertical,
+                        "sceFontRenderCharGlyphImageVertical");
+    Hle::register_typed("sw65+7wXCKE", font_set_scale, "sceFontSetScalePoint");
     // Intentional no-op lifecycle/capability surface used during Astro's initialization.
     R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
     R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
