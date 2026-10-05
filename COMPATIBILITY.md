@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-10-03
+Last updated: 2026-10-05
 
 ## Summary
 
@@ -30,7 +30,7 @@ Last updated: 2026-10-03
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ First playable room | [#1867](https://github.com/mattias800/prosper/issues/1867) |
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
-| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat on the reviewed revision. The black-frame regression is **fixed**: the route that produced one uniformly black frame now produces 26 of 26 pixel-distinct composited frames. The `cobra-gameplay` guard is **still red** on structure alone, and the scene draws **without its HUD and with a seam in the sky** ([#2899](https://github.com/mattias800/prosper/issues/2899)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
+| *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | 🚧 Tutorial combat on the reviewed revision. The black-frame regression is **fixed**: the route that produced one uniformly black frame now produces 26 of 26 pixel-distinct composited frames. The `cobra-gameplay` guard is **still red** on structure alone, and on 2026-09-05 the scene drew **without its HUD and with a seam in the sky** ([#2899](https://github.com/mattias800/prosper/issues/2899)). **2026-10-05:** most of the in-game 3D had since been dropped by two recompiler defects and renders again at full resolution — ship, characters, terrain and deck, and the health bar is drawn ([#4508](https://github.com/mattias800/prosper/issues/4508), [#4519](https://github.com/mattias800/prosper/issues/4519)). The guard stays red: at its render scale (4) the sky and lighting come out black ([#4525](https://github.com/mattias800/prosper/issues/4525)) | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🚧 4K title screen on a one-button route; a default launch stops at the game's own auto-save notice, which waits for Cross | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; a route reaches Cyber Space gameplay and the world now renders — 84% of the frame is lit with a correct HUD — but a saturated band dominates the middle of it, so the scene is not yet recognisable | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
