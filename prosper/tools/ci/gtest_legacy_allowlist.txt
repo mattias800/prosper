@@ -156,16 +156,12 @@ tests/hle/test_c11_thread_slots.cpp
 tests/hle/test_cond_clock.cpp
 tests/hle/test_fiber.cpp
 tests/hle/test_file_sync.cpp
-tests/hle/test_font.cpp
 tests/hle/test_font_render.cpp
-tests/hle/test_guard_recursion.cpp
-tests/hle/test_hle_registered.cpp
 tests/hle/test_json2.cpp
 tests/hle/test_libc_alloc.cpp
 tests/hle/test_posix_sem.cpp
 tests/hle/test_pthread_sched_getters.cpp
 tests/hle/test_savedata_capacity.cpp
-tests/hle/test_service_logging.cpp
 tests/hle/test_win_pthread_key_destructor.cpp
 tests/hle/video/test_videodec2_decode.cpp
 tests/host/abi/test_guest_tailjump.cpp
