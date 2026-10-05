@@ -173,11 +173,62 @@ TEST(Font, RebindRendererValidatesTheFace) {
     ASSERT_EQ(astro.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
     void* handle = nullptr;
     ASSERT_EQ(astro.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    // libSceFont.native's RebindRenderer (0xad20): no renderer bound -> 0x80460061; a bound
+    // pointer that is not a renderer -> 0x80460001; a real one -> 0.
+    HleFn bind = Hle::lookup("3OdRkSjOcog");
+    HleFn unbind = Hle::lookup("1QjhKxrsOB8");
+    ASSERT_NE(bind, nullptr);
+    ASSERT_NE(unbind, nullptr);
+    EXPECT_EQ(font.rebind(addr(handle), 0, 0, 0, 0, 0), 0x80460061u) << "no renderer bound yet";
+    uint8_t not_a_renderer[64]{};
+    ASSERT_EQ(bind(addr(handle), addr(not_a_renderer), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(font.rebind(addr(handle), 0, 0, 0, 0, 0), 0x80460001u) << "bound pointer is no renderer";
+    void* renderer = nullptr;
+    ASSERT_EQ(font.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    ASSERT_EQ(bind(addr(handle), addr(renderer), 0, 0, 0, 0), 0u);
     EXPECT_EQ(font.rebind(addr(handle), 0, 0, 0, 0, 0), 0u) << "rebind keeps a live face bound";
+    ASSERT_EQ(unbind(addr(handle), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(font.rebind(addr(handle), 0, 0, 0, 0, 0), 0x80460061u) << "unbound again";
     // A wild pointer would fault in face()'s magic read (guest pointers are dereferenced
     // directly here), so the refusal arm uses valid memory with the wrong magic instead.
     uint8_t decoy[64]{};
-    EXPECT_NE(font.rebind(addr(decoy), 0, 0, 0, 0, 0), 0u) << "rebind refuses a foreign face";
+    EXPECT_EQ(font.rebind(addr(decoy), 0, 0, 0, 0, 0), 0x80460005u) << "rebind refuses a foreign face";
+    EXPECT_EQ(font.rebind(0, 0, 0, 0, 0, 0), 0x80460005u) << "and a NULL one";
+    EXPECT_EQ(astro.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+// The Render-prefixed getters (native 0x95d0 / 0x96a0 / 0x9b70 / 0x99e0) refuse a face with no
+// bound renderer with 0x80460061 and clear their outputs the way a failed handle does; the plain
+// getters on the same face still succeed.
+TEST(Font, RenderGettersNeedABoundRenderer) {
+    const FontState font = font_state();
+    const AstroFont astro = astro_font();
+    ASSERT_TRUE(font.registered());
+    ASSERT_TRUE(astro.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(astro.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(astro.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    float w = 5.0f, h = 5.0f, slant = 5.0f, x = 5.0f, y = 5.0f;
+    uint32_t mode = 9;
+    EXPECT_EQ(font.get_render_scale(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0x80460061u);
+    EXPECT_EQ(w, 0.0f);
+    EXPECT_EQ(h, 0.0f);
+    w = 5.0f;
+    EXPECT_EQ(font.get_render_scale_point(addr(handle), addr(&w), 0, 0, 0, 0), 0x80460061u);
+    EXPECT_EQ(w, 0.0f);
+    EXPECT_EQ(font.get_render_slant(addr(handle), addr(&slant), 0, 0, 0, 0), 0x80460061u);
+    EXPECT_EQ(slant, 0.0f);
+    EXPECT_EQ(font.get_render_weight(addr(handle), addr(&x), addr(&y), addr(&mode), 0, 0),
+              0x80460061u);
+    EXPECT_EQ(x, 1.0f);
+    EXPECT_EQ(y, 1.0f);
+    EXPECT_EQ(mode, 0u);
+    EXPECT_EQ(font.get_scale(addr(handle), addr(&w), 0, 0, 0, 0), 0u) << "the face getter is ungated";
+    // A foreign face is still the handle error, not the renderer one.
+    uint8_t decoy[64]{};
+    EXPECT_EQ(font.get_render_slant(addr(decoy), addr(&slant), 0, 0, 0, 0), 0x80460005u);
     EXPECT_EQ(astro.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
 }
 
@@ -191,6 +242,10 @@ TEST(Font, ScaleSlantWeightRoundTrip) {
     ASSERT_EQ(astro.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
     void* handle = nullptr;
     ASSERT_EQ(astro.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    // The Render twins answer only with a renderer bound (RenderGettersNeedABoundRenderer).
+    void* renderer = nullptr;
+    ASSERT_EQ(font.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    ASSERT_EQ(Hle::lookup("3OdRkSjOcog")(addr(handle), addr(renderer), 0, 0, 0, 0), 0u);
     // Float setters go through their real C++ signatures: an HleFn-cast call would misdeliver
     // floats (xmm vs integer registers), so the bridge path is not what this asserts.
     using SetScaleFn = int32_t (*)(void*, float, float);
