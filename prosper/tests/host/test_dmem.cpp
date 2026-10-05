@@ -171,7 +171,7 @@ static void test_automatic_placement() {
         CHECK(have_fixed && done == 1, "exact later fixed arena map succeeds after automatic startup maps");
         if (bulk_occupant)
             CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xC0111DE5u,
-                  "refused fixed map preserves the bulk occupant at the exact fixed target");
+                  "a later fixed arena never lands inside the automatic bulk backing");
         if (have_fixed && have_automatic)
             CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xD1AEC771u,
                   "the fixed view aliases the earlier automatic direct view");
@@ -180,13 +180,17 @@ static void test_automatic_placement() {
     if (have_bulk) {
         entry.start = bulk + page_len;
         done = -1;
-        CHECK(batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) != 0 &&
-                  done == 0,
-              "fixed different-physical backing still refuses a live bulk overlap");
+        // A fixed map REPLACES the direct view it lands on (kernel MAP_FIXED semantics; Black Flag's
+        // allocator relies on it). Only the replaced page changes: the bulk backing around it is kept.
+        CHECK(batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) == 0 &&
+                  done == 1,
+              "fixed different-physical backing replaces a live bulk page");
         CHECK(*(volatile uint32_t*)(uintptr_t)bulk == 0xB017C041u &&
-              *(volatile uint32_t*)(uintptr_t)(bulk + page_len) == 0xB017D1A0u &&
               *(volatile uint32_t*)(uintptr_t)(bulk + bulk_len - page_len) == 0xB0177A11u,
-              "the later fixed views preserve the distinct automatic bulk backing");
+              "the replaced bulk view keeps its untouched prefix and suffix");
+        if (have_automatic)
+            CHECK(*(volatile uint32_t*)(uintptr_t)(bulk + page_len) == 0xD1AEC771u,
+                  "the replaced page aliases the new physical backing");
     }
     if (have_heap) {
         CHECK(*(volatile uint32_t*)(uintptr_t)heap == 0xC041AB1Eu,
