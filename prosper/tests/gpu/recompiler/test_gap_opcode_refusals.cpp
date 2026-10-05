@@ -557,6 +557,36 @@ TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
                        {round[0]}, Rdna2Format::SOPP, 0x24u);
 }
 
+// Unlowered end-of-program variants must refuse fail-visibly. Only the exact
+// s_endpgm word terminates a stream (rdna2_decode.cpp S_ENDPGM); the saved
+// and ordered forms fall through to the SOPP reject. Accepting either as a
+// plain terminator would silently drop its ordering/save semantics. All words
+// below are llvm-mc gfx1030 round-tripped. The control is s_endpgm in the
+// same slot, which terminates cleanly. WHEN a lowering lands for either
+// variant, ITS CASE GOES RED; replace it with an execution test of the new
+// lowering.
+TEST(GapOpcodeRefusals, EndpgmVariantRefuse) {
+    static const uint32_t saved[1] = {0xbf9b0000u};
+    static const uint32_t ordered[1] = {0xbf9e0000u};
+    for (const uint32_t* words : {saved, ordered}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.len_dwords, 1u);
+        EXPECT_FALSE(dec.is_end) << "variants must not terminate the walk";
+    }
+    EXPECT_EQ(rdna2_decode_one(saved, 1).opcode, 0x1bu);
+    EXPECT_EQ(rdna2_decode_one(ordered, 1).opcode, 0x1eu);
+
+    static const uint32_t endpgm[1] = {0xbf810000u};
+    EXPECT_TRUE(rdna2_decode_one(endpgm, 1).is_end) << "the control is the real terminator";
+    expect_compiles(program(kVop3Prologue, {endpgm[0]}), 0xA120ull,
+                    "control: s_endpgm terminates in the variant slot");
+    expect_gap_refusal(program(kVop3Prologue, {saved[0]}), 0xA121ull, 4, {saved[0]},
+                       Rdna2Format::SOPP, 0x1bu);
+    expect_gap_refusal(program(kVop3Prologue, {ordered[0]}), 0xA122ull, 4, {ordered[0]},
+                       Rdna2Format::SOPP, 0x1eu);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
