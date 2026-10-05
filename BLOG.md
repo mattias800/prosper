@@ -23,7 +23,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Alex Kidd holds 60 fps
 
-Alex Kidd in Miracle World DX used to settle at a random rate between 30 and 60 fps each time you played. Every frame, prosper was copying ~48 MB of finished images back from the GPU for a data copy that never needed them. It now holds the game's 60 fps cap, and Greak and Summer Sports Games skip the same waste ([#4459](https://github.com/mattias800/prosper/pull/4459)).
+Alex Kidd in Miracle World DX used to settle at a random rate between 30 and 60 fps each time you played. Every frame, prosper was copying ~51 MB of finished images back from the GPU for a data copy that never needed them. It now holds the game's 60 fps cap, and Greak skips the same waste ([#4459](https://github.com/mattias800/prosper/pull/4459)). Summer Sports Games still pays most of it; that is next ([#4457](https://github.com/mattias800/prosper/issues/4457)).
 
 ## 2026-10-04
 
