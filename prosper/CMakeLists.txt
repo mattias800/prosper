@@ -1355,8 +1355,8 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
-  # libSceGameUpdate request lifecycle: init-gated ids, offline "no update" checks with
-  # caller-sized zeroed results, request-not-found refusals. Pure, no game dump.
+  # libSceGameUpdate request lifecycle pinned to the shipped sprx: argument-check order, 0x30-byte
+  # param/result structs, 8 request slots, a no-update write-back of `found` only. Pure, no game dump.
   prosper_add_gtest(test_gameupdate
     SOURCES tests/hle/dispatch/test_gameupdate.cpp
     LIBRARIES prosper_core)

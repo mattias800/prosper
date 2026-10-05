@@ -1283,11 +1283,12 @@ HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3
 //   Initialize       already initialized -> 0x80412802.
 //   Terminate        not initialized -> 0x80412801.
 //   CreateRequest    not initialized -> 0x80412801; 8 fixed request slots, a 9th -> 0x80412806;
-//                    ids are minted from 0x20000000 and wrap back to it after 0x2ffffffe.
+//                    ids are minted from 0x20000000 up to 0x2fffffff, then wrap back.
 //   Check(id, param*, result*)
 //                    id <= 0 -> 0x80412805; NULL param/result -> 0x80412803; each struct leads with a
 //                    u64 size that must be 0x30 -> 0x80412804; param's reserved words (+0xc..+0x2c)
-//                    must be zero and its check type 0 or 1 -> 0x80412803; then not initialized ->
+//                    must be zero and its check type 0 (1 only in a PS4 process) -> 0x80412803;
+//                    then not initialized ->
 //                    0x80412801, unknown id -> 0x80412805, aborted request -> 0x80412807.
 //                    The result write-back touches only `found` (+8), one byte at +9, and 11 version
 //                    bytes at +0xc when found.
@@ -1350,7 +1351,7 @@ HLE(s_gameupdate_create) {
     for (GameUpdateSlot& slot : g_gameupdate_slots) {
         if (slot.id != 0) continue;
         const int32_t id = g_gameupdate_next_id;
-        g_gameupdate_next_id = id >= kGameUpdateLastId ? kGameUpdateFirstId : id + 1;
+        g_gameupdate_next_id = id > kGameUpdateLastId ? kGameUpdateFirstId : id + 1;
         slot = {id, false};
         return (uint64_t)id;
     }
@@ -1368,7 +1369,9 @@ HLE(s_gameupdate_check) {
     if (param_size != 0x30 || result_size != 0x30) return GAME_UPDATE_ERROR_INVALID_SIZE;
     uint32_t param[12] = {};
     if (!svc_copy_bytes(a1, param, sizeof(param))) return GAME_UPDATE_ERROR_INVALID_ARG;
-    if (param[2] > 1) return GAME_UPDATE_ERROR_INVALID_ARG;   // check type at +8
+    // Check type at +8: the firmware allows type 1 only in a PS4 process (sceKernelIsPs4Process),
+    // so a PS5 title may pass only 0.
+    if (param[2] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;
     for (int i = 3; i < 12; ++i)
         if (param[i] != 0) return GAME_UPDATE_ERROR_INVALID_ARG;   // reserved +0xc..+0x2c
     {

@@ -96,7 +96,7 @@ TEST(GameUpdate, CreateMintsFromTheFirmwareRangeIntoEightSlots) {
     for (int32_t& id : ids) {
         id = (int32_t)call_nid("sceGameUpdateCreateRequest");
         EXPECT_GE(id, 0x20000000);
-        EXPECT_LE(id, 0x2ffffffe);
+        EXPECT_LE(id, 0x2fffffff);
     }
     EXPECT_NE(ids[0], ids[1]);
     EXPECT_EQ(call_nid("sceGameUpdateCreateRequest"), kTooManyRequests) << "only 8 slots";
@@ -133,8 +133,12 @@ TEST(GameUpdate, CheckValidatesInTheFirmwareOrder) {
                   kInvalidSize)
             << "result size " << bad;
     }
-    GuStruct type2 = make_param(2);
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&type2), addr(&result)), kInvalidArg);
+    for (uint32_t type : {1u, 2u}) {   // type 1 is PS4-process only
+        GuStruct typed = make_param(type);
+        EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&typed), addr(&result)),
+                  kInvalidArg)
+            << "check type " << type;
+    }
     GuStruct reserved = make_param();
     reserved.b[0x2c] = 1;
     EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&reserved), addr(&result)),
@@ -151,8 +155,8 @@ TEST(GameUpdate, CheckReportsNoUpdateAndTouchesOnlyFound) {
     reset();
     ASSERT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
     const int32_t id = (int32_t)call_nid("sceGameUpdateCreateRequest");
-    for (uint32_t type : {0u, 1u}) {
-        GuStruct param = make_param(type), result = make_result();
+    {
+        GuStruct param = make_param(0), result = make_result();
         ASSERT_EQ(call_nid("sceGameUpdateCheck", (uint64_t)id, addr(&param), addr(&result)), 0u);
         uint64_t size = 0;
         std::memcpy(&size, result.b, 8);
