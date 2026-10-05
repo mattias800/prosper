@@ -433,6 +433,24 @@ HLE(s_npuds_destroy_property_array) {
     svc_log("sceNpUniversalDataSystemDestroyEventPropertyArray", a0,a1,a2,a3,a4,a5);
     return uds_destroy(a0, UdsKind::Array);
 }
+HLE(s_npuds_destroy_handle) {
+    svc_log("sceNpUniversalDataSystemDestroyHandle", a0,a1,a2,a3,a4,a5);
+    // CreateHandle hands out id 1 with no table behind it (s_npuds_create), so DestroyHandle
+    // validates against the only id in circulation: 1 succeeds, anything else is a handle no
+    // create ever produced. Unregistered, the dispatcher answered 0 for both — and Uncharted
+    // forwards this result (#3630 bucket D), so a garbage handle read as success here.
+    // NID AUIHb7jUX3I resolved via nid_hash against the firmware stub export list.
+    return (uint32_t)a0 == 1 ? 0 : kUdsInvalidArgument;
+}
+HLE(s_npuds_object_set_int32) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetInt32", a0,a1,a2,a3,a4,a5);
+    // (Object*, key*, int32): the same validation as the SetArray sibling — a live object
+    // (event-owned objects included) and a pointer-like key. The value travels by register.
+    // NID YE4dbtbz6OE resolved via nid_hash against the firmware stub export list; Dreaming
+    // Sarah imports it.
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
 
 // sceNpSessionSignalingInitialize(const InitParam*): Silksong passes an input-only parameter block
 // (a version word, a size and thread attributes) and reads no out-parameter. Signaling is the
@@ -998,6 +1016,8 @@ void register_np_hle() {
     Hle::register_fn("W-0xwY0ZMjw", (HleFn)s_npuds_destroy_property_array, "sceNpUniversalDataSystemDestroyEventPropertyArray");
     Hle::register_fn("Hm7qubT3b70", (HleFn)s_npuds_create_property_array, "sceNpUniversalDataSystemCreateEventPropertyArray");
     Hle::register_fn("s6W4Zl4Slgk", (HleFn)s_npuds_create_property_object, "sceNpUniversalDataSystemCreateEventPropertyObject");
+    Hle::register_fn("AUIHb7jUX3I", (HleFn)s_npuds_destroy_handle, "sceNpUniversalDataSystemDestroyHandle");
+    Hle::register_fn("YE4dbtbz6OE", (HleFn)s_npuds_object_set_int32, "sceNpUniversalDataSystemEventPropertyObjectSetInt32");
 #ifndef _WIN32
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
     // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.

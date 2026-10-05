@@ -132,3 +132,42 @@ TEST(NpUdsProperties, CreateEventObjectsAcceptArrays) {
     EXPECT_EQ(u.object_set_array(properties2, ptr("platforms"), array, 0, 0, 0), 0u);
     EXPECT_EQ(u.destroy_array(array, 0, 0, 0, 0, 0), 0u);
 }
+
+// DestroyHandle validates against the only handle id in circulation (#3630 bucket D forwards
+// this result, and Dreaming Sarah imports it). Unregistered, any handle read as success.
+TEST(NpUdsProperties, DestroyHandleValidatesTheHandle) {
+    register_builtin_hle();
+    HleFn create = Hle::lookup("hT0IAEvN+M0");
+    HleFn destroy = Hle::lookup("AUIHb7jUX3I");
+    ASSERT_NE(create, nullptr) << "CreateHandle must stay registered";
+    ASSERT_NE(destroy, nullptr) << "DestroyHandle must be registered";
+    int32_t handle = 0;
+    ASSERT_EQ(create(ptr(&handle), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(handle, 1) << "CreateHandle hands out id 1";
+    EXPECT_EQ(destroy(1, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(0, 0, 0, 0, 0, 0), kInvalidArgument) << "id 0 was never handed out";
+    EXPECT_EQ(destroy(2, 0, 0, 0, 0, 0), kInvalidArgument) << "foreign id is refused";
+    EXPECT_EQ(destroy(0xDEADu, 0, 0, 0, 0, 0), kInvalidArgument) << "garbage is refused";
+}
+
+// EventPropertyObjectSetInt32 (YE4dbtbz6OE resolved via nid_hash; Dreaming Sarah imports it):
+// same validation as the SetArray sibling — a live object and a pointer-like key.
+TEST(NpUdsProperties, ObjectSetInt32ValidatesItsObject) {
+    const Uds u = registered();
+    ASSERT_TRUE(u.all());
+    HleFn set_int32 = Hle::lookup("YE4dbtbz6OE");
+    ASSERT_NE(set_int32, nullptr) << "SetInt32 must be registered";
+    uint64_t object = 0, array = 0;
+    ASSERT_EQ(u.create_object(ptr(&object), 0, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(u.create_array(ptr(&array), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set_int32(object, ptr("score"), 100, 0, 0, 0), 0u);
+    EXPECT_EQ(set_int32(0x7c0000000ull, ptr("score"), 100, 0, 0, 0), kInvalidArgument)
+        << "stale handle refused";
+    EXPECT_EQ(set_int32(array, ptr("score"), 100, 0, 0, 0), kInvalidArgument)
+        << "an array is not an object";
+    EXPECT_EQ(set_int32(object, 0, 100, 0, 0, 0), kInvalidArgument) << "null key refused";
+    EXPECT_EQ(u.destroy_object(object, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set_int32(object, ptr("score"), 100, 0, 0, 0), kInvalidArgument)
+        << "a destroyed handle is no longer accepted";
+    EXPECT_EQ(u.destroy_array(array, 0, 0, 0, 0, 0), 0u);
+}

@@ -1550,6 +1550,14 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # sceSaveDataDelete (#2081): unregistered, it answered SCE_OK while deleting nothing
+  # (37-title reach). Drives the real NIDs -- Mount3 creates, Umount2 releases, Delete removes --
+  # with a persistence arm (gone from disk) and refusal arms (null/traversal/live-mount).
+  prosper_add_gtest(test_savedata_delete
+    SOURCES tests/hle/test_savedata_delete.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   # #3654: the mount wrappers carry the requested blocks into a per-save allocation record, and
   # GetMountInfo reports blocks / freeBlocks from that record and the files in the save. Includes a
   # re-exec of itself to prove the allocation survives a new process.

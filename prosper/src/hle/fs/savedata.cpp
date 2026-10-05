@@ -1307,6 +1307,48 @@ HLE(s_savedata_dirname_search_ps4) {
 }
 
 
+// sceSaveDataDelete(const SceSaveDataDelete* del) (S1GkePI17zQ, libSceSaveData_native).
+// OrbisSaveDataDelete { u32 userId @0; u32 pad; const TitleId* titleId @8; const DirName*
+// dirName @16; u32 unused; u8 reserved[32]; s32 pad } — 64 bytes (shadPS4 savedata.cpp;
+// MED on the layout, HIGH on the single-struct-pointer shape). Unregistered, it answered
+// SCE_OK while deleting nothing (#2081: 37-title reach — "reports a deletion that did not
+// happen").
+//
+// prosper runs single-identity, so userId/titleId select nothing: the delete keys on dirName
+// under the current title namespace (save_paths, #2734). titleId is never dereferenced, so a
+// stale pointer cannot fault; dirName is range-gated before the bounded 32-byte name read.
+//   null del, unreadable del/dirName, empty or traversal dirName  -> PARAMETER
+//   dirName of the live mount                                     -> PARAMETER (LOW: the facility
+//      has no BUSY code; removing a live mount's backing dir is what is being refused)
+//   dir present                                                  -> removed, 0
+//   dir absent                                                   -> 0 (idempotent; shadPS4-compatible;
+//      the postcondition "absent" holds either way). MED.
+HLE(s_savedata_delete) {
+    svc_log("sceSaveDataDelete", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !svc_ptrish(a0)) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* del = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(del + 0x10);
+    if (!dirname || !svc_ptrish((uint64_t)(uintptr_t)dirname)) return SAVE_DATA_ERR_PARAMETER;
+    char name[33]{};
+    size_t n = 0;
+    while (n < 32 && dirname[n]) { name[n] = dirname[n]; n++; }
+    if (!savedata_dirname_ok(name)) return SAVE_DATA_ERR_PARAMETER;
+    const std::string mounted = savedata0_mounted_dir();
+    if (!mounted.empty() && std::filesystem::path(mounted).filename() == name)
+        return SAVE_DATA_ERR_PARAMETER;
+    const std::string target = savedata0_dir() + "/" + name;
+    std::error_code ec;
+    if (std::filesystem::is_directory(target, ec)) {
+        std::filesystem::remove_all(target, ec);
+        if (ec) {
+            fprintf(stderr, "[svc] sceSaveDataDelete: could not remove \"%s\": %s\n",
+                    target.c_str(), ec.message().c_str());
+            return SAVE_DATA_ERR_INTERNAL;
+        }
+    }
+    return 0;
+}
+
 // Registration for this library, called by register_builtin_hle(). One entry point per
 // Sony library keeps every handler `static` to the translation unit implementing it (#3735).
 void register_savedata_hle() {
@@ -1348,6 +1390,8 @@ void register_savedata_hle() {
     Hle::register_fn("85zul--eGXs", (HleFn)s_savedata_setparam,  "sceSaveDataSetParam");
     Hle::register_fn("c88Yy54Mx0w", (HleFn)s_savedata_saveicon,  "sceSaveDataSaveIcon");
     Hle::register_fn("XgvSuIdnMlw", (HleFn)s_savedata_getparam,  "sceSaveDataGetParam");
+    // #2081: unregistered, this answered SCE_OK while deleting nothing (37-title reach).
+    Hle::register_fn("S1GkePI17zQ", (HleFn)s_savedata_delete,   "sceSaveDataDelete");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space
     Hle::register_fn("j8xKtiFj0SY", (HleFn)s_savedata_get_event, "sceSaveDataGetEventResult");
