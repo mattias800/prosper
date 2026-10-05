@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-05
 
+### Space Adventure Cobra's world is back in gameplay
+
+Space Adventure Cobra renders its in-game 3D again: the ship, the characters and the enemies, and the desert, rocks and deck around them ([issue #4508](https://github.com/mattias800/prosper/issues/4508), [issue #4519](https://github.com/mattias800/prosper/issues/4519)).
+
+<p align="center"><img src="assets/screenshots/cobra-gameplay-4508-a-before.webp" alt="Space Adventure Cobra tutorial combat before the fix: flat silhouettes for the characters over a flat blue floor, no ship and no terrain; Linux prosper-app, RADV, cobra/reach-title-or-gameplay.pad, flip 4400"></p>
+<p align="center"><img src="assets/screenshots/cobra-gameplay-4508-a-after.webp" alt="Space Adventure Cobra tutorial combat after the fix: the ship overhead, lit characters and enemies, dunes and rocks behind a metal deck; Linux prosper-app, RADV, cobra/reach-title-or-gameplay.pad, flip 4400"></p>
+<p align="center"><img src="assets/screenshots/cobra-gameplay-4508-b-before.webp" alt="Space Adventure Cobra a few seconds later before the fix, still silhouettes over flat colour; Linux prosper-app, RADV, cobra/reach-title-or-gameplay.pad, flip 5000"></p>
+<p align="center"><img src="assets/screenshots/cobra-gameplay-4508-b-after.webp" alt="Space Adventure Cobra a few seconds later after the fix with the full scene; Linux prosper-app, RADV, cobra/reach-title-or-gameplay.pad, flip 5000"></p>
+
 ### Summer Sports Games' track is terracotta again
 
 The running track and the grass in Summer Sports Games look as they did before late September again; they had been rendering pale pink and washed out ([issue #4496](https://github.com/mattias800/prosper/issues/4496)).
