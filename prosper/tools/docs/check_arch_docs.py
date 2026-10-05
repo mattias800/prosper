@@ -51,6 +51,10 @@ EXIT_OK, EXIT_VIOLATION, EXIT_UNEVALUATED = 0, 1, 2
 SPEC_DIR = Path("prosper/docs/spec")
 ADR_DIR = Path("prosper/docs/adr")
 RATCHET = Path("prosper/tools/ci/check_arch_ratchet.py")
+ALARM_RULES = Path("prosper/src/diagnostics/perf/perf_alarm_rules.cpp")
+# A git revision as CI and humans pass it. Refuses a leading "-" so a --base value can never be
+# read by git as an option.
+SAFE_REV_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/@~^-]*")
 LAYERS_DOC = SPEC_DIR / "layers.md"
 
 KIND_STATUSES = {
@@ -124,6 +128,20 @@ def rule_sections(body: str) -> list[tuple[str, str]]:
         nxt = next((h.start() for h in heads if h.start() > m.start()), len(body))
         out.append((m.group(1), body[m.start() : nxt]))
     return out
+
+
+def load_alarm_rules(root: Path) -> frozenset[str]:
+    """The perf-alarm rule names, read from `rule_names()` in perf_alarm_rules.cpp."""
+    path = root / ALARM_RULES
+    if not path.is_file():
+        raise EvaluationError(f"{ALARM_RULES} not found under {root}")
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r"rule_names\(\)\s*\{.*?=\s*\{(.*?)\};", text, re.S)
+    names = frozenset(re.findall(r'"([a-z0-9-]+)"', m.group(1))) if m else frozenset()
+    # Far below today's count; fewer means the initializer moved, not that the alarms went away.
+    if len(names) < 5:
+        raise EvaluationError(f"could not read the alarm rule names from {ALARM_RULES}")
+    return names
 
 
 def load_ratchet(root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -243,7 +261,11 @@ def check_adrs(root: Path, parsed) -> tuple[list[Finding], set[str]]:
 
 
 def check_rules(
-    root: Path, parsed, adrs: set[str], ratchet_rules: tuple[str, ...]
+    root: Path,
+    parsed,
+    adrs: set[str],
+    ratchet_rules: tuple[str, ...],
+    alarm_rules: frozenset[str],
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: dict[str, str] = {}
@@ -323,6 +345,14 @@ def check_rules(
                 elif kind == "adr" and arg not in adrs:
                     findings.append(
                         Finding("enforcement", rel, f"{rule_id}: adr:{arg} does not exist")
+                    )
+                elif kind == "runtime" and arg and arg not in alarm_rules:
+                    findings.append(
+                        Finding(
+                            "enforcement",
+                            rel,
+                            f"{rule_id}: runtime:{arg} is not a perf-alarm rule in {ALARM_RULES.name}",
+                        )
                     )
                 elif kind in ("ctest", "ci", "runtime") and not arg:
                     findings.append(Finding("enforcement", rel, f"{rule_id}: {kind}: needs a name"))
@@ -434,11 +464,13 @@ def check_immutable(root: Path, rev: str) -> list[Finding]:
 
 
 def evaluate(root: Path, base: str | None = None, write: bool = False) -> list[Finding]:
+    if base is not None and not SAFE_REV_RE.fullmatch(base):
+        raise EvaluationError(f"--base {base!r} is not a git revision")
     ratchet_rules, order = load_ratchet(root)
     findings, parsed = check_frontmatter(root)
     adr_findings, adrs = check_adrs(root, parsed)
     findings += adr_findings
-    findings += check_rules(root, parsed, adrs, ratchet_rules)
+    findings += check_rules(root, parsed, adrs, ratchet_rules, load_alarm_rules(root))
     findings += check_layer_table(root, order, write)
     if base:
         findings += check_immutable(root, base)

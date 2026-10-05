@@ -36,5 +36,6 @@ rule into the build.
 
 ## Approval
 
-Merged as #4199, #4198 (delta mode) and #4215 (2026-10-02) and enforced in the `Docs` CI job; recorded here as a
-backfill.
+The gate, with its delta mode, merged as #4199 (closing issue #4198) and the structural rules as
+#4215, both on 2026-10-02; the `platform-stub` rule, cited here through `PLAT-2`, followed as #4366 on
+2026-10-04. All are enforced in the `Docs` CI job. Recorded here as a backfill.

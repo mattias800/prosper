@@ -51,5 +51,5 @@ the largest of these proposals and depends on ADR 0004 (backend location) and AD
 
 ## Approval
 
-Requires the project owner's acceptance; the survey in point 4 may proceed beforehand, since it
+Requires the project owner's acceptance; the survey described after the numbered list may proceed beforehand, since it
 changes no code.

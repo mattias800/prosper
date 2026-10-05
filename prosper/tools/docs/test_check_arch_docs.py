@@ -19,6 +19,11 @@ import check_arch_docs as cad  # noqa: E402
 REPO = HERE.parents[2]
 
 RATCHET_STUB = 'RULES = ("r1", "r2")\nLAYER_ORDER = ("low", "high")\n'
+ALARMS_STUB = (
+    "const std::vector<const char*>& rule_names() {\n"
+    '    static const std::vector<const char*> names = {"a1", "a2", "a3", "a4", "gpu-sync-wait"};\n'
+    "    return names;\n}\n"
+)
 
 SPEC_RULES = """---
 kind: spec
@@ -33,7 +38,7 @@ last-verified: 2026-10-05 abcdef01
 
 Text.
 Status: accepted
-Enforcement: ratchet:r1
+Enforcement: ratchet:r1, runtime:gpu-sync-wait
 
 ### TST-2 -- second rule
 
@@ -68,6 +73,7 @@ def layers_doc() -> str:
 def build(root: Path, **overrides: str | None) -> Path:
     files = {
         "prosper/tools/ci/check_arch_ratchet.py": RATCHET_STUB,
+        "prosper/src/diagnostics/perf/perf_alarm_rules.cpp": ALARMS_STUB,
         "prosper/docs/spec/layers.md": layers_doc(),
         "prosper/docs/spec/rules.md": SPEC_RULES,
         "prosper/docs/spec/AGENTS.md": "# no frontmatter needed here\n",
@@ -109,12 +115,26 @@ def test_the_repository_itself_is_clean():
             "Enforcement: ratchet:r1",
             "TST-1: no `Status:` line",
         ),
-        ("Enforcement: ratchet:r1\n", "\n", "TST-1: no `Enforcement:` line"),
+        (
+            "Enforcement: ratchet:r1, runtime:gpu-sync-wait\n",
+            "\n",
+            "TST-1: no `Enforcement:` line",
+        ),
         ("Status: proposed (adr:0001)", "Status: proposed", "names its ADR"),
         ("Status: proposed (adr:0001)", "Status: maybe", "Status is `accepted` or"),
         ("Status: proposed (adr:0001)", "Status: proposed (adr:0042)", "adr:0042 does not exist"),
         ("Enforcement: ratchet:r1", "Enforcement: ratchet:nope, ratchet:r1", "ratchet:nope is not"),
-        ("Enforcement: ratchet:r1", "Enforcement: a careful reader", "names no ratchet:"),
+        (
+            "Enforcement: ratchet:r1, runtime:gpu-sync-wait",
+            "Enforcement: a careful reader",
+            "names no ratchet:",
+        ),
+        ("runtime:gpu-sync-wait", "runtime:gpu-sync-wiat", "runtime:gpu-sync-wiat is not"),
+        (
+            "Enforcement: ratchet:r1",
+            "Enforcement: adr:0042, ratchet:r1",
+            "TST-1: adr:0042 does not",
+        ),
         ("review: (a reason no tool can check it)", "review:", "must say in parentheses"),
         ("Enforcement: ratchet:r1", "Enforcement: ctest:", "ctest: needs a name"),
         ("### TST-1 -- first rule", "### TST-1 first rule", "heading must read"),
@@ -125,6 +145,18 @@ def test_each_spec_violation_is_reported(tmp_path, old, new, expect):
     root = build(tmp_path, **{"prosper/docs/spec/rules.md": SPEC_RULES.replace(old, new, 1)})
     found = checks(root)
     assert any(expect in f for f in found), found
+
+
+@pytest.mark.parametrize("base", ["-oops", "--output=x", "HEAD;rm", ""])
+def test_a_base_that_is_not_a_revision_cannot_be_evaluated(tmp_path, base):
+    with pytest.raises(cad.EvaluationError):
+        cad.evaluate(build(tmp_path), base=base)
+
+
+def test_unreadable_alarm_rules_cannot_be_evaluated(tmp_path):
+    root = build(tmp_path, **{"prosper/src/diagnostics/perf/perf_alarm_rules.cpp": "// moved\n"})
+    with pytest.raises(cad.EvaluationError):
+        cad.evaluate(root)
 
 
 def test_an_uncited_ratchet_rule_is_reported(tmp_path):

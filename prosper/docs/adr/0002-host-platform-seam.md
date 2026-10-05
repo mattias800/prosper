@@ -1,7 +1,7 @@
 ---
 kind: adr
 status: accepted
-date: 2026-10-02
+date: 2026-10-04
 ---
 
 # ADR 0002: Reach the OS through one interface per service, one backend file per OS
@@ -36,5 +36,6 @@ the first migration of each service.
 
 ## Approval
 
-Adopted as charter policy ("Platform arms hold primitives only", `CLAUDE.md`) with the seam
-document in #4215; recorded here as a backfill.
+The seam document landed in #4215 (2026-10-02). The decision became charter policy ("Platform arms
+hold primitives only", `CLAUDE.md`) in #4367 on 2026-10-04, alongside the `platform-stub` ratchet
+rule in #4366. Recorded here as a backfill; the date is that of the charter adoption.

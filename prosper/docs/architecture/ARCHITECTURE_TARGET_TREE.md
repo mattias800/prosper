@@ -186,8 +186,11 @@ kept because the ratchet's `platform-stub` hint and other documents cite it.
 2. **Portable logic is written once; a platform arm holds primitives only** -- spec `PLAT-1` and
    `PLAT-2`, accepted, ADR 0002. Mechanically enforced only in part: `platform-ifdef` and
    `layer-include` catch directives and includes, `platform-stub` (#4366) catches handlers named
-   `HLE(*_stub)`, and a reduced copy under another name remains a review rule.
-3. **Each engine ships a replay test that runs on both hosts** -- ADR 0003, decision point 5.
+   `HLE(*_stub)`, and a reduced copy under another name remains a review rule (see the stub-arm row
+   in "Bad practices").
+3. **Each engine ships a replay test that runs on both hosts** -- ADR 0003, decision point 5. It
+   extends the seam's one-test-per-interface rule from the OS services to the engines above them,
+   so an unported platform arm is found by a test rather than title by title.
 
 ## Historical title observations
 

@@ -91,16 +91,17 @@ Enforcement: ratchet:platform-stub, review: (the ratchet sees only handlers name
 ### TITLE-1 -- no title ids in shared-code conditions
 
 Shared code MUST NOT branch on a title id. Behaviour one title needs is a general rule the evidence
-supports, derived from what the guest presents. Naming the evidence in a comment is fine; tests
-may use title ids as fixture data.
+supports, derived from what the guest presents, or isolated code with its measurement
+(`src/gpu/recompiler/gta5/`), as the charter states. Naming the evidence in a comment is fine;
+tests may use title ids as fixture data.
 Status: accepted
 Enforcement: ratchet:title-id
 
 ### TITLE-2 -- no title-named modules
 
-No directory or module in shared code is named after a title. The existing one
-(`src/gpu/recompiler/gta5/`) may shrink, never grow, and is generalised into properties of the
-shader and its data.
+No new title-named directory or module is added to shared code. The existing isolated one
+(`src/gpu/recompiler/gta5/`) may shrink, never grow; target-tree move 10 proposes generalising it into
+properties of the shader and its data.
 Status: accepted
 Enforcement: ratchet:title-dir
 

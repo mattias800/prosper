@@ -13,8 +13,10 @@ date: 2026-10-05
 `*_for_test` variants in `rdna2_to_spirv.hpp`), and its behaviour depends on more than its inputs.
 Measured on 61557f29 with `grep`:
 
-- 10 files in `src/gpu/recompiler/` read environment switches (`getenv`, `env_cache`,
-  `env_submit`), so the same bytes can recompile differently depending on the shell.
+- 11 files under `src/gpu/recompiler/` (subfolders included) read environment switches, counting
+  files with a live, non-comment `getenv`, `PROSPER_ENV_ON`/`PROSPER_ENV_VALUE`, `env_u64_or*`,
+  `env_cache` or `env_submit` use (a raw grep gives 12, the twelfth a comment in
+  `rdna2_to_spirv.hpp`). So the same bytes can recompile differently depending on the shell.
 - `raster_quad_collector.hpp` and `rdna2_raw_x2_lifetime.cpp` include `gpu/execute/`, and two files
   include `gpu/state/` facts -- the recompiler reaches up into the code that calls it.
 - 11 lines include `gpu/diagnostics/diagnostic_selectors.hpp`.
