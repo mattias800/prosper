@@ -318,6 +318,34 @@ TEST(RawWideReplayedLoad, AnSmemThatIsNotAPlainLoadKeepsReplayUncertain) {
     EXPECT_EQ(numeric_blocker(instructions), "load-re-executed");
 }
 
+TEST(RawWideReplayedLoad, LoadedWordsCopiedIntoVccAreReadByItsImplicitReaders) {
+    // No compare: s_mov_b64 vcc, s[16:17] moves the V#'s own words into VCC, and the
+    // s_cbranch_vccz that follows branches on them. Nothing names VCC as an operand (#4527).
+    const auto branch = program({.compare = false});
+    ASSERT_EQ(at(branch, 5).fmt, Rdna2Format::SOP1);   // the move
+    ASSERT_EQ(at(branch, 6).fmt, Rdna2Format::SOPP);   // s_cbranch_vccz
+    EXPECT_TRUE(flagged(branch));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(branch, &pc), "implicit-vcc-reader");
+    EXPECT_EQ(pc, 6u);
+
+    // v_cndmask_b32 v2, v0, v3 (e32: the mask is VCC, implicitly) ahead of the branch.
+    const auto select = program({.compare = false, .after_mask = {0x02040700u}});
+    ASSERT_EQ(at(select, 6).fmt, Rdna2Format::VOP2);
+    ASSERT_EQ(at(select, 6).opcode, 0x1u);
+    EXPECT_TRUE(flagged(select));
+    EXPECT_EQ(numeric_blocker(select, &pc), "implicit-vcc-reader");
+    EXPECT_EQ(pc, 6u);
+}
+
+TEST(RawWideReplayedLoad, AFreshMaskInVccIsNotAnImplicitRead) {
+    // The live shape, plus the same e32 select: VCC was just written from the compare's pair,
+    // so the select and the branch consume a mask, not the load.
+    const auto instructions = program({.after_mask = {0x02040700u}});
+    ASSERT_EQ(at(instructions, 8).fmt, Rdna2Format::VOP2);
+    EXPECT_FALSE(flagged(instructions)) << numeric_blocker(instructions);
+}
+
 TEST(RawWideReplayedLoad, CopyCarriedRoundTheBackEdgeReachesItsReader) {
     // v_mov_b32 v0, s40 then s_mov_b32 s40, s18. On the first iteration s40 is unrelated to the
     // load when it is read; the copy only reaches the reader on the NEXT one. The old rule gave

@@ -180,6 +180,21 @@ public:
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04u || in.opcode == 0x05u))
                 return blocked(in.pc, "scc-branch-on-derived-value");
+            // Readers of VCC that never name it (#4527): the e32 select and carry-in forms and the
+            // vccz/vccnz branches, the same list sgpr_dead_at_merge keeps. They consume the pair as
+            // a lane mask, so they are harmless exactly when VCC IS one: a fresh compare into VCC,
+            // or a transfer from an independent mask root, which is what masks[106] records. With
+            // a derived word in the pair and no such fact, the "mask" is the load's own bytes --
+            // `s_mov_b64 vcc, s[16:17]` straight after the load, then a select or a branch.
+            //
+            // Wave width does not enter into it. In Wave64 a fresh compare wrote both words. In
+            // Wave32 it wrote only vcc_lo, a derived word may survive in vcc_hi, and these readers
+            // do not look at vcc_hi there.
+            if ((state.regs.test(106) || state.regs.test(107)) && !state.masks.test(106) &&
+                ((in.fmt == Rdna2Format::VOP2 &&
+                  (in.opcode == 0x01u || (in.opcode >= 0x28u && in.opcode <= 0x2au))) ||
+                 (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06u || in.opcode == 0x07u))))
+                return blocked(in.pc, "implicit-vcc-reader");
             if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x08u || in.opcode == 0x09u) &&
                 !state.masks.test(126))
                 return blocked(in.pc, "exec-branch-on-dependent-exec");
