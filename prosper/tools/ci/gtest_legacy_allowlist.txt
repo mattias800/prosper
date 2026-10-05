@@ -166,7 +166,6 @@ tests/hle/test_posix_sem.cpp
 tests/hle/test_pthread_sched_getters.cpp
 tests/hle/test_savedata_capacity.cpp
 tests/hle/test_service_logging.cpp
-tests/hle/test_win_pthread_key_destructor.cpp
 tests/hle/video/test_videodec2_decode.cpp
 tests/host/abi/test_guest_tailjump.cpp
 tests/host/abi/test_guest_varargs.cpp

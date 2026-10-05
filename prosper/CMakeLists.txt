@@ -2112,9 +2112,9 @@ if(TARGET prosper_core)
     target_link_libraries(test_win_exception_delivery PRIVATE prosper_core)
     add_test(NAME win_exception_delivery COMMAND test_win_exception_delivery)
 
-    add_executable(test_win_pthread_key_destructor tests/hle/test_win_pthread_key_destructor.cpp)
-    target_link_libraries(test_win_pthread_key_destructor PRIVATE prosper_core)
-    add_test(NAME win_pthread_key_destructor COMMAND test_win_pthread_key_destructor)
+    prosper_add_gtest(test_win_pthread_key_destructor
+      SOURCES tests/hle/test_win_pthread_key_destructor.cpp
+      LIBRARIES prosper_core)
 
     add_executable(test_win_kernel_is_stack tests/host/image/test_win_kernel_is_stack.cpp)
     target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)
