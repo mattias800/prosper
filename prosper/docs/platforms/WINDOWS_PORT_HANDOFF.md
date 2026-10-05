@@ -404,8 +404,66 @@ that thread waits on becomes the focus, so matching signals from other threads a
 - Note that #2117 narrowed the allowance during review: its PR body still describes the withdrawn first
   cut, which accepted any committed page.
 
+- **The host's own allocations must not live in the guest's address range, and by default on
+  Windows they did.** A PE linked with `HIGH_ENTROPY_VA` — the default for current binutils and for
+  lld — has the base of its bottom-up allocations (main-thread stack, PEB/TEBs, heaps, then every
+  later `VirtualAlloc(NULL)`) drawn from the low terabyte, which is exactly where the guest's
+  range `[16 GiB, 1008 GiB)` lives. So the host's memory sat at a different place inside the
+  guest's range on every launch. Most of the time nothing notices. A UE4 title notices one launch
+  in five or so: its 512 GiB MallocBinned3 arena must cover `[0x7c00000000, 0xa000000000)`
+  wherever it is placed, a host allocation there gets the reservation refused, and the title
+  deadlocks in its allocator bootstrap before printing anything (#4426).
+  The fix has two halves, and the second exists because of the first. **(1)** An executable that
+  boots a guest is linked through `prosper_hosts_a_guest()` (`prosper/CMakeLists.txt`), which
+  clears the flag; its bottom-up allocations then start below 16 MiB and the guest's range starts
+  out empty. **(2)** `boot_program()` first reserves whatever is free below 4 GiB at that moment
+  (`host::confine_host_allocations_above_4gib`), so an allocation that needs fresh address space
+  from then on — a new thread's stack above all, and guest thread stacks are host allocations —
+  lands in `[4 GiB, 16 GiB)`: above the values that code taking guest addresses reads as
+  immediates, below what the guest places.
+  What to keep in mind.
+  - The symptom that should send you here is *placement that varies between launches of the same
+    binary* — an arena at `0x7c00000000` on one run and `0x2000000000` on the next was this, one
+    notch short of fatal.
+  - **(2) is best effort, not a floor.** What existed before the boot stays below 4 GiB: the main
+    thread's stack, the frontend's early allocations, and any heap segment already there, which
+    keeps serving small allocations. It runs once, so low address space freed later is not
+    reserved again. Measured on Kena: 15-16 thread stacks stayed below 4 GiB and 93-126 landed in
+    `[4, 16)` GiB; which threads the 15-16 are was not traced.
+  - **Low host memory is live memory.** A truncated or byte-shifted guest pointer in
+    `[64 KiB, 4 GiB)` can now land on the host's pre-boot stacks and heap instead of faulting, where
+    a position-independent Linux build has nothing mapped there. Keep it in mind when a corruption
+    shows up only on Windows.
+  - **Guest requests below 4 GiB meet the host's reservation.** A fixed guest reservation there
+    fails and a hinted one is placed elsewhere; a path that commits at the hint without reserving
+    (`sceKernelBatchMap`'s flexible op, through `win_commit`) can still commit pages INSIDE that
+    reservation. No title is known to ask for any of these.
+  - **Host-placed guest memory is now always low.** The few guest-visible allocations prosper
+    places with an unconstrained host call (the primary guest stack, `win_commit(0, …)`, the legacy
+    reserve fallback) land in `[4, 16)` GiB on every launch instead of at a random point of the low
+    terabyte. Two consumers have address floors above that and would ignore such a pointer:
+    `hle_audio.cpp` drops a waveform block pointer below 8 GiB, and `agc_shader_layout.cpp` skips a
+    buffer descriptor whose base is below 64 GiB. Neither is known to be handed such memory.
+  - **The host has `[4, 16)` GiB, 12 GiB, to itself.** prosper's own SSE4a chain cache is a fixed
+    allocation just under 16 GiB and fails soft if the host got there first. Past 16 GiB the host's
+    lowest-first allocations spill into the gaps of the guest's FIXED map — between module bases,
+    then the import-stub window, then the runtime-PRX pool — not into the automatic window. Nobody
+    has measured a long session against that (3 GiB at 14 s of a Kena boot); reserving the guest's
+    range up front is #4513.
+  - The instrument for "what is in the guest's range" is `host::query_guest_range_occupancy`; a
+    huge reservation that cannot be placed now prints it (`[memhle] reserve FAILED …`).
+
 ## Ruled out
 
+- **Clearing `HIGH_ENTROPY_VA` for EVERY executable is the fix for the guest-range collision.**
+  Rejected by the test suite the first time it ran (#4426). It does keep the guest's range free,
+  but it also drops every host stack and heap below 4 GiB, and eight tests failed — `EopWrite`,
+  `WaitBarrier`, `IndirectDispatchDeviceRoute`, `guest_mapping_lease` and four
+  `shader_recompile_cache` cases — each passing again with only that header bit set back in the
+  same binary. They hand host buffers to code that takes guest addresses, and that code tells an
+  address from an immediate by "above 4 GiB" in places (`dma_data_address_source`, for one). The
+  same would have applied to a guest thread's stack, which is a host allocation. Hence a per-target
+  flag plus the boot-time reservation described under *Gotchas*, not a global link option.
 - **A positive `fprintf` character count proves a Windows diagnostic write succeeded.** Falsified
   by the native large-seek fixture on 2026-10-02 (MinGW GCC 16.1/UCRT): redirected to a read-only
   regular-file descriptor, `fprintf` returned 19 while setting `errno=EBADF` (9). The independent

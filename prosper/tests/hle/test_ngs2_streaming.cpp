@@ -96,7 +96,7 @@ TEST(Ngs2Streaming, Contract) {
         CHECK(call_raw("uu94irFOGpA", voice, PTR(chain)) == 0, "VoiceControl feed (format + block)");
 
         uint8_t out[512];
-        RenderInfo render{PTR(out), sizeof out, 0, 2};
+        RenderInfo render{PTR(out), sizeof out, 0x18, 2};   // 0x18: a type the native module takes
         // First render starts the stream clock; then advance wall-clock and re-render.
         CHECK(call_raw("i0VnXM-C9fc", system, PTR(&render), 1) == 0, "SystemRender after feed");
         uint32_t flags1 = 0;

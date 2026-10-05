@@ -30,6 +30,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 #include <chrono>
 #include <thread>
 #include <deque>
@@ -234,6 +235,10 @@ struct AvpPlayer {
     AvpFileReplace file{};
     int32_t num_fb = 0;
     bool auto_start = false, have_source = false, synthetic = false;
+    // The source's container type as libSceAvPlayer.native classifies it at AddSource: the
+    // AddSourceEx details' sourceType when non-zero, else the URI extension (avp_source_type_from_uri).
+    // sceAvPlayerSetTrickSpeed only accepts a trick speed for types 1 (MP4 family) and 2 (WebM).
+    uint32_t source_type = 0;
     bool playing = false, paused = false, stop_fired = false;
     // Set by a successful sceAvPlayerJumpToTime, cleared by the first frame delivered after it.
     // A seek repositions the player and must publish the new position even while the guest holds
@@ -921,22 +926,29 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
 }
 HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); return 0; }
 // --- AvPlayer remainder: trick speed and bandwidth window -----------------------------------------
-// Contracts from the shipped libSceAvPlayer sprx (testdata/sprx), not from a secondary table.
-// s32 sceAvPlayerSetTrickSpeed(handle, int32 speed) -- libSceAvPlayer export av8Z++94rs0: a NULL handle
-// answers 0x806a0001; speed 0, and any speed in -399..-1 or 1..399 other than 100, answers 0x806a0004;
-// any other speed (100 included) is handed to an inner setter whose failure answers 0x806a0002, and
-// which fails unless the player has a ready source in a playable state. Modelled here as "no source ->
-// 0x806a0002"; the play-state half of that gate is not. No trick-play backend exists (the media clock
-// runs at wall rate), so a valid speed other than 100 is accepted but NOT honoured -- logged once so the
-// gap stays visible. CONFIDENCE: HIGH on the refusals and the source gate; MED on the state gate.
+// Contracts from libSceAvPlayer.native.sprx -- the module PS5 titles link (titles in the local corpus
+// import sceAvPlayerSetAvailableBandwidth and sceAvPlayerGetStreamInfoEx, which only it exports; the
+// plain libSceAvPlayer.sprx is the PS4 build). Module vaddrs below.
+// s32 sceAvPlayerSetTrickSpeed(handle, int32 speed) -- export av8Z++94rs0 (0x3c0) tail-calls 0x4ab0,
+// which answers 0x806a0001 for a NULL or unknown handle and maps the player's inner setter (0x9ac0):
+//   no source                                    -> 0x806a0002   (checked FIRST, before the speed)
+//   speed in -399..399 other than 100 (0 included) -> 0x806a0004
+//   a source type other than 1 (.mp4/.m4v/.m4a/.mov) or 2 (.webm), e.g. HLS -> 0x806a0004
+//   otherwise the speed is clamped to +-3200 and handed to the source; 0.
+// Not modelled: a title built with SDK 2.x passing 100 while the player's state machine is in state
+// 4 returns 0 before the type gate (0x9b8a), and the source's own setter can fail. No trick-play
+// backend exists (the media clock runs at wall rate), so a valid speed other than 100 is accepted but
+// NOT honoured -- logged once so the gap stays visible. CONFIDENCE: HIGH on the refusals and their
+// order; MED on the extension classifier's edge cases (see avp_source_type_from_uri).
 HLE(s_avp_trickspeed) {
     svc_log("sceAvPlayerSetTrickSpeed", a0, a1, a2, a3, a4, a5);
     const int32_t speed = (int32_t)a1;
     std::lock_guard<std::mutex> lk(g_avp_mx);
-    if (!a0 || g_avp.find(a0) == g_avp.end()) return 0x806a0001ull;
-    if (speed == 0) return 0x806a0004ull;
+    auto it = a0 ? g_avp.find(a0) : g_avp.end();
+    if (it == g_avp.end()) return 0x806a0001ull;
+    if (!it->second.have_source) return 0x806a0002ull;
     if (speed != 100 && speed > -400 && speed < 400) return 0x806a0004ull;
-    if (!g_avp.find(a0)->second.have_source) return 0x806a0002ull;
+    if (it->second.source_type != 1 && it->second.source_type != 2) return 0x806a0004ull;
     if (speed != 100) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
@@ -958,8 +970,39 @@ HLE(s_avp_bandwidth) {
     if (it->second.have_source) return 0x806a0002ull;
     return 0;
 }
+// The container type libSceAvPlayer.native derives from a source URI (0x7d70): for a "scheme://" URI
+// the path ends at the first '?' or '#'; the extension runs from the last '.' to the next '/' (or the
+// end) and must be at least four characters; its first four characters, case-insensitively, select
+// .mp4/.m4v/.m4a/.mov -> 1, and its first five .webm -> 2 or .m3u8 -> 8. Anything else is 0, which
+// the native AddSource refuses (prosper's does not). CONFIDENCE: MED on the edge cases.
+static uint32_t avp_source_type_from_uri(const char* uri) {
+    if (!uri) return 0;
+    std::string_view path(uri);
+    if (const size_t colon = path.find(':');
+        colon != std::string_view::npos && path.substr(colon, 3) == "://") {
+        const size_t cut = path.find_first_of("?#");
+        if (cut != std::string_view::npos) path = path.substr(0, cut);
+    }
+    const size_t dot = path.rfind('.');
+    if (dot == std::string_view::npos) return 0;
+    std::string_view ext = path.substr(dot);
+    if (const size_t slash = ext.find('/'); slash != std::string_view::npos) ext = ext.substr(0, slash);
+    if (ext.size() < 4) return 0;
+    auto starts = [&](const char* want, size_t n) {
+        if (ext.size() < n) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char)ext[i]) != want[i]) return false;
+        return true;
+    };
+    if (starts(".mp4", 4) || starts(".m4v", 4) || starts(".m4a", 4) || starts(".mov", 4)) return 1;
+    if (starts(".webm", 5)) return 2;
+    if (starts(".m3u8", 5)) return 8;
+    return 0;
+}
+
 // Begin a source: resolve/open it, fire READY, and (auto_start) begin playback with PLAY.
-static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
+// `explicit_type` is the AddSourceEx details' sourceType (0 = derive it from the URI).
+static uint64_t avp_add_source(uint64_t handle, const char* guest_path, uint32_t explicit_type = 0) {
     if (!guest_path || !*guest_path) return 0x806a0001ull;
 
     if (avp_log()) {
@@ -1158,6 +1201,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
             } else {
                 AvpPlayer& p = it->second;
                 p.guest_path = guest_path;
+                p.source_type = explicit_type ? explicit_type : avp_source_type_from_uri(guest_path);
                 p.have_source = true; p.synthetic = false;
                 p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0;
                 p.paused = false; p.stop_fired = false; p.seek_deliver = false;
@@ -1202,6 +1246,7 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
         } else {
             AvpPlayer& p = it->second;
             p.guest_path = guest_path;
+            p.source_type = explicit_type ? explicit_type : avp_source_type_from_uri(guest_path);
             p.have_source = true; p.synthetic = synthetic;
             p.poll = 0; p.audio_poll = 0; p.active_poll = 0; p.last_ts_ms = 0; p.paused = false;
             p.stop_fired = false; p.seek_deliver = false;
@@ -1250,8 +1295,9 @@ HLE(s_avp_addsource)   {   // s32 sceAvPlayerAddSource(handle, const char* filen
 HLE(s_avp_addsourceex) {   // s32 sceAvPlayerAddSourceEx(handle, AvPlayerUriType, AvPlayerSourceDetails*)
     svc_log("sceAvPlayerAddSourceEx", a0,a1,a2,a3,a4,a5);
     const char* path = nullptr;
-    if (auto* d = (const AvpSourceDetails*)PW(a2)) path = d->uri.name;
-    return avp_add_source(a0, path);
+    uint32_t source_type = 0;
+    if (auto* d = (const AvpSourceDetails*)PW(a2)) { path = d->uri.name; source_type = d->source_type; }
+    return avp_add_source(a0, path, source_type);
 }
 // The shared body of sceAvPlayerStart and sceAvPlayerStartEx: begin playback of a player whose
 // source was added with auto_start false, and fire AVP_PLAY outside the player lock.
