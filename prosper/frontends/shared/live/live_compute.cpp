@@ -1736,7 +1736,10 @@ struct VulkanComputeContext {
         if (indirect_scratch_memory) release_memory(indirect_scratch_memory);
         // Before the pool is emptied: release_cached_memory() frees every ACTIVE allocation too,
         // so releasing the scratch afterwards misses in the pool and frees it a second time.
-        bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
+        try {   // release_memory() takes the pool mutex; a destructor must not throw
+            bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
+        } catch (...) {
+        }
         release_cached_buffers();
         release_cached_images();
         release_cached_memory();
