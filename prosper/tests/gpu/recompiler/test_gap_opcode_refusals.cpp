@@ -324,3 +324,37 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered 64-bit DS (LDS) operations must refuse fail-visibly. ds_add_u64
+// and ds_or_b32's 64-bit form need the workgroup/LDS wave model that only the
+// mbcnt/readlane path has begun to build -- accepting them would silently
+// compute over the wrong lane set. Words below are llvm-mc gfx1030
+// round-tripped (assembled, disassembled, same mnemonic back). The control is
+// ds_add_u32 in the same slot, the 32-bit sibling the recompiler lowers.
+// WHEN a 64-bit LDS lowering lands, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, Ds64Refuse) {
+    static const uint32_t add_u64[2] = {0xd9000000u, 0x00000100u};
+    static const uint32_t or_b64[2] = {0xd9280000u, 0x00000100u};
+    static const uint32_t add_u32[2] = {0xd8000000u, 0x00000100u};
+    for (const uint32_t* words : {add_u64, or_b64, add_u32}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::DS);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(add_u64, 2).opcode, 0x40u);
+    EXPECT_EQ(rdna2_decode_one(or_b64, 2).opcode, 0x4au);
+    EXPECT_EQ(rdna2_decode_one(add_u32, 2).opcode, 0x00u);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5 (address)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5 (data)
+        0x7e040280u,   // v_mov_b32 v2, 0 (data high half)
+    };
+    expect_compiles(program(prologue, {add_u32[0], add_u32[1]}), 0xA090ull,
+                    "control: ds_add_u32 in the 64-bit slot");
+    expect_gap_refusal(program(prologue, {add_u64[0], add_u64[1]}), 0xA091ull, 3,
+                       {add_u64[0], add_u64[1]}, Rdna2Format::DS, 0x40u);
+    expect_gap_refusal(program(prologue, {or_b64[0], or_b64[1]}), 0xA092ull, 3,
+                       {or_b64[0], or_b64[1]}, Rdna2Format::DS, 0x4au);
+}
