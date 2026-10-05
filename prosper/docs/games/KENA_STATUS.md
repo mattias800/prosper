@@ -185,8 +185,10 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
    stores `last := cnt` unconditionally, so a late lower counter rewinds it and the next event completes a token
    a second time; its tracking entry is gone and the guest dereferences null (`eboot+0x16bd26b`). Two deferred
    posts could read the ring's high-water mark as N and N+1 and post them in the opposite order. Reading the
-   mark and posting it are now one step. 12 of 64 launches before; with the fix, 0 of 21 booted launches posted
-   out of order or faulted. Shared code: any UE4 title using this listener.
+   mark and posting it are now one step. Before: 12 of 64 launches died this way (the 64 include launches that
+   hung first, so the rate among booted launches was higher). With the fix: 0 of 21 booted launches faulted, and
+   a detector built for that measurement (not in the tree) saw no out-of-order post in any of them, against 4 of
+   12 with the ordering removed. Shared code: any UE4 title using this listener.
 
 ## Ruled out
 
