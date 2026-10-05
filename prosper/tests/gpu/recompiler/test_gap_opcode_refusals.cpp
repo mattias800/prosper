@@ -326,25 +326,30 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 }
 
 // Unlowered float MIMG atomics must refuse fail-visibly. image_atomic_fmin
-// (0x1d) and image_atomic_fmax (0x1e) need float-typed atomic lowering, which
+// (0x1e) and image_atomic_fmax (0x1f) need float-typed atomic lowering, which
 // does not exist (only the integer/R32_UINT atomic path is lowered); forcing
-// them through it would silently reinterpret float bits as integers. Opcodes
-// mapped by llvm-mc gfx1030 disassembly sweep; the add words are the
-// byte-exact Astro Bot packet from test_game_compute.cpp. The control is
-// image_atomic_add over a Uint32 entry in its own table, which is lowered.
-// WHEN a float-atomic lowering lands, ITS CASE GOES RED; replace it with an
-// execution test of the new lowering.
+// them through it would silently reinterpret float bits as integers.
+// image_atomic_fcmpswap (0x1d) needs a float compare-swap lowering. Opcodes
+// verified against the LLVM checkout's gfx10_asm_mimg.s (an earlier revision
+// of this arm mislabeled all three by one from a stale disassembler table --
+// the numbers below are what the current suite's CHECK lines encode). The add
+// words are the byte-exact Astro Bot packet from test_game_compute.cpp. The
+// control is image_atomic_add over a Uint32 entry in its own table, which is
+// lowered. WHEN a lowering lands for any of the three, ITS CASE GOES RED;
+// replace it with an execution test of the new lowering.
 TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
-    static const uint32_t fmin[2] = {0xf0742108u, 0x00000900u};
-    static const uint32_t fmax[2] = {0xf0782108u, 0x00000900u};
+    static const uint32_t fcs[2] = {0xf0742108u, 0x00000900u};
+    static const uint32_t fmin[2] = {0xf0782108u, 0x00000900u};
+    static const uint32_t fmax[2] = {0xf07c2108u, 0x00000900u};
     static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
-    for (const uint32_t* words : {fmin, fmax, add}) {
+    for (const uint32_t* words : {fcs, fmin, fmax, add}) {
         const Rdna2Inst dec = rdna2_decode_one(words, 2);
         EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
         EXPECT_EQ(dec.len_dwords, 2u);
     }
-    EXPECT_EQ(rdna2_decode_one(fmin, 2).opcode, 0x1du);
-    EXPECT_EQ(rdna2_decode_one(fmax, 2).opcode, 0x1eu);
+    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1du);
+    EXPECT_EQ(rdna2_decode_one(fmin, 2).opcode, 0x1eu);
+    EXPECT_EQ(rdna2_decode_one(fmax, 2).opcode, 0x1fu);
     EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
 
     std::vector<uint8_t> backing(8u * 8u * 4u, 0);
@@ -379,11 +384,14 @@ TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
     };
     const ShaderResourceTable float_rt =
         table(DataFormat::Float32, ResourceClass::Texture);
-    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA0E0ull, 3,
-                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1du, &float_rt,
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA0E0ull, 3,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &float_rt,
                        config);
-    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA0E1ull, 3,
-                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt,
+    expect_gap_refusal(program(prologue, {fmin[0], fmin[1]}), 0xA0E1ull, 3,
+                       {fmin[0], fmin[1]}, Rdna2Format::MIMG, 0x1eu, &float_rt,
+                       config);
+    expect_gap_refusal(program(prologue, {fmax[0], fmax[1]}), 0xA0E3ull, 3,
+                       {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &float_rt,
                        config);
     const ShaderResourceTable uint_rt =
         table(DataFormat::Uint32, ResourceClass::StorageImage);
