@@ -37,12 +37,13 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
                           source_dwords));
         }
         if (refused_shader_already_noted(tag, original)) continue;
-        char detail[160];
+        char detail[256];
         std::snprintf(
-            detail, sizeof detail, "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx",
+            detail, sizeof detail, "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx%s%s",
             static_cast<unsigned long long>(shaders.command_order), shaders.vs_words,
             shaders.gs_words, shaders.fs_words, static_cast<unsigned long long>(shaders.es_address),
-            static_cast<unsigned long long>(shaders.ps_address));
+            static_cast<unsigned long long>(shaders.ps_address), shaders.refusal ? " refusal=" : "",
+            shaders.refusal ? shaders.refusal : "");
         note_refused_shader(tag, address, original, detail);
     }
 }

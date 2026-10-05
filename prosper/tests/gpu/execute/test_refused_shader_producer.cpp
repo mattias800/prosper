@@ -4,6 +4,8 @@
 #include "fixtures/test_scratch.h"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <gtest/gtest.h>
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -236,6 +239,75 @@ TEST_F(RefusedShaderProducer, GraphicsRewriteKeepsOnlyRefusedStageAndSuccessfulN
     EXPECT_TRUE(realize_draw_item(state, &packet, 3, std::size(vertex_words), false, item));
     EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 2u);
     EXPECT_EQ(recorded_words().size(), 2u) << "a successful rewritten neighbor is never evidence";
+}
+
+TEST_F(RefusedShaderProducer, OwnedWaveGateRefusalKeepsTheProgramAndItsReason) {
+    // #4555. A fragment program with a numeric raw-wide load and a v_readfirstlane is routed to
+    // the owned-wave path, and that path's gate can refuse the draw before any recompile is
+    // attempted. The drop is counted as shader-recompile/fragment, but nothing used to keep the
+    // program: GTA V lost ~2,500 draws a run to one such program and left no copy of it.
+    //   0  v_mov_b32 v1, 0
+    //   1  s_load_dwordx4 s[16:19], s[28:29], 0xf0     numeric: s18 is read by a v_mov below
+    //   3  s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+    //   5  v_mov_b32 v0, s18
+    //   6  v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17] ; s_cbranch_vccz +1 ; s_branch 1
+    //  11  v_readfirstlane vcc_lo, v1 ; s_endpgm
+    alignas(256) static const uint32_t fragment[] = {
+        0x7e020280u, 0xf408040eu, 0xfa0000f0u, 0xf4280208u, 0xfa0000c0u, 0x7e000212u, 0x7c1a14f9u,
+        0x86869080u, 0xbeea0410u, 0xbf860001u, 0xbf82fff6u, 0x7ed40501u, 0xbf810000u,
+    };
+    {
+        std::vector<Rdna2Inst> decoded;
+        ASSERT_EQ(rdna2_walk(fragment, std::size(fragment), decoded), std::size(fragment));
+        ASSERT_FALSE(rdna2_raw_wave_wide_data_loads(decoded).empty())
+            << "the fixture must be a program the classifier routes to owned waves";
+    }
+    static ComputeShaderBlob blob;   // two SH registers and a header: the PS pair fits as well
+    {
+        prosper::register_agc_hle();
+        const auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        ASSERT_TRUE(create_shader);
+        blob.registers[0] = {P::SPI_SHADER_PGM_LO_PS, 0};
+        blob.registers[1] = {P::SPI_SHADER_PGM_HI_PS, 0};
+        blob.header = {};
+        blob.header.file_header = 0x34333231u;
+        blob.header.version = 0x18;
+        blob.header.sh_registers =
+            reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(blob.registers) -
+                                          reinterpret_cast<uintptr_t>(&blob.header.sh_registers));
+        blob.header.shader_size = static_cast<uint32_t>(sizeof fragment);
+        blob.header.num_sh_registers = 2;
+        void* registered = nullptr;
+        ASSERT_EQ(create_shader(reinterpret_cast<uint64_t>(&registered),
+                                reinterpret_cast<uint64_t>(&blob.header),
+                                reinterpret_cast<uint64_t>(fragment), 0, 0, 0),
+                  0u);
+        ASSERT_EQ(registered, &blob.header);
+    }
+    const auto address = reinterpret_cast<uint64_t>(fragment);
+    ASSERT_TRUE(graphics_program_requires_owned_waves(address));
+    // No fragment launch state is set, so the gate refuses on its first register check.
+    auto state = graphics_state(fragment);
+    GpuState::Draw packet;
+    packet.index_count = 3;
+    packet.command_order = 4555;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        DrawItem item;
+        OperationRealizationFailure failure;
+        ASSERT_FALSE(
+            realize_draw_item(state, &packet, 3, std::size(vertex_words), false, item, &failure));
+        EXPECT_EQ(failure.reason, RealizationFailureReason::ShaderRecompile);
+    }
+    const std::vector<uint32_t> expected(std::begin(fragment), std::end(fragment));
+    ASSERT_EQ(recorded_words(), (std::vector<std::vector<uint32_t>>{expected}))
+        << "one copy of the refused fragment program, however many draws it lost";
+    EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 1u);
+    std::ifstream index(fs::path(refused_shader_dump_directory()) / "index.txt");
+    const std::string lines((std::istreambuf_iterator<char>(index)), {});
+    EXPECT_NE(lines.find("ps addr=0x"), std::string::npos) << lines;
+    EXPECT_NE(lines.find("refusal=draw-wave-known-fragment64-launch-unavailable"),
+              std::string::npos)
+        << lines;
 }
 
 TEST_F(RefusedShaderProducer, PreKeyGraphicsGuardsStillKeepOriginalEvidence) {
