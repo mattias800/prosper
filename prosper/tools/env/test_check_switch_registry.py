@@ -55,6 +55,11 @@ def test_the_repository_itself_is_clean():
     assert csr.evaluate(REPO)[0] == []
 
 
+def test_a_switch_read_only_from_objective_c_is_seen(tmp_path):
+    root = build(tmp_path, **{"prosper/frontends/v.mm": 'getenv("PROSPER_MAC_ONLY");'})
+    assert "unregistered: PROSPER_MAC_ONLY -- add a row with its class" in problems(root)
+
+
 def test_a_name_with_trailing_underscore_is_a_prefix_not_a_switch(tmp_path):
     root = build(tmp_path, **{"prosper/src/d.cpp": 'std::string p = "PROSPER_RENDER_";\n'})
     assert problems(root) == []

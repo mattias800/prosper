@@ -50,7 +50,8 @@ EXIT_OK, EXIT_VIOLATION, EXIT_UNEVALUATED = 0, 1, 2
 
 REGISTRY = Path("prosper/tools/env/switch_registry.txt")
 SCAN_ROOTS = (Path("prosper/src"), Path("prosper/frontends"), Path("prosper/tests/fixtures"))
-SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".inc"}
+# Objective-C++ is listed because the macOS video backend (frontends/video_vt) reads switches.
+SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".m", ".mm"}
 CLASSES = ("host-capability", "diagnostic", "selector", "unclassified")
 NAME_RE = re.compile(r'"(PROSPER_[A-Z0-9_]*[A-Z0-9])"')
 ROW_RE = re.compile(r"^(PROSPER_[A-Z0-9_]+)\s+(\S+)(?:\s+(#[0-9]+))?\s*(#\s.*)?$")
