@@ -19,7 +19,7 @@ doc in the folder whose question it answers, not beside whatever you last opened
 | --- | --- |
 | `spec/` | The binding architecture rules, each with an ID, a status and the instrument that enforces it. Rules only; no measurements or narrative |
 | `adr/` | Architecture decision records: why each rule exists and who accepted it. Accepted ADRs are frozen and superseded, never edited |
-| `architecture/` | How the pieces fit: components, the host/platform seam, the target source tree, refactor plans |
+| `architecture/` | How the pieces fit: components, the host/platform seam, the target source tree, refactor plans, and `DESIGN_DOC_TEMPLATE.md`, the section shape for a new subsystem design doc |
 | `gpu/` | AGC/PM4, the Vulkan executor, resource binding, tiling, recompiler, renderer design notes (dated `_YYYY_MM` design/measurement docs included) |
 | `performance/` | Profiling method, performance roadmaps and the dated measurement passes |
 | `subsystems/` | One reimplemented library or service per doc: audio, video decode, save data, input, the frontend app |

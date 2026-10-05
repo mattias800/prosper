@@ -307,10 +307,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
 
-- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds eleven
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds
   per-file counts to "down, never up": title ids and title-named directories in shared code, raw
   `getenv` reads, blocking GPU syncs, files over 5,000 lines, `prosper::test::` in the frontends,
-  host-platform `#if` directives and `HLE(*_stub)` platform-arm handlers outside `src/host`,
+  host-platform `#if` directives, `HLE(*_stub)` platform-arm handlers and `throw` sites outside
+  `src/host`,
   includes against the layer order, frontends including `tests/fixtures/`, and Vulkan
   object-creation call sites (the checker's docstring lists every rule). **Check your change with
   delta mode:**

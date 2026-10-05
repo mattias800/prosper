@@ -574,6 +574,9 @@ capture/replay without requiring an importable system Python module.
   `LAYER_ORDER` (`--write` regenerates it), and with `--base` an accepted ADR is never edited or
   deleted, only superseded. It proves references are live, not that a rule is true. Runs in the
   `Docs` CI job; tests are `docs/test_check_arch_docs.py` (pytest).
+- **`docs/confidence_ledger.py`** -- lists every `CONFIDENCE: HIGH|MED|LOW` marker in the shipping
+  code (`--summary` for counts per area, `--json` for records): the ledger of what prosper currently
+  believes on thin evidence, generated so it cannot go stale. A report, never a gate.
 - **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
   reference in the repository must name a row that exists. `check_numbered_table.py` validates the
   TABLE and has no idea anything cites it, so until this existed a reference to a row that never

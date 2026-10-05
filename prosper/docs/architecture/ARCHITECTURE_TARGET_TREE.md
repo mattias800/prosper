@@ -170,6 +170,7 @@ Every structural cost identified in the ratchet work is either a rule in
 | shipping code depending on `prosper::test::` | `test-dep` | 343 in 25 files |
 | the shipping backend under `tests/` | `fixture-include` (frontends including `fixtures/`) | 13 in 7 files |
 | host-platform `#if` outside `src/host` | `platform-ifdef` | 355 in 44 files |
+| a host exception that can unwind into guest frames | `host-throw` (a count of `throw` sites in `src/{hle,loader,self,gpu}`; added with ADR 0022) | 23 in 10 files |
 | reverse layer includes | `layer-include` | 29 in 22 rows |
 | Vulkan object creation on hot paths | `vk-object` (call-site count of `vkCreateDescriptorPool`, `vkAllocateMemory`, `vkCreateFence`) -- a static proxy only: it cannot tell per-draw from one-time | 22 in 15 rows |
 | a platform arm that is a stub or reduced copy of the other arm's logic | `platform-stub`, a **name-based proxy**: it counts handlers defined as `HLE(<name>_stub)` in `src/{hle,loader,self,gpu}`, so a stub with another name is not seen, and a reduced copy that is not a stub is not seen either. Owned by the `src/hle/memory/hle_kernel_mem.cpp` migration in `HOST_PLATFORM_SEAM.md` (move 7 in the table above). | 2 in 1 file: the Windows arm of `hle_kernel_mem.cpp` stubs `sceAmprAprCommandBufferConstructor` and `sceAmprCommandBufferSetBuffer`, and leaves the AMM handlers unregistered (#2384) |

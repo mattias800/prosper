@@ -90,6 +90,11 @@ class OnePositivePerRule(unittest.TestCase):
             "platform-stub|prosper/src/hle/memory/a.cpp",
             1,
         ),
+        "host-throw": (
+            {"prosper/src/hle/kernel/a.cpp": 'if (!ok) throw std::runtime_error("x");\n'},
+            "host-throw|prosper/src/hle/kernel/a.cpp",
+            1,
+        ),
         "layer-include": (
             {"prosper/src/host/image/a.cpp": '#include "hle/dispatch/dispatch.hpp"\n'},
             "layer-include|prosper/src/host/image/a.cpp|hle",

@@ -1,4 +1,4 @@
-# Baseline for tools/ci/check_arch_ratchet.py -- eleven cross-title and structural costs
+# Baseline for tools/ci/check_arch_ratchet.py -- twelve cross-title and structural costs
 # that may go DOWN, never UP.
 #
 # One row per finding: `RULE|path[|token] VALUE  # optional note`. No line numbers in the key, so
@@ -26,6 +26,10 @@
 #
 # platform-stub was seeded on main e88a9e1b: two `HLE(*_stub)` handlers, the Windows arm of the APR
 # command-buffer constructor and SetBuffer in hle_kernel_mem.cpp (#2384). It is a name-based proxy.
+#
+# host-throw was seeded on 01285a38 (proposed in ADR 0022): 23 throw sites in 10 files under
+# src/{hle,gpu}, mostly capture codecs and recompiler choice parsing. A count, not a proof that any
+# escapes into guest frames.
 #
 # platform-ifdef, layer-include, fixture-include and vk-object were seeded on main 6499c4d7, again
 # with nothing fixed. The layer-include table (LAYER_ORDER in the checker) is, lowest first:
@@ -273,6 +277,16 @@ platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
 platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
 platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
+host-throw|prosper/src/gpu/capture/fold_capture.cpp 4
+host-throw|prosper/src/gpu/capture/fragment_compile_case.cpp 2
+host-throw|prosper/src/gpu/capture/serialize/fold_capture_codec.cpp 2
+host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
+host-throw|prosper/src/gpu/execute/gpu_executor.cpp 2
+host-throw|prosper/src/gpu/execute/nested_wide_data_admission.cpp 2
+host-throw|prosper/src/gpu/pm4/command_processor.hpp 2
+host-throw|prosper/src/gpu/recompiler/compiler_choices.cpp 2
+host-throw|prosper/src/gpu/recompiler/compiler_resource_access.cpp 4
+host-throw|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 layer-include|prosper/src/diagnostics/perf/perf_alarms.cpp|gpu 1
 layer-include|prosper/src/diagnostics/perf/wave64_refusal.hpp|gpu 1
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
