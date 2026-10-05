@@ -299,6 +299,29 @@ bool native_r11_sampled_upload_supported(const prosper::gpu::ShaderResource& res
         resource.num_components == 3u && !resource.compression_enabled && !resource.srgb;
 }
 
+// BC6H is HDR. Uploaded natively it samples values above 1.0, which is what hardware returns --
+// but this renderer works in gamma space end to end (NOTE(#263) in render_runner.h): an sRGB
+// albedo is sampled without linearisation and nothing re-encodes on output. A baked lightmap
+// value of 2.0 should brighten a linearised albedo and then be compressed by the output encode;
+// here it doubles an already-encoded colour and saturates it. Summer Sports Games' track turned
+// pale pink that way when #3883 made BC6H native (#4496). Until the linear workflow of #263
+// exists, BC6H keeps the decoder, which clamps to UNORM8 exactly as it did before #3883.
+// PROSPER_NATIVE_BC6H_HDR (set, any value) opts back into the native HDR upload: a
+// guest-behaviour selector that #263 settles and deletes.
+//
+// This is the opposite decision to native_r11_sampled_upload_supported() just above, which keeps
+// R11G11B10F's range above 1.0. That one was measured on a title with its own HDR pipeline (GTA
+// V's lighting map feeds a tonemap); this one on a title whose captures show no tonemap between
+// shading and display (its lit-pass target format was not inspected). Neither is a rule about
+// the format: both stand in for the missing linear workflow.
+// CONFIDENCE: MED -- a regression revert on one title's evidence, an approximation of hardware
+// in both directions (too dark below 1.0, cut off above it).
+bool native_bc6h_hdr_enabled() {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one process-lifetime read; nothing sets it mid-run.
+    static const bool enabled = PROSPER_ENV_ON("PROSPER_NATIVE_BC6H_HDR");
+    return enabled;
+}
+
 uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
                                   bool allow_declared_mips) {
     using prosper::gpu::DataFormat;
@@ -312,7 +335,7 @@ uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
         case DataFormat::Bc3: return VK_FORMAT_BC3_UNORM_BLOCK;
         case DataFormat::Bc4: return VK_FORMAT_BC4_UNORM_BLOCK;
         case DataFormat::Bc5: return VK_FORMAT_BC5_UNORM_BLOCK;
-        case DataFormat::Bc6: return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+        case DataFormat::Bc6: return native_bc6h_hdr_enabled() ? VK_FORMAT_BC6H_UFLOAT_BLOCK : 0u;
         case DataFormat::Bc7: return VK_FORMAT_BC7_UNORM_BLOCK;
         default: return 0u;
     }

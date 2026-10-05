@@ -512,6 +512,19 @@ have rendered, together with the pass identity that decides which surface receiv
 the first place. One line each: the dead hypothesis, the evidence, the link. Extend this rather than
 re-deriving — and read it before forming a hypothesis about a frozen, black, or missing frame.
 
+- **(Texture upload, not present: recorded here for want of a texture-path list.) On *Summer
+  Sports Games*, a pale, over-bright lit surface that `PROSPER_NO_NATIVE_BC_MIP_CHAIN=1` fixed was
+  not misplaced mip data.** One title's evidence: its track rendered pale pink, and the switch restored it, which
+  points straight at the native BC mip-chain placement of #3883. It is cleared: the per-level
+  `PROSPER_NATIVE_BC_CHAIN_AUDIT` finds all 52 chained textures self-consistent down to 1x1, and
+  contact sheets show every level, tail-packed ones included, as a downscale of level 0. Their small
+  levels are brighter than a plain average only as linear-light mips are (the track albedo's last
+  level is (172, 134, 106) against a linear-light mean of level 0 of (171, 134, 105)). The cause
+  was BC6H: native, its baked lightmaps reach the shader above 1.0 and multiply a gamma-encoded
+  albedo (#263). The switch "fixed" it only because lightmaps declare chains; sending BC6H alone
+  to the decoder gives the same (174, 107, 95) track against the reference (170, 103, 94). The
+  audit decodes through the clamping decoder, so it clears PLACEMENT; it says nothing about how
+  far above 1.0 the lightmaps go. #4496.
 - **The three slot-0 colour-target readers cannot be merged into one accessor as a refactor — the
   merge is a semantic decision, and it decides what the renderer renders to.** `mrt_color_binding`
   (array-first, the active-binding rule behind the attachment count and feedback detection),

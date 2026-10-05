@@ -1384,10 +1384,26 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             //
             // and the pair charge rejected its second barrier phase with
             // `wave64-ambiguous-mask-read` at pc184.
-            if (in.opcode == 0x141 || in.opcode == 0x143 ||
-                in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
-                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
-                in.opcode == kVop3OpcodeAndOrB32 ||
+            //
+            // V_MED3_F32 (0x157): `D.f32 = median(S0.f32, S1.f32, S2.f32)`, three 32-bit operands
+            // (RDNA2 ISA 70648; the emitter already lowers it that way). One Unity vertex program,
+            // byte-identical in Alex Kidd in Miracle World DX, Greak and Summer Sports Games
+            // (#4429), clamps with a constant held in the SGPR just below a vertex-buffer
+            // descriptor it selected from a table by a runtime index:
+            //
+            //     s_load_dwordx4 s[8:11], s[24:25], vcc_lo   the V# for this attribute
+            //     v_med3_f32     v16, 0x509502f9, s7, v0     a 32-BIT read of s7, not of s7:s8
+            //     buffer_load_format_xyzw v[0:3], v1, s[8:11], s12 idxen
+            //
+            // Charging that read the pair made s8 -- the descriptor's first word -- look like
+            // numeric data, so the load "needed backing" it could never be given
+            // (`raw-wide-data-requires-backing` at pc62) and every draw using the program was
+            // dropped: 20,998 in 120 s of Alex Kidd, 85,840 in 140 s of Summer Sports.
+            // Its integer siblings 0x158 / 0x159 and the min3/max3 forms 0x151-0x156 are B32 too
+            // and still fall to the default, under the add-on-evidence rule above.
+            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x157 ||
+                in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 || in.opcode == 0x36f ||
+                in.opcode == kVop3OpcodeAdd3U32 || in.opcode == kVop3OpcodeAndOrB32 ||
                 in.opcode == kVop3OpcodeMulLoU32 || in.opcode == kVop3OpcodeMulHiU32)
                 return 1;
             return 2;

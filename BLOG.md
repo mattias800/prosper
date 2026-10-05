@@ -19,6 +19,38 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-05
+
+### Summer Sports Games' track is terracotta again
+
+The running track and the grass in Summer Sports Games look as they did before late September again; they had been rendering pale pink and washed out ([issue #4496](https://github.com/mattias800/prosper/issues/4496)).
+
+<p align="center"><img src="assets/screenshots/summer-sports-ground-4496-before.webp" alt="Summer Sports Games javelin run-up before the fix: the track is pale pink with white speckles; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-ground-4496-after.webp" alt="Summer Sports Games javelin run-up after the fix: a terracotta track with white lane lines, HUD unchanged; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+
+### Unity menus, HUDs and story art are back in three titles
+
+Greak, Alex Kidd in Miracle World DX and Summer Sports Games have their UI again: menu panels and logos, HUDs, dialogue boxes, intro text and Greak's hand-drawn story art ([issue #4429](https://github.com/mattias800/prosper/issues/4429)).
+
+<p align="center"><img src="assets/screenshots/greak-menu-4429-before.webp" alt="Greak: Memories of Azur main menu before the fix: only the words Start, Settings and Credits over the forest, no logo and no button panels; Linux prosper-app, RADV, greak/reach-gameplay.pad, flip 1000"></p>
+<p align="center"><img src="assets/screenshots/greak-menu-4429-after.webp" alt="Greak: Memories of Azur main menu after the fix with the Greak logo and the Start, Settings and Credits button panels; Linux prosper-app, RADV, greak/reach-gameplay.pad, flip 1000"></p>
+<p align="center"><img src="assets/screenshots/greak-story-4429-before.webp" alt="Greak story screen before the fix: a black screen with only the subtitle line; Linux prosper-app, RADV, greak/reach-gameplay.pad, flip 5000"></p>
+<p align="center"><img src="assets/screenshots/greak-story-4429-after.webp" alt="Greak story screen after the fix: the sepia hand-drawn battle illustration above the same subtitle; Linux prosper-app, RADV, greak/reach-gameplay.pad, flip 5000"></p>
+<p align="center"><img src="assets/screenshots/greak-intro-4429-after.webp" alt="Greak hand-drawn intro cutscene after the fix, a lake at sunset with a distant tower; every intro frame was black before; Linux prosper-app, RADV, logo passed then no input, flip 1600"></p>
+<p align="center"><img src="assets/screenshots/alexkidd-gameplay-4429-before.webp" alt="Alex Kidd in Miracle World DX first level before the fix: the level renders but there is no HUD and no dialogue box; Linux prosper-app, RADV, ppsa02664/reach-first-gameplay.pad, flip 4500"></p>
+<p align="center"><img src="assets/screenshots/alexkidd-gameplay-4429-after.webp" alt="Alex Kidd in Miracle World DX first level after the fix with the lives and money HUD, the map scroll and a dialogue box; Linux prosper-app, RADV, ppsa02664/reach-first-gameplay.pad, flip 4500"></p>
+<p align="center"><img src="assets/screenshots/alexkidd-intro-4429-after.webp" alt="Alex Kidd in Miracle World DX intro after the fix with its story text over the grass scene; the text was missing before; Linux prosper-app, RADV, ppsa02664/reach-first-gameplay.pad, flip 2000"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-hud-4429-before.webp" alt="Summer Sports Games javelin before the fix: bare Attempt and Speed labels with no panels or meter; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+<p align="center"><img src="assets/screenshots/summer-sports-hud-4429-after.webp" alt="Summer Sports Games javelin after the fix with the attempt panel, the speed meter and the foul marker; the track is still too pale, a separate older defect; Linux prosper-app, RADV, summer-sports/reach-gameplay.pad, flip 3000"></p>
+
+All three are Unity games and share one vertex shader, byte for byte, that draws their UI images. A safety check that was extended to vertex shaders on October 2 refuses any shader that reads a buffer descriptor's bytes as plain numbers without a verified copy of them. This shader does no such thing, but prosper misjudged one instruction next to the descriptor as reading two registers instead of one, so the check fired and every draw using the shader was dropped: about 86,000 per run in Summer Sports. With that instruction sized correctly, none are dropped.
+
+Summer Sports' track and grass are still too pale. That is a separate, slightly older defect ([issue #4496](https://github.com/mattias800/prosper/issues/4496)).
+
+### Alex Kidd holds 60 fps
+
+Alex Kidd in Miracle World DX used to settle at a random rate between 30 and 60 fps each time you played. Every frame, prosper was copying ~51 MB of finished images back from the GPU for a data copy that never needed them. It now holds the game's 60 fps cap, and Greak skips the same waste ([#4459](https://github.com/mattias800/prosper/pull/4459)). Summer Sports Games still pays most of it; that is next ([#4457](https://github.com/mattias800/prosper/issues/4457)).
+
 ## 2026-10-04
 
 ### GTA V's bank heist is fast again — mostly

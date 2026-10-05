@@ -2782,6 +2782,10 @@ struct AjmDecJob {
     uint64_t in_addr[4] = {0, 0, 0, 0};
     uint32_t in_size[4] = {0, 0, 0, 0};
     uint32_t num_in = 0;
+    // Bytes the guest gave for the result sideband. The decode sideband is 32 bytes; a job that
+    // was handed less (the direct Run/RunSplit shapes pass an explicit size) gets a truncated
+    // write rather than an overflow. Builders that pass no size keep the full 32.
+    uint32_t result_size = 32;
 };
 // SCE_AJM_ERROR_INVALID_PARAMETER — the AJM error space (see the constants above); -1 is not a value
 // the guest's error mapping recognizes.
@@ -3117,15 +3121,15 @@ namespace {
 //   SceAjmSidebandMFrame { u32 numFrames; u32 reserved; }            (codec frames decoded by this job)
 // uiTotalDecodedSamples is load-bearing, not padding: with it left zero the guest's mixer (FMOD) stops
 // after a single batch, so it carries the instance's running sample-frame total.
-bool ajm2_write_result(uint64_t result_addr, int32_t err, uint32_t consumed, uint32_t produced,
-                       uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
-    if (!result_addr) return true;
+bool ajm2_write_result(uint64_t result_addr, uint32_t result_size, int32_t err, uint32_t consumed,
+                       uint32_t produced, uint64_t total_samples = 0, uint32_t decoded_frames = 0) {
+    if (!result_addr || !result_size) return true;
     struct Sideband { int32_t iResult; int32_t iCodecResult; uint32_t iSizeConsumed;
                       uint32_t iSizeProduced; uint64_t uiTotalDecodedSamples;
                       uint32_t numFrames; uint32_t reserved; };
     static_assert(sizeof(Sideband) == 32, "AJM decode sideband must include the MFrame result");
     Sideband sb{ err, 0, consumed, produced, total_samples, decoded_frames, 0 };
-    return audio_store_bytes(result_addr, &sb, sizeof sb);
+    return audio_store_bytes(result_addr, &sb, std::min<size_t>(sizeof sb, result_size));
 }
 
 // Decode a batch's queued jobs. Jobs sharing an instance are consecutive stream blocks whose input
@@ -3153,7 +3157,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             for (size_t k = ji; k < je; ++k) {
                 AjmDecJob& job = jobs[k];
                 if (!instance.host_dec->valid()) {
-                    ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                    ajm2_write_result(job.result_addr, job.result_size, kAjm2ErrDecode, 0, 0,
                                       instance.decoded_samples);
                     continue;
                 }
@@ -3233,7 +3237,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                     std::span<const uint8_t>(input.data(), consumed), pcm.data(), produced);
                 if (!err && produced) instance.decoded_samples += produced / frame_bytes;
                 const bool result_published = ajm2_write_result(
-                    job.result_addr, err, consumed, produced, instance.decoded_samples,
+                    job.result_addr, job.result_size, err, consumed, produced, instance.decoded_samples,
                     err ? 0 : decoded.decoded_frames);
                 if (!result_published) {
                     // The codec and guest PCM may already have advanced, but the guest did not
@@ -3257,7 +3261,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         // ATRAC9 path or erase the cumulative sample count on a later batch's error sideband.
         if (it != g_ajm2_inst.end() && it->second.host_dec) {
             for (size_t k = ji; k < je; ++k)
-                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0,
+                ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0,
                                   it->second.decoded_samples);
             if (getenv("PROSPER_AUDIOLOG"))
                 fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu host_dec INVALID\n",
@@ -3273,7 +3277,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
                                             : it->second.decoded_samples)
                 : 0;
             for (size_t k = ji; k < je; ++k)
-                ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0, total);
+                ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0, total);
             if (getenv("PROSPER_AUDIOLOG"))
                 fprintf(stderr, "[ajm2] decode inst=%u SKIP n=%zu no at9/host (inst_%s)\n",
                         inst_id, je - ji,
@@ -3285,7 +3289,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
         const int sfb = dec->superframe_bytes();
         const int sfs = dec->superframe_samples();
         if (ch <= 0 || sfb <= 0 || sfs <= 0) {
-            for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, kAjm2ErrDecode, 0, 0); ji = je; continue; }
+            for (size_t k = ji; k < je; ++k) ajm2_write_result(jobs[k].result_addr, jobs[k].result_size, kAjm2ErrDecode, 0, 0); ji = je; continue; }
         const uint32_t frame_bytes = (uint32_t)ch * sizeof(int16_t);   // one interleaved sample-frame
         const uint32_t sf_out_bytes = (uint32_t)sfs * frame_bytes;
         std::vector<int16_t> pcm((size_t)sfs * ch);
@@ -3300,7 +3304,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             // Such an instance is terminal: later jobs must report zero progress instead of
             // decoding against state the guest could not observe.
             if (!dec) {
-                ajm2_write_result(job.result_addr, kAjm2ErrDecode, 0, 0,
+                ajm2_write_result(job.result_addr, job.result_size, kAjm2ErrDecode, 0, 0,
                                   I.total_samples ? I.gapless_delivered : I.decoded_samples);
                 continue;
             }
@@ -3387,7 +3391,7 @@ void ajm2_decode_batch(std::vector<AjmDecJob>& jobs) {
             }
             I.decoded_samples += produced / frame_bytes;
             const bool result_published = ajm2_write_result(
-                job.result_addr, err, in_cur, produced,
+                job.result_addr, job.result_size, err, in_cur, produced,
                 prog ? I.gapless_delivered : I.decoded_samples, decoded_codec_frames);
             if (!result_published) {
                 // Decoder/trim/carry state and guest PCM may already have advanced, but the guest
@@ -3570,6 +3574,150 @@ HLE10(ajm_batch_job_set_resample_ex) { return 0; } // resample params: the host 
 // CONFIDENCE: LOW that returning success-without-writes is safe beyond GRIS.
 HLE10(ajm_batch_job_get_resample_info) { return 0; }
 HLE10(ajm_batch_job_get_statistics) { return 0; }
+
+// --- AJM direct-job shapes: queue onto the batch like the builders above ----------------------
+// These take raw/single buffers (not Ra builders) but the same (info, instance, ...) prefix, so each
+// queues one AjmDecJob onto g_ajm2_jobs[batchInfo] for BatchStart to execute through the real decode
+// pipeline -- the uniform model of this file, not a parallel implementation. Validation mirrors
+// sceAjmBatchJobDecode above: a NULL batch, input or output is INVALID_PARAMETER and sizes are capped,
+// but a zero size is accepted (Tactics Ogre's input size reaches 0 at end of stream).
+// Argument orders were checked against live call sites: DecodeSingle in PPSA03839 (eboot+0x55863f),
+// RunSplit in PPSA26414 (eboot+0x22a0c3, sideband size 0x20). CONFIDENCE: HIGH on the queueing model,
+// MED on each arity, LOW on the sideband layout for Run/RunSplit: the firmware sizes the sideband by
+// the run flags, which this model does not record, so the 32-byte decode sideband is written,
+// truncated to the size the guest passed.
+// Not registered, deliberately: Encode (no encoder exists; queueing PCM through a decoder can produce
+// decoded noise reported as success), Control and SetResampleParameters (their payloads would be
+// dropped), and GetCodecInfo/GetGaplessDecode/GetInfo/DecMp3ParseFrame (they have outputs prosper
+// does not compute). Unregistered, they still answer 0 but stay visible to the unimplemented-call alarm.
+HLE10(ajm_batch_job_decode_single) {
+    // (info, instance, in, inSize, out, outSize, result): one-fragment decode job.
+    if (!a0 || !a2 || !a4) return AJM_ERR_INVALID_PARAMETER;
+    if (a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a6;
+    job.out_addr = a4;
+    job.out_size = (uint32_t)a5;
+    job.num_in = 1;
+    job.in_addr[0] = a2;
+    job.in_size[0] = (uint32_t)a3;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run) {
+    // (info, instance, flags, data_in, in_size, data_out, out_size, sideband_out, sideband_size).
+    if (!a0 || !a3 || !a5) return AJM_ERR_INVALID_PARAMETER;
+    if (a4 > AJM_MAX_BUILDER_BYTES || a6 > AJM_MAX_BUILDER_BYTES || a8 > UINT32_MAX)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    job.result_size = (uint32_t)a8;
+    job.out_addr = a5;
+    job.out_size = (uint32_t)a6;
+    job.num_in = 1;
+    job.in_addr[0] = a3;
+    job.in_size[0] = (uint32_t)a4;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run_split) {
+    // (info, instance, flags, in_bufs, in_num, out_bufs, out_num, sideband_out, sideband_size):
+    // multi-fragment variant; caps mirror DecodeSplit's structural 4-in/2-out job limits, which also
+    // bound the host-stack descriptor arrays below.
+    if (!a0 || !a3 || !a5 || a4 < 1 || a4 > 4 || a6 < 1 || a6 > 2 || a8 > UINT32_MAX)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    job.result_size = (uint32_t)a8;
+    uint64_t in_desc[2 * 4] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (audio_read_bytes_partial(a3, in_desc, sizeof(uint64_t) * 2 * (size_t)a4) !=
+        sizeof(uint64_t) * 2 * (size_t)a4)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.num_in = (uint32_t)a4;
+    for (uint32_t f = 0; f < job.num_in; ++f) {
+        job.in_addr[f] = in_desc[2 * f];
+        const uint64_t sz = in_desc[2 * f + 1];
+        if (!job.in_addr[f] || sz > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+        job.in_size[f] = (uint32_t)sz;
+    }
+    uint64_t out_desc[2 * 2] = {0, 0, 0, 0};
+    if (audio_read_bytes_partial(a5, out_desc, sizeof(uint64_t) * 2 * (size_t)a6) !=
+        sizeof(uint64_t) * 2 * (size_t)a6)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.out_addr = out_desc[0];
+    job.out_size = (uint32_t)std::min<uint64_t>(out_desc[1], AJM_MAX_BUILDER_BYTES);
+    if (!job.out_addr || !job.out_size) return AJM_ERR_INVALID_PARAMETER;
+    if (a6 > 1) {
+        job.out2_addr = out_desc[2];
+        job.out2_size = (uint32_t)std::min<uint64_t>(out_desc[3], AJM_MAX_BUILDER_BYTES);
+        if (!job.out2_addr || !job.out2_size) return AJM_ERR_INVALID_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE(ajm_memory_register) {   // (context, ptr, pages): the reference acknowledges unconditionally
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+HLE(ajm_memory_unregister) {   // (context, ptr): likewise acknowledged
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+// sceAjmDecAt9ParseConfigData(config_data*, info*) -> 0; info is five u32s:
+// {channels, sample_rate, frame_samples, superframe_samples, superframe_bytes}. The 20-byte layout
+// fits PPSA26414's call site (eboot+0x22a303), which uses fields 3 and 4 as a samples/bytes pair.
+// CONFIDENCE: MED.
+// Parsed for real through the vendored ATRAC9 decoder (same init path the B2 decode path
+// drives); a bad config fails INVALID_PARAMETER rather than filling plausible numbers.
+HLE(ajm_dec_at9_parse_config) {
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (!a0 || !a1) return AJM_ERR_INVALID_PARAMETER;
+    uint8_t config[4]{};
+    if (!audio_read_bytes(a0, config, sizeof config)) return AJM_ERR_INVALID_PARAMETER;
+    Atrac9Decoder dec;
+    if (!dec.init(config)) return AJM_ERR_INVALID_PARAMETER;
+    uint32_t info[5]{};
+    info[0] = (uint32_t)dec.channels();
+    info[1] = (uint32_t)dec.sample_rate();
+    info[2] = (uint32_t)dec.frame_samples();
+    info[3] = (uint32_t)dec.superframe_samples();
+    info[4] = (uint32_t)dec.superframe_bytes();
+    if (!audio_store_bytes(a1, info, sizeof info)) return AJM_ERR_INVALID_PARAMETER;
+    return 0;
+}
+// sceAjmStrError(error) -> a readable string. The system libSceAjm.sprx carries per-code message
+// strings, but their code mapping is not yet derived, so this answers one static string for every
+// input (log-only use) rather than a guessed table -- and never null, which a %s formatter may not
+// survive. CONFIDENCE: LOW on the text, HIGH on never returning null.
+HLE(ajm_str_error) {
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    static const char kMsg[] = "unknown AJM error";
+    return (uint64_t)(uintptr_t)kMsg;
+}
 HLE10(ajm_batch_start2) {
     // Run every decode job queued on this batchInfo (a1), in order, then clear it. Synchronous:
     // BatchWait then just returns success. GTA V passes its u32 batch-id output in a4 and immediately
@@ -3628,6 +3776,8 @@ constexpr uint64_t kNgs2ErrInvalidOut    = (uint64_t)(int64_t)(int32_t)0x804a005
 constexpr uint64_t kNgs2ErrInvalidSystem = (uint64_t)(int64_t)(int32_t)0x804a0230;
 constexpr uint64_t kNgs2ErrInvalidRack   = (uint64_t)(int64_t)(int32_t)0x804a0261;
 constexpr uint64_t kNgs2ErrInvalidVoice  = (uint64_t)(int64_t)(int32_t)0x804a0302;
+constexpr uint64_t kNgs2ErrInvalidAllocator = (uint64_t)(int64_t)(int32_t)0x804a020a;
+constexpr uint64_t kNgs2ErrInvalidGrain     = (uint64_t)(int64_t)(int32_t)0x804a0051;
 
 struct Ngs2RackState {
     bool used = false;
@@ -4054,6 +4204,114 @@ HLE(ngs2_rack_get_voice) {
     return a2_store_u64(a2, kNgs2VoiceTag | (rack_slot << 8) | a1) ? 0 : kNgs2ErrInvalidOut;
 }
 
+// --- Ngs2 lifecycle remainder: allocator creates, destroy, grain, locks ----------------------
+// These follow the table/tag/error model directly above (slots, kNgs2*Tag validation, the
+// 0x804a facility), so no new contract is invented: CreateWithAllocator allocates exactly like
+// Create (the allocator pointer is required input, but its callbacks are never invoked —
+// prosper keeps its own slot table and reads guest memory directly, so there is no
+// allocation to perform; documented MED); SystemDestroy frees the system slot plus the
+// racks it owns and their voices (mirroring RackDestroy's cascade) and zeroes the
+// released-context OUT block; SetGrainSamples records
+// into the shared grain word within Create's sane range; Lock/Unlock validate and acknowledge
+// (uncontended headless). NIDs via nid_hash; System/RackCreateWithAllocator reproduce the
+// firmware set. The DSP quartet (PanInit/PanGetVolumeMatrix/ParseWaveformData/CalcWaveformBlock)
+// and SystemGetInfo stay out: their struct layouts are unpinned by any local caller and no
+// touch backend exists to compute against.
+// The allocator struct's first word is its allocHandler; the library refuses a missing one.
+static bool ngs2_allocator_valid(uint64_t allocator) {
+    uint64_t handler = 0;
+    return allocator && audio_read_bytes(allocator, &handler, 8) && handler;
+}
+HLE(ngs2_system_create_with_allocator) {
+    NGS2_LOG("sceNgs2SystemCreateWithAllocator");
+    // (option?, allocator, handle*): the allocator's callbacks are never invoked — prosper keeps
+    // its own slot table and reads guest memory directly, so there is no allocation to perform.
+    // CONFIDENCE: MED. Argument checks follow the shipped libSceNgs2.sprx (export mPYgU4oYpuY): a
+    // NULL allocator or a NULL allocHandler (+0) answers 0x804a020a, and only then does a NULL
+    // handle out answer 0x804a0053.
+    if (!ngs2_allocator_valid(a1)) return kNgs2ErrInvalidAllocator;
+    if (!a2) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    // Optional SystemOption grain at +0x70, same as SystemCreate.
+    if (a0) {
+        uint32_t g = 0;
+        if (audio_read_bytes(a0 + 0x70, &g, 4) && g >= 64 && g <= 8192) g_ngs2_grain = g;
+    }
+    for (uint64_t i = 0; i < 4; ++i) {
+        if (g_ngs2_systems[i]) continue;
+        g_ngs2_systems[i] = true;
+        if (!a2_store_u64(a2, kNgs2SystemTag | (i + 1))) {
+            g_ngs2_systems[i] = false;
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidSystem;
+}
+HLE(ngs2_system_destroy) {
+    NGS2_LOG("sceNgs2SystemDestroy");
+    // (system, buffer_info*): the info block is the released-context OUT param, so on success it
+    // is zeroed like RackDestroy's (prosper owns no returned host buffer). a1 == 0 is accepted
+    // (no info wanted back). Outputs stay untouched on failure.
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    const uint64_t slot = a0 & 0xff;
+    if ((a0 & kNgs2TagMask) != kNgs2SystemTag || slot < 1 || slot > 4 || !g_ngs2_systems[slot - 1])
+        return kNgs2ErrInvalidSystem;
+    if (a1 && !a2_store_zeros(a1, 0x40)) return kNgs2ErrInvalidOut;
+    g_ngs2_systems[slot - 1] = false;
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (!g_ngs2_racks[i].used || g_ngs2_racks[i].system != a0) continue;
+        g_ngs2_racks[i] = {};
+        for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end();) {
+            it = ((it->first >> 8) == i + 1) ? g_ngs2_voices.erase(it) : std::next(it);
+        }
+    }
+    return 0;
+}
+HLE(ngs2_system_set_grain_samples) {
+    NGS2_LOG("sceNgs2SystemSetGrainSamples");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    // The shipped library (export l4Q2dWEH6UM) answers 0x804a0051 for a count that is not a
+    // multiple of 64 or lies outside the system's limits, and stores only a valid one. The limits
+    // used here are SystemCreate's sane range. CONFIDENCE: MED on the exact bounds.
+    const uint32_t g = (uint32_t)a1;
+    if (g < 64 || g > 8192 || (g & 63)) return kNgs2ErrInvalidGrain;
+    g_ngs2_grain = g;
+    return 0;
+}
+HLE(ngs2_rack_create_with_allocator) {
+    NGS2_LOG("sceNgs2RackCreateWithAllocator");
+    // (system, rack_id, option?, allocator, handle*): callbacks uninvoked, same model and the
+    // same allocator-then-out check order (export U546k6orxQo) as the system create above.
+    if (!ngs2_allocator_valid(a3)) return kNgs2ErrInvalidAllocator;
+    if (!a4) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (g_ngs2_racks[i].used) continue;
+        g_ngs2_racks[i] = {true, a0, (uint32_t)a1, ngs2_max_voices(a2)};
+        if (!a2_store_u64(a4, kNgs2RackTag | (i + 1))) {
+            g_ngs2_racks[i] = {};
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidRack;
+}
+HLE(ngs2_rack_lock) {
+    NGS2_LOG("sceNgs2RackLock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
+    return 0;
+}
+HLE(ngs2_rack_unlock) {
+    NGS2_LOG("sceNgs2RackUnlock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
+    return 0;
+}
+
 // PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
 // Ngs2VoiceParamHead { uint16 size; int16 next; uint32 id; payload... } (Sony's documented
 // voice-param list shape). This is capture-first RE for the real sampler implementation —
@@ -4280,11 +4538,22 @@ HLE(ngs2_geom_calc_listener) {
 // a faithful null-backend voice implementation (init succeeds, ports return valid silent parameters)
 // is the alternative if a title ever needs working voice (tracked separately).
 HLE(voice_init_unavailable) {   // sceVoiceInit / sceVoiceInitHQ -> report voice unavailable
-    // Negative SCE_VOICE-class error (facility 0x8041; the guest only sign-checks the return via `js`).
-    // Chosen as a HARD, non-retryable init failure: it is NOT the ALREADY_INITIALIZED code (0x80410004,
-    // which some engines treat as success), so the guest takes its "voice off" branch and does not retry.
+    // Negative error (facility 0x8041; the guest only sign-checks the return via `js`), chosen as a
+    // HARD, non-retryable init failure so the guest takes its "voice off" branch and does not retry.
+    // It is not a libSceVoice code: the shipped module's facility is 0x804E08xx, and its real
+    // already-initialised code is 0x804E0802 (Init with a live context, module VA 0x14517) -- not
+    // 0x80410004 as this comment used to say.
     return (uint64_t)(int64_t)(int32_t)0x80410002;
 }
+
+// libSceVoice.sprx: every port/lifecycle entry point checks the library context first and returns
+// SCE_VOICE_ERROR_LIBVOICE_NOT_INIT (0x804E0801) before touching any argument -- which is the state
+// the real module is in after sceVoiceInit failed (e.g. Start 0x146e0 -> 0x14764, CreatePort
+// 0x15d90 -> 0x15e1f, GetPortInfo 0x161b0 -> 0x161dc). CONFIDENCE: HIGH (read from the shipped module).
+// Do not make Init succeed while these keep refusing: GTA V's success path retries
+// sceVoiceGetPortInfo forever on any negative return (eboot+0x2604348: usleep(100000), then a `js`
+// back-edge), so a half-change would hang it.
+HLE(voice_not_initialized) { return (uint64_t)(int64_t)(int32_t)0x804E0801; }
 
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -4295,6 +4564,27 @@ void register_audio_hle() {
     // standard and HQ init entry points get the same "unavailable" answer.
     R("sceVoiceInit", voice_init_unavailable);
     R("sceVoiceInitHQ", voice_init_unavailable);
+    // The port surface answers not-initialised, as the real module does after a failed Init
+    // (voice_not_initialized): handing out working port handles would contradict Init, and any
+    // title that proceeds past a failed Init anyway lands on error branches instead of dividing by
+    // unwritten voice parameters. No handles, no state, no out-param writes. sceVoiceEnd,
+    // sceVoiceGetMuteFlag and sceVoiceSetMuteFlag (imported by GTA V / Uncharted) are NOT
+    // registered here and still fall to the dispatcher's 0; the module answers 0x804E0801 for them
+    // too when not initialised.
+    R("sceVoiceCreatePort", voice_not_initialized);
+    R("sceVoiceDeletePort", voice_not_initialized);
+    R("sceVoiceStart", voice_not_initialized);
+    R("sceVoiceStop", voice_not_initialized);
+    R("sceVoiceConnectIPortToOPort", voice_not_initialized);
+    R("sceVoiceDisconnectIPortFromOPort", voice_not_initialized);
+    R("sceVoiceGetBitRate", voice_not_initialized);
+    R("sceVoiceGetPortAttr", voice_not_initialized);
+    R("sceVoiceGetPortInfo", voice_not_initialized);
+    R("sceVoiceGetVolume", voice_not_initialized);
+    R("sceVoiceSetVolume", voice_not_initialized);
+    R("sceVoiceSetThreadsParams", voice_not_initialized);
+    R("sceVoiceReadFromOPort", voice_not_initialized);
+    R("sceVoiceWriteToIPort", voice_not_initialized);
     R("sceAudioOutOutput", audio_output);
     R("sceAudioOutOutputs", audio_outputs);
     R("sceAudioOutSetVolume", audio_set_volume);
@@ -4356,6 +4646,16 @@ void register_audio_hle() {
     R("sceAjmBatchJobGetResampleInfo", ajm_batch_job_get_resample_info);
     R("sceAjmBatchJobGetStatistics", ajm_batch_job_get_statistics);
     R("sceAjmBatchJobSetGaplessDecode", ajm_batch_job_gapless);
+    // Direct-job shapes: queue onto the batch like the builders above for BatchStart to execute.
+    // Encode/Control/GetCodecInfo/GetGaplessDecode/GetInfo/SetResampleParameters and
+    // DecMp3ParseFrame stay unregistered (see the comment above ajm_batch_job_decode_single).
+    R("sceAjmBatchJobDecodeSingle", ajm_batch_job_decode_single);
+    R("sceAjmBatchJobRun", ajm_batch_job_run);
+    R("sceAjmBatchJobRunSplit", ajm_batch_job_run_split);
+    R("sceAjmMemoryRegister", ajm_memory_register);
+    R("sceAjmMemoryUnregister", ajm_memory_unregister);
+    R("sceAjmDecAt9ParseConfigData", ajm_dec_at9_parse_config);
+    R("sceAjmStrError", ajm_str_error);
     R("sceAjmBatchStart", ajm_batch_start2);
     Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
     Hle::register_fn("koBbCMvOKWw", ngs2_system_create, "sceNgs2SystemCreate");
@@ -4367,6 +4667,14 @@ void register_audio_hle() {
     Hle::register_fn("-TOuuAQ-buE", ngs2_voice_get_state, "sceNgs2VoiceGetState");
     Hle::register_fn("rEh728kXk3w", ngs2_voice_get_state_flags, "sceNgs2VoiceGetStateFlags");
     Hle::register_fn("lCqD7oycmIM", ngs2_rack_destroy, "sceNgs2RackDestroy");
+    Hle::register_fn("mPYgU4oYpuY", ngs2_system_create_with_allocator,
+                     "sceNgs2SystemCreateWithAllocator");
+    Hle::register_fn("u-WrYDaJA3k", ngs2_system_destroy, "sceNgs2SystemDestroy");
+    Hle::register_fn("l4Q2dWEH6UM", ngs2_system_set_grain_samples, "sceNgs2SystemSetGrainSamples");
+    Hle::register_fn("U546k6orxQo", ngs2_rack_create_with_allocator,
+                     "sceNgs2RackCreateWithAllocator");
+    Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
+    Hle::register_fn("++YZ7P9e87U", ngs2_rack_unlock, "sceNgs2RackUnlock");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
 #if defined(__linux__)
