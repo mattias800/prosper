@@ -4155,7 +4155,7 @@ bool ngs2_grain_ok(uint32_t grain, uint32_t max) {
 // The SceNgs2SystemOption checks SystemQueryBufferSize, SystemCreate and SystemCreateWithAllocator
 // share (native core 0x1e7e0): a NULL option takes the defaults (max grain 512, grain 256, 48 kHz,
 // 8 channels); otherwise size must be 0x90, maxGrainSamples (+0x6c) a multiple of 64 in [64, 2048],
-// numGrainSamples (+0x70) one in [64, maxGrainSamples], sampleRate (+0x74) one of the nine rates
+// numGrainSamples (+0x70) one in [64, maxGrainSamples], sampleRate (+0x74) one of the ten rates
 // below, and numChannels (+0x78) in [1, 37]. The four job-scheduler option pointers at +0x48..+0x60
 // are not inspected (their struct is unpinned). CONFIDENCE: HIGH on the checks and their order.
 struct Ngs2SystemOption { uint32_t max_grain = 512, num_grain = 256; };
@@ -4168,8 +4168,8 @@ uint64_t ngs2_check_system_option(uint64_t option, Ngs2SystemOption& out) {
     if (!audio_read_bytes(option + 0x6c, fields, sizeof fields)) return kNgs2ErrOptionSize;
     if (!ngs2_grain_ok(fields[0], 2048)) return kNgs2ErrInvalidMaxGrain;
     if (!ngs2_grain_ok(fields[1], fields[0])) return kNgs2ErrInvalidGrain;
-    static constexpr uint32_t kRates[] = {11025, 12000, 22050, 24000, 44100,
-                                          48000, 88200, 96000, 192000};
+    static constexpr uint32_t kRates[] = {11025, 12000, 22050, 24000,  44100,
+                                          48000, 88200, 96000, 176400, 192000};
     if (std::find(std::begin(kRates), std::end(kRates), fields[2]) == std::end(kRates))
         return kNgs2ErrSampleRate;
     if (fields[3] < 1 || fields[3] > 37) return kNgs2ErrNumChannels;
@@ -4531,9 +4531,10 @@ HLE(ngs2_system_render) {
     // one grain" refusal (0x804a8252), whose grain is not prosper's trimmed g_ngs2_grain. A buffer
     // over 64 MiB is a prosper bound on the host-side mix copy, not a native refusal.
     struct RenderBufferInfo { uint64_t buffer, size; uint32_t waveform_type, channels; };
-    if (a2 > 31) return kNgs2ErrRenderCount;
-    if (a2 && !a1) return kNgs2ErrInvalidOut;
-    for (uint64_t i = 0; i < a2; ++i) {
+    const uint32_t count = (uint32_t)a2;   // a 32-bit count natively; ignore the register's upper half
+    if (count > 31) return kNgs2ErrRenderCount;
+    if (count && !a1) return kNgs2ErrInvalidOut;
+    for (uint64_t i = 0; i < count; ++i) {
         RenderBufferInfo info{};
         if (!ngs2_read_bytes(a1 + i * sizeof(info), &info, sizeof(info))) return kNgs2ErrInvalidOut;
         const uint32_t t = info.waveform_type;

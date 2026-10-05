@@ -178,7 +178,13 @@ TEST(Ngs2Lifecycle, SystemOptionIsValidatedLikeTheNativeCore) {
     opt = {}; opt.max_grain = 4096; opt.num_grain = 1024;
     rejects(opt, kInvalidMaxGrain, "the max is checked before the grain");
     opt = {}; opt.sample_rate = 44000;
-    rejects(opt, kSampleRate, "not one of the nine rates");
+    rejects(opt, kSampleRate, "not one of the ten rates");
+    for (uint32_t rate : {11025u, 12000u, 22050u, 24000u, 44100u, 48000u, 88200u, 96000u, 176400u,
+                          192000u}) {
+        opt = {}; opt.sample_rate = rate;
+        BufferInfo q{};
+        EXPECT_EQ(query(addr(&opt), addr(&q), 0, 0, 0, 0), 0u) << "rate " << rate << " is accepted";
+    }
     opt = {}; opt.channels = 0;
     rejects(opt, kNumChannels, "no channels");
     opt = {}; opt.channels = 38;
