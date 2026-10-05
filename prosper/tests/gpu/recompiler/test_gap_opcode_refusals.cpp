@@ -324,3 +324,40 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered fused-multiply-add-with-scale division helpers must refuse
+// fail-visibly. v_div_fmas_f32/f64 need the scaled-FMA division lowering,
+// which does not exist (only v_div_fixup_f32 is lowered, #4391); accepting
+// one would silently compute an unscaled multiply-add. All words below are
+// llvm-mc gfx1030 round-tripped. The control is v_div_fixup_f32 in the same
+// slot, which is lowered. WHEN a lowering lands, ITS CASE GOES RED; replace
+// it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, DivFmasRefuse) {
+    static const uint32_t fmas32[2] = {0xd56f0000u, 0x040e0501u};
+    static const uint32_t fmas64[2] = {0xd5700000u, 0x041a0902u};
+    static const uint32_t fixup32[2] = {0xd55f0000u, 0x040e0501u};
+    for (const uint32_t* words : {fmas32, fmas64, fixup32}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fmas32, 2).opcode, 0x16fu);
+    EXPECT_EQ(rdna2_decode_one(fmas64, 2).opcode, 0x170u);
+    EXPECT_EQ(rdna2_decode_one(fixup32, 2).opcode, 0x15fu);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0x7e060283u,   // v_mov_b32 v3, 3
+        0x7e080280u,   // v_mov_b32 v4, 0
+        0x7e0a0281u,   // v_mov_b32 v5, 1
+        0x7e0c0282u,   // v_mov_b32 v6, 2
+        0x7e0e0283u,   // v_mov_b32 v7, 3
+    };
+    expect_compiles(program(prologue, {fixup32[0], fixup32[1]}), 0xA0D0ull,
+                    "control: v_div_fixup_f32 in the fmas slot");
+    expect_gap_refusal(program(prologue, {fmas32[0], fmas32[1]}), 0xA0D1ull, 7,
+                       {fmas32[0], fmas32[1]}, Rdna2Format::VOP3, 0x16fu);
+    expect_gap_refusal(program(prologue, {fmas64[0], fmas64[1]}), 0xA0D2ull, 7,
+                       {fmas64[0], fmas64[1]}, Rdna2Format::VOP3, 0x170u);
+}
