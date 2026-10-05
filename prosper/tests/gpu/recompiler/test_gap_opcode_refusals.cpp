@@ -500,6 +500,63 @@ TEST(GapOpcodeRefusals, SwapPcCodeEndRefuse) {
                        {codeend[0]}, Rdna2Format::SOPP, 0x1fu);
 }
 
+// Unlowered signed scalar bitfield-extracts and FP-mode setters must refuse
+// fail-visibly. s_bfe_i64 and s_bfe_i32 need a signed extract lowering (only
+// the unsigned s_bfe_u64 and s_bfe_u32 are lowered); s_denorm_mode and
+// s_round_mode need in-shader FP-mode changes, which are not modeled (only the
+// dispatch-time PGM_RSRC1 mode is). All words below are llvm-mc gfx1030
+// round-tripped. Controls are the unsigned SOP2 siblings (same operand fields,
+// only the opcode differs) and s_nop (SOPP no-op, same SIMM16). WHEN a
+// lowering lands for any of the four, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, Bfe64ModeRefuse) {
+    static const uint32_t bfei[1] = {0x95000402u};   // s_bfe_i64 s[0:1], s[2:3], s4
+    static const uint32_t bfei32[1] = {0x94000402u};   // s_bfe_i32 s0, s2, s4
+    static const uint32_t denorm[1] = {0xbfa50000u};
+    static const uint32_t round[1] = {0xbfa40000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(bfei, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOP2);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(bfei, 1).opcode, 0x2au);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).fmt, Rdna2Format::SOP2);
+    EXPECT_EQ(rdna2_decode_one(bfei32, 1).opcode, 0x28u);
+    for (const uint32_t* words : {denorm, round}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(denorm, 1).opcode, 0x25u);
+    EXPECT_EQ(rdna2_decode_one(round, 1).opcode, 0x24u);
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+        0xbe820301u,   // s_mov_b32 s2, s1
+        0xbe830301u,   // s_mov_b32 s3, s1
+        0xbe840301u,   // s_mov_b32 s4, s1
+    };
+    static const uint32_t bfeu[1] = {0x94800402u};     // s_bfe_u64 s[0:1], s[2:3], s4 (lowered)
+    static const uint32_t bfeu32[1] = {0x93800402u};   // s_bfe_u32 s0, s2, s4 (lowered)
+    expect_compiles(program(sprologue, {bfeu[0]}), 0xA110ull,
+                    "control: s_bfe_u64 in the bfe_i64 slot");
+    expect_gap_refusal(program(sprologue, {bfei[0]}), 0xA111ull, 5, {bfei[0]},
+                       Rdna2Format::SOP2, 0x2au);
+    expect_compiles(program(sprologue, {bfeu32[0]}), 0xA112ull,
+                    "control: s_bfe_u32 in the bfe_i32 slot");
+    expect_gap_refusal(program(sprologue, {bfei32[0]}), 0xA116ull, 5, {bfei32[0]},
+                       Rdna2Format::SOP2, 0x28u);
+
+    static const uint32_t nop[1] = {0xbf800000u};
+    expect_compiles(program(kVop3Prologue, {nop[0]}), 0xA113ull,
+                    "control: s_nop in the mode slot");
+    expect_gap_refusal(program(kVop3Prologue, {denorm[0]}), 0xA114ull, 4,
+                       {denorm[0]}, Rdna2Format::SOPP, 0x25u);
+    expect_gap_refusal(program(kVop3Prologue, {round[0]}), 0xA115ull, 4,
+                       {round[0]}, Rdna2Format::SOPP, 0x24u);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
