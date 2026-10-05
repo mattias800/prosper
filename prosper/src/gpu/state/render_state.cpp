@@ -304,6 +304,24 @@ uint64_t color_target_physical_bytes(const ColorTargetState& target, ColorExtent
     }
 }
 
+uint64_t color_target_footprint_bound_bytes(const ColorTargetState& target) {
+    ColorExtentRefusal refusal = ColorExtentRefusal::None;
+    if (const uint64_t exact = color_target_physical_bytes(target, &refusal)) return exact;
+    // Every earlier check (binding, programming, dimensions, format, mip, volume, array) passed:
+    // what is missing is only an exact size for this sample count or swizzle mode.
+    if (refusal != ColorExtentRefusal::Msaa && refusal != ColorExtentRefusal::TileMode) return 0;
+    // The mip check proves only that the VIEW selects level 0, not that the allocation has one
+    // level. GFX10 stores level 0 last, above the tail and levels max..1, and extract_render_state
+    // moves `base` onto it only for modes tiled_mip_level_layout() models -- the ones that already
+    // have an exact size. So for a chained allocation here `base` is the allocation origin, and a
+    // level-0-sized range from it would miss the top of level 0 (#4464 review).
+    if (target.max_mip || target.log2_samples > 4u) return 0;
+    const uint32_t bpp =
+        color_format_bytes_per_texel(target.format, target.number_type, target.comp_swap);
+    return thin_surface_bytes_upper_bound(target.width, target.height, target.color_sw_mode, bpp,
+                                          1u << target.log2_samples);
+}
+
 // #1724 diagnostic-only escape hatch; see render_state.hpp. Read once: resolve_pipeline_state is
 // on the per-draw path.
 bool legacy_cb_disable_mask_enabled() {
