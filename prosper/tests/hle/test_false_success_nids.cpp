@@ -39,6 +39,7 @@ constexpr const char* kNpTrophy2GetGroupInfoArray = "+PDSI6WgPRc";
 constexpr const char* kNpTrophy2GetGameIcon = "2QgUy+xJqS0";   // via nid_hash
 constexpr const char* kNpTrophy2GetGroupIcon = "6IjXJUy6ZnA";   // via nid_hash
 constexpr const char* kNpTrophy2GetTrophyIcon = "-9LLVU0uvs8";   // via nid_hash
+constexpr const char* kNpTrophy2GetRewardIcon = "BsE-m8JxIOg";   // 3.20 libSceNpTrophy2 table
 constexpr const char* kNpTrophy2GetGameInfo       = "4IzqhhUQ3nk";  // already registered
 constexpr const char* kNpTrophy2GetTrophyInfoArray = "y3zHpdZO6ME"; // already registered
 constexpr const char* kSaveDataTransferringMount    = "WAzWTZm1H+I";
@@ -126,7 +127,7 @@ void test_nptrophy2_info_queries() {
     printf("-- libSceNpTrophy2 info queries --\n");
     // Each of these fills a caller-supplied out-struct. Unregistered, they return SCE_OK over
     // memory nothing wrote — the #213 shape, where a heap-garbage trophy count sized a 34 GB array.
-    // All eight must answer, not just the two a title happened to crash on: the icon getters are
+    // All nine must answer, not just the two a title happened to crash on: the icon getters are
     // the same out-struct shape one name-variant away.
     const struct {
         const char* nid;
@@ -140,13 +141,14 @@ void test_nptrophy2_info_queries() {
         {kNpTrophy2GetGameIcon, "sceNpTrophy2GetGameIcon"},
         {kNpTrophy2GetGroupIcon, "sceNpTrophy2GetGroupIcon"},
         {kNpTrophy2GetTrophyIcon, "sceNpTrophy2GetTrophyIcon"},
+        {kNpTrophy2GetRewardIcon, "sceNpTrophy2GetRewardIcon"},
     };
     for (const auto& q : queries) {
         HleFn fn = Hle::lookup(q.nid);
         char msg[160];
         snprintf(msg, sizeof(msg), "%s is registered", q.name);
-        // Kills: leaving any one of the eight on the unregistered path. The singular/plural pairs are
-        // the trap this arm exists for — registering `…InfoArray` and not `…Info` leaves the
+        // Kills: leaving any one of the nine on the unregistered path. The singular/plural pairs
+        // are the trap this arm exists for — registering `…InfoArray` and not `…Info` leaves the
         // identical failure live behind a name that reads as covered.
         CHECK(fn != nullptr, msg);
         if (!fn) continue;

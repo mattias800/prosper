@@ -735,9 +735,10 @@ void register_np_hle() {
     Hle::register_fn("sk54bi6FtYM", (HleFn)s_npweb_create_user_context,
                      "sceNpWebApi2CreateUserContext");
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
-    // ALL FIVE of the library's info queries must answer here, not just the two that a title
-    // happened to crash on. Each writes its result through a caller-supplied out-struct, so any one
-    // of them left unregistered returns the dispatcher's 0 — SCE_OK — over memory nothing wrote,
+    // ALL of the library's info queries, and the four icon getters below, must answer here --
+    // not just the two that a title happened to crash on. Each writes its result through a
+    // caller-supplied out-struct, so any one of them left unregistered returns the dispatcher's
+    // 0 — SCE_OK — over memory nothing wrote,
     // which is the failure #213 diagnosed (a heap-garbage trophy count sized a 34 GB array). The
     // singular/plural pairs are the trap: registering `…TrophyInfoArray` and not `…TrophyInfo`
     // leaves the identical shape live behind a name that looks covered. #1956, swept under #2081.
@@ -752,6 +753,7 @@ void register_np_hle() {
     Hle::register_fn("2QgUy+xJqS0", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameIcon");
     Hle::register_fn("6IjXJUy6ZnA", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGroupIcon");
     Hle::register_fn("-9LLVU0uvs8", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyIcon");
+    R("sceNpTrophy2GetRewardIcon", s_nptrophy2_unavailable);   // BsE-m8JxIOg, the fourth getter
     // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
     // libSceNpManager stub table AND shadPS4's PS4 registrations (identical).
     R("sceNpGetState", s_np_state);
