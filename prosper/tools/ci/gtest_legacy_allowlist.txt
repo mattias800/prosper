@@ -144,7 +144,6 @@ tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp
 tests/hle/kernel/test_kernel_nanosleep.cpp
 tests/hle/kernel/test_kernel_sem_timedwait.cpp
 tests/hle/kernel/test_sce_errno.cpp
-tests/hle/kernel/test_select_sleep.cpp
 tests/hle/memory/test_dmem_caller_attribution_alloc_dmem.cpp
 tests/hle/memory/test_dmem_caller_attribution_alloc_main_dmem.cpp
 tests/hle/memory/test_guest_mapping_lease.cpp
