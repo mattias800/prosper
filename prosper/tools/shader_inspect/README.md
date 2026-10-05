@@ -223,6 +223,36 @@ decide whether its loaded words may be used as numeric data:
 - `register-proven` — the register SOFFSET's reaching scalar definition is authenticated
   against the full stream.
 
+A row with `needs-backing=1` also says **what** made the classifier call the load numeric
+(#4499), as two `pc:kind` pairs appended after the nine fields above:
+
+- `backing-blocker` — the first instruction that stopped the cheap walk asking "may the loaded
+  words be replaced by a descriptor placeholder":
+  - `data-read`: an ordinary scalar read of a word that walk still considers loaded;
+  - `unknown-or-indirect-control`, `unmodelled-control`: the walk could not follow the program;
+  - `destination-above-s105`: the load writes into VCC or above (reported at the load).
+- `numeric-blocker` — the first instruction that stopped the walk asking "is there a numeric
+  reader, or a path that cannot be followed":
+  - `numeric-reader`: a non-scalar instruction reads a value derived from the load;
+  - `derived-value-leaves-scalar-data`: a derived value reaches EXEC, a SETREG or a non-SGPR
+    destination;
+  - `scc-branch-on-derived-value`, `exec-branch-on-dependent-exec`: control flow depends on it;
+  - `load-re-executed`: control returned to the load and it could not be shown to read the same
+    bytes again (reported at the load);
+  - `register-offset-with-guest-memory-write`: no reader was found, but the load has a register
+    offset in a program that may write guest memory (reported at the load);
+  - `unknown-instruction`, `indirect-control`, `unmodelled-control`,
+    `branch-target-out-of-range`, `branch-target-mid-instruction`, `walk-budget`: the walk could
+    not follow the program.
+
+```
+raw-wide-load pc=1 op=0x2 sbase=s28 soffset-kind=1 soffset=20 imm=0x0 needs-backing=1 entry-proven=0 register-proven=0 backing-blocker=7:data-read numeric-blocker=1:load-re-executed
+```
+
+Read the two pcs in the listing before changing a proof: the same `needs-backing=1` has stood
+for an over-wide operand (#4429), a compare whose mask width the walk cannot know, and a
+descriptor load inside a loop (#4519) — three different repairs.
+
 A `raw-wide-proof-end` line terminates the output. Unlike `--stage`, these proofs read code
 only, so a raw dump answers them exactly. A row with `needs-backing=1 entry-proven=0` is a
 load the recompiler is expected to refuse with `[smem-reject] reason=raw-wide-data-requires-backing`
