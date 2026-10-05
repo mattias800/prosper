@@ -207,6 +207,28 @@ def test_layer_table_drift_is_reported_and_write_repairs_it(tmp_path):
     assert checks(root) == []
 
 
+def test_write_refuses_a_layers_doc_outside_the_root(tmp_path):
+    root = build(
+        tmp_path / "repo",
+        **{
+            "prosper/tools/ci/check_arch_ratchet.py": (
+                'RULES = ("r1", "r2")\nLAYER_ORDER = ("low", "mid", "high")\n'
+            )
+        },
+    )
+    outside = tmp_path / "outside.md"
+    outside.write_text(layers_doc(), encoding="utf-8")
+    link = root / "prosper/docs/spec/layers.md"
+    link.unlink()
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("this host cannot create symlinks")
+    with pytest.raises(cad.EvaluationError):
+        cad.evaluate(root, write=True)
+    assert outside.read_text(encoding="utf-8") == layers_doc()
+
+
 def test_missing_ratchet_cannot_be_evaluated(tmp_path):
     root = build(tmp_path, **{"prosper/tools/ci/check_arch_ratchet.py": None})
     with pytest.raises(cad.EvaluationError):

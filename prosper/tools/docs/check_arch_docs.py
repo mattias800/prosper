@@ -390,7 +390,12 @@ def check_layer_table(root: Path, order: tuple[str, ...], write: bool) -> list[F
     if current == wanted:
         return []
     if write:
-        path.write_text(text[:start] + wanted + text[end + len(GEN_END) :], encoding="utf-8")
+        # --write edits a file inside the checkout and nowhere else: a layers.md that resolves
+        # outside --root (a symlink, say) is refused rather than followed.
+        target = path.resolve()
+        if not target.is_relative_to(root.resolve()):
+            raise EvaluationError(f"{rel} resolves outside {root}; refusing to write {target}")
+        target.write_text(text[:start] + wanted + text[end + len(GEN_END) :], encoding="utf-8")
         return []
     return [
         Finding(
