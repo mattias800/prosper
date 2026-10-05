@@ -651,3 +651,64 @@ TEST(GapOpcodeRefusals, DsWrxchg2Refuse) {
     expect_gap_refusal(program(prologue, {xchg2_b64[0], xchg2_b64[1]}), 0xA0A2ull,
                        9, {xchg2_b64[0], xchg2_b64[1]}, Rdna2Format::DS, 0x6eu);
 }
+
+// Fragment IMAGE_LOAD_MIP on a genuinely multi-level resource must refuse
+// fail-visibly. Live shape: Stray's fragment 0x30be800000 (6 real levels; see
+// RECOMPILER_REMAINING.md "Stray's rejected IMAGE_LOAD_MIP" / #2818). The words
+// are the live GTA V 2D packet (test_dynfetch_fold.cpp): mip address VGPR v2,
+// T# s[20:27]. Compute already lowers a multi-level runtime mip through the
+// dynamic-mip route (test_game_compute.cpp), which is compute-only by design, so
+// the gap pinned here is the fragment stage. The table sets proven_zero_mip, so
+// the refused program and the single-level control differ ONLY in the declared
+// level count: the refusal is the zero-mip gate's `declared_mip_levels != 1`
+// term. (The recompiler never evaluates v2; it reads the table's
+// proven_zero_mip bit, which a correct executor would not set for v2 = 1.)
+// The plain IMAGE_LOAD sibling against the multi-level table is a second
+// control that rules out the packet, table and export. WHEN a fragment
+// multi-level mip lowering lands, THIS ARM GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageLoadMipMultiLevelRefusesFragment) {
+    static const uint32_t w[2] = {0xf0043108u, 0x00050000u};
+    static const uint32_t plain[2] = {0xf0003108u, 0x00050000u};
+    static const uint32_t exp_mrt0[2] = {0xf800180fu, 0x03020100u};   // exp mrt0 v0-v3 done vm
+
+    auto table = [](uint32_t levels) {
+        ShaderResourceTable rt;
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.binding = 4;
+        texture.img_dim = 1;
+        texture.width = texture.height = 8;
+        texture.sgpr_base = 20;
+        texture.declared_mip_levels = levels;
+        texture.proven_zero_mip = true;   // held fixed: only the level count varies
+        rt.resources.push_back(texture);
+        return rt;
+    };
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040281u,   // v_mov_b32 v2, 1 (mip address; never read by the gate)
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+    };
+    const ShaderResourceTable multi_rt = table(2u);
+
+    auto with_export = [&](const uint32_t pkg[2]) {
+        std::vector<uint32_t> code = prologue;
+        code.push_back(pkg[0]);
+        code.push_back(pkg[1]);
+        code.push_back(exp_mrt0[0]);
+        code.push_back(exp_mrt0[1]);
+        code.push_back(kEndpgm);
+        return code;
+    };
+    EXPECT_TRUE(recompile_fragment(with_export(w).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "fragment IMAGE_LOAD_MIP on a multi-level resource must refuse";
+    const ShaderResourceTable single_rt = table(1u);
+    EXPECT_FALSE(
+        recompile_fragment(with_export(w).data(), prologue.size() + 5u, &single_rt).empty())
+        << "control: identical IMAGE_LOAD_MIP against a single-level, proven-zero-mip resource";
+    EXPECT_FALSE(
+        recompile_fragment(with_export(plain).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "control: fragment plain IMAGE_LOAD with identical fields";
+}
