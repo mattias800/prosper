@@ -2133,16 +2133,21 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_signin_dialog.cpp
     LIBRARIES prosper_core)
 
-  # Remaining SystemService/UserService getters: flags round-trip, tick acknowledged,
-  # privacy reads a deterministic default.
-  prosper_add_gtest(test_syssvc_usersvc
-    SOURCES tests/hle/service/test_syssvc_usersvc.cpp
+  # libSceMouse (device-with-no-input + close completing the 4-call set).
+  prosper_add_gtest(test_mouse
+    SOURCES tests/hle/service/test_mouse.cpp
     LIBRARIES prosper_core)
 
   # Remaining dialog entry points (LoginDialog lifecycle, MsgDialog progress bars,
   # WebBrowserDialog pair): headless lifecycles pinning NONE -> FINISHED transitions.
   prosper_add_gtest(test_login_dialog
     SOURCES tests/hle/service/test_login_dialog.cpp
+    LIBRARIES prosper_core)
+
+  # Remaining SystemService/UserService getters: flags round-trip, tick acknowledged,
+  # privacy reads a deterministic default.
+  prosper_add_gtest(test_syssvc_usersvc
+    SOURCES tests/hle/service/test_syssvc_usersvc.cpp
     LIBRARIES prosper_core)
 
   # Includes a shared fixture, which resolves from the `tests` root.
