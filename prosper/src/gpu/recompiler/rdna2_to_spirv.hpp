@@ -211,6 +211,19 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
 // Non-null raw x4/x8 SMEM loads whose words have an ordinary scalar/vector data reader before
 // replacement. Such loads cannot use the descriptor-only zero-placeholder lowering.
 std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
+// WHY each of those loads is classified as numeric data: the first instruction that stopped the
+// "may the words be replaced by a descriptor placeholder" walk, and the first that stopped the
+// "is there a numeric reader or an uncertain path" walk. Diagnostics only (#4499) -- it runs the
+// same two walks as the classifier above and never changes its answer.
+struct RawWideLoadDiagnosis {
+    uint32_t load_pc = 0;
+    uint32_t backing_pc = UINT32_MAX;
+    const char* backing_kind = "none";
+    uint32_t numeric_pc = UINT32_MAX;
+    const char* numeric_kind = "none";
+};
+std::vector<RawWideLoadDiagnosis>
+rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
 // Exact immediate x4/x8 read points requiring an owned same-fold observation: entry pointers

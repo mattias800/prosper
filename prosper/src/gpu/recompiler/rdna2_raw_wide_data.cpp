@@ -38,6 +38,16 @@ struct RawWideState {
 // not certify descriptor provenance; resource resolution still decides whether a consumer works.
 class RawWideLifetime {
 public:
+    // The first instruction that stopped each walk, for diagnostics only (#4499). A walk that
+    // reports only "failed" makes every widening of it a guess: three different follow-ups hide
+    // behind one `needs-backing=1`. Never read by the classification itself.
+    struct Blocker {
+        uint32_t pc = UINT32_MAX;
+        const char* kind = "none";
+    };
+    const Blocker& backing_blocker() const { return backing_blocker_; }
+    const Blocker& numeric_blocker() const { return numeric_blocker_; }
+
     RawWideLifetime(const std::vector<Rdna2Inst>& instructions,
                     const std::unordered_map<uint32_t, size_t>& pc_indices,
                     size_t load_index, uint32_t word_count)
@@ -45,7 +55,12 @@ public:
           first(instructions[load_index].dst.value), words(word_count) {}
 
     bool requires_backing() const {
-        if (first + static_cast<int>(words) > 106) return true;
+        const auto blocked = [&](uint32_t pc, const char* kind) {
+            backing_blocker_ = {pc, kind};
+            return true;
+        };
+        if (first + static_cast<int>(words) > 106)
+            return blocked(ins[start].pc, "destination-above-s105");
         std::vector<RawWideState> pending;
         std::unordered_set<uint64_t> visited;
         if (start + 1 < ins.size())
@@ -59,16 +74,21 @@ public:
             const Rdna2Inst& in = ins[state.index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
                 (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u))
-                return true;
+                return blocked(in.pc, "unknown-or-indirect-control");
             if (in.is_end) continue;
-            if (reads_data(in, state.live)) return true;
+            if (reads_data(in, state.live)) return blocked(in.pc, "data-read");
             const uint16_t live = kill_written_words(in, state.live);
-            if (live && !enqueue_successors(in, state.index, live, pending)) return true;
+            if (live && !enqueue_successors(in, state.index, live, pending))
+                return blocked(in.pc, "unmodelled-control");
         }
         return false;
     }
 
     bool has_numeric_reader_or_uncertain_path() const {
+        const auto blocked = [&](uint32_t pc, const char* kind) {
+            numeric_blocker_ = {pc, kind};
+            return true;
+        };
         // Scalar data is MAY provenance (OR at joins). A separate MUST fact identifies exact
         // fresh mask roots used by the emitter's Bool consumers (AND at joins). A compare can
         // replace that Bool without proving that both physical scalar words were overwritten.
@@ -128,7 +148,8 @@ public:
             State state = std::move(pending.back());
             pending.pop_back();
             if ((!state.regs.any() && !state.scc) || state.index >= ins.size()) continue;
-            if (state.index == start) return true; // a replayed load needs a new byte observation
+            // A replayed load needs a new byte observation.
+            if (state.index == start) return blocked(ins[start].pc, "load-re-executed");
             const size_t slot = state.scc ? 1u : 0u;
             if (seen_any[state.index][slot] &&
                 (state.regs & ~seen[state.index][slot]).none() &&
@@ -141,21 +162,23 @@ public:
             seen[state.index][slot] |= state.regs;
             state.regs = seen[state.index][slot];
             state.masks = seen_masks[state.index][slot];
-            if (++processed > 32768) return true;
+            if (++processed > 32768) return blocked(ins[state.index].pc, "walk-budget");
             const Rdna2Inst& in = ins[state.index];
-            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords)
+                return blocked(in.pc, "unknown-instruction");
             if (in.is_end) continue;
-            if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u &&
-                 in.opcode <= 0x22u) ||
+            if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
                 (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64) ||
                 (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u &&
-                 in.opcode <= 0x2au)) return true; // indirect control/relative SGPR write
+                 in.opcode <= 0x2au))   // indirect control/relative SGPR write
+                return blocked(in.pc, "indirect-control");
 
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
-                (in.opcode == 0x04u || in.opcode == 0x05u)) return true;
-            if (in.fmt == Rdna2Format::SOPP &&
-                (in.opcode == 0x08u || in.opcode == 0x09u) &&
-                !state.masks.test(126)) return true;
+                (in.opcode == 0x04u || in.opcode == 0x05u))
+                return blocked(in.pc, "scc-branch-on-derived-value");
+            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x08u || in.opcode == 0x09u) &&
+                !state.masks.test(126))
+                return blocked(in.pc, "exec-branch-on-dependent-exec");
             const auto independent_mask = [&](const Operand& operand) {
                 if (operand.kind == OperandKind::InlineInt)
                     return operand.value == 0 || operand.value == -1;
@@ -220,13 +243,14 @@ public:
             }
             const bool scalar_result = in.fmt == Rdna2Format::SOP1 ||
                 in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK;
-            if (derived_read && !scalar_result && in.fmt != Rdna2Format::SOPC) return true;
+            if (derived_read && !scalar_result && in.fmt != Rdna2Format::SOPC)
+                return blocked(in.pc, "numeric-reader");
             if (derived_read && scalar_result &&
                 (in.dst.kind != OperandKind::SGPR ||
-                 (in.fmt == Rdna2Format::SOPK &&
-                  in.opcode == kSopkOpcodeSetregB32) ||
+                 (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeSetregB32) ||
                  rdna2_instruction_may_change_exec(in)) &&
-                !independent_transfer) return true;
+                !independent_transfer)
+                return blocked(in.pc, "derived-value-leaves-scalar-data");
 
             // Evaluate inputs before expiring overlapping roots. Both siblings are invalidated
             // conservatively: a saved Bool must never authorize a later physical data lifetime.
@@ -311,18 +335,23 @@ public:
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
                 const int64_t target_pc = static_cast<int64_t>(in.pc) +
                     in.len_dwords + in.simm16;
-                if (target_pc < 0 || target_pc > UINT32_MAX) return true;
+                if (target_pc < 0 || target_pc > UINT32_MAX)
+                    return blocked(in.pc, "branch-target-out-of-range");
                 const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
                 if (target == by_pc.end()) {
-                    if (target_pc <= ins.back().pc) return true;
-                } else if (!enqueue(target->second)) return true;
+                    if (target_pc <= ins.back().pc)
+                        return blocked(in.pc, "branch-target-mid-instruction");
+                } else if (!enqueue(target->second)) {
+                    return blocked(ins[start].pc, "load-re-executed");
+                }
                 if (in.opcode == kSoppOpcodeBranch) continue;
             } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
                        in.opcode != 0x0au && in.opcode != 0x10u &&
                        in.opcode != 0x16u && in.opcode != 0x17u) {
-                return true;
+                return blocked(in.pc, "unmodelled-control");
             }
-            if (state.index + 1 < ins.size() && !enqueue(state.index + 1)) return true;
+            if (state.index + 1 < ins.size() && !enqueue(state.index + 1))
+                return blocked(ins[start].pc, "load-re-executed");
         }
         return false;
     }
@@ -363,6 +392,7 @@ private:
     size_t start;
     int first;
     uint32_t words;
+    mutable Blocker backing_blocker_, numeric_blocker_;
 
     std::bitset<128> saved_exec_masks_at_load() const {
         // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
@@ -543,6 +573,38 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
             data_loads.push_back(load.pc);
     }
     return data_loads;
+}
+
+// The same two walks as rdna2_raw_wide_data_loads, reporting where each one stopped. One row per
+// load the classifier calls numeric data; a load it clears has no row. Diagnostics only.
+std::vector<RawWideLoadDiagnosis>
+rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins) {
+    std::vector<RawWideLoadDiagnosis> rows;
+    std::unordered_map<uint32_t, size_t> by_pc;
+    for (size_t index = 0; index < ins.size(); ++index) by_pc.emplace(ins[index].pc, index);
+    const bool has_guest_write = std::any_of(ins.begin(), ins.end(), rdna2_may_write_guest_memory);
+    for (size_t index = 0; index < ins.size(); ++index) {
+        const Rdna2Inst& load = ins[index];
+        if (load.fmt != Rdna2Format::SMEM || (load.opcode != 0x2u && load.opcode != 0x3u) ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
+            load.dst.value + (load.opcode == 0x2u ? 4 : 8) > 128)
+            continue;
+        const RawWideLifetime lifetime(ins, by_pc, index, load.opcode == 0x2u ? 4u : 8u);
+        if (!lifetime.requires_backing()) continue;
+        const bool numeric = lifetime.has_numeric_reader_or_uncertain_path();
+        const bool register_offset =
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125;
+        if (!numeric && !(register_offset && has_guest_write)) continue;
+        RawWideLoadDiagnosis row;
+        row.load_pc = load.pc;
+        row.backing_pc = lifetime.backing_blocker().pc;
+        row.backing_kind = lifetime.backing_blocker().kind;
+        row.numeric_pc = numeric ? lifetime.numeric_blocker().pc : load.pc;
+        row.numeric_kind =
+            numeric ? lifetime.numeric_blocker().kind : "register-offset-with-guest-memory-write";
+        rows.push_back(row);
+    }
+    return rows;
 }
 
 // A small, deliberately stricter subset of the above refusal population can use a current-byte
