@@ -576,9 +576,10 @@ HLE(s_imedlg_abort) {
 // is usable. Panel geometry answers "no panel" (0x0) rather than Sony's panel constants, which
 // prosper cannot verify and which would lay the title's UI out around a panel that never
 // appears. Position/form stays out: its struct has no size arg, so it cannot be filled safely.
-// Signatures agree between shadPS4 and portps5; error codes are the file's established
-// 0x80BC00xx IME values. CONFIDENCE: MED on shapes/errors; LOW on panel-absent behavior,
-// which no local title has exercised.
+// Signatures agree between shadPS4 and portps5; ParamInit, GetPanelSize and KeyboardSetMode are
+// re-derived from the shipped libSceIme (see each handler). Metaphor (PPSA20800) calls ParamInit,
+// Open, Close, SetText, SetCaret and GetPanelSize at its name entry. CONFIDENCE: MED on the other
+// shapes/errors; LOW on panel-absent behavior.
 namespace {
 // already open
 constexpr uint64_t kImeErrBusy = 0x80BC0001ull;
@@ -586,9 +587,13 @@ constexpr uint64_t kImeErrBusy = 0x80BC0001ull;
 constexpr uint64_t kImeErrNotOpened = 0x80BC0002ull;
 constexpr uint64_t kImeErrInvalidParam = 0x80BC0030ull;
 constexpr uint64_t kImeErrInvalidAddr = 0x80BC0031ull;
-// OrbisImeParam size/user_id facts: 88 bytes, user_id (s32) at +0. ParamInit zeroes and marks
-// the user invalid, mirroring the reference init.
-constexpr uint64_t kImeParamBytes = 88;
+constexpr uint64_t kImeErrInvalidUserId = 0x80BC0010ull;
+constexpr uint64_t kImeErrInvalidType = 0x80BC0011ull;
+constexpr uint64_t kImeErrInvalidOption = 0x80BC0015ull;
+constexpr uint64_t kImeErrInvalidMode = 0x80BC0024ull;
+// The shipped libSceIme's ParamInit (export WmYDzdC4EHI) zeroes 0x60 bytes and then writes -1 to the
+// user id at +0; Metaphor allocates its param block as exactly 0x60 bytes.
+constexpr uint64_t kImeParamBytes = 0x60;
 constexpr int32_t kImeInvalidUser = -1;
 // Longest UTF-16 text the session retains. The guest's maxTextLength caps its own buffer;
 // prosper additionally refuses to copy more than this out of guest memory in one call.
@@ -673,11 +678,29 @@ HLE(s_ime_confirm_candidate) {
     // No candidate engine exists to confirm through.
     return 0;
 }
+// sceImeGetPanelSize(param*, width*, height*) -- from the shipped libSceIme (export ziPDcIjO0Vk). No
+// open session is needed. NULL pointers answer 0x80BC0031; a panel type (param +4) above 4 answers
+// 0x80BC0011; option bits (param +0x20) outside what the SDK allows answer 0x80BC0015 (current SDKs
+// reject 0xffff8400; older SDKs allow fewer bits -- CONFIDENCE: MED on the mask). The size is 872x440,
+// or 300x432 for type 4, scaled by the display safe-area ratio (prosper's safe area is the full
+// screen, so 1.0) and doubled when option bit 0x4000 is set. CONFIDENCE: HIGH on the sizes.
 HLE(s_ime_get_panel_size) {
     svc_log("sceImeGetPanelSize", a0, a1, a2, a3, a4, a5);
     if (!a0 || !a1 || !a2) return kImeErrInvalidAddr;
-    *(uint32_t*)PW(a1) = 0;
-    *(uint32_t*)PW(a2) = 0;
+    uint32_t type = 0, option = 0;
+    if (!svc_copy_bytes(a0 + 4, &type, sizeof(type)) ||
+        !svc_copy_bytes(a0 + 0x20, &option, sizeof(option)))
+        return kImeErrInvalidAddr;
+    if (type > 4) return kImeErrInvalidType;
+    if (option & 0xffff8400u) return kImeErrInvalidOption;
+    uint32_t width = type == 4 ? 300u : 872u;
+    uint32_t height = type == 4 ? 432u : 440u;
+    if (option & 0x4000u) {
+        width *= 2;
+        height *= 2;
+    }
+    *(uint32_t*)PW(a1) = width;
+    *(uint32_t*)PW(a2) = height;
     return 0;
 }
 HLE(s_ime_disable_controller) {
@@ -687,9 +710,13 @@ HLE(s_ime_disable_controller) {
 }
 HLE(s_ime_kbd_setmode) {
     svc_log("sceImeKeyboardSetMode", a0, a1, a2, a3, a4, a5);
+    // Order from the shipped libSceIme (export ua+13Hk9kKs): no keyboard open -> 0x80BC0002; mode bits
+    // outside the SDK's mask -> 0x80BC0024 (current SDKs allow 0x7f; CONFIDENCE: MED on the mask); a
+    // user without an open keyboard -> 0x80BC0010. The pump ignores modes.
     std::lock_guard<std::mutex> lock(g_ime_mx);
-    if (!g_ime_keyboard.open || g_ime_keyboard.user_id != (int32_t)a0) return kImeErrNotOpened;
-    // The pump ignores modes; the open keyboard keeps its behavior.
+    if (!g_ime_keyboard.open) return kImeErrNotOpened;
+    if ((uint32_t)a1 & 0xffffff80u) return kImeErrInvalidMode;
+    if (g_ime_keyboard.user_id != (int32_t)a0) return kImeErrInvalidUserId;
     return 0;
 }
 

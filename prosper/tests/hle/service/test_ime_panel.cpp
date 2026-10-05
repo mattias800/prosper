@@ -66,7 +66,7 @@ TEST(ImePanel, ParamInitZeroesAndInvalidatesUser) {
     register_builtin_hle();
     // Void function: a null pointer is a silent no-op, matching the reference shape.
     EXPECT_EQ(call_nid("sceImeParamInit", 0), 0u);
-    uint8_t param[88];
+    uint8_t param[0x60];
     std::memset(param, 0xAB, sizeof(param));
     EXPECT_EQ(call_nid("sceImeParamInit", addr(param)), 0u);
     int32_t user = 0;
@@ -81,7 +81,7 @@ TEST(ImePanel, OpenCloseLifecycle) {
     register_builtin_hle();
     EXPECT_EQ(call_nid("sceImeClose"), kNotOpened) << "close with no session fails";
     EXPECT_EQ(call_nid("sceImeOpen", 0, 0), kInvalidAddr) << "open without a param fails";
-    uint8_t param[88]{};
+    uint8_t param[0x60]{};
     EXPECT_EQ(call_nid("sceImeOpen", addr(param), 0), 0u) << "open starts a session";
     EXPECT_EQ(call_nid("sceImeOpen", addr(param), 0), kBusy) << "double open reports busy";
     EXPECT_EQ(call_nid("sceImeClose"), 0u) << "close ends the session";
@@ -96,7 +96,7 @@ TEST(ImePanel, TextAndCaretValidateAgainstTheSession) {
         << "set-text on a closed session fails";
     EXPECT_EQ(call_nid("sceImeSetCaret", 0), kNotOpened) << "caret on a closed session fails";
 
-    uint8_t param[88]{};
+    uint8_t param[0x60]{};
     ASSERT_EQ(call_nid("sceImeOpen", addr(param), 0), 0u);
     EXPECT_EQ(call_nid("sceImeSetText", 0, 2), kInvalidAddr) << "null text is refused";
     EXPECT_EQ(call_nid("sceImeSetText", addr(text), 4097), kInvalidParam)
@@ -125,7 +125,7 @@ TEST(ImePanel, HintsCandidatesPanelAndMode) {
     EXPECT_EQ(call_nid("sceImeConfirmCandidate", 3), kNotOpened)
         << "candidate confirm on a closed session fails";
 
-    uint8_t param[88]{};
+    uint8_t param[0x60]{};
     ASSERT_EQ(call_nid("sceImeOpen", addr(param), 0), 0u);
     EXPECT_EQ(call_nid("sceImeSetCandidateIndex", 3), 0u);
     EXPECT_EQ(call_nid("sceImeConfirmCandidate", 3), 0u);
@@ -140,8 +140,23 @@ TEST(ImePanel, HintsCandidatesPanelAndMode) {
         << "null param is refused";
     uint32_t w = 0xDEADu, h = 0xDEADu;
     EXPECT_EQ(call_nid("sceImeGetPanelSize", addr(param), addr(&w), addr(&h)), 0u);
-    EXPECT_EQ(w, 0u) << "no panel exists, so the width is zero, not residue";
-    EXPECT_EQ(h, 0u) << "no panel exists, so the height is zero, not residue";
+    EXPECT_EQ(w, 872u) << "the firmware's panel width";
+    EXPECT_EQ(h, 440u) << "the firmware's panel height";
+    uint8_t typed[0x60]{};
+    const uint32_t type4 = 4, type5 = 5, big = 0x4000, bad_option = 0x400;
+    std::memcpy(typed + 4, &type4, 4);
+    EXPECT_EQ(call_nid("sceImeGetPanelSize", addr(typed), addr(&w), addr(&h)), 0u);
+    EXPECT_EQ(w, 300u);
+    EXPECT_EQ(h, 432u);
+    std::memcpy(typed + 0x20, &big, 4);
+    EXPECT_EQ(call_nid("sceImeGetPanelSize", addr(typed), addr(&w), addr(&h)), 0u);
+    EXPECT_EQ(w, 600u) << "option 0x4000 doubles the panel";
+    EXPECT_EQ(h, 864u);
+    std::memcpy(typed + 0x20, &bad_option, 4);
+    EXPECT_EQ(call_nid("sceImeGetPanelSize", addr(typed), addr(&w), addr(&h)), 0x80BC0015u);
+    std::memcpy(typed + 0x20, &big, 4);
+    std::memcpy(typed + 4, &type5, 4);
+    EXPECT_EQ(call_nid("sceImeGetPanelSize", addr(typed), addr(&w), addr(&h)), 0x80BC0011u);
     EXPECT_EQ(call_nid("sceImeClose"), 0u);
 
     // Keyboard mode follows the keyboard pump's own open state, not the panel session.
@@ -149,7 +164,8 @@ TEST(ImePanel, HintsCandidatesPanelAndMode) {
         << "mode with no open keyboard fails";
     EXPECT_EQ(call_nid("sceImeKeyboardOpen", 1, 0), 0u);
     EXPECT_EQ(call_nid("sceImeKeyboardSetMode", 1, 0), 0u) << "mode on the open keyboard succeeds";
-    EXPECT_EQ(call_nid("sceImeKeyboardSetMode", 2, 0), kNotOpened)
-        << "mode for another user fails";
+    EXPECT_EQ(call_nid("sceImeKeyboardSetMode", 1, 0x80), 0x80BC0024u) << "invalid mode bits";
+    EXPECT_EQ(call_nid("sceImeKeyboardSetMode", 2, 0), 0x80BC0010u)
+        << "a user without an open keyboard is an invalid user id";
     EXPECT_EQ(call_nid("sceImeKeyboardClose", 1), 0u);
 }
