@@ -1055,6 +1055,8 @@ void register_builtin_hle() {
     register_rudp_hle();   // libSceRudp setup acknowledged, no backend
     register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
+    register_cescs_hle();   // libSceCesCs CP1252<->UTF-8 single-character conversion
+    register_pngdec_hle();   // libScePngDec PNG decode via vendored stb_image
     register_fiber_hle();    // libSceFiber cooperative guest-stack execution
     register_ult_hle();      // libSceUlt: NOT implemented — fail-visible counted stubs (#1603)
     register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)

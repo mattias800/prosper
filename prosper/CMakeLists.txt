@@ -128,9 +128,11 @@ if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
   # stb_truetype.h backs the libSceFont Ft (FreeType-edition) rasterizer in
-  # src/hle/util/hle_font.cpp. PRIVATE: it is an implementation detail of one translation unit, not
-  # part of prosper_core's interface. See third_party/stb/README.md -- unlike stb_image.h next to
-  # it, THIS header is on the guest path.
+  # src/hle/util/hle_font.cpp, and stb_image.h (v2.30, PNG only) backs libScePngDec in
+  # src/hle/util/hle_pngdec.cpp -- the latter by owner decision 2026-10-05; prosper-app links its
+  # own copy for cover art. PRIVATE: implementation details of those translation units, not part
+  # of prosper_core's interface. BOTH headers are on the guest path and parse bytes a title
+  # supplies, so treat them as parsers of untrusted input; see third_party/stb/README.md.
   target_include_directories(prosper_core PRIVATE third_party/stb)
   target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1178,6 +1180,16 @@ if(TARGET prosper_core)
   # execute; plus ATRAC9 config parse, memory ack and StrError.
   prosper_add_gtest(test_ajm_jobs
     SOURCES tests/hle/test_ajm_jobs.cpp
+    LIBRARIES prosper_core)
+
+  # libSceCesCs (single-character CP1252<->UTF-8) and libScePngDec (PNG to 8-bit
+  # RGBA/BGRA): pure codecs with no backend. Unregistered, both answered SCE_OK while
+  # writing nothing into 1-3 byte text buffers and pixel rasters respectively.
+  prosper_add_gtest(test_cescs
+    SOURCES tests/hle/test_cescs.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_pngdec
+    SOURCES tests/hle/test_pngdec.cpp
     LIBRARIES prosper_core)
 
   prosper_add_gtest(test_avplayer
