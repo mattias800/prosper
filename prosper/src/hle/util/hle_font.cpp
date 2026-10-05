@@ -829,6 +829,31 @@ int32_t font_get_render_weight(void* handle, float* out_x, float* out_y, uint32_
     return font_get_weight(handle, out_x, out_y, out_mode);
 }
 
+FontLibrary* library(void* handle) {
+    auto* l = static_cast<FontLibrary*>(handle);
+    return l && l->magic == kLibraryMagic ? l : nullptr;
+}
+
+int32_t font_get_pixel_resolution(void* handle, uint32_t* out) {
+    const auto* l = library(handle);
+    if (out) *out = l ? 1u : 0u;
+    if (!l) return kFontErrInvalidHandle;
+    return out ? 0 : kFontErrInvalidParam;
+}
+
+int32_t font_clear_device_cache(void* handle) {
+    const auto* l = library(handle);
+    if (!l) return kFontErrInvalidHandle;
+    return 0;
+}
+
+int32_t font_get_library(void* handle, void** out) {
+    const auto* f = face(handle);
+    if (out) *out = f ? &g_library : nullptr;
+    if (!f) return kFontErrInvalidHandle;
+    return out ? 0 : kFontErrInvalidParam;
+}
+
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
     if (!out) return static_cast<int32_t>(0x80540002u);
@@ -992,6 +1017,9 @@ void register_font_hle() {
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
     R("8-zmgsxkBek", (HleFn)font_ok, "sceFontGlyphDefineAttribute");
+    R("BozJej5T6fs", (HleFn)font_get_pixel_resolution, "sceFontGetPixelResolution");
+    R("I9R5VC6eZWo", (HleFn)font_clear_device_cache, "sceFontClearDeviceCache");
+    R("LzmHDnlcwfQ", (HleFn)font_get_library, "sceFontGetLibrary");
 }
 
 } // namespace prosper

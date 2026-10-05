@@ -363,3 +363,76 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
         << "DestroyString returns success";
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
+
+struct FontResolution {
+    HleFn create_library = nullptr, get_pixel_resolution = nullptr, clear_device_cache = nullptr,
+          get_library = nullptr, open_font_set = nullptr, close_font = nullptr;
+    bool registered() const {
+        return create_library && get_pixel_resolution && clear_device_cache && get_library &&
+               open_font_set && close_font;
+    }
+};
+FontResolution font_resolution() {
+    register_builtin_hle();
+    FontResolution font;
+    font.create_library = Hle::lookup("nWrfPI4Okmg");
+    font.get_pixel_resolution = Hle::lookup("BozJej5T6fs");
+    font.clear_device_cache = Hle::lookup("I9R5VC6eZWo");
+    font.get_library = Hle::lookup("LzmHDnlcwfQ");
+    font.open_font_set = Hle::lookup("cKYtVmeSTcw");
+    font.close_font = Hle::lookup("vzHs3C8lWJk");
+    return font;
+}
+
+TEST(Font, ResolutionSurfaceIsRegistered) {
+    EXPECT_TRUE(font_resolution().registered()) << "font resolution surface is registered";
+}
+
+TEST(Font, ResolutionNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontGetPixelResolution"), "BozJej5T6fs");
+    EXPECT_EQ(nid_hash("sceFontClearDeviceCache"), "I9R5VC6eZWo");
+    EXPECT_EQ(nid_hash("sceFontGetLibrary"), "LzmHDnlcwfQ");
+    EXPECT_NE(nid_hash("sceFontGetPixelResolution"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+TEST(Font, GetPixelResolutionWritesNonZeroSubPixelCount) {
+    const FontResolution font = font_resolution();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    uint32_t sub_pixel = 0;
+    EXPECT_EQ(font.get_pixel_resolution(addr(library), addr(&sub_pixel), 0, 0, 0, 0), 0u)
+        << "GetPixelResolution returns success";
+    EXPECT_EQ(sub_pixel, 1u) << "GetPixelResolution writes a non-zero sub-pixel count";
+}
+
+TEST(Font, ClearDeviceCacheReturnsSuccess) {
+    const FontResolution font = font_resolution();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    EXPECT_EQ(font.clear_device_cache(addr(library), 0, 0, 0, 0, 0), 0u)
+        << "ClearDeviceCache returns success";
+}
+
+TEST(Font, GetLibraryWritesBackTheCreatedLibrary) {
+    const FontResolution font = font_resolution();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    ASSERT_NE(handle, nullptr);
+    void* out_library = nullptr;
+    EXPECT_EQ(font.get_library(addr(handle), addr(&out_library), 0, 0, 0, 0), 0u)
+        << "GetLibrary returns success";
+    EXPECT_EQ(out_library, library) << "GetLibrary writes back the same library handle";
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+}
