@@ -64,7 +64,9 @@ FontState font_state() {
     font.render_vertical = Hle::lookup("i6UNdSig1uE");
     return font;
 }
-constexpr uint64_t addr(const void* p) {
+// Not constexpr: a reinterpret_cast is never a constant expression, and clang (the macOS build)
+// rejects a constexpr function that can never produce one (#4467).
+uint64_t addr(const void* p) {
     return reinterpret_cast<uint64_t>(p);
 }
 }  // namespace
