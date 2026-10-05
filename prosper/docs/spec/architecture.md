@@ -203,7 +203,7 @@ A reimplemented library lists the functions it implements in one declaration tab
 handlers and the argument semantics a C++ type cannot carry; NIDs are derived from names, so no
 firmware symbol data is committed. Registration and a typed relay trace of every call's decoded
 arguments are generated from the table. The Windows calling-convention bridge is already generated
-from each handler's deduced signature and stays so.
+by `emit_sysv_to_ms_bridge` and stays so.
 Status: proposed (adr:0015)
 Enforcement: adr:0015
 
