@@ -1,6 +1,7 @@
 // build_draw_frame_resources -- see draw_resources.hpp. Moved verbatim out of live_renderer.cpp (#3892).
 #include "shared/live/submit_renderer/draw_resources.hpp"
 #include "shared/live/submit_renderer/image_resources.hpp"
+#include "shared/live/submit_renderer/native_bc_chain_audit.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
 #include "diagnostics/readback_refusal.hpp"
 
@@ -4366,35 +4367,20 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                               dst, src.data(), span, lbw, lbh, bcb, r.tile_mode);
                       offset += level_bytes;
                   }
-                  // PROSPER_NATIVE_BC_CHAIN_AUDIT=1: does the level-1 placement hold this
-                  // texture's own level 1? A real mip is close to the 2x2 box of level 0; a
-                  // foreign or unwritten region is not. Logged once per identity (bounded).
+                  // PROSPER_NATIVE_BC_CHAIN_AUDIT=1: does each level's placement hold this
+                  // texture's own level? A real mip is close to the 2x2 box of the level above
+                  // it; a foreign or unwritten region is not. Level 1 alone is not enough: the
+                  // levels a distant or grazing surface samples are far smaller, and the ones
+                  // packed in the shared tail are placed by a different rule (#4496). Logged
+                  // once per identity (bounded). `levels_mad` lists levels 1..N-1, a `t` suffix
+                  // marking a tail-packed level; `shifted_control` is level 1 against a
+                  // half-width-shifted box, so a flat texture (both near zero) reads as such.
                   if (PROSPER_ENV_ON("PROSPER_NATIVE_BC_CHAIN_AUDIT") &&
                       native_bc_chain_levels > 1 && tw >= 8 && th >= 8) {
                       static std::set<uint64_t> audited;
-                      if (audited.size() < 400 && audited.insert(r.gpu_addr).second) {
-                          std::vector<uint8_t> l0(size_t(tw) * th * 4), l1(size_t(tw / 2) * (th / 2) * 4);
-                          const size_t l0_bytes = size_t((tw + 3) / 4) * ((th + 3) / 4) * bcb;
-                          prosper::gpu::bc_decode_surface(l0.data(), texture_pixels.data(), l0_bytes, tw, th, r.format);
-                          prosper::gpu::bc_decode_surface(l1.data(), texture_pixels.data() + l0_bytes,
-                              texture_pixels.size() - l0_bytes, tw / 2, th / 2, r.format);
-                          double mad = 0, mad_shift = 0; size_t n = 0;
-                          for (uint32_t y = 0; y < th / 2; ++y)
-                              for (uint32_t x = 0; x < tw / 2; ++x)
-                                  for (uint32_t c = 0; c < 3; ++c) {
-                                      auto at = [&](uint32_t xx, uint32_t yy) { return int(l0[(size_t(yy) * tw + xx) * 4 + c]); };
-                                      const int box = (at(2*x,2*y) + at(2*x+1,2*y) + at(2*x,2*y+1) + at(2*x+1,2*y+1) + 2) / 4;
-                                      const int v = l1[(size_t(y) * (tw / 2) + x) * 4 + c];
-                                      const uint32_t sx = (x + tw / 4) % (tw / 2);
-                                      const int vs = l1[(size_t(y) * (tw / 2) + sx) * 4 + c];
-                                      mad += std::abs(v - box); mad_shift += std::abs(vs - box); ++n;
-                                  }
-                          std::fprintf(stderr, "[native-bc-audit] addr=0x%llx fmt=%u %ux%u levels=%u tile=%u "
-                                       "l1_vs_box0=%.2f shifted_control=%.2f\n",
-                                       static_cast<unsigned long long>(r.gpu_addr),
-                                       static_cast<unsigned>(r.format), tw, th, native_bc_chain_levels,
-                                       r.tile_mode, n ? mad / n : 0.0, n ? mad_shift / n : 0.0);
-                      }
+                      if (audited.size() < 400 && audited.insert(r.gpu_addr).second)
+                          log_native_bc_chain_audit(texture_pixels, *native_bc_plan,
+                                                    native_bc_chain_levels, bcb, r);
                   }
               } else if (bcb && native_bc_linear_copy) {
                   // Linear, unpadded native BC: one guarded copy of the guest blocks, which
