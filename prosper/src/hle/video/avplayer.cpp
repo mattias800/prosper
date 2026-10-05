@@ -920,6 +920,44 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
     return 0;
 }
 HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); return 0; }
+// --- AvPlayer remainder: trick speed and bandwidth window -----------------------------------------
+// Contracts from the shipped libSceAvPlayer sprx (testdata/sprx), not from a secondary table.
+// s32 sceAvPlayerSetTrickSpeed(handle, int32 speed) -- libSceAvPlayer export av8Z++94rs0: a NULL handle
+// answers 0x806a0001; speed 0, and any speed in -399..-1 or 1..399 other than 100, answers 0x806a0004;
+// any other speed (100 included) is handed to an inner setter whose failure answers 0x806a0002, and
+// which fails unless the player has a ready source in a playable state. Modelled here as "no source ->
+// 0x806a0002"; the play-state half of that gate is not. No trick-play backend exists (the media clock
+// runs at wall rate), so a valid speed other than 100 is accepted but NOT honoured -- logged once so the
+// gap stays visible. CONFIDENCE: HIGH on the refusals and the source gate; MED on the state gate.
+HLE(s_avp_trickspeed) {
+    svc_log("sceAvPlayerSetTrickSpeed", a0, a1, a2, a3, a4, a5);
+    const int32_t speed = (int32_t)a1;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    if (!a0 || g_avp.find(a0) == g_avp.end()) return 0x806a0001ull;
+    if (speed == 0) return 0x806a0004ull;
+    if (speed != 100 && speed > -400 && speed < 400) return 0x806a0004ull;
+    if (!g_avp.find(a0)->second.have_source) return 0x806a0002ull;
+    if (speed != 100) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "[avp] sceAvPlayerSetTrickSpeed(%d) accepted but not honoured: playback "
+                            "stays at normal speed\n", speed);
+    }
+    return 0;
+}
+// s32 sceAvPlayerSetAvailableBandwidth(handle, start, min, max) -- libSceAvPlayer.native export
+// N6Oy-EjduiY: a NULL or unknown handle answers 0x806a0001; before a source is added the three values
+// are stored and it answers 0; once the player has a source it answers 0x806a0002. There is no
+// min/max coherence check. Nothing here streams adaptively, so the stored window has no consumer.
+// CONFIDENCE: HIGH.
+HLE(s_avp_bandwidth) {
+    svc_log("sceAvPlayerSetAvailableBandwidth", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = a0 ? g_avp.find(a0) : g_avp.end();
+    if (it == g_avp.end()) return 0x806a0001ull;
+    if (it->second.have_source) return 0x806a0002ull;
+    return 0;
+}
 // Begin a source: resolve/open it, fire READY, and (auto_start) begin playback with PLAY.
 static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     if (!guest_path || !*guest_path) return 0x806a0001ull;
@@ -1827,6 +1865,9 @@ void register_avplayer_hle() {
     Hle::register_fn("XC9wM+xULz8", (HleFn)s_avp_jumptotime, "sceAvPlayerJumpToTime");
     Hle::register_fn("k-q+xOxdc3E", (HleFn)s_avp_stream_ok, "sceAvPlayerSetAvSyncMode");
     Hle::register_fn("OVths0xGfho", (HleFn)s_avp_stream_ok, "sceAvPlayerSetLooping");
+    // AvPlayer remainder; contracts from the shipped libSceAvPlayer sprx (see the handlers).
+    Hle::register_fn("av8Z++94rs0", (HleFn)s_avp_trickspeed, "sceAvPlayerSetTrickSpeed");
+    Hle::register_fn("N6Oy-EjduiY", (HleFn)s_avp_bandwidth, "sceAvPlayerSetAvailableBandwidth");
     #undef R
 }
 // The local network libraries allocate opaque contexts even on a disconnected console; connection
