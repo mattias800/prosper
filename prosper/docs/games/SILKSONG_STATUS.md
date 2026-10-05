@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Hollow Knight: Silksong (`PPSA12544`) — status
 
 Tracker: [#4121](https://github.com/mattias800/prosper/issues/4121). Engine: Unity 6 (6000.0.50f1).

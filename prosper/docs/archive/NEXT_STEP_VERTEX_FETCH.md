@@ -1,3 +1,8 @@
+---
+kind: archive
+status: historical
+---
+
 # NEXT STEP — bindless-dynamic vertex fetch → the first real game frame
 
 > **SUPERSEDED (2026-07-11).** This document describes an old state where the Messenger vertex shader

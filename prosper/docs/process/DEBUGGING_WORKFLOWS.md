@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Debugging and profiling: start from the question
 
 Commands below run from `prosper/` in your own worktree. Build in the environment named by

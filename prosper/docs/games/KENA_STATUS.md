@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Kena: Bridge of Spirits (`PPSA01802`) — status
 
 Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK `0x03000000`. Tracker

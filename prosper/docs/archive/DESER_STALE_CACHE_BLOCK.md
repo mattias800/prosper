@@ -1,3 +1,8 @@
+---
+kind: archive
+status: historical
+---
+
 # DESER CRASH ROOT CAUSE — stale CachedReader block, NOT a typetree/descriptor bug (2026-07-06)
 
 > **RESOLVED — see the final section: guest `close(0)` sentinel closes killed a live fd.

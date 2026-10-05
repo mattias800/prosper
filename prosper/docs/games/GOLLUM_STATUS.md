@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # The Lord of the Rings: Gollum (`PPSA06367`) — status and evidence
 
 Unreal Engine 4. **Rung 0** as of 2026-08-22. The title boots, links every module, reaches the live

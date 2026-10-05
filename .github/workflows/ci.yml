@@ -659,6 +659,9 @@ jobs:
       # when an ACCEPTED ADR's text is edited or deleted instead of superseded. Its pytest suite runs
       # in the Python quality job. Base selection mirrors the ratchet step; without a base the
       # immutability check is skipped and says so.
+      - name: Verify every document declares its kind and every relative link resolves
+        run: python3 prosper/tools/docs/check_doc_meta.py --github --root .
+
       - name: Verify the architecture spec and ADRs are consistent
         env:
           EVENT: ${{ github.event_name }}

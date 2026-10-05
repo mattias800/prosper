@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Target source tree and layer order
 
 > **Status: proposal.** The current-tree measurements and the layer order, which the ratchet

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # R-Type Delta: HD Boosted status
 
 `PPSA26414` is **rung 2** — the publisher logo, the whole opening movie, the **title screen** and the

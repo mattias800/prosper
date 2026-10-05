@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # libSceAgc call trace — API reconstruction reference (M4 groundwork)
 
 ## ⭐ NAMES RESOLVED via shadPS4 (2026-07-04) — no longer guessing

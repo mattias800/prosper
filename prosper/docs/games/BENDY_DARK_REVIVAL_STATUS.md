@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Bendy and the Dark Revival (`PPSA27624`) — status
 
 Tracker: [#1897](https://github.com/mattias800/prosper/issues/1897). Engine: Unity 2022.3.51f1 /

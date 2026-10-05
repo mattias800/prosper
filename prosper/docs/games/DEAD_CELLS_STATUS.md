@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Dead Cells graphics status and regression workflow
 
 Last updated: 2026-07-15

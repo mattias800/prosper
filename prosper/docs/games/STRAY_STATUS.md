@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Stray (`PPSA02101`) — status
 
 Tracker: [#2883](https://github.com/mattias800/prosper/issues/2883). Engine: Unreal Engine 4.

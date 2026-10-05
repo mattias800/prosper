@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Tomb Raider I-III Remastered (`PPSA16901`) — status
 
 Tracker: [#2990](https://github.com/mattias800/prosper/issues/2990).

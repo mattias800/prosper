@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Audio (`libSceAudioOut`)
 
 prosper implements the PS5 `sceAudioOut*` API as a **headless, backend-agnostic core** with
