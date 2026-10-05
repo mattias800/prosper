@@ -241,6 +241,8 @@ A row with `needs-backing=1` also says **what** made the classifier call the loa
     bytes again (reported at the load);
   - `register-offset-with-guest-memory-write`: no reader was found, but the load has a register
     offset in a program that may write guest memory (reported at the load);
+  - `implicit-vcc-reader`: a select, carry-in or vccz/vccnz branch consumes VCC while it holds a
+    derived word and is not known to be a fresh mask;
   - `unknown-instruction`, `unmodelled-control-or-relative-sgpr`, `unmodelled-control`,
     `branch-target-out-of-range`, `branch-target-mid-instruction`, `walk-budget`: the walk could
     not follow the program.
