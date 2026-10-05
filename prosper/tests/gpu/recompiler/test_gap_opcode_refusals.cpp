@@ -324,3 +324,43 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// Unlowered WRXCHG2 (double-exchange) DS operations must refuse fail-visibly.
+// They are read-modify-write-write primitives over two LDS addresses with a
+// returned prior value -- outside the admitted DS set in rdna2_emit_alu.cpp
+// (which covers write2/read2 used by Astro Bot's reduction, but no exchange
+// family). Words below are llvm-mc gfx1030 round-tripped. The control is
+// ds_write2_b32 in the same slot, which the recompiler lowers. WHEN an
+// exchange lowering lands, ITS CASE GOES RED; replace it with an execution
+// test of the new lowering.
+TEST(GapOpcodeRefusals, DsWrxchg2Refuse) {
+    static const uint32_t xchg2_b32[2] = {0xd8b80000u, 0x00040302u};
+    static const uint32_t xchg2_b64[2] = {0xd9b80000u, 0x00070504u};
+    static const uint32_t write2[2] = {0xd8380000u, 0x00020100u};
+    for (const uint32_t* words : {xchg2_b32, xchg2_b64, write2}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::DS);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(xchg2_b32, 2).opcode, 0x2eu);
+    EXPECT_EQ(rdna2_decode_one(xchg2_b64, 2).opcode, 0x6eu);
+    EXPECT_EQ(rdna2_decode_one(write2, 2).opcode, 0x0eu);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e0402f0u,   // v_mov_b32 v2, 0.5
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+        0x7e0802f0u,   // v_mov_b32 v4, 0.5
+        0x7e0a02f0u,   // v_mov_b32 v5, 0.5
+        0x7e0c02f0u,   // v_mov_b32 v6, 0.5
+        0x7e0e02f0u,   // v_mov_b32 v7, 0.5
+        0x7e1002f0u,   // v_mov_b32 v8, 0.5
+    };
+    expect_compiles(program(prologue, {write2[0], write2[1]}), 0xA0A0ull,
+                    "control: ds_write2_b32 in the exchange slot");
+    expect_gap_refusal(program(prologue, {xchg2_b32[0], xchg2_b32[1]}), 0xA0A1ull,
+                       9, {xchg2_b32[0], xchg2_b32[1]}, Rdna2Format::DS, 0x2eu);
+    expect_gap_refusal(program(prologue, {xchg2_b64[0], xchg2_b64[1]}), 0xA0A2ull,
+                       9, {xchg2_b64[0], xchg2_b64[1]}, Rdna2Format::DS, 0x6eu);
+}
