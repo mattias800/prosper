@@ -640,6 +640,62 @@ TEST(GapOpcodeRefusals, SetregImm32Refuse) {
     }
 }
 
+// Deferred 32-bit MUBUF atomics must refuse fail-visibly. csub/dec/inc do
+// mem = mem OP VDATA with wrap/conditional semantics the generic atomic shape
+// does not cover (rdna2_emit_alu.cpp names all three as deferred). All words
+// below are llvm-mc gfx1030 round-tripped in the same idxen form (VDATA v0,
+// VADDR v2). The control is buffer_atomic_add with those same fields over the
+// same entry (lowered); each pair differs only in the opcode. WHEN a
+// lowering lands for any of the three, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicDeferred32Refuse) {
+    // buffer_atomic_{csub,dec,inc,add} v0, v2, s[8:11], 0 idxen
+    static const uint32_t csub[2] = {0xe0d02000u, 0x80020002u};
+    static const uint32_t dec[2] = {0xe0f42000u, 0x80020002u};
+    static const uint32_t inc[2] = {0xe0f02000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};
+    for (const uint32_t* words : {csub, dec, inc, add}) {
+        const Rdna2Inst d = rdna2_decode_one(words, 2);
+        EXPECT_EQ(d.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(d.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(csub, 2).opcode, 0x34u);
+    EXPECT_EQ(rdna2_decode_one(dec, 2).opcode, 0x3du);
+    EXPECT_EQ(rdna2_decode_one(inc, 2).opcode, 0x3cu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (VDATA: the atomic's data)
+        0x7e020283u,   // v_mov_b32 v1, 3 (unused; keeps the gap at pc 3)
+        0x7e040280u,   // v_mov_b32 v2, 0 (VADDR: the idxen element index)
+    };
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA100ull,
+                    "control: buffer_atomic_add with the refused words' fields",
+                    &rt, config);
+    expect_gap_refusal(program(prologue, {csub[0], csub[1]}), 0xA101ull, 3,
+                       {csub[0], csub[1]}, Rdna2Format::MUBUF, 0x34u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {dec[0], dec[1]}), 0xA102ull, 3,
+                       {dec[0], dec[1]}, Rdna2Format::MUBUF, 0x3du, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {inc[0], inc[1]}), 0xA103ull, 3,
+                       {inc[0], inc[1]}, Rdna2Format::MUBUF, 0x3cu, &rt,
+                       config);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
