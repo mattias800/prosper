@@ -554,9 +554,171 @@ HLE(s_imedlg_result) {
     if (a0) *(int32_t*)PW(a0) = 0 /*SCE_IME_DIALOG_END_STATUS_OK*/;
     return 0;
 }
-HLE(s_imedlg_term)  { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_imedlg_abort) { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_imedlg_term) {
+    if (g_imedialog_backed.exchange(0)) {
+        if (auto* ui = platform_ui()) ui->imeDialogClose();
+    }
+    g_imedialog_status.store(0 /*NONE*/);
+    return 0;
+}
+HLE(s_imedlg_abort) {
+    if (g_imedialog_backed.exchange(0)) {
+        if (auto* ui = platform_ui()) ui->imeDialogClose();
+    }
+    g_imedialog_status.store(0 /*NONE*/);
+    return 0;
+}
 
+// --- libSceIme on-screen text-entry session -----------------------------------------------
+// The PANEL itself does not exist headless (no OSK UI to show), but the session around it is
+// real state: open/closed, the text set on it, the caret. Setters validate against the open
+// session and refuse when closed; display-only hints (geometry) acknowledge once their pointer
+// is usable. GetPanelSize answers the shipped library's panel constants even though no panel is
+// drawn, so a title lays its UI out exactly as on the console. Position/form stays out: its struct
+// has no size arg, so it cannot be filled safely.
+// Signatures agree between shadPS4 and portps5; ParamInit, GetPanelSize and KeyboardSetMode are
+// re-derived from the shipped libSceIme (see each handler). Metaphor (PPSA20800) calls ParamInit,
+// Open, Close, SetText, SetCaret and GetPanelSize at its name entry. CONFIDENCE: MED on the other
+// shapes/errors; LOW on panel-absent behavior.
+namespace {
+// already open
+constexpr uint64_t kImeErrBusy = 0x80BC0001ull;
+// no live session
+constexpr uint64_t kImeErrNotOpened = 0x80BC0002ull;
+constexpr uint64_t kImeErrInvalidParam = 0x80BC0030ull;
+constexpr uint64_t kImeErrInvalidAddr = 0x80BC0031ull;
+constexpr uint64_t kImeErrInvalidUserId = 0x80BC0010ull;
+constexpr uint64_t kImeErrInvalidType = 0x80BC0011ull;
+constexpr uint64_t kImeErrInvalidOption = 0x80BC0015ull;
+constexpr uint64_t kImeErrInvalidMode = 0x80BC0024ull;
+// The shipped libSceIme's ParamInit (export WmYDzdC4EHI) zeroes 0x60 bytes and then writes -1 to the
+// user id at +0; Metaphor allocates its param block as exactly 0x60 bytes.
+constexpr uint64_t kImeParamBytes = 0x60;
+constexpr int32_t kImeInvalidUser = -1;
+// Longest UTF-16 text the session retains. The guest's maxTextLength caps its own buffer;
+// prosper additionally refuses to copy more than this out of guest memory in one call.
+constexpr uint32_t kImeTextCap = 4096;
+struct ImePanelSession {
+    bool open = false;
+    std::u16string text;
+    uint32_t caret = 0;
+};
+std::mutex g_ime_panel_mx;
+ImePanelSession g_ime_panel;
+}   // namespace
+// void sceImeParamInit(param*): zeroes the block and marks no user. Returns nothing, so a null
+// pointer is a silent no-op rather than an error the caller could observe.
+HLE(s_ime_param_init) {
+    svc_log("sceImeParamInit", a0, a1, a2, a3, a4, a5);
+    if (!a0) return 0;
+    uint8_t* p = (uint8_t*)PW(a0);
+    std::memset(p, 0, kImeParamBytes);
+    *(int32_t*)(p + 0) = kImeInvalidUser;
+    return 0;
+}
+HLE(s_ime_open) {
+    svc_log("sceImeOpen", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (g_ime_panel.open) return kImeErrBusy;
+    if (!a0) return kImeErrInvalidAddr;
+    g_ime_panel = ImePanelSession{};
+    g_ime_panel.open = true;
+    return 0;
+}
+HLE(s_ime_close) {
+    svc_log("sceImeClose", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (!g_ime_panel.open) return kImeErrNotOpened;
+    g_ime_panel = ImePanelSession{};
+    return 0;
+}
+HLE(s_ime_set_text) {
+    svc_log("sceImeSetText", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (!g_ime_panel.open) return kImeErrNotOpened;
+    if (!a0) return kImeErrInvalidAddr;
+    if (a1 > kImeTextCap) return kImeErrInvalidParam;
+    std::u16string text((size_t)a1, u'\0');
+    if (a1 && !svc_copy_bytes(a0, text.data(), (size_t)a1 * sizeof(char16_t)))
+        return kImeErrInvalidAddr;
+    g_ime_panel.text = std::move(text);
+    if (g_ime_panel.caret > (uint32_t)g_ime_panel.text.size())
+        g_ime_panel.caret = (uint32_t)g_ime_panel.text.size();
+    return 0;
+}
+HLE(s_ime_set_caret) {
+    svc_log("sceImeSetCaret", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (!g_ime_panel.open) return kImeErrNotOpened;
+    if (!a0) return kImeErrInvalidAddr;
+    // OrbisImeCaret index is the u32 at +12 (x, y, height precede it).
+    uint32_t index = 0;
+    if (!svc_copy_bytes(a0 + 12, &index, sizeof(index))) return kImeErrInvalidAddr;
+    if (index > g_ime_panel.text.size()) return kImeErrInvalidParam;
+    g_ime_panel.caret = index;
+    return 0;
+}
+HLE(s_ime_set_text_geometry) {
+    svc_log("sceImeSetTextGeometry", a0, a1, a2, a3, a4, a5);
+    if (!a1) return kImeErrInvalidAddr;
+    // Display hint for a panel that is never shown.
+    return 0;
+}
+HLE(s_ime_set_candidate_index) {
+    svc_log("sceImeSetCandidateIndex", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (!g_ime_panel.open) return kImeErrNotOpened;
+    // No candidate engine exists to select from.
+    return 0;
+}
+HLE(s_ime_confirm_candidate) {
+    svc_log("sceImeConfirmCandidate", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lock(g_ime_panel_mx);
+    if (!g_ime_panel.open) return kImeErrNotOpened;
+    // No candidate engine exists to confirm through.
+    return 0;
+}
+// sceImeGetPanelSize(param*, width*, height*) -- from the shipped libSceIme (export ziPDcIjO0Vk). No
+// open session is needed. NULL pointers answer 0x80BC0031; a panel type (param +4) above 4 answers
+// 0x80BC0011; option bits (param +0x20) outside what the SDK allows answer 0x80BC0015 (current SDKs
+// reject 0xffff8400; older SDKs allow fewer bits -- CONFIDENCE: MED on the mask). The size is 872x440,
+// or 300x432 for type 4, scaled by the display safe-area ratio (prosper's safe area is the full
+// screen, so 1.0) and doubled when option bit 0x4000 is set. CONFIDENCE: HIGH on the sizes.
+HLE(s_ime_get_panel_size) {
+    svc_log("sceImeGetPanelSize", a0, a1, a2, a3, a4, a5);
+    if (!a0 || !a1 || !a2) return kImeErrInvalidAddr;
+    uint32_t type = 0, option = 0;
+    if (!svc_copy_bytes(a0 + 4, &type, sizeof(type)) ||
+        !svc_copy_bytes(a0 + 0x20, &option, sizeof(option)))
+        return kImeErrInvalidAddr;
+    if (type > 4) return kImeErrInvalidType;
+    if (option & 0xffff8400u) return kImeErrInvalidOption;
+    uint32_t width = type == 4 ? 300u : 872u;
+    uint32_t height = type == 4 ? 432u : 440u;
+    if (option & 0x4000u) {
+        width *= 2;
+        height *= 2;
+    }
+    *(uint32_t*)PW(a1) = width;
+    *(uint32_t*)PW(a2) = height;
+    return 0;
+}
+HLE(s_ime_disable_controller) {
+    svc_log("sceImeDisableController", a0, a1, a2, a3, a4, a5);
+    // No pad-as-keyboard routing exists to disable.
+    return 0;
+}
+HLE(s_ime_kbd_setmode) {
+    svc_log("sceImeKeyboardSetMode", a0, a1, a2, a3, a4, a5);
+    // Order from the shipped libSceIme (export ua+13Hk9kKs): no keyboard open -> 0x80BC0002; mode bits
+    // outside the SDK's mask -> 0x80BC0024 (current SDKs allow 0x7f; CONFIDENCE: MED on the mask); a
+    // user without an open keyboard -> 0x80BC0010. The pump ignores modes.
+    std::lock_guard<std::mutex> lock(g_ime_mx);
+    if (!g_ime_keyboard.open) return kImeErrNotOpened;
+    if ((uint32_t)a1 & 0xffffff80u) return kImeErrInvalidMode;
+    if (g_ime_keyboard.user_id != (int32_t)a0) return kImeErrInvalidUserId;
+    return 0;
+}
 
 // Registration for the on-screen keyboard and text-entry dialog, called by
 // register_builtin_hle(). One entry point per library keeps every handler `static` to the
@@ -578,6 +740,18 @@ void register_ime_hle() {
 #endif
     Hle::register_fn("VkqLPArfFdc", (HleFn)s_ime_kbd_info,  "sceImeKeyboardGetInfo");
     Hle::register_fn("dKadqZFgKKQ", (HleFn)s_ime_kbd_resid, "sceImeKeyboardGetResourceId");
+    Hle::register_fn("ua+13Hk9kKs", (HleFn)s_ime_kbd_setmode, "sceImeKeyboardSetMode");
+    // libSceIme text-entry session: real open/text/caret state, no panel UI behind it.
+    Hle::register_fn("WmYDzdC4EHI", (HleFn)s_ime_param_init, "sceImeParamInit");
+    Hle::register_fn("RPydv-Jr1bc", (HleFn)s_ime_open, "sceImeOpen");
+    Hle::register_fn("TmVP8LzcFcY", (HleFn)s_ime_close, "sceImeClose");
+    Hle::register_fn("ieCNrVrzKd4", (HleFn)s_ime_set_text, "sceImeSetText");
+    Hle::register_fn("WLxUN2WMim8", (HleFn)s_ime_set_caret, "sceImeSetCaret");
+    Hle::register_fn("TXYHFRuL8UY", (HleFn)s_ime_set_text_geometry, "sceImeSetTextGeometry");
+    Hle::register_fn("TQaogSaqkEk", (HleFn)s_ime_set_candidate_index, "sceImeSetCandidateIndex");
+    Hle::register_fn("tKLmVIUkpyM", (HleFn)s_ime_confirm_candidate, "sceImeConfirmCandidate");
+    Hle::register_fn("ziPDcIjO0Vk", (HleFn)s_ime_get_panel_size, "sceImeGetPanelSize");
+    Hle::register_fn("E+f1n8e8DAw", (HleFn)s_ime_disable_controller, "sceImeDisableController");
 }
 
 // --- Transaction resources (#1905). sceSaveDataCreateTransactionResource returns the NEW RESOURCE'S

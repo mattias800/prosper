@@ -1659,6 +1659,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/service/test_ime_keyboard.cpp
     LIBRARIES prosper_core)
 
+  # libSceIme text-entry session: open/text/caret state is real, the panel answers "none".
+  # Pure, no game dump.
+  prosper_add_gtest(test_ime_panel
+    SOURCES tests/hle/service/test_ime_panel.cpp
+    LIBRARIES prosper_core)
+
   # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
   # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
   prosper_add_gtest(test_pthread_sched_getters
