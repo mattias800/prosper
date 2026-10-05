@@ -320,6 +320,29 @@ int main() {
               "realized draw carries Kena's bounded 3D view and native layout proof");
     }
     {
+        // #4457: a 4xaa SW_64KB_R_X colour target (Summer Sports) has no exact extent -- only Z_X
+        // 4xaa has one -- so the realized binding must carry that refusal and the conservative
+        // footprint bound the ordered-DMA predicate decides against.
+        GpuState msaa = st;
+        msaa.cx[P::CB_COLOR0_BASE] = 0x400000u;   // 0x40000000: registers only, never dereferenced
+        msaa.cx[P::CB_COLOR0_BASE_EXT] = 0u;
+        msaa.cx[P::CB_COLOR0_INFO] = 0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT;
+        msaa.cx[P::CB_COLOR0_ATTRIB2] = (63u << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) | 63u;
+        msaa.cx[P::CB_COLOR0_ATTRIB3] = (1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT) |
+                                        (27u << P::CB_COLOR0_ATTRIB3_COLOR_SW_MODE_SHIFT);
+        msaa.cx[P::CB_COLOR0_ATTRIB] = 2u << P::CB_COLOR0_ATTRIB_NUM_SAMPLES_SHIFT;
+        DrawItem msaa_draw;
+        const bool made = realize_draw_item(msaa, &msaa.draws[0], msaa.draws[0].index_count,
+                                            0x10000u, false, msaa_draw);
+        const ColorTargetState state = extract_render_state(msaa).color_targets[0];
+        const auto& binding = msaa_draw.color_targets[0];
+        CHECK(made && binding.raw_snapshot_footprint_bytes == 0u &&
+                  binding.footprint_refusal == ColorExtentRefusal::Msaa &&
+                  binding.footprint_bound_bytes >= 65536u &&   // at least the one 64 KiB block
+                  binding.footprint_bound_bytes == color_target_footprint_bound_bytes(state),
+              "realized draw carries an unproved MSAA target's refusal and footprint bound");
+    }
+    {
         // The live draw path must acquire one exact fragment version and share it across metadata
         // and compilation, then acquire again for the next draw. Besides detecting a stale
         // address-only shortcut, the acquisition count distinguishes the production fast path from

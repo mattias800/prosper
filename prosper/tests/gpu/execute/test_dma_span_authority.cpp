@@ -67,3 +67,21 @@ TEST(DmaSpanAuthority, GdsOperandsAreNotGuestRanges) {
     EXPECT_FALSE(dma_needs_authoritative_span(span, copy(0x20000000, 0x24, 4, 0x100)));
     EXPECT_TRUE(dma_needs_authoritative_span(span, copy(0x30, 0x24, 4, 0x100)));
 }
+
+// #4457: a target whose exact extent is unproved (an MSAA or unusual-swizzle view) still has a
+// conservative bound, and the predicate decides against it -- disjoint copies skip the readback,
+// overlapping ones keep it. PROSPER_DMA_EXACT_EXTENT_ONLY is read once per process, so its
+// control arm is exercised by the live A/B, not here.
+TEST(DmaSpanAuthority, BoundedUnprovedTargetIsDecidedByItsBound) {
+    DrawItem draw = draw_with_target(kTarget, 0);
+    draw.color_targets[0].footprint_bound_bytes = kTargetBytes;
+    const std::vector<DrawItem> span{draw};
+    EXPECT_FALSE(dma_needs_authoritative_span(span, copy(0x10000000, 0x20000000, 4096)));
+    EXPECT_FALSE(dma_needs_authoritative_span(span, copy(kTarget + kTargetBytes, 0x20000000, 64)));
+    EXPECT_TRUE(
+        dma_needs_authoritative_span(span, copy(0x10000000, kTarget + kTargetBytes - 1, 2)));
+    EXPECT_TRUE(dma_needs_authoritative_span(span, copy(kTarget, 0x20000000, 64)));
+    // Without a bound the same target is unproved, so even the far-away copy keeps the readback.
+    const std::vector<DrawItem> unbounded{draw_with_target(kTarget, 0)};
+    EXPECT_TRUE(dma_needs_authoritative_span(unbounded, copy(0x10000000, 0x20000000, 4096)));
+}

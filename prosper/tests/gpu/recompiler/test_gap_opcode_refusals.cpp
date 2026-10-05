@@ -1,6 +1,6 @@
-// test_gap_opcode_refusals — fail-visible refusal guards of lowerings that stay fail-visible
-// for inputs they cannot represent (s_movrels_b32). Every opcode it once pinned as an unlowered
-// gap is now lowered. The image_gather4 arm below checks where 0x40 is admitted.
+// test_gap_opcode_refusals — fail-visible refusal pins: instructions the recompiler decodes but
+// does not lower, and guards of lowerings that stay fail-visible for inputs they cannot represent
+// (s_movrels_b32). The image_gather4 arm checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
 // backstop. These arms pin that backstop: the guest word decodes to the right instruction, the
@@ -34,6 +34,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -323,4 +324,485 @@ TEST(GapOpcodeRefusals, ImageGather4) {
     EXPECT_TRUE(
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
+}
+
+// Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
+// v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
+// exist (f16/f32 siblings are lowered); accepting them would silently compute
+// in the wrong precision. All words below are llvm-mc gfx1030 round-tripped.
+// The control is v_rcp_f32 in the same slot, which is lowered. WHEN an f64
+// lowering lands, ITS CASE GOES RED; replace it with an execution test of
+// the new lowering.
+TEST(GapOpcodeRefusals, VopF64TranscendentalRefuse) {
+    static const uint32_t rcp[1] = {0x7e005f02u};
+    static const uint32_t rsq[1] = {0x7e006302u};
+    static const uint32_t sqrt[1] = {0x7e006902u};
+    static const uint32_t control[1] = {0x7e005501u};
+    for (const uint32_t* words : {rcp, rsq, sqrt, control}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::VOP1);
+        EXPECT_EQ(dec.len_dwords, 1u);
+    }
+    EXPECT_EQ(rdna2_decode_one(rcp, 1).opcode, 0x2fu);
+    EXPECT_EQ(rdna2_decode_one(rsq, 1).opcode, 0x31u);
+    EXPECT_EQ(rdna2_decode_one(sqrt, 1).opcode, 0x34u);
+    EXPECT_EQ(rdna2_decode_one(control, 1).opcode, 0x2au);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0402f0u,   // v_mov_b32 v2, 0.5 (f64 source low)
+        0x7e060280u,   // v_mov_b32 v3, 0 (f64 source high)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5 (f32 control source)
+    };
+    expect_compiles(program(prologue, {control[0]}), 0xA0C0ull,
+                    "control: v_rcp_f32 in the f64 slot");
+    expect_gap_refusal(program(prologue, {rcp[0]}), 0xA0C1ull, 3, {rcp[0]},
+                       Rdna2Format::VOP1, 0x2fu);
+    expect_gap_refusal(program(prologue, {rsq[0]}), 0xA0C2ull, 3, {rsq[0]},
+                       Rdna2Format::VOP1, 0x31u);
+    expect_gap_refusal(program(prologue, {sqrt[0]}), 0xA0C3ull, 3, {sqrt[0]},
+                       Rdna2Format::VOP1, 0x34u);
+}
+
+// Unlowered fused-multiply-add-with-scale division helpers must refuse
+// fail-visibly. v_div_fmas_f32/f64 need the scaled-FMA division lowering,
+// which does not exist (only v_div_fixup_f32 is lowered, #4391); accepting
+// one would silently compute an unscaled multiply-add. All words below are
+// llvm-mc gfx1030 round-tripped. The control is v_div_fixup_f32 in the same
+// slot, which is lowered. WHEN a lowering lands, ITS CASE GOES RED; replace
+// it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, DivFmasRefuse) {
+    static const uint32_t fmas32[2] = {0xd56f0000u, 0x040e0501u};
+    static const uint32_t fmas64[2] = {0xd5700000u, 0x041a0902u};
+    static const uint32_t fixup32[2] = {0xd55f0000u, 0x040e0501u};
+    for (const uint32_t* words : {fmas32, fmas64, fixup32}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fmas32, 2).opcode, 0x16fu);
+    EXPECT_EQ(rdna2_decode_one(fmas64, 2).opcode, 0x170u);
+    EXPECT_EQ(rdna2_decode_one(fixup32, 2).opcode, 0x15fu);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0x7e060283u,   // v_mov_b32 v3, 3
+        0x7e080280u,   // v_mov_b32 v4, 0
+        0x7e0a0281u,   // v_mov_b32 v5, 1
+        0x7e0c0282u,   // v_mov_b32 v6, 2
+        0x7e0e0283u,   // v_mov_b32 v7, 3
+    };
+    expect_compiles(program(prologue, {fixup32[0], fixup32[1]}), 0xA0D0ull,
+                    "control: v_div_fixup_f32 in the fmas slot");
+    expect_gap_refusal(program(prologue, {fmas32[0], fmas32[1]}), 0xA0D1ull, 7,
+                       {fmas32[0], fmas32[1]}, Rdna2Format::VOP3, 0x16fu);
+    expect_gap_refusal(program(prologue, {fmas64[0], fmas64[1]}), 0xA0D2ull, 7,
+                       {fmas64[0], fmas64[1]}, Rdna2Format::VOP3, 0x170u);
+}
+
+// Unlowered scalar miscellany must refuse fail-visibly. s_cmovk_i32 (an SCC-conditional move,
+// D = SCC ? sext(SIMM16) : D -- ordinary scalar ALU that simply has no case in the SOPK switch
+// yet), s_getreg_b32 (a hardware-register read), s_call_b64 (a call) and s_rfe_b64 (an
+// exception return) all reach the emitter's default arm; the last three are control flow or
+// driver state that accepting would invent. All words below are llvm-mc gfx1030
+// round-tripped. Controls are s_movk_i32 (SOPK, lowered) and s_mov_b32
+// (SOP1, lowered) in matching slots. WHEN a lowering lands for any of the
+// four, ITS CASE GOES RED; replace it with an execution test of the new
+// lowering.
+TEST(GapOpcodeRefusals, ScalarMiscRefuse) {
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+    };
+    auto sprog = [&](std::vector<uint32_t> inst) {
+        std::vector<uint32_t> code = sprologue;
+        code.insert(code.end(), inst.begin(), inst.end());
+        code.push_back(kEndpgm);
+        return code;
+    };
+    // Controls first: the lowering siblings compile in these exact slots.
+    static const uint32_t movk[1] = {0xb0001234u};   // s_movk_i32 s0, 0x1234
+    {
+        const Rdna2Inst dec = rdna2_decode_one(movk, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x00u);
+    }
+    expect_compiles(sprog({movk[0]}), 0xA0B0ull, "control: s_movk_i32");
+    static const uint32_t movb[1] = {0xbe800301u};   // s_mov_b32 s0, s1
+    expect_compiles(sprog({movb[0]}), 0xA0B1ull, "control: s_mov_b32");
+
+    struct Case {
+        std::vector<uint32_t> words;
+        Rdna2Format fmt;
+        uint32_t opcode;
+        uint64_t addr;
+    };
+    // s_setreg_imm32_b32 (SOPK 0x15, words 0xba801234 + literal) is deliberately
+    // NOT pinned here: the walk stores its trailing literal outside in.words,
+    // so the terminal record prints a zero second dword and the shared
+    // word-exact harness cannot assert it. It gets its own record-shape-aware
+    // arm once that shape is decided, not an assertion on an artifact.
+    const std::vector<Case> cases = {
+        {{0xb1001234u}, Rdna2Format::SOPK, 0x02u, 0xA0B2ull},   // s_cmovk_i32 s0, 0x1234
+        {{0xb900f801u}, Rdna2Format::SOPK, 0x12u, 0xA0B3ull},   // s_getreg_b32 s0, hwreg(MODE)
+        {{0xbb001234u}, Rdna2Format::SOPK, 0x16u, 0xA0B5ull},   // s_call_b64 s[0:1], 4660
+        {{0xbe802200u}, Rdna2Format::SOP1, 0x22u, 0xA0B6ull},   // s_rfe_b64 s[0:1]
+    };
+    for (const auto& c : cases) {
+        const Rdna2Inst dec =
+            rdna2_decode_one(c.words.data(), c.words.size());
+        EXPECT_EQ(dec.fmt, c.fmt);
+        EXPECT_EQ(dec.opcode, c.opcode);
+        EXPECT_EQ(dec.len_dwords, (uint32_t)c.words.size());
+        expect_gap_refusal(sprog(c.words), c.addr, 2, c.words, c.fmt, c.opcode);
+    }
+}
+
+// Unlowered float VOP3P dot product must refuse fail-visibly. v_dot2_f32_f16
+// needs an f32 pairwise dot lowering, which does not exist (only the integer
+// 0x14-0x19 family is lowered in rdna2_dot.cpp); accepting it as the integer
+// form would silently compute garbage. All words below are llvm-mc gfx1030
+// round-tripped. The control is v_dot2_i32_i16 in the same slot, which is
+// lowered. Both use op_sel_hi:[0,0,0] so neither touches the decoder's VOP3P
+// modifier gate and the refusal is the missing lowering itself; the
+// realistic default-op_sel_hi encoding of 0x13 is refused earlier, by that
+// gate in rdna2_decode.cpp, so a float-dot lowering also has to model it.
+// V_FMA_MIX_F32/MIXLO/HI need no pins: already lowered, #273. V_SUB_CO_U32 (VOP3 0x310) is
+// lowered too. V_INTERP_P1LL/P1LV/P2_F16 (VOP3 0x342/0x343/0x35a) are RDNA2 instructions with
+// no lowering yet; they are fragment-stage and want their own arm. WHEN a float-dot lowering
+// lands, THIS ARM GOES RED; replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, Dot2F32Refuse) {
+    // v_dot2_{f32_f16,i32_i16} v0, v1, v2, v3 op_sel_hi:[0,0,0]
+    static const uint32_t dotf[2] = {0xcc130000u, 0x040e0501u};
+    static const uint32_t doti[2] = {0xcc140000u, 0x040e0501u};
+    for (const uint32_t* words : {dotf, doti}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::VOP3P);
+        EXPECT_EQ(dec.len_dwords, 2u);
+        EXPECT_FALSE(dec.has_modifier)
+            << "the refusal must come from the missing lowering, not the modifier gate";
+    }
+    EXPECT_EQ(rdna2_decode_one(dotf, 2).opcode, 0x13u);
+    EXPECT_EQ(rdna2_decode_one(doti, 2).opcode, 0x14u);
+
+    expect_compiles(program(kVop3Prologue, {doti[0], doti[1]}), 0xA0E0ull,
+                    "control: v_dot2_i32_i16 in the float-dot slot");
+    expect_gap_refusal(program(kVop3Prologue, {dotf[0], dotf[1]}), 0xA0E1ull, 4,
+                       {dotf[0], dotf[1]}, Rdna2Format::VOP3P, 0x13u);
+}
+
+// Unlowered 64-bit (x2) MUBUF atomics must refuse fail-visibly.
+// buffer_atomic_add_x2/and_x2 need a true qword RMW, which does not exist
+// (only swap_x2/or_x2 have separately guarded lowerings, and widening a
+// 32-bit atomic in place would be a different operation). All words below
+// are llvm-mc gfx1030 round-tripped with the idxen form. The control is the
+// 32-bit buffer_atomic_add with the x2 words' operand fields (idxen, VADDR v2,
+// data v0) over the same table entry -- only the opcode differs -- and it is
+// lowered.
+// WHEN an x2 lowering lands, ITS CASE GOES RED; replace it with an execution
+// test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicX2Refuse) {
+    static const uint32_t addx2[2] = {0xe1482000u, 0x80020002u};
+    static const uint32_t andx2[2] = {0xe1642000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};   // add v0, v2, idxen
+    for (const uint32_t* words : {addx2, andx2, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(addx2, 2).opcode, 0x52u);
+    EXPECT_EQ(rdna2_decode_one(andx2, 2).opcode, 0x59u);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (data, low dword)
+        0x7e020283u,   // v_mov_b32 v1, 3 (data, high dword of the x2 forms)
+        0x7e040280u,   // v_mov_b32 v2, 0 (idxen element index)
+    };
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F0ull,
+                    "control: 32-bit buffer_atomic_add over the same entry",
+                    &rt, config);
+    expect_gap_refusal(program(prologue, {addx2[0], addx2[1]}), 0xA0F1ull, 3,
+                       {addx2[0], addx2[1]}, Rdna2Format::MUBUF, 0x52u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {andx2[0], andx2[1]}), 0xA0F2ull, 3,
+                       {andx2[0], andx2[1]}, Rdna2Format::MUBUF, 0x59u, &rt,
+                       config);
+}
+
+// Unlowered SOPP halt/kill terminators must refuse fail-visibly. s_sethalt 1
+// (debug halt), s_setkill 1 (kill the wave) and s_sendmsghalt (message + halt,
+// regardless of its immediate) have no lowering in the per-invocation model --
+// accepting any of them as a no-op would silently execute past a guest-visible
+// termination. The imm-0 forms of s_sethalt/s_setkill (resume / do not kill)
+// ARE hardware no-ops, so the terminating imm-1 forms are pinned instead
+// (llvm-mc gfx1030: 0xbf8d0001 = s_sethalt 1, 0xbf8b0001 = s_setkill 1). The
+// control is s_nop in the same slot, which is a documented no-op and compiles.
+// WHEN a lowering lands for any of the three, ITS CASE GOES RED; replace it
+// with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SoppHaltKillRefuse) {
+    static const uint32_t kNop = 0xbf800000u;
+    {
+        const Rdna2Inst dec = rdna2_decode_one(&kNop, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, 0x00u);
+    }
+    expect_compiles(program(kVop3Prologue, {kNop}), 0xA080ull,
+                    "control: s_nop in the halt slot");
+    for (const auto [word, opcode, addr] :
+         {std::tuple<uint32_t, uint32_t, uint64_t>{0xbf8d0001u, 0x0du, 0xA081ull},
+          {0xbf8b0001u, 0x0bu, 0xA082ull},
+          {0xbf910000u, 0x11u, 0xA083ull}}) {
+        const Rdna2Inst dec = rdna2_decode_one(&word, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
+        EXPECT_EQ(dec.opcode, opcode);
+        EXPECT_EQ(dec.len_dwords, 1u);
+        expect_gap_refusal(program(kVop3Prologue, {word}), addr, 4, {word},
+                           Rdna2Format::SOPP, opcode);
+    }
+}
+
+// Unlowered 64-bit DS (LDS) atomics must refuse fail-visibly. ds_add_u64 (0x40) and ds_or_b64
+// (0x4a) are outside the compute DS opcode allowlist in rdna2_emit_alu.cpp; the LDS model is a
+// Workgroup uint32 array, so a lowering needs a 64-bit atomic view (Int64Atomics) or a two-dword
+// compare-exchange loop. Words below are llvm-mc gfx1030 round-tripped. The control is ds_add_u32
+// (0x00) with identical operand fields, which the recompiler lowers as an LDS atomic add.
+// WHEN a 64-bit LDS lowering lands, ITS CASE GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, Ds64Refuse) {
+    static const uint32_t add_u64[2] = {0xd9000000u, 0x00000100u};
+    static const uint32_t or_b64[2] = {0xd9280000u, 0x00000100u};
+    static const uint32_t add_u32[2] = {0xd8000000u, 0x00000100u};
+    for (const uint32_t* words : {add_u64, or_b64, add_u32}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::DS);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(add_u64, 2).opcode, 0x40u);
+    EXPECT_EQ(rdna2_decode_one(or_b64, 2).opcode, 0x4au);
+    EXPECT_EQ(rdna2_decode_one(add_u32, 2).opcode, 0x00u);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5 (address)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5 (data)
+        0x7e040280u,   // v_mov_b32 v2, 0 (data high half)
+    };
+    expect_compiles(program(prologue, {add_u32[0], add_u32[1]}), 0xA090ull,
+                    "control: ds_add_u32 in the 64-bit slot");
+    expect_gap_refusal(program(prologue, {add_u64[0], add_u64[1]}), 0xA091ull, 3,
+                       {add_u64[0], add_u64[1]}, Rdna2Format::DS, 0x40u);
+    expect_gap_refusal(program(prologue, {or_b64[0], or_b64[1]}), 0xA092ull, 3,
+                       {or_b64[0], or_b64[1]}, Rdna2Format::DS, 0x4au);
+}
+
+// Unlowered DS_WRXCHG2_RTN (two-address exchange returning both prior dwords/qwords) must refuse
+// fail-visibly. 0x2e/0x6e are outside the compute DS allowlist in rdna2_emit_alu.cpp, which
+// admits the single-address ds_wrxchg_rtn_b32 (0x2d, an OpAtomicExchange) and write2/read2, but
+// not the paired exchange; a lowering is two OpAtomicExchange calls with the equal-offset
+// single-access rule write2 already applies. Words below are llvm-mc gfx1030 round-tripped. Each
+// control is the write2 sibling with IDENTICAL operand fields (ds_write2_b32 v2, v3, v4 and
+// ds_write2_b64 v4, v[5:6], v[7:8]), so only the opcode differs. WHEN an exchange lowering
+// lands, ITS CASE GOES RED; replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, DsWrxchg2Refuse) {
+    static const uint32_t xchg2_b32[2] = {0xd8b80000u, 0x00040302u};
+    static const uint32_t xchg2_b64[2] = {0xd9b80000u, 0x00070504u};
+    static const uint32_t write2[2] = {0xd8380000u, 0x00040302u};
+    static const uint32_t write2_b64[2] = {0xd9380000u, 0x00070504u};
+    for (const uint32_t* words : {xchg2_b32, xchg2_b64, write2, write2_b64}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::DS);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(xchg2_b32, 2).opcode, 0x2eu);
+    EXPECT_EQ(rdna2_decode_one(xchg2_b64, 2).opcode, 0x6eu);
+    EXPECT_EQ(rdna2_decode_one(write2, 2).opcode, 0x0eu);
+    EXPECT_EQ(rdna2_decode_one(write2_b64, 2).opcode, 0x4eu);
+
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e0402f0u,   // v_mov_b32 v2, 0.5
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+        0x7e0802f0u,   // v_mov_b32 v4, 0.5
+        0x7e0a02f0u,   // v_mov_b32 v5, 0.5
+        0x7e0c02f0u,   // v_mov_b32 v6, 0.5
+        0x7e0e02f0u,   // v_mov_b32 v7, 0.5
+        0x7e1002f0u,   // v_mov_b32 v8, 0.5
+    };
+    expect_compiles(program(prologue, {write2[0], write2[1]}), 0xA0A0ull,
+                    "control: ds_write2_b32 with the b32 exchange's operand fields");
+    expect_compiles(program(prologue, {write2_b64[0], write2_b64[1]}), 0xA0A3ull,
+                    "control: ds_write2_b64 with the b64 exchange's operand fields");
+    expect_gap_refusal(program(prologue, {xchg2_b32[0], xchg2_b32[1]}), 0xA0A1ull,
+                       9, {xchg2_b32[0], xchg2_b32[1]}, Rdna2Format::DS, 0x2eu);
+    expect_gap_refusal(program(prologue, {xchg2_b64[0], xchg2_b64[1]}), 0xA0A2ull,
+                       9, {xchg2_b64[0], xchg2_b64[1]}, Rdna2Format::DS, 0x6eu);
+}
+
+// Fragment IMAGE_LOAD_MIP on a genuinely multi-level resource must refuse
+// fail-visibly. Live shape: Stray's fragment 0x30be800000 (6 real levels; see
+// RECOMPILER_REMAINING.md "Stray's rejected IMAGE_LOAD_MIP" / #2818). The words
+// are the live GTA V 2D packet (test_dynfetch_fold.cpp): mip address VGPR v2,
+// T# s[20:27]. Compute already lowers a multi-level runtime mip through the
+// dynamic-mip route (test_game_compute.cpp), which is compute-only by design, so
+// the gap pinned here is the fragment stage. The table sets proven_zero_mip, so
+// the refused program and the single-level control differ ONLY in the declared
+// level count: the refusal is the zero-mip gate's `declared_mip_levels != 1`
+// term. (The recompiler never evaluates v2; it reads the table's
+// proven_zero_mip bit, which a correct executor would not set for v2 = 1.)
+// The plain IMAGE_LOAD sibling against the multi-level table is a second
+// control that rules out the packet, table and export. WHEN a fragment
+// multi-level mip lowering lands, THIS ARM GOES RED; replace it with an
+// execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageLoadMipMultiLevelRefusesFragment) {
+    static const uint32_t w[2] = {0xf0043108u, 0x00050000u};
+    static const uint32_t plain[2] = {0xf0003108u, 0x00050000u};
+    static const uint32_t exp_mrt0[2] = {0xf800180fu, 0x03020100u};   // exp mrt0 v0-v3 done vm
+
+    auto table = [](uint32_t levels) {
+        ShaderResourceTable rt;
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.binding = 4;
+        texture.img_dim = 1;
+        texture.width = texture.height = 8;
+        texture.sgpr_base = 20;
+        texture.declared_mip_levels = levels;
+        texture.proven_zero_mip = true;   // held fixed: only the level count varies
+        rt.resources.push_back(texture);
+        return rt;
+    };
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040281u,   // v_mov_b32 v2, 1 (mip address; never read by the gate)
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+    };
+    const ShaderResourceTable multi_rt = table(2u);
+
+    auto with_export = [&](const uint32_t pkg[2]) {
+        std::vector<uint32_t> code = prologue;
+        code.push_back(pkg[0]);
+        code.push_back(pkg[1]);
+        code.push_back(exp_mrt0[0]);
+        code.push_back(exp_mrt0[1]);
+        code.push_back(kEndpgm);
+        return code;
+    };
+    EXPECT_TRUE(recompile_fragment(with_export(w).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "fragment IMAGE_LOAD_MIP on a multi-level resource must refuse";
+    const ShaderResourceTable single_rt = table(1u);
+    EXPECT_FALSE(
+        recompile_fragment(with_export(w).data(), prologue.size() + 5u, &single_rt).empty())
+        << "control: identical IMAGE_LOAD_MIP against a single-level, proven-zero-mip resource";
+    EXPECT_FALSE(
+        recompile_fragment(with_export(plain).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "control: fragment plain IMAGE_LOAD with identical fields";
+}
+
+// IMAGE_STORE_MIP on a genuinely multi-level storage image must refuse
+// fail-visibly. Words below are the live GTA V NSA 2D packet
+// (test_dynfetch_fold.cpp): x = v4, y = v3, mip = v5, T# s[12:19]. That packet
+// is admitted against a single-level, proven-zero-mip entry (it compiles and
+// executes in test_game_compute.cpp), so this arm holds proven_zero_mip fixed
+// and its primary control is the identical STORE_MIP against the same entry at
+// one level: the refusal is the `declared_mip_levels != 1u` term of the
+// storage-image STORE_MIP gate in rdna2_emit_alu.cpp, nothing else. NSA packets
+// (len > 2) record their terminal reason on the MIMG-address line rather than
+// the straight-line one (rdna2_emit_cfg.cpp), so the pin asserts that record
+// shape. A second control, the consecutive plain IMAGE_STORE (GTA V chain
+// `0xf0200108, 0x00020004`, coords [v4,v5], T# s[8:15]), shows the storage path
+// itself works. WHEN a multi-level storage-image binding lets the guest mip
+// reach the image write, THIS ARM GOES RED; replace it with an execution test.
+// (The load-side analogue landed as #3048; no store-side route exists yet.)
+TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
+    static const uint32_t w[3] = {0xf024310au, 0x00030004u, 0x00000503u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(w, 3);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x09u);
+        EXPECT_EQ(dec.len_dwords, 3u);
+    }
+    static const uint32_t plain[2] = {0xf0200108u, 0x00020004u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(plain, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x08u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    ShaderResourceTable rt;
+    {
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.binding = 4;
+        image.format = DataFormat::Uint32;
+        image.num_components = 1;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 12;   // STORE_MIP word1 names s12 as the T# base
+        image.declared_mip_levels = 2u;
+        image.proven_zero_mip = true;   // held fixed: only the level count varies
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+    }
+    {
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.binding = 5;
+        image.format = DataFormat::Uint32;
+        image.num_components = 1;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 8;    // plain-STORE word1 names s8 as the T# base
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(20);   // s8..s19 T#s are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5 (store data)
+        0x7e080281u,   // v_mov_b32 v4, 1 (x)
+        0x7e0a0280u,   // v_mov_b32 v5, 0 (STORE_MIP mip; plain IMAGE_STORE y)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040280u,   // v_mov_b32 v2, 0
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5 (STORE_MIP y)
+    };
+    const std::vector<uint32_t> refused =
+        compile(program(prologue, {w[0], w[1], w[2]}), 0xA070ull, &rt, config);
+    EXPECT_TRUE(refused.empty()) << "NSA IMAGE_STORE_MIP on multi-level must refuse";
+    {
+        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA070ull));
+        EXPECT_EQ(r.tag, "recompile-reject-mimg-address") << "NSA terminal record shape";
+        EXPECT_EQ(r.fields["pc"], "6") << "the reject must name the gap pc";
+        EXPECT_EQ(r.fields["extra"], "1") << "one extra address dword";
+    }
+    ShaderResourceTable single_rt = rt;
+    single_rt.resources[0].declared_mip_levels = 1u;
+    expect_compiles(program(prologue, {w[0], w[1], w[2]}), 0xA071ull,
+                    "control: identical IMAGE_STORE_MIP, single-level proven-zero-mip entry",
+                    &single_rt, config);
+    expect_compiles(program(prologue, {plain[0], plain[1]}), 0xA072ull,
+                    "control: consecutive IMAGE_STORE with backed storage entry",
+                    &rt, config);
 }

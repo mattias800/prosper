@@ -734,6 +734,80 @@ HLE(s_dialog_result) {
     return 0;
 }
 
+// --- LoginDialog + WebBrowserDialog lifecycles; MsgDialog progress bars ----------------------
+// LoginDialog: imported by Sonic Frontiers PPSA03831 and Sonic Origins PPSA05325 (Initialize, Open,
+// UpdateStatus, GetResult, Terminate), Sonic Racing: CrossWorlds PPSA08804 (Initialize, Open,
+// UpdateStatus, Terminate) and Darksiders II PPSA23806 (all seven). No platform_ui route exists
+// for login, so it is headless only: Open auto-dismisses to FINISHED and GetResult reports that
+// no login happened. Every error code and the GetResult default below are read from the shipped
+// libSceLoginDialog module (Initialize 0x1560, Terminate 0x15a0, Open 0x18f0, Close 0x1d20,
+// GetResult 0x1f10). CONFIDENCE: HIGH on the codes and on GetResult's first word meaning "not
+// completed" (all three importers branch on it); MED on the meaning of its second word.
+// WebBrowserDialog: Initialize/Terminate only. The firmware library has 15 exports; Open,
+// UpdateStatus, GetResult and the rest stay unregistered (#4463) because a real lifecycle changes
+// the answer for every guarded Unity title and needs its own snapshot runs.
+// MsgDialog progress bars: unchanged from the dispatcher default (0). The shipped module would
+// report NOT_RUNNING (0x80B8000B) for a headless MsgDialog, and at least PGA TOUR 2K25 gates on the
+// result, so this is a deliberate match of the SaveDataDialog progress precedent. CONFIDENCE: MED.
+// NIDs via nid_hash (LoginDialogInitialize reproduces the registered qP-EvQRl2Hc).
+namespace {
+constexpr uint64_t kLoginDialogNotInitialized = 0x81340001ull;
+constexpr uint64_t kLoginDialogAlreadyInitialized = 0x81340002ull;
+constexpr uint64_t kLoginDialogParamInvalid = 0x81340003ull;
+constexpr uint64_t kLoginDialogBusy = 0x81340005ull;   // also "not finished" for GetResult
+constexpr uint32_t kLoginDialogNoService = 0x81340007u;
+constexpr int kDialogNone = 0, kDialogInitialized = 1, kDialogRunning = 2, kDialogFinished = 3;
+std::atomic<int> g_logindialog_status{kDialogNone};
+}  // namespace
+HLE(s_login_dialog_init) {
+    int expected = kDialogNone;
+    if (!g_logindialog_status.compare_exchange_strong(expected, kDialogInitialized))
+        return kLoginDialogAlreadyInitialized;
+    return 0;
+}
+HLE(s_login_dialog_open) {
+    // Param: u32 size == 0x40 at +0, a selector below 2 at +4, reserved words +0x2c..+0x3c zero.
+    if (!svc_ptrish(a0)) return kLoginDialogParamInvalid;
+    const auto* p = (const uint32_t*)PW(a0);
+    if (p[0] != 0x40u || p[1] >= 2u) return kLoginDialogParamInvalid;
+    for (int w = 0x2c / 4; w <= 0x3c / 4; ++w)
+        if (p[w] != 0) return kLoginDialogParamInvalid;
+    const int st = g_logindialog_status.load();
+    if (st == kDialogNone) return kLoginDialogNotInitialized;
+    if (st == kDialogRunning) return kLoginDialogBusy;
+    g_logindialog_status.store(kDialogFinished);   // headless: auto-dismiss
+    return 0;
+}
+HLE(s_login_dialog_status) {
+    return (uint64_t)(unsigned)g_logindialog_status.load();
+}
+HLE(s_login_dialog_result) {
+    // The module writes {1, NO_SERVICE} before anything else and only a live service overwrites
+    // it, so with no service the headless answer is "not completed": no login happened. Writing 0
+    // (or nothing over a zeroed struct) would read as a successful login for userId 0.
+    if (!svc_ptrish(a0)) return kLoginDialogParamInvalid;
+    const int st = g_logindialog_status.load();
+    if (st == kDialogNone) return kLoginDialogNotInitialized;
+    auto* r = (uint32_t*)PW(a0);
+    r[0] = 1u;
+    r[1] = kLoginDialogNoService;
+    return st == kDialogFinished ? 0 : kLoginDialogBusy;
+}
+HLE(s_login_dialog_close) {
+    if (g_logindialog_status.load() == kDialogNone) return kLoginDialogNotInitialized;
+    // The firmware stores FINISHED here, like main's Signin/Commerce dialogs.
+    g_logindialog_status.store(kDialogFinished);
+    return 0;
+}
+HLE(s_login_dialog_term) {
+    if (g_logindialog_status.exchange(kDialogNone) == kDialogNone)
+        return kLoginDialogNotInitialized;
+    return 0;
+}
+HLE(s_dialog_progress) {
+    return 0;
+}   // ProgressBarInc/SetMsg/SetValue: dispatcher-default 0 (see above)
+
 // ===== Issue #232: the Sony services DOLL's level-load flow polls (PlayGo / SaveData / =========
 // ===== NpTrophy2 lifecycle / Share). All NID<->name pairs verified against the PS5 3.20 ========
 // ===== library stub tables (PS5-3.20_Libs/libSce{PlayGo,SaveData.native,NpTrophy2,Share}.c). ===
@@ -1414,9 +1488,22 @@ void register_service_hle() {
     // size field and returns success, satisfying both concerns.
     Hle::register_fn("-sD02mFDBh4", (HleFn)s_gamepresets, "sceUserServiceGetGamePresets");
     Hle::register_fn("qbwy0Ub8b3M", (HleFn)s_user_number, "sceUserServiceGetUserNumber");
-    // Sonic imports LoginDialog only to initialize the service at startup.  There is no UI to show
-    // until Open is requested, so initialization is a truthful successful no-op in the headless HLE.
-    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_ok, "sceLoginDialogInitialize");
+    // LoginDialog: headless lifecycle with the shipped module's error codes (see the handlers).
+    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_login_dialog_init, "sceLoginDialogInitialize");
+    R("sceLoginDialogOpen", s_login_dialog_open);
+    R("sceLoginDialogClose", s_login_dialog_close);
+    R("sceLoginDialogTerminate", s_login_dialog_term);
+    R("sceLoginDialogUpdateStatus", s_login_dialog_status);
+    R("sceLoginDialogGetStatus", s_login_dialog_status);
+    R("sceLoginDialogGetResult", s_login_dialog_result);
+    // MsgDialog progress bars: dispatcher-default 0, kept deliberately (see the handler block).
+    R("sceMsgDialogProgressBarInc", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetMsg", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetValue", s_dialog_progress);
+    // WebBrowserDialog: Initialize/Terminate only, returning 0 as the dispatcher did. Open,
+    // UpdateStatus, GetResult and the other exports remain unregistered (#4463).
+    R("sceWebBrowserDialogInitialize", s_ok);
+    R("sceWebBrowserDialogTerminate", s_ok);
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
