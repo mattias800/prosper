@@ -2252,15 +2252,15 @@ if(TARGET prosper_core)
 
   # Diagnostics: enabled-path and JSON tests (only when feature is built).
   if(PROSPER_DIAGNOSTICS)
-    add_executable(test_diagnostics_enabled tests/diagnostics/test_diagnostics_enabled.cpp)
-    target_link_libraries(test_diagnostics_enabled PRIVATE prosper_core)
+    prosper_add_gtest(test_diagnostics_enabled
+      SOURCES tests/diagnostics/test_diagnostics_enabled.cpp
+      LIBRARIES prosper_core)
     target_compile_definitions(test_diagnostics_enabled PRIVATE PROSPER_DIAGNOSTICS)
-    add_test(NAME diagnostics_enabled_capture COMMAND test_diagnostics_enabled)
 
-    add_executable(test_diagnostics_json tests/diagnostics/test_diagnostics_json.cpp)
-    target_link_libraries(test_diagnostics_json PRIVATE prosper_core)
+    prosper_add_gtest(test_diagnostics_json
+      SOURCES tests/diagnostics/test_diagnostics_json.cpp
+      LIBRARIES prosper_core)
     target_compile_definitions(test_diagnostics_json PRIVATE PROSPER_DIAGNOSTICS)
-    add_test(NAME diagnostics_json_format COMMAND test_diagnostics_json)
   endif()
 
   # Unity native-plugin auto-link (#1609): a title's own Media/Plugins/*.prx that the fixed preload

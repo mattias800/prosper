@@ -32,8 +32,6 @@ frontends/video_mf/test_video_mf.cpp
 frontends/video_mf/test_videodec2_mf.cpp
 frontends/video_vaapi/test_video_vaapi.cpp
 tests/diagnostics/test_boot_phase_log.cpp
-tests/diagnostics/test_diagnostics_enabled.cpp
-tests/diagnostics/test_diagnostics_json.cpp
 tests/diagnostics/test_env_numeric_sites.cpp
 tests/diagnostics/test_exit_reports.cpp
 tests/diagnostics/test_wait_regmem_observation.cpp
