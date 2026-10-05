@@ -1053,7 +1053,6 @@ void register_builtin_hle() {
     register_http_hle();     // libSceHttp local URI parsing
     register_net_hle();   // libSceNet socket ids + honest offline packet failure
     register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
-    register_https_hle();   // libSceHttps TLS setup, acknowledged headless
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
     register_fiber_hle();    // libSceFiber cooperative guest-stack execution
     register_ult_hle();      // libSceUlt: NOT implemented — fail-visible counted stubs (#1603)
