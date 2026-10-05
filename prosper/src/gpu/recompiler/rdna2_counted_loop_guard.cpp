@@ -17,6 +17,11 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
     // scalar loop for every invocation while narrowed EXEC predicates vector writes; inactive
     // lanes retain their old VGPRs until the exact restore. Reject stores/exports/barriers and
     // unclassified memory so this never becomes a general branch-linearization escape hatch.
+    // Linearizing also runs the region's SCALAR writes on a wave the hardware would have skipped.
+    // That is only invisible while nothing reads those scalars after the restore on the skip path;
+    // the guarded shapes seen so far (Evergate, Kena's lighting loops) recompute what they use.
+    // CONFIDENCE: MED on that property, which this scan does not prove (inherited from the original
+    // s_and_saveexec form).
     // Scan inside-out so an already-proven nested guard may contribute its balanced save/restore
     // pair without making an otherwise-safe outer guarded loop look like it leaks narrowed EXEC.
     struct GuardedExecRegion { uint32_t save_pc, restore_pc; };
@@ -24,7 +29,8 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
     // Every SOPP that can transfer control: s_branch, the SCC/VCC/EXEC conditional branches and
     // the debugger-conditional ones (0x17-0x1a), whose taken edge must still count as an edge.
     auto is_branch_opcode = [](uint32_t op) {
-        return (op >= 0x02 && op <= 0x09 && op != 0x03) || (op >= 0x17 && op <= 0x1a);
+        return sopp_opcode_is_direct_branch(op) ||
+               (op >= kSoppOpcodeCbranchCdbgsys && op <= kSoppOpcodeCbranchCdbgsysAndUser);
     };
     for (size_t branch_index = ins.size(); branch_index-- > 0;) {
         const Rdna2Inst& branch = ins[branch_index];
@@ -90,8 +96,12 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
         const Rdna2Inst* restore = nullptr;
         constexpr uint32_t kRestoreWindow = 8;
         uint32_t window = 0;
+        bool landed = false;
         for (const auto& candidate : ins) {
             if (candidate.pc < target) continue;
+            // The branch must land on an instruction boundary; anything else is not a guard we model.
+            if (!landed && candidate.pc != target) break;
+            landed = true;
             if (candidate.fmt == Rdna2Format::SOP1 && candidate.opcode == kSop1OpcodeMovB64 &&
                 candidate.dst.value >= 126 && reg_operand(candidate.src[0], saveexec->dst.value)) {
                 restore = &candidate;
@@ -143,11 +153,12 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
                     break;
                 }
             }
-            // Reads from a descriptor-bounded buffer or image are allowed: their results are
-            // EXEC-predicated VGPR writes (inactive lanes keep the old value, as for any VALU here),
-            // and an inactive lane's out-of-range address is bounded by the descriptor. Everything
-            // that writes memory (rdna2_instruction_may_write_memory is fail-closed), LDS-mode
-            // buffer loads, FLAT (an unbounded address), DS, exports and barriers stay refused.
+            // Buffer and image reads are allowed: the read is issued for every invocation, but its
+            // VGPR result goes through predicate_write, so inactive lanes keep the old value as for
+            // any VALU here, and an inactive lane's out-of-range access is made safe by the device's
+            // robustBufferAccess / robustImageAccess (rdna2_to_spirv_internal.hpp). Everything that
+            // writes memory (rdna2_instruction_may_write_memory is fail-closed), LDS-mode buffer
+            // loads, FLAT (a raw address with no robustness), DS, exports and barriers stay refused.
             const bool bounded_read =
                 (candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                  candidate.fmt == Rdna2Format::MIMG) &&
