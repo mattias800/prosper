@@ -1,11 +1,10 @@
 // test_ajm_jobs — the direct AJM job shapes queue onto the batch for BatchStart to execute.
 //
-// These 14 exports were unregistered, so the dispatcher answered `0`. The builders
-// (Decode/Run/RunSplit/Encode) would then report queued jobs nobody queued, and the getters
-// success over unwritten result sidebands. Every arm drives the real NIDs: validation arms
-// refuse bad inputs, and the execution arm proves a queued job actually reaches the decode
-// pipeline (its sideband carries the decode error for undecodable input) instead of
-// evaporating.
+// DecodeSingle/Run/RunSplit were unregistered, so the dispatcher answered `0` for jobs nobody
+// queued. Every arm drives the real NIDs: validation arms refuse bad inputs, the execution arms
+// prove a queued job reaches the decode pipeline (its sideband carries the decode error for
+// undecodable input), and a Run given a short sideband gets a truncated write, never an overflow.
+// Exports with outputs prosper does not compute stay unregistered, and that is pinned too.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -27,61 +26,96 @@ static uint64_t addr(const void* p) {
 static constexpr uint64_t kInvalidParameter = 0xffffffff80930005ull;
 static constexpr uint64_t kDecodeError = 0xffffffff80930005ull;  // sideband iResult value
 
-TEST(AjmJobs, AllNidsBound) {
+static Hle10Fn job_fn(const char* name) { return (Hle10Fn)Hle::lookup(nid_hash(name)); }
+
+// Run every job queued under `batch` so no test leaves jobs in the process-global map.
+static void drain(uint64_t batch) {
+    Hle10Fn start2 = job_fn("sceAjmBatchStart");
+    ASSERT_NE(start2, nullptr);
+    uint32_t batch_id = 0;
+    start2(1, batch, 0, 0, addr(&batch_id), 0, 0, 0, 0, 0);
+}
+
+TEST(AjmJobs, BoundAndDeliberatelyUnbound) {
     register_builtin_hle();
-    static const char* table[] = {
-        "sceAjmBatchJobDecodeSingle",
-        "sceAjmBatchJobRun",
-        "sceAjmBatchJobRunSplit",
-        "sceAjmBatchJobEncode",
-        "sceAjmBatchJobControl",
-        "sceAjmBatchJobGetCodecInfo",
-        "sceAjmBatchJobGetGaplessDecode",
-        "sceAjmBatchJobGetInfo",
-        "sceAjmBatchJobSetResampleParameters",
-        "sceAjmMemoryRegister",
-        "sceAjmMemoryUnregister",
-        "sceAjmDecAt9ParseConfigData",
-        "sceAjmDecMp3ParseFrame",
-        "sceAjmStrError",
-    };
-    static_assert(sizeof(table) / sizeof(table[0]) == 14, "the 14 direct-job exports");
-    for (const char* name : table) {
+    for (const char* name : {"sceAjmBatchJobDecodeSingle", "sceAjmBatchJobRun",
+                             "sceAjmBatchJobRunSplit", "sceAjmMemoryRegister",
+                             "sceAjmMemoryUnregister", "sceAjmDecAt9ParseConfigData",
+                             "sceAjmStrError"})
         EXPECT_NE(Hle::lookup(nid_hash(name)), nullptr) << name << " is not registered";
-    }
+    // Registering these would only hide them from the unimplemented-call alarm: their outputs
+    // (encoded data, codec/gapless/stream info, MP3 frame headers) are not computed, and the
+    // control/resample payloads would be dropped.
+    for (const char* name : {"sceAjmBatchJobEncode", "sceAjmBatchJobControl",
+                             "sceAjmBatchJobGetCodecInfo", "sceAjmBatchJobGetGaplessDecode",
+                             "sceAjmBatchJobGetInfo", "sceAjmBatchJobSetResampleParameters",
+                             "sceAjmDecMp3ParseFrame"})
+        EXPECT_EQ(Hle::lookup(nid_hash(name)), nullptr) << name << " must stay unregistered";
 }
 
 TEST(AjmJobs, DirectShapesValidate) {
     register_builtin_hle();
-    Hle10Fn decode_single = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobDecodeSingle"));
-    Hle10Fn run = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobRun"));
-    Hle10Fn run_split = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobRunSplit"));
-    Hle10Fn encode = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobEncode"));
-    Hle10Fn control = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobControl"));
-    Hle10Fn get_info = (Hle10Fn)Hle::lookup(nid_hash("sceAjmBatchJobGetInfo"));
-    for (void* f : {(void*)decode_single, (void*)run, (void*)run_split, (void*)encode,
-                    (void*)control, (void*)get_info})
-        ASSERT_NE(f, nullptr);
+    Hle10Fn decode_single = job_fn("sceAjmBatchJobDecodeSingle");
+    Hle10Fn run = job_fn("sceAjmBatchJobRun");
+    Hle10Fn run_split = job_fn("sceAjmBatchJobRunSplit");
+    for (void* f : {(void*)decode_single, (void*)run, (void*)run_split}) ASSERT_NE(f, nullptr);
     uint8_t io[64]{};
     uint8_t result[32]{};
     const uint64_t batch = 0xBEEF0001ull;  // batch-info key; jobs queue under it
-    // Nulls and over-long sizes are refused before anything queues.
+    EXPECT_EQ(decode_single(0, 1, addr(io), 64, addr(io), 64, addr(result), 0, 0, 0),
+              kInvalidParameter)
+        << "null batch";
     EXPECT_EQ(decode_single(batch, 1, 0, 64, addr(io), 64, addr(result), 0, 0, 0),
               kInvalidParameter)
         << "null input";
     EXPECT_EQ(decode_single(batch, 1, addr(io), 64, 0, 64, addr(result), 0, 0, 0),
               kInvalidParameter)
         << "null output";
-    EXPECT_EQ(run(batch, 1, 0, 0, 64, addr(io), 64, 0, 0, 0), kInvalidParameter)
-        << "Run validates like DecodeSingle";
+    EXPECT_EQ(decode_single(batch, 1, addr(io), 0, addr(io), 64, addr(result), 0, 0, 0), 0u)
+        << "a zero input size is accepted, as by sceAjmBatchJobDecode (end of stream)";
+    EXPECT_EQ(run(batch, 1, 0, 0, 64, addr(io), 64, 0, 0, 0), kInvalidParameter) << "null input";
+    EXPECT_EQ(run(0, 1, 0, addr(io), 64, addr(io), 64, 0, 0, 0), kInvalidParameter) << "null batch";
     EXPECT_EQ(run(batch, 1, 0, addr(io), 64, addr(io), 64, 0, 0, 0), 0u) << "valid Run queues";
-    EXPECT_EQ(run_split(batch, 1, 0, 0, 1, addr(io), 1, 0, 0, 0), kInvalidParameter)
+
+    uint64_t in_desc[2 * 5];
+    uint64_t out_desc[2 * 3];
+    for (int i = 0; i < 5; ++i) { in_desc[2 * i] = addr(io); in_desc[2 * i + 1] = 16; }
+    for (int i = 0; i < 3; ++i) { out_desc[2 * i] = addr(io); out_desc[2 * i + 1] = 16; }
+    EXPECT_EQ(run_split(batch, 1, 0, 0, 1, addr(out_desc), 1, 0, 0, 0), kInvalidParameter)
         << "null descriptor arrays";
-    EXPECT_EQ(encode(batch, 1, addr(io), 64, addr(io), 64, addr(result), 0, 0, 0), 0u)
-        << "valid encode queues (execution reports the error, not the call)";
-    EXPECT_EQ(control(batch, 1, 0, 0, 64, addr(io), 64, 0, 0, 0), 0u);
-    EXPECT_EQ(control(batch, 1, 0, 0, 0, 0, 0, 0, 0, 0), 0u) << "sidebands optional";
-    EXPECT_EQ(get_info(batch, 1, addr(result), 64, 0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(run_split(batch, 1, 0, addr(in_desc), 5, addr(out_desc), 1, 0, 0, 0),
+              kInvalidParameter)
+        << "five input fragments overflow the four-entry job";
+    EXPECT_EQ(run_split(batch, 1, 0, addr(in_desc), 1, addr(out_desc), 3, 0, 0, 0),
+              kInvalidParameter)
+        << "three outputs overflow the two-entry job";
+    EXPECT_EQ(run_split(batch, 1, 0, addr(in_desc), 4, addr(out_desc), 2, 0, 0, 0), 0u)
+        << "the four-in/two-out maximum queues";
+    drain(batch);
+}
+
+TEST(AjmJobs, RunNeverWritesPastTheGuestSideband) {
+    register_builtin_hle();
+    Hle10Fn run = job_fn("sceAjmBatchJobRun");
+    ASSERT_NE(run, nullptr);
+    uint8_t garbage[64];
+    std::memset(garbage, 0xAB, sizeof garbage);
+    uint8_t pcm[512];
+    uint8_t sideband[32];
+    std::memset(sideband, 0xDD, sizeof sideband);
+    const uint64_t batch = 0xBEEF0003ull;
+    // An undecodable job on an unknown instance: execution writes the error sideband, but the
+    // guest gave only 8 bytes for it.
+    ASSERT_EQ(run(batch, 0x7FFFFFFFu, 0, addr(garbage), sizeof garbage, addr(pcm), sizeof pcm,
+                  addr(sideband), 8, 0),
+              0u);
+    drain(batch);
+    int32_t i_result = 0;
+    std::memcpy(&i_result, sideband, sizeof i_result);
+    EXPECT_EQ((uint64_t)(uint32_t)i_result, (uint64_t)(uint32_t)kDecodeError)
+        << "the result header is written";
+    for (size_t i = 8; i < sizeof sideband; ++i)
+        EXPECT_EQ(sideband[i], 0xDDu) << "byte " << i << " lies past the guest's 8-byte sideband";
 }
 
 TEST(AjmJobs, QueuedJobExecutesWithErrorSideband) {
@@ -120,9 +154,7 @@ TEST(AjmJobs, ConfigParseAndMisc) {
     HleFn mem_reg = Hle::lookup(nid_hash("sceAjmMemoryRegister"));
     HleFn mem_unreg = Hle::lookup(nid_hash("sceAjmMemoryUnregister"));
     HleFn strerror = Hle::lookup(nid_hash("sceAjmStrError"));
-    HleFn mp3parse = Hle::lookup(nid_hash("sceAjmDecMp3ParseFrame"));
-    HleFn set_resample = Hle::lookup(nid_hash("sceAjmBatchJobSetResampleParameters"));
-    for (HleFn f : {parse, mem_reg, mem_unreg, strerror, mp3parse, set_resample})
+    for (HleFn f : {parse, mem_reg, mem_unreg, strerror})
         ASSERT_NE(f, nullptr);
     // FE 72 09 F0: the ATRAC9 config from the B2 comment = 48 kHz stereo.
     const uint8_t config[4] = {0xFE, 0x72, 0x09, 0xF0};
@@ -138,8 +170,6 @@ TEST(AjmJobs, ConfigParseAndMisc) {
     EXPECT_EQ(parse(0, addr(info), 0, 0, 0, 0), kInvalidParameter) << "null config";
     EXPECT_EQ(mem_reg(1, addr(info), 8, 0, 0, 0), 0u);
     EXPECT_EQ(mem_unreg(1, addr(info), 0, 0, 0, 0), 0u);
-    EXPECT_EQ(set_resample(1, 1, 0, 0, 0, 0), 0u);
-    EXPECT_EQ(mp3parse(0, 0, 0, 0, 0, 0), 0u);
     const uint64_t msg = strerror(5, 0, 0, 0, 0, 0);
     EXPECT_NE(msg, 0u) << "StrError never returns null (a %s formatter may not survive it)";
 }
