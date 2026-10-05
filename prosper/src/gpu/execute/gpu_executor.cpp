@@ -36,6 +36,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
+#include "gpu/execute/oversize_buffer_window.hpp"  // clamp_oversized_buffer_window_live
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -5427,6 +5428,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             if (have_common_key) u.key = common_key;
                         }
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        // A "view of guest memory" window far past the 256 MiB cap is, in practice, one
+                        // mapped run: publish it clamped to that run when the mapping table proves
+                        // nothing else in the window is mapped (see oversize_buffer_window.hpp).
+                        if (uint64_t clamped = 0; d.size_bytes > 0x10000000u &&
+                            clamp_oversized_buffer_window_live(d.base, d.size_bytes, d.stride, 0x10000000u,
+                                                              clamped)) {
+                            u.v4[2] = static_cast<uint32_t>(clamped / (d.stride ? d.stride : 1u));
+                            d = decode_buffer_descriptor(u.v4.data());
+                        }
                         const uint32_t atomic_x2_record_count = atomic_x2_candidate
                             ? exact_atomic_x2_record_count(in, d, u.v4.data()) : 0u;
                         if (atomic_x2_record_count)
