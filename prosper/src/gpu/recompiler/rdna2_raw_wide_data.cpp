@@ -148,8 +148,12 @@ public:
             State state = std::move(pending.back());
             pending.pop_back();
             if ((!state.regs.any() && !state.scc) || state.index >= ins.size()) continue;
-            // A replayed load needs a new byte observation.
-            if (state.index == start) return blocked(ins[start].pc, "load-re-executed");
+            // Control came back to the load itself. One descriptor is resolved per fetch PC, so
+            // a load that can observe DIFFERENT bytes on a later execution cannot keep using the
+            // first observation: that stays uncertain. A load that provably reads the same bytes
+            // every time is handled below, once it has been walked like any other instruction.
+            if (state.index == start && !replay_observes_same_bytes())
+                return blocked(ins[start].pc, "load-re-executed");
             const size_t slot = state.scc ? 1u : 0u;
             if (seen_any[state.index][slot] &&
                 (state.regs & ~seen[state.index][slot]).none() &&
@@ -316,6 +320,20 @@ public:
                 !vopc_is_cmpx(in.opcode))
                 state.regs.reset(106); // only the guaranteed VCC low word, no width assumption
             state.regs |= produced;
+            // The load itself, reached again round a back-edge, reading the same bytes as before
+            // (checked on entry). It was processed like any other instruction on the way here:
+            // its destination words were expired as a definite scalar write, and what it writes
+            // now is the same observation this walk started from. Those words become derived
+            // again and the walk runs to a fixed point -- MAY words only grow, and the MUST mask
+            // roots have already been narrowed by everything executed on the way round, entry
+            // EXEC included.
+            // Every return to the load used to answer "uncertain". A per-light loop reloads its
+            // V# from the resource table on each iteration and only ever hands it to
+            // s_buffer_load as SBASE; that load then needed backing with no reader anywhere, as
+            // soon as the cheaper walk above was unsure about one of its words.
+            if (state.index == start)
+                for (uint32_t word = 0; word < words; ++word)
+                    state.regs.set(static_cast<size_t>(first) + word);
             if (plain_copy)
                 for (uint32_t k = 0; k < copy_words; ++k)
                     if (copied[k] && in.dst.value >= 0 &&
@@ -326,11 +344,9 @@ public:
 
             auto enqueue = [&](size_t next) {
                 // MAY words grow and MUST mask roots shrink at joins, including backedges.
-                // The finite worklist must converge within the cap above. Reexecuting this
-                // load still requires a fresh observation, not its earlier descriptor proof.
-                if (next == start) return false;
+                // The finite worklist must converge within the cap above. A path back to the
+                // load is followed like any other; the load re-derives its words above.
                 pending.push_back({next, state.regs, state.scc, state.masks});
-                return true;
             };
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
                 const int64_t target_pc = static_cast<int64_t>(in.pc) +
@@ -341,8 +357,8 @@ public:
                 if (target == by_pc.end()) {
                     if (target_pc <= ins.back().pc)
                         return blocked(in.pc, "branch-target-mid-instruction");
-                } else if (!enqueue(target->second)) {
-                    return blocked(ins[start].pc, "load-re-executed");
+                } else {
+                    enqueue(target->second);
                 }
                 if (in.opcode == kSoppOpcodeBranch) continue;
             } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
@@ -350,8 +366,7 @@ public:
                        in.opcode != 0x16u && in.opcode != 0x17u) {
                 return blocked(in.pc, "unmodelled-control");
             }
-            if (state.index + 1 < ins.size() && !enqueue(state.index + 1))
-                return blocked(ins[start].pc, "load-re-executed");
+            if (state.index + 1 < ins.size()) enqueue(state.index + 1);
         }
         return false;
     }
@@ -393,6 +408,42 @@ private:
     int first;
     uint32_t words;
     mutable Blocker backing_blocker_, numeric_blocker_;
+
+    // Whether every execution of this load reads the same bytes: an immediate offset from a base
+    // pair that no instruction ever writes, in a program that cannot write guest memory at all.
+    // Deliberately whole-program and path-insensitive -- being wrong about "same" would hand a
+    // later iteration an earlier iteration's descriptor. A register SOFFSET never qualifies,
+    // whatever its value: the offset is exactly what a loop changes.
+    //
+    // "No instruction ever writes" is only as good as the writer inventory, so the three kinds of
+    // instruction for_each_scalar_write cannot see through refuse outright, wherever they sit:
+    // a call or indirect transfer (code this walk never decodes may run), and the M0-relative
+    // destination moves, whose target register is not in the encoding. The immediate-load proof
+    // below refuses the first group program-wide for the same reason.
+    bool replay_observes_same_bytes() const {
+        const Rdna2Inst& load = ins[start];
+        if (load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            load.src[0].kind != OperandKind::SGPR || load.src[0].value < 0 ||
+            load.src[0].value + 1 > 105)
+            return false;
+        for (const Rdna2Inst& in : ins) {
+            if (in.fmt == Rdna2Format::Unknown || rdna2_may_write_guest_memory(in)) return false;
+            if ((in.fmt == Rdna2Format::SOP1 &&
+                 ((in.opcode >= 0x20u && in.opcode <= 0x22u) ||   // s_setpc/s_swappc/s_rfe
+                  in.opcode == kSop1OpcodeMovreldB32 || in.opcode == kSop1OpcodeMovreldB64 ||
+                  in.opcode == kSop1OpcodeMovrelsd2B32)) ||
+                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64))
+                return false;
+            bool writes_base = false;
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                if (base <= load.src[0].value + 1 &&
+                    base + static_cast<int>(width) > load.src[0].value)
+                    writes_base = true;
+            });
+            if (writes_base) return false;
+        }
+        return true;
+    }
 
     std::bitset<128> saved_exec_masks_at_load() const {
         // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
