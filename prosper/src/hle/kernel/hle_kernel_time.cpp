@@ -408,6 +408,438 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
     return 0;
 }
 
+// --- SceRtc calendar arithmetic (22 exports) -------------------------------------------------
+// Pure functions of their inputs against the host clock/calendar: no network, no device, no
+// backend needed, so all of these are REAL implementations rather than refusals. Reference:
+// shadPS4 rtc.cpp (signatures, validation order,quirk-compatible formats). Re-derived here
+// against prosper's own tick/datetime core above; three deliberate deviations are marked.
+//
+// ERROR FACILITY. New code uses the evidenced RTC facility 0x80B5 (shadPS4 rtc_error.h):
+// INVALID_POINTER = ...02, INVALID_VALUE = ...03, per-field year..microsecond = ...08..0E.
+// This DISAGREES with the two pre-existing handlers above, which answer 0x80250001 for a null
+// pointer. That older constant is left untouched (changing merged guest-visible behavior needs
+// its own title-impact analysis); the discrepancy is recorded here instead of papered over.
+// New failures are sign-extended so int32 and int64 readers both see them as negative.
+// Host UTC offset via the TU's own host_local_offset (seconds EAST of UTC at a unix time).
+// prosper has no system timezone setting, so this is the HOST zone including DST — consistent
+// with prosper's own GetCurrentClockLocalTime, which reads the same zone. MED.
+static void host_local_offset(time_t t, long& gmtoff_sec, int& isdst);
+namespace {
+constexpr uint64_t kRtcErrInvalidPointer = (uint64_t)(int64_t)(int32_t)0x80B50002u;
+constexpr uint64_t kRtcErrInvalidValue = (uint64_t)(int64_t)(int32_t)0x80B50003u;
+constexpr uint64_t kRtcErrInvalidYear = (uint64_t)(int64_t)(int32_t)0x80B50008u;
+constexpr uint64_t kRtcErrInvalidMonth = (uint64_t)(int64_t)(int32_t)0x80B50009u;
+constexpr uint64_t kRtcErrInvalidDay = (uint64_t)(int64_t)(int32_t)0x80B5000Au;
+constexpr uint64_t kRtcErrInvalidHour = (uint64_t)(int64_t)(int32_t)0x80B5000Bu;
+constexpr uint64_t kRtcErrInvalidMinute = (uint64_t)(int64_t)(int32_t)0x80B5000Cu;
+constexpr uint64_t kRtcErrInvalidSecond = (uint64_t)(int64_t)(int32_t)0x80B5000Du;
+constexpr uint64_t kRtcErrInvalidMicrosecond = (uint64_t)(int64_t)(int32_t)0x80B5000Eu;
+constexpr uint64_t kRtcErrBadParse = (uint64_t)(int64_t)(int32_t)0x80B50007u;
+// Win32 FILETIME epoch (1601-01-01) in RTC ticks. Pinned against shadPS4's
+// WIN32_FILETIME_EPOCH_TICKS rather than derived silently.
+constexpr uint64_t kRtcWin32EpochOffsetUs = (62135596800ull - 11644473600ull) * 1000000ull;
+static_assert(kRtcWin32EpochOffsetUs == 0xb36168b6a58000ull, "Win32 FILETIME epoch in microseconds");
+
+bool rtc_is_leap(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+int rtc_days_in_month(int y, int m) {
+    static const uint8_t table[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m < 1 || m > 12) return 0;
+    return (int)table[m - 1] + (m == 2 && rtc_is_leap(y) ? 1 : 0);
+}
+// 0 when the broken-down datetime is valid, else the field's 0x80B5 error.
+uint64_t rtc_check_valid_dt(const uint16_t* d) {
+    if (d[0] == 0 || d[0] > 9999) return kRtcErrInvalidYear;
+    if (d[1] == 0 || d[1] > 12) return kRtcErrInvalidMonth;
+    if (d[2] == 0 || (int)d[2] > rtc_days_in_month((int)d[0], (int)d[1])) return kRtcErrInvalidDay;
+    if (d[3] >= 24) return kRtcErrInvalidHour;
+    if (d[4] >= 60) return kRtcErrInvalidMinute;
+    if (d[5] >= 60) return kRtcErrInvalidSecond;
+    if (*(const uint32_t*)(d + 6) >= 1000000u) return kRtcErrInvalidMicrosecond;
+    return 0;
+}
+// Civil-date arithmetic (Howard Hinnant's days_from_civil/civil_from_days, public domain).
+// Used INSTEAD of gmtime/timegm here: those need a per-OS spelling (#ifdef _WIN32), and new
+// platform branches in shared code trip the arch ratchet. Pure arithmetic has no branches at
+// all, handles pre-1970 dates identically on every host, and is verified below against fixed
+// dates rather than against libc. The pre-existing handlers above keep their libc conversions
+// untouched; these helpers mirror their results (same epoch offset, same field layout).
+static int64_t rtc_days_from_civil(int y, int m, int d) {
+    y -= m <= 2 ? 1 : 0;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)(d - 1);
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+static void rtc_civil_from_days(int64_t z, int& y, int& m, int& d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    y = (int)yoe + (int)(era * 400);
+    const unsigned doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    const unsigned mp = (5u * doy + 2u) / 153u;
+    d = (int)(doy - (153u * mp + 2u) / 5u + 1);
+    m = (int)(mp + (mp < 10 ? 3 : -9));
+    y += m <= 2 ? 1 : 0;
+}
+// Tick -> broken-down UTC datetime. Mirrors k_rtc_set_tick's conversion (not shared: that
+// handler's exact body stays untouched).
+void rtc_fill_from_tick(void* out, uint64_t tick) {
+    const int64_t us = (int64_t)(tick - kRtcUnixEpochOffsetUs);
+    int64_t days = us >= 0 ? us / 86400000000ll : (us - 86400000000ll + 1) / 86400000000ll;
+    int64_t rem = us - days * 86400000000ll;
+    int y = 0, m = 0, d = 0;
+    rtc_civil_from_days(days, y, m, d);
+    uint16_t f[8]{};
+    f[0] = (uint16_t)y;
+    f[1] = (uint16_t)m;
+    f[2] = (uint16_t)d;
+    f[3] = (uint16_t)(rem / 3600000000ll);
+    rem -= (int64_t)f[3] * 3600000000ll;
+    f[4] = (uint16_t)(rem / 60000000ll);
+    rem -= (int64_t)f[4] * 60000000ll;
+    f[5] = (uint16_t)(rem / 1000000ll);
+    *(uint32_t*)(f + 6) = (uint32_t)(rem % 1000000ll);
+    uint16_t* o = (uint16_t*)out;
+    for (int i = 0; i < 6; i++) o[i] = f[i];
+    *(uint32_t*)(o + 6) = *(const uint32_t*)(f + 6);
+}
+// Broken-down UTC datetime -> tick. Mirrors k_rtc_get_tick's conversion. Caller validates.
+uint64_t rtc_tick_from_dt(const uint16_t* d) {
+    const int64_t days = rtc_days_from_civil((int)d[0], (int)d[1], (int)d[2]);
+    const int64_t secs =
+        days * 86400ll + (int64_t)d[3] * 3600ll + (int64_t)d[4] * 60ll + (int64_t)d[5];
+    return (uint64_t)(secs * 1000000ll + (int64_t)*(const uint32_t*)(d + 6) +
+                      (int64_t)kRtcUnixEpochOffsetUs);
+}
+// Fixed-position decimal digits; false on any non-digit. ParseRFC3339 must not throw across
+// the HLE boundary (the reference uses stoi), so malformed input is BAD_PARSE, not an exception.
+bool rtc_digits(const char* p, size_t n, int* out) {
+    int v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') return false;
+        v = v * 10 + (p[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+}   // namespace
+
+HLE(k_rtc_check_valid) {   // (SceRtcDateTime* dt) -> 0 or the field's error
+    if (!a0) return kRtcErrInvalidPointer;
+    return rtc_check_valid_dt((const uint16_t*)P(a0));
+}
+HLE(k_rtc_is_leap_year) {   // (int year) -> 1/0, negative on invalid year
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    const int y = (int)a0;
+    if (y < 1) return kRtcErrInvalidYear;
+    return rtc_is_leap(y) ? 1 : 0;
+}
+HLE(k_rtc_get_days_in_month) {   // (int year, int month) -> last day, negative on invalid
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    const int y = (int)a0, m = (int)a1;
+    if (y < 1) return kRtcErrInvalidYear;
+    if (m < 1 || m > 12) return kRtcErrInvalidMonth;
+    return (uint64_t)(uint32_t)rtc_days_in_month(y, m);
+}
+HLE(k_rtc_get_day_of_week) {   // (int year, int month, int day) -> 0=Sunday..6=Saturday
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    const int y = (int)a0, m = (int)a1, d = (int)a2;
+    // SDK >= 3.00 order (module +0x20e7): month before year, year capped at 9999. Older-SDK
+    // titles get no year cap on hardware; prosper has no compiled-SDK accessor yet, so the new
+    // path is used for all. CONFIDENCE: MED for pre-3.00 titles.
+    if (m < 1 || m > 12) return kRtcErrInvalidMonth;
+    if (y < 1 || y > 9999) return kRtcErrInvalidYear;
+    if (d < 1 || d > rtc_days_in_month(y, m)) return kRtcErrInvalidDay;
+    // 1970-01-01 was a Thursday (4); Sunday is 0 like chrono's c_encoding and tm_wday.
+    const int64_t days = rtc_days_from_civil(y, m, d);
+    return (uint64_t)(uint32_t)(((days + 4) % 7 + 7) % 7);
+}
+HLE(k_rtc_get_tick_resolution) {   // () -> ticks per second (the tick is microseconds)
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 1000000ull;
+}
+HLE(k_rtc_get_time_t) {   // (const SceRtcDateTime* dt, time_t* out)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const uint64_t bad = rtc_check_valid_dt((const uint16_t*)P(a0));
+    if (bad) return bad;
+    const uint64_t tick = rtc_tick_from_dt((const uint16_t*)P(a0));
+    // Before 1970 the module (+0x3151) zeroes the output and answers INVALID_YEAR.
+    if (tick < kRtcUnixEpochOffsetUs) {
+        *(int64_t*)P(a1) = 0;
+        return kRtcErrInvalidYear;
+    }
+    *(int64_t*)P(a1) = (int64_t)((tick - kRtcUnixEpochOffsetUs) / 1000000ull);
+    return 0;
+}
+HLE(k_rtc_get_win32_file_time) {   // (const SceRtcDateTime* dt, uint64_t* out100ns)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const uint64_t bad = rtc_check_valid_dt((const uint16_t*)P(a0));
+    if (bad) return bad;
+    const uint64_t tick = rtc_tick_from_dt((const uint16_t*)P(a0));
+    // Before 1601 the module (+0x2cb1) zeroes the output and answers INVALID_YEAR.
+    if (tick < kRtcWin32EpochOffsetUs) {
+        *(uint64_t*)P(a1) = 0;
+        return kRtcErrInvalidYear;
+    }
+    *(uint64_t*)P(a1) = (tick - kRtcWin32EpochOffsetUs) * 10ull;
+    return 0;
+}
+HLE(k_rtc_set_time_t) {   // (SceRtcDateTime* dt, time_t t)
+    // SDK >= 3.00 behaviour (module +0x2e5e): a negative time_t is refused before the null
+    // check... prosper keeps the null check first so a null pointer never reaches a write. On
+    // SDKs before 3.00 the module zero-extends the low 32 bits instead; launch-window PS5 titles
+    // were built before 3.00, but prosper has no compiled-SDK accessor yet, so they get the new
+    // path. Known gap. CONFIDENCE: MED.
+    if (!a0) return kRtcErrInvalidPointer;
+    const int64_t t = (int64_t)a1;
+    if (t < 0) return kRtcErrInvalidValue;
+    rtc_fill_from_tick(P(a0), (uint64_t)t * 1000000ull + kRtcUnixEpochOffsetUs);
+    return 0;
+}
+HLE(k_rtc_set_win32_file_time) {   // (SceRtcDateTime* dt, uint64_t wft100ns)
+    if (!a0) return kRtcErrInvalidPointer;
+    rtc_fill_from_tick(P(a0), a1 / 10ull + kRtcWin32EpochOffsetUs);
+    return 0;
+}
+HLE(k_rtc_convert_utc_to_local) {   // (const SceRtcTick* utc, SceRtcTick* local)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const uint64_t utc = *(const uint64_t*)P(a0);
+    const int64_t unix_secs =
+        (int64_t)((utc >= kRtcUnixEpochOffsetUs ? utc - kRtcUnixEpochOffsetUs : 0) / 1000000ull);
+    long gmtoff = 0;
+    int isdst = 0;
+    host_local_offset((time_t)unix_secs, gmtoff, isdst);
+    *(uint64_t*)P(a1) = utc + (uint64_t)((int64_t)gmtoff * 1000000ll);
+    return 0;
+}
+HLE(k_rtc_convert_local_to_utc) {   // (const SceRtcTick* local, SceRtcTick* utc)
+    // Two-pass: the offset is a function of the UTC instant, which is what is being solved
+    // for, so the first pass seeds it and the second corrects across a DST edge. MED.
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const uint64_t local = *(const uint64_t*)P(a0);
+    const int64_t s0 =
+        (int64_t)((local >= kRtcUnixEpochOffsetUs ? local - kRtcUnixEpochOffsetUs : 0) /
+                  1000000ull);
+    long off1 = 0, off2 = 0;
+    int dst = 0;
+    host_local_offset((time_t)s0, off1, dst);
+    host_local_offset((time_t)(s0 - off1), off2, dst);
+    *(uint64_t*)P(a1) = local - (uint64_t)((int64_t)off2 * 1000000ll);
+    return 0;
+}
+HLE(k_rtc_format_rfc3339) {   // (char* out, const SceRtcTick* tickOrNull, int tzMinutes)
+    if (!a0) return kRtcErrInvalidPointer;
+    const uint64_t tick = a1 ? *(const uint64_t*)P(a1) : wall_now_us() + kRtcUnixEpochOffsetUs;
+    const int tz = (int)a2;
+    // The module (FormatRFC3339 +0x2010 -> FormatRFC3339Precise +0x1b20, 2 digits) refuses a
+    // zone outside +/-1439 minutes and a shifted date that fails CheckValid, before writing
+    // anything; its output is therefore never longer than 28 characters plus the NUL.
+    if (tz < -1439 || tz > 1439) return kRtcErrInvalidValue;
+    uint8_t raw[16]{};
+    rtc_fill_from_tick(raw, tick + (uint64_t)((int64_t)tz * 60000000ll));
+    const uint16_t* d = (const uint16_t*)raw;
+    if (const uint64_t bad = rtc_check_valid_dt(d)) return bad;
+    const uint32_t usec = *(const uint32_t*)(d + 6);
+    char* out = (char*)P(a0);
+    int n = snprintf(out, 64, "%04u-%02u-%02uT%02u:%02u:%02u", d[0], d[1], d[2], d[3], d[4], d[5]);
+    // Two fraction digits: usec / 10^(6-2), zero-padded, as the module's Precise path prints.
+    n += snprintf(out + n, 64 - (size_t)n, ".%02u", usec / 10000u);
+    if (tz == 0) {
+        snprintf(out + n, 64 - (size_t)n, "Z");
+    } else {
+        const int ah = tz >= 0 ? tz / 60 : -tz / 60;
+        int rm = tz >= 0 ? tz % 60 : -tz % 60;
+        if (rm < 0) rm = -rm;
+        snprintf(out + n, 64 - (size_t)n, "%c%02d:%02d", tz >= 0 ? '+' : '-', ah, rm);
+    }
+    return 0;
+}
+HLE(k_rtc_parse_rfc3339) {   // (SceRtcTick* out, const char* "YYYY-MM-DDTHH:MM:SS[.ff][Z|±HH:MM]")
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const char* s = (const char*)P(a1);
+    // In-order parse, one field at a time, stopping at the first mismatch -- as the module's
+    // ParseRFC3339 (+0x12f0) does -- so a short string is never read past its NUL (rtc_digits
+    // stops at the first non-digit, and every separator is checked only after the field before
+    // it parsed). Malformed input is BAD_PARSE.
+    int v[6]{};
+    static const size_t kPos[6] = {0, 5, 8, 11, 14, 17};
+    static const size_t kLen[6] = {4, 2, 2, 2, 2, 2};
+    static const char kSep[5] = {'-', '-', 'T', ':', ':'};
+    for (int i = 0; i < 6; i++) {
+        if (!rtc_digits(s + kPos[i], kLen[i], &v[i])) return kRtcErrBadParse;
+        if (i < 5) {
+            const char c = s[kPos[i] + kLen[i]];
+            const bool ok = c == kSep[i] || (kSep[i] == 'T' && c == 't');   // module accepts 't'
+            if (!ok) return kRtcErrBadParse;
+        }
+    }
+    uint32_t usec = 0;
+    size_t tzpos = 19;
+    if (s[19] == '.') {
+        // Decimal fraction scaled to microseconds. The module accepts '.' with no digits and
+        // keeps consuming digits past the sixth with a scale of 0.
+        uint32_t scale = 100000u;
+        size_t i = 20;
+        for (; s[i] >= '0' && s[i] <= '9'; i++) {
+            usec += (uint32_t)(s[i] - '0') * scale;
+            scale /= 10u;
+        }
+        tzpos = i;
+    }
+    int tz_sign = 0, tz_h = 0, tz_m = 0;
+    if (s[tzpos] == 'Z' || s[tzpos] == 'z') {
+        // UTC
+    } else if (s[tzpos] == '+' || s[tzpos] == '-') {
+        int hh = 0, mm = 0;
+        // Field by field: HH, then ':', then MM. The module does not range-check the offset.
+        if (!rtc_digits(s + tzpos + 1, 2, &hh) || s[tzpos + 3] != ':' ||
+            !rtc_digits(s + tzpos + 4, 2, &mm)) {
+            return kRtcErrBadParse;
+        }
+        tz_sign = s[tzpos] == '+' ? 1 : -1;
+        tz_h = hh;
+        tz_m = mm;
+    } else {
+        return kRtcErrBadParse;   // includes a missing zone designator, which the module refuses
+    }
+    uint16_t d[8]{};
+    d[0] = (uint16_t)v[0];
+    d[1] = (uint16_t)v[1];
+    d[2] = (uint16_t)v[2];
+    d[3] = (uint16_t)v[3];
+    d[4] = (uint16_t)v[4];
+    d[5] = (uint16_t)v[5];
+    *(uint32_t*)(d + 6) = usec;
+    const uint64_t bad = rtc_check_valid_dt(d);
+    if (bad) return bad;
+    uint64_t tick = rtc_tick_from_dt(d);
+    // UTC = local - offset. DEVIATION from the reference, which adds the offset (inverting
+    // both signs): "00:00+05:00" is 19:00Z the previous day, not 05:00Z. The arithmetic above
+    // is the RFC3339 definition; the reference's direction fails its own Format inverse.
+    tick -= (uint64_t)((int64_t)tz_sign * (tz_h * 60 + tz_m) * 60000000ll);
+    *(uint64_t*)P(a0) = tick;
+    return 0;
+}
+HLE(k_rtc_tick_add_days) {   // (SceRtcTick* out, const SceRtcTick* in, int32_t days)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)(int32_t)a2 * 86400000000ll);
+    return 0;
+}
+HLE(k_rtc_tick_add_hours) {
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)(int32_t)a2 * 3600000000ll);
+    return 0;
+}
+HLE(k_rtc_tick_add_microseconds) {   // (out, in, int64_t us)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)(int64_t)a2;
+    return 0;
+}
+HLE(k_rtc_tick_add_minutes) {   // (out, in, int64_t min)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)a2 * 60000000ll);
+    return 0;
+}
+HLE(k_rtc_tick_add_seconds) {   // (out, in, int64_t sec)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)a2 * 1000000ll);
+    return 0;
+}
+HLE(k_rtc_tick_add_ticks) {   // (out, in, int64_t ticks)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)(int64_t)a2;
+    return 0;
+}
+HLE(k_rtc_tick_add_weeks) {
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)(int32_t)a2 * 604800000000ll);
+    return 0;
+}
+// Calendar steps read the INPUT tick (a1), never the output: the reference reads the output
+// tick instead, so in-place callers work there and two-arg callers silently compute from
+// garbage. DEVIATION, documented: input-driven is the only reading under which both call
+// shapes are correct. Day clamping (Jan 31 + 1 month -> Feb 28/29) follows the reference.
+HLE(k_rtc_tick_add_months) {   // (SceRtcTick* out, const SceRtcTick* in, int32_t months)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    uint8_t raw[16]{};
+    rtc_fill_from_tick(raw, *(const uint64_t*)P(a1));
+    const int32_t add = (int32_t)a2;
+    if (add == 0) {
+        *(uint64_t*)P(a0) = *(const uint64_t*)P(a1);
+        return 0;
+    }
+    int y = (int)((const uint16_t*)raw)[0] + add / 12;
+    int m = (int)((const uint16_t*)raw)[1] + add % 12 - 1;
+    while (m > 11) {
+        m -= 12;
+        y++;
+    }
+    while (m < 0) {
+        m += 12;
+        y--;
+    }
+    uint16_t d[8]{};
+    d[0] = (uint16_t)y;
+    d[1] = (uint16_t)(m + 1);
+    const int last = rtc_days_in_month(y, m + 1);
+    // Out of range: the module (+0x3520) returns SCE_OK without writing the output (eax is
+    // zeroed before the range checks); INVALID_POINTER is the only error it can return.
+    if (last == 0) return 0;
+    const uint16_t day = ((const uint16_t*)raw)[2];
+    d[2] = day > (uint16_t)last ? (uint16_t)last : day;
+    d[3] = ((const uint16_t*)raw)[3];
+    d[4] = ((const uint16_t*)raw)[4];
+    d[5] = ((const uint16_t*)raw)[5];
+    *(uint32_t*)(d + 6) = *(const uint32_t*)(((const uint16_t*)raw) + 6);
+    if (rtc_check_valid_dt(d)) return 0;   // out of range: SCE_OK, no write
+    *(uint64_t*)P(a0) = rtc_tick_from_dt(d);
+    return 0;
+}
+HLE(k_rtc_tick_add_years) {   // (SceRtcTick* out, const SceRtcTick* in, int32_t years)
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    uint8_t raw[16]{};
+    rtc_fill_from_tick(raw, *(const uint64_t*)P(a1));
+    const int32_t add = (int32_t)a2;
+    if (add == 0) {
+        *(uint64_t*)P(a0) = *(const uint64_t*)P(a1);
+        return 0;
+    }
+    const int y = (int)((const uint16_t*)raw)[0] + add;
+    const int m = (int)((const uint16_t*)raw)[1];
+    const int last = rtc_days_in_month(y, m);
+    if (last == 0) return 0;   // out of range: SCE_OK, no write (module +0x3890)
+    uint16_t d[8]{};
+    d[0] = (uint16_t)y;
+    d[1] = (uint16_t)m;
+    const uint16_t day = ((const uint16_t*)raw)[2];
+    d[2] = day > (uint16_t)last ? (uint16_t)last : day;
+    d[3] = ((const uint16_t*)raw)[3];
+    d[4] = ((const uint16_t*)raw)[4];
+    d[5] = ((const uint16_t*)raw)[5];
+    *(uint32_t*)(d + 6) = *(const uint32_t*)(((const uint16_t*)raw) + 6);
+    if (rtc_check_valid_dt(d)) return 0;   // out of range: SCE_OK, no write
+    *(uint64_t*)P(a0) = rtc_tick_from_dt(d);
+    return 0;
+}
+
 // Real sleeps so timed wait loops actually yield the CPU (and advance real time).
 //
 // NOT nanosleep, and on Windows that is the whole point (#3013). MinGW's nanosleep is winpthreads',
@@ -2278,6 +2710,29 @@ void register_kernel_time_hle() {
     R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_utc);
     R("sceRtcSetTick", k_rtc_set_tick);   // tick -> UTC datetime (issue #115 follow-on: FDateTime spam)
     R("sceRtcGetTick", k_rtc_get_tick);   // UTC datetime -> tick
+    // SceRtc calendar arithmetic: pure functions of their inputs (see the handlers above).
+    R("sceRtcCheckValid", k_rtc_check_valid);
+    R("sceRtcIsLeapYear", k_rtc_is_leap_year);
+    R("sceRtcGetDaysInMonth", k_rtc_get_days_in_month);
+    R("sceRtcGetDayOfWeek", k_rtc_get_day_of_week);
+    R("sceRtcGetTickResolution", k_rtc_get_tick_resolution);
+    R("sceRtcGetTime_t", k_rtc_get_time_t);
+    R("sceRtcGetWin32FileTime", k_rtc_get_win32_file_time);
+    R("sceRtcSetTime_t", k_rtc_set_time_t);
+    R("sceRtcSetWin32FileTime", k_rtc_set_win32_file_time);
+    R("sceRtcConvertUtcToLocalTime", k_rtc_convert_utc_to_local);
+    R("sceRtcConvertLocalTimeToUtc", k_rtc_convert_local_to_utc);
+    R("sceRtcFormatRFC3339", k_rtc_format_rfc3339);
+    R("sceRtcParseRFC3339", k_rtc_parse_rfc3339);
+    R("sceRtcTickAddDays", k_rtc_tick_add_days);
+    R("sceRtcTickAddHours", k_rtc_tick_add_hours);
+    R("sceRtcTickAddMicroseconds", k_rtc_tick_add_microseconds);
+    R("sceRtcTickAddMinutes", k_rtc_tick_add_minutes);
+    R("sceRtcTickAddMonths", k_rtc_tick_add_months);
+    R("sceRtcTickAddSeconds", k_rtc_tick_add_seconds);
+    R("sceRtcTickAddTicks", k_rtc_tick_add_ticks);
+    R("sceRtcTickAddWeeks", k_rtc_tick_add_weeks);
+    R("sceRtcTickAddYears", k_rtc_tick_add_years);
     // module loading (report success; real PRX are already resident in our address space).
     // IsLoaded is a state QUERY and must not share that stub — see the handlers above (#2002).
     R("sceSysmoduleLoadModule", k_sysmodule_load);

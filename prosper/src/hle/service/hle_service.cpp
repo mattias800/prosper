@@ -217,6 +217,15 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // overran a single-entry mouse buffer, and the game consumed a phantom mouse event every call. No
 // mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
+// sceMouseClose(handle). The firmware validates (module VA 0xaf0): 0x80DF0005 before
+// sceMouseInit, and 0x80DF0003 for a zero, unknown or already-closed handle after scanning its 8
+// open slots. s_open does not track handles, so prosper accepts every close. CONFIDENCE: MED. This
+// matches the dispatcher's previous answer for every well-formed close; tracking handles would
+// change what 52 importing titles (13 snapshot-guarded) see, so it belongs in its own change.
+HLE(s_mouse_close) {
+    (void)a0;
+    return 0;
+}
 
 // --- app content ---
 namespace {
@@ -733,6 +742,80 @@ HLE(s_dialog_result) {
     if (a0) memset(PW(a0), 0, 0x2C);
     return 0;
 }
+
+// --- LoginDialog + WebBrowserDialog lifecycles; MsgDialog progress bars ----------------------
+// LoginDialog: imported by Sonic Frontiers PPSA03831 and Sonic Origins PPSA05325 (Initialize, Open,
+// UpdateStatus, GetResult, Terminate), Sonic Racing: CrossWorlds PPSA08804 (Initialize, Open,
+// UpdateStatus, Terminate) and Darksiders II PPSA23806 (all seven). No platform_ui route exists
+// for login, so it is headless only: Open auto-dismisses to FINISHED and GetResult reports that
+// no login happened. Every error code and the GetResult default below are read from the shipped
+// libSceLoginDialog module (Initialize 0x1560, Terminate 0x15a0, Open 0x18f0, Close 0x1d20,
+// GetResult 0x1f10). CONFIDENCE: HIGH on the codes and on GetResult's first word meaning "not
+// completed" (all three importers branch on it); MED on the meaning of its second word.
+// WebBrowserDialog: Initialize/Terminate only. The firmware library has 15 exports; Open,
+// UpdateStatus, GetResult and the rest stay unregistered (#4463) because a real lifecycle changes
+// the answer for every guarded Unity title and needs its own snapshot runs.
+// MsgDialog progress bars: unchanged from the dispatcher default (0). The shipped module would
+// report NOT_RUNNING (0x80B8000B) for a headless MsgDialog, and at least PGA TOUR 2K25 gates on the
+// result, so this is a deliberate match of the SaveDataDialog progress precedent. CONFIDENCE: MED.
+// NIDs via nid_hash (LoginDialogInitialize reproduces the registered qP-EvQRl2Hc).
+namespace {
+constexpr uint64_t kLoginDialogNotInitialized = 0x81340001ull;
+constexpr uint64_t kLoginDialogAlreadyInitialized = 0x81340002ull;
+constexpr uint64_t kLoginDialogParamInvalid = 0x81340003ull;
+constexpr uint64_t kLoginDialogBusy = 0x81340005ull;   // also "not finished" for GetResult
+constexpr uint32_t kLoginDialogNoService = 0x81340007u;
+constexpr int kDialogNone = 0, kDialogInitialized = 1, kDialogRunning = 2, kDialogFinished = 3;
+std::atomic<int> g_logindialog_status{kDialogNone};
+}  // namespace
+HLE(s_login_dialog_init) {
+    int expected = kDialogNone;
+    if (!g_logindialog_status.compare_exchange_strong(expected, kDialogInitialized))
+        return kLoginDialogAlreadyInitialized;
+    return 0;
+}
+HLE(s_login_dialog_open) {
+    // Param: u32 size == 0x40 at +0, a selector below 2 at +4, reserved words +0x2c..+0x3c zero.
+    if (!svc_ptrish(a0)) return kLoginDialogParamInvalid;
+    const auto* p = (const uint32_t*)PW(a0);
+    if (p[0] != 0x40u || p[1] >= 2u) return kLoginDialogParamInvalid;
+    for (int w = 0x2c / 4; w <= 0x3c / 4; ++w)
+        if (p[w] != 0) return kLoginDialogParamInvalid;
+    const int st = g_logindialog_status.load();
+    if (st == kDialogNone) return kLoginDialogNotInitialized;
+    if (st == kDialogRunning) return kLoginDialogBusy;
+    g_logindialog_status.store(kDialogFinished);   // headless: auto-dismiss
+    return 0;
+}
+HLE(s_login_dialog_status) {
+    return (uint64_t)(unsigned)g_logindialog_status.load();
+}
+HLE(s_login_dialog_result) {
+    // The module writes {1, NO_SERVICE} before anything else and only a live service overwrites
+    // it, so with no service the headless answer is "not completed": no login happened. Writing 0
+    // (or nothing over a zeroed struct) would read as a successful login for userId 0.
+    if (!svc_ptrish(a0)) return kLoginDialogParamInvalid;
+    const int st = g_logindialog_status.load();
+    if (st == kDialogNone) return kLoginDialogNotInitialized;
+    auto* r = (uint32_t*)PW(a0);
+    r[0] = 1u;
+    r[1] = kLoginDialogNoService;
+    return st == kDialogFinished ? 0 : kLoginDialogBusy;
+}
+HLE(s_login_dialog_close) {
+    if (g_logindialog_status.load() == kDialogNone) return kLoginDialogNotInitialized;
+    // The firmware stores FINISHED here, like main's Signin/Commerce dialogs.
+    g_logindialog_status.store(kDialogFinished);
+    return 0;
+}
+HLE(s_login_dialog_term) {
+    if (g_logindialog_status.exchange(kDialogNone) == kDialogNone)
+        return kLoginDialogNotInitialized;
+    return 0;
+}
+HLE(s_dialog_progress) {
+    return 0;
+}   // ProgressBarInc/SetMsg/SetValue: dispatcher-default 0 (see above)
 
 // ===== Issue #232: the Sony services DOLL's level-load flow polls (PlayGo / SaveData / =========
 // ===== NpTrophy2 lifecycle / Share). All NID<->name pairs verified against the PS5 3.20 ========
@@ -1289,9 +1372,42 @@ HLE(s_npent_skuflag) {
 // (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
 // 3 adjacent stack bytes. 0 = "no skip" is the inert default a retail console with no
 // notice-screen state reports. CONFIDENCE: MED (byte-sized out pinned live; value semantics LOW).
+// The Set/DisableAutoSet siblings below store into the same flag so a title round-trips what
+// it set instead of reading a hardwired 0 after asking for skip (read-your-writes).
+// CONFIDENCE: LOW on that read-back model -- not established against the module. The shipped
+// Set takes no arguments (it always requests skip), and g_noticeskip_autoset is recorded but
+// never read: nothing here models the auto-set behaviour it disables.
+namespace {
+std::atomic<bool> g_noticeskip{false};
+std::atomic<bool> g_noticeskip_autoset{true};
+}   // namespace
 HLE(s_syss_noticeskip) {
     svc_log("sceSystemServiceGetNoticeScreenSkipFlag", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = 0;
+    if (!svc_ptrish(a0)) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER, as the module
+    *(uint8_t*)PW(a0) = g_noticeskip.load() ? 1 : 0;
+    return 0;
+}
+HLE(s_syss_set_noticeskip) {
+    svc_log("sceSystemServiceSetNoticeScreenSkipFlag", a0, a1, a2, a3, a4, a5);
+    g_noticeskip.store(true);
+    return 0;
+}
+HLE(s_syss_noticeskip_noautoset) {
+    svc_log("sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", a0, a1, a2, a3, a4, a5);
+    g_noticeskip_autoset.store(false);
+    return 0;
+}
+HLE(s_syss_powertick) {
+    svc_log("sceSystemServicePowerTick", a0, a1, a2, a3, a4, a5);
+    return 0;   // keep-awake hint; nothing sleeps headless
+}
+// sceUserServiceGetPlatformPrivacyWs1(userId, int32_t* out): the shipped module writes 0/1
+// (setting 0x89c, (v & ~2) == 1) and returns 0x80960005 for a NULL out. 0 = the consent-free
+// default; a user setting is not derivable from the dump. CONFIDENCE: MED.
+HLE(s_user_privacy_ws1) {
+    svc_log("sceUserServiceGetPlatformPrivacyWs1", a0, a1, a2, a3, a4, a5);
+    if (!svc_ptrish(a1)) return 0x80960005ull;
+    *(int32_t*)PW(a1) = 0;
     return 0;
 }
 
@@ -1414,15 +1530,37 @@ void register_service_hle() {
     // size field and returns success, satisfying both concerns.
     Hle::register_fn("-sD02mFDBh4", (HleFn)s_gamepresets, "sceUserServiceGetGamePresets");
     Hle::register_fn("qbwy0Ub8b3M", (HleFn)s_user_number, "sceUserServiceGetUserNumber");
-    // Sonic imports LoginDialog only to initialize the service at startup.  There is no UI to show
-    // until Open is requested, so initialization is a truthful successful no-op in the headless HLE.
-    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_ok, "sceLoginDialogInitialize");
+    // LoginDialog: headless lifecycle with the shipped module's error codes (see the handlers).
+    Hle::register_fn("qP-EvQRl2Hc", (HleFn)s_login_dialog_init, "sceLoginDialogInitialize");
+    R("sceLoginDialogOpen", s_login_dialog_open);
+    R("sceLoginDialogClose", s_login_dialog_close);
+    R("sceLoginDialogTerminate", s_login_dialog_term);
+    R("sceLoginDialogUpdateStatus", s_login_dialog_status);
+    R("sceLoginDialogGetStatus", s_login_dialog_status);
+    R("sceLoginDialogGetResult", s_login_dialog_result);
+    // MsgDialog progress bars: dispatcher-default 0, kept deliberately (see the handler block).
+    R("sceMsgDialogProgressBarInc", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetMsg", s_dialog_progress);
+    R("sceMsgDialogProgressBarSetValue", s_dialog_progress);
+    // WebBrowserDialog: Initialize/Terminate only, returning 0 as the dispatcher did. Open,
+    // UpdateStatus, GetResult and the other exports remain unregistered (#4463).
+    R("sceWebBrowserDialogInitialize", s_ok);
+    R("sceWebBrowserDialogTerminate", s_ok);
     R("sceUserServiceInitialize", s_ok);
+    R("sceUserServiceInitialize2", s_ok);
     R("sceUserServiceTerminate", s_ok);
+    // PlatformPrivacyWs1 (userId, int* out): a deterministic default with a NULL check, like the
+    // module (s_user_privacy_ws1). Not in the 3.20 list: it lives in the newer
+    // libSceUserServicePlatformPrivacyWs1 sub-library that the shipped libSceUserService.sprx
+    // exports; nid_hash("sceUserServiceGetPlatformPrivacyWs1") is D-CzAxQL0XI, and three local
+    // dumps import it (PPSA03671, PPSA05684, PPSA21564).
+    Hle::register_fn("D-CzAxQL0XI", (HleFn)s_user_privacy_ws1,
+                     "sceUserServiceGetPlatformPrivacyWs1");
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
     R("sceMouseRead", s_mouse_read);
+    R("sceMouseClose", s_mouse_close);
     // app content / dialogs
     R("sceAppContentInitialize", s_ok);
     R("sceAppContentAppParamGetInt", s_appcontent_int);
@@ -1491,6 +1629,11 @@ void register_service_hle() {
     Hle::register_fn("t2FvHRXzgqk", (HleFn)s_errdialog_status, "sceErrorDialogGetStatus");
     Hle::register_fn("WWiGuh9XfgQ", (HleFn)s_errdialog_status, "sceErrorDialogUpdateStatus");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
+    Hle::register_fn("Q3utJvma4Mo", (HleFn)s_syss_set_noticeskip,
+                     "sceSystemServiceSetNoticeScreenSkipFlag");
+    Hle::register_fn("8Lo6Zv94aho", (HleFn)s_syss_noticeskip_noautoset,
+                     "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet");
+    Hle::register_fn("XbbJC3E+L5M", (HleFn)s_syss_powertick, "sceSystemServicePowerTick");
     Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
     // libSceNpEntitlementAccess / libSceGameUpdate — observability (svc_log) with the real-console
     // "local init succeeds offline" return; follow-ups deliberately left unimplemented (see above).
