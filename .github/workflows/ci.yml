@@ -652,6 +652,33 @@ jobs:
             echo "::warning::architecture ratchet: the full-tree report is not clean (informational only; see the log above). Repair rows with --update, or raise them with a note naming the PR that grew them."
           fi
 
+      # Same job, same reason: the architecture spec (prosper/docs/spec/) and decision records
+      # (prosper/docs/adr/) are only worth having if their references are live. This fails when a
+      # spec rule names an enforcement that does not exist, when a ratchet rule above is cited by no
+      # spec rule, when the generated layer table drifts from LAYER_ORDER, and -- given a base --
+      # when an ACCEPTED ADR's text is edited or deleted instead of superseded. Its pytest suite runs
+      # in the Python quality job. Base selection mirrors the ratchet step; without a base the
+      # immutability check is skipped and says so.
+      - name: Verify the architecture spec and ADRs are consistent
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          has() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; }
+          BASE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            if has "$PR_BASE"; then BASE="$PR_BASE"; else BASE="HEAD~1"; fi
+          elif has "$PUSH_BEFORE"; then
+            BASE="$PUSH_BEFORE"
+          fi
+          if [ -n "$BASE" ]; then
+            python3 prosper/tools/docs/check_arch_docs.py --github --root . --base "$BASE"
+          else
+            echo "::notice::architecture docs: no base commit for this $EVENT event; ADR immutability skipped"
+            python3 prosper/tools/docs/check_arch_docs.py --github --root .
+          fi
+
       # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
       # the "needing nothing built" part is the point, because the defect this catches is visible
       # ONLY on Windows and would otherwise wait for the MinGW job. stdout carries bytes, and the

@@ -5,6 +5,10 @@
 > the new `src/guest/` layer, the move of the shipping Vulkan backend to `frontends/shared/backend/`,
 > and the "Planned moves" table. Read them as a plan to discuss, and don't start a move from this
 > document alone.
+>
+> Approval is now tracked per decision in `docs/adr/`: ADR 0003 (the `guest/` layer, moves 4-6
+> and 12) and ADR 0004 (the backend move, moves 1-3) are `proposed` until the owner accepts them.
+> The binding rules these moves serve are in `docs/spec/`.
 
 What the source tree looks like now, what it should look like, which way dependencies may point,
 and the planned moves that get from one to the other. Every move is a move-only PR made with the

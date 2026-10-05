@@ -17,6 +17,8 @@ doc in the folder whose question it answers, not beside whatever you last opened
 
 | Folder | What belongs there |
 | --- | --- |
+| `spec/` | The binding architecture rules, each with an ID, a status and the instrument that enforces it. Rules only; no measurements or narrative |
+| `adr/` | Architecture decision records: why each rule exists and who accepted it. Accepted ADRs are frozen and superseded, never edited |
 | `architecture/` | How the pieces fit: components, the host/platform seam, the target source tree, refactor plans |
 | `gpu/` | AGC/PM4, the Vulkan executor, resource binding, tiling, recompiler, renderer design notes (dated `_YYYY_MM` design/measurement docs included) |
 | `performance/` | Profiling method, performance roadmaps and the dated measurement passes |
@@ -30,5 +32,6 @@ doc in the folder whose question it answers, not beside whatever you last opened
 | `evidence/`, `screenshots/` | Raw measurement output and committed captures cited by the docs above |
 
 Cite docs by full path (`prosper/docs/gpu/GRAPHICS.md`); file names are unique repo-wide, so a bare
-name is still greppable. `tools/docs/reorganize_docs.py` is the one-shot that performed the 2026-10
+name is still greppable. `tools/docs/check_arch_docs.py` gates `spec/` and `adr/` in CI.
+`tools/docs/reorganize_docs.py` is the one-shot that performed the 2026-10
 move; do not re-run it.
