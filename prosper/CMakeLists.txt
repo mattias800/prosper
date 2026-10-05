@@ -1548,6 +1548,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/audio/test_audio_spatial.cpp
     LIBRARIES prosper_core)
 
+  # libSceVoice: no capture backend, so Init reports unavailable and the port surface
+  # agrees with it instead of handing out contradicting handles (GTA V, #1158).
+  prosper_add_gtest(test_voice
+    SOURCES tests/hle/audio/test_voice.cpp
+    LIBRARIES prosper_core)
+
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
   # answered SCE_OK while storing and reading nothing. Drives the real NIDs, including a mutation arm
   # (a different block must read back differently) and a persistence arm (it must come off disk).
