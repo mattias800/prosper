@@ -51,14 +51,17 @@ endfunction()
 # is title- or dump-specific, so a link error is a stale list and never a missing fixture.
 host_test(self_segment_key "${PROSPER_ROOT}/tests/test_self_segment_key.cpp"
                           "${PROSPER_ROOT}/src/self/module.cpp")
+target_link_libraries(self_segment_key PRIVATE GTest::gtest GTest::gtest_main)
 # Run the production SELF/ELF parser and image builder through their existing malformed-input
 # bounds regression suite, and exercise VA-to-file-offset resolution under the same sanitizers.
 # These synthetic tests need no game dump or Vulkan; keeping them here puts ELF metadata reads and
 # loader-facing image construction under ASan + UBSan in CI (#4338).
 host_test(self_bounds "${PROSPER_ROOT}/tests/test_self_bounds.cpp"
                       "${PROSPER_ROOT}/src/self/module.cpp")
+target_link_libraries(self_bounds PRIVATE GTest::gtest GTest::gtest_main)
 host_test(va2foff "${PROSPER_ROOT}/tests/test_va2foff.cpp"
                   "${PROSPER_ROOT}/src/self/module.cpp")
+target_link_libraries(va2foff PRIVATE GTest::gtest GTest::gtest_main)
 # Run the synthetic link and rejection contracts through the production linker, SELF/ELF parser,
 # relocation applier, and NID hash implementation under ASan + UBSan. The fixtures are generated
 # from synthetic ELF bytes and exercise import/export resolution and malformed relocation targets;
