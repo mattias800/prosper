@@ -299,6 +299,11 @@ void register_rudp_hle();
 void register_http2_hle();
 // libSceFont/libSceFontFt opaque lifecycle and deterministic metrics; called by register_builtin_hle().
 void register_font_hle();
+// libSceCesCs single-character CP1252<->UTF-8 conversion; called by register_builtin_hle().
+void register_cescs_hle();
+// libScePngDec PNG decode to 8-bit RGBA/BGRA via vendored stb_image; called by
+// register_builtin_hle().
+void register_pngdec_hle();
 // libSceFiber cooperative guest-stack switching; called by register_builtin_hle().
 void register_fiber_hle();
 // Optional host-side hooks around a spawned guest thread's guest-code region. Both run on the HOST
