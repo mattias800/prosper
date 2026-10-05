@@ -309,9 +309,16 @@ jobs:
       #
       # Measured cost on this runner: ctest reports 30.46 s without the layer and 31.08 s with it,
       # so this step is ~31 s of wall clock. The layer package lives in noble/universe.
+      #
+      # --sync adds SYNCHRONIZATION validation (barrier and layout hazards between calls) to the same
+      # run; core validation still runs. Locally the whole suite is clean under it (#3248) and it
+      # costs no separable time; it runs here because barrier hazards are invisible to every other
+      # check, and pipelining GPU submission (#3948) will move exactly those barriers. The scanner
+      # refuses a sync verdict until vkval_sync_probe's deliberate hazard comes back, so a layer
+      # version that ignores the setting fails loudly instead of reporting clean.
       - name: Vulkan validation scan
         run: |
-          python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci
+          python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci --sync
 
       - name: ccache statistics
         if: always()

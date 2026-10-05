@@ -24,7 +24,8 @@ That is the difference the guard buys.
 
 ## Synchronization validation — `--sync`
 
-**It is a separate check set, and the default run does not include it.** Core validation checks how
+**It is a separate check set, and the default run does not include it** -- the `Linux` CI job
+passes `--sync`, so CI runs both. Core validation checks how
 each call is *used*; synchronization validation models the hazards *between* calls — the barriers,
 the subpass dependencies, the layout transitions — and it is what sees prosper's synchronization.
 Add `--sync` to switch it on:
