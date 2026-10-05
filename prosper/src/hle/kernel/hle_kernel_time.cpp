@@ -2188,12 +2188,15 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     // LOWER than an earlier one on the same ring is not a harmless duplicate — it rewinds the
     // guest's bookkeeping and the next event completes a token twice (#4504). This is the only
     // place that order can be observed: the post side logs what was scheduled, not what arrived.
+    // ring/cnt are the counter dialect's reading of `data`; for a pointer or zero tag they are
+    // just its top 6 and low 58 bits, which is why the raw value is printed beside them.
     if (evlog() && ev)
         for (int i = 0; i < n; i++)
             if (ev[i].filter == EVFILT_AMPR)
-                fprintf(stderr, "[ev]   apr-delivered eq=0x%llx ident=%lld ring=%u cnt=%llu\n",
+                fprintf(stderr,
+                        "[ev]   apr-delivered eq=0x%llx ident=%lld data=0x%llx ring=%u cnt=%llu\n",
                         (unsigned long long)a0, (long long)ev[i].ident,
-                        (unsigned)((uint64_t)ev[i].data >> 58),
+                        (unsigned long long)ev[i].data, (unsigned)((uint64_t)ev[i].data >> 58),
                         (unsigned long long)((uint64_t)ev[i].data & ((1ull << 58) - 1)));
     // Timed wait that expired with nothing: the real API distinguishes this from success (Kyty
     // EventQueue.cpp:310 KERNEL_ERROR_ETIMEDOUT). Only reachable with a timeout arg — the infinite
@@ -2406,6 +2409,11 @@ void post_apr_constant_zero(uint64_t eq, uint64_t eq_identity, int64_t id, uint6
 // and the handler dereferences the null it gets back. Measured on Kena (PPSA01802): 12 of 64
 // launches died there, 5-10 s into the boot. The mark only ever rises, so holding one mutex across
 // read-then-post makes the posted sequence non-decreasing for every (queue, ring).
+//
+// What that does NOT cover: the mark is keyed by (queue, ring) but a pending event is keyed by
+// ident = id + ring, so two DIFFERENT counter ids bound to one ring would own two pending events,
+// and an in-place refresh of the older one could still be read after a higher value in the newer.
+// UE4 registers exactly one id per ring (0x74fe + ring), which is what delivery order relies on.
 // CONFIDENCE: HIGH (both ends live-captured and disassembled; see the block comment above).
 void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
     const unsigned ring = (unsigned)(token >> 58) & 0x3f;
@@ -2440,8 +2448,11 @@ void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t to
 }
 }   // namespace
 // Post the completion for a bound command buffer, delivered per the binding's DIALECT (classified
-// once at bind time, apr_event_dialect.hpp). Deferred ~2 ms so the guest finishes installing its
-// tracking slot/hash entry first (real DMA latency the submitter's bookkeeping never races).
+// once at bind time, apr_event_dialect.hpp). Deferred ~2 ms as modelled DMA latency. It was
+// introduced so that a guest could finish installing its tracking slot/hash entry first; do NOT
+// read it as an ordering or readiness guarantee. Kena's listener installs its entry before it
+// submits (from that title's disassembly, #4504), and what it needed was order, which the counter
+// dialect now provides by construction. Whether any title needs the delay itself is unmeasured.
 void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token,
                                AprDialect dialect) {
     if (!eq_identity || prosper_eq_identity(eq) != eq_identity) return;

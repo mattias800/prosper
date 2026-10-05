@@ -22,9 +22,13 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   stored `last := N` unconditionally, and the next event walked N+1 a second time. Caught in the
   act on unfixed code: `posted=4754 after=4784` on ring 4, then the fault on token 4755. Reading
   the mark and posting it are now one step
-  ([#4504](https://github.com/mattias800/prosper/issues/4504)). The deferral stays as modelled
-  latency; this row only records that it is not an ordering guarantee and was never the thing
-  protecting this consumer.
+  ([#4504](https://github.com/mattias800/prosper/issues/4504)). Two halves of this row rest on
+  different evidence. That prosper posted a lower counter after a higher one, and that the fault
+  followed, is measured (4 of 12 booted launches with the ordering mutex removed, 0 of 21 with
+  it). That the guest installs before it submits is read from this title's disassembly and cannot
+  be checked from the repository; and no launch was run with the deferral set to zero, so "the
+  deferral was not protecting this consumer" is an inference from that disassembly, not a
+  measurement. The deferral stays as modelled latency.
 - **Both `AndGetResult` outputs carry the event token — false.** Original callers read an
   eight-byte `{status32, failing_offset32}` result and a separate four-byte submit ID, which
   they pass to the wait function. Silent Hill 2 reads its status at `eboot+0x230e7d4` and the

@@ -342,7 +342,15 @@ TEST(AprEqueueCompletion, CounterPostsNeverRegress) {
     g_counter_hook_calls = 0;
     g_first_post_parked = false;
     g_release_first_post = false;
-    prosper_apr_counter_post_hook_for_test(park_first_counter_post);
+    // Uninstalled on every exit path, including a failed ASSERT below: a hook left installed
+    // would park the next counter post in this process for good.
+    struct HookGuard {
+        HookGuard() { prosper_apr_counter_post_hook_for_test(park_first_counter_post); }
+        ~HookGuard() {
+            g_release_first_post = true;
+            prosper_apr_counter_post_hook_for_test(nullptr);
+        }
+    } hook_guard;
 
     prosper_eq_post_apr_token(eq, identity, kListenerId, kFirst);
     for (int i = 0; i < 2000 && !g_first_post_parked.load(); i++)
@@ -356,9 +364,15 @@ TEST(AprEqueueCompletion, CounterPostsNeverRegress) {
     collect_for(250);
     const std::vector<uint64_t> while_parked = delivered;
 
+    // After the release both posts are free to land. The first and last steps below wait on a
+    // condition (both posts past the seam; the final level read), so a slow machine costs time
+    // and not a false failure, and their bounds only stop a real hang. The 150 ms between them is
+    // the one fixed wait: it is where a late LOWER counter, if one exists, shows itself.
     g_release_first_post = true;
-    collect_for(250);
-    prosper_apr_counter_post_hook_for_test(nullptr);
+    for (int i = 0; i < 100 && g_counter_hook_calls.load() < 2; i++) collect_for(50);
+    collect_for(150);
+    for (int i = 0; i < 100 && (delivered.empty() || delivered.back() != kSecond); i++)
+        collect_for(50);
 
     EXPECT_TRUE(while_parked.empty())
         << "a later counter (" << (while_parked.empty() ? 0 : while_parked.front())
@@ -369,7 +383,8 @@ TEST(AprEqueueCompletion, CounterPostsNeverRegress) {
             << "counter " << delivered[i] << " was delivered after " << delivered[i - 1]
             << ": the listener rewinds to it and completes a token twice (#4504)";
     EXPECT_EQ(delivered.back(), kSecond) << "the final level must be the highest token submitted";
-    // Positive control for the seam: both posts went through it, so the second one really did
-    // reach the point where it could have overtaken.
+    // Both posts went through the seam. This shows the second post ran, not when: that it was
+    // free to overtake during the parked window is what `while_parked` being empty rests on, and
+    // the arm with the mutex removed is what shows that window is long enough to be used.
     EXPECT_EQ(g_counter_hook_calls.load(), 2);
 }
