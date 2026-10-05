@@ -43,20 +43,23 @@ are verification references for structure only; no code, types or prose are take
  diagnostics  observe-only, cross-cutting: perf alarms, capture, timeline
 ```
 
-## Direction not yet proposed as a rule
+## Runtime and performance direction
 
-These follow from the shape above and the frame invariants, and each needs its own ADR before it
-becomes a rule: one canonical resource identity per guest allocation with page-granular write
-tracking, so several guest mappings of one allocation share one host resource (`PERF-P5`); a single wait and synchronisation model
-in `guest/` that never assumes the host thread entering an HLE call is the one that returns from it
-(fiber titles, #3615 / #3638 / #3623); a submit worker that records frame N+1 while frame N executes
-(`PERF-P1`, `PERF-P6`); a typed GPU command representation between PM4 decode and the backend; and
-an SSA IR inside the shader recompiler, migrated one instruction family at a time.
+Each of these is a proposed ADR with a rule here or in `performance.md`: pipelined GPU submission
+retiring guest-visible effects in stream order (ADR 0009, `PERF-P8`); one canonical resource per
+guest allocation validated by page tracking (ADR 0010, `PERF-P9`); a typed GPU command
+representation with deterministic passes (ADR 0011, `GPU-2`); an SSA IR inside the recompiler
+(ADR 0012, `GPU-3`); one guest sync and scheduling model with no thread-identity assumptions
+(ADR 0013, `SYNC-1`); pipeline compilation off the submit thread from a persistent cache (ADR 0014,
+`PERF-P7`); declarative per-library HLE export tables (ADR 0015, `HLE-3`); and a release gate on the
+reference workloads (ADR 0016, `PERF-G1`). Profile-guided and AI-assisted optimisation are deferred
+until those instruments exist (`performance.md`).
 
 Deliberately not part of the target: a CPU translation layer or relinker (the guest runs natively),
 a virtual interface on every boundary (implementations are chosen at build time, and there is no
-LTO to remove the cost of a cross-unit call), a per-title behaviour database (see `TITLE-1`), and a
-second GPU backend before the command representation exists.
+LTO to remove the cost of a cross-unit call), a per-title behaviour database (see `TITLE-1`), a
+separate runtime orchestration layer (frame pacing belongs to submission, ADR 0009), and a second
+GPU backend before the command representation exists.
 
 ## Rules
 
@@ -167,3 +170,32 @@ registration code and reported per library, and the count of unregistered NIDs a
 reported by the always-on alarm on every run.
 Status: proposed (adr:0007)
 Enforcement: runtime:unimplemented-hle-calls, adr:0007
+
+### GPU-2 -- the backend consumes typed operations, never PM4
+
+PM4 decode produces an ordered list of typed operations per submit, each with its resolved state
+and guest accesses. Execution consumes only that list, and optimisation is a set of pure passes over
+it, each replay-tested for unchanged guest-visible output.
+Status: proposed (adr:0011)
+Enforcement: adr:0011
+
+### GPU-3 -- the recompiler lowers through an SSA IR
+
+RDNA2 instructions lower into an IR on which passes run before SPIR-V is emitted, one instruction
+family at a time, each family gated on byte-identical SPIR-V over a recorded corpus.
+Status: proposed (adr:0012)
+Enforcement: adr:0012
+
+### SYNC-1 -- one wait model, no host-thread identity across a fiber switch
+
+Every blocking guest wait goes through one model that names what it waits for. No state keyed by
+host thread is assumed to survive an HLE call that can switch fibers.
+Status: proposed (adr:0013)
+Enforcement: runtime:hle-blocking-wait, adr:0013
+
+### HLE-3 -- each library declares its exports in one table
+
+A reimplemented library lists the functions it implements in one declaration table of names and
+handlers; NIDs are derived from names, so no firmware symbol data is committed.
+Status: proposed (adr:0015)
+Enforcement: adr:0015

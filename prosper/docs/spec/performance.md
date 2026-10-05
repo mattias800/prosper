@@ -61,6 +61,43 @@ Frame N+1 records while frame N executes on the GPU, with a fixed bound on frame
 Status: accepted
 Enforcement: runtime:gpu-sync-wait, review: (overlap is a property of the submit design; it is visible only on a GPU timeline, tools/gpu_timeline)
 
+### PERF-P7 -- a pipeline the cache lacks is compiled off the submit thread
+
+A missing pipeline is compiled on a worker, from libraries where the device supports them, and a
+persistent cache makes later launches compile nothing already seen. Whether the submit waits is
+decided by what the guest observes; a draw is never dropped for want of a pipeline (`FAIL-1`).
+Status: proposed (adr:0014)
+Enforcement: runtime:shader-compile, adr:0014
+
+### PERF-P8 -- guest-visible GPU effects retire in stream order
+
+A completion label, EOP event, flip, guest-memory writeback or write-watch invalidation is applied
+only after all GPU work and writebacks that precede it in the command stream, and in stream order.
+Every other wait the executor performs may be deferred.
+Status: proposed (adr:0009)
+Enforcement: runtime:gpu-sync-wait, adr:0009
+
+### PERF-P9 -- caches validate against page tracking, not by comparing bytes
+
+A cache asks the guest memory tracker whether any page under its source changed. A full comparison
+is a counted fallback where tracking is unavailable, never the normal path.
+Status: proposed (adr:0010)
+Enforcement: runtime:host-copy-pressure, adr:0010
+
+### PERF-G1 -- releases are compared on the reference workloads
+
+Each release candidate is measured against the previous release on the reference workloads, and a
+regression beyond run-to-run spread, or a new steady-state alarm, is a release finding.
+Status: proposed (adr:0016)
+Enforcement: adr:0016
+
+## Deferred until the instruments exist
+
+Profile-guided and AI-assisted optimisation are deliberately not proposed yet. Both need ground
+truth to be checked against: replayable workloads (ADR 0005), a representation to transform (ADRs
+0011 and 0012), and a regression gate to accept or reject a transform (ADR 0016). Proposed before
+those exist, an optimiser would have nothing to prove it correct or faster.
+
 ## Ruled out
 
 - **Enforcing the frame invariants in CI.** CI has neither the game dumps nor a GPU (the
