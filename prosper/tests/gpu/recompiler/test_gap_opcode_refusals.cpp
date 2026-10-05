@@ -326,6 +326,63 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
+// Unlowered arithmetic x2 MUBUF atomics must refuse fail-visibly. sub/inc/
+// dec_x2 need a true qword RMW like the add/and_x2 family (previous arm).
+// All words below are llvm-mc gfx1030 round-tripped with the idxen form.
+// (cmpswap_x2 assembles on no tried operand shape; it gets its arm once
+// verified words exist.) WHEN an x2 lowering lands, ITS CASE GOES RED;
+// replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicX2ArithmeticRefuse) {
+    static const uint32_t subx2[2] = {0xe14c2000u, 0x80020002u};
+    static const uint32_t incx2[2] = {0xe1702000u, 0x80020002u};
+    static const uint32_t decx2[2] = {0xe1742000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c80000u, 0x80020100u};
+    for (const uint32_t* words : {subx2, incx2, decx2, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(subx2, 2).opcode, 0x53u);
+    EXPECT_EQ(rdna2_decode_one(incx2, 2).opcode, 0x5cu);
+    EXPECT_EQ(rdna2_decode_one(decx2, 2).opcode, 0x5du);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (address)
+        0x7e020283u,   // v_mov_b32 v1, 3 (value)
+        0x7e040280u,   // v_mov_b32 v2, 0
+    };
+    // NOTE: swap_x2 was tried as the same-shape control first, but its
+    // separately guarded lowering needs fuller backing than this bare entry
+    // provides, so it cannot serve as a control here. The 32-bit add (proven
+    // compiling over this exact entry shape in the previous arm) proves the
+    // harness instead; the x2-ness is what the refusals discriminate.
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F5ull,
+                    "control: 32-bit add over the same entry", &rt, config);
+    expect_gap_refusal(program(prologue, {subx2[0], subx2[1]}), 0xA0F6ull, 3,
+                       {subx2[0], subx2[1]}, Rdna2Format::MUBUF, 0x53u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {incx2[0], incx2[1]}), 0xA0F7ull, 3,
+                       {incx2[0], incx2[1]}, Rdna2Format::MUBUF, 0x5cu, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {decx2[0], decx2[1]}), 0xA0F8ull, 3,
+                       {decx2[0], decx2[1]}, Rdna2Format::MUBUF, 0x5du, &rt,
+                       config);
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
