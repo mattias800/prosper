@@ -1579,6 +1579,7 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+
   # sceSaveDataLoadIcon (#2081): unregistered, it answered SCE_OK over an unwritten icon
   # buffer. Round-trips through the real SaveIcon/LoadIcon NIDs, with refusal arms.
   prosper_add_gtest(test_savedata_icon
