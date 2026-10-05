@@ -2749,8 +2749,11 @@ int main() {
           "wrong copied lane cannot claim exact composite source");
     auto split_prior_store = split_image_code;
     split_prior_store[12] = 0xf0200f08u; // preceding sample becomes a possible image write
-    CHECK(!split_store(split_prior_store, 14, expected_atomic_t8),
-          "prior image write revokes composite backing proof");
+    // The earlier write goes through a fully known image far from this table, so it cannot rewrite the
+    // composite source and the proof stands. An overlapping footprint still revokes it; that arm is
+    // test_split_t8_image_write_extent's StoreToImageOverlappingTableRefused.
+    CHECK(split_store(split_prior_store, 14, expected_atomic_t8),
+          "prior image write to a provably disjoint footprint keeps the composite backing proof");
     auto split_pre_copy_clobber = split_image_code;
     split_pre_copy_clobber.insert(split_pre_copy_clobber.begin() + 6,
                                  0xbe900380u); // s16 <- 0 before s24 <- s16

@@ -128,6 +128,14 @@ static bool mimg_opcode_only_reads(uint32_t opcode) {
     }
 }
 
+bool rdna2_mimg_reads_sampler(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::MIMG) return false;
+    const bool storage_only = in.opcode == 0x08 || in.opcode == 0x09 || in.opcode == 0x0f ||
+                              (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
+    return !(in.opcode == 0x00 || in.opcode == 0x01 || in.opcode == 0x0e || in.opcode == 0xe6 ||
+             storage_only);
+}
+
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::MIMG:

@@ -92,7 +92,8 @@ bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
         if (in.fmt == Rdna2Format::MIMG) {
             const int tbase = in.src[1].kind == OperandKind::SGPR ? in.src[1].value : -1;
             const int half = tbase == base ? 0 : tbase == base + 8 ? 1 : -1;
-            if (overlaps(state.live, in.src[2].value,
+            if (rdna2_mimg_reads_sampler(in) &&
+                overlaps(state.live, in.src[2].value,
                          in.src[2].kind == OperandKind::SGPR ? 4u : 0u)) return false;
             if (overlaps(state.live, tbase, 8)) {
                 const ShaderResource* resource = rt.by_fetch_pc(in.pc);
@@ -119,7 +120,10 @@ bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
                   operand.value >= 106 && operand.value <= 124)) continue;
             if (image_source && source == 1) continue;
             uint32_t width = 1;
-            if (in.fmt == Rdna2Format::MIMG && source == 2) width = 4;
+            if (in.fmt == Rdna2Format::MIMG && source == 2) {
+                if (!rdna2_mimg_reads_sampler(in)) continue;
+                width = 4;
+            }
             else if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
                      source == 1) width = 4;
             else if (in.fmt == Rdna2Format::SMEM && source == 0)
@@ -331,7 +335,7 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
                 const int half = t_is_scalar && in.src[1].value == base ? 0
                                : t_is_scalar && in.src[1].value == base + 8 ? 1 : -1;
                 const bool touches_t = t_is_scalar && live_overlap(in.src[1].value, 8);
-                const bool touches_sampler = scalar_operand(in.src[2]) &&
+                const bool touches_sampler = rdna2_mimg_reads_sampler(in) && scalar_operand(in.src[2]) &&
                                              live_overlap(in.src[2].value, 4);
                 if (touches_sampler) { valid = false; break; }
                 if (half >= 0) {
@@ -374,6 +378,7 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
             } else {
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     if (!scalar_operand(in.src[source])) continue;
+                    if (in.fmt == Rdna2Format::MIMG && source == 2 && !rdna2_mimg_reads_sampler(in)) continue;
                     const uint32_t words =
                         in.fmt == Rdna2Format::SOP1 ||
                         in.fmt == Rdna2Format::SOP2 ||

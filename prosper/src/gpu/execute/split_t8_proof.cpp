@@ -1,4 +1,6 @@
+#include <algorithm>
 #include "gpu/execute/split_t8_proof.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
 
 #include "gpu/execute/sopp_cfg.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -33,7 +35,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
                                  int tbase, const std::array<uint32_t, 8>& source_pc,
                                  const std::array<uint64_t, 8>& source_addr,
                                  const uint32_t* user_sgprs, uint32_t nsgpr,
-                                 uint32_t user_sgpr_base) {
+                                 uint32_t user_sgpr_base,
+                                 const std::vector<ImageWriteExtent>& image_writes) {
     constexpr int kSgprs = 106;
     // This rare fallback reparses the owned code. Keep its CFG analysis bounded; larger programs
     // retain the ordinary unresolved path until they have a cached analysis.
@@ -261,9 +264,55 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             back.push_back(p);
         }
     }
+    // A storage-image write whose footprint is known and disjoint from every descriptor byte read here
+    // cannot change what the loads observed, so it does not revoke the proof.
+    auto cannot_reach_descriptor = [&](const Rdna2Inst& writer) {
+        if (writer.fmt != Rdna2Format::MIMG) return false;
+        for (const ImageWriteExtent& extent : image_writes) {
+            if (extent.pc != writer.pc) continue;
+            for (int lane = 0; lane < 8; ++lane) {
+                const uint64_t addr = source_addr[static_cast<size_t>(lane)];
+                if (addr < extent.hi && extent.lo < addr + sizeof(uint32_t)) return false;
+            }
+            return true;
+        }
+        return false;
+    };
     for (size_t i = 0; i < full.size(); ++i)
-        if (before_use[i] && reached[i] && rdna2_instruction_may_write_memory(full[i]))
+        if (before_use[i] && reached[i] && rdna2_instruction_may_write_memory(full[i]) &&
+            !cannot_reach_descriptor(full[i]))
             return false;
+    return true;
+}
+
+bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo, uint64_t& hi) {
+    const DecodedImageDescriptor d = decode_image_descriptor(t8.data());
+    Gen5ImageFormatInfo format;
+    if (!d.base || !d.width || !d.height || !gen5_image_format(d.format, &format) ||
+        !format.bytes_per_block || d.compression_enabled || d.write_compress_enabled ||
+        d.metadata_addr) return false;
+    constexpr uint64_t kTile = 256;
+    const uint64_t w = (static_cast<uint64_t>(d.width) + kTile - 1) / kTile * kTile;
+    const uint64_t h = (static_cast<uint64_t>(d.height) + kTile - 1) / kTile * kTile;
+    const uint64_t slices = std::max<uint64_t>(d.depth, 1) + d.base_array;
+    const uint64_t samples = std::max<uint32_t>(d.sample_count, 1u);
+    const uint64_t mips = (d.max_mip || d.last_level) ? 2u : 1u;
+    // The block size is per block of block_width x block_height texels; one byte per texel of block
+    // size is a superset for every format (blocks never hold fewer texels than bytes_per_block / 16).
+    const uint64_t bytes_per_texel = format.bytes_per_block;
+    if (w > UINT64_MAX / h) return false;
+    uint64_t bytes = w * h;
+    if (bytes > UINT64_MAX / slices) return false;
+    bytes *= slices;
+    if (bytes > UINT64_MAX / samples) return false;
+    bytes *= samples;
+    if (bytes > UINT64_MAX / bytes_per_texel) return false;
+    bytes *= bytes_per_texel;
+    if (bytes > UINT64_MAX / mips) return false;
+    bytes *= mips;
+    if (d.base > UINT64_MAX - bytes) return false;
+    lo = d.base;
+    hi = d.base + bytes;
     return true;
 }
 
