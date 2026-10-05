@@ -1038,9 +1038,14 @@ if(TARGET prosper_core)
   # briefly in both, with two different lists -- and a third Rosetta figure existed in neither
   # (23.22 ms, found in a CI log during review). Two copies of a figure list is one copy too
   # many, and this is the copy that gets read second.
-  add_executable(test_kernel_sem_timedwait tests/hle/kernel/test_kernel_sem_timedwait.cpp)
-  target_link_libraries(test_kernel_sem_timedwait PRIVATE prosper_core)
-  add_test(NAME kernel_sem_timedwait COMMAND test_kernel_sem_timedwait)
+  prosper_add_gtest(test_kernel_sem_timedwait
+    SOURCES tests/hle/kernel/test_kernel_sem_timedwait.cpp
+    LABELS timing-margin
+    LIBRARIES prosper_core
+    # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
+    # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
+    # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
+    PROPERTIES TIMEOUT 60)
 
   # scePthreadCondTimedwait resolves the CONDVAR'S clock for its relative microsecond timeout
   # (#3056), which its POSIX sibling already did and this spelling did not. CROSS-PLATFORM, and
@@ -1048,17 +1053,14 @@ if(TARGET prosper_core)
   # and the discriminator (SCE_KERNEL_CLOCK_VIRTUAL is process CPU time, so an idle wait cannot
   # reach its deadline) reads a RETURN VALUE rather than a duration. See the test's own header for
   # why realtime and monotonic clocks cannot discriminate anything here.
-  add_executable(test_kernel_cond_timedwait_clock tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp)
-  target_link_libraries(test_kernel_cond_timedwait_clock PRIVATE prosper_core)
-  add_test(NAME kernel_cond_timedwait_clock COMMAND test_kernel_cond_timedwait_clock)
-  # Bounded: the arm parks a worker on a condvar whose deadline an idle process cannot reach, and
-  # relies on the main thread's signal to release it. A regression that loses the signal would
-  # otherwise hang the suite rather than fail it.
-  set_tests_properties(kernel_cond_timedwait_clock PROPERTIES TIMEOUT 60)
-  # Bounded for the same reason as the nanosleep case: the fixed path returns in ~5 ms, so a
-  # regression that reverts to a blocking wait on a semaphore nothing will ever post would hang
-  # rather than fail, and CTest's default 1500 s hang reads as neither pass nor fail.
-  set_tests_properties(kernel_sem_timedwait PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_kernel_cond_timedwait_clock
+    SOURCES tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp
+    LABELS timing-margin
+    LIBRARIES prosper_core
+    # Bounded: the arm parks a worker on a condvar whose deadline an idle process cannot reach, and
+    # relies on the main thread's signal to release it. A regression that loses the signal would
+    # otherwise hang the suite rather than fail it.
+    PROPERTIES TIMEOUT 60)
 
   # scePthreadSemInit must forward a real sem_init() failure instead of discarding it and
   # manufacturing success (#3068). Platform-neutral: it probes the host sem_init() with an
@@ -1094,9 +1096,8 @@ if(TARGET prosper_core)
   # figures.
   # `kernel_nanosleep` is deliberately NOT labelled: its wall-clock bounds are 500 ms order-of-
   # magnitude guards against a ~292-year sleep and it prints no measured value, so a verbose re-run
-  # would report nothing. Add the label when a test both DEPENDS ON and PRINTS a margin.
-  set_tests_properties(kernel_sem_timedwait kernel_cond_timedwait_clock
-                       PROPERTIES LABELS "timing-margin")
+  # would report nothing. Add the label when a test both DEPENDS ON and PRINTS a margin. Both
+  # targets above carry `LABELS timing-margin` on their own registration.
 
   # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
   # code is Linux-only (guest %fs), so gate the test on it too.
@@ -1614,9 +1615,9 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core
     PROPERTIES TIMEOUT 60)
 
-  add_executable(test_cond_clock tests/hle/test_cond_clock.cpp)
-  target_link_libraries(test_cond_clock PRIVATE prosper_core)
-  add_test(NAME pthread_cond_clock COMMAND test_cond_clock)
+  prosper_add_gtest(test_cond_clock
+    SOURCES tests/hle/test_cond_clock.cpp
+    LIBRARIES prosper_core)
 
   # Registered on every host, not only under if(UNIX): its _WIN32 arms exercise the Windows
   # ownership registry, which was otherwise covered by no test (noted on #4150).
