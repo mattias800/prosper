@@ -113,7 +113,7 @@ def split_frontmatter(text: str) -> tuple[dict[str, str] | None, str]:
         if not sep or not key.strip() or key != key.strip():
             raise ValueError(f"frontmatter line is not `key: value`: {line!r}")
         fields[key.strip()] = value.strip()
-    return fields, text[end + 5:]
+    return fields, text[end + 5 :]
 
 
 def rule_sections(body: str) -> list[tuple[str, str]]:
@@ -122,7 +122,7 @@ def rule_sections(body: str) -> list[tuple[str, str]]:
     out = []
     for m in RULE_HEADING_RE.finditer(body):
         nxt = next((h.start() for h in heads if h.start() > m.start()), len(body))
-        out.append((m.group(1), body[m.start():nxt]))
+        out.append((m.group(1), body[m.start() : nxt]))
     return out
 
 
@@ -188,13 +188,15 @@ def check_frontmatter(root: Path) -> tuple[list[Finding], dict[Path, tuple[dict[
                 if not fields.get(key):
                     findings.append(Finding("frontmatter", rel, f"missing required key `{key}`"))
             if fields.get("kind") and fields["kind"] != kind:
-                findings.append(Finding("frontmatter", rel,
-                                        f"kind `{fields['kind']}` in the {kind}/ folder"))
+                findings.append(
+                    Finding("frontmatter", rel, f"kind `{fields['kind']}` in the {kind}/ folder")
+                )
             status = fields.get("status")
             if status and status not in KIND_STATUSES[kind]:
                 allowed = ", ".join(sorted(KIND_STATUSES[kind]))
-                findings.append(Finding("frontmatter", rel,
-                                        f"status `{status}` is not one of: {allowed}"))
+                findings.append(
+                    Finding("frontmatter", rel, f"status `{status}` is not one of: {allowed}")
+                )
             parsed[path] = (fields, body)
     return findings, parsed
 
@@ -210,7 +212,9 @@ def check_adrs(root: Path, parsed) -> tuple[list[Finding], set[str]]:
             continue
         num = m.group(1)
         if num in numbers:
-            findings.append(Finding("adr-shape", rel, f"ADR number {num} also used by {numbers[num]}"))
+            findings.append(
+                Finding("adr-shape", rel, f"ADR number {num} also used by {numbers[num]}")
+            )
         numbers[num] = rel
         if path not in parsed:
             continue
@@ -219,8 +223,9 @@ def check_adrs(root: Path, parsed) -> tuple[list[Finding], set[str]]:
         if not h1:
             findings.append(Finding("adr-shape", rel, "no `# ADR NNNN: title` heading"))
         elif h1.group(1) != num:
-            findings.append(Finding("adr-shape", rel,
-                                    f"heading says ADR {h1.group(1)}, file name says {num}"))
+            findings.append(
+                Finding("adr-shape", rel, f"heading says ADR {h1.group(1)}, file name says {num}")
+            )
     for path in documents(root, ADR_DIR):
         if path not in parsed:
             continue
@@ -229,14 +234,17 @@ def check_adrs(root: Path, parsed) -> tuple[list[Finding], set[str]]:
         if fields.get("status") == "superseded":
             succ = fields.get("superseded-by", "")
             if not re.fullmatch(r"[0-9]{4}", succ):
-                findings.append(Finding("adr-shape", rel,
-                                        "superseded ADR needs `superseded-by: NNNN`"))
+                findings.append(
+                    Finding("adr-shape", rel, "superseded ADR needs `superseded-by: NNNN`")
+                )
             elif succ not in numbers:
                 findings.append(Finding("adr-shape", rel, f"superseded-by {succ} does not exist"))
     return findings, set(numbers)
 
 
-def check_rules(root: Path, parsed, adrs: set[str], ratchet_rules: tuple[str, ...]) -> list[Finding]:
+def check_rules(
+    root: Path, parsed, adrs: set[str], ratchet_rules: tuple[str, ...]
+) -> list[Finding]:
     findings: list[Finding] = []
     seen: dict[str, str] = {}
     cited_ratchets: set[str] = set()
@@ -248,11 +256,18 @@ def check_rules(root: Path, parsed, adrs: set[str], ratchet_rules: tuple[str, ..
         well_formed = {m.group(1) for m in RULE_HEADING_RE.finditer(body)}
         for m in ANY_H3_ID_RE.finditer(body):
             if m.group(1) not in well_formed:
-                findings.append(Finding("rule-shape", rel,
-                                        f"{m.group(1)}: heading must read `### {m.group(1)} -- title`"))
+                findings.append(
+                    Finding(
+                        "rule-shape",
+                        rel,
+                        f"{m.group(1)}: heading must read `### {m.group(1)} -- title`",
+                    )
+                )
         for rule_id, section in rule_sections(body):
             if rule_id in seen:
-                findings.append(Finding("rule-shape", rel, f"{rule_id} also defined in {seen[rule_id]}"))
+                findings.append(
+                    Finding("rule-shape", rel, f"{rule_id} also defined in {seen[rule_id]}")
+                )
             seen[rule_id] = rel
             status = STATUS_LINE_RE.search(section)
             if not status:
@@ -261,39 +276,73 @@ def check_rules(root: Path, parsed, adrs: set[str], ratchet_rules: tuple[str, ..
                 value = status.group(1).strip()
                 if value.startswith("proposed"):
                     if not re.search(r"\badr:[0-9]{4}\b", value):
-                        findings.append(Finding("rule-shape", rel,
-                                                f"{rule_id}: a proposed rule names its ADR (adr:NNNN)"))
+                        findings.append(
+                            Finding(
+                                "rule-shape",
+                                rel,
+                                f"{rule_id}: a proposed rule names its ADR (adr:NNNN)",
+                            )
+                        )
                 elif value != "accepted":
-                    findings.append(Finding("rule-shape", rel,
-                                            f"{rule_id}: Status is `accepted` or `proposed (adr:NNNN)`"))
+                    findings.append(
+                        Finding(
+                            "rule-shape",
+                            rel,
+                            f"{rule_id}: Status is `accepted` or `proposed (adr:NNNN)`",
+                        )
+                    )
                 for _, num in re.findall(r"\b(adr):([0-9]{4})\b", value):
                     if num not in adrs:
-                        findings.append(Finding("enforcement", rel, f"{rule_id}: adr:{num} does not exist"))
+                        findings.append(
+                            Finding("enforcement", rel, f"{rule_id}: adr:{num} does not exist")
+                        )
             enf = ENFORCEMENT_LINE_RE.search(section)
             if not enf:
                 findings.append(Finding("rule-shape", rel, f"{rule_id}: no `Enforcement:` line"))
                 continue
             tokens = TOKEN_RE.findall(enf.group(1))
             if not tokens:
-                findings.append(Finding("enforcement", rel,
-                                        f"{rule_id}: Enforcement names no ratchet:/ci:/ctest:/runtime:/adr:/review: token"))
+                findings.append(
+                    Finding(
+                        "enforcement",
+                        rel,
+                        f"{rule_id}: Enforcement names no ratchet:/ci:/ctest:/runtime:/adr:/review: token",
+                    )
+                )
             for kind, arg in tokens:
                 if kind == "ratchet":
                     if arg not in ratchet_rules:
-                        findings.append(Finding("enforcement", rel,
-                                                f"{rule_id}: ratchet:{arg} is not a check_arch_ratchet rule"))
+                        findings.append(
+                            Finding(
+                                "enforcement",
+                                rel,
+                                f"{rule_id}: ratchet:{arg} is not a check_arch_ratchet rule",
+                            )
+                        )
                     cited_ratchets.add(arg)
                 elif kind == "adr" and arg not in adrs:
-                    findings.append(Finding("enforcement", rel, f"{rule_id}: adr:{arg} does not exist"))
+                    findings.append(
+                        Finding("enforcement", rel, f"{rule_id}: adr:{arg} does not exist")
+                    )
                 elif kind in ("ctest", "ci", "runtime") and not arg:
                     findings.append(Finding("enforcement", rel, f"{rule_id}: {kind}: needs a name"))
                 elif kind == "review" and not re.search(r"review:\S*\s*\(\S", enf.group(1)):
-                    findings.append(Finding("enforcement", rel,
-                                            f"{rule_id}: `review` must say in parentheses why no tool can check it"))
+                    findings.append(
+                        Finding(
+                            "enforcement",
+                            rel,
+                            f"{rule_id}: `review` must say in parentheses why no tool can check it",
+                        )
+                    )
     for rule in ratchet_rules:
         if rule not in cited_ratchets:
-            findings.append(Finding("coverage", SPEC_DIR.as_posix(),
-                                    f"ratchet rule `{rule}` is cited by no spec rule"))
+            findings.append(
+                Finding(
+                    "coverage",
+                    SPEC_DIR.as_posix(),
+                    f"ratchet rule `{rule}` is cited by no spec rule",
+                )
+            )
     return findings
 
 
@@ -306,36 +355,51 @@ def check_layer_table(root: Path, order: tuple[str, ...], write: bool) -> list[F
     start, end = text.find(GEN_BEGIN), text.find(GEN_END)
     if start < 0 or end < start:
         return [Finding("layer-table", rel, "gen:layer-order markers missing")]
-    current = text[start:end + len(GEN_END)]
+    current = text[start : end + len(GEN_END)]
     wanted = render_layer_block(order)
     if current == wanted:
         return []
     if write:
-        path.write_text(text[:start] + wanted + text[end + len(GEN_END):], encoding="utf-8")
+        path.write_text(text[:start] + wanted + text[end + len(GEN_END) :], encoding="utf-8")
         return []
-    return [Finding("layer-table", rel,
-                    "table differs from LAYER_ORDER; run tools/docs/check_arch_docs.py --write")]
+    return [
+        Finding(
+            "layer-table",
+            rel,
+            "table differs from LAYER_ORDER; run tools/docs/check_arch_docs.py --write",
+        )
+    ]
 
 
 def git_show(root: Path, rev: str, path: str) -> str | None:
-    proc = subprocess.run(["git", "-C", str(root), "show", f"{rev}:{path}"],
-                          capture_output=True, text=True, encoding="utf-8")
+    proc = subprocess.run(
+        ["git", "-C", str(root), "show", f"{rev}:{path}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
     return proc.stdout if proc.returncode == 0 else None
 
 
 def base_adr_paths(root: Path, rev: str) -> list[str]:
-    proc = subprocess.run(["git", "-C", str(root), "ls-tree", "--name-only", rev,
-                           ADR_DIR.as_posix() + "/"],
-                          capture_output=True, text=True, encoding="utf-8")
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "--name-only", rev, ADR_DIR.as_posix() + "/"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
     if proc.returncode != 0:
         raise EvaluationError(f"cannot list {ADR_DIR} at {rev}: {proc.stderr.strip()}")
-    return [p for p in proc.stdout.splitlines() if p.endswith(".md") and not p.endswith("AGENTS.md")]
+    return [
+        p for p in proc.stdout.splitlines() if p.endswith(".md") and not p.endswith("AGENTS.md")
+    ]
 
 
 def immutable_view(text: str) -> str:
     """The ADR with its mutable frontmatter lines removed."""
-    lines = [ln for ln in text.splitlines()
-             if not any(ln.startswith(k + ":") for k in ADR_MUTABLE_KEYS)]
+    lines = [
+        ln for ln in text.splitlines() if not any(ln.startswith(k + ":") for k in ADR_MUTABLE_KEYS)
+    ]
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -353,13 +417,19 @@ def check_immutable(root: Path, rev: str) -> list[Finding]:
             continue
         path = root / rel
         if not path.is_file():
-            findings.append(Finding("adr-immutable", rel,
-                                    "an accepted ADR was deleted; supersede it instead"))
+            findings.append(
+                Finding("adr-immutable", rel, "an accepted ADR was deleted; supersede it instead")
+            )
             continue
         if immutable_view(path.read_text(encoding="utf-8")) != immutable_view(old):
-            findings.append(Finding("adr-immutable", rel,
-                                    "an accepted ADR's text changed; only status/superseded-by may. "
-                                    "Write a new ADR that supersedes it"))
+            findings.append(
+                Finding(
+                    "adr-immutable",
+                    rel,
+                    "an accepted ADR's text changed; only status/superseded-by may. "
+                    "Write a new ADR that supersedes it",
+                )
+            )
     return findings
 
 

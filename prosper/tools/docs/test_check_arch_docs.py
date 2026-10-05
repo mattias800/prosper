@@ -57,9 +57,12 @@ The decision.
 
 
 def layers_doc() -> str:
-    return ("---\nkind: spec\nstatus: accepted\nowner: area:infra\n"
-            "last-verified: 2026-10-05 abcdef01\n---\n\n# Layers\n\n"
-            + cad.render_layer_block(("low", "high")) + "\n")
+    return (
+        "---\nkind: spec\nstatus: accepted\nowner: area:infra\n"
+        "last-verified: 2026-10-05 abcdef01\n---\n\n# Layers\n\n"
+        + cad.render_layer_block(("low", "high"))
+        + "\n"
+    )
 
 
 def build(root: Path, **overrides: str | None) -> Path:
@@ -93,23 +96,30 @@ def test_the_repository_itself_is_clean():
     assert checks(REPO) == []
 
 
-@pytest.mark.parametrize("old,new,expect", [
-    ("---\nkind: spec\n", "", "no leading --- frontmatter"),
-    ("kind: spec\n", "kind: adr\n", "kind `adr` in the spec/ folder"),
-    ("status: accepted\nowner", "status: final\nowner", "status `final`"),
-    ("owner: area:infra\n", "", "missing required key `owner`"),
-    ("### TST-2 -- second rule", "### TST-1 -- second rule", "TST-1 also defined"),
-    ("Status: accepted\nEnforcement: ratchet:r1", "Enforcement: ratchet:r1", "TST-1: no `Status:` line"),
-    ("Enforcement: ratchet:r1\n", "\n", "TST-1: no `Enforcement:` line"),
-    ("Status: proposed (adr:0001)", "Status: proposed", "names its ADR"),
-    ("Status: proposed (adr:0001)", "Status: maybe", "Status is `accepted` or"),
-    ("Status: proposed (adr:0001)", "Status: proposed (adr:0042)", "adr:0042 does not exist"),
-    ("Enforcement: ratchet:r1", "Enforcement: ratchet:nope, ratchet:r1", "ratchet:nope is not"),
-    ("Enforcement: ratchet:r1", "Enforcement: a careful reader", "names no ratchet:"),
-    ("review: (a reason no tool can check it)", "review:", "must say in parentheses"),
-    ("Enforcement: ratchet:r1", "Enforcement: ctest:", "ctest: needs a name"),
-    ("### TST-1 -- first rule", "### TST-1 first rule", "heading must read"),
-])
+@pytest.mark.parametrize(
+    "old,new,expect",
+    [
+        ("---\nkind: spec\n", "", "no leading --- frontmatter"),
+        ("kind: spec\n", "kind: adr\n", "kind `adr` in the spec/ folder"),
+        ("status: accepted\nowner", "status: final\nowner", "status `final`"),
+        ("owner: area:infra\n", "", "missing required key `owner`"),
+        ("### TST-2 -- second rule", "### TST-1 -- second rule", "TST-1 also defined"),
+        (
+            "Status: accepted\nEnforcement: ratchet:r1",
+            "Enforcement: ratchet:r1",
+            "TST-1: no `Status:` line",
+        ),
+        ("Enforcement: ratchet:r1\n", "\n", "TST-1: no `Enforcement:` line"),
+        ("Status: proposed (adr:0001)", "Status: proposed", "names its ADR"),
+        ("Status: proposed (adr:0001)", "Status: maybe", "Status is `accepted` or"),
+        ("Status: proposed (adr:0001)", "Status: proposed (adr:0042)", "adr:0042 does not exist"),
+        ("Enforcement: ratchet:r1", "Enforcement: ratchet:nope, ratchet:r1", "ratchet:nope is not"),
+        ("Enforcement: ratchet:r1", "Enforcement: a careful reader", "names no ratchet:"),
+        ("review: (a reason no tool can check it)", "review:", "must say in parentheses"),
+        ("Enforcement: ratchet:r1", "Enforcement: ctest:", "ctest: needs a name"),
+        ("### TST-1 -- first rule", "### TST-1 first rule", "heading must read"),
+    ],
+)
 def test_each_spec_violation_is_reported(tmp_path, old, new, expect):
     assert old in SPEC_RULES
     root = build(tmp_path, **{"prosper/docs/spec/rules.md": SPEC_RULES.replace(old, new, 1)})
@@ -118,21 +128,33 @@ def test_each_spec_violation_is_reported(tmp_path, old, new, expect):
 
 
 def test_an_uncited_ratchet_rule_is_reported(tmp_path):
-    root = build(tmp_path, **{"prosper/docs/spec/rules.md":
-                              SPEC_RULES.replace("ratchet:r2, ", "")})
+    root = build(tmp_path, **{"prosper/docs/spec/rules.md": SPEC_RULES.replace("ratchet:r2, ", "")})
     assert "coverage: ratchet rule `r2` is cited by no spec rule" in checks(root)
 
 
-@pytest.mark.parametrize("name,text,expect", [
-    ("0002-Bad_Name.md", ADR.replace("0001", "0002"), "not NNNN-slug.md"),
-    ("0002-other.md", ADR, "heading says ADR 0001, file name says 0002"),
-    ("0001-again.md", ADR, "ADR number 0001 also used"),
-    ("0002-gone.md", ADR.replace("0001", "0002").replace("accepted", "superseded"),
-     "needs `superseded-by: NNNN`"),
-    ("0002-gone.md", ADR.replace("0001", "0002").replace("accepted", "superseded\nsuperseded-by: 0009"),
-     "superseded-by 0009 does not exist"),
-    ("0002-no-title.md", ADR.replace("# ADR 0001: Decide a thing", "# Decide"), "no `# ADR NNNN"),
-])
+@pytest.mark.parametrize(
+    "name,text,expect",
+    [
+        ("0002-Bad_Name.md", ADR.replace("0001", "0002"), "not NNNN-slug.md"),
+        ("0002-other.md", ADR, "heading says ADR 0001, file name says 0002"),
+        ("0001-again.md", ADR, "ADR number 0001 also used"),
+        (
+            "0002-gone.md",
+            ADR.replace("0001", "0002").replace("accepted", "superseded"),
+            "needs `superseded-by: NNNN`",
+        ),
+        (
+            "0002-gone.md",
+            ADR.replace("0001", "0002").replace("accepted", "superseded\nsuperseded-by: 0009"),
+            "superseded-by 0009 does not exist",
+        ),
+        (
+            "0002-no-title.md",
+            ADR.replace("# ADR 0001: Decide a thing", "# Decide"),
+            "no `# ADR NNNN",
+        ),
+    ],
+)
 def test_each_adr_violation_is_reported(tmp_path, name, text, expect):
     root = build(tmp_path, **{f"prosper/docs/adr/{name}": text})
     found = checks(root)
@@ -140,8 +162,12 @@ def test_each_adr_violation_is_reported(tmp_path, name, text, expect):
 
 
 def test_layer_table_drift_is_reported_and_write_repairs_it(tmp_path):
-    root = build(tmp_path, **{"prosper/tools/ci/check_arch_ratchet.py":
-                              'RULES = ("r1", "r2")\nLAYER_ORDER = ("low", "mid", "high")\n'})
+    root = build(
+        tmp_path,
+        **{
+            "prosper/tools/ci/check_arch_ratchet.py": 'RULES = ("r1", "r2")\nLAYER_ORDER = ("low", "mid", "high")\n'
+        },
+    )
     assert any("layer-table" in f for f in checks(root))
     assert checks(root, write=True) == []
     text = (root / "prosper/docs/spec/layers.md").read_text(encoding="utf-8")
@@ -173,15 +199,19 @@ ADR_PATH = "prosper/docs/adr/0001-decide-a-thing.md"
 
 
 def test_accepted_adr_body_is_frozen(committed):
-    (committed / ADR_PATH).write_text(ADR.replace("The decision.", "A new decision."), encoding="utf-8")
+    (committed / ADR_PATH).write_text(
+        ADR.replace("The decision.", "A new decision."), encoding="utf-8"
+    )
     assert any("adr-immutable" in f for f in checks(committed, base="HEAD"))
 
 
 def test_accepted_adr_status_may_change(committed):
     (committed / "prosper/docs/adr/0002-next.md").write_text(
-        ADR.replace("0001: Decide", "0002: Decide"), encoding="utf-8")
+        ADR.replace("0001: Decide", "0002: Decide"), encoding="utf-8"
+    )
     (committed / ADR_PATH).write_text(
-        ADR.replace("status: accepted", "status: superseded\nsuperseded-by: 0002"), encoding="utf-8")
+        ADR.replace("status: accepted", "status: superseded\nsuperseded-by: 0002"), encoding="utf-8"
+    )
     assert checks(committed, base="HEAD") == []
 
 
@@ -194,5 +224,7 @@ def test_proposed_adr_may_be_edited(committed):
     proposed = ADR.replace("status: accepted", "status: proposed")
     (committed / ADR_PATH).write_text(proposed, encoding="utf-8")
     git(committed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "proposed")
-    (committed / ADR_PATH).write_text(proposed.replace("The decision.", "Revised."), encoding="utf-8")
+    (committed / ADR_PATH).write_text(
+        proposed.replace("The decision.", "Revised."), encoding="utf-8"
+    )
     assert checks(committed, base="HEAD") == []
