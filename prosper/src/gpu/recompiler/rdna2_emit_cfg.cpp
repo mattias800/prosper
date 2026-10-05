@@ -1086,17 +1086,6 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
     return proven;
 }
 
-void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
-    for (int reg : sregs) {
-        rs.sreg_written.insert(reg);
-        rs.sreg_input.erase(reg);
-        rs.sreg_srt.erase(reg);
-        // A loop body that may write this register must not leave a copy alias standing: the alias
-        // was established on one iteration's path and says nothing about the next one (#1773).
-        rs.sreg_ud_alias.erase(reg);
-    }
-}
-
 // Complex CFG dispatch and the narrow loop structurizers persist B64 mask values, but not the
 // separate one-word-validity state required by Wave32 aliases. Conservatively find any B32 mask
 // copy that the region could create. The source set is deliberately path-insensitive: a pair made a
