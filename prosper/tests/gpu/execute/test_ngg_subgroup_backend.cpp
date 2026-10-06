@@ -23,6 +23,7 @@
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/ngg_subgroup_plan.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
+#include "gpu/recompiler/ngg_subgroup_shell.hpp"
 
 #include <gtest/gtest.h>
 
@@ -33,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -159,10 +161,9 @@ const float* texel(const std::vector<uint8_t>& bytes, uint32_t layer, uint32_t x
                 const float* p = texel(bytes, layer, x, y);
                 const float sx = (static_cast<float>(x) + 0.5f) / kSize;
                 const float sy = (static_cast<float>(y) + 0.5f) / kSize;
-                const bool ok = layer < covered
-                                    ? std::fabs(p[0] - sx) <= tolerance &&
-                                          std::fabs(p[1] - sy) <= tolerance
-                                    : p[0] == -1.0f && p[1] == -1.0f;
+                const bool ok = layer < covered ? std::fabs(p[0] - sx) <= tolerance &&
+                                                      std::fabs(p[1] - sy) <= tolerance
+                                                : p[0] == -1.0f && p[1] == -1.0f;
                 if (!ok)
                     return ::testing::AssertionFailure()
                            << "layer " << layer << " pixel (" << x << "," << y << ") = (" << p[0]
@@ -176,37 +177,37 @@ struct StatsSnapshot {
 };
 StatsSnapshot stats_now() {
     auto& s = ngg_subgroup_backend_stats();
-    return {s.draws.load(), s.dispatches.load(), s.completed.load(), s.invalid_blocks.load(),
-            s.connectivity.load(), s.layer_culled.load()};
+    return {s.draws.load(),          s.dispatches.load(),   s.completed.load(),
+            s.invalid_blocks.load(), s.connectivity.load(), s.layer_culled.load()};
 }
 
 // The P3 offline result: the P2 shell runner, then the P3 raster runner, on their own device.
-std::optional<std::vector<float>> offline_kena_lut(NggLayerRoute route) {
+// Empty when either runner fails.
+std::vector<float> offline_kena_lut(NggLayerRoute route) {
     const KenaInputs& in = kena_inputs();
     NggDrawShape shape;
     shape.topology = NggInputTopology::TriangleStrip;
     shape.vertex_count = 4;
     shape.instance_count = 32;
     const NggSubgroupPlan plan = plan_ngg_subgroups(shape, ngg::kena_limits());
-    if (!plan.ok()) return std::nullopt;
+    if (!plan.ok()) return {};
     NggSubgroupShellConfig shell;
     shell.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(ngg::kKenaRsrc2Gs);
     shell.user_sgprs = ngg::kKenaUserSgprs;
     NggExportRecordLayout layout;
     std::string why;
     NggSubgroupDispatch dispatch;
-    dispatch.spirv = recompile_ngg_subgroup(in.linked.data(), in.linked.size(), &in.table, shell,
-                                            &layout,
-                                            {RecompileDiagnosticStage::Vertex, 0x5009440000ull},
-                                            &why);
-    if (dispatch.spirv.empty()) return std::nullopt;
+    dispatch.spirv =
+        recompile_ngg_subgroup(in.linked.data(), in.linked.size(), &in.table, shell, &layout,
+                               {RecompileDiagnosticStage::Vertex, 0x5009440000ull}, &why);
+    if (dispatch.spirv.empty()) return {};
     dispatch.workgroups = 32;
     dispatch.launch = ngg::launch_records(plan, ngg::kena_limits(), 1);
     dispatch.export_words = 32 * layout.block_words(1);
     dispatch.guest_buffers = ngg::kena_buffers(ngg::vertex_records(ngg::kLutQuad));
     dispatch.push_constants.assign(ngg::kKenaUserSgprs, 0u);
     const auto exports = run_ngg_subgroup(dispatch);
-    if (!exports) return std::nullopt;
+    if (!exports) return {};
     NggRasterCommitConfig config;
     config.layout = layout;
     config.layer_from_pos1 = true;
@@ -224,7 +225,7 @@ std::optional<std::vector<float>> offline_kena_lut(NggLayerRoute route) {
     run.layers = 32;
     run.shader_output_layer = route == NggLayerRoute::ShaderOutputLayer;
     const auto result = run_ngg_raster(run);
-    if (!result || result->counters != std::array<uint32_t, 3>{}) return std::nullopt;
+    if (!result || result->counters != std::array<uint32_t, 3>{}) return {};
     return result->pixels;
 }
 
@@ -259,7 +260,7 @@ std::vector<uint32_t> constant_fragment(float value) {
 
 std::vector<uint32_t> full_screen_vertex() {
 #include "../tools/boot_trace/refvs.inc"
-    return {kRefVs, kRefVs + sizeof(kRefVs) / 4};
+    return {std::begin(kRefVs), std::end(kRefVs)};
 }
 
 // ---- Description ----------------------------------------------------------------------------------
@@ -343,7 +344,8 @@ TEST(NggSubgroupBackend, DescriptionRefusals) {
 TEST(NggSubgroupBackend, ShellGuestBindingReflection) {
     const auto module = [](std::initializer_list<std::vector<uint32_t>> instructions) {
         std::vector<uint32_t> m = {0x07230203u, 0x00010300u, 0u, 32u, 0u};
-        for (const auto& instruction : instructions) m.insert(m.end(), instruction.begin(), instruction.end());
+        for (const auto& instruction : instructions)
+            m.insert(m.end(), instruction.begin(), instruction.end());
         return m;
     };
     const auto op = [](uint32_t code, std::initializer_list<uint32_t> operands) {
@@ -381,8 +383,7 @@ TEST(NggSubgroupBackend, KenaLutMatchesTheOfflineResultByteForByte) {
     const auto ngg = kena_draw(*ctx, 4, 32, 32, &why);
     ASSERT_TRUE(ngg) << why;
     const ResolvedPipelineState state = flipped_state();
-    const BackendDraw draw =
-        ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
+    const BackendDraw draw = ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
     const BackendColorTarget target = volume_target(0x4e4747340001ull, 32);
     const StatsSnapshot before = stats_now();
     const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
@@ -396,10 +397,10 @@ TEST(NggSubgroupBackend, KenaLutMatchesTheOfflineResultByteForByte) {
     EXPECT_EQ(after.connectivity - before.connectivity, 0u);
     EXPECT_EQ(after.culled - before.culled, 0u);
 
-    const auto offline = offline_kena_lut(route);
-    ASSERT_TRUE(offline) << "the P3 offline reference did not run";
-    ASSERT_EQ(offline->size() * 4u, bytes.size());
-    EXPECT_EQ(std::memcmp(offline->data(), bytes.data(), bytes.size()), 0)
+    const std::vector<float> reference = offline_kena_lut(route);
+    ASSERT_FALSE(reference.empty()) << "the P3 offline reference did not run";
+    ASSERT_EQ(reference.size() * 4u, bytes.size());
+    EXPECT_EQ(std::memcmp(reference.data(), bytes.data(), bytes.size()), 0)
         << "the backend's 32-layer target differs from the P3 offline result";
 }
 
@@ -471,8 +472,10 @@ TEST(NggSubgroupBackend, DrawBetweenOrdinaryDrawsKeepsSubmissionOrder) {
             const float* p = texel(bytes, 0, x, y);
             const float sx = (static_cast<float>(x) + 0.5f) / kSize;
             const float sy = (static_cast<float>(y) + 0.5f) / kSize;
-            ASSERT_NEAR(p[0], sx, 1e-4f) << "R: the NGG draw must follow A (" << x << "," << y << ")";
-            ASSERT_NEAR(p[1], sy, 1e-4f) << "G: the NGG draw must follow A (" << x << "," << y << ")";
+            ASSERT_NEAR(p[0], sx, 1e-4f)
+                << "R: the NGG draw must follow A (" << x << "," << y << ")";
+            ASSERT_NEAR(p[1], sy, 1e-4f)
+                << "G: the NGG draw must follow A (" << x << "," << y << ")";
             ASSERT_EQ(p[2], 0.75f) << "B: B must follow the NGG draw (" << x << "," << y << ")";
             ASSERT_EQ(p[3], 0.75f) << "A: B must follow the NGG draw (" << x << "," << y << ")";
         }
@@ -509,8 +512,8 @@ TEST(NggSubgroupBackend, SecondFrameReusesTheSliceAndSeesNoStaleExport) {
     const uint64_t offset1 = stats.last_export_offset.load();
     const size_t chunks = NggScratchRing::instance().chunk_count();
     const StatsSnapshot before = stats_now();
-    const auto frame2 = render_draws_rgba({ngg_backend_draw(second, records, &state)}, kSize,
-                                          kSize, nullptr, kClear, true, &target2);
+    const auto frame2 = render_draws_rgba({ngg_backend_draw(second, records, &state)}, kSize, kSize,
+                                          nullptr, kClear, true, &target2);
     const StatsSnapshot after = stats_now();
     EXPECT_EQ(stats.last_export_buffer.load(), buffer1) << "the same export slice is reused";
     EXPECT_EQ(stats.last_export_offset.load(), offset1);

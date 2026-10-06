@@ -96,7 +96,9 @@ public:
     void release(const NggScratchSlice& slice) {
         if (!slice.chunk) return;
         const std::lock_guard lock(mutex_);
-        if (slice.chunk->leases && !--slice.chunk->leases) slice.chunk->head = 0;
+        if (!slice.chunk->leases) return;
+        --slice.chunk->leases;
+        if (!slice.chunk->leases) slice.chunk->head = 0;
     }
 
     size_t chunk_count() const {
@@ -137,11 +139,12 @@ private:
         allocate.memoryTypeIndex = type;
         void* mapped = nullptr;
         if (type == UINT32_MAX ||
-            vkAllocateMemory(ctx.dev, &allocate, nullptr, &chunk->memory) != VK_SUCCESS ||
+            prosper::gpu::allocate_device_memory(ctx.dev, &allocate, &chunk->memory) !=
+                VK_SUCCESS ||
             vkBindBufferMemory(ctx.dev, chunk->buffer, chunk->memory, 0) != VK_SUCCESS ||
-            (host && vkMapMemory(ctx.dev, chunk->memory, 0, VK_WHOLE_SIZE, 0, &mapped) !=
-                         VK_SUCCESS)) {
-            if (chunk->memory) vkFreeMemory(ctx.dev, chunk->memory, nullptr);
+            (host &&
+             vkMapMemory(ctx.dev, chunk->memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)) {
+            if (chunk->memory) prosper::gpu::free_device_memory(ctx.dev, chunk->memory);
             vkDestroyBuffer(ctx.dev, chunk->buffer, nullptr);
             return nullptr;
         }
@@ -194,6 +197,7 @@ inline const NggShellPipeline* ngg_shell_pipeline(const RenderVkCtx& ctx,
     };
     const auto make_layout = [&](const std::vector<uint32_t>& bindings) {
         std::vector<VkDescriptorSetLayoutBinding> entries;
+        entries.reserve(bindings.size());
         for (uint32_t binding : bindings)
             entries.push_back({binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
@@ -206,8 +210,8 @@ inline const NggShellPipeline* ngg_shell_pipeline(const RenderVkCtx& ctx,
     };
     entry->guest = make_layout(guest_bindings);
     entry->empty = make_layout({});
-    entry->shell = make_layout({prosper::gpu::kNggShellLaunchBinding,
-                                prosper::gpu::kNggShellExportBinding});
+    entry->shell =
+        make_layout({prosper::gpu::kNggShellLaunchBinding, prosper::gpu::kNggShellExportBinding});
     entry->push_bytes = push_words * 4u;
     const VkDescriptorSetLayout sets[3] = {entry->guest, entry->empty, entry->shell};
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, entry->push_bytes};
@@ -258,8 +262,10 @@ public:
         // Reached only after the batch that used the slices completed or was discarded: the
         // completion callback holds this object until then (an abandoned batch leaks it).
         for (const Prelude& prelude : preludes_) {
-            for (const NggScratchSlice& slice : prelude.launch) NggScratchRing::instance().release(slice);
-            for (const NggScratchSlice& slice : prelude.exports) NggScratchRing::instance().release(slice);
+            for (const NggScratchSlice& slice : prelude.launch)
+                NggScratchRing::instance().release(slice);
+            for (const NggScratchSlice& slice : prelude.exports)
+                NggScratchRing::instance().release(slice);
             NggScratchRing::instance().release(prelude.counters);
         }
     }
@@ -310,7 +316,8 @@ public:
         if (draw != prelude.first_draw) return prelude.armed;
         if (!pool || !set0) return fail_capture(prelude, "descriptor-pool");
         std::vector<VkDescriptorSetLayout> layouts = {prelude.pipelines.front()->guest};
-        for (const NggShellPipeline* pipeline : prelude.pipelines) layouts.push_back(pipeline->shell);
+        for (const NggShellPipeline* pipeline : prelude.pipelines)
+            layouts.push_back(pipeline->shell);
         std::vector<VkDescriptorSet> sets(layouts.size());
         VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocate.descriptorPool = pool;
@@ -333,10 +340,10 @@ public:
             out.push_back(write);
         }
         for (size_t g = 0; g < prelude.pipelines.size(); ++g) {
-            infos.push_back({prelude.launch[g].buffer(), prelude.launch[g].offset,
-                             prelude.launch[g].bytes});
-            infos.push_back({prelude.exports[g].buffer(), prelude.exports[g].offset,
-                             prelude.exports[g].bytes});
+            infos.push_back(
+                {prelude.launch[g].buffer(), prelude.launch[g].offset, prelude.launch[g].bytes});
+            infos.push_back(
+                {prelude.exports[g].buffer(), prelude.exports[g].offset, prelude.exports[g].bytes});
             for (uint32_t k = 0; k < 2; ++k) {
                 VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 write.dstSet = sets[1 + g];
@@ -373,12 +380,11 @@ public:
             prior.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             prior.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd,
-                                 graphics | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 1, &prior, 0, nullptr, 0, nullptr);
+            vkCmdPipelineBarrier(
+                cmd,
+                graphics | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &prior,
+                0, nullptr, 0, nullptr);
             // 1. Zero every export block (an unwritten flag means "not exported") and counter.
             for (const NggScratchSlice& slice : prelude.exports)
                 vkCmdFillBuffer(cmd, slice.buffer(), slice.offset, slice.bytes, 0u);
@@ -396,10 +402,10 @@ public:
             for (size_t g = 0; g < prelude.pipelines.size(); ++g) {
                 const NggShellPipeline& pipeline = *prelude.pipelines[g];
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0,
-                                        1, &prelude.guest_set, 0, nullptr);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 2,
-                                        1, &prelude.shell_sets[g], 0, nullptr);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1,
+                                        &prelude.guest_set, 0, nullptr);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 2, 1,
+                                        &prelude.shell_sets[g], 0, nullptr);
                 if (pipeline.push_bytes)
                     vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                        pipeline.push_bytes, prelude.ngg->push_constants.data());
@@ -413,10 +419,8 @@ public:
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, raster_stages, 0, 1,
                                  &exported, 0, nullptr, 0, nullptr);
             prelude.recorded = true;
-            uint64_t handle = 0;
-            const VkBuffer first_export = prelude.exports.front().buffer();
-            std::memcpy(&handle, &first_export, sizeof(first_export));
-            ngg_subgroup_backend_stats().last_export_buffer.store(handle);
+            ngg_subgroup_backend_stats().last_export_buffer.store(
+                std::bit_cast<uint64_t>(prelude.exports.front().buffer()));
             ngg_subgroup_backend_stats().last_export_offset.store(prelude.exports.front().offset);
             ngg_subgroup_backend_stats().draws.fetch_add(1, std::memory_order_relaxed);
         }
@@ -495,8 +499,8 @@ private:
             for (const FrameBufferResource& r : draw.B)
                 if (r.set == set && r.binding == binding) {
                     ++count;
-                    *buffer = r.table_entries.empty() && !r.is_internal_gds &&
-                              !r.fragment_draw_buffer;
+                    *buffer =
+                        r.table_entries.empty() && !r.is_internal_gds && !r.fragment_draw_buffer;
                 }
             return count;
         };
@@ -514,8 +518,10 @@ private:
         prelude.ngg = draw.ngg_subgroup;
         prelude.first_draw = out.size();
         const auto release_all = [&] {
-            for (const NggScratchSlice& slice : prelude.launch) NggScratchRing::instance().release(slice);
-            for (const NggScratchSlice& slice : prelude.exports) NggScratchRing::instance().release(slice);
+            for (const NggScratchSlice& slice : prelude.launch)
+                NggScratchRing::instance().release(slice);
+            for (const NggScratchSlice& slice : prelude.exports)
+                NggScratchRing::instance().release(slice);
             NggScratchRing::instance().release(prelude.counters);
         };
         auto& ring = NggScratchRing::instance();
@@ -547,15 +553,16 @@ private:
                         static_cast<size_t>(launch_bytes));
         }
         if (ngg.count_violations) {
-            prelude.counters = ring.acquire(ctx_, true, kNggViolationWords * 4u);
+            constexpr VkDeviceSize kCounterBytes = VkDeviceSize{kNggViolationWords} * 4u;
+            prelude.counters = ring.acquire(ctx_, true, kCounterBytes);
             if (!prelude.counters.chunk) {
                 release_all();
                 return refuse(refusal, "ngg-backend-resources");
             }
-            prelude.counters.bytes = kNggViolationWords * 4u;
+            prelude.counters.bytes = kCounterBytes;
             // The GPU fill zeroes them before use; zero them here too, so a batch that is never
             // submitted reads back zeros rather than a previous lease's counts.
-            std::memset(prelude.counters.words(), 0, kNggViolationWords * 4u);
+            std::memset(prelude.counters.words(), 0, static_cast<size_t>(kCounterBytes));
         }
 
         // The pass-through topology replaces the guest's input topology; everything else of the
