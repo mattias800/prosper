@@ -4,6 +4,8 @@
 #include "gpu/execute/gpu_dependency_graph.hpp"
 #include "fixtures/test_scratch.h"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <array>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -166,6 +168,81 @@ TEST(GpuCaptureObservation, CompleteEndRetainsStrictAdmission) {
     ASSERT_TRUE(materialize_gpu_replay(capture, executable, error)) << error;
     EXPECT_EQ(executable.items.size(), 1);
     EXPECT_EQ(executable.items[0].vs_raw_shader_index, 0);
+}
+
+namespace {
+// An alpha-tested fragment program as MOUSE: P.I. For Hire's shadow casters end (#4556): the
+// survivors' mask loses the lanes that failed, and `branch` at pc 1 decides where a wave with no
+// survivor goes. Seven words, so pc 7 is the first one past the program.
+std::vector<uint32_t> alpha_tested_fragment(uint32_t branch) {
+    return {0x8a906a10u,                // s_andn2_b64 s16, s16, vcc
+            branch,
+            0xbefe0410u,                // s_mov_b64 exec, s16
+            0x7e000280u,                // v_mov_b32 v0, 0
+            0xf8001c0fu, 0x00000000u,   // exp mrt0 v0, v0, v0, v0 done compr vm
+            0xbf810000u};               // s_endpgm
+}
+// What replay admission says to a draw whose original fragment program is `words`; empty when
+// the draw is admitted.
+std::string fragment_admission(const std::vector<uint32_t>& words) {
+    auto capture = capsule(true);
+    GpuCaptureRawShaderVersion raw;
+    raw.words = words;
+    raw.has_endpgm = true;
+    raw.content_hash = gpu_capture_hash(reinterpret_cast<const uint8_t*>(raw.words.data()),
+                                        raw.words.size() * sizeof(uint32_t));
+    capture.raw_shader_versions.push_back(raw);
+    capture.draws[0].fs_raw_shader_index = 1;
+    GpuReplayFrame executable;
+    std::string error;
+    if (!materialize_gpu_replay(capture, executable, error)) return error;
+    return executable.items.size() == 1 ? std::string{} : "admitted without its draw";
+}
+}   // namespace
+
+TEST(GpuCaptureObservation, AConditionalBranchPastTheProgramEndLeavesTheProgram) {
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf840005u)), "");   // scc0 -> pc 7
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf85000cu)), "");   // scc1 -> pc 14
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf860005u)), "");   // vccz -> pc 7
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf880005u)), "");   // execz -> pc 7
+}
+
+TEST(GpuCaptureObservation, OtherBranchesOutOfTheInstructionsStayRefused) {
+    const std::string refused = "logical-wave replay original decode unavailable stage=fs pc=1";
+    // Unconditional: nothing after it in these words would run, so they are not the program.
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf820005u)), refused);
+    // Backward to before the first word.
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf84fff0u)), refused);
+    // Forward into the export's second word, which is inside the words and not an instruction.
+    EXPECT_EQ(fragment_admission(alpha_tested_fragment(0xbf840003u)), refused);
+}
+
+// Admitting the edge must not lose what the rest of the program owes. The same exit in front of
+// a loop whose wide scalar load has a numeric reader: the inventory still reaches the load, and
+// a draw that carries no wave owners is refused for it, by its pc.
+TEST(GpuCaptureObservation, AnExitEdgeDoesNotHideALoadThatNeedsOwners) {
+    const std::vector<uint32_t> words{
+        0x8aa86a28u,                // pc 0   s_andn2_b64 s40, s40, vcc
+        0xbf84000du,                // pc 1   s_cbranch_scc0 -> pc 15, past the program
+        0x7e020280u,                // pc 2   v_mov_b32 v1, 0
+        0xf408040eu, 0xfa0000f0u,   // pc 3   s_load_dwordx4 s[16:19], s[28:29], 0xf0
+        0xf4280208u, 0xfa0000c0u,   // pc 5   s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+        0xbefe046au,                // pc 7   s_mov_b64 exec, vcc
+        0x7c1a14f9u, 0x86869080u,   // pc 8   v_cmp_*_sdwa s[16:17], 0, s10
+        0xbeea0410u,                // pc 10  s_mov_b64 vcc, s[16:17]
+        0xbf860001u,                // pc 11  s_cbranch_vccz -> pc 13
+        0xbf82fff6u,                // pc 12  s_branch -> pc 3
+        0x7ed40501u,                // pc 13  v_readfirstlane vcc_lo, v1
+        0xbf810000u};               // pc 14  s_endpgm
+    // The premise: classified as the live decode does it, the program has a load that needs
+    // owners. Without one this arm would pass on any inventory at all.
+    std::vector<Rdna2Inst> decoded;
+    ASSERT_EQ(rdna2_walk(words.data(), words.size(), decoded), words.size());
+    const auto required = rdna2_raw_wave_wide_data_loads(decoded);
+    ASSERT_FALSE(required.empty());
+    EXPECT_EQ(fragment_admission(words),
+              "logical-wave replay lacks original exact-PC window owners stage=fs pc=" +
+                  std::to_string(required.front()));
 }
 
 TEST(GpuCaptureObservation, BadPresentBlobIsNotOmittedPayload) {
