@@ -363,3 +363,124 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
         << "DestroyString returns success";
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
+
+struct FontStyleFrameApi {
+    HleFn init = nullptr, set_scale_pixel = nullptr, set_scale_point = nullptr, set_dpi = nullptr,
+          set_slant = nullptr, set_weight = nullptr, unset_scale = nullptr, unset_slant = nullptr,
+          unset_weight = nullptr, get_scale_pixel = nullptr, get_scale_point = nullptr,
+          get_dpi = nullptr, get_slant = nullptr, get_weight = nullptr, set_surface = nullptr;
+    bool registered() const {
+        return init && set_scale_pixel && set_scale_point && set_dpi && set_slant && set_weight &&
+               unset_scale && unset_slant && unset_weight && get_scale_pixel && get_scale_point &&
+               get_dpi && get_slant && get_weight && set_surface;
+    }
+};
+FontStyleFrameApi font_style_frame_api() {
+    register_builtin_hle();
+    FontStyleFrameApi api;
+    api.init = Hle::lookup("la2AOWnHEAc");
+    api.set_scale_pixel = Hle::lookup("da4rQ4-+p-4");
+    api.set_scale_point = Hle::lookup("O997laxY-Ys");
+    api.set_dpi = Hle::lookup("dB4-3Wdwls8");
+    api.set_slant = Hle::lookup("394sckksiCU");
+    api.set_weight = Hle::lookup("faw77-pEBmU");
+    api.unset_scale = Hle::lookup("bePC0L0vQWY");
+    api.unset_slant = Hle::lookup("dUmABkAnVgk");
+    api.unset_weight = Hle::lookup("hwsuXgmKdaw");
+    api.get_scale_pixel = Hle::lookup("2QfqfeLblbg");
+    api.get_scale_point = Hle::lookup("7x2xKiiB7MA");
+    api.get_dpi = Hle::lookup("VSw18Aqzl0U");
+    api.get_slant = Hle::lookup("lOfduYnjgbo");
+    api.get_weight = Hle::lookup("HIUdjR-+Wl8");
+    api.set_surface = Hle::lookup("0hr-w30SjiI");
+    return api;
+}
+uint64_t style_frame_addr() {
+    static uint8_t frame[0x60]{};
+    return addr(frame);
+}
+
+TEST(Font, StyleFrameSurfaceIsRegistered) {
+    EXPECT_TRUE(font_style_frame_api().registered()) << "font style-frame surface is registered";
+}
+
+TEST(Font, StyleFrameNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontStyleFrameInit"), "la2AOWnHEAc");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetScalePixel"), "da4rQ4-+p-4");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetScalePoint"), "O997laxY-Ys");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetResolutionDpi"), "dB4-3Wdwls8");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetEffectSlant"), "394sckksiCU");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetEffectWeight"), "faw77-pEBmU");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetScale"), "bePC0L0vQWY");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetEffectSlant"), "dUmABkAnVgk");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetEffectWeight"), "hwsuXgmKdaw");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetScalePixel"), "2QfqfeLblbg");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetScalePoint"), "7x2xKiiB7MA");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetResolutionDpi"), "VSw18Aqzl0U");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectSlant"), "lOfduYnjgbo");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectWeight"), "HIUdjR-+Wl8");
+    EXPECT_EQ(nid_hash("sceFontRenderSurfaceSetStyleFrame"), "0hr-w30SjiI");
+    EXPECT_NE(nid_hash("sceFontStyleFrameInit"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+TEST(Font, StyleFrameInitSeedsSeventyTwoDpi) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    std::memset(frame, 0xcc, sizeof(frame));
+    EXPECT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u) << "StyleFrameInit returns success";
+    EXPECT_EQ(frame[0], 0x09u) << "StyleFrameInit writes the magic low byte";
+    EXPECT_EQ(frame[1], 0x0Fu) << "StyleFrameInit writes the magic high byte";
+    uint32_t h_dpi = 0, v_dpi = 0;
+    EXPECT_EQ(api.get_dpi(addr(frame), addr(&h_dpi), addr(&v_dpi), 0, 0, 0), 0u)
+        << "GetResolutionDpi reads the seeded frame";
+    EXPECT_EQ(h_dpi, 0x48u) << "StyleFrameInit seeds 72 horizontal DPI";
+    EXPECT_EQ(v_dpi, 0x48u) << "StyleFrameInit seeds 72 vertical DPI";
+}
+
+TEST(Font, StyleFrameScalePixelRoundTrips) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SetFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetFn>(api.set_scale_pixel);
+    ASSERT_NE(set_pixel, nullptr);
+    EXPECT_EQ(set_pixel((void*)addr(frame), 16.0f, 20.0f), 0) << "SetScalePixel returns success";
+    float w = 0.0f, h = 0.0f;
+    EXPECT_EQ(api.get_scale_pixel(addr(frame), addr(&w), addr(&h), 0, 0, 0), 0u)
+        << "GetScalePixel reads the set frame";
+    EXPECT_EQ(w, 16.0f) << "GetScalePixel returns the set width";
+    EXPECT_EQ(h, 20.0f) << "GetScalePixel returns the set height";
+}
+
+TEST(Font, StyleFrameUnsetScaleRefusesReads) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SetFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetFn>(api.set_scale_pixel);
+    ASSERT_NE(set_pixel, nullptr);
+    ASSERT_EQ(set_pixel((void*)addr(frame), 16.0f, 20.0f), 0);
+    EXPECT_EQ(api.unset_scale(addr(frame), 0, 0, 0, 0, 0), 0u) << "UnsetScale returns success";
+    float w = 0.0f, h = 0.0f;
+    EXPECT_EQ(api.get_scale_pixel(addr(frame), addr(&w), addr(&h), 0, 0, 0), 0x80460058u)
+        << "GetScalePixel refuses after UnsetScale";
+}
+
+TEST(Font, StyleFrameSlantClampsAndRoundTrips) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SlantFn = int32_t (*)(void*, float);
+    auto set_slant = reinterpret_cast<SlantFn>(api.set_slant);
+    ASSERT_NE(set_slant, nullptr);
+    EXPECT_EQ(set_slant((void*)addr(frame), 2.0f), 0) << "SetEffectSlant clamps out-of-range";
+    float slant = 0.0f;
+    EXPECT_EQ(api.get_slant(addr(frame), addr(&slant), 0, 0, 0, 0), 0u)
+        << "GetEffectSlant reads the clamped frame";
+    EXPECT_EQ(slant, 1.0f) << "SetEffectSlant clamps to +1.0";
+}
