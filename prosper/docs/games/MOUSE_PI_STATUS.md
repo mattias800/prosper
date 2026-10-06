@@ -87,10 +87,12 @@ flip figure understates the difference.
 - **Under 10 frames a second in gameplay, about 3 in the menus.** Not investigated beyond the
   above, and not re-measured on a quiet GPU since the fixes. Host copying is no longer the
   obvious cost: it fell by 85% and the flip count barely moved.
-- **A second depth target is refused at its one sample per frame** ([#4620]). The effect of that
-  full-screen draw has not been identified.
-- **110 draws are dropped in one burst before gameplay** ([#4612]): a 16-dword fragment program
-  that does not decode.
+- **Before gameplay, one depth target is fast-cleared through HTILE and sampled with nothing
+  drawn into it**, and prosper answers that sample from guest memory instead of from the clear
+  value ([#4620]). The answer is right here only because both are zero. In gameplay the target is
+  drawn into every frame and served.
+- **110 draws are dropped in one burst before gameplay, in some runs** ([#4612]): a 16-dword
+  fragment program that does not decode. It appeared in two of the last six runs of the route.
 - Whether the gameplay picture is *right* is not known. No PS5 reference has been compared. The
   room is dark with two bright lamps, which may be the scene's look.
 
@@ -120,6 +122,12 @@ flip figure understates the difference.
 - **"The texture cache budget is starving the materials."** The runs use a 1,024 MiB texture
   budget to stand in for a discrete card. No texture-cache refusal appears in the log, and the
   G-buffer's first target is just as empty in a replay at the default 4,096 MiB.
+- **"A second depth target is refused in gameplay, right after two draws have written it."**
+  Published as [#4620] and wrong. It was read off a refusal count for the whole route plus the
+  draw order of one gameplay frame, and the two were never put on one timeline. An ordered
+  `PROSPER_DSLOG=1` run does that: the refusals of that target reach 5,115 by 176 s and are
+  still 5,115 at 293 s, and the first frame with the two depth-writing draws is at 173 s. Every
+  refusal is from a frame before gameplay, where nothing draws into the target after its clear.
 
 [#4609]: https://github.com/mattias800/prosper/pull/4609
 [#4615]: https://github.com/mattias800/prosper/pull/4615
@@ -141,6 +149,10 @@ flip figure understates the difference.
 - **Until [#4622], no frame of this title could be replayed at all.** Its alpha-tested shadow
   casters end with a conditional branch past their own `s_endpgm`, and replay admission refused
   the frame for it: `logical-wave replay original decode unavailable stage=fs pc=53`.
+- **A whole-route counter is not a statement about gameplay.** The route spends its first 170 s
+  in logos, menus and an intro that run the same deferred pipeline, so a `[dsbridge] declined`
+  total, a dropped-draw total or a host-copy total mostly describes those. Read the counter at two
+  moments, or put it beside the pass it is about, before attaching it to a gameplay frame.
 - **A slow start desynchronizes the route.** The stick moves that choose a difficulty are
   anchored to flips 840–1000 and the presses around them to wall-clock seconds. A run that shares
   the GPU with another lane reaches those flips a minute late; this one still arrived, but check
@@ -152,6 +164,5 @@ flip figure understates the difference.
 ## What the next lane should do
 
 Compare the gameplay frame with a PS5 reference before optimising anything: the room renders,
-and whether its lighting is right is unknown. Then [#4620], which is one filtered
-`PROSPER_DSLOG=1` run from an answer. The frame rate is the larger problem and has no diagnosis
-yet; start from the `[perf-alarm]` summary of a run on a quiet GPU.
+and whether its lighting is right is unknown. The frame rate is the larger problem and has no
+diagnosis yet; start from the `[perf-alarm]` summary of a run on a quiet GPU.
