@@ -180,13 +180,13 @@ int main() {
     CHECK(parse_param_title_id("").empty(), "empty json yields no id");
     // --- version + region: the list columns ------------------------------------------------
     CHECK(parse_param_content_version(
-              "{\"contentVersion\":\"01.000.006\",\"titleId\":\"PPSA19990\"}") == "01.000.006",
+              "{\"contentVersion\":\"01.000.006\",\"titleId\":\"TEST19990\"}") == "01.000.006",
           "contentVersion is read");
     CHECK(parse_param_content_version("").empty(), "empty json yields no version");
-    CHECK(parse_param_content_version("{\"titleId\":\"PPSA19990\"}").empty(),
+    CHECK(parse_param_content_version("{\"titleId\":\"TEST19990\"}").empty(),
           "a dump without contentVersion yields empty, not garbage");
     CHECK(parse_param_region(
-              "{\"contentId\":\"EP0700-PPSA19990_00-TALESOFGRACESF00\"}") == "EP",
+              "{\"contentId\":\"EP0700-TEST19990_00-SOME-GAME-00\"}") == "EP",
           "the region is the two letters heading the contentId prefix");
     CHECK(parse_param_region("{\"contentId\":\"nodashes\"}").empty(),
           "a dashless contentId yields no region rather than the whole string");
@@ -194,13 +194,13 @@ int main() {
     // --- search filter ---------------------------------------------------------------------
     {
         GameEntry e;
-        e.app0_root = "/games/PPSA24651-app0";
-        e.title_id = "PPSA24651";
+        e.app0_root = "/games/TEST24651-app0";
+        e.title_id = "TEST24651";
         e.title_name = "The Messenger";
         CHECK(game_entry_matches_filter(e, ""), "an empty box matches everything");
         CHECK(game_entry_matches_filter(e, "messenger"), "name matches case-insensitively");
-        CHECK(game_entry_matches_filter(e, "PPSA24651"), "title id matches");
-        CHECK(game_entry_matches_filter(e, "ppsa24651"), "title id matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "TEST24651"), "title id matches");
+        CHECK(game_entry_matches_filter(e, "test24651"), "title id matches case-insensitively");
         CHECK(game_entry_matches_filter(e, "24651-app0"), "the path matches too");
         CHECK(!game_entry_matches_filter(e, "zelda"), "an unrelated needle matches nothing");
     }
@@ -269,11 +269,17 @@ int main() {
     CHECK(scan_game_library("/does/not/exist", probe, io).empty(), "a missing directory yields nothing");
     CHECK(scan_game_library("", probe, io).empty(), "an empty path yields nothing");
     // The games dir itself IS listed when it is a title root — a dump can sit at a drive
-    // root, where the folder is the game rather than a folder of games.
+    // root, where the folder is the game rather than a folder of games. A dedicated probe (not
+    // a PPSA-named fixture) so this test adds no title-id occurrences of its own.
     {
-        const std::vector<GameEntry> self = scan_game_library("/games/PPSA24651-app0", probe, io);
-        CHECK(self.size() == 1 && self[0].title_name == "The Messenger" &&
-                  self[0].app0_root == "/games/PPSA24651-app0",
+        GamePathProbe solo_probe;
+        solo_probe.is_dir = [](const std::string& s) { return s == "/solo"; };
+        solo_probe.is_file = [](const std::string& s) { return s == "/solo/eboot.bin"; };
+        GameLibraryIo solo_io;
+        solo_io.list_dir = [](const std::string&) { return std::vector<std::string>{}; };
+        const std::vector<GameEntry> self = scan_game_library("/solo", solo_probe, solo_io);
+        CHECK(self.size() == 1 && self[0].title_name == "solo" &&
+                  self[0].app0_root == "/solo",
               "a title root used as the games dir lists itself");
     }
     CHECK(scan_game_library("/games/", probe, io).size() == 7, "a trailing separator is tolerated");

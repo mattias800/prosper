@@ -35,7 +35,7 @@
 
 title-id|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
 title-id|prosper/frontends/prosper-app/test_frame_grab_naming.cpp 29
-title-id|prosper/frontends/prosper-app/test_game_library.cpp 79  # note: +6 fixture title ids in the version/region/filter list-column tests, +1 in the scan-self test; the charter permits title ids as test fixture data.
+title-id|prosper/frontends/prosper-app/test_game_library.cpp 71
 title-id|prosper/frontends/prosper-app/test_game_path.cpp 26
 title-id|prosper/frontends/prosper-app/test_launcher_media.cpp 6
 title-id|prosper/frontends/prosper-app/test_snap_author.cpp 3
