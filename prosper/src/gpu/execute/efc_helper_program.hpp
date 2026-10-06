@@ -20,25 +20,45 @@
 // Two observed compiles are listed EXACTLY (CONFIDENCE: HIGH; live census of every MODE=2 vertex
 // program: Dragon Quest VII runs exactly one, the first entry; Astro Bot runs the second plus five
 // ordinary vertex programs with 2-23 vertex resources each, which this deliberately does not
-// match). Beyond them, the rectangle is recognised by its FAMILY (is_agc_rect_family_program):
-// AGC's position math word for word, after an NGG prologue of its own. This was "exact programs
-// only" until #4610. Once BOOL64 predication runs the eliminate pass when its "needs it" word says so,
-// that pass lands after the frame's composite, and an unlisted compile of the same rectangle paints
-// the inherited pixel shader over the whole scanout. The Oregon Trail (PPSA19244) and Kena
-// (PPSA01802) each bind a third and a fourth compile, and both went black. An unrecognised helper is
-// therefore a black frame, a worse failure than the stale-MODE risk the exact list guarded against.
-// The family still cannot match an ordinary full-screen pass: that pass would need AGC's exact
-// vertex-id-to-rectangle arithmetic and position export, no memory instruction, and a primitive
-// export, all inside 32 dwords. The rectangle itself is shared: Astro Bot draws it
-// under MODE 2 and 6 with one pixel program, and Dragon Quest VII also draws it under MODE 0 for
-// AGC's "Decompress Htile" helper (below; an earlier revision read those as ordinary copies), so the
-// vertex program alone is not the operation either -- both halves are needed.
+// match). Beyond them, the rectangle is recognised by its FAMILY (is_agc_rect_family_program).
+// This was "exact programs only" until #4610. Once BOOL64 predication runs the eliminate pass when
+// its "needs it" word says so, that pass lands after the frame's composite, and an unlisted compile
+// of the same rectangle paints the inherited pixel shader over the whole scanout. The Oregon Trail
+// (PPSA19244) and Kena (PPSA01802) each bind a third and a fourth compile, and both went black.
+//
+// THE RESIDUAL RISK, stated plainly. The family's core is the textbook vertex-id full-screen quad,
+// pos = float4(float2(id & 1, id >> 1) * 2 - 1, 0, 1), and its prologue is NGG toolchain
+// boilerplate. Oregon's prologue equals Astro Bot's entry, and Kena's is a reordering of the first
+// entry. So an ORDINARY title pass whose vertex shader is that quad and nothing else (no memory
+// read, no output beyond position) can match. If it is drawn under a stale MODE=2, or a stale MODE=0
+// with DB_RENDER_CONTROL's compress-disable bits, its colour is dropped. Both of those latched states
+// are measured on ordinary draws (#1724; DQ7 latches 0x60). The protections are:
+//   * the MODE / DB_RENDER_CONTROL gate of the two operations below;
+//   * no memory instruction before the core, which rejects any vertex shader that reads a resource
+//     (Astro Bot's ordinary MODE=2 programs read 2-23);
+//   * the 32-dword bound and the NGG primitive export;
+//   * the draw's own shape, applied to the family branch only: AGC draws every helper as a 3-vertex
+//     non-indexed RectList (DrawIndexAuto(3), VGT_PRIMITIVE_TYPE 7), in DQ7's, Oregon's and Kena's
+//     dumped segments alike. A full-screen pass drawn as a triangle list or strip cannot match; one
+//     drawn as a 3-vertex RectList with this exact shader still can.
+// Each program the family matches is reported once ([agc] helper rectangle recognised by family),
+// so a false positive is visible in an ordinary run log, not only in the dropped-draw census.
+// CONFIDENCE: MED for the family branch. The trade is deliberate: an unrecognised helper is a black
+// frame, while a false positive needs a position-only RectList(3) quad under a latched helper MODE.
+//
+// The rectangle itself is shared: Astro Bot draws it under MODE 2 and 6 with one pixel program, and
+// Dragon Quest VII also draws it under MODE 0 for AGC's "Decompress Htile" helper (below; an earlier
+// revision read those as ordinary copies), so the vertex program alone is not the operation either:
+// both halves are needed.
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
+#include <mutex>
+#include <unordered_set>
 
 #include "gpu/pm4/pm4_registers.hpp"
 
@@ -74,8 +94,9 @@ inline constexpr uint32_t kAgcRectPositionCore[] = {
 // at most 32 dwords through its s_endpgm, ending in kAgcRectPositionCore, with an NGG primitive
 // export (EXP prim, 0xf8000941) and no memory instruction (SMEM, buffer, image, flat, LDS) before
 // the core. The scan is over raw dwords. A literal in the prologue that happens to look like a
-// memory encoding can only make this refuse, never match. CONFIDENCE: MED (two titles' compiles
-// observed; the family never matched a program that writes colour in the A/B).
+// memory encoding can only make this refuse, never match. This alone also matches an ordinary
+// position-only full-screen quad: callers gate it on the helper's draw shape (see the header).
+// CONFIDENCE: MED.
 inline bool is_agc_rect_family_program(const uint32_t* code, size_t max_dwords) {
     constexpr size_t kMaxProgramDwords = 32;
     constexpr size_t kCore = std::size(kAgcRectPositionCore);
@@ -110,28 +131,67 @@ inline constexpr AgcEfcRectVertexProgram kAgcEfcRectVertexPrograms[] = {
     {kAgcEfcRectVertexB, std::size(kAgcEfcRectVertexB)},
 };
 
-// True when `code` (at least `max_dwords` readable) is AGC's helper rectangle: one of the exact
-// observed compiles, or a compile of the same rectangle family.
-inline bool is_agc_efc_rect_vertex_program(const uint32_t* code, size_t max_dwords) {
+// True when `code` begins with one of the exact observed compiles.
+inline bool is_agc_efc_rect_exact_program(const uint32_t* code, size_t max_dwords) {
     if (!code) return false;
     return std::any_of(std::begin(kAgcEfcRectVertexPrograms), std::end(kAgcEfcRectVertexPrograms),
                        [&](const AgcEfcRectVertexProgram& helper) {
                            return max_dwords >= helper.dwords &&
                                   std::equal(helper.words, helper.words + helper.dwords, code);
-                       }) ||
-           is_agc_rect_family_program(code, max_dwords);
+                       });
+}
+
+// The draw's shape, as AGC issues every helper: DrawIndexAuto(3), non-indexed, RectList
+// (VGT_PRIMITIVE_TYPE 7). It gates only the family branch; the exact entries keep matching without it.
+struct AgcHelperDrawShape {
+    uint32_t prim_type = 7;
+    uint32_t vertices = 3;
+    bool indexed = false;
+};
+inline constexpr AgcHelperDrawShape kAgcHelperRectDraw{};
+inline bool is_agc_helper_draw_shape(const AgcHelperDrawShape& shape) {
+    return shape.prim_type == 7u && shape.vertices == 3u && !shape.indexed;
+}
+
+// True when `code` (at least `max_dwords` readable) is AGC's helper rectangle: one of the exact
+// observed compiles, or a compile of the same family drawn in the helper's shape.
+inline bool is_agc_efc_rect_vertex_program(const uint32_t* code, size_t max_dwords,
+                                           const AgcHelperDrawShape& shape = kAgcHelperRectDraw) {
+    if (!code) return false;
+    return is_agc_efc_rect_exact_program(code, max_dwords) ||
+           (is_agc_helper_draw_shape(shape) && is_agc_rect_family_program(code, max_dwords));
+}
+
+// One line per distinct program the FAMILY branch identified as a helper (bounded), so a false
+// positive is visible in an ordinary run log.
+inline void report_agc_rect_family_match(uint64_t vs_addr, size_t dwords, uint32_t cb_color_control,
+                                         const char* operation) {
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (seen.size() >= 64 || !seen.insert(vs_addr).second) return;
+    }
+    namespace P = prosper::agc::Pm4;
+    std::fprintf(stderr,
+                 "[agc] helper rectangle recognised by family: vs=0x%llx dwords=%zu mode=%u op=%s "
+                 "(not an exact entry; a colour-writing pass here would be a false positive, #4610)\n",
+                 (unsigned long long)vs_addr, dwords,
+                 (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK,
+                 operation);
 }
 
 // The draw IS the colour-block eliminate-fast-clear operation: its decoded MODE says so AND it is
 // AGC's own rectangle for that operation. Such a draw writes no colour on this backend.
 inline bool is_agc_eliminate_fast_clear_operation(uint32_t cb_color_control,
                                                   const uint32_t* vertex_code,
-                                                  size_t vertex_dwords) {
+                                                  size_t vertex_dwords,
+                                                  const AgcHelperDrawShape& shape = kAgcHelperRectDraw) {
     namespace P = prosper::agc::Pm4;
     const uint32_t mode =
         (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
     return mode == P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR &&
-           is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
+           is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords, shape);
 }
 
 // The draw is AGC's "Decompress Htile" helper: AGC's own rectangle under CB_COLOR_CONTROL.MODE = 0
@@ -152,7 +212,8 @@ inline bool is_agc_eliminate_fast_clear_operation(uint32_t cb_color_control,
 // CONFIDENCE: HIGH that the decompress writes no colour; MED that the signature never marks a
 // colour-writing use of the rectangle (every observed match is inside a labelled AGC helper segment).
 inline bool is_agc_decompress_htile_operation(uint32_t cb_color_control, uint32_t db_render_control,
-                                              const uint32_t* vertex_code, size_t vertex_dwords) {
+                                              const uint32_t* vertex_code, size_t vertex_dwords,
+                                              const AgcHelperDrawShape& shape = kAgcHelperRectDraw) {
     namespace P = prosper::agc::Pm4;
     const uint32_t mode =
         (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
@@ -162,7 +223,7 @@ inline bool is_agc_decompress_htile_operation(uint32_t cb_color_control, uint32_
         (P::DB_RENDER_CONTROL_STENCIL_COMPRESS_DISABLE_MASK
          << P::DB_RENDER_CONTROL_STENCIL_COMPRESS_DISABLE_SHIFT);
     return mode == P::CB_COLOR_CONTROL_MODE_DISABLE && (db_render_control & compress_disable) != 0 &&
-           is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
+           is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords, shape);
 }
 
 }   // namespace prosper::gpu

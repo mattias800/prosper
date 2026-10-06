@@ -109,6 +109,23 @@ TEST(EfcHelperProgram, TheFamilyIsTheRectangleAndNothingNear) {
         << "a window that ends before s_endpgm cannot match";
 }
 
+// The family branch needs the helper's draw shape; the exact entries do not.
+TEST(EfcHelperProgram, TheFamilyBranchNeedsTheHelperDrawShape) {
+    const auto kena = with_metadata(kKenaRect, std::size(kKenaRect));
+    const auto exact = with_metadata(kAgcEfcRectVertexA, std::size(kAgcEfcRectVertexA));
+    const AgcHelperDrawShape helper{7u, 3u, false};
+    EXPECT_TRUE(is_agc_efc_rect_vertex_program(kena.data(), kena.size(), helper));
+    for (const AgcHelperDrawShape other : {AgcHelperDrawShape{4u, 3u, false},    // triangle list
+                                           AgcHelperDrawShape{5u, 4u, false},    // triangle strip
+                                           AgcHelperDrawShape{7u, 4u, false},    // 4 vertices
+                                           AgcHelperDrawShape{7u, 3u, true}}) {  // indexed
+        EXPECT_FALSE(is_agc_efc_rect_vertex_program(kena.data(), kena.size(), other))
+            << "prim " << other.prim_type << " vertices " << other.vertices;
+        EXPECT_TRUE(is_agc_efc_rect_vertex_program(exact.data(), exact.size(), other))
+            << "the exact entries are not shape-gated";
+    }
+}
+
 TEST(EfcHelperProgram, ExactWordsOnly) {
     std::vector<uint32_t> mutated(std::begin(kAgcEfcRectVertexA), std::end(kAgcEfcRectVertexA));
     mutated[19] = 0x7e020280u;   // v_mov_b32 v1, 0 instead of 1.0: another program
@@ -243,6 +260,29 @@ TEST(EfcHelperProgram, OtherCompilesWriteNoColourEither) {
         decompress.cx[P::DB_RENDER_CONTROL] = 0x60;
         EXPECT_FALSE(realize(decompress).made);
     }
+}
+
+// The residual class the family relaxation leaves, pinned: a position-only full-screen quad with
+// exactly the family's shader, drawn as an ordinary triangle list under a stale helper MODE, still
+// writes its colour. So does the same program under MODE=1.
+TEST(EfcHelperProgram, APositionOnlyQuadOutsideTheHelperShapeStillDraws) {
+    constexpr uint32_t kTriangleList = 4;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+    const Realized stale_eliminate =
+        realize(state(kHelperBlock, kTriangleList, P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR));
+    EXPECT_TRUE(stale_eliminate.made);
+    EXPECT_EQ(stale_eliminate.mask, 0xFu);
+    GpuState stale_decompress =
+        state(kHelperBlock, kTriangleList, P::CB_COLOR_CONTROL_MODE_DISABLE);
+    stale_decompress.cx[P::DB_RENDER_CONTROL] = 0x60;
+    const Realized decompress = realize(stale_decompress);
+    EXPECT_TRUE(decompress.made);
+    EXPECT_EQ(decompress.mask, 0xFu);
+    const Realized normal =
+        realize(state(kHelperBlock, 7u, P::CB_COLOR_CONTROL_MODE_NORMAL));
+    EXPECT_TRUE(normal.made) << "the helper shape under MODE=1 is an ordinary draw";
+    EXPECT_EQ(normal.mask, 0xFu);
 }
 
 TEST(EfcHelperProgram, TheOperationKeepsItsDepthStencilEffect) {
