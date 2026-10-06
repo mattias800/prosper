@@ -4847,6 +4847,13 @@ endif()
       target_include_directories(test_game_compute_rtt_mirror PRIVATE tests frontends)
       target_link_libraries(test_game_compute_rtt_mirror PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
+      # #4553: ds_read_b32 ... gds on the production compute backend, against the persistent GDS
+      # instance: a later dispatch reads what an earlier one stored.
+      prosper_add_gtest(test_compute_gds_read
+        SOURCES tests/gpu/execute/test_compute_gds_read.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer
+        PROPERTIES TIMEOUT 120)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
                COMMAND test_game_compute_rtt_mirror)

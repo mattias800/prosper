@@ -899,6 +899,9 @@ struct SpirvCompute {
     void compute_gds_atomic_minmax(uint16_t opcode, uint32_t index, uint32_t value,
                                    uint32_t pred);
     void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred);
+    // The read that pairs with it: one dword of the same device-global buffer. Not predicated;
+    // the caller keeps the old register value on an inactive lane, as for every VGPR write.
+    uint32_t compute_gds_load(uint32_t index);
     uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value);
     // Native-subgroup GDS append/consume is one device-global atomic per hardware wave. Fragment
     // helper invocations participate in subgroup operations but cannot consume guest counter slots;

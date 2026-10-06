@@ -1314,6 +1314,23 @@ int main(int argc, char** argv) {
           0xD7650000u,0x00020E7Eu,0x4A140106u,0x36001481u,0x7E000D00u,
           0x7E020280u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_gds_consume", recompile_fragment(c, sizeof(c)/4)); }
+    // Compute: a plain GDS read and a plain GDS store against the internal GDS buffer (#4553).
+    // v0 = 4 ; ds_read_b32 v1, v0 gds ; v0 = 8 ; ds_write_b32 v0, v1 gds.
+    {
+        const uint32_t c[] = {0x7e0002ffu, 0x00000004u, 0xd8da0000u, 0x01000000u, 0x7e0002ffu,
+                              0x00000008u, 0xd8360000u, 0x00000100u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource gds{};
+        gds.cls = ResourceClass::ConstantBuffer;
+        gds.format = DataFormat::Uint32;
+        gds.num_components = 1;
+        gds.binding = kComputeInternalGdsBinding;
+        gds.size = 64u * 1024u;
+        gds.stride = 4;
+        rt.resources.push_back(gds);
+        dump(dir, "compute_gds_read_write",
+             recompile_compute(c, std::size(c), &rt, ComputeShaderConfig{}));
+    }
     // Fragment private spill/fill (Function-storage declaration in the graphics shell).
     { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
                             0xf800000fu,0x00000000u,0xBF810000u};
