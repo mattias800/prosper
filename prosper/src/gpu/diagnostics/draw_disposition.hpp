@@ -65,8 +65,9 @@
 
 namespace prosper::gpu {
 
-// The reasons a draw prosper wanted to issue did not reach the GPU. Order is the order the setup
-// loop can reach them, so a reader comparing two runs sees reasons appear in a stable sequence.
+// The reasons a draw prosper wanted to issue did not reach the GPU. The first eight follow the
+// order the setup loop can reach them; later ones are appended (never inserted), so a slot's
+// meaning, its perf::DropReason mirror and every grepped name stay stable across versions.
 // clang-format off: one reason per line, comments aligned; perf::DropReason mirrors this order
 enum class DrawDrop : uint8_t {
     GeometryCapability = 0,  // fragment program needs the Geometry capability; device lacks it
@@ -92,7 +93,7 @@ enum class DrawDrop : uint8_t {
     VolumeFeedback,          // a volume pass samples the volume it writes (no snapshot yet)
     CommandPool,             // no command pool could be leased for the pass
     VolumeMultiTarget,       // a volume pass with more than one colour target (#4643)
-    VolumeSeeded,            // a volume pass with a CPU seed for its colour target
+    VolumeSeeded,            // a single-target volume pass with a CPU seed (multi-target wins)
     VolumeTargetLimits,      // the device cannot hold the volume target or its layer count
     VolumeDepthStencil,      // a volume pass with a depth/stencil attachment
     VolumeBudget,            // a volume target could not be retained (budget or allocation)
@@ -162,6 +163,8 @@ public:
     // The current pass's seen - recorded - dropped, clamped at zero: what a refusal names.
     uint64_t pass_unaccounted_for_scope() const;
     uint64_t seen() const;
+    // Passes recorded by note_pass_duration (refused passes are excluded; see the scope).
+    uint64_t timed_passes() const;
     uint64_t recorded() const;
     uint64_t dropped(DrawDrop reason) const;
     uint64_t dropped_total() const;

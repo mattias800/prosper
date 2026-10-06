@@ -8557,7 +8557,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Layered MRT and a layer-one DS attachment need a separate common-layer contract. Admit
     // only the proven single-color shape while the volume path is established.
     if (volume_color && (color_count != 1u || seed_rgba))   // #4643
-        return disposition.refuse(seed_rgba ? DD::VolumeSeeded : DD::VolumeMultiTarget, out);
+        return disposition.refuse(color_count != 1u ? DD::VolumeMultiTarget : DD::VolumeSeeded,
+                                  out);
     const auto first_pipeline_format = [&](uint32_t slot) {
         for (const auto& draw : draws) {
             if (!draw.ps) continue;

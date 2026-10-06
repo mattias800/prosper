@@ -205,6 +205,13 @@ uint64_t DrawDispositionCensus::pass_unaccounted_for_scope() const {
     return pass.seen > accounted ? pass.seen - accounted : 0;
 }
 
+uint64_t DrawDispositionCensus::timed_passes() const {
+    uint64_t passes = 0;
+    for (const auto& bucket : state().bucket_passes)
+        passes += bucket.load(std::memory_order_relaxed);
+    return passes;
+}
+
 uint64_t DrawDispositionCensus::seen() const { return state().seen.load(std::memory_order_relaxed); }
 uint64_t DrawDispositionCensus::recorded() const {
     return state().recorded.load(std::memory_order_relaxed);
@@ -310,9 +317,12 @@ DrawDispositionPassScope::~DrawDispositionPassScope() {
     // leaves the gap for report_pass() to call UNACCOUNTED.
     if (refusal_ != DrawDrop::Count)
         census.note_dropped(refusal_, census.pass_unaccounted_for_scope());
-    // Read the pass's draw count BEFORE report_pass() resets the per-pass counters.
+    // Read the pass's draw count BEFORE report_pass() resets the per-pass counters. A refused
+    // pass returned before building anything, so it is no sample of a pass's FIXED cost: timing
+    // it would pull the small-draw bucket means toward zero (every refusal precedes the loop).
     const uint64_t drawn = census.pass_seen_for_scope();
-    if (drawn) census.note_pass_duration(drawn, now_ns() - start_ns_);
+    if (drawn && refusal_ == DrawDrop::Count)
+        census.note_pass_duration(drawn, now_ns() - start_ns_);
     census.report_pass();
 }
 

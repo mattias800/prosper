@@ -378,3 +378,20 @@ TEST(DrawDisposition, ConcurrentPassesDoNotChargeEachOther) {
     EXPECT_EQ(unaccounted_counter(), before)
         << "a pass reports only its own thread's draws, whatever overlaps it";
 }
+
+TEST(DrawDisposition, RefusedPassesStayOutOfPassCost) {
+    // The pass-cost buckets measure how much of a pass is FIXED. A pass refused before it built
+    // anything -- including the ~0 ns whole-batch preflight -- is not a sample of that, and would
+    // drag the one-draw bucket's mean toward zero (GTA V refuses a batch per frame).
+    auto& c = draw_disposition_census();
+    const uint64_t before = c.timed_passes();
+    (void)capture_report([] { (void)synthetic_pass(2, true); });
+    (void)capture_report([] { refuse_draw_pass(3, DrawDrop::ResourceOrder); });
+    EXPECT_EQ(c.timed_passes(), before) << "a named refusal is not a timed pass";
+    // Positive control: a pass that ran is timed, so the zero above is the exclusion.
+    (void)capture_report([&] {
+        DrawDispositionPassScope pass(2);
+        c.note_recorded(2);
+    });
+    EXPECT_EQ(c.timed_passes(), before + 1);
+}
