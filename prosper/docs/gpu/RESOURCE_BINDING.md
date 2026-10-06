@@ -374,9 +374,20 @@ separate `GpuState` was tested as a default-off A/B: reject counts stayed within
 the 3D world remained identically black, so that split is ruled out as a fix. The earlier GS-versus-PS
 acceptance test is retired too. The signature appears in 8/12/28-dword vertex windows and not in
 30/32-dword vertex windows; every pixel stage with a declared pointer in the measured run also had a
-30-dword window. Window fit, not stage identity, predicts the result. What remains open is the
+30-dword window. Window fit, not stage identity, predicts the result. What remained open was the
 hardware ordering/ring contract that prevents a larger required block from being paired with the
 smaller bound pipeline window.
+
+**Update (#4540): the q3 "DcbFinal" fold was not a hardware queue.** It was prosper executing
+`sceAgcCbBranch` (`w1KFAHVqpaU`) targets at the moment the guest *recorded* the branch, against
+whatever pipeline the previous fold left bound. The firmware writes a 14-dword conditional
+indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the same and runs the
+target when the command processor reaches the packet inside the buffer that carries it. So there is
+no separate ring whose ordering contract was unknown, and the split-register-file lever
+(`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
+26/25/5 to 6/6/2 (vertex/fragment/compute, `prosper-app` default launch with `PROSPER_NULL_PAGE=1`,
+240 s, no input; one control run on main, two runs with the change, and a third with the change read
+11/12/4). Re-measure the window-fit signature on Nikoderiko and Stray before quoting it as live.
 
 `test_command_provenance` pins the diagnostic contract synthetically across q1/q2/q3 origins,
 top-level folds, an inner Jump, direct/indirect paths and retained write/draw order. It protects the

@@ -7440,7 +7440,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // shader, and the draw's own order.
         if (prosper::gpu::udprov_enabled()) {
             // order + path + SOURCE. `q` is the queue origin the packet folded under
-            // (0=unknown/graphics, 1=Dcb, 2=Acb, 3=DcbFinal), `f` the top-level fold (submit
+            // (0=unknown/graphics, 1=Dcb, 2=Acb; 3=DcbFinal, unused since #4540), `f` the fold (submit
             // stream) id, `j` the sceAgcDcbJump recursion depth. A write whose q/f differs from
             // the draw's own is one that did not arrive in this submit's inline position.
             const auto prov = [&](uint32_t reg) -> std::string {

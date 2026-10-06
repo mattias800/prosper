@@ -4027,6 +4027,12 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
     LIBRARIES prosper_core)
 
+  # sceAgcCbBranch is a builder (#4540): packet layout, patchers, condition, and the ordering
+  # contract (the target runs inside the buffer that carries the branch).
+  prosper_add_gtest(test_cb_branch
+    SOURCES tests/gpu/pm4/test_cb_branch.cpp
+    LIBRARIES prosper_core)
+
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
   prosper_add_gtest(test_agc_multi_dcb_empty_segment
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp

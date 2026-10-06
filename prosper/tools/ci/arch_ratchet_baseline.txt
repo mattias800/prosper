@@ -127,7 +127,7 @@ getenv|prosper/src/hle/dispatch/dispatch.cpp 1
 getenv|prosper/src/hle/dispatch/nid.cpp 1
 getenv|prosper/src/hle/fs/hle_file.cpp 16
 getenv|prosper/src/hle/fs/save_paths.cpp 1
-getenv|prosper/src/hle/graphics/hle_agc.cpp 50
+getenv|prosper/src/hle/graphics/hle_agc.cpp 49
 getenv|prosper/src/hle/graphics/hle_graphics.cpp 15
 getenv|prosper/src/hle/input/hle_pad.cpp 10
 getenv|prosper/src/hle/input/ime.cpp 3

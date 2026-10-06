@@ -39,8 +39,8 @@ TEST(EfcHelperProgram, RecognisesBothObservedHelpersOnlyUnderEliminateFastClear)
         EXPECT_TRUE(is_agc_eliminate_fast_clear_operation(
             mode_word(P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR), block.data(), block.size()));
         for (uint32_t other : {0u, 1u, 3u, 6u})
-            EXPECT_FALSE(is_agc_eliminate_fast_clear_operation(mode_word(other), block.data(),
-                                                               block.size()))
+            EXPECT_FALSE(
+                is_agc_eliminate_fast_clear_operation(mode_word(other), block.data(), block.size()))
                 << "mode " << other << " is not the operation, even on its rectangle";
     }
 }
@@ -58,9 +58,9 @@ TEST(EfcHelperProgram, ExactWordsOnly) {
 // Realization arms. Fullscreen-triangle VS + solid-green PS (llvm-mc gfx1030), the blobs
 // test_gpu_execute uses; 256-aligned so the SHADER_PGM encoding round-trips.
 alignas(256) const uint32_t kVs[] = {
-    0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u, 0x10020B01u,
-    0x08020D01u, 0x10040B02u, 0x08040D02u, 0x7E060280u, 0x7E0802F2u, 0xF80008CFu, 0x04030201u,
-    0xBF810000u,
+    0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u,
+    0x7E0C02F2u, 0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u,
+    0x7E060280u, 0x7E0802F2u, 0xF80008CFu, 0x04030201u, 0xBF810000u,
 };
 alignas(256) const uint32_t kPs[] = {
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
@@ -86,7 +86,11 @@ GpuState state(const void* vs, uint32_t prim, uint32_t mode) {
     return st;
 }
 
-struct Realized { bool made = false; uint32_t mask = 0; RealizationFailureReason reason{}; };
+struct Realized {
+    bool made = false;
+    uint32_t mask = 0;
+    RealizationFailureReason reason{};
+};
 Realized realize(const GpuState& st) {
     Realized r;
     DrawItem item;

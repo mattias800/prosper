@@ -133,7 +133,7 @@ struct GpuState {
     // cannot say. A submit stream's orders are contiguous, so a write that arrives from another
     // command buffer, another queue entry point, or inside a sceAgcDcbJump segment is
     // indistinguishable from an in-line one once folded. Packs the queue origin
-    // (0=unknown/graphics, 1=Dcb, 2=Acb async compute, 3=DcbFinal), the jump recursion depth at
+    // (0=unknown/graphics, 1=Dcb, 2=Acb async compute, 3=DcbFinal [unused, #4540]), the depth at
     // apply time, and the top-level fold id.
     std::unordered_map<uint32_t, uint64_t> sh_prov_src;
     static uint64_t pack_prov_src(uint8_t origin, uint32_t jump_depth, uint32_t fold) {
@@ -438,7 +438,7 @@ bool last_fold_deferred();
 bool deferred_pending();
 int  flush_deferred_streams();
 // Select the hardware queue represented by the next fold (0=unknown/graphics, 1=Dcb,
-// 2=Acb async compute, 3=DcbFinal). Submit entry points set this while holding their shared mutex;
+// 2=Acb async compute, 3=DcbFinal: unused since #4540). Entry points set it under their mutex;
 // tests use it to exercise cross-queue ordering.
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin);
 // submit_completion_pulse(): fire the submit's GPU-EOP equeue pulse — immediately when its queue

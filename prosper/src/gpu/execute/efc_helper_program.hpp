@@ -38,11 +38,11 @@ namespace prosper::gpu {
 
 // Dragon Quest VII Reimagined (PPSA17942).
 inline constexpr uint32_t kAgcEfcRectVertexA[] = {
-    0xbfa00001u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu, 0x887c6a00u,
-    0xbf800000u, 0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u, 0x81ea00c0u,
-    0xbf8cff0fu, 0x90fe6ac1u, 0x36040a81u, 0x2c060a81u, 0x7e000280u, 0x7e0202f2u, 0x7e040d02u,
-    0x7e060d03u, 0xd5410002u, 0x03ce04f4u, 0xd5410003u, 0x03ce06f4u, 0xf80008cfu, 0x01000302u,
-    0xbf810000u,
+    0xbfa00001u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu,
+    0x887c6a00u, 0xbf800000u, 0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u,
+    0x00000000u, 0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u, 0x36040a81u, 0x2c060a81u,
+    0x7e000280u, 0x7e0202f2u, 0x7e040d02u, 0x7e060d03u, 0xd5410002u, 0x03ce04f4u,
+    0xd5410003u, 0x03ce06f4u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
 };
 // Astro Bot (PPSA21564); also exports the layer (pos1.z = v8) for array targets.
 inline constexpr uint32_t kAgcEfcRectVertexB[] = {
@@ -79,10 +79,10 @@ inline bool is_agc_eliminate_fast_clear_operation(uint32_t cb_color_control,
                                                   const uint32_t* vertex_code,
                                                   size_t vertex_dwords) {
     namespace P = prosper::agc::Pm4;
-    const uint32_t mode = (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) &
-                          P::CB_COLOR_CONTROL_MODE_MASK;
+    const uint32_t mode =
+        (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
     return mode == P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR &&
            is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
 }
 
-}  // namespace prosper::gpu
+}   // namespace prosper::gpu
