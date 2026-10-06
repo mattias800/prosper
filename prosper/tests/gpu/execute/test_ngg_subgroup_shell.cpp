@@ -25,7 +25,6 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
-#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -39,27 +38,6 @@ using prosper::test::run_ngg_subgroup;
 namespace {
 
 using namespace prosper::test::ngg;
-
-using LaneEdit = std::function<void(NggLaneLaunch&, uint32_t& s3)>;
-
-// Launch records for every subgroup in `plan`, all dispatched with `waves` waves.
-std::vector<uint32_t> launch_records(const NggSubgroupPlan& plan, const NggSubgroupLimits& limits,
-                                     uint32_t waves, const LaneEdit& edit = {}) {
-    std::vector<uint32_t> words;
-    for (const NggSubgroup& subgroup : plan.subgroups)
-        for (uint32_t wave = 0; wave < waves; ++wave) {
-            uint32_t s3 = ngg_merged_wave_info(subgroup, wave);
-            if (waves != subgroup.waves) s3 = (s3 & 0x0fffffffu) | (waves << 28);
-            for (uint32_t lane = 0; lane < 64; ++lane) {
-                NggLaneLaunch launch = ngg_lane_launch(subgroup, limits, wave, lane);
-                uint32_t lane_s3 = s3;
-                if (edit) edit(launch, lane_s3);
-                words.insert(words.end(), launch.v, launch.v + 9);
-                words.push_back(lane_s3);
-            }
-        }
-    return words;
-}
 
 struct Primitive {
     uint32_t block = 0, slot = 0, layer = 0;
