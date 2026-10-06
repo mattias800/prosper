@@ -175,8 +175,8 @@ blocking-sync|prosper/frontends/shared/present/present_blit.cpp|vkWaitForFences 
 blocking-sync|prosper/tests/fixtures/render_runner.h|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT 10
 blocking-sync|prosper/tests/fixtures/render_runner.h|vkQueueWaitIdle 2
 blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
-file-size|prosper/frontends/shared/live/live_compute.cpp 14911  # raised by #4586: the compute storage seed/writeback and the raw-uvec4 writeback helper use the linear row-pitch rule (#4606, #4618) and a compute pass registers a renderer target's DCC plane; the rule lives in gpu/resources/linear_row_pitch.hpp and the DCC decode moved to shared/compute/sampled_dcc_fast_clear.hpp
-file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5533  # raised by #4586: a draw's storage image seeds and writes back a linear guest image at the linear row pitch (#4618)
+file-size|prosper/frontends/shared/live/live_compute.cpp 14869  # lowered: pack_live_target_r11g11b10 moved to live_target_r11g11b10.cpp, storage texel codec lifted into live_compute_storage_codec.hpp
+file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5501  # lowered: lazy sampled colour-target materializer moved to lazy_sampled_color_target.hpp
 # note: retain eleven upstream DST_SEL/refused-CS observation lines (#4290) alongside the finality reduction.
 # note #4328: 59 lines above that lowered cap connect real public-entry activity, borrowed private
 # helpers and checked draw/dependency boundaries; reusable issuance/version/consumer logic is in
@@ -194,7 +194,7 @@ file-size|prosper/src/hle/kernel/hle_kernel.cpp 5561
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
 # same-origin mapping windows under
 # the private HLE ledger lock; neither VMA remainder nor physical allocation size grants bytes.
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8760  # raised by #4586: unmapping retires an HLE-stated linear row pitch (VideoOut, AvPlayer)
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-table query templates moved to guest_mapping_queries.hpp
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
