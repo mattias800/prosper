@@ -78,10 +78,24 @@ bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords
 
     std::unordered_set<uint32_t> pcs;
     for (const auto& in : decoded) pcs.insert(in.pc);
+    // A conditional branch forward to or past the end of the retained words leaves the program on
+    // its taken edge and adds no instruction to the inventory. No such branch survives when a
+    // terminating else arm was appended above (that shape's one branch targets the arm), so here
+    // `decoded` is still the rdna2_walk prefix of the words: the list the live decode classified.
+    // Replay's re-derived answer therefore equals the live one whatever lies at the target, and
+    // the classifiers themselves end a path on such an edge. MOUSE: P.I. For Hire's alpha-tested
+    // fragment programs end this way, branching past their S_ENDPGM when no lane survives
+    // (#4556). An unconditional branch out of the words stays refused, as does any target inside
+    // them that is not an instruction.
+    const auto leaves_program = [&](const Rdna2Inst& in) {
+        const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
+        return in.opcode != kSoppOpcodeBranch && target >= int64_t(dwords);
+    };
     for (const auto& in : decoded) {
         unavailable_pc = in.pc;
         if (in.fmt == Rdna2Format::SOPP) {
-            if (sopp_opcode_is_direct_branch(in.opcode) && !pcs.contains(scalar_branch_target(in)))
+            if (sopp_opcode_is_direct_branch(in.opcode) &&
+                !pcs.contains(scalar_branch_target(in)) && !leaves_program(in))
                 return false;
             if (in.opcode == 0x11 || in.opcode == kSoppOpcodeTrap ||
                 (in.opcode >= kSoppOpcodeCbranchCdbgsys &&

@@ -47,15 +47,17 @@ ShaderOverrides load_shader_overrides();
 
 // ---- Dirty DCC fast-clear materialization (#3892) -----------------------------------------------
 //
-// Before a graphics span, turn each sampled retained target whose DCC metadata an ordered compute
-// span dirtied into its uniform clear colour (PROSPER_DCCLOG reports each decode). Moved out of the
-// submit callback verbatim.
+// Before a graphics span, turn each retained target the span samples or renders to, and whose DCC
+// metadata an ordered compute span dirtied, into its uniform clear colour (PROSPER_DCCLOG reports
+// each decode).
 // The submit callback's state that materialize_dirty_dcc_clears reads and writes, one reference per object.
 struct DccClearContext {
     RttCache& g_rtt;
     const std::vector<prosper::gpu::DrawItem> & items;
     RenderTiming& pending_timing;
     const bool& timing_enabled;
+    // PROSPER_RENDER_SCALE: a retained target may be this much smaller than the guest's.
+    uint32_t render_scale = 1;
 };
 void materialize_dirty_dcc_clears(DccClearContext& ctx);
 
