@@ -5334,6 +5334,8 @@ void GpuState::apply(const Pm4Command& c) {
                 }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
                 skip = predicated_jump_skips(pred_op, cond);
+            } else if (c.jump_pred && pred_cond_addr) {
+                report_unreadable_predicate_condition(pred_cond_addr);
             }
             if (PROSPER_ENV_ON("PROSPER_PREDLOG")) {
                 // A flat first-N cap answers only about start-up. On a routed GTA V boot the 3D

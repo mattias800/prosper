@@ -365,8 +365,8 @@ struct GpuState {
     // (0 = no window). A packet-predicated Jump inside the window is executed/skipped on the
     // condition value read at fold time. Cleared by the end form (addr == 0).
     uint64_t pred_cond_addr = 0;
-    // The window's raw predication op (sceAgcDcbSetPredication's third argument), the hardware
-    // SET_PREDICATION PRED_OP: 3 = BOOL64. Decides how the condition word is read; see Jump.
+    // The window's control word: PRED_OP plus the two flag arguments that carry PRED_BOOL
+    // (pack_set_predication_control, cond_indirect_buffer.hpp). Decides the polarity; see Jump.
     uint32_t pred_op = 0;
     // Jump recursion depth (a jump target could itself contain a jump; bounded to stop a cycle).
     uint32_t jump_depth = 0;
