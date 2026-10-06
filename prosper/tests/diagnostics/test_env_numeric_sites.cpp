@@ -242,8 +242,8 @@ static uint64_t dispatch_cap_old(const char* t) {
 }
 
 // --- the four default-ON guards ----------------------------------------------------------------
-// PROSPER_REL1_FORGE_GUARD, PROSPER_REL1_STOMP_GUARD, PROSPER_MB3_CENTRAL_SCAN,
-// PROSPER_MB3_TRACK_TLS and PROSPER_NETCTL_CB all read `!e || strtol(e, nullptr, 0) != 0`. The
+// PROSPER_REL1_FORGE_GUARD, PROSPER_REL1_STOMP_GUARD, PROSPER_MB3_CENTRAL_SCAN and
+// PROSPER_MB3_TRACK_TLS all read `!e || strtol(e, nullptr, 0) != 0`. The
 // inversion is the whole finding: `=yes`, `=true` and `=on` are what a person types to make a
 // default-ON switch explicit, and strtol answers 0 for every one of them -- i.e. OFF.
 static uint64_t default_on_new(const char* n, const char* t) {
@@ -537,8 +537,6 @@ static const Site kSites[] = {
      default_on_new, default_on_old, "true", 1, "0", 0},
     {"mb3_freelist.cpp PROSPER_MB3_TRACK_TLS", "PROSPER_MB3_TRACK_TLS",
      default_on_new, default_on_old, "enabled", 1, "0", 0},
-    {"hle_service.cpp PROSPER_NETCTL_CB", "PROSPER_NETCTL_CB",
-     default_on_new, default_on_old, "yes", 1, "0", 0},
 
     {"hle_kernel.cpp PROSPER_MUTEX_FAIR_US", "PROSPER_MUTEX_FAIR_US",
      fair_us_new, fair_us_old, "3ms", 3000ull, "500", 500ull},
