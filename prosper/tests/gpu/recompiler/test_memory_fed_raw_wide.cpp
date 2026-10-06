@@ -294,6 +294,9 @@ TEST(MemoryFedRawWide, Contract) {
               join_before_table.by_fetch_pc(8u) &&
               join_before_table.by_fetch_pc(8u)->gpu_addr == address + 32u,
           "a branch landing at the source joins ahead of it");
+    auto lands_on_load = code;
+    lands_on_load.insert(lands_on_load.begin(), 0xbf840007u);   // s_cbranch_scc0 -> the x4 (pc8)
+    CHECK(proof(lands_on_load).empty(), "a branch landing on the load itself stays unproven");
     auto lands_between = code;
     lands_between.insert(lands_between.begin(), 0xbf840004u);   // s_cbranch_scc0 -> s_lshl (pc5)
     CHECK(proof(lands_between).empty(), "a branch landing between source and load stays unproven");

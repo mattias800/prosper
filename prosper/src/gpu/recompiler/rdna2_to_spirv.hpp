@@ -226,6 +226,10 @@ std::vector<RawWideLoadDiagnosis>
 rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
+// The entry-pointer stage of the register-offset proof: each x4/x8 load evaluated with SOFFSET
+// nulled, its entry pointer required only UNTIL the load (it reads a per-PC snapshot afterwards).
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_entry_loads(const std::vector<Rdna2Inst>& instructions);
 // Exact immediate x4/x8 read points requiring an owned same-fold observation: entry pointers
 // may change after the fetch, or the fetched words select a proven register-offset child.
 std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(

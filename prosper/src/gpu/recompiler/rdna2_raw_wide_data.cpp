@@ -847,9 +847,8 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     return proven_immediate_wide_data_loads(ins, false);
 }
 
-std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins, std::vector<uint32_t>* scalar_source_pcs) {
-    if (scalar_source_pcs) scalar_source_pcs->clear();
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_entry_loads(const std::vector<Rdna2Inst>& ins) {
     // Reuse the entry-pointer, forward-CFG, bypass-reader and guest-write proofs. Only the
     // candidate's addressing mode changes here; its loaded-word lifetime is unchanged.
     auto immediate = ins;
@@ -857,7 +856,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
         if (load.fmt == Rdna2Format::SMEM &&
             (load.opcode == 0x2u || load.opcode == 0x3u))
             load.src[1] = {OperandKind::Special, 125};
-    const auto entry_proven = proven_immediate_wide_data_loads(immediate, false, true);
+    return proven_immediate_wide_data_loads(immediate, false, true);
+}
+
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                          std::vector<uint32_t>* scalar_source_pcs) {
+    if (scalar_source_pcs) scalar_source_pcs->clear();
+    const auto entry_proven = rdna2_proven_raw_register_wide_entry_loads(ins);
     const auto owned_parents = proven_immediate_wide_data_loads(ins, true);
     std::vector<uint32_t> proven;
     for (size_t i = 0; i < ins.size(); ++i) {
