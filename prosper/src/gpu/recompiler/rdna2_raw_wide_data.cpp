@@ -767,8 +767,14 @@ rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins) {
 // buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
 // admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
 // an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
-static std::vector<uint32_t> proven_immediate_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins, bool owned_read_point) {
+// `pointer_until_read` ends the entry-pointer lifetime at the load instead of the program end. Only
+// the register-offset path asks for it: its load reads the fold's exact per-PC snapshot and never
+// the base register again, and forward-only control means the load runs at most once, so only
+// writes BEFORE it can change which bytes it reads (#4578 follow-up). The strict immediate set and
+// the owned read points keep their own lifetimes, so their consumers are unchanged.
+static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                                              bool owned_read_point,
+                                                              bool pointer_until_read = false) {
     std::vector<uint32_t> proven;
     if (ins.empty()) return proven;
     std::unordered_map<uint32_t, size_t> by_pc;
@@ -822,7 +828,7 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(
                         by_pc.at(static_cast<uint32_t>(target))))
                     stable_entry_pointer = false;
             }
-            if (!owned_read_point || in.pc < load.pc)
+            if ((!owned_read_point && !pointer_until_read) || in.pc < load.pc)
                 for_each_scalar_write(in, [&](int base, uint32_t width) {
                     if (base >= 0 && base <= load.src[0].value + 1 &&
                         base + static_cast<int>(width) > load.src[0].value)
@@ -841,9 +847,8 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     return proven_immediate_wide_data_loads(ins, false);
 }
 
-std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins, std::vector<uint32_t>* scalar_source_pcs) {
-    if (scalar_source_pcs) scalar_source_pcs->clear();
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_entry_loads(const std::vector<Rdna2Inst>& ins) {
     // Reuse the entry-pointer, forward-CFG, bypass-reader and guest-write proofs. Only the
     // candidate's addressing mode changes here; its loaded-word lifetime is unchanged.
     auto immediate = ins;
@@ -851,7 +856,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
         if (load.fmt == Rdna2Format::SMEM &&
             (load.opcode == 0x2u || load.opcode == 0x3u))
             load.src[1] = {OperandKind::Special, 125};
-    const auto entry_proven = rdna2_proven_raw_immediate_wide_data_loads(immediate);
+    return proven_immediate_wide_data_loads(immediate, false, true);
+}
+
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                          std::vector<uint32_t>* scalar_source_pcs) {
+    if (scalar_source_pcs) scalar_source_pcs->clear();
+    const auto entry_proven = rdna2_proven_raw_register_wide_entry_loads(ins);
     const auto owned_parents = proven_immediate_wide_data_loads(ins, true);
     std::vector<uint32_t> proven;
     for (size_t i = 0; i < ins.size(); ++i) {
@@ -933,9 +945,21 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 bool entry_at_read = true;
                 for (size_t prefix = 0; prefix < j && entry_at_read; ++prefix) {
                     const auto& before = ins[prefix];
-                    if (rdna2_may_write_guest_memory(before) ||
-                        (before.fmt == Rdna2Format::SOPP &&
-                         sopp_opcode_is_direct_branch(before.opcode)) ||
+                    // Control is forward-only (entry_proven). A branch before the source matters
+                    // only if it lands after the source and at or before the load: then the load
+                    // can run without this read. One landing at or before the source joins
+                    // ahead of it; one landing past the load skips both, which the wide load's
+                    // own bypass proof covers. Every earlier instruction is still checked for
+                    // guest writes and source-pointer writes, on every path.
+                    bool lands_inside = false;
+                    if (before.fmt == Rdna2Format::SOPP &&
+                        sopp_opcode_is_direct_branch(before.opcode)) {
+                        const int64_t target =
+                            static_cast<int64_t>(before.pc) + before.len_dwords + before.simm16;
+                        lands_inside = target > static_cast<int64_t>(writer.pc) &&
+                                       target <= static_cast<int64_t>(load.pc);
+                    }
+                    if (rdna2_may_write_guest_memory(before) || lands_inside ||
                         rdna2_may_write_unnamed_register_or_leave_cfg(before)) {
                         entry_at_read = false;
                         break;
@@ -954,6 +978,9 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 // realization still requires mapped current bytes for this draw's pointer.
                 needed &= ~writes;
                 sources.push_back(writer.pc);
+                // As for an owned parent: once every selector word resolves, earlier control is
+                // irrelevant. A word still needed keeps the walk, and its branch refusal, going.
+                if (needed.none()) break;
                 continue;
             }
             // Scalar moves and B32 arithmetic are per-draw data, rather than masks or conditional
