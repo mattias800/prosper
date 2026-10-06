@@ -2470,12 +2470,21 @@ struct SpirvCompute {
     // shared corner is v0 the rotation is the identity, so nothing that renders correctly today
     // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
-            const FragmentInterpolationLayout& layout, bool capture_geometry_position,
-            bool synthesize_rect = false, bool publish_primitive_id = false) {
+        const FragmentInterpolationLayout& layout, bool capture_geometry_position,
+        bool synthesize_rect = false, bool publish_primitive_id = false,
+        uint32_t layer_input_location = FragmentInterpolationLayout::kUnusedLocation) {
         if ((!layout.requires_geometry && !synthesize_rect) || !layout.valid) return {};
         // The collector's primitive key covers a one-input/one-output triangle, not RectList's
         // two generated children. Native geometry emission is unchanged when this is false.
         if (publish_primitive_id && synthesize_rect) return {};
+        // The merged-NGG raster commit (#3135 P3) delivers a primitive's layer as a uint input at
+        // `layer_input_location`, equal on all three vertices; this stage writes it to gl_Layer.
+        // RectList synthesis never carries one, and the location must not shadow an attribute.
+        const bool forward_layer =
+            layer_input_location != FragmentInterpolationLayout::kUnusedLocation;
+        if (forward_layer && (synthesize_rect || layer_input_location >= 32u ||
+                              (layout.attribute_mask & (1u << layer_input_location))))
+            return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
@@ -2498,6 +2507,11 @@ struct SpirvCompute {
         const uint32_t primitive_out = publish_primitive_id ? id() : 0;
         const uint32_t primitive_in_ptr = publish_primitive_id ? id() : 0;
         const uint32_t primitive_out_ptr = publish_primitive_id ? id() : 0;
+        const uint32_t layer_in = forward_layer ? id() : 0, layer_out = forward_layer ? id() : 0;
+        const uint32_t t_layer_inputs = forward_layer ? id() : 0;
+        const uint32_t layer_in_ptr = forward_layer ? id() : 0;
+        const uint32_t layer_in_element_ptr = forward_layer ? id() : 0;
+        const uint32_t layer_out_ptr = forward_layer ? id() : 0;
 
         std::array<uint32_t, 32> attribute_inputs{}, attribute_outputs{};
         std::array<std::array<uint32_t, 3>, 32> parameter_outputs{};
@@ -2574,6 +2588,12 @@ struct SpirvCompute {
             put(deco, Op_Decorate, {primitive_out, Dec_BuiltIn, 7});
             iface.push_back(primitive_in); iface.push_back(primitive_out);
         }
+        if (forward_layer) {
+            put(deco, Op_Decorate, {layer_in, Dec_Location, layer_input_location});
+            put(deco, Op_Decorate, {layer_out, Dec_BuiltIn, BI_Layer});
+            iface.push_back(layer_in);
+            iface.push_back(layer_out);
+        }
 
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
@@ -2589,6 +2609,14 @@ struct SpirvCompute {
         }
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
+        if (forward_layer) {
+            put(types, Op_TypeArray, {t_layer_inputs, t_u32, uconst(3)});
+            put(types, Op_TypePointer, {layer_in_ptr, SC_Input, t_layer_inputs});
+            put(types, Op_TypePointer, {layer_in_element_ptr, SC_Input, t_u32});
+            put(types, Op_TypePointer, {layer_out_ptr, SC_Output, t_i32});
+            put(types, Op_Variable, {layer_in_ptr, layer_in, SC_Input});
+            put(types, Op_Variable, {layer_out_ptr, layer_out, SC_Output});
+        }
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
         put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
@@ -2615,6 +2643,14 @@ struct SpirvCompute {
         put(code, Op_Label, {label}); cur_block = label;
         const uint32_t primitive_value = publish_primitive_id ? id() : 0;
         if (publish_primitive_id) put(code, Op_Load, {t_i32, primitive_value, primitive_in});
+        uint32_t layer_value = 0;
+        if (forward_layer) {
+            const uint32_t pointer = id(), bits = id();
+            layer_value = id();
+            put(code, Op_AccessChain, {layer_in_element_ptr, pointer, layer_in, uconst(0)});
+            put(code, Op_Load, {t_u32, bits, pointer});
+            put(code, Op_Bitcast, {t_i32, layer_value, bits});
+        }
 
         std::array<std::array<uint32_t, 3>, 32> attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
@@ -2744,6 +2780,7 @@ struct SpirvCompute {
         const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
         for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
             if (publish_primitive_id) put(code, Op_Store, {primitive_out, primitive_value});
+            if (forward_layer) put(code, Op_Store, {layer_out, layer_value});
             const uint32_t position = slot_of(vertex, positions, rect_position);
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
