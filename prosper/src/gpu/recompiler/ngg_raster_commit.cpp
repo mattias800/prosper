@@ -21,7 +21,8 @@ static_assert(kNggRasterDescriptorSet == kNggShellDescriptorSet &&
 
 constexpr uint32_t kGuestWaveLanes = 64;
 constexpr uint32_t kMaxWaves = 4;
-// Vulkan's guaranteed maxFramebufferLayers is 256; a larger value cannot name a real target.
+// The largest layer count a target can have: gfx10's CB_COLOR*_VIEW.SLICE_MAX is 11 bits, and 2048 is
+// also RADV's maxFramebufferLayers (Vulkan only guarantees 256, so a device may allow fewer).
 constexpr uint32_t kMaxLayerSlices = 2048;
 constexpr uint32_t kIndexBits = 0x1ffu;   // one 9-bit PRIM vertex index
 constexpr uint32_t kPrimNullBit = 31;
@@ -105,6 +106,12 @@ NggOutputTopology ngg_output_topology(uint32_t vgt_gs_out_prim_type) {
 }
 
 NggLayerRoute select_ngg_layer_route(const NggLayerRouteQuery& query, std::string* refusal) {
+    if (refusal) refusal->clear();
+    if (query.interpolation_geometry_required &&
+        query.topology != NggOutputTopology::TriangleList) {
+        if (refusal) *refusal = "reason=ngg-interpolation-geometry-needs-triangles";
+        return NggLayerRoute::None;
+    }
     if (!query.layer_from_pos1) return NggLayerRoute::None;
     if (query.interpolation_geometry_required && query.geometry_shader)
         return NggLayerRoute::InterpolationGeometry;
@@ -134,11 +141,25 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
         if (target < kExpTargetParam0 || target >= kExpTargetParam0 + 32u ||
             layout.first_param_word == kNggRecordAbsent)
             return fail(refusal, "ngg-raster-config", "cause=param-target");
+    // Every word the stage reads must lie inside one record: POS0, POS1 when present, each PARAM.
+    // 64-bit arithmetic, so an absurd offset cannot wrap into range.
+    const auto fits = [&](uint32_t first_word) {
+        return uint64_t{first_word} + 4u <= layout.words_per_lane;
+    };
+    bool layout_fits = fits(kNggRecordPos0Word) &&
+                       (layout.pos1_word == kNggRecordAbsent || fits(layout.pos1_word));
+    for (uint32_t k = 0; k < layout.param_targets.size(); ++k)
+        layout_fits =
+            layout_fits && fits(layout.first_param_word) &&
+            uint64_t{layout.first_param_word} + uint64_t{4} * (k + 1u) <= layout.words_per_lane;
+    if (!layout_fits) return fail(refusal, "ngg-raster-config", "cause=layout-out-of-record");
     const bool read_layer = config.layer_from_pos1;
     if (read_layer && (layout.pos1_word == kNggRecordAbsent || !(layout.pos1_channels & 4u)))
         return fail(refusal, "ngg-layer-without-pos1");
     if (read_layer && config.route == NggLayerRoute::None)
         return fail(refusal, "ngg-layer-route-unavailable", "cause=route-none");
+    if (config.route == NggLayerRoute::InterpolationGeometry && corners != 3)
+        return fail(refusal, "ngg-interpolation-geometry-needs-triangles");
 
     NggRasterCommitInterface published;
     published.vertices_per_primitive = corners;
@@ -205,10 +226,15 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
 
     const uint32_t verts_alloc = header_word(kNggHeaderVertsAlloc);
     const uint32_t prims_alloc = header_word(kNggHeaderPrimsAlloc);
-    const uint32_t block_ok =
+    // An allocation larger than the block's records would lose the primitives that have none, so
+    // it invalidates the block (counted) rather than dropping them silently.
+    const uint32_t fits_block = b.land(b.ucmp(Op_ULessThanEqual, verts_alloc, b.uconst(lanes)),
+                                       b.ucmp(Op_ULessThanEqual, prims_alloc, b.uconst(lanes)));
+    const uint32_t block_ok = b.land(
+        fits_block,
         b.land(b.ucmp(Op_IEqual, header_word(kNggHeaderAllocRequests), b.uconst(1)),
                b.land(b.ucmp(Op_IEqual, header_word(kNggHeaderStrayRequests), b.uconst(0)),
-                      b.ucmp(Op_IEqual, header_word(kNggHeaderLaunchMismatches), b.uconst(0))));
+                      b.ucmp(Op_IEqual, header_word(kNggHeaderLaunchMismatches), b.uconst(0)))));
     const uint32_t in_range = b.ucmp(Op_ULessThan, thread, prims_alloc);
     const uint32_t prim_record = record(thread);
     const uint32_t prim_flags = word_at(prim_record, kNggRecordFlagsWord);

@@ -9,7 +9,9 @@
 //
 // CONNECTIVITY. Slot p of a block is drawn only when ALL of these hold, otherwise all its corners
 // collapse onto one point outside the clip volume:
-//   * the block is valid: alloc_requests == 1, stray_requests == 0, launch_mismatches == 0;
+//   * the block is valid: alloc_requests == 1, stray_requests == 0, launch_mismatches == 0, and
+//     verts_alloc and prims_alloc both fit the block's 64W records (a larger allocation would lose
+//     primitives that have no record, so the whole block is refused and counted instead);
 //   * p < prims_alloc;
 //   * thread p exported PRIM, and its null bit 31 is clear;
 //   * each of the K 9-bit indices is below verts_alloc and below 64W, and names a thread that
@@ -19,10 +21,16 @@
 // CORNER ORDER. Vulkan's provoking vertex is the first. Under PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST
 // the guest's provoking vertex is its last, so output corner c takes guest corner (c + K - 1) % K:
 // a rotation, which keeps a triangle's winding. Flat attributes then come from the right vertex.
+// For a line this swaps the endpoints. CONFIDENCE: MED -- it is the inference that the provoking
+// endpoint must be Vulkan's first; it also moves which endpoint pixel the half-open line rule
+// leaves out, and no test (nor hardware evidence) pins that pixel.
 //
 // THE LAYER. When `layer_from_pos1` (PA_CL_VS_OUT_CNTL.USE_VTX_RENDER_TARGET_INDX) is set, the layer
 // is POS1.z's raw bits of the guest's PROVOKING vertex, and every corner carries that one value. A
-// layer at or above `layer_slices` culls the primitive and is counted. How the layer reaches
+// layer at or above `layer_slices` culls the primitive and is counted. CONFIDENCE: LOW on cull
+// versus clamp: the hardware may clamp an out-of-range index to the view's SLICE_MAX instead. Culling
+// is the fail-visible choice (the counter names it); a title that depends on the clamp would show it.
+// How the layer reaches
 // gl_Layer is the route (`select_ngg_layer_route`):
 //   * ShaderOutputLayer   the vertex stage writes BuiltIn Layer (SPV_EXT_shader_viewport_index_layer;
 //                         the device must enable VK_EXT_shader_viewport_index_layer);
@@ -75,6 +83,7 @@ enum class NggLayerRoute : uint8_t {
 };
 
 struct NggLayerRouteQuery {
+    NggOutputTopology topology = NggOutputTopology::TriangleList;
     bool layer_from_pos1 = false;   // USE_VTX_RENDER_TARGET_INDX
     bool interpolation_geometry_required = false;
     bool shader_output_layer = false;   // host capability: vertex-stage gl_Layer is enabled
@@ -82,8 +91,12 @@ struct NggLayerRouteQuery {
 };
 
 // The route, in the order: interpolation geometry (when it is required anyway), shader output
-// layer, forwarding geometry. Returns None with `refusal` set to "reason=ngg-layer-route-unavailable"
-// when the layer is read and no route exists.
+// layer, forwarding geometry. Returns None with an EMPTY `refusal` when the layer is not read and
+// nothing else is wrong. Returns None with `refusal` set to "reason=ngg-layer-route-unavailable" when
+// the layer is read and no route exists, and with "reason=ngg-interpolation-geometry-needs-triangles"
+// whenever the pixel shader needs the interpolation geometry stage for a line list: that stage's
+// input is Triangles, and no other route can supply the AMD vertex parameters it exists for
+// (the ordinary draw path refuses the same case, gpu_execute.hpp's triangle_topology).
 NggLayerRoute select_ngg_layer_route(const NggLayerRouteQuery& query, std::string* refusal);
 
 struct NggRasterCommitConfig {
