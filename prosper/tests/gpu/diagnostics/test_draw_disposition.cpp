@@ -19,12 +19,14 @@
 #include "diagnostics/perf/perf_ledger.hpp"
 
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace prosper::gpu;
 
@@ -170,21 +172,28 @@ TEST(DrawDisposition, Contract) {
     std::mutex mutex;
     std::condition_variable changed;
     bool ready = false, release = false, worker_finished = false;
+    const uint64_t seen_before_worker = c.seen();
+    // The worker runs a REAL pass: per-pass figures are thread-local, so a pass must open and
+    // report on its own thread. Counting on the worker and reporting from this thread would read
+    // this thread's empty counters, and the joined-pass check below could then never fail.
     std::thread worker([&] {
-        c.note_seen();
-        std::unique_lock lock(mutex);
-        ready = true;
-        changed.notify_one();
-        changed.wait(lock, [&] { return release; });
-        lock.unlock();
-        c.note_recorded();
-        lock.lock();
+        {
+            DrawDispositionPassScope pass(1);
+            std::unique_lock lock(mutex);
+            ready = true;
+            changed.notify_one();
+            changed.wait(lock, [&] { return release; });
+            lock.unlock();
+            c.note_recorded();
+        }   // the worker's own report_pass(), inside the capture around the join below
+        std::scoped_lock lock(mutex);
         worker_finished = true;
     });
     {
         std::unique_lock lock(mutex);
         changed.wait(lock, [&] { return ready; });
-        check(!worker_finished && c.pass_seen_for_scope() == 1,
+        // The process total sees the worker's in-flight draw.
+        check(!worker_finished && c.seen() == seen_before_worker + 1,
               "counter-producing worker remains live with an in-flight pass before flush");
     }
     const uint64_t exit_before = unaccounted();
@@ -200,8 +209,10 @@ TEST(DrawDisposition, Contract) {
         release = true;
     }
     changed.notify_one();
-    worker.join();
-    check(capture_pass().empty() && unaccounted() == exit_before,
+    // Capture the worker's own pass report (stderr is process-wide), so a worker pass that lost
+    // its recorded draw prints UNACCOUNTED here and raises the counter.
+    const std::string worker_report = capture_report([&] { worker.join(); });
+    check(worker_report.empty() && unaccounted() == exit_before,
           "joined healthy pass retains quiet completed-pass accounting");
     const std::string joined = capture_report([&] { c.report_totals(); });
     check(joined.find("snapshot-delta=") == std::string::npos &&
@@ -209,4 +220,178 @@ TEST(DrawDisposition, Contract) {
           "balanced post-join loads still require an explicit quiescence proof");
 
     EXPECT_EQ(failures, 0);
+}
+
+// --- seen is counted at the PASS ENTRY (#4643) ----------------------------------------------------
+//
+// The blind spot this closes: `seen` used to be counted inside the per-draw loop, so a pass that
+// returned before reaching it left seen = recorded = dropped = 0 and balanced trivially. Kena's
+// 64^3 volume draws arrived with two colour targets, the backend refused every such pass before its
+// loop, and the draws were lost for weeks with `unaccounted-draws` silent.
+//
+// `synthetic_pass` is that shape: a scope taking the draws handed to the pass, then an early return
+// before any per-draw loop -- with or without naming why. Mutation proofs (run by hand, recorded in
+// the PR): making the scope's constructor count nothing turns the unnamed arm red (no UNACCOUNTED);
+// making its destructor ignore `refuse()` turns the named arm red (UNACCOUNTED instead of a drop).
+namespace {
+uint64_t unaccounted_counter() {
+    namespace perf = prosper::diagnostics::perf;
+    return perf::ledger().counters[static_cast<size_t>(perf::Counter::DrawsUnaccounted)].load();
+}
+uint64_t backend_reason_counter(DrawDrop reason) {
+    namespace perf = prosper::diagnostics::perf;
+    return perf::ledger()
+        .drop_reasons[static_cast<size_t>(perf::kFirstBackendDropReason) +
+                      static_cast<size_t>(reason)]
+        .load();
+}
+std::vector<uint8_t> synthetic_pass(size_t draws, bool name_the_refusal) {
+    std::vector<uint8_t> out;
+    DrawDispositionPassScope disposition(draws);
+    if (name_the_refusal) return disposition.refuse(DrawDrop::VolumeMultiTarget, out);
+    return out;   // the bug's shape: an early return that names nothing
+}
+}   // namespace
+
+TEST(DrawDisposition, EarlyReturnWithoutReasonIsUnaccounted) {
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter(), seen_before = c.seen();
+    const std::string out = capture_report([] { (void)synthetic_pass(3, false); });
+    EXPECT_EQ(c.seen() - seen_before, 3u) << "the draws handed to the pass are seen at its entry";
+    EXPECT_EQ(unaccounted_counter() - before, 3u)
+        << "a refusal that names no reason is UNACCOUNTED, raising unaccounted-draws";
+    EXPECT_NE(out.find("UNACCOUNTED=3"), std::string::npos) << out;
+    EXPECT_NE(out.find("BLACK-PASS"), std::string::npos) << out;
+}
+
+TEST(DrawDisposition, EarlyReturnWithNamedReasonIsADrop) {
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter();
+    const uint64_t named = c.dropped(DrawDrop::VolumeMultiTarget);
+    const uint64_t perf_named = backend_reason_counter(DrawDrop::VolumeMultiTarget);
+    const std::string out = capture_report([] { (void)synthetic_pass(3, true); });
+    EXPECT_EQ(unaccounted_counter(), before) << "a named refusal is accounted, not UNACCOUNTED";
+    EXPECT_EQ(c.dropped(DrawDrop::VolumeMultiTarget) - named, 3u)
+        << "every draw the refused pass abandoned is dropped under the named reason";
+    EXPECT_EQ(backend_reason_counter(DrawDrop::VolumeMultiTarget) - perf_named, 3u)
+        << "...and reaches the dropped-draws alarm as backend/volume-multi-target";
+    EXPECT_NE(out.find("volume-multi-target=3"), std::string::npos) << out;
+    EXPECT_EQ(out.find("UNACCOUNTED"), std::string::npos) << out;
+}
+
+TEST(DrawDisposition, RefusalNamesOnlyTheRemainder) {
+    // A refusal after some draws were already recorded or dropped names only what is left, so a
+    // named reason can never double-count a draw another route already accounted for.
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter();
+    const uint64_t named = c.dropped(DrawDrop::PressureFlush);
+    const uint64_t shader = c.dropped(DrawDrop::ShaderRejected);
+    (void)capture_report([&] {
+        DrawDispositionPassScope disposition(6);
+        c.note_recorded(2);
+        c.note_dropped(DrawDrop::ShaderRejected);
+        disposition.refuse(DrawDrop::PressureFlush);
+    });
+    EXPECT_EQ(c.dropped(DrawDrop::PressureFlush) - named, 3u);
+    EXPECT_EQ(c.dropped(DrawDrop::ShaderRejected) - shader, 1u);
+    EXPECT_EQ(unaccounted_counter(), before);
+}
+
+TEST(DrawDisposition, RebatchAndPreflightRefusalBalance) {
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter();
+    // A merged-NGG draw expands into three run draws; all three are recorded.
+    (void)capture_report([&] {
+        DrawDispositionPassScope disposition(1);
+        disposition.rebatch(1, 3);
+        c.note_recorded(3);
+    });
+    EXPECT_EQ(unaccounted_counter(), before) << "an expansion re-bases seen to the run draws";
+    // ...and an expansion to fewer draws re-bases downward without wrapping.
+    (void)capture_report([&] {
+        DrawDispositionPassScope disposition(4);
+        disposition.rebatch(4, 2);
+        c.note_recorded(2);
+    });
+    EXPECT_EQ(unaccounted_counter(), before) << "a shrinking rebatch subtracts exactly";
+    // A logical batch refused before any pass: one self-contained, accounted pass.
+    const uint64_t order = c.dropped(DrawDrop::ResourceOrder);
+    (void)capture_report([] { refuse_draw_pass(5, DrawDrop::ResourceOrder); });
+    EXPECT_EQ(c.dropped(DrawDrop::ResourceOrder) - order, 5u);
+    EXPECT_EQ(unaccounted_counter(), before);
+}
+
+TEST(DrawDisposition, CaptureSuppressionCountsNothing) {
+    // An F9/menu capture or a diagnostic replay is not live execution (#3951): even an unnamed
+    // refusal on a suppressed thread must not raise the alarm being investigated.
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter(), seen_before = c.seen();
+    {
+        const prosper::diagnostics::perf::SuppressDrawDropCounting capture;
+        (void)capture_report([] { (void)synthetic_pass(4, false); });
+    }
+    EXPECT_EQ(unaccounted_counter(), before);
+    EXPECT_EQ(c.seen(), seen_before);
+    // The positive control: the same pass outside the scope does count, so the zero above is the
+    // suppression and not a census that never ran.
+    (void)capture_report([] { (void)synthetic_pass(4, false); });
+    EXPECT_EQ(unaccounted_counter() - before, 4u);
+}
+
+TEST(DrawDisposition, ConcurrentPassesDoNotChargeEachOther) {
+    // Two passes overlap the way concurrent render_draws_rgba callers do: both have counted their
+    // entry draws before either reports (seen is counted before the persistent-resource lock).
+    // With a SHARED per-pass counter the first report read seen=4 recorded=1 UNACCOUNTED=3 and the
+    // second a negative -- phantom drops in a run that lost nothing (backend_persistent_resource_lock).
+    auto& c = draw_disposition_census();
+    const uint64_t before = unaccounted_counter();
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool a_entered = false, b_done = false;
+    std::thread a([&] {
+        DrawDispositionPassScope disposition(3);
+        {
+            std::unique_lock lock(mutex);
+            a_entered = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return b_done; });
+        }
+        c.note_recorded(3);
+    });
+    std::thread b([&] {
+        {
+            std::unique_lock lock(mutex);
+            changed.wait(lock, [&] { return a_entered; });
+        }
+        {
+            DrawDispositionPassScope disposition(1);
+            c.note_recorded(1);
+        }
+        std::scoped_lock lock(mutex);
+        b_done = true;
+        changed.notify_all();
+    });
+    (void)capture_report([&] {
+        b.join();
+        a.join();
+    });
+    EXPECT_EQ(unaccounted_counter(), before)
+        << "a pass reports only its own thread's draws, whatever overlaps it";
+}
+
+TEST(DrawDisposition, RefusedPassesStayOutOfPassCost) {
+    // The pass-cost buckets measure how much of a pass is FIXED. A pass refused before it built
+    // anything -- including the ~0 ns whole-batch preflight -- is not a sample of that, and would
+    // drag the one-draw bucket's mean toward zero (GTA V refuses a batch per frame).
+    auto& c = draw_disposition_census();
+    const uint64_t before = c.timed_passes();
+    (void)capture_report([] { (void)synthetic_pass(2, true); });
+    (void)capture_report([] { refuse_draw_pass(3, DrawDrop::ResourceOrder); });
+    EXPECT_EQ(c.timed_passes(), before) << "a named refusal is not a timed pass";
+    // Positive control: a pass that ran is timed, so the zero above is the exclusion.
+    (void)capture_report([&] {
+        DrawDispositionPassScope pass(2);
+        c.note_recorded(2);
+    });
+    EXPECT_EQ(c.timed_passes(), before + 1);
 }

@@ -1,0 +1,18 @@
+# PPSA16901: EULA gate, then ONE Down on the title screen to switch to Tomb Raider II, then
+# select the ring's default item ("Lara's Home"). This is the scene the rung-3 claim and the
+# committed Croft Manor screenshots are about: brick walls, timber steps, hedges, Lara, Winston.
+#
+# reach-gameplay.pad has the same presses without the Down. It was written to enter Tomb Raider I's
+# home, arrived on Tomb Raider II when the status doc was written, and arrives on Tomb Raider I on
+# today's builds, where the level renders as exploded geometry (#4637). A timed route's presses
+# land on different screens when the frame rate changes; this one states its destination.
+#
+# VALIDATED 2026-10-06, once (1 of 1), frontend prosper-app on Linux / RADV, on a loaded machine.
+# The presses landed on these flips, for whoever converts this to flip anchors:
+#   Down 278-757 (EULA), Cross 878-997, Down 2363-2410 (title screen), Cross 2710-2830,
+#   Cross 3190-3278. The level is on screen by flip 3800.
+6-14:down
+16-18:cross
+41-42:down
+47-49:cross
+55-57:cross

@@ -945,6 +945,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             return prosper::gpu::correlate_compression_metadata_kind(request, depth, color);
         });
 
+    prosper::gpu::set_live_rtt_dcc_plane_registrar(
+        [](uint64_t addr, uint64_t metadata_addr, uint64_t metadata_bytes) {
+            auto surface = g_rtt.find(addr);
+            if (surface == g_rtt.end() || !metadata_addr || !metadata_bytes) return;
+            surface->second.dcc_metadata_addr = metadata_addr;
+            surface->second.dcc_metadata_bytes = metadata_bytes;
+            surface->second.dcc_guest_origins.observe(metadata_addr, metadata_bytes);
+        });
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
         auto it = g_rtt.find(addr);
@@ -966,6 +974,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         return any_volume_target(g_rtt, [&](uint64_t base, const RttSurf& surface) {
             return unpublished_volume_may_overlap(base, surface.volume_guest_bytes, addr, bytes);
         });
+    });
+    // #4625: a consumer that needs guest bytes asks for the claimed volumes it overlaps to be
+    // written back. Each is read back, tiled into the producer's native layout, and its claim
+    // released; the write notification then retires the retained image like any guest write.
+    prosper::gpu::set_renderer_volume_publisher([invalidate_ds](uint64_t addr, uint64_t bytes) {
+        using prosper::gpu::VolumePublication;
+        drain_guest_gpu_writes(g_rtt, invalidate_ds);
+        std::vector<uint64_t> bases;
+        any_volume_target(g_rtt, [&](uint64_t base, const RttSurf& surface) {
+            if (unpublished_volume_may_overlap(base, surface.volume_guest_bytes, addr, bytes))
+                bases.push_back(base);
+            return false;
+        });
+        if (bases.empty()) return VolumePublication::NothingToPublish;
+        for (const uint64_t base : bases) {
+            RttSurf& surface = g_rtt[base];
+            auto source = prosper::frontend::volume_publication_source(base, surface);
+            const auto [alias, alias_bytes] = prosper::frontend::volume_publication_alias(
+                g_rtt, base, surface.volume_guest_bytes,
+                [](const RttSurf& other) { return cpu_rtt_guest_write_bytes(other, nullptr); },
+                unpublished_volume_may_overlap);
+            source.overlapping_alias = alias != 0;
+            const VolumePublication result = prosper::gpu::publish_volume_to_guest(
+                source,
+                [&](std::vector<uint8_t>& linear) {
+                    std::string error;
+                    return prosper::test::readback_persistent_color_target(
+                        base, surface.w, surface.h, surface.format, linear, error,
+                        surface.volume_depth);
+                },
+                reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(base)));
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16u)
+                std::fprintf(stderr,
+                             "[render-volume] publish target=0x%llx bytes=%llu %ux%ux%u "
+                             "tile=%u alias=0x%llx+%llu result=%s\n",
+                             static_cast<unsigned long long>(base),
+                             static_cast<unsigned long long>(surface.volume_guest_bytes), surface.w,
+                             surface.h, surface.volume_depth, surface.volume_layout.tile_mode,
+                             static_cast<unsigned long long>(alias),
+                             static_cast<unsigned long long>(alias_bytes),
+                             prosper::gpu::volume_publication_name(result));
+            if (result != VolumePublication::Published) return result;
+            // Guest memory now holds every slice. The queued notification erases this entry and
+            // invalidates the retained image at the next drain.
+            prosper::frontend::release_volume_claim(surface);
+        }
+        return VolumePublication::Published;
     });
     prosper::gpu::set_live_target_reader(
         [invalidate_ds](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
