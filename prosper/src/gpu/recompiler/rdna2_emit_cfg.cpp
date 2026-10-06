@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
+#include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -2450,6 +2451,12 @@ bool emit_cfg_state_machine(
     // Words a V_READLANE may have written last (a MAY fact, joined by union). See
     // proven_scalar_data_writelane_pcs.
     std::vector<std::set<int>> wave64_readlane_word_in(starts.size());
+    // Which saved-mask half each spill slot and reloaded SGPR holds (rdna2_spilled_mask_halves),
+    // so `s_mov_b64 dst, s[N:N+1]` over both reloaded halves of one mask stays a mask. Tracked only
+    // with an exact native Wave64 subgroup, where that move also materializes the ballot words.
+    std::vector<SpilledMaskHalves> wave64_spilled_halves_in(starts.size());
+    const bool track_spilled_halves =
+        b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64;
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
     // architectural SCC or the false placeholder stored for an unrepresentable wave-mask result.
     // Carry a separate CFG MUST-validity bit and use it both for scalar-word provenance and when
@@ -2560,7 +2567,8 @@ bool emit_cfg_state_machine(
 
         auto advance_wave64_b64_masks = [&](std::set<int>& masks, std::set<int>& ambiguous,
                                             std::set<int>& scalar_words, std::set<int>& m0_tokens,
-                                            std::set<int>& readlane_words, bool& scalar_scc,
+                                            std::set<int>& readlane_words,
+                                            SpilledMaskHalves& halves, bool& scalar_scc,
                                             const Rdna2Inst& in, bool record_compare) {
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
@@ -2835,6 +2843,8 @@ bool emit_cfg_state_machine(
                     (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
                     source_is_mask(in.src[0]))
                     mask_write = in.dst.value;
+                else if (track_spilled_halves && reassembles_spilled_mask_pair(halves, in))
+                    mask_write = in.dst.value;   // emit_alu reloads the low half's Bool slot
                 else if ((in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                           in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
                          in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
@@ -3092,6 +3102,12 @@ bool emit_cfg_state_machine(
                 for (const auto& [base, width] : scalar_writes)
                     for (uint32_t word = 0; word < width; ++word)
                         readlane_words.insert(base + static_cast<int>(word));
+            if (track_spilled_halves) {
+                std::vector<int> vector_writes;
+                for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+                advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
+                                            vector_writes, mask_write);
+            }
             return true;
         };
 
@@ -3104,13 +3120,14 @@ bool emit_cfg_state_machine(
             std::set<int> scalar_words = wave64_scalar_word_in[block];
             std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             std::set<int> readlane_words = wave64_readlane_word_in[block];
+            SpilledMaskHalves halves = wave64_spilled_halves_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
-                                              readlane_words, scalar_scc, in,
+                                              readlane_words, halves, scalar_scc, in,
                                               /*record_compare*/ false))
                     return false;
             }
@@ -3122,6 +3139,7 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor] = scalar_words;
                     wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_readlane_word_in[successor] = readlane_words;
+                    wave64_spilled_halves_in[successor] = halves;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
                     continue;
@@ -3153,18 +3171,22 @@ bool emit_cfg_state_machine(
                                       std::inserter(joined_m0_tokens, joined_m0_tokens.end()));
                 std::set<int> joined_readlane_words = wave64_readlane_word_in[successor];
                 joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
+                SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
+                meet_spilled_mask_halves(joined_halves, halves);
                 const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
                 if (joined != wave64_b64_mask_in[successor] ||
                     joined_ambiguous != wave64_b64_ambiguous_in[successor] ||
                     joined_scalar_words != wave64_scalar_word_in[successor] ||
                     joined_m0_tokens != wave64_m0_token_word_in[successor] ||
                     joined_readlane_words != wave64_readlane_word_in[successor] ||
+                    !(joined_halves == wave64_spilled_halves_in[successor]) ||
                     joined_scalar_scc != wave64_scalar_scc_valid_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
                     wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
                     wave64_scalar_word_in[successor] = std::move(joined_scalar_words);
                     wave64_m0_token_word_in[successor] = std::move(joined_m0_tokens);
                     wave64_readlane_word_in[successor] = std::move(joined_readlane_words);
+                    wave64_spilled_halves_in[successor] = std::move(joined_halves);
                     wave64_scalar_scc_valid_in[successor] = joined_scalar_scc;
                     pending.push_back(successor);
                 }
@@ -3177,13 +3199,14 @@ bool emit_cfg_state_machine(
             std::set<int> scalar_words = wave64_scalar_word_in[block];
             std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             std::set<int> readlane_words = wave64_readlane_word_in[block];
+            SpilledMaskHalves halves = wave64_spilled_halves_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
-                                              readlane_words, scalar_scc, in,
+                                              readlane_words, halves, scalar_scc, in,
                                               /*record_compare*/ true))
                     return false;
             }
