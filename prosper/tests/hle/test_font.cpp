@@ -569,6 +569,220 @@ TEST(Font, RenderSurfaceSetStyleFrameRecordsTheFrame) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Resolution, the point/pixel conversion, the renderer's outline workspace and the writing mask
+// (libSceFont.native.sprx 0x6ac0, 0xbf70..0xc0e0, 0xa630/0xa860/0xa910, 0x13240).
+// ---------------------------------------------------------------------------------------------
+TEST(Font, RendererAndResolutionNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontSetResolutionDpi"), "I1acwR7Qp8E");
+    EXPECT_EQ(nid_hash("sceFontRendererSetOutlineBufferPolicy"), "ydF+WuH0fAk");
+    EXPECT_EQ(nid_hash("sceFontRendererGetOutlineBufferSize"), "amcmrY62BD4");
+    EXPECT_EQ(nid_hash("sceFontRendererResetOutlineBuffer"), "ai6AfGrBs4o");
+    EXPECT_EQ(nid_hash("sceFontWritingSetMaskInvisible"), "BbCZjJizU4A");
+}
+
+// A face scaled in points changes pixel size when the dpi changes; one scaled in pixels does not, and
+// its point size moves instead. The rasterizer-facing metrics follow the pixel size.
+TEST(Font, ResolutionDpiConvertsBetweenPointsAndPixels) {
+    const FontState font = font_state();
+    const AstroFont astro = astro_font();
+    ASSERT_TRUE(font.registered());
+    ASSERT_TRUE(astro.registered());
+    HleFn set_dpi = Hle::lookup("I1acwR7Qp8E");
+    ASSERT_NE(set_dpi, nullptr);
+    using SetScaleFn = int32_t (*)(void*, float, float);
+    auto set_point = reinterpret_cast<SetScaleFn>(font.set_scale_point);
+    auto set_pixel = reinterpret_cast<SetScaleFn>(Hle::lookup("N1EBMeGhf7E"));
+    ASSERT_NE(set_pixel, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(astro.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(astro.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+
+    uint8_t decoy[64]{};
+    EXPECT_EQ(set_dpi(addr(decoy), 144, 144, 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(set_dpi(0, 144, 144, 0, 0, 0), 0x80460005u);
+
+    ASSERT_EQ(set_point(handle, 12.0f, 12.0f), 0);
+    ASSERT_EQ(set_dpi(addr(handle), 144, 144, 0, 0, 0), 0u);
+    float w = 0.0f, h = 0.0f;
+    ASSERT_EQ(font.get_scale(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(w, 24.0f) << "12 pt at 144 dpi is 24 px";
+    EXPECT_EQ(h, 24.0f);
+    ASSERT_EQ(font.get_scale_point(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(w, 12.0f) << "the point size is what was set";
+    float glyph[8]{};
+    ASSERT_EQ(astro.metrics(addr(handle), 'A', addr(glyph), 0, 0, 0), 0u);
+    EXPECT_EQ(glyph[1], 24.0f) << "layout and rasterization see the PIXEL size";
+
+    ASSERT_EQ(set_pixel(handle, 30.0f, 30.0f), 0);
+    ASSERT_EQ(font.get_scale(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(w, 30.0f) << "a pixel size is reported as set";
+    ASSERT_EQ(font.get_scale_point(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(w, 15.0f) << "30 px at 144 dpi is 15 pt";
+    EXPECT_EQ(h, 15.0f);
+
+    // The firmware compares only the horizontal value: equal to the stored one -> nothing changes,
+    // the vertical one included.
+    ASSERT_EQ(set_dpi(addr(handle), 144, 72, 0, 0, 0), 0u);
+    ASSERT_EQ(font.get_scale_point(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(h, 15.0f) << "an unchanged horizontal dpi leaves the vertical one at 144";
+    ASSERT_EQ(set_dpi(addr(handle), 0, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(font.get_scale_point(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(w, 30.0f) << "0 dpi stands for 72";
+    EXPECT_EQ(h, 30.0f);
+    // ...STORED as 72, which the horizontal-only compare can see: 72 now matches, so this is a no-op
+    // and the vertical 144 is not taken. Had 0 been stored, it would be.
+    ASSERT_EQ(set_dpi(addr(handle), 72, 144, 0, 0, 0), 0u);
+    ASSERT_EQ(font.get_scale_point(addr(handle), addr(&w), addr(&h), 0, 0, 0), 0u);
+    EXPECT_EQ(h, 30.0f) << "a 0 dpi is stored as 72, not as 0";
+
+    // The Render twins convert the same way, behind the bound-renderer check.
+    void* renderer = nullptr;
+    ASSERT_EQ(font.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    EXPECT_EQ(font.get_render_scale_point(addr(handle), addr(&w), 0, 0, 0, 0), 0x80460061u);
+    ASSERT_EQ(Hle::lookup("3OdRkSjOcog")(addr(handle), addr(renderer), 0, 0, 0, 0), 0u);
+    ASSERT_EQ(set_point(handle, 12.0f, 12.0f), 0);
+    ASSERT_EQ(set_dpi(addr(handle), 144, 144, 0, 0, 0), 0u);
+    ASSERT_EQ(font.get_render_scale(addr(handle), addr(&w), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(w, 24.0f);
+    ASSERT_EQ(font.get_render_scale_point(addr(handle), addr(&w), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(w, 12.0f);
+    EXPECT_EQ(astro.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+namespace {
+struct OutlineApi {
+    HleFn create = nullptr, destroy = nullptr, set_policy = nullptr, get_size = nullptr,
+          reset = nullptr;
+    void* renderer = nullptr;
+    bool ready() const { return create && destroy && set_policy && get_size && reset && renderer; }
+};
+// A renderer in its creation state: prosper has one renderer object, so destroy first.
+OutlineApi outline_api() {
+    register_builtin_hle();
+    OutlineApi api;
+    api.create = Hle::lookup("u5fZd3KZcs0");
+    api.destroy = Hle::lookup("exAxkyVLt0s");
+    api.set_policy = Hle::lookup("ydF+WuH0fAk");
+    api.get_size = Hle::lookup("amcmrY62BD4");
+    api.reset = Hle::lookup("ai6AfGrBs4o");
+    static uint8_t mem[64]{};
+    if (api.create && api.destroy) {
+        api.create(addr(mem), 0, addr(&api.renderer), 0, 0, 0);
+        void* doomed = api.renderer;
+        api.destroy(addr(&doomed), 0, 0, 0, 0, 0);
+        api.create(addr(mem), 0, addr(&api.renderer), 0, 0, 0);
+    }
+    return api;
+}
+constexpr uint64_t kFixed = 0x1000000u;
+constexpr uint64_t kGrowable = 0x2000000u;
+}   // namespace
+
+TEST(Font, OutlineBufferRefusesBadRenderersAndPolicies) {
+    const OutlineApi api = outline_api();
+    ASSERT_TRUE(api.ready());
+    uint8_t decoy[256]{};
+    uint32_t size = 7;
+    EXPECT_EQ(api.get_size(addr(decoy), addr(&size), 0, 0, 0, 0), 0x80460007u)
+        << "a bad renderer is 0x80460007, not 0x80460001";
+    EXPECT_EQ(size, 0u) << "the output is zeroed before the renderer is checked";
+    EXPECT_EQ(api.get_size(0, addr(&size), 0, 0, 0, 0), 0x80460007u);
+    EXPECT_EQ(api.get_size(0, 0, 0, 0, 0, 0), 0x80460007u) << "NULL out with a NULL renderer";
+    EXPECT_EQ(api.get_size(addr(api.renderer), 0, 0, 0, 0, 0), 0x80460002u);
+    EXPECT_EQ(api.get_size(addr(decoy), 0, 0, 0, 0, 0), 0x80460002u)
+        << "NULL out with a non-NULL renderer never reads the renderer";
+    EXPECT_EQ(api.reset(addr(decoy), 0, 0, 0, 0, 0), 0x80460007u);
+    EXPECT_EQ(api.reset(0, 0, 0, 0, 0, 0), 0x80460007u);
+    EXPECT_EQ(api.set_policy(0, kFixed, 0x4000, 0, 0, 0), 0x80460007u);
+    EXPECT_EQ(api.set_policy(addr(decoy), kFixed, 0x4000, 0, 0, 0), 0x80460007u);
+
+    for (uint64_t bad : {uint64_t{0}, uint64_t{1}, uint64_t{0x3000000}, uint64_t{0x2010000},
+                         uint64_t{0x1000001}, uint64_t{0x102000000}}) {
+        EXPECT_EQ(api.set_policy(addr(api.renderer), bad, 0x4000, 0, 0, 0), 0x80460002u)
+            << "policy 0x" << std::hex << bad;
+    }
+    EXPECT_EQ(api.set_policy(addr(decoy), 0, 0x4000, 0, 0, 0), 0x80460002u)
+        << "the policy is validated before the renderer's magic";
+    EXPECT_EQ(api.set_policy(addr(api.renderer), kFixed, 0x5000, 0x4000, 0, 0), 0x80460002u)
+        << "a non-zero limit below the basal size";
+    EXPECT_EQ(api.set_policy(addr(api.renderer), kGrowable | 0xffff, 0x5000, 0x4000, 0, 0),
+              0x80460002u);
+    ASSERT_EQ(api.get_size(addr(api.renderer), addr(&size), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(size, 0x4000u) << "refused policies changed nothing; a new renderer has 0x4000";
+}
+
+TEST(Font, OutlineBufferFollowsItsPolicy) {
+    const OutlineApi api = outline_api();
+    ASSERT_TRUE(api.ready());
+    auto size = [&] {
+        uint32_t s = 0xdeadbeef;
+        EXPECT_EQ(api.get_size(addr(api.renderer), addr(&s), 0, 0, 0, 0), 0u);
+        return s;
+    };
+    EXPECT_EQ(size(), 0x4000u);
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kFixed, 0x8000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x8000u) << "a fixed policy resizes to its basal size";
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kFixed, 0x2000, 0x10000, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x2000u) << "...in either direction";
+
+    // Growable after a fixed policy: a workspace above basal is still resized to basal.
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x1000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x1000u) << "switching from fixed resizes to basal";
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x3000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x3000u) << "under basal: up to basal";
+    // Growable after growable, size within (basal, no limit): kept -- no "max(current, basal)" rule.
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x1000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x3000u) << "a growable workspace above its new basal size is kept";
+    // ...unless it is over the new limit,
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x1000, 0x2000, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x1000u) << "over the limit: back to basal";
+    // ...or under the new basal size,
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x5000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x5000u) << "under basal: up to basal";
+    // ...or its excess over basal is not a multiple of granularity + 1.
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable | 0x0fff, 0x2000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x5000u) << "excess 0x3000 is a multiple of 0x1000: kept";
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable | 0x0ffe, 0x2000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x2000u) << "excess 0x3000 is not a multiple of 0xfff: resized";
+
+    // Reset goes back to the recorded basal size from wherever the workspace is.
+    ASSERT_EQ(api.set_policy(addr(api.renderer), kGrowable, 0x1000, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x2000u);
+    ASSERT_EQ(api.reset(addr(api.renderer), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x1000u) << "Reset shrinks the workspace to basal";
+
+    void* doomed = api.renderer;
+    ASSERT_EQ(api.destroy(addr(&doomed), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(size(), 0x4000u) << "destroying the renderer restores the creation defaults";
+}
+
+TEST(Font, WritingMaskInvisibleWritesTheInvertedBit) {
+    register_builtin_hle();
+    HleFn init = Hle::lookup("fD5rqhEXKYQ");
+    HleFn mask = Hle::lookup("BbCZjJizU4A");
+    ASSERT_NE(init, nullptr);
+    ASSERT_NE(mask, nullptr);
+    alignas(8) uint8_t writing[0x100];
+    std::memset(writing, 0xcc, sizeof(writing));
+    ASSERT_EQ(init(addr(writing), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(writing[0], 0x06) << "WritingInit stamps the 0x0f06 magic";
+    EXPECT_EQ(writing[1], 0x0f);
+    EXPECT_EQ(mask(addr(writing), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(writing[0x18] & 1, 1) << "mask 0 SETS bit 0";
+    writing[0x18] |= 0x80;
+    EXPECT_EQ(mask(addr(writing), 1, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(writing[0x18], 0x80) << "mask 1 CLEARS bit 0 and nothing else";
+    EXPECT_EQ(mask(addr(writing), 2, 0, 0, 0, 0), 0x80460002u);
+    EXPECT_EQ(writing[0x18], 0x80);
+    EXPECT_EQ(mask(0, 0, 0, 0, 0, 0), 0x80460002u);
+    uint8_t foreign[0x100]{};
+    EXPECT_EQ(mask(addr(foreign), 0, 0, 0, 0, 0), 0x8046000au) << "no writing magic";
+    EXPECT_EQ(foreign[0x18], 0) << "a refused call writes nothing";
+}
+
+// ---------------------------------------------------------------------------------------------
 // Resolution and glyph-form queries (libSceFont.native.sprx 0x6b70, 0xe660, 0xe6b0).
 // ---------------------------------------------------------------------------------------------
 TEST(Font, ResolutionAndGlyphFormNidsMatchTheFirmwareDump) {
