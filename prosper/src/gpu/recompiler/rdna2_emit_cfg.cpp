@@ -2424,13 +2424,13 @@ bool emit_cfg_state_machine(
         },
         wave64_mask_half_sreg_in, wave64_mask_half_reachable);
     // What each V_WRITELANE spill slot holds on every path (rdna2_spill_slot_domain.hpp), so a
-    // V_READLANE reload is typed as emit_alu typed it. Any compute reload may receive a mask, so
-    // each destination gets a Bool variable.
+    // V_READLANE reload is typed as emit_alu typed it. Any Wave64 compute reload may receive a
+    // mask, so each destination gets a Bool variable; only the Wave64 analysis types reloads.
     std::set<int> spill_mask_keys = static_mask_keys;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (b.is_compute && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
-            in.dst.value <= 105)
+        if (b.is_compute && b.wave_size == 64 && in.fmt == Rdna2Format::VOP3 &&
+            in.opcode == 0x360 && in.dst.value <= 105)
             spill_mask_keys.insert(in.dst.value);
     }
     const SpillSlotContext slot_context{
