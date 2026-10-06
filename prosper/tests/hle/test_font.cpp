@@ -395,11 +395,6 @@ FontStyleFrameApi font_style_frame_api() {
     api.set_surface = Hle::lookup("0hr-w30SjiI");
     return api;
 }
-uint64_t style_frame_addr() {
-    static uint8_t frame[0x60]{};
-    return addr(frame);
-}
-
 TEST(Font, StyleFrameSurfaceIsRegistered) {
     EXPECT_TRUE(font_style_frame_api().registered()) << "font style-frame surface is registered";
 }
@@ -420,8 +415,6 @@ TEST(Font, StyleFrameNidsResolveToStubValues) {
     EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectSlant"), "lOfduYnjgbo");
     EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectWeight"), "HIUdjR-+Wl8");
     EXPECT_EQ(nid_hash("sceFontRenderSurfaceSetStyleFrame"), "0hr-w30SjiI");
-    EXPECT_NE(nid_hash("sceFontStyleFrameInit"), "AAAAAAAAAAA")
-        << "positive control: the discriminator rejects a wrong NID";
 }
 
 TEST(Font, StyleFrameInitSeedsSeventyTwoDpi) {
@@ -483,4 +476,88 @@ TEST(Font, StyleFrameSlantClampsAndRoundTrips) {
     EXPECT_EQ(api.get_slant(addr(frame), addr(&slant), 0, 0, 0, 0), 0u)
         << "GetEffectSlant reads the clamped frame";
     EXPECT_EQ(slant, 1.0f) << "SetEffectSlant clamps to +1.0";
+}
+
+// The weight is stored as an offset from the neutral 1.0, clamped to +/-0.04, and the getter adds
+// the 1.0 back (libSceFont.native.sprx +0xc3a0 / +0xc600). Storing the raw weight instead reads the
+// neutral 1.0 back as 2.0.
+TEST(Font, StyleFrameEffectWeightIsStoredAsAClampedOffset) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    using WeightFn = int32_t (*)(void*, float, float, uint32_t);
+    auto set_weight = reinterpret_cast<WeightFn>(api.set_weight);
+    ASSERT_NE(set_weight, nullptr);
+    struct Case { float in_x, in_y, want_x, want_y; };
+    const Case cases[] = {
+        {1.0f, 1.0f, 1.0f, 1.0f},     // neutral round-trips
+        {1.5f, 0.5f, 1.04f, 0.96f},   // clamped to the band on both sides
+        {1.02f, 0.99f, 1.02f, 0.99f}, // inside the band, kept
+    };
+    for (const Case& c : cases) {
+        uint8_t frame[0x60]{};
+        ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+        EXPECT_EQ(set_weight(frame, c.in_x, c.in_y, 0), 0) << "SetEffectWeight returns success";
+        float stored_x = 0.0f, stored_y = 0.0f;
+        std::memcpy(&stored_x, frame + 0x1c, sizeof(stored_x));
+        std::memcpy(&stored_y, frame + 0x20, sizeof(stored_y));
+        EXPECT_NEAR(stored_x, c.want_x - 1.0f, 1e-6f) << "frame+0x1c holds the offset from 1.0";
+        EXPECT_NEAR(stored_y, c.want_y - 1.0f, 1e-6f) << "frame+0x20 holds the offset from 1.0";
+        float x = 0.0f, y = 0.0f;
+        uint32_t mode = 0xdeadbeef;
+        EXPECT_EQ(api.get_weight(addr(frame), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
+        EXPECT_NEAR(x, c.want_x, 1e-6f) << "GetEffectWeight x for input " << c.in_x;
+        EXPECT_NEAR(y, c.want_y, 1e-6f) << "GetEffectWeight y for input " << c.in_y;
+        EXPECT_EQ(mode, 0u) << "GetEffectWeight reports mode 0";
+    }
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(static_cast<uint32_t>(set_weight(frame, 1.0f, 1.0f, 1)), 0x80460002u)
+        << "a non-zero mode is rejected";
+    float x = 0.0f;
+    EXPECT_EQ(api.get_weight(addr(frame), addr(&x), 0, 0, 0, 0), 0x80460058u)
+        << "a rejected set leaves the weight unset";
+}
+
+// libSceFont.native.sprx +0xabb0: the frame pointer lands at surface+0x28 whether or not it is
+// null, the dword at surface+0x30 is zeroed, and surface+0xe bit 0 says whether a frame is set. A
+// non-null frame without the magic is refused with nothing written.
+TEST(Font, RenderSurfaceSetStyleFrameRecordsTheFrame) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    auto read_ptr = [](const uint8_t* p) {
+        uint64_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+    auto read_u32 = [](const uint8_t* p) {
+        uint32_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+
+    uint8_t surface[0x80];
+    std::memset(surface, 0xcc, sizeof(surface));
+    surface[0xe] = 0xfe;
+    EXPECT_EQ(api.set_surface(addr(surface), addr(frame), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(surface[0xe], 0xffu) << "a frame sets bit 0 of surface+0xe and keeps the rest";
+    EXPECT_EQ(read_ptr(surface + 0x28), addr(frame)) << "the frame pointer lands at surface+0x28";
+    EXPECT_EQ(read_u32(surface + 0x30), 0u) << "the dword at surface+0x30 is zeroed";
+    EXPECT_EQ(read_u32(surface + 0x34), 0xccccccccu) << "the write stops at the dword";
+
+    std::memset(surface, 0xcc, sizeof(surface));
+    EXPECT_EQ(api.set_surface(addr(surface), 0, 0, 0, 0, 0), 0u) << "a null frame detaches";
+    EXPECT_EQ(surface[0xe], 0xccu & 0xfeu) << "a null frame clears bit 0 of surface+0xe";
+    EXPECT_EQ(read_ptr(surface + 0x28), 0u) << "a null frame is still stored at surface+0x28";
+    EXPECT_EQ(read_u32(surface + 0x30), 0u) << "the dword at surface+0x30 is zeroed";
+
+    uint8_t bogus[0x60]{};
+    std::memset(surface, 0xcc, sizeof(surface));
+    EXPECT_EQ(api.set_surface(addr(surface), addr(bogus), 0, 0, 0, 0), 0x80460002u)
+        << "a frame without the magic is refused";
+    for (size_t i = 0; i < sizeof(surface); ++i)
+        ASSERT_EQ(surface[i], 0xccu) << "a refused frame writes nothing, byte " << i;
+    EXPECT_EQ(api.set_surface(0, addr(frame), 0, 0, 0, 0), 0x80460002u)
+        << "a null surface is refused";
 }
