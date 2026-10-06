@@ -370,8 +370,8 @@ static void ngg_arms(FixtureState& state) {
     const char* const mode = nullptr;
     auto overrides = load_shader_overrides();
     auto resource_context = state.context();
-    BackendDrawContext backend_context{policy, phase, off, state.pending_timing, off, off, mode,
-                                       resource_context, overrides};
+    BackendDrawContext backend_context{
+        policy, phase, off, state.pending_timing, off, off, mode, resource_context, overrides};
     const std::vector<const DrawItem*> group_items = {&draw};
     const auto bds = build_backend_draws(backend_context, group_items, nullptr);
     check(bds.size() == 1 && bds[0].ngg_subgroup == draw.ngg_subgroup, arm,

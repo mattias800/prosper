@@ -540,12 +540,13 @@ public:
             // Bounded positive evidence that the path ran: the first draw, then every 4096th.
             if (recorded == 0 || recorded % 4096 == 0) {
                 uint32_t blocks = 0;
+                const uint64_t ordinal = recorded + 1;
                 for (const auto& group : prelude.ngg->groups) blocks += group.blocks;
                 std::fprintf(stderr,
                              "[ngg-backend] recorded merged-NGG draw #%llu: %zu dispatch(es), "
                              "%u subgroup(s), %zu run(s)\n",
-                             static_cast<unsigned long long>(recorded + 1),
-                             prelude.ngg->groups.size(), blocks, prelude.ngg->runs.size());
+                             static_cast<unsigned long long>(ordinal), prelude.ngg->groups.size(),
+                             blocks, prelude.ngg->runs.size());
             }
         }
         if (!any) return;
@@ -749,8 +750,10 @@ private:
         } else {
             for (uint32_t token : draw.resource_order) {
                 const uint32_t i = token & 0x7fffffffu;
-                if (token & 0x80000000u) keep_buffer(i);
-                else keep_full(i);
+                if (token & 0x80000000u)
+                    keep_buffer(i);
+                else
+                    keep_full(i);
             }
         }
         draw.R = std::move(full);
@@ -824,9 +827,8 @@ inline std::span<const BackendDraw> ngg_admit_backend_draws(const std::vector<Ba
                      [](const BackendDraw& d) { return bool(d.ngg_subgroup); }))
         return draws;
     const prosper::gpu::NggHostCapabilities host = ngg_host_capabilities(render_vk_ctx());
-    const bool splits_safely =
-        draws.size() == 1u ||
-        (persist_depth_stencil && color_target && color_target->persistent_id);
+    const bool splits_safely = draws.size() == 1u || (persist_depth_stencil && color_target &&
+                                                      color_target->persistent_id);
     const auto refusal = [&](const BackendDraw& d) -> const char* {
         if (!d.ngg_subgroup) return nullptr;
         if (const char* device = prosper::gpu::ngg_device_refusal(*d.ngg_subgroup, host))

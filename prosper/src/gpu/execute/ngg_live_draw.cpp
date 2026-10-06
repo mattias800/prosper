@@ -29,7 +29,8 @@ constexpr size_t kDrawEntries = 128;
 constexpr uint32_t kMaxWaves = 4;
 
 uint64_t mix(uint64_t hash, uint64_t value) {
-    for (unsigned i = 0; i < 8; ++i) hash = (hash ^ ((value >> (8 * i)) & 0xffu)) * 1099511628211ull;
+    for (unsigned i = 0; i < 8; ++i)
+        hash = (hash ^ ((value >> (8 * i)) & 0xffu)) * 1099511628211ull;
     return hash;
 }
 
@@ -76,31 +77,67 @@ std::vector<uint32_t> resource_shape(const ShaderResourceTable* table) {
                                (r.size == 2 ? 512u : 0u) |
                                (uint64_t{r.atomic_x2_record_count} * 8u == r.size ? 1024u : 0u) |
                                (r.host_data ? 2048u : 0u);
-        out.insert(out.end(),
-                   {static_cast<uint32_t>(r.cls), static_cast<uint32_t>(r.format),
-                    r.num_components, r.binding, r.stride, r.srt_offset, r.sgpr_base,
-                    r.table_index_count, r.table_entry_stride, r.table_index_sgpr,
-                    static_cast<uint32_t>(r.table_selector_mode), r.table_load_pc,
-                    static_cast<uint32_t>(r.table_entries.size()),
-                    r.direct_vsharp_sh_register_base, r.fetch_pc,
-                    static_cast<uint32_t>(r.fetch_index_mode), r.bvh_box_grow, r.flat_base_sgpr,
-                    r.img_dim, r.width, r.height, r.depth, r.sample_count, r.tile_mode,
-                    r.declared_mip_levels, r.mag_filter, r.min_filter, r.mip_filter,
-                    r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2], r.border_color_type,
-                    r.depth_compare_func, r.unnormalized, r.swizzle[0], r.swizzle[1],
-                    r.swizzle[2], r.swizzle[3], r.atomic_x2_record_count,
-                    r.selected_sbuffer_soffset, r.selected_sbuffer_words[0],
-                    r.selected_sbuffer_words[1], r.selected_sbuffer_words[2],
-                    r.selected_sbuffer_words[3], r.indirect_buffer_contract_tag,
-                    r.indirect_buffer_binding_bytes, r.indirect_buffer_slot_count,
-                    r.indirect_buffer_header_bytes, r.indirect_buffer_slot_bytes,
-                    relocation.carrier_version, relocation.proof_schema, relocation.binding_bytes,
-                    relocation.record_count, relocation.segment_count,
-                    relocation.segment_directory_byte_offset,
-                    static_cast<uint32_t>(relocation.proof_fingerprint),
-                    static_cast<uint32_t>(relocation.proof_fingerprint >> 32),
-                    r.scalar_buffer_dword_count, r.owned_raw_snapshot_bytes,
-                    r.owned_nested_snapshot_bytes, flags});
+        out.insert(out.end(), {static_cast<uint32_t>(r.cls),
+                               static_cast<uint32_t>(r.format),
+                               r.num_components,
+                               r.binding,
+                               r.stride,
+                               r.srt_offset,
+                               r.sgpr_base,
+                               r.table_index_count,
+                               r.table_entry_stride,
+                               r.table_index_sgpr,
+                               static_cast<uint32_t>(r.table_selector_mode),
+                               r.table_load_pc,
+                               static_cast<uint32_t>(r.table_entries.size()),
+                               r.direct_vsharp_sh_register_base,
+                               r.fetch_pc,
+                               static_cast<uint32_t>(r.fetch_index_mode),
+                               r.bvh_box_grow,
+                               r.flat_base_sgpr,
+                               r.img_dim,
+                               r.width,
+                               r.height,
+                               r.depth,
+                               r.sample_count,
+                               r.tile_mode,
+                               r.declared_mip_levels,
+                               r.mag_filter,
+                               r.min_filter,
+                               r.mip_filter,
+                               r.addr_uvw[0],
+                               r.addr_uvw[1],
+                               r.addr_uvw[2],
+                               r.border_color_type,
+                               r.depth_compare_func,
+                               r.unnormalized,
+                               r.swizzle[0],
+                               r.swizzle[1],
+                               r.swizzle[2],
+                               r.swizzle[3],
+                               r.atomic_x2_record_count,
+                               r.selected_sbuffer_soffset,
+                               r.selected_sbuffer_words[0],
+                               r.selected_sbuffer_words[1],
+                               r.selected_sbuffer_words[2],
+                               r.selected_sbuffer_words[3],
+                               r.indirect_buffer_contract_tag,
+                               r.indirect_buffer_binding_bytes,
+                               r.indirect_buffer_slot_count,
+                               r.indirect_buffer_header_bytes,
+                               r.indirect_buffer_slot_bytes,
+                               relocation.carrier_version,
+                               relocation.proof_schema,
+                               relocation.binding_bytes,
+                               relocation.record_count,
+                               relocation.segment_count,
+                               relocation.segment_directory_byte_offset,
+                               static_cast<uint32_t>(relocation.proof_fingerprint),
+                               static_cast<uint32_t>(relocation.proof_fingerprint >> 32),
+                               r.scalar_buffer_dword_count,
+                               r.owned_raw_snapshot_bytes,
+                               r.owned_nested_snapshot_bytes,
+                               flags});
     }
     return out;
 }
@@ -125,9 +162,9 @@ struct StageKey {
     bool count_violations = false, interpolation = false;
     uint64_t interpolation_layout = 0;
     auto tie() const {
-        return std::tie(program, resources, pixel_inputs, user_sgprs, lds_granules, layer_slices, topology, route,
-                        float_transport, native_wave64, provoking_vertex_last, layer_from_pos1,
-                        count_violations, interpolation, interpolation_layout);
+        return std::tie(program, resources, pixel_inputs, user_sgprs, lds_granules, layer_slices,
+                        topology, route, float_transport, native_wave64, provoking_vertex_last,
+                        layer_from_pos1, count_violations, interpolation, interpolation_layout);
     }
     bool operator<(const StageKey& other) const { return tie() < other.tie(); }
 };
@@ -171,8 +208,12 @@ Cache& cache() {
     return instance;
 }
 
-uint64_t last_use_of(const std::shared_ptr<StageEntry>& entry) { return entry->last_use; }
-uint64_t last_use_of(const DrawEntry& entry) { return entry.last_use; }
+uint64_t last_use_of(const std::shared_ptr<StageEntry>& entry) {
+    return entry->last_use;
+}
+uint64_t last_use_of(const DrawEntry& entry) {
+    return entry.last_use;
+}
 
 template <typename Map>
 void evict(Map& map, size_t bound, uint64_t* evictions) {
@@ -246,8 +287,8 @@ std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* pr
     std::vector<uint32_t> words(prolog, prolog + prefix_dwords);
     words.insert(words.end(), main, main + main_span);
     static std::mutex mutex;
-    static std::map<std::vector<uint32_t>, std::pair<std::shared_ptr<const std::vector<uint32_t>>,
-                                                     uint64_t>>
+    static std::map<std::vector<uint32_t>,
+                    std::pair<std::shared_ptr<const std::vector<uint32_t>>, uint64_t>>
         chains;
     static uint64_t clock = 0;
     const std::lock_guard lock(mutex);

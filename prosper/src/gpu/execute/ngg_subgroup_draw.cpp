@@ -110,9 +110,8 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     const DescriptorValidationReport used =
         validate_spirv_descriptor_interface(module, nullptr, 0, SpirvShaderStage::Compute, false);
     for (uint32_t binding : declared)
-        if (std::any_of(used.descriptors.begin(), used.descriptors.end(), [&](const auto& d) {
-                return d.set == 0 && d.binding == binding;
-            }))
+        if (std::any_of(used.descriptors.begin(), used.descriptors.end(),
+                        [&](const auto& d) { return d.set == 0 && d.binding == binding; }))
             stages->guest_bindings.push_back(binding);
     stages->shell_hash = ngg_words_hash(module);
     stages->shell = std::make_shared<const std::vector<uint32_t>>(std::move(module));
@@ -125,7 +124,8 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     stages->raster_vertex = std::make_shared<const std::vector<uint32_t>>(std::move(vertex));
     stages->vertices_per_primitive = published.vertices_per_primitive;
     if (raster.route == NggLayerRoute::ForwardingGeometry)
-        stages->raster_geometry = build_ngg_layer_forward_geometry(published, raster.float_transport);
+        stages->raster_geometry =
+            build_ngg_layer_forward_geometry(published, raster.float_transport);
     // The interpolation stage is built whenever the request supplies it: for its own layer route,
     // and for a draw that needs it although no layer is read (route None).
     if ((raster.route == NggLayerRoute::InterpolationGeometry ||

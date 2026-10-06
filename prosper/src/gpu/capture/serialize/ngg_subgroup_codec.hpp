@@ -61,8 +61,8 @@ inline bool write_ngg_subgroup_draw(Writer& w, const std::shared_ptr<const NggSu
     w.u8(static_cast<uint8_t>(draw->topology));
     w.u8(static_cast<uint8_t>(draw->route));
     w.u32(draw->vertices_per_primitive);
-    w.u8(static_cast<uint8_t>((draw->count_violations ? 1u : 0u) |
-                              (draw->native_wave64 ? 2u : 0u)));
+    w.u8(
+        static_cast<uint8_t>((draw->count_violations ? 1u : 0u) | (draw->native_wave64 ? 2u : 0u)));
     w.u32(draw->lds_bytes);
     w.words(draw->guest_bindings);
     w.words(draw->push_constants);
