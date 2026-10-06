@@ -191,6 +191,15 @@ namespace {
     // destination register, advance past the instruction). Set once; default off, matching Linux.
     const bool g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     volatile long g_null_page_count = 0;
+    // Diagnostic switches consulted from several sites below: read each once, here.
+    bool sse4a_log_enabled() {
+        static const bool on = getenv("PROSPER_SSE4A_LOG") != nullptr;
+        return on;
+    }
+    bool stubdump_enabled() {
+        static const bool on = getenv("PROSPER_STUBDUMP") != nullptr;
+        return on;
+    }
     NidDb*   g_nid_db = nullptr;
 
     // Per-thread recovery point. A guest fault on the armed thread is turned into a longjmp back to
@@ -789,7 +798,7 @@ namespace {
             fprintf(stderr, "[sse4a] warning: code cache remained writable (error=%lu)\n",
                     (unsigned long)GetLastError());
         }
-        if (getenv("PROSPER_SSE4A_LOG"))
+        if (sse4a_log_enabled())
             fprintf(stderr,
                     "[sse4a] fastpath eboot+0x%llx span=%zu entries=%zu extrq=%zu cache=%p\n",
                     (unsigned long long)(plan.insns[0].site - g_base), plan.span,
@@ -889,7 +898,7 @@ namespace {
         }
         const size_t sites = (size_t)(
             InterlockedCompareExchange(&g_sse4a_fastpath_count, 0, 0) - before);
-        if (sites || getenv("PROSPER_SSE4A_LOG"))
+        if (sites || sse4a_log_enabled())
             fprintf(stderr,
                     "[sse4a] prepatched %zu verified entry points for %zu EXTRQ instructions before guest entry\n",
                     sites, patched);
@@ -1254,7 +1263,7 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     // Keep the stack-address-to-import diagnostic available on every execution host. The fingerprint
     // tool reports return addresses inside this table; index/off/name output makes those frames useful
     // without relying on a Linux-only boot.
-    if (getenv("PROSPER_STUBDUMP")) {
+    if (stubdump_enabled()) {
         for (uint64_t i = 0; i < n; i++) {
             const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
             fprintf(stderr, "[stub] #%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
@@ -1296,7 +1305,7 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     detail::publish_stub_suffix(staged, g_stub_base, g_stub_size, first_new);
     g_nstubs = n;
     dispatch_grow_slots(&slots);   // publish only after every new stub is written
-    if (getenv("PROSPER_STUBDUMP"))
+    if (stubdump_enabled())
         for (uint64_t i = first_new; i < n; i++) {
             const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
             fprintf(stderr, "[stub] +#%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
@@ -1331,7 +1340,7 @@ bool install_import_data(const std::vector<ImportSlot>& slots, uint64_t data_bas
     for (uint64_t i = 0; i < n; i++)
         seed_import_data(slots[i].nid, (uint8_t*)got + i * stride, (size_t)stride);
     g_data_base = data_base; g_data_stride = stride; g_ndata = n;
-    if (getenv("PROSPER_STUBDUMP"))
+    if (stubdump_enabled())
         for (uint64_t i = 0; i < n; i++) {
             const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
             fprintf(stderr, "[import-data] #%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
@@ -1367,7 +1376,7 @@ bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, 
                          (uint8_t*)(uintptr_t)(g_data_base + i * g_data_stride),
                          (size_t)g_data_stride);
     g_ndata = n;
-    if (getenv("PROSPER_STUBDUMP"))
+    if (stubdump_enabled())
         for (uint64_t i = first_new; i < n; i++) {
             const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
             fprintf(stderr, "[import-data] +#%llu at 0x%llx %s::%s %s\n", (unsigned long long)i,
