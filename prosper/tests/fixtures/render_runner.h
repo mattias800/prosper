@@ -13,6 +13,7 @@
 #include "gpu_detile_upload.h"
 #include "mapped_staging.h"
 #include "buffer_range_plan.h"
+#include "gpu/resources/device_storage_reads.hpp"   // published at device creation
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
@@ -180,7 +181,7 @@ struct FrameBufferResource {
                                     // share a set — both stages number bindings from 2, so one set would
                                     // collide binding 2/3 between stages and make the layout invalid).
     std::vector<uint32_t> dwords;   // owned storage-buffer contents (empty -> a 1-dword zero buffer)
-    // A production callback may point directly at a fully readable immutable guest/capture range.
+    // A callback may point at a fully readable guest/capture range, or at its readable start.
     // The backend consumes and uploads this view synchronously; an explicit submission batch retains
     // only the completed Vulkan upload, never this pointer. Tests/replays may use the same contract
     // when their backing outlives render_draws_rgba().
@@ -190,7 +191,7 @@ struct FrameBufferResource {
     // within one synchronous call only when both this identity and the complete captured bytes match;
     // zero keeps synthetic/replay resources conservatively distinct.
     uint64_t buffer_identity = 0;
-    // Explicit live-producer proof: this complete unmaterialized input is the direct guest VA.
+    // Explicit live-producer proof: every word of this view is the direct guest VA, unmaterialized.
     // Hosted/capture/owned/padded inputs leave zero; numeric identity alone never grants a watch.
     uint64_t direct_guest_buffer_addr = 0;
     // Backend-owned PS5 GDS storage. Unlike guest/capture buffers this is one persistent,
@@ -2021,6 +2022,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         if (prosper::gpu::breadcrumbs_requested())
             prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
                                                 breadcrumb_fault_enabled, "render");
+        prosper::gpu::device_reads_zero_past_a_binding() = r.deterministic_storage_reads;
         std::fprintf(stderr, "[vk] deterministic storage word reads %s (robustBufferAccess2=%d)\n",
             r.deterministic_storage_reads ? "ENABLED" : "unavailable",
             static_cast<int>(robust2_features.robustBufferAccess2));

@@ -4740,6 +4740,11 @@ endif()
       add_test(NAME draw_resource_status COMMAND test_draw_resource_status)
       set_tests_properties(draw_resource_status PROPERTIES
         ENVIRONMENT "PROSPER_TEXREF_CENSUS=1" TIMEOUT 45)
+      # The comparison arm of the over-declared buffer view (#4556): the same arms expect the copy.
+      add_test(NAME draw_resource_status_no_short_buffer_view
+               COMMAND test_draw_resource_status --expect-copy)
+      set_tests_properties(draw_resource_status_no_short_buffer_view PROPERTIES
+        ENVIRONMENT "PROSPER_TEXREF_CENSUS=1;PROSPER_NO_SHORT_BUFFER_VIEW=1" TIMEOUT 45)
       prosper_add_gtest(test_float32_array_upload
         SOURCES tests/shared/live/test_float32_array_upload.cpp
         INCLUDES frontends src tests
