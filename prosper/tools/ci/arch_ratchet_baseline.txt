@@ -99,11 +99,14 @@ getenv|prosper/src/gpu/execute/compute_program_facts.cpp 1
 getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
 # #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
 # This renames one existing site; no new raw environment read or switch was introduced.
-getenv|prosper/src/gpu/execute/gpu_executor.cpp 89
-getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
+getenv|prosper/src/gpu/execute/gpu_executor.cpp 86
+# note (DRAFT): moved verbatim with diagnose_compute_dispatches from gpu_executor.cpp
+# (86 there, down from 89); tree total conserved, no new raw environment read.
+getenv|prosper/src/gpu/execute/gpu_executor_diagnostics.cpp 3
 getenv|prosper/src/gpu/execute/index_expand.hpp 1
 getenv|prosper/src/gpu/execute/mb3_freelist.cpp 3
 getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3
+getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
@@ -188,7 +191,11 @@ file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7814  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559)
-file-size|prosper/src/hle/kernel/hle_kernel.cpp 5561
+# note (DRAFT, needs reviewer accept): +3 since the cap from ordinary libkernel work
+# (#4351 macOS GC fix, #4337 Windows wait provenance, #4166 scePthreadAttrGetstack); the
+# file's mid-size functions sit in platform arms (30% UNPARSED), so a mechanical split
+# waits on a Windows+Linux build to verify.
+file-size|prosper/src/hle/kernel/hle_kernel.cpp 5564
 # note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
 # including changed-line formatting; other memory behavior is unchanged.
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
@@ -252,7 +259,7 @@ platform-ifdef|prosper/src/hle/input/ime.cpp 11
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
 platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 59
-platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 10
+platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 9
 platform-ifdef|prosper/src/hle/kernel/sce_errno.hpp 1
 platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
