@@ -239,6 +239,11 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **#4610's BOOL64 polarity is wrong for this title (black from about t=100 s on the first-gameplay route)** — false.
+  The polarity is right. Kena binds its own compile of AGC's helper rectangle for its "Eliminate Fast Clear" and
+  depth-decompress segments, and #1588's exact list did not recognise it. Once the corrected polarity ran the
+  eliminate pass the title asked for, the pass painted the inherited pixel shader over the finished scanout. With
+  the rectangle family recognised, the forest loading art renders through 320 s (#4610).
 - **The black pre-menu screen is a renderer failure** — false. The composite was black because the logo movie was
   never started (unregistered `sceAvPlayerStartEx`, #3781); registering it reaches the menu with no renderer change.
 - **The BatchMap ENOMEM is #2424's too-small free placeholder** — false. `VirtualQuery` on the failing range shows
