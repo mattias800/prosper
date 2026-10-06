@@ -2452,6 +2452,9 @@ static bool clear_environment(const char* name) {
 }
 
 int main(int argc, char** argv) {
+    // This process has no guest mapping table, so it compares guest addresses as addresses when
+    // it asks whether a write lands in a retained depth plane (guest_depth_plane.hpp, #4619).
+    prosper::gpu::guest_plane_alias_by_address() = true;
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool recompile_raw = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
