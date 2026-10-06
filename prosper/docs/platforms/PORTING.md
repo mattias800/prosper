@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Porting prosper to Windows, macOS, and Android
 
 *Investigation, 2026-07-13. Status: proposal — nothing here is implemented beyond the existing

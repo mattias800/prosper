@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Cutscene render frontier — reaching the intro cutscene's pixels
 
 > **See also `CUTSCENE_PROGRESSION.md`** for the boot/load history (getting *through* IL2CPP + the async

@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Renderer performance and tooling findings (2026-07-14)
 
 > **Native-Linux continuation:** the current Evergate performance frontier, reproducible dense-route

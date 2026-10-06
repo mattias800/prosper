@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Dragon Quest VII Reimagined (`PPSA17942`) — title/name-entry status
 
 **Status as of 2026-07-31.** Current master reaches the localized, animated title screen at native

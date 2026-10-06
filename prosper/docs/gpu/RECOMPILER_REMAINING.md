@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # RDNA2→SPIR-V recompiler — remaining work
 
 > **Current note (2026-08-11): this is a historical 41-shader bring-up corpus, not the current GTA V

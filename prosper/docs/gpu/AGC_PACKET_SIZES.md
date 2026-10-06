@@ -1,3 +1,8 @@
+---
+kind: reference
+status: current
+---
+
 # AGC command-packet sizes — the contract, the audit, and the instrument
 
 **Status: current.** Read this before changing any `begin_packet(a0, N, …)` count in

@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Game compatibility orchestration
 
 This is the durable playbook and current handoff for concurrent game-compatibility work. It is written for an

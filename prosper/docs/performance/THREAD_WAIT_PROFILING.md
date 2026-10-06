@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Thread wait profiling — what blocks, how much, and where
 
 **Status:** Linux implementation complete and merged (`tools/perf/wait_profile.py` #2377,

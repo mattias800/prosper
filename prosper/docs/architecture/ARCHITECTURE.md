@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Architecture — `prosper`
 
 > A PS5 (Prospero) → Windows/Linux user-space compatibility layer.

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Sonic Racing: CrossWorlds (`PPSA08804`) — status
 
 Tracker: [#1895](https://github.com/mattias800/prosper/issues/1895).

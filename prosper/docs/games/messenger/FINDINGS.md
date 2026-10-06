@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Findings — reconnaissance of `PPSA24651` (The Messenger, PS5)
 
 Everything below was extracted from the game dump with our own tool

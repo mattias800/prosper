@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Messenger black-render investigation
 
 This is the canonical completed record for the Messenger gameplay-render failure (#300 / #522).

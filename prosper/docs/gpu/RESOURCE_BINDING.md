@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Resource binding — the front-half ↔ recompiler contract
 
 > **Current note (2026-08-11): the contract and its front-half materialization are implemented.** GTA V's

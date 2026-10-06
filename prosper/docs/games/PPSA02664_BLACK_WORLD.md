@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # PPSA02664 black gameplay world — target validation & investigation plan
 
 > **RESOLVED 2026-07-31 — this document is a historical method/diagnostic record.** The black gameplay

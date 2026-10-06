@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Where prosper's render architecture costs more than it needs to (2026-09-26)
 
 A comparison study. prosper's render path was measured this session (see

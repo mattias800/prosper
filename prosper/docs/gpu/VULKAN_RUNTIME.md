@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Vulkan runtime and modernization (#3414)
 
 The live graphics backend, standalone live compute backend, and app's fallback presentation device
