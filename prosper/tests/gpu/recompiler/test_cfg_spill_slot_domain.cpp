@@ -137,6 +137,13 @@ const uint32_t kWave32MaskReloadDataRead[] = {
     0xD4C40014u, 0x00020094u, 0xD7610015u, 0x00010A14u, 0xD7600014u,
     0x00010B15u, 0x4A060014u, 0xE0702000u, 0x80020300u, 0xBF810000u,
 };
+// The same Wave32 reload into VCC_LO, whose mask an implicit consumer reads through the VCC
+// mirror (#4607 review): vcc = (20 > x); v20[3] = vcc_lo; vcc = (8 > x); vcc_lo = v20[3];
+// v3 = vcc ? 1 : 0; out[x] = v3 (1 below lane 20)
+const uint32_t kWave32VccReloadCndmask[] = {
+    0x7E080281u, 0x7D880094u, 0xD7610014u, 0x0001066Au, 0x7D880088u, 0xD760006Au,
+    0x00010714u, 0x02060880u, 0xE0702000u, 0x80020300u, 0xBF810000u,
+};
 const uint32_t kTail[] = {
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
     0xbf870001u, 0xbf82fffdu, 0x7e040d02u, 0xbf810000u,
@@ -166,6 +173,17 @@ std::vector<uint32_t> compile_native(const uint32_t (&prefix)[N], uint32_t wave 
     config.native_subgroup_size = wave;
     const ShaderResourceTable table = output_table();
     return recompile_compute(code.data(), code.size(), &table, config);
+}
+
+// A straight-line native Wave32 kernel (no kTail), one 32-lane wave.
+template <size_t N>
+std::vector<uint32_t> compile_wave32(const uint32_t (&code)[N]) {
+    ComputeShaderConfig config;
+    config.local_x = 32;
+    config.wave_size = 32;
+    config.native_subgroup_size = 32;
+    const ShaderResourceTable table = output_table();
+    return recompile_compute(code, N, &table, config);
 }
 
 // Runs a native-subgroup kernel over one wave of `lanes`; empty when the device cannot require it.
@@ -347,19 +365,27 @@ TEST(CfgSpillSlotDomain, AnExecSpilledAcrossABarrierIsRestored) {
 // Shape 1's Wave32 sibling (#4607 review). record_scalar_write ended the destination's B32 marker
 // on any scalar write except a B32 mask writer, and with it the Bool the reload had just
 // published, so the data read took the untracked SGPR's silent 0: out[x] = x. That loop is the
-// same on main, so the defect predates #4607 and is independent of its Wave64 preserve rule.
+// same on main, so the defect predates #4607 and is independent of its Wave64 preserve rule. This
+// fixes it within one block only; across a dispatcher edge the read is still 0 (#4613).
 TEST(CfgSpillSlotDomain, AWave32MaskReloadedIntoItsRegisterKeepsItsWord) {
     constexpr uint32_t kWave32 = 32;
-    ComputeShaderConfig config;
-    config.local_x = kWave32;
-    config.wave_size = kWave32;
-    config.native_subgroup_size = kWave32;
-    const ShaderResourceTable table = output_table();
-    const std::vector<uint32_t> spv = recompile_compute(
-        kWave32MaskReloadDataRead, std::size(kWave32MaskReloadDataRead), &table, config);
+    const std::vector<uint32_t> spv = compile_wave32(kWave32MaskReloadDataRead);
     ASSERT_FALSE(spv.empty()) << "a native Wave32 subgroup can form the reloaded mask's word";
     const std::vector<uint32_t> out = run_native(spv, kWave32);
     if (out.empty()) GTEST_SKIP() << "the device cannot require a 32-lane compute subgroup";
     for (uint32_t lane = 0; lane < kWave32; ++lane)
         EXPECT_EQ(out[lane], 0xfffffu + lane) << "lane " << lane << ": s20 is the mask, lanes < 20";
+}
+
+// A Wave32 mask reloaded into VCC_LO must also reach the implicit VCC consumers. The rule above
+// kept the reload's Bool on VCC_LO but left the mirror rs.vcc at the later compare, so v_cndmask
+// selected on lanes < 8 instead of the reloaded lanes < 20 (#4607 review). Main refused it.
+TEST(CfgSpillSlotDomain, AWave32MaskReloadedIntoVccReachesCndmask) {
+    constexpr uint32_t kWave32 = 32;
+    const std::vector<uint32_t> spv = compile_wave32(kWave32VccReloadCndmask);
+    ASSERT_FALSE(spv.empty()) << "the reloaded VCC_LO mask is a one-word mask";
+    const std::vector<uint32_t> out = run_native(spv, kWave32);
+    if (out.empty()) GTEST_SKIP() << "the device cannot require a 32-lane compute subgroup";
+    for (uint32_t lane = 0; lane < kWave32; ++lane)
+        EXPECT_EQ(out[lane], lane < 20 ? 1u : 0u) << "lane " << lane << ": vcc is the reload";
 }

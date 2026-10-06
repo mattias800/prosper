@@ -3534,6 +3534,7 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
         // Wave32 compute (the only stage the VCC bridge flag admits): every mask is one word, so a
         // mask reloaded into a register that held a B32 mask stays one. Dropping the marker here
         // also dropped the Bool, and a data read then took the untracked SGPR's silent 0 (#4607).
+        // Within one block: the Wave32 dispatcher still loses the reload at an edge (#4613).
         const bool keeps_b32_reload = publishes_reloaded_mask && allow_compute_scalar_vcc_bridge &&
                                       rs.sreg_bool_b32.contains(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
@@ -3554,6 +3555,13 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             }
         }
         if (!writes_b32_mask && !keeps_b32_reload) rs.sreg_bool_b32.erase(base);
+        // VCC_LO's mask is mirrored in rs.vcc, which every implicit-VCC consumer (v_cndmask,
+        // vccz/vccnz, carry-in) reads. The reload published only the Bool, so mirror it, and drop
+        // the uniformity proof of the compare it replaces (#4607 review).
+        if (keeps_b32_reload && base == 106) {
+            rs.vcc = rs.sreg_bool.at(106);
+            rs.vcc_wave_uniform = 0;
+        }
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);
