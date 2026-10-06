@@ -19,6 +19,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "build_revision.hpp"
 #include "gpu/texture/guest_texture_layout.hpp"
+#include "gpu/resources/linear_row_pitch.hpp"   // resolved_linear_row_pitch
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -307,17 +308,6 @@ inline uint64_t checked_mul(uint64_t a, uint64_t b) {
     return a && b > std::numeric_limits<uint64_t>::max() / a ? std::numeric_limits<uint64_t>::max() : a * b;
 }
 
-inline uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint32_t bpt) {
-    if (r.linear_row_pitch_bytes) return r.linear_row_pitch_bytes;
-    const uint64_t tight = checked_mul(width, bpt);
-    if (tight > UINT32_MAX) return UINT32_MAX;
-    if (r.host_data) return static_cast<uint32_t>(tight);
-    if (const uint32_t registered = guest_linear_texture_row_pitch(
-            r.gpu_addr, static_cast<uint32_t>(tight)))
-        return registered;
-    const size_t aligned = linear_sampled_row_pitch(width, bpt);
-    return aligned > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(aligned);
-}
 
 inline uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
