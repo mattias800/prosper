@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # GPU executor design — from submitted Dcb to on-screen frames
 
 **Date:** 2026-07-06. **Goal:** execute the game's submitted AGC command buffers on a real Vulkan device

@@ -94,6 +94,42 @@ TEST(OwnedRawX2, DefinitionLifetimes) {
     unknown[2].fmt = Rdna2Format::Unknown;
     EXPECT_TRUE(rdna2_owned_raw_x2_chains(unknown).empty());
 }
+TEST(OwnedRawX2, OnlyAnUnnamedWriterOrTransferVoidsTheChains) {
+    // Past the fresh compare, where the numeric lifetime has ended and nothing reads the pair.
+    const auto with = [](uint32_t word) {
+        auto code = program();
+        code.insert(code.end() - 1, word);
+        return code;
+    };
+    // s_orn2/s_nand/s_nor_saveexec_b64 s[40:41], -1 (SOP1 0x28..0x2a): ordinary mask transfers.
+    // They were refused here under the name "relative SGPR write".
+    for (uint32_t opcode : {0x28u, 0x29u, 0x2au}) {
+        const auto code = with(0xbea800c1u | (opcode << 8u));
+        ASSERT_EQ(decode(code)[code.size() - 4].opcode, opcode);
+        EXPECT_EQ(chains(code).size(), 1u) << "SOP1 0x" << std::hex << opcode;
+    }
+    // The instructions that range was meant to be, and the other escapes: each may write a
+    // register its encoding does not name, or run code that was never decoded.
+    struct Escape {
+        const char* name;
+        uint32_t word;
+    };
+    const Escape escapes[] = {
+        {"s_movreld_b32 s60, s40", 0xbebc3028u},
+        {"s_movreld_b64 s[60:61], s[40:41]", 0xbebc3128u},
+        {"s_movrelsd_2_b32 s60, s40", 0xbebc4928u},
+        {"s_setpc_b64 s[60:61]", 0xbe80203cu},
+        {"s_call_b64 s[60:61], +0", 0xbb3c0000u},
+    };
+    for (const Escape& escape : escapes) {
+        const Rdna2Inst in = rdna2_decode_one(&escape.word, 1);
+        ASSERT_TRUE(rdna2_may_write_unnamed_register_or_leave_cfg(in)) << escape.name;
+        EXPECT_TRUE(chains(with(escape.word)).empty()) << escape.name;
+    }
+    // s_movrels_b32 s60, s40 writes the register it names and reads s40..s105, never VCC: the
+    // chains stand, as they did before.
+    EXPECT_EQ(chains(with(0xbebc2e28u)).size(), 1u);
+}
 TEST(OwnedRawX2, BothControlPathsMustReplaceMaskBeforeConsumer) {
     auto code = program();
     code.insert(code.begin() + 5, 0xbf880002u); // branch pc5 -> fresh compare pc8

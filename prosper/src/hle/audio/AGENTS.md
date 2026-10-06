@@ -25,6 +25,10 @@ title may use several at once:
   unregistered: its one known importer asserts on a failure and then carries on regardless.
 - **`atrac9_decode.cpp`** — glue for the vendored `third_party/libatrac9`. ATRAC9 is the one codec
   the core decodes itself, because it is a Sony format with no host implementation to defer to.
+- **`ngs2_waveform.cpp`** — the `libSceNgs2` waveform contracts (ParseWaveformData,
+  CalcWaveformBlock, SystemResetOption) as pure functions; `hle_audio.cpp` keeps only their traced
+  entry points. They follow **`libSceNgs2.native.sprx`**, the module PS5 titles actually bind, which
+  differs from the plain `libSceNgs2.sprx` in error family and struct sizes.
 
 ## The two seams out of the core
 

@@ -98,4 +98,29 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
         }
     }
 }
+
+// Scalar registers that MAY be overwritten while a loop executes. This is deliberately separate
+// from loop_written_regs: mask-pair destinations overwrite physical SGPRs (and therefore descriptor
+// provenance) but their values live in sreg_bool rather than the scalar-data SSA domain.
+void loop_scalar_may_writes(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
+                            std::set<int>& sregs) {
+    for (const auto& in : ins) {
+        if (in.pc < lo || in.pc >= hi) continue;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word)
+                sregs.insert(base + static_cast<int>(word));
+        });
+    }
+}
+
+void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
+    for (int reg : sregs) {
+        rs.sreg_written.insert(reg);
+        rs.sreg_input.erase(reg);
+        rs.sreg_srt.erase(reg);
+        // A loop body that may write this register must not leave a copy alias standing: the alias
+        // was established on one iteration's path and says nothing about the next one (#1773).
+        rs.sreg_ud_alias.erase(reg);
+    }
+}
 }   // namespace prosper::gpu

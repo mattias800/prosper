@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Syberia: Remastered (`PPSA30140`) — status and evidence
 
 Unity / IL2CPP, Microids / Virtuallyz Gaming. **Rung 3 — gameplay reached** with real GPU draws on a

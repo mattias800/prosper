@@ -189,4 +189,13 @@ private:
     std::shared_ptr<State> state_;
 };
 
+// Copy `bytes` into a snapshot, through `pool` unless it is disabled.
+inline CpuRttSnapshot copy_cpu_rtt_snapshot(CpuRttSnapshotPool& pool, bool pooled,
+                                            const uint8_t* source, size_t bytes) {
+    if (pooled) return pool.copy(source, bytes);
+    CpuRttSnapshot snapshot;
+    snapshot.pixels = std::make_shared<std::vector<uint8_t>>(source, source + bytes);
+    return snapshot;
+}
+
 } // namespace prosper::frontend

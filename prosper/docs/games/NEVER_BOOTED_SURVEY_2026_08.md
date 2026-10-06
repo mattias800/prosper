@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # The never-booted eight — a breadth survey (2026-08-22)
 
 Eight tracked titles had never been run. This records what one build and one-to-four bounded runs

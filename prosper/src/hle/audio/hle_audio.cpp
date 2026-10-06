@@ -12,10 +12,12 @@
 #include "hle/audio/audio.hpp"
 #include "hle/audio/ajm_decoder.hpp"     // optional host codecs (MP3); core retains AJM ABI + guest copies
 #include "hle/audio/atrac9_decode.hpp"    // vendored LibAtrac9 glue — AJM ATRAC9 batch decode (Blasphemous 2)
+#include "hle/audio/ngs2_waveform.hpp"    // libSceNgs2 waveform parse/calc/reset-option contracts
 #include "hle/dispatch/callback_fs.hpp"      // recover the caller's guest %fs for firing guest callbacks
 #include <memory>
 #include "host/platform/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <cmath>
 #include <deque>
@@ -3772,13 +3774,30 @@ constexpr uint64_t kNgs2RackTag   = 0x4e47533252000000ull; // "NGS2R"
 constexpr uint64_t kNgs2VoiceTag  = 0x4e47533256000000ull; // "NGS2V"
 constexpr uint64_t kNgs2TagMask   = 0xffffffffffffff00ull;
 constexpr uint64_t kNgs2VoiceMask = 0xffffffffff000000ull;
-constexpr uint64_t kNgs2ErrInvalidOut = (uint64_t)(int64_t)(int32_t)0x804a0053;
-constexpr uint64_t kNgs2ErrInvalidSystem = (uint64_t)(int64_t)(int32_t)0x804a0230;
-constexpr uint64_t kNgs2ErrInvalidRack = (uint64_t)(int64_t)(int32_t)0x804a0261;
-constexpr uint64_t kNgs2ErrInvalidVoice = (uint64_t)(int64_t)(int32_t)0x804a0302;
-constexpr uint64_t kNgs2ErrInvalidAllocator = (uint64_t)(int64_t)(int32_t)0x804a020a;
-constexpr uint64_t kNgs2ErrInvalidGrain = (uint64_t)(int64_t)(int32_t)0x804a0051;
-constexpr uint64_t kNgs2ErrInvalidRate = (uint64_t)(int64_t)(int32_t)0x804a0201;
+// Error codes of libSceNgs2.native.sprx -- the module PS5 titles link. The plain libSceNgs2.sprx in
+// the same firmware is the backward-compatibility build for PS4 titles and answers a different
+// 0x804a0xxx family; every title in the local corpus that imports NGS2 imports NIDs only the native
+// module exports (sceNgs2VoiceRunCommands, sceNgs2SystemResetOption), so these are the codes a PS5
+// guest observes. Each is cited at the native export (module vaddr) that answers it. CONFIDENCE: HIGH.
+constexpr uint64_t ngs2_err(uint32_t code) { return (uint64_t)(int64_t)(int32_t)code; }
+constexpr uint64_t kNgs2ErrInvalidOut       = ngs2_err(0x804a8010); // NULL out-pointer (0x1d183)
+constexpr uint64_t kNgs2ErrOutTooSmall      = ngs2_err(0x804a8011); // VoiceQueryInfo size (0x1f9aa)
+constexpr uint64_t kNgs2ErrOptionSize       = ngs2_err(0x804a8013); // option->size != 0x90 (0x1e943)
+constexpr uint64_t kNgs2ErrInvalidBufferInfo = ngs2_err(0x804a8020); // NULL info/hostBuffer (0x1d248)
+constexpr uint64_t kNgs2ErrInvalidAllocator = ngs2_err(0x804a8023); // NULL allocator/handler (0x1d36d)
+constexpr uint64_t kNgs2ErrWaveformType     = ngs2_err(0x804a8050); // render buffer type (0x13557)
+constexpr uint64_t kNgs2ErrSampleRate       = ngs2_err(0x804a8051); // option sample rate (0x1ec7d)
+constexpr uint64_t kNgs2ErrNumChannels      = ngs2_err(0x804a8052); // option channels (0x1ec44)
+constexpr uint64_t kNgs2ErrInvalidSystem    = ngs2_err(0x804a8201); // handle type 1 (0x3b6a)
+constexpr uint64_t kNgs2ErrInvalidRack      = ngs2_err(0x804a8202); // handle type 2 (0x3b71)
+constexpr uint64_t kNgs2ErrInvalidVoice     = ngs2_err(0x804a8203); // handle type 4 (0x20555)
+constexpr uint64_t kNgs2ErrRenderBuffer     = ngs2_err(0x804a8251); // NULL render buffer (0x13159)
+constexpr uint64_t kNgs2ErrInvalidRackId    = ngs2_err(0x804a8300); // unknown rack id (0x10239)
+constexpr uint64_t kNgs2ErrVoiceIndex       = ngs2_err(0x804a8305); // index >= maxVoices (0xfc73)
+constexpr uint64_t kNgs2ErrRenderCount      = ngs2_err(0x804a830b); // > 31 render buffers (0x12f1e)
+constexpr uint64_t kNgs2ErrInvalidGrain     = ngs2_err(0x804a8310); // grain samples (0x1dc09)
+constexpr uint64_t kNgs2ErrInvalidMaxGrain  = ngs2_err(0x804a8311); // max grain samples (0x1e954)
+constexpr uint64_t kNgs2ErrNullParamList    = ngs2_err(0x804a8360); // VoiceControl list (0x2365e)
 
 struct Ngs2RackState {
     bool used = false;
@@ -3789,11 +3808,6 @@ struct Ngs2RackState {
 
 std::mutex g_ngs2_mx;
 bool g_ngs2_systems[4]{};
-// Per-system sample rate. Nothing downstream consumes it yet (voices carry their own rate
-// from the waveform setup and the sink runs at the host rate); it is stored so the setter
-// below round-trips instead of acknowledging into the void. Default is the 48 kHz the
-// waveform and voice paths assume.
-uint32_t g_ngs2_rates[4]{48000, 48000, 48000, 48000};
 // NGS2 produces num_grain_samples frames per SystemRender; the guest hands us a buffer that can be far
 // larger (Dead Cells passes 37888 frames) and only consumes one grain, streaming one grain-sized block
 // per render. We fill only this many frames of an oversized buffer — filling the whole capacity makes a
@@ -3802,6 +3816,10 @@ uint32_t g_ngs2_rates[4]{48000, 48000, 48000, 48000};
 // safe upper bound that only trims oversized buffers. sceNgs2SystemCreate reads the real value from the
 // SceNgs2SystemOption (num_grain_samples @ +0x70) when the title supplies one; Dead Cells passes null.
 uint32_t g_ngs2_grain = 4096;
+// Each system's maxGrainSamples (SceNgs2SystemOption +0x6c, 512 when the option is NULL): the
+// native SetGrainSamples bounds a new grain by it (export l4Q2dWEH6UM -> 0x1dbd0, the u16 at
+// system+0x1de).
+uint32_t g_ngs2_max_grain[4]{};
 Ngs2RackState g_ngs2_racks[32];
 std::mutex g_ngs2_zero_mx;
 std::vector<uint8_t> g_ngs2_zeros;
@@ -4130,6 +4148,47 @@ bool ngs2_valid_system(uint64_t handle) {
            g_ngs2_systems[slot - 1];
 }
 
+// A grain count the native module accepts: a multiple of 64 in [64, max] (0x1e8ce / 0x1dbeb).
+bool ngs2_grain_ok(uint32_t grain, uint32_t max) {
+    return grain >= 64 && grain <= max && (grain & 63) == 0;
+}
+
+// The SceNgs2SystemOption checks SystemQueryBufferSize, SystemCreate and SystemCreateWithAllocator
+// share (native core 0x1e7e0): a NULL option takes the defaults (max grain 512, grain 256, 48 kHz,
+// 8 channels); otherwise size must be 0x90, maxGrainSamples (+0x6c) a multiple of 64 in [64, 2048],
+// numGrainSamples (+0x70) one in [64, maxGrainSamples], sampleRate (+0x74) one of the ten rates
+// below, and numChannels (+0x78) in [1, 37]. The four job-scheduler option pointers at +0x48..+0x60
+// are not inspected (their struct is unpinned). CONFIDENCE: HIGH on the checks and their order.
+struct Ngs2SystemOption { uint32_t max_grain = 512, num_grain = 256; };
+uint64_t ngs2_check_system_option(uint64_t option, Ngs2SystemOption& out) {
+    out = {};
+    if (!option) return 0;
+    uint64_t size = 0;
+    uint32_t fields[4] = {};  // maxGrainSamples, numGrainSamples, sampleRate, numChannels
+    if (!audio_read_bytes(option, &size, sizeof size) || size != 0x90) return kNgs2ErrOptionSize;
+    if (!audio_read_bytes(option + 0x6c, fields, sizeof fields)) return kNgs2ErrOptionSize;
+    if (!ngs2_grain_ok(fields[0], 2048)) return kNgs2ErrInvalidMaxGrain;
+    if (!ngs2_grain_ok(fields[1], fields[0])) return kNgs2ErrInvalidGrain;
+    static constexpr uint32_t kRates[] = {11025, 12000, 22050, 24000,  44100,
+                                          48000, 88200, 96000, 176400, 192000};
+    if (std::find(std::begin(kRates), std::end(kRates), fields[2]) == std::end(kRates))
+        return kNgs2ErrSampleRate;
+    if (fields[3] < 1 || fields[3] > 37) return kNgs2ErrNumChannels;
+    out.max_grain = fields[0];
+    out.num_grain = fields[1];
+    return 0;
+}
+
+// Rack ids the native rack core accepts when no rack option is given (0xffd0): sampler 0x1000,
+// submixer 0x2000/0x2001, mastering 0x3000 and the four 0x4001..0x4004 racks. An unknown id answers
+// 0x804a8300. With an option the module builds the rack from the option instead and this table is
+// not consulted, so neither is it here. CONFIDENCE: HIGH.
+bool ngs2_rack_id_ok(uint64_t option, uint32_t id) {
+    if (option) return true;
+    return id == 0x1000 || id == 0x2000 || id == 0x2001 || id == 0x3000 ||
+           (id >= 0x4001 && id <= 0x4004);
+}
+
 Ngs2RackState* ngs2_rack(uint64_t handle) {
     const uint64_t slot = handle & 0xff;
     if ((handle & kNgs2TagMask) != kNgs2RackTag || slot < 1 || slot > 32) return nullptr;
@@ -4148,81 +4207,113 @@ Ngs2RackState* ngs2_rack(uint64_t handle) {
 // argument/output positions and handle flow; MED on the deliberately private work-buffer sizes.
 HLE(ngs2_system_query_buffer) {
     NGS2_LOG("sceNgs2SystemQueryBufferSize");
-    if (!a1 || !a2_store_zeros(a1, 0x40) || !a2_store_u64(a1 + 8, 0x1000))
-        return kNgs2ErrInvalidOut;
+    // (option?, SceNgs2ContextBufferInfo* out). The native export (pgFAiLR5qT4, vaddr 0x1d140)
+    // refuses a NULL out with 0x804a8010, then clears the first 0x38 bytes -- hostBuffer,
+    // hostBufferSize and reserved[5]; userData at +0x38 is the caller's and survives -- and only
+    // then validates the option, so a refused option still leaves the block cleared.
+    if (!a1) return kNgs2ErrInvalidOut;
+    if (!a2_store_zeros(a1, 0x38)) return kNgs2ErrInvalidOut;
+    Ngs2SystemOption opt;
+    if (const uint64_t err = ngs2_check_system_option(a0, opt)) return err;
+    if (!a2_store_u64(a1 + 8, 0x1000)) return kNgs2ErrInvalidOut;
     return 0;
 }
 
-HLE(ngs2_system_create) {
-    NGS2_LOG("sceNgs2SystemCreate");
-    // a0 = const SceNgs2SystemOption* (optional). num_grain_samples is at +0x70 (size@0, name[64]@8,
-    // job_scheduler_options[4]@0x48, flags@0x68, max_grain_samples@0x6c, num_grain_samples@0x70). Honour
-    // it when present and sane, else keep the streaming-safe default. Dead Cells passes a0 == null.
-    // CONFIDENCE: MED — offset from the published SceNgs2SystemOption layout; not yet seen non-null live.
-    if (a0) { uint32_t g = 0; if (audio_read_bytes(a0 + 0x70, &g, 4) && g >= 64 && g <= 8192) g_ngs2_grain = g; }
-    if (!a1 || !a2) return kNgs2ErrInvalidOut;
+// The shared body of SystemCreate / SystemCreateWithAllocator once the caller's buffer or allocator
+// has been accepted: validate the option, then claim a slot. The option's numGrainSamples feeds the
+// render trim (g_ngs2_grain); its maxGrainSamples bounds later SetGrainSamples calls.
+static uint64_t ngs2_create_system(uint64_t option, uint64_t out) {
+    Ngs2SystemOption opt;
+    if (const uint64_t err = ngs2_check_system_option(option, opt)) return err;
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     for (uint64_t i = 0; i < 4; ++i) {
         if (g_ngs2_systems[i]) continue;
+        if (!a2_store_u64(out, kNgs2SystemTag | (i + 1))) return kNgs2ErrInvalidOut;
         g_ngs2_systems[i] = true;
-        if (!a2_store_u64(a2, kNgs2SystemTag | (i + 1))) {
-            g_ngs2_systems[i] = false;
-            return kNgs2ErrInvalidOut;
-        }
+        g_ngs2_max_grain[i] = opt.max_grain;
+        if (option) g_ngs2_grain = opt.num_grain;
         return 0;
     }
     return kNgs2ErrInvalidSystem;
 }
 
+HLE(ngs2_system_create) {
+    NGS2_LOG("sceNgs2SystemCreate");
+    // (option?, const SceNgs2ContextBufferInfo* buffer, handle*). Native export koBbCMvOKWw (vaddr
+    // 0x1d1e0): a NULL buffer info or a NULL hostBuffer (+0) answers 0x804a8020, then a NULL handle
+    // out 0x804a8010, then the option checks. The option layout (num_grain_samples @ +0x70) is the
+    // one the native core reads; Dead Cells passes a0 == null and keeps the streaming-safe default.
+    uint64_t host_buffer = 0;
+    if (!a1 || !audio_read_bytes(a1, &host_buffer, 8) || !host_buffer)
+        return kNgs2ErrInvalidBufferInfo;
+    if (!a2) return kNgs2ErrInvalidOut;
+    return ngs2_create_system(a0, a2);
+}
+
 HLE(ngs2_rack_query_buffer) {
     NGS2_LOG("sceNgs2RackQueryBufferSize");
+    // (rackId, option?, out). Native export 0eFLVCfWVds (vaddr 0xedf0): NULL out -> 0x804a8010,
+    // then all 0x40 bytes are cleared, then the rack id is checked (0x804a8300 when no option).
+    if (!a2) return kNgs2ErrInvalidOut;
+    if (!a2_store_zeros(a2, 0x40)) return kNgs2ErrInvalidOut;
+    if (!ngs2_rack_id_ok(a1, (uint32_t)a0)) return kNgs2ErrInvalidRackId;
     const uint64_t size = 0x1000ull + (uint64_t)ngs2_max_voices(a1) * 0x40ull;
-    if (!a2 || !a2_store_zeros(a2, 0x40) || !a2_store_u64(a2 + 8, size))
-        return kNgs2ErrInvalidOut;
+    if (!a2_store_u64(a2 + 8, size)) return kNgs2ErrInvalidOut;
     return 0;
 }
 
-HLE(ngs2_rack_create) {
-    NGS2_LOG("sceNgs2RackCreate");
-    if (!a3 || !a4) return kNgs2ErrInvalidOut;
+// The shared body of RackCreate / RackCreateWithAllocator after the buffer/allocator and the out
+// pointer were accepted: the native core checks the rack id first and resolves the system handle
+// last (0x1c9c0 -> 0x804a8201), so an unknown id wins over a dead system.
+static uint64_t ngs2_create_rack(uint64_t system, uint64_t rack_id, uint64_t option, uint64_t out) {
+    if (!ngs2_rack_id_ok(option, (uint32_t)rack_id)) return kNgs2ErrInvalidRackId;
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    if (!ngs2_valid_system(system)) return kNgs2ErrInvalidSystem;
     for (uint64_t i = 0; i < 32; ++i) {
         if (g_ngs2_racks[i].used) continue;
-        g_ngs2_racks[i] = {true, a0, (uint32_t)a1, ngs2_max_voices(a2)};
-        if (!a2_store_u64(a4, kNgs2RackTag | (i + 1))) {
-            g_ngs2_racks[i] = {};
-            return kNgs2ErrInvalidOut;
-        }
+        if (!a2_store_u64(out, kNgs2RackTag | (i + 1))) return kNgs2ErrInvalidOut;
+        g_ngs2_racks[i] = {true, system, (uint32_t)rack_id, ngs2_max_voices(option)};
         return 0;
     }
     return kNgs2ErrInvalidRack;
 }
 
+HLE(ngs2_rack_create) {
+    NGS2_LOG("sceNgs2RackCreate");
+    // (system, rackId, option?, const SceNgs2ContextBufferInfo* buffer, handle*). Native export
+    // cLV4aiT9JpA (vaddr 0xeea0): buffer info/hostBuffer -> 0x804a8020, handle out -> 0x804a8010,
+    // then the rack core.
+    uint64_t host_buffer = 0;
+    if (!a3 || !audio_read_bytes(a3, &host_buffer, 8) || !host_buffer)
+        return kNgs2ErrInvalidBufferInfo;
+    if (!a4) return kNgs2ErrInvalidOut;
+    return ngs2_create_rack(a0, a1, a2, a4);
+}
+
 HLE(ngs2_rack_get_voice) {
     NGS2_LOG("sceNgs2RackGetVoiceHandle");
-    if (!a2) return kNgs2ErrInvalidOut;
+    // (rack, voiceIndex, handle*). Native export MwmHz8pAdAo (vaddr 0xfbd0): the rack is resolved
+    // first (0x804a8202), then a NULL out answers 0x804a8010 and an index at or past the rack's
+    // maxVoices 0x804a8305. prosper's voice handle carries the index in 8 bits, so an index above
+    // 0xff is refused the same way.
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     Ngs2RackState* rack = ngs2_rack(a0);
     if (!rack) return kNgs2ErrInvalidRack;
-    if (a1 >= rack->max_voices || a1 > 0xff) return kNgs2ErrInvalidVoice;
+    if (!a2) return kNgs2ErrInvalidOut;
+    if (a1 >= rack->max_voices || a1 > 0xff) return kNgs2ErrVoiceIndex;
     const uint64_t rack_slot = a0 & 0xff;
     return a2_store_u64(a2, kNgs2VoiceTag | (rack_slot << 8) | a1) ? 0 : kNgs2ErrInvalidOut;
 }
 
 // --- Ngs2 lifecycle remainder: allocator creates, destroy, grain, locks ----------------------
-// These follow the table/tag/error model directly above (slots, kNgs2*Tag validation, the
-// 0x804a facility), so no new contract is invented: CreateWithAllocator allocates exactly like
-// Create (the allocator pointer is required input, but its callbacks are never invoked —
-// prosper keeps its own slot table and reads guest memory directly, so there is no
-// allocation to perform; documented MED); SystemDestroy frees the system slot plus the
-// racks it owns and their voices (mirroring RackDestroy's cascade) and zeroes the
-// released-context OUT block; SetGrainSamples records
-// into the shared grain word within Create's sane range; Lock/Unlock validate and acknowledge
-// (uncontended headless). NIDs via nid_hash; System/RackCreateWithAllocator reproduce the
-// firmware set. The DSP quartet (PanInit/PanGetVolumeMatrix/ParseWaveformData/CalcWaveformBlock)
-// and SystemGetInfo stay out: their struct layouts are unpinned by any local caller and no
-// touch backend exists to compute against.
+// Contracts from libSceNgs2.native.sprx (see the error table above), on the same slot/tag model as
+// Create. CreateWithAllocator takes (option?, allocator, handle*) and refuses a NULL allocator or a
+// NULL allocHandler (+0) with 0x804a8023 before a NULL handle out (0x804a8010). The native module
+// then calls allocHandler to obtain the context buffer and freeHandler on failure and at destroy;
+// prosper keeps its own slot table and reads guest memory directly, so it never invokes either
+// callback (balanced, CONFIDENCE: MED). SetGrainSamples and RackLock/Unlock are queued commands in
+// the native module (SystemRunCommands / RackRunCommands), validated synchronously there; the
+// handle and value checks below are the ones those command validators perform.
 // The allocator struct's first word is its allocHandler; the library refuses a missing one.
 static bool ngs2_allocator_valid(uint64_t allocator) {
     uint64_t handler = 0;
@@ -4230,39 +4321,20 @@ static bool ngs2_allocator_valid(uint64_t allocator) {
 }
 HLE(ngs2_system_create_with_allocator) {
     NGS2_LOG("sceNgs2SystemCreateWithAllocator");
-    // (option?, allocator, handle*): the allocator's callbacks are never invoked — prosper keeps
-    // its own slot table and reads guest memory directly, so there is no allocation to perform.
-    // CONFIDENCE: MED. Argument checks follow the shipped libSceNgs2.sprx (export mPYgU4oYpuY): a
-    // NULL allocator or a NULL allocHandler (+0) answers 0x804a020a, and only then does a NULL
-    // handle out answer 0x804a0053.
+    // Native export mPYgU4oYpuY (vaddr 0x1d2f0).
     if (!ngs2_allocator_valid(a1)) return kNgs2ErrInvalidAllocator;
     if (!a2) return kNgs2ErrInvalidOut;
-    std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    // Optional SystemOption grain at +0x70, same as SystemCreate.
-    if (a0) {
-        uint32_t g = 0;
-        if (audio_read_bytes(a0 + 0x70, &g, 4) && g >= 64 && g <= 8192) g_ngs2_grain = g;
-    }
-    for (uint64_t i = 0; i < 4; ++i) {
-        if (g_ngs2_systems[i]) continue;
-        g_ngs2_systems[i] = true;
-        if (!a2_store_u64(a2, kNgs2SystemTag | (i + 1))) {
-            g_ngs2_systems[i] = false;
-            return kNgs2ErrInvalidOut;
-        }
-        return 0;
-    }
-    return kNgs2ErrInvalidSystem;
+    return ngs2_create_system(a0, a2);
 }
 HLE(ngs2_system_destroy) {
     NGS2_LOG("sceNgs2SystemDestroy");
-    // (system, buffer_info*): the info block is the released-context OUT param, so on success it
-    // is zeroed like RackDestroy's (prosper owns no returned host buffer). a1 == 0 is accepted
-    // (no info wanted back). Outputs stay untouched on failure.
+    // (system, buffer_info*). Native export u-WrYDaJA3k (vaddr 0x1d410): a dead or foreign handle
+    // answers 0x804a8201; a1 == 0 is accepted. The native module copies the system's stored
+    // 0x40-byte buffer info to *a1 after tearing the system down; prosper owns no returned host
+    // buffer and writes zeros, like RackDestroy.
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
     const uint64_t slot = a0 & 0xff;
-    if ((a0 & kNgs2TagMask) != kNgs2SystemTag || slot < 1 || slot > 4 || !g_ngs2_systems[slot - 1])
-        return kNgs2ErrInvalidSystem;
     if (a1 && !a2_store_zeros(a1, 0x40)) return kNgs2ErrInvalidOut;
     g_ngs2_systems[slot - 1] = false;
     for (uint64_t i = 0; i < 32; ++i) {
@@ -4276,76 +4348,59 @@ HLE(ngs2_system_destroy) {
 }
 HLE(ngs2_system_set_grain_samples) {
     NGS2_LOG("sceNgs2SystemSetGrainSamples");
+    // Native export l4Q2dWEH6UM (vaddr 0x1e6a0) queues command 5 through SystemRunCommands, whose
+    // validator (0x1db31) answers 0x804a8201 for the handle and 0x804a8310 for a grain that is not
+    // a multiple of 64 in [64, the system's maxGrainSamples]. Only a valid grain is stored.
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
-    // The shipped library (export l4Q2dWEH6UM) answers 0x804a0051 for a count that is not a
-    // multiple of 64 or lies outside the system's limits, and stores only a valid one. The limits
-    // used here are SystemCreate's sane range. CONFIDENCE: MED on the exact bounds.
     const uint32_t g = (uint32_t)a1;
-    if (g < 64 || g > 8192 || (g & 63)) return kNgs2ErrInvalidGrain;
+    if (!ngs2_grain_ok(g, g_ngs2_max_grain[(a0 & 0xff) - 1])) return kNgs2ErrInvalidGrain;
     g_ngs2_grain = g;
     return 0;
 }
 HLE(ngs2_rack_create_with_allocator) {
     NGS2_LOG("sceNgs2RackCreateWithAllocator");
-    // (system, rack_id, option?, allocator, handle*): callbacks uninvoked, same model and the
-    // same allocator-then-out check order (export U546k6orxQo) as the system create above.
+    // (system, rackId, option?, allocator, handle*). Native export U546k6orxQo (vaddr 0xefc0):
+    // allocator -> 0x804a8023, handle out -> 0x804a8010, then the rack core.
     if (!ngs2_allocator_valid(a3)) return kNgs2ErrInvalidAllocator;
     if (!a4) return kNgs2ErrInvalidOut;
-    std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
-    for (uint64_t i = 0; i < 32; ++i) {
-        if (g_ngs2_racks[i].used) continue;
-        g_ngs2_racks[i] = {true, a0, (uint32_t)a1, ngs2_max_voices(a2)};
-        if (!a2_store_u64(a4, kNgs2RackTag | (i + 1))) {
-            g_ngs2_racks[i] = {};
-            return kNgs2ErrInvalidOut;
-        }
-        return 0;
-    }
-    return kNgs2ErrInvalidRack;
+    return ngs2_create_rack(a0, a1, a2, a4);
 }
 HLE(ngs2_rack_lock) {
     NGS2_LOG("sceNgs2RackLock");
+    // Native export MzTa7VLjogY (vaddr 0xfd10): one RackRunCommands lock command; a dead or foreign
+    // rack answers 0x804a8202. Uncontended headless, so the lock itself is an acknowledgement.
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
     return 0;
 }
 HLE(ngs2_rack_unlock) {
     NGS2_LOG("sceNgs2RackUnlock");
+    // Native export ++YZ7P9e87U (vaddr 0xfd70): the matching unlock command, same handle check.
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
     return 0;
 }
-// --- Ngs2 system controls: lock/unlock + sample rate ----------------------------------------
-// sceNgs2SystemLock/Unlock(system): validate-only acknowledgements (uncontended headless),
-// same model as the rack locks above. The reference implementation validates the handle and
-// nothing else, so there is no deeper contract to miss.
-// sceNgs2SystemSetSampleRate(system, rate): records the rate after range validation
-// (8000..192000 refused otherwise, per the reference contract). Stored per system; nothing
-// downstream reads it yet (see g_ngs2_rates). CONFIDENCE: MED on shapes/range (single
-// secondary + stub NIDs); LOW on the 0x804a0201 error, which extends this file's own
-// 0x804a00xx family rather than a firmware-observed value.
-HLE(ngs2_system_lock) {
-    NGS2_LOG("sceNgs2SystemLock");
-    std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
-    return 0;
+
+// --- Ngs2 waveform parsing + block calc + system-option reset -------------------------------
+// The contracts (re-derived from libSceNgs2.native.sprx, the module PS5 titles bind) live in
+// ngs2_waveform.cpp; these entry points only trace and widen the module's 32-bit result.
+HLE(ngs2_parse_waveform_data) {
+    NGS2_LOG("sceNgs2ParseWaveformData");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::parse_waveform_data(a0, a1, a2);
 }
-HLE(ngs2_system_unlock) {
-    NGS2_LOG("sceNgs2SystemUnlock");
-    std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
-    return 0;
+
+// Sample position and count are u32: the module reads only %esi/%edx (0x12070/0x12081), and the
+// SysV ABI leaves the upper halves of those registers undefined.
+HLE(ngs2_calc_waveform_block) {
+    NGS2_LOG("sceNgs2CalcWaveformBlock");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::calc_waveform_block(a0, (uint32_t)a1,
+                                                                          (uint32_t)a2, a3);
 }
-HLE(ngs2_system_set_sample_rate) {
-    NGS2_LOG("sceNgs2SystemSetSampleRate");
-    std::lock_guard<std::mutex> lock(g_ngs2_mx);
-    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
-    const uint32_t rate = (uint32_t)a1;
-    if (rate < 8000 || rate > 192000) return kNgs2ErrInvalidRate;
-    g_ngs2_rates[(a0 & 0xff) - 1] = rate;
-    return 0;
+
+HLE(ngs2_system_reset_option) {
+    NGS2_LOG("sceNgs2SystemResetOption");
+    return (uint64_t)(int64_t)(int32_t)ngs2_waveform::system_reset_option(a0);
 }
 
 // PROSPER_NGS2_TRACE=2 additionally dumps the voice-command param chain: each entry is a
@@ -4383,11 +4438,18 @@ void ngs2_dump_param_chain(const char* tag, uint64_t list) {
 HLE(ngs2_voice_control) {
     NGS2_LOG("sceNgs2VoiceControl");
     ngs2_dump_param_chain("VoiceControl", a1);
+    // Native export uu94irFOGpA (vaddr 0x227b0) refuses a NULL param list with 0x804a8360 before
+    // it looks at the voice; the voice is resolved when the translated commands run (0x804a8203).
+    if (!a1) return kNgs2ErrNullParamList;
     if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
     if (!ngs2_mix_disabled()) { std::lock_guard<std::mutex> lock(g_ngs2_mx); ngs2_apply_voice_params(a0, a1); }
     return 0;
 }
 
+// Unverified shape, recorded so it is not mistaken for a checked one: the native export
+// (AbYvTOZ8Pts, vaddr 0x20250) takes (voice, commands, count) with 16-byte command records -- it is
+// what VoiceControl translates a param list into -- not a param list. This handler parses a1 as a
+// param list. Only the handle check (0x804a8203) is from the native module here.
 HLE(ngs2_voice_run_commands) {
     NGS2_LOG("sceNgs2VoiceRunCommands");
     ngs2_dump_param_chain("RunCommands", a1);
@@ -4398,8 +4460,14 @@ HLE(ngs2_voice_run_commands) {
 
 HLE(ngs2_voice_get_state) {
     NGS2_LOG("sceNgs2VoiceGetState");
+    // (voice, state*, size). Native export -TOuuAQ-buE (vaddr 0x206b0) is VoiceQueryInfo(0x4002):
+    // a dead voice answers 0x804a8203, a size below 8 answers 0x804a8011 before a NULL state is
+    // checked (0x804a8010), and the whole `size` bytes are cleared before the state is written.
+    // prosper clears at most 0x1000 of them (its sampler state is 0x30 bytes).
     if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
-    if (!a1 || !a2 || a2 > 0x1000 || !a2_store_zeros(a1, (size_t)a2)) return kNgs2ErrInvalidOut;
+    if (a2 < 8) return kNgs2ErrOutTooSmall;
+    if (!a1) return kNgs2ErrInvalidOut;
+    if (!a2_store_zeros(a1, (size_t)std::min<uint64_t>(a2, 0x1000))) return kNgs2ErrInvalidOut;
     // SceNgs2SamplerVoiceState (0x30): state_flags@0x00, envelope_height@0x04(f), peak_height@0x08(f),
     // reserved@0x0c, num_decoded_samples@0x10(u64), decoded_data_size@0x18(u64), user_data@0x20,
     // waveform_data@0x28. The block-completion callback re-enters here and reads num_decoded_samples to
@@ -4447,7 +4515,9 @@ HLE(ngs2_rack_destroy) {
     NGS2_LOG("sceNgs2RackDestroy");
     std::lock_guard<std::mutex> lock(g_ngs2_mx);
     const uint64_t slot = a0 & 0xff;
-    if ((a0 & kNgs2TagMask) != kNgs2RackTag || slot < 1 || slot > 32) return kNgs2ErrInvalidRack;
+    // Native export lCqD7oycmIM (vaddr 0xf110) resolves a LIVE rack (0x804a8202), so a second
+    // destroy of the same handle is refused rather than acknowledged.
+    if (!ngs2_rack(a0)) return kNgs2ErrInvalidRack;
     g_ngs2_racks[slot - 1] = {};
     for (auto it = g_ngs2_voices.begin(); it != g_ngs2_voices.end(); )
         it = ((it->first >> 8) == slot) ? g_ngs2_voices.erase(it) : std::next(it);
@@ -4475,13 +4545,24 @@ HLE(ngs2_system_render) {
         std::lock_guard<std::mutex> lock(g_ngs2_mx);
         if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
     }
+    // (system, const SceNgs2RenderBufferInfo* buffers, count). Native export i0VnXM-C9fc (vaddr
+    // 0x1e460) resolves the system (0x804a8201), then its render core (0x12ef0) refuses more than
+    // 31 buffers with 0x804a830b and accepts zero; per buffer, a waveform type other than
+    // 0x12/0x13/0x18/0x19 answers 0x804a8050 and a NULL buffer 0x804a8251. Not modelled: the
+    // native channel-count check (SDK-version dependent, 0x804a8052) and its "buffer smaller than
+    // one grain" refusal (0x804a8252), whose grain is not prosper's trimmed g_ngs2_grain. A buffer
+    // over 64 MiB is a prosper bound on the host-side mix copy, not a native refusal.
     struct RenderBufferInfo { uint64_t buffer, size; uint32_t waveform_type, channels; };
-    if (!a1 || a2 == 0 || a2 > 16) return kNgs2ErrInvalidOut;
-    for (uint64_t i = 0; i < a2; ++i) {
+    const uint32_t count = (uint32_t)a2;   // a 32-bit count natively; ignore the register's upper half
+    if (count > 31) return kNgs2ErrRenderCount;
+    if (count && !a1) return kNgs2ErrInvalidOut;
+    for (uint64_t i = 0; i < count; ++i) {
         RenderBufferInfo info{};
-        if (!ngs2_read_bytes(a1 + i * sizeof(info), &info, sizeof(info)) ||
-            !info.buffer || info.size > 64ull * 1024 * 1024)
-            return kNgs2ErrInvalidOut;
+        if (!ngs2_read_bytes(a1 + i * sizeof(info), &info, sizeof(info))) return kNgs2ErrInvalidOut;
+        const uint32_t t = info.waveform_type;
+        if (t != 0x12 && t != 0x13 && t != 0x18 && t != 0x19) return kNgs2ErrWaveformType;
+        if (!info.buffer) return kNgs2ErrRenderBuffer;
+        if (info.size > 64ull * 1024 * 1024) return kNgs2ErrInvalidOut;
 
         // The render buffer is the mix destination. Output format: waveform_type 0x12 == S16, anything
         // else (the NGS2 render default) == F32. Frame count derives from size and the output stride.
@@ -4511,8 +4592,8 @@ HLE(ngs2_system_render) {
             static uint64_t rc = 0; static float maxpk = 0; static int maxpv = 0;
             if (pk > maxpk) maxpk = pk; if (playing > maxpv) maxpv = playing;
             if ((++rc & 0x3f) == 1 || (pk > 0 && playing > 0))
-                fprintf(stderr, "[ngs2] render buf#%llu out=%s ch=%u frames=%u size=%llu playing_voices=%d(max%d) mix_peak=%.4f(max%.4f)\n",
-                        (unsigned long long)i, out_s16 ? "s16" : "f32", out_channels, frames,
+                fprintf(stderr, "[ngs2] render buf#%llu type=0x%x out=%s ch=%u frames=%u size=%llu playing_voices=%d(max%d) mix_peak=%.4f(max%.4f)\n",
+                        (unsigned long long)i, info.waveform_type, out_s16 ? "s16" : "f32", out_channels, frames,
                         (unsigned long long)info.size, playing, maxpv, pk, maxpk);
         }
         // Serialize the float mix into the guest buffer's native format (clamped), then commit it.
@@ -4709,11 +4790,11 @@ void register_audio_hle() {
     Hle::register_fn("l4Q2dWEH6UM", ngs2_system_set_grain_samples, "sceNgs2SystemSetGrainSamples");
     Hle::register_fn("U546k6orxQo", ngs2_rack_create_with_allocator,
                      "sceNgs2RackCreateWithAllocator");
-    Hle::register_fn("gThZqM5PYlQ", ngs2_system_lock, "sceNgs2SystemLock");
-    Hle::register_fn("JXRC5n0RQls", ngs2_system_unlock, "sceNgs2SystemUnlock");
-    Hle::register_fn("-tbc2SxQD60", ngs2_system_set_sample_rate, "sceNgs2SystemSetSampleRate");
     Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
     Hle::register_fn("++YZ7P9e87U", ngs2_rack_unlock, "sceNgs2RackUnlock");
+    Hle::register_fn("hyVLT2VlOYk", ngs2_parse_waveform_data, "sceNgs2ParseWaveformData");
+    Hle::register_fn("3pCNbVM11UA", ngs2_calc_waveform_block, "sceNgs2CalcWaveformBlock");
+    Hle::register_fn("AQkj7C0f3PY", ngs2_system_reset_option, "sceNgs2SystemResetOption");
     Hle::register_fn("eF8yRCC6W64", ngs2_geom_apply, "sceNgs2GeomApply");
     Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
 #if defined(__linux__)

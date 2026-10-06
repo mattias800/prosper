@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Persistent texture source snapshot ownership
 
 Tracking: [#3407](https://github.com/mattias800/prosper/issues/3407).

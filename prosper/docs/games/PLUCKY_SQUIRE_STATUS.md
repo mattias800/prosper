@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # The Plucky Squire (`PPSA15319`) — status
 
 Unreal Engine 4. Tracker: [#1882](https://github.com/mattias800/prosper/issues/1882).

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # The First Berserker: Khazan — `PPSA20447` status
 
 **Rung 0.** The title boots, links every module, mounts and enumerates its save slots and reaches the

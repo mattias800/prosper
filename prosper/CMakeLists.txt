@@ -32,6 +32,44 @@ if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# Windows: an executable that HOSTS A GUEST opts out of high-entropy bottom-up ASLR (#4426).
+#
+# With IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA set (the default for current binutils and for
+# lld), the kernel picks the base of the process's bottom-up allocations -- the main thread's
+# stack, the PEB/TEBs, the heaps and then every later VirtualAlloc(NULL) -- from the low TERABYTE.
+# The guest's address range is that same terabyte ([16 GiB, 1008 GiB), which the guest libc bounds
+# from above), so the host's own allocations land inside it on most launches. A UE4 title's 512 GiB
+# MallocBinned3 arena has to cover the 144 GiB in the middle of the 880 GiB huge band wherever it
+# is placed; whenever the host cluster sits there (6 of 28 launches measured) the reservation
+# cannot be placed at all, the guest receives a null allocator, and it deadlocks on its own
+# __cxa_guard before printing anything.
+#
+# Without the flag the same randomisation spans the first 16 MiB, so the guest's range starts out
+# empty on every launch. boot_program() then reserves what is free below 4 GiB at that moment
+# (host::confine_host_allocations_above_4gib), so what the host allocates fresh from there on --
+# a guest thread's stack above all -- lands above 4 GiB as it did before, and below the guest's
+# range. Best effort: that header lists what it cannot move.
+#
+# Per target, NOT global: tests hand host stack and heap buffers to code that takes guest addresses,
+# and that code tells an address from an immediate by "above 4 GiB" in places. A global flag put
+# every such buffer below 4 GiB and broke eight tests that way. Apply this to an executable that
+# boots a guest, and to nothing else -- and name a new one in the list at the end of this file,
+# which is what makes tests/host/memory/test_windows_guest_window.cpp redden if it loses the flag. Host ASLR entropy is not a security boundary here: the process runs guest
+# code natively.
+function(prosper_hosts_a_guest target)
+  if(WIN32)
+    # LINKER: lets CMake spell the pass-through for whichever driver is in use. MSVC is set for cl
+    # and for every Clang driver that targets the MSVC ABI. That branch is written from the linker's
+    # documentation and has NOT been built here -- prosper's Windows toolchains are MinGW GCC and
+    # GNU-ABI Clang, both of which take the second form (verified on each).
+    if(MSVC)
+      target_link_options(${target} PRIVATE "LINKER:/HIGHENTROPYVA:NO")
+    else()
+      target_link_options(${target} PRIVATE "LINKER:--disable-high-entropy-va")
+    endif()
+  endif()
+endfunction()
+
 # --- Diagnostics (optional observer-only instrumentation) -----------------
 # Boot timeline capture, event bus, JSON export. OFF by default: zero cost when
 # disabled (stubs compile to no-ops). ON adds ~300 lines of optional code.
@@ -390,6 +428,10 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_hle_handler_map.py")
   # ...and reconciled against the registry the compiled binary actually builds, so a registration
   # SHAPE the parser does not recognise fails loudly instead of quietly shrinking the census.
+  # The HLE progress census counts per registered NID on top of hle_handler_map's parser; its
+  # fixtures are the registration shapes an HLE()-regex census miscounted (#4532).
+  add_test(NAME progress_census
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/progress/test_progress.py")
   add_test(NAME re_hle_handler_map_reconcile
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/re/test_hle_registry_reconcile.py"
@@ -711,6 +753,10 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_wrapper_identity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_compiler_wrapper.py")
+    set_tests_properties(compiler_wrapper_identity PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compiler_source_identity
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
@@ -1170,6 +1216,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_ngs2_lifecycle.cpp
     LIBRARIES prosper_core)
 
+  # NGS2 waveform surface: container parsing, block calculation, option reset.
+  # Pure, no game dump.
+  prosper_add_gtest(test_ngs2_waveform
+    SOURCES tests/hle/test_ngs2_waveform.cpp
+    LIBRARIES prosper_core)
+
   # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
   # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
   prosper_add_gtest(test_ajm
@@ -1220,6 +1272,30 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_dcc_helper_program
     SOURCES tests/gpu/execute/test_dcc_helper_program.cpp
     INCLUDES src)
+
+  # #1588: AGC's eliminate-fast-clear rectangle writes no colour; a latched MODE=2 on an ordinary
+  # draw still does. Matcher arms plus realize_draw_item arms (no device needed).
+  prosper_add_gtest(test_efc_helper_program
+    SOURCES tests/gpu/execute/test_efc_helper_program.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_srt_publication_dedupe
+    SOURCES tests/gpu/execute/test_srt_publication_dedupe.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_ngg_subgroup_plan
+    SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  # #3135 P2: static admission of a linked merged-NGG program for the subgroup shell. Pure decode
+  # and dataflow; the captured Kena chain is read from tests/data.
+  prosper_add_gtest(test_ngg_subgroup_abi
+    SOURCES tests/gpu/recompiler/test_ngg_subgroup_abi.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
@@ -2240,6 +2316,15 @@ if(TARGET prosper_core)
     prosper_add_gtest(test_win_data_watch
       SOURCES tests/host/image/test_win_data_watch.cpp
       LIBRARIES prosper_core)
+
+    # #4426: a guest-hosting executable's address range must start out empty (no high-entropy
+    # ASLR) with later host allocations confined above 4 GiB, and a huge reservation that cannot
+    # be placed must name what blocks it. The executables it inspects are listed at the end of
+    # this file, where every target they name exists.
+    prosper_add_gtest(test_windows_guest_window
+      SOURCES tests/host/memory/test_windows_guest_window.cpp
+      LIBRARIES prosper_core)
+    prosper_hosts_a_guest(test_windows_guest_window)
   endif()
 
   # Boot preload path case correction (#1006): a module present with different casing than the
@@ -2288,6 +2373,11 @@ if(TARGET prosper_core)
   # it needs none of test_perf_alarms' HLE-dispatcher fixtures.
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
+    LIBRARIES prosper_core)
+  # The wording of the Wave64 host line and of a refusal line: a recompile refusal must not read
+  # as a GPU limitation, and a narrow-subgroup device must be told what it will be missing.
+  prosper_add_gtest(test_wave64_host_line
+    SOURCES tests/diagnostics/test_wave64_host_line.cpp
     LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
@@ -2535,6 +2625,12 @@ if(TARGET prosper_core)
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   prosper_add_gtest(test_dmem
     SOURCES tests/host/test_dmem.cpp
+    LIBRARIES prosper_core)
+
+  # An over-cap buffer window publishes clamped to its mapped run, outside the replayable fold.
+  prosper_add_gtest(test_oversize_buffer_window
+    SOURCES tests/gpu/execute/test_oversize_buffer_window.cpp
+    INCLUDES src
     LIBRARIES prosper_core)
 
   # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
@@ -3039,6 +3135,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_wqm_into_vcc_execution
+      SOURCES tests/gpu/execute/test_compute_wqm_into_vcc.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
@@ -3118,6 +3219,11 @@ if(TARGET prosper_core)
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
+  prosper_add_gtest(test_raw_wide_replayed_load
+    SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
@@ -3232,6 +3338,9 @@ endif()
   # fires would otherwise pass the suite.
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_s_movrels_read_range
+    SOURCES tests/gpu/recompiler/test_s_movrels_read_range.cpp
     LIBRARIES prosper_core)
 
   prosper_add_gtest(test_fragment_draw_capacity
@@ -3945,6 +4054,12 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
     LIBRARIES prosper_core)
 
+  # sceAgcCbBranch is a builder (#4540): packet layout, patchers, condition, and the ordering
+  # contract (the target runs inside the buffer that carries the branch).
+  prosper_add_gtest(test_cb_branch
+    SOURCES tests/gpu/pm4/test_cb_branch.cpp
+    LIBRARIES prosper_core)
+
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
   prosper_add_gtest(test_agc_multi_dcb_empty_segment
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
@@ -4003,6 +4118,7 @@ endif()
   # itself is not yet verified on Windows — see docs/platforms/PORTING.md "Windows".
   if(WIN32)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp tools/boot_trace/first_frame_capture.cpp)
+    prosper_hosts_a_guest(boot_trace)
     # Includes a shared fixture, which resolves from the `tests` root.
     target_include_directories(boot_trace PRIVATE tests)
     # Spells a `shared/...` include, which resolves from `frontends`.
@@ -4831,6 +4947,13 @@ endif()
         SOURCES tests/gpu/execute/test_memory_fed_raw_wide_exec.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
+      # #3135 P2: the merged-NGG subgroup shell executed offline on Kena's linked LUT producer,
+      # with the planner's launch and the discriminating launch-model controls.
+      prosper_add_gtest(test_ngg_subgroup_shell
+        SOURCES tests/gpu/execute/test_ngg_subgroup_shell.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)
@@ -4946,11 +5069,59 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A wave-empty EXEC guard around a counted loop in UE4's save-then-v_cmpx form (#4427):
+      # compile-level positives/negatives plus two executed kernels.
+      prosper_add_gtest(test_counted_loop_cmpx_guard
+        SOURCES tests/gpu/recompiler/test_counted_loop_cmpx_guard.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
+      # counted-loop route declines and the general route lowers both loops, executed per lane.
+      prosper_add_gtest(test_counted_loop_prelude_exec_loop
+        SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The CFG dispatcher's spill-slot domain is decided per V_WRITELANE (Kena 0x5008ec0000):
+      # a data spill of an SGPR that holds a mask elsewhere survives a block edge, executed.
+      prosper_add_gtest(test_cfg_spill_slot_domain
+        SOURCES tests/gpu/recompiler/test_cfg_spill_slot_domain.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A Wave64 mask rebuilt from its two spilled halves stays a mask across a CFG-dispatcher
+      # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
+      prosper_add_gtest(test_cfg_spilled_mask_halves
+        SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
+      # positives/negatives, plus the program rendered with both back-edge polarities.
+      prosper_add_gtest(test_scc_do_while_loops
+        SOURCES tests/gpu/execute/test_scc_do_while_loops.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_recompiled_fragment
         SOURCES tests/gpu/recompiler/test_recompiled_fragment.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A fragment loop whose body recycles VCC as scalar scratch, compiled and executed (#4508:
+      # Space Adventure Cobra's per-pixel light loop).
+      prosper_add_gtest(test_fragment_loop_vcc_scratch
+        SOURCES tests/gpu/recompiler/test_fragment_loop_vcc_scratch.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The renderer's start-up Wave64 host line, on whatever device runs the test.
+      prosper_add_gtest(test_wave64_host_announcement
+        SOURCES tests/gpu/execute/test_wave64_host_announcement.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -5947,6 +6118,7 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     add_executable(screenshot tools/screenshot/screenshot.cpp
                               tools/screenshot/capture_manifest.cpp
                               tools/screenshot/overlay_text.cpp)
+    prosper_hosts_a_guest(screenshot)
                               # Spells a `shared/...` include, which resolves from `frontends`.
                               target_include_directories(screenshot PRIVATE frontends)
     target_include_directories(screenshot PRIVATE src tools/screenshot)
@@ -6298,6 +6470,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
                                frontends/prosper-app/library_media.cpp
                                frontends/prosper-app/fps_overlay.cpp)
+    prosper_hosts_a_guest(prosper-app)
     # third_party/renderdoc: the vendored in-application API header (#3321). Header-only and
     # never linked -- librenderdoc.so is dlopen'd at runtime by the capture trigger.
     target_include_directories(prosper-app PRIVATE src third_party/stb third_party/renderdoc
@@ -6528,6 +6701,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
+  # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
+  prosper_add_gtest(test_unorm10_snapshot
+    SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
   target_link_libraries(test_guest_write_drain PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
@@ -6677,3 +6856,26 @@ foreach(prosper_test_case IN LISTS prosper_registered_tests)
   set_property(TEST ${prosper_test_case} APPEND PROPERTY ENVIRONMENT
     "PROSPER_TEST_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-scratch/${prosper_test_case}")
 endforeach()
+
+# #4426: test_windows_guest_window reads the PE header of every executable that boots a guest. The
+# list is spelled out here rather than collected from prosper_hosts_a_guest() calls on purpose: a
+# target that DROPS its call must still be inspected, or losing the flag would also lose the check.
+if(WIN32 AND TARGET test_windows_guest_window)
+  set(_prosper_guest_host_files "")
+  foreach(_host IN ITEMS boot_trace screenshot prosper-app)
+    if(TARGET ${_host})
+      add_dependencies(test_windows_guest_window ${_host})
+      string(APPEND _prosper_guest_host_files "$<TARGET_FILE:${_host}>|")
+    endif()
+  endforeach()
+  # Written to an include file rather than passed as a -D: a path list on a compiler command line
+  # depends on every generator's quoting rules, and a file does not.
+  # $<CONFIG> in the path keeps a multi-config generator from writing one file per configuration
+  # to the same place (the content names per-configuration executables).
+  file(GENERATE
+    OUTPUT
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/$<CONFIG>/windows_guest_host_files.inc"
+    CONTENT "R\"prosperpaths(${_prosper_guest_host_files})prosperpaths\"\n")
+  target_include_directories(test_windows_guest_window PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/$<CONFIG>")
+endif()

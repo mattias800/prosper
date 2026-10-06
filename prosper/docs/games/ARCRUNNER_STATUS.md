@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # ArcRunner (`PPSA21406`) — status and evidence
 
 Unreal Engine 4.27-plus. **Rung 0 on a default launch — but with the `PROSPER_SUBMIT_STALL_US=1500`

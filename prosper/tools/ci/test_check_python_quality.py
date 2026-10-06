@@ -195,6 +195,15 @@ class EndToEnd(unittest.TestCase):
         self.commit("quoted path")
         self.assertTrue(any("D100" in p for p in self.verdict()))
 
+    def test_non_ascii_edit_reaches_ruff_intact(self):
+        # A MODIFIED file's base and head sources reach ruff on stdin. With text=True and no
+        # encoding, Python encoded them with the host code page (cp1252 on Windows), which cannot
+        # represent CJK text, so the check crashed on a compliant edit. U+4E2D is in no Western
+        # code page, which is what makes this arm fail without the fix.
+        self.write("prosper/tools/x/old.py", '"""CJK text."""\n\nX = "\u4e2d"\n')
+        self.commit("non-ascii edit")
+        self.assertEqual([], self.verdict())
+
     def test_renamed_python_retains_baseline_and_rejects_new_findings(self):
         self.git("mv", "prosper/tools/x/old.py", "prosper/tools/x/moved.py")
         self.commit("rename")
