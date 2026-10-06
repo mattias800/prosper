@@ -89,7 +89,7 @@ Last updated: 2026-10-06
 | *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — the owner previously selected New Game. A fresh normal rerun renders first-boot setup through settings-saved Continue, then retains that image while host presents advance; correct title-background rendering remains unverified. The earlier later-sequence GPU timeout is separate ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
 | *Hollow Knight: Silksong* | `PPSA12544` | Unity 6 | 🚧 Opening Moss Grotto gameplay, played and confirmed by eye by the owner; every menu and in-game string renders since #4120 | [#4121](https://github.com/mattias800/prosper/issues/4121) |
 | *Rayman 30th Anniversary Edition* | `PPSA33016` | Custom (libretro front end) | 🚧 The first level of *Rayman* (1995) in play at 60 fps on the title's very first launch: health warning, game carousel, save-slot menu, level intro and Pink Plant Woods with its HUD. Reached by hand from a controller; no input route and no guard yet | [#4552](https://github.com/mattias800/prosper/issues/4552) |
-| *MOUSE: P.I. For Hire* | `PPSA26578` | Unity / IL2CPP | 🔬 Rung 2 — a scripted route reaches first-person gameplay and the HUD draws, but the world is mostly black (two lamps and a patch of floor) and the game runs at 6 to 10 fps; the dropped fragment draws and the skipped compute program are fixed ([#4609](https://github.com/mattias800/prosper/pull/4609), [#4615](https://github.com/mattias800/prosper/pull/4615)) and the picture did not change, so the cause is still open ([#4554](https://github.com/mattias800/prosper/issues/4554), [#4612](https://github.com/mattias800/prosper/issues/4612)) | [#4556](https://github.com/mattias800/prosper/issues/4556) |
+| *MOUSE: P.I. For Hire* | `PPSA26578` | Unity / IL2CPP | 🚧 Rung 3 — a scripted route reaches first-person gameplay and the room renders under the HUD: walls, doors, furniture and lamps. The world was black until the decal buffer began each frame from its real clear colour ([#4621](https://github.com/mattias800/prosper/pull/4621)). It runs at under 10 fps, and the picture has not been compared with a PS5 | [#4556](https://github.com/mattias800/prosper/issues/4556) |
 
 ## At a glance
 
@@ -103,8 +103,8 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 30 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 20 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 31 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 19 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
 | **Boots, but no frame with content** (rung 0) | 12 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
@@ -870,18 +870,19 @@ controller, so there is no input route yet. See the
 
 ## MOUSE: P.I. For Hire — `PPSA26578`
 
-<p align="center"><img src="assets/screenshots/mouse-pi-first-gameplay-dark.webp" alt="MOUSE: P.I. For Hire in first-person gameplay: objective, compass and health badge drawn over a scene that is black except for two wall lamps and a patch of lit floor; Linux prosper-app, RADV, interactive play by the owner, F9 grab"></p>
+<p align="center"><img src="assets/screenshots/mouse-pi-gameplay-room.webp" alt="MOUSE: P.I. For Hire in first-person gameplay: a dim wood-panelled room seen through open doors, with a STAFF ONLY door, a counter, double doors, two wall lamps and a table under a white cloth, and the objective, compass and health badge drawn over it; Linux prosper-app, RADV, scripts/mouse-pi-PPSA26578/reach-gameplay.pad, flip 2000"></p>
 
-Gameplay is reached and the HUD is complete, but most of the world is dark and the game runs at
-6 to 10 frames per second. The picture above is the defect, not the game's look. See the
-[tracker](https://github.com/mattias800/prosper/issues/4556).
+Gameplay is reached and the room renders under a complete HUD.
+`scripts/mouse-pi-PPSA26578/reach-gameplay.pad` gets there without a person at the pad. The game
+runs at under 10 frames per second, and whether the scene is lit as it should be has not been
+checked against a PS5. See the [tracker](https://github.com/mattias800/prosper/issues/4556) and
+the [status page](prosper/docs/games/MOUSE_PI_STATUS.md).
 
 <p align="center"><img src="assets/screenshots/mouse-pi-difficulty-select.webp" alt="MOUSE: P.I. For Hire difficulty select: three framed cartoon portraits labelled Rookie, Detective and Supersleuth; Linux prosper-app, RADV, scripts/mouse-pi-PPSA26578/reach-gameplay.pad, flip 1300"></p>
 
-The menus render, as the difficulty select above shows. `scripts/mouse-pi-PPSA26578/reach-gameplay.pad`
-reaches the gameplay scene without a person at the pad. Since 2026-10-06 nothing in that scene is
-refused, dropped or skipped, and it is as dark as before, so the cause is not one of the losses
-the log names.
+Until 2026-10-06 the world in that scene was black except for two lamps and a patch of floor.
+Nothing was being dropped; the buffer the game blends its decals into was starting each frame
+transparent, and every surface's base colour is scaled by it.
 
 ## Reproducible routes
 

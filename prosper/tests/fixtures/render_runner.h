@@ -21,6 +21,7 @@
 #include "gpu/memory/spill_recovery.hpp"        // #3905: rebuild spilled retained resources in VRAM
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
+#include "gpu/state/guest_depth_plane.hpp"   // a retained depth plane's guest size (#4556)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
@@ -5901,6 +5902,8 @@ struct PersistentDsImage {
     uint32_t programmed_slice_max = 0;
     std::array<prosper::GuestDirectAllocation, 5> guest_allocations{};
     bool guest_producer_seen = false;
+    // Texel size of the GUEST plane; 0 until a pass has said (gpu/state/guest_depth_plane.hpp).
+    uint32_t guest_depth_texel_bytes = 0;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -5981,6 +5984,15 @@ inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHas
 persistent_ds_cache() {
     static std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash> cache;
     return cache;
+}
+
+// The entry a pass attaches, with what that pass's registers say about the guest plane it stands
+// for. The backend attaches through here; an entry reached any other way stays undescribed.
+inline PersistentDsImage& persistent_ds_entry_for(const prosper::gpu::ResolvedPipelineState& ps,
+                                                  const PersistentDsKey& key) {
+    PersistentDsImage& image = persistent_ds_cache()[key];
+    prosper::gpu::note_guest_depth_format(image, ps.db_z_info);
+    return image;
 }
 
 // Before the first exact consumer supplies a DS layer stride, the ordinary invalidator
@@ -6357,7 +6369,9 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
     for (auto& [key, image] : persistent_ds_cache()) {
         const uint64_t pixels = static_cast<uint64_t>(key.w) * key.h;
         const bool depth_extent_overflow = pixels > UINT64_MAX / 4;
-        const uint64_t depth_size = depth_extent_overflow ? UINT64_MAX : pixels * 4;
+        const uint64_t depth_size =   // the GUEST plane's size, not the D32 host image's
+            depth_extent_overflow ? UINT64_MAX
+                                  : prosper::gpu::guest_depth_plane_bytes(image, pixels);
         const uint64_t stencil_size = pixels;
         const uint64_t htile_blocks = ((static_cast<uint64_t>(key.w) + 7) / 8) *
                                       ((static_cast<uint64_t>(key.h) + 7) / 8);
@@ -6387,8 +6401,7 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
                                            bool malformed = false) {
             if (!base) return false;
             if (malformed || base > UINT64_MAX - offset) return true;
-            return prosper::guest_memory_topology_relation(addr, size, base + offset, bytes) !=
-                   prosper::GuestMemoryTopologyRelation::Disjoint;
+            return prosper::gpu::guest_write_may_alias_plane(addr, size, base + offset, bytes);
         };
         const bool malformed_depth = slice_offset_overflow || (!learned && depth_extent_overflow);
         const bool depth_overlap =
@@ -8932,7 +8945,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             identity->stencil_read_base >= 0x10000)
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
-        cached_ds = &persistent_ds_cache()[ds_key];
+        cached_ds = &persistent_ds_entry_for(*identity, ds_key);
         if (!cached_ds->image) {
             size_t index = 0;
             for (uint64_t base : {ds_key.dr, ds_key.dw, ds_key.sr, ds_key.sw, ds_key.htile}) {

@@ -4854,6 +4854,12 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_live_renderer
         PROPERTIES TIMEOUT 120)
+      # #4556: a DCC fast clear reaches the pass that renders to the cleared target, not only one
+      # that samples it.
+      prosper_add_gtest(test_dcc_clear_render_target
+        SOURCES tests/shared/live/test_dcc_clear_render_target.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
                COMMAND test_game_compute_rtt_mirror)
@@ -5020,6 +5026,18 @@ endif()
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_ds_layer_stride
         SOURCES tests/render/test_ds_layer_stride.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A retained depth plane's guest footprint follows the guest depth format (#4556).
+      prosper_add_gtest(test_ds_guest_plane_bytes
+        SOURCES tests/render/test_ds_guest_plane_bytes.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A replay process, which has no guest mapping table, compares guest addresses (#4619).
+      prosper_add_gtest(test_ds_replay_alias
+        SOURCES tests/render/test_ds_replay_alias.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 

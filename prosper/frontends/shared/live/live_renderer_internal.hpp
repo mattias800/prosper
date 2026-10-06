@@ -159,9 +159,38 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
+    // How that descriptor reads the metadata's clear codes (gfx10_dcc_fast_clear_rgba8's inputs)
+    // and the guest extent it described, kept so a pass that RENDERS to the cleared target can
+    // decode the clear without a descriptor, and only for the surface the descriptor was of.
+    uint32_t dcc_num_components = 0;
+    bool dcc_alpha_is_on_msb = false;
+    uint32_t dcc_width = 0, dcc_height = 0;
     prosper::test::BackendGuestProducerOrigins guest_origins;
     prosper::test::BackendGuestProducerOrigins dcc_guest_origins;
 };
+// What a retained colour target keeps from a descriptor that samples it with DCC enabled: where
+// its metadata is, and how the descriptor reads a clear code. `metadata_bytes` is that
+// descriptor's gpu_capture_dcc_metadata_footprint.
+inline void note_rtt_dcc_descriptor(RttSurf& surface, const prosper::gpu::ShaderResource& resource,
+                                    uint64_t metadata_bytes) {
+    surface.dcc_metadata_addr = resource.metadata_addr;
+    surface.dcc_metadata_bytes = metadata_bytes;
+    surface.dcc_num_components = resource.num_components;
+    surface.dcc_alpha_is_on_msb = resource.alpha_is_on_msb;
+    surface.dcc_width = resource.width;
+    surface.dcc_height = resource.height;
+    surface.dcc_guest_origins.observe(resource.metadata_addr, metadata_bytes);
+}
+// PROSPER_RENDER_SCALE as the renderer reads it: a positive integer, anything else 1.
+inline uint32_t configured_render_scale() {
+    static const uint32_t scale = [] {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): one cached read of a process-start setting
+        const char* value = PROSPER_ENV_VALUE("PROSPER_RENDER_SCALE");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 1;
+        return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
+    }();
+    return scale;
+}
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 inline bool g_ever_volume_target = false;
 // Keys of RTT-cache entries that may carry a nonzero volume_guest_bytes. A superset: every write

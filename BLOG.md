@@ -29,6 +29,16 @@ The title's epilepsy-warning screen now draws white text on black, where it firs
 <p align="center"><img src="assets/screenshots/ac-black-flag-warning-green-lines.webp" alt="Black Flag warning screen on black with green horizontal lines; same run after the fast-clear fix"></p>
 <p align="center"><img src="assets/screenshots/ac-black-flag-warning-fixed.webp" alt="Black Flag warning screen, white text on a clean black background; same run after the linear-pitch fix"></p>
 
+### MOUSE: P.I. For Hire: the room is there
+
+*MOUSE: P.I. For Hire* now renders its first gameplay scene: a pair of doors, and behind them the room, its furniture and lamps, under the HUD that used to sit over black.
+
+<p align="center"><img src="assets/screenshots/mouse-pi-gameplay-doors.webp" alt="MOUSE: P.I. For Hire as its first gameplay scene opens: closed double doors with a round emblem at their centre, the objective, compass and health badge drawn over them, and the subtitle Jack Pepper: Now... Where did that bastard go?; Linux prosper-app, RADV, scripts/mouse-pi-PPSA26578/reach-gameplay.pad, flip 1600"></p>
+
+<p align="center"><img src="assets/screenshots/mouse-pi-gameplay-room.webp" alt="MOUSE: P.I. For Hire in first-person gameplay, the doors now open: a dim wood-panelled room with a STAFF ONLY door, a counter, double doors, two wall lamps and a table under a white cloth, and the objective, compass and health badge drawn over it; Linux prosper-app, RADV, the same route, flip 2000"></p>
+
+It is a dark scene, and whether it is as dark as it should be has not been checked against a PS5. The cause of the black world, and the two things it was not, are in the [status page](prosper/docs/games/MOUSE_PI_STATUS.md); the [tracker](https://github.com/mattias800/prosper/issues/4556) has the rest.
+
 ### MOUSE: P.I. For Hire: a scripted route into gameplay, and a dark world that is not what the log said
 
 *MOUSE: P.I. For Hire* can now be driven from boot into its first gameplay scene by a script, and nothing in that scene is refused, dropped or skipped any more. The scene is still dark.
