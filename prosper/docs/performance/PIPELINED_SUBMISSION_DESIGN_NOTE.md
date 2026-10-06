@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Pipelined submission: design note for ADR 0009 Stage 1 (compute)
 
 Status: proposal for the project owner. Nothing here changes behaviour; the only code is a pure model
