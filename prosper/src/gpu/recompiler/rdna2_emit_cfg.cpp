@@ -2167,12 +2167,14 @@ bool emit_cfg_state_machine(
         for (int reg : inherited_entry_m0)
             if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
         wave64_b64_reachable.front() = true;
-        for (const auto& [vgpr, lanes] : initial.vgpr_lane_slots)
-            for (const auto& lane : lanes)
-                wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Data;
-        for (const auto& [vgpr, lanes] : initial.vgpr_lane_mask_slots)
-            for (const auto& lane : lanes)
-                wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::MaskAny;
+        // Initial slots are untyped, which keeps main's behaviour for them. The terminal
+        // load_state of a previous barrier phase loads BOTH variables of every slot, so map
+        // membership is not what a slot last held, and the mask-half facts start over (#4607
+        // review: seeding the Bool slots as masks refused an EXEC restored after a barrier).
+        for (const auto* slots : {&initial.vgpr_lane_slots, &initial.vgpr_lane_mask_slots})
+            for (const auto& [vgpr, lanes] : *slots)
+                for (const auto& lane : lanes)
+                    wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
