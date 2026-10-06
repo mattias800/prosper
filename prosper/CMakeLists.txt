@@ -1623,6 +1623,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_manager.cpp
     LIBRARIES prosper_core)
 
+  # libSceNetCtl / libSceNpManager state callbacks: registered on every host (they were POSIX-only,
+  # so a Windows title's boot registration answered 0 over an unwritten callback id). Delivery of the
+  # honest offline / signed-out state, capacity and null-argument cases, on host-function callbacks.
+  prosper_add_gtest(test_np_state_callbacks
+    SOURCES tests/hle/np/test_np_state_callbacks.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.

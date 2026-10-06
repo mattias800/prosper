@@ -11,7 +11,6 @@
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
-#include "hle/dispatch/callback_fs.hpp"
 #include "hle/input/ime_input.hpp"
 #include "hle/service/platform_ui.hpp"
 #include "hle/video/video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
@@ -56,17 +55,13 @@
 #include <unistd.h>
 #endif
 #include "hle/service/service_trace.hpp"
+#include "hle/np/state_callbacks.hpp"
 #include "hle/service/hle_handles.hpp"
 #ifdef _WIN32
 #include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
 #endif
 
 namespace prosper {
-
-#ifdef _WIN32
-extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1,
-                                               uint64_t a2, uint64_t a3);
-#endif
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
@@ -891,87 +886,12 @@ HLE(s_npuds_object_set_string) {
 // waited forever (docs/games/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
 // real, network-disconnected, signed-out console gives.
 
-// --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------
-// A registered callback is guest code: under PROSPER_GUEST_FS the HLE runs on the HOST %fs (the
-// import swap-stub switched), so the guest callback must run with the GUEST %fs restored or its
-// TLS accesses (UE MallocBinned caches!) read host TLS garbage. The swap-stub saves the guest fs
-// base in its frame (push r11), so an asm entry shim (the f_apr_read_submit_entry pattern) hands
-// the handler its entry %rsp. The guest swap path re-pushes args7/8/9, an alignment pad, then the
-// saved r11: [rsp]=ret-to-stub, args at +8/+0x10/+0x18, pad at +0x20, guest fs at +0x28, and guest
-// RA at +0x30. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
-// host-context tail-jmp path (no swap happened) — call the callback on the current fs.
-// Mechanism proven live by the PROSPER_NETCTL_CB experiment (run 7/9: delivered + consumed
-// cleanly, no crash). CONFIDENCE: HIGH.
-namespace {
-#ifndef _WIN32
-inline uint64_t cb_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
-inline void     cb_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
-// RAII: run the enclosed guest callback on the guest %fs (no-op when guest_fs==0).
-struct CbGuestFsScope {
-    uint64_t saved = 0, active = 0;
-    explicit CbGuestFsScope(uint64_t guest_fs) {
-        if (guest_fs) { saved = cb_rd_fsbase(); cb_wr_fsbase(guest_fs); active = guest_fs; }
-    }
-    ~CbGuestFsScope() { if (active) cb_wr_fsbase(saved); }
-};
-#endif
-}
+// --- Guest-callback delivery (NetCtl + Np state callbacks) lives in state_callbacks.cpp. --------
+// DOLL registers a NetCtl state callback once at boot and pumps sceNetCtlCheckCallback once per
+// frame forever (14,191 calls in a 240 s run); registration, delivery and the guest-%fs discipline
+// are there and portable, so every host answers the chain the same way (a disconnected, signed-out
+// console, docs/games/DOLL_LOADING_PROGRESSION.md).
 
-// --- libSceNetCtl: a network-DISCONNECTED console (default ON since #306). ----------------------
-// DOLL registers a NetCtl state callback once at boot (sceNetCtlRegisterCallback) and then pumps
-// sceNetCtlCheckCallback EXACTLY once per frame forever (14,191 calls in a 240 s run). On real
-// hardware CheckCallback invokes the registered callback on the calling thread with the current
-// state — an offline console still delivers an immediate DISCONNECTED. Register records {func,arg}
-// and writes the callback id (Kyty Network.cpp NetCtlRegisterCallback); CheckCallback invokes the
-// callback ONCE with SCE_NET_CTL_EVENT_TYPE_DISCONNECTED (PS4-inherited constant = 1; identical
-// export names+NIDs on PS5 3.20 — CONFIDENCE MED on the PS5 value). Was the gated experiment
-// PROSPER_NETCTL_CB=1; proven correct+consumed live (DOLL run 7/9), now default ON.
-// PROSPER_NETCTL_CB=0 restores the old unimplemented behavior.
-namespace {
-#ifndef _WIN32
-std::atomic<uint64_t> g_netctl_cb_fn{0};
-std::atomic<uint64_t> g_netctl_cb_arg{0};
-std::atomic<int>      g_netctl_cb_delivered{0};
-#endif
-}
-#ifndef _WIN32
-HLE(s_netctl_register_cb) {   // (func, arg, int* cid)
-    svc_log("sceNetCtlRegisterCallback", a0,a1,a2,a3,a4,a5);
-    g_netctl_cb_fn.store(a0);
-    g_netctl_cb_arg.store(a1);
-    if (svc_ptrish(a2)) *(int32_t*)PW(a2) = 1;   // callback id (Kyty Network.cpp NetCtlRegisterCallback)
-    return 0;
-}
-// sceNetCtlGetState(int* state): 0 = DISCONNECTED (Kyty Network.cpp:1398 writes exactly this).
-// Run-7 live capture: the game calls this for the FIRST time immediately after the DISCONNECTED
-// callback delivery — the unimplemented success+garbage-out answer is what re-wedged the flow.
-HLE(s_netctl_getstate) {
-    svc_log("sceNetCtlGetState", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 0;   // SCE_NET_CTL_STATE_DISCONNECTED
-    return 0;
-}
-extern "C" uint64_t s_netctl_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5,
-                                        uint64_t entry_rsp);
-PROSPER_ASM_TRAMPOLINE(s_netctl_check_cb_entry, s_netctl_check_cb_c)
-extern "C" void s_netctl_check_cb_entry();
-extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                        uint64_t entry_rsp) {
-    uint64_t fn = g_netctl_cb_fn.load();
-    if (!fn || g_netctl_cb_delivered.exchange(1)) return 0;   // deliver the initial state exactly once
-    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
-    {
-        CbGuestFsScope fs(gfs);
-        ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
-                                              (void*)(uintptr_t)g_netctl_cb_arg.load());
-    }
-    // NOTE: log only AFTER the scope restored the host %fs — host libc (fprintf) reads %fs-based
-    // TLS and crashes on the guest %fs (learned the hard way: NULL+0x308 fault in libc).
-    fprintf(stderr, "[svc] NetCtl state callback DELIVERED (eventType=DISCONNECTED, guest_fs=%d)\n",
-            gfs ? 1 : 0);
-    return 0;
-}
-#endif
 // sceNetCtlGetInfo(int code, SceNetCtlInfo* info): a console with no network connection answers
 // NOT_CONNECTED for the connection-dependent info codes and writes nothing (shadPS4 netctl.cpp:163
 // returns ORBIS_NET_CTL_ERROR_NOT_CONNECTED = 0x80412108 for ALL codes when disconnected; Kyty
@@ -982,57 +902,6 @@ HLE(s_netctl_getinfo) {
     svc_log("sceNetCtlGetInfo", a0,a1,a2,a3,a4,a5);
     return 0x80412108ull;   // SCE_NET_CTL_ERROR_NOT_CONNECTED
 }
-
-// --- libSceNpManager state callback: deliver SIGNED_OUT once (#306). ----------------------------
-// DOLL registers its Np sign-in state callback via sceNpRegisterStateCallbackA and pumps
-// sceNpCheckCallback. shadPS4 (offline mode) queues exactly one SIGNED_OUT event for the initial
-// user and delivers it inside sceNpCheckCallback on the pumping thread; we mirror that. Callback-A
-// prototype (shadPS4 np_manager.h): void cb(s32 userId, s32 state, void* userdata); state
-// SIGNED_OUT = 1 (Unknown=0, SignedOut=1, SignedIn=2 — Kyty + shadPS4 agree). Register returns the
-// positive callback id (shadPS4 RegisterStateCallbackA returns slot+1). CONFIDENCE: HIGH on the
-// contract (two agreeing PS4 references, PS4-inherited surface; PS5 3.20 exports the same names).
-namespace {
-#ifndef _WIN32
-struct NpStateCbSlot { std::atomic<uint64_t> fn{0}, arg{0}; std::atomic<int> delivered{0}; };
-NpStateCbSlot     g_np_state_cbs[4];
-std::atomic<int>  g_np_state_cb_n{0};
-#endif
-}
-#ifndef _WIN32
-HLE(s_np_register_state_cbA) {   // (SceNpStateCallbackA func, void* userdata) -> callback id
-    svc_log("sceNpRegisterStateCallbackA", a0,a1,a2,a3,a4,a5);
-    if (!a0) return 0x80550003ull;   // SCE_NP_ERROR_INVALID_ARGUMENT
-    int i = g_np_state_cb_n.fetch_add(1);
-    if (i >= 4) { g_np_state_cb_n.store(4); return 0x8055001Dull; }  // SCE_NP_ERROR_CALLBACK_MAX
-    g_np_state_cbs[i].arg.store(a1);
-    g_np_state_cbs[i].fn.store(a0);
-    return (uint64_t)(i + 1);
-}
-extern "C" uint64_t s_np_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                    uint64_t a3, uint64_t a4, uint64_t a5,
-                                    uint64_t entry_rsp);
-PROSPER_ASM_TRAMPOLINE(s_np_check_cb_entry, s_np_check_cb_c)
-extern "C" void s_np_check_cb_entry();
-extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                                    uint64_t entry_rsp) {
-    int n = g_np_state_cb_n.load(); if (n > 4) n = 4;
-    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
-    for (int i = 0; i < n; i++) {
-        uint64_t fn = g_np_state_cbs[i].fn.load();
-        if (!fn || g_np_state_cbs[i].delivered.exchange(1)) continue;
-        {
-            CbGuestFsScope fs(gfs);
-            ((void (*)(int32_t, int32_t, void*))(uintptr_t)fn)(
-                1 /*initial userId (sceUserServiceGetInitialUser)*/, 1 /*SCE_NP_STATE_SIGNED_OUT*/,
-                (void*)(uintptr_t)g_np_state_cbs[i].arg.load());
-        }
-        // Log only on the restored host %fs (fprintf on the guest %fs faults in libc TLS).
-        fprintf(stderr, "[svc] Np state callback DELIVERED (userId=1, state=SIGNED_OUT, guest_fs=%d)\n",
-                gfs ? 1 : 0);
-    }
-    return 0;
-}
-#endif
 
 // --- libSceErrorDialog: the real Initialize/Open/Close lifecycle (auto-dismiss, headless). ------
 // Status enum shared with CommonDialog: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3 (shadPS4
@@ -1516,32 +1385,12 @@ void register_np_hle() {
                      "sceNpUniversalDataSystemGetMemoryStat");
     Hle::register_fn("KmN62tT4U8A", (HleFn)s_npuds_get_storage_stat,
                      "sceNpUniversalDataSystemGetStorageStat");
-#ifndef _WIN32
-    // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
-    // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.
-    {
-        // DEFAULT ON since #306. `strtol` answered 0 for `=yes`/`=true`/`=on`, and the consequence
-        // is not a lost diagnostic: the three callback NIDs guarded here (RegisterCallback,
-        // CheckCallback, GetState) go UNREGISTERED, so the guest gets the pre-#306 unimplemented
-        // behaviour from what the operator read as "enable it". GetInfo and GetResult below are
-        // registered unconditionally and are unaffected (#3267).
-        const char* e = getenv("PROSPER_NETCTL_CB");
-        if (prosper::diag::env_u64_or_default_auto("PROSPER_NETCTL_CB", e, 1ull) != 0) {
-            R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
-            R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
-            R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
-        }
-    }
-#endif
-#ifndef _WIN32
-    // sceNpCheckCallback pumps the registered A-callbacks (SIGNED_OUT delivered once, guest %fs).
-    Hle::register_fn("3Zl8BePTh9Y", (HleFn)s_np_check_cb_entry,      "sceNpCheckCallback");
-    Hle::register_fn("qQJfO8HAiaY", (HleFn)s_np_register_state_cbA,  "sceNpRegisterStateCallbackA");
-    Hle::register_fn("M3wFXbYQtAA", (HleFn)s_np_ok,                     "sceNpUnregisterStateCallbackA");
-#else
-    R("sceNpCheckCallback", s_np_ok);
-#endif
-    #undef R
+    // NetCtl / NpManager state callbacks: portable, in state_callbacks.cpp.
+    np::register_state_callbacks_hle();
+    // The old PROSPER_NETCTL_CB opt-out is gone with the platform split: delivery has been default
+    // ON since #306 and the switch only ever existed to unregister the contract.
+    Hle::register_fn("M3wFXbYQtAA", (HleFn)s_np_ok, "sceNpUnregisterStateCallbackA");
+#undef R
 }
 
 // ===== libSceRandom ============================================================================

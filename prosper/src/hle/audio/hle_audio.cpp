@@ -4672,6 +4672,20 @@ HLE(voice_init_unavailable) {   // sceVoiceInit / sceVoiceInitHQ -> report voice
 // back-edge), so a half-change would hang it.
 HLE(voice_not_initialized) { return (uint64_t)(int64_t)(int32_t)0x804E0801; }
 
+// libSceVoiceQoS: sceVoiceQoSInit(void* mem_block, uint32_t mem_size, int app_type). The QoS layer
+// manages the quality of a live voice-chat session, and prosper has none (no capture backend, no
+// network voice path), so it answers exactly as sceVoiceInit does: voice is unavailable. The shipping
+// guest allocates the block, passes (block, 0x40000, 0x20000000), and tests the result with
+// `test eax,eax; je success` (Dragon Quest VII Reimagined, eboot+0xe46be5): a nonzero return leaves
+// its "voice QoS up" flag clear and carries on, and its teardown only terminates the
+// layer when that flag is set -- so refusing is a state the guest already handles, whereas a success
+// would promise a session layer whose every later entry point is unregistered. The block is neither
+// read nor written. CONFIDENCE: HIGH on the guest's reaction; LOW on the exact error code (no
+// libSceVoiceQoS module is available to read it from), so this reuses sceVoiceInit's code.
+HLE(voice_qos_init_unavailable) {
+    return voice_init_unavailable(a0, a1, a2, a3, a4, a5);
+}
+
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceAudioOutInit", audio_init);
@@ -4681,6 +4695,7 @@ void register_audio_hle() {
     // standard and HQ init entry points get the same "unavailable" answer.
     R("sceVoiceInit", voice_init_unavailable);
     R("sceVoiceInitHQ", voice_init_unavailable);
+    R("sceVoiceQoSInit", voice_qos_init_unavailable);
     // The port surface answers not-initialised, as the real module does after a failed Init
     // (voice_not_initialized): handing out working port handles would contradict Init, and any
     // title that proceeds past a failed Init anyway lands on error branches instead of dividing by

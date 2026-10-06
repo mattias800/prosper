@@ -59,3 +59,20 @@ TEST(Voice, PortSurfaceAnswersNotInitialized) {
     static_assert(sizeof(table) / sizeof(table[0]) == 14, "14 port entry points");
     for (const char* name : table) expect_refuses_untouched(name, kVoiceNotInit);
 }
+
+// libSceVoiceQoS sits on top of a voice session, and there is no voice backend: sceVoiceQoSInit must
+// refuse exactly as sceVoiceInit does and leave the guest's memory block alone (the real guest passes
+// a freshly allocated 0x40000-byte block and tests the result with `test eax,eax`).
+TEST(Voice, QoSInitReportsVoiceUnavailableAndTouchesNothing) {
+    register_builtin_hle();
+    HleFn fn = Hle::lookup(nid_hash("sceVoiceQoSInit"));
+    ASSERT_NE(fn, nullptr) << "sceVoiceQoSInit is not registered";
+    uint8_t block[64];
+    std::memset(block, 0xAA, sizeof block);
+    const uint64_t r = fn((uint64_t)(uintptr_t)block, sizeof block, 0x20000000u, 0, 0, 0);
+    EXPECT_EQ(r, kVoiceInitUnavailable);
+    EXPECT_LT((int64_t)r, 0) << "negative as int64 too, not a zero-extended error";
+    for (uint8_t b : block) ASSERT_EQ(b, 0xAA);
+    EXPECT_EQ(fn(0, 0, 0, 0, 0, 0), kVoiceInitUnavailable)
+        << "a null block is refused the same way";
+}

@@ -29,14 +29,18 @@ was drawn.
 
 ## The guest-callback discipline
 
-Several entry points here invoke a guest callback, which on Linux must run on the **guest `%fs`**.
-That is what the `PROSPER_ASM_TRAMPOLINE` pairs and `CbGuestFsScope` exist for, and it is why those
-registrations sit inside `#ifndef _WIN32` with a different handler on the other arm. A registration
-moved out of its conditional would leave one platform with the NID unbound.
+The NetCtl and NpManager state callbacks live in `state_callbacks.cpp` and are **portable**: a
+`StateCallbackTable` records registrations, each owed one delivery of the state the library's other
+entry points report (offline, signed out), and the pump (`sceNetCtlCheckCallback`,
+`sceNpCheckCallback`) delivers on the caller's thread. How a guest function is actually entered
+is per host and lives in `src/host/abi/guest_callback.*` -- the guest `%fs` restore on Linux/macOS,
+the System V call trampoline on Windows -- so nothing here carries a platform `#if`. These exports
+used to be registered on POSIX only, which left a Windows title's boot-time registration answering
+`0` over an unwritten callback id.
 
 ## Registration
 
-`register_np_hle()`, declared in `hle/dispatch/dispatch.hpp` and called by `register_builtin_hle()`.
+`register_np_hle()`, which also calls `np::register_state_callbacks_hle()`, declared in `hle/dispatch/dispatch.hpp` and called by `register_builtin_hle()`.
 Every handler stays `static` to this file, including its own `s_np_ok` success stub — that per-file
 copy is why the split needed nothing promoted.
 
