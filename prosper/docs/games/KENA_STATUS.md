@@ -9,6 +9,39 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The volume clear runs; the next blocker is #3835's NaN half image (2026-10-06, #4625)
+
+**Read this first.** Measured on Linux/RADV, stacked on #3135 P5 (`feat/ngg-live-p5`). The runs were
+`prosper-app` default launches (`PROSPER_NULL_PAGE=1`, no input, 260 s) and one `tools/screenshot`
+run (26 samples, 10 s apart).
+
+- **What #4625 was.** Compute `0x5007bc0000` is a clear: four 64×64×64 RGBA16F storage volumes, 16³
+  groups of 4×4×4 threads, all writes zero. Once the NGG producer drew into one of the volumes, the
+  renderer claimed it and the clear was skipped on every frame. The fix publishes a claimed volume
+  to guest memory before a compute binding reads guest bytes. It reads the retained image back,
+  tiles it in the producer's native layout, and releases the claim
+  (`src/gpu/execute/renderer_volume_publication`).
+- **Result.** The `skipped-dispatches` alarm went from 41 of 45 windows (`backend-declined:336`) to
+  1 of 33, 1 of 39 and 1 of 45 windows, with `backend-declined:1` in each run. That one skip is a
+  different program: `0x5008be0000` binds a 512³ R32 volume, which exceeds the 512 MiB backend
+  bound. **The menu world is still black.** The menu text appears in 23 of 26 samples, and every
+  sample is black behind it (`tools/screenshot`).
+- **Where the picture is lost.** These measurements come from a RenderDoc capture of one menu
+  frame on this build, and they reproduce #3835's 2026-09-25 chain:
+  - The lit scene target is present. It is 3200×1800 R11G11B10, 100% non-zero, mean 0.12, and
+    shows the shrine and forest.
+  - The 1600×900 RGBA16F half target is the problem. The pass that writes it (#3835's PS with five
+    unexported PARAM inputs) outputs NaN at 100% of pixels. PixelHistory shows `shaderOut = NaN`,
+    so blending is not the cause.
+  - Compute `0x500a1b0000` combines the lit scene with that NaN image. The R11 scene colour it
+    writes is 49% non-finite and 51% zero.
+  - The 3200×1800 RGBA16F scene image that compute `0x500b220000` writes back is all zero at its
+    next reader. The R11 image that reader writes is zero too.
+  - The final compositor samples zero scene and zero bloom, so it outputs zero. Its 32³ LUT is
+    populated (99.8% non-zero, mean 0.74).
+- **Also seen, not investigated:** the lit scene target looks tiled. The complete view fills about
+  the top-left two-thirds, and the right and bottom bands repeat parts of it.
+
 ## The merged-NGG LUT producer runs (2026-10-06, #3135 P5)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` and the default launch
@@ -276,6 +309,14 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
   What this does NOT show: whether the polarity is right for Kena. A recognised helper writes nothing under
   either polarity, so this result is polarity-blind. Kena's predicate words were not traced, and no per-helper
   lever was run on Kena.
+- **The skipped translucency-lighting clear (#4625) blacks out the title world** — false. With
+  the claimed volume published and the clear running every frame, `skipped-dispatches` fell from
+  `backend-declined:336` to `backend-declined:1` (a different 512³ program), and the world is still
+  black (2026-10-06, #4625).
+- **The scene is never lit, or the black comes from the compositor or its LUT** — false on this
+  build. In a RenderDoc capture the lit 3200×1800 R11 scene shows the forest and the compositor's
+  LUT is populated. The loss comes earlier: a 1600×900 half target is NaN at every pixel
+  (`shaderOut = NaN`, so not blending), and it is mixed into the scene colour (#3835, #4625).
 - **The black title-menu world is the zero colour LUT alone** — false. With the merged-NGG
   producer running and the 32³ LUT read back live at 131,072 bytes / 90,212 non-zero (#3857's
   figures), the world is still black (#3135 P5, 2026-10-06).
