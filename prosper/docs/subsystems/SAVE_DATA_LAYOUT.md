@@ -1,3 +1,8 @@
+---
+kind: reference
+status: current
+---
+
 # Where prosper keeps save data
 
 Status: current. Landed with [#2734](https://github.com/mattias800/prosper/issues/2734).

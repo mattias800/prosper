@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # DOLL (DQ VII Reimagined, PPSA17942) post-process recompiler frontier — handoff
 
 **Status as of 2026-07-19.** This document hands off the DOLL post-process compute-shader

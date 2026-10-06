@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # The host-platform seam
 
 prosper runs the guest's x86-64 code natively on Linux (the primary host) and on Windows. Code that
@@ -81,6 +86,9 @@ The dependency arrow is inverted in six places: `src/host` includes `src/hle/dis
 code living in the host folder, which is the subject of § Guest vs host.
 
 ## Decision
+
+Recorded as ADR 0002 (`docs/adr/0002-host-platform-seam.md`); the binding rules are spec
+`PLAT-1` and `PLAT-2` (`docs/spec/architecture.md`).
 
 1. **One interface per service, under `src/host/platform/`, with one backend per OS** (for example
    `futex.hpp` + `futex_linux.cpp` + `futex_win.cpp`), chosen at build time by which file the build

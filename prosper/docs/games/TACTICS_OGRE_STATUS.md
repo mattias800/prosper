@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Tactics Ogre: Reborn status (`PPSA03839`)
 
 > **2026-08-29 — restored after a 25-day regression.** `87e973eb` (#2302) registered

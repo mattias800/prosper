@@ -1,3 +1,8 @@
+---
+kind: reference
+status: current
+---
+
 # GFX10 64KB tiling (SW_64KB_S / SW_64KB_R_X) — the addrlib swizzle-pattern equation
 
 **Status: SW_64KB_S SOLVED (2026-07-10, issue #288), validated against a live DOLL (PPSA17942)

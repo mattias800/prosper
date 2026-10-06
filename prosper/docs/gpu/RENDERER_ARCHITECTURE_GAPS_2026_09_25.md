@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Renderer architecture gaps (2026-09-25)
 
 A structural review of what prosper's render path COSTS per frame. It began from the question "why are heavy

@@ -480,6 +480,9 @@ struct SpirvCompute {
     bool raw_output_words = false;
     bool raw_input_words = false;
     uint32_t packet_input_base = 0, packet_output_base = 0;   // optional dynamic wave ABI SSA ids
+    // Descriptor set of begin()'s binding 0 (input) / binding 1 (output) buffers. The merged-NGG
+    // subgroup shell moves them to set 2 so the guest's set-0 bindings keep their numbers.
+    uint32_t shell_io_descriptor_set = 0;
     uint32_t load_packet_word(uint32_t index);
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
@@ -555,7 +558,10 @@ struct SpirvCompute {
     uint32_t vertex_general_mask_mbcnt_pc = UINT32_MAX;
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
-    bool     ngg_workgroup_export_probe=false;       // test-only 64-lane guest wave/export shell
+    bool ngg_workgroup_shell = false;   // merged-NGG workgroup shell: guest waves share LDS
+    // The merged-NGG subgroup shell (#3135 P2) captures GS_ALLOC_REQ (`s_sendmsg 9`) through this
+    // hook. Unset, `s_sendmsg` stays the historical no-op every other stage relies on.
+    std::function<bool(struct RegState&, const Rdna2Inst&)> ngg_alloc_request;
     uint32_t ngg_probe_trace_pc = UINT32_MAX;        // optional offline VGPR milestone
     uint32_t ngg_probe_trace_vgpr = UINT32_MAX;
     bool     ngg_probe_trace_seen = false;
@@ -2144,8 +2150,10 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {t_rta, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct, 0, Dec_Offset, 0});
         put(deco, Op_Decorate, {t_struct, Dec_Block});
-        put(deco, Op_Decorate, {v_in, Dec_DescriptorSet, 0});  put(deco, Op_Decorate, {v_in, Dec_Binding, 0});
-        put(deco, Op_Decorate, {v_out, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_out, Dec_Binding, 1});
+        put(deco, Op_Decorate, {v_in, Dec_DescriptorSet, shell_io_descriptor_set});
+        put(deco, Op_Decorate, {v_in, Dec_Binding, 0});
+        put(deco, Op_Decorate, {v_out, Dec_DescriptorSet, shell_io_descriptor_set});
+        put(deco, Op_Decorate, {v_out, Dec_Binding, 1});
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -2356,13 +2364,11 @@ struct SpirvCompute {
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() {
-        if (ngg_workgroup_export_probe && ngg_vertex_index_value)
-            return ngg_vertex_index_value;
+        if (ngg_workgroup_shell && ngg_vertex_index_value) return ngg_vertex_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r);
     }
     uint32_t load_instance_index() {
-        if (ngg_workgroup_export_probe && ngg_instance_index_value)
-            return ngg_instance_index_value;
+        if (ngg_workgroup_shell && ngg_instance_index_value) return ngg_instance_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r);
     }
     // Hardware packs consecutive vertex/instance invocations into merged guest waves. VertexIndex
@@ -3157,6 +3163,7 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
                 case kSop1OpcodeCmovB64: // both words may change even though the write is conditional
+                case kSop1OpcodeMovrelsB64:   // D = SGPR[src + M0], a pair like any B64 move
                 case 0x04: case 0x08: case 0x0a: case 0x1f: case 0x2d:
                 case 0x24: case 0x25: case 0x26: case 0x27:
                 case 0x28: case 0x29: case 0x2a: case 0x2b:

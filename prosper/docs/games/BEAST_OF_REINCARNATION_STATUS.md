@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Beast of Reincarnation (`PPSA29343`) — status
 
 Tracker: [#2916](https://github.com/mattias800/prosper/issues/2916).

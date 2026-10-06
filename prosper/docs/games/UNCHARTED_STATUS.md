@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Uncharted: Legacy of Thieves Collection (PPSA05684) — status
 
 **Rung 0 as of 2026-09-14, and the frontier moved a long way inside one session.** Nothing is

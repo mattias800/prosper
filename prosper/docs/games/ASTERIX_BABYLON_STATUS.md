@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Asterix & Obelix: Babylon Mission status
 
 Tracking: [#1884](https://github.com/mattias800/prosper/issues/1884) (game tracker),

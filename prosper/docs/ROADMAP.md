@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Roadmap — `prosper`
 
 What is planned and where the project is heading, as of **2026-10-02**. This is a map, not a status

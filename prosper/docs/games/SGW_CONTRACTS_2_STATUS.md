@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Sniper Ghost Warrior Contracts 2 (`PPSA03130`) — status and evidence
 
 **CryEngine — the project's first title on this engine family.** Tracked on

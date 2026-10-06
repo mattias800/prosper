@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Metaphor: ReFantazio (`PPSA20800`) — status
 
 Atlus GFD engine + CRIWARE middleware, AGC SDK 12, 71 GB dump. Tracker
