@@ -191,14 +191,16 @@ namespace {
     // destination register, advance past the instruction). Set once; default off, matching Linux.
     const bool g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     volatile long g_null_page_count = 0;
-    // Diagnostic switches consulted from several sites below: read each once, here.
+    // Diagnostic switches consulted from several sites below: one helper per switch. Each call
+    // reads the environment LIVE, exactly as the call sites did before, so a test that arms the
+    // switch with _putenv_s after an earlier load still sees it. Caching would change semantics
+    // (src/diagnostics/env_cache.hpp) and a function-local static is invisible to
+    // tools/env/check_cached_env.py; these are cold boot and module-load paths, so stay live.
     bool sse4a_log_enabled() {
-        static const bool on = getenv("PROSPER_SSE4A_LOG") != nullptr;
-        return on;
+        return getenv("PROSPER_SSE4A_LOG") != nullptr;
     }
     bool stubdump_enabled() {
-        static const bool on = getenv("PROSPER_STUBDUMP") != nullptr;
-        return on;
+        return getenv("PROSPER_STUBDUMP") != nullptr;
     }
     NidDb*   g_nid_db = nullptr;
 
