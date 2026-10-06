@@ -580,7 +580,7 @@ bool draw_requires_owned_nested_snapshot(const GpuState& state,
 // Code-free physical launch hint. It chooses ordered realization, not a completion wait or
 // resource admission. The real issuer separately authenticates the current original version.
 bool draw_requires_original_scalar_bank(const GpuState& state);
-bool graphics_program_requires_owned_waves(uint64_t address);
+bool graphics_program_requires_owned_waves(uint64_t address, bool fragment_launch_wave64 = false);
 // The owned-wave refusal decided by register state alone (fragment launch, output and depth
 // extents), or null. No producer publication can change it, so prepare_draw_owned_waves asks it
 // before the producer check and the executor asks it before an authoritative flush.
@@ -713,7 +713,8 @@ checked_graphics_source(std::shared_ptr<const OrderedScalarBankReadPoint>, const
                         uint64_t address, uint64_t command_order, ShaderProgramStage);
 SharedShaderAnalysis checked_graphics_source_analysis(const CheckedGraphicsSource*);
 bool checked_graphics_source_current(const CheckedGraphicsSource*);
-bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*);
+bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*,
+                                                  bool fragment_launch_wave64 = false);
 GraphicsReadSource checked_graphics_source_observation(const CheckedGraphicsSource*);
 std::shared_ptr<const OriginalFragmentDrawProducer>
 seal_original_fragment_draw_producer(const OrderedScalarBankReadPoint&, const GpuState&,
@@ -2451,9 +2452,16 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     const bool owned_vertex =
         checked_vertex ? checked_graphics_source_requires_owned_waves(checked_vertex.get())
                        : graphics_program_requires_owned_waves(vs_program_addr);
+    // A fragment launch names its wave width, and whether a wide load is read as a number can
+    // depend on it: at 64 lanes a compare into a register pair replaces both loaded words. The
+    // fragment compiler below is handed the same rs.ps_wave32 (#4555). The vertex launch width
+    // is not plumbed, so the vertex stage keeps the width-agnostic answer.
+    const bool fragment_launch_wave64 = !rs.ps_wave32;
     const bool owned_fragment =
-        checked_fragment ? checked_graphics_source_requires_owned_waves(checked_fragment.get())
-                         : graphics_program_requires_owned_waves(rs.ps_addr);
+        checked_fragment
+            ? checked_graphics_source_requires_owned_waves(checked_fragment.get(),
+                                                           fragment_launch_wave64)
+            : graphics_program_requires_owned_waves(rs.ps_addr, fragment_launch_wave64);
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
     std::vector<uint32_t> owned_indices;
     if (owned_vertex || owned_fragment) {

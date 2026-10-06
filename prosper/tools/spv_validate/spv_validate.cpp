@@ -340,6 +340,9 @@ static const NotAnEmitter kNotEmitters[] = {
      "returns decoded numeric-child PCs, not SPIR-V; owned_nested_vertex_x4/x8 and "
      "owned_nested_fragment_x4/x8 below assert the census and exact owned chains, then "
      "strictly validate the consuming direct-stage modules"},
+    {"rdna2_fragment_compiles_wave64",
+     "returns a bool about the launch width the fragment compiler will use, not SPIR-V; "
+     "rdna2_spirv_struct pins the legacy exception it wraps"},
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},

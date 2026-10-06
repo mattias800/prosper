@@ -2247,6 +2247,15 @@ int main() {
         return 1;
     }
     printf("  [ok]   legacy Astro Wave32 capture selects a 32-lane subgroup and mask contract\n");
+    // The routing side asks the same exception through this wrapper (#4555): any other program
+    // launched 64 lanes wide is compiled 64 lanes wide, and no code is no answer.
+    if (!rdna2_fragment_compiles_wave64(wave32_fragment_masks, std::size(wave32_fragment_masks)) ||
+        rdna2_fragment_compiles_wave64(nullptr, 0) ||
+        rdna2_fragment_compiles_wave64(wave32_fragment_masks, 0)) {
+        printf("  [FAIL] an ordinary fragment program launched at 64 lanes must compile at 64\n");
+        return 1;
+    }
+    printf("  [ok]   an ordinary fragment program launched at 64 lanes compiles at 64\n");
 
     const uint32_t wave32_compute_masks[] = {
         0xbe80037eu,                         // s_mov_b32 s0, exec_lo

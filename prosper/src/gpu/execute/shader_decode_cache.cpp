@@ -134,6 +134,13 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // stream first: the compact fold stream intentionally omits most VALU, including implicit
         // VCC writers that must invalidate a scalar-data proof through s106:s107.
         result->raw_wave_wide_data_load_pcs = rdna2_raw_wave_wide_data_loads(decoded);
+        // The 64-lane answer is a subset of the default one, so an empty default needs no second
+        // classification, and that is nearly every program.
+        if (!result->raw_wave_wide_data_load_pcs.empty())
+            result->raw_wave_wide_data_load_pcs_wave64 =
+                rdna2_raw_wave_wide_data_loads(decoded, /*wave64*/ true);
+        result->fragment_compiles_wave64 =
+            rdna2_fragment_compiles_wave64(result->code.data(), result->code.size());
         result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
         result->raw_immediate_wide_data_load_pcs =
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
@@ -170,6 +177,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             sizeof(result->scalar_spill_written_vgprs) + result->control_plan.allocated_bytes() +
             result->shader_constant_control_plan.allocated_bytes() +
             (result->raw_wave_wide_data_load_pcs.capacity() +
+             result->raw_wave_wide_data_load_pcs_wave64.capacity() +
              result->raw_x2_data_load_pcs.capacity() +
              result->raw_immediate_wide_data_load_pcs.capacity() +
              result->raw_register_wide_data_load_pcs.capacity() +
