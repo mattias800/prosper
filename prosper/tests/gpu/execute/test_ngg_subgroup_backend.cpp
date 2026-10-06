@@ -708,8 +708,8 @@ TEST(NggSubgroupBackend, OnlyTheFirstRunCarriesSetZero) {
         EXPECT_EQ(set_count(out[i], 0), 0u) << "run " << i;
         EXPECT_GE(set_count(out[i], kNggRasterDescriptorSet), 1u) << "run " << i;
         for (uint32_t token : out[i].resource_order)
-            EXPECT_LT(token & 0x7fffffffu, (token & 0x80000000u) ? out[i].B.size()
-                                                                 : out[i].R.size());
+            EXPECT_LT(token & 0x7fffffffu,
+                      (token & 0x80000000u) ? out[i].B.size() : out[i].R.size());
     }
     EXPECT_EQ(out[0].vs_shared, ngg->groups[ngg->runs[0].group].stages->raster_vertex)
         << "the pass-through stage is shared, not copied";
@@ -749,8 +749,8 @@ TEST(NggSubgroupBackend, APartialNggDrawRecordsNothing) {
     std::string refusal;
     ASSERT_TRUE(NggSubgroupBackendBatch::expand(*ctx, in, out, batch, refusal)) << refusal;
     std::vector<Fake> runs(out.size());
-    const uint64_t census = prosper::gpu::draw_disposition_census().dropped(
-        prosper::gpu::DrawDrop::NggSubgroup);
+    const uint64_t census =
+        prosper::gpu::draw_disposition_census().dropped(prosper::gpu::DrawDrop::NggSubgroup);
     BackendSubmissionBatch submission;
     // Never captured, so never armed: nothing is recorded and every run is turned off.
     batch->record(VK_NULL_HANDLE, submission, std::span<Fake>(runs));
@@ -786,8 +786,10 @@ TEST(NggSubgroupBackend, ShellPipelineCacheIsKeyedOnceAndBounded) {
     const uint64_t evictions = stats.evictions;
     for (uint32_t words = push; words <= push + 40; ++words)
         for (bool native : {false, true})
-            if (native && !ngg_host_capabilities(*ctx).native_wave64) continue;
-            else (void)ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, words, native);
+            if (native && !ngg_host_capabilities(*ctx).native_wave64)
+                continue;
+            else
+                (void)ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, words, native);
     EXPECT_LE(stats.entries, kNggShellPipelineCacheEntries);
     EXPECT_GT(stats.evictions, evictions);
     EXPECT_TRUE(first->pipeline) << "an evicted entry a holder still owns stays valid";

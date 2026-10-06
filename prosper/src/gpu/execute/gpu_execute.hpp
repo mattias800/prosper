@@ -31,7 +31,7 @@
 #include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
-#include "gpu/execute/ngg_live_draw.hpp"       // its live producer (#3135 P5)
+#include "gpu/execute/ngg_live_draw.hpp"   // its live producer (#3135 P5)
 #include <span>
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
@@ -2835,9 +2835,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg.facts.instance_count = draw ? draw->instance_count : ds.num_instances;
         ngg.facts.indexed = draw && draw->indexed;
         ngg.facts.indirect = draw && (draw->indirect || draw->indirect_args_addr);
-        ngg.facts.vertex_offset = rs.ge_indx_offset != 0 ||
-                                  (draw && draw->has_vertex_offset_override &&
-                                   draw->indirect_vertex_offset != 0);
+        ngg.facts.vertex_offset =
+            rs.ge_indx_offset != 0 ||
+            (draw && draw->has_vertex_offset_override && draw->indirect_vertex_offset != 0);
         const auto volume = color_target_volume_view(rs.color_targets[0]);
         ngg.facts.target_slices = volume.slice_count;
         ngg.facts.target_first_slice = volume.first_slice;
@@ -2877,14 +2877,15 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg_subgroup = result.draw;
         if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
         ngg_refusal = result.applies && !ngg_subgroup
-                          ? (result.refusal ? result.refusal : "ngg-refused") : nullptr;
+                          ? (result.refusal ? result.refusal : "ngg-refused")
+                          : nullptr;
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): one cached process-lifetime read
         if (PROSPER_ENV_ON("PROSPER_DBG") && result.applies) {
             static std::mutex ngg_log_mutex;
             static std::set<std::pair<uint64_t, std::string>> ngg_logged;
             const std::lock_guard lock(ngg_log_mutex);
             if (ngg_logged.size() < 64 &&
-                ngg_logged.emplace(rs.es_addr, ngg_refusal ? ngg_refusal : "").second)
-            {
+                ngg_logged.emplace(rs.es_addr, ngg_refusal ? ngg_refusal : "").second) {
                 std::string table;
                 if (ngg_vrt)
                     for (const auto& r : ngg_vrt->resources) {
@@ -2905,9 +2906,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             }
         }
     }
-    if (!ngg_subgroup && ((vs_words.empty() && !owned_vertex) ||
-        (fs_words.empty() && !owned_fragment && !scalar_bank) ||
-        ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty()))) {
+    if (!ngg_subgroup &&
+        ((vs_words.empty() && !owned_vertex) ||
+         (fs_words.empty() && !owned_fragment && !scalar_bank) ||
+         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty()))) {
         if (PROSPER_ENV_ON("PROSPER_PROLOGLOG")) {
             // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
             // so the reject and the chain decision can be joined inside ONE run.
@@ -3002,8 +3004,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                    max_shader_dwords, vs_words.size(), gs.size(), fs_words.size(),
                                    vs_words.empty() && !owned_vertex,
                                    fs_words.empty() && !owned_fragment, ngg_refusal,
-                                   refused_ngg_class,
-                                   refused_link, vertex_chain ? chain_addr : 0});
+                                   refused_ngg_class, refused_link, vertex_chain ? chain_addr : 0});
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
@@ -3042,10 +3043,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     if ((!owned_vertex && !ngg_subgroup &&
          !validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0,
                                                SpirvShaderStage::Vertex, validate_mode)) ||
-        (ngg_subgroup &&
-         !validate_runtime_descriptor_contract("NGG", *ngg_subgroup->groups.front().stages->shell,
-                                               vrt.get(), 0, SpirvShaderStage::Compute,
-                                               validate_mode)) ||
+        (ngg_subgroup && !validate_runtime_descriptor_contract(
+                             "NGG", *ngg_subgroup->groups.front().stages->shell, vrt.get(), 0,
+                             SpirvShaderStage::Compute, validate_mode)) ||
         (!owned_fragment && !scalar_bank &&
          !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1,
                                                SpirvShaderStage::Fragment, validate_mode))) {

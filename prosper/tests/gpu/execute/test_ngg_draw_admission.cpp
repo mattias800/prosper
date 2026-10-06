@@ -147,11 +147,12 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-gs-wave32", [](auto& r, auto&, auto&) { r.vgt_shader_stages_en |= 1u << 22; }},
         {"ngg-gs-instancing",
          [](auto& r, auto&, auto&) { r.vgt_gs_instance_cnt = kGsInstanceEnable | (2u << 2); }},
-        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 5u; }},    // fan
-        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 0xcu; }},  // list adj
-        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 0x11u; }}, // rect
-        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 0x13u; }}, // quad
-        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 2u; }},    // lines
+        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 5u; }},   // fan
+        {"ngg-input-topology",
+         [](auto& r, auto&, auto&) { r.primitive_type = 0xcu; }},   // list adj
+        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 0x11u; }},   // rect
+        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 0x13u; }},   // quad
+        {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 2u; }},   // lines
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 0u; }},
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 3u; }},
         {"ngg-indexed", [](auto&, auto& f, auto&) { f.indexed = true; }},
@@ -269,8 +270,8 @@ TEST(NggDrawAdmission, RegistersAndUserDataAreReadFromTheDrawState) {
     std::vector<uint32_t> words;
     for (uint32_t k2 = 0; k2 < 8; ++k2) state.sh[P::SPI_SHADER_USER_DATA_GS_0 + k2] = 0x100 + k2;
     ASSERT_TRUE(read_ngg_user_data(state, 8, &words));
-    EXPECT_EQ(words, (std::vector<uint32_t>{0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106,
-                                            0x107}));
+    EXPECT_EQ(words,
+              (std::vector<uint32_t>{0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107}));
     state.sh.erase(P::SPI_SHADER_USER_DATA_GS_0 + 5);
     EXPECT_FALSE(read_ngg_user_data(state, 8, &words));
     EXPECT_TRUE(read_ngg_user_data(state, 5, &words));
@@ -465,20 +466,23 @@ TEST_F(NggLiveDraw, DeviceRefusals) {
     expect("ngg-backend-no-compute", [](auto& h) { h.compute = false; }, none);
     expect("ngg-backend-description", [](auto& h) { h.max_push_constants_size = 16; }, none);
     expect("ngg-backend-description", none, [](auto& d) { d.runs.clear(); });
-    expect("ngg-backend-vertex-stores-unavailable",
-           [](auto& h) { h.vertex_pipeline_stores = false; }, none);
-    expect("ngg-backend-layer-route-unavailable",
-           [](auto& h) { h.shader_output_layer = false; }, none);
-    expect("ngg-backend-layer-route-unavailable", [](auto& h) { h.geometry_shader = false; },
-           [](auto& d) { d.route = NggLayerRoute::ForwardingGeometry; });
+    expect(
+        "ngg-backend-vertex-stores-unavailable", [](auto& h) { h.vertex_pipeline_stores = false; },
+        none);
+    expect(
+        "ngg-backend-layer-route-unavailable", [](auto& h) { h.shader_output_layer = false; },
+        none);
+    expect(
+        "ngg-backend-layer-route-unavailable", [](auto& h) { h.geometry_shader = false; },
+        [](auto& d) { d.route = NggLayerRoute::ForwardingGeometry; });
     expect("ngg-backend-wave64-unavailable", [](auto& h) { h.native_wave64 = false; }, none);
     expect("ngg-backend-lds-limit", [](auto& h) { h.max_compute_shared_memory = 8192; }, none);
-    expect("ngg-backend-workgroup-limit", [](auto& h) { h.max_compute_workgroup_size_x = 32; },
-           none);
-    expect("ngg-backend-workgroup-limit",
-           [](auto& h) { h.max_compute_workgroup_subgroups = 0; }, none);
+    expect(
+        "ngg-backend-workgroup-limit", [](auto& h) { h.max_compute_workgroup_size_x = 32; }, none);
+    expect(
+        "ngg-backend-workgroup-limit", [](auto& h) { h.max_compute_workgroup_subgroups = 0; },
+        none);
     expect("ngg-backend-buffer-range", [](auto& h) { h.max_storage_buffer_range = 4096; }, none);
 }
 
 }   // namespace
-

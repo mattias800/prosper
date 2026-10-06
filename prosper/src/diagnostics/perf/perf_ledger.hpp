@@ -221,26 +221,26 @@ enum class DropReason : uint8_t {
     // complete == false with no code recorded: a drop site added without a reason. Nonzero here is
     // the instrument naming its own blind spot, the same contract as draw_disposition's UNACCOUNTED.
     Unattributed = 0,
-    ContractMismatch,          // resources resolved, but the descriptor contract check failed
-    VolumeInteriorAlias,       // samples inside an unpublished renderer-owned volume
-    VolumeShapeMismatch,       // retained volume, descriptor shape cannot consume its image
-    VolumeNoRendererImage,     // retained volume with no renderer image to sample (#3889)
-    ArrayFloat32Shape,         // Float32 layered T# with a reflected image shape we cannot bind
-    ArraySingleColorRtt,       // Float32 array aliases a single-layer colour RTT
-    ArrayShapeBudget,          // Float32 array shape/components/decode budget out of range
-    ArrayFormatSupport,        // device cannot sample RGBA32F as needed
-    ArrayNoncanonicalDepth,    // unproven retained depth write-base alias
-    ArrayDepthView,            // unsupported retained depth view
-    ArrayDepthStride,          // unproven retained depth layer stride
+    ContractMismatch,   // resources resolved, but the descriptor contract check failed
+    VolumeInteriorAlias,   // samples inside an unpublished renderer-owned volume
+    VolumeShapeMismatch,   // retained volume, descriptor shape cannot consume its image
+    VolumeNoRendererImage,   // retained volume with no renderer image to sample (#3889)
+    ArrayFloat32Shape,   // Float32 layered T# with a reflected image shape we cannot bind
+    ArraySingleColorRtt,   // Float32 array aliases a single-layer colour RTT
+    ArrayShapeBudget,   // Float32 array shape/components/decode budget out of range
+    ArrayFormatSupport,   // device cannot sample RGBA32F as needed
+    ArrayNoncanonicalDepth,   // unproven retained depth write-base alias
+    ArrayDepthView,   // unsupported retained depth view
+    ArrayDepthStride,   // unproven retained depth layer stride
     ArrayProducerCompletion,   // retained depth producer submit did not complete
-    ArrayDepthUnavailable,     // retained depth array could not be read
-    ArrayCompressedNoDepth,    // compressed Float32 array with no retained depth
-    ArrayCompressedGuest,      // compressed Float32 array would decode guest backing
-    ArrayShortBacking,         // Float32 array guest backing shorter than its slices
+    ArrayDepthUnavailable,   // retained depth array could not be read
+    ArrayCompressedNoDepth,   // compressed Float32 array with no retained depth
+    ArrayCompressedGuest,   // compressed Float32 array would decode guest backing
+    ArrayShortBacking,   // Float32 array guest backing shorter than its slices
     // realize_draw_item (src/gpu/execute/gpu_execute.hpp): a stage produced no SPIR-V, so the draw
     // never reaches the renderer's pass loop at all. Without these a recompiler refusal was the one
     // way to lose nearly every draw with the alarm silent (#3951: GTA V 1.27M -> 4.3k draws/run).
-    ShaderRecompileVertex,     // the vertex (or linked ES+VS chain) stage failed to recompile
+    ShaderRecompileVertex,   // the vertex (or linked ES+VS chain) stage failed to recompile
     ShaderRecompileFragment,   // the pixel stage failed to recompile
     ShaderRecompileGeometry,   // the synthesized interpolation/rect-list geometry stage failed
     BackendGeometryCapability,

@@ -18,15 +18,9 @@ constexpr size_t kReasonCount = static_cast<size_t>(DrawDrop::Count);
 // Indexed by DrawDrop. Kept adjacent to the enum's declaration order on purpose: a reason added
 // to one and not the other is a compile error via the static_assert below.
 constexpr std::array<const char*, kReasonCount> kNames{
-    "geometry-capability",
-    "mesh-shape",
-    "subgroup-features",
-    "gds-allocation",
-    "buffer-resources",
-    "shader-rejected",
-    "pipeline-creation",
-    "target-memory",
-    "ngg-subgroup",
+    "geometry-capability", "mesh-shape",       "subgroup-features",
+    "gds-allocation",      "buffer-resources", "shader-rejected",
+    "pipeline-creation",   "target-memory",    "ngg-subgroup",
 };
 static_assert(kNames.size() == kReasonCount,
               "every DrawDrop needs a stable name; logs are grepped by these strings");

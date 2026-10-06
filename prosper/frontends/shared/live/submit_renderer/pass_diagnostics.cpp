@@ -618,35 +618,9 @@ void dump_persistent_targets(PersistentTargetDumpContext& ctx) {
                 if (g_persist_extent.first &&
                     (s.w != g_persist_extent.first ||
                      s.h != g_persist_extent.second)) continue;
-                if (s.volume_depth) {
-                    // A volume writes no BMP: its raw bytes and their non-zero count answer
-                    // "did anything render into it" (#3135 P5: Kena's merged-NGG LUTs).
-                    const VkFormat vfmt = prosper::test::backend_color_format(s.format);
-                    std::vector<uint8_t> px;
-                    std::string err;
-                    const bool read = s.gpu_valid && s.w && s.h &&
-                        prosper::test::readback_persistent_color_target(
-                            kv.first, s.w, s.h, vfmt, px, err, s.volume_depth);
-                    size_t nz = 0;
-                    for (uint8_t byte : px) nz += byte != 0;
-                    char fn[512];
-                    std::snprintf(fn, sizeof fn, "%s/persist_s%04llu_%llx_%ux%ux%u.raw",
-                                  dd ? dd : ".", (unsigned long long)sub,
-                                  (unsigned long long)kv.first, s.w, s.h, s.volume_depth);
-                    if (read)
-                        if (FILE* f = std::fopen(fn, "wb")) {
-                            std::fwrite(px.data(), 1, px.size(), f);
-                            std::fclose(f);
-                        }
-                    fprintf(stderr, "[persist] submit=%llu addr=0x%llx volume %ux%ux%u fmt=%u "
-                            "read=%d raw_nonzero_bytes=%zu/%zu%s%s\n",
-                            (unsigned long long)sub, (unsigned long long)kv.first, s.w, s.h,
-                            s.volume_depth, (unsigned)s.format, (int)read, nz, px.size(),
-                            err.empty() ? "" : " error=", err.c_str());
-                    continue;
-                }
                 if (!s.gpu_valid || !s.w || !s.h ||
-                    static_cast<uint64_t>(s.w) * s.h < 64u * 64u) {
+                    static_cast<uint64_t>(s.w) * s.h * std::max(1u, s.volume_depth) <
+                        uint64_t{64u} * 64u) {
                     if (g_persist_filter.state ==
                             prosper::frontend::PersistentReadbackFilterState::Selected)
                         fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
@@ -676,9 +650,11 @@ void dump_persistent_targets(PersistentTargetDumpContext& ctx) {
                     }
                 } else
                     expected = static_cast<uint64_t>(s.w) * s.h * bpp;
+                expected *= std::max(1u, s.volume_depth);   // a volume reads back whole
                 std::vector<uint8_t> px; std::string err;
-                if (!prosper::test::readback_persistent_color_target(
-                        kv.first, s.w, s.h, fmt, px, err) || px.size() != expected) {
+                if (!prosper::test::readback_persistent_color_target(kv.first, s.w, s.h, fmt, px,
+                                                                     err, s.volume_depth) ||
+                    px.size() != expected) {
                     if (g_persist_filter.state ==
                             prosper::frontend::PersistentReadbackFilterState::Selected)
                         fprintf(stderr, "[persist] submit=%llu addr=0x%llx "
@@ -686,6 +662,26 @@ void dump_persistent_targets(PersistentTargetDumpContext& ctx) {
                                 (unsigned long long)sub,
                                 (unsigned long long)kv.first, err.c_str(), px.size(),
                                 (unsigned long long)expected);
+                    continue;
+                }
+                if (s.volume_depth) {
+                    // A volume writes no BMP: its raw bytes and their non-zero count answer "did
+                    // anything render into it" (#3135 P5: Kena's merged-NGG LUTs).
+                    size_t nz = 0;
+                    for (uint8_t byte : px) nz += byte != 0;
+                    char fn[512];
+                    std::snprintf(fn, sizeof fn, "%s/persist_s%04llu_%llx_%ux%ux%u.raw",
+                                  dd ? dd : ".", (unsigned long long)sub,
+                                  (unsigned long long)kv.first, s.w, s.h, s.volume_depth);
+                    if (FILE* f = std::fopen(fn, "wb")) {
+                        std::fwrite(px.data(), 1, px.size(), f);
+                        std::fclose(f);
+                    }
+                    fprintf(stderr,
+                            "[persist] submit=%llu addr=0x%llx volume %ux%ux%u fmt=%u "
+                            "raw_nonzero_bytes=%zu/%zu\n",
+                            (unsigned long long)sub, (unsigned long long)kv.first, s.w, s.h,
+                            s.volume_depth, (unsigned)s.format, nz, px.size());
                     continue;
                 }
                 const std::vector<uint8_t> rgba = inspection_rgba8(px, s.w, s.h, fmt);

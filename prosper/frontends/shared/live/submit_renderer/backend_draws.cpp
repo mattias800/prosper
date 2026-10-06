@@ -249,9 +249,8 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
             (it.owned_waves && it.owned_waves->vertex_pending ||
              (it.ngg_subgroup
                   ? prosper::gpu::validate_runtime_descriptor_contract(
-                        "NGG/backend", *it.ngg_subgroup->groups.front().stages->shell,
-                        it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Compute,
-                        descriptor_validate_mode)
+                        "NGG/backend", *it.ngg_subgroup->groups.front().stages->shell, it.vrt.get(),
+                        0, prosper::gpu::SpirvShaderStage::Compute, descriptor_validate_mode)
                   : prosper::gpu::validate_runtime_descriptor_contract(
                         "VS/backend", bd.vs_words(), it.vrt.get(), 0,
                         prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode))) &&

@@ -129,8 +129,8 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
 
 // Plans the draw and lays it out over the stages `stages_for(W)` supplies for each wave count the
 // plan uses (null with its refusal set when that W cannot be compiled).
-using NggSubgroupStagesSource = std::function<std::shared_ptr<const NggSubgroupStages>(
-    uint32_t waves, std::string* refusal)>;
+using NggSubgroupStagesSource =
+    std::function<std::shared_ptr<const NggSubgroupStages>(uint32_t waves, std::string* refusal)>;
 std::shared_ptr<const NggSubgroupDraw>
 assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
                            const NggSubgroupStagesSource& stages_for,
