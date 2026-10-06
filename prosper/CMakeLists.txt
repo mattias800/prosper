@@ -1285,6 +1285,11 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_ngg_subgroup_plan
+    SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
