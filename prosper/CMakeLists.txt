@@ -5063,6 +5063,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # The CFG dispatcher's spill-slot domain is decided per V_WRITELANE (Kena 0x5008ec0000):
+      # a data spill of an SGPR that holds a mask elsewhere survives a block edge, executed.
+      prosper_add_gtest(test_cfg_spill_slot_domain
+        SOURCES tests/gpu/recompiler/test_cfg_spill_slot_domain.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops
