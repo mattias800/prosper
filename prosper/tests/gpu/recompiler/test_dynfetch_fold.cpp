@@ -1191,14 +1191,24 @@ int main() {
                           [](uint32_t word) { return word == 0; }),
           "exact-null direct user-SGPR T# reaches sampled-image materialization");
 
-    // Same instruction and same base-zero descriptor, but one non-base word is nonzero. This must
-    // fail the exact-null exception rather than broadening it to malformed base-zero T# values.
+    // #4592: a nonzero NON-selector word keeps the descriptor null, because base zero and four
+    // SQ_SEL_0 selectors make every sampled channel the constant 0 whatever the other words hold.
     direct_null_seed[2] = 1;
+    std::vector<SrtUse> constant_direct_uses;
+    resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed, std::size(direct_null_seed), 0,
+                          &constant_direct_uses);
+    CHECK(constant_direct_uses.size() == 1 && constant_direct_uses[0].kind == 0 &&
+              constant_direct_uses[0].t8[2] == 1u,
+          "a base-zero direct T# with constant-zero selectors still reaches the null exception");
+    // ...but a base-zero T# that selects a memory channel must not broaden it.
+    direct_null_seed[3] = 0xfacu;
     std::vector<SrtUse> mutated_direct_null_uses;
     resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed,
                           std::size(direct_null_seed), 0, &mutated_direct_null_uses);
     CHECK(mutated_direct_null_uses.empty(),
-          "nonzero word at the same direct T# site fails the exact-null exception");
+          "a base-zero direct T# that selects a memory channel fails the null exception");
+    direct_null_seed[3] = 0;
+    direct_null_seed[2] = 0;
 
     // Astro Bot's world-map kernel uses IMAGE_BVH_INTERSECT_RAY with a compact four-dword BVH
     // descriptor in s[16:19]. It must not be mistaken for an eight-dword texture descriptor.

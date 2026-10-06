@@ -892,14 +892,31 @@ TEST(AgcShader, Contract) {
               null_image->srt_offset == UINT32_MAX,
           "exact all-zero table T# materializes as an exact-PC null sampled image");
 
-    // T# word 2, not the base words: the decoder still reports `base-zero`, so only the
-    // production all-eight-words predicate distinguishes this from the admitted descriptor.
-    null_image_table[10] = 1u;
-    auto nonzero_base_zero_resources = prosper::gpu::build_stage_table(
+    // #4592: a base-zero T# whose four DST_SEL fields (dword 3, bits 11:0) are all SQ_SEL_0
+    // returns the constant 0 in every channel, whatever its other words hold -- observably the
+    // all-zero null. Kena binds one with format/extent bits set and a V#-shaped upper half.
+    null_image_table[9] = 0x00fff000u;
+    null_image_table[10] = 0x06f00000u;
+    null_image_table[12] = 0x20e1e000u;
+    null_image_table[13] = 0x00100044u;
+    null_image_table[14] = 0x000000fcu;
+    null_image_table[15] = 0x0004dfacu;
+    auto constant_zero_resources = prosper::gpu::build_stage_table(
         null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
-    CHECK(!nonzero_base_zero_resources || !nonzero_base_zero_resources->by_fetch_pc(4),
-          "one nonzero T# word keeps a malformed low-base image fail-visible");
-    null_image_table[10] = 0u;
+    const prosper::gpu::ShaderResource* constant_zero =
+        constant_zero_resources ? constant_zero_resources->by_fetch_pc(4) : nullptr;
+    CHECK(constant_zero && constant_zero->cls == prosper::gpu::ResourceClass::Texture &&
+              constant_zero->gpu_addr == 0 && constant_zero->size == 0,
+          "a base-zero T# with constant-zero selectors is the same null sampled image");
+    // A base-zero T# that selects a memory channel still names address zero: fail-visible.
+    for (uint32_t selectors : {0xfacu, 0x004u, 0x200u}) {
+        null_image_table[11] = selectors;
+        auto selecting_resources = prosper::gpu::build_stage_table(
+            null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+        CHECK(!selecting_resources || !selecting_resources->by_fetch_pc(4),
+              "a base-zero T# that selects a memory channel keeps a malformed image fail-visible");
+    }
+    std::fill(std::begin(null_image_table) + 8, std::begin(null_image_table) + 16, 0u);
 
     const uint32_t null_image_store_shader[] = {
         0xF40C0304u, 0xFA000020u,   // same exact all-zero T# load
@@ -951,12 +968,24 @@ TEST(AgcShader, Contract) {
               direct_null_image->gpu_addr == 0 && direct_null_image->size == 0,
           "exact all-zero direct T# materializes as an exact-PC null sampled image");
 
-    direct_null_state.sh[kNullImagePsUser + 2] = 1u;
+    // #4592: a direct base-zero T# with constant-zero selectors is the same null (Kena binds one
+    // with extent/format bits set); one that selects a memory channel stays fail-visible.
+    direct_null_state.sh[kNullImagePsUser + 1] = 0x00fff000u;
+    direct_null_state.sh[kNullImagePsUser + 2] = 0x06f00000u;
+    direct_null_state.sh[kNullImagePsUser + 7] = 0x0004dfacu;
+    auto constant_direct_resources = prosper::gpu::build_stage_table(
+        direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
+    const prosper::gpu::ShaderResource* constant_direct =
+        constant_direct_resources ? constant_direct_resources->by_fetch_pc(0) : nullptr;
+    CHECK(constant_direct && constant_direct->cls == prosper::gpu::ResourceClass::Texture &&
+              constant_direct->gpu_addr == 0 && constant_direct->size == 0,
+          "a direct base-zero T# with constant-zero selectors is the same null sampled image");
+    direct_null_state.sh[kNullImagePsUser + 3] = 0xfacu;   // identity selectors: reads memory
     auto mutated_direct_null_resources = prosper::gpu::build_stage_table(
         direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
     CHECK(!mutated_direct_null_resources || !mutated_direct_null_resources->by_fetch_pc(0),
-          "one nonzero direct T# word keeps the same base-zero sample fail-visible");
-    direct_null_state.sh.erase(kNullImagePsUser + 2);
+          "a direct base-zero T# that selects a memory channel stays fail-visible");
+    for (uint32_t k : {1u, 2u, 3u, 7u}) direct_null_state.sh.erase(kNullImagePsUser + k);
 
     const uint32_t direct_null_store_shader[] = {
         0xF0200F08u, 0x00000000u,   // pc=0: image_store ..., s[0:7]
