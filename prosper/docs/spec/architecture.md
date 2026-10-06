@@ -111,7 +111,7 @@ A `PROSPER_*` switch is read through `src/diagnostics/env_cache.hpp`, never a ne
 Each new switch is classified in its PR as host-capability, diagnostic, or guest-behaviour
 selector; a selector has an issue whose resolution sets the default and deletes the switch.
 Status: accepted
-Enforcement: ratchet:getenv, review: (the classification is a statement of intent no scan can derive)
+Enforcement: ratchet:getenv, ci:switch-registry, review: (the registry checks that a class exists; whether it is true is a statement of intent no scan can derive)
 
 ### SIZE-1 -- no file grows past the line cap
 
