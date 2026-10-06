@@ -17,11 +17,11 @@ struct ImageWriteExtent {
 };
 
 // Upper bound of the guest memory an image_store / image atomic through `t8` can touch: the base,
-// plus the surface padded to 256x256 tiles, all slices and samples, doubled when it has a mip chain.
-// Returns false when no sound bound is known (unknown format, compressed surface with metadata, a 3D
-// surface whose thick tiling pads depth, a 64-bit overflow), and the caller then keeps treating the
-// write as able to alias anything.
-// CONFIDENCE: MED. The padding and the mip factor are bounds, not the layout; the layout is not needed
+// plus the surface padded to 256x256 tiles, all slices and samples. Returns false when no sound bound
+// is known (unknown format, compressed surface with metadata, a 3D surface whose thick tiling pads
+// depth, a declared mip chain whose level 0 is stored last, a 64-bit overflow), and the caller then
+// keeps treating the write as able to alias anything.
+// CONFIDENCE: MED. The padding is a bound, not the layout; the layout is not needed
 // to show two ranges are disjoint, only that this one does not underestimate the footprint. A linear
 // surface is covered because GFX10 aligns its row pitch to 256 bytes, so a row never spans more than
 // pad256(width) texels.

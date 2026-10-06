@@ -298,12 +298,17 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
     // UAV view's DEPTH is also only the selected slice range, not the volume. Neither is modelled,
     // so a 3D image, and any TYPE outside the GFX10 image range, has no sound bound.
     if (!valid_image_type(d.type) || d.type == 10) return false;
+    // A mip chain has no cheap sound bound either. GFX10 stores a tiled chain smallest level first
+    // and level 0 LAST, each level outside the tail padded to whole swizzle blocks, and BASE is the
+    // allocation base -- so level 0 can end past twice its own padded size. An R8 1280x256 chain
+    // with LAST_LEVEL 3 in a 64 KiB swizzle occupies 5+3+2+1 = 11 blocks (704 KiB), while 2 x the
+    // padded level 0 is 640 KiB. The measured shape is single-level, so refusing loses nothing.
+    if (d.max_mip || d.last_level) return false;
     constexpr uint64_t kTile = 256;
     const uint64_t w = (static_cast<uint64_t>(d.width) + kTile - 1) / kTile * kTile;
     const uint64_t h = (static_cast<uint64_t>(d.height) + kTile - 1) / kTile * kTile;
     const uint64_t slices = std::max<uint64_t>(d.depth, 1) + d.base_array;
     const uint64_t samples = std::max<uint32_t>(d.sample_count, 1u);
-    const uint64_t mips = (d.max_mip || d.last_level) ? 2u : 1u;
     // The block size is per block of block_width x block_height texels; one byte per texel of block
     // size is a superset for every format (blocks never hold fewer texels than bytes_per_block / 16).
     const uint64_t bytes_per_texel = format.bytes_per_block;
@@ -315,8 +320,6 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
     bytes *= samples;
     if (bytes > UINT64_MAX / bytes_per_texel) return false;
     bytes *= bytes_per_texel;
-    if (bytes > UINT64_MAX / mips) return false;
-    bytes *= mips;
     if (d.base > UINT64_MAX - bytes) return false;
     lo = d.base;
     hi = d.base + bytes;
