@@ -12,10 +12,17 @@
 // data (a MUST scalar word, no mask or ambiguous pair, and no V_READLANE that may have defined it)
 // and gives those slots the data domain. Anything it cannot decide keeps the old rule.
 //
-// Every program below takes the portable-readlane dispatcher route (a structured forward SCC if
-// plus `v_readlane_b32 s2, v0, 0` of an ordinary VGPR), so the spill really crosses a dispatcher
-// block edge between the write (block 0) and the reload (the join block). The kernels were
-// assembled with llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64.
+// The reload side (#4600): the analysis also carries what each slot holds on every path
+// (rdna2_spill_slot_domain), and types each V_READLANE by it. A data reload is a scalar word, a
+// mask reload is a mask (so a data read of it is the ballot word on a native Wave64 subgroup and
+// refused on the portable one), and a reload that is a mask on only some paths is refused at its
+// first read. A slot persisted in both Function variables is reloaded from the one it last got.
+//
+// The portable programs take the portable-readlane dispatcher route (a structured forward SCC if
+// plus `v_readlane_b32 s2, v0, 0` of an ordinary VGPR); the native ones append kTail, an
+// irreducible loop. Either way the spill really crosses a dispatcher block edge between the write
+// (block 0) and the reload (the join block). The kernels were assembled with
+// llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
@@ -66,12 +73,49 @@ const uint32_t kMaskReSpill[] = {
     0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
     0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
 };
+// Shape 1 with the reload in an SGPR that is not otherwise a mask key: the second spill slot is a
+// mask slot only because the analysis proves the write stores a Bool. Native Wave64 only.
+// ... v21[5] = s30; s40 = v21[5]; v20[28] = s40; ... join as kMaskReSpill
+const uint32_t kMaskReSpillThroughAnotherSgpr[] = {
+    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD7600028u, 0x00010B15u,
+    0xD7610014u, 0x00013828u, 0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
+    0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
+};
 // #4600 shape 2: a VALU DATA read of a word reloaded from a mask slot, on the portable route.
 // x = lane; s[30:31] = exec; v20[28] = s30; if (s4 == 0) v2 = 1;
 // join: s14 = v20[28] (EXEC_LO = 0xffffffff); s2 = v0[0]; v3 = float(s14 + x)
 const uint32_t kDataReadOfAMaskReload[] = {
     0x7E000F00u, 0xBE9E047Eu, 0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u,
     0xD760000Eu, 0x00013914u, 0xD7600002u, 0x00010100u, 0x4A06000Eu, 0x7E060D03u, 0xBF810000u,
+};
+// The native Wave64 form of shape 2: a native subgroup can form the ballot word, so the reloaded
+// mask's data read is the real EXEC_LO. A second branch puts a dispatcher edge between the reload
+// and the read, so the read sees what crossed the edge. Native Wave64 only, like kMaskSpill.
+// v3 = 0; s[30:31] = exec; v20[28] = s30; if (s4 == 0) v2 = 1;
+// J: s14 = v20[28]; if (s5 == 0) v2 = 2; K: v3 = s14 + x; out[x] = v3 (x - 1 mod 2^32)
+const uint32_t kNativeDataReadOfAMaskReload[] = {
+    0x7E060280u, 0xBE9E047Eu, 0xD7610014u, 0x0001381Eu, 0xBF068004u,
+    0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u, 0xBF068005u,
+    0xBF840001u, 0x7E040282u, 0x4A06000Eu, 0xE0702000u, 0x80020300u,
+};
+// A slot that holds data on one path and a mask on the other: the reload has no typed value at
+// the join, because the dispatcher's two Function variables carry no runtime tag. Portable route.
+// x = lane; s[30:31] = exec; s12 = 7; v20[28] = s12; if (s4 == 0) v20[28] = s30;
+// join: s14 = v20[28]; s2 = v0[0]; v3 = float(s14 + x)
+const uint32_t kDataOrMaskSlotReload[] = {
+    0x7E000F00u, 0xBE9E047Eu, 0xBE8C0387u, 0xD7610014u, 0x0001380Cu, 0xBF068004u,
+    0xBF840002u, 0xD7610014u, 0x0001381Eu, 0xD760000Eu, 0x00013914u, 0xD7600002u,
+    0x00010100u, 0x4A06000Eu, 0x7E060D03u, 0xBF810000u,
+};
+// A slot persisted in BOTH Function variables, that holds a mask at the reload: data first, then
+// the saved mask over it in the same block. The reload must take the Bool, not the uint variable,
+// which holds the zero placeholder. Native Wave64 only, like kMaskSpill.
+// v3 = 0; s[30:31] = exec; s12 = 7; v20[28] = s12; v20[28] = s30; if (s4 == 0) v2 = 1;
+// join: s14 = v20[28]; v3 = s14 + x; out[x] = v3 (x - 1 mod 2^32)
+const uint32_t kDataThenMaskSlotReload[] = {
+    0x7E060280u, 0xBE9E047Eu, 0xBE8C0387u, 0xD7610014u, 0x0001380Cu,
+    0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u,
+    0xD760000Eu, 0x00013914u, 0x4A06000Eu, 0xE0702000u, 0x80020300u,
 };
 const uint32_t kTail[] = {
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
@@ -166,6 +210,23 @@ TEST(CfgSpillSlotDomain, AReSpilledMaskReloadKeepsTheMask) {
         EXPECT_EQ(out[lane], lane < 40 ? 1u : 0u) << "lane " << lane;
 }
 
+// A reloaded mask re-spilled from an SGPR that is not a static mask key is persisted as a mask. The
+// static rule made that slot a data slot, so the Bool was lost at the edge and EXEC restored empty.
+TEST(CfgSpillSlotDomain, AMaskReSpilledThroughAnotherSgprKeepsTheMask) {
+    const std::vector<uint32_t> spv = compile_native(kMaskReSpillThroughAnotherSgpr);
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask";
+    EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    std::vector<uint32_t> out;
+    prosper::test::run_compute(spv, std::vector<float>(kLanes, 0.0f), kLanes, kLanes, {},
+                               std::vector<uint32_t>(kLanes, 0xdeadbeefu), &out, kLanes, nullptr,
+                               nullptr, nullptr, 64u);
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane < 40 ? 1u : 0u) << "lane " << lane;
+}
+
 // #4600 shape 2: the reloaded word is EXEC_LO's 0xffffffff, so v3 = x - 1 (mod 2^32). It used to
 // compile and read the word as 0 (v3 = x). The portable dispatcher cannot form a ballot word of
 // a Wave64 mask, so refusing is the correct answer there; a wrong value is not.
@@ -179,4 +240,46 @@ TEST(CfgSpillSlotDomain, ADataReadOfAMaskReloadIsTheMaskWordOrRefuses) {
     for (uint32_t lane = 0; lane < kLanes; ++lane)
         EXPECT_FLOAT_EQ(got[lane], static_cast<float>(lane - 1u))
             << "lane " << lane << ": the reloaded word is EXEC_LO, 0xffffffff";
+}
+
+// The native form of shape 2: the reloaded mask crosses a dispatcher edge as a mask, and its data
+// read takes the mask's low ballot word, EXEC_LO = 0xffffffff. Under the bug the word crossed as
+// the zero placeholder of its uint variable, so out[x] = x.
+TEST(CfgSpillSlotDomain, ANativeDataReadOfAMaskReloadIsTheBallotWord) {
+    const std::vector<uint32_t> spv = compile_native(kNativeDataReadOfAMaskReload);
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher can form the reloaded mask's word";
+    EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    std::vector<uint32_t> out;
+    prosper::test::run_compute(spv, std::vector<float>(kLanes, 0.0f), kLanes, kLanes, {},
+                               std::vector<uint32_t>(kLanes, 0xdeadbeefu), &out, kLanes, nullptr,
+                               nullptr, nullptr, 64u);
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane - 1u) << "lane " << lane << ": s14 is EXEC_LO, 0xffffffff";
+}
+
+// A reload whose slot is data on one path and a mask on another is refused at its first read. It
+// used to compile and read the uint variable, the zero placeholder on the mask path.
+TEST(CfgSpillSlotDomain, AReloadOfADataOrMaskSlotIsRefused) {
+    EXPECT_TRUE(compile(kDataOrMaskSlotReload).empty())
+        << "neither Function variable holds the reloaded word on every path";
+}
+
+// A slot that has both a data and a mask Function variable is reloaded from the one it last
+// received. It used to reload both, and the data read took the uint variable's zero: out[x] = x.
+TEST(CfgSpillSlotDomain, AReloadTakesTheDomainTheSlotLastReceived) {
+    const std::vector<uint32_t> spv = compile_native(kDataThenMaskSlotReload);
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher can form the reloaded mask's word";
+    EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    std::vector<uint32_t> out;
+    prosper::test::run_compute(spv, std::vector<float>(kLanes, 0.0f), kLanes, kLanes, {},
+                               std::vector<uint32_t>(kLanes, 0xdeadbeefu), &out, kLanes, nullptr,
+                               nullptr, nullptr, 64u);
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane - 1u) << "lane " << lane << ": s14 is EXEC_LO, 0xffffffff";
 }
