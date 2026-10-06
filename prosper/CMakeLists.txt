@@ -4064,6 +4064,12 @@ endif()
     SOURCES tests/gpu/pm4/test_cb_branch.cpp
     LIBRARIES prosper_core)
 
+  # A packet-predicated Jump under a BOOL64 SetPredication window runs only on a non-zero
+  # condition (Dragon Quest VII's AGC helper segments).
+  prosper_add_gtest(test_predicated_jump
+    SOURCES tests/gpu/pm4/test_predicated_jump.cpp
+    LIBRARIES prosper_core)
+
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
   prosper_add_gtest(test_agc_multi_dcb_empty_segment
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp

@@ -1,5 +1,6 @@
-// cond_indirect_buffer.hpp -- execution helpers for sceAgcCbBranch's packet and for refused Jump
-// segments (#4540). Kept beside command_processor.cpp, which is past the ratchet's line cap.
+// cond_indirect_buffer.hpp -- execution helpers for sceAgcCbBranch's packet, for refused Jump
+// segments (#4540) and for the predication decision of a packet-predicated Jump. Kept beside
+// command_processor.cpp, which is past the ratchet's line cap.
 #pragma once
 
 #include "gpu/pm4/pm4_decode.hpp"
@@ -28,5 +29,10 @@ Pm4Command cond_indirect_buffer_jump(const Pm4Command& c);
 //   readable: the whole segment is mapped guest memory.
 bool jump_segment_within_limits(uint64_t addr, uint32_t dwords, uint32_t depth);
 bool jump_segment_readable(uint64_t addr, uint32_t dwords);
+
+// Whether a packet-predicated Jump is skipped under a SetPredication window with raw `pred_op`, given
+// the 64-bit condition word read at fold time. Op 3 (BOOL64) runs the segment only on a non-zero
+// condition; other ops keep the previous rule and are reported once.
+bool predicated_jump_skips(uint32_t pred_op, uint64_t cond);
 
 }   // namespace prosper::gpu
