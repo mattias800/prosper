@@ -14244,11 +14244,6 @@ uint64_t live_compute_image_result_snapshot_bytes() {
     return context ? context->image_result_snapshot_bytes : 0;
 }
 
-bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
-                                            size_t guest_bytes, size_t minimum_bytes) {
-    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
-}
-
 void live_compute_fail_next_buffer_readback_for_test() {
     g_fail_next_buffer_readback_for_test.store(true, std::memory_order_release);
 }
