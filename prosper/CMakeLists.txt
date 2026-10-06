@@ -5042,6 +5042,12 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # What a colour slot above 1 starts from when nothing is loaded into it (#4624).
+      prosper_add_gtest(test_color_slot_clear
+        SOURCES tests/render/test_color_slot_clear.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core)
+
       # A replay process, which has no guest mapping table, compares guest addresses (#4619).
       prosper_add_gtest(test_ds_replay_alias
         SOURCES tests/render/test_ds_replay_alias.cpp

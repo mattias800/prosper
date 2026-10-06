@@ -893,6 +893,15 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             backend_target.persistent_id_slots[slot] = pass_bases[slot];
             backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
             backend_target.readback_slots[slot] = pass_bases[slot] != 0 && !defer_readback_slots[slot];
+            // A target left as one uniform colour (a DCC fast clear nothing has drawn over
+            // yet) has no image to load: the slot starts from that colour, as slots 0 and 1
+            // do through `retained_uniform_clear` (#4624). The backend uses it only when it
+            // loads nothing into the slot.
+            if (!backend_target.load_existing_slots[slot]) continue;
+            if (const auto sit = g_rtt.find(pass_bases[slot]);
+                sit != g_rtt.end() && sit->second.has_uniform_color && sit->second.w == gw &&
+                sit->second.h == gh && sit->second.format == pass_formats[slot])
+                backend_target.uniform_clear_slots[slot] = sit->second.uniform_color.data();
         }
         auto backend_draws = build_bds(
             render_pass, batch_backend_submits ? &backend_submission : nullptr);

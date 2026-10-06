@@ -12,9 +12,11 @@
 #include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -578,6 +580,69 @@ TEST(ShadowCompareRender, Contract) {
                           "#2550: a non-zero identity does not establish residency -- MRT2 still "
                           "survives the split with backend persistence disabled");
                 }
+            }
+        }
+
+        // #4624: what MRT2 STARTS from. The pass binds slot 2 and writes nothing to it (its write
+        // mask is 0, so the shader's export is masked out), which leaves the attachment exactly
+        // as the pass began it. A retained uniform colour passed for the slot must be that
+        // beginning -- the state of a G-buffer attachment the guest fast-cleared through DCC --
+        // and without one the slot keeps its old beginning: the pass's own programmed clear, or
+        // opaque black.
+        {
+            const uint32_t mrt0_and_mrt2_start[] = {
+                0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+                0xF800100Fu, 0x03020100u,
+                0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,
+                0xF800182Fu, 0x07060504u,
+                0xBF810000u,
+            };
+            std::vector<uint32_t> start_fs =
+                recompile_fragment(mrt0_and_mrt2_start, std::size(mrt0_and_mrt2_start));
+            CHECK(!start_fs.empty(), "#4624: MRT0+MRT2 producer recompiles");
+            if (!start_fs.empty()) {
+                // No depth: nothing here may force a pass split, which would carry slot 2 between
+                // segments by readback and seed and so hide what a single pass begins from.
+                ResolvedPipelineState start_state{};
+                start_state.topology = 3;
+                start_state.color_write_mask = 0xF;
+                start_state.color_targets[2].write_mask = 0u;
+                start_state.color_targets[2].format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                prosper::test::BackendDraw start_draw;
+                start_draw.vs = vert_z; start_draw.fs = start_fs; start_draw.ps = &start_state;
+                start_draw.vcount = 3;
+                const float uniform[4] = {1.0f, 1.0f, 1.0f, 0.0f};   // DCC code 0x80
+                const auto begin_of_slot2 = [&](const float* slot2_uniform, const char* what) {
+                    prosper::test::BackendColorTarget target{};
+                    target.uniform_clear_slots[2] = slot2_uniform;
+                    prosper::test::BackendMrtOutputs out;
+                    out.color_count = 3;
+                    (void)prosper::test::render_draws_rgba(
+                        {start_draw}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/false,
+                        &target, nullptr, nullptr, nullptr, nullptr, true, &out);
+                    std::array<uint8_t, 4> texel{0xEE, 0xEE, 0xEE, 0xEE};
+                    if (out.colors[2].size() == (size_t)W * H * 4)
+                        std::memcpy(texel.data(),
+                                    &out.colors[2][(((size_t)H / 2) * W + W / 2) * 4], 4);
+                    std::printf("  MRT2 begins from (%u,%u,%u,%u) %s\n", texel[0], texel[1],
+                                texel[2], texel[3], what);
+                    return texel;
+                };
+                CHECK(begin_of_slot2(uniform, "with a retained uniform colour") ==
+                          (std::array<uint8_t, 4>{255, 255, 255, 0}),
+                      "#4624: slot 2 begins from the retained uniform colour passed for it");
+                CHECK(begin_of_slot2(nullptr, "with none") ==
+                          (std::array<uint8_t, 4>{0, 0, 0, 255}),
+                      "#4624: with no uniform colour slot 2 still begins from opaque black");
+                start_state.color_targets[2].has_clear = true;
+                start_state.color_targets[2].clear[0] = 1.0f;   // the pass's own clear: red
+                CHECK(begin_of_slot2(nullptr, "with the pass's own clear") ==
+                          (std::array<uint8_t, 4>{255, 0, 0, 255}),
+                      "#4624: with no uniform colour the pass's own clear still applies");
+                CHECK(begin_of_slot2(uniform, "with both") ==
+                          (std::array<uint8_t, 4>{255, 255, 255, 0}),
+                      "#4624: the retained uniform colour wins over the pass's own clear");
             }
         }
 

@@ -277,14 +277,16 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
     // decals over it with the destination alpha as the running transmittance; the pass had been
     // starting from its own clear colour, (0,0,0,0), instead (#4556).
     //
+    // Every colour slot: an engine's G-buffer attachments sit above slot 1 (#4624; Stray, The
+    // Forgotten City and Bendy and the Dark Revival all clear theirs this way).
+    //
     // Narrower than the sampled case on purpose, because here no descriptor is in hand to check:
-    //   - slots 0 and 1 only, the two whose pass can start from a retained uniform colour;
     //   - the draw's guest extent must be the one the recorded descriptor described, so facts
     //     left over from another surface at this address are not applied to it;
     //   - the retained extent must be that extent, or it reduced by PROSPER_RENDER_SCALE;
     //   - no volume target: for those the dirty flag also marks a partial colour-plane write.
     for (const auto& item : candidates) {
-        for (uint32_t slot = 0; slot < 2u; ++slot) {
+        for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
             if (!prosper::frontend::mrt_write_mask(item, slot)) continue;
             const auto binding = color_binding(item, slot);
             auto found = binding.base ? g_rtt.find(binding.base) : g_rtt.end();

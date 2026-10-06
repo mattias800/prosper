@@ -222,19 +222,32 @@ TEST_F(DccClearRenderTarget, FactsFromAnotherSurfaceAtTheAddressAreNotApplied) {
     EXPECT_TRUE(surface().dcc_metadata_dirty);
 }
 
-// Slot 1 starts from a retained uniform colour as slot 0 does. The slots above it do not, so
-// taking their clear here would only lose it.
-TEST_F(DccClearRenderTarget, OnlyASlotThePassCanStartFromIsCleared) {
-    fast_clear(kClear0001);
-    prosper::gpu::DrawItem third;
-    third.color_targets[2].base = kTarget;
-    third.color_targets[2].width = kWidth;
-    third.color_targets[2].height = kHeight;
-    third.ps.color_targets[2].write_mask = 0xf;
-    ASSERT_EQ(prosper::frontend::mrt_write_mask(third, 2), 0xfu);
-    EXPECT_EQ(span(third), 0u);
-    EXPECT_TRUE(surface().dcc_metadata_dirty);
+// The clear is taken in whichever colour slot the pass binds the target. A G-buffer's attachments
+// sit above slot 1, and those were once left alone because no pass could start them from a
+// retained colour (#4624).
+TEST_F(DccClearRenderTarget, TheClearIsTakenInEveryColourSlot) {
+    for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+        SCOPED_TRACE(slot);
+        cache_[kTarget].has_uniform_color = false;
+        fast_clear(slot % 2 ? kClear1111 : kClear0001);
+        prosper::gpu::DrawItem draw;
+        draw.color_targets[slot].base = kTarget;
+        draw.color_targets[slot].width = kWidth;
+        draw.color_targets[slot].height = kHeight;
+        draw.ps.color_targets[slot].write_mask = 0xf;
+        draw.ps.color_targets[slot].format = static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+        ASSERT_EQ(prosper::frontend::mrt_write_mask(draw, slot), 0xfu);
+        EXPECT_EQ(span(draw), 1u);
+        EXPECT_FALSE(surface().dcc_metadata_dirty);
+        ASSERT_TRUE(surface().has_uniform_color);
+        EXPECT_EQ(surface().uniform_color,
+                  slot % 2 ? (std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f})
+                           : (std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}));
+    }
 
+    // The named slot-1 fields are a second way to say "slot 1" and must reach the same place.
+    cache_[kTarget].has_uniform_color = false;
+    fast_clear(kClear0001);
     prosper::gpu::DrawItem second;
     second.color1_base = kTarget;
     second.color1_width = kWidth;
@@ -242,6 +255,17 @@ TEST_F(DccClearRenderTarget, OnlyASlotThePassCanStartFromIsCleared) {
     second.ps.color1_write_mask = 0xf;
     EXPECT_EQ(span(second), 1u);
     EXPECT_EQ(surface().uniform_color, (std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}));
+
+    // A slot the pass binds but does not write (mask 0) takes nothing.
+    cache_[kTarget].has_uniform_color = false;
+    fast_clear(kClear0001);
+    prosper::gpu::DrawItem masked;
+    masked.color_targets[5].base = kTarget;
+    masked.color_targets[5].width = kWidth;
+    masked.color_targets[5].height = kHeight;
+    masked.ps.color_targets[5].write_mask = 0;
+    EXPECT_EQ(span(masked), 0u);
+    EXPECT_TRUE(surface().dcc_metadata_dirty);
 }
 
 // On a volume target the same flag also marks a partial colour-plane write, which is not a clear.
