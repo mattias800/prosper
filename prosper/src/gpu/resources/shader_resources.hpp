@@ -590,8 +590,10 @@ inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, ui
     return valid_owned_raw_snapshot_resource(resource, bytes, resource.host_data != nullptr);
 }
 
+// An x1 or x2 offset source (#4578): the snapshot is exactly the words the source load wrote.
 inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
-    return valid_owned_raw_snapshot_resource(resource, sizeof(uint32_t));
+    return (resource.size == 4u || resource.size == 8u) &&
+           valid_owned_raw_snapshot_resource(resource, resource.size);
 }
 
 // Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a

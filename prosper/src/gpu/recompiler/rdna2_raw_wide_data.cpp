@@ -916,13 +916,16 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 if (needed.none()) break;
                 continue;
             }
-            // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer
+            // A bounded immediate raw x1 or x2 fetch is a latched scalar value. Its entry pointer
             // needs to survive only UNTIL this read, unlike the wide source pointer, whose
             // full-program lifetime is authenticated above. GTA overwrites this source pair
-            // after the read while preserving the loaded scalar that supplies SOFFSET.
-            const bool immediate_scalar_read = writer.fmt == Rdna2Format::SMEM &&
-                writer.opcode == 0u && writer.dst.kind == OperandKind::SGPR &&
-                writer.dst.value >= 0 && writer.dst.value <= 105 &&
+            // after the read while preserving the loaded scalar that supplies SOFFSET. UE4's
+            // vertex-factory fetch loads its index pair with s_load_dwordx2 (Kena, #4578); the
+            // owned snapshot then carries both words, since the emitted load writes both.
+            const bool immediate_scalar_read =
+                writer.fmt == Rdna2Format::SMEM && (writer.opcode == 0u || writer.opcode == 1u) &&
+                writer.dst.kind == OperandKind::SGPR && writer.dst.value >= 0 &&
+                writer.dst.value + static_cast<int>(writer.opcode) <= 105 &&
                 writer.src[0].kind == OperandKind::SGPR && writer.src[0].value >= 0 &&
                 writer.src[0].value < 105 && writer.src[1].kind == OperandKind::Special &&
                 writer.src[1].value == 125 && writer.literal == 0u;

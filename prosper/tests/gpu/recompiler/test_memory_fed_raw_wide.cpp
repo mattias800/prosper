@@ -248,7 +248,8 @@ TEST(MemoryFedRawWide, Contract) {
     CHECK(proof(register_read).empty(), "a register-offset source read is outside the immediate x1 subset");
     auto pair_read = code;
     pair_read[0] = 0xf4040101u;
-    CHECK(proof(pair_read).empty(), "x2 source read is outside this bounded x1 unit");
+    // #4578: UE4's vertex-factory index is an s_load_dwordx2 pair; its snapshot owns both words.
+    CHECK(!proof(pair_read).empty(), "an x2 source read is a latched source too");
     auto unaligned_read = code;
     unaligned_read[1] = 0xfa000002u;
     CHECK(proof(unaligned_read).empty(), "unaligned source immediate stays unproven");

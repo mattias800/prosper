@@ -5731,7 +5731,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // A malformed replay table must fail before ordinary scalar-load resource fallback.
             if (!owned_wide_source && rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
                 (!register_source || register_source->fetch_pc != in.pc ||
-                 !valid_owned_raw_snapshot_resource(*register_source, sizeof(uint32_t),
+                 !valid_owned_raw_snapshot_resource(
+                     *register_source, n * sizeof(uint32_t),
                      compiler_resource_has_host_data(*register_source)))) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr,
