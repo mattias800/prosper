@@ -1927,12 +1927,6 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
 
-  # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
-  # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
-  add_executable(test_prosper_app_library_nav frontends/prosper-app/test_library_nav.cpp)
-  target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
-  add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
-
   # Library descriptor-pool sizing and the exhaustion rule (#1649): the pool must follow the title count
   # instead of a fixed 256, and a set must never be allocated out of a full pool — ImGui's backend writes
   # to whatever vkAllocateDescriptorSets returned without checking it. Pure arithmetic plus a fake

@@ -1,7 +1,6 @@
 // library_ui.cpp — see library_ui.hpp. Draws the library grid with Dear ImGui on the app's existing
 // Vulkan device, and decodes cover art with stb_image (#1471).
 #include "library_ui.hpp"
-#include "library_nav.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
@@ -22,16 +21,8 @@
 namespace prosper::frontend {
 namespace {
 
-// Cover art is square (icon0.png is 512x512 in every dump), so 320 still samples the source DOWN and
-// cannot show resampling artefacts. The previous 160 read as very small on a desktop monitor.
-constexpr float kCoverSize   = 320.0f;
-// Wide gutters are what let the focused title's background art actually be seen between the cards
-// (#1630) — at the old spacing the grid covered almost all of it.
-constexpr float kCellPadding = 96.0f;
-constexpr float kLabelHeight = 84.0f;    // up to three lines of wrapped title at the larger font
-constexpr float kTitleFontPx = 26.0f;    // 2x ImGui's 13px default; integer scale keeps the bitmap crisp
-constexpr float kCellWidth   = kCoverSize + kCellPadding;
-constexpr float kCellHeight  = kCoverSize + kLabelHeight + kCellPadding;
+// Table thumbnails sample the square icon0.png down, so they cannot show resampling artefacts.
+constexpr float kThumbSize = 56.0f;
 
 std::string read_file_bytes(const std::string& path) {
     std::string out;
@@ -153,21 +144,83 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     imguiCtx_ = true;   // set immediately: shutdown() must destroy the context even if a backend fails
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;   // no imgui.ini beside the binary: the app has its own settings file
-    // ImGui's own keyboard/gamepad nav is deliberately NOT enabled: this screen drives selection with
-    // the unit-tested grid rules in library_nav.hpp, and letting both run means the arrow keys move a
-    // widget focus as well as the selection, and Enter activates whatever widget that focus landed on
+    // ImGui's own keyboard/gamepad nav is deliberately NOT enabled: this screen drives selection
+    // itself (Up/Down/Home/End plus Enter), and letting both run means the arrow keys move a widget
+    // focus as well as the selection, and Enter activates whatever widget that focus landed on
     // rather than launching the highlighted game.
     io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
     ImGui::StyleColorsDark();
+    // Console-shelf polish: rounded widgets, roomier touch targets, one accent family. The default
+    // dark theme reads as a debugger; the library is a living-room screen, so it gets the small set
+    // of changes that carry that — geometry and a PlayStation-blue accent, not a second theme.
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 10.0f;
+        style.FrameRounding = 6.0f;
+        style.GrabRounding = 6.0f;
+        style.WindowPadding = ImVec2(16, 14);
+        style.FramePadding = ImVec2(10, 6);
+        style.ItemSpacing = ImVec2(10, 8);
+        style.ItemInnerSpacing = ImVec2(8, 6);
+        ImVec4* c = style.Colors;
+        c[ImGuiCol_Button] = ImVec4(0.10f, 0.32f, 0.68f, 1.00f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.42f, 0.82f, 1.00f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.07f, 0.25f, 0.55f, 1.00f);
+        c[ImGuiCol_Header] = ImVec4(0.10f, 0.32f, 0.68f, 1.00f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.16f, 0.42f, 0.82f, 1.00f);
+        c[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.75f, 1.00f, 1.00f);
+        c[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.14f, 0.17f, 1.00f);
+        c[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.20f, 0.24f, 1.00f);
+    }
 
-    // Game titles are drawn at twice the UI font size. A SECOND atlas entry rather than
-    // SetWindowFontScale: ImGui's default font is a bitmap designed for 13 px, and scaling it at draw
-    // time blurs it, while baking it at an exact 2x integer multiple stays sharp. The first font added
-    // remains the default, so the header, footer and buttons are unchanged.
-    io.Fonts->AddFontDefault();
-    ImFontConfig titleCfg;
-    titleCfg.SizePixels = kTitleFontPx;
-    titleFont_ = io.Fonts->AddFontDefault(&titleCfg);
+    // Type comes from the host's own UI font (Segoe UI on Windows, DejaVu/Noto on Linux),
+    // baked at the exact sizes it is drawn at — the same crispness rule as the bitmap path below.
+    // A system font is data, not code: nothing guest-controlled touches it, and when none is found
+    // the bitmap default keeps every label readable, only less pretty.
+    {
+        const char* regular = nullptr;
+        const char* bold = nullptr;
+#ifdef _WIN32
+        static const char kWinRegular[] = "C:\\Windows\\Fonts\\segoeui.ttf";
+        static const char kWinBold[] = "C:\\Windows\\Fonts\\segoeuib.ttf";
+        FILE* probe = std::fopen(kWinRegular, "rb");
+        if (probe) {
+            std::fclose(probe);
+            regular = kWinRegular;
+            probe = std::fopen(kWinBold, "rb");
+            if (probe) { std::fclose(probe); bold = kWinBold; }
+        }
+#else
+        static const struct { const char* regular; const char* bold; } kLinuxFonts[] = {
+            {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"},
+            {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"},
+            {"/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"},
+        };
+        for (const auto& candidate : kLinuxFonts) {
+            FILE* probe = std::fopen(candidate.regular, "rb");
+            if (!probe) continue;
+            std::fclose(probe);
+            regular = candidate.regular;
+            probe = std::fopen(candidate.bold, "rb");
+            if (probe) { std::fclose(probe); bold = candidate.bold; }
+            break;
+        }
+#endif
+        if (regular) {
+            // 16 px UI text and 16 px bold headers, baked at the exact sizes they draw at.
+            // All-or-nothing: a half-built atlas is discarded so the fallback below owns everything.
+            ImFont* ui = io.Fonts->AddFontFromFileTTF(regular, 16.0f);
+            if (ui && bold) boldFont_ = io.Fonts->AddFontFromFileTTF(bold, 16.0f);
+            if (!ui) io.Fonts->Clear();
+        }
+    }
+    if (io.Fonts->Fonts.empty()) {
+        // No system font: the bitmap default at 13 px. Scaling it at draw time would blur, so the
+        // list simply draws smaller rather than rescaling what it has.
+        io.Fonts->AddFontDefault();
+    }
 
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) { fprintf(stderr, "[library] SDL3 backend init failed\n"); shutdown(); return false; }
     sdlInit_ = true;
@@ -187,8 +240,8 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     // the developer's desktop by default.
     const char* musicEnv = SDL_getenv("PROSPER_LAUNCHER_MUSIC");
     musicToggle_ = resolve_launcher_music(musicEnv, musicToggle_, /*automated=*/stats_);
-    const float gain = launcher_music_output_gain(
-        resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME")), outputVolume_);
+    musicLevel_ = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
+    const float gain = launcher_music_output_gain(musicLevel_, outputVolume_);
     if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, &budget_, musicToggle_, gain))
         fprintf(stderr, "[library] background art and music unavailable\n");
     // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox
@@ -368,13 +421,26 @@ bool LibraryUi::ensure_descriptor_capacity(size_t title_count) {
     return true;
 }
 
-void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
-    // Hold the selection on the same title across a rescan, so adding a game elsewhere in the list
-    // does not move the cursor under the user's hands.
-    std::string keep;
-    if (selected_ >= 0 && selected_ < static_cast<int>(games_.size()))
-        keep = games_[static_cast<size_t>(selected_)].app0_root;
+void LibraryUi::apply_filter() {
+    filterApplied_ = filterBuf_;
+    filtered_.clear();
+    for (int i = 0; i < static_cast<int>(games_.size()); i++)
+        if (game_entry_matches_filter(games_[static_cast<size_t>(i)], filterApplied_))
+            filtered_.push_back(i);
+    selected_ = 0;
+}
 
+void LibraryUi::set_output_volume(float volume) {
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    outputVolume_ = volume;
+    volumePercent_ = static_cast<int>(volume * 100.0f + 0.5f);
+    // Live once the media layer is up; before init() this only seeds what init() will use.
+    if (media_.ready())
+        media_.set_output_gain(launcher_music_output_gain(musicLevel_, outputVolume_));
+}
+
+void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
     if (device_) vkDeviceWaitIdle(device_);   // covers may still be referenced by an in-flight frame
     destroy_covers();
     // After destroy_covers() and the device wait, so the grow finds the old pool free of cover sets and
@@ -383,12 +449,7 @@ void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games
     games_ = std::move(games);
     gamesDir_ = games_dir;
     covers_.resize(games_.size());
-
-    selected_ = 0;
-    if (!keep.empty())
-        for (size_t i = 0; i < games_.size(); i++)
-            if (games_[i].app0_root == keep) { selected_ = static_cast<int>(i); break; }
-    firstRow_ = 0;
+    apply_filter();
 }
 
 bool LibraryUi::handle_event(const SDL_Event& ev) {
@@ -403,25 +464,15 @@ bool LibraryUi::handle_event(const SDL_Event& ev) {
     return false;
 }
 
-VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
-    const size_t index = static_cast<size_t>(&game - games_.data());
-    if (index >= covers_.size()) return VK_NULL_HANDLE;
-    Cover& cover = covers_[index];
-    if (cover.tried) return cover.set;
-    cover.tried = true;   // one attempt per title: a corrupt icon must not be re-decoded every frame
-
-    if (game.icon_path.empty()) return VK_NULL_HANDLE;
-    const std::string bytes = read_file_bytes(game.icon_path);
-    if (bytes.empty()) return VK_NULL_HANDLE;
-
-    int w = 0, h = 0, channels = 0;
-    stbi_uc* pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()),
-                                            static_cast<int>(bytes.size()), &w, &h, &channels, 4);
-    if (!pixels || w <= 0 || h <= 0) {
-        if (pixels) stbi_image_free(pixels);
-        fprintf(stderr, "[library] could not decode %s\n", game.icon_path.c_str());
-        return VK_NULL_HANDLE;
-    }
+// Upload decoded RGBA as a sampled image plus an ImGui descriptor set. Shared by covers and
+// the header logo so there is one upload path, not two. Handles come back through the out-params;
+// on any failure they are destroyed here and the return is null, so the caller only branches on
+// the set. `what` names the image in diagnostics.
+VkDescriptorSet LibraryUi::upload_rgba(int w, int h, const unsigned char* rgba, const char* what,
+                                       VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
+    image = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+    view = VK_NULL_HANDLE;
     const VkDeviceSize bytesNeeded = static_cast<VkDeviceSize>(w) * h * 4;
 
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -437,16 +488,16 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
 
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory stagingMem = VK_NULL_HANDLE;
-    bool ok = vkCreateImage(device_, &ii, nullptr, &cover.image) == VK_SUCCESS;
+    bool ok = vkCreateImage(device_, &ii, nullptr, &image) == VK_SUCCESS;
     if (ok) {
         VkMemoryRequirements mr{};
-        vkGetImageMemoryRequirements(device_, cover.image, &mr);
+        vkGetImageMemoryRequirements(device_, image, &mr);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = mr.size;
         ai.memoryTypeIndex = find_memory_type(phys_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         ok = ai.memoryTypeIndex != UINT32_MAX &&
-             prosper::gpu::allocate_device_memory(device_, &ai, &cover.memory) == VK_SUCCESS &&
-             vkBindImageMemory(device_, cover.image, cover.memory, 0) == VK_SUCCESS;
+             prosper::gpu::allocate_device_memory(device_, &ai, &memory) == VK_SUCCESS &&
+             vkBindImageMemory(device_, image, memory, 0) == VK_SUCCESS;
     }
     if (ok) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -469,10 +520,9 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
         if (ok) {
             void* mapped = nullptr;
             ok = vkMapMemory(device_, stagingMem, 0, bytesNeeded, 0, &mapped) == VK_SUCCESS;
-            if (ok) { std::memcpy(mapped, pixels, static_cast<size_t>(bytesNeeded)); vkUnmapMemory(device_, stagingMem); }
+            if (ok) { std::memcpy(mapped, rgba, static_cast<size_t>(bytesNeeded)); vkUnmapMemory(device_, stagingMem); }
         }
     }
-    stbi_image_free(pixels);
 
     if (ok) {
         // A one-shot upload on the app's queue. The library is idle-state UI drawn a few times a
@@ -490,7 +540,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
             toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toDst.srcQueueFamilyIndex = toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.image = cover.image;
+            toDst.image = image;
             toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -498,7 +548,7 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageExtent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
-            vkCmdCopyBufferToImage(up, staging, cover.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkCmdCopyBufferToImage(up, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             VkImageMemoryBarrier toRead = toDst;
             toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -519,44 +569,72 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
 
     if (ok) {
         VkImageViewCreateInfo ivi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        ivi.image = cover.image;
+        ivi.image = image;
         ivi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         ivi.format = VK_FORMAT_R8G8B8A8_UNORM;
         ivi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        ok = vkCreateImageView(device_, &ivi, nullptr, &cover.view) == VK_SUCCESS;
+        ok = vkCreateImageView(device_, &ivi, nullptr, &view) == VK_SUCCESS;
     }
+    VkDescriptorSet set = VK_NULL_HANDLE;
     bool poolFull = false;
     if (ok) {
         // Through the budget, NOT straight to AddTexture: on a full pool that helper hands the
         // VK_NULL_HANDLE from vkAllocateDescriptorSets to vkUpdateDescriptorSets, so checking its return
         // value would be checking after the undefined behaviour (#1649).
         poolFull = budget_.available() == 0;
-        cover.set = acquire_texture_set(budget_, VkDescriptorSet(VK_NULL_HANDLE), [&] {
-            return ImGui_ImplVulkan_AddTexture(sampler_, cover.view,
+        set = acquire_texture_set(budget_, VkDescriptorSet(VK_NULL_HANDLE), [&] {
+            return ImGui_ImplVulkan_AddTexture(sampler_, view,
                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         });
     }
-    if (!ok || !cover.set) {
-        // Leave the entry usable without art rather than dropping a bootable title from the list.
-        // Said once for an exhausted pool: every remaining title would repeat it, and the cause is a
-        // property of the pool rather than of this icon.
+    if (!ok || !set) {
+        // Said once for an exhausted pool: every image past capacity would repeat it, and the cause
+        // is a property of the pool rather than of this image.
         if (poolFull) {
             if (!poolFullWarned_) {
                 poolFullWarned_ = true;
-                fprintf(stderr,
-                        "[library] descriptor pool full at %u sets; titles past this show no cover art\n",
-                        poolSets_);
+                fprintf(stderr, "[library] descriptor pool full at %u sets; %s has no image\n",
+                        poolSets_, what);
             }
         } else {
-            fprintf(stderr, "[library] could not upload cover for %s\n", game.title_name.c_str());
+            fprintf(stderr, "[library] could not upload %s\n", what);
         }
-        if (cover.view)   { vkDestroyImageView(device_, cover.view, nullptr); cover.view = VK_NULL_HANDLE; }
-        if (cover.image)  { vkDestroyImage(device_, cover.image, nullptr);    cover.image = VK_NULL_HANDLE; }
-        if (cover.memory) { prosper::gpu::free_device_memory(device_, cover.memory);     cover.memory = VK_NULL_HANDLE; }
-        cover.set = VK_NULL_HANDLE;
+        if (view)   { vkDestroyImageView(device_, view, nullptr);   view = VK_NULL_HANDLE; }
+        if (image)  { vkDestroyImage(device_, image, nullptr);      image = VK_NULL_HANDLE; }
+        if (memory) { prosper::gpu::free_device_memory(device_, memory); memory = VK_NULL_HANDLE; }
+        return VK_NULL_HANDLE;
     }
+    return set;
+}
+
+VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
+    const size_t index = static_cast<size_t>(&game - games_.data());
+    if (index >= covers_.size()) return VK_NULL_HANDLE;
+    Cover& cover = covers_[index];
+    if (cover.tried) return cover.set;
+    cover.tried = true;   // one attempt per title: a corrupt icon must not be re-decoded every frame
+
+    if (game.icon_path.empty()) return VK_NULL_HANDLE;
+    const std::string bytes = read_file_bytes(game.icon_path);
+    if (bytes.empty()) return VK_NULL_HANDLE;
+
+    int w = 0, h = 0, channels = 0;
+    stbi_uc* pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()),
+                                            static_cast<int>(bytes.size()), &w, &h, &channels, 4);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        fprintf(stderr, "[library] could not decode %s\n", game.icon_path.c_str());
+        return VK_NULL_HANDLE;
+    }
+    // A missing image leaves the entry usable without art rather than dropping a bootable title
+    // from the list.
+    cover.set = upload_rgba(w, h, pixels, game.title_name.c_str(),
+                            cover.image, cover.memory, cover.view);
+    stbi_image_free(pixels);
     return cover.set;
 }
+
+
 
 // Consume an already-signalled acquire semaphore without drawing. Used when an image was acquired but
 // cannot be rendered to; leaving the semaphore signalled would corrupt every later frame's pairing.
@@ -616,6 +694,85 @@ void LibraryUi::draw_backdrop() {
     }
 }
 
+void LibraryUi::draw_settings_content(LibraryAction& action) {
+    // The menu bar brought the user here; this is the way back. Tabs were the earlier shape —
+    // menu-led navigation won, and two coexisting navigations were the duplication.
+    if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
+    ImGui::Separator();
+    const auto section = [&](const char* title) {
+        // Bold section headers when the system font supplied one; the bitmap fallback has no
+        // bold, and faking it with a second size would blur.
+        ImGui::Spacing();
+        if (boldFont_) ImGui::PushFont(boldFont_);
+        ImGui::TextUnformatted(title);
+        if (boldFont_) ImGui::PopFont();
+        ImGui::Separator();
+    };
+    const auto radio_row = [&](const char* label, const char* hint, const std::string& current,
+                               const char* value, LibraryAction::Kind kind) {
+        // The label names the choice, the dim line below names its consequence; the stored value
+        // stays the bare policy name the config file and flags use.
+        const bool selected = (current == value);
+        if (ImGui::RadioButton(label, selected) && !selected &&
+            action.kind == LibraryAction::Kind::none) {
+            action.kind = kind;
+            action.value = value;
+        }
+        if (hint) {
+            ImGui::Indent();
+            ImGui::TextDisabled("%s", hint);
+            ImGui::Unindent();
+        }
+    };
+
+    ImGui::TextWrapped("These apply to games you open from here. A command-line flag or an "
+                       "environment variable still wins over each one.");
+    section("Presentation");
+    radio_row("Vsync", "Smoothest picture, a little more input lag.", presentMode_, "fifo",
+              LibraryAction::Kind::set_present_mode);
+    radio_row("Low-latency vsync", "Still tear-free, wakes the game sooner.", presentMode_,
+              "mailbox", LibraryAction::Kind::set_present_mode);
+    radio_row("Tearing allowed", "Fastest response, the image can shear mid-frame.", presentMode_,
+              "immediate", LibraryAction::Kind::set_present_mode);
+    // Mirror the choice locally: the persisted value comes back through main.cpp, but the dot
+    // must move on the click, not on the next rescan.
+    if (action.kind == LibraryAction::Kind::set_present_mode) presentMode_ = action.value;
+
+    section("Display the game thinks it is plugged into");
+    radio_row("Always 1080p", "What prosper has always answered. Safest.", displayMode_, "legacy",
+              LibraryAction::Kind::set_display_mode);
+    radio_row("Match this display", "Lets games offer 4K where the monitor allows it.",
+              displayMode_, "host", LibraryAction::Kind::set_display_mode);
+    radio_row("Match, including high refresh", "Experimental: some games run too fast past 60 Hz.",
+              displayMode_, "host-high-refresh", LibraryAction::Kind::set_display_mode);
+    if (action.kind == LibraryAction::Kind::set_display_mode) displayMode_ = action.value;
+
+    section("Patched-import repair");
+    // Off by default, matching the loader: it rewrites guest code, so the box stays unticked
+    // unless the run asked for it. Reported to the caller so it is persisted.
+    if (ImGui::Checkbox("Repair patched Sony imports", &restoreToggle_)) {
+        action.kind = LibraryAction::Kind::set_restore_imports;
+        action.restore_on = restoreToggle_;
+    }
+    ImGui::TextDisabled("Some dumps stall at high CPU on hand-patched stubs; repairing them lets "
+                        "waits block instead of spin.");
+
+    section("Save data folder");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("##savedata", savedataBuf_, sizeof savedataBuf_);
+    if (ImGui::Button("Apply") && action.kind == LibraryAction::Kind::none) {
+        savedataDir_ = savedataBuf_;
+        savedataApplied_ = savedataDir_;
+        action.kind = LibraryAction::Kind::set_savedata_dir;
+        action.value = savedataDir_;
+    }
+    ImGui::SameLine();
+    if (savedataApplied_.empty())
+        ImGui::TextDisabled("Using the default location.");
+    else
+        ImGui::TextDisabled("Now: %s", savedataApplied_.c_str());
+}
+
 LibraryAction LibraryUi::render_frame(const std::string& status) {
     LibraryAction action;
     if (!ready_) return action;
@@ -663,16 +820,47 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
     ImGui::Begin("prosper", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground);
+                 ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground |
+                 ImGuiWindowFlags_MenuBar);
 
-    ImGui::TextUnformatted(games_.empty() ? "prosper" : "Choose a game");
-    if (!gamesDir_.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", gamesDir_.c_str());
+    // Menu bar: File (folders, recent games, exit) and Settings. PKG install is deliberately
+    // absent — prosper runs user-supplied unpacked dumps, it installs nothing.
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Add games folder...")) action.kind = LibraryAction::Kind::browse;
+            if (ImGui::MenuItem("Open game folder...")) action.kind = LibraryAction::Kind::pick_game;
+            if (ImGui::BeginMenu("Recent games", !recentGames_.empty())) {
+                for (size_t ri = 0; ri < recentGames_.size(); ri++) {
+                    const RecentGame& recent = recentGames_[ri];
+                    ImGui::PushID(static_cast<int>(ri));
+                    // The name on the line, the path on hover: same screenshot rule as the table.
+                    if (ImGui::MenuItem(recent.label.c_str())) {
+                        action.kind = LibraryAction::Kind::open;
+                        action.app0_root = recent.root;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recent.root.c_str());
+                    ImGui::PopID();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit")) action.kind = LibraryAction::Kind::quit;
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Settings")) {
+            if (ImGui::MenuItem("Open settings")) tab_ = LibraryTab::settings;
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
     }
-    ImGui::Separator();
 
-    if (games_.empty()) {
+    // No header text and no path: the window bar already says Prosper (with the mark as its
+    // icon, set in main.cpp), navigation lives in the menu bar, and a home directory does not
+    // belong in screenshots.
+
+    if (tab_ == LibraryTab::settings) {
+        draw_settings_content(action);
+    } else if (games_.empty()) {
         ImGui::Spacing();
         if (gamesDir_.empty()) {
             ImGui::TextWrapped("No games folder is set yet. Choose the folder that holds your PS5 game "
@@ -691,97 +879,10 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::SameLine();
         ImGui::TextDisabled("or press Enter, or drop a game folder on this window");
     } else {
-        const float avail = ImGui::GetContentRegionAvail().x;
-        const int columns = library_columns_for_width(avail, kCellWidth);
-        const int count = static_cast<int>(games_.size());
-
-        // Selection. ImGui's own nav does not know about the grid, so movement is decided by the
-        // unit-tested rules in library_nav.hpp and the scroll follows the selection.
-        // Keyboard only. Controller navigation is NOT implemented: ImGui's gamepad nav is off (it
-        // fights these rules), and nothing initialises SDL's gamepad subsystem while the library is
-        // alive — the pad backend does that inside start_guest, by which point the library is gone.
-        // Tracked separately rather than shipped as code that cannot fire.
-        LibraryNavKey key = LibraryNavKey::none;
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))       key = LibraryNavKey::left;
-        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) key = LibraryNavKey::right;
-        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    key = LibraryNavKey::up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  key = LibraryNavKey::down;
-        else if (ImGui::IsKeyPressed(ImGuiKey_Home))     key = LibraryNavKey::home;
-        else if (ImGui::IsKeyPressed(ImGuiKey_End))      key = LibraryNavKey::end;
-        else if (ImGui::IsKeyPressed(ImGuiKey_PageUp))   key = LibraryNavKey::page_up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) key = LibraryNavKey::page_down;
-
-        const float gridHeight = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f;
-        const int rowsPerPage = static_cast<int>(gridHeight / kCellHeight);
-        const int before = selected_;
-        selected_ = library_nav_apply(key, selected_, count, columns, rowsPerPage);
-        if (stats_ && selected_ != before)
-            fprintf(stderr, "[library] selection %d -> %d (key=%d) at frame %llu\n", before, selected_,
-                    (int)key, (unsigned long long)frameCount_);
-        firstRow_ = library_scroll_row_for(selected_, columns, rowsPerPage, firstRow_);
-
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-            ImGui::IsKeyPressed(ImGuiKey_Space)) {
-            action.kind = LibraryAction::Kind::open;
-            action.app0_root = games_[static_cast<size_t>(selected_)].app0_root;
-        }
-
-        ImGui::BeginChild("grid", ImVec2(0, gridHeight), false);
-        // Apply the computed scroll, but only when a key moved the selection: doing it every frame
-        // would fight the mouse wheel. Without this the selection can move below the visible rows —
-        // the pure test covers library_scroll_row_for, only this line makes it reach the screen.
-        if (key != LibraryNavKey::none) ImGui::SetScrollY(static_cast<float>(firstRow_) * kCellHeight);
-        for (int i = 0; i < count; i++) {
-            if (i % columns != 0) ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::PushID(i);
-            const GameEntry& game = games_[static_cast<size_t>(i)];
-            const bool isSelected = (i == selected_);
-            if (isSelected)
-                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-
-            VkDescriptorSet cover = cover_for(game);
-            bool clicked = false;
-            if (cover) {
-                clicked = ImGui::ImageButton("cover", reinterpret_cast<ImTextureID>(cover),
-                                             ImVec2(kCoverSize, kCoverSize));
-            } else {
-                // No art: a labelled button of the same size keeps the grid aligned and the entry
-                // launchable, which matters more than the picture.
-                clicked = ImGui::Button(game.title_id.empty() ? "(no art)" : game.title_id.c_str(),
-                                        ImVec2(kCoverSize, kCoverSize));
-            }
-            if (isSelected) ImGui::PopStyleColor();
-            if (clicked) {
-                selected_ = i;
-                action.kind = LibraryAction::Kind::open;
-                action.app0_root = game.app0_root;
-            }
-            // The title and its FOLDER NAME, not the absolute path. The folder name is what identifies
-            // the dump (the content id is in it), while the rest of the path is the user's home
-            // directory — which would otherwise end up in every screenshot anyone shares of their
-            // library. The games directory is already shown once in the header for orientation.
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\n%s", game.title_name.c_str(),
-                                  path_basename(game.app0_root).c_str());
-
-            // Wrapped to the cover's width so a long localized name ("Space Adventure Cobra - The
-            // Awakening") breaks onto further lines instead of running into the next column.
-            if (titleFont_) ImGui::PushFont(titleFont_);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kCoverSize);
-            ImGui::TextUnformatted(game.title_name.c_str());
-            ImGui::PopTextWrapPos();
-            if (titleFont_) ImGui::PopFont();
-
-            ImGui::PopID();
-            ImGui::EndGroup();
-        }
-        ImGui::EndChild();
-
-        ImGui::Separator();
-        ImGui::Text("%d game%s", count, count == 1 ? "" : "s");
-        ImGui::SameLine();
+        // Toolbar: folder management left, search right.
         if (ImGui::Button("Change folder...")) action.kind = LibraryAction::Kind::browse;
+        ImGui::SameLine();
+        if (ImGui::Button("Rescan")) action.kind = LibraryAction::Kind::rescan;
         ImGui::SameLine();
         // Discoverable rather than env-only: someone who does not want a launcher making noise should
         // not have to find a variable name to stop it. Reported to the caller so it is persisted.
@@ -791,7 +892,116 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
             action.music_on = musicToggle_;
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Enter opens  |  arrows move  |  Esc quits");
+        ImGui::SetNextItemWidth(120.0f);
+        int vol = volumePercent_;
+        // Live while dragging (the gain applies on this thread), persisted on release: writing
+        // the settings file on every dragged frame would be a write per frame.
+        if (ImGui::SliderInt("##volume", &vol, 0, 100, "%d%%") && vol != volumePercent_) {
+            volumePercent_ = vol;
+            set_output_volume(static_cast<float>(vol) / 100.0f);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            action.kind == LibraryAction::Kind::none) {
+            action.kind = LibraryAction::Kind::set_volume;
+            action.value = std::to_string(volumePercent_);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Volume");
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 260.0f);
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::InputTextWithHint("##search", "Search...", filterBuf_, sizeof filterBuf_))
+            apply_filter();
+
+        // Keyboard. Controller navigation is NOT implemented: ImGui's gamepad nav is off, and
+        // nothing initialises SDL's gamepad subsystem while the library is alive — the pad backend
+        // does that inside start_guest, by which point the library is gone. Tracked separately
+        // rather than shipped as code that cannot fire.
+        // The settings tab is a different branch above, so its save-folder field can never
+        // share a frame with these: an Enter there edits text, it never reaches this poll.
+        const int shown = static_cast<int>(filtered_.size());
+        bool moveKey = false;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && selected_ > 0) {
+            selected_--;
+            moveKey = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && selected_ + 1 < shown) {
+            selected_++;
+            moveKey = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Home) && shown > 0) {
+            selected_ = 0;
+            moveKey = true;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_End) && shown > 0) {
+            selected_ = shown - 1;
+            moveKey = true;
+        }
+        if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
+             ImGui::IsKeyPressed(ImGuiKey_Space)) &&
+            selected_ >= 0 && selected_ < shown) {
+            action.kind = LibraryAction::Kind::open;
+            action.app0_root = games_[static_cast<size_t>(filtered_[static_cast<size_t>(selected_)])].app0_root;
+        }
+
+        const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                           ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable |
+                                           ImGuiTableFlags_ScrollY;
+        const float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
+        if (ImGui::BeginTable("games", 6, tableFlags, ImVec2(0, tableH))) {
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, kThumbSize);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Serial", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Region", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (int fi = 0; fi < shown; fi++) {
+                const GameEntry& game =
+                    games_[static_cast<size_t>(filtered_[static_cast<size_t>(fi)])];
+                ImGui::TableNextRow(0, kThumbSize + 8.0f);
+                if (fi == selected_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonActive));
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(fi);
+                const VkDescriptorSet cover = cover_for(game);
+                if (cover)
+                    ImGui::Image(reinterpret_cast<ImTextureID>(cover),
+                                 ImVec2(kThumbSize, kThumbSize));
+                else
+                    ImGui::TextDisabled("--");
+                if (ImGui::IsItemClicked()) selected_ = fi;
+                ImGui::TableSetColumnIndex(1);
+                // SpanAllColumns makes the whole row one click target; the double-click opens.
+                if (ImGui::Selectable(game.title_name.c_str(), fi == selected_,
+                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                    selected_ = fi;
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        action.kind = LibraryAction::Kind::open;
+                        action.app0_root = game.app0_root;
+                    }
+                }
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(game.title_id.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(game.region.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(game.version.c_str());
+                ImGui::TableSetColumnIndex(5);
+                // The FOLDER NAME, not the absolute path: the folder name is what identifies the
+                // dump while the rest of the path is the user's home directory — which would
+                // otherwise end up in every screenshot anyone shares of their library.
+                ImGui::TextDisabled("%s", path_basename(game.app0_root).c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", game.app0_root.c_str());
+                ImGui::PopID();
+                // Follow a keyboard move; a mouse scroll is left alone so the two never fight.
+                if (moveKey && fi == selected_) ImGui::SetScrollHereY(0.5f);
+            }
+            ImGui::EndTable();
+        }
+        if (shown == 0)
+            ImGui::TextDisabled("No games match.");
+        ImGui::Separator();
+        ImGui::Text("%d game%s", shown, shown == 1 ? "" : "s");
+        ImGui::SameLine();
+        ImGui::TextDisabled("Enter opens  |  double-click opens  |  Esc quits");
     }
 
     if (!status.empty()) {

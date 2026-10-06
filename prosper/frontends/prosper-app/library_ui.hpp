@@ -1,5 +1,6 @@
 #pragma once
-// library_ui.hpp — the game library screen: a grid of cover art the user picks a title from (#1471).
+// library_ui.hpp — the game library screen: a shadPS4-style list (cover, name, serial,
+// region, version, path) the user picks a title from, plus the settings tab (#1471).
 //
 // This is the app's idle state. Once a guest boots, the library is torn down and the window goes back
 // to presenting game frames; prosper runs one game per launch (#352), so the library never draws over a
@@ -9,8 +10,8 @@
 // adding only a render pass and per-image framebuffers — no second device, no second window. Cover art
 // is decoded from each dump's sce_sys/icon0.png with stb_image.
 //
-// The selection rules live in library_nav.hpp, which is pure and unit-tested; this file owns pixels,
-// resources, and event translation.
+// Filtering is pure (game_entry_matches_filter, unit-tested); this file owns pixels, resources,
+// and event translation.
 
 #include "game_library.hpp"
 #include "library_descriptor_budget.hpp"
@@ -20,6 +21,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstddef>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -34,16 +36,25 @@ namespace prosper::frontend {
 struct LibraryAction {
     enum class Kind {
         none,
-        open,          // launch `app0_root`
-        browse,        // asked for the folder picker (no games directory, or wants another folder)
-        set_games_dir, // chose `path` as the games directory; persist it and rescan
-        set_music,     // toggled launcher music to `music_on`; persist it
+        open,              // launch `app0_root`
+        browse,            // asked for the folder picker (no games directory, or wants another folder)
+        pick_game,         // asked for the folder picker for ONE game to boot right away (Ctrl+O path)
+        rescan,            // re-read the games directory now
+        set_games_dir,     // chose `path` as the games directory; persist it and rescan
+        set_music,         // toggled launcher music to `music_on`; persist it
+        set_present_mode,  // picked swapchain policy `value` (fifo|mailbox|immediate); persist + apply
+        set_display_mode,  // picked guest display policy `value`; persist + apply to the next boot
+        set_savedata_dir,  // picked save location `value` ("" clears); persist + apply to the next boot
+        set_restore_imports, // toggled patched-import repair to `restore_on`; persist + apply to next boot
+        set_volume,          // dragged the volume slider to `value` (0-100); persist + apply live
         quit,
     };
     Kind kind = Kind::none;
     std::string app0_root;   // Kind::open
     std::string path;        // Kind::set_games_dir
+    std::string value;       // Kind::set_present_mode/set_display_mode/set_savedata_dir
     bool music_on = true;    // Kind::set_music
+    bool restore_on = false; // Kind::set_restore_imports
 };
 
 class LibraryUi {
@@ -69,9 +80,34 @@ public:
     // app_config.hpp is layered. Has no effect once init() has run.
     void set_music_preference(bool on) { musicToggle_ = on; }
 
+    // Seed the settings panel with the run's EFFECTIVE host settings (flag > env > file, resolved
+    // by main.cpp at startup). The panel edits these live and reports changes as actions; main.cpp
+    // persists them. Seeded once before the first frame.
+    void set_host_settings(const std::string& present_mode, const std::string& display_mode,
+                           const std::string& savedata_dir, bool restore_imports) {
+        presentMode_ = present_mode.empty() ? "fifo" : present_mode;
+        displayMode_ = display_mode.empty() ? "legacy" : display_mode;
+        savedataDir_ = savedata_dir;
+        savedataApplied_ = savedata_dir;
+        std::snprintf(savedataBuf_, sizeof savedataBuf_, "%s", savedata_dir.c_str());
+        restoreToggle_ = restore_imports;
+    }
+
+    // One File > Recent games row: the root to boot, and the label to show for it. The label is
+    // resolved where the filesystem is available (main.cpp at seed); the menu only displays.
+    struct RecentGame {
+        std::string root;
+        std::string label;
+    };
+
+    // Seed File > Recent games from the persisted settings. Seeded once before the first frame;
+    // boots only happen from here pre-guest, after which the menu is gone with the library.
+    void set_recent(std::vector<RecentGame> recent) { recentGames_ = std::move(recent); }
+
     // prosper-app's `--volume`, as a linear factor in [0,1] (#3499). It attenuates the launcher music
-    // as well as the title (launcher_music_output_gain). Must be set before init(); no effect after.
-    void set_output_volume(float volume) { outputVolume_ = volume; }
+    // as well as the title (launcher_music_output_gain). Live once init() has run: the media layer
+    // reads its gain per chunk on this same thread.
+    void set_output_volume(float volume);
 
     // Release every Vulkan object. Safe to call twice, and safe to call without a successful init.
     void shutdown();
@@ -133,6 +169,11 @@ private:
         bool           tried   = false;   // decoded once; failures are not retried every frame
     };
 
+    // Upload decoded RGBA as a sampled image plus an ImGui descriptor set. Handles out via
+    // the refs; null set on any failure, partial handles freed.
+    VkDescriptorSet upload_rgba(int w, int h, const unsigned char* rgba, const char* what,
+                                VkImage& image, VkDeviceMemory& memory, VkImageView& view);
+
     SDL_Window*      window_   = nullptr;
     VkInstance       instance_ = VK_NULL_HANDLE;   // kept only so a pool grow can re-init ImGui's backend
     VkDevice         device_   = VK_NULL_HANDLE;
@@ -171,11 +212,33 @@ private:
     // readable over arbitrary artwork (#1630).
     void draw_backdrop();
 
-    ImFont*                titleFont_ = nullptr;   // 2x atlas entry used only for the game titles
+    // The settings tab content: host settings a terminal-free launch could never reach. Drawn
+    // inline in the main window (a floating dialog over a game library is the wrong shape — the
+    // library IS the window, so settings is one of its tabs, not a popup above it).
+    void draw_settings_content(LibraryAction& action);
+
+    // Which half of the window is showing. Games and settings share the header; only one draws.
+    enum class LibraryTab { games, settings };
+
+    ImFont*                boldFont_ = nullptr;    // section headers; null while on the bitmap fallback
 
     LibraryMedia           media_;
     bool                   musicToggle_ = true;   // mirrors the persisted setting for the in-UI switch
     float                  outputVolume_ = 1.0f;  // --volume, applied on top of the music's own level
+    float                  musicLevel_ = kDefaultMusicGain;  // the launcher's own mix level under --volume
+    int                    volumePercent_ = 100;  // toolbar slider position, mirrors outputVolume_
+
+    // The settings tab (same exe, same window). The radio state mirrors the run's effective
+    // policy; changing one emits an action main.cpp persists and applies live to the not-yet-
+    // booted guest. The save path edits a buffer and applies explicitly, so half-typed paths
+    // never reach the config; `savedataApplied_` is what the last Apply wrote.
+    LibraryTab             tab_ = LibraryTab::games;
+    bool                   restoreToggle_ = false;  // mirrors the repair opt-in for the in-UI switch
+    std::string            presentMode_ = "fifo";
+    std::string            displayMode_ = "legacy";
+    std::string            savedataDir_;
+    std::string            savedataApplied_;
+    char                   savedataBuf_[1024] = {};
 
     // PROSPER_LIBRARY_STATS=1: per-frame timing for the library view, reported at shutdown. A mean
     // cannot detect a stutter — a 40 ms frame among 5 ms ones averages away — so what is kept is the
@@ -194,11 +257,18 @@ private:
     static constexpr size_t kMaxFrameSamples = 200000;
     std::vector<double>    frameSamples_;
 
+    // Rebuild the visible rows: every game matching the search box, as indices into games_.
+    // Selection is a position in this list, reset whenever it is rebuilt.
+    void apply_filter();
+
     std::vector<GameEntry> games_;
     std::vector<Cover>     covers_;
+    std::vector<int>       filtered_;
+    std::vector<RecentGame> recentGames_;
     std::string            gamesDir_;
+    char                   filterBuf_[256] = {};
+    std::string            filterApplied_;
     int                    selected_  = 0;
-    int                    firstRow_  = 0;
     bool                   ready_     = false;
     bool                   imguiCtx_   = false;   // unwound independently so a part-failed init leaks nothing
     bool                   sdlInit_    = false;

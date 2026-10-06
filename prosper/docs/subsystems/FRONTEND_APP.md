@@ -179,7 +179,9 @@ Design points that are deliberate rather than incidental:
   whatever a newer build had stored.
 - **`scan_game_library` reuses `resolve_app0_root()`** from the interactive-open path above, so all three
   entry points agree on what a title is. The listing is "what a drop or the picker would accept", which
-  is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone.
+  is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone. The games directory
+  itself is listed when it is a title root (a dump at a drive root); the library-browse answer still
+  boots such a folder directly instead of scanning inside it.
 - **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
   exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
 
@@ -196,8 +198,8 @@ there too.
 
 Dear ImGui (`third_party/imgui`, MIT) and stb_image (`third_party/stb`, public domain) are vendored
 **frontend-only** — `prosper_core` links neither, so the arrow above is unchanged and deleting
-`frontends/` still leaves CI unaffected. `library_ui.{hpp,cpp}` draws the grid; `library_nav.hpp` holds
-the selection rules and is pure and unit-tested, so the grid's behaviour is covered without a window.
+`frontends/` still leaves CI unaffected. `library_ui.{hpp,cpp}` draws the list; the search filter
+(`game_entry_matches_filter`) is pure and unit-tested, so matching is covered without a window.
 
 Decisions worth knowing:
 
@@ -213,9 +215,10 @@ Decisions worth knowing:
   dropped. The render pass still appears to clear, which makes it look like a UI bug rather than a
   swapchain one — Vulkan validation names it immediately
   (`VUID-VkFramebufferCreateInfo-pAttachments-00877`).
-- **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by `library_nav.hpp`, and
-  running both means the arrow keys move a widget focus as well as the selection, and Enter activates
-  whatever widget that focus landed on instead of launching the highlighted game. A consequence worth
+- **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by the list's own
+Up/Down/Home/End handling, and running both means the arrow keys move a widget focus as well as the
+selection, and Enter activates whatever widget that focus landed on instead of launching the
+highlighted game. A consequence worth
   knowing: turning off `NavEnableGamepad` also silences the SDL3 backend's gamepad feed, so
   `ImGuiKey_Gamepad*` is never set. Controller navigation therefore needs the pad read directly *and*
   `SDL_INIT_GAMEPAD` initialized while the library is alive — neither is true today (the pad backend

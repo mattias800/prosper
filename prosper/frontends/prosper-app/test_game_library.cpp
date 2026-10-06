@@ -14,11 +14,19 @@ using prosper::frontend::AppConfig;
 using prosper::frontend::GameEntry;
 using prosper::frontend::GameLibraryIo;
 using prosper::frontend::GamePathProbe;
+using prosper::frontend::game_entry_matches_filter;
+using prosper::frontend::note_recent_game;
 using prosper::frontend::parse_app_config;
+using prosper::frontend::parse_volume_percent;
+using prosper::frontend::parse_param_content_version;
+using prosper::frontend::parse_param_region;
 using prosper::frontend::parse_param_title_id;
 using prosper::frontend::parse_param_title_name;
 using prosper::frontend::path_basename;
+using prosper::frontend::resolve_display_mode;
 using prosper::frontend::resolve_games_dir;
+using prosper::frontend::resolve_present_mode;
+using prosper::frontend::resolve_savedata_dir;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
 using prosper::frontend::guest_args_for;
@@ -170,6 +178,32 @@ int main() {
     CHECK(parse_param_title_id(kNoNameJson) == "PPSA00002", "titleId is read without a titleName");
     CHECK(parse_param_title_name("").empty(), "empty json yields no name");
     CHECK(parse_param_title_id("").empty(), "empty json yields no id");
+    // --- version + region: the list columns ------------------------------------------------
+    CHECK(parse_param_content_version(
+              "{\"contentVersion\":\"01.000.006\",\"titleId\":\"PPSA19990\"}") == "01.000.006",
+          "contentVersion is read");
+    CHECK(parse_param_content_version("").empty(), "empty json yields no version");
+    CHECK(parse_param_content_version("{\"titleId\":\"PPSA19990\"}").empty(),
+          "a dump without contentVersion yields empty, not garbage");
+    CHECK(parse_param_region(
+              "{\"contentId\":\"EP0700-PPSA19990_00-TALESOFGRACESF00\"}") == "EP",
+          "the region is the two letters heading the contentId prefix");
+    CHECK(parse_param_region("{\"contentId\":\"nodashes\"}").empty(),
+          "a dashless contentId yields no region rather than the whole string");
+    CHECK(parse_param_region("").empty(), "empty json yields no region");
+    // --- search filter ---------------------------------------------------------------------
+    {
+        GameEntry e;
+        e.app0_root = "/games/PPSA24651-app0";
+        e.title_id = "PPSA24651";
+        e.title_name = "The Messenger";
+        CHECK(game_entry_matches_filter(e, ""), "an empty box matches everything");
+        CHECK(game_entry_matches_filter(e, "messenger"), "name matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "PPSA24651"), "title id matches");
+        CHECK(game_entry_matches_filter(e, "ppsa24651"), "title id matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "24651-app0"), "the path matches too");
+        CHECK(!game_entry_matches_filter(e, "zelda"), "an unrelated needle matches nothing");
+    }
     CHECK(parse_param_title_name("{\"localizedParameters\":{\"en-US\":{\"titleName\":\"Solo\"}}}")
               == "Solo",
           "a single language with no defaultLanguage falls back to the first titleName");
@@ -234,10 +268,14 @@ int main() {
     CHECK(scan_game_library("/empty", probe, io).empty(), "a directory with no titles yields nothing");
     CHECK(scan_game_library("/does/not/exist", probe, io).empty(), "a missing directory yields nothing");
     CHECK(scan_game_library("", probe, io).empty(), "an empty path yields nothing");
-    // The games dir itself is never treated as a title, even when it is one — documented behaviour, so
-    // pointing this at a single app0 folder yields nothing rather than one oddly-named entry.
-    CHECK(scan_game_library("/games/PPSA24651-app0", probe, io).empty(),
-          "a title root used as the games dir yields nothing (children only)");
+    // The games dir itself IS listed when it is a title root — a dump can sit at a drive
+    // root, where the folder is the game rather than a folder of games.
+    {
+        const std::vector<GameEntry> self = scan_game_library("/games/PPSA24651-app0", probe, io);
+        CHECK(self.size() == 1 && self[0].title_name == "The Messenger" &&
+                  self[0].app0_root == "/games/PPSA24651-app0",
+              "a title root used as the games dir lists itself");
+    }
     CHECK(scan_game_library("/games/", probe, io).size() == 7, "a trailing separator is tolerated");
     const GameLibraryIo empty_io;
     CHECK(scan_game_library("/games", probe, empty_io).empty(), "an unpopulated io scans nothing");
@@ -323,6 +361,113 @@ int main() {
         CHECK(after.games_dir == "/new", "a rewrite updates the setting it owns");
         CHECK(after.unknown_lines.size() == 1 && after.unknown_lines[0] == "ui_scale = 1.5",
               "a rewrite preserves a setting this build does not understand");
+    }
+
+    // --- persisted host settings ----------------------------------------------------------
+    CHECK(parse_app_config("savedata_dir = /saves").savedata_dir == "/saves",
+          "savedata_dir is read");
+    CHECK(parse_app_config("present_mode = mailbox").present_mode == "mailbox",
+          "present_mode is read literally");
+    CHECK(parse_app_config("display_mode = host").display_mode == "host",
+          "display_mode is read literally");
+    CHECK(parse_app_config("present_mode = typo").present_mode == "typo",
+          "an unknown present_mode spelling is kept, not dropped (apply warns)");
+    {
+        AppConfig hs;
+        hs.savedata_dir = "/my saves";
+        hs.present_mode = "immediate";
+        hs.display_mode = "host-high-refresh";
+        const AppConfig hs_back = parse_app_config(serialize_app_config(hs));
+        CHECK(hs_back.savedata_dir == "/my saves" && hs_back.present_mode == "immediate" &&
+                  hs_back.display_mode == "host-high-refresh",
+              "savedata/present/display survive a serialize round trip");
+        CHECK(parse_app_config(serialize_app_config(AppConfig{})).savedata_dir.empty() &&
+                  parse_app_config(serialize_app_config(AppConfig{})).present_mode.empty() &&
+                  parse_app_config(serialize_app_config(AppConfig{})).display_mode.empty(),
+              "unset host settings stay unset (no phantom keys are written)");
+    }
+    {
+        AppConfig sf; sf.savedata_dir = "/from-file";
+        CHECK(resolve_savedata_dir("/from-flag", "/from-env", sf) == "/from-flag",
+              "a savedata flag wins over everything");
+        CHECK(resolve_savedata_dir("", "/from-env", sf) == "/from-env",
+              "the savedata environment wins over the persisted setting");
+        CHECK(resolve_savedata_dir("", "", sf) == "/from-file",
+              "the persisted savedata dir applies when nothing else does");
+        CHECK(resolve_savedata_dir("", "", AppConfig{}).empty(),
+              "with no savedata source there is no savedata dir");
+        CHECK(resolve_present_mode("mailbox", false) == "mailbox",
+              "the persisted present mode applies when no flag was given");
+        CHECK(resolve_present_mode("mailbox", true).empty(),
+              "a --present-mode flag suppresses the persisted one");
+        CHECK(resolve_display_mode("host", false, "") == "host",
+              "the persisted display mode applies when flag and env said nothing");
+        CHECK(resolve_display_mode("host", true, "").empty(),
+              "a --display-mode flag suppresses the persisted one");
+        CHECK(resolve_display_mode("host", false, "legacy").empty(),
+              "a PROSPER_DISPLAY_MODE in the environment suppresses the persisted one");
+    }
+
+    // --- restore_patched_imports: strict opt-in ------------------------------------------------
+    CHECK(!parse_app_config("").restore_patched_imports,
+          "guest-code editing defaults to off");
+    CHECK(parse_app_config("restore_patched_imports = 1").restore_patched_imports,
+          "an explicit 1 enables it");
+    CHECK(parse_app_config("restore_patched_imports = true").restore_patched_imports,
+          "true/on/yes enable it");
+    CHECK(!parse_app_config("restore_patched_imports = yes-please").restore_patched_imports,
+          "anything but an explicit on-value stays off");
+    CHECK(!parse_app_config("restore_patched_imports = ").restore_patched_imports,
+          "an empty value stays off");
+    {
+        AppConfig on;
+        on.restore_patched_imports = true;
+        CHECK(parse_app_config(serialize_app_config(on)).restore_patched_imports,
+              "an enabled repair survives a serialize round trip");
+        CHECK(parse_app_config(serialize_app_config(AppConfig{})).restore_patched_imports == false,
+              "a disabled repair round-trips as disabled");
+    }
+
+    // --- recent games --------------------------------------------------------------------------
+    {
+        AppConfig rc;
+        note_recent_game(rc, "/games/B-app0");
+        note_recent_game(rc, "/games/A-app0");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0" &&
+                  rc.recent_games[1] == "/games/B-app0",
+              "recent games are most-recent-first");
+        note_recent_game(rc, "/games/A-app0/");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0",
+              "reopening moves to the head without duplicating, separators canonicalized");
+        note_recent_game(rc, "");
+        CHECK(rc.recent_games.size() == 2, "an empty path records nothing");
+        for (int i = 0; i < 12; i++)
+            note_recent_game(rc, "/games/G" + std::to_string(i) + "-app0");
+        CHECK(rc.recent_games.size() == AppConfig::kRecentGamesMax &&
+                  rc.recent_games[0] == "/games/G11-app0",
+              "the recent list is capped, newest head");
+        const AppConfig back = parse_app_config(serialize_app_config(rc));
+        CHECK(back.recent_games == rc.recent_games, "recent games survive a round trip in order");
+        CHECK(parse_app_config("recent = \nrecent = /a").recent_games.size() == 1,
+              "an empty recent line is not kept");
+    }
+
+    // --- volume --------------------------------------------------------------------------------
+    CHECK(parse_volume_percent("") == -1, "an empty value is unset, not muted");
+    CHECK(parse_volume_percent("0") == 0, "zero is a real choice (muted)");
+    CHECK(parse_volume_percent("75") == 75, "a plain percent is read");
+    CHECK(parse_volume_percent("100") == 100, "a hundred is read");
+    CHECK(parse_volume_percent("120") == 100, "overflow clamps like the --volume flag");
+    CHECK(parse_volume_percent("12x") == -1, "trailing junk is unset, not partial");
+    CHECK(parse_volume_percent("-5") == -1, "a sign is unset, not negative");
+    CHECK(parse_volume_percent(" 80") == -1, "surrounding space is unset (values arrive trimmed)");
+    {
+        AppConfig vc;
+        vc.volume_percent = 0;
+        CHECK(parse_app_config(serialize_app_config(vc)).volume_percent == 0,
+              "muted survives a round trip rather than reading as unset");
+        CHECK(parse_app_config(serialize_app_config(AppConfig{})).volume_percent == -1,
+              "an unset volume stays unset (no phantom key is written)");
     }
 
     // --- precedence -----------------------------------------------------------------------------

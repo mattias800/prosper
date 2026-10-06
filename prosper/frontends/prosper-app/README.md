@@ -136,6 +136,20 @@ engines need a specific graphics mode to render in this app — Unity titles cur
 `-force-gfx-direct` (their default MT gfx-jobs path is not emulated yet; #2973) — while others
 must not receive it, so the choice is explicit and per-title rather than a silent global.
 
+Three more keys remember host settings a terminal-free launch could never set, and the
+library's **Settings** tab edits them without a text editor: `savedata_dir`
+(`PROSPER_SAVEDATA_DIR`), `present_mode` (`--present-mode`: `fifo`, `mailbox` or `immediate`)
+and `display_mode` (`PROSPER_DISPLAY_MODE`: `legacy`, `host` or `host-high-refresh`). Each
+applies only when its flag or environment variable said nothing for this run, and a misspelled
+value is ignored with a warning rather than acted on. Changing one in the UI applies it to the
+next game you open and remembers it for future launches.
+
+`restore_patched_imports` (`PROSPER_RESTORE_PATCHED_IMPORTS`) has the UI's **Repair patched Sony
+imports** checkbox. It defaults to off, matching the loader: repairing rewrites guest code, so it
+is strictly opt-in. Some dumps stall at high CPU on hand-patched stubs (waits spin instead of
+blocking); enabling this lets them block. Presence is consent — any value in the environment
+counts as on — so the file only fills the silence and unchecking never clears your own env.
+
 The scan looks **one level deep** and accepts a child directory as a title when
 `resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
 subdirectories are therefore never mistaken for separate games, and the games directory itself is not
@@ -147,22 +161,29 @@ with no readable metadata still appears, named after its directory, since the na
 The listing is therefore "what the drop and picker paths would accept", not a guarantee that every entry
 boots: that gate accepts `sce_sys/param.json` on its own, so a metadata-only folder with no `eboot.bin`
 is listed and will fail when opened. Keeping one definition of "is this a title" across all three entry
-points is worth more than pre-filtering the list.
+points is worth more than pre-filtering the list. The games directory itself is listed when it is a
+title root — a dump can sit at a drive root, where the folder is the game rather than a folder of games.
 
 ### The library view
 
-With a games directory set, launching with no game shows a grid of cover art instead of an empty
-window. Arrow keys move the selection, Enter/Space opens the highlighted title, clicking a cover opens it
-directly, and **Change folder...** picks a different games directory and remembers it. Esc quits. With no
-directory set yet, the window explains that and offers the same folder picker on Enter or a click.
+With a games directory set, launching with no game shows a game list instead of an empty
+window: cover thumbnail, name, serial, region, version and folder, with a search box and a
+**Rescan** button in the toolbar. Up/Down move, Enter/Space opens the highlighted title, and a
+double-click opens directly; **Change folder...** picks a different games directory and remembers
+it. Esc quits. With no directory set yet, the window explains that and offers the same folder
+picker on Enter or a click.
+
+Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
+the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either
+exists on a dump, and a recursive size walk over a 100 GB title is not something the UI thread
+does while you browse.
 
 Keyboard and mouse only for now — **controller navigation is not implemented** (tracked separately).
 Nothing initializes SDL's gamepad subsystem while the library is up: the pad backend does that inside
 the guest boot, by which point the library is gone.
 
 Cover art is each dump's `sce_sys/icon0.png`. A title whose icon is missing or undecodable still appears
-as a launchable button labelled with its content id — what matters is that it is bootable, not that it
-has a picture.
+as a launchable row — what matters is that it is bootable, not that it has a picture.
 
 The view is drawn with Dear ImGui on the app's existing Vulkan device and swapchain
 (`third_party/imgui`), and disappears the moment a guest boots: prosper runs one game per launch, so the
@@ -170,8 +191,8 @@ library never draws over a running title. If it cannot be brought up — no ImGu
 device that refuses the render pass — the window falls back to the flat idle colour and every
 command-line path keeps working.
 
-Selection movement lives in `library_nav.hpp`, which is pure and unit-tested, so the grid's behaviour is
-covered in ordinary CI rather than only by someone pressing arrow keys.
+Search matching lives in `game_entry_matches_filter`, which is pure and unit-tested, so it is
+covered in ordinary CI rather than only by someone typing in the box.
 
 #### Descriptor capacity
 

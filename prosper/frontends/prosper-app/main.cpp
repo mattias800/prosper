@@ -51,6 +51,7 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
 // too. They briefly did not, which compiled only because CMake defines that macro unconditionally
@@ -1164,8 +1165,9 @@ static CaptureTitle capture_title_for(const std::string& dump) {
     return out;
 }
 
-// "prosper - <game name>" for a booted game (name from param.json, falling back to the app0
-// basename), else a label that says what the empty window is waiting for.
+// "Prosper - <game name>" for a booted game (name from param.json, falling back to the app0
+// basename), else just "Prosper" — the idle window's library view already says what it is waiting
+// for, so the title bar does not need to repeat it.
 static std::string window_title_for(const std::string& dump, bool test_pattern) {
     if (!dump.empty()) {
         std::string name = read_game_title(dump);
@@ -1173,10 +1175,10 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
             const auto sl = dump.find_last_of("/\\");
             name = (sl == std::string::npos ? dump : dump.substr(sl + 1));
         }
-        return "prosper - " + name;
+        return "Prosper - " + name;
     }
-    if (test_pattern) return "prosper - test pattern";
-    return "prosper - no game (drop a game folder here, or press Ctrl+O)";
+    if (test_pattern) return "Prosper - test pattern";
+    return "Prosper";
 }
 
 // The guest, and the one boot this process gets. run_entry() never observes prosper_request_stop(),
@@ -1246,6 +1248,10 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
 // True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
+// True when THIS process authored PROSPER_RESTORE_PATCHED_IMPORTS from the settings file: the
+// loader treats presence as consent to edit guest code, so unchecking must be able to take it
+// back — but only when the app put it there, never a user's own environment.
+bool g_restore_imports_app_set = false;
 bool g_boot_attempted = false;
 
 // Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
@@ -1395,6 +1401,14 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
                 result.kind);
     });   // runs the guest frame loop
     fprintf(stderr, "[app] guest booted; presenting its frames.\n");
+    // File > Recent games: remember the boot, best-effort — a write failure is not worth
+    // interrupting a boot that already succeeded. CLI boots record here too.
+    {
+        prosper::frontend::AppConfig cfg = load_app_config();
+        prosper::frontend::note_recent_game(cfg, app0_root);
+        if (!save_app_config(cfg))
+            fprintf(stderr, "[app] could not record the recent game\n");
+    }
     return true;
 }
 
@@ -1533,6 +1547,21 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
+    // Whether the run named a policy on the command line. The persisted file applies only when
+    // neither the flag nor the environment did — it must never override an explicit request.
+    bool presentModeSeen = false;
+    bool displayModeSeen = false;
+    bool volumeSeen = false;   // --volume was given: the persisted volume must not override it
+    // The run's EFFECTIVE display/savedata policy after the apply block below folds the file in.
+    // Read from the environment exactly once each (the arch ratchet counts raw getenv sites, and
+    // one startup read per name is all precedence needs); the library seed reuses these, never
+    // re-reading.
+    std::string effDisplayMode = "legacy";
+    std::string effSavedataDir;
+    bool effRestoreImports = false;
+    // Whether PROSPER_RESTORE_PATCHED_IMPORTS was already in the environment at startup AND this
+    // process did not put it there: unchecking the box must never clear such a value.
+    bool restoreEnvExternal = false;
     std::string dump;
     // The game library (#1471): where to look, and whether to just print what is there and exit.
     std::string gamesDirFlag;
@@ -1560,6 +1589,7 @@ int main(int argc, char** argv) {
             g_volume_percent = atoi(argv[++i]);
             if (g_volume_percent < 0) g_volume_percent = 0;
             if (g_volume_percent > 100) g_volume_percent = 100;
+            volumeSeen = true;
         }
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
@@ -1595,6 +1625,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: --present-mode requires fifo, mailbox, or immediate\n");
                 return 2;
             }
+            presentModeSeen = true;
         }
         else if (a == "--record") {
             if (i + 1 >= argc) {
@@ -1650,6 +1681,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_DISPLAY_MODE\n");
                 return 2;
             }
+            displayModeSeen = true;
         }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
@@ -1704,6 +1736,90 @@ int main(int argc, char** argv) {
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
         fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
         return games.empty() ? 1 : 0;
+    }
+
+    // Persisted host settings: savedata dir, present mode, display mode, volume. The file applies
+    // only where the run said nothing
+    // where the run said nothing — a flag or the environment wins, exactly like games_dir above —
+    // so a scripted launch behaves the same with or without a settings file. Misspelled values
+    // are ignored with a warning: a typo costs the setting, never a wrong behaviour.
+    {
+        // No environment variable exists for volume, so this is flag > file: --volume wins,
+        // the persisted slider fills the silence. g_volume_percent feeds both the SDL sink gain
+        // at boot and the library seed below.
+        if (!volumeSeen && appConfig.volume_percent >= 0) {
+            g_volume_percent = appConfig.volume_percent;
+            fprintf(stderr, "[app] volume (config): %d%%\n", g_volume_percent);
+        }
+        // One read per name for the whole run (see the declaration above): env wins, the file
+        // fills the silence, and `eff*` carries the answer to the library seed below.
+        const char* savedataEnv = getenv("PROSPER_SAVEDATA_DIR");
+        if (!savedataEnv || !*savedataEnv) {
+            const std::string savedata =
+                prosper::frontend::resolve_savedata_dir("", "", appConfig);
+            if (!savedata.empty()) {
+                if (set_environment("PROSPER_SAVEDATA_DIR", savedata.c_str())) {
+                    fprintf(stderr, "[app] savedata dir (config): %s\n", savedata.c_str());
+                    effSavedataDir = savedata;
+                } else {
+                    fprintf(stderr, "[app] failed to set PROSPER_SAVEDATA_DIR from the settings\n");
+                }
+            }
+        } else {
+            effSavedataDir = savedataEnv;
+        }
+        const std::string filePresent = prosper::frontend::resolve_present_mode(
+            appConfig.present_mode, presentModeSeen);
+        if (!filePresent.empty()) {
+            prosper::frontend::AppPresentMode fromFile = prosper::frontend::AppPresentMode::fifo;
+            if (prosper::frontend::parse_present_mode(filePresent, fromFile)) {
+                requestedPresentMode = fromFile;
+                fprintf(stderr, "[app] present mode (config): %s\n", filePresent.c_str());
+            } else {
+                fprintf(stderr, "[app] ignoring unknown present_mode \"%s\" in the settings (%s)\n",
+                        filePresent.c_str(), app_config_path().c_str());
+            }
+        }
+        // One read for the whole run (see the declaration above): presence IS consent here —
+        // the loader enables on any value — so the file only fills the silence.
+        const char* restoreEnv = getenv("PROSPER_RESTORE_PATCHED_IMPORTS");
+        if (restoreEnv) {
+            effRestoreImports = true;
+        } else if (appConfig.restore_patched_imports) {
+            if (set_environment("PROSPER_RESTORE_PATCHED_IMPORTS", "1")) {
+                fprintf(stderr, "[app] patched-import repair (config): on\n");
+                g_restore_imports_app_set = true;
+                effRestoreImports = true;
+            } else {
+                fprintf(stderr, "[app] failed to set PROSPER_RESTORE_PATCHED_IMPORTS\n");
+            }
+        }
+        // External means present-at-startup AND not authored above: the toggle handler consults
+        // this instead of reading the environment again.
+        restoreEnvExternal = (restoreEnv != nullptr) && !g_restore_imports_app_set;
+        const char* displayEnv = getenv("PROSPER_DISPLAY_MODE");
+        if (displayEnv && *displayEnv) {
+            effDisplayMode = displayEnv;
+        } else {
+            const std::string fileDisplay = prosper::frontend::resolve_display_mode(
+                appConfig.display_mode, displayModeSeen, "");
+            if (!fileDisplay.empty()) {
+                prosper::hle::graphics::DisplayModePolicy policy{};
+                if (prosper::hle::graphics::parse_display_mode_policy(fileDisplay, policy)) {
+                    if (set_environment("PROSPER_DISPLAY_MODE", fileDisplay.c_str())) {
+                        fprintf(stderr, "[app] display mode (config): %s\n", fileDisplay.c_str());
+                        effDisplayMode = fileDisplay;
+                    } else {
+                        fprintf(stderr,
+                                "[app] failed to set PROSPER_DISPLAY_MODE from the settings\n");
+                    }
+                } else {
+                    fprintf(stderr,
+                            "[app] ignoring unknown display_mode \"%s\" in the settings (%s)\n",
+                            fileDisplay.c_str(), app_config_path().c_str());
+                }
+            }
+        }
     }
 
     // #3017: publish the host's REAL display mode before anything boots, so the VideoOut layer can
@@ -1770,8 +1886,8 @@ int main(int argc, char** argv) {
         return exit_startup_failure();
     }
 #endif
-    // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
-    // is waiting for. A title opened later replaces this (#1469).
+    // Title: "Prosper - <game name>" for a booted game, else just "Prosper" — the idle library
+    // view says what it waits for. A title opened later replaces this (#1469).
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
@@ -1780,6 +1896,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
         if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
         return exit_startup_failure();
+    }
+    // Title-bar + taskbar icon from the baked-in mark. Cosmetic: a failure keeps the default
+    // icon and is said once, never fatal. The bytes are already RGBA, so no decode is needed.
+    {
+        SDL_Surface* icon = SDL_CreateSurfaceFrom(
+            prosper::frontend::kProsperLogoSize, prosper::frontend::kProsperLogoSize,
+            SDL_PIXELFORMAT_RGBA32,
+            const_cast<unsigned char*>(prosper::frontend::kProsperLogoRgba),
+            prosper::frontend::kProsperLogoSize * 4);
+        if (icon) {
+            SDL_SetWindowIcon(win, icon);
+            SDL_DestroySurface(icon);
+        } else {
+            fprintf(stderr, "[app] window icon unavailable: %s\n", SDL_GetError());
+        }
     }
 
     Vk vk;
@@ -2682,6 +2813,33 @@ int main(int argc, char** argv) {
     };
     if (wantLibrary) {
         libraryUi.set_music_preference(appConfig.launcher_music);
+        // The panel edits the run's EFFECTIVE policy (the apply block above already folded the
+        // file into these), so what it shows is what the next boot gets — never a stale default.
+        libraryUi.set_host_settings(prosper::frontend::present_mode_name(requestedPresentMode),
+                                    effDisplayMode, effSavedataDir, effRestoreImports);
+        // Recent rows show game names, not raw paths: read each root's own param.json the
+        // same way the library scan does (no boot, no guest). Unreadable roots keep their
+        // basename so a removed dump still says which entry died.
+        {
+            std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
+            for (const std::string& root : appConfig.recent_games) {
+                const std::string json =
+                    host_library_io().read_file(root + "/sce_sys/param.json");
+                const std::string name = prosper::frontend::parse_param_title_name(json);
+                const std::string id = prosper::frontend::parse_param_title_id(json);
+                std::string label;
+                if (!name.empty() && !id.empty())
+                    label = name + "  (" + id + ")";
+                else if (!name.empty())
+                    label = name;
+                else if (!id.empty())
+                    label = id;
+                else
+                    label = prosper::frontend::path_basename(root);
+                recents.push_back({root, label});
+            }
+            libraryUi.set_recent(std::move(recents));
+        }
         libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
         if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
                            vk.scFormat, vk.scImages, vk.scExtent)) {
@@ -2741,7 +2899,7 @@ int main(int argc, char** argv) {
             // boot_program links and maps the whole module set inline, which takes seconds on a
             // large title and pumps no events meanwhile. Say so in the title bar first, or the
             // window just stops responding.
-            SDL_SetWindowTitle(win, "prosper - loading...");
+            SDL_SetWindowTitle(win, "Prosper - loading...");
             std::string err;
             if (!start_guest(root, &err)) {
                 fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
@@ -3094,10 +3252,16 @@ int main(int argc, char** argv) {
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
             // a title to boot. Without this the result went to open_game(), which resolves an app0 root
             // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
+            // One exception: the folder IS a title itself (a dump at a drive root, where F:\ holds
+            // eboot.bin directly). That falls through to open_game() below and boots like a
+            // drop or a Ctrl+O pick instead of scanning inside it for titles it cannot hold.
             if (!picked.empty() && libraryBrowsePending) {
                 libraryBrowsePending = false;
-                if (!host_path_probe().is_dir(picked)) {
+                if (prosper::frontend::picked_folder_is_title(picked, host_path_probe())) {
+                    fprintf(stderr, "[app] picked folder is a game itself; opening it\n");
+                } else if (!host_path_probe().is_dir(picked)) {
                     libraryStatus = "That is not a folder.";
+                    picked.clear();
                 } else {
                     prosper::frontend::AppConfig cfg = load_app_config();
                     cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
@@ -3106,8 +3270,9 @@ int main(int argc, char** argv) {
                                                         : "Could not save the games folder setting.";
                     fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
                     rescan_library();
+                    picked.clear();
                 }
-                picked.clear();
+                // No trailing clear: the is-title branch above keeps `picked` so open_game() below boots it.
             }
 #endif
             if (!picked.empty() && !testPattern) {
@@ -3258,6 +3423,14 @@ int main(int argc, char** argv) {
                     // raised while another picker is already up would claim that picker's answer.
                     if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
+                case prosper::frontend::LibraryAction::Kind::rescan:
+                    rescan_library();
+                    break;
+                case prosper::frontend::LibraryAction::Kind::pick_game:
+                    // Like Ctrl+O: the answer parks and boots via open_game() below, because no
+                    // library flag claims it. The modal picker callback runs on any thread.
+                    open_folder_picker(win);
+                    break;
                 case prosper::frontend::LibraryAction::Kind::quit:
                     running = false;
                     break;
@@ -3269,6 +3442,82 @@ int main(int argc, char** argv) {
                     cfg.launcher_music = act.music_on;
                     if (!save_app_config(cfg))
                         fprintf(stderr, "[app] could not persist the music setting\n");
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_present_mode: {
+                    // Persist, then apply live: the not-yet-booted guest has no frames, and the
+                    // library owns the swapchain, so a recreate picks the new policy up at once.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.present_mode = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the present mode\n");
+                    prosper::frontend::AppPresentMode next = requestedPresentMode;
+                    if (prosper::frontend::parse_present_mode(act.value, next) &&
+                        next != requestedPresentMode) {
+                        requestedPresentMode = next;
+                        swapchainDirty = true;
+                    }
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_display_mode: {
+                    // VideoOut resolves its mode on first use during the boot, so setting the
+                    // environment now reaches the next game without a relaunch.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.display_mode = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the display mode\n");
+                    if (!set_environment("PROSPER_DISPLAY_MODE", act.value.c_str()))
+                        fprintf(stderr, "[app] failed to set PROSPER_DISPLAY_MODE\n");
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_restore_imports: {
+                    // The repair applies at load, so this reaches the next boot. Unchecking takes
+                    // the variable back only when this process put it there — a user's own
+                    // environment is never cleared from under them.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.restore_patched_imports = act.restore_on;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the import-repair setting\n");
+                    if (act.restore_on) {
+                        // An externally provided value is already on: set nothing and, critically,
+                        // mark nothing authored, or unchecking later would clear the user's own env.
+                        if (!restoreEnvExternal &&
+                            set_environment("PROSPER_RESTORE_PATCHED_IMPORTS", "1"))
+                            g_restore_imports_app_set = true;
+                    } else if (g_restore_imports_app_set) {
+                        clear_environment("PROSPER_RESTORE_PATCHED_IMPORTS");
+                        g_restore_imports_app_set = false;
+                    }
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_volume: {
+                    // Persist, then apply live everywhere: the SDL sink gain for the title that
+                    // boots next, and the launcher music still playing now.
+                    int vol = atoi(act.value.c_str());
+                    if (vol < 0) vol = 0;
+                    if (vol > 100) vol = 100;
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.volume_percent = vol;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the volume\n");
+                    g_volume_percent = vol;
+#ifdef PROSPER_AUDIO_SDL3
+                    prosper::set_sdl3_audio_gain(static_cast<float>(vol) / 100.0f);
+#endif
+                    libraryUi.set_output_volume(static_cast<float>(vol) / 100.0f);
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_savedata_dir: {
+                    // Save data is located at boot, so this reaches the next game; empty clears
+                    // back to the core default rather than pinning an empty path.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.savedata_dir = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the savedata folder\n");
+                    if (act.value.empty())
+                        clear_environment("PROSPER_SAVEDATA_DIR");
+                    else if (!set_environment("PROSPER_SAVEDATA_DIR", act.value.c_str()))
+                        fprintf(stderr, "[app] failed to set PROSPER_SAVEDATA_DIR\n");
                     break;
                 }
                 case prosper::frontend::LibraryAction::Kind::set_games_dir:

@@ -1,6 +1,7 @@
 #pragma once
-// app_config.hpp — the small amount of state the app remembers between launches, currently just where
-// the user keeps their games (#1471).
+// app_config.hpp — the state the app remembers between launches: where the user keeps their
+// games (#1471), plus the host settings a terminal-free launch could never set (savedata,
+// present/display policy).
 //
 // The project's existing convention for host paths is a PROSPER_* environment override with a sensible
 // default (see PROSPER_SAVEDATA_DIR, PROSPER_SAVE0, PROSPER_CAPTURE_DIR). That stays intact and keeps
@@ -10,6 +11,8 @@
 //
 // Parsing and serializing are pure and unit-tested; choosing the file's location and touching the disk
 // stays in main.cpp.
+
+#include "game_path.hpp"   // strip_trailing_separators: recent roots compare canonically
 
 #include <map>
 #include <string>
@@ -30,6 +33,12 @@ struct AppConfig {
     // file, so without this a release build would silently delete whatever a newer build had stored.
     std::vector<std::string> unknown_lines;
 
+    // Recently opened titles, most-recent-first, as app0 roots. Backs File > Recent games.
+    // Capped so the file cannot grow without bound; a root whose dump is gone stays listed
+    // (opening it says so) rather than being silently forgotten.
+    std::vector<std::string> recent_games;
+    static constexpr size_t kRecentGamesMax = 8;
+
     // Guest launch arguments (PROSPER_GUEST_ARGS), applied when the user's environment does not
     // already set one (#2973): Unity titles need `-force-gfx-direct` to reach their frame loop in
     // this app (the MT gfx-jobs handshake is not emulated yet — see RENDER_LOOP.md), while some
@@ -37,7 +46,40 @@ struct AppConfig {
     // `guest_args_by_title` overrides per TITLE_ID (config key spelling: `guest_args.PPSA02664`).
     std::string guest_args_default;                                  // "" = none
     std::map<std::string, std::string> guest_args_by_title;
+
+    // Host settings previously reachable only via a flag or the environment, so a released build
+    // started without a terminal (desktop icon, library picker) could never set them:
+    // `savedata_dir` (PROSPER_SAVEDATA_DIR), `present_mode` (--present-mode) and `display_mode`
+    // (PROSPER_DISPLAY_MODE). "" on each means unset — the flag/env/default path is untouched.
+    // Values stay raw strings here; main.cpp validates present/display spellings at apply time,
+    // so a typo costs the setting rather than a wrong behaviour.
+    std::string savedata_dir;   // "" = not set
+    std::string present_mode;   // "" = unset; else fifo|mailbox|immediate
+    std::string display_mode;   // "" = unset; else legacy|host|host-high-refresh
+
+    // Whether the loader repairs import stubs a dump overwrote in place
+    // (PROSPER_RESTORE_PATCHED_IMPORTS). Off by default, matching the loader: it edits guest
+    // code, so the decision belongs to whoever runs the title. Strict opt-in — only an explicit
+    // on-value enables it, anything else (including a typo) stays off.
+    bool restore_patched_imports = false;
+
+    // Process volume in percent (--volume). -1 = unset, so the flag and the default path are
+    // untouched; 0 is a real choice (muted) and survives. Parsed strictly, clamped like the flag.
+    int volume_percent = -1;
 };
+
+// Strict decimal percent, clamped to [0,100]; anything unparseable is -1 (unset), so a typo
+// costs the setting rather than muting or deafening the run.
+inline int parse_volume_percent(const std::string& value) {
+    if (value.empty()) return -1;
+    int v = 0;
+    for (char c : value) {
+        if (c < '0' || c > '9') return -1;
+        v = v * 10 + (c - '0');
+        if (v > 100) return 100;
+    }
+    return v;
+}
 
 // Trim ASCII spaces and tabs from both ends.
 inline std::string config_trim(const std::string& s) {
@@ -70,6 +112,17 @@ inline AppConfig parse_app_config(const std::string& text) {
         else if (key == "guest_args") cfg.guest_args_default = value;
         else if (key.rfind("guest_args.", 0) == 0)
             cfg.guest_args_by_title[key.substr(11)] = value;
+        else if (key == "savedata_dir") cfg.savedata_dir = value;
+        else if (key == "present_mode") cfg.present_mode = value;
+        else if (key == "display_mode") cfg.display_mode = value;
+        else if (key == "restore_patched_imports")
+            // Strict: only an explicit on enables guest-code editing.
+            cfg.restore_patched_imports =
+                (value == "1" || value == "true" || value == "on" || value == "yes");
+        else if (key == "recent") {
+            if (!value.empty()) cfg.recent_games.push_back(value);
+        } else if (key == "volume")
+            cfg.volume_percent = parse_volume_percent(value);
         else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
@@ -89,6 +142,14 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     for (const auto& [title, args] : cfg.guest_args_by_title)
         out += "guest_args." + title + " = " + args + "\n";
     if (!cfg.guest_args_default.empty()) out += "guest_args = " + cfg.guest_args_default + "\n";
+    if (!cfg.savedata_dir.empty()) out += "savedata_dir = " + cfg.savedata_dir + "\n";
+    if (!cfg.present_mode.empty()) out += "present_mode = " + cfg.present_mode + "\n";
+    if (!cfg.display_mode.empty()) out += "display_mode = " + cfg.display_mode + "\n";
+    // Written unconditionally like launcher_music: "off" is a real choice that must survive.
+    out += std::string("restore_patched_imports = ") + (cfg.restore_patched_imports ? "1" : "0") + "\n";
+    for (const std::string& recent : cfg.recent_games)
+        if (!recent.empty()) out += "recent = " + recent + "\n";
+    if (cfg.volume_percent >= 0) out += "volume = " + std::to_string(cfg.volume_percent) + "\n";
     return out;
 }
 
@@ -98,6 +159,47 @@ inline std::string resolve_games_dir(const std::string& flag, const std::string&
     if (!flag.empty()) return flag;
     if (!env.empty()) return env;
     return file.games_dir;
+}
+
+// The same flag > env > file precedence for the save location. `flag` is "" while prosper-app
+// grows no --savedata-dir of its own — the release scripts already take one — so today this is
+// env > file, kept in the three-argument shape so a future flag slots in without re-testing.
+inline std::string resolve_savedata_dir(const std::string& flag, const std::string& env,
+                                        const AppConfig& file) {
+    if (!flag.empty()) return flag;
+    if (!env.empty()) return env;
+    return file.savedata_dir;
+}
+
+// Present/display policy from the file, for a run whose flag and environment said nothing.
+// "" in means "" out: the caller keeps its default. A value the corresponding parser rejects is
+// passed through unchanged and rejected again at apply time, where the warning lives — parsing
+// stays literal, so serialize -> parse still round-trips a hand-edited file byte-for-byte.
+inline std::string resolve_present_mode(const std::string& file_value, bool flag_seen) {
+    if (flag_seen) return "";
+    return file_value;
+}
+
+inline std::string resolve_display_mode(const std::string& file_value, bool flag_seen,
+                                        const std::string& env) {
+    if (flag_seen || !env.empty()) return "";
+    return file_value;
+}
+
+// Record a boot at `app0_root` at the head of the recent list: deduped, canonicalized,
+// capped at kRecentGamesMax. Pure over the struct, so the rule is unit-tested.
+inline void note_recent_game(AppConfig& cfg, const std::string& app0_root) {
+    const std::string root = strip_trailing_separators(app0_root);
+    if (root.empty()) return;
+    std::vector<std::string> kept;
+    kept.reserve(AppConfig::kRecentGamesMax);
+    kept.push_back(root);
+    for (const std::string& have : cfg.recent_games) {
+        if (kept.size() >= AppConfig::kRecentGamesMax) break;
+        if (have.empty() || strip_trailing_separators(have) == root) continue;
+        kept.push_back(have);
+    }
+    cfg.recent_games = std::move(kept);
 }
 
 // Per-title launch arguments for the guest: a `guest_args.<TITLE_ID>` entry wins over the global

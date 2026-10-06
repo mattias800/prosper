@@ -96,6 +96,10 @@ public:
     void set_music_enabled(bool on, uint64_t now_ms);
     bool music_enabled() const { return musicOn_; }
 
+    // Retarget the output gain live (the volume slider). Same thread as pump_audio, which reads
+    // musicGain_ per chunk, so no synchronization is needed — and none is added.
+    void set_output_gain(float gain) { musicGain_ = gain; }
+
     Backdrop backdrop() const;
 
     // Diagnostics for the frame-time histogram (PROSPER_LIBRARY_STATS=1).
