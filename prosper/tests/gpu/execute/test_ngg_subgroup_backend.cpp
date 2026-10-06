@@ -656,6 +656,14 @@ TEST(NggSubgroupBackend, UnsafeSplitsDropTheNggDraw) {
 
     const BackendColorTarget target = volume_target(0x4e4747340012ull, 4);
     const std::vector<BackendDraw> pair = {a, lut};
+    const auto host = ngg_host_capabilities(*ctx);
+    EXPECT_STREQ(ngg_backend_draw_refusal(lut, host, 2, false, &target),
+                 "ngg-backend-transient-depth-split");
+    EXPECT_STREQ(ngg_backend_draw_refusal(lut, host, 2, true, nullptr),
+                 "ngg-backend-readback-split");
+    EXPECT_EQ(ngg_backend_draw_refusal(lut, host, 2, true, &target), nullptr);
+    EXPECT_EQ(ngg_backend_draw_refusal(lut, host, 1, false, nullptr), nullptr) << "no split";
+    EXPECT_EQ(ngg_backend_draw_refusal(a, host, 2, false, nullptr), nullptr) << "not NGG";
     EXPECT_EQ(ngg_admit_backend_draws(pair, false, &target, kept).size(), 1u)
         << "transient depth across a split";
     ASSERT_EQ(kept.size(), 1u);
