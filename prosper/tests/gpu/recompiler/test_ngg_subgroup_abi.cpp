@@ -295,3 +295,14 @@ TEST(NggSubgroupAbi, ImplicitSccAndVccReadsBeforeWriteAreRefused) {
     EXPECT_EQ(analyze(program({0xd56f0009u, 0x040a0300u})).reason, "ngg-abi-read-undefined-vcc");
     EXPECT_TRUE(analyze(program({0x7d840080u, 0xd56f0009u, 0x040a0300u})).ok());
 }
+
+// v_xor3_b32 (VOP3 0x178) reads three 32-bit VGPRs. It sat in the unclassified 0x178-0x17f band,
+// so a program using it was refused for an unknown source width.
+TEST(NggSubgroupAbi, Xor3ReadsThirtyTwoBitSources) {
+    // v_xor3_b32 v10, v0, v1, v2
+    const auto facts = analyze(program({0xd578000au, 0x040a0300u}));
+    EXPECT_TRUE(facts.ok()) << facts.refusal;
+    // The neighbour 0x179 is still unclassified: the band was widened by one opcode, not dropped.
+    EXPECT_EQ(analyze(program({0xd579000au, 0x040a0300u})).reason,
+              "ngg-abi-unclassified-vector-width");
+}

@@ -251,7 +251,8 @@ uint32_t vgpr_source_span(const Rdna2Inst& in, uint32_t index) {
             case 0x161:
             case 0x162:
             case 0x163: return 0;   // not in the gfx10.3 table
-            default: return in.opcode <= 0x177 ? 1u : 0u;   // 0x178-0x17f: not classified
+            // 0x178 v_xor3_b32 (three 32-bit sources); 0x179-0x17f are not classified.
+            default: return in.opcode <= 0x178 ? 1u : 0u;
         }
     }
     if (in.opcode == 0x2ff || in.opcode == 0x300 || in.opcode == 0x301)   // b64 shifts: src1
