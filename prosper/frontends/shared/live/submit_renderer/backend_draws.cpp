@@ -247,9 +247,13 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         // it was declining to do.
         const bool contract_ok =
             (it.owned_waves && it.owned_waves->vertex_pending ||
-             prosper::gpu::validate_runtime_descriptor_contract(
-                 "VS/backend", bd.vs_words(), it.vrt.get(), 0,
-                 prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode)) &&
+             (it.ngg_subgroup
+                  ? prosper::gpu::validate_runtime_descriptor_contract(
+                        "NGG/backend", *it.ngg_subgroup->groups.front().stages->shell, it.vrt.get(),
+                        0, prosper::gpu::SpirvShaderStage::Compute, descriptor_validate_mode)
+                  : prosper::gpu::validate_runtime_descriptor_contract(
+                        "VS/backend", bd.vs_words(), it.vrt.get(), 0,
+                        prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode))) &&
             (it.owned_waves && it.owned_waves->fragment_pending ||
              (!bd.raster_quad_contract_modified && bd.fragment_draw_inputs &&
               bd.fragment_draw_inputs->original_fragment_producer &&

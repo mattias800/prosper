@@ -1061,6 +1061,13 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             settle_volume_guest_footprint(base, surface, surface.gpu_valid,
                                           producer_volume_guard_bytes,
                                           producer_volume_footprint_proven);
+            if (backend_target.volume_depth)
+                surface.volume_layout =
+                    producer_volume_footprint_proven
+                        ? prosper::gpu::VolumeGuestLayout{volume_native_w, volume_native_h,
+                                                          producer_volume_depth,
+                                                          primary_volume_view.tile_mode, volume_bpp}
+                        : prosper::gpu::VolumeGuestLayout{};
             if (!pass_pixels->empty()) surface.rgba = pass_pixels;
             else surface.rgba.reset();
             // GTA V builds its packed-HDR bloom pyramid as separate CB_COLOR targets,

@@ -47,6 +47,7 @@
 #endif
 #include "gpu/capture/gpu_capture_internal.hpp"
 #include "gpu/capture/serialize/capture_codecs.hpp"
+#include "gpu/capture/serialize/ngg_subgroup_codec.hpp"
 
 namespace prosper::gpu {
 
@@ -1852,6 +1853,18 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
         }
+    }
+    if (version >= 72u) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid merged-NGG draw count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_ngg_subgroup_draw(r, draw.ngg_subgroup)) {
+                if (error.empty()) error = "invalid merged-NGG draw description";
+                return false;
+            }
     }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one

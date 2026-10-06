@@ -217,6 +217,7 @@ constexpr const char* kDiagnosticPathSwitchNames[kDiagnosticPathSwitchCount] = {
 // codes reuse the site names that `[render-array-reject] site=` already prints. Backend codes mirror
 // prosper::gpu::DrawDrop in its order -- draw_disposition.cpp static_asserts that, so a reason added
 // there without one here fails to compile.
+// clang-format off: one reason per line, comments aligned; the backend range mirrors DrawDrop
 enum class DropReason : uint8_t {
     // complete == false with no code recorded: a drop site added without a reason. Nonzero here is
     // the instrument naming its own blind spot, the same contract as draw_disposition's UNACCOUNTED.
@@ -251,11 +252,34 @@ enum class DropReason : uint8_t {
     BackendShaderRejected,
     BackendPipelineCreation,
     BackendTargetMemory,
+    BackendResourceOrder,
+    BackendResourceContract,
+    BackendUnprovenSubmission,
+    BackendDeviceUnavailable,
+    BackendDetileDevice,
+    BackendOwnedWave,
+    BackendNggExpansion,
+    BackendVolumeView,
+    BackendVolumeNotPersistent,
+    BackendVolumeFeedback,
+    BackendCommandPool,
+    BackendVolumeMultiTarget,
+    BackendVolumeSeeded,
+    BackendVolumeTargetLimits,
+    BackendVolumeDepthStencil,
+    BackendVolumeBudget,
+    BackendTargetCreation,
+    BackendRenderPassCreation,
+    BackendFramebufferCreation,
+    BackendPressureFlush,
+    BackendNggSubgroup,
     Count
 };
+// clang-format on
 constexpr DropReason kFirstBackendDropReason = DropReason::BackendGeometryCapability;
 constexpr size_t kDropReasonCount = static_cast<size_t>(DropReason::Count);
 // Stable, grepped: never reword casually.
+// clang-format off: one grepped name per line, in DropReason order
 constexpr const char* kDropReasonNames[kDropReasonCount] = {
     "unattributed",
     "contract-mismatch",
@@ -285,7 +309,29 @@ constexpr const char* kDropReasonNames[kDropReasonCount] = {
     "backend/shader-rejected",
     "backend/pipeline-creation",
     "backend/target-memory",
+    "backend/resource-order",
+    "backend/resource-contract",
+    "backend/unproven-submission",
+    "backend/device-unavailable",
+    "backend/detile-device",
+    "backend/owned-wave",
+    "backend/ngg-expansion",
+    "backend/volume-view",
+    "backend/volume-not-persistent",
+    "backend/volume-feedback",
+    "backend/command-pool",
+    "backend/volume-multi-target",
+    "backend/volume-seeded",
+    "backend/volume-target-limits",
+    "backend/volume-depth-stencil",
+    "backend/volume-budget",
+    "backend/target-creation",
+    "backend/render-pass-creation",
+    "backend/framebuffer-creation",
+    "backend/pressure-flush",
+    "backend/ngg-subgroup",
 };
+// clang-format on
 
 // WHY a compute dispatch prosper wanted to run did not run. A skipped dispatch leaves its output
 // stale or zero -- a LUT, an exposure value, a light list -- and, like a dropped draw, can make a
@@ -554,13 +600,14 @@ inline void note_exact_result(ExactResultDecline verdict) {
 
 // One dropped draw, with the site's reason. Also bumps the matching coarse counter (frontend,
 // contract or backend), so the totals the rule reads and the breakdown can never disagree.
-inline void drop_draw(DropReason reason) {
+inline void drop_draw(DropReason reason, uint64_t n = 1) {
     const size_t i = static_cast<size_t>(reason);
     if (i >= kDropReasonCount) return;
-    add(reason == DropReason::ContractMismatch ? Counter::DroppedDrawsContract
+    add(reason == DropReason::ContractMismatch              ? Counter::DroppedDrawsContract
         : i >= static_cast<size_t>(kFirstBackendDropReason) ? Counter::DroppedDrawsBackend
-                                                             : Counter::DroppedDrawsFrontend);
-    ledger().drop_reasons[i].fetch_add(1, std::memory_order_relaxed);
+                                                            : Counter::DroppedDrawsFrontend,
+        n);
+    ledger().drop_reasons[i].fetch_add(n, std::memory_order_relaxed);
 }
 
 // One GPU-only renderer allocation that landed off device-local memory while the device has some
