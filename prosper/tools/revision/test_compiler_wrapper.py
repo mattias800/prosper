@@ -36,11 +36,16 @@ class _Skip(Exception):
     pass
 
 
+# Set by the ctest runner below. The skip mechanism follows how the file was started, never whether
+# pytest happens to import: pytest.skip raises a BaseException the runner must not have to catch.
+_UNDER_RUNNER = False
+
+
 def _skip(reason: str) -> None:
-    try:
-        import pytest
-    except ImportError:
-        raise _Skip(reason) from None
+    if _UNDER_RUNNER:
+        raise _Skip(reason)
+    import pytest
+
     pytest.skip(reason)
 
 
@@ -257,6 +262,8 @@ def test_the_cli_reports_a_path_free_reason():
 
 def _main() -> int:
     """Run every test without pytest (ctest has none); 77 when the host cannot run them."""
+    global _UNDER_RUNNER
+    _UNDER_RUNNER = True
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failures = skipped = 0
     for name, fn in tests:
@@ -265,9 +272,9 @@ def _main() -> int:
         except _Skip as skip:
             skipped += 1
             print(f"[SKIP] {name}: {skip}")
-        except AssertionError as error:
+        except Exception as error:  # an unexpected error is a failure, not an abort of the run
             failures += 1
-            print(f"[FAIL] {name}: {error}")
+            print(f"[FAIL] {name}: {type(error).__name__}: {error}")
     print(f"compiler wrapper: {len(tests)} tests, {failures} failures, {skipped} skipped")
     if failures:
         return 1
