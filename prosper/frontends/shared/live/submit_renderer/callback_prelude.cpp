@@ -175,10 +175,11 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
     uint64_t dcc_materialize_bytes = 0;
     // One uniform clear, decoded from `metadata_bytes` at `metadata_addr` (or from `host_data`
     // when the descriptor carries the bytes itself) as a descriptor with these components reads it.
+    // `rendered` says which of the two loops below asked, and is only reported.
     const auto materialize = [&](RttCache::iterator found, uint64_t metadata_addr,
                                  uint64_t metadata_bytes, const uint8_t* host_data,
                                  uint64_t host_data_bytes, uint32_t num_components,
-                                 bool alpha_is_on_msb) {
+                                 bool alpha_is_on_msb, bool rendered) {
         if (!metadata_bytes || metadata_bytes > SIZE_MAX) return;
         std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
         size_t copied = 0;
@@ -207,31 +208,33 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
         // materialised from a DCC fast-clear code becomes a UNIFORM colour for the
         // whole target, so if this decode is wrong the entire frame is one wrong
         // colour with no content -- which is exactly Little Nightmares III's
-        // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
-        // run costs a handful of lines.
+        // uniform-yellow presents (#2014). Deduped per (address, decoded colour, path) so a
+        // run costs a handful of lines. `via=` names the path that took the clear: a span that
+        // samples the target, or (since #4621) one that renders to it.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): the cached environment read this block always made
         if (const char* dcclog = PROSPER_ENV_VALUE("PROSPER_DCCLOG")) {
             if (dcclog[0] == '1' && dcclog[1] == '\0') {
                 static std::mutex dcc_mutex;
-                static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
+                static std::set<std::tuple<uint64_t, uint32_t, bool>> dcc_seen;
                 const uint32_t packed = (uint32_t)clear_rgba[0] | ((uint32_t)clear_rgba[1] << 8) |
                                         ((uint32_t)clear_rgba[2] << 16) |
                                         ((uint32_t)clear_rgba[3] << 24);
                 bool first = false;
                 {
                     std::lock_guard<std::mutex> lock(dcc_mutex);
-                    first = dcc_seen.emplace((uint64_t)found->first, packed).second;
+                    first = dcc_seen.emplace((uint64_t)found->first, packed, rendered).second;
                 }
                 if (first)
                     fprintf(
                         stderr,
                         "[dcclog] addr=0x%llx %ux%u fmt=%d ncomp=%u "
-                        "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f)\n",
+                        "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f) "
+                        "via=%s\n",
                         (unsigned long long)found->first, found->second.w, found->second.h,
                         (int)format, num_components, (int)alpha_is_on_msb, clear_rgba[0],
                         clear_rgba[1], clear_rgba[2], clear_rgba[3], found->second.uniform_color[0],
                         found->second.uniform_color[1], found->second.uniform_color[2],
-                        found->second.uniform_color[3]);
+                        found->second.uniform_color[3], rendered ? "rendered" : "sampled");
             }
         }
         found->second.dcc_metadata_dirty = false;
@@ -262,7 +265,7 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
                 materialize(found, resource.metadata_addr,
                             prosper::gpu::gpu_capture_dcc_metadata_footprint(resource),
                             resource.dcc_metadata_host_data, resource.dcc_metadata_host_data_size,
-                            resource.num_components, resource.alpha_is_on_msb);
+                            resource.num_components, resource.alpha_is_on_msb, /*rendered=*/false);
             }
         }
     }
@@ -294,7 +297,7 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
                       binding.width, binding.height, surface.w, surface.h, ctx.render_scale)))
                 continue;
             materialize(found, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, nullptr, 0,
-                        surface.dcc_num_components, surface.dcc_alpha_is_on_msb);
+                        surface.dcc_num_components, surface.dcc_alpha_is_on_msb, /*rendered=*/true);
         }
     }
     if (timing_enabled) {
