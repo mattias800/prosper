@@ -615,7 +615,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no);
 
 // 32-dword user-data SGPR block shared by the executor and its diagnostics companions. 32 (not
-// 16) because NGG merged shaders place descriptors in the extended user SGPRs s16..s31.
+// 16) because NGG merged shaders place descriptors in the extended user SGPRs s16..s31 (e.g.
+// vertex buffers at s16/s18).
 inline constexpr uint32_t kUserSgprs = 32;
 void read_user_sgprs(const RegisterFile& sh, uint32_t base, uint32_t out[kUserSgprs]);
 
