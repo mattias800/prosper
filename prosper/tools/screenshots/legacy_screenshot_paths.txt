@@ -24,6 +24,9 @@ assets/screenshots/3407-tail-on-sonic.webp
 assets/screenshots/3619-after-gta.webp
 assets/screenshots/3619-after-sonic.webp
 assets/screenshots/3619-before-sonic.webp
+assets/screenshots/ac-black-flag-warning-fixed.webp
+assets/screenshots/ac-black-flag-warning-green-lines.webp
+assets/screenshots/ac-black-flag-warning-red.webp
 assets/screenshots/alex-kidd-black-world.webp
 assets/screenshots/alex-kidd-inf-preserve.webp
 assets/screenshots/alex-kidd.webp
@@ -89,6 +92,8 @@ assets/screenshots/darksiders2-legal-screen.webp
 assets/screenshots/dead-cells-title.webp
 assets/screenshots/dead-cells.webp
 assets/screenshots/dq7-adventure-log-menu-efc.webp
+assets/screenshots/dq7-title-sky-sea-after-predication.webp
+assets/screenshots/dq7-title-sky-sea-before-predication.webp
 assets/screenshots/dragon-quest-vii-field-hud.webp
 assets/screenshots/dragon-quest-vii-name-confirmation.webp
 assets/screenshots/dragon-quest-vii-name-entry.webp
@@ -250,6 +255,8 @@ assets/screenshots/tales-graces-f-title-no-input.webp
 assets/screenshots/tales-graces-f-title.webp
 assets/screenshots/terminator-title.webp
 assets/screenshots/terminator.webp
+assets/screenshots/tomb-raider-1-laras-home-exploded.webp
+assets/screenshots/tomb-raider-2-laras-home-steps.webp
 assets/screenshots/tomb-raider-croft-manor-assault-course.webp
 assets/screenshots/tomb-raider-croft-manor-interior-wrong-textures.webp
 assets/screenshots/tomb-raider-croft-manor-untextured.webp

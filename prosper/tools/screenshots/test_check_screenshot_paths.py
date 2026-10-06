@@ -92,5 +92,19 @@ def test_missing_legacy_list_cannot_be_evaluated(tmp_path):
         csp.evaluate(root)
 
 
-def test_the_repository_itself_is_clean():
-    assert problems(REPO) == []
+def test_report_only_exits_zero_on_a_violation(tmp_path):
+    root = build(tmp_path, ["assets/screenshots/flat.webp"], [])
+    assert csp.main(["--root", str(root)]) == csp.EXIT_VIOLATION
+    assert csp.main(["--root", str(root), "--report-only"]) == csp.EXIT_OK
+
+
+def test_report_only_still_reports_an_unevaluable_tree(tmp_path):
+    root = build(tmp_path, [GOOD], [])
+    (root / csp.LEGACY).unlink()
+    assert csp.main(["--root", str(root), "--report-only"]) == csp.EXIT_UNEVALUATED
+
+
+def test_the_repository_can_be_evaluated():
+    # Not "is clean": screenshots land on main from every lane, and while ADR 0026 is proposed a new
+    # flat capture is legal, so a cleanliness assertion here would go red with no change of ours.
+    csp.evaluate(REPO)

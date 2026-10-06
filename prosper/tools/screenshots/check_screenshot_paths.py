@@ -26,6 +26,10 @@ and pass as they are. The list may only shrink: a listed path that no longer exi
 stale, so moving a legacy file into the convention also deletes its line. Any image under either
 root that neither conforms nor is listed fails.
 
+REPORT-ONLY. While ADR 0026 is proposed, CI runs this with `--report-only`: violations print as
+warnings and the step exits 0, so the convention is visible to every lane without being binding.
+Accepting the ADR removes the flag. The flag never hides an evaluation failure (exit 2).
+
 WHAT IT CANNOT SEE: whether the title id in a folder is the title the picture shows, or whether
 the date is when it was taken.
 
@@ -122,18 +126,27 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--root", type=Path, default=Path("."), help="repository root (default: .)")
     ap.add_argument("--github", action="store_true", help="emit GitHub annotations")
+    ap.add_argument(
+        "--report-only",
+        action="store_true",
+        help="print violations as warnings and exit 0 (until ADR 0026 is accepted)",
+    )
     args = ap.parse_args(argv)
     try:
         problems, total, legacy = evaluate(args.root.resolve())
     except EvaluationError as exc:
         print(f"check_screenshot_paths: could not evaluate: {exc}", file=sys.stderr)
         return EXIT_UNEVALUATED
+    level = "warning" if args.report_only else "error"
     for p in problems:
-        print(f"::error::{p}" if args.github else p)
+        print(f"::{level}::{p}" if args.github else p)
     print(
         f"check_screenshot_paths: {total} image(s), {total - legacy} in the convention, "
-        f"{legacy} grandfathered"
+        f"{legacy} grandfathered, {len(problems)} problem(s)"
+        + (" (report-only)" if args.report_only else "")
     )
+    if args.report_only:
+        return EXIT_OK
     return EXIT_VIOLATION if problems else EXIT_OK
 
 
