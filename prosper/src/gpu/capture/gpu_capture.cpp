@@ -655,11 +655,15 @@ public:
         d.ps_entry = x.ps_entry;
         d.ps_raster_launch = x.ps_raster_launch;
         d.float_transport = x.float_transport;
+        d.ngg_subgroup = x.ngg_subgroup;   // v72 (#3135 P5)
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
         return true;
     }
     bool admit_draw(const GpuCapturedDraw& x, DrawItem& d) {
-        if (x.vs_chain_raw_shader_index != UINT32_MAX) {
+        // A merged-NGG draw's vertex stage is its stored description, not a native module compiled
+        // from the raw chain, so the raw vertex-stage obligations below do not apply to it.
+        const bool ngg = x.ngg_subgroup != nullptr;
+        if (!ngg && x.vs_chain_raw_shader_index != UINT32_MAX) {
             const auto* prolog = x.vs_raw_shader_index < c.raw_shader_versions.size()
                 ? &c.raw_shader_versions[x.vs_raw_shader_index].words : nullptr;
             const auto* main = x.vs_chain_raw_shader_index < c.raw_shader_versions.size()
@@ -766,6 +770,7 @@ public:
             return true;
         };
         for (bool vertex : {true, false}) {
+            if (vertex && ngg) continue;
             uint32_t pc = UINT32_MAX;
             if (!needs_wave_owner(vertex ? x.vs_raw_shader_index : x.fs_raw_shader_index, vertex,
                                   pc))

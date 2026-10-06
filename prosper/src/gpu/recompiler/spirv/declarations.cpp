@@ -2,7 +2,7 @@
 // gpu/recompiler/rdna2_to_spirv_internal.hpp. outline_methods.py checked each body byte for byte.
 
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
 #include <set>
 #include <tuple>
 

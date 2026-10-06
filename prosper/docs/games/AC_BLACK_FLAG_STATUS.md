@@ -77,6 +77,52 @@ draws, since the compute refusals print `host-subgroups=unavailable`. (That fiel
 host on a `…/recompile` refusal: it had no host fields to print. Since #4530 those lines print
 `not-consulted`; only the two `subgroup-contract` lines carry the host range.)
 
+## Progress 2026-10-06: the solid red frame in the first seconds is fixed (#4197)
+
+Cause: a render-target cache entry served to a view that cannot be that target. Measured: draw 36 of the
+first submit clears `0x4205990000` through a pixel shader that exports the constant `0x7bff7bff` (half
+max, 65504) into a **2-byte R16_FLOAT** target. Draw 62 then samples the same address through a
+descriptor that is **4-component 8-bit at 1920x1080**, i.e. a view needing twice the bytes the target
+holds. prosper accepted the cached entry on extent alone, nearest-copied the half-max values and the
+post pass (`0x407f7f9400`, whose colour is `exp2(gamma * log2(sample))` with gamma 1.0 at that point)
+wrote them straight through as `(1,0,0,1)`. `rtt_sampled_texel_footprint_compatible` /
+`live_rtt_serves_sampled_view` now refuse a cached target for a view that needs more bytes per texel
+than the target stores, so the sample reads the guest backing instead. Windows `prosper-app`, NVIDIA,
+default launch: grabs at 1000, 1500, 2000 and 3000 ms were `(255,0,0)` before and `(0,0,0)` after;
+later frames settle at `(2,2,2)`. Regression: `LiveTargetFormat.CachedTargetServesAViewOnlyWhenExtentAndTexelFootprintFit`
+and `RttScale.SampledViewNeedingMoreBytesThanTheCachedTargetIsAnAlias`.
+
+**Inferred, not measured:** that the address was *reused* by a later RGBA8 writer. No writer of that
+range between draws 36 and 62 was named (writer provenance or the guest GPU write journal answers it in one run), so
+the refusal is `CONFIDENCE: MED`. Without such a writer, hardware would read the R16F clear bytes
+reinterpreted, not "the guest backing", and the black after the fix may be the fallback's zeros rather than a
+correct value; "not red" is the only verified property.
+
+The cached side is judged by the GUEST target format (`RttSurf::guest_format`), not the renderer's host
+storage, which folds every format outside a short list into RGBA8. A refusal logs `[rtt] footprint-alias
+refusal` (first 32, then powers of two) so a cross-title false refusal is visible.
+
+What this does **not** establish: what the frame should show at these moments (black is the expected
+rung-1 reading, not a verified oracle), and the draws that should refresh the aliased range are still
+dropped (below).
+
+## Progress 2026-10-06: what is still refused at startup
+
+Four compute programs are refused and a fragment draw is dropped in the first submits; none of them is
+the red frame (next section). Reasons, from `PROSPER_DBG=1` and `shader_inspect`:
+
+- `cs 0x407ed7a300` (2x2x2 groups): `image_sample_l` over a 3D 32x32x32 T#. The resource table skips
+  the descriptors with `[t#] unsupported BASE_LEVEL N (last=N max_mip=5) for type=10`, so the MIMG has
+  no resource (`need=sampled ... (2 res)`). The NSA address word printed beside it is not the blocker:
+  `cvg()` already reads NSA addresses for sampling.
+- `cs 0x407ee26700`: `s_cselect_b64 vcc, s[2:3], s[4:5]` with an incomplete source pair; it writes a
+  256-byte buffer the indirect draws read, so those draws drop ("dependency latch").
+- `cs 0x407ef88500` (30x17 groups): a full-screen luma/edge filter, a 4-iteration `s_branch` loop with
+  four `s_mov_b64 exec, vcc` / `s_cbranch_execz` ifs inside it; EXEC is narrowed at the branch, so the
+  counted-loop route's full-EXEC proof declines.
+- `cs 0x407ed65200`: `s_cbranch_scc1` at pc 93, control flow the structurizer cannot place.
+- a fragment draw at `0x407edfaf00` is refused by the 64-lane `unproved-vote` contract (host range 32..32).
+
 ## Current frontier
 
 1. **Fixed by #4129 (open): the guest dereferenced a Windows thread handle.** At `eboot+0x161ed91`
@@ -200,3 +246,17 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   faulting instruction; it does not rule out an earlier HLE error as the cause of the failed seek.
 - **"The boot or link phase is what stalls."** Falsified by the phase log: all seven phases complete
   (`PROCESS_START` through `BOOT_COMPLETE`) in under 2.1 s.
+- **"The refused compute programs (`0x407ed7a300`, `0x407ee26700`, `0x407ed65200`, `0x407ef88500`) cause the
+  solid red frame."** Falsified: the red pass `0x407f7f9400` does not read their outputs. It samples
+  `0x4202a00000` and `0x4203270000` and a constant ring (dwords 17 and 18 read `1.0`, sane), and the red
+  came from a cached 16-bit target served to an 8-bit view (see Progress 2026-10-06). The only
+  relation is that the refused `0x407ef88500` *reads* the red pass's output. Evidence: `PROSPER_COMPUTE_BINDS`,
+  `PROSPER_COMPUTE_RESOURCE_MAP`, SPIR-V of the pass, #4197.
+- **"The G-buffer clear quad (fs `0x41b5de100`, CB_TARGET_MASK 0x3) paints the red."** Not supported:
+  `PROSPER_SKIP_DRAW_PROGRAM=0x41b5de100` left all three probe pixels `(255,0,0)`.
+- **"The `CB_COLOR_CONTROL.MODE=2` draw (fs `0x407ea1ff00`) is a mis-detected eliminate-fast-clear helper that
+  should write no colour."** Not supported: its vertex program exports a UV parameter (AGC's helper does not)
+  and its pixel shader is a deliberate clear to half-max. `PROSPER_CB_EFC_NO_COLOR=1` also removes the red,
+  but by erasing a real clear, which only moves the error.
+- **"Gating the last-pass present fallback until the first guest flip removes it"** Falsified earlier: the
+  first guest flips already carry the red.

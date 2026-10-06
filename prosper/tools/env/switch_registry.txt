@@ -700,6 +700,7 @@ PROSPER_NO_SHADER_DECODE_CACHE  unclassified
 PROSPER_NO_SHADER_KEY_SCRATCH  unclassified
 PROSPER_NO_SHADER_KEY_WORD_HASH  unclassified
 PROSPER_NO_SHARED_VULKAN_DEVICE  unclassified
+PROSPER_NO_SHORT_BUFFER_VIEW  diagnostic  # comparison arm: an over-declared draw buffer is copied instead of borrowed
 PROSPER_NO_SKIP_SEED  unclassified
 PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH  unclassified
 PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE  unclassified

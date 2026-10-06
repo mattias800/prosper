@@ -1,4 +1,5 @@
 #pragma once
+#include "diagnostics/perf/fragment_vote_diagnostic.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -6,44 +7,6 @@
 namespace prosper::gpu {
 
 enum class FragmentWavePolicy { Strict, ProvenVotes };
-
-enum class FragmentVoteRefusal {
-    None,
-    MalformedModule,
-    InconsistentContract,
-    UnsupportedWaveOperation,
-    UnprovedVote,
-};
-
-inline constexpr const char* fragment_vote_refusal_name(FragmentVoteRefusal refusal) {
-    switch (refusal) {
-        case FragmentVoteRefusal::None: return "none";
-        case FragmentVoteRefusal::MalformedModule: return "malformed-module";
-        case FragmentVoteRefusal::InconsistentContract: return "inconsistent-contract";
-        case FragmentVoteRefusal::UnsupportedWaveOperation: return "unsupported-wave-operation";
-        case FragmentVoteRefusal::UnprovedVote: return "unproved-vote";
-    }
-    return "unknown";
-}
-
-// Observer-only source location of the first vote whose certificate actually failed. An absent
-// certificate does not prove that the predicate is varying or undefined. This is a SPIR-V dword
-// offset (including the five-word header), NOT an RDNA guest instruction PC.
-struct FragmentVoteFailureDetails {
-    bool available = false;
-    std::size_t source_word = 0;
-    uint32_t vote_result_id = 0;
-    uint32_t predicate_id = 0;
-    uint32_t predicate_opcode = UINT32_MAX; // unavailable, not an invented OpNop
-};
-
-// Value-owned diagnostic survives both memoized results and destruction of an uncached result.
-// Default construction means the lowering was not attempted, not that it succeeded.
-struct FragmentVoteLoweringDiagnostic {
-    bool attempted = false;
-    FragmentVoteRefusal refusal = FragmentVoteRefusal::MalformedModule;
-    FragmentVoteFailureDetails failed_vote;
-};
 
 struct FragmentVoteLowering {
     // Owned effective module; empty on refusal. The captured/source module is never modified.

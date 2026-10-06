@@ -342,3 +342,71 @@ TEST(LiveTargetComponentOrder, GraphicsAndComputeCompositionsAgree) {
         }
     }
 }
+
+// The composed decision the sampled-descriptor path asks (#4197): the AC Black Flag shape is a
+// 1920x1080 RGBA8 view over a cached 1920x1080 R16_FLOAT target.
+TEST(LiveTargetFormat, CachedTargetServesAViewOnlyWhenExtentAndTexelFootprintFit) {
+    using prosper::frontend::live_rtt_serves_sampled_view;
+    using prosper::frontend::live_target_vk_format_bytes;
+    EXPECT_TRUE(live_target_vk_format_bytes(VK_FORMAT_R16_SFLOAT) == 2u);
+    EXPECT_TRUE(live_target_vk_format_bytes(VK_FORMAT_R8G8B8A8_UNORM) == 4u);
+    EXPECT_TRUE(live_target_vk_format_bytes(VK_FORMAT_UNDEFINED) == 0u);
+    // Red-without-fix arm: the pre-fix rule (extent only) admitted this and served half-max texels.
+    EXPECT_TRUE(prosper::frontend::rtt_sampled_extent_compatible(1920, 1080, 1920, 1080, 1, false));
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                        VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, 0u, /*RGBA8 view*/ 4u));
+    // The same descriptor over a target that does hold four bytes per texel is served.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, 0u, 4u));
+    // A matching R16F view of the R16F target is served; a wrong extent still refuses.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                       VK_FORMAT_R16_SFLOAT, VK_FORMAT_UNDEFINED, 0u, 2u));
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1216, 684, 960, 540, 1, false,
+                                        VK_FORMAT_R16_SFLOAT, VK_FORMAT_UNDEFINED, 0u, 2u));
+    // A volume and an unknown cached format keep their own contracts.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(32, 32, 32, 32, 1, false, VK_FORMAT_R16_SFLOAT, VK_FORMAT_UNDEFINED, 32u, 4u));
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                       VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, 0u, 16u));
+}
+
+// Review of #4648: the cached side is the GUEST format. The renderer's host storage folds every
+// format outside a short list into RGBA8, so judging by it would refuse a legitimate 8-byte view and
+// admit a narrow guest target.
+TEST(LiveTargetFormat, FootprintJudgedByGuestFormatNotHostStorage) {
+    using prosper::frontend::live_rtt_serves_sampled_view;
+    using prosper::frontend::live_target_guest_format_bytes;
+    EXPECT_EQ(live_target_guest_format_bytes(VK_FORMAT_R16G16B16A16_UNORM), 8u);
+    EXPECT_EQ(live_target_guest_format_bytes(VK_FORMAT_R32G32_SFLOAT), 8u);
+    EXPECT_EQ(live_target_guest_format_bytes(VK_FORMAT_R16_UNORM), 2u);
+    EXPECT_EQ(live_target_guest_format_bytes(VK_FORMAT_B10G11R11_UFLOAT_PACK32), 0u);
+    // guest RGBA16_UNORM stored as host RGBA8, sampled by its own 8-byte view: served.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UNORM, 0u, 8u));
+    // guest R32G32_SFLOAT likewise.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32G32_SFLOAT, 0u, 8u));
+    // guest R16_UNORM (2 B) stored as host RGBA8, RGBA8 view over it: the AC shape, refused.
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16_UNORM, 0u, 4u));
+}
+
+// A cached target with NO recorded guest format (VK_FORMAT_UNDEFINED) is admitted whatever the view
+// asks. Its only size evidence is the renderer's canonical host storage, which folds most guest
+// formats into RGBA8, so a footprint judged by it refuses real views of the target -- the
+// dim-5 selected-address RTT case in test_gpu_capture_render samples an RGBA8-host target through a
+// Float32x4 view and must keep reading the renderer's pixels. Pre-#4648 behaviour for this branch.
+TEST(LiveTargetFormat, UnsetGuestFormatAdmitsAWiderView) {
+    using prosper::frontend::live_rtt_serves_sampled_view;
+    // RGBA8 host storage, 16 B/texel view: refused by a host-format fallback, admitted here.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(2, 2, 2, 2, 1, false, VK_FORMAT_R8G8B8A8_UNORM,
+                                             VK_FORMAT_UNDEFINED, 0u, 16u));
+    // R16F host storage, RGBA8 view: the #4197 footprint, but with no guest format to prove it.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                             VK_FORMAT_R16_SFLOAT, VK_FORMAT_UNDEFINED, 0u, 4u));
+    // A recorded guest format still refuses the same view (the #4197 shape stays refused).
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                              VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, 0u, 4u));
+    // The extent rule is unchanged for an unset guest format.
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1216, 684, 960, 540, 1, false, VK_FORMAT_R8G8B8A8_UNORM,
+                                              VK_FORMAT_UNDEFINED, 0u, 16u));
+}
