@@ -448,6 +448,31 @@ TEST(RawWideReplayedLoad, AUnaryMaskTransferIntoVccReplacesWhatVccHeld) {
     EXPECT_EQ(pc, 8u);
 }
 
+TEST(RawWideReplayedLoad, ACarryInFromAFreshCompareIsNotANumericRead) {
+    // #4555, the MOUSE: P.I. For Hire program. v_addc_co_u32 v3, s[44:45], 0, v3, s[16:17]
+    // (VOP3B 0x128) takes its carry-in from the pair the compare just recycled. The emitter
+    // consumes that operand as a Bool and refuses an untracked one. v_cndmask's condition was
+    // already exempt here when it is an independent root; the carry-in forms were not.
+    const std::vector<uint32_t> carry_in{0xd5282c03u, 0x00420680u};
+    const auto fresh = program({.after_mask = carry_in});
+    ASSERT_EQ(at(fresh, 8).fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(at(fresh, 8).opcode, 0x128u);
+    ASSERT_EQ(at(fresh, 8).src[2].kind, OperandKind::SGPR);
+    ASSERT_EQ(at(fresh, 8).src[2].value, 16);
+    ASSERT_EQ(at(fresh, 8).sdst.value, 44);
+    EXPECT_FALSE(flagged(fresh)) << numeric_blocker(fresh);
+
+    // Control: with no compare the pair still holds the load's own words, and a carry taken
+    // from them is a read of the load.
+    const auto loaded =
+        program({.compare = false, .move_mask_to_vcc = false, .after_mask = carry_in});
+    ASSERT_EQ(at(loaded, 5).opcode, 0x128u);
+    EXPECT_TRUE(flagged(loaded));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(loaded, &pc), "numeric-reader");
+    EXPECT_EQ(pc, 5u);
+}
+
 TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
     // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
     // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it

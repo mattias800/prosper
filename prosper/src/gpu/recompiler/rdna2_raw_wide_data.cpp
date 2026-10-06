@@ -277,8 +277,15 @@ public:
                         derived_read = true;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     const Operand& operand = in.src[source];
-                    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101u &&
-                        source == 2u && independent_mask(operand)) continue;
+                    // v_cndmask's condition was already exempt here when it is an independent
+                    // mask root. The carry-in of the three VOP3B add/sub-with-carry forms is the
+                    // same kind of operand: the emitter takes it as a Bool and refuses an
+                    // untracked one (rdna2_emit_alu.cpp), so from an independent root the Bool it
+                    // reads is the fresh compare's and no loaded word is observed.
+                    if (in.fmt == Rdna2Format::VOP3 && source == 2u &&
+                        (in.opcode == 0x101u || (in.opcode >= 0x128u && in.opcode <= 0x12au)) &&
+                        independent_mask(operand))
+                        continue;
                     if (operand.kind == OperandKind::Special && operand.value == 253) {
                         derived_read |= state.scc;
                         continue;
