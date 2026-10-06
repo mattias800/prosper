@@ -123,6 +123,22 @@ TEST(Rdna2PredicateTables, Sop1SccWritersAreNeverListedAsUnmodified) {
     }
 }
 
+TEST(Rdna2PredicateTables, Sop1DefiniteSccWritersAreExactlyTheLlvmSet) {
+    // The opposite question from the unmodified list, and not its complement: an opcode on
+    // neither list is one nothing may assume either way. A taint that is cleared by "writes SCC"
+    // needs this list; clearing on "not known to leave it alone" ended a compare's lifetime at
+    // s_ff1_i32_b32 and at the relative moves.
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        EXPECT_EQ(sop1_opcode_writes_scc(op),
+                  contains(kLlvmSccWriters, std::size(kLlvmSccWriters), op))
+            << "SOP1 op=" << op;
+        EXPECT_FALSE(sop1_opcode_writes_scc(op) && sop1_opcode_leaves_scc_unmodified(op))
+            << "SOP1 op=" << op << " is on both lists";
+    }
+    for (uint32_t op : kLlvmSccClean)
+        EXPECT_FALSE(sop1_opcode_writes_scc(op)) << "SOP1 op=" << op << " is LLVM-clean";
+}
+
 TEST(Rdna2PredicateTables, Sop1UnmodifiedListStaysWithinLlvmCleanSet) {
     for (uint32_t op = 0; op <= 0xFF; ++op) {
         if (!sop1_opcode_leaves_scc_unmodified(op)) continue;

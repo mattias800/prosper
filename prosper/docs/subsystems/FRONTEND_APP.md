@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # prosper-app — the OS-integration frontend (design)
 
 **Status:** **the app runs the game in a window, with audio out and controller in** (issue #164).

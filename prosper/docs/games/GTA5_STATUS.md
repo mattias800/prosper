@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Grand Theft Auto V (`PPSA04263`, RAGE) — status
 
 **Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws, **and since the

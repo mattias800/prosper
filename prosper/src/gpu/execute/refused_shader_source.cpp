@@ -22,6 +22,7 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
     if (refused_shader_dump_full()) return;
     for (auto [tag, address, failed, original] :
          {std::tuple{"vs", shaders.vs_address, shaders.vs_failed, shaders.vs},
+          std::tuple{"vsmain", shaders.chain_address, shaders.vs_failed, RefusedShaderSource{}},
           std::tuple{"ps", shaders.ps_address, shaders.ps_failed, shaders.ps}}) {
         if (!failed || !address) continue;
         // Pre-key guards have no compile-key owner. Observe their original readable program
@@ -37,12 +38,18 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
                           source_dwords));
         }
         if (refused_shader_already_noted(tag, original)) continue;
-        char detail[160];
-        std::snprintf(
-            detail, sizeof detail, "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx",
-            static_cast<unsigned long long>(shaders.command_order), shaders.vs_words,
-            shaders.gs_words, shaders.fs_words, static_cast<unsigned long long>(shaders.es_address),
-            static_cast<unsigned long long>(shaders.ps_address));
+        char detail[512];
+        std::snprintf(detail, sizeof detail,
+                      "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx ngg=%s link=%s "
+                      "main=0x%llx%s%s",
+                      static_cast<unsigned long long>(shaders.command_order), shaders.vs_words,
+                      shaders.gs_words, shaders.fs_words,
+                      static_cast<unsigned long long>(shaders.es_address),
+                      static_cast<unsigned long long>(shaders.ps_address),
+                      shaders.ngg_class ? shaders.ngg_class : "unknown",
+                      shaders.link ? shaders.link : "unknown",
+                      static_cast<unsigned long long>(shaders.chain_address),
+                      shaders.refusal ? " refusal=" : "", shaders.refusal ? shaders.refusal : "");
         note_refused_shader(tag, address, original, detail);
     }
 }

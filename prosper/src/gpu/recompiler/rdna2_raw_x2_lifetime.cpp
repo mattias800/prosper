@@ -458,10 +458,11 @@ std::vector<RawNestedWideChain> rdna2_owned_raw_x2_chains(const std::vector<Rdna
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
+        // Anything that can write a register its operands do not name, or run code off the
+        // decoded edges, voids every chain. This used to name SOP1 0x28..0x2a for the M0-relative
+        // moves; those three are B64 saveexec forms, and the relative moves went unrefused (#4559).
         if (in.fmt == Rdna2Format::Unknown || !in.len_dwords || !by_pc.emplace(in.pc, i).second ||
-            (in.fmt == Rdna2Format::SOP1 && ((in.opcode >= 0x20u && in.opcode <= 0x22u) ||
-                                             (in.opcode >= 0x28u && in.opcode <= 0x2au))) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64))
+            rdna2_may_write_unnamed_register_or_leave_cfg(in))
             return {};
     }
     for (const auto& in : ins) {

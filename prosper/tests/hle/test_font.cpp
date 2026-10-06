@@ -364,96 +364,202 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
 
-struct FontGlyphQueries {
-    HleFn create_library = nullptr, open_font_set = nullptr, close_font = nullptr,
-          get_dpi = nullptr, glyph_form = nullptr, metrics_form = nullptr, glyph_scale = nullptr,
-          scaled_kerning = nullptr, generate_glyph = nullptr, delete_glyph = nullptr;
+struct FontStyleFrameApi {
+    HleFn init = nullptr, set_scale_pixel = nullptr, set_scale_point = nullptr, set_dpi = nullptr,
+          set_slant = nullptr, set_weight = nullptr, unset_scale = nullptr, unset_slant = nullptr,
+          unset_weight = nullptr, get_scale_pixel = nullptr, get_scale_point = nullptr,
+          get_dpi = nullptr, get_slant = nullptr, get_weight = nullptr, set_surface = nullptr;
     bool registered() const {
-        return create_library && open_font_set && close_font && get_dpi && glyph_form &&
-               metrics_form && glyph_scale && scaled_kerning && generate_glyph && delete_glyph;
+        return init && set_scale_pixel && set_scale_point && set_dpi && set_slant && set_weight &&
+               unset_scale && unset_slant && unset_weight && get_scale_pixel && get_scale_point &&
+               get_dpi && get_slant && get_weight && set_surface;
     }
 };
-FontGlyphQueries font_glyph_queries() {
+FontStyleFrameApi font_style_frame_api() {
     register_builtin_hle();
-    FontGlyphQueries font;
-    font.create_library = Hle::lookup("nWrfPI4Okmg");
-    font.open_font_set = Hle::lookup("cKYtVmeSTcw");
-    font.close_font = Hle::lookup("vzHs3C8lWJk");
-    font.get_dpi = Hle::lookup("8REoLjNGCpM");
-    font.glyph_form = Hle::lookup("PXlA0M8ax40");
-    font.metrics_form = Hle::lookup("XUfSWpLhrUw");
-    font.glyph_scale = Hle::lookup("lNnUqa1zA-M");
-    font.scaled_kerning = Hle::lookup("ryPlnDDI3rU");
-    font.generate_glyph = Hle::lookup("C-4Qw5Srlyw");
-    font.delete_glyph = Hle::lookup("LHDoRWVFGqk");
-    return font;
+    FontStyleFrameApi api;
+    api.init = Hle::lookup("la2AOWnHEAc");
+    api.set_scale_pixel = Hle::lookup("da4rQ4-+p-4");
+    api.set_scale_point = Hle::lookup("O997laxY-Ys");
+    api.set_dpi = Hle::lookup("dB4-3Wdwls8");
+    api.set_slant = Hle::lookup("394sckksiCU");
+    api.set_weight = Hle::lookup("faw77-pEBmU");
+    api.unset_scale = Hle::lookup("bePC0L0vQWY");
+    api.unset_slant = Hle::lookup("dUmABkAnVgk");
+    api.unset_weight = Hle::lookup("hwsuXgmKdaw");
+    api.get_scale_pixel = Hle::lookup("2QfqfeLblbg");
+    api.get_scale_point = Hle::lookup("7x2xKiiB7MA");
+    api.get_dpi = Hle::lookup("VSw18Aqzl0U");
+    api.get_slant = Hle::lookup("lOfduYnjgbo");
+    api.get_weight = Hle::lookup("HIUdjR-+Wl8");
+    api.set_surface = Hle::lookup("0hr-w30SjiI");
+    return api;
+}
+TEST(Font, StyleFrameSurfaceIsRegistered) {
+    EXPECT_TRUE(font_style_frame_api().registered()) << "font style-frame surface is registered";
 }
 
-TEST(Font, GlyphQuerySurfaceIsRegistered) {
-    EXPECT_TRUE(font_glyph_queries().registered()) << "font glyph-query surface is registered";
+TEST(Font, StyleFrameNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontStyleFrameInit"), "la2AOWnHEAc");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetScalePixel"), "da4rQ4-+p-4");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetScalePoint"), "O997laxY-Ys");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetResolutionDpi"), "dB4-3Wdwls8");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetEffectSlant"), "394sckksiCU");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameSetEffectWeight"), "faw77-pEBmU");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetScale"), "bePC0L0vQWY");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetEffectSlant"), "dUmABkAnVgk");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameUnsetEffectWeight"), "hwsuXgmKdaw");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetScalePixel"), "2QfqfeLblbg");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetScalePoint"), "7x2xKiiB7MA");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetResolutionDpi"), "VSw18Aqzl0U");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectSlant"), "lOfduYnjgbo");
+    EXPECT_EQ(nid_hash("sceFontStyleFrameGetEffectWeight"), "HIUdjR-+Wl8");
+    EXPECT_EQ(nid_hash("sceFontRenderSurfaceSetStyleFrame"), "0hr-w30SjiI");
 }
 
-TEST(Font, GlyphQueryNidsResolveToStubValues) {
-    EXPECT_EQ(nid_hash("sceFontGetResolutionDpi"), "8REoLjNGCpM");
-    EXPECT_EQ(nid_hash("sceFontGlyphGetGlyphForm"), "PXlA0M8ax40");
-    EXPECT_EQ(nid_hash("sceFontGlyphGetMetricsForm"), "XUfSWpLhrUw");
-    EXPECT_EQ(nid_hash("sceFontGlyphGetScalePixel"), "lNnUqa1zA-M");
-    EXPECT_EQ(nid_hash("sceFontGetRenderScaledKerning"), "ryPlnDDI3rU");
-    EXPECT_NE(nid_hash("sceFontGetResolutionDpi"), "AAAAAAAAAAA")
-        << "positive control: the discriminator rejects a wrong NID";
-}
-
-TEST(Font, GetResolutionDpiWritesNonZeroDpi) {
-    const FontGlyphQueries font = font_glyph_queries();
-    ASSERT_TRUE(font.registered());
-    uint8_t mem[64]{};
-    void* library = nullptr;
-    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
-    ASSERT_NE(library, nullptr);
-    void* handle = nullptr;
-    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
-    ASSERT_NE(handle, nullptr);
+TEST(Font, StyleFrameInitSeedsSeventyTwoDpi) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    std::memset(frame, 0xcc, sizeof(frame));
+    EXPECT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u) << "StyleFrameInit returns success";
+    EXPECT_EQ(frame[0], 0x09u) << "StyleFrameInit writes the magic low byte";
+    EXPECT_EQ(frame[1], 0x0Fu) << "StyleFrameInit writes the magic high byte";
     uint32_t h_dpi = 0, v_dpi = 0;
-    EXPECT_EQ(font.get_dpi(addr(handle), addr(&h_dpi), addr(&v_dpi), 0, 0, 0), 0u)
-        << "GetResolutionDpi returns success";
-    EXPECT_EQ(h_dpi, 96u) << "GetResolutionDpi writes horizontal DPI";
-    EXPECT_EQ(v_dpi, 96u) << "GetResolutionDpi writes vertical DPI";
-    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+    EXPECT_EQ(api.get_dpi(addr(frame), addr(&h_dpi), addr(&v_dpi), 0, 0, 0), 0u)
+        << "GetResolutionDpi reads the seeded frame";
+    EXPECT_EQ(h_dpi, 0x48u) << "StyleFrameInit seeds 72 horizontal DPI";
+    EXPECT_EQ(v_dpi, 0x48u) << "StyleFrameInit seeds 72 vertical DPI";
 }
 
-TEST(Font, GlyphFormQueriesReturnDefaults) {
-    const FontGlyphQueries font = font_glyph_queries();
-    ASSERT_TRUE(font.registered());
-    void* glyph = nullptr;
-    ASSERT_EQ(font.generate_glyph(0, 'A', 0, addr(&glyph), 0, 0), 0u);
-    ASSERT_NE(glyph, nullptr);
-    EXPECT_EQ(font.glyph_form(addr(glyph), 0, 0, 0, 0, 0), 0u)
-        << "GlyphGetGlyphForm returns the default form";
-    EXPECT_EQ(font.metrics_form(addr(glyph), 0, 0, 0, 0, 0), 0u)
-        << "GlyphGetMetricsForm returns the default form";
+TEST(Font, StyleFrameScalePixelRoundTrips) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SetFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetFn>(api.set_scale_pixel);
+    ASSERT_NE(set_pixel, nullptr);
+    EXPECT_EQ(set_pixel((void*)addr(frame), 16.0f, 20.0f), 0) << "SetScalePixel returns success";
     float w = 0.0f, h = 0.0f;
-    EXPECT_EQ(font.glyph_scale(addr(glyph), addr(&w), addr(&h), 0, 0, 0), 0u)
-        << "GlyphGetScalePixel returns success";
-    EXPECT_EQ(w, 1.0f) << "GlyphGetScalePixel writes horizontal scale";
-    EXPECT_EQ(h, 1.0f) << "GlyphGetScalePixel writes vertical scale";
-    uint8_t mem[64]{};
-    EXPECT_EQ(font.delete_glyph(addr(mem), addr(&glyph), 0, 0, 0, 0), 0u)
-        << "DeleteGlyph releases the glyph";
+    EXPECT_EQ(api.get_scale_pixel(addr(frame), addr(&w), addr(&h), 0, 0, 0), 0u)
+        << "GetScalePixel reads the set frame";
+    EXPECT_EQ(w, 16.0f) << "GetScalePixel returns the set width";
+    EXPECT_EQ(h, 20.0f) << "GetScalePixel returns the set height";
 }
 
-TEST(Font, RenderScaledKerningReturnsSuccess) {
-    const FontGlyphQueries font = font_glyph_queries();
-    ASSERT_TRUE(font.registered());
-    uint8_t mem[64]{};
-    void* library = nullptr;
-    ASSERT_EQ(font.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
-    ASSERT_NE(library, nullptr);
-    void* handle = nullptr;
-    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
-    ASSERT_NE(handle, nullptr);
-    float kerning[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    EXPECT_EQ(font.scaled_kerning(addr(handle), 'A', 'V', addr(kerning), 0, 0), 0x80460061u)
-        << "GetRenderScaledKerning refuses without a bound renderer";
-    EXPECT_EQ(kerning[0], 0.0f) << "scaled kerning still zeroes the out-block on refusal";
-    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+TEST(Font, StyleFrameUnsetScaleRefusesReads) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SetFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetFn>(api.set_scale_pixel);
+    ASSERT_NE(set_pixel, nullptr);
+    ASSERT_EQ(set_pixel((void*)addr(frame), 16.0f, 20.0f), 0);
+    EXPECT_EQ(api.unset_scale(addr(frame), 0, 0, 0, 0, 0), 0u) << "UnsetScale returns success";
+    float w = 0.0f, h = 0.0f;
+    EXPECT_EQ(api.get_scale_pixel(addr(frame), addr(&w), addr(&h), 0, 0, 0), 0x80460058u)
+        << "GetScalePixel refuses after UnsetScale";
+}
+
+TEST(Font, StyleFrameSlantClampsAndRoundTrips) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    using SlantFn = int32_t (*)(void*, float);
+    auto set_slant = reinterpret_cast<SlantFn>(api.set_slant);
+    ASSERT_NE(set_slant, nullptr);
+    EXPECT_EQ(set_slant((void*)addr(frame), 2.0f), 0) << "SetEffectSlant clamps out-of-range";
+    float slant = 0.0f;
+    EXPECT_EQ(api.get_slant(addr(frame), addr(&slant), 0, 0, 0, 0), 0u)
+        << "GetEffectSlant reads the clamped frame";
+    EXPECT_EQ(slant, 1.0f) << "SetEffectSlant clamps to +1.0";
+}
+
+// The weight is stored as an offset from the neutral 1.0, clamped to +/-0.04, and the getter adds
+// the 1.0 back (libSceFont.native.sprx +0xc3a0 / +0xc600). Storing the raw weight instead reads the
+// neutral 1.0 back as 2.0.
+TEST(Font, StyleFrameEffectWeightIsStoredAsAClampedOffset) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    using WeightFn = int32_t (*)(void*, float, float, uint32_t);
+    auto set_weight = reinterpret_cast<WeightFn>(api.set_weight);
+    ASSERT_NE(set_weight, nullptr);
+    struct Case {
+        float in_x, in_y, want_x, want_y;
+    };
+    const Case cases[] = {
+        {1.0f, 1.0f, 1.0f, 1.0f},   // neutral round-trips
+        {1.5f, 0.5f, 1.04f, 0.96f},   // clamped to the band on both sides
+        {1.02f, 0.99f, 1.02f, 0.99f},   // inside the band, kept
+    };
+    for (const Case& c : cases) {
+        uint8_t frame[0x60]{};
+        ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+        EXPECT_EQ(set_weight(frame, c.in_x, c.in_y, 0), 0) << "SetEffectWeight returns success";
+        float stored_x = 0.0f, stored_y = 0.0f;
+        std::memcpy(&stored_x, frame + 0x1c, sizeof(stored_x));
+        std::memcpy(&stored_y, frame + 0x20, sizeof(stored_y));
+        EXPECT_NEAR(stored_x, c.want_x - 1.0f, 1e-6f) << "frame+0x1c holds the offset from 1.0";
+        EXPECT_NEAR(stored_y, c.want_y - 1.0f, 1e-6f) << "frame+0x20 holds the offset from 1.0";
+        float x = 0.0f, y = 0.0f;
+        uint32_t mode = 0xdeadbeef;
+        EXPECT_EQ(api.get_weight(addr(frame), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
+        EXPECT_NEAR(x, c.want_x, 1e-6f) << "GetEffectWeight x for input " << c.in_x;
+        EXPECT_NEAR(y, c.want_y, 1e-6f) << "GetEffectWeight y for input " << c.in_y;
+        EXPECT_EQ(mode, 0u) << "GetEffectWeight reports mode 0";
+    }
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(static_cast<uint32_t>(set_weight(frame, 1.0f, 1.0f, 1)), 0x80460002u)
+        << "a non-zero mode is rejected";
+    float x = 0.0f;
+    EXPECT_EQ(api.get_weight(addr(frame), addr(&x), 0, 0, 0, 0), 0x80460058u)
+        << "a rejected set leaves the weight unset";
+}
+
+// libSceFont.native.sprx +0xabb0: the frame pointer lands at surface+0x28 whether or not it is
+// null, the dword at surface+0x30 is zeroed, and surface+0xe bit 0 says whether a frame is set. A
+// non-null frame without the magic is refused with nothing written.
+TEST(Font, RenderSurfaceSetStyleFrameRecordsTheFrame) {
+    const FontStyleFrameApi api = font_style_frame_api();
+    ASSERT_TRUE(api.registered());
+    uint8_t frame[0x60]{};
+    ASSERT_EQ(api.init(addr(frame), 0, 0, 0, 0, 0), 0u);
+    auto read_ptr = [](const uint8_t* p) {
+        uint64_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+    auto read_u32 = [](const uint8_t* p) {
+        uint32_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+
+    uint8_t surface[0x80];
+    std::memset(surface, 0xcc, sizeof(surface));
+    surface[0xe] = 0xfe;
+    EXPECT_EQ(api.set_surface(addr(surface), addr(frame), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(surface[0xe], 0xffu) << "a frame sets bit 0 of surface+0xe and keeps the rest";
+    EXPECT_EQ(read_ptr(surface + 0x28), addr(frame)) << "the frame pointer lands at surface+0x28";
+    EXPECT_EQ(read_u32(surface + 0x30), 0u) << "the dword at surface+0x30 is zeroed";
+    EXPECT_EQ(read_u32(surface + 0x34), 0xccccccccu) << "the write stops at the dword";
+
+    std::memset(surface, 0xcc, sizeof(surface));
+    EXPECT_EQ(api.set_surface(addr(surface), 0, 0, 0, 0, 0), 0u) << "a null frame detaches";
+    EXPECT_EQ(surface[0xe], 0xccu & 0xfeu) << "a null frame clears bit 0 of surface+0xe";
+    EXPECT_EQ(read_ptr(surface + 0x28), 0u) << "a null frame is still stored at surface+0x28";
+    EXPECT_EQ(read_u32(surface + 0x30), 0u) << "the dword at surface+0x30 is zeroed";
+
+    uint8_t bogus[0x60]{};
+    std::memset(surface, 0xcc, sizeof(surface));
+    EXPECT_EQ(api.set_surface(addr(surface), addr(bogus), 0, 0, 0, 0), 0x80460002u)
+        << "a frame without the magic is refused";
+    for (size_t i = 0; i < sizeof(surface); ++i)
+        ASSERT_EQ(surface[i], 0xccu) << "a refused frame writes nothing, byte " << i;
+    EXPECT_EQ(api.set_surface(0, addr(frame), 0, 0, 0, 0), 0x80460002u)
+        << "a null surface is refused";
 }

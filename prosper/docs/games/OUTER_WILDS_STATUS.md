@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Outer Wilds (`PPSA08102`) — status
 
 Tracker: [#3804](https://github.com/mattias800/prosper/issues/3804). Engine: Unity 2019.4.39f1 / IL2CPP.

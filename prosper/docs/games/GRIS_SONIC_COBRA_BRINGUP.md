@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # GRIS, Sonic Origins, and Space Adventure Cobra bring-up
 
 Validated on Linux on 2026-07-25, with GRIS opening gameplay and Cobra tutorial combat revalidated
@@ -19,7 +24,7 @@ no new run was made for that pass. The rest of the document is unchanged.
 
 ### GRIS
 
-![GRIS — New Game title](../screenshots/issue-1356-gris-title.png)
+![GRIS — New Game title](../screenshots/issue-1356-gris-title.webp)
 
 Route: `scripts/gris/reach-title-screen.pad`. The title appears without input; the comments-only
 route keeps a neutral scripted controller connected and prevents an evidence run from selecting
@@ -48,7 +53,7 @@ The wall in front of it, from a **default launch with no input**: sample 21 of 4
 
 ### Space Adventure Cobra — The Awakening
 
-![Space Adventure Cobra — The Awakening title](../screenshots/issue-1356-space-adventure-cobra-title.png)
+![Space Adventure Cobra — The Awakening title](../screenshots/issue-1356-space-adventure-cobra-title.webp)
 
 ![Space Adventure Cobra — tutorial combat](../../../assets/screenshots/space-adventure-cobra.webp)
 

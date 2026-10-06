@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Stray (`PPSA02101`) — status
 
 Tracker: [#2883](https://github.com/mattias800/prosper/issues/2883). Engine: Unreal Engine 4.
@@ -615,6 +620,18 @@ the block from the `[udcand]` implied offset is falsified — and this run agree
 independently: `[udmap] … specials raw=[0,20) seeded=0 implied=0`, i.e. the implied-seed search finds
 no better offset. What is new is that the corruption is a **partial, mid-descriptor overwrite from the
 following frame's fold**, which is a sharper statement than "the block is wrong".
+
+**Update (#4540): the q3 "DcbFinal" fold was not a hardware queue.** It was prosper executing
+`sceAgcCbBranch` (`w1KFAHVqpaU`) targets at the moment the guest *recorded* the branch, against
+whatever pipeline the previous fold left bound. The firmware writes a 14-dword conditional
+indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the same and runs the
+target when the command processor reaches the packet inside the buffer that carries it. So there is
+no separate ring whose ordering contract was unknown, and the split-register-file lever
+(`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
+26/25/5 to 6/6/2 (vertex/fragment/compute, `prosper-app` default launch with `PROSPER_NULL_PAGE=1`,
+240 s, no input; one control run on main, two runs with the change, and a third with the change read
+11/12/4). That is the likely producer of the "following frame's fold" overwrite above; **not yet
+re-measured on this title**.
 
 **Two things here bear on #305 and belong in that issue, not this one.** First, the recorded frontier
 signature — "the pipeline was bound in a `q1` (Dcb) fold *N*, while the … user-data block was written

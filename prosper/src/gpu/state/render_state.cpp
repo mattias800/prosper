@@ -122,7 +122,10 @@ int32_t scale_scissor_boundary(int32_t value, float scale, bool lower) {
 // other values as their own operation: RESOLVE becomes cb_resolve, and DCC_DECOMPRESS keeps the
 // AGC helper-program handling in gpu_execute.hpp. Every REMAINING value of the 3-bit field is
 // reported here. ELIMINATE_FAST_CLEAR(2) is a color-block metadata operation that hardware performs
-// INSTEAD of shading and prosper still runs as an ordinary color draw — that gap is #1588. Values
+// INSTEAD of shading. MODE alone cannot identify it (titles latch MODE=2 onto ordinary draws that
+// must still write), so the operation is recognised in gpu_execute.hpp from AGC's own rectangle
+// vertex program (efc_helper_program.hpp, #1588) and every other MODE=2 draw still runs as an
+// ordinary color draw; this counter sees both, because it runs before the vertex program is known. Values
 // 4, 5 and 7 are grouped with it because they are simply "not one of the values prosper models",
 // NOT because their operation is known: 4 and 5 are decompress modes in the published enum, 7 is
 // not defined there, and no title here exercises any of them.
@@ -188,9 +191,10 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // measurable for #1706. The atomic pre-increment gives every caller a distinct value, so no
     // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
-        fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
-                        "color-block operation -> still executed as an ordinary color "
-                        "draw (count=%llu)\n",
+        fprintf(stderr,
+                "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
+                "color-block operation -> executed as an ordinary color draw unless "
+                "it is AGC's eliminate-fast-clear rectangle (count=%llu)\n",
                 mode, static_cast<unsigned long long>(count));
 }
 
@@ -333,6 +337,9 @@ bool legacy_cb_disable_mask_enabled() {
 }
 
 // PROSPER_CB_EFC_NO_COLOR=1 — diagnostic A/B lever for #1588, DEFAULT OFF, never a shipping mode.
+// The shipping behaviour is narrower: gpu_execute.hpp suppresses colour only for AGC's own
+// eliminate-fast-clear rectangle (efc_helper_program.hpp). This lever still acts on EVERY draw that
+// decodes as MODE=2, so it remains the superset arm for measuring what the narrow rule leaves out.
 //
 // ELIMINATE_FAST_CLEAR is a colour-block metadata operation hardware performs INSTEAD of shading:
 // it expands a compressed fast-clear representation into explicit pixels. prosper does not model

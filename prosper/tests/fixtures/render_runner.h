@@ -2007,6 +2007,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         std::fprintf(stderr, "[vk] deterministic storage word reads %s (robustBufferAccess2=%d)\n",
             r.deterministic_storage_reads ? "ENABLED" : "unavailable",
             static_cast<int>(robust2_features.robustBufferAccess2));
+        // Say once, in both directions, whether this device can run a guest Wave64 pixel shader
+        // at its own width. On a narrower one, the per-shader [wave64-unsupported] lines that
+        // follow are a consequence of the device, and that needs saying in plain words.
+        prosper::diagnostics::perf::announce_fragment_wave64_host(
+            {r.subgroup_size_control,
+             (r.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0,
+             (r.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0, r.min_subgroup_size,
+             r.max_subgroup_size});
         if (mesh_features.meshShader) {
             r.cmd_draw_mesh_tasks = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
                 vkGetDeviceProcAddr(r.dev, "vkCmdDrawMeshTasksEXT"));

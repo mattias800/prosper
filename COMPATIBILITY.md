@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-10-05
+Last updated: 2026-10-06
 
 ## Summary
 
@@ -78,7 +78,7 @@ Last updated: 2026-10-05
 | *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Rung 0 — every frame is a flat 4K clear, white then magenta. Two further defects on the same boot: a GPU hard recovery from a compute submit, in 2 of 3 runs and both naming the same program ([#2935](https://github.com/mattias800/prosper/issues/2935)), and the guest's own out-of-memory assert in the third ([#2908](https://github.com/mattias800/prosper/issues/2908) — recorded there as shared with *Khazan*, which is falsified: Sifu does not import `libScePsml` at all, and that is Khazan's cause) | [#2885](https://github.com/mattias800/prosper/issues/2885) |
 | *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Rung 2 — the title screen renders continuously on a default launch (40/40 samples over 200 s), and a routed run passes it on Cross and plays the **complete intro cinematic** in full colour to t≈65 s. The first level does not render. **The route needs an isolated `PROSPER_SAVE0`/`PROSPER_SAVEDATA_DIR`**: resuming a stale save at the shared default location turns the whole run black and looks exactly like a composite defect ([#2932](https://github.com/mattias800/prosper/issues/2932)). Route: `prosper/scripts/unbound-PPSA03274/` | [#2886](https://github.com/mattias800/prosper/issues/2886) |
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
-| *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
+| *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K on a default launch. The ELIMINATE_FAST_CLEAR passes that used to paint over the composite now write no colour ([#4568](https://github.com/mattias800/prosper/pull/4568), [#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
 | *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 3 — a fresh-save route accepts NEW EXPEDITION, clears the Wake Up prompt and reaches a recognizable wooded first-person scene with Look Around / Move prompts. The owner saw the in-game world and reported largely correct rendering, but an F9 frame has a large white blob. The title wordmark is absent against the supplied PS5 title oracle; gameplay has no matching PS5 oracle, and speed remains unverified against hardware. Route: `prosper/scripts/outer-wilds-PPSA08102/`. [Evidence and limits](prosper/docs/games/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
 | *Kena: Bridge of Spirits* | `PPSA01802` | Unreal Engine 4 | 🔬 Rung 2 — on Windows/NVIDIA a pad route reaches the main menu, the difficulty picker, the brightness calibration screen, the first level load, the full intro narration and the first gameplay prompt (*"Press … to Pulse"*, the button drawn as a pad glyph) — but **the world behind the prompt does not draw**: every sampled gameplay frame is black apart from the prompt. The leading suspect is the title's wave64 fragment shaders, which a 32-wide NVIDIA device skips ([#2147](https://github.com/mattias800/prosper/issues/2147)), but that is not established per draw, and a Linux trace of the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)) is a reason to check composition first. The two crashes before this point are fixed on `main` ([#3814](https://github.com/mattias800/prosper/pull/3814), [#3817](https://github.com/mattias800/prosper/pull/3817)). Route: `prosper/scripts/kena/` | [#3787](https://github.com/mattias800/prosper/issues/3787) |
@@ -88,6 +88,8 @@ Last updated: 2026-10-05
 | *Hades II* | `PPSA36082` | — | 🔬 Rung 0 — startup requests an approximately 32 GiB guest allocation, which is rejected; the main guest thread then faults at a null address, before any frame | [#4023](https://github.com/mattias800/prosper/issues/4023) |
 | *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — the owner previously selected New Game. A fresh normal rerun renders first-boot setup through settings-saved Continue, then retains that image while host presents advance; correct title-background rendering remains unverified. The earlier later-sequence GPU timeout is separate ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
 | *Hollow Knight: Silksong* | `PPSA12544` | Unity 6 | 🚧 Opening Moss Grotto gameplay, played and confirmed by eye by the owner; every menu and in-game string renders since #4120 | [#4121](https://github.com/mattias800/prosper/issues/4121) |
+| *Rayman 30th Anniversary Edition* | `PPSA33016` | Custom (libretro front end) | 🚧 The first level of *Rayman* (1995) in play at 60 fps on the title's very first launch: health warning, game carousel, save-slot menu, level intro and Pink Plant Woods with its HUD. Reached by hand from a controller; no input route and no guard yet | [#4552](https://github.com/mattias800/prosper/issues/4552) |
+| *MOUSE: P.I. For Hire* | `PPSA26578` | Unity / IL2CPP | 🔬 Rung 2 — menus and first-person gameplay are reached and the HUD draws, but the world is mostly black (two lamps and a patch of floor) and the game runs at about 6 fps; one compute program is skipped every frame, fragment draws are dropped, and oversized buffers are cut at 64 MiB ([#4553](https://github.com/mattias800/prosper/issues/4553), [#4555](https://github.com/mattias800/prosper/issues/4555), [#4554](https://github.com/mattias800/prosper/issues/4554)) | [#4556](https://github.com/mattias800/prosper/issues/4556) |
 
 ## At a glance
 
@@ -101,12 +103,12 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 29 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 19 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 30 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 20 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
 | **Boots, but no frame with content** (rung 0) | 12 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 62 |
+| Total tracked | 64 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -855,6 +857,24 @@ The owner plays the opening in Moss Grotto and confirms it by eye; nine of the o
 that session replay as the `silksong` guard (`tools/snapshot/snaps.py check silksong`). See the
 [tracker](https://github.com/mattias800/prosper/issues/4121) and
 [`prosper/docs/games/SILKSONG_STATUS.md`](prosper/docs/games/SILKSONG_STATUS.md).
+
+## Rayman 30th Anniversary Edition — `PPSA33016`
+
+<p align="center"><img src="assets/screenshots/rayman30-pink-plant-woods-gameplay.webp" alt="Rayman 30th Anniversary Edition: Rayman on a vine in Pink Plant Woods, lives and ting counters drawn, CRT filter on; Linux prosper-app, RADV, unscripted run driven from a controller, flip 3900"></p>
+<p align="center"><img src="assets/screenshots/rayman30-game-carousel.webp" alt="Rayman 30th Anniversary Edition: the collection's game carousel on Rayman, PlayStation 1995; Linux prosper-app, RADV, same run, flip 1500"></p>
+
+The collection boots and plays the first level of the original *Rayman* at its full 60 frames per
+second, with no draw dropped, on the first launch anyone made of it. The path was taken by hand on a
+controller, so there is no input route yet. See the
+[tracker](https://github.com/mattias800/prosper/issues/4552).
+
+## MOUSE: P.I. For Hire — `PPSA26578`
+
+<p align="center"><img src="assets/screenshots/mouse-pi-first-gameplay-dark.webp" alt="MOUSE: P.I. For Hire in first-person gameplay: objective, compass and health badge drawn over a scene that is black except for two wall lamps and a patch of lit floor; Linux prosper-app, RADV, interactive play by the owner, F9 grab"></p>
+
+Gameplay is reached and the HUD is complete, but most of the world is dark and the game runs at
+about 6 frames per second. The picture above is the defect, not the game's look. See the
+[tracker](https://github.com/mattias800/prosper/issues/4556).
 
 ## Reproducible routes
 

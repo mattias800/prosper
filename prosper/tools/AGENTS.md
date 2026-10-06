@@ -413,6 +413,9 @@ capture/replay without requiring an importable system Python module.
   published with and the 36 that is correct (#2070). There is no platform-independent answer to give,
   and `s_ok` is a case where the platform-blind count is wrong on *every* platform, so the tool
   refuses to pick for you. See `re/README.md`.
+- **`progress/progress.py`** — static HLE coverage census per registered Sony NID (real handler vs
+  placeholder-only), grouped by `src/hle/<area>/`, built on `re/hle_handler_map.py`'s parser. See
+  `progress/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,
@@ -565,6 +568,18 @@ capture/replay without requiring an importable system Python module.
   the file `unbroken` (#2108). What it does **not** cover, stated so silence is not read as
   coverage: HTML tables, delimiter-less pipe blocks (no header to measure against), whether an
   escaped pipe was what the author meant, and fenced regions, which are skipped deliberately.
+- **`docs/check_arch_docs.py`** — keeps `prosper/docs/spec/` and `prosper/docs/adr/` live: every spec
+  rule carries a `Status:` and an `Enforcement:` whose `ratchet:`/`adr:` references resolve, every
+  `check_arch_ratchet.py` rule is cited by some spec rule, the layer table in `spec/layers.md` matches
+  `LAYER_ORDER` (`--write` regenerates it), and with `--base` an accepted ADR is never edited or
+  deleted, only superseded. It proves references are live, not that a rule is true. Runs in the
+  `Docs` CI job; tests are `docs/test_check_arch_docs.py` (pytest).
+- **`docs/check_doc_meta.py`** -- every document under `prosper/docs/` (outside `spec/` and
+  `adr/`, which `check_arch_docs.py` covers) opens with `kind:` and `status:` frontmatter, and every
+  relative Markdown link in a tracked `.md` file resolves. Code spans and fences are skipped, and
+  the generated `PROGRESS_TRACKER.md` is not link-checked (fix its links in the source issue). A
+  `template: design` document must carry the design-doc sections. Runs in the `Docs` CI job; tests
+  are `docs/test_check_doc_meta.py`.
 - **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
   reference in the repository must name a row that exists. `check_numbered_table.py` validates the
   TABLE and has no idea anything cites it, so until this existed a reference to a row that never

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # The House of the Dead 2: Remake status
 
 Tracking: [#1896](https://github.com/mattias800/prosper/issues/1896)

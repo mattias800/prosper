@@ -19,6 +19,37 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-06
+
+### Two titles stop losing their picture to a clean-up pass
+
+*Beast of Reincarnation* now shows its Digital Deluxe bonus dialog on a default launch, and *Dragon Quest VII Reimagined*'s adventure-log menu holds steady instead of flashing white and blue ([#4568](https://github.com/mattias800/prosper/pull/4568)).
+
+Both titles ask the GPU for an "eliminate fast clear" pass: a metadata clean-up that writes no colour on real hardware. prosper keeps its render targets uncompressed, so there is nothing to clean up, but it was running the pass as an ordinary draw. That painted whatever pixel shader happened to be bound over the whole frame. The pass is now recognised by the small rectangle program the system library draws it with, so the same mode setting left latched on an ordinary draw still renders.
+
+<p align="center"><img src="assets/screenshots/beast-reincarnation-deluxe-dialog.webp" alt="Beast of Reincarnation: Digital Deluxe Version bonus received dialog listing Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, with an OK button; Linux tools/screenshot, RADV, default launch, no input, about 20 s"></p>
+<p align="center"><img src="assets/screenshots/dq7-adventure-log-menu-efc.webp" alt="Dragon Quest VII Reimagined adventure-log menu with three unused slots over the dimmed title background; Linux tools/screenshot, RADV, scripts/dragon-quest-vii/reach-title-screen.pad, about 40 s"></p>
+
+### Kena's refused shaders: 56 programs down to about 10
+
+No new picture yet; Kena's world is still black behind the title menu. But the number of shader programs prosper refuses to translate there fell from 56 to about 10 over four fixes, and the dropped vertex draws fell from about 4,300 to about 800 every five seconds ([#4576](https://github.com/mattias800/prosper/pull/4576), [#4584](https://github.com/mattias800/prosper/pull/4584), [#4587](https://github.com/mattias800/prosper/pull/4587), [#4588](https://github.com/mattias800/prosper/pull/4588); [tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+### Rayman 30th Anniversary Edition plays its first level on the first try
+
+A title nobody had launched before boots to its game carousel and plays the first level of the original Rayman at a steady 60 frames per second ([tracker #4552](https://github.com/mattias800/prosper/issues/4552)). These frames come from an unscripted run driven from a controller.
+
+<p align="center"><img src="assets/screenshots/rayman30-health-warning.webp" alt="Rayman 30th Anniversary Edition health warning screen; Linux prosper-app, RADV, unscripted run driven from a controller, flip 300"></p>
+<p align="center"><img src="assets/screenshots/rayman30-game-carousel.webp" alt="Rayman 30th Anniversary Edition game carousel on Rayman, PlayStation 1995, with Enhancements and Play Game prompts; same run, flip 1500"></p>
+<p align="center"><img src="assets/screenshots/rayman30-choose-a-game.webp" alt="Rayman's Choose a Game save-slot menu with three empty slots; same run, flip 2700"></p>
+<p align="center"><img src="assets/screenshots/rayman30-dream-forest-intro.webp" alt="Rayman level intro: The Dream Forest, Pink Plant Woods, seen through binoculars; same run, flip 3300"></p>
+<p align="center"><img src="assets/screenshots/rayman30-pink-plant-woods-gameplay.webp" alt="Rayman on a vine in Pink Plant Woods with lives and ting counters drawn; same run, flip 3900"></p>
+
+### MOUSE: P.I. For Hire reaches gameplay, in the dark
+
+MOUSE: P.I. For Hire gets through its menus into first-person gameplay with a complete HUD, but most of the world is black and it runs at about 6 frames per second ([tracker #4556](https://github.com/mattias800/prosper/issues/4556)). The darkness is the defect, not the game's look.
+
+<p align="center"><img src="assets/screenshots/mouse-pi-first-gameplay-dark.webp" alt="MOUSE: P.I. For Hire in gameplay: objective, compass and health badge over a scene that is black except for two wall lamps and a lit patch of floor; Linux prosper-app, RADV, interactive play by the owner, F9 grab"></p>
+
 ## 2026-10-05
 
 ### Space Adventure Cobra's world is back in gameplay

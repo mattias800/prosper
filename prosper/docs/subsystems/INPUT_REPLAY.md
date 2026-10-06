@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
 > **Status (2026-07-19): frame/pad-read anchoring and recording, route loading, and the opt-in deterministic clock have landed.**

@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Packed native storage-image GPU retile
 
 Tracking: [#3407](https://github.com/mattias800/prosper/issues/3407).

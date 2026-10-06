@@ -16,6 +16,16 @@ struct RefusedDrawShaders {
     uint64_t vs_address, ps_address, es_address, command_order;
     size_t max_dwords, vs_words, gs_words, fs_words;
     bool vs_failed, ps_failed;
+    // Set when the draw was refused before any recompile was attempted (the owned-wave gate), so
+    // the index line says why. Its first_bad_* fields are the generic coverage census, not a cause.
+    const char* refusal = nullptr;
+    // The draw's NGG shape (vgt_shader_stages.hpp) and how its vertex program is linked: "prolog"
+    // (a prolog chained to a main by s_setpc), "fused" (AGC's fused-back form, VS address differs
+    // from the ES address) or "none". A chained main is dumped beside its prolog as "vsmain", so an
+    // offline reader has both halves (#3135 P0).
+    const char* ngg_class = nullptr;
+    const char* link = nullptr;
+    uint64_t chain_address = 0;
 };
 
 void note_refused_draw_shaders(const RefusedDrawShaders& shaders);

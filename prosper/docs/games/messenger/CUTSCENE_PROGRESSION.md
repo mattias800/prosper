@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Title/loading screen → cutscene: progression investigation (2026-07-07)
 
 **Goal:** advance the game past the loading screen (the "Werewolf" title art) into the first cutscene
