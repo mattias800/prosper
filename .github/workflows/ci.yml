@@ -552,6 +552,13 @@ jobs:
       # The check is `--check`, which re-encodes to memory and exits 1 if any file WOULD change. It
       # skips a file that is already WebP and within the width cap, so a conforming tree goes green
       # -- a gate that always reports work to do is one nobody can satisfy, and would be turned off.
+      # Paths, the other half of the screenshot convention: every new capture lives at
+      # assets/screenshots/<TITLE_ID>-<slug>|cross-title|app/<YYYY-MM-DD>-<what>[-i<issue>].webp
+      # (spec ASSET-1, ADR 0026). Files committed before the rule are grandfathered by a list that
+      # may only shrink, so this changes nothing for existing captures.
+      - name: Verify committed screenshots follow the path convention
+        run: python3 prosper/tools/screenshots/check_screenshot_paths.py --github --root .
+
       - name: Verify committed screenshots are within the size convention
         run: |
           python3 -m pip install --quiet Pillow

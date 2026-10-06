@@ -1,5 +1,10 @@
 # `prosper/tools/screenshots/` — keeping committed imagery from swallowing the repository
 
+Two gates: `shrink.py` keeps every capture a 1920-wide WebP, and `check_screenshot_paths.py` keeps
+it at `assets/screenshots/<TITLE_ID>-<slug>|cross-title|app/<YYYY-MM-DD>-<what>[-i<issue>].webp`
+(spec `ASSET-1`, ADR 0026). Name a new capture that way before committing it. Captures committed
+before the path rule are listed in `legacy_screenshot_paths.txt`; that list only shrinks.
+
 One tool, `shrink.py`, and one rule: **a screenshot committed to `assets/screenshots/` is a 1920-wide
 WebP, not a 4K PNG.**
 
