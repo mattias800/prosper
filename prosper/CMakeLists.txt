@@ -5317,6 +5317,15 @@ endif()
                $<TARGET_FILE:test_compute_transfer_mip_chain>)
       set_tests_properties(compute_transfer_mip_chain PROPERTIES TIMEOUT 60)
 
+      # Live dispatches over a padded linear 2D image (sampled upload, sampled span, compute ->
+      # compute transfer borrow) and a compute pass naming a renderer target's DCC plane.
+      prosper_add_gtest(test_compute_linear_row_pitch
+        SOURCES tests/gpu/execute/test_compute_linear_row_pitch.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        ENVIRONMENT PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
+        PROPERTIES TIMEOUT 60)
+
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
       target_include_directories(test_near_full_storage_authority PRIVATE tests frontends)

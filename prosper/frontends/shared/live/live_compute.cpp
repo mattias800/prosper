@@ -8325,6 +8325,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      sampled_nc >= 1 && sampled_nc <= 4;
             const bool sampled_f32 = sampled_float32;
             size_t sampled_guest_need = 0;
+            // The byte count a compute STORAGE producer of this same image keys its retained result
+            // by, when that differs from `sampled_guest_need`. Only a padded linear 2D image differs:
+            // the sampled side spans the padded rows, while the storage arm still sizes the image as
+            // tight rows (`linear_guest_bytes` below). The retained native image does not depend on
+            // the guest pitch, so the transfer borrow must look it up under the producer's count.
+            size_t sampled_producer_guest_bytes = 0;
             const uint8_t* sampled_guest_source = nullptr;
             const uint8_t* sampled_dcc_metadata = nullptr;
             size_t sampled_dcc_metadata_bytes = 0;
@@ -8429,6 +8435,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
                             : (row_pitch ? row_pitch * (r->height - 1u) + size_t(r->width) * bpt
                                          : static_cast<size_t>(volume_texels) * bpt);
+                        if (!r->tile_mode && row_pitch)
+                            sampled_producer_guest_bytes = static_cast<size_t>(volume_texels) * bpt;
                     }
                 } else {
                     skip_image(r, "sampled format not decodable yet"); break;
@@ -8656,8 +8664,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (bi.mip_levels == 1u && native_transfer_dimension && transfer_hostless &&
                         transfer_format_match && transfer_validation_enabled &&
                         transfer_native_defined) {
+                        // A padded linear 2D producer keyed its result by tight rows; see
+                        // `sampled_producer_guest_bytes`. Keying by the padded span here would miss
+                        // it and fall back to guest bytes the storage writeback laid out tight.
+                        const size_t transfer_key_bytes = sampled_producer_guest_bytes
+                            ? sampled_producer_guest_bytes : sampled_guest_need;
                         ComputeImageCacheKey storage_key = storage_image_cache_key(
-                            *r, static_cast<uint32_t>(sampled_guest_need),
+                            *r, static_cast<uint32_t>(transfer_key_bytes),
                             transfer_native_format);
                         bool borrowed = ctx.borrow_cached_image_for_compute_transfer(
                             storage_key, *r, bi.compute_transfer_seed, trace,
@@ -8677,7 +8690,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             storage_identity.format = DataFormat::Uint32;
                             storage_key = storage_image_cache_key(
                                 storage_identity,
-                                static_cast<uint32_t>(sampled_guest_need),
+                                static_cast<uint32_t>(transfer_key_bytes),
                                 transfer_alias_storage_format);
                             borrowed = ctx.borrow_cached_image_for_compute_transfer(
                                 storage_key, *r, bi.compute_transfer_seed, trace,

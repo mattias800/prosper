@@ -4289,8 +4289,10 @@ int main() {
 
             // The final metadata scan is an independent promotion gate.  Model an unresolved DCC
             // plane after otherwise successful data writeback and require both correct guest bytes
-            // and absence of cache/transfer publication. 0x20 is a code the fast-clear decode does
-            // not own (a uniform 0x40 now reads as its clear colour, which is not "unresolved").
+            // and absence of cache/transfer publication. 0x20 is GFX8-10's clear-to-register code:
+            // the colour lives in the clear-colour registers, not in the control plane, so the
+            // fast-clear decode does not own it and the plane stays unresolved. (A uniform 0x40 is a
+            // self-contained clear the decode now owns, so it no longer models an unresolved plane.)
             std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x20);
             for (size_t index = 0; index < img_src.size(); ++index)
                 img_src[index] = static_cast<uint8_t>(index * 43u + 3u);
