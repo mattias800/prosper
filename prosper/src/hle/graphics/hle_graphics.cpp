@@ -241,6 +241,9 @@ namespace {
             bool registered = false;
             // The legacy attribute's pitch_in_pixel (0x14); 0 when the attribute states none
             // (attribute2 has no pitch field), meaning rows are `width` pixels apart.
+            // CONFIDENCE: MED for that width default -- it is what the presenter has always read,
+            // and it is unverified for widths whose row is not a multiple of 256 bytes (1440, 720,
+            // 1366); 1280, 1920, 2560 and 3840 are unaffected.
             uint32_t pitch_pixels = 0;
         } sets[4];
         uint32_t width = 0, height = 0;
@@ -475,7 +478,10 @@ bool videoout_buffer_bytes(const VideoOutBufferSnapshot& buffer, size_t& bytes) 
 void videoout_copy_pixels_locked(uint8_t* dst, const VideoOutBufferSnapshot& buffer, size_t bytes) {
     const auto* src = reinterpret_cast<const uint8_t*>((uintptr_t)buffer.address);
     const size_t row = (size_t)buffer.width * 4u;
-    if (buffer.row_pitch_bytes <= row) {
+    // A tiled buffer's bytes are a swizzle footprint, not rows: copy them as they are.
+    const bool linear =
+        !gpu::tile_mode_is_tiled(gpu::videoout_scanout_tile_mode(buffer.tiling_mode, 4));
+    if (!linear || buffer.row_pitch_bytes <= row) {
         std::memcpy(dst, src, bytes);
         return;
     }
@@ -635,8 +641,11 @@ static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t add
     // State this buffer's linear row pitch to every reader and writer of its guest memory (compute
     // storage writeback, graphics and compute sampled reads), the same pitch the presenter uses.
     const uint32_t pitch_bytes = std::max(config.pitch_pixels, config.width) * 4u;
-    gpu::register_guest_linear_texture_layout(address, (size_t)pitch_bytes * config.height,
-                                              pitch_bytes);
+    const bool linear =
+        !gpu::tile_mode_is_tiled(gpu::videoout_scanout_tile_mode(config.tiling_mode, 4));
+    if (linear)   // only linear lookups consult the registry; a tiled buffer states no row pitch
+        gpu::register_guest_linear_texture_layout(address, (size_t)pitch_bytes * config.height,
+                                                  pitch_bytes);
     videoout_seed_authorship_locked(slot, address, config.width, config.height);
     static unsigned reported = 0;          // guarded by the registry lock, like everything here
     constexpr unsigned kReportCap = 64;
@@ -644,9 +653,10 @@ static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t add
         ++reported;
         std::fprintf(stderr,
                      "[videoout] scanout buffer[%d] set=%d addr=0x%llx %ux%u fmt=0x%llx tile=%u "
-                     "bytes=%llu gen=%llu via=%s\n",
+                     "pitch=%u bytes=%llu gen=%llu via=%s\n",
                      slot, set, (unsigned long long)address, config.width, config.height,
                      (unsigned long long)config.pixel_format, (unsigned)config.tiling_mode,
+                     linear ? pitch_bytes : 0u,
                      (unsigned long long)config.width * (unsigned long long)config.height * 4ull,
                      (unsigned long long)generation, via);
         if (reported == kReportCap)
@@ -929,8 +939,20 @@ HLE(g_vo_open) {
     return (uint64_t)(int64_t)handle;
 }
 HLE(g_vo_close) {
-    std::lock_guard<std::mutex> lk(g_vo_handle_mx);
-    if (g_vo_handles.erase((int32_t)a0) != 1) return kVoErrorInvalidHandle;
+    bool last = false;
+    {
+        std::lock_guard<std::mutex> lk(g_vo_handle_mx);
+        if (g_vo_handles.erase((int32_t)a0) != 1) return kVoErrorInvalidHandle;
+        last = g_vo_handles.empty();
+    }
+    if (last) {
+        // With no VideoOut port left, the display buffers' stated row pitches no longer describe
+        // anything the presenter reads; retire them so reused memory does not inherit them.
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        for (int i = 0; i < 16; ++i)
+            if (g_display.buffer_set[i])
+                gpu::unregister_guest_linear_texture_layout(g_display.buffer_addr[i]);
+    }
     return 0;
 }
 // sceVideoOutAddFlipEvent(eq, handle, udata): register a flip-completion event source on an equeue.

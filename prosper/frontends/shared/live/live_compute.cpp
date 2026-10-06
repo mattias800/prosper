@@ -4029,10 +4029,8 @@ struct BoundImage {
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
     bool direct_storage_detile_used = false;
-    // A guest-backed linear 2D image's row pitch in guest memory (compute_linear_row_pitch), or 0
-    // for tight rows. The
-    // sampled upload and the storage seed gather rows from this pitch; the CPU storage writeback
-    // scatters them back to it.
+    // A linear 2D image's row pitch in guest memory (compute_linear_row_pitch), or 0 for tight rows.
+    // The sampled upload and storage seed gather rows from it; the storage writeback scatters to it.
     size_t guest_row_pitch = 0;
     bool watch_backed_snapshot_skip_requested = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
@@ -13880,13 +13878,13 @@ bool storage_image_materialize_raw_uvec4(
         channels, channel_dwords);
 }
 
-bool storage_image_writeback_raw_uvec4(
-    const uint32_t* channels, size_t channel_dwords,
-    prosper::gpu::DataFormat format, uint32_t components,
-    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
-    bool in_mip_tail, uint32_t mip_tail_bytes,
-    uint32_t mip_tail_x, uint32_t mip_tail_y,
-    uint8_t* destination, size_t destination_bytes) {
+bool storage_image_writeback_raw_uvec4(const uint32_t* channels, size_t channel_dwords,
+                                       prosper::gpu::DataFormat format, uint32_t components,
+                                       uint32_t width, uint32_t height, uint32_t depth,
+                                       uint32_t tile_mode, bool in_mip_tail,
+                                       uint32_t mip_tail_bytes, uint32_t mip_tail_x,
+                                       uint32_t mip_tail_y, uint8_t* destination,
+                                       size_t destination_bytes, size_t linear_row_pitch) {
     const uint32_t guest_texel = storage_image_guest_texel_bytes(format, components);
     const size_t required_destination = storage_image_raw_uvec4_source_bytes(
         format, components, width, height, depth, tile_mode,
@@ -13906,7 +13904,13 @@ bool storage_image_writeback_raw_uvec4(
     storage_pack_range(channels, format, components, texels,
                        linear.data(), guest_texel);
     if (!prosper::gpu::tile_mode_is_tiled(tile_mode)) {
-        std::memcpy(destination, linear.data(), linear.size());
+        const size_t row = static_cast<size_t>(width) * guest_texel;   // #4618: padded rows
+        if (linear_row_pitch <= row || depth != 1u || in_mip_tail)
+            std::memcpy(destination, linear.data(), linear.size());
+        else if (destination_bytes < linear_row_pitch * (height - 1u) + row)
+            return false;
+        else
+            copy_linear_rows(destination, linear_row_pitch, linear.data(), row, row, height);
         return true;
     }
     if (depth > 1u)

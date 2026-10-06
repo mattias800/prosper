@@ -1177,7 +1177,7 @@ TEST(VideooutPitch, StatedPitchIsPublishedAndPresented) {
 
     // Attribute2 states no pitch: the rows are `width` apart, and that is what gets published.
     uint8_t attr2[0x50] = {};
-    setba2((uint64_t)(uintptr_t)attr2, 0x8000000000000000ull, 0 /*LINEAR*/, kW, kH, 0, 0, 0);
+    setba2((uint64_t)(uintptr_t)attr2, 0x8000000000000000ull, 1 /*LINEAR*/, kW, kH, 0, 0, 0);
     struct VOB {
         const void* data;
         const void* metadata;
@@ -1189,4 +1189,38 @@ TEST(VideooutPitch, StatedPitchIsPublishedAndPresented) {
     EXPECT_EQ(gpu::guest_linear_texture_row_pitch((uint64_t)(uintptr_t)fb2.data(), kW * 4), kW * 4)
         << "no pitch attribute: the published pitch is the tight row the presenter reads";
     ASSERT_EQ(unreg(handle, 1, 0, 0, 0, 0), 0u);
+
+    // A TILED buffer has no row pitch; nothing is published for it.
+    setba2((uint64_t)(uintptr_t)attr2, 0x8000000000000000ull, 0 /*TILE*/, kW, kH, 0, 0, 0);
+    ASSERT_EQ(regb2(handle, 1, 0, (uint64_t)(uintptr_t)buffers, 1, (uint64_t)(uintptr_t)attr2), 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch((uint64_t)(uintptr_t)fb2.data(), kW * 4), 0u)
+        << "a tiled display buffer must not state a linear row pitch";
+    ASSERT_EQ(unreg(handle, 1, 0, 0, 0, 0), 0u);
+
+    // A TILED legacy buffer that also states a pitch: its bytes are a swizzle footprint, so the raw
+    // copy hands them over as they are rather than gathering "rows" out of them.
+    uint8_t tiled_attr[0x28] = {};
+    setba((uint64_t)(uintptr_t)tiled_attr, 0x80002200u, 0 /*TILE*/, 0, kW, kH, kPitchPixels);
+    const uint64_t tiled_group =
+        regb(handle, 0, (uint64_t)(uintptr_t)legacy_buffers, 1, (uint64_t)(uintptr_t)tiled_attr, 0);
+    ASSERT_EQ(tiled_group, 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), 0u);
+    ASSERT_TRUE(videoout_select_buffer(0, front, 2));
+    std::vector<uint8_t> tiled_raw;
+    ASSERT_TRUE(videoout_copy_front_buffer(tiled_raw, raw_meta));
+    EXPECT_TRUE(tiled_raw.size() == size_t(kW) * kH * 4 &&
+                std::equal(tiled_raw.begin(), tiled_raw.end(), fb.begin()))
+        << "a tiled buffer's raw copy is its leading bytes, not gathered rows";
+    ASSERT_EQ(unreg(handle, tiled_group, 0, 0, 0, 0), 0u);
+
+    // Closing the last VideoOut port retires the stated pitch of buffers still registered.
+    ASSERT_EQ(regb(handle, 0, (uint64_t)(uintptr_t)legacy_buffers, 1,
+                   (uint64_t)(uintptr_t)legacy_attr, 0),
+              0u);
+    ASSERT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), kPitch);
+    auto close = Hle::lookup(nid_hash("sceVideoOutClose"));
+    ASSERT_TRUE(close);
+    ASSERT_EQ(close(handle, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), 0u)
+        << "closing the last port retires the display buffers' stated pitch";
 }

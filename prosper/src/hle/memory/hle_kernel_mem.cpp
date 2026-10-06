@@ -28,6 +28,7 @@
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/committed_section.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"   // retire a stated linear pitch on unmap
 #include "host/memory/host_address_layout.hpp"
 #include <algorithm>
 #include <atomic>
@@ -1293,6 +1294,7 @@ namespace {
     // SIGSEGV class safe_copy exists to prevent (same overlap-trim shape as dmem_release above).
     void untrack(uint64_t base, uint64_t len) {
         if (!len) return;
+        gpu::unregister_guest_linear_texture_layouts_in(base, len);   // a stated pitch dies with it
         uint64_t end = base + len;
         std::lock_guard<std::mutex> lk(g_mx);
         std::vector<Mapping> out;
@@ -4765,6 +4767,7 @@ namespace {
     }
     void untrack(uint64_t base, uint64_t len) {
         if (!len) return;
+        gpu::unregister_guest_linear_texture_layouts_in(base, len);   // a stated pitch dies with it
         uint64_t end = base + len;
         std::lock_guard<std::mutex> lk(g_mx);
         std::vector<Mapping> out;

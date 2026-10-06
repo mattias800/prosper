@@ -36,9 +36,7 @@ inline size_t compute_linear_row_pitch(const gpu::ShaderResource& r, uint32_t by
         return 0;
     if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return 0;
     if (!(r.img_dim == 1u || (r.img_dim == 5u && r.depth == 1u))) return 0;
-    const size_t tight = static_cast<size_t>(r.width) * bytes_per_texel;
-    const uint32_t pitch = gpu::resolved_linear_row_pitch(r, r.width, bytes_per_texel);
-    return pitch != UINT32_MAX && pitch > tight ? pitch : 0;
+    return gpu::padded_linear_row_pitch(r, r.width, bytes_per_texel);
 }
 
 using gpu::copy_linear_rows;

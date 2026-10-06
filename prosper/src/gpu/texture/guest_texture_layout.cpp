@@ -30,6 +30,18 @@ void unregister_guest_linear_texture_layout(uint64_t base) {
     g_linear_texture_layouts.erase(base);
 }
 
+void unregister_guest_linear_texture_layouts_in(uint64_t base, uint64_t bytes) {
+    if (!bytes || bytes > UINT64_MAX - base) return;
+    const uint64_t end = base + bytes;
+    std::lock_guard<std::mutex> lock(g_linear_texture_layout_mx);
+    for (auto it = g_linear_texture_layouts.begin(); it != g_linear_texture_layouts.end();) {
+        if (it->first < end && it->second.end > base)
+            it = g_linear_texture_layouts.erase(it);
+        else
+            ++it;
+    }
+}
+
 uint32_t guest_linear_texture_row_pitch(uint64_t address, uint32_t visible_row_bytes) {
     if (!address || !visible_row_bytes) return 0;
     std::lock_guard<std::mutex> lock(g_linear_texture_layout_mx);

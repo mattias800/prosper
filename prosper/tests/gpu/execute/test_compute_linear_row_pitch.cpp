@@ -27,6 +27,14 @@
 //   RendererTouchedAddressKeepsOneLayout an address the renderer owns (seeded, or handed a compute
 //                                       result) is written back tight while plain memory is padded,
 //                                       so one address changes layout between dispatches
+//   GraphicsStorageWriteComputeSample   a draw's storage image (UAV) writes a linear image back as
+//                                       tight rows while compute reads it at the padded pitch (#4618)
+//   ComputeStorageWriteGraphicsStorageRead
+//                                       the reverse: a draw's storage image seeds tight from the
+//                                       padded rows a compute pass wrote, or writes its own output
+//                                       tight
+//   GraphicsStorageAtomicKeepsThePitch  the typed R32_UINT storage path (image atomics) seeds tight
+//                                       or writes back tight
 //   SampledRendererTargetRegistersPlane a compute pass that samples a renderer target through a
 //                                       DCC-compressed T# does not tell the renderer about the
 //                                       control plane, so a later plane write leaves stale pixels
@@ -34,6 +42,9 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/texture/guest_texture_layout.hpp"
+#include "fixtures/render_runner.h"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
 
@@ -95,7 +106,7 @@ ComputeItem compile(const std::vector<uint32_t>& code, const ShaderResourceTable
     return item;
 }
 
-ShaderResource linear_image(std::vector<uint8_t>& backing, ResourceClass cls) {
+ShaderResource linear_image(const uint8_t* data, size_t bytes, ResourceClass cls) {
     ShaderResource r{};
     r.cls = cls;
     r.binding = 5;
@@ -108,10 +119,13 @@ ShaderResource linear_image(std::vector<uint8_t>& backing, ResourceClass cls) {
     r.depth = 1;
     r.tile_mode = 0;
     r.declared_mip_levels = 1;
-    r.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
-    r.size = static_cast<uint32_t>(backing.size());
+    r.gpu_addr = reinterpret_cast<uint64_t>(data);
+    r.size = static_cast<uint32_t>(bytes);
     for (uint32_t c = 0; c < 4; ++c) r.swizzle[c] = 4u + c;
     return r;
+}
+ShaderResource linear_image(const std::vector<uint8_t>& backing, ResourceClass cls) {
+    return linear_image(backing.data(), backing.size(), cls);
 }
 
 ShaderResource output_buffer(std::vector<uint32_t>& out) {
@@ -256,11 +270,11 @@ uint64_t produce_then_consume(std::vector<uint8_t>& backing, uint32_t base,
 }
 
 // The storage writeback must lay rows at the padded pitch and leave the padding alone.
-void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base, uint8_t padding) {
+void expect_padded_guest_rows(const uint8_t* backing, uint32_t base, uint8_t padding) {
     for (uint32_t y = 0; y < H; ++y) {
         for (uint32_t x = 0; x < W; ++x) {
             uint32_t value = 0;
-            std::memcpy(&value, backing.data() + size_t(y) * Pitch + size_t(x) * Bpt, Bpt);
+            std::memcpy(&value, backing + size_t(y) * Pitch + size_t(x) * Bpt, Bpt);
             ASSERT_EQ(value, texel_value(base, x, y)) << "guest texel (" << x << ", " << y << ")";
         }
         if (y + 1u == H) break;   // the last row's padding is outside the image's span
@@ -268,6 +282,9 @@ void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base
             ASSERT_EQ(backing[size_t(y) * Pitch + b], padding)
                 << "row " << y << " padding byte " << b;
     }
+}
+void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base, uint8_t padding) {
+    expect_padded_guest_rows(backing.data(), base, padding);
 }
 
 }   // namespace
@@ -485,4 +502,177 @@ TEST(ComputeLinearRowPitch, StatedPitchOverridesTheRule) {
             std::memcpy(&value, backing.data() + size_t(y) * Stated + size_t(x) * Bpt, Bpt);
             ASSERT_EQ(value, texel_value(Base, x, y)) << "guest texel (" << x << ", " << y << ")";
         }
+}
+
+namespace {
+
+// A full-screen triangle (the live renderer's own fixture shape) and a W x H RGBA8 colour target.
+// clang-format off: one instruction per line
+const uint32_t kFullscreenVs[] = {
+    0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u,
+    0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u, 0x7E060280u, 0x7E0802F2u,
+    0xF80008CFu, 0x04030201u, 0xBF810000u,
+};
+// clang-format on
+
+ShaderResource draw_storage_image(uint8_t* data, size_t bytes, uint32_t sgpr, uint32_t binding) {
+    ShaderResource r{};
+    r.cls = ResourceClass::StorageImage;
+    r.binding = binding;
+    r.sgpr_base = sgpr;
+    r.img_dim = 1;
+    r.format = DataFormat::Uint32;
+    r.num_components = 1;
+    r.width = W;
+    r.height = H;
+    r.depth = 1;
+    r.declared_mip_levels = 1;
+    r.gpu_addr = reinterpret_cast<uint64_t>(data);
+    r.size = static_cast<uint32_t>(bytes);
+    for (uint32_t c = 0; c < 4; ++c) r.swizzle[c] = 4u + c;
+    return r;
+}
+
+// Render one draw whose fragment program is `ps` over the `resources`; the colour target is a
+// separate scratch allocation. Returns false if a stage fails to compile.
+// Guest memory for a draw's storage image: the renderer reads only REGISTERED guest mappings, so
+// these come from sceKernelMapNamedFlexibleMemory rather than the host heap. A span over the
+// mapping, kept for the life of the process like keep_alive's vectors.
+struct GuestBytes {
+    uint8_t* data = nullptr;
+    size_t bytes = 0;
+    uint8_t& operator[](size_t i) const { return data[i]; }
+};
+GuestBytes guest_bytes(size_t bytes, uint8_t fill) {
+    static uint64_t base = 0, used = 0;
+    constexpr uint64_t Arena = 1u << 20;
+    if (!base) {
+        prosper::register_builtin_hle();
+        auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+        if (!map || map(reinterpret_cast<uint64_t>(&base), Arena, 3, 0,
+                        reinterpret_cast<uint64_t>("linear-row-pitch"), 0) != 0)
+            return {};
+    }
+    const uint64_t aligned = (bytes + 0xfffu) & ~uint64_t{0xfffu};
+    if (used + aligned > Arena) return {};
+    GuestBytes span{reinterpret_cast<uint8_t*>(base + used), bytes};
+    used += aligned;
+    std::memset(span.data, fill, bytes);
+    return span;
+}
+
+bool render_storage_draw(const std::vector<uint32_t>& ps, std::vector<ShaderResource> resources) {
+    auto table = std::make_shared<ShaderResourceTable>();
+    table->resources = std::move(resources);
+    DrawItem draw;
+    draw.vs = recompile_vertex(kFullscreenVs, std::size(kFullscreenVs));
+    const PixelSystemInputMapping positions{0x300u, 0x300u};   // v0, v1 = pixel position
+    draw.fs = recompile_fragment(ps.data(), ps.size(), table.get(), &positions);
+    if (draw.vs.empty() || draw.fs.empty()) return false;
+    auto& colour = keep_alive(size_t{64} * 1024u, 0);
+    draw.prt = table;
+    draw.vertex_count = 3;
+    draw.ps.topology = 3;
+    draw.ps.color_write_mask = 15;
+    draw.ps.color0_format = VK_FORMAT_R8G8B8A8_UNORM;
+    draw.color0_base = reinterpret_cast<uint64_t>(colour.data());
+    draw.color0_width = W;
+    draw.color0_height = H;
+    (void)render_submit_items({draw}, W, H);
+    return true;
+}
+
+// clang-format off: one instruction per line, with its disassembly
+// Per pixel: v2 = x, v3 = y (from the pixel position), v4 = base + y*W + x.
+std::vector<uint32_t> pixel_index_prologue(uint32_t base) {
+    return {
+        0x7e040f00u,                 // v_cvt_u32_f32 v2, v0
+        0x7e060f01u,                 // v_cvt_u32_f32 v3, v1
+        0x160806ffu, W,              // v_mul_u32_u24 v4, W, v3
+        0x4a080504u,                 // v_add_nc_u32 v4, v4, v2
+        0x4a0808ffu, base,           // v_add_nc_u32 v4, base, v4
+    };
+}
+const uint32_t kExportAndEnd[] = {
+    0xf800000fu, 0x03020100u,        // exp mrt0 v0, v1, v2, v3
+    0xbf810000u,                     // s_endpgm
+};
+// clang-format on
+
+}   // namespace
+
+TEST(ComputeLinearRowPitch, GraphicsStorageWriteComputeSample) {
+    prosper::frontend::register_live_renderer("", false);
+    const GuestBytes image = guest_bytes(size_t(Pitch) * H, Poison);
+    ASSERT_TRUE(image.data);
+    constexpr uint32_t Base = 0x80000000u;
+    std::vector<uint32_t> ps = pixel_index_prologue(Base);
+    ps.insert(ps.end(), {0xf0200108u, 0x00020402u});   // image_store v4, v[2:3], s[8:15] 2D
+    ps.insert(ps.end(), std::begin(kExportAndEnd), std::end(kExportAndEnd));
+    ASSERT_TRUE(render_storage_draw(ps, {draw_storage_image(image.data, image.bytes, 8, 4)}));
+    expect_padded_guest_rows(image.data, Base, Poison);
+
+    std::vector<uint32_t> out;
+    ASSERT_TRUE(
+        sample_into(linear_image(image.data, image.bytes, ResourceClass::Texture), out, 30));
+    EXPECT_EQ(out, expected_values(Base)) << "compute reads the rows the draw wrote";
+}
+
+TEST(ComputeLinearRowPitch, ComputeStorageWriteGraphicsStorageRead) {
+    prosper::frontend::register_live_renderer("", false);
+    const GuestBytes source = guest_bytes(size_t(Pitch) * H, Poison);
+    const GuestBytes copy = guest_bytes(size_t(Pitch) * H, Poison);
+    ASSERT_TRUE(source.data && copy.data);
+    constexpr uint32_t Base = 0x90000000u;
+    ShaderResourceTable writer_table;
+    writer_table.resources = {linear_image(source.data, source.bytes, ResourceClass::StorageImage)};
+    const ComputeItem writer = compile(writer_program(Base), writer_table, 32,
+                                       native_storage_format_support_bit(DataFormat::Uint32, 1));
+    ASSERT_FALSE(writer.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({writer}));
+    expect_padded_guest_rows(source.data, Base, Poison);
+
+    // The draw loads each texel of `source` through one storage image and stores it into `copy`
+    // through another: both the seed and the writeback must use the padded rows.
+    std::vector<uint32_t> ps = pixel_index_prologue(0);
+    // clang-format off
+    ps.insert(ps.end(), {
+        0xf0000108u, 0x00020402u,    // image_load v4, v[2:3], s[8:15] 2D
+        0xbf8c3f70u,                 // s_waitcnt vmcnt(0)
+        0xf0200108u, 0x00040402u,    // image_store v4, v[2:3], s[16:23] 2D
+    });
+    // clang-format on
+    ps.insert(ps.end(), std::begin(kExportAndEnd), std::end(kExportAndEnd));
+    ASSERT_TRUE(render_storage_draw(ps, {draw_storage_image(source.data, source.bytes, 8, 4),
+                                         draw_storage_image(copy.data, copy.bytes, 16, 5)}));
+    expect_padded_guest_rows(copy.data, Base, Poison);
+}
+
+TEST(ComputeLinearRowPitch, GraphicsStorageAtomicKeepsThePitch) {
+    // Image atomics declare a typed R32_UINT storage image, which takes the renderer's native
+    // R32_UINT path rather than the formatless one. `a` holds an old pattern in the padded rows;
+    // the draw swaps a new pattern in and swaps the returned old value into `b`.
+    prosper::frontend::register_live_renderer("", false);
+    const GuestBytes a = guest_bytes(size_t(Pitch) * H, Poison);
+    const GuestBytes b = guest_bytes(size_t(Pitch) * H, Poison);
+    ASSERT_TRUE(a.data && b.data);
+    constexpr uint32_t Old = 0xa0000000u, New = 0xb0000000u;
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            const uint32_t value = texel_value(Old, x, y);
+            std::memcpy(a.data + size_t(y) * Pitch + size_t(x) * Bpt, &value, Bpt);
+        }
+    std::vector<uint32_t> ps = pixel_index_prologue(New);
+    // clang-format off
+    ps.insert(ps.end(), {
+        0xf03c2108u, 0x00020402u,    // image_atomic_swap v4, v[2:3], s[8:15] glc 2D: v4 = old
+        0xbf8c3f70u,                 // s_waitcnt vmcnt(0)
+        0xf03c2108u, 0x00040402u,    // image_atomic_swap v4, v[2:3], s[16:23] glc 2D
+    });
+    // clang-format on
+    ps.insert(ps.end(), std::begin(kExportAndEnd), std::end(kExportAndEnd));
+    ASSERT_TRUE(render_storage_draw(ps, {draw_storage_image(a.data, a.bytes, 8, 4),
+                                         draw_storage_image(b.data, b.bytes, 16, 5)}));
+    expect_padded_guest_rows(a.data, New, Poison);   // the writeback
+    expect_padded_guest_rows(b.data, Old, Poison);   // the seed of `a`, then `b`'s writeback
 }

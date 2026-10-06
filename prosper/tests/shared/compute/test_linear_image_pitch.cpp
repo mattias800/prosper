@@ -75,6 +75,17 @@ TEST(LinearImagePitch, StatedPitchWins) {
     EXPECT_EQ(compute_linear_row_pitch(registered, 1), 0u)
         << "a registered tight pitch (a VideoOut buffer with no pitch attribute) is tight";
     unregister_guest_linear_texture_layout(base);
+
+    // Unmapping any part of a registered allocation retires its stated pitch.
+    register_guest_linear_texture_layout(base, 1u << 20, 3072);
+    unregister_guest_linear_texture_layouts_in(base + 0x80000, 0x4000);
+    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 2048u)
+        << "an unmap inside the allocation retires its registered pitch";
+    register_guest_linear_texture_layout(base, 1u << 20, 3072);
+    unregister_guest_linear_texture_layouts_in(base + (1u << 20), 0x4000);
+    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 3072u)
+        << "an unmap just past the allocation leaves it alone";
+    unregister_guest_linear_texture_layout(base);
 }
 
 TEST(LinearImagePitch, ReplayBytesKeepTheirPitch) {

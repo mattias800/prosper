@@ -37,6 +37,12 @@ inline uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t widt
     return aligned > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(aligned);
 }
 
+// The resolved pitch when it pads the row (exceeds width*bpt), else 0 (tight rows).
+inline size_t padded_linear_row_pitch(const ShaderResource& r, uint32_t width, uint32_t bpt) {
+    const uint32_t pitch = resolved_linear_row_pitch(r, width, bpt);
+    return pitch != UINT32_MAX && pitch > static_cast<uint64_t>(width) * bpt ? pitch : 0;
+}
+
 // Copy `rows` rows of `row_bytes` between two pitches: gather into tight rows (dst_pitch ==
 // row_bytes) or scatter back to a padded pitch. Padding bytes in the destination are not written.
 inline void copy_linear_rows(uint8_t* dst, size_t dst_pitch, const uint8_t* src, size_t src_pitch,
