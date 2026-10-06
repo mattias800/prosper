@@ -173,3 +173,32 @@ Unexplained and not yet shown to matter:
   faulting instruction; it does not rule out an earlier HLE error as the cause of the failed seek.
 - **"The boot or link phase is what stalls."** Falsified by the phase log: all seven phases complete
   (`PROCESS_START` through `BOOT_COMPLETE`) in under 2.1 s.
+- **"Bounding a read-only constant buffer by its shader's static extent removes the compute upload
+  cost."** Falsified as a lever for this title (2026-10-06). The 43 MiB constant-buffer windows
+  (`size=45088768`) reach `plan_storage_buffer_materialization` with `dynamic_access=1`
+  (`required_bytes=4`), because the shader indexes them at a runtime offset, so SPIR-V reflection has
+  no static bound to apply. An A/B of the bound (same binary, opt-out switch as control, 3 runs of 60 s
+  per arm) read 2.2 / 3.2 / 3.8 flips/s on against 3.1 / 3.7 / 3.4 off, i.e. noise. The change was
+  abandoned and its switch removed. The cost is real (below); it needs the canonical-resource
+  identity of ADR 0010, not a smaller binding.
+
+## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
+
+The title reaches the warning screen, then the intro cinematic, at about 2.7 to 3.8 flips per second
+with the GPU about 10% busy. An F8 capture (5.2 s window, 14 flips) and
+`PROSPER_COMPUTE_PHASE_TIMING` / `PROSPER_COMPUTE_BUFFER_TIMING` runs attribute it:
+
+- Compute CPU time is about 270 ms of a ~370 ms frame; the GPU device time is about 39 ms. Of the
+  compute CPU time, setup is 60%, writeback 20%, fence wait 17%.
+- The dominant setup cost is **eight read-only constant-buffer windows of 43 MiB** (`size=45088768`,
+  `persistent=1`, `upload-skipped=0`), each re-uploaded about 25 times: ~650 ms each, `cache=miss`,
+  `validation=pooled-full`, `compared-bytes=45088768`, `uploaded-bytes` about 33 MiB. Their bases
+  advance a few hundred bytes per dispatch (`0x406260b900`, `c300`, `c700`, `d100`, `d500`, ...), so
+  the compute buffer cache, keyed by window start, never hits, although the windows overlap almost
+  entirely and the bytes at a given guest address do not change. That is the case ADR 0010 (canonical
+  resource identity, `PERF-P9`) describes.
+- Renderer side: `setup_resources` buffer copy 423 ms per 14 flips (768 MiB copied against 4,464 MiB
+  avoided), and a GPU retile that is 78% of storage-copy device time.
+- Alarms on this title: `host-copy-per-flip` (~24 MiB/flip), `gpu-sync-wait` (about 110% of the
+  33 ms budget: every submit waits on its own fence, `PERF-P1` / `PERF-P6`, ADR 0009) and
+  `surface-readback` (~9 ms per readback).
