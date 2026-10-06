@@ -879,7 +879,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         reduced_wave_mask = true;
                     }
                 }
-                if (!reduced_wave_mask && b.ngg_workgroup_export_probe &&
+                if (!reduced_wave_mask && b.ngg_workgroup_shell &&
                     b.wave_size == 64 && b.local_count == 64 &&
                     (allow_wave || b.ngg_uniform_wave_reduction_pcs.contains(in.pc)) &&
                     in.src[0].kind == OperandKind::SGPR &&
