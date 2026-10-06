@@ -79,7 +79,7 @@ host on a `…/recompile` refusal: it had no host fields to print. Since #4530 t
 
 ## Progress 2026-10-06: the solid red frame in the first seconds is fixed (#4197)
 
-Cause, measured: a reused-memory alias served from a stale render-target cache entry. Draw 36 of the
+Cause: a render-target cache entry served to a view that cannot be that target. Measured: draw 36 of the
 first submit clears `0x4205990000` through a pixel shader that exports the constant `0x7bff7bff` (half
 max, 65504) into a **2-byte R16_FLOAT** target. Draw 62 then samples the same address through a
 descriptor that is **4-component 8-bit at 1920x1080**, i.e. a view needing twice the bytes the target
@@ -91,6 +91,16 @@ than the target stores, so the sample reads the guest backing instead. Windows `
 default launch: grabs at 1000, 1500, 2000 and 3000 ms were `(255,0,0)` before and `(0,0,0)` after;
 later frames settle at `(2,2,2)`. Regression: `LiveTargetFormat.CachedTargetServesAViewOnlyWhenExtentAndTexelFootprintFit`
 and `RttScale.SampledViewNeedingMoreBytesThanTheCachedTargetIsAnAlias`.
+
+**Inferred, not measured:** that the address was *reused* by a later RGBA8 writer. No writer of that
+range between draws 36 and 62 was named (writer provenance or the guest GPU write journal answers it in one run), so
+the refusal is `CONFIDENCE: MED`. Without such a writer, hardware would read the R16F clear bytes
+reinterpreted, not "the guest backing", and the black after the fix may be the fallback's zeros rather than a
+correct value; "not red" is the only verified property.
+
+The cached side is judged by the GUEST target format (`RttSurf::guest_format`), not the renderer's host
+storage, which folds every format outside a short list into RGBA8. A refusal logs `[rtt] footprint-alias
+refusal` (first 32, then powers of two) so a cross-title false refusal is visible.
 
 What this does **not** establish: what the frame should show at these moments (black is the expected
 rung-1 reading, not a verified oracle), and the draws that should refresh the aliased range are still

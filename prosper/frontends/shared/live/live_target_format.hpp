@@ -219,22 +219,60 @@ constexpr uint32_t live_target_vk_format_bytes(VkFormat vk_format) {
                ? live_target_pixel_format_bytes(format) : 0u;
 }
 
+// Bytes per texel of a GUEST colour-target format (the raw CB format, not the renderer's canonical
+// host storage, which folds every format outside a short list into RGBA8). Zero for packed or
+// unrecognised formats: unknown is never grounds to refuse.
+constexpr uint32_t live_target_guest_format_bytes(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_SRGB:
+            return 1u;
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT:
+            return 2u;
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM:
+        case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_R16G16_UNORM:
+        case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32_SFLOAT:
+            return 4u;
+        case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+        case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+            return 8u;
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 16u;
+        default:
+            return 0u;
+    }
+}
+
 // Can the cached renderer-owned target at a sampled descriptor's base serve that descriptor? The
 // extent must match (or be the configured render-scale reduction), and for a single-layer 2D target
-// the descriptor's format must not need more bytes per texel than the target stores: a larger view
+// the descriptor's format must not need more bytes per texel than the GUEST target format
+// (cached_guest_format; the host format when that is unset) stores: a larger view
 // runs past what the renderer wrote, so the cache holds a stale occupant of reused memory (#4197,
 // AC Black Flag Resynced: a 4-component 8-bit view over a 2-byte R16_FLOAT target). A volume keeps
 // its own contract, and a zero size on either side never refuses.
 constexpr bool live_rtt_serves_sampled_view(uint32_t requested_w, uint32_t requested_h,
                                             uint32_t cached_w, uint32_t cached_h,
                                             uint32_t render_scale, bool normalized_sampling,
-                                            VkFormat cached_format, uint32_t cached_volume_depth,
+                                            VkFormat cached_format, VkFormat cached_guest_format,
+                                            uint32_t cached_volume_depth,
                                             uint32_t view_bytes_per_texel) {
     return rtt_sampled_extent_compatible(requested_w, requested_h, cached_w, cached_h,
                                          render_scale, normalized_sampling) &&
            (cached_volume_depth != 0u ||
-            rtt_sampled_texel_footprint_compatible(view_bytes_per_texel,
-                                                   live_target_vk_format_bytes(cached_format)));
+            rtt_sampled_texel_footprint_compatible(
+                view_bytes_per_texel,
+                cached_guest_format != VK_FORMAT_UNDEFINED
+                    ? live_target_guest_format_bytes(cached_guest_format)
+                    : live_target_vk_format_bytes(cached_format)));
 }
 
 // Packed-HDR render targets can be the independently rendered levels of one sampled mip chain.

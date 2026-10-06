@@ -67,9 +67,10 @@ constexpr bool rtt_sampled_extent_compatible(uint32_t requested_w, uint32_t requ
 
 // A cached render target holds `entry_bytes_per_texel` bytes per texel. A sampled descriptor whose
 // format needs MORE bytes per texel than that at the same base address cannot be a view of the
-// cached surface: its footprint runs past the bytes the renderer wrote, so the cached pixels are a
-// stale occupant of a memory range the guest has reused (a transient-allocator alias, the same
-// situation as the differing-extent alias above). AC Black Flag Resynced samples a 2-byte
+// cached surface: its footprint runs past the bytes the renderer wrote, so the cached pixels are most
+// likely a stale occupant of memory the guest reused (a transient-allocator alias, like the
+// differing-extent alias above). The reuse is INFERRED: no later writer of that range was named.
+// CONFIDENCE: MED. AC Black Flag Resynced samples a 2-byte
 // R16_FLOAT target through a 4-component 8-bit descriptor at 1920x1080; serving the cached 16-bit
 // half-max values as that view painted the whole frame red (#4197). Zero on either side means the
 // size is unknown or the format is packed, and is never grounds to refuse. A view needing LESS than

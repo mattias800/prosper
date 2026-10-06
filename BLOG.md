@@ -23,7 +23,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Assassin's Creed Black Flag Resynced no longer opens on solid red
 
-The red wash in the first two seconds and on screen transitions was a render target's old contents being read through a different-sized view of reused memory; those frames are now black ([#4197](https://github.com/mattias800/prosper/issues/4197)). No picture: the fixed frames are plain black, which is the honest reading until the title's startup draws render.
+The red wash in the first two seconds and on screen transitions was a render target's old contents being read through a view that needs twice the bytes the target holds (probably reused memory); those frames are now black ([#4197](https://github.com/mattias800/prosper/issues/4197)). No picture: the fixed frames are plain black, which is the honest reading until the title's startup draws render.
 
 ### Tomb Raider: one manor renders and the other explodes
 
