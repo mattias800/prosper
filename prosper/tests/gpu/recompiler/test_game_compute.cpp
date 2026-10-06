@@ -503,14 +503,14 @@ int main() {
         ShaderResource wrong_format = clear_resource;
         wrong_format.format = DataFormat::Unorm16;   // RGBA8 joined RGBA16F in the exact decode
         CHECK(!prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  clear_resource, true, false, false, rejected_pixel, 1,
-                  rejected.data(), rejected.size()) &&
-              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  wrong_shape, true, false, false, rejected_pixel, 1,
-                  clear_metadata.data(), clear_metadata.size()) &&
-              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  wrong_format, true, false, false, rejected_pixel, 1,
-                  clear_metadata.data(), clear_metadata.size()),
+                  clear_resource, true, false, false, rejected_pixel, 1, rejected.data(),
+                  rejected.size()) &&
+                  !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                      wrong_shape, true, false, false, rejected_pixel, 1, clear_metadata.data(),
+                      clear_metadata.size()) &&
+                  !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                      wrong_format, true, false, false, rejected_pixel, 1, clear_metadata.data(),
+                      clear_metadata.size()),
               "uncompressed metadata, mip chains, and formats outside RGBA8/RGBA16F fail closed");
     }
 

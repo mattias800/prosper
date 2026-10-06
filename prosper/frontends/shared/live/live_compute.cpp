@@ -8431,10 +8431,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             layer_stride * (sampled_layers - 1u) + level_offset + slice;
                     } else {
                         const size_t row_pitch = compute_linear_row_pitch(*r, bpt);
-                        sampled_guest_need = r->tile_mode
-                            ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
-                            : (row_pitch ? row_pitch * (r->height - 1u) + size_t(r->width) * bpt
-                                         : static_cast<size_t>(volume_texels) * bpt);
+                        sampled_guest_need =
+                            r->tile_mode
+                                ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
+                                : (row_pitch ? row_pitch * (r->height - 1u) + size_t(r->width) * bpt
+                                             : static_cast<size_t>(volume_texels) * bpt);
                         if (!r->tile_mode && row_pitch)
                             sampled_producer_guest_bytes = static_cast<size_t>(volume_texels) * bpt;
                     }
@@ -8668,10 +8669,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // `sampled_producer_guest_bytes`. Keying by the padded span here would miss
                         // it and fall back to guest bytes the storage writeback laid out tight.
                         const size_t transfer_key_bytes = sampled_producer_guest_bytes
-                            ? sampled_producer_guest_bytes : sampled_guest_need;
+                                                              ? sampled_producer_guest_bytes
+                                                              : sampled_guest_need;
                         ComputeImageCacheKey storage_key = storage_image_cache_key(
-                            *r, static_cast<uint32_t>(transfer_key_bytes),
-                            transfer_native_format);
+                            *r, static_cast<uint32_t>(transfer_key_bytes), transfer_native_format);
                         bool borrowed = ctx.borrow_cached_image_for_compute_transfer(
                             storage_key, *r, bi.compute_transfer_seed, trace,
                             &transfer_borrow_result);
@@ -8689,8 +8690,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             prosper::gpu::ShaderResource storage_identity = *r;
                             storage_identity.format = DataFormat::Uint32;
                             storage_key = storage_image_cache_key(
-                                storage_identity,
-                                static_cast<uint32_t>(transfer_key_bytes),
+                                storage_identity, static_cast<uint32_t>(transfer_key_bytes),
                                 transfer_alias_storage_format);
                             borrowed = ctx.borrow_cached_image_for_compute_transfer(
                                 storage_key, *r, bi.compute_transfer_seed, trace,
@@ -9717,7 +9717,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // is here because an UNTILED native cube reaches that branch with
                         // `r->tile_mode` false and none of the other terms true (#657).
                         const size_t padded_pitch = compute_linear_row_pitch(*r, bpt);
-                        const bool remap = r->tile_mode || padded_pitch ||
+                        const bool remap =
+                            r->tile_mode || padded_pitch ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
                             ((dim_2d_array || dim_cube_stacked || native_cube_sampled) &&
                              sampled_layers > 1);
@@ -9803,7 +9804,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             const prosper::gpu::TileCensusScope tcs("smpl-upl");
                             detile_surface(linear.get(), src, r->width, r->height,
                                            r->tile_mode, 0, bpt);
-                        } else if (padded_pitch) {   // drop the per-row padding (see linear_image_pitch.hpp)
+                        } else if (padded_pitch) {
+                            // Drop the per-row padding (see linear_image_pitch.hpp).
                             for (uint32_t y = 0; y < r->height; ++y)
                                 std::memcpy(linear.get() + size_t(y) * r->width * bpt,
                                             src + y * padded_pitch, size_t(r->width) * bpt);

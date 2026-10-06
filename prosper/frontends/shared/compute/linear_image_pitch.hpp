@@ -42,4 +42,4 @@ inline size_t compute_linear_row_pitch(const gpu::ShaderResource& r, uint32_t by
     return pitch > tight ? pitch : 0;
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend
