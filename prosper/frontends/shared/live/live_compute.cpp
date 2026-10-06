@@ -39,7 +39,7 @@
 
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
-#include "diagnostics/watch_list.hpp"        // strict opt-in address trace
+#include "diagnostics/watch_list.hpp"   // strict opt-in address trace
 #include "diagnostics/diag_ratelimit.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
