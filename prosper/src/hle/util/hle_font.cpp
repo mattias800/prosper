@@ -50,6 +50,7 @@ constexpr uint64_t kLibraryMagic = 0x5052464f4e544c49ull; // "PRFONTLI"
 constexpr uint64_t kFontMagic    = 0x5052464f4e54464eull; // "PRFONTFN"
 constexpr uint64_t kRendererMagic= 0x5052464f4e545244ull; // "PRFONTRD"
 constexpr uint64_t kStringMagic  = 0x5052464f4e545354ull; // "PRFONTST"
+constexpr uint64_t kGlyphMagic = 0x5052464f4e54474cull; // "PRFONTGL"
 
 struct FontMemory {
     uint16_t kind;
@@ -98,6 +99,10 @@ struct FontFace {
     float slant = 0.0f;
     float weight_x = 1.0f;
     float weight_y = 1.0f;
+    // Resolution in dots per inch (native face state +0x40/+0x44). A new face starts at 72 x 72,
+    // the resolution at which a point and a pixel coincide.
+    uint32_t dpi_h = 72;
+    uint32_t dpi_v = 72;
     void* renderer = nullptr;
     // The library the face was opened from (native face+0x28), as the guest passed it. Read back by
     // sceFontGetLibrary, which validates it before answering, and tested for NULL by the kerning core.
@@ -137,7 +142,14 @@ uint8_t g_ft_selection[64]{};
 // blob, because the two are distinct editions and a title is entitled to tell them apart.
 uint8_t g_ft_renderer_selection[64]{};
 struct FontString { uint64_t magic = kStringMagic; uint32_t terminate_code = 0; };
-struct FontGlyph { uint64_t magic = kFontMagic; };
+// A generated glyph. The two forms are what sceFontGenerateCharGlyph recorded from its parameter
+// block (glyph form at +6, metrics form at +7; native 0xddba/0xddbe, stored at glyph+4/+5), and what
+// sceFontGlyphGetGlyphForm / GetMetricsForm read back. A NULL parameter block records 0 for both.
+struct FontGlyph {
+    uint64_t magic = kGlyphMagic;
+    uint8_t glyph_form = 0;
+    uint8_t metrics_form = 0;
+};
 
 struct GlyphMetrics {
     float width, height;
@@ -677,10 +689,27 @@ int32_t font_get_vertical(void* handle, VerticalLayout* out) {
     return 0;
 }
 
-int32_t font_generate_glyph(void*, uint32_t, const void*, void** out) {
+// The parameter block's glyph form must be 0, 1 or 2; any other value is refused with 0x80460002
+// and a cleared out (native 0xde16..0xde35, then 0xd883). The metrics form is recorded as given.
+// CONFIDENCE: HIGH on the two offsets and the form check; MED that a NULL block means form 0 on every
+// path (0xde81 does; a font-set face reaches a second store at 0xe389 whose source is not traced).
+int32_t font_generate_glyph(void*, uint32_t, const void* params, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
-    *out = new (std::nothrow) FontGlyph;
-    return *out ? 0 : static_cast<int32_t>(0x80540001u);
+    uint8_t glyph_form = 0, metrics_form = 0;
+    if (params) {
+        glyph_form = static_cast<const uint8_t*>(params)[6];
+        metrics_form = static_cast<const uint8_t*>(params)[7];
+        if (glyph_form > 2) {
+            *out = nullptr;
+            return static_cast<int32_t>(0x80460002u);
+        }
+    }
+    auto* g = new (std::nothrow) FontGlyph;
+    *out = g;
+    if (!g) return static_cast<int32_t>(0x80540001u);
+    g->glyph_form = glyph_form;
+    g->metrics_form = metrics_form;
+    return 0;
 }
 int32_t font_delete_glyph(const FontMemory*, void** glyph) {
     if (glyph) { delete static_cast<FontGlyph*>(*glyph); *glyph = nullptr; }
@@ -1084,6 +1113,41 @@ int32_t font_get_render_weight(void* handle, float* out_x, float* out_y, uint32_
     return font_get_weight(handle, out_x, out_y, out_mode);
 }
 
+// sceFontGetResolutionDpi (8REoLjNGCpM, 0x6b70) reads the face's dpi pair (core 0xc100). A NULL or
+// invalid face answers 0x80460005 and writes 72 -- not 0 -- to every non-NULL output (0x6bec..
+// 0x6bfe); a valid face with both outputs NULL answers 0x80460002. Otherwise each non-NULL output
+// gets the face's value, 72 x 72 until sceFontSetResolutionDpi changes it. CONFIDENCE: HIGH.
+int32_t font_get_resolution_dpi(void* handle, uint32_t* h_dpi, uint32_t* v_dpi) {
+    const auto* f = face(handle);
+    if (!f || (!h_dpi && !v_dpi)) {
+        if (h_dpi) *h_dpi = 72;
+        if (v_dpi) *v_dpi = 72;
+        return f ? kFontErrInvalidParam : kFontErrInvalidHandle;
+    }
+    if (h_dpi) *h_dpi = f->dpi_h;
+    if (v_dpi) *v_dpi = f->dpi_v;
+    return 0;
+}
+
+// sceFontGlyphGetGlyphForm (PXlA0M8ax40, 0xe660) / GetMetricsForm (XUfSWpLhrUw, 0xe6b0) return a
+// small form number, not a status: 0 for a NULL glyph or one without the glyph magic, otherwise the
+// recorded byte, with a negative (top-bit-set) value reported as 0. CONFIDENCE: HIGH.
+const FontGlyph* glyph(const void* handle) {
+    const auto* g = static_cast<const FontGlyph*>(handle);
+    return g && g->magic == kGlyphMagic ? g : nullptr;
+}
+uint32_t form_byte(uint8_t form) {
+    return (form & 0x80u) ? 0u : form;
+}
+uint32_t font_glyph_get_glyph_form(const void* handle) {
+    const auto* g = glyph(handle);
+    return g ? form_byte(g->glyph_form) : 0u;
+}
+uint32_t font_glyph_get_metrics_form(const void* handle) {
+    const auto* g = glyph(handle);
+    return g ? form_byte(g->metrics_form) : 0u;
+}
+
 // sceFontGetPixelResolution (BozJej5T6fs, 0x2750): a NULL library or one without its magic answers
 // 0x80460004 (the LIBRARY code; 0x80460005 is the face's); so does a library whose edition driver
 // (library+0x80) or its +0x10 callback is missing. A NULL out is 0x80460002, and every failure path
@@ -1418,6 +1482,9 @@ void register_font_hle() {
     R("Gqa5Pp7y4MU", (HleFn)font_get_render_slant, "sceFontGetRenderEffectSlant");
     R("d7dDgRY+Bzw", (HleFn)font_get_weight, "sceFontGetEffectWeight");
     R("woOjHrkjIYg", (HleFn)font_get_render_weight, "sceFontGetRenderEffectWeight");
+    R("8REoLjNGCpM", (HleFn)font_get_resolution_dpi, "sceFontGetResolutionDpi");
+    R("PXlA0M8ax40", (HleFn)font_glyph_get_glyph_form, "sceFontGlyphGetGlyphForm");
+    R("XUfSWpLhrUw", (HleFn)font_glyph_get_metrics_form, "sceFontGlyphGetMetricsForm");
     R("sDuhHGNhHvE", (HleFn)font_get_kerning, "sceFontGetKerning");
     R("ryPlnDDI3rU", (HleFn)font_get_render_scaled_kerning, "sceFontGetRenderScaledKerning");
     R("LzmHDnlcwfQ", (HleFn)font_get_library, "sceFontGetLibrary");

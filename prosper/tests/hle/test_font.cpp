@@ -569,6 +569,110 @@ TEST(Font, RenderSurfaceSetStyleFrameRecordsTheFrame) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Resolution and glyph-form queries (libSceFont.native.sprx 0x6b70, 0xe660, 0xe6b0).
+// ---------------------------------------------------------------------------------------------
+TEST(Font, ResolutionAndGlyphFormNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontGetResolutionDpi"), "8REoLjNGCpM");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetGlyphForm"), "PXlA0M8ax40");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetMetricsForm"), "XUfSWpLhrUw");
+}
+
+TEST(Font, ResolutionDpiDefaultsToSeventyTwoAndFailsToSeventyTwo) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn get_dpi = Hle::lookup("8REoLjNGCpM");
+    ASSERT_NE(get_dpi, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+
+    uint32_t h = 0, v = 0;
+    EXPECT_EQ(get_dpi(addr(handle), addr(&h), addr(&v), 0, 0, 0), 0u);
+    EXPECT_EQ(h, 72u) << "a new face starts at 72 dpi, where points and pixels coincide";
+    EXPECT_EQ(v, 72u);
+    h = 0;
+    EXPECT_EQ(get_dpi(addr(handle), addr(&h), 0, 0, 0, 0), 0u) << "one output is enough";
+    EXPECT_EQ(h, 72u);
+    EXPECT_EQ(get_dpi(addr(handle), 0, 0, 0, 0, 0), 0x80460002u) << "both outputs NULL";
+
+    uint8_t decoy[64]{};
+    h = v = 1234;
+    EXPECT_EQ(get_dpi(addr(decoy), addr(&h), addr(&v), 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(h, 72u) << "the failure path writes 72, not 0";
+    EXPECT_EQ(v, 72u);
+    h = 1234;
+    EXPECT_EQ(get_dpi(0, addr(&h), 0, 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(h, 72u);
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+// The forms are what GenerateCharGlyph recorded from its parameter block (+6 glyph form, +7 metrics
+// form); the getters answer 0 -- a form number, not a status -- for anything that is not a glyph.
+TEST(Font, GlyphFormsReadBackWhatGenerateRecorded) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn generate = Hle::lookup("C-4Qw5Srlyw");
+    HleFn remove = Hle::lookup("LHDoRWVFGqk");
+    HleFn glyph_form = Hle::lookup("PXlA0M8ax40");
+    HleFn metrics_form = Hle::lookup("XUfSWpLhrUw");
+    for (HleFn f : {generate, remove, glyph_form, metrics_form}) ASSERT_NE(f, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* face = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&face), 0), 0u);
+
+    uint8_t params[16]{};
+    params[6] = 1;   // glyph form: outline
+    params[7] = 2;   // metrics form
+    void* g = nullptr;
+    ASSERT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0u);
+    ASSERT_NE(g, nullptr);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 1u);
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 2u);
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    params[6] = 2;
+    params[7] = 0x85;   // a negative byte reads back as 0
+    ASSERT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0u);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 2u);
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 0u) << "a negative form is reported as 0";
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    ASSERT_EQ(generate(addr(face), 'A', 0, addr(&g), 0, 0), 0u);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 0u) << "no parameter block: form 0";
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    params[6] = 3;
+    g = &g;
+    EXPECT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0x80460002u)
+        << "glyph forms are 0, 1 and 2";
+    EXPECT_EQ(g, nullptr) << "a refused generate clears the out";
+
+    uint8_t decoy[64]{};
+    decoy[4] = 1;
+    decoy[5] = 1;
+    EXPECT_EQ(glyph_form(addr(decoy), 0, 0, 0, 0, 0), 0u) << "not a glyph: 0, not an error code";
+    EXPECT_EQ(metrics_form(addr(decoy), 0, 0, 0, 0, 0), 0u);
+    // A face whose bytes at +8/+9 are non-zero, so reading it as a glyph would report a form.
+    using SetScaleFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetScaleFn>(Hle::lookup("N1EBMeGhf7E"));
+    ASSERT_NE(set_pixel, nullptr);
+    const uint32_t bits = 0x41800101u;   // 16.00006f: low bytes 0x01, 0x01
+    float odd_width = 0.0f;
+    std::memcpy(&odd_width, &bits, sizeof(odd_width));
+    ASSERT_EQ(set_pixel(face, odd_width, 16.0f), 0);
+    EXPECT_EQ(glyph_form(addr(face), 0, 0, 0, 0, 0), 0u) << "a face is not a glyph";
+    EXPECT_EQ(metrics_form(addr(face), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(glyph_form(0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(metrics_form(0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(font.close_font(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Library queries: pixel resolution and the device cache (libSceFont.native.sprx 0x2750, 0x13f0,
 // 0x1560, 0x17f0). prosper has one library object, so every arm below leaves it detached.
 // ---------------------------------------------------------------------------------------------
