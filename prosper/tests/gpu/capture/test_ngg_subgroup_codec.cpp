@@ -131,4 +131,15 @@ TEST(NggSubgroupCodec, MalformedRecordsAreRefused) {
     EXPECT_FALSE(write_ngg_subgroup_draw(empty, altered)) << "a description with no group";
 }
 
+// A capture is v72 only when a draw carries a description; every other capture stays a v71 file,
+// byte for byte (the v71 tail stays last).
+TEST(NggSubgroupCodec, OnlyACaptureWithADescriptionIsV72) {
+    GpuCaptureFile file;
+    file.draws.resize(2);
+    EXPECT_EQ(gpu_capture_version_for(file), 71u);
+    file.draws[1].ngg_subgroup = kena(4, 1);
+    ASSERT_TRUE(file.draws[1].ngg_subgroup);
+    EXPECT_EQ(gpu_capture_version_for(file), 72u);
+}
+
 }   // namespace

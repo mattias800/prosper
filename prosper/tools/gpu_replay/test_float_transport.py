@@ -94,11 +94,6 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
         # v71: per draw, five (presence u8, raw u32) SC/DB launch-control words. The fixture
         # programs none of them, so each record is canonical-unavailable: 25 zero bytes.
         launch_controls_tail=struct.pack("<I",draw_count)+bytes(25*draw_count)
-        # v72: one absent merged-NGG description (presence u8 = 0) per draw.
-        ngg_tail=struct.pack("<I",draw_count)+bytes(draw_count)
-        check(struct.unpack_from("<I",data,8)[0]==72 and data.endswith(ngg_tail),
-              "current ordinary capture has exact absent merged-NGG descriptions")
-        data=bytearray(data[:-len(ngg_tail)]); struct.pack_into("<I",data,8,71)
         check(struct.unpack_from("<I",data,8)[0]==71 and data.endswith(launch_controls_tail),
               "current ordinary capture has exact unavailable raster-launch controls")
         official70=bytearray(data[:-len(launch_controls_tail)]); struct.pack_into("<I",official70,8,70)

@@ -2879,8 +2879,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused")
                           : nullptr;
-        // NOLINTNEXTLINE(concurrency-mt-unsafe): one cached process-lifetime read
-        if (PROSPER_ENV_ON("PROSPER_DBG") && result.applies) {
+        // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit
+        if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_DBG") && result.applies) {
             static std::mutex ngg_log_mutex;
             static std::set<std::pair<uint64_t, std::string>> ngg_logged;
             const std::lock_guard lock(ngg_log_mutex);

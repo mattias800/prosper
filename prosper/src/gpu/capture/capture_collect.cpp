@@ -637,7 +637,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           uint64_t resource_limit_bytes_override,
                           const uint8_t* pre_submit_compute_gds,
                           size_t pre_submit_compute_gds_bytes) {
-    error.clear(); out = {}; out.format_version = kVersion; out.metadata = metadata;
+    error.clear(); out = {}; out.format_version = kVersionWithoutNgg; out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
         operations.size() > kMaxOperations) {
@@ -727,6 +727,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         }
         c.owned_waves = d.owned_waves;
         c.ngg_subgroup = d.ngg_subgroup;
+        if (c.ngg_subgroup) out.format_version = kVersion;   // v72 only when one is carried
         if (d.owned_waves && d.owned_waves->vertex_pending) {
             if (d.owned_waves->vertex.packets.empty() ||
                 !store_raw_shader_version(d.owned_waves->vertex.packets.front().guest_code, true,

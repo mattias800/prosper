@@ -327,14 +327,6 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
         wave_tail = struct.pack("<I", 1) + b"\x00"
         # v71: one draw's five unprogrammed (presence u8, raw u32) SC/DB launch-control words.
         launch_controls_tail = struct.pack("<I", 1) + bytes(25)
-        # v72: one draw's absent merged-NGG description (presence u8 = 0).
-        ngg_tail = struct.pack("<I", 1) + b"\x00"
-        genuine72 = (struct.unpack_from("<I", original, 8)[0] == 72 and original.endswith(ngg_tail))
-        check(genuine72, "ordinary width fixture retains an exact absent v72 NGG description")
-        if genuine72:
-            original = bytearray(original[:-len(ngg_tail)])
-            struct.pack_into("<I", original, 8, 71)
-            original = bytes(original)
         genuine71 = (len(original) > 4+159+5+29 and struct.unpack_from("<I", original, 8)[0] == 71 and
                      original.endswith(launch_controls_tail))
         check(genuine71, "ordinary width fixture retains exact unavailable v71 launch controls")
