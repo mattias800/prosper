@@ -15,6 +15,10 @@
 # `--update` only ever lowers or deletes rows. Raising or adding one is a hand edit with a
 # `# note` saying why, so the reviewer sees it -- for blocking-sync, the note names the
 # guest-visible result the new wait or ALL_COMMANDS barrier delivers.
+# A standalone `#` note between rows belongs to the row DIRECTLY BELOW it, and only that row:
+# `--update` keeps it with that row when it re-sorts, and drops it with that row when the row
+# goes stale. So place a note immediately above the row it justifies, write one note per row, and
+# never put a row out of canonical order under a note meant for a different row.
 #
 # title-dir and file-size VALUES ARE LINE CAPS: growth past the cap fails, and a shrink reports
 # `decrease` only once it is more than 2% below the cap, so ordinary edits to a large file do not
@@ -97,12 +101,12 @@ getenv|prosper/src/gpu/diagnostics/memory_placement_log.hpp 2
 getenv|prosper/src/gpu/diagnostics/shader_dump_filter.cpp 1
 getenv|prosper/src/gpu/execute/compute_program_facts.cpp 1
 getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
-# #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
-# This renames one existing site; no new raw environment read or switch was introduced.
 getenv|prosper/src/gpu/execute/gpu_executor.cpp 89
 getenv|prosper/src/gpu/execute/index_expand.hpp 1
 getenv|prosper/src/gpu/execute/mb3_freelist.cpp 3
 getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3
+# #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
+# This renames one existing site; no new raw environment read or switch was introduced.
 getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
@@ -212,8 +216,8 @@ test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.cpp 7
 test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.hpp 2
 test-dep|prosper/frontends/shared/live/submit_renderer/final_span_present.cpp 6
 test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 88  # lowered: two prosper::test:: references moved with the lazy sampled colour-target materializer
-test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target.hpp 2  # moved from image_resources.cpp, net zero
 test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.hpp 2
+test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target.hpp 2  # moved from image_resources.cpp, net zero
 test-dep|prosper/frontends/shared/live/submit_renderer/mrt_slots.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.cpp 14
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.hpp 2
