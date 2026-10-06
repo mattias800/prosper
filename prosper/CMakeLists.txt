@@ -4854,6 +4854,12 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_live_renderer
         PROPERTIES TIMEOUT 120)
+      # #4556: a DCC fast clear reaches the pass that renders to the cleared target, not only one
+      # that samples it.
+      prosper_add_gtest(test_dcc_clear_render_target
+        SOURCES tests/shared/live/test_dcc_clear_render_target.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
                COMMAND test_game_compute_rtt_mirror)
