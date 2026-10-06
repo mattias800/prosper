@@ -2549,6 +2549,13 @@ bool emit_cfg_state_machine(
     // This matters for GTA V's scalar scratch in VCC/ordinary mask pairs, where readfirstlane,
     // SMEM, or a B32 scalar ALU defines one half before a one-dword VALU/SALU consumer.
     std::vector<std::set<int>> wave64_scalar_word_in(starts.size());
+    // Words that hold an entry-M0 token (`s_mov_b32 sN, m0`, #3133) on every path, i.e. a definite
+    // NON-mask definition that carries no value. It is deliberately NOT a scalar word: `load_state`
+    // would then reload the Function variable's zero placeholder as data (the silent fabrication
+    // #3308/#3312 record). Its one consumer is the restore `s_mov_b32 m0, sN`, which the emitter
+    // lowers by consuming the token without reading a value, so that read cannot pick up the wrong
+    // domain of an ambiguous pair. Any other write of the word ends the fact.
+    std::vector<std::set<int>> wave64_m0_token_word_in(starts.size());
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
     // architectural SCC or the false placeholder stored for an unrepresentable wave-mask result.
     // Carry a separate CFG MUST-validity bit and use it both for scalar-word provenance and when
@@ -2612,6 +2619,8 @@ bool emit_cfg_state_machine(
         for (int reg : direct_descriptor_sregs)
             if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
+        for (int reg : inherited_entry_m0)
+            if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
         wave64_b64_reachable.front() = true;
 
         enum class ScalarSourceRead : uint8_t {
@@ -2658,6 +2667,7 @@ bool emit_cfg_state_machine(
         auto advance_wave64_b64_masks = [&](std::set<int>& masks,
                                             std::set<int>& ambiguous,
                                             std::set<int>& scalar_words,
+                                            std::set<int>& m0_tokens,
                                             bool& scalar_scc,
                                             const Rdna2Inst& in,
                                             bool record_compare) {
@@ -2716,6 +2726,13 @@ bool emit_cfg_state_machine(
             // loading either the Bool's false placeholder or the scalar variable's zero placeholder
             // would silently choose one predecessor's domain for both paths.
             bool reads_ambiguous = false;
+            // `s_mov_b32 m0, sN` over a token word reads no value (see wave64_m0_token_word_in).
+            const bool m0_token_restore = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                in.dst.value == 124 && in.src[0].kind == OperandKind::SGPR;
+            // The save starts a token only while M0 itself is not scalar data, as in emit_alu.
+            const bool m0_token_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                in.dst.value <= 105 && in.src[0].kind == OperandKind::Special &&
+                in.src[0].value == 124 && !scalar_words.contains(124);
             auto source_is_mask = [&](const Operand& source) {
                 if (source.kind == OperandKind::InlineInt) return true;
                 if (source.kind != OperandKind::SGPR &&
@@ -2777,7 +2794,9 @@ bool emit_cfg_state_machine(
                     const int overlap_first = std::max(first, base);
                     const int overlap_last = std::min(last, base + 2);
                     for (int word = overlap_first; word < overlap_last; ++word)
-                        if (!scalar_words.contains(word)) reads_ambiguous = true;
+                        if (!scalar_words.contains(word) &&
+                            !(m0_token_restore && m0_tokens.contains(word)))
+                            reads_ambiguous = true;
                 }
             }
             const bool implicit_vcc_read =
@@ -3159,6 +3178,10 @@ bool emit_cfg_state_machine(
                 native_b32_mask_scc_vote_pcs.contains(in.pc) ||
                 writes_exact_wave_scc)
                 scalar_scc = true;
+            for (const auto& [base, width] : scalar_writes)
+                for (uint32_t word = 0; word < width; ++word)
+                    m0_tokens.erase(base + static_cast<int>(word));
+            if (m0_token_save) m0_tokens.insert(in.dst.value);
             return true;
         };
 
@@ -3169,13 +3192,14 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        masks, ambiguous, scalar_words, m0_tokens, scalar_scc, in,
                         /*record_compare*/false))
                     return false;
             }
@@ -3185,6 +3209,7 @@ bool emit_cfg_state_machine(
                     wave64_b64_mask_in[successor] = masks;
                     wave64_b64_ambiguous_in[successor] = ambiguous;
                     wave64_scalar_word_in[successor] = scalar_words;
+                    wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
                     continue;
@@ -3209,15 +3234,23 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor].end(),
                     scalar_words.begin(), scalar_words.end(),
                     std::inserter(joined_scalar_words, joined_scalar_words.end()));
+                std::set<int> joined_m0_tokens;
+                std::set_intersection(
+                    wave64_m0_token_word_in[successor].begin(),
+                    wave64_m0_token_word_in[successor].end(),
+                    m0_tokens.begin(), m0_tokens.end(),
+                    std::inserter(joined_m0_tokens, joined_m0_tokens.end()));
                 const bool joined_scalar_scc =
                     wave64_scalar_scc_valid_in[successor] && scalar_scc;
                 if (joined != wave64_b64_mask_in[successor] ||
                     joined_ambiguous != wave64_b64_ambiguous_in[successor] ||
                     joined_scalar_words != wave64_scalar_word_in[successor] ||
+                    joined_m0_tokens != wave64_m0_token_word_in[successor] ||
                     joined_scalar_scc != wave64_scalar_scc_valid_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
                     wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
                     wave64_scalar_word_in[successor] = std::move(joined_scalar_words);
+                    wave64_m0_token_word_in[successor] = std::move(joined_m0_tokens);
                     wave64_scalar_scc_valid_in[successor] = joined_scalar_scc;
                     pending.push_back(successor);
                 }
@@ -3228,13 +3261,14 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        masks, ambiguous, scalar_words, m0_tokens, scalar_scc, in,
                         /*record_compare*/true))
                     return false;
             }
