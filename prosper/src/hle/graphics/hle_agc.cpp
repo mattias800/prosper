@@ -64,13 +64,21 @@ extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t 
 #define HLE9(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
                                        uint64_t a7, uint64_t a8)
+// sceAgcCbBranch takes twelve arguments, beyond the Windows legacy prologue's ten
+// (kLegacyForwardedArgs). Its handler is therefore registered with Hle::register_typed, whose
+// deduced signature lets the import bridge place all twelve; the (HleFn) cast form would drop two.
+#define HLE12(name)                                                                                \
+    static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,      \
+                                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,      \
+                                          uint64_t a8, uint64_t a9, uint64_t a10, uint64_t a11)
 
 namespace {
 
 // --- PM4 encoding (Kyty Pm4.h) ---------------------------------------------------------------
 constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F,
-                   IT_EVENT_WRITE = 0x46, IT_SET_CONTEXT_REG = 0x69,
-                   IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79;
+                   IT_EVENT_WRITE = 0x46, IT_SET_CONTEXT_REG = 0x69, IT_SET_SH_REG = 0x76,
+                   IT_SET_UCONFIG_REG = 0x79,
+                   IT_INDIRECT_BUFFER = 0x3F;   // sceAgcCbBranch's conditional form (#4540)
 // Custom sub-opcodes carried inside IT_NOP:
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
@@ -164,7 +172,9 @@ constexpr uint32_t kDwReleaseMem         = 8;
 // bits 30..31 type). Both header parsers already mask it off -- hle_agc's patch_check and
 // pm4_decode's hdr_r/hdr_op read bits 2 and up -- so it costs no dword and no new state.
 constexpr uint32_t kDwJump               = 4;
+constexpr uint32_t kDwCbBranch = 14;   // sceAgcCbBranch: header + 13 (firmware 0x38 bytes)
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
+constexpr uint64_t kAgcErrInvalidPacket = 0x8a6c000cull;   // BranchPatch*: not a branch packet
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -2085,7 +2095,8 @@ uint64_t g_submit_count = 0;
 // Serializes every access to the shared GpuState (fold + render + stats). DOLL's UE4 RHI submits
 // from TWO guest threads concurrently (core-proven, issue #278: one thread inside
 // agc_driver_submit_dcb -> execute_and_present -> extract_render_state reading st.cx/sh/uc while
-// another is inside agc_cb_branch -> run_command_buffer writing them). An
+// another was then inside agc_cb_branch -> run_command_buffer writing them; that branch now only
+// writes a packet, #4540, but SubmitDcb/SubmitAcb still race the same way). An
 // unordered_map rehash under a lock-free reader tears bucket pointers -> #GP with si_addr=0 (the
 // "rip=0 / writer 0x0" steady-state crash that ended runs as the scene began). The real driver
 // serializes ring submission internally — concurrent guest submits are legal and processed one at
@@ -2365,7 +2376,8 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
 
 // Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
 // (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
-// submit path (sceAgcDriverSubmitDcb) and sceAgcCbBranch (w1KFAHVqpaU) below.
+// submit paths (sceAgcDriverSubmitAcb, sceAgcDriverSubmitMultiDcbs). sceAgcCbBranch used to fold
+// through here as "SubmitDcbFinal"; it is a builder and no longer submits anything (#4540).
 // `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
 // we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
 extern "C" uint64_t prosper_guest_tsc_ns();                    // shared guest clock (hle_kernel_time)
@@ -2732,51 +2744,11 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
     }
 }
 
-// #1669 A/B ONLY — NOT A FIX, AND MUST NOT BE MADE DEFAULT-ON ON THE STRENGTH OF A NUMBER.
-//
-// #305 established that SubmitDcb (q1) and SubmitDcbFinal (q3) fold into the SAME graphics register
-// file, and that q3 is issued from threads that never issue q1. Whether sharing is correct depends on
-// an unestablished fact: is SubmitDcbFinal the same hardware ring as SubmitDcb — in which case it MUST
-// inherit q1's registers — or a distinct queue with its own register context, in which case merging
-// them is the defect? #1226 found exactly that symptom one queue over and fixed it by splitting the
-// register file, which raises the prior but does not settle it.
-//
-// This switch gives q3 its own GpuState so the question can be MEASURED: if the title's
-// recompile/vertex-reject counts collapse AND its world renders, that is evidence for the distinct-
-// queue answer; if they are unchanged, or draws fail in new ways, that is evidence for inheritance and
-// rules the direction out. Either result advances #1669 for one route.
-//
-// MEASURED (2026-08-01, Nikoderiko PPSA23760, two back-to-back 440 s routes, same binary):
-//
-//     metric                    control    split
-//     recompile-reject              524      529
-//     vertex-recompile-reject       138      135
-//     mubuf-unresolved              126      108
-//
-// No collapse — every delta is far inside the run-to-run variance of this route (an earlier control
-// on the same build measured 310/64/61). The frames are the decisive half and they are IDENTICAL:
-// the title screen renders and the 3D world is black in BOTH arms. The split is not a no-op — it
-// shifts the failure mix ([lazy-commit] 1118 -> 3476, [mimg-unresolved] appearing) — it simply does
-// not fix anything. So the direction is ruled out as a fix, and the switch is retained OFF as a
-// documented negative result, exactly like PROSPER_UD_TAIL_ALIGN.
-//
-// LIMIT OF THIS EXPERIMENT, stated because the pre-registered rule ("unchanged => inheritance") was
-// slightly too strong: a q3 buffer opens with user-data writes and a draw and has NO bind of its own,
-// so a freshly split state has no program bound under EITHER hypothesis. The result therefore rules
-// out the FIX cleanly, but is weaker evidence about ring semantics than the rule assumed. #1669's
-// section 1 still needs the guest-use / contract / disassembly evidence.
-//
-// It stays default-off until the SEMANTICS are established, however good the number looks. A numeric
-// improvement is not evidence of a correct model — that is the failure mode recorded as instrument
-// trap 15, and separating a queue that must inherit would create a new defect shaped exactly like the
-// one it appears to fix.
-static bool split_final_state() {
-    static const bool on = getenv("PROSPER_AGC_SPLIT_FINAL_STATE") != nullptr;
-    return on;
-}
-// Distinct from the Acb per-queue map: keyed by nothing, because there is exactly one Dcb-final
-// stream. Retained process-lifetime like the graphics state it shadows.
-static gpu::GpuState& agc_final_state() { static gpu::GpuState st; return st; }
+// #1669's PROSPER_AGC_SPLIT_FINAL_STATE lever gave "SubmitDcbFinal" folds their own register file.
+// It measured no fix (Nikoderiko, 2026-08-01) and is removed with #4540: those folds were
+// sceAgcCbBranch targets executed when the branch was recorded, and a branch now runs inside the
+// buffer that carries it, under that buffer's register state, so there is no separate stream left
+// to split.
 [[noreturn]] static void unsupported_multi_dcb(const char* reason, size_t count, size_t index = 0) {
     fprintf(stderr, "[agc] sceAgcDriverSubmitMultiDcbs unsupported: %s (count=%zu index=%zu)\n",
             reason, count, index);
@@ -2808,17 +2780,7 @@ static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buf
         }
     }
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
-    const bool dcb_final = strcmp(who, "SubmitDcbFinal") == 0;
-    gpu::GpuState& state = async_compute            ? agc_compute_state(queue_id)
-                         : (dcb_final && split_final_state()) ? agc_final_state()   // #1669 A/B
-                                                             : agc_graphics_state();
-    if (dcb_final && split_final_state()) {
-        static std::atomic<bool> announced{false};
-        if (!announced.exchange(true))
-            fprintf(stderr, "[agc] PROSPER_AGC_SPLIT_FINAL_STATE=1: SubmitDcbFinal is folding into its "
-                            "OWN register file (#1669 MEASUREMENT, not a fix -- this configuration is "
-                            "not validated and must not be treated as correct behaviour)\n");
-    }
+    gpu::GpuState& state = async_compute ? agc_compute_state(queue_id) : agc_graphics_state();
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
     // graphics Dcb stream from the async-compute Acb stream. The queues share ordered memory
     // effects, but not register files: folding Acb SH writes into graphics state overwrote live
@@ -2898,104 +2860,90 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     return submit_dcb_buffers(&buffer, 1, who, queue_id, dw_num != 0);
 }
 
-// sceAgcCbBranch (NID w1KFAHVqpaU). The identity is a determination, not a guess:
-// nid_hash("sceAgcCbBranch") == w1KFAHVqpaU, from the round-trip over all 39,158 published pairs in
-// the PS5 3.20 export tables with 0 mismatches (nid_census --self-check, #2081). It was previously
-// labelled a "submit variant" here, which was wrong in a way that cost something: "submit variant"
-// implies a second submit entry point, while "CbBranch" implies a control-flow packet in a command
-// stream, and those predict different things about the arguments and about what
-// sceAgcCbBranchGetSize should return (#2173).
+// sceAgcCbBranch (NID w1KFAHVqpaU; nid_hash("sceAgcCbBranch") == w1KFAHVqpaU, from the round-trip
+// over all 39,158 published pairs in the PS5 3.20 export tables, #2081) and its patch family (#4540).
 //
-// The BEHAVIOUR below is right and must not be "fixed" to match the new label -- it resolved the
-// #232 wall. The two readings agree: a command-buffer chain CALLS its intermediate buffers and
-// BRANCHES to the last one (a tail-jump, so the final buffer never returns), which is exactly the
-// pattern the RE notes describe. Folding -- executing -- the stream at that address is therefore the
-// correct thing for a software command processor to do, and sceAgcCbBranch semantics EXPLAIN the
-// RE'd ABI rather than contradict it. CONFIDENCE: HIGH on the identity; MED on the chain-tail-jump
-// reading of why DOLL calls it here (it fits the recorded disassembly, but no capture was taken to
-// confirm the final buffer is entered by branch rather than by call).
+// sceAgcCbBranch is a command-buffer BUILDER, like every other sceAgcCb*/Dcb* entry point: it appends
+// one packet to the buffer in `cb` and returns the packet's address. It submits nothing. The firmware
+// (libSceAgc.sprx, export at file offset 0x5e80) reserves 14 dwords through the same buffer object
+// prosper's AgcDcb models (cursor +0x10, limit +0x18, reserve +0x30, overflow callback +0x20/+0x28),
+// writes a type-3 packet with header 0xC00C3F00 (opcode 0x3F, 13 body dwords) and returns its
+// address, or 0 when the buffer cannot hold it:
 //
-// DOLL's UE4 RHI submits its per-frame command buffers
-// through TWO driver entry points: intermediate buffers via sceAgcDriverSubmitDcb (UglJIZjGssM,
-// folded above) and the FINAL buffer of a SubmitCommandBuffers batch through THIS one (the guest's
-// SubmitCommandBuffers impl at eboot+0x220a9a0 loops the buffer array, calling the indirect submit for
-// buffers [0..n-2] and w1KFAHVqpaU for buffer n-1). Left unimplemented, the final buffer's GPU EOP
-// fences (ReleaseMem writes) never executed, so the label the RenderThread polls (eboot+0x221d6c2,
-// FRenderCommandFence/RHI frame-sync) stayed 0 forever and the GameThread timed out — the #232 wall.
+//   [1]  mode (a1 & 3) | function (a2 & 7) << 8
+//   [2]  compare address low (a3, low 3 bits cleared)       [3]  compare address high
+//   [4]  mask low (a4)                                       [5]  mask high
+//   [6]  reference low (a5)                                  [7]  reference high
+//   [8]  then-target address low (a7, low 2 bits cleared)    [9]  then-target address high
+//   [10] then-target dwords (a8 & 0xfffff) | (a6 & 3) << 28
+//   [11] else-target address low (a10, low 2 bits cleared)   [12] else-target address high
+//   [13] else-target dwords (a11 & 0xfffff) | (a9 & 3) << 28
 //
-// ABI (RE'd from the compiler-generated adapter thunk at eboot+0x58df3f0, which marshals DOLL's
-// internal call at eboot+0x220aace into the Sony import): the raw Dcb dword-stream address arrives as
-// stack arg8, forwarded as a7 by the import ABI bridge. The dword COUNT is stack arg9: the callsite loads the buffer-array entry
-// {addr @+0x00, dw_count32 @+0x10} (`mov 0x10(%rax,%r12,1),%r10d`) and the adapter pushes it as the
-// import's 9th arg (32-bit, matching Packet.dw_num on the primary UglJIZjGssM path).
-//
-// WHY the exact count matters (#241 and the boot crash-zoo): the Dcb is carved from a live ring whose
-// STALE tail is still valid type-3 PM4 from previous frames. An unknown-length fold does not stop at
-// the logical end — it re-executes the stale packets, including stale WriteData/ReleaseMem fence writes
-// whose destination heap blocks the guest has since freed and reused. That scribbles 8-byte GPU values
-// into live allocator state (the deterministic 0x20015f00 free-list node of issue #241, the libc.prx
-// logger stack-smash) — intermittent because it depends on what got reallocated under the stale fences.
-// CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
-// the primary path's Packet.dw_num field offset).
-HLE9(agc_cb_branch) {
-    // The generated return hook is attached to this import invocation even when validation rejects
-    // it. Begin before every early return so nested/re-entrant tagged calls remain exactly paired.
-    prosper_gpu_submit_scope_begin();
-    auto is_pm4 = [](uint64_t p) -> bool {
-        if (p < 0x10000 || (p & 3)) return false;
-        uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
-        return (h & 0xC0000000u) == 0xC0000000u;
-    };
-    auto first_dword = [](uint64_t p) -> uint32_t {
-        return (p >= 0x10000 && !(p & 3)) ? *(const volatile uint32_t*)(uintptr_t)p : 0;
-    };
-    uint64_t cand = a7;                                     // arg8 = the Dcb stream address (adapter ABI)
-    if (!is_pm4(cand)) {                                    // fallback: scan the register args
-        // #1662: this substitutes a GUESSED stream address for the one the guest passed, on the
-        // strength of a ONE-DWORD type-3 test. It used to do so silently — only the found-nothing
-        // case below logged — so a submit folding a scavenged pointer was indistinguishable in the
-        // log from one folding the guest's. That is unproved provenance that is not fail-visible.
-        //
-        // The guess is unusually dangerous here because the adapter thunks that reach this import do
-        // NOT set the register arguments (verified by disassembly on two UE4 titles): a0..a5 hold
-        // whatever the caller left there, which at Nikoderiko's call site includes a STACK address.
-        // An arbitrary stack dword passes a bits-31:30 test about one time in four, and a fold does
-        // not merely read — WRITE_DATA/RELEASE_MEM packets write into guest memory (#241).
-        //
-        // Reported unconditionally and rate-limited. The policy question (refuse rather than guess)
-        // is deliberately separate from making it visible; see #1662.
-        const uint64_t regs[6] = { a0, a1, a2, a3, a4, a5 };
-        const uint64_t rejected = cand;
-        cand = 0;
-        int winner = -1;
-        for (int i = 0; i < 6; ++i) if (is_pm4(regs[i])) { cand = regs[i]; winner = i; break; }
-        static std::atomic<int> logged_sub{0};
-        const int n = logged_sub.fetch_add(1);
-        if (n < 16)
-            fprintf(stderr,
-                    "[agc] w1KFAHVqpaU SUBSTITUTED STREAM ADDRESS (#1662): arg8=0x%llx rejected "
-                    "(first dword 0x%08x is not a type-3 header); %s a%d=0x%llx (first dword 0x%08x); "
-                    "arg9=0x%llx. The fold below is from a GUESSED pointer, not the guest's%s\n",
-                    (unsigned long long)rejected, first_dword(rejected),
-                    winner < 0 ? "no register qualified --" : "using",
-                    winner, (unsigned long long)cand, first_dword(cand),
-                    (unsigned long long)a8, n == 15 ? " [further reports suppressed]" : "");
-    }
-    if (!cand) {
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (arg8=0x%llx a0=0x%llx a1=0x%llx) -- submit refused\n",
-                    (unsigned long long)a7, (unsigned long long)a0, (unsigned long long)a1);
-        return 0;
-    }
-    uint32_t dw_num = a8 && a8 <= 0x400000ull ? (uint32_t)a8 : 0;
-    if (!dw_num) {
-        static std::atomic<int> logged9{0};
-        if (logged9.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: invalid arg9 count 0x%llx -- self-terminating fold\n",
-                    (unsigned long long)a8);
-    }
-    return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, dw_num, "SubmitDcbFinal");
+// The branch therefore runs when the command processor REACHES the packet inside the buffer that
+// carries it -- after every bind and user-data write recorded before it. prosper used to fold the
+// then-target at the moment the guest recorded the branch, against whatever pipeline happened to be
+// bound by the last fold. That paired the target's opening draws with the wrong program (Kena,
+// PPSA01802: 0 of 19 sampled draws matched the program actually used, while their user data matched
+// the next bind of the same shape), which the recompiler then refused as unresolved descriptors.
+// It also wrote no packet, so the carrying buffer reached SubmitDcb without its tail branch.
+// Measured on Kena: 61 of the first 64 recorded branches sit at the exact end of a buffer the guest
+// later submits through sceAgcDriverSubmitDcb, so emitting the packet hands the target to the
+// command processor in guest order. The #232 dependency (DOLL's final-buffer EOP fences) is served
+// the same way: the fences run when the carrying buffer is folded. CONFIDENCE: HIGH on the packet
+// layout and size (read from the firmware stores); MED on the condition encoding (see
+// pm4_decode.hpp CondIndirectBuffer).
+HLE12(agc_cb_branch) {
+    uint32_t* cmd;
+    if (!begin_packet(a0, kDwCbBranch, IT_INDIRECT_BUFFER, 0, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a1 & 3u) | ((uint32_t)(a2 & 7u) << 8);
+    cmd[2] = (uint32_t)(a3 & 0xfffffff8u);
+    cmd[3] = (uint32_t)(a3 >> 32);
+    cmd[4] = (uint32_t)a4;
+    cmd[5] = (uint32_t)(a4 >> 32);
+    cmd[6] = (uint32_t)a5;
+    cmd[7] = (uint32_t)(a5 >> 32);
+    cmd[8] = (uint32_t)(a7 & 0xfffffffcu);
+    cmd[9] = (uint32_t)(a7 >> 32);
+    cmd[10] = (uint32_t)(a8 & 0xfffffu) | ((uint32_t)(a6 & 3u) << 28);
+    cmd[11] = (uint32_t)(a10 & 0xfffffffcu);
+    cmd[12] = (uint32_t)(a10 >> 32);
+    cmd[13] = (uint32_t)(a11 & 0xfffffu) | ((uint32_t)(a9 & 3u) << 28);
+    return (uint64_t)(uintptr_t)cmd;
+}
+constexpr uint32_t kCbBranchBytes = kDwCbBranch * 4u;   // firmware GetSize: mov $0x38,%eax
+HLE(agc_cb_branch_get_size) {
+    (void)a0;
+    return kCbBranchBytes;
+}
+// The three patchers rewrite one field of an already-built branch in place. Each first checks that
+// the packet's opcode byte is 0x3F and otherwise returns 0x8a6c000c without writing (firmware file
+// offsets 0xf040 / 0xeea0 / 0xef00). Bits the firmware preserves are preserved here.
+static bool cb_branch_patchable(uint64_t pkt, const char* who) {
+    if (!pkt || !patch_target_writable(pkt, kCbBranchBytes, who)) return false;
+    return ((*(const uint32_t*)(uintptr_t)pkt >> 8) & 0xffu) == IT_INDIRECT_BUFFER;
+}
+HLE(agc_branch_patch_set_compare_address) {   // (packet, address)
+    if (!cb_branch_patchable(a0, "BranchPatchSetCompareAddress")) return kAgcErrInvalidPacket;
+    auto* cmd = (uint32_t*)(uintptr_t)a0;
+    cmd[2] = (cmd[2] & 7u) | (uint32_t)(a1 & 0xfffffff8u);
+    cmd[3] = (uint32_t)(a1 >> 32);
+    return 0;
+}
+HLE(agc_branch_patch_set_then_target) {   // (packet, address, dwords)
+    if (!cb_branch_patchable(a0, "BranchPatchSetThenTarget")) return kAgcErrInvalidPacket;
+    auto* cmd = (uint32_t*)(uintptr_t)a0;
+    cmd[8] = (cmd[8] & 3u) | (uint32_t)(a1 & 0xfffffffcu);
+    cmd[9] = (uint32_t)(a1 >> 32);
+    cmd[10] = (cmd[10] & 0xfff00000u) | (uint32_t)(a2 & 0xfffffu);
+    return 0;
+}
+HLE(agc_branch_patch_set_else_target) {   // (packet, address, dwords)
+    if (!cb_branch_patchable(a0, "BranchPatchSetElseTarget")) return kAgcErrInvalidPacket;
+    auto* cmd = (uint32_t*)(uintptr_t)a0;
+    cmd[11] = (cmd[11] & 3u) | (uint32_t)(a1 & 0xfffffffcu);
+    cmd[12] = (uint32_t)(a1 >> 32);
+    cmd[13] = (cmd[13] & 0xfff00000u) | (uint32_t)(a2 & 0xfffffu);
+    return 0;
 }
 
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
@@ -3079,6 +3027,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                 case K::SetIndexCount:   return "SetIndexCount";
                 case K::DrawIndexOffset: return "DrawIndexOffset";
                 case K::Jump:            return "Jump";
+                case K::CondIndirectBuffer: return "CondIndirectBuffer";
                 case K::SetPredication:  return "SetPredication";
                 case K::SetBaseIndirectArgs: return "SetBaseIndirectArgs";
                 case K::StallCommandBufferParser: return "StallCommandBufferParser";
@@ -4021,27 +3970,22 @@ void register_agc_hle() {
     RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
     RN_SUBMIT_NAMED("6UzEidRZwkg", agc_driver_submit_multi_dcbs, "sceAgcDriverSubmitMultiDcbs");
-    // sceAgcCbBranch (#2173) — named, so logs and hle_calls do not report a bare NID for the one
-    // entry here whose published name is established. See the block above agc_cb_branch.
-    RN_SUBMIT_NAMED("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");
-    // The rest of the branch family is KNOWN-ABSENT rather than overlooked (#2173). libSceAgc
-    // exports them together; no title has been observed calling them, and each is left
-    // unregistered so a caller faults visibly instead of getting a silent wrong answer:
-    //   uZW-mqsxkrM  sceAgcCbBranchGetSize
-    //   GXBlM-ekzrI  sceAgcBranchPatchSetCompareAddress
-    //   QmfvaYpsOcI  sceAgcBranchPatchSetElseTarget
-    //   xb8VgcXQhvI  sceAgcBranchPatchSetThenTarget
-    // nid_census flags "builder registered, GetSize unregistered" for this pair, which normally
-    // means the guest reserves 0 dwords while prosper writes N. Here it is BENIGN ONLY BECAUSE
-    // agc_cb_branch folds the target stream and appends NOTHING to the guest buffer. If it is
-    // ever changed to emit a real branch packet, sceAgcCbBranchGetSize must be registered in the
-    // SAME change or the guest reserves nothing for what prosper then writes.
-    // The three BranchPatch* entries patch a branch's then/else targets and compare address
-    // AFTER it has been written, which a fold cannot honour: prosper folds unconditionally at
-    // build time and any later patch would be dropped. Whether a title does this is open.
-    #undef RN_SUBMIT_NAMED
-    #undef RN_SUBMIT
-    #undef RN
+    // sceAgcCbBranch and its family (#2173, #4540). The branch is a builder, not a submit, so it
+    // carries no submit-scope return hook. It takes twelve arguments, so it is registered with its
+    // declared signature: the (HleFn) cast form forwards only ten on Windows (kLegacyForwardedArgs).
+    // GetSize is registered in the same change as the packet, as the #1756 rule requires: a guest
+    // that asks reserves exactly the 0x38 bytes the builder writes.
+    Hle::register_typed("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");
+    Hle::register_fn("uZW-mqsxkrM", (HleFn)agc_cb_branch_get_size, "sceAgcCbBranchGetSize");
+    Hle::register_fn("GXBlM-ekzrI", (HleFn)agc_branch_patch_set_compare_address,
+                     "sceAgcBranchPatchSetCompareAddress");
+    Hle::register_fn("xb8VgcXQhvI", (HleFn)agc_branch_patch_set_then_target,
+                     "sceAgcBranchPatchSetThenTarget");
+    Hle::register_fn("QmfvaYpsOcI", (HleFn)agc_branch_patch_set_else_target,
+                     "sceAgcBranchPatchSetElseTarget");
+#undef RN_SUBMIT_NAMED
+#undef RN_SUBMIT
+#undef RN
 }
 
 }  // namespace prosper

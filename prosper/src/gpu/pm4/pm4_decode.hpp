@@ -24,8 +24,14 @@ inline constexpr uint32_t kDmaDataAddressSource = 1u << 16;
 
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
-    IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F, IT_EVENT_WRITE = 0x46,
-    IT_SET_CONTEXT_REG = 0x69, IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
+    IT_NOP = 0x10,
+    IT_INDEX_TYPE = 0x2A,
+    IT_NUM_INSTANCES = 0x2F,
+    IT_EVENT_WRITE = 0x46,
+    IT_SET_CONTEXT_REG = 0x69,
+    IT_SET_SH_REG = 0x76,
+    IT_SET_UCONFIG_REG = 0x79,
+    IT_INDIRECT_BUFFER = 0x3F,   // sceAgcCbBranch's 14-dword conditional form (#4540)
 };
 enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
@@ -72,13 +78,36 @@ enum class RegClass { Cx, Sh, Uc };
 // the header), so unknown packets are still walkable and inspectable.
 struct Pm4Command {
     enum class Kind {
-        DrawReset, WaitFlipDone, PushMarker, PopMarker, SetRegDirect, SetRegsIndirect, SetIndexType,
+        DrawReset,
+        WaitFlipDone,
+        PushMarker,
+        PopMarker,
+        SetRegDirect,
+        SetRegsIndirect,
+        SetIndexType,
         SetNumInstances,
-        DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
-        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
-        SetBaseIndirectArgs, StallCommandBufferParser, DrawIndexIndirect, DrawIndirect,
+        DrawIndex,
+        DrawIndexAuto,
+        EventWrite,
+        AcquireMem,
+        WriteData,
+        WaitRegMem,
+        Flip,
+        ReleaseMem,
+        DispatchDirect,
+        SetIndexBase,
+        SetIndexCount,
+        DrawIndexOffset,
+        Jump,
+        SetPredication,
+        SetBaseIndirectArgs,
+        StallCommandBufferParser,
+        DrawIndexIndirect,
+        DrawIndirect,
         DispatchIndirect,
-        DmaData, Unknown,
+        DmaData,
+        Unknown,
+        CondIndirectBuffer,   // appended after Unknown so no existing value moves
     } kind = Kind::Unknown;
 
     uint64_t stream_order = 0;          // assigned before apply and retained by deferred effects
@@ -199,6 +228,24 @@ struct Pm4Command {
     uint32_t jump_dwords = 0;            // Jump: segment length in dwords
     uint32_t jump_pred = 0;              // Jump: 1 = packet-predicated (header bit 0, the PM4 PREDICATE bit)
     bool     jump_valid = false;         // Jump: payload carried the full operand set
+
+    // CondIndirectBuffer: the type-3 opcode-0x3F packet with a 13-dword body that sceAgcCbBranch
+    // writes (#4540; layout in hle_agc.cpp above agc_cb_branch). The command processor evaluates
+    // the condition when it reaches the packet and runs the then- or else-target in place, as a
+    // call with length (the same execution a Jump performs). Function 0 is "always" -- every
+    // branch observed on Kena uses mode 1 / function 0 / mask 0 / reference 0, and taking the
+    // then-target for it is what resolved DOLL's #232 wall. Functions 1-6 are decoded as the
+    // comparisons (mem64 & mask) <, <=, ==, !=, >=, > reference; CONFIDENCE: LOW, no title has been
+    // observed using them, and the command processor reports any use.
+    uint32_t cib_mode = 0;   // CondIndirectBuffer: dword1 bits 1:0
+    uint32_t cib_func = 0;   // CondIndirectBuffer: dword1 bits 10:8
+    uint64_t cib_compare_addr = 0;   // CondIndirectBuffer: dwords 2..3
+    uint64_t cib_mask = 0;   // CondIndirectBuffer: dwords 4..5
+    uint64_t cib_reference = 0;   // CondIndirectBuffer: dwords 6..7
+    uint64_t cib_then_addr = 0;   // CondIndirectBuffer: dwords 8..9
+    uint32_t cib_then_dwords = 0;   // CondIndirectBuffer: dword 10 bits 19:0
+    uint64_t cib_else_addr = 0;   // CondIndirectBuffer: dwords 11..12
+    uint32_t cib_else_dwords = 0;   // CondIndirectBuffer: dword 13 bits 19:0
 
     // SetPredication (sceAgcDcbSetPredication -> R_SET_PRED; #319). Payload: [0..1]=condition
     // address lo/hi (0 = end the window), [2]=raw predication op (live capture: 3 on begin, 0 on end).

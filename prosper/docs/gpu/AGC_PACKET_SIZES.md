@@ -394,10 +394,11 @@ happened to ask, and each time fixed for that title's NIDs alone.
   Nikoderiko's #305 already lives.
 * `sceAgcQueueEndOfPipeActionPatchData` and `sceAgcDcbGetLodStats` are called and unimplemented
   (see the table above).
-* `w1KFAHVqpaU` is `sceAgcCbBranch` in the 3.20 export table, but prosper registers it as the DOLL
-  "final buffer" submit variant (#232), derived from live disassembly and load-bearing. `CbBranch`
-  also has a `GetSize`, which implies it is a *builder*. Recorded, not changed — a title calling it
-  as a branch would currently reach the submit path instead.
+* `w1KFAHVqpaU` is `sceAgcCbBranch`, a *builder* (#4540). The firmware writes a 14-dword type-3
+  packet (header `0xC00C3F00`, opcode `0x3F`) and `sceAgcCbBranchGetSize` returns `0x38`; prosper
+  writes the same 14 dwords and registers `GetSize`. Until #4540 it was registered as a
+  "final buffer" submit (#232) that folded the target when the branch was recorded and wrote
+  nothing.
 * `DcbDrawIndirect`'s 4 dwords are an inference from the published `DRAW_INDIRECT` field list,
   not a measurement of a guest reservation (#2929). The direction that matters is proven — 4 is at or
   below the reference, so it cannot overrun — but a `PROSPER_DCBWIN` window over a live caller
