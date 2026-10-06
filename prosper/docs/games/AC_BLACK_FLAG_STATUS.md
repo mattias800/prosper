@@ -159,6 +159,15 @@ Unexplained and not yet shown to matter:
 
 ## Ruled out
 
+- **"Write-watch can take over the per-frame compare of the constant ring on Windows."** Not available:
+  on Windows `GuestWriteWatch::create` always reports unsupported (page-protection watches corrupt the
+  guest SysV red zone, and direct memory is section-backed so `MEM_WRITE_WATCH` cannot see it), so every
+  CPU-written guest source is validated by a full compare. Measured 2026-10-06 with the arena on: the
+  guest rewrites 0.25-0.3 MiB of the ~59 MiB ring per frame, validation is `full` once per frame
+  (journal for the other windows), and forcing promotion with `PROSPER_COMPUTE_WATCH_DEFER_MIN_KB=0`
+  armed nothing (`watch=0` in the `PROSPER_WATCH_PROMOTE_CENSUS` totals). The remaining lever is the
+  compare itself (~11 ms/frame under load), not the copy: block-granular sync (#4635) took the upload
+  from ~49 MiB to ~0.3 MiB per frame.
 - **"The black window is a slow load or a hang in a long boot."** Falsified: the primary guest thread
   ended with `ACCESS-VIOLATION addr=0x3 rip=eboot+0x161ed91` at about 1.6 s while the process stayed up
   for 72 minutes with 32 s of CPU and no further log lines; `BOOT_COMPLETE` is reached at 1.6 to 2.0 s.
