@@ -25,10 +25,12 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   scalar loads: a must-dataflow over the program's CFG, so every path into the consumer has to
   deliver the same load words. `sopp_cfg` holds the direct-branch helpers the executor's CFG
   proofs share.
-- `dcc_helper_program.hpp` / `efc_helper_program.hpp` — recognise AGC's colour-block metadata
-  operations (DCC decompress, eliminate fast clear) by the exact helper program AGC binds for them,
+- `dcc_helper_program.hpp` / `efc_helper_program.hpp` — recognise AGC's metadata operations (DCC
+  decompress, eliminate fast clear, htile decompress) by the helper program AGC binds for them,
   never by `CB_COLOR_CONTROL.MODE` alone: titles latch a utility MODE onto later ordinary draws that
-  must still write. A new helper variant is added from an observed program, with its words.
+  must still write. DCC uses exact observed programs. The rectangle behind eliminate and htile
+  decompress also matches by family (AGC's exact position core plus an NGG prologue), because every
+  title compiles its own prologue, and an unrecognised one paints the scanout black (#4610).
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
