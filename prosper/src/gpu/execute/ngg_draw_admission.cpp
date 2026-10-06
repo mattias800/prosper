@@ -73,6 +73,7 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         return refuse("ngg-clip-cull-distance");
     if (registers.pa_cl_clip_cntl & 0x3fu) return refuse("ngg-user-clip-plane");   // UCP_ENA [5:0]
     if (vs_out & kVsOutUseVtxKillFlag) return refuse("ngg-vertex-kill-flag");
+    if (vs_out & kVsOutUndecodedMask) return refuse("ngg-vs-out-undecoded");
     admission.layer_from_pos1 = (vs_out & kVsOutUseVtxRenderTargetIndx) != 0;
     if (admission.layer_from_pos1) {
         if (!facts.target_slices) return refuse("ngg-layer-target-not-layered");

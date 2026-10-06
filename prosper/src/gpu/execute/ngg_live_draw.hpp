@@ -11,9 +11,11 @@
 //
 // CACHING (CLAUDE.md P3). Compiling the shell and the raster stages is the expensive part. They are
 // cached per (compile inputs, W), and the compile inputs are compared EXACTLY: the linked program's
-// words, the resource table's compile shape (every field the recompiler reads, never an address or
-// host byte -- the partition the ordinary shader cache's key makes, taken conservatively wide), the
-// pixel-input mapping, and the admission configuration (user SGPR count, LDS granules, native
+// words; the resource table's per-resource compile key, built by the same function as the ordinary
+// shader cache's key (append_shader_resource_compile_keys, with the compute stage the shell is), so
+// every data-dependent admission the emitter reads -- snapshot sizes and validity, scalar-buffer
+// and table contracts, null markers -- partitions the cache and no address or content byte does;
+// the pixel-input mapping; and the admission configuration (user SGPR count, LDS granules, native
 // Wave64, output topology, provoking vertex, layer read and slice count, route, violation counting,
 // interpolation layout, float transport). The ordinary shader cache's identity cannot stand in:
 // that path refuses a chain with owned raw inputs (Kena's) before it assigns one.
@@ -61,6 +63,9 @@ struct NggLiveDrawResult {
     bool applies = false;   // a merged ES+GS NGG draw: the path was tried
     const char* refusal = nullptr;   // the rule that refused (a static string), null on success
     std::string detail;   // the compiler's full refusal text, when it refused
+    // An admitted triangle STRIP: its odd triangles reach the guest GS in natural order, which
+    // open question 3 (#3135) leaves unsettled. Counted so P6 can find the titles relying on it.
+    bool strip = false;
 };
 
 // The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded
@@ -82,6 +87,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
 struct NggLiveDrawCacheStats {
     uint64_t stage_hits = 0, stage_compiles = 0, stage_evictions = 0;
     uint64_t draw_hits = 0, draw_assemblies = 0;
+    uint64_t strip_draws = 0;   // admitted strip draws (see NggLiveDrawResult::strip)
 };
 NggLiveDrawCacheStats ngg_live_draw_cache_stats();
 void reset_ngg_live_draw_cache_for_test();

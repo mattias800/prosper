@@ -39,6 +39,9 @@ inline constexpr uint32_t kVsOutUseVtxKillFlag = 1u << 20;
 inline constexpr uint32_t kVsOutMiscVecEna = 1u << 21;
 inline constexpr uint32_t kVsOutCcDist0VecEna = 1u << 22;
 inline constexpr uint32_t kVsOutCcDist1VecEna = 1u << 23;
+// Bits [31:25] (gfx10.3: GS cut flag, line width, VRS rate and its combiner bypasses, among
+// others) are not modelled by the pass-through stage. Refused until each one is decoded.
+inline constexpr uint32_t kVsOutUndecodedMask = 0xfe000000u;
 // VGT_GS_INSTANCE_CNT: ENABLE [0], CNT [8:2].
 inline constexpr uint32_t kGsInstanceEnable = 1u;
 inline uint32_t ngg_gs_instance_count(uint32_t vgt_gs_instance_cnt) {
@@ -146,10 +149,19 @@ struct NggDrawAdmission {
 //   ngg-indexed / ngg-indirect / ngg-vertex-offset   (P6)
 //   ngg-viewport-index / ngg-point-size / ngg-clip-cull-distance / ngg-user-clip-plane /
 //   ngg-vertex-kill-flag          per-vertex state the pass-through stage does not model
+//   ngg-vs-out-undecoded          PA_CL_VS_OUT_CNTL bits [31:25], until each is decoded
 //   ngg-layer-target-not-layered  the layer is read and colour target 0 is not a layered volume
 //   ngg-layer-slice-start         the layer is read and the view's SLICE_START is not 0
 //   ngg-strip-order-visible       a strip with culling, a FRONT_FACE input, a flat input or a raw
-//                                 per-vertex input (odd-triangle order is open question 3)
+//                                 per-vertex input (odd-triangle order is open question 3).
+//                                 CONFIDENCE: MED. This guards what the RASTERIZER can see of the
+//                                 odd-triangle vertex order. The guest GS itself also sees it: a
+//                                 GS deriving a facet normal or signed area from its inputs, or a
+//                                 layer per input vertex, would produce different values on odd
+//                                 triangles if the hardware swaps them. Whether a GS's outputs
+//                                 depend on input order is not statically decidable here, so it is
+//                                 not refused; admitted strips are counted (strip_draws, and
+//                                 "input=strip" on the [ngg-live] line) for P6 to audit.
 //   ngg-user-data-range           no AGC user-data range, a range not starting at 0, or more than
 //                                 the shell's push-constant budget
 //   ngg-user-sgpr-count           RSRC2_GS.USER_SGPR is non-zero and disagrees with the range

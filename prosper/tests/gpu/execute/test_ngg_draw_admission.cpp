@@ -169,6 +169,8 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-user-clip-plane", [](auto& r, auto&, auto&) { r.pa_cl_clip_cntl |= 1u; }},
         {"ngg-vertex-kill-flag",
          [](auto& r, auto&, auto&) { r.pa_cl_vs_out_cntl |= kVsOutUseVtxKillFlag; }},
+        {"ngg-vs-out-undecoded", [](auto& r, auto&, auto&) { r.pa_cl_vs_out_cntl |= 1u << 25; }},
+        {"ngg-vs-out-undecoded", [](auto& r, auto&, auto&) { r.pa_cl_vs_out_cntl |= 1u << 31; }},
         {"ngg-layer-target-not-layered", [](auto&, auto& f, auto&) { f.target_slices = 0; }},
         {"ngg-layer-slice-start", [](auto&, auto& f, auto&) { f.target_first_slice = 1; }},
         {"ngg-strip-order-visible", [](auto& r, auto&, auto&) { r.pa_su_sc_mode_cntl |= 2u; }},
@@ -414,6 +416,38 @@ TEST_F(NggLiveDraw, NothingCompilesOnceWarm) {
     const auto before_move = ngg_live_draw_cache_stats().stage_compiles;
     (void)realize_ngg_live_draw(in, radv());
     EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, before_move + 1);
+}
+
+// The stage key carries the emitter's data-dependent admission of each resource, built by the
+// ordinary shader cache's own per-resource function. Here the V# raw register snapshot at pc 33
+// loses its backing (8 of its 16 bytes): the ordinary key marks it invalid, so a warm module must
+// NOT be reused for it (the module would read words the draw does not have), and its refusal must
+// not stick to the valid table either.
+TEST_F(NggLiveDraw, AWarmEntryIsNotReusedAcrossAResourceAdmissionChange) {
+    const auto warm = realize_ngg_live_draw(kena_input(), radv());
+    ASSERT_TRUE(warm.draw);
+    const uint64_t compiles = ngg_live_draw_cache_stats().stage_compiles;
+    EXPECT_EQ(ngg_live_draw_cache_stats().strip_draws, 1u) << "Kena's producer is a strip";
+
+    KenaProgram unbacked = kena_program();
+    bool changed = false;
+    for (auto& r : unbacked.table.resources)
+        if (r.raw_register_snapshot && r.fetch_pc == 33) {
+            r.host_data_size = 8;
+            changed = true;
+        }
+    ASSERT_TRUE(changed);
+    auto in = kena_input(32, 7);
+    in.resources = &unbacked.table;
+    const auto partial = realize_ngg_live_draw(in, radv());
+    EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, compiles + 1)
+        << "the changed admission is a different stage key";
+    EXPECT_FALSE(partial.draw) << "the emitter refuses an unbacked register-offset load";
+
+    const auto again = realize_ngg_live_draw(kena_input(32, 7), radv());
+    ASSERT_TRUE(again.draw) << "the refusal did not stick to the backed table";
+    EXPECT_EQ(again.draw->groups[0].stages, warm.draw->groups[0].stages);
+    EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, compiles + 1);
 }
 
 TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {

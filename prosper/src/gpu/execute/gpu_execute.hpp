@@ -2855,25 +2855,33 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg.facts.raw_vertex_input_mask =
             interpolation.passthrough_mask | (interpolation.requires_geometry ? 1u : 0u);
         ngg.facts.interpolation_geometry_required = interpolation.requires_geometry;
-        ngg.user_data_complete =
-            read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
-        ngg.linked = ngg_linked_chain(
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
-            vertex_prolog.prefix_dwords,
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords);
-        // The shell runs the LINKED program, so its table is folded over the linked words.
-        const std::shared_ptr<ShaderResourceTable> ngg_vrt =
-            ngg.linked ? build_stage_table(ds, rs.es_addr, false, vcount_hint,
-                                           draw ? draw->command_order : 0, raw_context, nullptr,
-                                           nullptr, *ngg.linked)
-                       : nullptr;
-        ngg.resources = ngg_vrt.get();
-        ngg.pixel_inputs = pixel_input_ptr;
-        ngg.interpolation = interpolation;
-        ngg.float_transport = float_transport;
-        ngg.program_address = rs.es_addr;
-        const NggLiveDrawResult result =
-            realize_ngg_live_draw(ngg, published_ngg_host_capabilities());
+        // The register table first (cheap): a draw it refuses never pays for the linked fold.
+        const NggHostCapabilities ngg_host = published_ngg_host_capabilities();
+        const NggDrawAdmission ngg_admission = admit_ngg_draw(ngg.registers, ngg.facts, ngg_host);
+        NggLiveDrawResult result;
+        result.applies = ngg_admission.applies;
+        result.refusal = ngg_admission.refusal;
+        std::shared_ptr<ShaderResourceTable> ngg_vrt;
+        if (ngg_admission.ok()) {
+            ngg.user_data_complete =
+                read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
+            ngg.linked = ngg_linked_chain(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                vertex_prolog.prefix_dwords,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)),
+                chain_dwords);
+            // The shell runs the LINKED program, so its table is folded over the linked words.
+            if (ngg.linked)
+                ngg_vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint,
+                                            draw ? draw->command_order : 0, raw_context, nullptr,
+                                            nullptr, *ngg.linked);
+            ngg.resources = ngg_vrt.get();
+            ngg.pixel_inputs = pixel_input_ptr;
+            ngg.interpolation = interpolation;
+            ngg.float_transport = float_transport;
+            ngg.program_address = rs.es_addr;
+            result = realize_ngg_live_draw(ngg, ngg_host);
+        }
         ngg_subgroup = result.draw;
         if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
         ngg_refusal = result.applies && !ngg_subgroup
@@ -2900,10 +2908,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                       static_cast<int>(r.host_data != nullptr));
                         table += item;
                     }
-                fprintf(stderr, "[ngg-live] es=0x%llx chain=0x%llx %s%s %s table=%s\n",
+                fprintf(stderr, "[ngg-live] es=0x%llx chain=0x%llx %s%s%s %s table=%s\n",
                         (unsigned long long)rs.es_addr, (unsigned long long)chain_addr,
                         ngg_refusal ? "refused reason=" : "admitted",
-                        ngg_refusal ? ngg_refusal : "", result.detail.c_str(), table.c_str());
+                        ngg_refusal ? ngg_refusal : "",
+                        !ngg_refusal && result.strip ? " input=strip" : "", result.detail.c_str(),
+                        table.c_str());
             }
         }
     }
