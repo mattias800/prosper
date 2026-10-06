@@ -45,6 +45,70 @@ TEST(EfcHelperProgram, RecognisesBothObservedHelpersOnlyUnderEliminateFastClear)
     }
 }
 
+// Compiles of AGC's helper rectangle that are not exact entries (#4610). The Oregon Trail
+// (PPSA19244) and Kena (PPSA01802) bind these for their "Eliminate Fast Clear" and "Decompress
+// Htile" segments. Unrecognised, each eliminate pass painted the inherited pixel shader over the
+// finished scanout once BOOL64 predication ran the pass the title asked for, and both titles went
+// black. Words copied from the live programs, up to s_endpgm.
+constexpr uint32_t kOregonRect[] = {
+    0xbfa00001u, 0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu, 0x8f6a8c6au,
+    0x887c6a6bu, 0xbf800000u, 0xbf900009u, 0x906a8803u, 0x81ea6a80u, 0x90fe6ac1u,
+    0xf8000941u, 0x00000000u, 0x81ea0380u, 0xbf8cff0fu, 0x90fe6ac1u, 0x36040a81u,
+    0x2c060a81u, 0x7e000280u, 0x7e0202f2u, 0x7e040d02u, 0x7e060d03u, 0xd5410002u,
+    0x03ce04f4u, 0xd5410003u, 0x03ce06f4u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+};
+constexpr uint32_t kKenaRect[] = {
+    0xbfa00001u, 0x93ebff03u, 0x00080008u, 0x8f6a8c6bu, 0x8700ff03u, 0x000000ffu,
+    0x887c6a00u, 0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u,
+    0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u, 0x36040a81u, 0x2c060a81u, 0x7e000280u,
+    0x7e0202f2u, 0x7e040d02u, 0x7e060d03u, 0xd5410002u, 0x03ce04f4u, 0xd5410003u,
+    0x03ce06f4u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+};
+
+TEST(EfcHelperProgram, RecognisesOtherCompilesOfTheRectangleFamily) {
+    for (const auto& words : {std::vector<uint32_t>(std::begin(kOregonRect), std::end(kOregonRect)),
+                              std::vector<uint32_t>(std::begin(kKenaRect), std::end(kKenaRect))}) {
+        const auto block = with_metadata(words.data(), words.size());
+        EXPECT_TRUE(is_agc_efc_rect_vertex_program(block.data(), block.size()));
+        EXPECT_TRUE(is_agc_eliminate_fast_clear_operation(
+            mode_word(P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR), block.data(), block.size()));
+        EXPECT_TRUE(is_agc_decompress_htile_operation(mode_word(P::CB_COLOR_CONTROL_MODE_DISABLE),
+                                                      0x60, block.data(), block.size()));
+        EXPECT_FALSE(is_agc_eliminate_fast_clear_operation(
+            mode_word(P::CB_COLOR_CONTROL_MODE_NORMAL), block.data(), block.size()));
+    }
+}
+
+TEST(EfcHelperProgram, TheFamilyIsTheRectangleAndNothingNear) {
+    std::vector<uint32_t> w(std::begin(kKenaRect), std::end(kKenaRect));
+    auto matches = [](std::vector<uint32_t> v) {
+        return is_agc_efc_rect_vertex_program(v.data(), v.size());
+    };
+    ASSERT_TRUE(matches(w));
+    {   // the position arithmetic differs (v_mov v1, 0 instead of 1.0): another program
+        auto v = w;
+        v[18] = 0x7e020280u;
+        EXPECT_FALSE(matches(v));
+    }
+    {   // a memory instruction before the core (s_load_dwordx4): a resource-reading program
+        auto v = w;
+        v[7] = 0xf4080000u;
+        EXPECT_FALSE(matches(v));
+    }
+    {   // no NGG primitive export
+        auto v = w;
+        v[10] = 0xbf800000u;
+        EXPECT_FALSE(matches(v));
+    }
+    {   // the same core after a long prologue: past the 32-dword bound
+        std::vector<uint32_t> v(8, 0xbf800000u);
+        v.insert(v.end(), w.begin(), w.end());
+        EXPECT_FALSE(matches(v));
+    }
+    EXPECT_FALSE(is_agc_efc_rect_vertex_program(kKenaRect, std::size(kKenaRect) - 1))
+        << "a window that ends before s_endpgm cannot match";
+}
+
 TEST(EfcHelperProgram, ExactWordsOnly) {
     std::vector<uint32_t> mutated(std::begin(kAgcEfcRectVertexA), std::end(kAgcEfcRectVertexA));
     mutated[19] = 0x7e020280u;   // v_mov_b32 v1, 0 instead of 1.0: another program
@@ -161,6 +225,24 @@ TEST(EfcHelperProgram, TheDecompressHtileHelperWritesNoColour) {
     const Realized stale = realize(stale_state);
     EXPECT_TRUE(stale.made) << "an ordinary program under a latched MODE=0 and 0x60 still draws";
     EXPECT_EQ(stale.mask, 0xFu);
+}
+
+// The regression #4610's cross-title A/B caught: Oregon's eliminate pass, under MODE=2 on its own
+// compile of the rectangle, must write no colour; it ran after the composite and painted it black.
+TEST(EfcHelperProgram, OtherCompilesWriteNoColourEither) {
+    constexpr uint32_t kRectList = 7;
+    for (const auto& words : {std::vector<uint32_t>(std::begin(kOregonRect), std::end(kOregonRect)),
+                              std::vector<uint32_t>(std::begin(kKenaRect), std::end(kKenaRect))}) {
+        std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+        std::copy(words.begin(), words.end(), kHelperBlock);
+        const Realized eliminate =
+            realize(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR));
+        EXPECT_FALSE(eliminate.made);
+        EXPECT_EQ(eliminate.reason, RealizationFailureReason::NoEffect);
+        GpuState decompress = state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE);
+        decompress.cx[P::DB_RENDER_CONTROL] = 0x60;
+        EXPECT_FALSE(realize(decompress).made);
+    }
 }
 
 TEST(EfcHelperProgram, TheOperationKeepsItsDepthStencilEffect) {

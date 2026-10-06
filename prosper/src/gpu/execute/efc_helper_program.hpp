@@ -17,12 +17,19 @@
 // EXACT code prefixes through s_endpgm. The words after s_endpgm in a live program block are AGC
 // shader metadata and are not compared.
 //
-// EXACT programs, not a structural family, for the same reason as dcc_helper_program.hpp: an
-// ordinary full-screen pass can also be a vertex-id rectangle and must still draw under a stale
-// MODE. A new helper variant is added from observation, with its words. CONFIDENCE: HIGH for both
-// entries (live census of every MODE=2 vertex program: Dragon Quest VII runs exactly one, the first
-// entry; Astro Bot runs the second plus five ordinary vertex programs with 2-23 vertex resources
-// each, which this deliberately does not match). The rectangle itself is shared: Astro Bot draws it
+// Two observed compiles are listed EXACTLY (CONFIDENCE: HIGH; live census of every MODE=2 vertex
+// program: Dragon Quest VII runs exactly one, the first entry; Astro Bot runs the second plus five
+// ordinary vertex programs with 2-23 vertex resources each, which this deliberately does not
+// match). Beyond them, the rectangle is recognised by its FAMILY (is_agc_rect_family_program):
+// AGC's position math word for word, after an NGG prologue of its own. This was "exact programs
+// only" until #4610. Once BOOL64 predication runs the eliminate pass when its "needs it" word says so,
+// that pass lands after the frame's composite, and an unlisted compile of the same rectangle paints
+// the inherited pixel shader over the whole scanout. The Oregon Trail (PPSA19244) and Kena
+// (PPSA01802) each bind a third and a fourth compile, and both went black. An unrecognised helper is
+// therefore a black frame, a worse failure than the stale-MODE risk the exact list guarded against.
+// The family still cannot match an ordinary full-screen pass: that pass would need AGC's exact
+// vertex-id-to-rectangle arithmetic and position export, no memory instruction, and a primitive
+// export, all inside 32 dwords. The rectangle itself is shared: Astro Bot draws it
 // under MODE 2 and 6 with one pixel program, and Dragon Quest VII also draws it under MODE 0 for
 // AGC's "Decompress Htile" helper (below; an earlier revision read those as ordinary copies), so the
 // vertex program alone is not the operation either -- both halves are needed.
@@ -54,6 +61,46 @@ inline constexpr uint32_t kAgcEfcRectVertexB[] = {
     0xf80008cfu, 0x01000302u, 0xbf810000u,
 };
 
+// The rectangle's own arithmetic, from v_and_b32 v2, 1, v5 (vertex-id bit 0) through the position
+// export (v2, v3, v0 = 0, v1 = 1.0) and s_endpgm. It is identical, word for word, in the first
+// entry above, in The Oregon Trail's compile and in Kena's. Those compiles differ only in their
+// NGG prologue (wave-id decode, s_nop placement, the primitive export's register).
+inline constexpr uint32_t kAgcRectPositionCore[] = {
+    0x36040a81u, 0x2c060a81u, 0x7e000280u, 0x7e0202f2u, 0x7e040d02u, 0x7e060d03u, 0xd5410002u,
+    0x03ce04f4u, 0xd5410003u, 0x03ce06f4u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+};
+
+// True when `code` is a compile of AGC's procedural rectangle that is not one of the exact entries:
+// at most 32 dwords through its s_endpgm, ending in kAgcRectPositionCore, with an NGG primitive
+// export (EXP prim, 0xf8000941) and no memory instruction (SMEM, buffer, image, flat, LDS) before
+// the core. The scan is over raw dwords. A literal in the prologue that happens to look like a
+// memory encoding can only make this refuse, never match. CONFIDENCE: MED (two titles' compiles
+// observed; the family never matched a program that writes colour in the A/B).
+inline bool is_agc_rect_family_program(const uint32_t* code, size_t max_dwords) {
+    constexpr size_t kMaxProgramDwords = 32;
+    constexpr size_t kCore = std::size(kAgcRectPositionCore);
+    if (!code) return false;
+    const size_t window = std::min(max_dwords, kMaxProgramDwords);
+    size_t end = window;
+    for (size_t i = 0; i < window; ++i)
+        if (code[i] == 0xbf810000u) { end = i; break; }
+    if (end == window || end + 1 < kCore) return false;
+    const size_t core_at = end + 1 - kCore;
+    if (!std::equal(std::begin(kAgcRectPositionCore), std::end(kAgcRectPositionCore),
+                    code + core_at))
+        return false;
+    bool prim_export = false;
+    for (size_t i = 0; i < core_at; ++i) {
+        const uint32_t top6 = code[i] >> 26;
+        // SMEM 0x3d, MUBUF 0x38, MTBUF 0x3a, MIMG 0x3c, FLAT/GLOBAL/SCRATCH 0x37, DS 0x36.
+        if (top6 == 0x3du || top6 == 0x38u || top6 == 0x3au || top6 == 0x3cu || top6 == 0x37u ||
+            top6 == 0x36u)
+            return false;
+        if (code[i] == 0xf8000941u) prim_export = true;
+    }
+    return prim_export;
+}
+
 struct AgcEfcRectVertexProgram {
     const uint32_t* words;
     size_t dwords;
@@ -63,15 +110,16 @@ inline constexpr AgcEfcRectVertexProgram kAgcEfcRectVertexPrograms[] = {
     {kAgcEfcRectVertexB, std::size(kAgcEfcRectVertexB)},
 };
 
-// True when `code` (at least `max_dwords` readable) begins with one of the observed AGC
-// eliminate-fast-clear rectangle vertex programs.
+// True when `code` (at least `max_dwords` readable) is AGC's helper rectangle: one of the exact
+// observed compiles, or a compile of the same rectangle family.
 inline bool is_agc_efc_rect_vertex_program(const uint32_t* code, size_t max_dwords) {
     if (!code) return false;
     return std::any_of(std::begin(kAgcEfcRectVertexPrograms), std::end(kAgcEfcRectVertexPrograms),
                        [&](const AgcEfcRectVertexProgram& helper) {
                            return max_dwords >= helper.dwords &&
                                   std::equal(helper.words, helper.words + helper.dwords, code);
-                       });
+                       }) ||
+           is_agc_rect_family_program(code, max_dwords);
 }
 
 // The draw IS the colour-block eliminate-fast-clear operation: its decoded MODE says so AND it is
