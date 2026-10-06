@@ -15,6 +15,7 @@
 #include "gpu/execute/checked_graphics_source.hpp"
 #include "gpu/execute/native_graphics_source_lineage.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
+#include "gpu/execute/srt_publication_dedupe.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -7716,20 +7717,15 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // srt_offset (the EUD-sharp path may already have emitted it — first match wins in
         // by_srt_offset, and two DIFFERENT tables reusing one immediate would be ambiguous anyway).
         {
-            std::set<uint64_t> srt_seen;
+            // One publication per key, or per consuming pc: see srt_publication_dedupe.hpp.
+            SrtPublicationDedupe dedupe;
             for (const auto& u : srt_uses) {
-                // Dedupe: a KEYED cbuf use per key (the s_buffer_load resolves by key); texture and
-                // key-less buffer uses per CONSUMING INSTRUCTION (#273 — several image ops may share
-                // one key, or have none; a key-less V# fetch resolves by its pc).
-                // Distinct namespaces: pc keys must never collide with byte-offset keys.
+                if (!dedupe.admit(u)) continue;
                 const bool exact_mtbuf = u.kind == 1 && u.instruction_format != UINT32_MAX;
-                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu || exact_mtbuf)
-                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
-                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
-                if (!srt_seen.insert(dk).second) continue;
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (clash && !exact_mtbuf) dedupe.note_clash(u);   // a real holder of the key
                 if (u.kind == 6) {
                     add_owned_raw_wide_snapshot(t, u,
                         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
