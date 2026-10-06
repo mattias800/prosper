@@ -358,6 +358,11 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // Everything else, including the D16 and cache-invalidate forms, is treated as a writer.
 // Non-memory instructions return false.
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in);
+// Does this MIMG instruction read its S# (the SSAMP operand, src[2])? Only sampled operations do: image
+// load/store/resinfo, the integer atomics and the BVH intersect carry an unused sampler field, whose
+// register number must not be taken for a read. FAIL-CLOSED for opcodes it does not know: they are
+// reported as sampled. Non-MIMG instructions return false.
+bool rdna2_mimg_reads_sampler(const Rdna2Inst& in);
 // `full` is a `rdna2_walk` prefix ending at its first s_endpgm. Compilers place a divergent early-out
 // (discard, kill) AFTER that end and branch to it from the body, so a branch target can name code the
 // walk never decoded. Decode every block reachable through such a target and append it to `full`.
