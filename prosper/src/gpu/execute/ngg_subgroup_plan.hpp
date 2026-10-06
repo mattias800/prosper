@@ -15,7 +15,10 @@
 //   * ES vertices are deduplicated within a subgroup only;
 //   * instances are never packed together (one instance per subgroup);
 //   * a subgroup has max(es, gs, gs x GS_MAX_VERT_OUT) threads, so every output vertex a GS lane may
-//     export has a lane (open question 2 on #3135).
+//     export has a lane (open question 2 on #3135);
+//   * a limit is never exceeded. Mesa notes the hardware vertex grouper can overshoot
+//     ES_VERTS_PER_SUBGRP by checking only after a whole primitive; never exceeding it is the
+//     stricter, guest-safe choice (a guest sizes its LDS for the limit).
 //
 // Why a policy can be right without knowing the hardware's choice (hypothesis, CONFIDENCE: MED):
 // NGG code reads its own counts from s3 rather than assuming full subgroups, so it is correct for
@@ -35,8 +38,11 @@ struct NggSubgroupLimits {
     uint32_t es_verts_per_subgroup = 0;   // VGT_GS_ONCHIP_CNTL.ES_VERTS_PER_SUBGRP [10:0]
     uint32_t gs_prims_per_subgroup = 0;   // VGT_GS_ONCHIP_CNTL.GS_PRIMS_PER_SUBGRP [21:11]
     uint32_t prim_group_size = 0;   // GE_CNTL.PRIM_GRP_SIZE [8:0]
-    uint32_t vert_group_size = 0;   // GE_CNTL.VERT_GRP_SIZE [17:9]
-    uint32_t max_out_verts_per_subgroup = 0;   // GE_MAX_OUTPUT_PER_SUBGROUP [10:0]
+    // GE_CNTL.VERT_GRP_SIZE [17:9]. Taken as an ES-vertex limit (radv writes its NGG ES-vertex count
+    // here; gfx11 renames the field VERTS_PER_SUBGRP). radv writes 256 to mean "vertex grouping off",
+    // which the planner reads as no extra limit; 0 (tessellation) leaves no usable limit and refuses.
+    uint32_t vert_group_size = 0;
+    uint32_t max_out_verts_per_subgroup = 0;   // GE_MAX_OUTPUT_PER_SUBGROUP [9:0]
     uint32_t gs_max_vert_out = 0;   // VGT_GS_MAX_VERT_OUT [10:0]
     uint32_t esgs_item_size = 0;   // VGT_ESGS_RING_ITEMSIZE [14:0], in dwords
 };
@@ -59,12 +65,15 @@ struct NggDrawShape {
 
 struct NggSubgroupBudget {
     uint32_t max_subgroups = 1u << 16;
-    uint32_t max_waves_per_subgroup = 4;   // 256 threads: the compute shell's workgroup bound
+    // 256 threads: the compute shell's workgroup bound. Values above 15 are clamped: s3 carries the
+    // wave count in four bits.
+    uint32_t max_waves_per_subgroup = 4;
 };
 
 // One guest subgroup: a run of consecutive input primitives of one instance.
 struct NggSubgroup {
     uint32_t instance = 0;
+    uint32_t first_vertex = 0;   // the draw's, carried so the launch has one source for VertexID
     uint32_t first_prim = 0;   // the instance-local index of the first primitive
     // Unique vertex indices (VertexID before first_vertex), in first-use order: ES lane e runs
     // es_vertex[e].
@@ -102,6 +111,6 @@ struct NggLaneLaunch {
     uint32_t v[9] = {};
 };
 NggLaneLaunch ngg_lane_launch(const NggSubgroup& subgroup, const NggSubgroupLimits& limits,
-                              uint32_t first_vertex, uint32_t wave, uint32_t lane);
+                              uint32_t wave, uint32_t lane);
 
 }   // namespace prosper::gpu

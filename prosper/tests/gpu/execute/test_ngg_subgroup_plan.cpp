@@ -25,6 +25,9 @@ TEST(NggSubgroupPlan, DecodesTheRecordedRegisters) {
     EXPECT_EQ(l.max_out_verts_per_subgroup, 192u);
     EXPECT_EQ(l.gs_max_vert_out, 3u);
     EXPECT_EQ(l.esgs_item_size, 4u);
+    // GE_MAX_OUTPUT_PER_SUBGROUP.MAX_VERTS_PER_SUBGROUP is bits [9:0]: bit 10 is not part of it.
+    EXPECT_EQ(decode_ngg_subgroup_limits(0, 0, 192u | (1u << 10), 0, 0).max_out_verts_per_subgroup,
+              192u);
 }
 
 TEST(NggSubgroupPlan, KenaLutStripIsOneSubgroupPerInstance) {
@@ -45,20 +48,24 @@ TEST(NggSubgroupPlan, KenaLutStripIsOneSubgroupPerInstance) {
     }
     const NggSubgroup& s = plan.subgroups[5];
     EXPECT_EQ(ngg_merged_wave_info(s, 0), (1u << 28) | (2u << 8) | 4u);
-    const NggLaneLaunch lane0 = ngg_lane_launch(s, kena_limits(), 0, 0, 0);
+    const NggLaneLaunch lane0 = ngg_lane_launch(s, kena_limits(), 0, 0);
     EXPECT_EQ(lane0.v[0], 0u | (4u << 16)) << "slots 0,1 scaled by ITEMSIZE";
     EXPECT_EQ(lane0.v[1], 8u) << "slot 2 x 4";
     EXPECT_EQ(lane0.v[2], 0u);
     EXPECT_EQ(lane0.v[5], 0u);
     EXPECT_EQ(lane0.v[8], 5u) << "InstanceID";
-    const NggLaneLaunch lane1 = ngg_lane_launch(s, kena_limits(), 0, 0, 1);
+    const NggLaneLaunch lane1 = ngg_lane_launch(s, kena_limits(), 0, 1);
     EXPECT_EQ(lane1.v[0], 4u | (8u << 16));
     EXPECT_EQ(lane1.v[1], 12u);
     EXPECT_EQ(lane1.v[2], 1u) << "PrimitiveID";
-    const NggLaneLaunch lane3 = ngg_lane_launch(s, kena_limits(), 100, 0, 3);
+    NggDrawShape offset = draw;
+    offset.first_vertex = 100;
+    const NggSubgroupPlan offset_plan = plan_ngg_subgroups(offset, kena_limits());
+    ASSERT_TRUE(offset_plan.ok());
+    const NggLaneLaunch lane3 = ngg_lane_launch(offset_plan.subgroups[5], kena_limits(), 0, 3);
     EXPECT_EQ(lane3.v[0], 0u) << "lane 3 is an ES thread only";
     EXPECT_EQ(lane3.v[5], 103u) << "VertexID includes first_vertex";
-    const NggLaneLaunch lane9 = ngg_lane_launch(s, kena_limits(), 0, 0, 9);
+    const NggLaneLaunch lane9 = ngg_lane_launch(s, kena_limits(), 0, 9);
     for (uint32_t r = 0; r < 9u; ++r) EXPECT_EQ(lane9.v[r], 0u) << "v" << r << " of an idle lane";
 }
 
@@ -153,6 +160,20 @@ TEST(NggSubgroupPlan, RefusesWhatItCannotModel) {
     NggSubgroupLimits no_item = kena_limits();
     no_item.esgs_item_size = 0;
     EXPECT_EQ(plan_ngg_subgroups(list, no_item).refusal, "ngg-limits-unusable");
+    // A vertex offset (ES lane x ITEMSIZE) must fit v0's 16-bit halves: with 64 ES lanes the largest
+    // is 63 x ITEMSIZE, so 1040 (65,520) fits and 1041 (65,583) would spill into the next half.
+    NggSubgroupLimits fits = kena_limits();
+    fits.esgs_item_size = 1040;
+    EXPECT_TRUE(plan_ngg_subgroups(list, fits).ok());
+    NggSubgroupLimits spills = kena_limits();
+    spills.esgs_item_size = 1041;
+    EXPECT_EQ(plan_ngg_subgroups(list, spills).refusal, "ngg-limits-unusable");
+    NggSubgroupLimits grouping_off = kena_limits();
+    grouping_off.vert_group_size = 256;   // radv: vertex grouping off
+    EXPECT_TRUE(plan_ngg_subgroups(list, grouping_off).ok());
+    NggSubgroupLimits tess = kena_limits();
+    tess.vert_group_size = 0;
+    EXPECT_EQ(plan_ngg_subgroups(list, tess).refusal, "ngg-limits-unusable");
     NggSubgroupLimits no_out = kena_limits();
     no_out.max_out_verts_per_subgroup = 2;   // below GS_MAX_VERT_OUT: no primitive fits
     EXPECT_EQ(plan_ngg_subgroups(list, no_out).refusal, "ngg-limits-unusable");
@@ -182,4 +203,4 @@ TEST(NggSubgroupPlan, NothingToDrawIsAnEmptyPlan) {
     EXPECT_TRUE(plan_ngg_subgroups(none, kena_limits()).subgroups.empty());
 }
 
-}  // namespace
+}   // namespace

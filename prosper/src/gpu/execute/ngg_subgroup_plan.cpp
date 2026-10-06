@@ -18,7 +18,7 @@ NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32
     limits.gs_prims_per_subgroup = (vgt_gs_onchip_cntl >> 11) & 0x7ffu;
     limits.prim_group_size = ge_cntl & 0x1ffu;
     limits.vert_group_size = (ge_cntl >> 9) & 0x1ffu;
-    limits.max_out_verts_per_subgroup = ge_max_output_per_subgroup & 0x7ffu;
+    limits.max_out_verts_per_subgroup = ge_max_output_per_subgroup & 0x3ffu;
     limits.gs_max_vert_out = vgt_gs_max_vert_out & 0x7ffu;
     limits.esgs_item_size = vgt_esgs_ring_itemsize & 0x7fffu;
     return limits;
@@ -53,7 +53,10 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
     const uint32_t prim_limit = std::min(
         {limits.gs_prims_per_subgroup, limits.prim_group_size,
          limits.gs_max_vert_out ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out : 0u});
-    const uint32_t es_limit = std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    const uint32_t es_limit = limits.vert_group_size >= 256u
+                                  ? limits.es_verts_per_subgroup
+                                  : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    const uint32_t max_waves = std::min(budget.max_waves_per_subgroup, 15u);
     // A primitive must fit, and a vertex offset (lane x ITEMSIZE) must fit its 16-bit field.
     if (prim_limit == 0 || es_limit < 3u || limits.esgs_item_size == 0 ||
         (es_limit - 1u) * limits.esgs_item_size > 0xffffu) {
@@ -66,11 +69,12 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
     for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
         NggSubgroup current;
         current.instance = instance;
+        current.first_vertex = draw.first_vertex;
         const auto close = [&]() -> bool {
             if (current.prim_slot.empty()) return true;
             const uint32_t threads = threads_of(current, limits);
             current.waves = (threads + kWaveLanes - 1u) / kWaveLanes;
-            if (current.waves > budget.max_waves_per_subgroup) {
+            if (current.waves > max_waves) {
                 plan.refusal = "ngg-subgroup-too-wide";
                 return false;
             }
@@ -99,6 +103,7 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
                 }
                 current = NggSubgroup{};
                 current.instance = instance;
+                current.first_vertex = draw.first_vertex;
             }
             if (current.prim_slot.empty()) current.first_prim = p;
             for (uint32_t v : verts) {
@@ -128,7 +133,7 @@ uint32_t ngg_merged_wave_info(const NggSubgroup& subgroup, uint32_t wave) {
 }
 
 NggLaneLaunch ngg_lane_launch(const NggSubgroup& subgroup, const NggSubgroupLimits& limits,
-                              uint32_t first_vertex, uint32_t wave, uint32_t lane) {
+                              uint32_t wave, uint32_t lane) {
     NggLaneLaunch launch;
     const uint32_t t = wave * kWaveLanes + lane;
     if (t < subgroup.gs_threads()) {
@@ -139,7 +144,7 @@ NggLaneLaunch ngg_lane_launch(const NggSubgroup& subgroup, const NggSubgroupLimi
         launch.v[2] = subgroup.first_prim + t;
     }
     if (t < subgroup.es_threads()) {
-        launch.v[5] = first_vertex + subgroup.es_vertex[t];
+        launch.v[5] = subgroup.first_vertex + subgroup.es_vertex[t];
         launch.v[8] = subgroup.instance;
     }
     return launch;
