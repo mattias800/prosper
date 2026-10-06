@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Retained renderer buffer inputs (September 2026)
 
 Tracking: [#2343](https://github.com/mattias800/prosper/issues/2343),

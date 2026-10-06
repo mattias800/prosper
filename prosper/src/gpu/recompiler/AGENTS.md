@@ -6,6 +6,18 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+- `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
+  shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
+  buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`
+  is the static admission over the linked program (launch SGPR/VGPR reads, EXEC, side effects,
+  messages, export shapes), each refusal named; `ngg_export_record` is the record layout the
+  pass-through draw consumes. Compile and offline execution only; nothing live dispatches it.
+- `ngg_raster_commit` — that pass-through draw (#3135 P3): a vertex stage that reads the export
+  record buffer, rejects malformed connectivity as degenerate primitives (and counts it), rotates
+  corners for PROVOKING_VTX_LAST, takes the layer from the provoking vertex, and routes it through
+  the vertex stage, a forwarding geometry stage, or the interpolation geometry stage. Offline only.
+- `param_ps_routing` — the one PARAM-to-fragment-input routing rule every vertex-side commit stage
+  publishes through, so the owned-wave and NGG commits cannot drift from each other.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
@@ -13,6 +25,20 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `s_cbranch_execz` guard around or inside the loop may be linearized (the `s_and_saveexec` form
   and UE4's `s_mov sN, exec … v_cmpx` form). A shape it does not prove is left to `emit_alu`,
   which refuses the branch under narrowed EXEC.
+- `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
+  every compute and fragment shell runs before emission; it only fills `RegState` facts.
+- `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask
+  logical whose result no observable read can reach.
+- `rdna2_spilled_mask_halves` — a CFG MUST fact the dispatcher's Wave64 mask analysis carries:
+  which saved-mask instance each `v_writelane` slot and reloaded SGPR holds a half of, so a pair
+  reassembled from both halves of one mask stays a mask across a block edge.
+- `rdna2_mask_half_alias` — the companion MUST analysis for exact native Wave64: which physical
+  half (LO/HI) of EXEC a spill slot or reloaded SGPR holds, so a reload can publish that ballot
+  word as scalar data.
+- `rdna2_spill_slot_domain` — whether each `v_writelane` slot holds data or a mask on every path,
+  so the dispatcher types a `v_readlane` reload the way `emit_alu` did. The dispatcher's two
+  Function variables per slot carry no runtime tag; without this a reload read the other domain's
+  placeholder (#4600).
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.

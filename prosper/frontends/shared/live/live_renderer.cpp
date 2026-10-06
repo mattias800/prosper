@@ -169,9 +169,7 @@ void register_cpu_rtt_dcc_metadata(
                 const uint64_t metadata_bytes =
                     prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
                 if (!metadata_bytes) continue;
-                surface->second.dcc_metadata_addr = resource.metadata_addr;
-                surface->second.dcc_metadata_bytes = metadata_bytes;
-                surface->second.dcc_guest_origins.observe(resource.metadata_addr, metadata_bytes);
+                note_rtt_dcc_descriptor(surface->second, resource, metadata_bytes);
             }
         }
     }
@@ -1754,6 +1752,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .items = items,
                 .pending_timing = pending_timing,
                 .timing_enabled = timing_enabled};
+            materialize_dirty_dcc_clears_ctx.render_scale = configured_render_scale();
             materialize_dirty_dcc_clears(materialize_dirty_dcc_clears_ctx);
             // Keep decoded texture storage alive across callbacks. The old clear()+emplace(size, 0)
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite

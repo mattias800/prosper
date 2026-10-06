@@ -15,6 +15,7 @@
 #include "gpu/execute/checked_graphics_source.hpp"
 #include "gpu/execute/native_graphics_source_lineage.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
+#include "gpu/execute/srt_publication_dedupe.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -36,6 +37,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
+#include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -92,6 +94,29 @@ extern "C" size_t prosper_agc_shader_count();
 extern "C" const void* prosper_agc_shader_at(size_t index);
 
 namespace prosper::gpu {
+
+// A sampled read through this T# returns the constant 0 in every channel, whatever memory holds:
+// base address zero and all four DST_SEL fields (dword 3, bits 11:0) SQ_SEL_0. DST_SEL picks each
+// returned channel after the fetch, so the descriptor's other words cannot change the result. The
+// exact all-zero T# (#2422) is the special case with every other word zero too; Kena binds the
+// general one with width/format bits set and a V#-shaped upper half (#4592). A base-zero T# that
+// selects any memory channel still names address zero and stays fail-visible.
+// CONFIDENCE: HIGH on the selector semantics (RDNA2 ISA, T# DST_SEL).
+static bool t8_samples_constant_zero(const std::array<uint32_t, 8>& t8) {
+    return t8[0] == 0u && (t8[1] & 0xffu) == 0u && (t8[3] & 0xfffu) == 0u;
+}
+// MIMG ops whose result is texels routed through DST_SEL: image_load/load_mip (0x00/0x01) and the
+// sample and gather4 families (0x20-0x5f). The constant-zero argument holds only for these: a query
+// such as image_get_resinfo (0x0e, the descriptor's dimensions) or image_get_lod (0x60, computed from
+// the image size) reads fields DST_SEL does not touch, and writers and atomics are never null
+// reads. Every other op keeps the exact all-zero rule, whose words also describe a 1x1 image.
+static bool mimg_op_returns_selected_texels(uint32_t opcode) {
+    return opcode <= 0x01u || (opcode >= 0x20u && opcode <= 0x5fu);
+}
+static bool t8_is_null_for_op(const std::array<uint32_t, 8>& t8, bool texel_read) {
+    if (texel_read) return t8_samples_constant_zero(t8);
+    return std::all_of(t8.begin(), t8.end(), [](uint32_t w) { return w == 0u; });
+}
 
 bool should_log_recompile_reject(uint64_t es_addr, uint64_t ps_addr,
                                  size_t vs_words, size_t gs_words, size_t fs_words,
@@ -1288,7 +1313,7 @@ ShaderCompileKey make_shader_compile_key(
                                        scalar_source_proof->raw_offset_scalar_source_pcs.end(),
                                        resource.fetch_pc) &&
                     valid_raw_offset_scalar_snapshot_resource(resource))
-                    compiled.raw_offset_scalar_snapshot_bytes = sizeof(uint32_t);
+                    compiled.raw_offset_scalar_snapshot_bytes = resource.size;
                 if (scalar_source_proof && std::binary_search(
                         scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
                         scalar_source_proof->raw_owned_wide_data_load_pcs.end(), resource.fetch_pc)) {
@@ -3008,6 +3033,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                       uint32_t pcrel_dispatch_target, const PcrelDispatchInfo* pcrel_dispatch,
                       const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader,
                       const CheckedGraphicsSource* checked_source) {
+    const size_t srt_before = srt_uses ? srt_uses->size() : 0;
+    std::vector<DynFetch> out = resolve_dynamic_fetch_fold(
+        code, dwords, user_sgprs, nsgpr, user_sgpr_base, srt_uses, pcrel_dispatch_target,
+        pcrel_dispatch, system_sgprs, nsystem_sgprs, reader, checked_source);
+    // After the fold, never inside it: the mapping table is not a FoldReader-recorded input, so a
+    // clamp decided inside the fold would make a `.prfold` replay disagree with its capture.
+    if (srt_uses) resolve_oversized_buffer_windows(*srt_uses, srt_before);
+    return out;
+}
+
+std::vector<DynFetch>
+// NOLINTNEXTLINE(readability-function-size): the pre-existing fold body, renamed here, not grown.
+resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs,
+                           uint32_t nsgpr, uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
+                           uint32_t pcrel_dispatch_target, const PcrelDispatchInfo* pcrel_dispatch,
+                           const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader,
+                           const CheckedGraphicsSource* checked_source) {
     dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     if (checked_source && (!checked_source->current() ||
                            checked_source->address() != reinterpret_cast<uint64_t>(code) ||
@@ -4459,8 +4501,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((n == 4 || n == 8) && std::binary_search(
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
-                const bool latched_offset_source = !is_buffer && n == 1u &&
-                    soff_field == 125u && in.literal == 0u &&
+                const bool latched_offset_source =
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -4820,6 +4862,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     mem.snapshot_prefix(bounded_scalar_words.data(),
                                         scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                // The recompiler tags an immediate-only s_load's destination with its immediate
+                // (sreg_srt), EXCEPT a raw immediate-wide data load, whose words it treats as data
+                // carrying no descriptor identity (rdna2_emit_alu.cpp, the wide-load tag). Key
+                // descriptor uses exactly as it will: a key no consumer carries publishes a resource
+                // no consumer can reach, and every consumer is then refused (#4585).
+                const bool emitter_srt_tag =
+                    imm_only && !is_buffer &&
+                    !((n == 4 || n == 8) &&
+                      std::binary_search(decoded->raw_immediate_wide_data_load_pcs.begin(),
+                                         decoded->raw_immediate_wide_data_load_pcs.end(), in.pc));
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
@@ -4856,9 +4908,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     SrtUse source;
                     source.kind = 5;
                     source.key = UINT32_MAX;
+                    // v4[2..3] carry the observed words (x1 leaves v4[3] zero).
                     source.v4 = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u),
-                                 bounded_scalar_words[0], 0u};
-                    source.required_size = sizeof(uint32_t);
+                                 bounded_scalar_words[0], n == 2u ? bounded_scalar_words[1] : 0u};
+                    source.required_size = n * sizeof(uint32_t);
                     source.use_pc = in.pc;
                     srt_uses->push_back(source);
                 }
@@ -4938,7 +4991,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                 }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
-                    const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
+                    const uint32_t key = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
                         val_srt_key[(size_t)(sdst + (int)k)] = key;
                         val_srt_key_known.set((size_t)(sdst + (int)k));
@@ -4986,8 +5039,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
                               descr_known.set((size_t)sdst);
                               // only s_load (not s_buffer_load) dests get the recompiler's sreg_srt tag
-                              descr_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr_key_known.set((size_t)sdst);
                 }
                 if (n == 8 && valid_reg(sdst)) {
@@ -4995,8 +5047,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                   mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
                               descr8_known.set((size_t)sdst);
                               descr8_from_x16.reset((size_t)sdst);
-                              descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr8_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr8_key_known.set((size_t)sdst);
                               // SGPR loads are typeless: a later scalar buffer load may consume the
                               // first four words of this eight-dword result as a V#. Keep both views;
@@ -5177,9 +5228,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // the operation-class rule and admits only sampled reads as null Textures, while
                     // stores and atomics remain fail-visible. A partially-zero/nonzero seed still has
                     // to satisfy the normal image checks and cannot enter through this exception.
-                    const bool exact_null_seed = seed_provenance && live_t8_known &&
-                        std::all_of(live_t8.begin(), live_t8.end(),
-                                    [](uint32_t word) { return word == 0; });
+                    // #4592: for texel reads the same holds for any T# whose selected channels are
+                    // constant zero; t8_is_null_for_op applies the rule the consuming op allows.
+                    const bool exact_null_seed =
+                        seed_provenance && live_t8_known &&
+                        t8_is_null_for_op(live_t8, mimg_op_returns_selected_texels(in.opcode));
                     // Scalar loads are typeless. A consumer may assemble its T# from adjacent
                     // mapped loads rather than one x8/x16 load, so the load-start snapshot can sit
                     // at another SGPR. Accept the live words only when all eight still descend
@@ -5214,9 +5267,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         const bool same_code = code && decoded->code.size() <= dwords &&
                             std::memcmp(code, decoded->code.data(),
                                         decoded->code.size() * sizeof(uint32_t)) == 0;
-                        mapped_t8 = same_code && mapped_split_t8_reaches_use(
-                            code, std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u), in.pc, tbase,
-                            mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr, user_sgpr_base);
+                        // Earlier storage-image uses already published, with a footprint bound each.
+                        std::vector<ImageWriteExtent> image_writes;
+                        if (srt_uses)
+                            for (const SrtUse& earlier : *srt_uses) {
+                                ImageWriteExtent extent;
+                                if (earlier.kind == 0 && earlier.is_storage_image &&
+                                    storage_image_write_extent(earlier.t8, extent.lo, extent.hi)) {
+                                    extent.pc = earlier.use_pc;
+                                    image_writes.push_back(extent);
+                                }
+                            }
+                        mapped_t8 =
+                            same_code &&
+                            mapped_split_t8_reaches_use(
+                                code,
+                                std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u),
+                                in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
+                                user_sgpr_base, image_writes);
                     }
                     const std::array<uint32_t, 8>* t8 =
                         live_t8_known && (!branchy_x16 || mapped_t8) &&
@@ -5426,7 +5494,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             // must then resolve through this consuming instruction's exact pc.
                             if (have_common_key) u.key = common_key;
                         }
-                        DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                         const uint32_t atomic_x2_record_count = atomic_x2_candidate
                             ? exact_atomic_x2_record_count(in, d, u.v4.data()) : 0u;
                         if (atomic_x2_record_count)
@@ -5511,12 +5579,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             gta5_null_pointer_at_guard &&
                             gta5_null_raw_store_descriptor(u.v4) &&
                             rdna2_gta5_null_guarded_raw_store_site(in);
-                        if (proven_null_guarded_raw_store || zero_record_raw ||
-                            optional_null_raw_load || proven_null_nullable_raw_buffer ||
+                        const bool special_raw_use = proven_null_guarded_raw_store ||
+                                                     zero_record_raw || optional_null_raw_load ||
+                                                     proven_null_nullable_raw_buffer;
+                        // A "view of guest memory" window far past the 256 MiB cap is, in practice,
+                        // one mapped run. Publish it MARKED with its V# unchanged; whether the
+                        // mapping table proves it is that run is decided after the fold, where the
+                        // table may be read (oversize_buffer_window.hpp). Atomic x2 shapes, whose
+                        // record count is itself a proof, stay refused.
+                        const bool oversize_window_use = !special_raw_use && !format_load_use &&
+                                                         !atomic_x2_candidate && d.base > 0x10000 &&
+                                                         d.size_bytes > 0x10000000u &&
+                                                         stride_supported && format_supported;
+                        if (special_raw_use || oversize_window_use ||
                             (!format_load_use &&
-                            (d.base > 0x10000 && d.size_bytes != 0 &&
-                             d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
-                             (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
+                             (d.base > 0x10000 && d.size_bytes != 0 &&
+                              d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
+                              (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
+                            u.oversize_window = oversize_window_use;
                             u.zero_record_raw = zero_record_raw;
                             u.optional_null_raw_load = optional_null_raw_load;
                             u.proven_null_guarded_raw_store =
@@ -6028,13 +6108,14 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
     return result;
 }
 
-// A memory-fed register offset must use the exact x1 word observed by the fold. Re-reading
+// A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero x1 read point; the table owns its four bytes.
+// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
+    const bool x2 = use.required_size == 2u * sizeof(uint32_t);
     if (use.kind != 5 || use.key != UINT32_MAX || use.use_pc >= dwords ||
-        use.required_size != sizeof(uint32_t) || use.v4[3] ||
+        (use.required_size != sizeof(uint32_t) && !x2) || (!x2 && use.v4[3]) ||
         use.scalar_buffer_dword_count || use.zero_record_raw || use.table_record_count ||
         use.instruction_format != UINT32_MAX)
         return;
@@ -6044,16 +6125,18 @@ static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const Srt
         return;
     const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
                              (static_cast<uint64_t>(use.v4[1]) << 32u);
-    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - sizeof(uint32_t))
-        return;
-    auto bytes = std::make_shared<std::vector<uint8_t>>(sizeof(uint32_t));
-    std::memcpy(bytes->data(), &use.v4[2], sizeof(uint32_t));
+    const uint32_t size = use.required_size;
+    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - size) return;
+    // The source's opcode must agree with the observed width: x1 with 4 bytes, x2 with 8.
+    if (rdna2_decode_one(code + use.use_pc, dwords - use.use_pc).opcode != (x2 ? 1u : 0u)) return;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(size);
+    std::memcpy(bytes->data(), &use.v4[2], size);
     ShaderResource resource;
     resource.cls = ResourceClass::ConstantBuffer;
     resource.format = DataFormat::Uint32;
     resource.num_components = 1;
     resource.gpu_addr = address;
-    resource.size = sizeof(uint32_t);
+    resource.size = size;
     resource.fetch_pc = use.use_pc;
     resource.host_data = bytes->data();
     resource.host_data_size = bytes->size();
@@ -6980,10 +7063,10 @@ OwnedSnapshotNeeds owned_snapshot_needs(const GpuState& state,
                 needs.other = true;
                 continue;
             }
-            waves = !decoded->raw_wave_wide_data_load_pcs.empty();
+            waves = decoded->requires_owned_waves(fragment && !render.ps_wave32);
             needs.other |= !decoded->owned_nested_wide_chains.empty();
         } else {
-            waves = graphics_program_requires_owned_waves(address);
+            waves = graphics_program_requires_owned_waves(address, fragment && !render.ps_wave32);
             const auto* header = static_cast<const AgcShaderHeader*>(
                 prosper_agc_shader_header_for_code(address));
             const auto words = header ? registered_shader_dwords(*header, address) : 0;
@@ -7716,20 +7799,15 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // srt_offset (the EUD-sharp path may already have emitted it — first match wins in
         // by_srt_offset, and two DIFFERENT tables reusing one immediate would be ambiguous anyway).
         {
-            std::set<uint64_t> srt_seen;
+            // One publication per key, or per consuming pc: see srt_publication_dedupe.hpp.
+            SrtPublicationDedupe dedupe;
             for (const auto& u : srt_uses) {
-                // Dedupe: a KEYED cbuf use per key (the s_buffer_load resolves by key); texture and
-                // key-less buffer uses per CONSUMING INSTRUCTION (#273 — several image ops may share
-                // one key, or have none; a key-less V# fetch resolves by its pc).
-                // Distinct namespaces: pc keys must never collide with byte-offset keys.
+                if (!dedupe.admit(u)) continue;
                 const bool exact_mtbuf = u.kind == 1 && u.instruction_format != UINT32_MAX;
-                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu || exact_mtbuf)
-                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
-                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
-                if (!srt_seen.insert(dk).second) continue;
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (clash && !exact_mtbuf) dedupe.note_clash(u);   // a real holder of the key
                 if (u.kind == 6) {
                     add_owned_raw_wide_snapshot(t, u,
                         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
@@ -7844,9 +7922,20 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     //   * sampled reads only. A storage image or atomic reaching a null descriptor is
                     //     a WRITE to nowhere; that stays rejected rather than being made to look
                     //     handled.
-                    const bool exact_null_t8 =
-                        reject && std::string_view(reject) == "base-zero" && !u.is_storage_image &&
-                        std::all_of(u.t8.begin(), u.t8.end(), [](uint32_t w) { return w == 0u; });
+                    //   * #4592 generalizes "all-zero" to t8_samples_constant_zero: base zero and
+                    //     constant-zero selectors, which is what makes the all-zero T# null.
+                    // The consuming op decides which null rule applies (texel reads only widen).
+                    const auto* use_code =
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr));
+                    const bool texel_read = u.use_pc < shader_dwords && [&] {
+                        const Rdna2Inst op =
+                            rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);
+                        return op.fmt == Rdna2Format::MIMG &&
+                               mimg_op_returns_selected_texels(op.opcode);
+                    }();
+                    const bool exact_null_t8 = reject && std::string_view(reject) == "base-zero" &&
+                                               !u.is_storage_image &&
+                                               t8_is_null_for_op(u.t8, texel_read);
                     if (exact_null_t8) {
                         ShaderResource rn;
                         rn.cls      = ResourceClass::Texture;
@@ -7884,9 +7973,22 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // timing-dependent GTA V route without re-establishing its baseline, so an
                         // instrument only visible under it cannot be read in the run being measured.
                         // Publishing a null image is rare and consequential enough to say so.
-                        if (std::getenv("PROSPER_DBG"))
-                            fprintf(stderr, "[srt] %s null-image pc=%u key=0x%x (exact all-zero T#)\n",
-                                    is_ps ? "PS" : "VS", u.use_pc, u.key);
+                        // Rate-limited: a constant-zero slot is rebuilt for every draw that binds
+                        // it (one Kena run published 28,012), so report the first 8 and then
+                        // powers of two.
+                        static std::atomic<uint64_t> null_images{0};
+                        // A live read, not PROSPER_ENV_ON: tests arm PROSPER_DBG at run time, and a
+                        // cached read would never see it (cached_env_arming_logic, #4602).
+                        // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only diagnostic switch
+                        const bool dbg = std::getenv("PROSPER_DBG") != nullptr;
+                        const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
+                        if (null_ordinal &&
+                            (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))
+                            fprintf(stderr,
+                                    "[srt] %s null-image #%llu pc=%u key=0x%x (base-zero T#, "
+                                    "constant-zero selectors)\n",
+                                    is_ps ? "PS" : "VS",
+                                    static_cast<unsigned long long>(null_ordinal), u.use_pc, u.key);
                         record_null_image_source_probe(
                             code_addr, u.use_pc, u.descriptor_source_addr,
                             draw_command_order, u.t8);

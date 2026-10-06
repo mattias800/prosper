@@ -14,7 +14,13 @@ Two kinds live here and they are worth telling apart:
   layers into one sampled array image on the GPU instead of reading them back), and its sibling
   `retained_depth_cube_gpu.h` (the same for a fully retained depth cube: six faces gathered,
   quantised to the cube lowering's stacked RGBA8 by a compute pass, and restacked on the GPU).
-  These *do* things: bring up a device, record commands, read pixels back.
+  These *do* things: bring up a device, record commands, read pixels back. The merged-NGG pair
+  (#3135) is small and standalone: `ngg_subgroup_runner.h` dispatches the subgroup shell and reads
+  its export buffer, `ngg_raster_runner.h` draws that buffer through the raster commit into a
+  layered target. Those two are offline references; the SHIPPING half is `ngg_subgroup_gpu.h`, a
+  same-TU companion of `render_runner.h` (like `owned_graphics_wave_gpu.h`) that expands a
+  `BackendDraw::ngg_subgroup` into its pass-through run draws and records the fill, the shell
+  dispatches and their barriers in the pass's own command buffer, with scratch from a retained ring.
 - **Fixtures proper** — `at9_testvec.h`, `handmade_prx.h`, `synth_prx.h`, `spirv_*.h`, `test_data.h`,
   `gta5_*_fixture.hpp`. These are data, frozen at a known-good state so an assertion has something
   stable to compare against.

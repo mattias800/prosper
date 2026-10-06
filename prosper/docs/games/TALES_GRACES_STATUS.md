@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Tales of Graces f Remastered (`PPSA19991`) — status
 
 Unity / IL2CPP, Bandai Namco. Tracker: [#1889](https://github.com/mattias800/prosper/issues/1889).

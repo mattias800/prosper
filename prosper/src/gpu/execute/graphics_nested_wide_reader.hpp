@@ -157,6 +157,16 @@ struct GraphicsOwnedWaveDraw {
     FragmentFloatFlags fragment_float_flags{};
     std::shared_ptr<const struct RasterQuadInputs> fragment_raster_inputs;
 };
+
+// Whether the owner a successful preparation returned prepares exactly the stages the caller
+// routed to the owned-wave path. No owner prepares neither. Realization refuses a draw for which
+// this is false (#4555 review): the two decide separately, and a stage on which they disagree
+// would otherwise have neither a native module nor an owner, or both.
+inline bool owned_wave_owner_matches(const GraphicsOwnedWaveDraw* owner, bool vertex,
+                                     bool fragment) {
+    return (owner && owner->vertex_pending) == vertex &&
+           (owner && owner->fragment_pending) == fragment;
+}
 bool validate_graphics_wave_outputs(const GraphicsWaveStagePlan& plan,
                                     const std::vector<std::vector<uint32_t>>& completed_records,
                                     GraphicsWaveOutputTransaction& transaction,

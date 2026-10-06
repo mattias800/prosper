@@ -210,7 +210,7 @@ and `endpgm` at zero -- those describe an RDNA2 walk that did not happen.
 ## `--raw-wide-proof`: why a wide scalar load needs backing (#4422)
 
 ```
-shader_inspect <raw-rdna2.bin> --raw-wide-proof
+shader_inspect <raw-rdna2.bin> --raw-wide-proof [--wave64]
 ```
 
 Prints one `raw-wide-load` row per `s_load_dwordx4/x8` with the three code-side proofs that
@@ -236,6 +236,9 @@ A row with `needs-backing=1` also says **what** made the classifier call the loa
   - `numeric-reader`: a non-scalar instruction reads a value derived from the load;
   - `derived-value-leaves-scalar-data`: a derived value reaches EXEC, a SETREG or a non-SGPR
     destination;
+  - `derived-value-enters-m0`, `derived-value-enters-exec`: a derived word is moved into M0 or
+    EXEC, which later instructions read without naming them (#4547, #4574);
+  - `destination-above-s105`: the load itself writes VCC, M0 or EXEC (reported at the load);
   - `scc-branch-on-derived-value`, `exec-branch-on-dependent-exec`: control flow depends on it;
   - `load-re-executed`: control returned to the load and it could not be shown to read the same
     bytes again (reported at the load);
@@ -254,6 +257,16 @@ raw-wide-load pc=1 op=0x2 sbase=s28 soffset-kind=1 soffset=20 imm=0x0 needs-back
 Read the two pcs in the listing before changing a proof: the same `needs-backing=1` has stood
 for an over-wide operand (#4429), a compare whose mask width the walk cannot know, and a
 descriptor load inside a loop (#4519) — three different repairs.
+
+**`--wave64`** answers the second of those. By default the walks assume a compare into a register
+pair may write only the low word, which is what happens at 32 lanes, so the high word of a pair
+the shader recycles as a mask is taken to still hold what was loaded. At 64 lanes it writes both.
+With the flag, `needs-backing` and the two blockers are the answer for a program known to run 64
+lanes wide, and the sentinel line ends in `wave64=1`. The dump does not record the width: for a
+fragment program it is the draw's `SPI_PS_IN_CONTROL.PS_W32_EN`, and the live path applies the
+64-lane answer only to the question of whether a draw needs the owned-wave path (#4555). A load
+that is flagged without the flag and clear with it is one of those. `entry-proven` and
+`register-proven` do not take a width.
 
 A `raw-wide-proof-end` line terminates the output. Unlike `--stage`, these proofs read code
 only, so a raw dump answers them exactly. A row with `needs-backing=1 entry-proven=0` is a

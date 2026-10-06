@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -350,4 +351,461 @@ TEST(FiberUltMisc, RuntimeDestroyRefusesWhileUlthreadsAreUnjoined) {
     std::memset(&never_created, 0, sizeof(never_created));
     EXPECT_EQ(call_nid("-gxcs521SvA", addr(&never_created)), hle::kSceKernelErrorESRCH)
         << "destroy on a never-created runtime is refused";
+}
+
+TEST(FiberUltMisc, QueueSemNidsBound) {
+    register_builtin_hle();
+    static const char* table[] = {
+        "_sceUltQueueDataResourcePoolCreate",
+        "sceUltQueueDataResourcePoolGetWorkAreaSize",
+        "sceUltQueueDataResourcePoolDestroy",
+        "_sceUltQueueCreate",
+        "sceUltQueuePush",
+        "sceUltQueueTryPush",
+        "sceUltQueuePop",
+        "sceUltQueueTryPop",
+        "sceUltQueueDestroy",
+        "_sceUltSemaphoreCreate",
+        "sceUltSemaphoreAcquire",
+        "sceUltSemaphoreTryAcquire",
+        "sceUltSemaphoreRelease",
+        "sceUltSemaphoreDestroy",
+    };
+    static_assert(sizeof(table) / sizeof(table[0]) == 14, "the 14 queue/semaphore exports");
+    for (const char* name : table) {
+        EXPECT_NE(Hle::lookup(nid_hash(name)), nullptr) << name << " is not registered";
+    }
+    EXPECT_EQ(nid_hash("sceUltQueuePush"), "dUwpX3e5NDE");
+    EXPECT_EQ(nid_hash("sceUltSemaphoreAcquire"), "QAH1ofI97vU");
+    EXPECT_EQ(nid_hash("_sceUltSemaphoreCreate"), "h5QlIYj+Ro8");
+    EXPECT_NE(nid_hash("sceUltQueuePush"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+static UltBlob g_dpool, g_queue, g_sem;
+constexpr uint64_t kDataPoolNumData = 32;   // the data pool's declared item budget
+
+static void make_data_pool_and_queue(uint64_t item_bytes) {
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    ASSERT_GT(pool_bytes, 0u);
+    // The work areas outlive the objects built on them, as a guest's would.
+    static std::vector<unsigned char> pool_work;
+    pool_work.assign((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t dp_bytes = call_nid("evj9YPkS8s4", kDataPoolNumData, item_bytes, 4);
+    ASSERT_GT(dp_bytes, 0u);
+    ASSERT_LT(dp_bytes, 1024u * 1024u);
+    static std::vector<unsigned char> dp_work;
+    dp_work.assign((size_t)dp_bytes, 0);
+    ASSERT_EQ(call9_nid("TFHm6-N6vks", addr(&g_dpool), 0, kDataPoolNumData, item_bytes, 4,
+                        addr(&g_pool), addr(dp_work.data()), 0, 0x12000000ull),
+              0u);
+    ASSERT_EQ(call7_nid("9Y5keOvb6ok", addr(&g_queue), 0, item_bytes, addr(&g_pool), addr(&g_dpool),
+                        0, 0x12000000ull),
+              0u);
+}
+
+TEST(FiberUltMisc, QueueDataPoolLifecycle) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    make_data_pool_and_queue(16);
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&g_dpool)), 0u) << "data pool destroy succeeds";
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&g_dpool)), hle::kSceKernelErrorESRCH)
+        << "destroy frees exactly once";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("dh11uAUWNyM", addr(&never_created)), hle::kSceKernelErrorESRCH)
+        << "destroy on a never-created pool is refused";
+    // The size answer follows the documented formula: 128 + queues * 64.
+    EXPECT_EQ(call_nid("evj9YPkS8s4", 0, 16, 4), 128u + 4u * 64u)
+        << "size query answers prosper's own requirement";
+}
+
+TEST(FiberUltMisc, QueuePushPopRoundTrip) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(16);
+    const uint64_t q = addr(&g_queue);
+
+    uint8_t out[16];
+    std::memset(out, 0xAB, sizeof(out));
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), hle::kSceKernelErrorEAGAIN)
+        << "try-pop on an empty queue answers EAGAIN instead of blocking";
+    uint8_t in[16];
+    for (int i = 0; i < 16; ++i) in[i] = (uint8_t)(0xC0 + i);
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, addr(in)), 0u) << "push succeeds";
+    EXPECT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(in)), 0u) << "try-push succeeds";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), 0u) << "pop succeeds";
+    EXPECT_EQ(std::memcmp(out, in, sizeof(out)), 0)
+        << "pop delivers exactly the pushed bytes, in order";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), 0u) << "second pop takes the second item";
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), hle::kSceKernelErrorEAGAIN)
+        << "queue is empty again afterwards";
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, 0), hle::kSceKernelErrorEINVAL)
+        << "push through a null pointer is refused";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, 0), hle::kSceKernelErrorEINVAL)
+        << "pop through a null pointer is refused";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", addr(&never_created), addr(in)), hle::kSceKernelErrorESRCH)
+        << "push on a never-created queue is refused";
+    EXPECT_EQ(call_nid("PP9nZxpSKLY", q), 0u) << "queue destroy succeeds";
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), hle::kSceKernelErrorESRCH)
+        << "pop on a destroyed queue is refused";
+}
+
+TEST(FiberUltMisc, QueuePopBlocksUntilPush) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    const uint64_t q = addr(&g_queue);
+
+    uint8_t got[8];
+    std::memset(got, 0, sizeof(got));
+    std::atomic<uint64_t> pop_rc{~0ull};
+    std::thread popper([&] { pop_rc.store(call_nid("RVSq2tsm2yw", q, addr(got))); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // popper is now waiting
+    EXPECT_EQ(pop_rc.load(), ~0ull) << "pop on an empty queue must still be waiting";
+    uint8_t sent[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    EXPECT_EQ(call_nid("dUwpX3e5NDE", q, addr(sent)), 0u);
+    for (int i = 0; i < 100 && pop_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    popper.join();
+    EXPECT_EQ(pop_rc.load(), 0u) << "the blocked pop completes once an item arrives";
+    EXPECT_EQ(std::memcmp(got, sent, sizeof(got)), 0) << "it delivers that item";
+}
+
+TEST(FiberUltMisc, SemaphoreCountsResources) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_sem, 0, sizeof(g_sem));
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t s = addr(&g_sem);
+    ASSERT_EQ(call_nid("h5QlIYj+Ro8", s, 0, 3, addr(&g_pool), 0, 0x12000000ull), 0u);
+
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), 0u) << "try-acquire within the count succeeds";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), hle::kSceKernelErrorEAGAIN)
+        << "try-acquire past the count answers EAGAIN";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 1), 0u) << "blocking acquire takes the last unit";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 1), hle::kSceKernelErrorEAGAIN)
+        << "empty semaphore refuses";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 0), hle::kSceKernelErrorEINVAL)
+        << "acquiring zero units is refused";
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 2), 0u) << "release restores";
+    EXPECT_EQ(call_nid("HA1Ldbi3lPY", s, 2), 0u) << "the released units are acquirable";
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 0), hle::kSceKernelErrorEINVAL)
+        << "releasing zero units is refused";
+    EXPECT_EQ(call_nid("izXyehpoZGo", s), 0u) << "semaphore destroy succeeds";
+    EXPECT_EQ(call_nid("QAH1ofI97vU", s, 1), hle::kSceKernelErrorESRCH)
+        << "acquire on a destroyed semaphore is refused";
+    UltBlob never_created;
+    std::memset(&never_created, 0, sizeof(never_created));
+    EXPECT_EQ(call_nid("lbtk5X1mecw", addr(&never_created), 1), hle::kSceKernelErrorESRCH)
+        << "release on a never-created semaphore is refused";
+}
+
+TEST(FiberUltMisc, SemaphoreAcquireBlocksUntilRelease) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_sem, 0, sizeof(g_sem));
+    ASSERT_EQ(call_nid("hZIg1EWGsHM"), 0u);
+    const uint64_t pool_bytes = call_nid("WIWV1Qd7PFU", 16, 16);
+    std::vector<unsigned char> pool_work((size_t)pool_bytes, 0);
+    ASSERT_EQ(call7_nid("YiHujOG9vXY", addr(&g_pool), 0, 16, 16, addr(pool_work.data()), 0,
+                        0x12000000ull),
+              0u);
+    const uint64_t s = addr(&g_sem);
+    ASSERT_EQ(call_nid("h5QlIYj+Ro8", s, 0, 0, addr(&g_pool), 0, 0x12000000ull), 0u);
+
+    std::atomic<uint64_t> acq_rc{~0ull};
+    std::thread waiter([&] { acq_rc.store(call_nid("QAH1ofI97vU", s, 1)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // waiter is now parked
+    EXPECT_EQ(acq_rc.load(), ~0ull) << "acquire on an empty semaphore must still be waiting";
+    EXPECT_EQ(call_nid("lbtk5X1mecw", s, 1), 0u);
+    for (int i = 0; i < 100 && acq_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    waiter.join();
+    EXPECT_EQ(acq_rc.load(), 0u) << "the blocked acquire completes once released";
+}
+
+// The data pool's numData is the guest's own budget for the items its queues hold. TryPush on a
+// full queue must answer EAGAIN (an unbounded queue never does, so a "push until TryPush fails"
+// loop never ends), and a pop must make room again.
+TEST(FiberUltMisc, QueueTryPushRefusesWhenFull) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    const uint64_t q = addr(&g_queue);
+    uint8_t item[8] = {};
+    for (uint64_t i = 0; i < kDataPoolNumData; ++i) {
+        item[0] = (uint8_t)i;
+        ASSERT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(item)), 0u) << "try-push " << i << " fits";
+    }
+    EXPECT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(item)), hle::kSceKernelErrorEAGAIN)
+        << "try-push past numData answers EAGAIN";
+    uint8_t out[8] = {};
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), 0u);
+    EXPECT_EQ(out[0], 0u) << "the oldest item leaves first";
+    EXPECT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(item)), 0u) << "a pop makes room for one push";
+    EXPECT_EQ(call_nid("6Mc2Xs7pI1I", q, addr(item)), hle::kSceKernelErrorEAGAIN);
+}
+
+TEST(FiberUltMisc, QueuePushBlocksUntilPop) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    const uint64_t q = addr(&g_queue);
+    uint8_t item[8] = {};
+    for (uint64_t i = 0; i < kDataPoolNumData; ++i)
+        ASSERT_EQ(call_nid("dUwpX3e5NDE", q, addr(item)), 0u);
+    uint8_t last[8] = {9, 9, 9, 9, 9, 9, 9, 9};
+    std::atomic<uint64_t> push_rc{~0ull};
+    std::thread pusher([&] { push_rc.store(call_nid("dUwpX3e5NDE", q, addr(last))); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(push_rc.load(), ~0ull) << "push on a full queue waits for room";
+    uint8_t out[8] = {};
+    EXPECT_EQ(call_nid("RVSq2tsm2yw", q, addr(out)), 0u);
+    // The pop must WAKE the pusher. Without that the pusher still finishes, but only when its
+    // first bounded wait (PROSPER_ULT_BLOCK_WARN_MS, 5 s) times out and re-checks; 2 s separates them.
+    for (int i = 0; i < 200 && push_rc.load() == ~0ull; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(push_rc.load(), 0u) << "the pop wakes the waiting push, which then completes";
+    pusher.join();
+    // 31 earlier items remain ahead of the one the blocked push delivered: 32 pops in all.
+    for (uint64_t i = 0; i < kDataPoolNumData; ++i)
+        ASSERT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), 0u);
+    EXPECT_EQ(std::memcmp(out, last, sizeof(out)), 0) << "the blocked item arrived last";
+    EXPECT_EQ(call_nid("uZz3ci7XYqc", q, addr(out)), hle::kSceKernelErrorEAGAIN);
+}
+
+TEST(FiberUltMisc, DestroyReleasesBlockedPopAndAcquire) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    std::memset(&g_sem, 0, sizeof(g_sem));
+    make_data_pool_and_queue(8);
+    const uint64_t q = addr(&g_queue), s = addr(&g_sem);
+    ASSERT_EQ(call_nid("h5QlIYj+Ro8", s, 0, 0, addr(&g_pool), 0, 0x12000000ull), 0u);
+
+    uint8_t got[8] = {};
+    std::atomic<uint64_t> pop_rc{~0ull}, acq_rc{~0ull};
+    std::thread popper([&] { pop_rc.store(call_nid("RVSq2tsm2yw", q, addr(got))); });
+    std::thread acquirer([&] { acq_rc.store(call_nid("QAH1ofI97vU", s, 1)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_EQ(pop_rc.load(), ~0ull);
+    ASSERT_EQ(acq_rc.load(), ~0ull);
+    EXPECT_EQ(call_nid("PP9nZxpSKLY", q), 0u);
+    EXPECT_EQ(call_nid("izXyehpoZGo", s), 0u);
+    popper.join();
+    acquirer.join();
+    EXPECT_EQ(pop_rc.load(), hle::kSceKernelErrorESRCH) << "destroy releases a blocked pop";
+    EXPECT_EQ(acq_rc.load(), hle::kSceKernelErrorESRCH) << "destroy releases a blocked acquire";
+}
+
+// A waiter woken by destroy may reacquire the object's mutex only after a Create has reused the
+// slot. It must still report the destroy, and must not take the new queue's item or the new
+// semaphore's units. The interleaving is a race, so it is run many times.
+TEST(FiberUltMisc, StaleWaiterDoesNotJoinTheNextIncarnation) {
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    ASSERT_EQ(call_nid("PP9nZxpSKLY", addr(&g_queue)), 0u);
+    constexpr int kRounds = 40;
+    int stolen_items = 0, stolen_units = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        UltBlob first, second, sem_a, sem_b;
+        std::memset(&first, 0, sizeof(first));
+        std::memset(&second, 0, sizeof(second));
+        std::memset(&sem_a, 0, sizeof(sem_a));
+        std::memset(&sem_b, 0, sizeof(sem_b));
+        ASSERT_EQ(call7_nid("9Y5keOvb6ok", addr(&first), 0, 8, addr(&g_pool), addr(&g_dpool), 0,
+                            0x12000000ull),
+                  0u);
+        ASSERT_EQ(call_nid("h5QlIYj+Ro8", addr(&sem_a), 0, 0, addr(&g_pool), 0, 0x12000000ull), 0u);
+        uint8_t got[8] = {};
+        std::atomic<uint64_t> pop_rc{~0ull}, acq_rc{~0ull};
+        std::thread popper([&] { pop_rc.store(call_nid("RVSq2tsm2yw", addr(&first), addr(got))); });
+        std::thread acquirer([&] { acq_rc.store(call_nid("QAH1ofI97vU", addr(&sem_a), 1)); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Destroy, then immediately reuse the slot (the only dead object of each type).
+        ASSERT_EQ(call_nid("PP9nZxpSKLY", addr(&first)), 0u);
+        ASSERT_EQ(call7_nid("9Y5keOvb6ok", addr(&second), 0, 8, addr(&g_pool), addr(&g_dpool), 0,
+                            0x12000000ull),
+                  0u);
+        uint8_t sent[8] = {7, 7, 7, 7, 7, 7, 7, 7};
+        ASSERT_EQ(call_nid("dUwpX3e5NDE", addr(&second), addr(sent)), 0u);
+        ASSERT_EQ(call_nid("izXyehpoZGo", addr(&sem_a)), 0u);
+        ASSERT_EQ(call_nid("h5QlIYj+Ro8", addr(&sem_b), 0, 1, addr(&g_pool), 0, 0x12000000ull), 0u);
+        popper.join();
+        acquirer.join();
+        EXPECT_EQ(pop_rc.load(), hle::kSceKernelErrorESRCH) << "round " << round;
+        EXPECT_EQ(acq_rc.load(), hle::kSceKernelErrorESRCH) << "round " << round;
+        uint8_t out[8] = {};
+        if (call_nid("uZz3ci7XYqc", addr(&second), addr(out)) != 0u) ++stolen_items;
+        if (call_nid("HA1Ldbi3lPY", addr(&sem_b), 1) != 0u) ++stolen_units;
+        ASSERT_EQ(call_nid("PP9nZxpSKLY", addr(&second)), 0u);
+        ASSERT_EQ(call_nid("izXyehpoZGo", addr(&sem_b)), 0u);
+    }
+    EXPECT_EQ(stolen_items, 0) << "a stale popper took the next queue's item";
+    EXPECT_EQ(stolen_units, 0) << "a stale acquirer took the next semaphore's unit";
+}
+
+// An operation that looked its object up BEFORE a destroy but takes the object's lock only AFTER
+// a Create reused the slot must answer ESRCH and leave the new object alone. The resolve hook
+// holds the worker between lookup and lock, so the interleaving is forced, not raced.
+namespace stale_lookup {
+std::atomic<const char*> g_target{nullptr};
+std::atomic<std::thread::id> g_worker{};
+std::atomic<int> g_paused{0}, g_resume{0};
+void hook(const char* fn) {
+    const char* target = g_target.load();
+    if (!target || std::strcmp(fn, target) != 0 || std::this_thread::get_id() != g_worker.load())
+        return;
+    g_paused.store(1);
+    while (!g_resume.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+uint32_t slot_of(const UltBlob& blob) {
+    uint64_t id = 0;
+    std::memcpy(&id, blob.bytes + 8, sizeof(id));   // header {magic, id}; id = generation:slot
+    return (uint32_t)id;
+}
+// Run `op` on a worker that stops after resolving `name`; while it is stopped run `swap` (destroy
+// the object `op` names, create its replacement in the same slot); then let the worker finish.
+uint64_t run_held(const char* name, const std::function<uint64_t()>& op,
+                  const std::function<void()>& swap) {
+    g_paused.store(0);
+    g_resume.store(0);
+    g_target.store(name);
+    std::atomic<uint64_t> rc{~0ull};
+    std::thread worker([&] {
+        g_worker.store(std::this_thread::get_id());
+        rc.store(op());
+    });
+    for (int i = 0; i < 5000 && !g_paused.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(g_paused.load()) << name << " never reached the lookup hook";
+    swap();
+    g_resume.store(1);
+    worker.join();
+    g_target.store(nullptr);
+    return rc.load();
+}
+}   // namespace stale_lookup
+
+TEST(FiberUltMisc, OperationResolvedBeforeDestroyDoesNotTouchTheNextObject) {
+    using namespace stale_lookup;
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    ASSERT_EQ(call_nid("PP9nZxpSKLY", addr(&g_queue)), 0u);   // leaves exactly one dead queue slot
+    ult_set_resolve_hook_for_test(&hook);
+    const auto queue_at = [&](UltBlob& blob) {
+        std::memset(&blob, 0, sizeof(blob));
+        EXPECT_EQ(call7_nid("9Y5keOvb6ok", addr(&blob), 0, 8, addr(&g_pool), addr(&g_dpool), 0,
+                            0x12000000ull),
+                  0u);
+    };
+    const auto sem_at = [&](UltBlob& blob, uint64_t initial) {
+        std::memset(&blob, 0, sizeof(blob));
+        EXPECT_EQ(call_nid("h5QlIYj+Ro8", addr(&blob), 0, initial, addr(&g_pool), 0, 0x12000000ull),
+                  0u);
+    };
+    uint8_t item[8] = {5, 5, 5, 5, 5, 5, 5, 5}, out[8] = {};
+
+    // Push / TryPush: the stale item must not land in the replacement queue.
+    for (const char* name : {"sceUltQueuePush", "sceUltQueueTryPush"}) {
+        const char* nid = std::strcmp(name, "sceUltQueuePush") == 0 ? "dUwpX3e5NDE" : "6Mc2Xs7pI1I";
+        UltBlob first, second;
+        queue_at(first);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), addr(item)); },
+            [&] {
+                EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&first)), 0u);
+                queue_at(second);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed queue";
+        EXPECT_EQ(call_nid("uZz3ci7XYqc", addr(&second), addr(out)), hle::kSceKernelErrorEAGAIN)
+            << name << " put the destroyed queue's item into the replacement";
+        EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&second)), 0u);
+    }
+    // Pop / TryPop: the stale call must not take the replacement queue's item.
+    for (const char* name : {"sceUltQueuePop", "sceUltQueueTryPop"}) {
+        const char* nid = std::strcmp(name, "sceUltQueuePop") == 0 ? "RVSq2tsm2yw" : "uZz3ci7XYqc";
+        UltBlob first, second;
+        queue_at(first);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), addr(out)); },
+            [&] {
+                EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&first)), 0u);
+                queue_at(second);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+                EXPECT_EQ(call_nid("dUwpX3e5NDE", addr(&second), addr(item)), 0u);
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed queue";
+        EXPECT_EQ(call_nid("uZz3ci7XYqc", addr(&second), addr(out)), 0u)
+            << name << " took the replacement queue's item";
+        EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&second)), 0u);
+    }
+    // Acquire / TryAcquire: the stale call must not take the replacement's unit.
+    for (const char* name : {"sceUltSemaphoreAcquire", "sceUltSemaphoreTryAcquire"}) {
+        const char* nid =
+            std::strcmp(name, "sceUltSemaphoreAcquire") == 0 ? "QAH1ofI97vU" : "HA1Ldbi3lPY";
+        UltBlob first, second;
+        sem_at(first, 0);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), 1); },
+            [&] {
+                EXPECT_EQ(call_nid("izXyehpoZGo", addr(&first)), 0u);
+                sem_at(second, 1);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed semaphore";
+        EXPECT_EQ(call_nid("HA1Ldbi3lPY", addr(&second), 1), 0u)
+            << name << " took the replacement semaphore's unit";
+        EXPECT_EQ(call_nid("izXyehpoZGo", addr(&second)), 0u);
+    }
+    // Release: the stale call must not add a unit to the replacement.
+    {
+        UltBlob first, second;
+        sem_at(first, 0);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            "sceUltSemaphoreRelease", [&] { return call_nid("lbtk5X1mecw", addr(&first), 1); },
+            [&] {
+                EXPECT_EQ(call_nid("izXyehpoZGo", addr(&first)), 0u);
+                sem_at(second, 0);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << "release on the destroyed semaphore";
+        EXPECT_EQ(call_nid("HA1Ldbi3lPY", addr(&second), 1), hle::kSceKernelErrorEAGAIN)
+            << "release added a unit to the replacement semaphore";
+        EXPECT_EQ(call_nid("izXyehpoZGo", addr(&second)), 0u);
+    }
+    ult_set_resolve_hook_for_test(nullptr);
 }

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # PGA TOUR 2K25 (`PPSA17952`) — bring-up status
 
 **Rung 0** as of 2026-08-22. The guest boots, links, loads assets and submits real GPU work, but no

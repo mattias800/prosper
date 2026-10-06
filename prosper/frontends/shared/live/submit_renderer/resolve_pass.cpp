@@ -136,6 +136,9 @@ void resolve_pass(ResolvePassContext& ctx) {
         // transfer the source surface's metadata identity to an unrelated base.
         resolved.dcc_metadata_addr = 0;
         resolved.dcc_metadata_bytes = 0;
+        resolved.dcc_num_components = 0;
+        resolved.dcc_alpha_is_on_msb = false;
+        resolved.dcc_width = resolved.dcc_height = 0;
         resolved.dcc_metadata_dirty = false;
         resolved.dcc_guest_origins = {};
         const uint32_t rw = resolved.w, rh = resolved.h;

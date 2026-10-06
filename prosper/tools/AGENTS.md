@@ -574,6 +574,12 @@ capture/replay without requiring an importable system Python module.
   `LAYER_ORDER` (`--write` regenerates it), and with `--base` an accepted ADR is never edited or
   deleted, only superseded. It proves references are live, not that a rule is true. Runs in the
   `Docs` CI job; tests are `docs/test_check_arch_docs.py` (pytest).
+- **`docs/check_doc_meta.py`** -- every document under `prosper/docs/` (outside `spec/` and
+  `adr/`, which `check_arch_docs.py` covers) opens with `kind:` and `status:` frontmatter, and every
+  relative Markdown link in a tracked `.md` file resolves. Code spans and fences are skipped, and
+  the generated `PROGRESS_TRACKER.md` is not link-checked (fix its links in the source issue). A
+  `template: design` document must carry the design-doc sections. Runs in the `Docs` CI job; tests
+  are `docs/test_check_doc_meta.py`.
 - **`docs/confidence_ledger.py`** -- lists every `CONFIDENCE: HIGH|MED|LOW` marker in the shipping
   code (`--summary` for counts per area, `--json` for records): the ledger of what prosper currently
   believes on thin evidence, generated so it cannot go stale. A report, never a gate.

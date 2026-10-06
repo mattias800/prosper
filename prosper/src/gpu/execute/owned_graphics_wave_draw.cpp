@@ -37,7 +37,7 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // field checked_graphics_source_requires_owned_waves reads). Re-walking and re-running the
 // dataflow here on every call cost GTA V ~70% of its bank-scene frame rate (9.0 -> 3.0 flips/s
 // at #4270). PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE=1 restores the re-derivation as the A/B control.
-bool graphics_program_requires_owned_waves(uint64_t address) {
+bool graphics_program_requires_owned_waves(uint64_t address, bool fragment_launch_wave64) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return false;
@@ -45,10 +45,13 @@ bool graphics_program_requires_owned_waves(uint64_t address) {
     if (!source.words || !source.decoded) return false;
     if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE")) {
         std::vector<Rdna2Inst> original;
-        rdna2_walk(source.words->data(), source.words->size(), original);
-        return !rdna2_raw_wave_wide_data_loads(original).empty();
+        const size_t consumed = rdna2_walk(source.words->data(), source.words->size(), original);
+        return !rdna2_raw_wave_wide_data_loads(
+                    original, fragment_launch_wave64 &&
+                                  rdna2_fragment_compiles_wave64(source.words->data(), consumed))
+                    .empty();
     }
-    return !source.decoded->raw_wave_wide_data_load_pcs.empty();
+    return source.decoded->requires_owned_waves(fragment_launch_wave64);
 }
 
 const char* owned_wave_draw_state_refusal(const GpuState& state, bool fragment) {
@@ -92,7 +95,9 @@ bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
         return false;
     };
     const bool vertex = graphics_program_requires_owned_waves(vertex_address);
-    const bool fragment = graphics_program_requires_owned_waves(fragment_address);
+    // The same width the caller routed this draw by (realize_draw_item, #4555).
+    const bool fragment = graphics_program_requires_owned_waves(
+        fragment_address, !extract_render_state(state).ps_wave32);
     if (!vertex && !fragment) return true;
     // Register-state refusals first: no producer publication can change them, and the executor
     // relies on that order to skip a futile authoritative flush (gpu_executor.cpp).

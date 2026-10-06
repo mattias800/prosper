@@ -16,6 +16,9 @@
 namespace prosper::gpu {
 namespace {
 
+// One bit per stage tag (vs, ps, cs, vsmain) under an epoch that advances in steps of 16.
+constexpr uint64_t kStageBits = 15u;
+
 struct DumpState {
     std::mutex mutex;
     std::string root;            // empty: derive from PROSPER_CAPTURE_DIR on first use
@@ -23,7 +26,7 @@ struct DumpState {
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
     bool dir_failure_announced = false;
     std::atomic<bool> full{false};
-    std::atomic<uint64_t> epoch{8};
+    std::atomic<uint64_t> epoch{kStageBits + 1u};
     std::atomic<uint64_t> hash_evaluations{0};
     std::atomic<uint64_t> hashed_dwords{0};
 };
@@ -45,11 +48,12 @@ uint64_t hash_code(const uint32_t* code, size_t dwords) {
 }
 
 uint64_t stage_bit(const char* stage) {
-    return !stage                      ? 0u
-           : !std::strcmp(stage, "vs") ? 1u
-           : !std::strcmp(stage, "ps") ? 2u
-           : !std::strcmp(stage, "cs") ? 4u
-                                       : 0u;
+    return !stage                          ? 0u
+           : !std::strcmp(stage, "vs")     ? 1u
+           : !std::strcmp(stage, "ps")     ? 2u
+           : !std::strcmp(stage, "cs")     ? 4u
+           : !std::strcmp(stage, "vsmain") ? 8u   // a chained vertex program's main (#3135 P0)
+                                           : 0u;
 }
 
 std::string make_directory(DumpState& s) {
@@ -125,10 +129,21 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
                      detail.c_str());
         std::fclose(index);
     }
-    std::fprintf(stderr, "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
-                         "op=0x%x) -> %s%s\n",
+    // A draw a gate refused was never recompiled, so its "first unsupported" instruction is only
+    // the generic coverage census and not why the draw was lost. The reason is in the detail the
+    // caller passed; repeat it on this line, which is the one a person reads. It used to be in
+    // index.txt alone, and #4580 was filed saying nothing logged it.
+    std::string refusal;
+    if (const size_t at = detail.find("refusal="); at != std::string::npos) {
+        const size_t end = detail.find(' ', at);
+        refusal = " " + detail.substr(at, end == std::string::npos ? end : end - at);
+    }
+    std::fprintf(stderr,
+                 "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
+                 "op=0x%x)%s -> %s%s\n",
                  stage, (unsigned long long)address, dwords, coverage.first_bad_fmt,
-                 coverage.first_bad_op, path.string().c_str(), written ? "" : " (WRITE FAILED)");
+                 coverage.first_bad_op, refusal.c_str(), path.string().c_str(),
+                 written ? "" : " (WRITE FAILED)");
     return written;
 }
 
@@ -141,9 +156,9 @@ bool note_refused_shader(const char* stage, uint64_t address, const RefusedShade
         const uint64_t epoch = state().epoch.load(std::memory_order_relaxed);
         uint64_t previous = source.memo->epoch_stages.load(std::memory_order_relaxed);
         for (;;) {
-            if ((previous & ~uint64_t(7)) == epoch && (previous & bit)) return false;
+            if ((previous & ~kStageBits) == epoch && (previous & bit)) return false;
             const uint64_t desired =
-                epoch | bit | (((previous & ~uint64_t(7)) == epoch) ? (previous & 7u) : 0u);
+                epoch | bit | (((previous & ~kStageBits) == epoch) ? (previous & kStageBits) : 0u);
             if (source.memo->epoch_stages.compare_exchange_weak(previous, desired,
                                                                 std::memory_order_relaxed))
                 break;
@@ -156,7 +171,7 @@ bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& 
     if (refused_shader_dump_full() || !stage || !source.words || source.words->empty()) return true;
     if (!source.memo) return false;
     const uint64_t observed = source.memo->epoch_stages.load(std::memory_order_relaxed);
-    return (observed & ~uint64_t(7)) == state().epoch.load(std::memory_order_relaxed) &&
+    return (observed & ~kStageBits) == state().epoch.load(std::memory_order_relaxed) &&
            (observed & stage_bit(stage));
 }
 
@@ -193,7 +208,7 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.directory.clear();
     s.seen.clear();
     s.full.store(false);
-    s.epoch.fetch_add(8, std::memory_order_relaxed);
+    s.epoch.fetch_add(kStageBits + 1u, std::memory_order_relaxed);
     s.hash_evaluations.store(0, std::memory_order_relaxed);
     s.hashed_dwords.store(0, std::memory_order_relaxed);
     s.dir_failure_announced = false;

@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Performance roadmap handoff (2026-09-23)
 
 This handoff continues the general performance roadmap after #3770. It records one rejected

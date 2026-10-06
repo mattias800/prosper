@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # AGC graphics — implementation plan (the M4/M5 frontier)
 
 State as of 2026-07-04. The full non-graphics runtime is solid (real libc, IL2CPP, threads, memory,

@@ -22,6 +22,7 @@
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
+#include "gpu/pm4/vgt_shader_stages.hpp"   // NGG shape in the refused-shader index
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
@@ -29,6 +30,7 @@
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
 #include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
@@ -110,6 +112,9 @@ struct DrawItem {
     // does not mark a draw ready or promote host raster observations to guest entry values.
     std::shared_ptr<const RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
+    // A merged ES+GS NGG draw the backend runs through its subgroup shell (#3135 P4). No producer
+    // sets it yet: live admission is P5.
+    std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
     // Ordered source authority only. Never serialized or interpreted as ready resource backing.
     std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
@@ -436,6 +441,12 @@ struct SrtUse {
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;
+    // A raw MUBUF/MTBUF use whose fully-known V# declares a window over the 256 MiB resource cap.
+    // The fold publishes it with the V# unchanged and this mark set; it never reaches a consumer so:
+    // resolve_dynamic_fetch resolves every mark against the live mapping table after the fold
+    // (oversize_buffer_window.hpp), clamping NUM_RECORDS to the mapped run or dropping the use. Kept
+    // out of the fold because the mapping table is not a FoldReader-recorded input.
+    bool oversize_window = false;
 };
 
 // Materialization half of the IMAGE_*_MIP specialization contract. Kept observable so regression
@@ -444,6 +455,16 @@ bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view);
 std::vector<DynFetch> resolve_dynamic_fetch(
+    const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
+    uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses = nullptr,
+    uint32_t pcrel_dispatch_target = UINT32_MAX, const PcrelDispatchInfo* pcrel_dispatch = nullptr,
+    const uint32_t* system_sgprs = nullptr, uint32_t nsystem_sgprs = 0,
+    FoldReader* reader = nullptr, const CheckedGraphicsSource* checked_source = nullptr);
+// The fold alone: a pure function of its inputs and the reads `reader` records, so a `.prfold`
+// capture replays to identical outputs. It may leave SrtUse::oversize_window marks, which
+// resolve_dynamic_fetch (= this fold, then those marks resolved against the live mapping table)
+// never returns. Only the fold capture/replay workbench should call this directly.
+std::vector<DynFetch> resolve_dynamic_fetch_fold(
     const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
     uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses = nullptr,
     uint32_t pcrel_dispatch_target = UINT32_MAX, const PcrelDispatchInfo* pcrel_dispatch = nullptr,
@@ -563,7 +584,7 @@ bool draw_requires_owned_nested_snapshot(const GpuState& state,
 // Code-free physical launch hint. It chooses ordered realization, not a completion wait or
 // resource admission. The real issuer separately authenticates the current original version.
 bool draw_requires_original_scalar_bank(const GpuState& state);
-bool graphics_program_requires_owned_waves(uint64_t address);
+bool graphics_program_requires_owned_waves(uint64_t address, bool fragment_launch_wave64 = false);
 // The owned-wave refusal decided by register state alone (fragment launch, output and depth
 // extents), or null. No producer publication can change it, so prepare_draw_owned_waves asks it
 // before the producer check and the executor asks it before an authoritative flush.
@@ -696,7 +717,8 @@ checked_graphics_source(std::shared_ptr<const OrderedScalarBankReadPoint>, const
                         uint64_t address, uint64_t command_order, ShaderProgramStage);
 SharedShaderAnalysis checked_graphics_source_analysis(const CheckedGraphicsSource*);
 bool checked_graphics_source_current(const CheckedGraphicsSource*);
-bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*);
+bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*,
+                                                  bool fragment_launch_wave64 = false);
 GraphicsReadSource checked_graphics_source_observation(const CheckedGraphicsSource*);
 std::shared_ptr<const OriginalFragmentDrawProducer>
 seal_original_fragment_draw_producer(const OrderedScalarBankReadPoint&, const GpuState&,
@@ -2355,20 +2377,28 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const uint32_t gs_max_out = cx(P::VGT_GS_MAX_VERT_OUT, 9);
             const uint32_t max_output = cx(P::GE_MAX_OUTPUT_PER_SUBGROUP, 10);
             const uint32_t out_prim = cx(P::VGT_GS_OUT_PRIM_TYPE, 11);
+            // #3135 P0: the output/raster state the merged-NGG lowering must model or refuse.
+            const uint32_t vs_out_cntl = cx(P::PA_CL_VS_OUT_CNTL, 12);
+            const uint32_t su_mode = cx(P::PA_SU_SC_MODE_CNTL, 13);
+            const uint32_t pos_format = cx(P::SPI_SHADER_POS_FORMAT, 14);
+            const uint32_t color0_view = cx(P::CB_COLOR0_VIEW, 15);
+            const uint32_t clip_cntl = cx(P::PA_CL_CLIP_CNTL, 16);
+            const uint32_t primitiveid_en = cx(P::VGT_PRIMITIVEID_EN, 17);
             std::fprintf(stderr,
-                "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
-                "vertices=%u instances=%u topo=%u present=%03x rsrc1=%08x rsrc2=%08x "
-                "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
-                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
-                "max-output=%08x out-prim=%08x\n",
-                static_cast<unsigned long long>(rs.es_addr),
-                static_cast<unsigned long long>(chain_addr),
-                static_cast<unsigned long long>(rs.color0_base),
-                static_cast<unsigned long long>(draw ? draw->command_order : 0),
-                vcount_hint, draw ? draw->instance_count : ds.num_instances,
-                rs.prim_type, present,
-                rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
-                primitive, gs_instance, gs_max_out, max_output, out_prim);
+                         "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
+                         "vertices=%u instances=%u topo=%u present=%05x rsrc1=%08x rsrc2=%08x "
+                         "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
+                         "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
+                         "max-output=%08x out-prim=%08x vs-out-cntl=%08x su-mode=%08x "
+                         "pos-format=%08x color0-view=%08x clip-cntl=%08x primitiveid-en=%08x\n",
+                         static_cast<unsigned long long>(rs.es_addr),
+                         static_cast<unsigned long long>(chain_addr),
+                         static_cast<unsigned long long>(rs.color0_base),
+                         static_cast<unsigned long long>(draw ? draw->command_order : 0),
+                         vcount_hint, draw ? draw->instance_count : ds.num_instances, rs.prim_type,
+                         present, rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
+                         primitive, gs_instance, gs_max_out, max_output, out_prim, vs_out_cntl,
+                         su_mode, pos_format, color0_view, clip_cntl, primitiveid_en);
         }
     }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
@@ -2399,6 +2429,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
         : rs.es_addr;
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
+    // The refused-shader index records each refused draw's NGG shape and link kind (#3135 P0).
+    const char* const refused_ngg_class = [&] {
+        const auto it = ds.cx.find(prosper::agc::Pm4::VGT_SHADER_STAGES_EN);
+        return ngg_stage_class(VgtShaderStages{it == ds.cx.end() ? 0u : it->second});
+    }();
+    const char* const refused_link =
+        vertex_chain ? "prolog" : (vs_program_addr != rs.es_addr ? "fused" : "none");
     const auto* producer_header = vs_program_addr == rs.es_addr ? vertex_header : fused_back;
     const auto* pixel_header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(rs.ps_addr));
@@ -2419,19 +2456,36 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     const bool owned_vertex =
         checked_vertex ? checked_graphics_source_requires_owned_waves(checked_vertex.get())
                        : graphics_program_requires_owned_waves(vs_program_addr);
+    // A fragment launch names its wave width, and whether a wide load is read as a number can
+    // depend on it: at 64 lanes a compare into a register pair replaces both loaded words. The
+    // fragment compiler below is handed the same rs.ps_wave32 (#4555). The vertex launch width
+    // is not plumbed, so the vertex stage keeps the width-agnostic answer.
+    const bool fragment_launch_wave64 = !rs.ps_wave32;
     const bool owned_fragment =
-        checked_fragment ? checked_graphics_source_requires_owned_waves(checked_fragment.get())
-                         : graphics_program_requires_owned_waves(rs.ps_addr);
+        checked_fragment
+            ? checked_graphics_source_requires_owned_waves(checked_fragment.get(),
+                                                           fragment_launch_wave64)
+            : graphics_program_requires_owned_waves(rs.ps_addr, fragment_launch_wave64);
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
     std::vector<uint32_t> owned_indices;
     if (owned_vertex || owned_fragment) {
         std::string refusal;
-        if (vertex_chain || !prepare_draw_owned_waves(ds, draw, vs_program_addr, rs.ps_addr,
+        const bool prepared =
+            !vertex_chain && prepare_draw_owned_waves(ds, draw, vs_program_addr, rs.ps_addr,
                                                       vcount_hint, float_transport, raw_context,
-                                                      owned_waves, owned_indices, refusal)) {
+                                                      owned_waves, owned_indices, refusal);
+        // The preparation decides for itself which stages are owned, from the registered program,
+        // and answers "prepared" with no owner when it finds none. This routing can read a
+        // checked source instead, and both now take a launch width. If the two ever disagree,
+        // a stage would go on with neither a native module nor an owner, or with both, and the
+        // draw would be wrong without a word in the log. Refuse it by name instead.
+        const bool agreed =
+            prepared && owned_wave_owner_matches(owned_waves.get(), owned_vertex, owned_fragment);
+        if (!agreed) {
             if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
-            const char* const reason =
-                vertex_chain ? "owned-wave-chained-stage-unimplemented" : refusal.c_str();
+            const char* const reason = vertex_chain ? "owned-wave-chained-stage-unimplemented"
+                                       : !prepared  ? refusal.c_str()
+                                                    : "owned-wave-routing-disagreement";
             report_dropped_draw_target(rs.color0_base, reason, rs.cb_target_mask,
                                        rs.cb_shader_mask);
             // The drop is counted under the same label as a recompile reject, but no recompile
@@ -2452,7 +2506,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                  0,
                  owned_vertex,
                  owned_fragment,
-                 reason});
+                 reason,
+                 refused_ngg_class,
+                 refused_link,
+                 vertex_chain ? chain_addr : 0});
             prosper::diagnostics::perf::drop_draw_at_realization(
                 owned_vertex ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
                              : prosper::diagnostics::perf::DropReason::ShaderRecompileFragment);
@@ -2843,7 +2900,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                    rs.ps_addr, rs.es_addr, draw ? draw->command_order : 0,
                                    max_shader_dwords, vs_words.size(), gs.size(), fs_words.size(),
                                    vs_words.empty() && !owned_vertex,
-                                   fs_words.empty() && !owned_fragment});
+                                   fs_words.empty() && !owned_fragment, nullptr, refused_ngg_class,
+                                   refused_link, vertex_chain ? chain_addr : 0});
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "

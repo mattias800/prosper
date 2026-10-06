@@ -679,6 +679,13 @@ jobs:
             python3 prosper/tools/docs/check_arch_docs.py --github --root .
           fi
 
+      # Same job, same reason: every document under prosper/docs/ declares its kind and status, and
+      # every relative Markdown link in the repository resolves. Links are resolved by exact name
+      # against the directory listing, so the answer here matches a Windows checkout's. Its pytest
+      # suite runs in the Python quality job.
+      - name: Verify every document declares its kind and every relative link resolves
+        run: python3 prosper/tools/docs/check_doc_meta.py --github --root .
+
       # Same job, same reason: a text scan over the shipping sources. The charter asks every new
       # PROSPER_* switch to be classified -- host-capability, diagnostic, or a guest-behaviour
       # selector with the issue that will retire it -- and until this step nothing could notice one

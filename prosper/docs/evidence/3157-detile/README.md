@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Issue #3157: paired AVX2 detile measurements (2026-09-29)
 
 This is the numeric evidence for PR #3952. The input shape is Astro Bot's recurring

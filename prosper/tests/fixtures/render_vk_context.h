@@ -59,7 +59,13 @@ struct RenderVkCtx {
     bool logic_op_enabled = false;
     bool ok = false;
     bool geometry_shader_enabled = false;
+    // VK_EXT_shader_viewport_index_layer enabled: a vertex stage may write gl_Layer (#3135 P3's
+    // ShaderOutputLayer route in gpu/recompiler/ngg_raster_commit.hpp). Nothing consumes it yet.
+    bool shader_output_layer_enabled = false;
     bool fragment_stores_atomics = false;
+    // vertexPipelineStoresAndAtomics enabled: the merged-NGG pass-through vertex stage may count
+    // protocol violations (ngg_subgroup_gpu.h).
+    bool vertex_pipeline_stores = false;
     bool shader_int64_enabled = false;   // successful vkCreateDevice feature, never advertised-only
     // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.
     bool deterministic_storage_reads = false;

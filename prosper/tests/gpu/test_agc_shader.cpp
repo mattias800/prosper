@@ -613,6 +613,108 @@ TEST(AgcShader, Contract) {
                   *narrow_scalar_resource) == 4u,
           "graphics stage table bounds scalar dwords by the V# byte footprint");
 
+    // #4585: a V# loaded by a RAW immediate-wide data load (its words are also read numerically)
+    // carries no recompiler SRT tag, so its consumers can resolve only by pc. The fold keyed the
+    // descriptor by the load immediate anyway and published a resource no consumer could reach;
+    // every s_buffer_load reading it was then refused as unresolved-cbuf.
+    alignas(16) static uint32_t untagged_payload[32]{};
+    alignas(16) static uint32_t untagged_table[8]{};
+    const uint64_t untagged_payload_addr = reinterpret_cast<uint64_t>(untagged_payload);
+    untagged_table[4] = static_cast<uint32_t>(untagged_payload_addr);
+    untagged_table[5] = static_cast<uint32_t>(untagged_payload_addr >> 32) & 0xffffu;
+    untagged_table[6] = sizeof(untagged_payload);   // stride 0: NUM_RECORDS counts bytes
+    untagged_table[7] = (22u << 12) | 0xfacu;
+    const uint32_t untagged_shader[] = {
+        0xF4080200u, 0xFA000010u,   // pc0: s_load_dwordx4 s[8:11], s[0:1], 0x10
+        0x7E000208u,   // pc2: v_mov_b32 v0, s8 -- a numeric reader: raw-wide data
+        0xF4200304u, 0xFA000000u,   // pc3: s_buffer_load_dword s12, s[8:11], 0x0
+        0xF4200344u, 0xFA000040u,   // pc5: s_buffer_load_dword s13, s[8:11], 0x40
+        0xBF810000u,
+    };
+    Shader untagged{};
+    untagged.file_header = 0x34333231u;
+    untagged.version = 0x18u;
+    untagged.shader_size = sizeof(untagged_shader);
+    untagged.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&untagged),
+                       reinterpret_cast<uint64_t>(untagged_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &untagged, "raw-wide V# pixel shader enters the AGC registry");
+    prosper::gpu::GpuState untagged_state;
+    const uint64_t untagged_table_addr = reinterpret_cast<uint64_t>(untagged_table);
+    untagged_state.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] =
+        static_cast<uint32_t>(untagged_table_addr);
+    untagged_state.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1] =
+        static_cast<uint32_t>(untagged_table_addr >> 32);
+    auto untagged_resources = prosper::gpu::build_stage_table(
+        untagged_state, reinterpret_cast<uint64_t>(untagged_shader), true, 3);
+    const auto untagged_cbuf = [&](uint32_t pc) -> const prosper::gpu::ShaderResource* {
+        const auto* r = untagged_resources ? untagged_resources->by_fetch_pc(pc) : nullptr;
+        return r && r->cls == prosper::gpu::ResourceClass::ConstantBuffer ? r : nullptr;
+    };
+    CHECK(untagged_cbuf(3u) && untagged_cbuf(3u)->gpu_addr == untagged_payload_addr,
+          "the first consumer of an untagged raw-wide V# resolves by its pc");
+    CHECK(untagged_cbuf(5u) && untagged_cbuf(5u)->gpu_addr == untagged_payload_addr,
+          "...and so does the second");
+    CHECK(!untagged_resources || !untagged_resources->by_srt_offset(0x10u) ||
+              untagged_resources->by_srt_offset(0x10u)->gpu_addr != untagged_payload_addr,
+          "no resource is keyed by an immediate the recompiler never tags");
+
+    // #4584: a V# whose table key CLASHES is published key-less, so each scalar buffer load that
+    // reads it resolves only through its own fetch_pc entry. Here a texture loaded from table A at
+    // +0x20 holds key 0x20 first; the V# loaded from table B at the same +0x20 then clashes, and it is
+    // read by two s_buffer_loads. Per-key dedupe published only the first consumer's entry and the
+    // second was refused as unresolved-cbuf (Kena's title pixel shader has this shape).
+    alignas(256) static uint8_t clash_texture_bytes[256]{};
+    alignas(16) static uint32_t clash_payload[32]{};
+    alignas(32) static uint32_t clash_table_a[24]{};   // T# at +0x20, S# at +0x40
+    alignas(32) static uint32_t clash_table_b[16]{};   // V# at +0x20
+    make_test_tsharp(clash_table_a + 8, reinterpret_cast<uint64_t>(clash_texture_bytes), 4, 4, 60);
+    const uint64_t clash_payload_addr = reinterpret_cast<uint64_t>(clash_payload);
+    clash_table_b[8] = static_cast<uint32_t>(clash_payload_addr);
+    clash_table_b[9] = static_cast<uint32_t>(clash_payload_addr >> 32) & 0xffffu;
+    clash_table_b[10] = sizeof(clash_payload);   // stride 0: NUM_RECORDS counts bytes
+    clash_table_b[11] = (22u << 12) | 0xfacu;
+    const uint32_t clash_shader[] = {
+        0xF40C0304u, 0xFA000020u,   // pc0: s_load_dwordx8 s[12:19], s[8:9], 0x20   (T#, key 0x20)
+        0xF4080504u, 0xFA000040u,   // pc2: s_load_dwordx4 s[20:23], s[8:9], 0x40   (S#)
+        0xF0800F08u, 0x00A30000u,   // pc4: image_sample ..., s[12:19], s[20:23]
+        0xF4080605u, 0xFA000020u,   // pc6: s_load_dwordx4 s[24:27], s[10:11], 0x20 (V#, key 0x20)
+        0xF420070Cu, 0xFA000000u,   // pc8: s_buffer_load_dword s28, s[24:27], 0x0
+        0xF420074Cu, 0xFA000040u,   // pc10: s_buffer_load_dword s29, s[24:27], 0x40
+        0xBF810000u,
+    };
+    Shader clash{};
+    clash.file_header = 0x34333231u;
+    clash.version = 0x18u;
+    clash.shader_size = sizeof(clash_shader);
+    clash.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&clash),
+                       reinterpret_cast<uint64_t>(clash_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &clash, "clashed-key pixel shader enters the AGC registry");
+    prosper::gpu::GpuState clash_state;
+    constexpr uint32_t kClashPsUser = prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0;
+    const uint64_t clash_a = reinterpret_cast<uint64_t>(clash_table_a);
+    const uint64_t clash_b = reinterpret_cast<uint64_t>(clash_table_b);
+    clash_state.sh[kClashPsUser + 8] = static_cast<uint32_t>(clash_a);
+    clash_state.sh[kClashPsUser + 9] = static_cast<uint32_t>(clash_a >> 32);
+    clash_state.sh[kClashPsUser + 10] = static_cast<uint32_t>(clash_b);
+    clash_state.sh[kClashPsUser + 11] = static_cast<uint32_t>(clash_b >> 32);
+    auto clash_table = prosper::gpu::build_stage_table(
+        clash_state, reinterpret_cast<uint64_t>(clash_shader), true, 3);
+    const auto clash_cbuf = [&](uint32_t pc) -> const prosper::gpu::ShaderResource* {
+        const auto* r = clash_table ? clash_table->by_fetch_pc(pc) : nullptr;
+        return r && r->cls == prosper::gpu::ResourceClass::ConstantBuffer ? r : nullptr;
+    };
+    CHECK(clash_table && clash_table->by_srt_offset(0x20u) &&
+              clash_table->by_srt_offset(0x20u)->cls == prosper::gpu::ResourceClass::Texture,
+          "the texture holds key 0x20, so the V# loaded at the same immediate clashes");
+    CHECK(clash_cbuf(8u) && clash_cbuf(8u)->gpu_addr == clash_payload_addr,
+          "the clashed V#'s first consumer resolves by its pc");
+    CHECK(clash_cbuf(10u) && clash_cbuf(10u)->gpu_addr == clash_payload_addr,
+          "...and so does its second consumer");
+
     // #4167: a descriptor loaded through a scalar buffer has no SRT key. The RAW consumer must
     // resolve by its own PC after the load rewrites SRSRC. A matching metadata VertexBuffer with
     // no PC, or a dynamic format fetch with another PC, cannot replace that provenance.
@@ -790,14 +892,66 @@ TEST(AgcShader, Contract) {
               null_image->srt_offset == UINT32_MAX,
           "exact all-zero table T# materializes as an exact-PC null sampled image");
 
-    // T# word 2, not the base words: the decoder still reports `base-zero`, so only the
-    // production all-eight-words predicate distinguishes this from the admitted descriptor.
-    null_image_table[10] = 1u;
-    auto nonzero_base_zero_resources = prosper::gpu::build_stage_table(
+    // #4592: a base-zero T# whose four DST_SEL fields (dword 3, bits 11:0) are all SQ_SEL_0
+    // returns the constant 0 in every channel, whatever its other words hold -- observably the
+    // all-zero null. Kena binds one with format/extent bits set and a V#-shaped upper half.
+    null_image_table[9] = 0x00fff000u;
+    null_image_table[10] = 0x06f00000u;
+    null_image_table[12] = 0x20e1e000u;
+    null_image_table[13] = 0x00100044u;
+    null_image_table[14] = 0x000000fcu;
+    null_image_table[15] = 0x0004dfacu;
+    auto constant_zero_resources = prosper::gpu::build_stage_table(
         null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
-    CHECK(!nonzero_base_zero_resources || !nonzero_base_zero_resources->by_fetch_pc(4),
-          "one nonzero T# word keeps a malformed low-base image fail-visible");
-    null_image_table[10] = 0u;
+    const prosper::gpu::ShaderResource* constant_zero =
+        constant_zero_resources ? constant_zero_resources->by_fetch_pc(4) : nullptr;
+    CHECK(constant_zero && constant_zero->cls == prosper::gpu::ResourceClass::Texture &&
+              constant_zero->gpu_addr == 0 && constant_zero->size == 0,
+          "a base-zero T# with constant-zero selectors is the same null sampled image");
+    // A base-zero T# that selects a memory channel still names address zero: fail-visible.
+    for (uint32_t selectors : {0xfacu, 0x004u, 0xe00u}) {
+        null_image_table[11] = selectors;
+        auto selecting_resources = prosper::gpu::build_stage_table(
+            null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+        CHECK(!selecting_resources || !selecting_resources->by_fetch_pc(4),
+              "a base-zero T# that selects a memory channel keeps a malformed image fail-visible");
+    }
+    // DST_SEL_W = SQ_SEL_1 returns a constant ONE, which the zero-filled dummy cannot express.
+    null_image_table[11] = 0x200u;
+    auto constant_one_resources = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+    CHECK(!constant_one_resources || !constant_one_resources->by_fetch_pc(4),
+          "a base-zero T# with a constant-one selector stays fail-visible");
+    null_image_table[11] = 0u;
+    // image_get_resinfo returns the descriptor's dimensions, not texels: DST_SEL does not apply,
+    // so Kena's words (1 x 7105) must not be answered by the 1x1 dummy. The exact all-zero T#,
+    // which describes a 1x1 image itself, keeps its null.
+    static const uint32_t null_image_resinfo_shader[] = {
+        0xF40C0304u, 0xFA000020u,   // s_load_dwordx8 s[12:19], s[8:9], 0x20
+        0xF4080504u, 0xFA000040u,   // s_load_dwordx4 s[20:23], s[8:9], 0x40
+        0xF0380F08u, 0x00A30000u,   // pc=4: image_get_resinfo (opcode 0x0e), s[12:19]
+        0xBF810000u,
+    };
+    static Shader null_image_resinfo{};
+    null_image_resinfo.file_header = 0x34333231u;
+    null_image_resinfo.version = 0x18u;
+    null_image_resinfo.shader_size = sizeof(null_image_resinfo_shader);
+    null_image_resinfo.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&null_image_resinfo),
+                       reinterpret_cast<uint64_t>(null_image_resinfo_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &null_image_resinfo, "resinfo null-image shader enters the registry");
+    auto resinfo_constant = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_resinfo_shader), true, 3);
+    CHECK(!resinfo_constant || !resinfo_constant->by_fetch_pc(4),
+          "a resinfo query on a constant-zero-selector T# stays fail-visible");
+    std::fill(std::begin(null_image_table) + 8, std::begin(null_image_table) + 16, 0u);
+    auto resinfo_all_zero = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_resinfo_shader), true, 3);
+    CHECK(resinfo_all_zero && resinfo_all_zero->by_fetch_pc(4) &&
+              resinfo_all_zero->by_fetch_pc(4)->gpu_addr == 0,
+          "a resinfo query on the exact all-zero T# keeps its null");
 
     const uint32_t null_image_store_shader[] = {
         0xF40C0304u, 0xFA000020u,   // same exact all-zero T# load
@@ -849,12 +1003,24 @@ TEST(AgcShader, Contract) {
               direct_null_image->gpu_addr == 0 && direct_null_image->size == 0,
           "exact all-zero direct T# materializes as an exact-PC null sampled image");
 
-    direct_null_state.sh[kNullImagePsUser + 2] = 1u;
+    // #4592: a direct base-zero T# with constant-zero selectors is the same null (Kena binds one
+    // with extent/format bits set); one that selects a memory channel stays fail-visible.
+    direct_null_state.sh[kNullImagePsUser + 1] = 0x00fff000u;
+    direct_null_state.sh[kNullImagePsUser + 2] = 0x06f00000u;
+    direct_null_state.sh[kNullImagePsUser + 7] = 0x0004dfacu;
+    auto constant_direct_resources = prosper::gpu::build_stage_table(
+        direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
+    const prosper::gpu::ShaderResource* constant_direct =
+        constant_direct_resources ? constant_direct_resources->by_fetch_pc(0) : nullptr;
+    CHECK(constant_direct && constant_direct->cls == prosper::gpu::ResourceClass::Texture &&
+              constant_direct->gpu_addr == 0 && constant_direct->size == 0,
+          "a direct base-zero T# with constant-zero selectors is the same null sampled image");
+    direct_null_state.sh[kNullImagePsUser + 3] = 0xfacu;   // identity selectors: reads memory
     auto mutated_direct_null_resources = prosper::gpu::build_stage_table(
         direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
     CHECK(!mutated_direct_null_resources || !mutated_direct_null_resources->by_fetch_pc(0),
-          "one nonzero direct T# word keeps the same base-zero sample fail-visible");
-    direct_null_state.sh.erase(kNullImagePsUser + 2);
+          "a direct base-zero T# that selects a memory channel stays fail-visible");
+    for (uint32_t k : {1u, 2u, 3u, 7u}) direct_null_state.sh.erase(kNullImagePsUser + k);
 
     const uint32_t direct_null_store_shader[] = {
         0xF0200F08u, 0x00000000u,   // pc=0: image_store ..., s[0:7]

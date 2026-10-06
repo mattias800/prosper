@@ -454,6 +454,35 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
   each captured draw, so a clear strip and following caster can be checked against their actual
   viewport depth ranges rather than inferred from the clip-space shader output.
 
+### Where a replay is known to differ from the live run
+
+A replay executes the captured commands with the current renderer, in a process that has no guest:
+no guest memory at guest addresses, and no guest mapping table. Most of the renderer never
+notices. Two places do, and both produce a plausible frame rather than an error.
+
+- **A target fast-cleared through DCC and then RENDERED to does not start from its clear colour**
+  (#4627). The live renderer reads the metadata plane through its guest address; the replay
+  cannot. The pass starts from the draw's own clear colour instead, which is how the renderer
+  behaved before #4621. `PROSPER_DCCLOG=1` shows it: the live run logs the decode for that
+  target, the replay does not. A target that is *sampled* after such a clear is fine, because the
+  sampling descriptor carries the bytes.
+- **Fixed, and worth recognising in an old log:** until #4619 every guest write revoked every
+  retained depth image, because "can this write land in that plane?" is asked of the mapping
+  table and a replay has none. `[ds] guest-write ... invalidated=N` under `PROSPER_DSLOG=1`, with
+  N equal to the whole retained set on every line, is that artifact. The replay now compares
+  guest addresses for that question (`guest_plane_alias_by_address`, set in `main`). The trade is
+  stated plainly: a capture does not record which guest addresses share bytes, so a write that
+  reaches a retained plane through an alias address no longer revokes it.
+- **The same "no mapping table" answer still reaches volume targets.** The checks that decide
+  whether ordinary guest bytes may be read beside a renderer-only volume slice ask the mapping
+  table too (`unpublished_volume_may_overlap`), and in a replay they still get Unknown. A title
+  that renders to volume targets may replay differently from its live run for that reason.
+
+**Check a replayed target against its seed before trusting it.** A bundle's `rtt-seed` entries
+are the live run's own copies of those targets, one frame old; `--dump-rtt-seed` reads them
+without executing anything, and `--output-target-after OP:ADDR` gives the replay's version to
+compare with.
+
 ### Two silent wrong answers when you bisect a MULTI-TARGET chain
 
 Both of these return a plausible number rather than an error, which is what makes them expensive.

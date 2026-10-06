@@ -6,6 +6,8 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
 - `pm4_registers` — the register namespace and offsets the packets address.
 - `command_processor` — walks a submission, applies register writes, and emits the draws and
   dispatches the rest of the stack consumes.
+- `vgt_shader_stages.hpp` — decodes VGT_SHADER_STAGES_EN's routing fields (GS_EN, PRIMGEN_EN, the
+  wave-32 bits) and names a draw's NGG shape (`merged-gs`, `ngg-vs`, `legacy`).
 - `cond_indirect_buffer` — what a Jump-style segment does when the command processor reaches it:
   sceAgcCbBranch's conditional packet resolved to its then/else Jump, and the fail-visible guards
   (size, depth, mapped) a segment passes before it runs. Split out because `command_processor.cpp`

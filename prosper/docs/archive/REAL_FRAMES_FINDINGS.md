@@ -1,3 +1,8 @@
+---
+kind: archive
+status: historical
+---
+
 # Real game frames — findings & fixes (2026-07-07 nuclear run)
 
 > **ARCHIVED (historical, 2026-07-07).** Both blockers listed here were resolved; The Messenger now renders its first level. Kept for the evidence trail.

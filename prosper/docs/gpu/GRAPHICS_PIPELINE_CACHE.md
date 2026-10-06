@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Graphics pipeline cache persistence
 
 The renderer shares one device-lifetime `VkPipelineCache` across graphics pipeline creation.

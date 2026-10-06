@@ -480,6 +480,9 @@ struct SpirvCompute {
     bool raw_output_words = false;
     bool raw_input_words = false;
     uint32_t packet_input_base = 0, packet_output_base = 0;   // optional dynamic wave ABI SSA ids
+    // Descriptor set of begin()'s binding 0 (input) / binding 1 (output) buffers. The merged-NGG
+    // subgroup shell moves them to set 2 so the guest's set-0 bindings keep their numbers.
+    uint32_t shell_io_descriptor_set = 0;
     uint32_t load_packet_word(uint32_t index);
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
@@ -555,7 +558,10 @@ struct SpirvCompute {
     uint32_t vertex_general_mask_mbcnt_pc = UINT32_MAX;
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
-    bool     ngg_workgroup_export_probe=false;       // test-only 64-lane guest wave/export shell
+    bool ngg_workgroup_shell = false;   // merged-NGG workgroup shell: guest waves share LDS
+    // The merged-NGG subgroup shell (#3135 P2) captures GS_ALLOC_REQ (`s_sendmsg 9`) through this
+    // hook. Unset, `s_sendmsg` stays the historical no-op every other stage relies on.
+    std::function<bool(struct RegState&, const Rdna2Inst&)> ngg_alloc_request;
     uint32_t ngg_probe_trace_pc = UINT32_MAX;        // optional offline VGPR milestone
     uint32_t ngg_probe_trace_vgpr = UINT32_MAX;
     bool     ngg_probe_trace_seen = false;
@@ -893,6 +899,9 @@ struct SpirvCompute {
     void compute_gds_atomic_minmax(uint16_t opcode, uint32_t index, uint32_t value,
                                    uint32_t pred);
     void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred);
+    // The read that pairs with it: one dword of the same device-global buffer. Not predicated;
+    // the caller keeps the old register value on an inactive lane, as for every VGPR write.
+    uint32_t compute_gds_load(uint32_t index);
     uint32_t compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value);
     // Native-subgroup GDS append/consume is one device-global atomic per hardware wave. Fragment
     // helper invocations participate in subgroup operations but cannot consume guest counter slots;
@@ -2144,8 +2153,10 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {t_rta, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct, 0, Dec_Offset, 0});
         put(deco, Op_Decorate, {t_struct, Dec_Block});
-        put(deco, Op_Decorate, {v_in, Dec_DescriptorSet, 0});  put(deco, Op_Decorate, {v_in, Dec_Binding, 0});
-        put(deco, Op_Decorate, {v_out, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_out, Dec_Binding, 1});
+        put(deco, Op_Decorate, {v_in, Dec_DescriptorSet, shell_io_descriptor_set});
+        put(deco, Op_Decorate, {v_in, Dec_Binding, 0});
+        put(deco, Op_Decorate, {v_out, Dec_DescriptorSet, shell_io_descriptor_set});
+        put(deco, Op_Decorate, {v_out, Dec_Binding, 1});
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -2356,13 +2367,11 @@ struct SpirvCompute {
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() {
-        if (ngg_workgroup_export_probe && ngg_vertex_index_value)
-            return ngg_vertex_index_value;
+        if (ngg_workgroup_shell && ngg_vertex_index_value) return ngg_vertex_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r);
     }
     uint32_t load_instance_index() {
-        if (ngg_workgroup_export_probe && ngg_instance_index_value)
-            return ngg_instance_index_value;
+        if (ngg_workgroup_shell && ngg_instance_index_value) return ngg_instance_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r);
     }
     // Hardware packs consecutive vertex/instance invocations into merged guest waves. VertexIndex
@@ -2464,12 +2473,21 @@ struct SpirvCompute {
     // shared corner is v0 the rotation is the identity, so nothing that renders correctly today
     // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
-            const FragmentInterpolationLayout& layout, bool capture_geometry_position,
-            bool synthesize_rect = false, bool publish_primitive_id = false) {
+        const FragmentInterpolationLayout& layout, bool capture_geometry_position,
+        bool synthesize_rect = false, bool publish_primitive_id = false,
+        uint32_t layer_input_location = FragmentInterpolationLayout::kUnusedLocation) {
         if ((!layout.requires_geometry && !synthesize_rect) || !layout.valid) return {};
         // The collector's primitive key covers a one-input/one-output triangle, not RectList's
         // two generated children. Native geometry emission is unchanged when this is false.
         if (publish_primitive_id && synthesize_rect) return {};
+        // The merged-NGG raster commit (#3135 P3) delivers a primitive's layer as a uint input at
+        // `layer_input_location`, equal on all three vertices; this stage writes it to gl_Layer.
+        // RectList synthesis never carries one, and the location must not shadow an attribute.
+        const bool forward_layer =
+            layer_input_location != FragmentInterpolationLayout::kUnusedLocation;
+        if (forward_layer && (synthesize_rect || layer_input_location >= 32u ||
+                              (layout.attribute_mask & (1u << layer_input_location))))
+            return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
@@ -2492,6 +2510,11 @@ struct SpirvCompute {
         const uint32_t primitive_out = publish_primitive_id ? id() : 0;
         const uint32_t primitive_in_ptr = publish_primitive_id ? id() : 0;
         const uint32_t primitive_out_ptr = publish_primitive_id ? id() : 0;
+        const uint32_t layer_in = forward_layer ? id() : 0, layer_out = forward_layer ? id() : 0;
+        const uint32_t t_layer_inputs = forward_layer ? id() : 0;
+        const uint32_t layer_in_ptr = forward_layer ? id() : 0;
+        const uint32_t layer_in_element_ptr = forward_layer ? id() : 0;
+        const uint32_t layer_out_ptr = forward_layer ? id() : 0;
 
         std::array<uint32_t, 32> attribute_inputs{}, attribute_outputs{};
         std::array<std::array<uint32_t, 3>, 32> parameter_outputs{};
@@ -2568,6 +2591,12 @@ struct SpirvCompute {
             put(deco, Op_Decorate, {primitive_out, Dec_BuiltIn, 7});
             iface.push_back(primitive_in); iface.push_back(primitive_out);
         }
+        if (forward_layer) {
+            put(deco, Op_Decorate, {layer_in, Dec_Location, layer_input_location});
+            put(deco, Op_Decorate, {layer_out, Dec_BuiltIn, BI_Layer});
+            iface.push_back(layer_in);
+            iface.push_back(layer_out);
+        }
 
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
@@ -2583,6 +2612,14 @@ struct SpirvCompute {
         }
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
+        if (forward_layer) {
+            put(types, Op_TypeArray, {t_layer_inputs, t_u32, uconst(3)});
+            put(types, Op_TypePointer, {layer_in_ptr, SC_Input, t_layer_inputs});
+            put(types, Op_TypePointer, {layer_in_element_ptr, SC_Input, t_u32});
+            put(types, Op_TypePointer, {layer_out_ptr, SC_Output, t_i32});
+            put(types, Op_Variable, {layer_in_ptr, layer_in, SC_Input});
+            put(types, Op_Variable, {layer_out_ptr, layer_out, SC_Output});
+        }
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
         put(types, Op_TypeStruct, {t_output_per_vertex, t_v4f});
         put(types, Op_Constant, {t_u32, c_three, 3});
@@ -2609,6 +2646,14 @@ struct SpirvCompute {
         put(code, Op_Label, {label}); cur_block = label;
         const uint32_t primitive_value = publish_primitive_id ? id() : 0;
         if (publish_primitive_id) put(code, Op_Load, {t_i32, primitive_value, primitive_in});
+        uint32_t layer_value = 0;
+        if (forward_layer) {
+            const uint32_t pointer = id(), bits = id();
+            layer_value = id();
+            put(code, Op_AccessChain, {layer_in_element_ptr, pointer, layer_in, uconst(0)});
+            put(code, Op_Load, {t_u32, bits, pointer});
+            put(code, Op_Bitcast, {t_i32, layer_value, bits});
+        }
 
         std::array<std::array<uint32_t, 3>, 32> attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
@@ -2738,6 +2783,7 @@ struct SpirvCompute {
         const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
         for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
             if (publish_primitive_id) put(code, Op_Store, {primitive_out, primitive_value});
+            if (forward_layer) put(code, Op_Store, {layer_out, layer_value});
             const uint32_t position = slot_of(vertex, positions, rect_position);
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
@@ -3059,18 +3105,17 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // sprite draw in the title.
 //
 // `snapshot_saved_b64_masks` must be taken BEFORE emit_alu, because emit_alu materializes the new
-// lifetime for the same instruction. The staleness test is exactly "present in the snapshot AND its
-// Bool id is unchanged", which is a PROXY for "this instruction did not publish it": every publisher
-// either stores a fresh id or is named by `preserved_pair`. Classifying publishers syntactically
-// instead is not sufficient -- `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B mask
-// writers, but the `vgpr_lane_mask_slots` reload in rdna2_emit_alu.cpp republishes a spilled alias
-// from v_readlane with no syntactic marker at all. That same reload is the one publisher that could
-// in principle re-store an IDENTICAL id (it would have to reload a mask into a register that already
-// held that exact mask). If it were reached the alias would be dropped -- and the outcome is
-// FAIL-VISIBLE, not silent: `src_mask` resolves a missing `sreg_bool` entry to 0 and every
-// Bool-domain consumer then clears `ok` (rdna2_emit_alu.cpp :794, :817, :873, :1058, :1074), so the
-// stage rejects. Silent zero is the DATA-domain outcome only. So the residual is bounded by being
-// loud rather than by being harmless, and it is the same failure class this function repairs.
+// lifetime for the same instruction. The staleness test is "present in the snapshot AND its Bool id
+// is unchanged", a PROXY for "this instruction did not publish it": every publisher either stores a
+// fresh id or is named by `preserved_pair`. Classifying publishers syntactically instead is not
+// sufficient -- `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B mask writers, but the
+// `vgpr_lane_mask_slots` reload in rdna2_emit_alu.cpp republishes a spilled alias from v_readlane
+// with no syntactic marker at all. That reload re-stores an IDENTICAL id whenever the register
+// still holds the mask it spilled, which is the ordinary spill-then-reload of one register, so
+// record_scalar_write names it in `preserved_pair` too. Before it did, the proxy dropped exactly that
+// alias, and the outcome was SILENT, not fail-visible as this comment once claimed: the next
+// consumer, a re-spill, read the register through the DATA domain as an untracked zero, so a saved
+// mask restored an empty EXEC (#4600 shape 1).
 //
 // VCC (106/107) is deliberately out of scope, and NOT because it is unreachable -- SGPR-kind
 // operands really can carry 106/107 (`sgpr()` masks to 7 bits, rdna2_decode.cpp), and SOPK's
@@ -3485,14 +3530,25 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             effective_width == 1 && base == in.dst.value &&
             rs.sreg_wave64_mask_half.contains(base) &&
             rs.sreg_wave64_mask_half_index.contains(base);
+        // emit_alu's V_READLANE erases its destination's Bool unless it reloaded a mask slot into
+        // it, so a Bool there now is this instruction's. See expire_saved_b64_mask.
+        const bool publishes_reloaded_mask = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
+                                             base == in.dst.value && rs.sreg_bool.contains(base);
+        // Wave32 compute (the only stage the VCC bridge flag admits): every mask is one word, so a
+        // mask reloaded into a register that held a B32 mask stays one. Dropping the marker here
+        // also dropped the Bool, and a data read then took the untracked SGPR's silent 0 (#4607).
+        // Within one block: the Wave32 dispatcher still loses the reload at an edge (#4613).
+        const bool keeps_b32_reload = publishes_reloaded_mask && allow_compute_scalar_vcc_bridge &&
+                                      rs.sreg_bool_b32.contains(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
                 expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
-                                      writes_b64_mask ? base : -1);
+                                      writes_b64_mask || publishes_reloaded_mask ? base : -1);
             }
-            if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
+            if (!rs.sreg_bool_b32.contains(reg) ||
+                ((writes_b32_mask || keeps_b32_reload) && reg == base))
                 continue;
             rs.sreg_bool_b32.erase(reg);
             if (!writes_b64_mask || reg != base) {
@@ -3501,7 +3557,14 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                 if (reg == 106) rs.vcc = 0;
             }
         }
-        if (!writes_b32_mask) rs.sreg_bool_b32.erase(base);
+        if (!writes_b32_mask && !keeps_b32_reload) rs.sreg_bool_b32.erase(base);
+        // VCC_LO's mask is mirrored in rs.vcc, which every implicit-VCC consumer (v_cndmask,
+        // vccz/vccnz, carry-in) reads. The reload published only the Bool, so mirror it, and drop
+        // the uniformity proof of the compare it replaces (#4607 review).
+        if (keeps_b32_reload && base == 106) {
+            rs.vcc = rs.sreg_bool.at(106);
+            rs.vcc_wave_uniform = 0;
+        }
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);

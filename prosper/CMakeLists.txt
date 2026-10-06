@@ -753,6 +753,10 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_wrapper_identity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_compiler_wrapper.py")
+    set_tests_properties(compiler_wrapper_identity PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compiler_source_identity
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
@@ -921,6 +925,10 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_split_t8_sop2_width
     SOURCES tests/gpu/recompiler/test_split_t8_sop2_width.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_split_t8_image_write_extent
+    SOURCES tests/gpu/recompiler/test_split_t8_image_write_extent.cpp
     INCLUDES src
     LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_tail_blocks
@@ -1273,6 +1281,23 @@ if(TARGET prosper_core)
   # draw still does. Matcher arms plus realize_draw_item arms (no device needed).
   prosper_add_gtest(test_efc_helper_program
     SOURCES tests/gpu/execute/test_efc_helper_program.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_srt_publication_dedupe
+    SOURCES tests/gpu/execute/test_srt_publication_dedupe.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_ngg_subgroup_plan
+    SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  # #3135 P2: static admission of a linked merged-NGG program for the subgroup shell. Pure decode
+  # and dataflow; the captured Kena chain is read from tests/data.
+  prosper_add_gtest(test_ngg_subgroup_abi
+    SOURCES tests/gpu/recompiler/test_ngg_subgroup_abi.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
 
@@ -2604,6 +2629,12 @@ if(TARGET prosper_core)
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   prosper_add_gtest(test_dmem
     SOURCES tests/host/test_dmem.cpp
+    LIBRARIES prosper_core)
+
+  # An over-cap buffer window publishes clamped to its mapped run, outside the replayable fold.
+  prosper_add_gtest(test_oversize_buffer_window
+    SOURCES tests/gpu/execute/test_oversize_buffer_window.cpp
+    INCLUDES src
     LIBRARIES prosper_core)
 
   # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
@@ -4816,6 +4847,19 @@ endif()
       target_include_directories(test_game_compute_rtt_mirror PRIVATE tests frontends)
       target_link_libraries(test_game_compute_rtt_mirror PRIVATE prosper_live_renderer)
       add_test(NAME game_compute_exec COMMAND test_game_compute)
+      # #4553: ds_read_b32 ... gds on the production compute backend, against the persistent GDS
+      # instance: a later dispatch reads what an earlier one stored.
+      prosper_add_gtest(test_compute_gds_read
+        SOURCES tests/gpu/execute/test_compute_gds_read.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer
+        PROPERTIES TIMEOUT 120)
+      # #4556: a DCC fast clear reaches the pass that renders to the cleared target, not only one
+      # that samples it.
+      prosper_add_gtest(test_dcc_clear_render_target
+        SOURCES tests/shared/live/test_dcc_clear_render_target.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
                COMMAND test_game_compute_rtt_mirror)
@@ -4920,6 +4964,29 @@ endif()
         SOURCES tests/gpu/execute/test_memory_fed_raw_wide_exec.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
+      # #3135 P2: the merged-NGG subgroup shell executed offline on Kena's linked LUT producer,
+      # with the planner's launch and the discriminating launch-model controls.
+      prosper_add_gtest(test_ngg_subgroup_shell
+        SOURCES tests/gpu/execute/test_ngg_subgroup_shell.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
+      # #3135 P3: the merged-NGG raster commit. Kena's LUT export buffer from the P2 shell drawn into a
+      # 32-layer target through each layer route, plus hand-built buffers pinning the provoking
+      # vertex, the corner rotation, connectivity, invalid blocks, layer culling and line lists.
+      prosper_add_gtest(test_ngg_raster_commit
+        SOURCES tests/gpu/execute/test_ngg_raster_commit.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
+      # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
+      # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
+      # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.
+      prosper_add_gtest(test_ngg_subgroup_backend
+        SOURCES tests/gpu/execute/test_ngg_subgroup_backend.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 240)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)
@@ -4959,6 +5026,18 @@ endif()
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_ds_layer_stride
         SOURCES tests/render/test_ds_layer_stride.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A retained depth plane's guest footprint follows the guest depth format (#4556).
+      prosper_add_gtest(test_ds_guest_plane_bytes
+        SOURCES tests/render/test_ds_guest_plane_bytes.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A replay process, which has no guest mapping table, compares guest addresses (#4619).
+      prosper_add_gtest(test_ds_replay_alias
+        SOURCES tests/render/test_ds_replay_alias.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -5039,6 +5118,27 @@ endif()
       # compile-level positives/negatives plus two executed kernels.
       prosper_add_gtest(test_counted_loop_cmpx_guard
         SOURCES tests/gpu/recompiler/test_counted_loop_cmpx_guard.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
+      # counted-loop route declines and the general route lowers both loops, executed per lane.
+      prosper_add_gtest(test_counted_loop_prelude_exec_loop
+        SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The CFG dispatcher's spill-slot domain is decided per V_WRITELANE (Kena 0x5008ec0000):
+      # a data spill of an SGPR that holds a mask elsewhere survives a block edge, executed.
+      prosper_add_gtest(test_cfg_spill_slot_domain
+        SOURCES tests/gpu/recompiler/test_cfg_spill_slot_domain.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A Wave64 mask rebuilt from its two spilled halves stays a mask across a CFG-dispatcher
+      # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
+      prosper_add_gtest(test_cfg_spilled_mask_halves
+        SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -6645,6 +6745,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     SOURCES tests/shared/live/test_live_target_format.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+  # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
+  prosper_add_gtest(test_unorm10_snapshot
+    SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
 
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
