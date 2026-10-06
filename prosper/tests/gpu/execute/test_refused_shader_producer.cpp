@@ -444,6 +444,27 @@ TEST_F(RefusedShaderProducer, AFragmentLaunchWidthDecidesTheRouteOfAWidthSensiti
     }
 }
 
+TEST(OwnedWaveRouting, AnOwnerMustPrepareExactlyTheStagesRealizationRouted) {
+    // Realization and the owned-wave preparation decide separately which stages are owned.
+    // Realization goes on only when the owner it was handed prepares exactly its own stages;
+    // anything else is refused as owned-wave-routing-disagreement.
+    GraphicsOwnedWaveDraw owner;
+    for (const bool vertex : {false, true})
+        for (const bool fragment : {false, true}) {
+            owner.vertex_pending = vertex;
+            owner.fragment_pending = fragment;
+            for (const bool routed_vertex : {false, true})
+                for (const bool routed_fragment : {false, true})
+                    EXPECT_EQ(owned_wave_owner_matches(&owner, routed_vertex, routed_fragment),
+                              vertex == routed_vertex && fragment == routed_fragment)
+                        << vertex << fragment << routed_vertex << routed_fragment;
+        }
+    // No owner is what the preparation returns when it finds no owned stage.
+    EXPECT_TRUE(owned_wave_owner_matches(nullptr, false, false));
+    EXPECT_FALSE(owned_wave_owner_matches(nullptr, true, false));
+    EXPECT_FALSE(owned_wave_owner_matches(nullptr, false, true));
+}
+
 TEST_F(RefusedShaderProducer, PreKeyGraphicsGuardsStillKeepOriginalEvidence) {
     const uint32_t code[] = {0x7e000280u, 0x7e020282u, 0xbf810000u};
     RefusedShaderSource original;
