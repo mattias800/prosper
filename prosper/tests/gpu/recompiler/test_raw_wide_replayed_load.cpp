@@ -388,6 +388,66 @@ TEST(RawWideReplayedLoad, OnlyARealSccWriterEndsACompareOnALoadedWord) {
     }
 }
 
+TEST(RawWideReplayedLoad, AUnaryMaskTransferKeepsExecIndependent) {
+    // #4555. `s_wqm_b64 exec, exec` is how nearly every pixel shader begins. It derives EXEC
+    // from EXEC, so an independent EXEC stays independent, and the compare that later recycles
+    // the V#'s pair is still a fresh mask. While only s_mov_b64 was a recognised unary transfer,
+    // this instruction made the walk distrust every compare after it, for any load fetched
+    // above it. Here it sits in the loop, below the load; in GTA V the V# loads are at pc 4
+    // and the prologue at pc 9.
+    const auto wqm = program({.in_loop = {0xbefe0a7eu}});   // s_wqm_b64 exec, exec
+    ASSERT_EQ(at(wqm, 5).fmt, Rdna2Format::SOP1);
+    ASSERT_EQ(at(wqm, 5).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(wqm, 5).dst.value, 126);
+    ASSERT_EQ(at(wqm, 5).src[0].value, 126);
+    EXPECT_FALSE(flagged(wqm)) << numeric_blocker(wqm);
+    EXPECT_TRUE(rdna2_raw_wave_wide_data_loads(wqm).empty());
+
+    const auto inverted = program({.in_loop = {0xbefe087eu}});   // s_not_b64 exec, exec
+    ASSERT_EQ(at(inverted, 5).opcode, kSop1OpcodeNotB64);
+    EXPECT_FALSE(flagged(inverted)) << numeric_blocker(inverted);
+
+    // From the recycled pair itself, whose high word still MAY be the load's: the transfer is
+    // from an independent root, so EXEC stays independent and the loop is cleared.
+    const auto from_fresh = program({.after_mask = {0xbefe0a10u}});   // s_wqm_b64 exec, s[16:17]
+    ASSERT_EQ(at(from_fresh, 8).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(from_fresh, 8).src[0].value, 16);
+    EXPECT_FALSE(flagged(from_fresh)) << numeric_blocker(from_fresh);
+
+    // Control: the transfer is only as independent as its source. s_wqm_b64 exec, s[18:19] makes
+    // EXEC out of two loaded words, and that is a use of them.
+    const auto from_load = program({.in_loop = {0xbefe0a12u}});
+    ASSERT_EQ(at(from_load, 5).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(from_load, 5).src[0].value, 18);
+    EXPECT_TRUE(flagged(from_load));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(from_load, &pc), "derived-value-leaves-scalar-data");
+    EXPECT_EQ(pc, 5u);
+}
+
+TEST(RawWideReplayedLoad, AUnaryMaskTransferIntoVccReplacesWhatVccHeld) {
+    // s_mov_b64 vcc, s[18:19] ; (compare into s[16:17]) ; s_wqm_b64 vcc, s[16:17] ;
+    // s_cbranch_vccz. VCC first holds two loaded words, then the fresh compare's mask, and the
+    // branch reads the second. This is only true because the emitter makes S_WQM into VCC a VCC
+    // write (ComputeWqmIntoVcc pins that on the GPU); it used to leave the branch on the stale
+    // VCC, and with that the classification below would have been wrong.
+    const auto replaced =
+        program({.in_loop = {0xbeea0412u}, .move_mask_to_vcc = false, .after_mask = {0xbeea0a10u}});
+    ASSERT_EQ(at(replaced, 5).opcode, kSop1OpcodeMovB64);
+    ASSERT_EQ(at(replaced, 5).dst.value, 106);
+    ASSERT_EQ(at(replaced, 5).src[0].value, 18);
+    ASSERT_EQ(at(replaced, 8).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(replaced, 8).dst.value, 106);
+    ASSERT_EQ(at(replaced, 8).src[0].value, 16);
+    ASSERT_EQ(at(replaced, 9).fmt, Rdna2Format::SOPP);
+    EXPECT_FALSE(flagged(replaced)) << numeric_blocker(replaced);
+    // Control: without the S_WQM the branch reads the loaded words the move put in VCC.
+    const auto stale = program({.in_loop = {0xbeea0412u}, .move_mask_to_vcc = false});
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(stale, &pc), "implicit-vcc-reader");
+    EXPECT_EQ(pc, 8u);
+}
+
 TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
     // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
     // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it
