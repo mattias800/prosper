@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/bc_decode.hpp"
@@ -45,6 +46,25 @@ inline size_t compute_linear_row_pitch(const gpu::ShaderResource& r, uint32_t by
     if (!pitch && !r.host_data && tight <= UINT32_MAX)
         pitch = gpu::guest_linear_texture_row_pitch(r.gpu_addr, static_cast<uint32_t>(tight));
     return pitch > tight ? pitch : 0;
+}
+
+// The live compute backend applies compute_linear_row_pitch to BOTH the sampled read and the storage
+// seed/writeback (live_compute.cpp, `live_guest_row_pitch`), so a compute producer and a compute
+// consumer of one image agree (#4606). Two kinds of memory keep tight rows even under a stated
+// pitch, because another part of prosper owns those bytes and reads them tight: a renderer-owned
+// colour target and a registered VideoOut display buffer (the presenter reads width x height x 4).
+// A stated-pitch result is never handed to the renderer either -- neither mirrored into a renderer
+// target (the LinearPitch exact-result decline) nor published as a CPU RTT snapshot -- so one address
+// keeps one layout across dispatches, and graphics reads it from guest memory at the stated pitch.
+// CONFIDENCE: HIGH that a stated pitch is the guest's layout; MED that the two exemptions never
+// meet a stated pitch on a real title (none is measured).
+
+// Copy `rows` rows of `row_bytes` between two pitches: gather into tight rows (dst_pitch ==
+// row_bytes) or scatter back to a padded pitch. Padding bytes in the destination are not written.
+inline void copy_linear_rows(uint8_t* dst, size_t dst_pitch, const uint8_t* src, size_t src_pitch,
+                             size_t row_bytes, uint32_t rows) {
+    for (uint32_t y = 0; y < rows; ++y)
+        std::memcpy(dst + y * dst_pitch, src + y * src_pitch, row_bytes);
 }
 
 }   // namespace prosper::frontend

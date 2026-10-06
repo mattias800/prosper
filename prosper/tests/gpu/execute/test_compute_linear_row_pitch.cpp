@@ -26,6 +26,8 @@
 //                                       unregistered 400-byte-row image is written back padded
 //   RendererOwnedTargetStaysTight       a renderer-owned target is written back at a stated pitch,
 //                                       although the renderer's own pixels and readers are tight
+//   StatedPitchResultKeepsItsLayout     a stated-pitch result is mirrored into a (tight) renderer
+//                                       target, so the next dispatch writes the address tight
 //   SampledRendererTargetRegistersPlane a compute pass that samples a renderer target through a
 //                                       DCC-compressed T# does not tell the renderer about the
 //                                       control plane, so a later plane write leaves stale pixels
@@ -85,9 +87,9 @@ ComputeItem compile(const std::vector<uint32_t>& code, const ShaderResourceTable
     item.spirv = recompile_compute(code.data(), code.size(), &resources, config);
     item.user_sgprs = config.user_sgprs;
     item.resources = std::make_shared<ShaderResourceTable>(resources);
-    item.code_addr = 0x30490000ull + index * 0x100u;
+    item.code_addr = 0x30490000ull + uint64_t{index} * 0x100u;
     item.dispatch_index = index;
-    item.command_order = index * 10u;
+    item.command_order = uint64_t{index} * 10u;
     item.launch.threads_x = item.launch.local_x = W;
     item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.local_y = item.launch.local_z = 1;
@@ -233,6 +235,7 @@ uint64_t produce_then_consume(std::vector<uint8_t>& backing, uint32_t base,
     for (const auto& item : items) EXPECT_FALSE(item.spirv.empty());
 
     std::vector<SubmitOperation> operations;
+    operations.reserve(items.size());
     for (const auto& item : items)
         operations.push_back(
             {SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order});
@@ -264,11 +267,12 @@ void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base
         }
         if (y + 1u == H) break;   // the last row's padding is outside the image's span
         for (size_t b = size_t(W) * Bpt; b < Pitch; ++b)
-            ASSERT_EQ(backing[size_t(y) * Pitch + b], padding) << "row " << y << " padding byte " << b;
+            ASSERT_EQ(backing[size_t(y) * Pitch + b], padding)
+                << "row " << y << " padding byte " << b;
     }
 }
 
-}  // namespace
+}   // namespace
 
 TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
     auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
@@ -301,9 +305,12 @@ TEST(ComputeLinearRowPitch, StorageSeedReadsPaddedRows) {
 // default 4 KiB thresholds: a 1,600-byte image is never retained, the consumer cannot borrow, and
 // the chain goes through guest memory -- the path every sub-4 KiB image takes on a default run.
 TEST(ComputeLinearRowPitchDefaults, ProducerConsumerThroughGuestMemory) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): read before any thread exists; single-threaded test
     if (std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB") ||
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
         std::getenv("PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB"))
-        GTEST_SKIP() << "needs the default cache thresholds; see the _default_thresholds registration";
+        GTEST_SKIP()
+            << "needs the default cache thresholds; see the _default_thresholds registration";
     auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
     constexpr uint32_t Base = 0x50000000u;
     std::vector<uint32_t> out;
@@ -317,6 +324,7 @@ TEST(ComputeLinearRowPitchDefaults, ProducerConsumerThroughGuestMemory) {
 TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
     // The replay RTT seed writer is how a test publishes a real renderer-owned target; the live
     // renderer installs it only when asked (see guest_write_drain's registration).
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): set before the renderer starts any thread
     ::setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
     prosper::frontend::register_live_renderer("", false);
     constexpr uint32_t Side = 4;
@@ -395,9 +403,50 @@ TEST(ComputeLinearRowPitch, UnstatedPitchStaysTight) {
         ASSERT_EQ(backing[b], Poison) << "byte " << b << " lies past a tight image";
 }
 
+namespace {
+
+// An RGBA8 storage image over `backing`, written with every channel = 1.0 (0xff) or 0.0 by one lane
+// per column.
+ComputeItem rgba8_fill(std::vector<uint8_t>& backing, bool ones, uint32_t index) {
+    ShaderResource output{};
+    output.cls = ResourceClass::StorageImage;
+    output.binding = 5;
+    output.sgpr_base = 8;
+    output.img_dim = 1;
+    output.format = DataFormat::Unorm8;
+    output.num_components = 4;
+    output.width = W;
+    output.height = H;
+    output.depth = 1;
+    output.declared_mip_levels = 1;
+    output.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+    output.size = static_cast<uint32_t>(size_t(W) * H * 4u);
+    for (uint32_t c = 0; c < 4; ++c) output.swizzle[c] = 4u + c;
+    ShaderResourceTable table;
+    table.resources = {output};
+    const uint32_t value = ones ? 0xf2u : 0x80u;   // inline constant 1.0 or 0
+    // clang-format off: one instruction per line
+    std::vector<uint32_t> code{
+        0x7e080300u,                                       // v_mov_b32 v4, v0 (x)
+        0x7e000200u | value, 0x7e020200u | value,          // v0 = v1 = value
+        0x7e040200u | value, 0x7e060200u | value,          // v2 = v3 = value
+    };
+    for (uint32_t y = 0; y < H; ++y)
+        code.insert(code.end(), {
+            0x7e0a02ffu, y,                                // v_mov_b32 v5, y
+            0xf0200f08u, 0x00020004u,                      // image_store v[0:3], v[4:5], s[8:15]
+        });
+    code.push_back(0xbf810000u);
+    // clang-format on
+    return compile(code, table, index, native_storage_format_support_bit(DataFormat::Unorm8, 4));
+}
+
+}   // namespace
+
 TEST(ComputeLinearRowPitch, RendererOwnedTargetStaysTight) {
     // A renderer-owned RGBA8 target whose address ALSO carries a stated 512-byte pitch: the renderer
     // owns those pixels and reads them tight, so the compute writeback must stay tight.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): set before the renderer starts any thread
     ::setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
     prosper::frontend::register_live_renderer("", false);
     auto& target = stated_pitch(keep_alive(size_t(Pitch) * H, 0x11));
@@ -412,41 +461,39 @@ TEST(ComputeLinearRowPitch, RendererOwnedTargetStaysTight) {
     ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
     ASSERT_TRUE(is_live_render_target(address));
 
-    ShaderResource output{};
-    output.cls = ResourceClass::StorageImage;
-    output.binding = 5;
-    output.sgpr_base = 8;
-    output.img_dim = 1;
-    output.format = DataFormat::Unorm8;
-    output.num_components = 4;
-    output.width = W;
-    output.height = H;
-    output.depth = 1;
-    output.declared_mip_levels = 1;
-    output.gpu_addr = address;
-    output.size = static_cast<uint32_t>(size_t(W) * H * 4u);
-    for (uint32_t c = 0; c < 4; ++c) output.swizzle[c] = 4u + c;
-    ShaderResourceTable table;
-    table.resources = {output};
-    // clang-format off: one instruction per line
-    std::vector<uint32_t> code{
-        0x7e080300u,                           // v_mov_b32 v4, v0 (x)
-        0x7e0002f2u, 0x7e0202f2u,              // v0 = v1 = 1.0
-        0x7e0402f2u, 0x7e0602f2u,              // v2 = v3 = 1.0
-    };
-    for (uint32_t y = 0; y < H; ++y)
-        code.insert(code.end(), {
-            0x7e0a02ffu, y,                    // v_mov_b32 v5, y
-            0xf0200f08u, 0x00020004u,          // image_store v[0:3], v[4:5], s[8:15] 2D
-        });
-    code.push_back(0xbf810000u);
-    // clang-format on
-    const ComputeItem item = compile(code, table, 14,
-                                     native_storage_format_support_bit(DataFormat::Unorm8, 4));
+    const ComputeItem item = rgba8_fill(target, true, 14);
     ASSERT_FALSE(item.spirv.empty());
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
     const size_t tight = size_t(W) * H * 4u;
     for (size_t b = 0; b < tight; ++b) ASSERT_EQ(target[b], 0xffu) << "tight byte " << b;
     for (size_t b = tight; b < target.size(); ++b)
         ASSERT_EQ(target[b], 0x11u) << "byte " << b << " lies past the tight target";
+}
+
+TEST(ComputeLinearRowPitch, StatedPitchResultKeepsItsLayout) {
+    // A stated-pitch full overwrite must not be mirrored into a renderer target: the renderer's
+    // targets are tight, so the next dispatch would see a renderer-owned address and write it tight.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): set before the renderer starts any thread
+    ::setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
+    prosper::frontend::register_live_renderer("", false);
+    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, 0x11));
+    const uint64_t address = reinterpret_cast<uint64_t>(backing.data());
+    const auto expect_rows = [&](uint8_t texel, const char* when) {
+        for (uint32_t y = 0; y < H; ++y) {
+            for (size_t b = 0; b < size_t(W) * 4u; ++b)
+                ASSERT_EQ(backing[size_t(y) * Pitch + b], texel) << when << " row " << y;
+            for (size_t b = size_t(W) * 4u; y + 1u < H && b < Pitch; ++b)
+                ASSERT_EQ(backing[size_t(y) * Pitch + b], 0x11u) << when << " padding, row " << y;
+        }
+    };
+    const ComputeItem first = rgba8_fill(backing, true, 16);
+    ASSERT_FALSE(first.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({first}));
+    expect_rows(0xffu, "first dispatch");
+    EXPECT_FALSE(is_live_render_target(address))
+        << "a stated-pitch result became a renderer target";
+    const ComputeItem second = rgba8_fill(backing, false, 17);
+    ASSERT_FALSE(second.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({second}));
+    expect_rows(0x00u, "second dispatch");
 }

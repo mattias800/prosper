@@ -12500,15 +12500,6 @@ void set_live_target_query(LiveTargetQueryFn fn) { g_live_target_query = std::mo
 bool is_live_render_target(uint64_t gpu_addr) {
     return g_live_target_query && g_live_target_query(gpu_addr);
 }
-static LiveRttDccPlaneRegistrarFn g_live_rtt_dcc_plane_registrar;
-void set_live_rtt_dcc_plane_registrar(LiveRttDccPlaneRegistrarFn fn) {
-    g_live_rtt_dcc_plane_registrar = std::move(fn);
-}
-void register_live_rtt_dcc_plane(uint64_t gpu_addr, uint64_t metadata_addr,
-                                 uint64_t metadata_bytes) {
-    if (g_live_rtt_dcc_plane_registrar)
-        g_live_rtt_dcc_plane_registrar(gpu_addr, metadata_addr, metadata_bytes);
-}
 static UnpublishedVolumeQueryFn g_unpublished_volume_query;
 void set_unpublished_volume_query(UnpublishedVolumeQueryFn fn) {
     g_unpublished_volume_query = std::move(fn);
