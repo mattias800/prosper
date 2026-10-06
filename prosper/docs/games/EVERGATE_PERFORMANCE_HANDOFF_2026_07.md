@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Evergate renderer-performance handoff (2026-07-19)
 
 This document is the native-Linux continuation point for Evergate (`PPSA01885`). It records the

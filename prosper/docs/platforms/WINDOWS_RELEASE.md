@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Using the Windows release
 
 The Windows archive contains the native `prosper-app` frontend: a Vulkan window with audio and

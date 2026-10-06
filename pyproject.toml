@@ -49,10 +49,13 @@ indent-style = "space"
 # Left out although collected: tools/test_lanekill.py (7 errors on this host) and
 # tools/test_session_start.py (passes, but 71 s).
 testpaths = [
+    "prosper/tools/revision/test_compiler_wrapper.py",
     "prosper/tests/tools/test_dump_hygiene.py",
     "prosper/tools/ci",
     "prosper/tools/doctor/test_doctor.py",
     "prosper/tools/docs/test_check_arch_docs.py",
+    "prosper/tools/docs/test_check_doc_meta.py",
+    "prosper/tools/env/test_check_switch_registry.py",
     "prosper/tools/perf/test_compare_capture_pair.py",
     "prosper/tools/perf/test_perf_caller_report.py",
     "prosper/tools/perf/test_perf_f8_gap.py",
@@ -74,6 +77,7 @@ testpaths = [
 pythonpath = [
     "prosper/tools/docs",
     "prosper/tools/doctor",
+    "prosper/tools/env",
     "prosper/tools/perf",
     "prosper/tools/pixel_history",
     "prosper/tools/progress",

@@ -110,10 +110,12 @@ std::vector<DynFetch> evaluate(const FoldInputs& in, FoldReader& reader, std::ve
     const uint32_t empty = 0;
     const uint32_t* user = !in.user_present ? nullptr : in.user.empty() ? &empty : in.user.data();
     const uint32_t* system = !in.system_present ? nullptr : in.system.empty() ? &empty : in.system.data();
-    return resolve_dynamic_fetch(in.code.data(), in.code.size(), user,
-        static_cast<uint32_t>(in.user.size()), in.user_base, uses, in.dispatch_target,
-        in.dispatch_present ? &in.dispatch : nullptr, system,
-        in.system_present ? static_cast<uint32_t>(in.system.size()) : in.absent_system_count, &reader);
+    // The fold alone: the live mapping-table step after it is not a recorded input.
+    return resolve_dynamic_fetch_fold(
+        in.code.data(), in.code.size(), user, static_cast<uint32_t>(in.user.size()), in.user_base,
+        uses, in.dispatch_target, in.dispatch_present ? &in.dispatch : nullptr, system,
+        in.system_present ? static_cast<uint32_t>(in.system.size()) : in.absent_system_count,
+        &reader);
 }
 void finish_capture(FoldCapture& c, const FoldReader& reader) {
     c.evaluated_instructions = reader.evaluated_instructions;

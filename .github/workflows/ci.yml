@@ -679,6 +679,40 @@ jobs:
             python3 prosper/tools/docs/check_arch_docs.py --github --root .
           fi
 
+      # Same job, same reason: every document under prosper/docs/ declares its kind and status, and
+      # every relative Markdown link in the repository resolves. Links are resolved by exact name
+      # against the directory listing, so the answer here matches a Windows checkout's. Its pytest
+      # suite runs in the Python quality job.
+      - name: Verify every document declares its kind and every relative link resolves
+        run: python3 prosper/tools/docs/check_doc_meta.py --github --root .
+
+      # Same job, same reason: a text scan over the shipping sources. The charter asks every new
+      # PROSPER_* switch to be classified -- host-capability, diagnostic, or a guest-behaviour
+      # selector with the issue that will retire it -- and until this step nothing could notice one
+      # arriving unclassified. Switches that predate the registry are grandfathered as
+      # `unclassified`; with a base, a NEW unclassified row fails, so that set only shrinks. A
+      # switch added or removed without its row fails either way. Base selection mirrors the
+      # ratchet step.
+      - name: Verify every PROSPER_* switch is registered and every new one classified
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          has() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; }
+          BASE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            if has "$PR_BASE"; then BASE="$PR_BASE"; else BASE="HEAD~1"; fi
+          elif has "$PUSH_BEFORE"; then
+            BASE="$PUSH_BEFORE"
+          fi
+          if [ -n "$BASE" ]; then
+            python3 prosper/tools/env/check_switch_registry.py --github --root . --base "$BASE"
+          else
+            echo "::notice::switch registry: no base commit for this $EVENT event; new-unclassified check skipped"
+            python3 prosper/tools/env/check_switch_registry.py --github --root .
+          fi
+
       # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
       # the "needing nothing built" part is the point, because the defect this catches is visible
       # ONLY on Windows and would otherwise wait for the MinGW job. stdout carries bytes, and the

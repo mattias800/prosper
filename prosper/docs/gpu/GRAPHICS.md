@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Graphics & Audio bring-up (the M4/M5 frontier)
 
 Status as of the boot reaching multithreaded graphics/audio initialization. The game now runs its

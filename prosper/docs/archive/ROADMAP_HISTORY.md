@@ -1,3 +1,9 @@
+---
+kind: archive
+status: superseded
+superseded-by: prosper/docs/ROADMAP.md
+---
+
 > **Historical document, archived 2026-10-03.** This preserves the prior milestone plan and
 > dated status reports through 2026-08-11. Its claims and instructions are historical evidence,
 > not current status or policy. Read [the current roadmap](../ROADMAP.md) for directions,

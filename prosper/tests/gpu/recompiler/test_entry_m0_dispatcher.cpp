@@ -383,3 +383,78 @@ TEST(EntryM0Dispatcher, Contract) {
     //                                          the arm while refusing the wrong instruction.
     EXPECT_EQ(fails, 0);
 }
+
+// Kena's compute program 0x5008ec0000 saves entry M0 into the HIGH word of a pair that is a saved
+// mask on one incoming path and scalar data on another, then restores M0 from it in the same
+// block (pc1244 `s_mov_b32 s21, m0` ... pc1262 `s_mov_b32 m0, s21`). The Wave64 mask analysis
+// keeps that pair ambiguous after a one-word write, and the restore used to be refused as
+// `wave64-ambiguous-mask-read` although it reads no value: the emitter consumes the token. The
+// save is now a MUST "token word" fact, which only that restore may read.
+//
+// Every program here takes the same portable-readlane dispatcher route as the arms above, and all
+// four share pc0..pc6. The ambiguous join is at pc5: s[0:1] is ordinary data (pc0/pc1) when the
+// branch at pc3 is taken and a saved EXEC (pc4) when it falls through.
+TEST(EntryM0Dispatcher, RestoreOverAnAmbiguousPair) {
+    // POSITIVE. pc7 saves M0 into s1, pc8 rewrites M0, pc9 restores it from s1.
+    const uint32_t restore[] = {
+        0xBE800385u,   // pc0: s_mov_b32 s0, 5
+        0xBE810386u,   // pc1: s_mov_b32 s1, 6
+        0xBF068004u,   // pc2: s_cmp_eq_u32 s4, 0
+        0xBF840001u,   // pc3: s_cbranch_scc0 -> pc5
+        0xBE80047Eu,   // pc4: s_mov_b64 s[0:1], exec   (the mask path)
+        0xD7600002u, 0x00010100u,   // pc5: v_readlane_b32 s2, v0, 0 (join: s[0:1] ambiguous)
+        0xBE81037Cu,   // pc7: s_mov_b32 s1, m0         (save)
+        0xBEFC0380u,   // pc8: s_mov_b32 m0, 0
+        0xBEFC0301u,   // pc9: s_mov_b32 m0, s1         (restore)
+        0xBF810000u,   // pc10: s_endpgm
+    };
+    // CONTROL. The positive with the mask path's write replaced by s_nop: s[0:1] is ordinary data
+    // on both paths, so the region compiles whatever the token rule does. It shows that the
+    // positive's shape and route are representable, so the positive can only fail on ambiguity.
+    const uint32_t restore_no_mask_path[] = {
+        0xBE800385u, 0xBE810386u, 0xBF068004u, 0xBF840001u,
+        0xBF800000u,   // pc4: s_nop 0
+        0xD7600002u, 0x00010100u, 0xBE81037Cu, 0xBEFC0380u, 0xBEFC0301u, 0xBF810000u,
+    };
+    // NEGATIVE 1. The positive with the restore replaced by a DATA read of the saved word. A token
+    // has no value, so this must still be refused at that read.
+    const uint32_t data_read_of_token[] = {
+        0xBE800385u, 0xBE810386u, 0xBF068004u, 0xBF840001u, 0xBE80047Eu,
+        0xD7600002u, 0x00010100u, 0xBE81037Cu, 0xBEFC0380u,
+        0x80038101u,   // pc9: s_add_u32 s3, s1, 1
+        0xBF810000u,
+    };
+    // NEGATIVE 2. The save happens on only one path to the restore (pc8 skips it). On the other
+    // path s1 is still the ambiguous word, so the restore must still be refused.
+    const uint32_t save_on_one_path[] = {
+        0xBE800385u, 0xBE810386u, 0xBF068004u, 0xBF840001u, 0xBE80047Eu, 0xD7600002u, 0x00010100u,
+        0xBF068005u,   // pc7: s_cmp_eq_u32 s5, 0
+        0xBF840001u,   // pc8: s_cbranch_scc0 -> pc10
+        0xBE81037Cu,   // pc9: s_mov_b32 s1, m0  (save, one path only)
+        0xBEFC0301u,   // pc10: s_mov_b32 m0, s1 (restore at the join)
+        0xBF810000u,
+    };
+
+    const auto control =
+        compile(restore_no_mask_path, std::size(restore_no_mask_path), 0x50080001ull);
+    ASSERT_FALSE(control.empty()) << "control: the shape compiles when s[0:1] is never a mask";
+    EXPECT_TRUE(has_opcode(control, kOpSwitch)) << "control: through the CFG dispatcher";
+
+    const auto positive = compile(restore, std::size(restore), 0x50080002ull);
+    EXPECT_FALSE(positive.empty())
+        << "a same-block save and restore of entry M0 over an ambiguous pair compiles; reason was '"
+        << last_terminal_reject_reason(0x50080002ull) << "'";
+    EXPECT_TRUE(has_opcode(positive, kOpSwitch)) << "the positive lowered through the dispatcher";
+
+    EXPECT_TRUE(compile(data_read_of_token, std::size(data_read_of_token), 0x50080003ull).empty())
+        << "a data read of the saved word is still refused";
+    const std::string data_reason = last_terminal_reject_reason(0x50080003ull);
+    EXPECT_TRUE(has(data_reason, "wave64-ambiguous-mask-read") && has(data_reason, "pc=9"))
+        << "refused at the data read, for ambiguity: '" << data_reason << "'";
+
+    EXPECT_TRUE(compile(save_on_one_path, std::size(save_on_one_path), 0x50080004ull).empty())
+        << "a restore that one path reaches without the save is still refused";
+    const std::string skip_reason = last_terminal_reject_reason(0x50080004ull);
+    EXPECT_TRUE(has(skip_reason, "wave64-ambiguous-mask-read") && has(skip_reason, "pc=10"))
+        << "refused at the restore, for ambiguity: '" << skip_reason << "'";
+}

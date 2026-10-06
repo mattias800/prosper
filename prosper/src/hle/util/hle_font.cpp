@@ -66,10 +66,7 @@ struct FontMemory {
 static_assert(sizeof(FontMemory) == 64);
 
 struct FontLibrary { uint64_t magic = kLibraryMagic; };
-struct FontRenderer {
-    uint64_t magic = kRendererMagic;
-    uint64_t outline_workspace_size = 0;
-};
+struct FontRenderer { uint64_t magic = kRendererMagic; };
 
 // A parsed memory font. Shared, because `sceFontOpenFontInstance` clones a face and both clones
 // must keep the same parsed outlines alive.
@@ -93,8 +90,6 @@ struct FontFace {
     float weight_x = 1.0f;
     float weight_y = 1.0f;
     void* renderer = nullptr;
-    uint32_t h_dpi = 72;
-    uint32_t v_dpi = 72;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
     std::shared_ptr<FontData> data;
@@ -163,6 +158,34 @@ struct TextCharacter {
     uint32_t code;
 };
 
+struct FontStyleFrame {
+    uint16_t magic = 0;
+    uint8_t flags1 = 0;
+    uint8_t flags2 = 0;
+    uint32_t h_dpi = 0;
+    uint32_t v_dpi = 0;
+    uint32_t scale_unit = 0;
+    float base_scale = 0.0f;
+    float scale_pixel_w = 0.0f;
+    float scale_pixel_h = 0.0f;
+    float effect_weight_x = 0.0f;
+    float effect_weight_y = 0.0f;
+    float slant_ratio = 0.0f;
+    uint32_t reserved_0x28 = 0;
+    uint32_t layout_cache_state = 0;
+    uint32_t cache_flags_and_direction = 0;
+    uint8_t tail[0x60 - 0x34]{};
+};
+static_assert(sizeof(FontStyleFrame) == 0x60);
+constexpr uint16_t kStyleFrameMagic = 0x0F09;
+constexpr uint8_t kStyleFrameFlagScale = 0x01;
+constexpr uint8_t kStyleFrameFlagSlant = 0x02;
+constexpr uint8_t kStyleFrameFlagWeight = 0x04;
+// The effect weight is stored as an offset from the neutral 1.0 and clamped to a small band
+// (libSceFont.native.sprx +0xc3a0: constants -1.0 at +0x1aa4c, -0.04/+0.04 at +0x1aa58/+0x1aa5c);
+// the getter (+0xc600) adds the 1.0 back. CONFIDENCE: HIGH (read from the firmware).
+constexpr float kStyleFrameWeightLimit = 0.04f;
+
 struct RenderSurface {
     void* buffer;
     int32_t width_bytes;
@@ -173,9 +196,17 @@ struct RenderSurface {
     int32_t width;
     int32_t height;
     uint32_t scissor[4];
-    uint64_t reserved[11];
+    // sceFontRenderSurfaceSetStyleFrame writes both of these (libSceFont.native.sprx +0xabb0): the
+    // frame pointer, null or not, and a zeroed dword the firmware keeps beside it.
+    void* style_frame;
+    uint32_t style_state;
+    uint32_t pad2;
+    uint64_t reserved[9];
 };
 static_assert(sizeof(RenderSurface) == 128);
+static_assert(offsetof(RenderSurface, style) == 0xe);
+static_assert(offsetof(RenderSurface, style_frame) == 0x28);
+static_assert(offsetof(RenderSurface, style_state) == 0x30);
 
 FontFace* face(void* handle) {
     auto* f = static_cast<FontFace*>(handle);
@@ -631,6 +662,159 @@ int32_t font_surface_set_scissor(RenderSurface* surface, int32_t x, int32_t y,
     return 0;
 }
 
+FontStyleFrame* style_frame(void* handle) {
+    auto* s = static_cast<FontStyleFrame*>(handle);
+    return s && s->magic == kStyleFrameMagic ? s : nullptr;
+}
+
+int32_t font_style_frame_init(FontStyleFrame* out) {
+    if (!out) return static_cast<int32_t>(0x80460002u);
+    std::memset(out, 0, sizeof(*out));
+    out->magic = kStyleFrameMagic;
+    out->h_dpi = 0x48;
+    out->v_dpi = 0x48;
+    return 0;
+}
+
+int32_t font_style_frame_set_scale_pixel(FontStyleFrame* frame, float w, float h) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->scale_unit = 0;
+    frame->scale_pixel_w = w;
+    frame->scale_pixel_h = h;
+    frame->flags1 |= kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_set_scale_point(FontStyleFrame* frame, float w, float h) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->scale_unit = 1;
+    frame->scale_pixel_w = w;
+    frame->scale_pixel_h = h;
+    frame->flags1 |= kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_set_resolution_dpi(FontStyleFrame* frame, uint32_t h_dpi, uint32_t v_dpi) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->h_dpi = h_dpi == 0 ? 0x48 : h_dpi;
+    frame->v_dpi = v_dpi == 0 ? 0x48 : v_dpi;
+    return 0;
+}
+
+int32_t font_style_frame_set_effect_slant(FontStyleFrame* frame, float slant) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->slant_ratio = std::clamp(slant, -1.0f, 1.0f);
+    frame->flags1 |= kStyleFrameFlagSlant;
+    return 0;
+}
+
+int32_t font_style_frame_set_effect_weight(FontStyleFrame* frame, float w_x, float w_y,
+                                           uint32_t mode) {
+    if (!style_frame(frame) || mode != 0) return static_cast<int32_t>(0x80460002u);
+    frame->effect_weight_x =
+        std::clamp(w_x - 1.0f, -kStyleFrameWeightLimit, kStyleFrameWeightLimit);
+    frame->effect_weight_y =
+        std::clamp(w_y - 1.0f, -kStyleFrameWeightLimit, kStyleFrameWeightLimit);
+    frame->flags1 |= kStyleFrameFlagWeight;
+    return 0;
+}
+
+int32_t font_style_frame_unset_scale(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_unset_effect_slant(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagSlant;
+    return 0;
+}
+
+int32_t font_style_frame_unset_effect_weight(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagWeight;
+    return 0;
+}
+
+int32_t font_style_frame_get_scale_pixel(const FontStyleFrame* frame, float* out_w, float* out_h) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagScale) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_w && !out_h) return static_cast<int32_t>(0x80460002u);
+    float w = frame->scale_pixel_w;
+    float h = frame->scale_pixel_h;
+    if (frame->scale_unit != 0) {
+        // The firmware divides first and multiplies second (+0xc568); keep its rounding.
+        if (frame->h_dpi != 0) w = w * ((float)frame->h_dpi / 72.0f);
+        if (frame->v_dpi != 0) h = h * ((float)frame->v_dpi / 72.0f);
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+int32_t font_style_frame_get_scale_point(const FontStyleFrame* frame, float* out_w, float* out_h) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagScale) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_w && !out_h) return static_cast<int32_t>(0x80460002u);
+    float w = frame->scale_pixel_w;
+    float h = frame->scale_pixel_h;
+    if (frame->scale_unit == 0) {
+        // As above, ratio first (+0xc4cc).
+        if (frame->h_dpi != 0) w = w * (72.0f / (float)frame->h_dpi);
+        if (frame->v_dpi != 0) h = h * (72.0f / (float)frame->v_dpi);
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+int32_t font_style_frame_get_resolution_dpi(const FontStyleFrame* frame, uint32_t* h_dpi,
+                                            uint32_t* v_dpi) {
+    if (!style_frame((void*)frame) || (!h_dpi && !v_dpi)) return static_cast<int32_t>(0x80460002u);
+    if (h_dpi) *h_dpi = frame->h_dpi;
+    if (v_dpi) *v_dpi = frame->v_dpi;
+    return 0;
+}
+
+int32_t font_style_frame_get_effect_slant(const FontStyleFrame* frame, float* out) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagSlant) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out) return static_cast<int32_t>(0x80460002u);
+    *out = frame->slant_ratio;
+    return 0;
+}
+
+int32_t font_style_frame_get_effect_weight(const FontStyleFrame* frame, float* out_x, float* out_y,
+                                           uint32_t* out_mode) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagWeight) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_x && !out_y && !out_mode) return static_cast<int32_t>(0x80460002u);
+    if (out_x) *out_x = frame->effect_weight_x + 1.0f;
+    if (out_y) *out_y = frame->effect_weight_y + 1.0f;
+    if (out_mode) *out_mode = 0;
+    return 0;
+}
+
+// libSceFont.native.sprx +0xabb0: a null surface, or a non-null frame without the magic, is
+// rejected with nothing written. Otherwise bit 0 of surface+0xe says whether a frame is attached,
+// the frame pointer (null included) goes to surface+0x28, and the dword at surface+0x30 is zeroed.
+//
+// CONFIDENCE: LOW that this is the whole effect. The frame is recorded exactly as the firmware
+// records it, but render_glyph never reads it: glyphs are drawn at the face's scale, with no slant
+// or weight, whatever the frame says. Tracked in #4591.
+int32_t font_surface_set_style_frame(RenderSurface* surface, FontStyleFrame* frame) {
+    if (!surface) return static_cast<int32_t>(0x80460002u);
+    if (frame && !style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    if (frame)
+        surface->style |= 0x1u;
+    else
+        surface->style &= (uint8_t)~0x1u;
+    surface->style_frame = frame;
+    surface->style_state = 0;
+    return 0;
+}
+
 // The real work behind sceFontRenderCharGlyphImage: rasterize `code` into `surface` with the pen
 // box at (pen_x, pen_y), and report what was drawn through both out-parameters.
 //
@@ -847,56 +1031,6 @@ int32_t font_text_default(TextSource* source, void* handle) {
     if (source) source->default_font = handle;
     return 0;
 }
-
-FontRenderer* renderer(void* handle) {
-    auto* r = static_cast<FontRenderer*>(handle);
-    return r && r->magic == kRendererMagic ? r : nullptr;
-}
-
-int32_t font_renderer_get_outline_buffer_size(void* handle, uint32_t* out) {
-    const auto* r = renderer(handle);
-    if (out) *out = r ? (uint32_t)r->outline_workspace_size : 0u;
-    if (!r) return static_cast<int32_t>(0x80460001u);
-    return out ? 0 : static_cast<int32_t>(0x80460002u);
-}
-
-int32_t font_renderer_reset_outline_buffer(void* handle) {
-    const auto* r = renderer(handle);
-    if (!r) return static_cast<int32_t>(0x80460001u);
-    return 0;
-}
-
-int32_t font_renderer_set_outline_buffer_policy(void* handle, uint64_t, uint32_t basal,
-                                                uint32_t limit) {
-    auto* r = renderer(handle);
-    if (!r) return static_cast<int32_t>(0x80460001u);
-    if (limit != 0 && basal > limit) return static_cast<int32_t>(0x80460002u);
-    uint64_t size = r->outline_workspace_size > basal ? r->outline_workspace_size : basal;
-    if (limit != 0 && size > limit) size = limit;
-    if (size == 0) size = 0x4000;
-    r->outline_workspace_size = size;
-    return 0;
-}
-
-int32_t font_set_resolution_dpi(void* handle, uint32_t h_dpi, uint32_t v_dpi) {
-    auto* f = face(handle);
-    if (!f) return static_cast<int32_t>(0x80460005u);
-    f->h_dpi = h_dpi == 0 ? 72 : h_dpi;
-    f->v_dpi = v_dpi == 0 ? 72 : v_dpi;
-    return 0;
-}
-
-int32_t font_text_source_rewind(TextSource* source) {
-    if (!source) return static_cast<int32_t>(0x80460002u);
-    source->current = source->start;
-    return 0;
-}
-
-int32_t font_writing_set_mask_invisible(void* writing, int32_t mask) {
-    if (!writing) return static_cast<int32_t>(0x80460002u);
-    if (mask != 0 && mask != 1) return static_cast<int32_t>(0x80460002u);
-    return 0;
-}
 int32_t font_text_writing_form(TextSource* source, int32_t form) {
     if (source) source->system = (uint32_t)form;
     return 0;
@@ -1047,15 +1181,30 @@ void register_font_hle() {
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
     R("8-zmgsxkBek", (HleFn)font_ok, "sceFontGlyphDefineAttribute");
-    R("amcmrY62BD4", (HleFn)font_renderer_get_outline_buffer_size,
-      "sceFontRendererGetOutlineBufferSize");
-    R("ai6AfGrBs4o", (HleFn)font_renderer_reset_outline_buffer,
-      "sceFontRendererResetOutlineBuffer");
-    R("ydF+WuH0fAk", (HleFn)font_renderer_set_outline_buffer_policy,
-      "sceFontRendererSetOutlineBufferPolicy");
-    R("I1acwR7Qp8E", (HleFn)font_set_resolution_dpi, "sceFontSetResolutionDpi");
-    R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
-    R("BbCZjJizU4A", (HleFn)font_writing_set_mask_invisible, "sceFontWritingSetMaskInvisible");
+    R("la2AOWnHEAc", (HleFn)font_style_frame_init, "sceFontStyleFrameInit");
+    Hle::register_typed("da4rQ4-+p-4", font_style_frame_set_scale_pixel,
+                        "sceFontStyleFrameSetScalePixel");
+    Hle::register_typed("O997laxY-Ys", font_style_frame_set_scale_point,
+                        "sceFontStyleFrameSetScalePoint");
+    R("dB4-3Wdwls8", (HleFn)font_style_frame_set_resolution_dpi,
+      "sceFontStyleFrameSetResolutionDpi");
+    Hle::register_typed("394sckksiCU", font_style_frame_set_effect_slant,
+                        "sceFontStyleFrameSetEffectSlant");
+    Hle::register_typed("faw77-pEBmU", font_style_frame_set_effect_weight,
+                        "sceFontStyleFrameSetEffectWeight");
+    R("bePC0L0vQWY", (HleFn)font_style_frame_unset_scale, "sceFontStyleFrameUnsetScale");
+    R("dUmABkAnVgk", (HleFn)font_style_frame_unset_effect_slant,
+      "sceFontStyleFrameUnsetEffectSlant");
+    R("hwsuXgmKdaw", (HleFn)font_style_frame_unset_effect_weight,
+      "sceFontStyleFrameUnsetEffectWeight");
+    R("2QfqfeLblbg", (HleFn)font_style_frame_get_scale_pixel, "sceFontStyleFrameGetScalePixel");
+    R("7x2xKiiB7MA", (HleFn)font_style_frame_get_scale_point, "sceFontStyleFrameGetScalePoint");
+    R("VSw18Aqzl0U", (HleFn)font_style_frame_get_resolution_dpi,
+      "sceFontStyleFrameGetResolutionDpi");
+    R("lOfduYnjgbo", (HleFn)font_style_frame_get_effect_slant, "sceFontStyleFrameGetEffectSlant");
+    R("HIUdjR-+Wl8", (HleFn)font_style_frame_get_effect_weight, "sceFontStyleFrameGetEffectWeight");
+    // Recorded on the surface but not yet applied by the renderer -- CONFIDENCE: LOW, see #4591.
+    R("0hr-w30SjiI", (HleFn)font_surface_set_style_frame, "sceFontRenderSurfaceSetStyleFrame");
 }
 
 } // namespace prosper

@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Separable CPU mip-tail layout conversion
 
 Tracking: [#3407](https://github.com/mattias800/prosper/issues/3407).

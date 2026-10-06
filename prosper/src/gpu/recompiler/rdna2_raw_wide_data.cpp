@@ -232,8 +232,18 @@ public:
                 (in.opcode == 0x0fu || in.opcode == 0x11u || in.opcode == 0x13u ||
                  in.opcode == 0x15u || in.opcode == 0x17u || in.opcode == 0x19u ||
                  in.opcode == 0x1bu || in.opcode == 0x1du);
-            const bool mask_move = in.fmt == Rdna2Format::SOP1 &&
-                in.opcode == kSop1OpcodeMovB64;
+            // The unary B64 mask transfers: S_MOV, S_NOT and S_WQM. From an independent mask each
+            // produces an independent mask, and the emitter keeps all three in the Bool domain
+            // (into VCC as well: all three update the VCC the branches read).
+            // S_WQM is the one that matters: nearly every pixel shader opens with
+            // `s_wqm_b64 exec, exec`, and while only S_MOV was listed, that instruction left EXEC
+            // "dependent" for every load fetched ABOVE it -- the walk starts at the load with
+            // EXEC independent, so a load below the prologue never saw it. For those early loads
+            // no later compare counted as fresh and every consumer of a recycled pair was a
+            // numeric reader (#4555: GTA V's V# loads at pc 4, above the prologue at pc 9).
+            const bool mask_move = in.fmt == Rdna2Format::SOP1 && (in.opcode == kSop1OpcodeMovB64 ||
+                                                                   in.opcode == kSop1OpcodeNotB64 ||
+                                                                   in.opcode == kSop1OpcodeWqmB64);
             const bool mask_saveexec = in.fmt == Rdna2Format::SOP1 &&
                 in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                 in.opcode <= kSop1OpcodeXnorSaveexecB64;
@@ -267,8 +277,15 @@ public:
                         derived_read = true;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     const Operand& operand = in.src[source];
-                    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101u &&
-                        source == 2u && independent_mask(operand)) continue;
+                    // v_cndmask's condition was already exempt here when it is an independent
+                    // mask root. The carry-in of the three VOP3B add/sub-with-carry forms is the
+                    // same kind of operand: the emitter takes it as a Bool and refuses an
+                    // untracked one (rdna2_emit_alu.cpp), so from an independent root the Bool it
+                    // reads is the fresh compare's and no loaded word is observed.
+                    if (in.fmt == Rdna2Format::VOP3 && source == 2u &&
+                        (in.opcode == 0x101u || (in.opcode >= 0x128u && in.opcode <= 0x12au)) &&
+                        independent_mask(operand))
+                        continue;
                     if (operand.kind == OperandKind::Special && operand.value == 253) {
                         derived_read |= state.scc;
                         continue;
@@ -338,10 +355,14 @@ public:
                   in.opcode == kSop1OpcodeCmovB64)) ||
                 (in.fmt == Rdna2Format::SOPK &&
                  in.opcode == kSopkOpcodeCmovkI32);
-            const bool definite_scalar_write = !conditional_write &&
+            const bool definite_scalar_write =
+                !conditional_write &&
                 (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                  in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
                  (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
+                 // The two lane reads write their SGPR whatever EXEC is. Only v_readlane was
+                 // listed, so a register v_readfirstlane had just replaced kept its old mark.
+                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u) ||
                  (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u));
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
@@ -496,13 +517,41 @@ private:
     }
 
     std::bitset<128> saved_exec_masks_at_load() const {
-        // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
-        // Their value predates this load; no scalar bits, wave width or zero are inferred.
+        // Only actual mask saves, on every path that reaches this load from above, may seed its
+        // Bool facts. Their value predates this load; no scalar bits, wave width or zero are
+        // inferred.
+        //
+        // A MUST dataflow over the instructions before the load, run to a fixed point. It used
+        // to be one forward pass that returned nothing at the first backward branch, so a loop
+        // anywhere above a load cost it every seed; and it accepted a save only into s0..s104,
+        // while compilers also park EXEC in VCC (`s_mov_b64 vcc, exec` ... `s_mov_b64 exec,
+        // vcc` around a guarded sample). Both together kept a GTA V program on the owned-wave
+        // path (#4555).
+        //
+        // The pass only sees instructions before the load, and ignores a branch that leaves
+        // that range, as the sweep it replaces did. So a path that jumps over the load and
+        // reaches it from below can arrive with a seeded pair holding something else. A seed
+        // asserts one thing, that the pair does not depend on this load. On the first arrival
+        // that holds outright: everything was written before the load ran. On a later arrival
+        // it holds only as far as every value that depends on the load carries a mark while it
+        // lives, because then a pair rewritten from such a value is a write the walk reaches,
+        // and it drops the fact there. The marks are known to be incomplete in one place
+        // (#4574): a plain copy of loaded words into EXEC marks EXEC and nothing formed under
+        // it, so a compare run under that EXEC yields an unmarked mask, and the same goes for
+        // the VCC a carry-out leaves under it. Moved into a seeded pair after the walk has
+        // stopped and brought back round a loop, that mask is restored as an independent
+        // EXEC. The sweep this replaces cleared the same program; closing it belongs to the
+        // EXEC copy, which has to become a reader.
         std::vector<std::bitset<128>> incoming(start + 1);
         std::vector<bool> reached(start + 1);
         reached[0] = true;
-        for (size_t index = 0; index < start; ++index) {
-            if (!reached[index]) continue;
+        std::vector<size_t> pending{0};
+        size_t steps = 0;
+        while (!pending.empty()) {
+            const size_t index = pending.back();
+            pending.pop_back();
+            if (index >= start) continue;   // the load is where the facts are read
+            if (++steps > 65536) return {};
             const auto& in = ins[index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
                 rdna2_may_write_unnamed_register_or_leave_cfg(in))
@@ -515,25 +564,32 @@ private:
                     if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
                 }
             });
+            // VCC has writers the explicit inventory does not report: a compare with the
+            // implicit destination, and the carry-out of the e32 add/sub-with-carry forms.
+            if ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) && in.dst.value == 106) ||
+                (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28u && in.opcode <= 0x2au))
+                masks.reset(106);
             if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
-                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 104 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
+                (in.dst.value <= 104 || in.dst.value == 106) &&
                 in.src[0].kind == OperandKind::Special && in.src[0].value == 126)
                 masks.set(static_cast<size_t>(in.dst.value));
             const auto enter = [&](size_t next) {
                 if (next > start) return;
-                if (reached[next]) incoming[next] &= masks;
-                else incoming[next] = masks;
+                const std::bitset<128> joined = reached[next] ? incoming[next] & masks : masks;
+                if (reached[next] && joined == incoming[next]) return;
+                incoming[next] = joined;
                 reached[next] = true;
+                pending.push_back(next);
             };
             if (in.is_end) continue;
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
                 const int64_t target_pc = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-                if (target_pc <= in.pc || target_pc > UINT32_MAX) return {};
+                if (target_pc < 0 || target_pc > UINT32_MAX) return {};
                 const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
                 if (target == by_pc.end()) {
                     if (target_pc <= ins.back().pc) return {};
                 } else {
-                    if (target->second <= index) return {};
                     enter(target->second);
                 }
                 if (in.opcode == kSoppOpcodeBranch) continue;
@@ -711,8 +767,14 @@ rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins) {
 // buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
 // admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
 // an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
-static std::vector<uint32_t> proven_immediate_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins, bool owned_read_point) {
+// `pointer_until_read` ends the entry-pointer lifetime at the load instead of the program end. Only
+// the register-offset path asks for it: its load reads the fold's exact per-PC snapshot and never
+// the base register again, and forward-only control means the load runs at most once, so only
+// writes BEFORE it can change which bytes it reads (#4578 follow-up). The strict immediate set and
+// the owned read points keep their own lifetimes, so their consumers are unchanged.
+static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                                              bool owned_read_point,
+                                                              bool pointer_until_read = false) {
     std::vector<uint32_t> proven;
     if (ins.empty()) return proven;
     std::unordered_map<uint32_t, size_t> by_pc;
@@ -766,7 +828,7 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(
                         by_pc.at(static_cast<uint32_t>(target))))
                     stable_entry_pointer = false;
             }
-            if (!owned_read_point || in.pc < load.pc)
+            if ((!owned_read_point && !pointer_until_read) || in.pc < load.pc)
                 for_each_scalar_write(in, [&](int base, uint32_t width) {
                     if (base >= 0 && base <= load.src[0].value + 1 &&
                         base + static_cast<int>(width) > load.src[0].value)
@@ -785,9 +847,8 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     return proven_immediate_wide_data_loads(ins, false);
 }
 
-std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins, std::vector<uint32_t>* scalar_source_pcs) {
-    if (scalar_source_pcs) scalar_source_pcs->clear();
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_entry_loads(const std::vector<Rdna2Inst>& ins) {
     // Reuse the entry-pointer, forward-CFG, bypass-reader and guest-write proofs. Only the
     // candidate's addressing mode changes here; its loaded-word lifetime is unchanged.
     auto immediate = ins;
@@ -795,7 +856,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
         if (load.fmt == Rdna2Format::SMEM &&
             (load.opcode == 0x2u || load.opcode == 0x3u))
             load.src[1] = {OperandKind::Special, 125};
-    const auto entry_proven = rdna2_proven_raw_immediate_wide_data_loads(immediate);
+    return proven_immediate_wide_data_loads(immediate, false, true);
+}
+
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                          std::vector<uint32_t>* scalar_source_pcs) {
+    if (scalar_source_pcs) scalar_source_pcs->clear();
+    const auto entry_proven = rdna2_proven_raw_register_wide_entry_loads(ins);
     const auto owned_parents = proven_immediate_wide_data_loads(ins, true);
     std::vector<uint32_t> proven;
     for (size_t i = 0; i < ins.size(); ++i) {
@@ -860,13 +928,16 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 if (needed.none()) break;
                 continue;
             }
-            // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer
+            // A bounded immediate raw x1 or x2 fetch is a latched scalar value. Its entry pointer
             // needs to survive only UNTIL this read, unlike the wide source pointer, whose
             // full-program lifetime is authenticated above. GTA overwrites this source pair
-            // after the read while preserving the loaded scalar that supplies SOFFSET.
-            const bool immediate_scalar_read = writer.fmt == Rdna2Format::SMEM &&
-                writer.opcode == 0u && writer.dst.kind == OperandKind::SGPR &&
-                writer.dst.value >= 0 && writer.dst.value <= 105 &&
+            // after the read while preserving the loaded scalar that supplies SOFFSET. UE4's
+            // vertex-factory fetch loads its index pair with s_load_dwordx2 (Kena, #4578); the
+            // owned snapshot then carries both words, since the emitted load writes both.
+            const bool immediate_scalar_read =
+                writer.fmt == Rdna2Format::SMEM && (writer.opcode == 0u || writer.opcode == 1u) &&
+                writer.dst.kind == OperandKind::SGPR && writer.dst.value >= 0 &&
+                writer.dst.value + static_cast<int>(writer.opcode) <= 105 &&
                 writer.src[0].kind == OperandKind::SGPR && writer.src[0].value >= 0 &&
                 writer.src[0].value < 105 && writer.src[1].kind == OperandKind::Special &&
                 writer.src[1].value == 125 && writer.literal == 0u;
@@ -874,9 +945,21 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 bool entry_at_read = true;
                 for (size_t prefix = 0; prefix < j && entry_at_read; ++prefix) {
                     const auto& before = ins[prefix];
-                    if (rdna2_may_write_guest_memory(before) ||
-                        (before.fmt == Rdna2Format::SOPP &&
-                         sopp_opcode_is_direct_branch(before.opcode)) ||
+                    // Control is forward-only (entry_proven). A branch before the source matters
+                    // only if it lands after the source and at or before the load: then the load
+                    // can run without this read. One landing at or before the source joins
+                    // ahead of it; one landing past the load skips both, which the wide load's
+                    // own bypass proof covers. Every earlier instruction is still checked for
+                    // guest writes and source-pointer writes, on every path.
+                    bool lands_inside = false;
+                    if (before.fmt == Rdna2Format::SOPP &&
+                        sopp_opcode_is_direct_branch(before.opcode)) {
+                        const int64_t target =
+                            static_cast<int64_t>(before.pc) + before.len_dwords + before.simm16;
+                        lands_inside = target > static_cast<int64_t>(writer.pc) &&
+                                       target <= static_cast<int64_t>(load.pc);
+                    }
+                    if (rdna2_may_write_guest_memory(before) || lands_inside ||
                         rdna2_may_write_unnamed_register_or_leave_cfg(before)) {
                         entry_at_read = false;
                         break;
@@ -895,6 +978,9 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                 // realization still requires mapped current bytes for this draw's pointer.
                 needed &= ~writes;
                 sources.push_back(writer.pc);
+                // As for an owned parent: once every selector word resolves, earlier control is
+                // irrelevant. A word still needed keeps the walk, and its branch refusal, going.
+                if (needed.none()) break;
                 continue;
             }
             // Scalar moves and B32 arithmetic are per-draw data, rather than masks or conditional

@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Overlapping graphics buffer uploads (#3407)
 
 The renderer now copies connected overlapping direct guest storage-buffer inputs once per

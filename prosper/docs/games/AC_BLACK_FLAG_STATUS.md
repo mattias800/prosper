@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Assassin's Creed Black Flag Resynced (`PPSA28183`) — status
 
 Tracker: [#4131](https://github.com/mattias800/prosper/issues/4131). This document is the technical

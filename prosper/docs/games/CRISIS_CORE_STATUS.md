@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Crisis Core –Final Fantasy VII– Reunion (`PPSA07809`) — status
 
 Unreal Engine 4.27 + IoStore. Tracker: [#1894](https://github.com/mattias800/prosper/issues/1894).

@@ -226,6 +226,10 @@ std::vector<RawWideLoadDiagnosis>
 rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
+// The entry-pointer stage of the register-offset proof: each x4/x8 load evaluated with SOFFSET
+// nulled, its entry pointer required only UNTIL the load (it reads a per-PC snapshot afterwards).
+std::vector<uint32_t>
+rdna2_proven_raw_register_wide_entry_loads(const std::vector<Rdna2Inst>& instructions);
 // Exact immediate x4/x8 read points requiring an owned same-fold observation: entry pointers
 // may change after the fetch, or the fetched words select a proven register-offset child.
 std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(
@@ -755,6 +759,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 // operands in a 13-word record per lane: PRIM, POS0.xyzw, POS1.xyzw, PARAM0.xyzw. This is a
 // translator/execution test hook only. It does not assemble primitives, route layers, or create a
 // graphics pipeline, and it refuses any other export target rather than silently discarding it.
+// A linked merged ES+GS program compiles through recompile_ngg_subgroup (ngg_subgroup_shell.hpp)
+// instead; this probe stays for the synthetic wave-contract tests built on its fixed record.
 inline constexpr uint32_t kNggExportProbeWords = 13;
 inline constexpr uint32_t kNggTraceValueWord = kNggExportProbeWords;
 inline constexpr uint32_t kNggTraceHitWord = kNggExportProbeWords + 1;

@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Windows native port — handoff (2026-07-16)
 
 For users of the prebuilt archive, start with `WINDOWS_RELEASE.md`. This document is the engineering
