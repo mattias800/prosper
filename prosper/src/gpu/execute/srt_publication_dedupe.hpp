@@ -6,8 +6,9 @@
 // a resource already holding it is published key-less, so it too resolves only by fetch_pc -- and
 // from then on that key must be deduplicated per instruction, or every consumer after the first is
 // left with no entry and refused as unresolved-cbuf (Kena's title pixel shader: one V#, two scalar
-// buffer loads, the key already held by the raw-pointer snapshot that loaded it). Compute publishes
-// every buffer use per instruction for the same reason.
+// buffer loads, the key already held by another resource -- a metadata sharp or a descriptor loaded
+// at the same immediate from another table; test_agc_shader pins the texture case). Compute
+// publishes every buffer use per instruction for the same reason.
 #pragma once
 
 #include "gpu/execute/gpu_execute.hpp"
