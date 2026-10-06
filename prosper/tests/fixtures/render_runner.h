@@ -15466,7 +15466,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (FILE* f = fopen(dp, "w")) {
                         fprintf(f, "i,x,y,z,w\n");
                         for (uint32_t i = 0; i < written; i++)
-                            fprintf(f, "%u,%.7g,%.7g,%.7g,%.7g\n",
+                            fprintf(f, "%u,%.9g,%.9g,%.9g,%.9g\n",
                                     i, pos[i*4+0], pos[i*4+1], pos[i*4+2], pos[i*4+3]);
                         fclose(f);
                         fprintf(stderr, "[geom-probe]   wrote %u verts -> %s\n", written, dp);
