@@ -6,25 +6,25 @@ Linux/AMD title-menu investigations are recorded below.
 
 ## Linux/AMD shader refusals (2026-10-06)
 
-**Read this first.** All counts below are distinct refused programs (vertex / fragment / compute). Each was measured on Linux/RADV with `prosper-app`, a default launch, `PROSPER_NULL_PAGE=1`, 260 s, no input and `PROSPER_DBG=1`. The title picture is unchanged: the menu still renders over a black world, because of the zero colour LUT (#3135).
+**Read this first.** Counts are distinct refused programs (vertex / fragment / compute), all on Linux/RADV with `prosper-app`, a default launch, `PROSPER_NULL_PAGE=1`, no input and `PROSPER_DBG=1`. Runs are 260 s unless noted, and each row is its own run or runs, measured on that fix's branch. The counts vary from run to run with what the title streams: the vertex column reads 6 or 8 for the same code. The title picture is unchanged, the menu over a black world, which is the zero colour LUT (#3135).
 
-| fix | refused programs | what it was |
+| build | refused programs | what changed |
 |---|---|---|
-| main `9b223e64` | 26 / 25 / 5 | — |
-| #4576 | 6 / 6 / 2 (two runs; one read 11 / 12 / 4) | `sceAgcCbBranch` targets were folded at record time and paired with the previous fold's pipeline; the branch now runs in-stream |
-| #4584, #4588 | 8 / 0 / 2 | a V# read at two PCs, under a key that clashed or that the recompiler never tags, left the second consumer without a resource (`unresolved-cbuf`) |
-| #4587 | 6 vertex | an `s_load_dwordx2` index pair as the source of a raw-wide register offset; vertex dropped draws per 5 s window fell from 4,294 to about 800 |
+| main `9b223e64` (1 run, 240 s) | 26 / 25 / 5 | — |
+| #4576 (3 runs, 240 s) | 6 / 6 / 2, 6 / 6 / 2, 11 / 12 / 4 | `sceAgcCbBranch` targets used to be folded at record time and paired with the previous fold's pipeline; the branch now runs in-stream |
+| #4584 (1 clean run) | 8 / 0 / 2 | a V# read at two PCs under a clashed key left the second consumer without a resource (`unresolved-cbuf`). #4588 closes the unclashed variant and was not measured on Kena |
+| #4587 (1 run, without #4584) | 6 / 5 / 2 | an `s_load_dwordx2` index pair as the source of a raw-wide register offset; vertex dropped draws per 5 s window fell from 4,294 to about 800 |
+| main `b295a17a`, all of the above (2 runs) | 6 / 2 / 2, 6 / 1 / 2 | the fragment refusals are a new class, a base-0 T# in a direct sharp slot (#4592), absent from the earlier runs' scenes |
 
-What remains:
-- **Vertex:**
-  - a chained vertex prolog with register-SOFFSET loads (`vs` 184 dwords);
-  - a V# loaded through a shader-loaded pointer with a VCC offset (1,526 dwords, pc 52);
-  - two large NGG programs (pc 326/330).
-- **Compute:**
-  - a counted-loop prelude CFG rejection (388 dwords);
-  - an unresolved operand at pc 29 (2,060 dwords).
-
-The refused shaders of each run are dumped under `PROSPER_CAPTURE_DIR/refused_shaders_*`.
+What remains (each run's refused shaders are dumped under `PROSPER_CAPTURE_DIR/refused_shaders_*`):
+- **Fragment:** #4592.
+- **Vertex**, diagnosed 2026-10-06; shares are of about 650 dropped vertex draws per 5 s:
+  - **About 61%:** the merged ES+GS NGG chain (a 102-dword prolog linked to a 413-dword main). It is the same program as #3857's strip-layer producer, and it is refused at the main's `v_mbcnt` over a ballot mask, with LDS and `GS_ALLOC_REQ`. No proof rule fixes it; it needs the merged-NGG launch (#3135).
+  - **About 28%:** a 1,526-dword program (three copies). Its register-offset wide load's pointer pair is rewritten after the load, which the whole-program pointer-stability rule refuses.
+  - **About 11%:** two large NGG programs (pc 326/330). They hit the same pointer rule, plus the x1/x2 source proof refusing any branch before the source.
+- **Compute**, diagnosed 2026-10-06:
+  - **388 dwords:** a counted-loop route claims the program and refuses on a prelude EXEC do-while instead of falling back to the general CFG route.
+  - **2,060 dwords:** three stacked CFG-dispatcher gaps (entry-M0 save over an ambiguous pair; a spill slot classified mask program-wide; a mask reassembled from two spilled halves). With all three applied in a scratch build, it compiles and passes `spirv-val`.
 
 ## Handoff to Linux/AMD (2026-10-05)
 

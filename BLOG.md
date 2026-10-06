@@ -30,9 +30,9 @@ Both titles ask the GPU for an "eliminate fast clear" pass: a metadata clean-up 
 <p align="center"><img src="assets/screenshots/beast-reincarnation-deluxe-dialog.webp" alt="Beast of Reincarnation: Digital Deluxe Version bonus received dialog listing Big Dipper, Black Shiba Skin, Special Hat, Amber and crop seedlings, with an OK button; Linux tools/screenshot, RADV, default launch, no input, about 20 s"></p>
 <p align="center"><img src="assets/screenshots/dq7-adventure-log-menu-efc.webp" alt="Dragon Quest VII Reimagined adventure-log menu with three unused slots over the dimmed title background; Linux tools/screenshot, RADV, scripts/dragon-quest-vii/reach-title-screen.pad, about 40 s"></p>
 
-### Kena's refused shaders: 56 programs down to 8
+### Kena's refused shaders: 56 programs down to about 10
 
-No new picture yet; Kena's world is still black behind the title menu. But the number of shader programs prosper refuses to translate there fell from 56 to 8 over three fixes, and the dropped vertex draws fell from about 4,300 to about 800 every five seconds ([#4576](https://github.com/mattias800/prosper/pull/4576), [#4584](https://github.com/mattias800/prosper/pull/4584), [#4587](https://github.com/mattias800/prosper/pull/4587); [tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+No new picture yet; Kena's world is still black behind the title menu. But the number of shader programs prosper refuses to translate there fell from 56 to about 10 over four fixes, and the dropped vertex draws fell from about 4,300 to about 800 every five seconds ([#4576](https://github.com/mattias800/prosper/pull/4576), [#4584](https://github.com/mattias800/prosper/pull/4584), [#4587](https://github.com/mattias800/prosper/pull/4587), [#4588](https://github.com/mattias800/prosper/pull/4588); [tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
 
 ### Rayman 30th Anniversary Edition plays its first level on the first try
 
