@@ -635,9 +635,9 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
               const bool sampled_retained_volume =
                   live_rtt != g_rtt.end() && live_rtt->second.volume_guest_bytes != 0u;
               if (live_rtt != g_rtt.end() &&
-                  !prosper::frontend::rtt_sampled_extent_compatible(
-                      tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
-                      normalized_sampling)) {
+                  !prosper::frontend::live_rtt_serves_sampled_view(
+                      live_rtt->second, sampled_source_addr, tw, th, render_scale, normalized_sampling,
+                      prosper::gpu::data_format_bytes(r.format) * r.num_components)) {
                   live_rtt = g_rtt.end();
               }
               if (sampled_retained_volume && live_rtt == g_rtt.end()) {

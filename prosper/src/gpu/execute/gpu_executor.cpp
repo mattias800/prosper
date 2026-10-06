@@ -1239,179 +1239,7 @@ ShaderCompileKey make_shader_compile_key(
             key.chain_analysis_identity = chain_analysis->identity;
         }
     }
-    if (resources) {
-        // Reuse cached exact-byte analysis for instruction-scoped resources. Owned sources use
-        // the same exact-PC selection and width as emission, including duplicate/poisoned entries.
-        // Guest addresses/content do not change module identity; admission state does.
-        std::shared_ptr<const DecodedShader> scalar_source_proof;
-        key.resources.reserve(resources->resources.size());
-        for (const auto& resource : resources->resources) {
-            const bool texture = resource.cls == ResourceClass::Texture;
-            const bool storage_image = resource.cls == ResourceClass::StorageImage;
-            const bool manual_compare = texture && resource.depth_compare;
-            const bool normalize_unnormalized = texture && resource.unnormalized &&
-                !std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
-            const bool atomic_extent = storage_image &&
-                resource.format == DataFormat::Uint32 && resource.num_components == 1;
-            ShaderResourceCompileKey compiled;
-            compiled.cls = static_cast<uint32_t>(resource.cls);
-            compiled.format = static_cast<uint32_t>(resource.format);
-            compiled.num_components = resource.num_components;
-            compiled.width = (atomic_extent || normalize_unnormalized) ? resource.width : 0u;
-            compiled.height = (atomic_extent || normalize_unnormalized) ? resource.height : 0u;
-            compiled.depth = (storage_image || normalize_unnormalized) ? resource.depth : 0u;
-            compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
-            compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
-            compiled.declared_mip_levels = (texture || storage_image)
-                ? resource.declared_mip_levels : 1u;
-            compiled.materialized_mip_levels = texture
-                ? shader_resource_compute_mip_chain_levels(resource) : 1u;
-            compiled.in_mip_tail = (texture || storage_image) && resource.in_mip_tail;
-            compiled.compression_enabled =
-                (texture || storage_image) && resource.compression_enabled;
-            compiled.proven_zero_mip = (texture || storage_image) && resource.proven_zero_mip;
-            compiled.binding = resource.binding;
-            compiled.stride = resource.stride;
-            const bool one_record_tail = resource.num_components == 1u &&
-                resource.stride == 2u && resource.size == 2u;
-            compiled.one_record_tail_semantic = static_cast<uint32_t>(
-                one_record_tail && resource.format == DataFormat::Uint16
-                    ? StorageBufferTailSemantic::Uint16
-                    : one_record_tail && resource.format == DataFormat::Float16
-                        ? StorageBufferTailSemantic::Float16
-                        : StorageBufferTailSemantic::None);
-            // A warm cache hit bypasses emitter-side resource revalidation. Partition on the
-            // complete resource-side admission result, not the serialized marker alone, so an
-            // opaque/corrupt marker cannot borrow a valid module across size, alignment, or array
-            // shape changes. Address identity remains intentionally absent; only alignment matters.
-            const bool atomic_x2_exact_admission =
-                resource.atomic_x2_record_count != 0u &&
-                resource.atomic_x2_record_count <= 0x02000000u &&
-                static_cast<uint64_t>(resource.atomic_x2_record_count) * 8u == resource.size &&
-                resource.stride == 8u &&
-                (resource.gpu_addr & 7u) == 0u && resource.table_index_count == 0u;
-            compiled.atomic_x2_record_count =
-                atomic_x2_exact_admission ? resource.atomic_x2_record_count : 0u;
-            compiled.scalar_buffer_dword_count = resource.scalar_buffer_dword_count;
-            compiled.scalar_buffer_contract_valid =
-                !resource.scalar_buffer_dword_count ||
-                shader_resource_buffer_binding_bytes(resource) != 0u;
-            compiled.srt_offset = resource.srt_offset;
-            compiled.sgpr_base = resource.sgpr_base;
-            compiled.fetch_pc = resource.fetch_pc;
-            compiled.nested_raw_snapshot_bytes =
-                stage == ShaderProgramStage::Compute &&
-                resource.nested_raw_snapshot_admitted && resource.host_data &&
-                resource.host_data_size >= resource.size ? resource.size : 0u;
-            compiled.raw_register_snapshot_bytes = !resource.raw_register_snapshot ? 0u :
-                valid_raw_register_snapshot_resource(resource) ? resource.size : UINT32_MAX;
-            if (resource.fetch_pc != UINT32_MAX) {
-                if (!scalar_source_proof && key.code && !key.code->empty())
-                    scalar_source_proof = decode_shader_cached(key.code->data(), key.code->size());
-                if (scalar_source_proof &&
-                    std::binary_search(scalar_source_proof->raw_offset_scalar_source_pcs.begin(),
-                                       scalar_source_proof->raw_offset_scalar_source_pcs.end(),
-                                       resource.fetch_pc) &&
-                    valid_raw_offset_scalar_snapshot_resource(resource))
-                    compiled.raw_offset_scalar_snapshot_bytes = resource.size;
-                if (scalar_source_proof && std::binary_search(
-                        scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
-                        scalar_source_proof->raw_owned_wide_data_load_pcs.end(), resource.fetch_pc)) {
-                    const auto load = rdna2_decode_one(key.code->data() + resource.fetch_pc,
-                                                      key.code->size() - resource.fetch_pc);
-                    const uint32_t bytes = load.opcode == 0x2u ? 16u : 32u;
-                    compiled.raw_owned_wide_snapshot_bytes =
-                        owned_raw_snapshot_at(*resources, resource.fetch_pc, bytes) ? bytes : UINT32_MAX;
-                }
-                if (stage != ShaderProgramStage::Compute && scalar_source_proof) {
-                    for (const auto& chain : scalar_source_proof->owned_nested_wide_chains) {
-                        if (resource.fetch_pc != chain.parent_pc && resource.fetch_pc != chain.child_pc)
-                            continue;
-                        const bool complete = owned_nested_snapshot_at(*resources, chain.parent_pc,
-                                chain.parent_bytes) &&
-                            owned_nested_snapshot_at(*resources, chain.child_pc, chain.child_bytes);
-                        compiled.owned_nested_snapshot_bytes = complete
-                            ? (resource.fetch_pc == chain.parent_pc ? chain.parent_bytes : chain.child_bytes)
-                            : UINT32_MAX;
-                    }
-                }
-                if (stage == ShaderProgramStage::Compute && scalar_source_proof)
-                    for (const auto& chain : scalar_source_proof->owned_raw_x2_chains) {
-                        if (resource.fetch_pc != chain.parent_pc &&
-                            resource.fetch_pc != chain.child_pc)
-                            continue;
-                        compiled.owned_nested_snapshot_bytes =
-                            owned_nested_snapshot_at(*resources, chain.parent_pc, 8u) &&
-                                    owned_nested_snapshot_at(*resources, chain.child_pc, 8u)
-                                ? 8u
-                                : UINT32_MAX;
-                    }
-                if (resource.owned_nested_snapshot_bytes && !compiled.owned_nested_snapshot_bytes)
-                    compiled.owned_nested_snapshot_bytes = UINT32_MAX;
-            }
-            compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
-            compiled.table_index_count = resource.table_index_count;
-            compiled.table_entry_stride = resource.table_entry_stride;
-            compiled.table_index_sgpr = resource.table_index_sgpr;
-            compiled.table_selector_mode =
-                static_cast<uint32_t>(resource.table_selector_mode);
-            compiled.table_load_pc = resource.table_load_pc;
-            compiled.table_contract_valid = valid_shader_buffer_table_contract(resource);
-            compiled.flat_base_sgpr = resource.flat_base_sgpr;
-            compiled.bvh_box_grow = resource.bvh_box_grow;
-            compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
-            compiled.null_bvh = is_proven_null_bvh(resource);
-            // gpu_addr/size intentionally stay out of the module key, but this semantic is compiled
-            // into zero-producing/no-op instructions. Partition exactly this proven marker so a
-            // later nonzero descriptor at the same pc cannot reuse the specialized module.
-            compiled.zero_record_raw = is_zero_record_raw_buffer(resource);
-            compiled.optional_null_raw_load = is_optional_null_raw_load_buffer(resource);
-            // This marker elides a real one-record store, unlike NUM_RECORDS=0. Keep the admission
-            // result explicit even though its impossible V# stride also differs, so cache identity
-            // documents and enforces the semantic boundary directly.
-            compiled.proven_null_guarded_raw_store =
-                is_proven_null_guarded_raw_store(resource);
-            compiled.proven_null_nullable_raw_buffer =
-                is_proven_null_nullable_raw_buffer(resource);
-            compiled.gta5_cf9200_no_backing =
-                is_proven_gta5_cf9200_no_backing(resource);
-            if (is_gta5_selected_sbuffer_descriptor(resource)) {
-                compiled.selected_sbuffer_soffset = resource.selected_sbuffer_soffset;
-                compiled.selected_sbuffer_words = resource.selected_sbuffer_words;
-            }
-            if (is_gta5_packed_pointer_resource(resource)) {
-                compiled.indirect_buffer_contract_tag =
-                    resource.indirect_buffer_contract_tag;
-                compiled.indirect_buffer_binding_bytes =
-                    resource.indirect_buffer_binding_bytes;
-                compiled.indirect_buffer_slot_count = resource.indirect_buffer_slot_count;
-                compiled.indirect_buffer_header_bytes = resource.indirect_buffer_header_bytes;
-                compiled.indirect_buffer_slot_bytes = resource.indirect_buffer_slot_bytes;
-            }
-            if (is_indirect_pointer_relocation_resource(resource)) {
-                const auto& relocation = resource.indirect_pointer_relocation;
-                compiled.indirect_pointer_carrier_version = relocation.carrier_version;
-                compiled.indirect_pointer_proof_schema = relocation.proof_schema;
-                compiled.indirect_pointer_binding_bytes = relocation.binding_bytes;
-                compiled.indirect_pointer_record_count = relocation.record_count;
-                compiled.indirect_pointer_segment_count = relocation.segment_count;
-                compiled.indirect_pointer_segment_directory_byte_offset =
-                    relocation.segment_directory_byte_offset;
-                compiled.indirect_pointer_proof_fingerprint =
-                    relocation.proof_fingerprint;
-            }
-            compiled.srgb = storage_image && resource.srgb;
-            compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
-            compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
-            compiled.mag_filter = manual_compare ? resource.mag_filter : 0u;
-            compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
-            compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
-            compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
-            compiled.normalize_unnormalized_coordinates = normalize_unnormalized;
-            compiled.emitted_dst_sel = compile_key_dst_sel(resource);
-            key.resources.push_back(compiled);
-        }
-    }
+    if (resources) append_shader_resource_compile_keys(stage, *resources, key.code, key.resources);
     // All three callers still attach their program's trip-bound settings. Hash only after that
     // finalization: a provisional hash here is unconditionally overwritten before any cache lookup.
     return key;
@@ -1750,6 +1578,182 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
 }
 
 } // namespace
+
+// The per-resource half of a shader's compile identity (see make_shader_compile_key). Shared with
+// the merged-NGG stage cache (#3135 P5), so its key and this one cannot partition differently.
+void append_shader_resource_compile_keys(ShaderProgramStage stage,
+                                         const ShaderResourceTable& resources,
+                                         const std::shared_ptr<const std::vector<uint32_t>>& code,
+                                         std::vector<ShaderResourceCompileKey>& out) {
+    // Reuse cached exact-byte analysis for instruction-scoped resources. Owned sources use
+    // the same exact-PC selection and width as emission, including duplicate/poisoned entries.
+    // Guest addresses/content do not change module identity; admission state does.
+    std::shared_ptr<const DecodedShader> scalar_source_proof;
+    out.reserve(out.size() + resources.resources.size());
+    for (const auto& resource : resources.resources) {
+        const bool texture = resource.cls == ResourceClass::Texture;
+        const bool storage_image = resource.cls == ResourceClass::StorageImage;
+        const bool manual_compare = texture && resource.depth_compare;
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): the read make_shader_compile_key always made
+        const char* const no_normalize = std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
+        const bool normalize_unnormalized = texture && resource.unnormalized && !no_normalize;
+        const bool atomic_extent =
+            storage_image && resource.format == DataFormat::Uint32 && resource.num_components == 1;
+        ShaderResourceCompileKey compiled;
+        compiled.cls = static_cast<uint32_t>(resource.cls);
+        compiled.format = static_cast<uint32_t>(resource.format);
+        compiled.num_components = resource.num_components;
+        compiled.width = (atomic_extent || normalize_unnormalized) ? resource.width : 0u;
+        compiled.height = (atomic_extent || normalize_unnormalized) ? resource.height : 0u;
+        compiled.depth = (storage_image || normalize_unnormalized) ? resource.depth : 0u;
+        compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
+        compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
+        compiled.declared_mip_levels =
+            (texture || storage_image) ? resource.declared_mip_levels : 1u;
+        compiled.materialized_mip_levels =
+            texture ? shader_resource_compute_mip_chain_levels(resource) : 1u;
+        compiled.in_mip_tail = (texture || storage_image) && resource.in_mip_tail;
+        compiled.compression_enabled = (texture || storage_image) && resource.compression_enabled;
+        compiled.proven_zero_mip = (texture || storage_image) && resource.proven_zero_mip;
+        compiled.binding = resource.binding;
+        compiled.stride = resource.stride;
+        const bool one_record_tail =
+            resource.num_components == 1u && resource.stride == 2u && resource.size == 2u;
+        compiled.one_record_tail_semantic =
+            static_cast<uint32_t>(one_record_tail && resource.format == DataFormat::Uint16
+                                      ? StorageBufferTailSemantic::Uint16
+                                  : one_record_tail && resource.format == DataFormat::Float16
+                                      ? StorageBufferTailSemantic::Float16
+                                      : StorageBufferTailSemantic::None);
+        // A warm cache hit bypasses emitter-side resource revalidation. Partition on the
+        // complete resource-side admission result, not the serialized marker alone, so an
+        // opaque/corrupt marker cannot borrow a valid module across size, alignment, or array
+        // shape changes. Address identity remains intentionally absent; only alignment matters.
+        const bool atomic_x2_exact_admission =
+            resource.atomic_x2_record_count != 0u &&
+            resource.atomic_x2_record_count <= 0x02000000u &&
+            static_cast<uint64_t>(resource.atomic_x2_record_count) * 8u == resource.size &&
+            resource.stride == 8u && (resource.gpu_addr & 7u) == 0u &&
+            resource.table_index_count == 0u;
+        compiled.atomic_x2_record_count =
+            atomic_x2_exact_admission ? resource.atomic_x2_record_count : 0u;
+        compiled.scalar_buffer_dword_count = resource.scalar_buffer_dword_count;
+        compiled.scalar_buffer_contract_valid =
+            !resource.scalar_buffer_dword_count ||
+            shader_resource_buffer_binding_bytes(resource) != 0u;
+        compiled.srt_offset = resource.srt_offset;
+        compiled.sgpr_base = resource.sgpr_base;
+        compiled.fetch_pc = resource.fetch_pc;
+        compiled.nested_raw_snapshot_bytes =
+            stage == ShaderProgramStage::Compute && resource.nested_raw_snapshot_admitted &&
+                    resource.host_data && resource.host_data_size >= resource.size
+                ? resource.size
+                : 0u;
+        compiled.raw_register_snapshot_bytes = !resource.raw_register_snapshot ? 0u
+                                               : valid_raw_register_snapshot_resource(resource)
+                                                   ? resource.size
+                                                   : UINT32_MAX;
+        if (resource.fetch_pc != UINT32_MAX) {
+            if (!scalar_source_proof && code && !code->empty())
+                scalar_source_proof = decode_shader_cached(code->data(), code->size());
+            if (scalar_source_proof &&
+                std::binary_search(scalar_source_proof->raw_offset_scalar_source_pcs.begin(),
+                                   scalar_source_proof->raw_offset_scalar_source_pcs.end(),
+                                   resource.fetch_pc) &&
+                valid_raw_offset_scalar_snapshot_resource(resource))
+                compiled.raw_offset_scalar_snapshot_bytes = resource.size;
+            if (scalar_source_proof &&
+                std::binary_search(scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
+                                   scalar_source_proof->raw_owned_wide_data_load_pcs.end(),
+                                   resource.fetch_pc)) {
+                const auto load = rdna2_decode_one(code->data() + resource.fetch_pc,
+                                                   code->size() - resource.fetch_pc);
+                const uint32_t bytes = load.opcode == 0x2u ? 16u : 32u;
+                compiled.raw_owned_wide_snapshot_bytes =
+                    owned_raw_snapshot_at(resources, resource.fetch_pc, bytes) ? bytes : UINT32_MAX;
+            }
+            if (stage != ShaderProgramStage::Compute && scalar_source_proof) {
+                for (const auto& chain : scalar_source_proof->owned_nested_wide_chains) {
+                    if (resource.fetch_pc != chain.parent_pc && resource.fetch_pc != chain.child_pc)
+                        continue;
+                    const bool complete =
+                        owned_nested_snapshot_at(resources, chain.parent_pc, chain.parent_bytes) &&
+                        owned_nested_snapshot_at(resources, chain.child_pc, chain.child_bytes);
+                    compiled.owned_nested_snapshot_bytes =
+                        complete ? (resource.fetch_pc == chain.parent_pc ? chain.parent_bytes
+                                                                         : chain.child_bytes)
+                                 : UINT32_MAX;
+                }
+            }
+            if (stage == ShaderProgramStage::Compute && scalar_source_proof)
+                for (const auto& chain : scalar_source_proof->owned_raw_x2_chains) {
+                    if (resource.fetch_pc != chain.parent_pc && resource.fetch_pc != chain.child_pc)
+                        continue;
+                    compiled.owned_nested_snapshot_bytes =
+                        owned_nested_snapshot_at(resources, chain.parent_pc, 8u) &&
+                                owned_nested_snapshot_at(resources, chain.child_pc, 8u)
+                            ? 8u
+                            : UINT32_MAX;
+                }
+            if (resource.owned_nested_snapshot_bytes && !compiled.owned_nested_snapshot_bytes)
+                compiled.owned_nested_snapshot_bytes = UINT32_MAX;
+        }
+        compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
+        compiled.table_index_count = resource.table_index_count;
+        compiled.table_entry_stride = resource.table_entry_stride;
+        compiled.table_index_sgpr = resource.table_index_sgpr;
+        compiled.table_selector_mode = static_cast<uint32_t>(resource.table_selector_mode);
+        compiled.table_load_pc = resource.table_load_pc;
+        compiled.table_contract_valid = valid_shader_buffer_table_contract(resource);
+        compiled.flat_base_sgpr = resource.flat_base_sgpr;
+        compiled.bvh_box_grow = resource.bvh_box_grow;
+        compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
+        compiled.null_bvh = is_proven_null_bvh(resource);
+        // gpu_addr/size intentionally stay out of the module key, but this semantic is compiled
+        // into zero-producing/no-op instructions. Partition exactly this proven marker so a
+        // later nonzero descriptor at the same pc cannot reuse the specialized module.
+        compiled.zero_record_raw = is_zero_record_raw_buffer(resource);
+        compiled.optional_null_raw_load = is_optional_null_raw_load_buffer(resource);
+        // This marker elides a real one-record store, unlike NUM_RECORDS=0. Keep the admission
+        // result explicit even though its impossible V# stride also differs, so cache identity
+        // documents and enforces the semantic boundary directly.
+        compiled.proven_null_guarded_raw_store = is_proven_null_guarded_raw_store(resource);
+        compiled.proven_null_nullable_raw_buffer = is_proven_null_nullable_raw_buffer(resource);
+        compiled.gta5_cf9200_no_backing = is_proven_gta5_cf9200_no_backing(resource);
+        if (is_gta5_selected_sbuffer_descriptor(resource)) {
+            compiled.selected_sbuffer_soffset = resource.selected_sbuffer_soffset;
+            compiled.selected_sbuffer_words = resource.selected_sbuffer_words;
+        }
+        if (is_gta5_packed_pointer_resource(resource)) {
+            compiled.indirect_buffer_contract_tag = resource.indirect_buffer_contract_tag;
+            compiled.indirect_buffer_binding_bytes = resource.indirect_buffer_binding_bytes;
+            compiled.indirect_buffer_slot_count = resource.indirect_buffer_slot_count;
+            compiled.indirect_buffer_header_bytes = resource.indirect_buffer_header_bytes;
+            compiled.indirect_buffer_slot_bytes = resource.indirect_buffer_slot_bytes;
+        }
+        if (is_indirect_pointer_relocation_resource(resource)) {
+            const auto& relocation = resource.indirect_pointer_relocation;
+            compiled.indirect_pointer_carrier_version = relocation.carrier_version;
+            compiled.indirect_pointer_proof_schema = relocation.proof_schema;
+            compiled.indirect_pointer_binding_bytes = relocation.binding_bytes;
+            compiled.indirect_pointer_record_count = relocation.record_count;
+            compiled.indirect_pointer_segment_count = relocation.segment_count;
+            compiled.indirect_pointer_segment_directory_byte_offset =
+                relocation.segment_directory_byte_offset;
+            compiled.indirect_pointer_proof_fingerprint = relocation.proof_fingerprint;
+        }
+        compiled.srgb = storage_image && resource.srgb;
+        compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
+        compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
+        compiled.mag_filter = manual_compare ? resource.mag_filter : 0u;
+        compiled.addr_u = manual_compare ? resource.addr_uvw[0] : 0u;
+        compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
+        compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
+        compiled.normalize_unnormalized_coordinates = normalize_unnormalized;
+        compiled.emitted_dst_sel = compile_key_dst_sel(resource);
+        out.push_back(compiled);
+    }
+}
 
 ShaderAnalysisCacheStats shader_analysis_cache_stats() {
     auto& cache = shader_analysis_cache();
@@ -7101,10 +7105,13 @@ bool owned_nested_snapshot_is_futile(const GpuState& state,
 std::shared_ptr<ShaderResourceTable>
 build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t draw_vertex_count,
                   uint64_t draw_command_order, const GraphicsRawSnapshotContext* raw_context,
-                  const CheckedGraphicsSource* checked_source,
-                  GraphicsReadSource* original_source) {
+                  const CheckedGraphicsSource* checked_source, GraphicsReadSource* original_source,
+                  std::span<const uint32_t> linked) {
     if (original_source) *original_source = {};
-    if (!code_addr) return nullptr;
+    if (!code_addr || (!linked.empty() && checked_source)) return nullptr;
+    // A linked merged-NGG chain (#3135 P5) folds the prolog+main words under the prolog's header.
+    const auto* code =
+        linked.empty() ? reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)) : linked.data();
     const auto stage = is_ps ? ShaderProgramStage::Fragment : ShaderProgramStage::Vertex;
     if (checked_source && !checked_source->belongs_to(st, code_addr, draw_command_order, stage))
         return std::make_shared<ShaderResourceTable>();
@@ -7122,13 +7129,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
     const auto metadata_start = phase_timing ? StageClock::now() : StageClock::time_point{};
     namespace P = prosper::agc::Pm4;
     const bool log = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG");
-    const size_t shader_dwords = checked_source ? checked_source->source().decoded->source_dwords
-                                                : registered_shader_dwords(*hdr, code_addr);
-    const auto full_source =
-        checked_source
-            ? checked_source->source().decoded
-            : decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)),
-                                   shader_dwords);
+    const size_t shader_dwords = checked_source    ? checked_source->source().decoded->source_dwords
+                                 : !linked.empty() ? linked.size()
+                                                   : registered_shader_dwords(*hdr, code_addr);
+    const auto full_source = checked_source ? checked_source->source().decoded
+                                            : decode_shader_cached(code, shader_dwords);
     if (original_source) {
         *original_source =
             checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
@@ -7605,19 +7610,14 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
     PcrelDispatchSelection dispatch_selection;
     std::shared_ptr<const ShaderCodeAnalysis> shader_analysis;
     if (is_ps) {
-        shader_analysis = checked_source
-                              ? checked_source->analysis()
-                              : analyze_shader_code_cached(reinterpret_cast<const uint32_t*>(
-                                                               static_cast<uintptr_t>(code_addr)),
-                                                           shader_dwords);
-        dispatch_selection = select_pcrel_dispatch(
-            (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources,
-            shader_analysis.get());
+        shader_analysis = checked_source ? checked_source->analysis()
+                                         : analyze_shader_code_cached(code, shader_dwords);
+        dispatch_selection =
+            select_pcrel_dispatch(code, shader_dwords, &primary_resources, shader_analysis.get());
     }
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       primary_sgprs, kUserSgprs, 0, &srt_uses,
+        dyn_vb = resolve_dynamic_fetch(code, shader_dwords, primary_sgprs, kUserSgprs, 0, &srt_uses,
                                        dispatch_selection.target, &dispatch_selection.dispatch,
                                        nullptr, 0, nested_reader.get(), checked_source);
     } else {
@@ -7634,10 +7634,9 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
             system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
             system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
         }
-        dyn_vb =
-            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                  primary_sgprs, kUserSgprs, 8, &srt_uses, UINT32_MAX, nullptr,
-                                  system_sgprs, system_count, nested_reader.get(), checked_source);
+        dyn_vb = resolve_dynamic_fetch(code, shader_dwords, primary_sgprs, kUserSgprs, 8, &srt_uses,
+                                       UINT32_MAX, nullptr, system_sgprs, system_count,
+                                       nested_reader.get(), checked_source);
         if (log || PROSPER_ENV_ON("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -7684,9 +7683,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
             read_user_sgprs(st.sh, base + range_start, sgprs);
             t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         }
-        set_owned_raw_snapshot_requirements(
-            t, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords,
-            full_source);
+        set_owned_raw_snapshot_requirements(t, code, shader_dwords, full_source);
         // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
@@ -7809,21 +7806,15 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
                 if (clash && !exact_mtbuf) dedupe.note_clash(u);   // a real holder of the key
                 if (u.kind == 6) {
-                    add_owned_raw_wide_snapshot(t, u,
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                        shader_dwords);
+                    add_owned_raw_wide_snapshot(t, u, code, shader_dwords);
                     continue;
                 }
                 if (u.kind == 5) {
-                    add_raw_offset_scalar_snapshot(t, u,
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                        shader_dwords);
+                    add_raw_offset_scalar_snapshot(t, u, code, shader_dwords);
                     continue;
                 }
                 if (u.kind == 4) {
-                    if (auto snapshot = raw_register_snapshot_resource(u,
-                            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                            shader_dwords))
+                    if (auto snapshot = raw_register_snapshot_resource(u, code, shader_dwords))
                         t.resources.push_back(*snapshot);
                     continue;
                 }
@@ -7834,11 +7825,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         continue;
                     if (d.base <= 0x10000) continue;
                     const uint32_t scalar_buffer_dwords =
-                        validated_scalar_buffer_dword_count(
-                            u, d,
-                            reinterpret_cast<const uint32_t*>(
-                                static_cast<uintptr_t>(code_addr)),
-                            shader_dwords);
+                        validated_scalar_buffer_dword_count(u, d, code, shader_dwords);
                     if (u.scalar_buffer_dword_count && !scalar_buffer_dwords) continue;
                     uint32_t resource_size = d.size_bytes;
                     uint32_t resource_stride = d.stride;
@@ -7925,8 +7912,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     //   * #4592 generalizes "all-zero" to t8_samples_constant_zero: base zero and
                     //     constant-zero selectors, which is what makes the all-zero T# null.
                     // The consuming op decides which null rule applies (texel reads only widen).
-                    const auto* use_code =
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr));
+                    const auto* use_code = code;
                     const bool texel_read = u.use_pc < shader_dwords && [&] {
                         const Rdna2Inst op =
                             rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);

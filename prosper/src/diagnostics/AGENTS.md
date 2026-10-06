@@ -261,7 +261,14 @@ before adding a parallel one.
 
 **The 2026-09-28 queue rules** (#3891) each hang off an event path that already existed, so none
 costs anything on an accepted draw, reference or present: `unaccounted-draws` is the
-`draw_disposition` census's own `UNACCOUNTED` blind spot, added once per pass; `unimplemented-hle-calls`
+`draw_disposition` census's own `UNACCOUNTED` blind spot, added once per pass. Its `seen` is
+counted ONCE, at the backend pass's entry (`DrawDispositionPassScope` at the top of
+`render_draw_pass_rgba`, plus `refuse_draw_pass` for `render_draws_rgba`'s whole-batch preflight),
+not per draw inside the setup loop: counted there, any `return` before the loop left
+seen = recorded = dropped = 0 and the pass balanced trivially, which is how #4643's two-target
+volume draws were lost for weeks with this alarm silent. So a refusal site must name its cause
+(`return disposition.refuse(DD::X, out)`, a `DrawDrop` reason), and any exit that names nothing is
+UNACCOUNTED by construction. Passes on a thread inside `SuppressDrawDropCounting` count nothing; `unimplemented-hle-calls`
 counts the dispatcher's `prosper_on_unimpl` and fires on the FIRST call of an unregistered NID after
 the first flip (boot-time ones are before the engine's baseline); `diagnostic-path-active` is a
 gauge the live renderer sets once, naming the switch that turned GPU-resident colour targets off;
