@@ -473,6 +473,27 @@ TEST(RawWideReplayedLoad, ACarryInFromAFreshCompareIsNotANumericRead) {
     EXPECT_EQ(pc, 5u);
 }
 
+TEST(RawWideReplayedLoad, ADefiniteLaneReadEndsTheMarkOnItsDestination) {
+    // s_mov_b32 s20, s19 ; v_readfirstlane s20, v1 ; v_mov_b32 v0, s20. The copy carries a
+    // loaded word into s20, and v_readfirstlane then replaces s20 whatever EXEC is. Only
+    // v_readlane was treated as a definite write, so s20 kept the load's mark and the v_mov
+    // was a numeric reader (#4555, the MOUSE program: vcc_hi rewritten at its pc 390).
+    const uint32_t copy = 0xbe940313u, lane_read = 0x7e280501u, reader = 0x7e000214u;
+    const auto replaced = program({.in_loop = {copy, lane_read, reader}});
+    ASSERT_EQ(at(replaced, 5).dst.value, 20);
+    ASSERT_EQ(at(replaced, 5).src[0].value, 19);
+    ASSERT_EQ(at(replaced, 6).fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(at(replaced, 6).opcode, 0x02u);
+    ASSERT_EQ(at(replaced, 6).dst.value, 20);
+    ASSERT_EQ(at(replaced, 7).src[0].value, 20);
+    EXPECT_FALSE(flagged(replaced)) << numeric_blocker(replaced);
+    // Control: without the lane read the v_mov reads the copied word.
+    const auto copied = program({.in_loop = {copy, reader}});
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(copied, &pc), "numeric-reader");
+    EXPECT_EQ(pc, 6u);
+}
+
 TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
     // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
     // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it

@@ -360,6 +360,9 @@ public:
                 (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                  in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
                  (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
+                 // The two lane reads write their SGPR whatever EXEC is. Only v_readlane was
+                 // listed, so a register v_readfirstlane had just replaced kept its old mark.
+                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u) ||
                  (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u));
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
