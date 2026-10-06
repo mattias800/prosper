@@ -809,6 +809,18 @@ route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1`
 by that setting. No new runtime result or rung change is claimed here.
 
 ## Ruled out — eliminated, do not re-run these
+- **"Holding a queue's EOP completion pulse while a default-model WaitRegMem is unsatisfied stops the
+  guest recycling the label block (the Windows `FMallocBinned3 ... unrecognized block 7c00000001`
+  death)."** **Not supported, 2026-10-05.** Windows/NVIDIA, field route, fresh saves, two builds of the
+  same tree differing only in the hold, 8 runs per arm of 60 s: guest allocator fatal 1 of 8 without
+  the hold and 2 of 8 with it, host segfault 3 of 8 against 5 of 8, ran the full 60 s 4 of 8 against
+  2 of 8. n=8 is too small to say the hold made it worse, but it shows no improvement, and both
+  fatals in the hold arm still occurred with the pulse held. A watch on a crashing run showed prosper's
+  deferred DMA-init and REL1 label writes landing about 1.5 s after the label was built (about 200 ms
+  in ordinary cycles), after the guest allocator had already reused the block, so the late write is
+  real; what makes the guest recycle the block before it is not the EOP pulse. Two fatals occurred
+  with no unsatisfied-wait line at all. The remaining lever, `PROSPER_WAIT_DEFER=1`, removes the violated
+  waits but 3 of 6 runs still segfaulted silently at 16-20 s. #2982.
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
   raising the confirm rate from one per 15 s to one per 2 s takes the run from 0 field-HUD frames to
   144. See *The field state is reached* above for the three-run table. #1874.
