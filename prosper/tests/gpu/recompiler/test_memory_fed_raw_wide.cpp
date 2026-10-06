@@ -272,9 +272,35 @@ TEST(MemoryFedRawWide, Contract) {
     auto dynamic = code;
     dynamic.insert(dynamic.begin() + 2, 0x7e080500u); // v_readfirstlane_b32 s4,v0
     CHECK(proof(dynamic).empty(), "a wave-derived replacement of the fetched scalar stays unproven");
+    // The register-offset wide load reads the fold's exact per-PC snapshot and never re-reads its
+    // base register, and control is forward-only, so its entry pair need only survive UNTIL the
+    // load (UE4's NGG vertex programs reuse s[34:35] after it). An overwrite before it still
+    // refuses.
     auto wide_pointer = code;
-    wide_pointer.insert(wide_pointer.begin() + 9, 0xbe800380u);
-    CHECK(proof(wide_pointer).empty(), "wide source still requires its full-program entry-pair lifetime");
+    wide_pointer.insert(wide_pointer.begin() + 9, 0xbe800380u);   // s_mov_b32 s0, 0 after the x4
+    const auto wide_pointer_table = table_for(wide_pointer);
+    CHECK(proof(wide_pointer) == std::vector<uint32_t>{7u} && wide_pointer_table.by_fetch_pc(7u) &&
+              wide_pointer_table.by_fetch_pc(7u)->gpu_addr == address + 32u,
+          "a wide source pointer overwritten after the load keeps the proof and its snapshot");
+    auto wide_pointer_early = code;
+    wide_pointer_early.insert(wide_pointer_early.begin() + 7, 0xbe800380u);   // before the x4
+    CHECK(proof(wide_pointer_early).empty(),
+          "a wide source pointer overwritten before the load stays unproven");
+    // A branch BEFORE the latched source is harmless unless it lands between source and load.
+    auto join_before = code;
+    join_before.insert(join_before.begin(), 0xbf840000u);   // s_cbranch_scc0 -> the x1 source
+    const auto join_before_table = table_for(join_before);
+    CHECK(proof(join_before) == std::vector<uint32_t>{8u} && join_before_table.by_fetch_pc(1u) &&
+              join_before_table.by_fetch_pc(8u) &&
+              join_before_table.by_fetch_pc(8u)->gpu_addr == address + 32u,
+          "a branch landing at the source joins ahead of it");
+    auto lands_between = code;
+    lands_between.insert(lands_between.begin(), 0xbf840004u);   // s_cbranch_scc0 -> s_lshl (pc5)
+    CHECK(proof(lands_between).empty(), "a branch landing between source and load stays unproven");
+    auto skipped_writer = code;
+    skipped_writer.insert(skipped_writer.begin(), {0xbf840001u, 0xbe820380u});   // may skip s2 = 0
+    CHECK(proof(skipped_writer).empty(),
+          "a source-pointer write on either path before the read stays unproven");
     auto no_scalar = table;
     no_scalar.resources.erase(no_scalar.resources.begin());
     CHECK(recompile_valu(code.data(), code.size(), 1u, 0u, &no_scalar).empty(),
