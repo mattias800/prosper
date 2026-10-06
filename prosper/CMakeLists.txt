@@ -753,6 +753,10 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_wrapper_identity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_compiler_wrapper.py")
+    set_tests_properties(compiler_wrapper_identity PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compiler_source_identity
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"

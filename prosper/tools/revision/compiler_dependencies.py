@@ -4,15 +4,16 @@ This runs before compilation, using current resolved compile commands, not stale
 configure-only source census. The output is ONLY a digest. Unsupported invocation/dependency
 syntax fails closed; CMake embeds unknown rather than claiming a complete compiler case.
 """
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 MAX_UNITS, MAX_PATHS, MAX_BYTES = 1024, 16384, 256 * 1024 * 1024
 
@@ -35,12 +36,56 @@ def argv(command):
         ctypes.windll.kernel32.LocalFree(ctypes.cast(result, ctypes.c_void_p))
 
 
+DRIVER = re.compile(r"(?:[\w.-]+-)?(?:g\+\+|gcc|c\+\+|clang\+\+|clang)(?:-\d+(?:\.\d+)*)?(?:\.exe)?")
+WRAPPER = re.compile(r"(?:ccache|sccache)(?:\.exe)?")
+
+
+def unwrap_compiler(args, search_path=None):
+    """The real compiler behind a compiler-cache wrapper, and the argv that compiler receives.
+
+    A cache wrapper does not change what is compiled, so the identity is the compiler it forwards
+    to. Two spellings reach compile_commands.json (#4356): the explicit `ccache g++ ...`, and the
+    masquerade `/usr/lib64/ccache/c++ ...`, a symlink to ccache that finds the real `c++` by
+    searching PATH and skipping every entry that is itself the wrapper. Both are resolved here the
+    same way the wrapper resolves them; anything else fails closed.
+    """
+    first = Path(args[0])
+    resolved = first.resolve(strict=True)
+    if not WRAPPER.fullmatch(resolved.name):
+        return resolved, args
+    if WRAPPER.fullmatch(first.name):
+        # Explicit form: the compiler is the next argument, found the way a shell would.
+        if len(args) < 2 or args[1].startswith("-"):
+            raise ValueError("compiler wrapper without a compiler")
+        named = shutil.which(args[1], path=search_path)
+        if not named:
+            raise ValueError("wrapped compiler not found")
+        real, rest = Path(named).resolve(strict=True), args[1:]
+    else:
+        # Masquerade: the same basename, later on PATH, that is not the wrapper itself.
+        real = None
+        for entry in (search_path if search_path is not None else os.environ.get("PATH", "")).split(os.pathsep):
+            candidate = Path(entry or ".") / first.name
+            if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+                continue
+            target = candidate.resolve(strict=True)
+            if not WRAPPER.fullmatch(target.name):
+                real = target
+                break
+        if real is None:
+            raise ValueError("masqueraded compiler not found")
+        rest = args
+    if WRAPPER.fullmatch(real.name):
+        raise ValueError("compiler wrapper chain unsupported")
+    return real, [str(real)] + list(rest[1:])
+
+
 def dependencies(command):
     args = command.get("arguments") or argv(command["command"])
     if not args or any(x.startswith("@") for x in args):
         raise ValueError("response/wrapped compiler invocation unsupported")
-    compiler = Path(args[0]).resolve(strict=True)
-    if not re.fullmatch(r"(?:[\w.-]+-)?(?:g\+\+|gcc|c\+\+|clang\+\+|clang)(?:-\d+(?:\.\d+)*)?(?:\.exe)?", compiler.name):
+    compiler, args = unwrap_compiler(args)
+    if not DRIVER.fullmatch(compiler.name):
         raise ValueError("compiler driver unsupported")
     filtered = [str(compiler)]
     skip = False
@@ -102,6 +147,9 @@ def dependencies(command):
 
 def secondary_commands(commands_path, root, required):
     """Same-sysroot producer argv emitted by the opt-in mixed Windows build seam."""
+    # Sources are compared after resolve(), so the root must be resolved too: a work tree reached
+    # through a symlink would otherwise own none of its own files.
+    root = Path(root).resolve(strict=True)
     directory = commands_path.parent / "gnu-variadic"
     manifests = sorted(directory.glob("*.obj.argv"))
     if len(manifests) > 16:
@@ -134,6 +182,7 @@ def secondary_commands(commands_path, root, required):
 
 def fingerprint(commands_file, root, secondary_required=False):
     commands_path = Path(commands_file)
+    root = Path(root).resolve(strict=True)   # see secondary_commands
     if commands_path.stat().st_size > 32 * 1024 * 1024:
         raise ValueError("compile command budget")
     commands = json.loads(commands_path.read_text(encoding="utf-8"))
@@ -173,7 +222,10 @@ if __name__ == "__main__":
                 raise ValueError("secondary policy argument")
             required = value in ("1", "ON", "TRUE")
         print(fingerprint(sys.argv[1], Path(sys.argv[2]).resolve(strict=True), required))
-    except Exception:
-        # Do not print private compiler/header paths or subprocess stderr in a public build log.
-        print("compiler dependency identity unavailable", file=sys.stderr)
+    except Exception as error:
+        # This module's own refusals are plain ValueErrors with fixed, path-free phrases, so their
+        # reason is safe to show. Anything else (OSError, JSON/Unicode decode errors, subprocess
+        # failures) can carry a private path or file content and is named by type only.
+        reason = str(error) if type(error) is ValueError else type(error).__name__
+        print(f"compiler dependency identity unavailable: {reason}", file=sys.stderr)
         sys.exit(2)

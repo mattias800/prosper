@@ -46,7 +46,13 @@ if(PROSPER_REVISION_WORK_TREE AND PROSPER_REVISION_CONFIG_ID)
       "${PROSPER_REVISION_COMPILE_COMMANDS}" "${PROSPER_REVISION_WORK_TREE}"
       "${PROSPER_REVISION_GNU_VARIADIC_REQUIRED}"
       RESULT_VARIABLE _dependencies_result OUTPUT_VARIABLE _dependencies_hash
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_VARIABLE _dependencies_error
+      ERROR_STRIP_TRAILING_WHITESPACE)
+    # The scanner's stderr is a single path-free reason; show it so an "unknown" identity can be
+    # diagnosed from the build log (#4356) instead of by patching the script.
+    if(NOT _dependencies_result EQUAL 0)
+      message(STATUS "prosper build revision: ${_dependencies_error}")
+    endif()
     string(APPEND _source_manifest "|dependencies=${_dependencies_hash}")
   endif()
   foreach(_relative IN LISTS _source_inputs)
