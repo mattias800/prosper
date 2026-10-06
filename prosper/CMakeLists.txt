@@ -2627,6 +2627,12 @@ if(TARGET prosper_core)
     SOURCES tests/host/test_dmem.cpp
     LIBRARIES prosper_core)
 
+  # An over-cap buffer window publishes clamped to its mapped run, outside the replayable fold.
+  prosper_add_gtest(test_oversize_buffer_window
+    SOURCES tests/gpu/execute/test_oversize_buffer_window.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+
   # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
   prosper_add_gtest(test_dmem_fixed_remap
     SOURCES tests/hle/memory/test_dmem_fixed_remap.cpp
