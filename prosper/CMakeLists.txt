@@ -5051,6 +5051,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
+      # counted-loop route declines and the general route lowers both loops, executed per lane.
+      prosper_add_gtest(test_counted_loop_prelude_exec_loop
+        SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops

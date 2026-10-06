@@ -6930,11 +6930,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return true;
     };
     auto& safe_branches = effective_safe;
-    if (L.found) {
-        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+    // The counted-loop route claims the whole program, but `detect_counted_loop` only counts
+    // s_branch and SCC back-edges: a bottom-tested EXEC loop (`s_andn2_b64 exec, exec, vcc;
+    // s_cbranch_execnz header`) in the prelude is invisible to it. Probe the prelude before
+    // committing, so a prelude this route cannot structure falls back to the general route below
+    // (divergent loops, forward ifs, then the CFG dispatcher), which does know that loop shape.
+    bool counted_route = L.found;
+    bool guarded_narrow_entry = false;
+    std::vector<ForwardIf> preloop_ifs;
+    Rdna2Inst preloop_end;
+    if (counted_route) {
         // Proven wave-empty EXEC guards around or inside the loop (rdna2_counted_loop_guard.cpp).
-        const bool guarded_narrow_entry = mark_counted_loop_exec_guards(ins, L, effective_safe);
+        guarded_narrow_entry = mark_counted_loop_exec_guards(ins, L, effective_safe);
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
         // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
         // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
@@ -6951,14 +6958,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 branch_target(in) >= L.header_pc) continue;
             preloop.push_back(in);
         }
-        Rdna2Inst preloop_end;
         preloop_end.pc = L.header_pc;
         preloop_end.is_end = true;
         preloop.push_back(preloop_end);
         bool preloop_rejected = false;
-        const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
-            preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
-            &preloop_rejected, /*compute_wave_branches*/b.is_compute, b.diagnostic);
+        preloop_ifs = detect_forward_ifs(preloop, /*allow_vcc*/ !b.is_compute, code, dwords,
+                                         &effective_safe, nullptr, &preloop_rejected,
+                                         /*compute_wave_branches*/ b.is_compute, b.diagnostic);
         // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
         // and records it as early_out. In this truncated prelude that can be a real branch over the
         // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
@@ -6967,13 +6973,38 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return branch.early_out ||
                     (branch.has_else ? branch.merge_pc : branch.target_pc) > L.header_pc;
             });
-        if (preloop_rejected || preloop_if_unsupported) {
-            log_recompile_diagnostic(
-                b.diagnostic, "recompile-reject", "terminal",
-                "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
-                preloop_rejected, preloop_ifs.size(), L.header_pc);
+        if (preloop_if_unsupported) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
+                                     preloop_rejected, preloop_ifs.size(), L.header_pc);
             return false;
         }
+        if (preloop_rejected) {
+            // The prelude holds control flow the forward-if scan refuses without loop information
+            // (Kena's 0x5006fb0000 carries a bottom-tested EXEC loop before its counted loop). Nothing
+            // has been emitted yet, so decline this route instead of refusing the program. Undo the
+            // guard marks above: they were proven for THIS route's loop structure, and the general
+            // route must start from the caller's linearization set, as it does for any program
+            // without a counted loop.
+            log_recompile_diagnostic(
+                b.diagnostic, "compute-struct-reject", "route-decline",
+                "counted-loop prelude cfg rejected header=%u: trying the general route",
+                L.header_pc);
+            effective_safe = safe;
+            guarded_narrow_entry = false;
+            preloop_ifs.clear();
+            counted_route = false;
+        }
+    }
+    if (counted_route) {
+        auto vget = [&](int r) {
+            auto it = rs.vreg.find(r);
+            return it == rs.vreg.end() ? b.uconst(0) : it->second;
+        };
+        auto sget = [&](int r) {
+            auto it = rs.sreg.find(r);
+            return it == rs.sreg.end() ? b.uconst(0) : it->second;
+        };
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
         } else if (preloop_ifs.size() > 1) {
