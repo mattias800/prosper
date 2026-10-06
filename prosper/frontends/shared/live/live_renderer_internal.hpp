@@ -172,6 +172,29 @@ struct RttSurf {
     prosper::test::BackendGuestProducerOrigins guest_origins;
     prosper::test::BackendGuestProducerOrigins dcc_guest_origins;
 };
+
+// Can this cached target serve a sampled descriptor of this extent and per-texel size? (#4197)
+// A refusal is logged (first 32, then powers of two) so a cross-title false refusal is visible.
+inline bool live_rtt_serves_sampled_view(const RttSurf& surf, uint64_t addr, uint32_t w, uint32_t h,
+                                         uint32_t render_scale, bool normalized_sampling,
+                                         uint32_t view_bytes_per_texel) {
+    const bool extent_ok = rtt_sampled_extent_compatible(w, h, surf.w, surf.h, render_scale,
+                                                         normalized_sampling);
+    const bool ok = live_rtt_serves_sampled_view(
+        w, h, surf.w, surf.h, render_scale, normalized_sampling, surf.format, surf.guest_format,
+        surf.volume_depth + (surf.volume_guest_bytes != 0u), view_bytes_per_texel);
+    if (extent_ok && !ok) {
+        static std::atomic<uint64_t> refusals{0};
+        const uint64_t n = ++refusals;
+        if (n <= 32u || (n & (n - 1u)) == 0u)
+            std::fprintf(stderr,
+                         "[rtt] footprint-alias refusal #%llu addr=0x%llx %ux%u view=%u B/texel "
+                         "cached guest_format=%d host_format=%d\n",
+                         (unsigned long long)n, (unsigned long long)addr, w, h,
+                         view_bytes_per_texel, (int)surf.guest_format, (int)surf.format);
+    }
+    return ok;
+}
 // What a retained colour target keeps from a descriptor that samples it with DCC enabled: where
 // its metadata is, and how the descriptor reads a clear code. `metadata_bytes` is that
 // descriptor's gpu_capture_dcc_metadata_footprint.

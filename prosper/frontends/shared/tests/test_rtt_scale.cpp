@@ -14,6 +14,7 @@ using prosper::frontend::rtt_integer_upscale_factor;
 using prosper::frontend::rtt_direct_import_compatible;
 using prosper::frontend::rtt_gpu_seed_import_extent_compatible;
 using prosper::frontend::rtt_sampled_extent_compatible;
+using prosper::frontend::rtt_sampled_texel_footprint_compatible;
 using prosper::frontend::rtt_scaled_axis;
 using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
@@ -222,4 +223,18 @@ TEST(RttScale, Contract) {
     CHECK(live_rtt_color_footprint_bytes(UINT32_MAX, UINT32_MAX, UINT32_MAX, 16) ==
           UINT64_MAX);
 
+}
+
+// #4197: AC Black Flag Resynced samples a 2-byte R16_FLOAT target through a 4-component 8-bit
+// descriptor. The cached half-max values are not that view's bytes; serving them painted the frame red.
+TEST(RttScale, SampledViewNeedingMoreBytesThanTheCachedTargetIsAnAlias) {
+    CHECK(!rtt_sampled_texel_footprint_compatible(/*RGBA8*/ 4u, /*R16F*/ 2u));
+    CHECK(!rtt_sampled_texel_footprint_compatible(/*RGBA16F*/ 8u, /*RGBA8*/ 4u));
+    // Same size, or a narrower view of a wider target, is still served as before.
+    CHECK(rtt_sampled_texel_footprint_compatible(2u, 2u));
+    CHECK(rtt_sampled_texel_footprint_compatible(4u, 8u));
+    CHECK(rtt_sampled_texel_footprint_compatible(1u, 4u));
+    // Unknown or packed formats report zero and are never grounds to refuse.
+    CHECK(rtt_sampled_texel_footprint_compatible(0u, 2u));
+    CHECK(rtt_sampled_texel_footprint_compatible(4u, 0u));
 }
