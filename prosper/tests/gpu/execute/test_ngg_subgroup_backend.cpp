@@ -278,7 +278,9 @@ TEST(NggSubgroupBackend, DescriptionGroupsWaveCountsAndOrdersRuns) {
     EXPECT_EQ(lut->groups[0].blocks, 32u);
     EXPECT_EQ(lut->groups[0].launch_words.size(), 32u * 64u * kNggLaunchWordsPerLane);
     EXPECT_EQ(lut->runs.size(), 1u);
-    EXPECT_EQ(lut->guest_bindings, (std::vector<uint32_t>{2, 3, 4, 5, 6, 7, 8, 9}));
+    // Binding 2 (the direct V# at s8) is declared but every load goes through the fetch-PC
+    // entries: only ACCESSED bindings are guest bindings, as the frontend only builds those.
+    EXPECT_EQ(lut->guest_bindings, (std::vector<uint32_t>{3, 4, 5, 6, 7, 8, 9}));
 
     const auto strip = kena_draw(*ctx, 76, 2, 2, &why);
     ASSERT_TRUE(strip) << why;
@@ -701,7 +703,7 @@ TEST(NggSubgroupBackend, OnlyTheFirstRunCarriesSetZero) {
         for (const auto& r : d.B) n += r.set == set;
         return n;
     };
-    EXPECT_EQ(set_count(out[0], 0), ngg->guest_bindings.size());
+    EXPECT_EQ(set_count(out[0], 0), set_count(in[0], 0)) << "the first run keeps all of set 0";
     for (size_t i = 1; i < out.size(); ++i) {
         EXPECT_EQ(set_count(out[i], 0), 0u) << "run " << i;
         EXPECT_GE(set_count(out[i], kNggRasterDescriptorSet), 1u) << "run " << i;

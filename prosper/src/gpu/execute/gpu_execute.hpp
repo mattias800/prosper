@@ -32,6 +32,7 @@
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
 #include "gpu/execute/ngg_live_draw.hpp"       // its live producer (#3135 P5)
+#include <span>
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
@@ -608,7 +609,9 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
                   uint32_t draw_vertex_count = 0, uint64_t draw_command_order = 0,
                   const GraphicsRawSnapshotContext* raw_context = nullptr,
                   const CheckedGraphicsSource* checked_source = nullptr,
-                  GraphicsReadSource* original_source = nullptr);
+                  GraphicsReadSource* original_source = nullptr,
+                  // #3135 P5: fold these linked prolog+main words under code_addr's header.
+                  std::span<const uint32_t> linked = {});
 
 // PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
 // AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
@@ -2854,11 +2857,17 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg.facts.interpolation_geometry_required = interpolation.requires_geometry;
         ngg.user_data_complete =
             read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
-        ngg.prolog = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr));
-        ngg.prolog_prefix_dwords = vertex_prolog.prefix_dwords;
-        ngg.main = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr));
-        ngg.main_dwords = chain_dwords;
-        ngg.resources = vrt.get();
+        ngg.linked = ngg_linked_chain(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+            vertex_prolog.prefix_dwords,
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords);
+        // The shell runs the LINKED program, so its table is folded over the linked words.
+        const std::shared_ptr<ShaderResourceTable> ngg_vrt =
+            ngg.linked ? build_stage_table(ds, rs.es_addr, false, vcount_hint,
+                                           draw ? draw->command_order : 0, raw_context, nullptr,
+                                           nullptr, *ngg.linked)
+                       : nullptr;
+        ngg.resources = ngg_vrt.get();
         ngg.pixel_inputs = pixel_input_ptr;
         ngg.interpolation = interpolation;
         ngg.float_transport = float_transport;
@@ -2866,6 +2875,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         const NggLiveDrawResult result =
             realize_ngg_live_draw(ngg, published_ngg_host_capabilities());
         ngg_subgroup = result.draw;
+        if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused") : nullptr;
         if (PROSPER_ENV_ON("PROSPER_DBG") && result.applies) {
@@ -2874,10 +2884,25 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const std::lock_guard lock(ngg_log_mutex);
             if (ngg_logged.size() < 64 &&
                 ngg_logged.emplace(rs.es_addr, ngg_refusal ? ngg_refusal : "").second)
-                fprintf(stderr, "[ngg-live] es=0x%llx chain=0x%llx %s%s %s\n",
+            {
+                std::string table;
+                if (ngg_vrt)
+                    for (const auto& r : ngg_vrt->resources) {
+                        char item[128];
+                        std::snprintf(item, sizeof item, " b%u:c%u:pc%d:s%d:o%u:r%d:@%llx+%u:h%d",
+                                      r.binding, static_cast<unsigned>(r.cls),
+                                      static_cast<int>(r.fetch_pc), static_cast<int>(r.sgpr_base),
+                                      r.owned_raw_snapshot_bytes,
+                                      static_cast<int>(r.raw_register_snapshot),
+                                      static_cast<unsigned long long>(r.gpu_addr), r.size,
+                                      static_cast<int>(r.host_data != nullptr));
+                        table += item;
+                    }
+                fprintf(stderr, "[ngg-live] es=0x%llx chain=0x%llx %s%s %s table=%s\n",
                         (unsigned long long)rs.es_addr, (unsigned long long)chain_addr,
                         ngg_refusal ? "refused reason=" : "admitted",
-                        ngg_refusal ? ngg_refusal : "", result.detail.c_str());
+                        ngg_refusal ? ngg_refusal : "", result.detail.c_str(), table.c_str());
+            }
         }
     }
     if (!ngg_subgroup && ((vs_words.empty() && !owned_vertex) ||

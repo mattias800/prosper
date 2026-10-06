@@ -535,7 +535,18 @@ public:
             ngg_subgroup_backend_stats().last_export_buffer.store(
                 std::bit_cast<uint64_t>(prelude.exports.front().buffer()));
             ngg_subgroup_backend_stats().last_export_offset.store(prelude.exports.front().offset);
-            ngg_subgroup_backend_stats().draws.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t recorded =
+                ngg_subgroup_backend_stats().draws.fetch_add(1, std::memory_order_relaxed);
+            // Bounded positive evidence that the path ran: the first draw, then every 4096th.
+            if (recorded == 0 || recorded % 4096 == 0) {
+                uint32_t blocks = 0;
+                for (const auto& group : prelude.ngg->groups) blocks += group.blocks;
+                std::fprintf(stderr,
+                             "[ngg-backend] recorded merged-NGG draw #%llu: %zu dispatch(es), "
+                             "%u subgroup(s), %zu run(s)\n",
+                             static_cast<unsigned long long>(recorded + 1),
+                             prelude.ngg->groups.size(), blocks, prelude.ngg->runs.size());
+            }
         }
         if (!any) return;
         auto self = shared_from_this();
@@ -588,7 +599,7 @@ private:
     }
 
     bool refuse(std::string& refusal, const char* reason) {
-        refusal = std::string("reason=") + reason;
+        refusal = reason;
         return false;
     }
 
@@ -620,8 +631,12 @@ private:
         };
         for (uint32_t binding : ngg.guest_bindings) {
             bool buffer = false;
-            if (resource_count(0, binding, &buffer) != 1 || !buffer)
-                return refuse(refusal, "ngg-backend-guest-binding");
+            const uint32_t count = resource_count(0, binding, &buffer);
+            if (count != 1 || !buffer) {
+                refusal = "ngg-backend-guest-binding binding=" + std::to_string(binding) +
+                          " count=" + std::to_string(count) + " buffer=" + (buffer ? "1" : "0");
+                return false;
+            }
         }
         for (const FrameResource& r : draw.R)
             if (r.set == kNggRasterDescriptorSet) return refuse(refusal, "ngg-backend-set2-taken");

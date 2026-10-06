@@ -50,7 +50,9 @@ struct NggSubgroupStages {
     // module per draw.
     uint64_t shell_hash = 0;
     NggExportRecordLayout layout;   // what the shell writes
-    std::vector<uint32_t> guest_bindings;   // set-0 storage-buffer bindings the shell reads
+    // The set-0 storage-buffer bindings the shell ACCESSES (a declared binding no instruction reads
+    // is left out, as the frontend's reflection leaves it unbuilt).
+    std::vector<uint32_t> guest_bindings;
     uint32_t vertices_per_primitive = 3;   // K, as the vertex stage published it
 };
 

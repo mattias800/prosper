@@ -7102,9 +7102,12 @@ std::shared_ptr<ShaderResourceTable>
 build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t draw_vertex_count,
                   uint64_t draw_command_order, const GraphicsRawSnapshotContext* raw_context,
                   const CheckedGraphicsSource* checked_source,
-                  GraphicsReadSource* original_source) {
+                  GraphicsReadSource* original_source, std::span<const uint32_t> linked) {
     if (original_source) *original_source = {};
-    if (!code_addr) return nullptr;
+    if (!code_addr || (!linked.empty() && checked_source)) return nullptr;
+    // A linked merged-NGG chain (#3135 P5) folds the prolog+main words under the prolog's header.
+    const auto* code = linked.empty() ? reinterpret_cast<const uint32_t*>(uintptr_t(code_addr))
+                                      : linked.data();
     const auto stage = is_ps ? ShaderProgramStage::Fragment : ShaderProgramStage::Vertex;
     if (checked_source && !checked_source->belongs_to(st, code_addr, draw_command_order, stage))
         return std::make_shared<ShaderResourceTable>();
@@ -7123,12 +7126,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
     namespace P = prosper::agc::Pm4;
     const bool log = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG");
     const size_t shader_dwords = checked_source ? checked_source->source().decoded->source_dwords
-                                                : registered_shader_dwords(*hdr, code_addr);
-    const auto full_source =
-        checked_source
-            ? checked_source->source().decoded
-            : decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)),
-                                   shader_dwords);
+                                 : !linked.empty() ? linked.size()
+                                                   : registered_shader_dwords(*hdr, code_addr);
+    const auto full_source = checked_source ? checked_source->source().decoded
+                                            : decode_shader_cached(code, shader_dwords);
     if (original_source) {
         *original_source =
             checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
@@ -7607,16 +7608,13 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
     if (is_ps) {
         shader_analysis = checked_source
                               ? checked_source->analysis()
-                              : analyze_shader_code_cached(reinterpret_cast<const uint32_t*>(
-                                                               static_cast<uintptr_t>(code_addr)),
-                                                           shader_dwords);
-        dispatch_selection = select_pcrel_dispatch(
-            (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources,
-            shader_analysis.get());
+                              : analyze_shader_code_cached(code, shader_dwords);
+        dispatch_selection = select_pcrel_dispatch(code, shader_dwords, &primary_resources,
+                                                   shader_analysis.get());
     }
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
+        dyn_vb = resolve_dynamic_fetch(code, shader_dwords,
                                        primary_sgprs, kUserSgprs, 0, &srt_uses,
                                        dispatch_selection.target, &dispatch_selection.dispatch,
                                        nullptr, 0, nested_reader.get(), checked_source);
@@ -7635,7 +7633,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
             system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
         }
         dyn_vb =
-            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
+            resolve_dynamic_fetch(code, shader_dwords,
                                   primary_sgprs, kUserSgprs, 8, &srt_uses, UINT32_MAX, nullptr,
                                   system_sgprs, system_count, nested_reader.get(), checked_source);
         if (log || PROSPER_ENV_ON("PROSPER_RESDUMP")) {
@@ -7684,9 +7682,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
             read_user_sgprs(st.sh, base + range_start, sgprs);
             t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         }
-        set_owned_raw_snapshot_requirements(
-            t, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords,
-            full_source);
+        set_owned_raw_snapshot_requirements(t, code, shader_dwords, full_source);
         // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
@@ -7809,21 +7805,15 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
                 if (clash && !exact_mtbuf) dedupe.note_clash(u);   // a real holder of the key
                 if (u.kind == 6) {
-                    add_owned_raw_wide_snapshot(t, u,
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                        shader_dwords);
+                    add_owned_raw_wide_snapshot(t, u, code, shader_dwords);
                     continue;
                 }
                 if (u.kind == 5) {
-                    add_raw_offset_scalar_snapshot(t, u,
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                        shader_dwords);
+                    add_raw_offset_scalar_snapshot(t, u, code, shader_dwords);
                     continue;
                 }
                 if (u.kind == 4) {
-                    if (auto snapshot = raw_register_snapshot_resource(u,
-                            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                            shader_dwords))
+                    if (auto snapshot = raw_register_snapshot_resource(u, code, shader_dwords))
                         t.resources.push_back(*snapshot);
                     continue;
                 }
@@ -7834,11 +7824,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         continue;
                     if (d.base <= 0x10000) continue;
                     const uint32_t scalar_buffer_dwords =
-                        validated_scalar_buffer_dword_count(
-                            u, d,
-                            reinterpret_cast<const uint32_t*>(
-                                static_cast<uintptr_t>(code_addr)),
-                            shader_dwords);
+                        validated_scalar_buffer_dword_count(u, d, code, shader_dwords);
                     if (u.scalar_buffer_dword_count && !scalar_buffer_dwords) continue;
                     uint32_t resource_size = d.size_bytes;
                     uint32_t resource_stride = d.stride;
@@ -7925,8 +7911,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     //   * #4592 generalizes "all-zero" to t8_samples_constant_zero: base zero and
                     //     constant-zero selectors, which is what makes the all-zero T# null.
                     // The consuming op decides which null rule applies (texel reads only widen).
-                    const auto* use_code =
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr));
+                    const auto* use_code = code;
                     const bool texel_read = u.use_pc < shader_dwords && [&] {
                         const Rdna2Inst op =
                             rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);
