@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -55,16 +56,54 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 // intervening mutation -- but nothing in the type stops the next one, so it is written down here
 // rather than left to be rediscovered. Raised in review by Wren, who went looking for the pattern
 // specifically because it is what a map-to-vector swap silently changes.
+//
+// CONTENT IDENTITY. `content_id()` names the file's contents: two files with the same id hold the
+// same entries. A copy keeps the id (it holds the same entries); every call that can change the
+// entries takes a fresh one, drawn from one process-wide counter so ids are never reused; an
+// empty file made by default construction, `clear()` or being moved from has id 0. This exists so
+// a value derived from the registers alone (extract_render_state) can be reused while the
+// registers have not changed, without comparing a few hundred entries to find that out.
+//
+// The converse does not hold and nothing may assume it: equal contents reached by different
+// writes have different ids, which costs a recomputation and nothing else.
+//
+// The reference rule above gets a second reason here. `operator[]` and the mutable `at()` take the
+// fresh id when they are CALLED, not when the reference they return is written through. Anything
+// that happens between the two sees an id that will name different entries a moment later: a
+// reader of `content_id()`, and equally a COPY of the file, which keeps that id for good. So write
+// through the reference at once and let nothing come between. `set()` does both in one call and
+// is what the command fold uses.
 class RegisterFile {
 public:
     using value_type = std::pair<uint32_t, uint32_t>;
     using const_iterator = std::vector<value_type>::const_iterator;
 
+    RegisterFile() = default;
+    RegisterFile(const RegisterFile&) = default;
+    RegisterFile& operator=(const RegisterFile&) = default;
+    // A moved-from file is empty, so it must not go on answering to the id of what it held.
+    RegisterFile(RegisterFile&& other) noexcept
+        : entries_(std::move(other.entries_)), content_id_(std::exchange(other.content_id_, 0u)) {
+        other.entries_.clear();
+    }
+    RegisterFile& operator=(RegisterFile&& other) noexcept {
+        if (this != &other) {
+            entries_ = std::move(other.entries_);
+            other.entries_.clear();
+            content_id_ = std::exchange(other.content_id_, 0u);
+        }
+        return *this;
+    }
+
     const_iterator begin() const { return entries_.begin(); }
     const_iterator end() const { return entries_.end(); }
     size_t size() const { return entries_.size(); }
     bool empty() const { return entries_.empty(); }
-    void clear() { entries_.clear(); }
+    void clear() {
+        entries_.clear();
+        content_id_ = 0;
+    }
+    uint64_t content_id() const { return content_id_; }
 
     const_iterator find(uint32_t offset) const {
         const auto it = lower(offset);
@@ -84,6 +123,7 @@ public:
         const auto it = lower(offset);
         if (it == entries_.end() || it->first != offset)
             throw std::out_of_range("RegisterFile::at: register not set");
+        content_id_ = fresh_content_id();
         return it->second;
     }
 
@@ -93,6 +133,7 @@ public:
         const auto it = lower(offset);
         if (it == entries_.end() || it->first != offset) return 0;
         entries_.erase(it);
+        content_id_ = fresh_content_id();
         return 1;
     }
 
@@ -100,12 +141,28 @@ public:
     // writes arrive in bursts of ascending offsets (SET_*_REG writes a consecutive run), so the
     // common insert lands at or near the end and the memmove is short.
     uint32_t& operator[](uint32_t offset) {
+        content_id_ = fresh_content_id();
         const auto it = lower(offset);
         if (it != entries_.end() && it->first == offset) return it->second;
         return entries_.insert(it, value_type{offset, 0u})->second;
     }
 
+    // Writes one register, inserting it when absent. The id is fresh only once the value is in.
+    void set(uint32_t offset, uint32_t value) {
+        const auto it = lower(offset);
+        if (it != entries_.end() && it->first == offset)
+            it->second = value;
+        else
+            entries_.insert(it, value_type{offset, value});
+        content_id_ = fresh_content_id();
+    }
+
 private:
+    // Never 0 (the empty file's id) and never repeated. Relaxed: only uniqueness is asked of it.
+    static uint64_t fresh_content_id() {
+        static std::atomic<uint64_t> issued{0};
+        return issued.fetch_add(1, std::memory_order_relaxed) + 1u;
+    }
     std::vector<value_type>::iterator lower(uint32_t offset) {
         return std::lower_bound(entries_.begin(), entries_.end(), offset,
                                 [](const value_type& e, uint32_t k) { return e.first < k; });
@@ -115,6 +172,7 @@ private:
                                 [](const value_type& e, uint32_t k) { return e.first < k; });
     }
     std::vector<value_type> entries_;   // sorted by offset, unique
+    uint64_t content_id_ = 0;   // see CONTENT IDENTITY above
 };
 
 // Folded GPU state after replaying a command stream.
@@ -307,6 +365,9 @@ struct GpuState {
     // (0 = no window). A packet-predicated Jump inside the window is executed/skipped on the
     // condition value read at fold time. Cleared by the end form (addr == 0).
     uint64_t pred_cond_addr = 0;
+    // The window's control word: PRED_OP plus the two flag arguments that carry PRED_BOOL
+    // (pack_set_predication_control, cond_indirect_buffer.hpp). Decides the polarity; see Jump.
+    uint32_t pred_op = 0;
     // Jump recursion depth (a jump target could itself contain a jump; bounded to stop a cycle).
     uint32_t jump_depth = 0;
 

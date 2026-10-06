@@ -2983,10 +2983,23 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // expansion it performs is already complete and the inherited pixel shader's export must not
     // reach the target. Identified by the operation's vertex program (efc_helper_program.hpp), never
     // by MODE alone: titles latch MODE=2 onto ordinary draws that must still write.
-    if (is_agc_eliminate_fast_clear_operation(
-            rs.cb_color_control,
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr)),
-            vs_program_dwords)) {
+    // The same rectangle under MODE = DISABLE with DB_RENDER_CONTROL's compress-disable bits is
+    // AGC's "Decompress Htile" helper: a depth-metadata operation that writes no colour and has no
+    // colour state of its own, so it would otherwise paint over the parent's target (#4610).
+    // The family branch of the rectangle match also needs the helper's draw shape: DrawIndexAuto(3)
+    // as a RectList.
+    const auto* helper_vs = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
+    const AgcHelperDrawShape helper_shape{rs.prim_type, vcount_hint, draw && draw->indexed};
+    const bool helper_eliminate = is_agc_eliminate_fast_clear_operation(
+        rs.cb_color_control, helper_vs, vs_program_dwords, helper_shape);
+    const bool helper_decompress = !helper_eliminate &&
+        is_agc_decompress_htile_operation(rs.cb_color_control, rs.db_render_control, helper_vs,
+                                          vs_program_dwords, helper_shape);
+    if ((helper_eliminate || helper_decompress) &&
+        !is_agc_efc_rect_exact_program(helper_vs, vs_program_dwords))
+        report_agc_rect_family_match(vs_program_addr, vs_program_dwords, rs.cb_color_control,
+                                     helper_eliminate ? "eliminate-fast-clear" : "decompress-htile");
+    if (helper_eliminate || helper_decompress) {
         for (auto& target : ps.color_targets) target.write_mask = 0;
         ps.color_write_mask = 0;
         ps.color1_write_mask = 0;
