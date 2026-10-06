@@ -815,7 +815,7 @@ void LibraryUi::draw_backdrop() {
 void LibraryUi::draw_controls_content() {
     if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
     ImGui::Separator();
-    ImGui::TextWrapped("Keyboard controls. A connected controller just works as pad 0 — "
+    ImGui::TextWrapped("Keyboard controls. A connected controller just works as pad 0 -- "
                        "this map is composed over it.");
     const ImGuiTableFlags flags =
         ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV;
