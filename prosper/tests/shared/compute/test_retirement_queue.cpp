@@ -13,10 +13,21 @@
 #include <array>
 #include <cstdint>
 #include <map>
-#include <random>
 #include <vector>
 
 namespace {
+
+// Deterministic test-data generator (splitmix64). Not for any security purpose.
+struct SplitMix {
+    uint64_t state;
+    explicit SplitMix(uint64_t seed) : state(seed) {}
+    uint32_t operator()() {
+        uint64_t z = (state += 0x9e3779b97f4a7c15ull);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return static_cast<uint32_t>((z ^ (z >> 31)) >> 16);
+    }
+};
 
 using prosper::frontend::GuestRange;
 using prosper::frontend::PendingOperation;
@@ -112,7 +123,7 @@ struct Step {
     size_t slot = 0;                     // CpuRead / CpuWrite
 };
 
-std::vector<Step> random_stream(std::mt19937& rng, size_t length) {
+std::vector<Step> random_stream(SplitMix& rng, size_t length) {
     std::vector<Step> steps;
     for (size_t i = 0; i < length; ++i) {
         Step s;
@@ -213,7 +224,7 @@ Trace run_pipelined(const std::vector<Step>& steps, size_t depth) {
 
 TEST(RetirementQueueModel, PipelinedRunIsIndistinguishableFromSequential) {
     for (uint32_t seed = 1; seed <= 400; ++seed) {
-        std::mt19937 rng(seed);
+        SplitMix rng(seed);
         const std::vector<Step> steps = random_stream(rng, 60);
         const Trace expected = run_sequential(steps);
         for (const size_t depth : {size_t{1}, size_t{2}, size_t{4}, size_t{16}}) {
@@ -230,7 +241,7 @@ TEST(RetirementQueueModel, PipelinedRunIsIndistinguishableFromSequential) {
 TEST(RetirementQueueModel, ARunThatSkipsConflictRetirementIsDetected) {
     bool diverged = false;
     for (uint32_t seed = 1; seed <= 50 && !diverged; ++seed) {
-        std::mt19937 rng(seed);
+        SplitMix rng(seed);
         const std::vector<Step> steps = random_stream(rng, 60);
         const Trace expected = run_sequential(steps);
         // Pipelined without retiring on conflict: writes only land at effects/submit end.
