@@ -29,8 +29,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   decompress, eliminate fast clear, htile decompress) by the helper program AGC binds for them,
   never by `CB_COLOR_CONTROL.MODE` alone: titles latch a utility MODE onto later ordinary draws that
   must still write. DCC uses exact observed programs. The rectangle behind eliminate and htile
-  decompress also matches by family (AGC's exact position core plus an NGG prologue), because every
-  title compiles its own prologue, and an unrecognised one paints the scanout black (#4610).
+  decompress also matches by family (AGC's exact position core plus an NGG prologue, and only on a
+  DrawIndexAuto(3) RectList), because every title compiles its own prologue, and an unrecognised
+  one paints the scanout black (#4610). The family can also match an ordinary position-only quad;
+  each family match is logged once.
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
