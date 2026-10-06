@@ -7,7 +7,6 @@ PROSPER_AGCSHADER  unclassified
 PROSPER_AGCSHADER_OUT  unclassified
 PROSPER_AGC_REG_TRACE  unclassified
 PROSPER_AGC_SHADER_INDEX_AUDIT  unclassified
-PROSPER_AGC_SPLIT_FINAL_STATE  unclassified
 PROSPER_AJM_DUMP  unclassified
 PROSPER_ALPHA1  unclassified
 PROSPER_AMPRLOG  unclassified
