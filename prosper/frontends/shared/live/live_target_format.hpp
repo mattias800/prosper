@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 
 #include "gpu/execute/gpu_execute.hpp"
+#include "shared/rtt/rtt_scale.hpp"
 
 namespace prosper::frontend {
 
@@ -208,6 +209,32 @@ constexpr bool live_target_pixel_format_from_vk(VkFormat vk_format,
         return true;
     }
     return false;
+}
+
+// Bytes per texel of a renderer-owned target's Vulkan format, or zero when the format is not one the
+// live-target contract names (never a size: callers treat zero as "unknown, do not refuse").
+constexpr uint32_t live_target_vk_format_bytes(VkFormat vk_format) {
+    prosper::gpu::LiveTargetPixelFormat format{};
+    return live_target_pixel_format_from_vk(vk_format, format)
+               ? live_target_pixel_format_bytes(format) : 0u;
+}
+
+// Can the cached renderer-owned target at a sampled descriptor's base serve that descriptor? The
+// extent must match (or be the configured render-scale reduction), and for a single-layer 2D target
+// the descriptor's format must not need more bytes per texel than the target stores: a larger view
+// runs past what the renderer wrote, so the cache holds a stale occupant of reused memory (#4197,
+// AC Black Flag Resynced: a 4-component 8-bit view over a 2-byte R16_FLOAT target). A volume keeps
+// its own contract, and a zero size on either side never refuses.
+constexpr bool live_rtt_serves_sampled_view(uint32_t requested_w, uint32_t requested_h,
+                                            uint32_t cached_w, uint32_t cached_h,
+                                            uint32_t render_scale, bool normalized_sampling,
+                                            VkFormat cached_format, uint32_t cached_volume_depth,
+                                            uint32_t view_bytes_per_texel) {
+    return rtt_sampled_extent_compatible(requested_w, requested_h, cached_w, cached_h,
+                                         render_scale, normalized_sampling) &&
+           (cached_volume_depth != 0u ||
+            rtt_sampled_texel_footprint_compatible(view_bytes_per_texel,
+                                                   live_target_vk_format_bytes(cached_format)));
 }
 
 // Packed-HDR render targets can be the independently rendered levels of one sampled mip chain.

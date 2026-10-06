@@ -65,6 +65,22 @@ constexpr bool rtt_sampled_extent_compatible(uint32_t requested_w, uint32_t requ
         requested_w, requested_h, cached_w, cached_h, render_scale);
 }
 
+// A cached render target holds `entry_bytes_per_texel` bytes per texel. A sampled descriptor whose
+// format needs MORE bytes per texel than that at the same base address cannot be a view of the
+// cached surface: its footprint runs past the bytes the renderer wrote, so the cached pixels are a
+// stale occupant of a memory range the guest has reused (a transient-allocator alias, the same
+// situation as the differing-extent alias above). AC Black Flag Resynced samples a 2-byte
+// R16_FLOAT target through a 4-component 8-bit descriptor at 1920x1080; serving the cached 16-bit
+// half-max values as that view painted the whole frame red (#4197). Zero on either side means the
+// size is unknown or the format is packed, and is never grounds to refuse. A view needing LESS than
+// the entry stores stays admitted: hardware reads the same bytes through a narrower format and the
+// established path already serves it.
+constexpr bool rtt_sampled_texel_footprint_compatible(uint32_t sampled_bytes_per_texel,
+                                                      uint32_t entry_bytes_per_texel) {
+    return sampled_bytes_per_texel == 0u || entry_bytes_per_texel == 0u ||
+           sampled_bytes_per_texel <= entry_bytes_per_texel;
+}
+
 // Renderer-owned persistent color images are created for attachment/sampling/transfer use, not
 // storage descriptors. Only sampled descriptors may borrow them directly; storage bindings retain
 // an owned storage-capable image and the guest writeback path even at an exact extent.

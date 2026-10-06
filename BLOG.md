@@ -21,6 +21,10 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-06
 
+### Assassin's Creed Black Flag Resynced no longer opens on solid red
+
+The red wash in the first two seconds and on screen transitions was a render target's old contents being read through a different-sized view of reused memory; those frames are now black ([#4197](https://github.com/mattias800/prosper/issues/4197)). No picture: the fixed frames are plain black, which is the honest reading until the title's startup draws render.
+
 ### Assassin's Creed Black Flag Resynced shows its health warning on a black background
 
 The title's epilepsy-warning screen now draws white text on black, where it first drew on saturated red and then on black with green stripes ([tracker #4131](https://github.com/mattias800/prosper/issues/4131)). Windows `prosper-app`, default launch, about 32 seconds in: red (before), green stripes (after the fast-clear fix), black (after the linear-pitch fix).
