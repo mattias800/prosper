@@ -9006,6 +9006,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // existing wave_append model was landed and live-validated against exactly those
             // packets (#554/#580). Kept as a documented per-workgroup approximation of the
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
+            if (b.is_compute && in.ds_gds && in.opcode == 0x36)   // the plain GDS read (#4553)
+                return emit_compute_gds_read(b, rs, in);
             if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
                 !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
             // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1). AMD RDNA2 ISA 10.4:

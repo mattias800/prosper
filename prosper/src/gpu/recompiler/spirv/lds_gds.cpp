@@ -40,6 +40,15 @@ void SpirvCompute::compute_gds_store(uint32_t index, uint32_t value, bool predic
         put(code, Op_Label, {merge}); cur_block = merge;
     }
 
+    uint32_t SpirvCompute::compute_gds_load(uint32_t index) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain, {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t value = id();
+        put(code, Op_Load, {t_u32, value, pointer});
+        return value;
+    }
+
 uint32_t SpirvCompute::compute_gds_atomic_rtn(uint32_t op, uint32_t index, uint32_t value) {
         declare_internal_gds(0, kComputeInternalGdsBinding);
         uint32_t pointer = id();
