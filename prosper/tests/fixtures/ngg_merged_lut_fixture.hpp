@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <utility>
 #include <vector>
@@ -163,6 +164,29 @@ kena_buffers(const std::vector<uint32_t>& records) {
 
 inline constexpr std::array<std::array<float, 2>, 4> kLutQuad = {
     {{1, -1}, {1, 1}, {-1, -1}, {-1, 1}}};
+
+using LaneEdit = std::function<void(gpu::NggLaneLaunch&, uint32_t& s3)>;
+
+// Launch records for every subgroup in `plan`, all dispatched with `waves` waves (the shell's set 2
+// binding 0 layout). `edit`, when given, may change any lane's values before they are written.
+inline std::vector<uint32_t> launch_records(const gpu::NggSubgroupPlan& plan,
+                                            const gpu::NggSubgroupLimits& limits, uint32_t waves,
+                                            const LaneEdit& edit = {}) {
+    std::vector<uint32_t> words;
+    for (const gpu::NggSubgroup& subgroup : plan.subgroups)
+        for (uint32_t wave = 0; wave < waves; ++wave) {
+            uint32_t s3 = gpu::ngg_merged_wave_info(subgroup, wave);
+            if (waves != subgroup.waves) s3 = (s3 & 0x0fffffffu) | (waves << 28);
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                gpu::NggLaneLaunch launch = gpu::ngg_lane_launch(subgroup, limits, wave, lane);
+                uint32_t lane_s3 = s3;
+                if (edit) edit(launch, lane_s3);
+                words.insert(words.end(), launch.v, launch.v + 9);
+                words.push_back(lane_s3);
+            }
+        }
+    return words;
+}
 
 inline gpu::NggSubgroupLimits kena_limits() {
     // KENA_STATUS.md: VGT_GS_ONCHIP_CNTL 0x10020040, GE_CNTL 0x8040, 192 / 3 / ITEMSIZE 4.

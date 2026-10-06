@@ -4954,6 +4954,14 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #3135 P3: the merged-NGG raster commit. Kena's LUT export buffer from the P2 shell drawn into a
+      # 32-layer target through each layer route, plus hand-built buffers pinning the provoking
+      # vertex, the corner rotation, connectivity, invalid blocks, layer culling and line lists.
+      prosper_add_gtest(test_ngg_raster_commit
+        SOURCES tests/gpu/execute/test_ngg_raster_commit.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)
