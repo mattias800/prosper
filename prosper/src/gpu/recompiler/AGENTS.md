@@ -15,6 +15,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   which refuses the branch under narrowed EXEC.
 - `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
   every compute and fragment shell runs before emission; it only fills `RegState` facts.
+- `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask
+  logical whose result no observable read can reach.
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.
