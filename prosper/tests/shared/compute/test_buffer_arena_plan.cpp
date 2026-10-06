@@ -5,6 +5,8 @@
 //     already reached past it (the first version's unsigned subtraction wrapped there);
 //   * a reused arena is re-probed, so memory released since its creation is not read;
 //   * an isolated window costs nothing: no arena, no guest probe;
+//   * the same window bound again (every frame, for a persistent buffer) is not evidence of a ring,
+//     so it stays private and costs nothing on every frame, not only the first;
 //   * an arena's headroom is a fraction of what it covers and it never exceeds twice the largest
 //     window it serves, so per-dispatch cost does not grow with a constant;
 //   * a binding that aliases a writable binding is never served from an arena.
@@ -50,6 +52,48 @@ TEST(BufferArenaPlan, AnIsolatedWindowIsPrivateAndCostsNothing) {
     EXPECT_EQ(d.action, BufferArenaAction::Private);
     EXPECT_EQ(registry.size(), 0u);
     EXPECT_EQ(guest.probes, 0) << "no overlap evidence: nothing is probed";
+}
+
+TEST(BufferArenaPlan, TheSameWindowBoundEveryFrameNeverGetsAnArena) {
+    // A persistent read-only buffer is bound once per frame at the same base and size. Its own earlier
+    // binding is not evidence of a ring: counting it made the second frame build an arena of the
+    // window plus hull/16 headroom on each side, so every such buffer validated and uploaded ~12.5%
+    // more from then on, and two of GTA V's 256 MiB windows no longer fitted the 512 MiB cache.
+    for (const uint64_t window : {4 * kMiB, 256 * kMiB}) {
+        BufferArenaRegistry registry;
+        Guest guest{kBase, kBase + 1024 * kMiB};
+        for (int frame = 0; frame < 5; ++frame) {
+            const BufferArenaDecision d =
+                select_buffer_arena(registry, kBase + 10 * kMiB, window, 256, guest);
+            EXPECT_EQ(d.action, BufferArenaAction::Private) << "window " << window << " frame " << frame;
+        }
+        EXPECT_EQ(registry.size(), 0u) << window;
+        EXPECT_EQ(guest.probes, 0) << "the same window again is no evidence, so nothing is probed";
+        EXPECT_EQ(registry.recent_size(), 1u) << "remembered once, not once per frame";
+    }
+    // The pure planner agrees: a recent entry identical to the window is not evidence.
+    const std::vector<BufferArenaExtent> recent = {{kBase + 10 * kMiB, 4 * kMiB}};
+    EXPECT_FALSE(buffer_arena_has_evidence({}, recent, kBase + 10 * kMiB, 4 * kMiB));
+    EXPECT_EQ(plan_buffer_arena({}, recent, kBase + 10 * kMiB, 4 * kMiB, kBase, kBase + 200 * kMiB, 256)
+                  .action,
+              BufferArenaAction::Private);
+}
+
+TEST(BufferArenaPlan, ARepeatedWindowStillJoinsARingWhenADifferentWindowOverlapsIt) {
+    // The identity rule must not hide real overlap: after the same window was bound several times,
+    // a genuinely different overlapping window builds an arena that covers both, and the original
+    // window is then served from it.
+    BufferArenaRegistry registry;
+    Guest guest{kBase, kBase + 200 * kMiB};
+    const uint64_t window = 8 * kMiB, first = kBase + 50 * kMiB;
+    for (int frame = 0; frame < 3; ++frame)
+        ASSERT_EQ(select_buffer_arena(registry, first, window, 256, guest).action, BufferArenaAction::Private);
+    const BufferArenaDecision shifted = select_buffer_arena(registry, first + 4096, window, 256, guest);
+    ASSERT_EQ(shifted.action, BufferArenaAction::Create);
+    EXPECT_TRUE(shifted.arena.contains(first, window));
+    EXPECT_TRUE(shifted.arena.contains(first + 4096, window));
+    EXPECT_EQ(select_buffer_arena(registry, first, window, 256, guest).action, BufferArenaAction::Reuse);
+    EXPECT_EQ(registry.size(), 1u);
 }
 
 TEST(BufferArenaPlan, AWindowBelowTheMinimumNeverGetsAnArena) {

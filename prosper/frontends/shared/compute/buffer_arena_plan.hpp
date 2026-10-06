@@ -14,8 +14,9 @@
 // read-only AND that no binding of the same dispatch that aliases it is writable.
 //
 // Cost rule (PERF-P5): per-dispatch cost grows with the arena, so an arena is created only on
-// evidence of overlap (a second window overlapping a window already seen), its headroom is a fraction
-// of what it covers rather than a constant, and it never grows past twice the largest window it serves.
+// evidence of overlap (a second, different window overlapping a window already seen; the same window
+// bound again is not evidence), its headroom is a fraction of what it covers rather than a constant,
+// and it never grows past twice the largest window it serves.
 #pragma once
 
 #include <algorithm>
@@ -67,8 +68,12 @@ struct BufferArenaDecision {
 };
 
 // Two windows of one ring overlap by at least half of the smaller one (a sliding window, not a
-// neighbour that merely touches).
+// neighbour that merely touches). They must be two DIFFERENT windows: an extent with the same base
+// and size is the window itself, seen again. A persistent buffer is bound every frame, so counting
+// its own earlier binding as overlap would turn every isolated window of 1 MiB or more into an arena
+// (window + hull/16 headroom each side, ~12.5% more to validate and upload) from its second frame on.
 inline bool buffer_windows_share_a_ring(const BufferArenaExtent& a, uint64_t addr, uint64_t bytes) {
+    if (a.base == addr && a.bytes == bytes) return false;
     return a.overlap_bytes(addr, bytes) * 2 >= std::min(a.bytes, bytes) && a.overlap_bytes(addr, bytes) != 0;
 }
 
