@@ -315,7 +315,14 @@ struct RenderState {
 };
 
 // Extract the render-state from a folded GpuState (pure; reads register files only).
+// Repeated calls for unchanged registers reuse the answer (render_state.cpp).
 RenderState extract_render_state(const GpuState& st);
+// The same answer, always computed. For the comparison arm and for a test that needs a
+// diagnostic inside the extraction to run; nothing on a draw path should call it.
+RenderState extract_render_state_uncached(const GpuState& st);
+// How many times the extraction has been computed, by either call, in this process. It lets a
+// test see that an unchanged state is NOT computed again; it is not a statistic to report.
+uint64_t render_state_computations();
 
 // A pipeline's fixed-function state with every RDNA2 enum already translated to its Vulkan value
 // (via vk_translate). All fields are plain integers equal to the corresponding Vk* enumerators, so

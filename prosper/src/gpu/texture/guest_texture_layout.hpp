@@ -12,6 +12,9 @@ namespace prosper::gpu {
 void register_guest_linear_texture_layout(uint64_t base, size_t bytes,
                                           uint32_t row_pitch_bytes);
 void unregister_guest_linear_texture_layout(uint64_t base);
+// Retire every registered layout that overlaps [base, base + bytes): the memory was unmapped, so a
+// later allocation in the same range must not inherit an HLE producer's pitch.
+void unregister_guest_linear_texture_layouts_in(uint64_t base, uint64_t bytes);
 
 // Return the registered pitch only when `address` belongs to a registered allocation and the
 // descriptor's visible row fits within that physical row. Zero means no exact host provenance.

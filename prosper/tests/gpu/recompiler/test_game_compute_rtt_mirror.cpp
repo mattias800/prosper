@@ -27,7 +27,11 @@ static int fails = 0;
 static int run_destination_mirror_regression() {
     // This mode registers and renders before the first compute dispatch, so compute adopts the
     // renderer device. The ordinary suite deliberately keeps its independent-device coverage.
-    constexpr uint32_t W = 8, H = 4;
+    // 64 texels: every fixture's rows (RGBA8, R32 and R11 at 256 bytes, RGBA16F at 512) are already
+    // multiples of GFX10's 256-byte linear pitch, so the guest buffers below ARE the hardware layout
+    // of these images. An 8-wide image would occupy 256-byte rows in guest memory (#4586); its tight
+    // W*H*bpp vectors would be overrun by the compute writeback.
+    constexpr uint32_t W = 64, H = 4;
 #ifdef _WIN32
     _putenv_s("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB", "0");
 #else

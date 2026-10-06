@@ -21,6 +21,34 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-06
 
+### Assassin's Creed Black Flag Resynced no longer opens on solid red
+
+The red wash in the first two seconds and on screen transitions was a render target's old contents being read through a view that needs twice the bytes the target holds (probably reused memory); those frames are now black ([#4197](https://github.com/mattias800/prosper/issues/4197)). No picture: the fixed frames are plain black, which is the honest reading until the title's startup draws render.
+
+### Tomb Raider: one manor renders and the other explodes
+
+Tomb Raider II's Croft Manor renders textured on current `main`, while Tomb Raider I's is a handful of huge triangles on every build back to v0.2.2: the repo's timed route had quietly started arriving in the other game ([#4637](https://github.com/mattias800/prosper/issues/4637), [tracker #2990](https://github.com/mattias800/prosper/issues/2990)).
+
+<p align="center"><img src="assets/screenshots/tomb-raider-2-laras-home-steps.webp" alt="Tomb Raider II, Lara's Home: Lara from behind facing timber steps between brick walls, hedges on the right, Winston with his tray at the left edge; Linux prosper-app, route reach-tr2-laras-home.pad, flip 5000"></p>
+<p align="center"><img src="assets/screenshots/tomb-raider-1-laras-home-exploded.webp" alt="Tomb Raider I, Lara's Home: the screen filled by a few huge orange triangles radiating from a point; Linux prosper-app, route reach-gameplay.pad, flip 4800"></p>
+
+### Assassin's Creed Black Flag Resynced shows its health warning on a black background
+
+The title's epilepsy-warning screen now draws white text on black, where it first drew on saturated red and then on black with green stripes ([tracker #4131](https://github.com/mattias800/prosper/issues/4131)). Windows `prosper-app`, default launch, about 32 seconds in: red (before), green stripes (after the fast-clear fix), black (after the linear-pitch fix).
+
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-red.webp" alt="Black Flag warning screen with the text over a saturated red background; Windows prosper-app, default launch"></p>
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-green-lines.webp" alt="Black Flag warning screen on black with green horizontal lines; same run after the fast-clear fix"></p>
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-fixed.webp" alt="Black Flag warning screen, white text on a clean black background; same run after the linear-pitch fix"></p>
+
+### Dragon Quest VII's title gets its clouds and sea back
+
+The title screen's sky now has clouds and the sea has waves and sun glints, where it used to be two flat gradients ([tracker #1874](https://github.com/mattias800/prosper/issues/1874)). Before, then after:
+
+<p align="center"><img src="assets/screenshots/dq7-title-sky-sea-before-predication.webp" alt="Dragon Quest VII Reimagined title screen before the fix: logo over a flat blue sky gradient and a smooth flat blue sea; Linux prosper-app F9 grab, RADV, Cross pulses at 3-18 s, about 42 s"></p>
+<p align="center"><img src="assets/screenshots/dq7-title-sky-sea-after-predication.webp" alt="Dragon Quest VII Reimagined title screen after the fix: clouds in the sky and a textured sea with bright sun glints; Linux prosper-app F9 grab, RADV, Cross pulses at 3-18 s, about 75 s"></p>
+
+The clouds are still fainter than on a PS5.
+
 ### MOUSE: P.I. For Hire: the room is there
 
 *MOUSE: P.I. For Hire* now renders its first gameplay scene: a pair of doors, and behind them the room, its furniture and lamps, under the HUD that used to sit over black.

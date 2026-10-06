@@ -9,6 +9,8 @@
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
+#include "shared/compute/linear_image_pitch.hpp"
+#include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
@@ -47,6 +49,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
+#include "gpu/execute/renderer_volume_publication.hpp"   // #4625
 #include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -156,35 +159,6 @@ LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
     return plan;
 }
 
-bool compute_sampled_dcc_fast_clear_rgba8(
-    const prosper::gpu::ShaderResource& resource,
-    bool ordinary_guest_backed_sampled_view,
-    bool arrayed_sampled_view,
-    bool disabled,
-    uint8_t* rgba,
-    size_t texel_count,
-    const uint8_t* metadata,
-    size_t metadata_bytes,
-    uint8_t* clear_code) {
-    const uint32_t components = resource.num_components ? resource.num_components : 1u;
-    if (disabled || !ordinary_guest_backed_sampled_view || arrayed_sampled_view ||
-        resource.cls != prosper::gpu::ResourceClass::Texture ||
-        resource.format != prosper::gpu::DataFormat::Float16 || components != 4u ||
-        resource.img_dim != 1u || resource.depth != 1u ||
-        resource.declared_mip_levels != 1u || resource.in_mip_tail ||
-        resource.layer_stride_bytes || resource.layer_mip_offset_bytes ||
-        resource.srgb || resource.depth_compare || !resource.compression_enabled ||
-        !resource.metadata_addr || !rgba || !texel_count)
-        return false;
-    const uint64_t expected_metadata = prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
-    if (!expected_metadata || expected_metadata > SIZE_MAX ||
-        metadata_bytes != static_cast<size_t>(expected_metadata))
-        return false;
-    return prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-        rgba, texel_count, metadata, metadata_bytes, components,
-        resource.alpha_is_on_msb, clear_code);
-}
-
 uint8_t storage_pack_unorm8(uint32_t float_bits) {
     float value;
     std::memcpy(&value, &float_bits, sizeof(value));
@@ -220,48 +194,6 @@ uint32_t storage_unpack_float16_bits(uint16_t half_bits) {
         return result;
     }();
     return table[half_bits];
-}
-
-bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot,
-                                uint8_t* packed, size_t packed_size) {
-    if (!snapshot.width || !snapshot.height || !snapshot.pixels) return false;
-    const uint64_t texels = static_cast<uint64_t>(snapshot.width) * snapshot.height;
-    const uint32_t source_bytes =
-        prosper::frontend::live_target_pixel_format_bytes(snapshot.format);
-    if (!source_bytes) return false;
-    const prosper::frontend::LiveTargetSourceLayout layout =
-        prosper::frontend::live_target_source_layout(snapshot.format);
-    if (texels > SIZE_MAX / source_bytes || texels > SIZE_MAX / sizeof(uint32_t) ||
-        snapshot.pixels->size() != static_cast<size_t>(texels) * source_bytes ||
-        !packed || packed_size != static_cast<size_t>(texels) * sizeof(uint32_t))
-        return false;
-    if (layout == prosper::frontend::LiveTargetSourceLayout::PackedR11G11B10) {
-        std::memcpy(packed, snapshot.pixels->data(), packed_size);
-        return true;
-    }
-    if (layout == prosper::frontend::LiveTargetSourceLayout::Unorm8x1 ||
-        layout == prosper::frontend::LiveTargetSourceLayout::Unorm8x2 ||
-        layout == prosper::frontend::LiveTargetSourceLayout::Uint32x1 ||
-        layout == prosper::frontend::LiveTargetSourceLayout::Float32x1)
-        return false;
-    for (size_t t = 0; t < static_cast<size_t>(texels); ++t) {
-        float rgb[3]{};
-        if (layout == prosper::frontend::LiveTargetSourceLayout::Float16x4) {
-            for (uint32_t c = 0; c < 3; ++c) {
-                uint16_t half = 0;
-                std::memcpy(&half, snapshot.pixels->data() + t * 8 + c * 2, sizeof(half));
-                rgb[c] = prosper::gpu::half_to_float(half);
-            }
-        } else {
-            for (uint32_t c = 0; c < 3; ++c)
-                rgb[c] = (*snapshot.pixels)[t * 4 + c] / 255.0f;
-        }
-        const uint32_t word = static_cast<uint32_t>(prosper::gpu::float_to_f11(rgb[0])) |
-                              (static_cast<uint32_t>(prosper::gpu::float_to_f11(rgb[1])) << 11) |
-                              (static_cast<uint32_t>(prosper::gpu::float_to_f10(rgb[2])) << 22);
-        std::memcpy(packed + t * sizeof(word), &word, sizeof(word));
-    }
-    return true;
 }
 
 namespace {
@@ -4056,6 +3988,9 @@ struct BoundImage {
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
     bool direct_storage_detile_used = false;
+    // A linear 2D image's row pitch in guest memory (compute_linear_row_pitch), or 0 for tight rows.
+    // The sampled upload and storage seed gather rows from it; the storage writeback scatters to it.
+    size_t guest_row_pitch = 0;
     bool watch_backed_snapshot_skip_requested = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
     VkDeviceSize allocation_bytes = 0;
@@ -7549,9 +7484,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ComputeClock::now() - query_start).count();
             const uint64_t resource_bytes = std::max<uint64_t>(
                 1u, gpu_capture_resource_footprint(*r));
-            if (overlaps_unpublished_renderer_volume(r->gpu_addr, resource_bytes) &&
-                (dim_3d || dim_2d_array || r->depth > 1u || !renderer_owned)) {
-                skip_image(r, "renderer volume has no complete guest publication");
+            if (const char* why = compute_renderer_volume_refusal(
+                    r->gpu_addr, resource_bytes,
+                    dim_3d || dim_2d_array || r->depth > 1u || !renderer_owned)) {
+                skip_image(r, why);
                 break;
             }
             // Exact write-only storage aliases already have a fully prepared canonical image.
@@ -7636,6 +7572,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
+            if (renderer_owned && !bi.storage && r->compression_enabled && r->metadata_addr)
+                if (const uint64_t plane = prosper::gpu::gpu_capture_dcc_metadata_footprint(*r))
+                    prosper::gpu::register_live_rtt_dcc_plane(r->gpu_addr, r->metadata_addr, plane);
             if (!bi.storage && (renderer_owned || depth_import_eligible) &&
                 !dim_1d && !dim_3d && !dim_2d_array &&
                 r->depth == 1 && !r->depth_compare) {
@@ -8448,9 +8387,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         sampled_guest_need =
                             layer_stride * (sampled_layers - 1u) + level_offset + slice;
                     } else {
-                        sampled_guest_need = r->tile_mode
-                            ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
-                            : static_cast<size_t>(volume_texels) * bpt;
+                        const size_t row_pitch = compute_linear_row_pitch(*r, bpt);
+                        bi.guest_row_pitch = row_pitch;
+                        sampled_guest_need =
+                            r->tile_mode
+                                ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
+                                : (row_pitch ? row_pitch * (r->height - 1u) + size_t(r->width) * bpt
+                                             : static_cast<size_t>(volume_texels) * bpt);
                     }
                 } else {
                     skip_image(r, "sampled format not decodable yet"); break;
@@ -8679,8 +8622,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         transfer_format_match && transfer_validation_enabled &&
                         transfer_native_defined) {
                         ComputeImageCacheKey storage_key = storage_image_cache_key(
-                            *r, static_cast<uint32_t>(sampled_guest_need),
-                            transfer_native_format);
+                            *r, static_cast<uint32_t>(sampled_guest_need), transfer_native_format);
                         bool borrowed = ctx.borrow_cached_image_for_compute_transfer(
                             storage_key, *r, bi.compute_transfer_seed, trace,
                             &transfer_borrow_result);
@@ -8698,8 +8640,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             prosper::gpu::ShaderResource storage_identity = *r;
                             storage_identity.format = DataFormat::Uint32;
                             storage_key = storage_image_cache_key(
-                                storage_identity,
-                                static_cast<uint32_t>(sampled_guest_need),
+                                storage_identity, static_cast<uint32_t>(sampled_guest_need),
                                 transfer_alias_storage_format);
                             borrowed = ctx.borrow_cached_image_for_compute_transfer(
                                 storage_key, *r, bi.compute_transfer_seed, trace,
@@ -8846,13 +8787,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint64_t linear_guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
                 bi.exact_result_bytes = bi.exact_storage_bytes()
                     ? static_cast<VkDeviceSize>(linear_guest_bytes) : sbytes;
-                size_t guest_bytes = r->tile_mode
-                    ? (dim_3d && r->depth > 1
-                           ? tiled_volume_bytes(r->width, r->height, r->depth, r->tile_mode,
-                                                static_cast<uint32_t>(guest_texel))
-                           : tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
-                                                 static_cast<uint32_t>(guest_texel)))
-                    : static_cast<size_t>(linear_guest_bytes);
+                const size_t storage_row_pitch =
+                    compute_linear_row_pitch(*r, static_cast<uint32_t>(guest_texel));
+                bi.guest_row_pitch = storage_row_pitch;
+                size_t guest_bytes =
+                    r->tile_mode
+                        ? (dim_3d && r->depth > 1
+                               ? tiled_volume_bytes(r->width, r->height, r->depth, r->tile_mode,
+                                                    static_cast<uint32_t>(guest_texel))
+                               : tiled_surface_bytes(r->width, r->height, r->tile_mode, 0,
+                                                     static_cast<uint32_t>(guest_texel)))
+                        : (storage_row_pitch ? storage_row_pitch * (r->height - 1u) +
+                                                   size_t(r->width) * guest_texel
+                                             : static_cast<size_t>(linear_guest_bytes));
                 size_t array_slice_bytes = 0;
                 if (dim_2d_array && r->depth > 1) {
                     array_slice_bytes = r->in_mip_tail
@@ -8878,7 +8825,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 if (!linear_guest_bytes || linear_guest_bytes > SIZE_MAX || !guest_bytes ||
                     guest_bytes > UINT32_MAX ||
-                    (!r->tile_mode && !r->layer_stride_bytes && guest_bytes > r->size)) {
+                    // The T#'s size counts tight rows, so a padded image's span exceeds it by design.
+                    (!r->tile_mode && !r->layer_stride_bytes && !storage_row_pitch &&
+                     guest_bytes > r->size)) {
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
@@ -9042,7 +8991,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // materializer; see decode_scratch.hpp for the zero contract.
                 prosper::frontend::ScratchBuffer linear;
                 if (linear_size && !renderer_owned && !direct_storage_detile &&
-                    (r->tile_mode || (dim_2d_array && r->depth > 1))) {
+                    (r->tile_mode || (dim_2d_array && r->depth > 1) || storage_row_pitch)) {
                     // Two ways the branch chain below can leave part of `linear_size` unwritten,
                     // and both must take the zero because a fresh mapping used to supply it. First,
                     // a 64 KiB detile whose element size the pattern tables do not cover falls back
@@ -9131,6 +9080,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             ComputeClock::now() - detile_start).count();
                     unpack_source = direct_storage_detile ? upload : linear.get();
                     bi.direct_storage_detile_used = direct_storage_detile;
+                } else if (storage_row_pitch) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
+                    const size_t row_bytes = static_cast<size_t>(r->width) * guest_texel;
+                    copy_linear_rows(linear.get(), row_bytes, src, storage_row_pitch, row_bytes,
+                                     r->height);   // gather out of the stated pitch
+                    unpack_source = linear.get();
                 } else {
                     if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     // Linear guest storage is already in the row-major layout consumed by unpack.
@@ -9725,7 +9680,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // while `linear` was never reset -- a null-pointer write. `native_cube_sampled`
                         // is here because an UNTILED native cube reaches that branch with
                         // `r->tile_mode` false and none of the other terms true (#657).
-                        const bool remap = r->tile_mode ||
+                        const size_t padded_pitch = bi.guest_row_pitch;
+                        const bool remap =
+                            r->tile_mode || padded_pitch ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
                             ((dim_2d_array || dim_cube_stacked || native_cube_sampled) &&
                              sampled_layers > 1);
@@ -9811,6 +9768,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             const prosper::gpu::TileCensusScope tcs("smpl-upl");
                             detile_surface(linear.get(), src, r->width, r->height,
                                            r->tile_mode, 0, bpt);
+                        } else if (padded_pitch) {
+                            const size_t row_bytes = size_t(r->width) * bpt;
+                            copy_linear_rows(linear.get(), row_bytes, src, padded_pitch, row_bytes,
+                                             r->height);
                         }
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10 || unorm2_10_10_10 ||
@@ -12733,8 +12694,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // over all `texels`), so no zero is needed.
             prosper::frontend::ScratchBuffer linear;
             uint8_t* packed = destination;
-            if (!bi.retile_buffer && ((r->tile_mode && !tile_mapped_bytes) ||
-                (!r->tile_mode && array_image && r->depth > 1))) {
+            if (!bi.retile_buffer &&
+                ((r->tile_mode && !tile_mapped_bytes) ||
+                 (!r->tile_mode && array_image && r->depth > 1) || bi.guest_row_pitch)) {
                 linear.reset(linear_bytes, /*zero_fill=*/false);
                 packed = linear.get();
             }
@@ -12962,6 +12924,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             } else if (r->tile_mode) {
                 tile_surface(destination, layout_source, r->width, r->height, r->tile_mode, 0,
                              static_cast<uint32_t>(guest_texel));
+            } else if (bi.guest_row_pitch) {
+                const size_t row_bytes = static_cast<size_t>(r->width) * guest_texel;
+                copy_linear_rows(destination, bi.guest_row_pitch, layout_source, row_bytes,
+                                 row_bytes, r->height);   // padding keeps the guest's bytes
             }
             const auto layout_done = ComputeClock::now();
             pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
@@ -13028,9 +12994,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "binding=%u addr=0x%llx extent=%ux%u\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  mirror.imported_width, mirror.imported_height);
-            } else if (bi.storage && layout_source && r->width && r->height &&
-                       r->depth == 1 && !r->in_mip_tail &&
-                       !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
+            } else if (bi.storage && layout_source && r->width && r->height && r->depth == 1 &&
+                       !r->in_mip_tail && !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
                 if (r->format == DataFormat::Unorm2_10_10_10 && r->num_components == 4) {
                     prosper::frontend::publish_unorm10_as_rgba8(
                         r->gpu_addr, r->width, r->height, layout_source, linear_bytes);
@@ -13873,13 +13838,13 @@ bool storage_image_materialize_raw_uvec4(
         channels, channel_dwords);
 }
 
-bool storage_image_writeback_raw_uvec4(
-    const uint32_t* channels, size_t channel_dwords,
-    prosper::gpu::DataFormat format, uint32_t components,
-    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
-    bool in_mip_tail, uint32_t mip_tail_bytes,
-    uint32_t mip_tail_x, uint32_t mip_tail_y,
-    uint8_t* destination, size_t destination_bytes) {
+bool storage_image_writeback_raw_uvec4(const uint32_t* channels, size_t channel_dwords,
+                                       prosper::gpu::DataFormat format, uint32_t components,
+                                       uint32_t width, uint32_t height, uint32_t depth,
+                                       uint32_t tile_mode, bool in_mip_tail,
+                                       uint32_t mip_tail_bytes, uint32_t mip_tail_x,
+                                       uint32_t mip_tail_y, uint8_t* destination,
+                                       size_t destination_bytes, size_t linear_row_pitch) {
     const uint32_t guest_texel = storage_image_guest_texel_bytes(format, components);
     const size_t required_destination = storage_image_raw_uvec4_source_bytes(
         format, components, width, height, depth, tile_mode,
@@ -13899,7 +13864,13 @@ bool storage_image_writeback_raw_uvec4(
     storage_pack_range(channels, format, components, texels,
                        linear.data(), guest_texel);
     if (!prosper::gpu::tile_mode_is_tiled(tile_mode)) {
-        std::memcpy(destination, linear.data(), linear.size());
+        const size_t row = static_cast<size_t>(width) * guest_texel;   // #4618: padded rows
+        if (linear_row_pitch <= row || depth != 1u || in_mip_tail)
+            std::memcpy(destination, linear.data(), linear.size());
+        else if (destination_bytes < linear_row_pitch * (height - 1u) + row)
+            return false;
+        else
+            copy_linear_rows(destination, linear_row_pitch, linear.data(), row, row, height);
         return true;
     }
     if (depth > 1u)
@@ -14273,11 +14244,6 @@ uint64_t live_compute_storage_result_snapshot_bytes() {
 uint64_t live_compute_image_result_snapshot_bytes() {
     const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     return context ? context->image_result_snapshot_bytes : 0;
-}
-
-bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
-                                            size_t guest_bytes, size_t minimum_bytes) {
-    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
 }
 
 void live_compute_fail_next_buffer_readback_for_test() {

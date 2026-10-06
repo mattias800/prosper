@@ -8,6 +8,7 @@
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include "diagnostics/exit_reports.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -397,7 +398,17 @@ bool unmodeled_cb_color_mode_summary(char* out, size_t cap) {
     return true;
 }
 
-RenderState extract_render_state(const GpuState& st) {
+namespace {
+std::atomic<uint64_t> g_render_state_computations{0};
+}   // namespace
+
+uint64_t render_state_computations() {
+    return g_render_state_computations.load(std::memory_order_relaxed);
+}
+
+// NOLINTNEXTLINE(readability-function-size): the extraction as it was, under its second name
+RenderState extract_render_state_uncached(const GpuState& st) {
+    g_render_state_computations.fetch_add(1, std::memory_order_relaxed);
     RenderState rs;
 
     // Shader program addresses (SH register file).
@@ -960,6 +971,53 @@ RenderState extract_render_state(const GpuState& st) {
     }
 
     return rs;
+}
+
+// The render state is a function of the three register files and nothing else, and one draw asks
+// for it about ten times over: realization, the owned-wave and scalar-bank admission questions,
+// the read-point issuer and the producers each extract it again from the same state. Measured on
+// MOUSE: P.I. For Hire (1,350 draws a frame) the extraction was the largest single symbol of the
+// whole process, 6.9% of its CPU samples, ahead of the allocator.
+//
+// So keep the last few answers per thread, named by the register files' content ids
+// (RegisterFile, CONTENT IDENTITY): equal ids mean equal registers, hence an equal answer. A few
+// entries rather than one, because callers interleave a draw's state with the state of the draw
+// whose output it reads.
+//
+// Off, and every call computes, when:
+//   - PROSPER_NO_RENDER_STATE_MEMO is set -- the control arm of the A/B that justified this;
+//   - a diagnostic that reports per CALL rather than per distinct state is armed
+//     (PROSPER_MSAA_LOG, PROSPER_STENCILLOG, PROSPER_SCISSORLOG), so their output is unchanged.
+// PROSPER_CLEARLOG needs neither: it reports each distinct target once, and every distinct state
+// is still computed at least once -- on each thread that sees it.
+//
+// One thing this changes for the future: an answer computed from a state that another thread was
+// writing at that moment used to be wrong for one call and is now wrong until the ids move on.
+// Every reader of a state that is still being folded holds the submit lock today; one that did
+// not would have to stop reusing.
+RenderState extract_render_state(const GpuState& st) {
+    // NOLINTBEGIN(concurrency-mt-unsafe): four cached environment reads, made once
+    static const bool every_call =
+        PROSPER_ENV_ON("PROSPER_NO_RENDER_STATE_MEMO") || PROSPER_ENV_ON("PROSPER_MSAA_LOG") ||
+        PROSPER_ENV_ON("PROSPER_STENCILLOG") || PROSPER_ENV_ON("PROSPER_SCISSORLOG");
+    // NOLINTEND(concurrency-mt-unsafe)
+    if (every_call) return extract_render_state_uncached(st);
+    struct Remembered {
+        uint64_t cx = UINT64_MAX, sh = UINT64_MAX, uc = UINT64_MAX;   // an id no file ever has
+        RenderState state;
+    };
+    thread_local std::array<Remembered, 4> remembered;
+    thread_local uint32_t oldest = 0;
+    const uint64_t cx = st.cx.content_id(), sh = st.sh.content_id(), uc = st.uc.content_id();
+    for (const auto& entry : remembered)
+        if (entry.cx == cx && entry.sh == sh && entry.uc == uc) return entry.state;
+    Remembered& entry = remembered[oldest++ % remembered.size()];
+    entry.cx = entry.sh = entry.uc = UINT64_MAX;   // not a hit for anybody while it is being filled
+    entry.state = extract_render_state_uncached(st);
+    entry.cx = cx;
+    entry.sh = sh;
+    entry.uc = uc;
+    return entry.state;
 }
 
 ColorStateTraceSnapshot snapshot_color_state_trace(const RenderState& rs,

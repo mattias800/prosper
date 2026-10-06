@@ -14,8 +14,8 @@ namespace {
 constexpr size_t kCount = static_cast<size_t>(Transfer::Count);
 
 constexpr std::array<const char*, kCount> kNames{
-    "storage-materialize", "buffer-upload", "buffer-compare", "rtt-snapshot", "detile",
-    "guest-scanout",
+    "storage-materialize", "buffer-upload",     "buffer-compare", "rtt-snapshot", "detile",
+    "guest-scanout",       "draw-buffer-stage",
 };
 static_assert(kNames.size() == kCount, "every Transfer needs a stable name; logs are grepped");
 

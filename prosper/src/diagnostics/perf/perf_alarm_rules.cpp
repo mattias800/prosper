@@ -569,7 +569,10 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
         a.hint = "every guest frame costs this many bytes of CPU copying, independent of frame "
                  "rate: usually a residency or dirty-tracking gap re-copying what did not change "
                  "(storage-materialize: storage images re-staged per dispatch; rtt-snapshot: "
-                 "render targets re-read to the CPU; guest-scanout: the CPU present fallback). "
+                 "render targets re-read to the CPU; guest-scanout: the CPU present fallback; "
+                 "draw-buffer-stage: a draw's buffer copied because guest memory could not be "
+                 "borrowed for it, see PROSPER_RENDER_TIMING=detail's [render-timing] buffer "
+                 "lines with direct=0). "
                  "@MiB/call separates bigger copies from more copies; next: the "
                  "[transfer-pressure] exit line, [storage-materialize]/[gpu-seed-refused], "
                  "[tile-census] for detile; cf. #3871, #3926";

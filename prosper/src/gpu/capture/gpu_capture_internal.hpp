@@ -19,6 +19,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "build_revision.hpp"
 #include "gpu/texture/guest_texture_layout.hpp"
+#include "gpu/resources/linear_row_pitch.hpp"   // resolved_linear_row_pitch
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -199,7 +200,16 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // This is distinct from physical fragment entry facts and never restores captured guest VAs.
 // v71: producing SC shader/mode/AA and DB shader controls with independent per-word presence.
 // Older captures leave these raw launch facts unavailable, never infer them from pipeline defaults.
-constexpr uint32_t kVersion = 71;
+// v72 (#3135 P5): the realized merged-NGG draw description (ngg_subgroup_codec.hpp). A capture is
+// written as v72 ONLY when one of its draws carries one; every other capture is still written as
+// v71, byte for byte, so the v71 tail stays the last thing in it (gpu_capture_version_for).
+constexpr uint32_t kVersion = 72;
+constexpr uint32_t kVersionWithoutNgg = 71;
+inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& draw : c.draws)
+        if (draw.ngg_subgroup) return kVersion;
+    return kVersionWithoutNgg;
+}
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -307,17 +317,6 @@ inline uint64_t checked_mul(uint64_t a, uint64_t b) {
     return a && b > std::numeric_limits<uint64_t>::max() / a ? std::numeric_limits<uint64_t>::max() : a * b;
 }
 
-inline uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint32_t bpt) {
-    if (r.linear_row_pitch_bytes) return r.linear_row_pitch_bytes;
-    const uint64_t tight = checked_mul(width, bpt);
-    if (tight > UINT32_MAX) return UINT32_MAX;
-    if (r.host_data) return static_cast<uint32_t>(tight);
-    if (const uint32_t registered = guest_linear_texture_row_pitch(
-            r.gpu_addr, static_cast<uint32_t>(tight)))
-        return registered;
-    const size_t aligned = linear_sampled_row_pitch(width, bpt);
-    return aligned > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(aligned);
-}
 
 inline uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;

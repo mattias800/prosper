@@ -32,7 +32,8 @@
 //
 // SELF-VALIDATION, because a census that cannot detect its own invalidity is worth little
 // (charter: prefer experiments that detect their own invalidity). `seen` is counted once at the
-// top of the setup loop, before any skip path can divert a draw; `recorded` is counted
+// pass's entry (DrawDispositionPassScope), before any refusal or skip path can divert a draw;
+// `recorded` is counted
 // independently at the Vulkan draw call. A pass therefore asserts
 //
 //     seen == recorded + sum(dropped)
@@ -64,8 +65,10 @@
 
 namespace prosper::gpu {
 
-// The reasons a draw prosper wanted to issue did not reach the GPU. Order is the order the setup
-// loop can reach them, so a reader comparing two runs sees reasons appear in a stable sequence.
+// The reasons a draw prosper wanted to issue did not reach the GPU. The first eight follow the
+// order the setup loop can reach them; later ones are appended (never inserted), so a slot's
+// meaning, its perf::DropReason mirror and every grepped name stay stable across versions.
+// clang-format off: one reason per line, comments aligned; perf::DropReason mirrors this order
 enum class DrawDrop : uint8_t {
     GeometryCapability = 0,  // fragment program needs the Geometry capability; device lacks it
     MeshShape,               // mesh draw exceeds the device's mesh work-group limits
@@ -75,22 +78,58 @@ enum class DrawDrop : uint8_t {
     ShaderRejected,          // the recompiler produced no SPIR-V for a required stage
     PipelineCreation,        // vkCreateGraphicsPipelines declined the draw's pipeline
     TargetMemory,            // no memory type could hold a pass attachment (#3901): whole pass
+    // Whole-pass refusals before the per-draw loop. Each was a silent drop until `seen` moved to
+    // the pass entry (#4643): a `return` there left seen = recorded = dropped = 0 and the
+    // conservation check balanced trivially. Appended, so earlier slots keep their indices.
+    ResourceOrder,           // a draw's compact resource order is not a permutation
+    ResourceContract,        // a texture plane span or storage-image numeric contract failed
+    UnprovenSubmission,      // an earlier submission's completion was never proven
+    DeviceUnavailable,       // the backend has no usable Vulkan device
+    DetileDevice,            // a GPU detile program belongs to another device
+    OwnedWave,               // an owned-graphics-wave draw could not be materialized
+    NggExpansion,            // a merged-NGG draw could not be expanded into its run draws
+    VolumeView,              // the volume colour target's view range is invalid
+    VolumeNotPersistent,     // a volume target with persistent colour targets disabled
+    VolumeFeedback,          // a volume pass samples the volume it writes (no snapshot yet)
+    CommandPool,             // no command pool could be leased for the pass
+    VolumeMultiTarget,       // a volume pass with more than one colour target (#4643)
+    VolumeSeeded,            // a single-target volume pass with a CPU seed (multi-target wins)
+    VolumeTargetLimits,      // the device cannot hold the volume target or its layer count
+    VolumeDepthStencil,      // a volume pass with a depth/stencil attachment
+    VolumeBudget,            // a volume target could not be retained (budget or allocation)
+    TargetCreation,          // a pass attachment's image or view could not be created or bound
+    RenderPassCreation,      // vkCreateRenderPass failed
+    FramebufferCreation,     // vkCreateFramebuffer failed
+    PressureFlush,           // the cache-pressure flush before the pass failed to submit or wait
+    NggSubgroup,             // a merged-NGG draw the backend could not run whole (#3135 P5)
     Count
 };
+// clang-format on
 
 // Stable kebab-case strings; they appear in logs that get grepped. Never reword casually.
 const char* draw_drop_name(DrawDrop reason);
 
 class DrawDispositionCensus {
 public:
-    // Counted once per draw at the top of the setup loop, before any skip path can divert it.
+    // Counted ONCE per pass, by DrawDispositionPassScope at the entry of the backend's pass
+    // (render_draw_pass_rgba), for every draw handed to it -- before any refusal or skip can
+    // divert one. Not called per draw in the setup loop: an early `return` before that loop then
+    // left `seen` at zero and the pass balanced trivially, which is how #4643's volume draws were
+    // lost for weeks with no alarm. Counting at entry makes every unnamed exit UNACCOUNTED.
     void note_seen(uint64_t count = 1);
     // Counted at the Vulkan draw call, by a route sharing no counter with note_seen.
     void note_recorded(uint64_t count = 1);
     // Counted at each involuntary skip site, naming the mechanism that was missing.
-    void note_dropped(DrawDrop reason);
+    void note_dropped(DrawDrop reason, uint64_t count = 1);
+    // The pass replaced its draw list with a different number of draws (a merged-NGG draw
+    // becomes its run draws). Re-bases `seen` from `from` to `to` so the pass is judged against
+    // the draws it will actually try to record.
+    void note_rebatched(uint64_t from, uint64_t to);
+    // All five above count nothing on a thread inside perf::SuppressDrawDropCounting (an F9 or
+    // menu capture, a diagnostic re-realization): those passes are not live execution and must
+    // not raise the alarm being investigated.
 
-    // Called once at the end of a pass. Prints nothing when the pass was healthy and quiet under
+    // Called once at the end of a pass, on the pass's own thread. Prints nothing when the pass was healthy and quiet under
     // the per-reason budget; always prints a pass that recorded zero draws having seen some, and
     // always prints when the two independent routes disagree.
     void report_pass();
@@ -117,9 +156,15 @@ public:
     void note_pass_duration(uint64_t draws, uint64_t nanoseconds);
 
     // Programmatic readers (tests, tools). Totals are process-lifetime, not per pass.
+    // The CALLING THREAD's current pass: per-pass figures are thread-local, because concurrent
+    // passes overlap at the entry where `seen` is counted (draw_disposition.cpp, PassCounters).
     // The current pass's seen count, for the scope guard to read before report_pass() resets it.
     uint64_t pass_seen_for_scope() const;
+    // The current pass's seen - recorded - dropped, clamped at zero: what a refusal names.
+    uint64_t pass_unaccounted_for_scope() const;
     uint64_t seen() const;
+    // Passes recorded by note_pass_duration (refused passes are excluded; see the scope).
+    uint64_t timed_passes() const;
     uint64_t recorded() const;
     uint64_t dropped(DrawDrop reason) const;
     uint64_t dropped_total() const;
@@ -138,14 +183,37 @@ DrawDispositionCensus& draw_disposition_census();
 // `UNACCOUNTED=1` on an Astro Bot run, and the unaccounted draw belonged to a different pass
 // entirely. A guard is used rather than auditing the 48 `return` statements in the enclosing
 // function because the next `return` added would silently reintroduce the leak.
+//
+// It is also where `seen` is counted: the constructor takes the number of draws handed to the
+// pass. A refusal site names its cause with `refuse(reason)` (or `return scope.refuse(reason,
+// out);`), and the scope then drops every draw still unaccounted at exit under that reason. An
+// exit that names nothing leaves the gap standing, so it is reported as UNACCOUNTED.
 struct DrawDispositionPassScope {
-    DrawDispositionPassScope();
+    explicit DrawDispositionPassScope(uint64_t draws);
     DrawDispositionPassScope(const DrawDispositionPassScope&) = delete;
     DrawDispositionPassScope& operator=(const DrawDispositionPassScope&) = delete;
     ~DrawDispositionPassScope();
 
+    void refuse(DrawDrop reason) { refusal_ = reason; }
+    template <typename Result>
+    Result& refuse(DrawDrop reason, Result& result) {
+        refuse(reason);
+        return result;
+    }
+    // Some of the pass's draws dropped by a filter that lets the rest through.
+    void drop(DrawDrop reason, uint64_t count) {
+        draw_disposition_census().note_dropped(reason, count);
+    }
+    // The pass now holds `to` draws in place of `from` (DrawDispositionCensus::note_rebatched).
+    void rebatch(uint64_t from, uint64_t to) { draw_disposition_census().note_rebatched(from, to); }
+
 private:
     uint64_t start_ns_ = 0;
+    DrawDrop refusal_ = DrawDrop::Count;
 };
+
+// A logical batch refused before it reached any pass (render_draws_rgba's whole-batch preflight):
+// accounted as one pass that saw `draws` draws and dropped every one under `reason`.
+void refuse_draw_pass(uint64_t draws, DrawDrop reason);
 
 }  // namespace prosper::gpu

@@ -1301,6 +1301,18 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  # #3135 P5: live admission of merged-NGG draws -- the register table, the device half and the
+  # cached live producer. Pure CPU; the Kena arms compile the captured chain from tests/data.
+  prosper_add_gtest(test_ngg_draw_admission
+    SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  # #3135 P5: the v72 capture record of a merged-NGG draw description.
+  prosper_add_gtest(test_ngg_subgroup_codec
+    SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
@@ -2879,6 +2891,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
+            tests/gpu/state/test_render_state_memo.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -4064,6 +4077,12 @@ endif()
     SOURCES tests/gpu/pm4/test_cb_branch.cpp
     LIBRARIES prosper_core)
 
+  # A packet-predicated Jump under a BOOL64 SetPredication window runs only on a non-zero
+  # condition (Dragon Quest VII's AGC helper segments).
+  prosper_add_gtest(test_predicated_jump
+    SOURCES tests/gpu/pm4/test_predicated_jump.cpp
+    LIBRARIES prosper_core)
+
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
   prosper_add_gtest(test_agc_multi_dcb_empty_segment
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
@@ -4159,6 +4178,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4568,6 +4588,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4731,6 +4752,11 @@ endif()
       add_test(NAME draw_resource_status COMMAND test_draw_resource_status)
       set_tests_properties(draw_resource_status PROPERTIES
         ENVIRONMENT "PROSPER_TEXREF_CENSUS=1" TIMEOUT 45)
+      # The comparison arm of the over-declared buffer view (#4556): the same arms expect the copy.
+      add_test(NAME draw_resource_status_no_short_buffer_view
+               COMMAND test_draw_resource_status --expect-copy)
+      set_tests_properties(draw_resource_status_no_short_buffer_view PROPERTIES
+        ENVIRONMENT "PROSPER_TEXREF_CENSUS=1;PROSPER_NO_SHORT_BUFFER_VIEW=1" TIMEOUT 45)
       prosper_add_gtest(test_float32_array_upload
         SOURCES tests/shared/live/test_float32_array_upload.cpp
         INCLUDES frontends src tests
@@ -4979,6 +5005,13 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #4625: a compute binding of a renderer-claimed volume publishes it to guest memory first,
+      # then runs a real 3D storage dispatch on the published bytes through the live backend.
+      prosper_add_gtest(test_renderer_volume_publication
+        SOURCES tests/gpu/execute/test_renderer_volume_publication.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
       # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
       # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
       # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.
@@ -5395,6 +5428,25 @@ endif()
                PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
                $<TARGET_FILE:test_compute_transfer_mip_chain>)
       set_tests_properties(compute_transfer_mip_chain PROPERTIES TIMEOUT 60)
+
+      # Live dispatches over a padded linear 2D image (sampled upload, sampled span, compute ->
+      # compute transfer borrow) and a compute pass naming a renderer target's DCC plane.
+      prosper_add_gtest(test_compute_linear_row_pitch
+        SOURCES tests/gpu/execute/test_compute_linear_row_pitch.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        ENVIRONMENT PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
+        PROPERTIES TIMEOUT 60)
+      # The same binary at the DEFAULT cache thresholds: below 4 KiB nothing is retained, so a
+      # compute -> compute chain goes through guest memory (the discovered copy of this case skips).
+      add_test(NAME compute_linear_row_pitch_default_thresholds
+               COMMAND ${CMAKE_COMMAND} -E env
+                       --unset=PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB
+                       --unset=PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB
+                       $<TARGET_FILE:test_compute_linear_row_pitch>
+                       --gtest_filter=ComputeLinearRowPitchDefaults.*)
+      set_tests_properties(compute_linear_row_pitch_default_thresholds PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
@@ -6749,6 +6801,18 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
   prosper_add_gtest(test_unorm10_snapshot
     SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # A fast-cleared compressed RGBA8 T# is its clear colour (Black Flag's warning-screen background).
+  prosper_add_gtest(test_sampled_dcc_fast_clear
+    SOURCES tests/shared/compute/test_sampled_dcc_fast_clear.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # A padded linear image is read row by row by the compute backend too (Black Flag's video planes).
+  prosper_add_gtest(test_linear_image_pitch
+    SOURCES tests/shared/compute/test_linear_image_pitch.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 
