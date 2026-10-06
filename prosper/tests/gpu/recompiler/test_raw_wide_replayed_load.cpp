@@ -388,6 +388,195 @@ TEST(RawWideReplayedLoad, OnlyARealSccWriterEndsACompareOnALoadedWord) {
     }
 }
 
+TEST(RawWideReplayedLoad, AUnaryMaskTransferKeepsExecIndependent) {
+    // #4555. `s_wqm_b64 exec, exec` is how nearly every pixel shader begins. It derives EXEC
+    // from EXEC, so an independent EXEC stays independent, and the compare that later recycles
+    // the V#'s pair is still a fresh mask. While only s_mov_b64 was a recognised unary transfer,
+    // this instruction made the walk distrust every compare after it, for any load fetched
+    // above it. Here it sits in the loop, below the load; in GTA V the V# loads are at pc 4
+    // and the prologue at pc 9.
+    const auto wqm = program({.in_loop = {0xbefe0a7eu}});   // s_wqm_b64 exec, exec
+    ASSERT_EQ(at(wqm, 5).fmt, Rdna2Format::SOP1);
+    ASSERT_EQ(at(wqm, 5).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(wqm, 5).dst.value, 126);
+    ASSERT_EQ(at(wqm, 5).src[0].value, 126);
+    EXPECT_FALSE(flagged(wqm)) << numeric_blocker(wqm);
+    EXPECT_TRUE(rdna2_raw_wave_wide_data_loads(wqm).empty());
+
+    const auto inverted = program({.in_loop = {0xbefe087eu}});   // s_not_b64 exec, exec
+    ASSERT_EQ(at(inverted, 5).opcode, kSop1OpcodeNotB64);
+    EXPECT_FALSE(flagged(inverted)) << numeric_blocker(inverted);
+
+    // From the recycled pair itself, whose high word still MAY be the load's: the transfer is
+    // from an independent root, so EXEC stays independent and the loop is cleared.
+    const auto from_fresh = program({.after_mask = {0xbefe0a10u}});   // s_wqm_b64 exec, s[16:17]
+    ASSERT_EQ(at(from_fresh, 8).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(from_fresh, 8).src[0].value, 16);
+    EXPECT_FALSE(flagged(from_fresh)) << numeric_blocker(from_fresh);
+
+    // Control: the transfer is only as independent as its source. s_wqm_b64 exec, s[18:19] makes
+    // EXEC out of two loaded words, and that is a use of them.
+    const auto from_load = program({.in_loop = {0xbefe0a12u}});
+    ASSERT_EQ(at(from_load, 5).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(from_load, 5).src[0].value, 18);
+    EXPECT_TRUE(flagged(from_load));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(from_load, &pc), "derived-value-leaves-scalar-data");
+    EXPECT_EQ(pc, 5u);
+}
+
+TEST(RawWideReplayedLoad, AUnaryMaskTransferIntoVccReplacesWhatVccHeld) {
+    // s_mov_b64 vcc, s[18:19] ; (compare into s[16:17]) ; s_wqm_b64 vcc, s[16:17] ;
+    // s_cbranch_vccz. VCC first holds two loaded words, then the fresh compare's mask, and the
+    // branch reads the second. This is only true because the emitter makes S_WQM into VCC a VCC
+    // write (ComputeWqmIntoVcc pins that on the GPU); it used to leave the branch on the stale
+    // VCC, and with that the classification below would have been wrong.
+    const auto replaced =
+        program({.in_loop = {0xbeea0412u}, .move_mask_to_vcc = false, .after_mask = {0xbeea0a10u}});
+    ASSERT_EQ(at(replaced, 5).opcode, kSop1OpcodeMovB64);
+    ASSERT_EQ(at(replaced, 5).dst.value, 106);
+    ASSERT_EQ(at(replaced, 5).src[0].value, 18);
+    ASSERT_EQ(at(replaced, 8).opcode, kSop1OpcodeWqmB64);
+    ASSERT_EQ(at(replaced, 8).dst.value, 106);
+    ASSERT_EQ(at(replaced, 8).src[0].value, 16);
+    ASSERT_EQ(at(replaced, 9).fmt, Rdna2Format::SOPP);
+    EXPECT_FALSE(flagged(replaced)) << numeric_blocker(replaced);
+    // Control: without the S_WQM the branch reads the loaded words the move put in VCC.
+    const auto stale = program({.in_loop = {0xbeea0412u}, .move_mask_to_vcc = false});
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(stale, &pc), "implicit-vcc-reader");
+    EXPECT_EQ(pc, 8u);
+}
+
+TEST(RawWideReplayedLoad, ACarryInFromAFreshCompareIsNotANumericRead) {
+    // #4555, the MOUSE: P.I. For Hire program. v_addc_co_u32 v3, s[44:45], 0, v3, s[16:17]
+    // (VOP3B 0x128) takes its carry-in from the pair the compare just recycled. The emitter
+    // consumes that operand as a Bool and refuses an untracked one. v_cndmask's condition was
+    // already exempt here when it is an independent root; the carry-in forms were not.
+    const std::vector<uint32_t> carry_in{0xd5282c03u, 0x00420680u};
+    const auto fresh = program({.after_mask = carry_in});
+    ASSERT_EQ(at(fresh, 8).fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(at(fresh, 8).opcode, 0x128u);
+    ASSERT_EQ(at(fresh, 8).src[2].kind, OperandKind::SGPR);
+    ASSERT_EQ(at(fresh, 8).src[2].value, 16);
+    ASSERT_EQ(at(fresh, 8).sdst.value, 44);
+    EXPECT_FALSE(flagged(fresh)) << numeric_blocker(fresh);
+
+    // Control: with no compare the pair still holds the load's own words, and a carry taken
+    // from them is a read of the load.
+    const auto loaded =
+        program({.compare = false, .move_mask_to_vcc = false, .after_mask = carry_in});
+    ASSERT_EQ(at(loaded, 5).opcode, 0x128u);
+    EXPECT_TRUE(flagged(loaded));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(loaded, &pc), "numeric-reader");
+    EXPECT_EQ(pc, 5u);
+}
+
+TEST(RawWideReplayedLoad, ADefiniteLaneReadEndsTheMarkOnItsDestination) {
+    // s_mov_b32 s20, s19 ; v_readfirstlane s20, v1 ; v_mov_b32 v0, s20. The copy carries a
+    // loaded word into s20, and v_readfirstlane then replaces s20 whatever EXEC is. Only
+    // v_readlane was treated as a definite write, so s20 kept the load's mark and the v_mov
+    // was a numeric reader (#4555, the MOUSE program: vcc_hi rewritten at its pc 390).
+    const uint32_t copy = 0xbe940313u, lane_read = 0x7e280501u, reader = 0x7e000214u;
+    const auto replaced = program({.in_loop = {copy, lane_read, reader}});
+    ASSERT_EQ(at(replaced, 5).dst.value, 20);
+    ASSERT_EQ(at(replaced, 5).src[0].value, 19);
+    ASSERT_EQ(at(replaced, 6).fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(at(replaced, 6).opcode, 0x02u);
+    ASSERT_EQ(at(replaced, 6).dst.value, 20);
+    ASSERT_EQ(at(replaced, 7).src[0].value, 20);
+    EXPECT_FALSE(flagged(replaced)) << numeric_blocker(replaced);
+    // Control: without the lane read the v_mov reads the copied word.
+    const auto copied = program({.in_loop = {copy, reader}});
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(copied, &pc), "numeric-reader");
+    EXPECT_EQ(pc, 6u);
+}
+
+namespace {
+// The same loop with instructions in front of it, so the load is no longer at pc 1:
+//      (prefix)
+//   L  s_load_dwordx4 s[16:19], s[28:29], 0xf0
+//      s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+//      (in_loop)
+//      v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17]
+//      s_cbranch_vccz +1 ; s_branch L
+//      v_readfirstlane vcc_lo, v1 ; s_endpgm
+// Returns whether the load is flagged, and its numeric blocker through `kind`.
+bool prefixed_load_is_flagged(const std::vector<uint32_t>& prefix,
+                              const std::vector<uint32_t>& in_loop, std::string* kind = nullptr) {
+    std::vector<uint32_t> code = prefix;
+    const uint32_t load_pc = static_cast<uint32_t>(code.size());
+    code.insert(code.end(), {0xf408040eu, 0xfa0000f0u, 0xf4280208u, 0xfa0000c0u});
+    code.insert(code.end(), in_loop.begin(), in_loop.end());
+    code.insert(code.end(), {0x7c1a14f9u, 0x86869080u, 0xbeea0410u, 0xbf860001u});
+    const uint32_t branch_pc = static_cast<uint32_t>(code.size());
+    code.push_back(0xbf820000u | ((load_pc - (branch_pc + 1u)) & 0xffffu));
+    code.insert(code.end(), {0x7ed40501u, 0xbf810000u});
+    std::vector<Rdna2Inst> instructions;
+    EXPECT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
+    if (kind) kind->clear();
+    for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions))
+        if (row.load_pc == load_pc && kind) *kind = row.numeric_kind;
+    const auto loads = rdna2_raw_wide_data_loads(instructions);
+    return std::find(loads.begin(), loads.end(), load_pc) != loads.end();
+}
+constexpr uint32_t kSaveExecInVcc = 0xbeea047eu;   // s_mov_b64 vcc, exec
+constexpr uint32_t kRestoreExecFromVcc = 0xbefe046au;   // s_mov_b64 exec, vcc
+constexpr uint32_t kSaveExecInS96 = 0xbee0047eu;   // s_mov_b64 s[96:97], exec
+constexpr uint32_t kRestoreExecFromS96 = 0xbefe0460u;   // s_mov_b64 exec, s[96:97]
+}   // namespace
+
+TEST(RawWideReplayedLoad, ExecSavedInVccBeforeTheLoadIsAnIndependentRoot) {
+    // #4555, the second GTA V program: `s_mov_b64 vcc, exec` above a guarded sample and
+    // `s_mov_b64 exec, vcc` after it. The seeds only recognised a save into s0..s104, so the
+    // restore made EXEC "dependent" and every compare after it stopped counting as fresh.
+    std::string kind;
+    EXPECT_FALSE(prefixed_load_is_flagged({kSaveExecInVcc}, {kRestoreExecFromVcc}, &kind)) << kind;
+    // Control: with nothing saved, the same restore takes EXEC from an unknown VCC.
+    EXPECT_TRUE(prefixed_load_is_flagged({0x7e020280u}, {kRestoreExecFromVcc}));
+    // And VCC stops being the save when something writes it. A compare with the implicit
+    // destination is not in the explicit writer inventory, so the seed pass names it itself.
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInVcc, 0x7d820204u /* v_cmp_lt_u32 vcc */},
+                                         {kRestoreExecFromVcc}));
+    // So is the carry-out of an e32 add-with-carry: v_addc_co_u32 v4, vcc, 0, v3, vcc.
+    constexpr uint32_t kAddWithCarry = 0x50080680u;
+    std::vector<Rdna2Inst> carry;
+    ASSERT_EQ(rdna2_walk(&kAddWithCarry, 1, carry), 1u);
+    ASSERT_EQ(carry.front().fmt, Rdna2Format::VOP2);
+    ASSERT_EQ(carry.front().opcode, 0x28u);
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInVcc, kAddWithCarry}, {kRestoreExecFromVcc}));
+}
+
+TEST(RawWideReplayedLoad, ALoopAboveTheLoadDoesNotCostItsSeeds) {
+    // The seed pass was one forward sweep that gave up at the first backward branch, so any
+    // loop earlier in the program (GTA V has one at its pc 149) left every later load with no
+    // saved-EXEC fact at all. It is a fixed point now.
+    //   0  s_mov_b64 s[96:97], exec
+    //   1  s_nop
+    //   2  s_cbranch_scc1 -2        back to pc 1
+    std::string kind;
+    EXPECT_FALSE(prefixed_load_is_flagged({kSaveExecInS96, 0xbf800000u, 0xbf85fffeu},
+                                          {kRestoreExecFromS96}, &kind))
+        << kind;
+    // Control: a loop body that overwrites the saved pair leaves nothing to seed.
+    //   1  s_mov_b32 s96, 0
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInS96, 0xbee00380u, 0xbf85fffeu},
+                                         {kRestoreExecFromS96}));
+    // Control: a save that only one path makes is not a fact at the join.
+    //   0  s_cbranch_scc1 +1 ; 1  s_mov_b64 s[96:97], exec
+    EXPECT_TRUE(prefixed_load_is_flagged({0xbf850001u, kSaveExecInS96}, {kRestoreExecFromS96}));
+    // Control: the overwrite is only on the way BACK round the loop, after the exit branch, so
+    // it reaches the load through the back-edge alone. A pass that skipped backward branches
+    // instead of following them would still seed here.
+    //   0  save ; 1  s_nop ; 2  s_cbranch_scc1 +2 (out, to the load) ; 3  s_mov_b32 s96, 0 ;
+    //   4  s_branch -4 (to pc 1)
+    EXPECT_TRUE(prefixed_load_is_flagged(
+        {kSaveExecInS96, 0xbf800000u, 0xbf850002u, 0xbee00380u, 0xbf82fffcu},
+        {kRestoreExecFromS96}));
+}
+
 TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
     // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
     // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it

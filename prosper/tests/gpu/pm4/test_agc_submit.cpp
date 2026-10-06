@@ -313,30 +313,27 @@ TEST(AgcSubmit, Contract) {
 
     // Tagged submit imports must open their scope before validation because the generated return
     // hook runs for rejected calls too. Model Windows' same-thread re-entrancy window: the outer
-    // handler has returned but its trampoline is dispatching guest exception code, which makes two
-    // rejected tagged submits before the outer hook runs. Each nested hook must consume only the
+    // handler has returned but its trampoline is dispatching guest exception code, which makes a
+    // rejected tagged submit before the outer hook runs. Each nested hook must consume only the
     // scope opened by its own invocation.
+    //
+    // sceAgcCbBranch (w1KFAHVqpaU) used to be in this group because prosper folded its target as
+    // a submit. It is a command-buffer builder (#4540): it must carry NO submit return hook, or a
+    // hook would close a scope the builder never opened.
     {
-        auto submit_final = reinterpret_cast<HostHle9>(Hle::lookup("w1KFAHVqpaU"));
         auto submit_hook = Hle::return_hook_of("UglJIZjGssM");
-        CHECK(submit_final && submit_hook &&
-              submit_hook == Hle::return_hook_of("gSRnr79F8tQ") &&
-              submit_hook == Hle::return_hook_of("w1KFAHVqpaU"),
-              "all tagged submit imports expose their shared return hook");
+        CHECK(submit_hook && submit_hook == Hle::return_hook_of("gSRnr79F8tQ"),
+              "the tagged submit imports expose their shared return hook");
+        CHECK(Hle::lookup_address("w1KFAHVqpaU") && !Hle::return_hook_of("w1KFAHVqpaU"),
+              "sceAgcCbBranch is registered as a builder, without the submit return hook");
         prosper_gpu_enable_post_submit_visibility();
         CHECK(submit(0, 0, 0, 0, 0, 0) != 0 && prosper_gpu_submit_scope_active(),
               "rejected outer DCB invocation opens a scope before validation");
         CHECK(submit_acb(0, 0, 0, 0, 0, 0) != 0 && prosper_gpu_submit_scope_active(),
               "rejected nested ACB invocation opens its own same-thread scope");
-        submit_final(0, 0, 0, 0, 0, 0, 0, 0, 0);
-        CHECK(prosper_gpu_submit_scope_active(),
-              "rejected nested final-DCB invocation also opens its own scope");
         submit_hook();
         CHECK(prosper_gpu_submit_scope_active(),
-              "first nested return hook preserves both enclosing scopes");
-        submit_hook();
-        CHECK(prosper_gpu_submit_scope_active(),
-              "second nested return hook preserves the outer scope");
+              "the nested return hook preserves the outer scope");
         submit_hook();
         CHECK(!prosper_gpu_submit_scope_active(),
               "outer return hook retires the final matching scope");

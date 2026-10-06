@@ -38,7 +38,18 @@ snapshots; `PROSPER_SUBMITORDER` separately records pre-mutex call order and sub
 The trace localizes the mismatch (the bound program came from a q1/Dcb fold and the larger write from
 the following q3/DcbFinal fold), but does not by itself establish a cross-queue root cause. Giving
 DcbFinal a separate register file was tested as a default-off A/B and did not restore the world or
-collapse rejects. The underlying ordering/ring contract remains unproven.
+collapse rejects.
+
+**Update (#4540): the q3 "DcbFinal" fold was not a hardware queue.** It was prosper executing
+`sceAgcCbBranch` (`w1KFAHVqpaU`) targets at the moment the guest *recorded* the branch, against
+whatever pipeline the previous fold left bound. The firmware writes a 14-dword conditional
+indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the same and runs the
+target when the command processor reaches the packet inside the buffer that carries it. So there is
+no separate ring whose ordering contract was unknown, and the split-register-file lever
+(`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
+26/25/5 to 6/6/2 (vertex/fragment/compute, `prosper-app` default launch with `PROSPER_NULL_PAGE=1`,
+240 s, no input; one control run on main, two runs with the change, and a third with the change read
+11/12/4). **Not yet re-measured on this title**, so whether it restores the world is open.
 
 **Nikoderiko is the loud reproduction #305 has been missing.** On DOLL / Dragon Quest VII
 (`PPSA17942`) the same defect costs 0–33 UI draws per 7-minute run; here it costs the world — 25

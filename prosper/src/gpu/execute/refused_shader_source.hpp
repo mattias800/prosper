@@ -16,6 +16,9 @@ struct RefusedDrawShaders {
     uint64_t vs_address, ps_address, es_address, command_order;
     size_t max_dwords, vs_words, gs_words, fs_words;
     bool vs_failed, ps_failed;
+    // Set when the draw was refused before any recompile was attempted (the owned-wave gate), so
+    // the index line says why. Its first_bad_* fields are the generic coverage census, not a cause.
+    const char* refusal = nullptr;
 };
 
 void note_refused_draw_shaders(const RefusedDrawShaders& shaders);

@@ -753,6 +753,10 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_wrapper_identity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_compiler_wrapper.py")
+    set_tests_properties(compiler_wrapper_identity PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compiler_source_identity
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
@@ -1268,6 +1272,18 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_dcc_helper_program
     SOURCES tests/gpu/execute/test_dcc_helper_program.cpp
     INCLUDES src)
+
+  # #1588: AGC's eliminate-fast-clear rectangle writes no colour; a latched MODE=2 on an ordinary
+  # draw still does. Matcher arms plus realize_draw_item arms (no device needed).
+  prosper_add_gtest(test_efc_helper_program
+    SOURCES tests/gpu/execute/test_efc_helper_program.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_srt_publication_dedupe
+    SOURCES tests/gpu/execute/test_srt_publication_dedupe.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
@@ -3101,6 +3117,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_wqm_into_vcc_execution
+      SOURCES tests/gpu/execute/test_compute_wqm_into_vcc.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
@@ -4013,6 +4034,12 @@ endif()
 
   prosper_add_gtest(test_agc_submit
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
+    LIBRARIES prosper_core)
+
+  # sceAgcCbBranch is a builder (#4540): packet layout, patchers, condition, and the ordering
+  # contract (the target runs inside the buffer that carries the branch).
+  prosper_add_gtest(test_cb_branch
+    SOURCES tests/gpu/pm4/test_cb_branch.cpp
     LIBRARIES prosper_core)
 
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
@@ -6627,6 +6654,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     SOURCES tests/shared/live/test_live_target_format.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+  # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
+  prosper_add_gtest(test_unorm10_snapshot
+    SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
 
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)

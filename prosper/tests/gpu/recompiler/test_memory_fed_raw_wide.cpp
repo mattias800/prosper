@@ -248,7 +248,8 @@ TEST(MemoryFedRawWide, Contract) {
     CHECK(proof(register_read).empty(), "a register-offset source read is outside the immediate x1 subset");
     auto pair_read = code;
     pair_read[0] = 0xf4040101u;
-    CHECK(proof(pair_read).empty(), "x2 source read is outside this bounded x1 unit");
+    // #4578: UE4's vertex-factory index is an s_load_dwordx2 pair; its snapshot owns both words.
+    CHECK(!proof(pair_read).empty(), "an x2 source read is a latched source too");
     auto unaligned_read = code;
     unaligned_read[1] = 0xfa000002u;
     CHECK(proof(unaligned_read).empty(), "unaligned source immediate stays unproven");
@@ -293,4 +294,111 @@ TEST(MemoryFedRawWide, Contract) {
     add_compute_buffer_resources(invalid_wide, code.data(), code.size(),
                                  invalid_user.data(), invalid_user.size());
     CHECK(!invalid_wide.by_fetch_pc(7u), "an overflowing selected wide range stays unbacked");
+}
+
+// #4578: UE4's vertex-factory fetch loads its index PAIR with s_load_dwordx2. The table owns both
+// observed words, and a frame capture keeps each draw's own pair rather than re-reading the guest.
+TEST(MemoryFedRawWide, X2SourceOwnsBothWordsThroughCapture) {
+    alignas(16) std::array<uint32_t, 128> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = 100u + static_cast<uint32_t>(i);
+    alignas(8) std::array<uint32_t, 2> pair{2u, 0x77u};
+    const auto address = reinterpret_cast<uint64_t>(bytes.data());
+    const auto pair_address = reinterpret_cast<uint64_t>(pair.data());
+    std::array<uint32_t, 4> user{
+        static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+        static_cast<uint32_t>(pair_address), static_cast<uint32_t>(pair_address >> 32u)};
+    const std::vector<uint32_t> code = {
+        0xf4040101u, 0xfa000000u,   // x2 s[4:5],entry s[2:3],0
+        0xbe820380u, 0xbe830380u,   // s[2:3] = 0 after the read
+        0x8f6b8404u,   // s_lshl_b32 vcc_hi,s4,4
+        0x876bff6bu, 0x000001f0u,   // s_and_b32 vcc_hi,vcc_hi,0x1f0
+        0xf4080200u, 0xd6000000u,   // x4 s[8:11],entry s[0:1],vcc_hi
+        0x7e000c0bu,   // last loaded word -> v0 float
+        0xbf810000u,
+    };
+    auto table_for = [&] {
+        ShaderResourceTable table;
+        add_compute_buffer_resources(table, code.data(), code.size(), user.data(), user.size());
+        assign_convention_bindings(table, 2u);
+        return table;
+    };
+    CHECK(proof(code) == std::vector<uint32_t>{7u}, "an x2 source admits the later wide offset");
+    const auto table = table_for();
+    const auto* scalar = table.by_fetch_pc(0u);
+    std::array<uint32_t, 2> owned{UINT32_MAX, UINT32_MAX};
+    if (scalar && scalar->host_data && scalar->host_data_size == sizeof(owned))
+        std::memcpy(owned.data(), scalar->host_data, sizeof(owned));
+    CHECK(scalar && valid_raw_offset_scalar_snapshot_resource(*scalar) && scalar->size == 8u &&
+              owned[0] == 2u && owned[1] == 0x77u,
+          "the x2 source owns both observed words");
+    CHECK(table.by_fetch_pc(7u) && table.by_fetch_pc(7u)->gpu_addr == address + 32u,
+          "the low word selects the wide range");
+    ComputeShaderConfig config;
+    config.user_sgprs.assign(user.begin(), user.end());
+    config.wave_size = 64u;
+    CHECK(!recompile_compute(code.data(), code.size(), &table, config).empty(),
+          "the x2-sourced program recompiles");
+    auto short_backing = table;
+    for (auto& r : short_backing.resources)
+        if (r.fetch_pc == 0u) r.host_data_size = 4u;
+    CHECK(recompile_compute(code.data(), code.size(), &short_backing, config).empty(),
+          "an x2 source with only one owned word is refused");
+
+    pair[0] = 3u;
+    pair[1] = 0x88u;
+    const auto changed = table_for();
+    DrawItem first_draw, changed_draw;
+    first_draw.vs = changed_draw.vs = {0x07230203u, 1u, 2u};
+    first_draw.vrt = std::make_shared<ShaderResourceTable>(table);
+    changed_draw.vrt = std::make_shared<ShaderResourceTable>(changed);
+    uint64_t planned = 0;
+    std::string error;
+    CHECK(preflight_gpu_capture_draw_resources(first_draw, 1u << 20u, planned, error) &&
+              planned == 24u,
+          "capture budget includes the owned eight-byte source and selected sixteen-byte range");
+    unsigned pair_reads = 0;
+    const CaptureMemoryReader reader = [&](uint64_t addr, uint8_t* dst, size_t size) {
+        if (addr >= pair_address && addr < pair_address + sizeof(pair)) ++pair_reads;
+        if (addr < address || addr > address + sizeof(bytes) ||
+            size > address + sizeof(bytes) - addr)
+            return size_t{0};
+        std::memcpy(dst, reinterpret_cast<const void*>(addr), size);
+        return size;
+    };
+    GpuCaptureFile capture, restored;
+    std::vector<uint8_t> encoded;
+    GpuReplayFrame replay;
+    const bool restored_ok =
+        capture_draw_items({first_draw, changed_draw}, {}, reader, capture, error) &&
+        serialize_gpu_capture(capture, encoded, error) &&
+        deserialize_gpu_capture(encoded, restored, error) &&
+        materialize_gpu_replay(restored, replay, error);
+    std::array<uint32_t, 2> replay_first{}, replay_changed{};
+    if (restored_ok && replay.items.size() == 2u && replay.items[0].vrt && replay.items[1].vrt) {
+        const auto* first = replay.items[0].vrt->by_fetch_pc(0u);
+        const auto* second = replay.items[1].vrt->by_fetch_pc(0u);
+        if (first && first->host_data && first->host_data_size == 8u)
+            std::memcpy(replay_first.data(), first->host_data, 8u);
+        if (second && second->host_data && second->host_data_size == 8u)
+            std::memcpy(replay_changed.data(), second->host_data, 8u);
+    }
+    if (!restored_ok) std::printf("capture error: %s\n", error.c_str());
+    CHECK(restored_ok && pair_reads == 0u && replay_first == (std::array<uint32_t, 2>{2u, 0x77u}) &&
+              replay_changed == (std::array<uint32_t, 2>{3u, 0x88u}),
+          "capture owns each draw's own x2 pair without re-reading the guest");
+}
+
+// The x2 destination pair must stay below VCC: s[104:105] is a latched source, s[105:106] is not.
+TEST(MemoryFedRawWide, X2SourceDestinationStaysBelowVcc) {
+    std::vector<uint32_t> code = {
+        0xf4041a01u, 0xfa000000u,   // x2 s[104:105],entry s[2:3],0
+        0x8f6b8468u,   // s_lshl_b32 vcc_hi,s104,4
+        0x876bff6bu, 0x000001f0u,   // s_and_b32 vcc_hi,vcc_hi,0x1f0
+        0xf4080200u, 0xd6000000u,   // x4 s[8:11],entry s[0:1],vcc_hi
+        0x7e000c0bu, 0xbf810000u,
+    };
+    CHECK(proof(code) == std::vector<uint32_t>{5u}, "an x2 pair ending at s105 is a source");
+    code[0] = 0xf4041a41u;   // x2 s[105:106]: its high word is VCC_LO
+    code[2] = 0x8f6b8469u;   // s_lshl_b32 vcc_hi,s105,4
+    CHECK(proof(code).empty(), "an x2 pair reaching into VCC is not");
 }

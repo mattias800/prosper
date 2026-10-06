@@ -9,7 +9,7 @@ The boundary against its siblings: `tools/doctor/` asks whether the *machine* ca
 `tools/perf/` reads a capture prosper produced, and `tools/getenv_probe/` measures which switches
 are actually hot. This folder is about the switch surface itself.
 
-## The three gates (all run under ctest)
+## The gates (the first three run under ctest; the registry runs in the Docs CI job)
 
 - **`check_cached_env.py`** — refuses to cache a name something arms at runtime. A cached read is
   sampled once at first use, so a test that arms a diagnostic and then asserts on it does not fail
@@ -24,6 +24,13 @@ are actually hot. This folder is about the switch surface itself.
   list: a row has to carry a mechanism at a `file:line` the next reader can open. Its narrow cached
   reference-getter bridge preserves config provenance through an identified singleton receiver;
   cross-file positive, bridge-off and adversarial controls run with `--selftest`.
+- **`check_switch_registry.py`** + `switch_registry.txt` -- the list of every `PROSPER_*` name the
+  shipping code mentions, each with the charter's class: `host-capability`, `diagnostic`, or
+  `selector` (with the `#issue` that will settle its default and delete it). Names that predate the
+  registry are `unclassified` and grandfathered; that set may only shrink, and a new switch must be
+  classified in the PR that adds it. Classify one by editing its row; `--update` adds new names and
+  drops removed ones. It checks that a class exists, never that it is true. Runs in the `Docs` CI
+  job; tests are `test_check_switch_registry.py` (pytest).
 - **`member_fact_domains.py`** + `MEMBER_FACT_DOMAINS.md` — explicit TEST_LOCAL source-role
   declarations partition both member declaration and initializer facts without excluding files.
   Every header and uncertain/refused source remains shared; test TUs retain the original all-file

@@ -70,9 +70,9 @@ const ShaderResourceTable* producing_pixel_table(const DrawItem& draw) {
 }
 
 // Resource folding owns a scalar observation when that exact value selected a later
-// register-offset load. Preserve each draw's observation independently, including when another
-// draw uses the same guest address after it changes. Ordinary guest-backed buffers keep their
-// shared allocation intervals.
+// register-offset load: one word for an x1 source, two for an x2 source (#4578). Preserve each
+// draw's observation independently, including when another draw uses the same guest address after
+// it changes. Ordinary guest-backed buffers keep their shared allocation intervals.
 bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& resource) {
     const bool owned_wide = std::any_of(
         table.owned_raw_snapshot_requirements.begin(), table.owned_raw_snapshot_requirements.end(),
@@ -82,17 +82,18 @@ bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& re
                          table.owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
             return requirement.first == resource.fetch_pc && requirement.second == resource.size;
         });
-    return resource.cls == ResourceClass::ConstantBuffer &&
-        resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
-        (resource.size == sizeof(uint32_t) || owned_wide) &&
-        resource.host_data_size == resource.size &&
-        resource.host_data && !resource.host_data_prefix_bytes && !resource.table_index_count &&
-        !resource.metadata_addr && resource.fetch_pc != UINT32_MAX &&
-        std::any_of(table.owned_host_data.begin(), table.owned_host_data.end(),
-            [&](const auto& owner) {
-                return owner && owner->size() == resource.size &&
-                    owner->data() == resource.host_data;
-            });
+    return resource.cls == ResourceClass::ConstantBuffer && resource.format == DataFormat::Uint32 &&
+           resource.num_components == 1u &&
+           (resource.size == sizeof(uint32_t) || resource.size == 2u * sizeof(uint32_t) ||
+            owned_wide) &&
+           resource.host_data_size == resource.size && resource.host_data &&
+           !resource.host_data_prefix_bytes && !resource.table_index_count &&
+           !resource.metadata_addr && resource.fetch_pc != UINT32_MAX &&
+           std::any_of(table.owned_host_data.begin(), table.owned_host_data.end(),
+                       [&](const auto& owner) {
+                           return owner && owner->size() == resource.size &&
+                                  owner->data() == resource.host_data;
+                       });
 }
 
 bool validate_owned_raw_capture_inputs(const ShaderResourceTable& table, std::string& error) {

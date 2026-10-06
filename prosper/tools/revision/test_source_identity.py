@@ -4,13 +4,14 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
-from test_build_revision import build as build_target, configure, executable_path, run
+from test_build_revision import build as build_target
+from test_build_revision import configure, executable_path, run
 
 
 def main():
@@ -78,7 +79,8 @@ set_target_properties(q PROPERTIES
         if original == "unknown":
             commands = build_dir / "compile_commands.json"
             driver = commands.read_text(encoding="utf-8") if commands.exists() else ""
-            if any(word in driver for word in ("g++", "clang", "c++.exe")):
+            # A compiler-cache wrapper is supported too (#4356): it must not take this exit.
+            if any(word in driver for word in ("g++", "clang", "c++.exe", "ccache")):
                 raise AssertionError("supported dependency scan unexpectedly unavailable")
             check(original == "unknown", "unsupported compiler fails closed")
             print("source identity: unsupported compiler guard verified; no positive fidelity claim")

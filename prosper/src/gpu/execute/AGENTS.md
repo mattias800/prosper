@@ -25,9 +25,16 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   scalar loads: a must-dataflow over the program's CFG, so every path into the consumer has to
   deliver the same load words. `sopp_cfg` holds the direct-branch helpers the executor's CFG
   proofs share.
+- `dcc_helper_program.hpp` / `efc_helper_program.hpp` — recognise AGC's colour-block metadata
+  operations (DCC decompress, eliminate fast clear) by the exact helper program AGC binds for them,
+  never by `CB_COLOR_CONTROL.MODE` alone: titles latch a utility MODE onto later ordinary draws that
+  must still write. A new helper variant is added from an observed program, with its words.
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
+- `srt_publication_dedupe.hpp` — which of those uses the graphics stage table publishes: once per
+  key while the key resolves by `srt_offset`, once per consuming pc once it clashes. Getting this
+  wrong leaves a consumer with no resource and refuses the whole program.
 - `fragment_packet_analysis` aliases exact immutable ShaderCodeAnalysis-owned VGPR requirements
   into the producing collector capsule. `fragment_packet_preparation` consumes those code facts
   without warm per-draw reparse or added global lock: writer-only scratch is not an entry input,

@@ -15,6 +15,7 @@
 #include "gpu/execute/checked_graphics_source.hpp"
 #include "gpu/execute/native_graphics_source_lineage.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
+#include "gpu/execute/srt_publication_dedupe.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -1288,7 +1289,7 @@ ShaderCompileKey make_shader_compile_key(
                                        scalar_source_proof->raw_offset_scalar_source_pcs.end(),
                                        resource.fetch_pc) &&
                     valid_raw_offset_scalar_snapshot_resource(resource))
-                    compiled.raw_offset_scalar_snapshot_bytes = sizeof(uint32_t);
+                    compiled.raw_offset_scalar_snapshot_bytes = resource.size;
                 if (scalar_source_proof && std::binary_search(
                         scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
                         scalar_source_proof->raw_owned_wide_data_load_pcs.end(), resource.fetch_pc)) {
@@ -4459,8 +4460,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((n == 4 || n == 8) && std::binary_search(
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
-                const bool latched_offset_source = !is_buffer && n == 1u &&
-                    soff_field == 125u && in.literal == 0u &&
+                const bool latched_offset_source =
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -4820,6 +4821,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     mem.snapshot_prefix(bounded_scalar_words.data(),
                                         scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                // The recompiler tags an immediate-only s_load's destination with its immediate
+                // (sreg_srt), EXCEPT a raw immediate-wide data load, whose words it treats as data
+                // carrying no descriptor identity (rdna2_emit_alu.cpp, the wide-load tag). Key
+                // descriptor uses exactly as it will: a key no consumer carries publishes a resource
+                // no consumer can reach, and every consumer is then refused (#4585).
+                const bool emitter_srt_tag =
+                    imm_only && !is_buffer &&
+                    !((n == 4 || n == 8) &&
+                      std::binary_search(decoded->raw_immediate_wide_data_load_pcs.begin(),
+                                         decoded->raw_immediate_wide_data_load_pcs.end(), in.pc));
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
@@ -4856,9 +4867,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     SrtUse source;
                     source.kind = 5;
                     source.key = UINT32_MAX;
+                    // v4[2..3] carry the observed words (x1 leaves v4[3] zero).
                     source.v4 = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u),
-                                 bounded_scalar_words[0], 0u};
-                    source.required_size = sizeof(uint32_t);
+                                 bounded_scalar_words[0], n == 2u ? bounded_scalar_words[1] : 0u};
+                    source.required_size = n * sizeof(uint32_t);
                     source.use_pc = in.pc;
                     srt_uses->push_back(source);
                 }
@@ -4938,7 +4950,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                 }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
-                    const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
+                    const uint32_t key = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
                         val_srt_key[(size_t)(sdst + (int)k)] = key;
                         val_srt_key_known.set((size_t)(sdst + (int)k));
@@ -4986,8 +4998,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
                               descr_known.set((size_t)sdst);
                               // only s_load (not s_buffer_load) dests get the recompiler's sreg_srt tag
-                              descr_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr_key_known.set((size_t)sdst);
                 }
                 if (n == 8 && valid_reg(sdst)) {
@@ -4995,8 +5006,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                   mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
                               descr8_known.set((size_t)sdst);
                               descr8_from_x16.reset((size_t)sdst);
-                              descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr8_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr8_key_known.set((size_t)sdst);
                               // SGPR loads are typeless: a later scalar buffer load may consume the
                               // first four words of this eight-dword result as a V#. Keep both views;
@@ -6028,13 +6038,14 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
     return result;
 }
 
-// A memory-fed register offset must use the exact x1 word observed by the fold. Re-reading
+// A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero x1 read point; the table owns its four bytes.
+// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
+    const bool x2 = use.required_size == 2u * sizeof(uint32_t);
     if (use.kind != 5 || use.key != UINT32_MAX || use.use_pc >= dwords ||
-        use.required_size != sizeof(uint32_t) || use.v4[3] ||
+        (use.required_size != sizeof(uint32_t) && !x2) || (!x2 && use.v4[3]) ||
         use.scalar_buffer_dword_count || use.zero_record_raw || use.table_record_count ||
         use.instruction_format != UINT32_MAX)
         return;
@@ -6044,16 +6055,18 @@ static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const Srt
         return;
     const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
                              (static_cast<uint64_t>(use.v4[1]) << 32u);
-    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - sizeof(uint32_t))
-        return;
-    auto bytes = std::make_shared<std::vector<uint8_t>>(sizeof(uint32_t));
-    std::memcpy(bytes->data(), &use.v4[2], sizeof(uint32_t));
+    const uint32_t size = use.required_size;
+    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - size) return;
+    // The source's opcode must agree with the observed width: x1 with 4 bytes, x2 with 8.
+    if (rdna2_decode_one(code + use.use_pc, dwords - use.use_pc).opcode != (x2 ? 1u : 0u)) return;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(size);
+    std::memcpy(bytes->data(), &use.v4[2], size);
     ShaderResource resource;
     resource.cls = ResourceClass::ConstantBuffer;
     resource.format = DataFormat::Uint32;
     resource.num_components = 1;
     resource.gpu_addr = address;
-    resource.size = sizeof(uint32_t);
+    resource.size = size;
     resource.fetch_pc = use.use_pc;
     resource.host_data = bytes->data();
     resource.host_data_size = bytes->size();
@@ -7440,7 +7453,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // shader, and the draw's own order.
         if (prosper::gpu::udprov_enabled()) {
             // order + path + SOURCE. `q` is the queue origin the packet folded under
-            // (0=unknown/graphics, 1=Dcb, 2=Acb, 3=DcbFinal), `f` the top-level fold (submit
+            // (0=unknown/graphics, 1=Dcb, 2=Acb; 3=DcbFinal, unused since #4540), `f` the fold (submit
             // stream) id, `j` the sceAgcDcbJump recursion depth. A write whose q/f differs from
             // the draw's own is one that did not arrive in this submit's inline position.
             const auto prov = [&](uint32_t reg) -> std::string {
@@ -7716,20 +7729,15 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // srt_offset (the EUD-sharp path may already have emitted it — first match wins in
         // by_srt_offset, and two DIFFERENT tables reusing one immediate would be ambiguous anyway).
         {
-            std::set<uint64_t> srt_seen;
+            // One publication per key, or per consuming pc: see srt_publication_dedupe.hpp.
+            SrtPublicationDedupe dedupe;
             for (const auto& u : srt_uses) {
-                // Dedupe: a KEYED cbuf use per key (the s_buffer_load resolves by key); texture and
-                // key-less buffer uses per CONSUMING INSTRUCTION (#273 — several image ops may share
-                // one key, or have none; a key-less V# fetch resolves by its pc).
-                // Distinct namespaces: pc keys must never collide with byte-offset keys.
+                if (!dedupe.admit(u)) continue;
                 const bool exact_mtbuf = u.kind == 1 && u.instruction_format != UINT32_MAX;
-                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu || exact_mtbuf)
-                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
-                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
-                if (!srt_seen.insert(dk).second) continue;
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (clash && !exact_mtbuf) dedupe.note_clash(u);   // a real holder of the key
                 if (u.kind == 6) {
                     add_owned_raw_wide_snapshot(t, u,
                         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),

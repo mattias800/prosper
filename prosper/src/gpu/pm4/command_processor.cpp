@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
@@ -776,7 +777,7 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     uint32_t first = n > 16 ? n - 16 : 0;
     size_t off = (size_t)snprintf(out, cap, "events(total=%u):", n);
     // Exec events carry the folding submit entry point (#1226): D=SubmitDcb A=SubmitAcb
-    // F=SubmitDcbFinal, absent when unknown/build-side — the cross-queue discriminator.
+    // F=SubmitDcbFinal (not produced since #4540; kept so old logs decode), absent when unknown.
     static const char* qn[] = {"", "(D)", "(A)", "(F)"};
     // #2192: the reserve was 52 while one entry can reach 63 bytes
     // (" %s%s@%llu/f%u:0x%llx" = 1 + 7 + 3 + 1 + 20 + 2 + 10 + 3 + 16), so the last admitted
@@ -5167,6 +5168,11 @@ void GpuState::apply(const Pm4Command& c) {
             // window (never leaves a stale condition gating later jumps).
             pred_cond_addr = c.pred_valid ? c.pred_addr : 0;
             break;
+        case K::CondIndirectBuffer: {   // sceAgcCbBranch's packet (#4540): runs as a Jump segment
+            const Pm4Command j = cond_indirect_buffer_jump(c);
+            if (j.jump_addr && j.jump_dwords) apply(j);   // an empty else-target is a no-op
+            break;
+        }
         case K::Jump: {
             // sceAgcDcbJump (#319): execute `jump_dwords` dwords at `jump_addr`, then resume
             // (call-with-length — live capture shows the target segment is exactly the passed
@@ -5244,9 +5250,7 @@ void GpuState::apply(const Pm4Command& c) {
             // PROSPER_NO_JUMP=1: diagnostic A/B — reproduce the pre-#319 behavior (jump ignored).
             static const bool no_jump = [] { const char* e = getenv("PROSPER_NO_JUMP"); return e && e[0] == '1'; }();
             if (no_jump) break;
-            constexpr uint32_t kMaxJumpDwords = 0x40000;   // 1 MiB of dwords — far past any real segment
-            constexpr uint32_t kMaxJumpDepth  = 8;
-            if (c.jump_dwords > kMaxJumpDwords || jump_depth >= kMaxJumpDepth) break;
+            if (!jump_segment_within_limits(c.jump_addr, c.jump_dwords, jump_depth)) break;
             // #3574 instruments below are GATED. `GpuState::apply` runs on every folded PM4 command
             // of every submit and `!dispatches.empty()` is the ordinary case, so an ungated line here
             // emits on a DEFAULT run -- ~90 lines on the measured title. These are instruments, not
@@ -5371,7 +5375,7 @@ void GpuState::apply(const Pm4Command& c) {
                             (unsigned long long)c.jump_addr, c.jump_dwords,
                             (unsigned long long)command_order);
             }
-            if (!guest_readable(c.jump_addr, c.jump_dwords * 4)) break;   // whole segment must be mapped
+            if (!jump_segment_readable(c.jump_addr, c.jump_dwords)) break;   // whole segment mapped
             jump_depth++;
             run_command_buffer((const uint32_t*)(uintptr_t)c.jump_addr, c.jump_dwords, *this);
             jump_depth--;
@@ -5398,7 +5402,7 @@ void GpuState::apply(const Pm4Command& c) {
     }
 }
 
-// #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb, 3=SubmitDcbFinal).
+// #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb; 3 unused since #4540).
 // Set by hle_agc under g_agc_state_mu (all folds are serialized), stamped onto every decoded
 // command so deferred/pended effects retain their queue of origin and barrier scheduling can keep
 // Dcb/DcbFinal ordered independently from Acb.

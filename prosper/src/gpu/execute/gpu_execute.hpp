@@ -27,6 +27,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
+#include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
@@ -2429,10 +2430,29 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                                       vcount_hint, float_transport, raw_context,
                                                       owned_waves, owned_indices, refusal)) {
             if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
-            report_dropped_draw_target(rs.color0_base,
-                                       vertex_chain ? "owned-wave-chained-stage-unimplemented"
-                                                    : refusal.c_str(),
-                                       rs.cb_target_mask, rs.cb_shader_mask);
+            const char* const reason =
+                vertex_chain ? "owned-wave-chained-stage-unimplemented" : refusal.c_str();
+            report_dropped_draw_target(rs.color0_base, reason, rs.cb_target_mask,
+                                       rs.cb_shader_mask);
+            // The drop is counted under the same label as a recompile reject, but no recompile
+            // ran, so nothing kept the program. Keep it here: the owned stage is the one whose
+            // classification and gate somebody has to look at next (#4555).
+            note_refused_draw_shaders(
+                {{},
+                 {},
+                 checked_fragment ? checked_graphics_source_analysis(checked_fragment.get())
+                                  : SharedShaderAnalysis{},
+                 vs_program_addr,
+                 rs.ps_addr,
+                 rs.es_addr,
+                 draw ? draw->command_order : 0,
+                 max_shader_dwords,
+                 0,
+                 0,
+                 0,
+                 owned_vertex,
+                 owned_fragment,
+                 reason});
             prosper::diagnostics::perf::drop_draw_at_realization(
                 owned_vertex ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
                              : prosper::diagnostics::perf::DropReason::ShaderRecompileFragment);
@@ -2891,6 +2911,19 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
     ps.color_write_mask = ps.color_targets[0].write_mask;
     ps.color1_write_mask = ps.color_targets[1].write_mask;
+    // #1588: CB_COLOR_CONTROL.MODE = ELIMINATE_FAST_CLEAR on AGC's own rectangle is a colour-block
+    // metadata operation, not a shaded draw. prosper keeps render targets uncompressed, so the
+    // expansion it performs is already complete and the inherited pixel shader's export must not
+    // reach the target. Identified by the operation's vertex program (efc_helper_program.hpp), never
+    // by MODE alone: titles latch MODE=2 onto ordinary draws that must still write.
+    if (is_agc_eliminate_fast_clear_operation(
+            rs.cb_color_control,
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr)),
+            vs_program_dwords)) {
+        for (auto& target : ps.color_targets) target.write_mask = 0;
+        ps.color_write_mask = 0;
+        ps.color1_write_mask = 0;
+    }
     // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
     // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
