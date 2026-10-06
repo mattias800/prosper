@@ -327,6 +327,23 @@ class Cli(unittest.TestCase):
         self.assertIn("getenv|prosper/src/e.cpp 1\n", self.baseline.read_text(encoding="utf-8"))
         self.assertEqual(car.EXIT_OK, self.gate())
 
+    def test_update_preserves_standalone_notes(self):
+        lines = self.baseline.read_text(encoding="utf-8").splitlines(keepends=True)
+        noted = []
+        for line in lines:
+            if line.startswith("getenv|prosper/src/e.cpp"):
+                noted.append("# note: raised with a reason a reviewer read.\n")
+            noted.append(line)
+        self.baseline.write_text("".join(noted), encoding="utf-8")
+        self.write("prosper/src/e.cpp", 'auto v = getenv("X");\n')
+        self.assertEqual(car.EXIT_VIOLATION, self.gate())
+        self.assertEqual(car.EXIT_OK, self.gate("--update"))
+        self.assertIn(
+            "# note: raised with a reason a reviewer read.\ngetenv|prosper/src/e.cpp 1\n",
+            self.baseline.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(car.EXIT_OK, self.gate())
+
     def test_unevaluable_is_two_not_zero(self):
         self.assertEqual(car.EXIT_UNEVALUATED, car.main(["--root", str(self.root / "nowhere")]))
         self.baseline.write_text("getenv|a not-a-number\n", encoding="utf-8")
