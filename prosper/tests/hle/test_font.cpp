@@ -363,3 +363,99 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
         << "DestroyString returns success";
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
+
+struct FontRendererMisc {
+    HleFn create_library = nullptr, create_renderer = nullptr, open_font_set = nullptr,
+          close_font = nullptr, get_outline_size = nullptr, reset_outline = nullptr,
+          set_outline_policy = nullptr, set_dpi = nullptr, text_init = nullptr, rewind = nullptr,
+          writing_init = nullptr, set_mask = nullptr;
+    bool registered() const {
+        return create_library && create_renderer && open_font_set && close_font &&
+               get_outline_size && reset_outline && set_outline_policy && set_dpi && text_init &&
+               rewind && writing_init && set_mask;
+    }
+};
+FontRendererMisc font_renderer_misc() {
+    register_builtin_hle();
+    FontRendererMisc api;
+    api.create_library = Hle::lookup("nWrfPI4Okmg");
+    api.create_renderer = Hle::lookup("u5fZd3KZcs0");
+    api.open_font_set = Hle::lookup("cKYtVmeSTcw");
+    api.close_font = Hle::lookup("vzHs3C8lWJk");
+    api.get_outline_size = Hle::lookup("amcmrY62BD4");
+    api.reset_outline = Hle::lookup("ai6AfGrBs4o");
+    api.set_outline_policy = Hle::lookup("ydF+WuH0fAk");
+    api.set_dpi = Hle::lookup("I1acwR7Qp8E");
+    api.text_init = Hle::lookup("oaJ1BpN2FQk");
+    api.rewind = Hle::lookup("VRFd3diReec");
+    api.writing_init = Hle::lookup("fD5rqhEXKYQ");
+    api.set_mask = Hle::lookup("BbCZjJizU4A");
+    return api;
+}
+
+TEST(Font, RendererMiscSurfaceIsRegistered) {
+    EXPECT_TRUE(font_renderer_misc().registered()) << "font renderer-misc surface is registered";
+}
+
+TEST(Font, RendererMiscNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontRendererGetOutlineBufferSize"), "amcmrY62BD4");
+    EXPECT_EQ(nid_hash("sceFontRendererResetOutlineBuffer"), "ai6AfGrBs4o");
+    EXPECT_EQ(nid_hash("sceFontRendererSetOutlineBufferPolicy"), "ydF+WuH0fAk");
+    EXPECT_EQ(nid_hash("sceFontSetResolutionDpi"), "I1acwR7Qp8E");
+    EXPECT_EQ(nid_hash("sceFontTextSourceRewind"), "VRFd3diReec");
+    EXPECT_EQ(nid_hash("sceFontWritingSetMaskInvisible"), "BbCZjJizU4A");
+    EXPECT_NE(nid_hash("sceFontSetResolutionDpi"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+TEST(Font, OutlineBufferPolicyRoundTrips) {
+    const FontRendererMisc api = font_renderer_misc();
+    ASSERT_TRUE(api.registered());
+    uint8_t mem[64]{};
+    void* renderer = nullptr;
+    ASSERT_EQ(api.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    ASSERT_NE(renderer, nullptr);
+    uint32_t size = 0xdeadbeef;
+    EXPECT_EQ(api.get_outline_size(addr(renderer), addr(&size), 0, 0, 0, 0), 0u)
+        << "GetOutlineBufferSize returns success";
+    EXPECT_EQ(size, 0u) << "fresh renderer reports zero outline workspace";
+    EXPECT_EQ(api.set_outline_policy(addr(renderer), 0, 0x4000, 0, 0, 0), 0u)
+        << "SetOutlineBufferPolicy accepts a basal size";
+    EXPECT_EQ(api.get_outline_size(addr(renderer), addr(&size), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(size, 0x4000u) << "policy stores the basal size";
+    EXPECT_EQ(api.reset_outline(addr(renderer), 0, 0, 0, 0, 0), 0u)
+        << "ResetOutlineBuffer returns success";
+}
+
+TEST(Font, SetResolutionDpiStoresNonZeroDpi) {
+    const FontRendererMisc api = font_renderer_misc();
+    ASSERT_TRUE(api.registered());
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(api.create_library(addr(mem), 0, addr(&library), 0, 0, 0), 0u);
+    ASSERT_NE(library, nullptr);
+    void* handle = nullptr;
+    ASSERT_EQ(api.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(api.set_dpi(addr(handle), 144, 144, 0, 0, 0), 0u)
+        << "SetResolutionDpi returns success";
+    EXPECT_EQ(api.close_font(addr(handle), 0, 0, 0, 0, 0), 0u) << "CloseFont releases the face";
+}
+
+TEST(Font, TextSourceRewindResetsCurrent) {
+    const FontRendererMisc api = font_renderer_misc();
+    ASSERT_TRUE(api.registered());
+    uint8_t source[0x60]{};
+    const char text[] = "ASTRO";
+    ASSERT_EQ(api.text_init(addr(source), addr(text), sizeof(text), 0, 0, 0), 0u);
+    EXPECT_EQ(api.rewind(addr(source), 0, 0, 0, 0, 0), 0u) << "Rewind returns success";
+}
+
+TEST(Font, WritingSetMaskInvisibleAcceptsValidMasks) {
+    const FontRendererMisc api = font_renderer_misc();
+    ASSERT_TRUE(api.registered());
+    uint8_t writing[0x100]{};
+    EXPECT_EQ(api.set_mask(addr(writing), 0, 0, 0, 0, 0), 0u) << "mask 0 returns success";
+    EXPECT_EQ(api.set_mask(addr(writing), 1, 0, 0, 0, 0), 0u) << "mask 1 returns success";
+    EXPECT_EQ(api.set_mask(addr(writing), 2, 0, 0, 0, 0), 0x80460002u) << "invalid mask is refused";
+}

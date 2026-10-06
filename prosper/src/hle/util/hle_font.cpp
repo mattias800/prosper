@@ -66,7 +66,10 @@ struct FontMemory {
 static_assert(sizeof(FontMemory) == 64);
 
 struct FontLibrary { uint64_t magic = kLibraryMagic; };
-struct FontRenderer { uint64_t magic = kRendererMagic; };
+struct FontRenderer {
+    uint64_t magic = kRendererMagic;
+    uint64_t outline_workspace_size = 0;
+};
 
 // A parsed memory font. Shared, because `sceFontOpenFontInstance` clones a face and both clones
 // must keep the same parsed outlines alive.
@@ -90,6 +93,8 @@ struct FontFace {
     float weight_x = 1.0f;
     float weight_y = 1.0f;
     void* renderer = nullptr;
+    uint32_t h_dpi = 72;
+    uint32_t v_dpi = 72;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
     std::shared_ptr<FontData> data;
@@ -842,6 +847,56 @@ int32_t font_text_default(TextSource* source, void* handle) {
     if (source) source->default_font = handle;
     return 0;
 }
+
+FontRenderer* renderer(void* handle) {
+    auto* r = static_cast<FontRenderer*>(handle);
+    return r && r->magic == kRendererMagic ? r : nullptr;
+}
+
+int32_t font_renderer_get_outline_buffer_size(void* handle, uint32_t* out) {
+    const auto* r = renderer(handle);
+    if (out) *out = r ? (uint32_t)r->outline_workspace_size : 0u;
+    if (!r) return static_cast<int32_t>(0x80460001u);
+    return out ? 0 : static_cast<int32_t>(0x80460002u);
+}
+
+int32_t font_renderer_reset_outline_buffer(void* handle) {
+    const auto* r = renderer(handle);
+    if (!r) return static_cast<int32_t>(0x80460001u);
+    return 0;
+}
+
+int32_t font_renderer_set_outline_buffer_policy(void* handle, uint64_t, uint32_t basal,
+                                                uint32_t limit) {
+    auto* r = renderer(handle);
+    if (!r) return static_cast<int32_t>(0x80460001u);
+    if (limit != 0 && basal > limit) return static_cast<int32_t>(0x80460002u);
+    uint64_t size = r->outline_workspace_size > basal ? r->outline_workspace_size : basal;
+    if (limit != 0 && size > limit) size = limit;
+    if (size == 0) size = 0x4000;
+    r->outline_workspace_size = size;
+    return 0;
+}
+
+int32_t font_set_resolution_dpi(void* handle, uint32_t h_dpi, uint32_t v_dpi) {
+    auto* f = face(handle);
+    if (!f) return static_cast<int32_t>(0x80460005u);
+    f->h_dpi = h_dpi == 0 ? 72 : h_dpi;
+    f->v_dpi = v_dpi == 0 ? 72 : v_dpi;
+    return 0;
+}
+
+int32_t font_text_source_rewind(TextSource* source) {
+    if (!source) return static_cast<int32_t>(0x80460002u);
+    source->current = source->start;
+    return 0;
+}
+
+int32_t font_writing_set_mask_invisible(void* writing, int32_t mask) {
+    if (!writing) return static_cast<int32_t>(0x80460002u);
+    if (mask != 0 && mask != 1) return static_cast<int32_t>(0x80460002u);
+    return 0;
+}
 int32_t font_text_writing_form(TextSource* source, int32_t form) {
     if (source) source->system = (uint32_t)form;
     return 0;
@@ -992,6 +1047,15 @@ void register_font_hle() {
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
     R("8-zmgsxkBek", (HleFn)font_ok, "sceFontGlyphDefineAttribute");
+    R("amcmrY62BD4", (HleFn)font_renderer_get_outline_buffer_size,
+      "sceFontRendererGetOutlineBufferSize");
+    R("ai6AfGrBs4o", (HleFn)font_renderer_reset_outline_buffer,
+      "sceFontRendererResetOutlineBuffer");
+    R("ydF+WuH0fAk", (HleFn)font_renderer_set_outline_buffer_policy,
+      "sceFontRendererSetOutlineBufferPolicy");
+    R("I1acwR7Qp8E", (HleFn)font_set_resolution_dpi, "sceFontSetResolutionDpi");
+    R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
+    R("BbCZjJizU4A", (HleFn)font_writing_set_mask_invisible, "sceFontWritingSetMaskInvisible");
 }
 
 } // namespace prosper
