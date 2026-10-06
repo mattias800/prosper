@@ -340,8 +340,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     stubs are the Windows APR arms in
     `src/hle/memory/hle_kernel_mem.cpp` (#2384).
   - **Steady-state invariants P1-P6** — after warm-up: no unobserved in-frame GPU wait or readback
-    (P1), no Vulkan object creation per draw (P2), no compile on the submit thread (P3), no
-    process-global lock on a hot path (P4), per-draw cost independent of resource size (P5), bounded
+    (P1), no Vulkan object creation per draw or dispatch (P2), no compile on the submit thread (P3), no
+    process-global lock on a hot path (P4), per-draw cost independent of resource size, so memory that tracking can prove
+    unchanged is not compared or copied in full (P5), bounded
     frames in flight with recording overlapping execution (P6). A PR that moves away from one says
     so. **prosper violates P1 and P5 today.** The rules, their enforcement and where each is
     violated are `prosper/docs/spec/performance.md` (`PERF-P1`..`PERF-P6`); that page is
