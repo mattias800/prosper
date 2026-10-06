@@ -211,7 +211,8 @@ test-dep|prosper/frontends/shared/live/submit_renderer/callback_types.hpp 6
 test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.cpp 7
 test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.hpp 2
 test-dep|prosper/frontends/shared/live/submit_renderer/final_span_present.cpp 6
-test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 90
+test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 88  # lowered: two prosper::test:: references moved with the lazy sampled colour-target materializer
+test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target.hpp 2  # moved from image_resources.cpp, net zero
 test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.hpp 2
 test-dep|prosper/frontends/shared/live/submit_renderer/mrt_slots.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.cpp 14
