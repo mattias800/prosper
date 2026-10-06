@@ -2327,16 +2327,17 @@ struct VulkanComputeContext {
                 upload_skipped = !changed;
             } else {
                 g_write_watch_census.record_exact_compare(key.bytes);
-                // One pass: differing 64 KiB blocks are copied as they are found (compare and copy
-                // are fused, so the whole cost lands in upload_compare_ms).
-                uint64_t copied;
+                bool changed;
                 {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                    copied = sync_compute_buffer_blocks(mapped, source, key.bytes);
+                    changed = !compute_buffers_equal(mapped, source, key.bytes);
                 }
                 timing.compared_bytes += key.bytes;
-                timing.uploaded_bytes += copied;
-                const bool changed = copied != 0;
+                if (changed) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
+                    copy_compute_buffer(mapped, source, key.bytes);
+                    timing.uploaded_bytes += key.bytes;
+                }
                 upload_skipped = !changed;
             }
             {

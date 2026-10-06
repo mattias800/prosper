@@ -158,34 +158,6 @@ inline bool compute_buffers_diff_span(const void* lhs, const void* rhs, size_t b
     return false;
 }
 
-// Bring `destination` up to date with `source` in one pass: every 64 KiB block that differs is
-// copied, every equal block is only read. Returns the bytes copied (0 = already equal). Unlike
-// compute_buffers_diff_span + one narrowed copy, a guest that rewrites scattered pieces of a large
-// ring (Black Flag's constant ring: first and last difference ~49 MiB apart) pays for the changed
-// blocks rather than for the whole span between them. The result is byte-identical to a full copy.
-inline uint64_t sync_compute_buffer_blocks(void* destination, const void* source, size_t bytes) {
-    constexpr size_t kBlock = 64u << 10;
-    constexpr size_t kParallelThreshold = 8u << 20;
-    auto* dst = static_cast<uint8_t*>(destination);
-    const auto* src = static_cast<const uint8_t*>(source);
-    std::atomic<uint64_t> copied{0};
-    const auto sync = [&](size_t begin, size_t end) {
-        uint64_t local = 0;
-        for (size_t at = begin; at < end;) {
-            const size_t step = std::min(kBlock, end - at);
-            if (std::memcmp(dst + at, src + at, step) != 0) {
-                std::memcpy(dst + at, src + at, step);
-                local += step;
-            }
-            at += step;
-        }
-        copied.fetch_add(local, std::memory_order_relaxed);
-    };
-    if (bytes < kParallelThreshold) sync(0, bytes);
-    else parallel_compute_texels(bytes, bytes, sync, 8u);
-    return copied.load(std::memory_order_relaxed);
-}
-
 inline void copy_compute_buffer(void* destination, const void* source, size_t bytes) {
     constexpr size_t kParallelThreshold = 8u << 20;
     if (bytes < kParallelThreshold) {
