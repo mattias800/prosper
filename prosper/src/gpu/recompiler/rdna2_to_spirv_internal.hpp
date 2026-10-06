@@ -3494,6 +3494,11 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
         // it, so a Bool there now is this instruction's. See expire_saved_b64_mask.
         const bool publishes_reloaded_mask = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
                                              base == in.dst.value && rs.sreg_bool.contains(base);
+        // Wave32 compute (the only stage the VCC bridge flag admits): every mask is one word, so a
+        // mask reloaded into a register that held a B32 mask stays one. Dropping the marker here
+        // also dropped the Bool, and a data read then took the untracked SGPR's silent 0 (#4607).
+        const bool keeps_b32_reload = publishes_reloaded_mask && allow_compute_scalar_vcc_bridge &&
+                                      rs.sreg_bool_b32.contains(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
@@ -3501,7 +3506,8 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                 expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
                                       writes_b64_mask || publishes_reloaded_mask ? base : -1);
             }
-            if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
+            if (!rs.sreg_bool_b32.contains(reg) ||
+                ((writes_b32_mask || keeps_b32_reload) && reg == base))
                 continue;
             rs.sreg_bool_b32.erase(reg);
             if (!writes_b64_mask || reg != base) {
@@ -3510,7 +3516,7 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                 if (reg == 106) rs.vcc = 0;
             }
         }
-        if (!writes_b32_mask) rs.sreg_bool_b32.erase(base);
+        if (!writes_b32_mask && !keeps_b32_reload) rs.sreg_bool_b32.erase(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             rs.sreg_written.insert(reg);
