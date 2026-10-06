@@ -254,7 +254,7 @@ with the GPU about 10% busy. An F8 capture (5.2 s window, 14 flips) and
   compute CPU time, setup is 60%, writeback 20%, fence wait 17%.
 - The dominant setup cost is the **read-only constant-buffer windows of 43 MiB** (`size=45088768`,
   `persistent=1`, `upload-skipped=0`). In one 40 s run with `PROSPER_COMPUTE_BUFFER_TIMING=1` (timing
-  adds overhead; 69 submits, PR head of #4586, no arena) they were acquired 449 times, about 6.5 per
+  adds overhead; 69 submits, a #4635 build with `PROSPER_NO_COMPUTE_BUFFER_ARENA=1`) they were acquired 449 times, about 6.5 per
   submit, with 185 distinct bases: 433 `cache=miss validation=pooled-full`, 15 `full`, 1 `journal`.
   Each acquisition cost 13.7 ms of `setup_ms` on average (compare 8.0 + copy 5.6, `compared-bytes` =
   45,088,768), i.e. about 89 ms per submit. Their bases
@@ -268,5 +268,6 @@ with the GPU about 10% busy. An F8 capture (5.2 s window, 14 flips) and
   33 ms budget: every submit waits on its own fence, `PERF-P1` / `PERF-P6`, ADR 0009) and
   `surface-readback` (~9 ms per readback).
 
-(All figures in this section are from the PR head of #4586 without the arena of #4635; the per-submit
-figures quoted in #4645 are from a build with #4635 applied, which is why the two breakdowns differ.)
+(All figures in this section are from a build with #4635 applied and its arena switched off
+(`PROSPER_NO_COMPUTE_BUFFER_ARENA=1`), per the #4631 measurements; #4635 changes more than the arena, so
+they are not figures for main, and the per-submit figures quoted in #4645 are from the same build with the arena on.)
