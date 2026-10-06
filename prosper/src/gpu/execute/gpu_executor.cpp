@@ -104,6 +104,18 @@ namespace prosper::gpu {
 static bool t8_samples_constant_zero(const std::array<uint32_t, 8>& t8) {
     return t8[0] == 0u && (t8[1] & 0xffu) == 0u && (t8[3] & 0xfffu) == 0u;
 }
+// MIMG ops whose result is texels routed through DST_SEL: image_load/load_mip (0x00/0x01) and the
+// sample and gather4 families (0x20-0x5f). The constant-zero argument holds only for these: a query
+// such as image_get_resinfo (0x0e, the descriptor's dimensions) or image_get_lod (0x60, computed from
+// the image size) reads fields DST_SEL does not touch, and writers and atomics are never null
+// reads. Every other op keeps the exact all-zero rule, whose words also describe a 1x1 image.
+static bool mimg_op_returns_selected_texels(uint32_t opcode) {
+    return opcode <= 0x01u || (opcode >= 0x20u && opcode <= 0x5fu);
+}
+static bool t8_is_null_for_op(const std::array<uint32_t, 8>& t8, bool texel_read) {
+    if (texel_read) return t8_samples_constant_zero(t8);
+    return std::all_of(t8.begin(), t8.end(), [](uint32_t w) { return w == 0u; });
+}
 
 bool should_log_recompile_reject(uint64_t es_addr, uint64_t ps_addr,
                                  size_t vs_words, size_t gs_words, size_t fs_words,
@@ -5201,7 +5213,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // #4592: the same holds for any T# whose sampled reads are constant zero (see
                     // t8_samples_constant_zero); the all-zero descriptor is one such.
                     const bool exact_null_seed =
-                        seed_provenance && live_t8_known && t8_samples_constant_zero(live_t8);
+                        seed_provenance && live_t8_known &&
+                        t8_is_null_for_op(live_t8, mimg_op_returns_selected_texels(in.opcode));
                     // Scalar loads are typeless. A consumer may assemble its T# from adjacent
                     // mapped loads rather than one x8/x16 load, so the load-start snapshot can sit
                     // at another SGPR. Accept the live words only when all eight still descend
@@ -7866,9 +7879,18 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     //     handled.
                     //   * #4592 generalizes "all-zero" to t8_samples_constant_zero: base zero and
                     //     constant-zero selectors, which is what makes the all-zero T# null.
+                    // The consuming op decides which null rule applies (texel reads only widen).
+                    const auto* use_code =
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr));
+                    const bool texel_read = u.use_pc < shader_dwords && [&] {
+                        const Rdna2Inst op =
+                            rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);
+                        return op.fmt == Rdna2Format::MIMG &&
+                               mimg_op_returns_selected_texels(op.opcode);
+                    }();
                     const bool exact_null_t8 = reject && std::string_view(reject) == "base-zero" &&
                                                !u.is_storage_image &&
-                                               t8_samples_constant_zero(u.t8);
+                                               t8_is_null_for_op(u.t8, texel_read);
                     if (exact_null_t8) {
                         ShaderResource rn;
                         rn.cls      = ResourceClass::Texture;
@@ -7910,9 +7932,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // it (one Kena run published 28,012), so report the first 8 and then
                         // powers of two.
                         static std::atomic<uint64_t> null_images{0};
-                        const uint64_t null_ordinal = null_images.fetch_add(1) + 1;
-                        // NOLINTNEXTLINE(concurrency-mt-unsafe): PROSPER_ENV_ON reads once, in a static init
-                        if (PROSPER_ENV_ON("PROSPER_DBG") &&
+                        // PROSPER_ENV_ON reads the environment once, in a static initializer.
+                        const bool dbg =
+                            PROSPER_ENV_ON("PROSPER_DBG");   // NOLINT(concurrency-mt-unsafe)
+                        const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
+                        if (null_ordinal &&
                             (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))
                             fprintf(stderr,
                                     "[srt] %s null-image #%llu pc=%u key=0x%x (base-zero T#, "

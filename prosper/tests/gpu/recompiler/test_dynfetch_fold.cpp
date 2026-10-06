@@ -1200,6 +1200,15 @@ int main() {
     CHECK(constant_direct_uses.size() == 1 && constant_direct_uses[0].kind == 0 &&
               constant_direct_uses[0].t8[2] == 1u,
           "a base-zero direct T# with constant-zero selectors still reaches the null exception");
+    // The same words through image_get_resinfo, whose result is the descriptor's dimensions and not
+    // texels, must not reach the widened exception.
+    auto k5d_resinfo = std::vector<uint32_t>(std::begin(k5d), std::end(k5d));
+    k5d_resinfo[0] = (k5d_resinfo[0] & ~(0xffu << 18)) | (0x0eu << 18);
+    std::vector<SrtUse> resinfo_uses;
+    resolve_dynamic_fetch(k5d_resinfo.data(), k5d_resinfo.size(), direct_null_seed,
+                          std::size(direct_null_seed), 0, &resinfo_uses);
+    CHECK(resinfo_uses.empty(),
+          "a resinfo query on a constant-zero-selector direct T# fails the null exception");
     // ...but a base-zero T# that selects a memory channel must not broaden it.
     direct_null_seed[3] = 0xfacu;
     std::vector<SrtUse> mutated_direct_null_uses;

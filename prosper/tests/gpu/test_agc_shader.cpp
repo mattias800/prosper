@@ -909,14 +909,49 @@ TEST(AgcShader, Contract) {
               constant_zero->gpu_addr == 0 && constant_zero->size == 0,
           "a base-zero T# with constant-zero selectors is the same null sampled image");
     // A base-zero T# that selects a memory channel still names address zero: fail-visible.
-    for (uint32_t selectors : {0xfacu, 0x004u, 0x200u}) {
+    for (uint32_t selectors : {0xfacu, 0x004u, 0xe00u}) {
         null_image_table[11] = selectors;
         auto selecting_resources = prosper::gpu::build_stage_table(
             null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
         CHECK(!selecting_resources || !selecting_resources->by_fetch_pc(4),
               "a base-zero T# that selects a memory channel keeps a malformed image fail-visible");
     }
+    // DST_SEL_W = SQ_SEL_1 returns a constant ONE, which the zero-filled dummy cannot express.
+    null_image_table[11] = 0x200u;
+    auto constant_one_resources = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+    CHECK(!constant_one_resources || !constant_one_resources->by_fetch_pc(4),
+          "a base-zero T# with a constant-one selector stays fail-visible");
+    null_image_table[11] = 0u;
+    // image_get_resinfo returns the descriptor's dimensions, not texels: DST_SEL does not apply,
+    // so Kena's words (1 x 7105) must not be answered by the 1x1 dummy. The exact all-zero T#,
+    // which describes a 1x1 image itself, keeps its null.
+    static const uint32_t null_image_resinfo_shader[] = {
+        0xF40C0304u, 0xFA000020u,   // s_load_dwordx8 s[12:19], s[8:9], 0x20
+        0xF4080504u, 0xFA000040u,   // s_load_dwordx4 s[20:23], s[8:9], 0x40
+        0xF0380F08u, 0x00A30000u,   // pc=4: image_get_resinfo (opcode 0x0e), s[12:19]
+        0xBF810000u,
+    };
+    static Shader null_image_resinfo{};
+    null_image_resinfo.file_header = 0x34333231u;
+    null_image_resinfo.version = 0x18u;
+    null_image_resinfo.shader_size = sizeof(null_image_resinfo_shader);
+    null_image_resinfo.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&null_image_resinfo),
+                       reinterpret_cast<uint64_t>(null_image_resinfo_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &null_image_resinfo, "resinfo null-image shader enters the registry");
+    auto resinfo_constant = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_resinfo_shader), true, 3);
+    CHECK(!resinfo_constant || !resinfo_constant->by_fetch_pc(4),
+          "a resinfo query on a constant-zero-selector T# stays fail-visible");
     std::fill(std::begin(null_image_table) + 8, std::begin(null_image_table) + 16, 0u);
+    auto resinfo_all_zero = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_resinfo_shader), true, 3);
+    CHECK(resinfo_all_zero && resinfo_all_zero->by_fetch_pc(4) &&
+              resinfo_all_zero->by_fetch_pc(4)->gpu_addr == 0,
+          "a resinfo query on the exact all-zero T# keeps its null");
 
     const uint32_t null_image_store_shader[] = {
         0xF40C0304u, 0xFA000020u,   // same exact all-zero T# load
