@@ -419,7 +419,9 @@ public:
                 continue;
             }
             if (!batch->expand_one(draw, out, refusal)) {
-                note_ngg_backend_drop(refusal.c_str(), false);
+                // In a pass: render_draw_pass_rgba counted this draw seen at its entry, and its
+                // NggExpansion refusal names only the remainder, so the ledger counts N, not N+1.
+                note_ngg_backend_drop(refusal.c_str(), true);
                 return false;
             }
         }
