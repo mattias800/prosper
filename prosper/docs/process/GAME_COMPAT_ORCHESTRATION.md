@@ -2140,7 +2140,8 @@ indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the
 target when the command processor reaches the packet inside the buffer that carries it. So there is
 no separate ring whose ordering contract was unknown, and the split-register-file lever
 (`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
-26/25/5 to 6/6/2 (vertex/fragment/compute, `tools/screenshot` default route, two runs; a third read
+26/25/5 to 6/6/2 (vertex/fragment/compute, `prosper-app` default launch with `PROSPER_NULL_PAGE=1`,
+240 s, no input; one control run on main, two runs with the change, and a third with the change read
 11/12/4).
 
 **Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
