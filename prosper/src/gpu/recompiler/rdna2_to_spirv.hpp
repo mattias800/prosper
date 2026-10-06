@@ -736,10 +736,15 @@ bool dead_varying_elimination_enabled();
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
 // triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive. The optional
 // capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
+// `layer_input_location`, when set, names a uint input carrying the primitive's layer (equal on
+// all three vertices), which the stage writes to gl_Layer: the merged-NGG raster commit's
+// interpolation-geometry layer route (#3135 P3, ngg_raster_commit.hpp). It must not be one of the
+// layout's attribute locations, and is refused with RectList synthesis.
 std::vector<uint32_t> recompile_interpolation_geometry(
     const FragmentInterpolationLayout& layout, bool capture_position = false,
     bool synthesize_rect = false, FloatTransportConfig float_transport = {},
-    bool publish_primitive_id = false);
+    bool publish_primitive_id = false,
+    uint32_t layer_input_location = FragmentInterpolationLayout::kUnusedLocation);
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional

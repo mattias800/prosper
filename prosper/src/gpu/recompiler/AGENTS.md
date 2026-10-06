@@ -12,6 +12,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   is the static admission over the linked program (launch SGPR/VGPR reads, EXEC, side effects,
   messages, export shapes), each refusal named; `ngg_export_record` is the record layout the
   pass-through draw consumes. Compile and offline execution only; nothing live dispatches it.
+- `ngg_raster_commit` — that pass-through draw (#3135 P3): a vertex stage that reads the export
+  record buffer, rejects malformed connectivity as degenerate primitives (and counts it), rotates
+  corners for PROVOKING_VTX_LAST, takes the layer from the provoking vertex, and routes it through
+  the vertex stage, a forwarding geometry stage, or the interpolation geometry stage. Offline only.
+- `param_ps_routing` — the one PARAM-to-fragment-input routing rule every vertex-side commit stage
+  publishes through, so the owned-wave and NGG commits cannot drift from each other.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.

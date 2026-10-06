@@ -21,6 +21,7 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/fragment_draw_capacity.hpp"
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
@@ -522,6 +523,47 @@ static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& s
     dump(dir, "ngg_subgroup_kena_lut_native2",
          recompile_ngg_subgroup(kena.data(), kena.size(), &kena_rt, kena_cfg),
          "recompile_ngg_subgroup");
+}
+
+// #3135 P3: the merged-NGG raster commit. The pass-through vertex stage in every shape that changes
+// its module -- each layer route, line lists, PROVOKING_VTX_LAST, a PS input mapping, and without the
+// violation counters -- and the forwarding geometry stage for triangles and lines.
+static void dump_ngg_raster_commit(const std::string& dir) {
+    NggRasterCommitConfig config;
+    config.layout.words_per_lane = 14;
+    config.layout.pos1_word = 6;
+    config.layout.first_param_word = 10;
+    config.layout.param_targets = {kExpTargetParam0};
+    config.layout.param_channels = {0xfu};
+    config.layout.pos1_channels = 4;
+    config.layer_from_pos1 = true;
+    config.layer_slices = 32;
+    NggRasterCommitInterface triangles, lines;
+    config.route = NggLayerRoute::ShaderOutputLayer;
+    dump(dir, "ngg_raster_vertex_output_layer", build_ngg_raster_commit_vertex(config),
+         "build_ngg_raster_commit_vertex");
+    config.route = NggLayerRoute::ForwardingGeometry;
+    config.provoking_vertex_last = true;
+    dump(dir, "ngg_raster_vertex_forward_last", build_ngg_raster_commit_vertex(config, &triangles),
+         "build_ngg_raster_commit_vertex");
+    dump(dir, "ngg_raster_forward_geometry_triangles", build_ngg_layer_forward_geometry(triangles),
+         "build_ngg_layer_forward_geometry");
+    config.topology = NggOutputTopology::LineList;
+    config.waves = 2;
+    dump(dir, "ngg_raster_vertex_lines", build_ngg_raster_commit_vertex(config, &lines),
+         "build_ngg_raster_commit_vertex");
+    dump(dir, "ngg_raster_forward_geometry_lines", build_ngg_layer_forward_geometry(lines),
+         "build_ngg_layer_forward_geometry");
+    PixelInputMapping mapping;
+    mapping.valid_mask = 0b11;
+    mapping.controls[1] = 0x400u;   // input 1 <- PARAM0, flat
+    config.topology = NggOutputTopology::TriangleList;
+    config.route = NggLayerRoute::None;
+    config.layer_from_pos1 = false;
+    config.pixel_inputs = &mapping;
+    config.count_violations = false;
+    dump(dir, "ngg_raster_vertex_mapped_no_counters", build_ngg_raster_commit_vertex(config),
+         "build_ngg_raster_commit_vertex");
 }
 
 static void dump_numeric_mbcnt(const std::string& dir) {
@@ -1774,6 +1816,7 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
     dump_ngg_subgroup_shell(dir, src_root);
+    dump_ngg_raster_commit(dir);
     { const uint32_t c[] = {
           0x7e000f00u,0x7e0202ffu,160u,
           0x7d8402f9u,0x06068600u, // save one VOPC lane in s[6:7]
@@ -1875,6 +1918,11 @@ int main(int argc, char** argv) {
       const FloatTransportConfig profile{FloatTransportProfile::ExplicitNonFinite32};
       dump(dir, "geometry_interpolation_primitive_id",
            recompile_interpolation_geometry(layout, false, false, profile, true),
+           "recompile_interpolation_geometry");
+      // #3135 P3: the merged-NGG raster commit's interpolation-geometry layer route adds a uint
+      // input and a BuiltIn Layer output. Location 31 is outside this layout's attributes.
+      dump(dir, "geometry_interpolation_layer",
+           recompile_interpolation_geometry(layout, false, false, profile, false, 31u),
            "recompile_interpolation_geometry");
       RasterQuadInputs inputs;
       inputs.raw_code = std::make_shared<const std::vector<uint32_t>>(ps, ps + std::size(ps));
