@@ -16,13 +16,27 @@ namespace prosper::np {
 
 // A fixed-capacity table of registered guest callbacks, each owed one delivery. Pure bookkeeping:
 // it never calls guest code itself, so it is testable without a guest.
+//
+// Both shipped modules keep 8 slots of {fn, arg, ...} and hand out the lowest free one:
+// libSceNetCtl.sprx's sceNetCtlRegisterCallback (RVA 0x2010) scans 0x11048 + 0x18*i for i < 8, and
+// libSceNpManager.sprx's sceNpRegisterStateCallbackA (RVA 0x15580) scans 0x565a0 + 0x18*i for i < 8.
+// They differ on a repeated function: NetCtl gives it another slot, NpManager refuses it (see add()).
+// CONFIDENCE: HIGH (read from the modules).
 class StateCallbackTable {
 public:
-    static constexpr int kCapacity = 4;
+    static constexpr int kCapacity = 8;
 
-    // Registers `fn` with its user argument. Returns the slot index, or -1 when the table is full.
-    // The same function may be registered more than once; each registration is its own slot.
-    int add(uint64_t fn, uint64_t arg);
+    // add()'s refusals. A slot index is never negative.
+    static constexpr int kFull = -1;
+    static constexpr int kDuplicate = -2;
+
+    // Registers `fn` with its user argument in the lowest free slot and returns the slot index, or
+    // kFull when every slot is taken. With `refuse_duplicate`, a `fn` already present in ANY slot is
+    // kDuplicate instead -- and that is decided before fullness, as NpManager's register compares
+    // all 8 slots' functions before its free-slot answer is used (a full table holding `fn` answers
+    // ALREADY_REGISTERED, not CALLBACK_MAX). Without it the same function may hold several slots,
+    // which is NetCtl's behaviour.
+    int add(uint64_t fn, uint64_t arg, bool refuse_duplicate = false);
 
     // Releases a slot. False when the slot is out of range or not registered.
     bool remove(int slot);

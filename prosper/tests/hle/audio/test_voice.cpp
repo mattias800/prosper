@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 using namespace prosper;
 
@@ -60,19 +61,43 @@ TEST(Voice, PortSurfaceAnswersNotInitialized) {
     for (const char* name : table) expect_refuses_untouched(name, kVoiceNotInit);
 }
 
-// libSceVoiceQoS sits on top of a voice session, and there is no voice backend: sceVoiceQoSInit must
-// refuse exactly as sceVoiceInit does and leave the guest's memory block alone (the real guest passes
-// a freshly allocated 0x40000-byte block and tests the result with `test eax,eax`).
-TEST(Voice, QoSInitReportsVoiceUnavailableAndTouchesNothing) {
+// libSceVoiceQoS sits on top of a voice session, and there is no voice backend. libSceVoiceQoS.sprx's
+// sceVoiceQoSInit (RVA 0x260) validates its arguments with its own code (0x804E0902), then calls
+// sceVoiceInit and returns that result unchanged -- so with the arguments the real guest passes
+// (a 0x40000-byte block, app_type 0x20000000) it must answer exactly what sceVoiceInit answers, and
+// leave the block alone.
+static constexpr uint64_t kVoiceQosBadArg = (uint64_t)(int64_t)(int32_t)0x804E0902u;
+static constexpr uint64_t kQosMemSize = 0x40000;
+
+TEST(Voice, QoSInitForwardsVoiceInitsAnswerAndTouchesNothing) {
     register_builtin_hle();
     HleFn fn = Hle::lookup(nid_hash("sceVoiceQoSInit"));
     ASSERT_NE(fn, nullptr) << "sceVoiceQoSInit is not registered";
-    uint8_t block[64];
-    std::memset(block, 0xAA, sizeof block);
-    const uint64_t r = fn((uint64_t)(uintptr_t)block, sizeof block, 0x20000000u, 0, 0, 0);
-    EXPECT_EQ(r, kVoiceInitUnavailable);
-    EXPECT_LT((int64_t)r, 0) << "negative as int64 too, not a zero-extended error";
+    std::vector<uint8_t> block(kQosMemSize, 0xAA);
+    const uint64_t p = (uint64_t)(uintptr_t)block.data();
+    for (uint64_t app_type : {0x20000000ull, 0x10000000ull}) {
+        const uint64_t r = fn(p, kQosMemSize, app_type, 0, 0, 0);
+        EXPECT_EQ(r, kVoiceInitUnavailable) << "app_type " << std::hex << app_type;
+        EXPECT_LT((int64_t)r, 0) << "negative as int64 too, not a zero-extended error";
+    }
     for (uint8_t b : block) ASSERT_EQ(b, 0xAA);
-    EXPECT_EQ(fn(0, 0, 0, 0, 0, 0), kVoiceInitUnavailable)
-        << "a null block is refused the same way";
+}
+
+// The argument checks run before sceVoiceInit is consulted, and answer the QoS module's own code.
+TEST(Voice, QoSInitRefusesBadArgumentsWithItsOwnCode) {
+    register_builtin_hle();
+    HleFn fn = Hle::lookup(nid_hash("sceVoiceQoSInit"));
+    ASSERT_NE(fn, nullptr) << "sceVoiceQoSInit is not registered";
+    std::vector<uint8_t> block(kQosMemSize, 0xAA);
+    const uint64_t p = (uint64_t)(uintptr_t)block.data();
+    EXPECT_EQ(fn(0, kQosMemSize, 0x20000000u, 0, 0, 0), kVoiceQosBadArg) << "null block";
+    EXPECT_EQ(fn(p, kQosMemSize - 1, 0x20000000u, 0, 0, 0), kVoiceQosBadArg) << "short block";
+    EXPECT_EQ(fn(p, 64, 0x20000000u, 0, 0, 0), kVoiceQosBadArg) << "tiny block";
+    EXPECT_EQ(fn(p, kQosMemSize, 0, 0, 0, 0), kVoiceQosBadArg) << "app_type 0";
+    EXPECT_EQ(fn(p, kQosMemSize, 0x30000000u, 0, 0, 0), kVoiceQosBadArg) << "both app bits";
+    // Only the low 32 bits of each register are the argument (`cmp esi`, `cmp edx`).
+    EXPECT_EQ(fn(p, (1ull << 32) | kQosMemSize, (1ull << 32) | 0x20000000u, 0, 0, 0),
+              kVoiceInitUnavailable)
+        << "high register halves are not part of the uint32/int arguments";
+    for (uint8_t b : block) ASSERT_EQ(b, 0xAA);
 }

@@ -10,7 +10,6 @@
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
-#include "diagnostics/env_numeric.hpp"   // #3267: a typo must not unregister a default-ON NID family
 #include "hle/input/ime_input.hpp"
 #include "hle/service/platform_ui.hpp"
 #include "hle/video/video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
@@ -1385,11 +1384,11 @@ void register_np_hle() {
                      "sceNpUniversalDataSystemGetMemoryStat");
     Hle::register_fn("KmN62tT4U8A", (HleFn)s_npuds_get_storage_stat,
                      "sceNpUniversalDataSystemGetStorageStat");
-    // NetCtl / NpManager state callbacks: portable, in state_callbacks.cpp.
+    // NetCtl / NpManager state callbacks (register, unregister, check, GetState): portable, in
+    // state_callbacks.cpp. The old PROSPER_NETCTL_CB opt-out is gone with the platform split:
+    // delivery has been default ON since #306 and the switch only ever existed to unregister the
+    // contract.
     np::register_state_callbacks_hle();
-    // The old PROSPER_NETCTL_CB opt-out is gone with the platform split: delivery has been default
-    // ON since #306 and the switch only ever existed to unregister the contract.
-    Hle::register_fn("M3wFXbYQtAA", (HleFn)s_np_ok, "sceNpUnregisterStateCallbackA");
 #undef R
 }
 

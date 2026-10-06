@@ -32,7 +32,10 @@ was drawn.
 The NetCtl and NpManager state callbacks live in `state_callbacks.cpp` and are **portable**: a
 `StateCallbackTable` records registrations, each owed one delivery of the state the library's other
 entry points report (offline, signed out), and the pump (`sceNetCtlCheckCallback`,
-`sceNpCheckCallback`) delivers on the caller's thread. How a guest function is actually entered
+`sceNpCheckCallback`) delivers on the caller's thread. Slot count, id base, duplicate rule and
+error codes follow the shipped `libSceNetCtl.sprx` and `libSceNpManager.sprx` (8 slots each;
+NetCtl ids are 0-based, Np ids 1-based; NpManager refuses a function already registered), with
+the module RVAs cited in the code. How a guest function is actually entered
 is per host and lives in `src/host/abi/guest_callback.*` -- the guest `%fs` restore on Linux/macOS,
 the System V call trampoline on Windows -- so nothing here carries a platform `#if`. These exports
 used to be registered on POSIX only, which left a Windows title's boot-time registration answering
@@ -40,7 +43,8 @@ used to be registered on POSIX only, which left a Windows title's boot-time regi
 
 ## Registration
 
-`register_np_hle()`, which also calls `np::register_state_callbacks_hle()`, declared in `hle/dispatch/dispatch.hpp` and called by `register_builtin_hle()`.
+`register_np_hle()`, declared in `hle/dispatch/dispatch.hpp` and called by
+`register_builtin_hle()`; it also calls `np::register_state_callbacks_hle()`.
 Every handler stays `static` to this file, including its own `s_np_ok` success stub — that per-file
 copy is why the split needed nothing promoted.
 
