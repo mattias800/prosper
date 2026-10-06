@@ -2,6 +2,7 @@
 // live_renderer.cpp (#3892).
 #include "shared/live/submit_renderer/callback_prelude.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
+#include "shared/live/submit_renderer/mrt_slots.hpp"   // color_binding
 
 namespace prosper::frontend::submit_renderer {
 
@@ -172,7 +173,79 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
         ? RenderClock::now() : RenderClock::time_point{};
     uint64_t dcc_materialize_surfaces = 0;
     uint64_t dcc_materialize_bytes = 0;
-    for (const auto& item : items) {
+    // One uniform clear, decoded from `metadata_bytes` at `metadata_addr` (or from `host_data`
+    // when the descriptor carries the bytes itself) as a descriptor with these components reads it.
+    const auto materialize = [&](RttCache::iterator found, uint64_t metadata_addr,
+                                 uint64_t metadata_bytes, const uint8_t* host_data,
+                                 uint64_t host_data_bytes, uint32_t num_components,
+                                 bool alpha_is_on_msb) {
+        if (!metadata_bytes || metadata_bytes > SIZE_MAX) return;
+        std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
+        size_t copied = 0;
+        if (host_data) {
+            copied = static_cast<size_t>(std::min<uint64_t>(metadata.size(), host_data_bytes));
+            std::memcpy(metadata.data(), host_data, copied);
+        } else {
+            copied = safe_copy(metadata.data(), metadata_addr, metadata.size());
+        }
+        const uint64_t texels = static_cast<uint64_t>(found->second.w) * found->second.h;
+        const VkFormat format = prosper::test::backend_color_format(found->second.format);
+        const uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(format);
+        if (copied != metadata.size() || !bpp || texels > SIZE_MAX / bpp) return;
+        uint8_t clear_rgba[4]{};
+        if (!prosper::gpu::gfx10_dcc_fast_clear_rgba8(
+                clear_rgba, 1, metadata.data(), metadata.size(), num_components, alpha_is_on_msb))
+            return;
+        if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+            format != VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+            return;
+        found->second.rgba.reset();
+        found->second.has_uniform_color = true;
+        for (uint32_t channel = 0; channel < 4; ++channel)
+            found->second.uniform_color[channel] = clear_rgba[channel] ? 1.0f : 0.0f;
+        // PROSPER_DCCLOG=1 -- diagnostic only, no behaviour change. A surface
+        // materialised from a DCC fast-clear code becomes a UNIFORM colour for the
+        // whole target, so if this decode is wrong the entire frame is one wrong
+        // colour with no content -- which is exactly Little Nightmares III's
+        // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
+        // run costs a handful of lines.
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): the cached environment read this block always made
+        if (const char* dcclog = PROSPER_ENV_VALUE("PROSPER_DCCLOG")) {
+            if (dcclog[0] == '1' && dcclog[1] == '\0') {
+                static std::mutex dcc_mutex;
+                static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
+                const uint32_t packed = (uint32_t)clear_rgba[0] | ((uint32_t)clear_rgba[1] << 8) |
+                                        ((uint32_t)clear_rgba[2] << 16) |
+                                        ((uint32_t)clear_rgba[3] << 24);
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lock(dcc_mutex);
+                    first = dcc_seen.emplace((uint64_t)found->first, packed).second;
+                }
+                if (first)
+                    fprintf(
+                        stderr,
+                        "[dcclog] addr=0x%llx %ux%u fmt=%d ncomp=%u "
+                        "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f)\n",
+                        (unsigned long long)found->first, found->second.w, found->second.h,
+                        (int)format, num_components, (int)alpha_is_on_msb, clear_rgba[0],
+                        clear_rgba[1], clear_rgba[2], clear_rgba[3], found->second.uniform_color[0],
+                        found->second.uniform_color[1], found->second.uniform_color[2],
+                        found->second.uniform_color[3]);
+            }
+        }
+        found->second.dcc_metadata_dirty = false;
+        ++dcc_materialize_surfaces;
+        dcc_materialize_bytes += sizeof(found->second.uniform_color);
+    };
+    // Nearly every span has no dirty target at all, and then neither loop below has anything to
+    // find: walk the draws only when one exists.
+    static const std::vector<prosper::gpu::DrawItem> no_draws;
+    const bool any_dirty = std::any_of(g_rtt.begin(), g_rtt.end(), [](const auto& entry) {
+        return entry.second.dcc_metadata_dirty;
+    });
+    const auto& candidates = any_dirty ? items : no_draws;
+    for (const auto& item : candidates) {
         const prosper::gpu::ShaderResourceTable* tables[] = {
             item.vrt.get(), item.prt.get(),
         };
@@ -186,77 +259,42 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
                     resource.width != found->second.w ||
                     resource.height != found->second.h)
                     continue;
-                const uint64_t metadata_bytes =
-                    prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
-                if (!metadata_bytes || metadata_bytes > SIZE_MAX) continue;
-                std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
-                size_t copied = 0;
-                if (resource.dcc_metadata_host_data) {
-                    copied = static_cast<size_t>(std::min<uint64_t>(
-                        metadata.size(), resource.dcc_metadata_host_data_size));
-                    std::memcpy(metadata.data(), resource.dcc_metadata_host_data, copied);
-                } else {
-                    copied = safe_copy(metadata.data(), resource.metadata_addr,
-                                       metadata.size());
-                }
-                const uint64_t texels = static_cast<uint64_t>(found->second.w) *
-                                        found->second.h;
-                const VkFormat format = prosper::test::backend_color_format(
-                    found->second.format);
-                const uint32_t bpp =
-                    prosper::test::backend_color_bytes_per_pixel(format);
-                if (copied != metadata.size() || !bpp || texels > SIZE_MAX / bpp)
-                    continue;
-                uint8_t clear_rgba[4]{};
-                if (!prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-                        clear_rgba, 1, metadata.data(), metadata.size(),
-                    resource.num_components, resource.alpha_is_on_msb))
-                    continue;
-                if (format != VK_FORMAT_R8G8B8A8_UNORM &&
-                    format != VK_FORMAT_R16G16B16A16_SFLOAT &&
-                    format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
-                    continue;
-                }
-                found->second.rgba.reset();
-                found->second.has_uniform_color = true;
-                for (uint32_t channel = 0; channel < 4; ++channel)
-                    found->second.uniform_color[channel] =
-                        clear_rgba[channel] ? 1.0f : 0.0f;
-                // PROSPER_DCCLOG=1 -- diagnostic only, no behaviour change. A surface
-                // materialised from a DCC fast-clear code becomes a UNIFORM colour for the
-                // whole target, so if this decode is wrong the entire frame is one wrong
-                // colour with no content -- which is exactly Little Nightmares III's
-                // uniform-yellow presents (#2014). Deduped per (address, decoded colour) so a
-                // run costs a handful of lines.
-                if (const char* dcclog = PROSPER_ENV_VALUE("PROSPER_DCCLOG")) {
-                    if (dcclog[0] == '1' && dcclog[1] == '\0') {
-                        static std::mutex dcc_mutex;
-                        static std::set<std::pair<uint64_t, uint32_t>> dcc_seen;
-                        const uint32_t packed = (uint32_t)clear_rgba[0] |
-                            ((uint32_t)clear_rgba[1] << 8) |
-                            ((uint32_t)clear_rgba[2] << 16) |
-                            ((uint32_t)clear_rgba[3] << 24);
-                        bool first = false;
-                        {
-                            std::lock_guard<std::mutex> lock(dcc_mutex);
-                            first = dcc_seen.emplace((uint64_t)found->first, packed).second;
-                        }
-                        if (first)
-                            fprintf(stderr,
-                                    "[dcclog] addr=0x%llx %ux%u fmt=%d ncomp=%u "
-                                    "alpha_msb=%d clear_rgba=(%u,%u,%u,%u) -> uniform=(%.0f,%.0f,%.0f,%.0f)\n",
-                                    (unsigned long long)found->first,
-                                    found->second.w, found->second.h, (int)format,
-                                    resource.num_components, (int)resource.alpha_is_on_msb,
-                                    clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3],
-                                    found->second.uniform_color[0], found->second.uniform_color[1],
-                                    found->second.uniform_color[2], found->second.uniform_color[3]);
-                    }
-                }
-                found->second.dcc_metadata_dirty = false;
-                ++dcc_materialize_surfaces;
-                dcc_materialize_bytes += sizeof(found->second.uniform_color);
+                materialize(found, resource.metadata_addr,
+                            prosper::gpu::gpu_capture_dcc_metadata_footprint(resource),
+                            resource.dcc_metadata_host_data, resource.dcc_metadata_host_data_size,
+                            resource.num_components, resource.alpha_is_on_msb);
             }
+        }
+    }
+    // A pass that RENDERS to such a target loads it as surely as one that samples it: a blend
+    // reads the destination, and whatever the draws do not cover stays as the clear left it.
+    // Nothing in such a span need sample the target, so the clear is decoded as the last
+    // descriptor to sample it would have (note_rtt_dcc_descriptor). MOUSE: P.I. For Hire fills
+    // its decal buffer's metadata with 0x40 -- the code for (0,0,0,1) -- each frame and blends
+    // decals over it with the destination alpha as the running transmittance; the pass had been
+    // starting from its own clear colour, (0,0,0,0), instead (#4556).
+    //
+    // Narrower than the sampled case on purpose, because here no descriptor is in hand to check:
+    //   - slots 0 and 1 only, the two whose pass can start from a retained uniform colour;
+    //   - the draw's guest extent must be the one the recorded descriptor described, so facts
+    //     left over from another surface at this address are not applied to it;
+    //   - the retained extent must be that extent, or it reduced by PROSPER_RENDER_SCALE;
+    //   - no volume target: for those the dirty flag also marks a partial colour-plane write.
+    for (const auto& item : candidates) {
+        for (uint32_t slot = 0; slot < 2u; ++slot) {
+            if (!prosper::frontend::mrt_write_mask(item, slot)) continue;
+            const auto binding = color_binding(item, slot);
+            auto found = binding.base ? g_rtt.find(binding.base) : g_rtt.end();
+            if (found == g_rtt.end() || !found->second.dcc_metadata_dirty) continue;
+            const RttSurf& surface = found->second;
+            if (surface.volume_depth || surface.volume_guest_bytes ||
+                binding.width != surface.dcc_width || binding.height != surface.dcc_height ||
+                !((binding.width == surface.w && binding.height == surface.h) ||
+                  prosper::frontend::rtt_scaled_extent_compatible(
+                      binding.width, binding.height, surface.w, surface.h, ctx.render_scale)))
+                continue;
+            materialize(found, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, nullptr, 0,
+                        surface.dcc_num_components, surface.dcc_alpha_is_on_msb);
         }
     }
     if (timing_enabled) {
