@@ -47,6 +47,15 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
+`diag_ratelimit.hpp` and `watch_list.{hpp,cpp}` are here for the same reason: they are shared
+helpers that diagnostics in several layers use (gpu, frontends, and this folder's own
+`readback_refusal` and `perf/perf_alarms`), so they sit in the lowest layer that needs them rather
+than in `src/gpu/diagnostics/`. `diag_ratelimit` is rate limiting for diagnostic lines. **Check a
+diagnostic's rate limit before quoting its volume as a frequency**; several phantom findings came
+from reading a capped count as a real one. `watch_list` is the strict hex address-list parser behind
+the `0xaddr[,0xaddr...]` selector switches. It still declares `prosper::gpu::parse_hex_watch_list`;
+the namespace did not move with the file.
+
 `native_host_wait.{hpp,cpp}` is the Windows observation-only companion to the guest-thread dump
 (#4330). `PROSPER_HOST_WAIT_OBSERVE` is a process-start presence switch, default off. It records
 only the actual empty-equeue and contended-pthread-once native condition-wait CALL scopes,
