@@ -1,44 +1,13 @@
 // build_draw_frame_resources -- see draw_resources.hpp. Moved verbatim out of live_renderer.cpp (#3892).
+#include "gpu/resources/linear_row_pitch.hpp"   // the one linear row-pitch rule (#4618)
 #include "shared/live/submit_renderer/draw_resources.hpp"
 #include "shared/live/submit_renderer/image_resources.hpp"
 #include "shared/live/submit_renderer/native_bc_chain_audit.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
+#include "shared/live/submit_renderer/lazy_sampled_color_target.hpp"
 #include "diagnostics/readback_refusal.hpp"
 
 namespace prosper::frontend::submit_renderer {
-namespace {
-void materialize_lazy_sampled_color_target(RttSurf& surface, uint64_t address,
-                                         VkFormat format, uint64_t expected_bytes) {
-    std::vector<uint8_t> materialized;
-    std::string error;
-    const bool readback_ok = [&] {
-        namespace refusal = prosper::diagnostics::readback_refusal;
-        if (!refusal::selected(address))
-            return prosper::test::readback_persistent_color_target(
-                address, surface.w, surface.h, format, materialized, error);
-        refusal::Record record{};
-        record.context.caller = refusal::Caller::LazySampled;
-        record.context.frontend_gpu_valid = surface.gpu_valid
-            ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
-        record.context.frontend_cpu_pixels = surface.rgba
-            ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
-        const bool result = prosper::test::readback_persistent_color_target(
-            address, surface.w, surface.h, format, materialized, error, 0, &record);
-        refusal::emit(record);
-        return result;
-    }();
-    if (readback_ok && materialized.size() == expected_bytes) {
-        surface.rgba = std::make_shared<const std::vector<uint8_t>>(std::move(materialized));
-    } else {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 24)
-            fprintf(stderr,
-                    "[rtt] lazy sampled target readback failed: "
-                    "base=0x%llx extent=%ux%u error=%s\n",
-                    (unsigned long long)address, surface.w, surface.h, error.c_str());
-    }
-}
-} // namespace
 
 size_t consume_image_renderer_mip_chain(DrawResourceContext& ctx, const RendererMipChainLayout& chain, uint32_t width, uint32_t height, VkFormat format) {
     auto& pinned_renderer_mip_targets = ctx.pinned_renderer_mip_targets;
@@ -1487,24 +1456,17 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   ? persistent_bc_block_bytes : sampled_source_bpt;
               const size_t linear_dst_row =
                   static_cast<size_t>(linear_row_width) * linear_row_element_bytes;
-              const uint32_t registered_linear_pitch = linear_dst_row <= UINT32_MAX
-                  ? prosper::gpu::guest_linear_texture_row_pitch(
-                        r.gpu_addr, static_cast<uint32_t>(linear_dst_row))
-                  : 0;
-              size_t linear_src_row = r.linear_row_pitch_bytes
-                  ? r.linear_row_pitch_bytes
-                  : (registered_linear_pitch
-                         ? registered_linear_pitch
-                         : prosper::gpu::linear_sampled_row_pitch(
-                               linear_row_width, linear_row_element_bytes));
+              // The one linear row-pitch rule, shared with compute, captures and storage writebacks.
+              size_t linear_src_row = prosper::gpu::resolved_linear_row_pitch(
+                  r, linear_row_width, linear_row_element_bytes);
               if (const char* lp = PROSPER_ENV_VALUE("PROSPER_LINPITCH"))
                   linear_src_row =
                       (size_t)strtoull(lp, nullptr, 0) * linear_row_element_bytes;
+              // Storage images too: a draw's UAV reads the rows compute and sampled reads do (#4618).
               const bool linear_padded_read =
-                  r.cls == RC::Texture && (r.img_dim == 1u || r.img_dim == 5u) &&
-                  r.tile_mode == 0 &&
-                  (!r.host_data || r.linear_row_pitch_bytes != 0) &&
-                  !r.compression_enabled &&
+                  (r.cls == RC::Texture || r.cls == RC::StorageImage) &&
+                  (r.img_dim == 1u || r.img_dim == 5u) && r.tile_mode == 0 &&
+                  (!r.host_data || r.linear_row_pitch_bytes != 0) && !r.compression_enabled &&
                   linear_dst_row != 0 && linear_src_row > linear_dst_row;
               // Dynamic single-channel video/coverage surfaces are already exactly what a
               // VK_FORMAT_R8_UNORM sampled image consumes. Expanding every byte to RGBA on the
@@ -4305,10 +4267,20 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                       r.in_mip_tail, r.mip_tail_bytes);
                   std::vector<uint8_t> source(source_bytes);
                   bool decoded = fr.storage_image_contract_valid;
-                  const size_t got = decoded && source_bytes
-                      ? copy_resource(
-                            source.data(), sampled_source_addr, source_bytes)
-                      : 0u;
+                  // An untiled image's guest rows sit at the linear row pitch (#4618).
+                  const size_t seed_row = static_cast<size_t>(tw) * portable_storage_guest_texel;
+                  const size_t seed_pitch = !tiled && materialize_depth == 1u && !r.in_mip_tail
+                                                ? prosper::gpu::padded_linear_row_pitch(
+                                                      r, tw, portable_storage_guest_texel)
+                                                : 0u;
+                  size_t got = 0;
+                  if (decoded && source_bytes && seed_pitch && seed_row * th == source_bytes) {
+                      for (uint32_t y = 0; y < th; ++y)
+                          got += copy_resource(source.data() + y * seed_row,
+                                               sampled_source_addr + y * seed_pitch, seed_row);
+                  } else if (decoded && source_bytes) {
+                      got = copy_resource(source.data(), sampled_source_addr, source_bytes);
+                  }
                   const bool materialized = decoded && got == source_bytes &&
                       storage_image_materialize_raw_uvec4(
                           source.data(), got, r.format,
@@ -5286,12 +5258,17 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                       ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0u;
                   const size_t linear_bytes = static_cast<size_t>(tw) * th * 4u;
                   const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                  const size_t guest_bytes = r.in_mip_tail
-                      ? r.mip_tail_bytes
-                      : (tiled
-                             ? prosper::gpu::tiled_surface_bytes(
-                                   tw, th, r.tile_mode, writeback_pitch, 4u)
-                             : linear_bytes);
+                  // An untiled image is written back at the linear row pitch (#4618).
+                  const size_t row_bytes = static_cast<size_t>(tw) * 4u;
+                  const size_t padded_pitch = !tiled && !r.in_mip_tail
+                                                  ? prosper::gpu::padded_linear_row_pitch(r, tw, 4u)
+                                                  : 0u;
+                  const size_t guest_bytes =
+                      r.in_mip_tail ? r.mip_tail_bytes
+                                    : (tiled ? prosper::gpu::tiled_surface_bytes(
+                                                   tw, th, r.tile_mode, writeback_pitch, 4u)
+                                             : (padded_pitch ? padded_pitch * (th - 1u) + row_bytes
+                                                             : linear_bytes));
                   // The exact Astro atomic surface is a base-level 2D R32_UINT image. Keep
                   // the callback fail-closed for malformed/short replay backing; losing a
                   // write is preferable to overrunning an unrelated guest allocation.
@@ -5311,9 +5288,8 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                           // capture list (clang rejects it outright), and the body reaches
                           // the render thread's own instances directly — which is the
                           // right identity, since this callback runs on that thread.
-                          [guest_addr, replay_data, guest_bytes, linear_bytes,
-                           tw, th, tile_mode,
-                           writeback_pitch, in_mip_tail, mip_tail_x,
+                          [guest_addr, replay_data, guest_bytes, linear_bytes, tw, th, tile_mode,
+                           padded_pitch, row_bytes, writeback_pitch, in_mip_tail, mip_tail_x,
                            mip_tail_y](const uint8_t* pixels, size_t bytes) {
                               if (!pixels || bytes != linear_bytes) return;
                               uint8_t* destination = replay_data;
@@ -5332,6 +5308,9 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                                   prosper::gpu::tile_surface_level(
                                       destination, guest_bytes, pixels, tw, th,
                                       tile_mode, 4u, mip_tail_x, mip_tail_y);
+                              } else if (padded_pitch) {
+                                  prosper::gpu::copy_linear_rows(destination, padded_pitch, pixels,
+                                                                 row_bytes, row_bytes, th);
                               } else {
                                   prosper::gpu::tile_surface(
                                       destination, pixels, tw, th, tile_mode,
@@ -5386,9 +5365,20 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   const uint32_t writeback_depth = is_volume ? r.depth : 1u;
                   const uint32_t components =
                       r.num_components ? r.num_components : 1u;
-                  const size_t guest_bytes = storage_image_raw_uvec4_source_bytes(
-                      r.format, components, tw, th, writeback_depth,
-                      writeback_tile_mode, r.in_mip_tail, r.mip_tail_bytes);
+                  // An untiled 2D image is written back at the linear row pitch (#4618).
+                  const uint32_t writeback_texel =
+                      storage_image_guest_texel_bytes(r.format, components);
+                  const size_t writeback_row = static_cast<size_t>(tw) * writeback_texel;
+                  const size_t writeback_row_pitch =
+                      !tiled && writeback_depth == 1u && !r.in_mip_tail && writeback_row
+                          ? prosper::gpu::padded_linear_row_pitch(r, tw, writeback_texel)
+                          : 0u;
+                  const size_t guest_bytes =
+                      writeback_row_pitch
+                          ? writeback_row_pitch * (th - 1u) + writeback_row
+                          : storage_image_raw_uvec4_source_bytes(
+                                r.format, components, tw, th, writeback_depth, writeback_tile_mode,
+                                r.in_mip_tail, r.mip_tail_bytes);
                   const size_t texels = static_cast<size_t>(tw) * th * writeback_depth;
                   const size_t expanded_bytes = texels <= SIZE_MAX / 16u
                       ? texels * 16u : 0u;
@@ -5405,10 +5395,10 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                       const uint32_t mip_tail_x = r.mip_tail_x;
                       const uint32_t mip_tail_y = r.mip_tail_y;
                       fr.storage_image_writeback =
-                          [guest_addr, replay_data, guest_bytes, expanded_bytes,
-                           format, components, tw, th, writeback_depth,
-                           writeback_tile_mode, in_mip_tail, mip_tail_bytes,
-                           mip_tail_x, mip_tail_y](const uint8_t* pixels, size_t bytes) {
+                          [guest_addr, replay_data, guest_bytes, expanded_bytes, format, components,
+                           tw, th, writeback_depth, writeback_tile_mode, in_mip_tail,
+                           mip_tail_bytes, mip_tail_x, mip_tail_y,
+                           writeback_row_pitch](const uint8_t* pixels, size_t bytes) {
                               if (!pixels || bytes != expanded_bytes) return;
                               uint8_t* destination = replay_data;
                               if (!destination) {
@@ -5424,11 +5414,10 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                               }
                               if (!storage_image_writeback_raw_uvec4(
                                       reinterpret_cast<const uint32_t*>(pixels),
-                                      bytes / sizeof(uint32_t), format, components,
-                                      tw, th, writeback_depth, writeback_tile_mode,
-                                      in_mip_tail, mip_tail_bytes,
-                                      mip_tail_x, mip_tail_y,
-                                      destination, guest_bytes))
+                                      bytes / sizeof(uint32_t), format, components, tw, th,
+                                      writeback_depth, writeback_tile_mode, in_mip_tail,
+                                      mip_tail_bytes, mip_tail_x, mip_tail_y, destination,
+                                      guest_bytes, writeback_row_pitch))
                                   return;
                               if (guest_addr) {
                                   prosper::gpu::set_guest_gpu_write_origin(

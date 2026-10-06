@@ -21,6 +21,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-06
 
+### Assassin's Creed Black Flag Resynced shows its health warning on a black background
+
+The title's epilepsy-warning screen now draws white text on black, where it first drew on saturated red and then on black with green stripes ([tracker #4131](https://github.com/mattias800/prosper/issues/4131)). Windows `prosper-app`, default launch, about 32 seconds in: red (before), green stripes (after the fast-clear fix), black (after the linear-pitch fix).
+
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-red.webp" alt="Black Flag warning screen with the text over a saturated red background; Windows prosper-app, default launch"></p>
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-green-lines.webp" alt="Black Flag warning screen on black with green horizontal lines; same run after the fast-clear fix"></p>
+<p align="center"><img src="assets/screenshots/ac-black-flag-warning-fixed.webp" alt="Black Flag warning screen, white text on a clean black background; same run after the linear-pitch fix"></p>
+
 ### Dragon Quest VII's title gets its clouds and sea back
 
 The title screen's sky now has clouds and the sea has waves and sun glints, where it used to be two flat gradients ([tracker #1874](https://github.com/mattias800/prosper/issues/1874)). Before, then after:
