@@ -5023,6 +5023,12 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A retained depth plane's guest footprint follows the guest depth format (#4556).
+      prosper_add_gtest(test_ds_guest_plane_bytes
+        SOURCES tests/render/test_ds_guest_plane_bytes.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # The per-draw internal-GDS scan memo (#2334). Two registrations of ONE binary: the second
       # sets the opt-out, so the pair proves the memo both fires and can be turned off, on a single
       # build. Both must PASS -- the binary flips its own expectation from the environment.
