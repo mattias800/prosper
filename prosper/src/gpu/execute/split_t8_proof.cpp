@@ -291,6 +291,12 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
     if (!d.base || !d.width || !d.height || !gen5_image_format(d.format, &format) ||
         !format.bytes_per_block || d.compression_enabled || d.write_compress_enabled ||
         d.metadata_addr) return false;
+    // Only layouts whose slices are separate 2D surfaces are bounded here. A 3D surface (TYPE 10) in
+    // a thick swizzle mode is tiled in 3D blocks (a 64 KiB block at 4 bytes per texel is 32x32x16
+    // texels), so its depth pads to the block depth: 1024x1024x2 R32 occupies 64 MiB, not 8. A 3D
+    // UAV view's DEPTH is also only the selected slice range, not the volume. Neither is modelled,
+    // so a 3D image, and any TYPE outside the GFX10 image range, has no sound bound.
+    if (!valid_image_type(d.type) || d.type == 10) return false;
     constexpr uint64_t kTile = 256;
     const uint64_t w = (static_cast<uint64_t>(d.width) + kTile - 1) / kTile * kTile;
     const uint64_t h = (static_cast<uint64_t>(d.height) + kTile - 1) / kTile * kTile;

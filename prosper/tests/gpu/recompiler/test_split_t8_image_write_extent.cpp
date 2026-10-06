@@ -11,7 +11,12 @@
 // WHAT EACH TEST KILLS:
 //   StoreToDistantImageKeepsProof        the extent is ignored again, or computed too large
 //   StoreToImageOverlappingTableRefused  a store whose footprint covers the table is admitted
-//   ExtentIsASupersetOfTheSurface        the footprint underestimates a padded, mipped, multi-slice surface
+//   ExtentIsASupersetOfTheSurface        the footprint drops the padding or the bytes per texel
+//   ExtentCountsSlicesAndMips            the footprint drops the array-slice or the mip-chain term
+//   ThreeDimensionalSurfaceHasNoExtent   a 3D surface is bounded by width*height*depth, which a thick
+//                                        swizzle exceeds (its depth pads to the 3D block depth)
+//   StoreToThickThreeDImageRefused       end to end: a 3D store whose naive bound stops short of the
+//                                        table is still treated as able to reach it
 //   CompressedSurfaceHasNoExtent         a surface with metadata is given a bound that ignores the metadata
 //   SamplerPredicate                     a store's unused sampler field is read as a use of s0..s3
 //   X16ProofAdmitsTwoStoresDespiteUnusedSamplerField  the unused sampler field of image_store revokes the x16 proof
@@ -38,6 +43,18 @@ alignas(64) uint32_t g_table[16];
 // Captured shape of a 960x540 2D image T# (base is patched per test) and a 240x136 one.
 std::array<uint32_t, 8> store_t8(uint64_t base) {
     return { static_cast<uint32_t>(base >> 8), 0xc0d00000u | static_cast<uint32_t>((base >> 40) & 0xffu), 0x0086c0efu, 0x90900204u, 0, 0x00700000u, 0, 0 };
+}
+// The same surface reinterpreted with another SQ_RSRC_IMG TYPE (WORD3[31:28]) and WORD4 DEPTH field.
+std::array<uint32_t, 8> with_type(std::array<uint32_t, 8> t8, uint32_t type, uint32_t depth_field) {
+    t8[3] = (t8[3] & 0x0fffffffu) | (type << 28);
+    t8[4] = (t8[4] & ~0x1fffu) | (depth_field & 0x1fffu);
+    return t8;
+}
+uint64_t bytes_per_block_of(const std::array<uint32_t, 8>& t8) {
+    Gen5ImageFormatInfo format;
+    const DecodedImageDescriptor d = decode_image_descriptor(t8.data());
+    EXPECT_TRUE(gen5_image_format(d.format, &format));
+    return format.bytes_per_block;
 }
 std::array<uint32_t, 8> load_t8() {
     return { 0x421abe00u, 0xc1400000u, 0x0021c03bu, 0x90900004u, 0, 0x00700000u, 0, 0 };
@@ -94,9 +111,47 @@ TEST(SplitT8ImageWriteExtent, ExtentIsASupersetOfTheSurface) {
     uint64_t lo = 0, hi = 0;
     ASSERT_TRUE(storage_image_write_extent(store_t8(0x421c4d0000ull), lo, hi));
     EXPECT_EQ(lo, 0x421c4d0000ull);
-    // 960x540 padded to 256x256 tiles is 1024x768; at one byte per texel that is the floor.
-    EXPECT_GE(hi - lo, 1024ull * 768ull) << "the footprint must cover the padded surface";
-    EXPECT_LT(hi - lo, 1ull << 31) << "and stay a usable bound, not the whole address space";
+    // 960x540 padded to 256x256 tiles is 1024x768, one slice, one sample, no mip chain.
+    const uint64_t bpb = bytes_per_block_of(store_t8(0x421c4d0000ull));
+    ASSERT_GT(bpb, 1u) << "the captured format must have more than one byte per texel for this to bite";
+    EXPECT_EQ(hi - lo, 1024ull * 768ull * bpb) << "the footprint is the padded surface at its texel size";
+}
+
+TEST(SplitT8ImageWriteExtent, ExtentCountsSlicesAndMips) {
+    // 2D_ARRAY (TYPE 13) with LAST_ARRAY 2 from BASE_ARRAY 0: three layers.
+    auto t8 = with_type(store_t8(0x421c4d0000ull), 13u, 2u);
+    const uint64_t layer = 1024ull * 768ull * bytes_per_block_of(t8);
+    uint64_t lo = 0, hi = 0;
+    ASSERT_EQ(decode_image_descriptor(t8.data()).depth, 3u);
+    ASSERT_TRUE(storage_image_write_extent(t8, lo, hi));
+    EXPECT_EQ(hi - lo, 3u * layer) << "every array slice is inside the footprint";
+    t8[3] |= 3u << 16;   // WORD3 LAST_LEVEL 3: a mip chain
+    ASSERT_TRUE(storage_image_write_extent(t8, lo, hi));
+    EXPECT_EQ(hi - lo, 6ull * layer) << "a mip chain doubles the bound";
+}
+
+TEST(SplitT8ImageWriteExtent, ThreeDimensionalSurfaceHasNoExtent) {
+    // The same 960x540 surface as a 3D image of depth 2 (WORD4 DEPTH is depth-1). In a thick 64 KiB
+    // swizzle its depth pads to the 3D block depth (16 at 4 bytes per texel), so width*height*2 is
+    // an underestimate; there is no sound bound without modelling the block depth.
+    const auto t8 = with_type(store_t8(0x421c4d0000ull), 10u, 1u);
+    ASSERT_EQ(decode_image_descriptor(t8.data()).depth, 2u);
+    uint64_t lo = 0, hi = 0;
+    EXPECT_FALSE(storage_image_write_extent(t8, lo, hi));
+}
+
+TEST(SplitT8ImageWriteExtent, StoreToThickThreeDImageRefused) {
+    // A 3D store based 16 MiB below the descriptor table. The naive width*height*depth*bpp bound is
+    // well under 16 MiB, so it would call the table unreachable; a thick-tiled 3D surface padded to
+    // its block depth reaches it. The proof must not survive.
+    const uint64_t table = reinterpret_cast<uint64_t>(g_table) & ~0xffull;
+    const uint64_t base = table - (16ull << 20);
+    const auto naive_t8 = with_type(store_t8(base), 9u, 0u);
+    uint64_t lo = 0, hi = 0;
+    ASSERT_TRUE(storage_image_write_extent(naive_t8, lo, hi));
+    ASSERT_LT(2u * (hi - lo), 16ull << 20) << "the two-slice naive bound must stop short of the table";
+    EXPECT_FALSE(has_use(uses_for(with_type(store_t8(base), 10u, 1u), load_t8()), 6u))
+        << "a 3D store's footprint is unknown, so it must still revoke the proof";
 }
 
 TEST(SplitT8ImageWriteExtent, CompressedSurfaceHasNoExtent) {

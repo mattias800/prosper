@@ -18,10 +18,13 @@ struct ImageWriteExtent {
 
 // Upper bound of the guest memory an image_store / image atomic through `t8` can touch: the base,
 // plus the surface padded to 256x256 tiles, all slices and samples, doubled when it has a mip chain.
-// Returns false when no sound bound is known (unknown format, compressed surface with metadata, a
-// 64-bit overflow), and the caller then keeps treating the write as able to alias anything.
+// Returns false when no sound bound is known (unknown format, compressed surface with metadata, a 3D
+// surface whose thick tiling pads depth, a 64-bit overflow), and the caller then keeps treating the
+// write as able to alias anything.
 // CONFIDENCE: MED. The padding and the mip factor are bounds, not the layout; the layout is not needed
-// to show two ranges are disjoint, only that this one does not underestimate the footprint.
+// to show two ranges are disjoint, only that this one does not underestimate the footprint. A linear
+// surface is covered because GFX10 aligns its row pitch to 256 bytes, so a row never spans more than
+// pad256(width) texels.
 bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo, uint64_t& hi);
 
 // `image_writes` lists the earlier storage-image uses whose extents are known. A write through one of
