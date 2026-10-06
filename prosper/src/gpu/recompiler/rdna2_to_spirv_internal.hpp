@@ -3065,18 +3065,17 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // sprite draw in the title.
 //
 // `snapshot_saved_b64_masks` must be taken BEFORE emit_alu, because emit_alu materializes the new
-// lifetime for the same instruction. The staleness test is exactly "present in the snapshot AND its
-// Bool id is unchanged", which is a PROXY for "this instruction did not publish it": every publisher
-// either stores a fresh id or is named by `preserved_pair`. Classifying publishers syntactically
-// instead is not sufficient -- `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B mask
-// writers, but the `vgpr_lane_mask_slots` reload in rdna2_emit_alu.cpp republishes a spilled alias
-// from v_readlane with no syntactic marker at all. That same reload is the one publisher that could
-// in principle re-store an IDENTICAL id (it would have to reload a mask into a register that already
-// held that exact mask). If it were reached the alias would be dropped -- and the outcome is
-// FAIL-VISIBLE, not silent: `src_mask` resolves a missing `sreg_bool` entry to 0 and every
-// Bool-domain consumer then clears `ok` (rdna2_emit_alu.cpp :794, :817, :873, :1058, :1074), so the
-// stage rejects. Silent zero is the DATA-domain outcome only. So the residual is bounded by being
-// loud rather than by being harmless, and it is the same failure class this function repairs.
+// lifetime for the same instruction. The staleness test is "present in the snapshot AND its Bool id
+// is unchanged", a PROXY for "this instruction did not publish it": every publisher either stores a
+// fresh id or is named by `preserved_pair`. Classifying publishers syntactically instead is not
+// sufficient -- `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B mask writers, but the
+// `vgpr_lane_mask_slots` reload in rdna2_emit_alu.cpp republishes a spilled alias from v_readlane
+// with no syntactic marker at all. That reload re-stores an IDENTICAL id whenever the register
+// still holds the mask it spilled, which is the ordinary spill-then-reload of one register, so
+// record_scalar_write names it in `preserved_pair` too. Before it did, the proxy dropped exactly that
+// alias, and the outcome was SILENT, not fail-visible as this comment once claimed: the next
+// consumer, a re-spill, read the register through the DATA domain as an untracked zero, so a saved
+// mask restored an empty EXEC (#4600 shape 1).
 //
 // VCC (106/107) is deliberately out of scope, and NOT because it is unreachable -- SGPR-kind
 // operands really can carry 106/107 (`sgpr()` masks to 7 bits, rdna2_decode.cpp), and SOPK's
@@ -3491,12 +3490,16 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             effective_width == 1 && base == in.dst.value &&
             rs.sreg_wave64_mask_half.contains(base) &&
             rs.sreg_wave64_mask_half_index.contains(base);
+        // emit_alu's V_READLANE erases its destination's Bool unless it reloaded a mask slot into
+        // it, so a Bool there now is this instruction's. See expire_saved_b64_mask.
+        const bool publishes_reloaded_mask = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
+                                             base == in.dst.value && rs.sreg_bool.contains(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
                 expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
-                                      writes_b64_mask ? base : -1);
+                                      writes_b64_mask || publishes_reloaded_mask ? base : -1);
             }
             if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
                 continue;
