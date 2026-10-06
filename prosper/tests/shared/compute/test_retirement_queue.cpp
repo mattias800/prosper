@@ -1,15 +1,24 @@
-// The ordering contract for pipelined GPU work (ADR 0009, PERF-P8), asserted without Vulkan.
+// The ordering rules of RetirementQueue (ADR 0009, PERF-P8), asserted without Vulkan.
 //
-// Two layers: hand-written cases for each rule in retirement_queue.hpp, and a model check that runs
-// random operation streams both sequentially (every writeback applied immediately -- today's
-// behaviour) and pipelined through the queue, and requires every input an operation reads and every
-// CPU observation to see byte-identical guest memory. That second layer is the guarantee: it does
-// not assert that the queue "looks right", it asserts that the pipelined run is indistinguishable
-// from the sequential one for the guest, whatever the stream.
+// What this proves, and what it does not. The tests exercise the QUEUE, a model of the contract;
+// no production code uses it yet, so nothing here shows the backend obeys the rules. Two layers:
+//   1. a hand-written case per rule;
+//   2. a model check that runs random streams sequentially (every writeback applied immediately,
+//      today's behaviour) and pipelined through the queue, where a dispatch READS guest memory when
+//      the "GPU" executes it (at a random point between admission and retirement) and its writes
+//      are applied at retirement, and requires every dispatch result, every CPU read and every
+//      guest-visible effect to be identical. That model can fail on: a missed read-after-write at
+//      admission, a CPU read of a pending writer, a CPU store over a pending reader, an effect that
+//      does not retire the queue, and an unbounded queue. Each of those has its own negative test
+//      that switches the rule off IN THE REAL QUEUE (RetirementPolicy) and requires the model check
+//      to diverge, so the check cannot pass vacuously.
+// It cannot see write-after-write between dispatches: in-order retirement already applies writes in
+// order, so that clause is redundant in this model and rests on its hand-written case.
 #include "shared/compute/retirement_queue.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -31,6 +40,7 @@ struct SplitMix {
 
 using prosper::frontend::GuestRange;
 using prosper::frontend::PendingOperation;
+using prosper::frontend::RetirementPolicy;
 using prosper::frontend::RetirementQueue;
 
 PendingOperation op(uint64_t id, std::vector<GuestRange> reads, std::vector<GuestRange> writes) {
@@ -144,68 +154,97 @@ std::vector<Step> random_stream(SplitMix& rng, size_t length) {
     return steps;
 }
 
+using Memory = std::array<uint64_t, kSlots>;
+
 // What a dispatch computes: a value derived from every slot it read, so a stale input shows up.
-uint64_t compute(const std::array<uint64_t, kSlots>& memory, const Step& s, uint64_t id) {
+uint64_t compute(const Memory& memory, const Step& s, uint64_t id) {
     uint64_t v = id * 1000003u;
     for (size_t r : s.reads) v = v * 31u + memory[r];
     return v;
 }
 
-struct Trace { std::vector<uint64_t> seen; std::array<uint64_t, kSlots> final_memory{}; };
+// A guest-visible effect observes ALL of memory (a label, a flip, an EOP event).
+uint64_t observe_all(const Memory& memory) {
+    uint64_t v = 0xE;
+    for (uint64_t word : memory) v = v * 1099511628211ull + word;
+    return v;
+}
+
+struct Trace {
+    std::vector<uint64_t> seen;   // indexed by step: a dispatch's value, a read, an effect's view
+    Memory final_memory{};
+    bool depth_exceeded = false;
+};
 
 Trace run_sequential(const std::vector<Step>& steps) {
-    Trace t; std::array<uint64_t, kSlots> mem{};
-    uint64_t id = 0, store = 7;
-    for (const Step& s : steps) {
-        ++id;
+    Trace t; t.seen.assign(steps.size(), 0);
+    Memory mem{};
+    uint64_t store = 7;
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const Step& s = steps[i];
         switch (s.kind) {
             case Step::Dispatch: {
-                const uint64_t v = compute(mem, s, id);
-                t.seen.push_back(v);
+                const uint64_t v = compute(mem, s, i + 1);
+                t.seen[i] = v;
                 for (size_t w : s.writes) mem[w] = v;
                 break;
             }
-            case Step::CpuRead: t.seen.push_back(mem[s.slot]); break;
+            case Step::CpuRead: t.seen[i] = mem[s.slot]; break;
             case Step::CpuWrite: mem[s.slot] = ++store; break;
-            case Step::Effect: t.seen.push_back(0xE); break;
+            case Step::Effect: t.seen[i] = observe_all(mem); break;
         }
     }
     t.final_memory = mem;
     return t;
 }
 
-Trace run_pipelined(const std::vector<Step>& steps, size_t depth) {
-    Trace t; std::array<uint64_t, kSlots> mem{};
-    struct Pending { uint64_t id; std::vector<size_t> writes; uint64_t value; };
+// The pipelined run: a dispatch executes ("the GPU reads guest memory") at a random point after
+// admission, in submission order, and applies its writes at retirement.
+Trace run_pipelined(const std::vector<Step>& steps, size_t depth, RetirementPolicy policy,
+                    uint32_t schedule_seed) {
+    Trace t; t.seen.assign(steps.size(), 0);
+    Memory mem{};
+    struct Pending { size_t step = 0; uint64_t value = 0; bool executed = false; };
     std::map<uint64_t, Pending> in_flight;
-    RetirementQueue q(depth);
+    std::vector<uint64_t> unexecuted;      // ids in submission order
+    RetirementQueue q(depth, policy);
+    SplitMix schedule(schedule_seed);
+    const auto execute = [&](uint64_t id) {
+        Pending& p = in_flight[id];
+        if (p.executed) return;
+        p.value = compute(mem, steps[p.step], id);
+        p.executed = true;
+        t.seen[p.step] = p.value;
+        unexecuted.erase(std::find(unexecuted.begin(), unexecuted.end(), id));
+    };
     const auto retire = [&](const std::vector<uint64_t>& ids) {
-        ASSERT_TRUE(q.retire(ids)) << "retirement out of order";
+        // Execution is in order, so executing the requested prefix executes everything older too.
+        for (uint64_t id : ids) execute(id);
+        EXPECT_TRUE(q.retire(ids)) << "retirement out of order";
         for (uint64_t id : ids) {
-            for (size_t w : in_flight[id].writes) mem[w] = in_flight[id].value;
+            for (size_t w : steps[in_flight[id].step].writes) mem[w] = in_flight[id].value;
             in_flight.erase(id);
         }
     };
-    uint64_t id = 0, store = 7;
-    for (const Step& s : steps) {
-        ++id;
+    uint64_t store = 7;
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const Step& s = steps[i];
+        const uint64_t id = i + 1;
         switch (s.kind) {
             case Step::Dispatch: {
                 PendingOperation p; p.id = id;
                 for (size_t r : s.reads) p.reads.push_back(slot_range(r));
                 for (size_t w : s.writes) p.writes.push_back(slot_range(w));
                 retire(q.required_before_admit(p));
-                // The GPU reads guest memory as the host sees it NOW (the upload), so every
-                // pending writer that matters has retired by this point.
-                const uint64_t v = compute(mem, s, id);
-                t.seen.push_back(v);
-                in_flight[id] = {id, s.writes, v};
+                in_flight[id] = Pending{i, 0, false};
+                unexecuted.push_back(id);
                 q.admit(p);
+                if (q.size() > depth) t.depth_exceeded = true;
                 break;
             }
             case Step::CpuRead:
                 retire(q.required_for_observation(slot_range(s.slot)));
-                t.seen.push_back(mem[s.slot]);
+                t.seen[i] = mem[s.slot];
                 break;
             case Step::CpuWrite:
                 retire(q.required_for_observation(slot_range(s.slot), true));
@@ -213,53 +252,64 @@ Trace run_pipelined(const std::vector<Step>& steps, size_t depth) {
                 break;
             case Step::Effect:
                 retire(q.required_for_effect());
-                t.seen.push_back(0xE);
+                t.seen[i] = observe_all(mem);
                 break;
         }
+        // The GPU makes progress at its own pace between steps.
+        for (unsigned k = schedule() % 3; k > 0 && !unexecuted.empty(); --k)
+            execute(unexecuted.front());
     }
-    retire(q.required_for_effect());   // submit end
+    // Submit end. Under a policy that never retires at an effect this flush still applies everything.
+    for (uint64_t id : std::vector<uint64_t>(unexecuted)) execute(id);
+    for (auto& [id, pending] : in_flight)
+        for (size_t w : steps[pending.step].writes) mem[w] = pending.value;
     t.final_memory = mem;
     return t;
 }
 
-TEST(RetirementQueueModel, PipelinedRunIsIndistinguishableFromSequential) {
+constexpr size_t kDepths[] = {1, 2, 4, 16};
+
+// True when some stream, depth or schedule makes the pipelined run differ from the sequential one.
+bool model_diverges(RetirementPolicy policy) {
     for (uint32_t seed = 1; seed <= 400; ++seed) {
         SplitMix rng(seed);
         const std::vector<Step> steps = random_stream(rng, 60);
         const Trace expected = run_sequential(steps);
-        for (const size_t depth : {size_t{1}, size_t{2}, size_t{4}, size_t{16}}) {
-            const Trace actual = run_pipelined(steps, depth);
-            ASSERT_EQ(actual.seen, expected.seen) << "seed " << seed << " depth " << depth;
-            ASSERT_EQ(actual.final_memory, expected.final_memory)
-                << "seed " << seed << " depth " << depth;
+        for (const size_t depth : kDepths) {
+            const Trace actual = run_pipelined(steps, depth, policy, seed * 7919u + depth);
+            if (actual.seen != expected.seen || actual.final_memory != expected.final_memory ||
+                actual.depth_exceeded)
+                return true;
         }
     }
+    return false;
 }
 
-// The control: a deliberately broken policy (no retirement before admit, as Stage 2 behaved for a
-// label read) must be CAUGHT by the same model, otherwise the check above proves nothing.
-TEST(RetirementQueueModel, ARunThatSkipsConflictRetirementIsDetected) {
-    bool diverged = false;
-    for (uint32_t seed = 1; seed <= 50 && !diverged; ++seed) {
-        SplitMix rng(seed);
-        const std::vector<Step> steps = random_stream(rng, 60);
-        const Trace expected = run_sequential(steps);
-        // Pipelined without retiring on conflict: writes only land at effects/submit end.
-        Trace t; std::array<uint64_t, kSlots> mem{};
-        std::vector<std::pair<std::vector<size_t>, uint64_t>> pending;
-        uint64_t id = 0, store = 7;
-        const auto flush = [&] { for (auto& [w, v] : pending) for (size_t s : w) mem[s] = v; pending.clear(); };
-        for (const Step& s : steps) {
-            ++id;
-            if (s.kind == Step::Dispatch) { const uint64_t v = compute(mem, s, id); t.seen.push_back(v); pending.push_back({s.writes, v}); }
-            else if (s.kind == Step::CpuRead) t.seen.push_back(mem[s.slot]);
-            else if (s.kind == Step::CpuWrite) mem[s.slot] = ++store;
-            else { flush(); t.seen.push_back(0xE); }
-        }
-        flush();
-        diverged = t.seen != expected.seen;
-    }
-    EXPECT_TRUE(diverged) << "the model must detect a policy that skips conflict retirement";
+TEST(RetirementQueueModel, PipelinedRunIsIndistinguishableFromSequential) {
+    EXPECT_FALSE(model_diverges(RetirementPolicy{}))
+        << "the full contract must be indistinguishable from sequential execution";
+}
+
+// Each rule is necessary: turning it off in the REAL queue makes the same check fail.
+TEST(RetirementQueueModel, DroppingConflictRetirementIsDetected) {
+    RetirementPolicy p; p.retire_on_conflict = false;
+    EXPECT_TRUE(model_diverges(p));
+}
+TEST(RetirementQueueModel, DroppingObservationRetirementIsDetected) {
+    RetirementPolicy p; p.retire_on_observation = false;
+    EXPECT_TRUE(model_diverges(p));
+}
+TEST(RetirementQueueModel, DroppingReaderWaitOnStoreIsDetected) {
+    RetirementPolicy p; p.retire_readers_on_store = false;
+    EXPECT_TRUE(model_diverges(p));
+}
+TEST(RetirementQueueModel, DroppingEffectRetirementIsDetected) {
+    RetirementPolicy p; p.retire_on_effect = false;
+    EXPECT_TRUE(model_diverges(p));
+}
+TEST(RetirementQueueModel, DroppingTheDepthBoundIsDetected) {
+    RetirementPolicy p; p.bound_depth = false;
+    EXPECT_TRUE(model_diverges(p));
 }
 
 }  // namespace

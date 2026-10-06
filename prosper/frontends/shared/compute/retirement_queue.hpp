@@ -47,18 +47,30 @@ struct PendingOperation {
     std::vector<GuestRange> writes;
 };
 
+// Every field true IS the contract. The switches exist so a test can turn one rule off in the real
+// queue and prove the model check notices; production code never constructs a partial policy.
+struct RetirementPolicy {
+    bool retire_on_conflict = true;       // RAW/WAW/WAR between an incoming and a pending operation
+    bool retire_on_effect = true;         // a guest-visible effect with no range retires everything
+    bool retire_on_observation = true;    // a guest-memory read retires up to the last writer of it
+    bool retire_readers_on_store = true;  // a guest store also waits for pending readers of the range
+    bool bound_depth = true;              // PERF-P6: never more than max_in_flight pending
+};
+
 class RetirementQueue {
 public:
-    explicit RetirementQueue(size_t max_in_flight = 4) : max_in_flight_(max_in_flight ? max_in_flight : 1) {}
+    explicit RetirementQueue(size_t max_in_flight = 4, RetirementPolicy policy = {})
+        : max_in_flight_(max_in_flight ? max_in_flight : 1), policy_(policy) {}
 
     // Ids that must retire (oldest first) before `op` may be admitted. Retiring them is the
     // caller's job; call retire() with the returned ids, then admit().
     std::vector<uint64_t> required_before_admit(const PendingOperation& op) const {
         size_t last_conflict = npos;
-        for (size_t i = 0; i < pending_.size(); ++i)
-            if (conflicts(pending_[i], op)) last_conflict = i;
+        if (policy_.retire_on_conflict)
+            for (size_t i = 0; i < pending_.size(); ++i)
+                if (conflicts(pending_[i], op)) last_conflict = i;
         size_t count = last_conflict == npos ? 0 : last_conflict + 1;
-        if (pending_.size() - std::min(count, pending_.size()) >= max_in_flight_)
+        if (policy_.bound_depth && pending_.size() - std::min(count, pending_.size()) >= max_in_flight_)
             count = pending_.size() - max_in_flight_ + 1;   // bound the depth: retire the oldest
         return ids_prefix(count);
     }
@@ -66,17 +78,20 @@ public:
     void admit(const PendingOperation& op) { pending_.push_back(op); }
 
     // A guest-visible effect with no range (label write, EOP, flip, submit end): everything retires.
-    std::vector<uint64_t> required_for_effect() const { return ids_prefix(pending_.size()); }
+    std::vector<uint64_t> required_for_effect() const {
+        return ids_prefix(policy_.retire_on_effect ? pending_.size() : 0);
+    }
 
     // A guest-memory observation of `range`: everything up to the last pending writer of it.
     // `will_write` additionally covers readers (a write-after-read), for a CPU store.
     std::vector<uint64_t> required_for_observation(const GuestRange& range,
                                                    bool will_write = false) const {
         size_t last = npos;
+        if (!policy_.retire_on_observation) return {};
         for (size_t i = 0; i < pending_.size(); ++i) {
             for (const GuestRange& w : pending_[i].writes)
                 if (w.overlaps(range)) last = i;
-            if (will_write)
+            if (will_write && policy_.retire_readers_on_store)
                 for (const GuestRange& r : pending_[i].reads)
                     if (r.overlaps(range)) last = i;
         }
@@ -117,6 +132,7 @@ private:
     }
 
     size_t max_in_flight_;
+    RetirementPolicy policy_;
     std::deque<PendingOperation> pending_;
 };
 
