@@ -517,13 +517,41 @@ private:
     }
 
     std::bitset<128> saved_exec_masks_at_load() const {
-        // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
-        // Their value predates this load; no scalar bits, wave width or zero are inferred.
+        // Only actual mask saves, on every path that reaches this load from above, may seed its
+        // Bool facts. Their value predates this load; no scalar bits, wave width or zero are
+        // inferred.
+        //
+        // A MUST dataflow over the instructions before the load, run to a fixed point. It used
+        // to be one forward pass that returned nothing at the first backward branch, so a loop
+        // anywhere above a load cost it every seed; and it accepted a save only into s0..s104,
+        // while compilers also park EXEC in VCC (`s_mov_b64 vcc, exec` ... `s_mov_b64 exec,
+        // vcc` around a guarded sample). Both together kept a GTA V program on the owned-wave
+        // path (#4555).
+        //
+        // The pass only sees instructions before the load, and ignores a branch that leaves
+        // that range, as the sweep it replaces did. So a path that jumps over the load and
+        // reaches it from below can arrive with a seeded pair holding something else. A seed
+        // asserts one thing, that the pair does not depend on this load. On the first arrival
+        // that holds outright: everything was written before the load ran. On a later arrival
+        // it holds only as far as every value that depends on the load carries a mark while it
+        // lives, because then a pair rewritten from such a value is a write the walk reaches,
+        // and it drops the fact there. The marks are known to be incomplete in one place
+        // (#4574): a plain copy of loaded words into EXEC marks EXEC and nothing formed under
+        // it, so a compare run under that EXEC yields an unmarked mask, and the same goes for
+        // the VCC a carry-out leaves under it. Moved into a seeded pair after the walk has
+        // stopped and brought back round a loop, that mask is restored as an independent
+        // EXEC. The sweep this replaces cleared the same program; closing it belongs to the
+        // EXEC copy, which has to become a reader.
         std::vector<std::bitset<128>> incoming(start + 1);
         std::vector<bool> reached(start + 1);
         reached[0] = true;
-        for (size_t index = 0; index < start; ++index) {
-            if (!reached[index]) continue;
+        std::vector<size_t> pending{0};
+        size_t steps = 0;
+        while (!pending.empty()) {
+            const size_t index = pending.back();
+            pending.pop_back();
+            if (index >= start) continue;   // the load is where the facts are read
+            if (++steps > 65536) return {};
             const auto& in = ins[index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
                 rdna2_may_write_unnamed_register_or_leave_cfg(in))
@@ -536,25 +564,32 @@ private:
                     if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
                 }
             });
+            // VCC has writers the explicit inventory does not report: a compare with the
+            // implicit destination, and the carry-out of the e32 add/sub-with-carry forms.
+            if ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) && in.dst.value == 106) ||
+                (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28u && in.opcode <= 0x2au))
+                masks.reset(106);
             if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
-                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 104 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
+                (in.dst.value <= 104 || in.dst.value == 106) &&
                 in.src[0].kind == OperandKind::Special && in.src[0].value == 126)
                 masks.set(static_cast<size_t>(in.dst.value));
             const auto enter = [&](size_t next) {
                 if (next > start) return;
-                if (reached[next]) incoming[next] &= masks;
-                else incoming[next] = masks;
+                const std::bitset<128> joined = reached[next] ? incoming[next] & masks : masks;
+                if (reached[next] && joined == incoming[next]) return;
+                incoming[next] = joined;
                 reached[next] = true;
+                pending.push_back(next);
             };
             if (in.is_end) continue;
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
                 const int64_t target_pc = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-                if (target_pc <= in.pc || target_pc > UINT32_MAX) return {};
+                if (target_pc < 0 || target_pc > UINT32_MAX) return {};
                 const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
                 if (target == by_pc.end()) {
                     if (target_pc <= ins.back().pc) return {};
                 } else {
-                    if (target->second <= index) return {};
                     enter(target->second);
                 }
                 if (in.opcode == kSoppOpcodeBranch) continue;

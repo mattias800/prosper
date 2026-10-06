@@ -494,6 +494,89 @@ TEST(RawWideReplayedLoad, ADefiniteLaneReadEndsTheMarkOnItsDestination) {
     EXPECT_EQ(pc, 6u);
 }
 
+namespace {
+// The same loop with instructions in front of it, so the load is no longer at pc 1:
+//      (prefix)
+//   L  s_load_dwordx4 s[16:19], s[28:29], 0xf0
+//      s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+//      (in_loop)
+//      v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17]
+//      s_cbranch_vccz +1 ; s_branch L
+//      v_readfirstlane vcc_lo, v1 ; s_endpgm
+// Returns whether the load is flagged, and its numeric blocker through `kind`.
+bool prefixed_load_is_flagged(const std::vector<uint32_t>& prefix,
+                              const std::vector<uint32_t>& in_loop, std::string* kind = nullptr) {
+    std::vector<uint32_t> code = prefix;
+    const uint32_t load_pc = static_cast<uint32_t>(code.size());
+    code.insert(code.end(), {0xf408040eu, 0xfa0000f0u, 0xf4280208u, 0xfa0000c0u});
+    code.insert(code.end(), in_loop.begin(), in_loop.end());
+    code.insert(code.end(), {0x7c1a14f9u, 0x86869080u, 0xbeea0410u, 0xbf860001u});
+    const uint32_t branch_pc = static_cast<uint32_t>(code.size());
+    code.push_back(0xbf820000u | ((load_pc - (branch_pc + 1u)) & 0xffffu));
+    code.insert(code.end(), {0x7ed40501u, 0xbf810000u});
+    std::vector<Rdna2Inst> instructions;
+    EXPECT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
+    if (kind) kind->clear();
+    for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions))
+        if (row.load_pc == load_pc && kind) *kind = row.numeric_kind;
+    const auto loads = rdna2_raw_wide_data_loads(instructions);
+    return std::find(loads.begin(), loads.end(), load_pc) != loads.end();
+}
+constexpr uint32_t kSaveExecInVcc = 0xbeea047eu;   // s_mov_b64 vcc, exec
+constexpr uint32_t kRestoreExecFromVcc = 0xbefe046au;   // s_mov_b64 exec, vcc
+constexpr uint32_t kSaveExecInS96 = 0xbee0047eu;   // s_mov_b64 s[96:97], exec
+constexpr uint32_t kRestoreExecFromS96 = 0xbefe0460u;   // s_mov_b64 exec, s[96:97]
+}   // namespace
+
+TEST(RawWideReplayedLoad, ExecSavedInVccBeforeTheLoadIsAnIndependentRoot) {
+    // #4555, the second GTA V program: `s_mov_b64 vcc, exec` above a guarded sample and
+    // `s_mov_b64 exec, vcc` after it. The seeds only recognised a save into s0..s104, so the
+    // restore made EXEC "dependent" and every compare after it stopped counting as fresh.
+    std::string kind;
+    EXPECT_FALSE(prefixed_load_is_flagged({kSaveExecInVcc}, {kRestoreExecFromVcc}, &kind)) << kind;
+    // Control: with nothing saved, the same restore takes EXEC from an unknown VCC.
+    EXPECT_TRUE(prefixed_load_is_flagged({0x7e020280u}, {kRestoreExecFromVcc}));
+    // And VCC stops being the save when something writes it. A compare with the implicit
+    // destination is not in the explicit writer inventory, so the seed pass names it itself.
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInVcc, 0x7d820204u /* v_cmp_lt_u32 vcc */},
+                                         {kRestoreExecFromVcc}));
+    // So is the carry-out of an e32 add-with-carry: v_addc_co_u32 v4, vcc, 0, v3, vcc.
+    constexpr uint32_t kAddWithCarry = 0x50080680u;
+    std::vector<Rdna2Inst> carry;
+    ASSERT_EQ(rdna2_walk(&kAddWithCarry, 1, carry), 1u);
+    ASSERT_EQ(carry.front().fmt, Rdna2Format::VOP2);
+    ASSERT_EQ(carry.front().opcode, 0x28u);
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInVcc, kAddWithCarry}, {kRestoreExecFromVcc}));
+}
+
+TEST(RawWideReplayedLoad, ALoopAboveTheLoadDoesNotCostItsSeeds) {
+    // The seed pass was one forward sweep that gave up at the first backward branch, so any
+    // loop earlier in the program (GTA V has one at its pc 149) left every later load with no
+    // saved-EXEC fact at all. It is a fixed point now.
+    //   0  s_mov_b64 s[96:97], exec
+    //   1  s_nop
+    //   2  s_cbranch_scc1 -2        back to pc 1
+    std::string kind;
+    EXPECT_FALSE(prefixed_load_is_flagged({kSaveExecInS96, 0xbf800000u, 0xbf85fffeu},
+                                          {kRestoreExecFromS96}, &kind))
+        << kind;
+    // Control: a loop body that overwrites the saved pair leaves nothing to seed.
+    //   1  s_mov_b32 s96, 0
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInS96, 0xbee00380u, 0xbf85fffeu},
+                                         {kRestoreExecFromS96}));
+    // Control: a save that only one path makes is not a fact at the join.
+    //   0  s_cbranch_scc1 +1 ; 1  s_mov_b64 s[96:97], exec
+    EXPECT_TRUE(prefixed_load_is_flagged({0xbf850001u, kSaveExecInS96}, {kRestoreExecFromS96}));
+    // Control: the overwrite is only on the way BACK round the loop, after the exit branch, so
+    // it reaches the load through the back-edge alone. A pass that skipped backward branches
+    // instead of following them would still seed here.
+    //   0  save ; 1  s_nop ; 2  s_cbranch_scc1 +2 (out, to the load) ; 3  s_mov_b32 s96, 0 ;
+    //   4  s_branch -4 (to pc 1)
+    EXPECT_TRUE(prefixed_load_is_flagged(
+        {kSaveExecInS96, 0xbf800000u, 0xbf850002u, 0xbee00380u, 0xbf82fffcu},
+        {kRestoreExecFromS96}));
+}
+
 TEST(RawWideReplayedLoad, OnlyAWriterOrTransferVoidsAProvenImmediateLoad) {
     // prefix; s_load_dwordx4 s[16:19], s[28:29], 0xf0; v_mov_b32 v0, s18; s_endpgm.
     // The load is numeric (the v_mov reads a loaded word) and its entry pointer is stable, so it
