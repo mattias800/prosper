@@ -57,7 +57,11 @@ namespace {
 } // namespace
 
 bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
-    error.clear(); Writer w; w.raw(kMagic, sizeof(kMagic)); w.u32(gpu_capture_version_for(c)); w.u32(kEndian);
+    error.clear();
+    Writer w;
+    w.raw(kMagic, sizeof(kMagic));
+    w.u32(gpu_capture_version_for(c));
+    w.u32(kEndian);
     w.u32(c.metadata.width); w.u32(c.metadata.height); w.u64(c.metadata.submit_index);
     w.string(c.metadata.revision); w.string(c.metadata.title_id); w.string(c.metadata.input_route); w.string(c.metadata.savedata_dir);
     w.u32(static_cast<uint32_t>(c.metadata.renderer_env.size()));

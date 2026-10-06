@@ -813,6 +813,21 @@ inline size_t ngg_segment_split_index(std::span<const BackendDraw> draws) {
     return draws.size();
 }
 
+// Why render_draws_rgba cannot run `draw` (an NGG draw) in a call of `draws` draws, or null.
+inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
+                                            const prosper::gpu::NggHostCapabilities& host,
+                                            size_t draws, bool persist_depth_stencil,
+                                            const BackendColorTarget* color_target) {
+    if (!draw.ngg_subgroup) return nullptr;
+    if (const char* device = prosper::gpu::ngg_device_refusal(*draw.ngg_subgroup, host))
+        return device;
+    const bool splits_safely =
+        draws == 1u || (persist_depth_stencil && color_target && color_target->persistent_id);
+    if (!persist_depth_stencil && !splits_safely) return "ngg-backend-transient-depth-split";
+    if (!splits_safely) return "ngg-backend-readback-split";
+    return nullptr;
+}
+
 // Before render_draws_rgba splits a batch: the NGG draws this call can run. An NGG draw is dropped
 // (counted under backend/ngg-subgroup) when the device cannot run it (ngg_device_refusal, the same
 // answer the producer got), or when it shares the call with other draws and its own segment would
@@ -827,15 +842,8 @@ inline std::span<const BackendDraw> ngg_admit_backend_draws(const std::vector<Ba
                      [](const BackendDraw& d) { return bool(d.ngg_subgroup); }))
         return draws;
     const prosper::gpu::NggHostCapabilities host = ngg_host_capabilities(render_vk_ctx());
-    const bool splits_safely = draws.size() == 1u || (persist_depth_stencil && color_target &&
-                                                      color_target->persistent_id);
-    const auto refusal = [&](const BackendDraw& d) -> const char* {
-        if (!d.ngg_subgroup) return nullptr;
-        if (const char* device = prosper::gpu::ngg_device_refusal(*d.ngg_subgroup, host))
-            return device;
-        if (!persist_depth_stencil && !splits_safely) return "ngg-backend-transient-depth-split";
-        if (!splits_safely) return "ngg-backend-readback-split";
-        return nullptr;
+    const auto refusal = [&](const BackendDraw& d) {
+        return ngg_backend_draw_refusal(d, host, draws.size(), persist_depth_stencil, color_target);
     };
     if (std::none_of(draws.begin(), draws.end(), refusal)) return draws;
     kept.clear();

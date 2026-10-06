@@ -637,7 +637,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           uint64_t resource_limit_bytes_override,
                           const uint8_t* pre_submit_compute_gds,
                           size_t pre_submit_compute_gds_bytes) {
-    error.clear(); out = {}; out.format_version = kVersionWithoutNgg; out.metadata = metadata;
+    error.clear();
+    out = {};
+    out.format_version = kVersionWithoutNgg;
+    out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
         operations.size() > kMaxOperations) {
