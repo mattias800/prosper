@@ -419,6 +419,7 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords);
 // Complete executable inventory for an owned original, using the compiler's proved terminating
 // arms and PC-relative data/dispatch shapes. Table bytes remain data. An unavailable decode or
 // control target refuses rather than presenting an empty ownership inventory; PCs stay original.
+// A conditional branch forward out of `code` is not such a target: it leaves the program.
 bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords,
                                              std::vector<Rdna2Inst>& instructions,
                                              uint32_t& unavailable_pc);
