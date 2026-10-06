@@ -49,16 +49,29 @@ const uint32_t kDataSpillOfALaterMask[] = {
 // Wave64 `s_mov_b64 s[30:31], vcc` is dual-domain, so s30 IS a MUST scalar word at the spill: only
 // the mask-pair exclusion keeps this slot a mask slot.
 //
-// A second arm that re-spilled a word RELOADED from a mask slot (the case the readlane exclusion
-// is for) was dropped: it restores an empty EXEC with or without this change, a pre-existing
-// defect tracked in its own issue.
-//
 // v3 = 0; vcc = (40 > x); s[30:31] = vcc; v20[28] = s30; if (s4 == 0) v2 = 1;
 // join: s14 = v20[28]; exec = s[14:15]; v3 = 1; exec = -1; out[x] = v3 (1 below lane 40, else 0)
 const uint32_t kMaskSpill[] = {
     0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610014u, 0x0001381Eu,
     0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
     0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
+};
+// #4600 shape 1: the saved mask is spilled, reloaded and spilled AGAIN in one block before the
+// dispatcher edge; the join block restores EXEC from the second slot. Native Wave64 only, like
+// kMaskSpill, whose output it must match.
+// v3 = 0; vcc = (40 > x); s[30:31] = vcc; v21[5] = s30; s30 = v21[5]; v20[28] = s30;
+// if (s4 == 0) v2 = 1; join: s14 = v20[28]; exec = s[14:15]; v3 = 1; exec = -1; out[x] = v3
+const uint32_t kMaskReSpill[] = {
+    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD760001Eu, 0x00010B15u,
+    0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
+    0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
+};
+// #4600 shape 2: a VALU DATA read of a word reloaded from a mask slot, on the portable route.
+// x = lane; s[30:31] = exec; v20[28] = s30; if (s4 == 0) v2 = 1;
+// join: s14 = v20[28] (EXEC_LO = 0xffffffff); s2 = v0[0]; v3 = float(s14 + x)
+const uint32_t kDataReadOfAMaskReload[] = {
+    0x7E000F00u, 0xBE9E047Eu, 0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u,
+    0xD760000Eu, 0x00013914u, 0xD7600002u, 0x00010100u, 0x4A06000Eu, 0x7E060D03u, 0xBF810000u,
 };
 const uint32_t kTail[] = {
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
@@ -134,4 +147,36 @@ TEST(CfgSpillSlotDomain, AMaskSpillKeepsTheMaskDomain) {
     ASSERT_EQ(out.size(), kLanes);
     for (uint32_t lane = 0; lane < kLanes; ++lane)
         EXPECT_EQ(out[lane], lane < 40 ? 1u : 0u) << "lane " << lane;
+}
+
+// #4600 shape 1: a reload that is spilled again is still the saved mask. It used to restore an
+// EXEC with no lanes, so every lane read 0.
+TEST(CfgSpillSlotDomain, AReSpilledMaskReloadKeepsTheMask) {
+    const std::vector<uint32_t> spv = compile_native(kMaskReSpill);
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask";
+    EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    std::vector<uint32_t> out;
+    prosper::test::run_compute(spv, std::vector<float>(kLanes, 0.0f), kLanes, kLanes, {},
+                               std::vector<uint32_t>(kLanes, 0xdeadbeefu), &out, kLanes, nullptr,
+                               nullptr, nullptr, 64u);
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane < 40 ? 1u : 0u) << "lane " << lane;
+}
+
+// #4600 shape 2: the reloaded word is EXEC_LO's 0xffffffff, so v3 = x - 1 (mod 2^32). It used to
+// compile and read the word as 0 (v3 = x). The portable dispatcher cannot form a ballot word of
+// a Wave64 mask, so refusing is the correct answer there; a wrong value is not.
+TEST(CfgSpillSlotDomain, ADataReadOfAMaskReloadIsTheMaskWordOrRefuses) {
+    const std::vector<uint32_t> spv = compile(kDataReadOfAMaskReload);
+    if (spv.empty()) return;   // fail-visible
+    std::vector<float> input(kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) input[lane] = static_cast<float>(lane);
+    const std::vector<float> got = prosper::test::run_compute(spv, input, kLanes, kLanes);
+    if (got.empty()) GTEST_SKIP() << "no Vulkan compute device";
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_FLOAT_EQ(got[lane], static_cast<float>(lane - 1u))
+            << "lane " << lane << ": the reloaded word is EXEC_LO, 0xffffffff";
 }
