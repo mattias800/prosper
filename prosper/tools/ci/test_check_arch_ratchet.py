@@ -230,12 +230,45 @@ class BaselineFormat(unittest.TestCase):
 
     def test_round_trip(self):
         text = "# head\n\ngetenv|a.cpp 3  # why\ntitle-id|b.cpp 1\n"
-        header, rows = car.parse_baseline(text)
+        header, rows, footer = car.parse_baseline(text)
         self.assertEqual(["# head"], header)
         self.assertEqual("why", rows["getenv|a.cpp"].note)
         self.assertEqual(
-            car.parse_baseline(car.format_baseline(header, rows.values())), (header, rows)
+            car.parse_baseline(car.format_baseline(header, rows.values(), footer)),
+            (header, rows, footer),
         )
+
+    def test_standalone_notes_survive_round_trip(self):
+        text = (
+            "# head\n"
+            "\n"
+            "title-id|b.cpp 1\n"
+            "# note: raised with a reason a reviewer read (#1).\n"
+            "# second line of the same justification.\n"
+            "getenv|a.cpp 3  # why\n"
+            "# trailing remark, attached to no row.\n"
+        )
+        header, rows, footer = car.parse_baseline(text)
+        self.assertEqual(
+            (
+                "# note: raised with a reason a reviewer read (#1).",
+                "# second line of the same justification.",
+            ),
+            rows["getenv|a.cpp"].above,
+        )
+        self.assertEqual(("# trailing remark, attached to no row.",), footer)
+        self.assertEqual(text, car.format_baseline(header, rows.values(), footer))
+
+    def test_update_keeps_standalone_notes_on_their_row(self):
+        rows = {
+            "getenv|a.cpp": car.Row(
+                "getenv|a.cpp", 5, "kept note", ("# raised with a reason (#1).",)
+            ),
+        }
+        found = {"getenv|a.cpp": car.Finding("getenv|a.cpp", 2)}
+        repaired = car.apply_repairs(rows, car.compare(found, rows))
+        out = car.format_baseline(["# head"], repaired.values())
+        self.assertIn("# raised with a reason (#1).\ngetenv|a.cpp 2", out)
 
     def test_refusals(self):
         for bad in ("getenv|a 1 2\n", "nonsense|a 1\n", "getenv|a 1\ngetenv|a 2\n", "getenv|a 0\n"):
@@ -461,7 +494,7 @@ class Delta(unittest.TestCase):
         self.baseline.write_text(car.format_baseline(["# t"], rows.values()), encoding="utf-8")
 
     def raise_row(self, key, value):
-        _header, rows = car.parse_baseline(self.baseline.read_text(encoding="utf-8"))
+        _header, rows, _footer = car.parse_baseline(self.baseline.read_text(encoding="utf-8"))
         rows[key] = car.Row(key, value, "justified")
         self.write_rows(rows)
 

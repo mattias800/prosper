@@ -573,22 +573,32 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
 # --------------------------------------------------------------------------------------------
 @dataclass
 class Row:
-    """One baseline row: key, the value it pins, and the free-text note after `#`."""
+    """One baseline row: key, the value it pins, the free-text note after `#`, and the
+    standalone comment lines immediately above it (a raised row's reviewer justification)."""
 
     key: str
     value: int
     note: str = ""
+    above: tuple[str, ...] = ()
 
 
-def parse_baseline(text: str) -> tuple[list[str], dict[str, Row]]:
-    """(header comment lines, rows). Raises EvaluationError on anything it cannot read."""
+def parse_baseline(text: str) -> tuple[list[str], dict[str, Row], tuple[str, ...]]:
+    """(header comment lines, rows, trailing comment lines).
+
+    Standalone `#` lines between rows belong to the row they precede, so `--update`
+    keeps a raised row's reviewer justification with that row instead of dropping it.
+    Raises EvaluationError on anything it cannot read.
+    """
     header: list[str] = []
     rows: dict[str, Row] = {}
+    pending: list[str] = []
     for number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             if not rows:
                 header.append(raw.rstrip())
+            else:
+                pending.append(raw.rstrip())
             continue
         body, _sep, note = line.partition("#")
         fields = body.split()
@@ -601,20 +611,23 @@ def parse_baseline(text: str) -> tuple[list[str], dict[str, Row]]:
             raise EvaluationError(f"baseline line {number}: duplicate key {key!r}")
         if value <= 0:
             raise EvaluationError(f"baseline line {number}: a zero row is a deleted row: {key!r}")
-        rows[key] = Row(key, value, note.strip())
+        rows[key] = Row(key, value, note.strip(), tuple(pending))
+        pending = []
     while header and header[-1] == "":
         header.pop()
-    return header, rows
+    return header, rows, tuple(pending)
 
 
 def _row_order(key: str) -> tuple[int, str]:
     return RULES.index(rule_of(key)), key
 
 
-def format_baseline(header: list[str], rows: Iterable[Row]) -> str:
+def format_baseline(header: list[str], rows: Iterable[Row], footer: Iterable[str] = ()) -> str:
     out = [*header, ""] if header else []
     for row in sorted(rows, key=lambda r: _row_order(r.key)):
+        out.extend(row.above)
         out.append(f"{row.key} {row.value}" + (f"  # {row.note}" if row.note else ""))
+    out.extend(footer)
     return "\n".join(out) + "\n"
 
 
@@ -715,7 +728,7 @@ def compare_delta(
 
 def apply_repairs(rows: dict[str, Row], problems: list[Problem]) -> dict[str, Row]:
     """Lower `decrease` rows and delete `stale` ones. Never raises or adds a row."""
-    out = {k: Row(r.key, r.value, r.note) for k, r in rows.items()}
+    out = {k: Row(r.key, r.value, r.note, r.above) for k, r in rows.items()}
     for p in problems:
         if p.kind == "decrease":
             out[p.key].value = p.current
@@ -842,7 +855,7 @@ def run_delta(root: Path, baseline: Path, ref: str) -> int:
     """Delta mode: fail only on a count this change raised past its row. See the docstring."""
     if not baseline.is_file():
         raise EvaluationError(f"baseline {baseline} not found")
-    _header, rows = parse_baseline(baseline.read_text(encoding="utf-8"))
+    _header, rows, _footer = parse_baseline(baseline.read_text(encoding="utf-8"))
     base = resolve_merge_base(root, ref)
     tracked = tracked_paths(root)
     untracked = _nul_split(_git(root, "ls-files", "--others", "--exclude-standard", "-z"))
@@ -1062,7 +1075,7 @@ def run(root: Path, baseline: Path, mode: str) -> int:
         return EXIT_OK
     if not baseline.is_file():
         raise EvaluationError(f"baseline {baseline} not found")
-    header, rows = parse_baseline(baseline.read_text(encoding="utf-8"))
+    header, rows, footer = parse_baseline(baseline.read_text(encoding="utf-8"))
     print(f"scanned {len(files)} C/C++ file(s), {len(slugs)} title slug(s): {summary(found)}")
     if mode == "list":
         for key in sorted(found, key=_row_order):
@@ -1073,7 +1086,9 @@ def run(root: Path, baseline: Path, mode: str) -> int:
     if mode == "update":
         repaired = apply_repairs(rows, problems)
         if repaired != rows:
-            baseline.write_text(format_baseline(header, repaired.values()), encoding="utf-8")
+            baseline.write_text(
+                format_baseline(header, repaired.values(), footer), encoding="utf-8"
+            )
             fixed = sum(p.kind in ("decrease", "stale") for p in problems)
             print(f"updated {baseline.name}: lowered or deleted {fixed} row(s)")
         rows = repaired
