@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # History bug-hunt: verified-active findings backlog
 
 A full review of all 405 mainline commits (oldest → newest, 14 parallel review passes,

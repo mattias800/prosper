@@ -283,11 +283,9 @@ int main(int argc, char** argv) {
     if (raw_wide_proof) {
         const auto needs = rdna2_raw_wide_data_loads(instructions);
         const auto diagnoses = rdna2_raw_wide_data_load_diagnoses(instructions);
-        auto nulled = instructions;
-        for (auto& in : nulled)
-            if (in.fmt == Rdna2Format::SMEM && (in.opcode == 0x2u || in.opcode == 0x3u))
-                in.src[1] = {OperandKind::Special, 125};
-        const auto entry = rdna2_proven_raw_immediate_wide_data_loads(nulled);
+        // The register proof's own entry stage (pointer lifetime ends at the load), so the column
+        // never reports a blocker that proof no longer applies.
+        const auto entry = rdna2_proven_raw_register_wide_entry_loads(instructions);
         const auto registered = rdna2_proven_raw_register_wide_data_loads(instructions);
         const auto has = [](const std::vector<uint32_t>& set, uint32_t pc) {
             return std::find(set.begin(), set.end(), pc) != set.end();

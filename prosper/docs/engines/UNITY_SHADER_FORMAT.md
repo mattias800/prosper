@@ -1,3 +1,8 @@
+---
+kind: reference
+status: current
+---
+
 # Unity 2022.3.32f1 shader serialization format (for the deser-fault RE)
 
 Verified format from a multi-agent collaboration (Fable, cross-checked against AssetRipper 0.3.4.0

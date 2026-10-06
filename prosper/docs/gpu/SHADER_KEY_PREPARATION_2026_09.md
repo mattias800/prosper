@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Resource preparation: cheaper keys and retained GPU comparisons (#3407)
 
 The combined change reduces warm shader-key preparation work and raises the persistent compute

@@ -1280,6 +1280,16 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_srt_publication_dedupe
+    SOURCES tests/gpu/execute/test_srt_publication_dedupe.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_ngg_subgroup_plan
+    SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
@@ -5043,6 +5053,13 @@ endif()
       # compile-level positives/negatives plus two executed kernels.
       prosper_add_gtest(test_counted_loop_cmpx_guard
         SOURCES tests/gpu/recompiler/test_counted_loop_cmpx_guard.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
+      # counted-loop route declines and the general route lowers both loops, executed per lane.
+      prosper_add_gtest(test_counted_loop_prelude_exec_loop
+        SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 

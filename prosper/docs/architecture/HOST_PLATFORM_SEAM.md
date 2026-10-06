@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # The host-platform seam
 
 prosper runs the guest's x86-64 code natively on Linux (the primary host) and on Windows. Code that

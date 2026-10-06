@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # DOLL (PPSA17942, "Dragon Quest VII Reimagined") — why it never leaves the loading screen
 
 > **RESOLVED 2026-07-10 (issue #306, branch `fix/issue-306-frontend-progression`).** The gate was

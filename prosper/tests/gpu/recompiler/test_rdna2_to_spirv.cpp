@@ -8541,16 +8541,29 @@ int main() {
           "kernel 43a2 rejects a per-wave VCC arm spanning a workgroup barrier");
 
     // Partially-overlapping pre-loop regions are not a structured IF tree. Their branch intervals
-    // [3,7) and [5,9) cross, so the prefix must reject instead of entering the counted loop with
-    // invented merge semantics.
+    // [3,7) and [5,9) cross, so the counted-loop route must not enter its loop with invented merge
+    // semantics. It used to refuse the whole program here; it now declines, and the general route
+    // lowers the crossing branches through the CFG dispatcher, which executes them as written. The
+    // counted loop sums 0..4 into v1, so every lane must read 10.
     const uint32_t code43a2_overlap[] = {
         0xBE800383u, 0xBE810385u, 0xBF0A0100u, 0xBF840003u, 0xBF0A0100u,
         0xBF840003u, 0xBE830381u, 0xBE830382u, 0xBE830383u, 0xB0020005u,
         0xBE800380u, 0x7E020280u, 0xBF0A0200u, 0xBF840003u, 0x4A020200u,
         0x81008100u, 0xBF82FFFBu, 0x7E000D01u, 0xBF810000u,
     };
-    CHECK(recompile_valu(code43a2_overlap, std::size(code43a2_overlap), 0, 0).empty(),
-          "kernel 43a2 rejects partially-overlapping pre-loop IF regions");
+    const auto spv43a2_overlap =
+        recompile_valu(code43a2_overlap, std::size(code43a2_overlap), 0, 0);
+    CHECK(!spv43a2_overlap.empty(),
+          "kernel 43a2's crossing pre-loop IF regions fall back to the general route");
+    const auto got43a2_overlap =
+        spv43a2_overlap.empty()
+            ? std::vector<float>{}
+            : prosper::test::run_compute(spv43a2_overlap, std::vector<float>(N, 0.0f), N, N);
+    uint32_t bad43a2_overlap = 0;
+    for (uint32_t i = 0; i < N && got43a2_overlap.size() == N; ++i)
+        if (got43a2_overlap[i] != 10.0f) ++bad43a2_overlap;
+    CHECK(got43a2_overlap.size() == N && bad43a2_overlap == 0,
+          "kernel 43a2's crossing pre-loop regions then run the counted loop once per lane");
 
     // Kernel 43b: a pre-loop conditional that jumps over the complete counted loop to s_endpgm.
     // The prelude CFG scan uses the loop header as an artificial end marker, so it must preserve the

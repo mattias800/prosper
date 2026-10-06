@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
 Last revised: 2026-09-07 (opening FMV regression #3423; see Ruled out). Ladder position was last
@@ -15,7 +20,7 @@ chain are now hardware-faithful offline (families 1-3 resolved 2026-07-26).
 Rung 3 was cleared by that route; rungs 4-6 were cleared afterwards and this section lagged behind
 them. Per tracker [#1808](https://github.com/mattias800/prosper/issues/1808) (2026-08-06, master
 `bf861656`): the live renderer is confirmed by eye, the hall has a checked-in PS5 hardware
-comparison ([`screenshots/issue-1287-hall-live-vs-oracle.png`](../screenshots/issue-1287-hall-live-vs-oracle.png)),
+comparison ([`screenshots/issue-1287-hall-live-vs-oracle.png`](../screenshots/issue-1287-hall-live-vs-oracle.webp)),
 and `blue-prince-hall` guards the restored scene using reviewed evidence from two independent
 fresh-save runs. Both `blue-prince-title` and `blue-prince-hall` are registered in
 `tools/snapshot/snapshots.json`, the latter with a `review` note approving all 16 composited

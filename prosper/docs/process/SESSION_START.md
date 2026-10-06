@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Checkout and instruction freshness
 
 Issue [#2710](https://github.com/mattias800/prosper/issues/2710) reproduced with the shared

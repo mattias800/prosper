@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # The Oregon Trail (`PPSA19244`) — status and evidence
 
 Unreal Engine 4. **Rung 2 — title screen**, and since #1946 the whole UI layer composites correctly

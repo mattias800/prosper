@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Nikoderiko: The Magical World (`PPSA23760`) — status and evidence
 
 Unreal Engine 4. **Rung 2 — title screen.** The epilepsy warning, the Knights Peak publisher logo and

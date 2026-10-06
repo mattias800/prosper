@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Cross-engine check — Unreal Engine 4 title (PPSA17942)
 
 > **HISTORICAL (2026-07-05). Every "no" and "untested" in the table below has since been
