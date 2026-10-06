@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Subsystem design document template
 
 Copy this when writing a new design document for a subsystem (a `gpu/` or `subsystems/` doc that

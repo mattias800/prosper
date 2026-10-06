@@ -11,10 +11,16 @@ date: 2026-10-05
 Guest code calls prosper's HLE handlers directly and runs on the same stack; many titles are native
 C++ themselves (every Unity title through IL2CPP) and carry their own exception tables and
 `catch (...)` blocks. A host exception thrown inside a handler, or inside code a handler reaches
-(the GPU submit path, the recompiler), does not stop at the HLE boundary: it unwinds into guest
-frames, where the guest's own `catch (...)` can swallow it and carry on with a half-done call, or a
-`noexcept` frame turns it into `std::terminate`. Either way the failure is not the visible, logged
-one `FAIL-1` requires.
+(the GPU submit path, the recompiler), and not caught in prosper code reaches the HLE boundary with
+guest frames above it on the stack. prosper registers no guest unwind information with the host
+unwinder: there is no `__register_frame`, `RtlAddFunctionTable` or
+`RtlInstallFunctionTableCallback` anywhere in `prosper/src`. So the expected outcome is not a guest
+`catch` running: on Linux the unwinder cannot step through the guest frame and the process ends in
+`std::terminate`; on Windows x64 a frame with no function-table entry is treated as a leaf, so the
+unwind goes wrong in a way that depends on the stack. Either way the failure is not the visible,
+logged one `FAIL-1` requires, and it is reported far from the call that caused it.
+`CONFIDENCE: LOW` on the exact Windows behaviour: it has not been measured. A test that throws from
+a handler called through a guest-ABI frame, on each host, would settle it.
 
 The sibling project PortPS5 records the same hazard in its technical-debt ledger, with a per-module
 count of host throws that can reach a guest-callable export, which is where this was noticed.

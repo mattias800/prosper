@@ -255,12 +255,13 @@ Enforcement: ratchet:host-throw, adr:0022
 
 ### LOCAL-1 -- everything derived from a title stays on the user's machine
 
-Game content is never committed or uploaded, and neither is anything derived from it: captures and
-capsules, replay corpora, pipeline-cache files, fuzz inputs taken from dumps, profiles and bug-report
-bundles carrying game bytes. What a PR may commit is prosper's own data about a run -- hashes, counts,
-timings, pipeline keys -- and screenshots under the charter's screenshot rules.
-Status: accepted
-Enforcement: review: (whether a file is derived from game content is a question about its origin, which no scan of its bytes can answer; the gitignore covers dumps, not derivatives)
+Game content is never committed or uploaded, and neither are captures and capsules, replay
+corpora, pipeline-cache files, fuzz inputs taken from dumps, or bug-report bundles carrying game
+bytes. What a PR may commit is prosper's own data about a run -- hashes, counts, timings, pipeline
+keys -- and screenshots under the charter's screenshot rules. How title-derived shader programs in
+test fixtures are treated is decided in ADR 0025 before this rule is accepted.
+Status: proposed (adr:0025)
+Enforcement: adr:0025, review: (whether a file is derived from game content is a question about its origin, which no scan of its bytes can answer; the gitignore covers dumps, not derivatives)
 
 ### TITLE-3 -- isolated title code is registered with its measurement and exit
 
@@ -273,6 +274,6 @@ Enforcement: ratchet:title-dir, adr:0024
 ### VER-4 -- an evidence run records its switches
 
 Screenshot and snapshot runs record every `PROSPER_*` switch set, and a run counts as acceptance
-evidence only if each is a host-capability switch.
+evidence only if each is a host-capability or diagnostic switch; a selector disqualifies it.
 Status: proposed (adr:0023)
 Enforcement: adr:0023

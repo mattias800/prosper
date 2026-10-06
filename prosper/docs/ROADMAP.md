@@ -54,17 +54,18 @@ Ordered by how many titles each one unblocks.
    shared code, raw `getenv`, blocking GPU syncs, 5,000-line files). Target tree and file splits:
    `docs/architecture/`.
 
-## Architecture sequence
+## Architecture sequence (proposed)
 
-The architecture work is recorded as decision records in `docs/adr/`; most are `proposed` until the
-project owner accepts them, and none starts before that. The order below is chosen so each step lands
-behind the safety net the previous one built. The binding rules each step serves are in `docs/spec/`.
+The architecture work is recorded as decision records in `docs/adr/`. None of the ADRs sequenced here
+is accepted yet, so this is a **proposed** order for the owner to confirm or change, and no step
+starts before its ADR is accepted. It is chosen so each step lands behind the safety net the previous
+one built. The binding rules each step serves are in `docs/spec/`.
 
 | order | step | ADRs | why here |
 | ---: | --- | --- | --- |
 | 1 | Move the Vulkan backend out of `tests/` | 0004 | every renderer change after this lands in the backend's permanent home |
 | 2 | Split guest semantics into `guest/`; one CMake target per clean layer | 0003, 0008 | gives engines, the memory tracker and the sync model a home, and makes layering a compile error |
-| 3 | Replay gate for GPU-path changes; sync validation in CI | 0005 | the regression net for every restructure below |
+| 3 | Replay gate for GPU-path changes; sync validation in CI (blocked on #3255: a hazard only the CI runner's layers report) | 0005 | the regression net for every restructure below |
 | 4 | Pipelined submission (Stage 2 first), off-thread pipeline compilation | 0009, 0014 | the largest measured cost (`PERF-P1`, `PERF-P6`, `PERF-P3`) |
 | 5 | Page-owned memory tracking, canonical resource identity, one sync model | 0010, 0013 | `PERF-P5`, and the fiber-migration defect class |
 | 6 | Typed GPU command representation; SSA IR in a pure recompiler | 0011, 0006, 0012 | separable passes instead of edits to thousand-line bodies |

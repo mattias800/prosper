@@ -25,10 +25,16 @@ and a run with any debug key can never pass.
 
 1. The screenshot and snapshot harnesses write every `PROSPER_*` variable present in the run's
    environment into the manifest they already produce.
-2. Using the switch classes from the registry (#4543): a run is marked **acceptance evidence** only
-   if every recorded switch is a `host-capability` switch. A `diagnostic` switch marks it
-   **diagnostic-only** (observes, but was not the default route), and a `selector` marks it
-   **not evidence**. An `unclassified` switch marks it **unverified** until classified.
+2. Using the switch classes from the registry (#4543): a run is marked **acceptance evidence** when
+   every recorded switch is a `host-capability` or `diagnostic` switch. A diagnostic, by the
+   charter's definition, observes and changes nothing the guest sees, so it does not disqualify a
+   run; if one turns out to change guest-visible output, it was misclassified and is a selector.
+   A `selector` marks the run **not evidence**, and an `unclassified` switch marks it **unverified**
+   until classified.
+   The charter's own recipe for reaching the frame loop sets `PROSPER_RENDER=1` and
+   `PROSPER_GUEST_ARGS=-force-gfx-direct`. This ADR proposes both as `host-capability`: they choose
+   the route every evidence run uses, not a deviation from it. If the owner classifies either
+   differently, that choice must name how evidence runs qualify, or none will.
 3. The snapshot `check` refuses to report a guarded title as passing from a run that is not
    acceptance evidence.
 4. PR and tracker evidence quotes the manifest's classification next to the screenshot.
