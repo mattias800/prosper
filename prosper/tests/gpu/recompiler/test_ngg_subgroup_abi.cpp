@@ -295,3 +295,32 @@ TEST(NggSubgroupAbi, ImplicitSccAndVccReadsBeforeWriteAreRefused) {
     EXPECT_EQ(analyze(program({0xd56f0009u, 0x040a0300u})).reason, "ngg-abi-read-undefined-vcc");
     EXPECT_TRUE(analyze(program({0x7d840080u, 0xd56f0009u, 0x040a0300u})).ok());
 }
+
+// v_xor3_b32 (VOP3 0x178) reads three 32-bit VGPRs. It sat in the unclassified 0x178-0x17f band,
+// so a program using it was refused for an unknown source width.
+TEST(NggSubgroupAbi, Xor3ReadsThirtyTwoBitSources) {
+    // v_xor3_b32 v10, v0, v1, v2
+    const auto facts = analyze(program({0xd578000au, 0x040a0300u}));
+    EXPECT_TRUE(facts.ok()) << facts.refusal;
+    // The neighbour 0x179 is still unclassified: the band was widened by one opcode, not dropped.
+    EXPECT_EQ(analyze(program({0xd579000au, 0x040a0300u})).reason,
+              "ngg-abi-unclassified-vector-width");
+}
+
+// A VOP3 encoding always carries three source fields, and the ones the opcode does not read decode
+// as s0. Without a known user-data address s0 is not a launch value, so counting that phantom read
+// refused programs that never touch s0.
+TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
+    EXPECT_EQ(vop3_architectural_source_count(0x181), 1u) << "VOP3-encoded VOP1";
+    EXPECT_EQ(vop3_architectural_source_count(0x125), 2u) << "VOP3-encoded VOP2";
+    EXPECT_EQ(vop3_architectural_source_count(0x101), 3u) << "cndmask reads its mask from SRC2";
+    EXPECT_EQ(vop3_architectural_source_count(0x14b), 3u) << "v_fma_f32";
+    // v_mov_b32_e64 v10, v0: SRC1 and SRC2 are zero fields, i.e. s0.
+    EXPECT_TRUE(analyze(program({0xd581000au, 0x00000100u})).ok());
+    // v_add_nc_u32_e64 v10, v0, v1: SRC2 is a zero field.
+    EXPECT_TRUE(analyze(program({0xd525000au, 0x00020300u})).ok());
+    // v_cndmask_b32_e64 v10, v0, v1, s0: the mask is a real read of s0.
+    EXPECT_EQ(analyze(program({0xd501000au, 0x00020300u})).reason, "ngg-abi-read-s0-s1");
+    // A real read of s0 is still counted: v_add_nc_u32_e64 v10, s0, v1 reads it through SRC0.
+    EXPECT_EQ(analyze(program({0xd525000au, 0x00020200u})).reason, "ngg-abi-read-s0-s1");
+}

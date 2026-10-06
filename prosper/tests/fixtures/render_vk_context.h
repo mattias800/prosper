@@ -59,6 +59,9 @@ struct RenderVkCtx {
     bool logic_op_enabled = false;
     bool ok = false;
     bool geometry_shader_enabled = false;
+    // VK_EXT_shader_viewport_index_layer enabled: a vertex stage may write gl_Layer (#3135 P3's
+    // ShaderOutputLayer route in gpu/recompiler/ngg_raster_commit.hpp). Nothing consumes it yet.
+    bool shader_output_layer_enabled = false;
     bool fragment_stores_atomics = false;
     bool shader_int64_enabled = false;   // successful vkCreateDevice feature, never advertised-only
     // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.

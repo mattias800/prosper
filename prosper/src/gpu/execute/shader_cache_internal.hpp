@@ -545,8 +545,24 @@ inline bool fold_control_cache_enabled() {
 }
 
 struct DecodedShader {
-    // Full ORIGINAL stream classification, derived cold before fold compaction.
+    // Full ORIGINAL stream classification, derived cold before fold compaction: the numeric wide
+    // loads that put a draw on the owned-wave path. There are two answers, because the
+    // classification depends on whether a compare into a register pair writes one word or both
+    // (#4555): the default, for a launch of unknown or 32-lane width, and the one for a fragment
+    // launch the compiler will run 64 lanes wide. The second is always a subset of the first.
+    // Ask through requires_owned_waves(); every site deciding this for one draw must agree.
     std::vector<uint32_t> raw_wave_wide_data_load_pcs;
+    std::vector<uint32_t> raw_wave_wide_data_load_pcs_wave64;
+    bool fragment_compiles_wave64 = false;   // rdna2_fragment_compiles_wave64 of this version
+    // `fragment_launch_wave64`: the stage asked about is the fragment stage and its launch state
+    // asks for 64 lanes (SPI_PS_IN_CONTROL.PS_W32_EN clear). Vertex launches pass false: their
+    // width is not plumbed.
+    bool requires_owned_waves(bool fragment_launch_wave64) const {
+        return !(fragment_launch_wave64 && fragment_compiles_wave64
+                     ? raw_wave_wide_data_load_pcs_wave64
+                     : raw_wave_wide_data_load_pcs)
+                    .empty();
+    }
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;

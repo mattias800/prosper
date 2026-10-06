@@ -1933,6 +1933,20 @@ inline const RenderVkCtx& render_vk_ctx() {
                       r.transform_feedback_enabled = true;
                   }
               }
+              // #3135 P3: a vertex stage that writes gl_Layer (the merged-NGG raster commit's
+              // ShaderOutputLayer route). Gated on Vulkan 1.2's shaderOutputLayer, enabled through
+              // the extension: its modules declare SPV_EXT_shader_viewport_index_layer, and a
+              // Vulkan12Features struct cannot join a chain holding DescriptorIndexing (02830).
+              if (!strcmp(de[i].extensionName, VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+                  VkPhysicalDeviceVulkan12Features v12{
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (v12.shaderOutputLayer) {
+                      dev_exts.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+                      r.shader_output_layer_enabled = true;
+                  }
+              }
               if (!strcmp(de[i].extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                   f2.pNext = &mesh_features;

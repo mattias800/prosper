@@ -184,7 +184,7 @@ file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
 file-size|prosper/src/gpu/execute/gpu_executor.cpp 13156
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 # note #3951: one caller line delegates checked logical64 raw-window emission to its companion.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9421
+file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7814  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559)

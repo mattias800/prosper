@@ -29,6 +29,18 @@ The title's epilepsy-warning screen now draws white text on black, where it firs
 <p align="center"><img src="assets/screenshots/ac-black-flag-warning-green-lines.webp" alt="Black Flag warning screen on black with green horizontal lines; same run after the fast-clear fix"></p>
 <p align="center"><img src="assets/screenshots/ac-black-flag-warning-fixed.webp" alt="Black Flag warning screen, white text on a clean black background; same run after the linear-pitch fix"></p>
 
+### MOUSE: P.I. For Hire: a scripted route into gameplay, and a dark world that is not what the log said
+
+*MOUSE: P.I. For Hire* can now be driven from boot into its first gameplay scene by a script, and nothing in that scene is refused, dropped or skipped any more. The scene is still dark.
+
+<p align="center"><img src="assets/screenshots/mouse-pi-difficulty-select.webp" alt="MOUSE: P.I. For Hire difficulty select: three framed cartoon portraits labelled Rookie, Detective and Supersleuth on a patterned wall, with a Confirm prompt; Linux prosper-app, RADV, scripts/mouse-pi-PPSA26578/reach-gameplay.pad, flip 1300"></p>
+
+<p align="center"><img src="assets/screenshots/mouse-pi-intro-cinematic.webp" alt="MOUSE: P.I. For Hire intro: an airship over a city skyline inside a soft vignette; Linux prosper-app, RADV, the same route, flip 1600. This is the game's intro sequence playing, which may be a movie rather than a rendered scene"></p>
+
+<p align="center"><img src="assets/screenshots/mouse-pi-gameplay-still-dark.webp" alt="MOUSE: P.I. For Hire first gameplay scene: objective text, compass and health badge over a scene that is black except for two lamps and a lit patch of floor; Linux prosper-app, RADV, the same route, flip 2000, with the GDS read of PR 4615"></p>
+
+Two fixes went in on the way ([#4609](https://github.com/mattias800/prosper/pull/4609), [#4615](https://github.com/mattias800/prosper/pull/4615)) and gave back every draw and compute dispatch the log said was lost; the last picture is with both in place and is the same picture as before, so the [tracker](https://github.com/mattias800/prosper/issues/4556) has what is ruled out and what comes next.
+
 ### Two titles stop losing their picture to a clean-up pass
 
 *Beast of Reincarnation* now shows its Digital Deluxe bonus dialog on a default launch, and *Dragon Quest VII Reimagined*'s adventure-log menu holds steady instead of flashing white and blue ([#4568](https://github.com/mattias800/prosper/pull/4568)).

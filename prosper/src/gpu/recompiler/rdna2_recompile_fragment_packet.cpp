@@ -6,6 +6,7 @@
 #include "gpu/recompiler/fragment_packet_exports_internal.hpp"
 #include "gpu/recompiler/fragment_packet_export_timing.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
+#include "gpu/recompiler/param_ps_routing.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -952,27 +953,13 @@ std::vector<uint32_t> build_owned_vertex_export_commit(const std::vector<uint32_
         return b.cbuf_load(b.ibin(Op_IAdd, base, b.uconst(word)), 0u);
     };
     b.export_position(component(0), component(1), component(2), component(3));
-    const uint32_t passthrough = pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     for (uint32_t ordinal = 0; ordinal < parameters.size(); ++ordinal) {
-        const uint32_t source = parameters[ordinal];
         const uint32_t first = (ordinal + 1u) * 4u;
-        const auto publish = [&](uint32_t location) {
+        // Match the ordinary vertex compiler's exact producing PARAM-to-pixel-input routing.
+        for_each_param_ps_location(parameters[ordinal], pixel_inputs, [&](uint32_t location) {
             b.export_param(location, component(first), component(first + 1u), component(first + 2u),
                            component(first + 3u));
-        };
-        // Match the ordinary vertex compiler's exact producing PARAM-to-pixel-input routing.
-        if (!pixel_inputs || !(pixel_inputs->valid_mask & (1u << source))) {
-            if (!pixel_inputs || pixel_inputs->consumes(source)) publish(source);
-        }
-        if (pixel_inputs)
-            for (uint32_t input = 0; input < pixel_inputs->controls.size(); ++input) {
-                if (!(pixel_inputs->valid_mask & (1u << input)) || !pixel_inputs->consumes(input))
-                    continue;
-                const uint32_t raw_offset = pixel_inputs->controls[input] & 0x3fu;
-                const uint32_t offset =
-                    (passthrough & (1u << input)) ? raw_offset & 0x1fu : raw_offset;
-                if (offset == source) publish(input);
-            }
+        });
     }
     return b.finish();
 }

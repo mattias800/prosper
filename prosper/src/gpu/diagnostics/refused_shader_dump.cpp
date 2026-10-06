@@ -129,10 +129,21 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
                      detail.c_str());
         std::fclose(index);
     }
-    std::fprintf(stderr, "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
-                         "op=0x%x) -> %s%s\n",
+    // A draw a gate refused was never recompiled, so its "first unsupported" instruction is only
+    // the generic coverage census and not why the draw was lost. The reason is in the detail the
+    // caller passed; repeat it on this line, which is the one a person reads. It used to be in
+    // index.txt alone, and #4580 was filed saying nothing logged it.
+    std::string refusal;
+    if (const size_t at = detail.find("refusal="); at != std::string::npos) {
+        const size_t end = detail.find(' ', at);
+        refusal = " " + detail.substr(at, end == std::string::npos ? end : end - at);
+    }
+    std::fprintf(stderr,
+                 "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
+                 "op=0x%x)%s -> %s%s\n",
                  stage, (unsigned long long)address, dwords, coverage.first_bad_fmt,
-                 coverage.first_bad_op, path.string().c_str(), written ? "" : " (WRITE FAILED)");
+                 coverage.first_bad_op, refusal.c_str(), path.string().c_str(),
+                 written ? "" : " (WRITE FAILED)");
     return written;
 }
 

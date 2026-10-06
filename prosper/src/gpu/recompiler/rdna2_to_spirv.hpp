@@ -210,7 +210,12 @@ struct Rdna2Inst;
 std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst>& instructions);
 // Non-null raw x4/x8 SMEM loads whose words have an ordinary scalar/vector data reader before
 // replacement. Such loads cannot use the descriptor-only zero-placeholder lowering.
-std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
+// `wave64` is for a caller that knows the program runs 64 lanes wide: a compare or a carry-out
+// into a register pair then writes both words, so the high word of a pair recycled as a mask is
+// no longer assumed to hold what was loaded (#4555). `false` is unknown or 32 lanes. The 64-lane
+// answer is always a subset of the default one.
+std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions,
+                                                bool wave64 = false);
 // WHY each of those loads is classified as numeric data: the first instruction that stopped the
 // "may the words be replaced by a descriptor placeholder" walk, and the first that stopped the
 // "is there a numeric reader or an uncertain path" walk. Diagnostics only (#4499) -- it runs the
@@ -223,7 +228,7 @@ struct RawWideLoadDiagnosis {
     const char* numeric_kind = "none";
 };
 std::vector<RawWideLoadDiagnosis>
-rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions);
+rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions, bool wave64 = false);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
 // The entry-pointer stage of the register-offset proof: each x4/x8 load evaluated with SOFFSET
@@ -256,7 +261,11 @@ std::vector<RawWaveWideCertificate>
 rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& original);
 // Conservative original-code obligation, independent of bounded admission. A refused proof
 // cannot authorize stored native modules for a READFIRST-containing numeric-load program.
-std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original);
+// `wave64` as for rdna2_raw_wide_data_loads. Pass it only for a launch whose width is known and
+// is the width the stage compiler will use (rdna2_fragment_compiles_wave64); every site that
+// asks this question about one draw has to pass the same value.
+std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original,
+                                                     bool wave64 = false);
 // One-hop raw x4/x8 data loads through a pointer from an earlier proven immediate load.
 // A dispatch must additionally own the parent/child bytes and exclude writable aliases.
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
@@ -736,10 +745,15 @@ bool dead_varying_elimination_enabled();
 // is required or the packed interface is invalid. Triangle lists, strips, fans, and the RectList
 // triangle-strip lowering all feed Vulkan's `Triangles` geometry input primitive. The optional
 // capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
+// `layer_input_location`, when set, names a uint input carrying the primitive's layer (equal on
+// all three vertices), which the stage writes to gl_Layer: the merged-NGG raster commit's
+// interpolation-geometry layer route (#3135 P3, ngg_raster_commit.hpp). It must not be one of the
+// layout's attribute locations, and is refused with RectList synthesis.
 std::vector<uint32_t> recompile_interpolation_geometry(
     const FragmentInterpolationLayout& layout, bool capture_position = false,
     bool synthesize_rect = false, FloatTransportConfig float_transport = {},
-    bool publish_primitive_id = false);
+    bool publish_primitive_id = false,
+    uint32_t layer_input_location = FragmentInterpolationLayout::kUnusedLocation);
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
@@ -874,6 +888,10 @@ bool fragment_vcc_branch_is_wave_uniform_for_test(
 uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
                                                size_t program_dwords,
                                                uint64_t program_hash);
+// Whether the fragment compiler runs this program 64 lanes wide when its launch asks for 64.
+// False only for the legacy capture above. `program_dwords` is the span rdna2_walk consumed, the
+// same span the compiler hashes.
+bool rdna2_fragment_compiles_wave64(const uint32_t* code, size_t program_dwords);
 
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact guest-wave subgroup. Returns zero for ordinary modules and 32/64 for that contract.

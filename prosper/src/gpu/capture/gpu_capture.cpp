@@ -752,7 +752,16 @@ public:
                 decoded.insert(decoded.end(), main.begin(), main.end());
             } else if (!inventory(code, vertex ? "vs" : "fs", decoded))
                 return false;
-            const auto required = rdna2_raw_wave_wide_data_loads(decoded);
+            // The width the live draw was routed by (realize_draw_item): a fragment launch that
+            // recorded its wave configuration and asked for 64 lanes, compiled at 64. Anything
+            // else, including a capture too old to have recorded it, keeps the default answer.
+            bool wave64 = false;
+            if (!vertex && x.fragment_wave_config_available && !x.ps_wave32) {
+                std::vector<Rdna2Inst> walked;
+                const size_t consumed = rdna2_walk(code.data(), code.size(), walked);
+                wave64 = rdna2_fragment_compiles_wave64(code.data(), consumed);
+            }
+            const auto required = rdna2_raw_wave_wide_data_loads(decoded, wave64);
             if (!required.empty()) pc = required.front();
             return true;
         };

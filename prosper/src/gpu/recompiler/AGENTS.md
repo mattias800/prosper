@@ -12,6 +12,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   is the static admission over the linked program (launch SGPR/VGPR reads, EXEC, side effects,
   messages, export shapes), each refusal named; `ngg_export_record` is the record layout the
   pass-through draw consumes. Compile and offline execution only; nothing live dispatches it.
+- `ngg_raster_commit` — that pass-through draw (#3135 P3): a vertex stage that reads the export
+  record buffer, rejects malformed connectivity as degenerate primitives (and counts it), rotates
+  corners for PROVOKING_VTX_LAST, takes the layer from the provoking vertex, and routes it through
+  the vertex stage, a forwarding geometry stage, or the interpolation geometry stage. Offline only.
+- `param_ps_routing` — the one PARAM-to-fragment-input routing rule every vertex-side commit stage
+  publishes through, so the owned-wave and NGG commits cannot drift from each other.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
@@ -26,6 +32,13 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_spilled_mask_halves` — a CFG MUST fact the dispatcher's Wave64 mask analysis carries:
   which saved-mask instance each `v_writelane` slot and reloaded SGPR holds a half of, so a pair
   reassembled from both halves of one mask stays a mask across a block edge.
+- `rdna2_mask_half_alias` — the companion MUST analysis for exact native Wave64: which physical
+  half (LO/HI) of EXEC a spill slot or reloaded SGPR holds, so a reload can publish that ballot
+  word as scalar data.
+- `rdna2_spill_slot_domain` — whether each `v_writelane` slot holds data or a mask on every path,
+  so the dispatcher types a `v_readlane` reload the way `emit_alu` did. The dispatcher's two
+  Function variables per slot carry no runtime tag; without this a reload read the other domain's
+  placeholder (#4600).
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.

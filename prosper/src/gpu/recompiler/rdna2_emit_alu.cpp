@@ -93,23 +93,6 @@ bool inline_16bit_operand_dword(const Operand& o, uint32_t& out) {
 
 }  // namespace
 
-// Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
-// prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
-inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {
-    if (rs.exec_narrowed) rs.vreg[idx] = b.sel(rs.exec, rs.vreg[idx], old_val);
-    // A VGPR can be recycled after serving as a v_writelane scalar-spill array. Any ordinary
-    // per-lane write starts a new register lifetime, so later ALU/EXP reads must see that value
-    // rather than rejecting it as a stale cross-lane spill. Blasphemous 2 does exactly this after
-    // an image_sample overwrites the shader's early scalar-spill v11 (#652).
-    if (rs.vgpr_lane_slots.count(idx) || rs.vgpr_lane_mask_slots.count(idx))
-        rs.invalidated_vgpr_lane_slots.insert(idx);
-    rs.vgpr_lane_slots.erase(idx);
-    rs.vgpr_lane_mask_slots.erase(idx);
-}
-inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
-    auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
-}
-
 inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
     for (uint32_t word = 0; word < words; ++word)
         if (rs.sreg_written.count(base + static_cast<int>(word))) return true;
@@ -9023,6 +9006,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // existing wave_append model was landed and live-validated against exactly those
             // packets (#554/#580). Kept as a documented per-workgroup approximation of the
             // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
+            if (b.is_compute && in.ds_gds && in.opcode == 0x36)   // the plain GDS read (#4553)
+                return emit_compute_gds_read(b, rs, in);
             if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
                 !(b.is_compute && in.opcode == 0x0d)) { ok = false; return true; }
             // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1). AMD RDNA2 ISA 10.4:

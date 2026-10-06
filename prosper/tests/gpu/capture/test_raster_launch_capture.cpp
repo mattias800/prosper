@@ -196,3 +196,53 @@ TEST(RasterLaunchCapture, CompleteNewTailCannotHideTrailingGarbage) {
     EXPECT_FALSE(deserialize_gpu_capture(bytes, rejected, error));
     EXPECT_EQ(error, "capture has trailing data");
 }
+
+TEST(RasterLaunchCapture, AFragmentLaunchWidthDecidesWhetherReplayNeedsWaveOwners) {
+    // #4555. Replay re-derives from the ORIGINAL program whether a draw needed the owned-wave
+    // path, and refuses a capsule that has no owners for one that did. That question depends on
+    // the fragment launch width for a program like this one (MOUSE: P.I. For Hire's shape: the
+    // loaded pair is recycled by a compare and then read by a 64-bit mask operation whose SCC
+    // is branched on), and the live path now routes it natively at 64 lanes. Replay has to ask
+    // with the width the capsule recorded, or every such frame grab would be refused.
+    //   0  v_mov_b32 v1, 0
+    //   1  s_load_dwordx4 s[16:19], s[28:29], 0xf0
+    //   3  s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+    //   5  v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17]
+    //   8  s_and_b64 s[40:41], s[16:17], exec ; s_cbranch_scc1 +0
+    //  10  s_cbranch_vccz +1 ; s_branch 1
+    //  12  v_readfirstlane vcc_lo, v1 ; s_endpgm
+    const std::vector<uint32_t> fragment{
+        0x7e020280u, 0xf408040eu, 0xfa0000f0u, 0xf4280208u, 0xfa0000c0u, 0x7c1a14f9u, 0x86869080u,
+        0xbeea0410u, 0x87a87e10u, 0xbf850000u, 0xbf860001u, 0xbf82fff5u, 0x7ed40501u, 0xbf810000u,
+    };
+    auto capture = capsule();
+    capture.draws.resize(1);
+    capture.operations.resize(1);
+    GpuCaptureRawShaderVersion raw;
+    raw.words = fragment;
+    raw.content_hash = gpu_capture_hash(reinterpret_cast<const uint8_t*>(raw.words.data()),
+                                        raw.words.size() * sizeof(uint32_t));
+    raw.has_endpgm = true;
+    capture.raw_shader_versions.push_back(raw);
+    capture.draws[0].fs_raw_shader_index = 0;
+    capture.draws[0].fragment_wave_config_available = true;
+    const auto materialize = [&](std::string& error) {
+        std::vector<uint8_t> bytes;
+        GpuCaptureFile loaded;
+        GpuReplayFrame replay;
+        if (!serialize_gpu_capture(capture, bytes, error)) return false;
+        if (!deserialize_gpu_capture(bytes, loaded, error)) return false;
+        return materialize_gpu_replay(loaded, replay, error);
+    };
+    std::string error;
+    capture.draws[0].ps_wave32 = false;
+    EXPECT_TRUE(materialize(error)) << error;
+    capture.draws[0].ps_wave32 = true;
+    EXPECT_FALSE(materialize(error));
+    EXPECT_EQ(error, "logical-wave replay lacks original exact-PC window owners stage=fs pc=1");
+    // A capsule that never recorded the launch width gets the default answer, as before.
+    capture.draws[0].ps_wave32 = false;
+    capture.draws[0].fragment_wave_config_available = false;
+    EXPECT_FALSE(materialize(error));
+    EXPECT_EQ(error, "logical-wave replay lacks original exact-PC window owners stage=fs pc=1");
+}

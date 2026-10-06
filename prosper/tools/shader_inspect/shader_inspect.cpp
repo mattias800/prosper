@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     bool mimg_sites = false;
     bool wave_reasons = false;
     bool raw_wide_proof = false;
+    bool wave64 = false;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -166,6 +167,8 @@ int main(int argc, char** argv) {
             wave_reasons = true;
         } else if (arg == "--raw-wide-proof") {
             raw_wide_proof = true;
+        } else if (arg == "--wave64") {
+            wave64 = true;
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -177,40 +180,45 @@ int main(int argc, char** argv) {
     if (input_path.empty() || bad_usage || (mimg_sites && !stage.empty()) ||
         (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
         (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
+        (wave64 && !raw_wide_proof) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
     std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
-    std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof\n", argv[0]);
-        std::fprintf(stderr,
-            "\n"
-            "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
-            "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
-            "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
-            "census from a run that died before printing one.\n"
-            "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
-            "wave width the source module requires, why, and its legacy reason-set classification.\n"
-            "This is NOT the live ProvenVotes rewrite certificate: policy, enabled device contracts\n"
-            "and pass input authority are not evaluated here. No title allowlist controls admission.\n"
-            "Every row states these limits. Same sentinel discipline as\n"
-            "--mimg-sites.\n"
-            "--raw-wide-proof prints ONLY the code-side proofs that gate numeric use of an x4/x8\n"
-            "scalar load: needs-backing, entry-proven and register-proven per load, then a\n"
-            "`raw-wide-proof-end` sentinel. These proofs read code only, so a raw dump answers them.\n"
-            "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
-            "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
-            "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
-            "was compiled with the real resource table.\n"
-            "\n"
-            "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
-            "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
-            "When such an instruction is present, a failed stage recompile is reported as\n"
-            "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
-            "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
-            "  gpu_replay <capture>.prgcap --inspect-only\n"
-            "\n"
-            "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource table).\n");
-        return 2;
+    std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof [--wave64]\n", argv[0]);
+    std::fprintf(
+        stderr,
+        "\n"
+        "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
+        "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
+        "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
+        "census from a run that died before printing one.\n"
+        "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
+        "wave width the source module requires, why, and its legacy reason-set classification.\n"
+        "This is NOT the live ProvenVotes rewrite certificate: policy, enabled device contracts\n"
+        "and pass input authority are not evaluated here. No title allowlist controls admission.\n"
+        "Every row states these limits. Same sentinel discipline as\n"
+        "--mimg-sites.\n"
+        "--raw-wide-proof prints ONLY the code-side proofs that gate numeric use of an x4/x8\n"
+        "scalar load: needs-backing, entry-proven and register-proven per load, then a\n"
+        "`raw-wide-proof-end` sentinel. These proofs read code only, so a raw dump answers them.\n"
+        "With --wave64, needs-backing and its blockers are the answer for a program known to run\n"
+        "64 lanes wide (a compare into a register pair writes both words); the default is the\n"
+        "answer for an unknown or 32-lane width. The dump does not say which the title uses.\n"
+        "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
+        "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
+        "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
+        "was compiled with the real resource table.\n"
+        "\n"
+        "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
+        "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
+        "When such an instruction is present, a failed stage recompile is reported as\n"
+        "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
+        "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
+        "  gpu_replay <capture>.prgcap --inspect-only\n"
+        "\n"
+        "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource table).\n");
+    return 2;
     }
 
     std::ifstream input(input_path.c_str(), std::ios::binary);
@@ -281,8 +289,8 @@ int main(int argc, char** argv) {
     // three stages a load passes: needs-backing, entry-proven (the same load with SOFFSET
     // nulled, as the register proof itself evaluates it) and register-proven.
     if (raw_wide_proof) {
-        const auto needs = rdna2_raw_wide_data_loads(instructions);
-        const auto diagnoses = rdna2_raw_wide_data_load_diagnoses(instructions);
+        const auto needs = rdna2_raw_wide_data_loads(instructions, wave64);
+        const auto diagnoses = rdna2_raw_wide_data_load_diagnoses(instructions, wave64);
         // The register proof's own entry stage (pointer lifetime ends at the load), so the column
         // never reports a blocker that proof no longer applies.
         const auto entry = rdna2_proven_raw_register_wide_entry_loads(instructions);
@@ -307,7 +315,9 @@ int main(int argc, char** argv) {
                                 why.backing_kind, why.numeric_pc, why.numeric_kind);
             std::printf("\n");
         }
-        std::printf("raw-wide-proof-end instructions=%zu loads=%zu\n", instructions.size(), loads);
+        // The width is on the sentinel only when asked for, so the default output is unchanged.
+        std::printf("raw-wide-proof-end instructions=%zu loads=%zu%s\n", instructions.size(), loads,
+                    wave64 ? " wave64=1" : "");
         return 0;
     }
 

@@ -12,6 +12,8 @@
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
+#include "gpu/recompiler/rdna2_mask_half_alias.hpp"
+#include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -2029,6 +2031,31 @@ bool emit_cfg_state_machine(
                 if (reg <= 105) static_mask_keys.insert(reg);
     }
 
+    // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
+    std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
+    std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
+    analyze_wave64_mask_half_aliases(
+        b, ins, starts, successors,
+        [&](const Rdna2Inst& in, const std::function<void(int)>& visit) {
+            for_each_possible_vector_write(in, visit);
+        },
+        wave64_mask_half_sreg_in, wave64_mask_half_reachable);
+    // What each V_WRITELANE spill slot holds on every path (rdna2_spill_slot_domain.hpp), so a
+    // V_READLANE reload is typed as emit_alu typed it. Any Wave64 compute reload may receive a
+    // mask, so each destination gets a Bool variable; only the Wave64 analysis types reloads.
+    std::set<int> spill_mask_keys = static_mask_keys;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (b.is_compute && b.wave_size == 64 && in.fmt == Rdna2Format::VOP3 &&
+            in.opcode == 0x360 && in.dst.value <= 105)
+            spill_mask_keys.insert(in.dst.value);
+    }
+    const SpillSlotContext slot_context{
+        spill_mask_keys, b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64,
+        b.wave64_mask_readlane_half_for_pc, b.wave64_mask_writelane_alias_pcs};
+    std::vector<SpillSlotDomains> wave64_slot_domain_in(starts.size());
+    std::unordered_set<uint32_t> proven_mask_writelane_pcs;
+
     // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
     // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
     // membership look like a valid saved mask. Prove the B64 mask domain separately at every
@@ -2140,6 +2167,14 @@ bool emit_cfg_state_machine(
         for (int reg : inherited_entry_m0)
             if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
         wave64_b64_reachable.front() = true;
+        // Initial slots are untyped, which keeps main's behaviour for them. The terminal
+        // load_state of a previous barrier phase loads BOTH variables of every slot, so map
+        // membership is not what a slot last held, and the mask-half facts start over (#4607
+        // review: seeding the Bool slots as masks refused an EXEC restored after a barrier).
+        for (const auto* slots : {&initial.vgpr_lane_slots, &initial.vgpr_lane_mask_slots})
+            for (const auto& [vgpr, lanes] : *slots)
+                for (const auto& lane : lanes)
+                    wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -2185,7 +2220,8 @@ bool emit_cfg_state_machine(
         auto advance_wave64_b64_masks = [&](std::set<int>& masks, std::set<int>& ambiguous,
                                             std::set<int>& scalar_words, std::set<int>& m0_tokens,
                                             std::set<int>& readlane_words,
-                                            SpilledMaskHalves& halves, bool& scalar_scc,
+                                            SpilledMaskHalves& halves,
+                                            SpillSlotDomains& slot_domains, bool& scalar_scc,
                                             const Rdna2Inst& in, bool record_compare) {
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
@@ -2338,15 +2374,9 @@ bool emit_cfg_state_machine(
             if (reads_ambiguous)
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
             if (record_compare && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
-                in.src[1].kind == OperandKind::InlineInt && in.src[0].kind == OperandKind::SGPR) {
-                const int source = in.src[0].value;
-                const auto in_pair = [&](const std::set<int>& pairs) {
-                    return pairs.contains(source) || (source > 0 && pairs.contains(source - 1));
-                };
-                if (scalar_words.contains(source) && !in_pair(masks) && !in_pair(ambiguous) &&
-                    !readlane_words.contains(source))
-                    proven_scalar_data_writelane_pcs.insert(in.pc);
-            }
+                in.src[1].kind == OperandKind::InlineInt &&
+                spill_source_is_scalar_data(in, masks, ambiguous, scalar_words, readlane_words))
+                proven_scalar_data_writelane_pcs.insert(in.pc);
 
             const int reduction_source = wave64_mask_reduction_source(in);
             // EXEC needs no saved-mask lifetime: it is architectural state that always holds a
@@ -2719,12 +2749,16 @@ bool emit_cfg_state_machine(
                 for (const auto& [base, width] : scalar_writes)
                     for (uint32_t word = 0; word < width; ++word)
                         readlane_words.insert(base + static_cast<int>(word));
-            if (track_spilled_halves) {
-                std::vector<int> vector_writes;
-                for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            std::vector<int> vector_writes;
+            for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
-            }
+            if (b.is_compute)
+                advance_spill_slot_domains(slot_domains, in,
+                                           {masks, ambiguous, scalar_words, readlane_words},
+                                           slot_context, vector_writes,
+                                           record_compare ? &proven_mask_writelane_pcs : nullptr);
             return true;
         };
 
@@ -2738,13 +2772,14 @@ bool emit_cfg_state_machine(
             std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             std::set<int> readlane_words = wave64_readlane_word_in[block];
             SpilledMaskHalves halves = wave64_spilled_halves_in[block];
+            SpillSlotDomains slot_domains = wave64_slot_domain_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
-                                              readlane_words, halves, scalar_scc, in,
+                                              readlane_words, halves, slot_domains, scalar_scc, in,
                                               /*record_compare*/ false))
                     return false;
             }
@@ -2762,6 +2797,7 @@ bool emit_cfg_state_machine(
                     wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_readlane_word_in[successor] = readlane_words;
                     wave64_spilled_halves_in[successor] = halves;
+                    wave64_slot_domain_in[successor] = slot_domains;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
                     continue;
@@ -2795,6 +2831,8 @@ bool emit_cfg_state_machine(
                 joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
                 SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
                 meet_spilled_mask_halves(joined_halves, halves);
+                SpillSlotDomains joined_slots = wave64_slot_domain_in[successor];
+                meet_spill_slot_domains(joined_slots, slot_domains);
                 const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
                 if (joined != wave64_b64_mask_in[successor] ||
                     joined_ambiguous != wave64_b64_ambiguous_in[successor] ||
@@ -2802,6 +2840,7 @@ bool emit_cfg_state_machine(
                     joined_m0_tokens != wave64_m0_token_word_in[successor] ||
                     joined_readlane_words != wave64_readlane_word_in[successor] ||
                     !(joined_halves == wave64_spilled_halves_in[successor]) ||
+                    joined_slots != wave64_slot_domain_in[successor] ||
                     joined_scalar_scc != wave64_scalar_scc_valid_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
                     wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
@@ -2809,6 +2848,7 @@ bool emit_cfg_state_machine(
                     wave64_m0_token_word_in[successor] = std::move(joined_m0_tokens);
                     wave64_readlane_word_in[successor] = std::move(joined_readlane_words);
                     wave64_spilled_halves_in[successor] = std::move(joined_halves);
+                    wave64_slot_domain_in[successor] = std::move(joined_slots);
                     wave64_scalar_scc_valid_in[successor] = joined_scalar_scc;
                     pending.push_back(successor);
                 }
@@ -2822,153 +2862,17 @@ bool emit_cfg_state_machine(
             std::set<int> m0_tokens = wave64_m0_token_word_in[block];
             std::set<int> readlane_words = wave64_readlane_word_in[block];
             SpilledMaskHalves halves = wave64_spilled_halves_in[block];
+            SpillSlotDomains slot_domains = wave64_slot_domain_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
-                                              readlane_words, halves, scalar_scc, in,
+                                              readlane_words, halves, slot_domains, scalar_scc, in,
                                               /*record_compare*/ true))
                     return false;
             }
-        }
-    }
-
-    // V_WRITELANE/V_READLANE scalar spills can carry one physical half of a Wave64 mask through a
-    // loop. The Bool slot alone loses whether it was LO or HI, while a dispatcher uint placeholder
-    // is not a validity tag. Track that identity as a CFG MUST fact and publish it only at exact
-    // native-Wave64 readlane PCs. Joins retain equal facts; every ordinary overwrite kills them.
-    std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
-    std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
-    if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && !starts.empty()) {
-        struct MaskHalfState {
-            std::map<int, uint32_t> sreg;
-            std::map<std::pair<int, int>, uint32_t> slot;
-            bool operator==(const MaskHalfState&) const = default;
-        };
-        auto special_half = [](const Operand& source) -> int {
-            if (source.kind != OperandKind::Special) return -1;
-            // EXEC is always a live mask in RegState. VCC_LO/HI may instead be scalar scratch, and
-            // their physical encodings do not carry a runtime domain tag; treating those words as
-            // masks here can turn a dispatcher placeholder into a ballot of false. Admit VCC only
-            // after a future proof is explicitly tied to the Wave64 mask-domain MUST analysis.
-            if (source.value == 126) return 0;
-            if (source.value == 127) return 1;
-            return -1;
-        };
-        auto meet = [](MaskHalfState& dst, const MaskHalfState& incoming) {
-            for (auto it = dst.sreg.begin(); it != dst.sreg.end();) {
-                const auto other = incoming.sreg.find(it->first);
-                if (other == incoming.sreg.end() || other->second != it->second)
-                    it = dst.sreg.erase(it);
-                else
-                    ++it;
-            }
-            for (auto it = dst.slot.begin(); it != dst.slot.end();) {
-                const auto other = incoming.slot.find(it->first);
-                if (other == incoming.slot.end() || other->second != it->second)
-                    it = dst.slot.erase(it);
-                else
-                    ++it;
-            }
-        };
-        auto transfer = [&](MaskHalfState& state, const Rdna2Inst& in, bool record) {
-            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) {
-                for_each_scalar_write(in, [&](int base, uint32_t width) {
-                    for (uint32_t word = 0; word < width; ++word)
-                        state.sreg.erase(base + static_cast<int>(word));
-                }, /*wave32_one_word_masks*/false);
-                if (in.src[1].kind == OperandKind::InlineInt &&
-                    in.src[1].value >= 0 && in.src[1].value <= 63) {
-                    const std::pair<int, int> key{in.src[0].value, in.src[1].value};
-                    const auto half = state.slot.find(key);
-                    if (half != state.slot.end()) {
-                        state.sreg[in.dst.value] = half->second;
-                        if (record)
-                            b.wave64_mask_readlane_half_for_pc[in.pc] = half->second;
-                    }
-                }
-                return;
-            }
-
-            for_each_scalar_write(in, [&](int base, uint32_t width) {
-                for (uint32_t word = 0; word < width; ++word)
-                    state.sreg.erase(base + static_cast<int>(word));
-            }, /*wave32_one_word_masks*/false);
-
-            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
-                // A dynamic selector may overwrite any lane and therefore kills every known slot
-                // in this VGPR. A constant selector updates only its named slot.
-                if (in.src[1].kind != OperandKind::InlineInt ||
-                    in.src[1].value < 0 || in.src[1].value > 63) {
-                    for (auto it = state.slot.begin(); it != state.slot.end();) {
-                        if (it->first.first == in.dst.value) it = state.slot.erase(it);
-                        else ++it;
-                    }
-                    return;
-                }
-                const std::pair<int, int> key{in.dst.value, in.src[1].value};
-                int half = special_half(in.src[0]);
-                if (half < 0 && in.src[0].kind == OperandKind::SGPR) {
-                    const auto source = state.sreg.find(in.src[0].value);
-                    if (source != state.sreg.end()) {
-                        half = source->second;
-                        if (record)
-                            b.wave64_mask_writelane_alias_pcs.insert(in.pc);
-                    }
-                }
-                if (half < 0) state.slot.erase(key);
-                else state.slot[key] = static_cast<uint32_t>(half);
-                return;
-            }
-
-            for_each_possible_vector_write(in, [&](int vgpr) {
-                for (auto it = state.slot.begin(); it != state.slot.end();) {
-                    if (it->first.first == vgpr) it = state.slot.erase(it);
-                    else ++it;
-                }
-            });
-        };
-
-        std::vector<MaskHalfState> half_in(starts.size());
-        std::vector<bool> half_reachable(starts.size(), false);
-        half_reachable.front() = true;
-        std::vector<uint32_t> pending{0};
-        while (!pending.empty()) {
-            const uint32_t block = pending.back();
-            pending.pop_back();
-            MaskHalfState state = half_in[block];
-            const uint32_t lo = starts[block];
-            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
-            for (const auto& in : ins)
-                if (in.pc >= lo && in.pc < hi && !in.is_end)
-                    transfer(state, in, /*record*/false);
-            for (uint32_t successor : successors[block]) {
-                if (!half_reachable[successor]) {
-                    half_reachable[successor] = true;
-                    half_in[successor] = state;
-                    pending.push_back(successor);
-                    continue;
-                }
-                MaskHalfState joined = half_in[successor];
-                meet(joined, state);
-                if (!(joined == half_in[successor])) {
-                    half_in[successor] = std::move(joined);
-                    pending.push_back(successor);
-                }
-            }
-        }
-        for (uint32_t block = 0; block < starts.size(); ++block) {
-            if (!half_reachable[block]) continue;
-            wave64_mask_half_reachable[block] = true;
-            wave64_mask_half_sreg_in[block] = half_in[block].sreg;
-            MaskHalfState state = half_in[block];
-            const uint32_t lo = starts[block];
-            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
-            for (const auto& in : ins)
-                if (in.pc >= lo && in.pc < hi && !in.is_end)
-                    transfer(state, in, /*record*/true);
         }
     }
 
@@ -3109,7 +3013,7 @@ bool emit_cfg_state_machine(
     }
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
-    std::set<int> mask_keys = static_mask_keys;
+    std::set<int> mask_keys = spill_mask_keys;
     std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
@@ -3141,12 +3045,15 @@ bool emit_cfg_state_machine(
             const bool proven_data_spill = b.is_compute &&
                                            proven_scalar_data_writelane_pcs.contains(in.pc) &&
                                            !b.wave64_mask_writelane_alias_pcs.contains(in.pc);
-            const bool is_mask = !fragment_physical_mask_word && !proven_data_spill &&
-                                 (in.src[0].value == 106 || in.src[0].value == 107 ||
-                                  in.src[0].value == 126 || in.src[0].value == 127 ||
-                                  (in.src[0].kind == OperandKind::SGPR &&
-                                   (static_mask_keys.count(in.src[0].value) ||
-                                    b.wave64_mask_writelane_alias_pcs.contains(in.pc))));
+            // A write the slot-domain analysis proves stores a Bool is a mask slot, including a
+            // re-spill of a reloaded mask whose SGPR is not otherwise a mask key (#4600).
+            const bool is_mask =
+                !fragment_physical_mask_word && !proven_data_spill &&
+                (proven_mask_writelane_pcs.contains(in.pc) || in.src[0].value == 106 ||
+                 in.src[0].value == 107 || in.src[0].value == 126 || in.src[0].value == 127 ||
+                 (in.src[0].kind == OperandKind::SGPR &&
+                  (static_mask_keys.count(in.src[0].value) ||
+                   b.wave64_mask_writelane_alias_pcs.contains(in.pc))));
             (is_mask ? mask_lane_slots : lane_slots).insert(slot);
         }
     }
@@ -3729,12 +3636,27 @@ bool emit_cfg_state_machine(
                 high->second, low.second);
             state.sreg_bool_narrowed[base] = true;
         }
+        // A slot persisted in both domains holds only a placeholder in the one it did not last
+        // receive on every path here. Load just the live one, so emit_alu reloads the domain the
+        // CFG analysis typed (#4600); an untyped slot keeps both views.
+        const SpillSlotDomains* entry_slots =
+            dispatch != UINT32_MAX && b.is_compute && entry_wave64_b64
+                ? &wave64_slot_domain_in[entry_block]
+                : nullptr;
+        auto slot_holds = [&](const std::pair<int, int>& slot, bool mask) {
+            if (!entry_slots) return false;
+            const auto found = entry_slots->find(slot);
+            return found != entry_slots->end() &&
+                   (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
+        };
         for (const auto& kv : lv)
-            state.vgpr_lane_slots[kv.first.first][kv.first.second] =
-                b.load_function(b.t_u32, kv.second);
+            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true)))
+                state.vgpr_lane_slots[kv.first.first][kv.first.second] =
+                    b.load_function(b.t_u32, kv.second);
         for (const auto& kv : lmv)
-            state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
-                b.load_function(b.t_bool, kv.second);
+            if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
+                state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
+                    b.load_function(b.t_bool, kv.second);
         const bool filters_wave64_scalar_scc =
             (b.is_compute || b.is_fragment) && b.wave_size == 64;
         const bool live_scalar_scc = !filters_wave64_scalar_scc ||

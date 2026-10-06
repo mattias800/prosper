@@ -21,6 +21,7 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/fragment_draw_capacity.hpp"
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
@@ -339,6 +340,9 @@ static const NotAnEmitter kNotEmitters[] = {
      "returns decoded numeric-child PCs, not SPIR-V; owned_nested_vertex_x4/x8 and "
      "owned_nested_fragment_x4/x8 below assert the census and exact owned chains, then "
      "strictly validate the consuming direct-stage modules"},
+    {"rdna2_fragment_compiles_wave64",
+     "returns a bool about the launch width the fragment compiler will use, not SPIR-V; "
+     "rdna2_spirv_struct pins the legacy exception it wraps"},
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},
@@ -522,6 +526,47 @@ static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& s
     dump(dir, "ngg_subgroup_kena_lut_native2",
          recompile_ngg_subgroup(kena.data(), kena.size(), &kena_rt, kena_cfg),
          "recompile_ngg_subgroup");
+}
+
+// #3135 P3: the merged-NGG raster commit. The pass-through vertex stage in every shape that changes
+// its module -- each layer route, line lists, PROVOKING_VTX_LAST, a PS input mapping, and without the
+// violation counters -- and the forwarding geometry stage for triangles and lines.
+static void dump_ngg_raster_commit(const std::string& dir) {
+    NggRasterCommitConfig config;
+    config.layout.words_per_lane = 14;
+    config.layout.pos1_word = 6;
+    config.layout.first_param_word = 10;
+    config.layout.param_targets = {kExpTargetParam0};
+    config.layout.param_channels = {0xfu};
+    config.layout.pos1_channels = 4;
+    config.layer_from_pos1 = true;
+    config.layer_slices = 32;
+    NggRasterCommitInterface triangles, lines;
+    config.route = NggLayerRoute::ShaderOutputLayer;
+    dump(dir, "ngg_raster_vertex_output_layer", build_ngg_raster_commit_vertex(config),
+         "build_ngg_raster_commit_vertex");
+    config.route = NggLayerRoute::ForwardingGeometry;
+    config.provoking_vertex_last = true;
+    dump(dir, "ngg_raster_vertex_forward_last", build_ngg_raster_commit_vertex(config, &triangles),
+         "build_ngg_raster_commit_vertex");
+    dump(dir, "ngg_raster_forward_geometry_triangles", build_ngg_layer_forward_geometry(triangles),
+         "build_ngg_layer_forward_geometry");
+    config.topology = NggOutputTopology::LineList;
+    config.waves = 2;
+    dump(dir, "ngg_raster_vertex_lines", build_ngg_raster_commit_vertex(config, &lines),
+         "build_ngg_raster_commit_vertex");
+    dump(dir, "ngg_raster_forward_geometry_lines", build_ngg_layer_forward_geometry(lines),
+         "build_ngg_layer_forward_geometry");
+    PixelInputMapping mapping;
+    mapping.valid_mask = 0b11;
+    mapping.controls[1] = 0x400u;   // input 1 <- PARAM0, flat
+    config.topology = NggOutputTopology::TriangleList;
+    config.route = NggLayerRoute::None;
+    config.layer_from_pos1 = false;
+    config.pixel_inputs = &mapping;
+    config.count_violations = false;
+    dump(dir, "ngg_raster_vertex_mapped_no_counters", build_ngg_raster_commit_vertex(config),
+         "build_ngg_raster_commit_vertex");
 }
 
 static void dump_numeric_mbcnt(const std::string& dir) {
@@ -1269,6 +1314,23 @@ int main(int argc, char** argv) {
           0xD7650000u,0x00020E7Eu,0x4A140106u,0x36001481u,0x7E000D00u,
           0x7E020280u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_gds_consume", recompile_fragment(c, sizeof(c)/4)); }
+    // Compute: a plain GDS read and a plain GDS store against the internal GDS buffer (#4553).
+    // v0 = 4 ; ds_read_b32 v1, v0 gds ; v0 = 8 ; ds_write_b32 v0, v1 gds.
+    {
+        const uint32_t c[] = {0x7e0002ffu, 0x00000004u, 0xd8da0000u, 0x01000000u, 0x7e0002ffu,
+                              0x00000008u, 0xd8360000u, 0x00000100u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource gds{};
+        gds.cls = ResourceClass::ConstantBuffer;
+        gds.format = DataFormat::Uint32;
+        gds.num_components = 1;
+        gds.binding = kComputeInternalGdsBinding;
+        gds.size = 64u * 1024u;
+        gds.stride = 4;
+        rt.resources.push_back(gds);
+        dump(dir, "compute_gds_read_write",
+             recompile_compute(c, std::size(c), &rt, ComputeShaderConfig{}));
+    }
     // Fragment private spill/fill (Function-storage declaration in the graphics shell).
     { const uint32_t c[] = {0xdc704010u,0x00000000u,0x7e000280u,0xdc304010u,0x00000000u,
                             0xf800000fu,0x00000000u,0xBF810000u};
@@ -1774,6 +1836,7 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
     dump_ngg_subgroup_shell(dir, src_root);
+    dump_ngg_raster_commit(dir);
     { const uint32_t c[] = {
           0x7e000f00u,0x7e0202ffu,160u,
           0x7d8402f9u,0x06068600u, // save one VOPC lane in s[6:7]
@@ -1875,6 +1938,11 @@ int main(int argc, char** argv) {
       const FloatTransportConfig profile{FloatTransportProfile::ExplicitNonFinite32};
       dump(dir, "geometry_interpolation_primitive_id",
            recompile_interpolation_geometry(layout, false, false, profile, true),
+           "recompile_interpolation_geometry");
+      // #3135 P3: the merged-NGG raster commit's interpolation-geometry layer route adds a uint
+      // input and a BuiltIn Layer output. Location 31 is outside this layout's attributes.
+      dump(dir, "geometry_interpolation_layer",
+           recompile_interpolation_geometry(layout, false, false, profile, false, 31u),
            "recompile_interpolation_geometry");
       RasterQuadInputs inputs;
       inputs.raw_code = std::make_shared<const std::vector<uint32_t>>(ps, ps + std::size(ps));

@@ -251,7 +251,8 @@ uint32_t vgpr_source_span(const Rdna2Inst& in, uint32_t index) {
             case 0x161:
             case 0x162:
             case 0x163: return 0;   // not in the gfx10.3 table
-            default: return in.opcode <= 0x177 ? 1u : 0u;   // 0x178-0x17f: not classified
+            // 0x178 v_xor3_b32 (three 32-bit sources); 0x179-0x17f are not classified.
+            default: return in.opcode <= 0x178 ? 1u : 0u;
         }
     }
     if (in.opcode == 0x2ff || in.opcode == 0x300 || in.opcode == 0x301)   // b64 shifts: src1
@@ -426,8 +427,14 @@ Reads instruction_reads(const Rdna2Inst& in) {
         case Rdna2Format::VOP2:
         case Rdna2Format::VOP3:
         case Rdna2Format::VOP3P:
-        case Rdna2Format::VOPC:
-            for (uint32_t k = 0; k < in.n_src; ++k) {
+        case Rdna2Format::VOPC: {
+            // A VOP3 encoding always carries three source fields; the ones its opcode does not
+            // read decode as s0 and must not count as reads (a phantom s0 refuses the program).
+            const uint32_t sources =
+                in.fmt == Rdna2Format::VOP3
+                    ? std::min<uint32_t>(in.n_src, vop3_architectural_source_count(in.opcode))
+                    : in.n_src;
+            for (uint32_t k = 0; k < sources; ++k) {
                 const uint32_t words = scalar_alu_source_words(in, k);
                 if (words != UINT32_MAX) add_scalar(reads, in, in.src[k], words ? words : 2u, k);
                 if (in.src[k].kind != OperandKind::VGPR) continue;
@@ -446,6 +453,7 @@ Reads instruction_reads(const Rdna2Inst& in) {
             if (vop_rmw_destination(in))
                 add_vgpr(reads, in.dst, std::max(1u, rdna2_vgpr_write_count(in)));
             break;
+        }
         case Rdna2Format::DS:
             for (uint32_t k = 0; k < in.n_src; ++k)
                 add_vgpr(reads, in.src[k], vgpr_source_span(in, k));
