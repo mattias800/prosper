@@ -131,6 +131,11 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     struct.pack("<II",0,1)+launch)
         draw_count=0 if name.endswith("failed") else 1
         wave_tail=struct.pack("<I",draw_count)+bytes(draw_count)
+        # v72: one absent merged-NGG description (presence u8 = 0) per draw.
+        ngg_tail=struct.pack("<I",draw_count)+bytes(draw_count)
+        check(struct.unpack_from("<I",data,8)[0]==72 and data.endswith(ngg_tail),
+              name+" exact absent merged-NGG descriptions in current capture")
+        data=bytearray(data[:-len(ngg_tail)]); struct.pack_into("<I",data,8,71)
         # v71: five unprogrammed (presence u8, raw u32) SC/DB launch-control words per draw.
         launch_controls_tail=struct.pack("<I",draw_count)+bytes(25*draw_count)
         check(struct.unpack_from("<I",data,8)[0]==71 and data.endswith(launch_controls_tail),

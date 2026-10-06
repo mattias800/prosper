@@ -47,6 +47,7 @@
 #endif
 #include "gpu/capture/gpu_capture_internal.hpp"
 #include "gpu/capture/serialize/capture_codecs.hpp"
+#include "gpu/capture/serialize/ngg_subgroup_codec.hpp"
 
 namespace prosper::gpu {
 namespace {
@@ -1311,6 +1312,13 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(launch.db_shader_control_available ? 1u : 0u);
         w.u32(launch.db_shader_control);
     }
+    // v72: the merged-NGG description each realized draw carries, or none.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_ngg_subgroup_draw(w, draw.ngg_subgroup)) {
+            error = "invalid merged-NGG draw description";
+            return false;
+        }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

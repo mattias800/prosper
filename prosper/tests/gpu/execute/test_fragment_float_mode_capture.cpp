@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized, metadata, reader, capture, error) &&
               serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 71 &&
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 72 &&
               loaded.draws.size() == realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
