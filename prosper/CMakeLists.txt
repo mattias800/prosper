@@ -5070,6 +5070,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A Wave64 mask rebuilt from its two spilled halves stays a mask across a CFG-dispatcher
+      # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
+      prosper_add_gtest(test_cfg_spilled_mask_halves
+        SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops
