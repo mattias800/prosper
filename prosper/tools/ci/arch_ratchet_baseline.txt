@@ -275,7 +275,6 @@ platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
 platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
 layer-include|prosper/src/diagnostics/perf/perf_alarms.cpp|gpu 1
-layer-include|prosper/src/diagnostics/perf/wave64_refusal.hpp|gpu 1
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
 layer-include|prosper/src/diagnostics/readback_refusal.cpp|gpu 1
 layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
