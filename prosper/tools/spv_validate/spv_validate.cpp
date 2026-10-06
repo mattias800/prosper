@@ -20,6 +20,7 @@
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ngg_subgroup_shell.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/fragment_draw_capacity.hpp"
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
@@ -35,6 +36,7 @@
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/dpp_row_fadd.hpp"
+#include "../../tests/fixtures/ngg_merged_lut_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
@@ -488,6 +490,38 @@ static int check_emitter_coverage(const std::string& src_root) {
                fails ? " (one or more of which FAILED above)" : ", and every module validated");
     }
     return problems;
+}
+
+// #3135 P2: the merged-NGG subgroup shell. The synthetic program covers two portable Wave64 waves,
+// GS_ALLOC_REQ capture and set-2 shell I/O beside a guest binding 0; Kena's captured linked LUT
+// producer covers the CFG dispatcher, both as one portable wave and as two native Wave64 waves.
+static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& src_root) {
+    const auto synthetic = prosper::test::ngg::synthetic_program();
+    const auto synthetic_rt = prosper::test::ngg::synthetic_resources();
+    NggSubgroupShellConfig cfg;
+    cfg.waves = 2;
+    cfg.user_sgprs = 4;
+    dump(dir, "ngg_subgroup_synthetic",
+         recompile_ngg_subgroup(synthetic.data(), synthetic.size(), &synthetic_rt, cfg),
+         "recompile_ngg_subgroup");
+    cfg.native_wave64 = true;
+    dump(dir, "ngg_subgroup_synthetic_native",
+         recompile_ngg_subgroup(synthetic.data(), synthetic.size(), &synthetic_rt, cfg),
+         "recompile_ngg_subgroup");
+    const auto kena =
+        prosper::test::ngg::kena_linked(std::filesystem::path(src_root) / "tests" / "data");
+    const auto kena_rt = prosper::test::ngg::kena_resources(4);
+    NggSubgroupShellConfig kena_cfg;
+    kena_cfg.lds_bytes = prosper::test::ngg::kKenaLds;
+    kena_cfg.user_sgprs = prosper::test::ngg::kKenaUserSgprs;
+    dump(dir, "ngg_subgroup_kena_lut",
+         recompile_ngg_subgroup(kena.data(), kena.size(), &kena_rt, kena_cfg),
+         "recompile_ngg_subgroup");
+    kena_cfg.waves = 2;
+    kena_cfg.native_wave64 = true;
+    dump(dir, "ngg_subgroup_kena_lut_native2",
+         recompile_ngg_subgroup(kena.data(), kena.size(), &kena_rt, kena_cfg),
+         "recompile_ngg_subgroup");
 }
 
 static void dump_numeric_mbcnt(const std::string& dir) {
@@ -1739,6 +1773,7 @@ int main(int argc, char** argv) {
       dump(dir, "ngg_workgroup_exports",
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
+    dump_ngg_subgroup_shell(dir, src_root);
     { const uint32_t c[] = {
           0x7e000f00u,0x7e0202ffu,160u,
           0x7d8402f9u,0x06068600u, // save one VOPC lane in s[6:7]

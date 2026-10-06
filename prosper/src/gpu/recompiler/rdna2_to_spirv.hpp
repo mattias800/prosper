@@ -759,6 +759,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 // operands in a 13-word record per lane: PRIM, POS0.xyzw, POS1.xyzw, PARAM0.xyzw. This is a
 // translator/execution test hook only. It does not assemble primitives, route layers, or create a
 // graphics pipeline, and it refuses any other export target rather than silently discarding it.
+// A linked merged ES+GS program compiles through recompile_ngg_subgroup (ngg_subgroup_shell.hpp)
+// instead; this probe stays for the synthetic wave-contract tests built on its fixed record.
 inline constexpr uint32_t kNggExportProbeWords = 13;
 inline constexpr uint32_t kNggTraceValueWord = kNggExportProbeWords;
 inline constexpr uint32_t kNggTraceHitWord = kNggExportProbeWords + 1;

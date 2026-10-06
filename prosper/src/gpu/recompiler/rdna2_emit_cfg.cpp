@@ -1189,14 +1189,14 @@ bool emit_cfg_state_machine(
             if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeBcnt1I32B64)
                 b.ngg_uniform_wave_reduction_pcs.insert(in.pc);
     }
-    if (b.ngg_workgroup_shell && b.is_compute && b.wave_size == 64 &&
-        !initial.vcc && initial.terminal_wave64_scalar_words.contains(106) &&
-        initial.terminal_wave64_scalar_words.contains(107) &&
-        initial.sreg.contains(106) && initial.sreg.contains(107)) {
+    if (b.ngg_workgroup_shell && b.is_compute && b.wave_size == 64 && !initial.vcc &&
+        initial.terminal_wave64_scalar_words.contains(106) &&
+        initial.terminal_wave64_scalar_words.contains(107) && initial.sreg.contains(106) &&
+        initial.sreg.contains(107)) {
         // A barrier does not erase the architectural VCC bits. The preceding CFG phase proved
         // both physical words are scalar data on every terminal path; reconstruct this lane's
-        // mask bit instead of propagating a missing Bool-domain value. Keep the bridge confined
-        // to the compile-only NGG probe until its full workgroup ABI is validated.
+        // mask bit instead of propagating a missing Bool-domain value. Confined to the merged-NGG
+        // workgroup shell, whose launch ABI ngg_subgroup_abi admits.
         const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
         const uint32_t word = b.sel(
             b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
@@ -6641,8 +6641,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               (b.ngg_workgroup_shell &&
-                                is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
+                               (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +

@@ -1290,6 +1290,13 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  # #3135 P2: static admission of a linked merged-NGG program for the subgroup shell. Pure decode
+  # and dataflow; the captured Kena chain is read from tests/data.
+  prosper_add_gtest(test_ngg_subgroup_abi
+    SOURCES tests/gpu/recompiler/test_ngg_subgroup_abi.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
@@ -4934,6 +4941,13 @@ endif()
         SOURCES tests/gpu/execute/test_memory_fed_raw_wide_exec.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
+      # #3135 P2: the merged-NGG subgroup shell executed offline on Kena's linked LUT producer,
+      # with the planner's launch and the discriminating launch-model controls.
+      prosper_add_gtest(test_ngg_subgroup_shell
+        SOURCES tests/gpu/execute/test_ngg_subgroup_shell.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)
