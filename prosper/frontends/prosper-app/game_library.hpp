@@ -210,18 +210,19 @@ inline bool game_entry_display_less(const GameEntry& a, const GameEntry& b) {
     return a.app0_root < b.app0_root;
 }
 
-// Every PS5 title directly inside `games_dir`, in display order.
+// Every PS5 title at `games_dir`, in display order: the directory itself when IT is a title
+// root (a dump can sit at a drive root, where F:\ holds eboot.bin directly), plus every title
+// directly inside it.
 //
 // One level deep, deliberately: a title's own subdirectories hold its assets, so recursing would both
-// waste time and risk presenting an inner directory as a separate game. The directory itself is not
-// considered even when it is a title root — pointing this at a single app0 folder yields nothing
-// rather than one oddly-named entry, and #1469's picker already covers opening one specific game.
+// waste time and risk presenting an inner directory as a separate game.
 inline std::vector<GameEntry> scan_game_library(const std::string& games_dir,
-                                                const GamePathProbe& probe,
-                                                const GameLibraryIo& io) {
+                                                 const GamePathProbe& probe,
+                                                 const GameLibraryIo& io) {
     std::vector<GameEntry> games;
     const std::string dir = strip_trailing_separators(games_dir);
     if (dir.empty() || !io.list_dir || !probe.is_dir || !probe.is_dir(dir)) return games;
+    if (is_app0_root(dir, probe)) games.push_back(describe_game(dir, probe, io));
     for (const std::string& child : io.list_dir(dir)) {
         if (child.empty() || child == "." || child == "..") continue;
         const std::string path = dir + "/" + child;

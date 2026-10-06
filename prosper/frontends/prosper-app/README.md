@@ -138,8 +138,9 @@ must not receive it, so the choice is explicit and per-title rather than a silen
 
 The scan looks **one level deep** and accepts a child directory as a title when
 `resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
-subdirectories are therefore never mistaken for separate games, and the games directory itself is not
-considered even when it happens to be a title root (use `--dump` or the picker for one specific game).
+subdirectories are therefore never mistaken for separate games. When the games directory is itself a
+title root — a dump copied to the top of a drive such as `F:\` or a mounted USB stick — that title is
+listed as the folder's one game.
 Names come from `sce_sys/param.json`, preferring the entry for the dump's own `defaultLanguage`; a title
 with no readable metadata still appears, named after its directory, since the name is presentation and
 `boot_program` only needs `eboot.bin`.

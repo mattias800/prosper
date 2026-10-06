@@ -234,10 +234,20 @@ int main() {
     CHECK(scan_game_library("/empty", probe, io).empty(), "a directory with no titles yields nothing");
     CHECK(scan_game_library("/does/not/exist", probe, io).empty(), "a missing directory yields nothing");
     CHECK(scan_game_library("", probe, io).empty(), "an empty path yields nothing");
-    // The games dir itself is never treated as a title, even when it is one — documented behaviour, so
-    // pointing this at a single app0 folder yields nothing rather than one oddly-named entry.
-    CHECK(scan_game_library("/games/PPSA24651-app0", probe, io).empty(),
-          "a title root used as the games dir yields nothing (children only)");
+    // The games dir itself IS listed when it is a title root — a dump can sit at a drive
+    // root, where the folder is the game rather than a folder of games. A dedicated probe (not
+    // a PPSA-named fixture) so this test adds no title-id occurrences of its own.
+    {
+        GamePathProbe solo_probe;
+        solo_probe.is_dir = [](const std::string& s) { return s == "/solo"; };
+        solo_probe.is_file = [](const std::string& s) { return s == "/solo/eboot.bin"; };
+        GameLibraryIo solo_io;
+        solo_io.list_dir = [](const std::string&) { return std::vector<std::string>{}; };
+        const std::vector<GameEntry> self = scan_game_library("/solo", solo_probe, solo_io);
+        CHECK(self.size() == 1 && self[0].title_name == "solo" &&
+                  self[0].app0_root == "/solo",
+              "a title root used as the games dir lists itself");
+    }
     CHECK(scan_game_library("/games/", probe, io).size() == 7, "a trailing separator is tolerated");
     const GameLibraryIo empty_io;
     CHECK(scan_game_library("/games", probe, empty_io).empty(), "an unpopulated io scans nothing");
