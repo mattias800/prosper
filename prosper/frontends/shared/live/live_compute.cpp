@@ -9,6 +9,7 @@
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
+#include "shared/compute/linear_image_pitch.hpp"
 #include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -8423,9 +8424,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         sampled_guest_need =
                             layer_stride * (sampled_layers - 1u) + level_offset + slice;
                     } else {
+                        const size_t row_pitch = compute_linear_row_pitch(*r, bpt);
                         sampled_guest_need = r->tile_mode
                             ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
-                            : static_cast<size_t>(volume_texels) * bpt;
+                            : (row_pitch ? row_pitch * (r->height - 1u) + size_t(r->width) * bpt
+                                         : static_cast<size_t>(volume_texels) * bpt);
                     }
                 } else {
                     skip_image(r, "sampled format not decodable yet"); break;
@@ -9700,7 +9703,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // while `linear` was never reset -- a null-pointer write. `native_cube_sampled`
                         // is here because an UNTILED native cube reaches that branch with
                         // `r->tile_mode` false and none of the other terms true (#657).
-                        const bool remap = r->tile_mode ||
+                        const size_t padded_pitch = compute_linear_row_pitch(*r, bpt);
+                        const bool remap = r->tile_mode || padded_pitch ||
                             (cube_face_as_2d && r->layer_stride_bytes) ||
                             ((dim_2d_array || dim_cube_stacked || native_cube_sampled) &&
                              sampled_layers > 1);
@@ -9786,6 +9790,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             const prosper::gpu::TileCensusScope tcs("smpl-upl");
                             detile_surface(linear.get(), src, r->width, r->height,
                                            r->tile_mode, 0, bpt);
+                        } else if (padded_pitch) {   // drop the per-row padding (see linear_image_pitch.hpp)
+                            for (uint32_t y = 0; y < r->height; ++y)
+                                std::memcpy(linear.get() + size_t(y) * r->width * bpt,
+                                            src + y * padded_pitch, size_t(r->width) * bpt);
                         }
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10 || unorm2_10_10_10 ||
