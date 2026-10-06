@@ -1,6 +1,8 @@
 // ngg_live_draw.cpp -- see ngg_live_draw.hpp.
 #include "gpu/execute/ngg_live_draw.hpp"
 
+#include "gpu/execute/shader_cache_internal.hpp"
+
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -15,6 +17,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,99 +50,30 @@ uint64_t interpolation_hash(const FragmentInterpolationLayout& layout) {
     return hash;
 }
 
-// The compile-relevant shape of the resource table: every field the recompiler may read, and
-// none that is per-draw data (addresses, host bytes) -- the same partition the ordinary shader
-// cache's ShaderResourceCompileKey makes, taken conservatively wide. A size enters only through
-// the size-derived markers the emitter specializes on (zero records, a one-record 16-bit tail,
-// an exact atomic x2 record count).
-std::vector<uint32_t> resource_shape(const ShaderResourceTable* table) {
-    std::vector<uint32_t> out;
-    if (!table) return out;
-    out.push_back(1u);
-    out.push_back(table->vertices_per_instance);
-    for (const auto& [pc, bytes] : table->owned_raw_snapshot_requirements) {
-        out.push_back(pc);
-        out.push_back(bytes);
-    }
-    out.push_back(0xfffffff0u);
-    for (const auto& [pc, bytes] : table->owned_nested_snapshot_requirements) {
-        out.push_back(pc);
-        out.push_back(bytes);
-    }
-    out.push_back(0xfffffff1u);
-    for (const ShaderResource& r : table->resources) {
-        const auto& relocation = r.indirect_pointer_relocation;
-        const uint32_t flags = (r.nested_raw_snapshot_admitted ? 1u : 0u) |
-                               (r.bvh_sort_enabled ? 2u : 0u) | (r.in_mip_tail ? 4u : 0u) |
-                               (r.proven_zero_mip ? 8u : 0u) | (r.srgb ? 16u : 0u) |
-                               (r.depth_compare ? 32u : 0u) | (r.compression_enabled ? 64u : 0u) |
-                               (r.raw_register_snapshot ? 128u : 0u) | (r.size == 0 ? 256u : 0u) |
-                               (r.size == 2 ? 512u : 0u) |
-                               (uint64_t{r.atomic_x2_record_count} * 8u == r.size ? 1024u : 0u) |
-                               (r.host_data ? 2048u : 0u);
-        out.insert(out.end(), {static_cast<uint32_t>(r.cls),
-                               static_cast<uint32_t>(r.format),
-                               r.num_components,
-                               r.binding,
-                               r.stride,
-                               r.srt_offset,
-                               r.sgpr_base,
-                               r.table_index_count,
-                               r.table_entry_stride,
-                               r.table_index_sgpr,
-                               static_cast<uint32_t>(r.table_selector_mode),
-                               r.table_load_pc,
-                               static_cast<uint32_t>(r.table_entries.size()),
-                               r.direct_vsharp_sh_register_base,
-                               r.fetch_pc,
-                               static_cast<uint32_t>(r.fetch_index_mode),
-                               r.bvh_box_grow,
-                               r.flat_base_sgpr,
-                               r.img_dim,
-                               r.width,
-                               r.height,
-                               r.depth,
-                               r.sample_count,
-                               r.tile_mode,
-                               r.declared_mip_levels,
-                               r.mag_filter,
-                               r.min_filter,
-                               r.mip_filter,
-                               r.addr_uvw[0],
-                               r.addr_uvw[1],
-                               r.addr_uvw[2],
-                               r.border_color_type,
-                               r.depth_compare_func,
-                               r.unnormalized,
-                               r.swizzle[0],
-                               r.swizzle[1],
-                               r.swizzle[2],
-                               r.swizzle[3],
-                               r.atomic_x2_record_count,
-                               r.selected_sbuffer_soffset,
-                               r.selected_sbuffer_words[0],
-                               r.selected_sbuffer_words[1],
-                               r.selected_sbuffer_words[2],
-                               r.selected_sbuffer_words[3],
-                               r.indirect_buffer_contract_tag,
-                               r.indirect_buffer_binding_bytes,
-                               r.indirect_buffer_slot_count,
-                               r.indirect_buffer_header_bytes,
-                               r.indirect_buffer_slot_bytes,
-                               relocation.carrier_version,
-                               relocation.proof_schema,
-                               relocation.binding_bytes,
-                               relocation.record_count,
-                               relocation.segment_count,
-                               relocation.segment_directory_byte_offset,
-                               static_cast<uint32_t>(relocation.proof_fingerprint),
-                               static_cast<uint32_t>(relocation.proof_fingerprint >> 32),
-                               r.scalar_buffer_dword_count,
-                               r.owned_raw_snapshot_bytes,
-                               r.owned_nested_snapshot_bytes,
-                               flags});
-    }
-    return out;
+// The resource table's half of the stage key. The per-resource part is built by the SAME code as
+// the ordinary shader cache's key (append_shader_resource_compile_keys), with the shell's stage
+// (compute) and its program (the linked chain), so the two partitions cannot drift: every
+// data-dependent admission the emitter reads -- snapshot sizes and validity, scalar-buffer and
+// table contracts, null markers -- is in it, and no address or content byte is.
+struct ResourceKey {
+    bool present = false;
+    uint32_t vertices_per_instance = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> owned_raw, owned_nested;
+    std::vector<ShaderResourceCompileKey> resources;
+    bool operator==(const ResourceKey&) const = default;
+};
+
+ResourceKey resource_key(const ShaderResourceTable* table,
+                         const std::shared_ptr<const std::vector<uint32_t>>& program) {
+    ResourceKey key;
+    if (!table) return key;
+    key.present = true;
+    key.vertices_per_instance = table->vertices_per_instance;
+    key.owned_raw = table->owned_raw_snapshot_requirements;
+    key.owned_nested = table->owned_nested_snapshot_requirements;
+    append_shader_resource_compile_keys(ShaderProgramStage::Compute, *table, program,
+                                        key.resources);
+    return key;
 }
 
 std::vector<uint32_t> pixel_input_shape(const PixelInputMapping* mapping) {
@@ -154,19 +88,34 @@ std::vector<uint32_t> pixel_input_shape(const PixelInputMapping* mapping) {
 // Everything a compiled stage depends on besides W (see the header's CACHING note).
 struct StageKey {
     std::vector<uint32_t> program;   // the linked chain, compared exactly
-    std::vector<uint32_t> resources;   // resource_shape()
+    ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
     uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
     bool count_violations = false, interpolation = false;
     uint64_t interpolation_layout = 0;
-    auto tie() const {
-        return std::tie(program, resources, pixel_inputs, user_sgprs, lds_granules, layer_slices,
-                        topology, route, float_transport, native_wave64, provoking_vertex_last,
-                        layer_from_pos1, count_violations, interpolation, interpolation_layout);
+    bool operator==(const StageKey&) const = default;
+};
+
+struct StageKeyHash {
+    size_t operator()(const StageKey& key) const {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t word : key.program) hash = mix(hash, word);
+        for (const ShaderResourceCompileKey& r : key.resources.resources)
+            hash = mix(hash, (uint64_t{r.binding} << 32) ^ r.fetch_pc ^ (uint64_t{r.cls} << 48));
+        for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
+        hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
+        hash = mix(hash, key.lds_granules);
+        hash = mix(hash, key.interpolation_layout);
+        hash = mix(hash, key.topology | (key.route << 8) | (key.float_transport << 16) |
+                             (uint64_t{key.native_wave64} << 24) |
+                             (uint64_t{key.provoking_vertex_last} << 25) |
+                             (uint64_t{key.layer_from_pos1} << 26) |
+                             (uint64_t{key.count_violations} << 27) |
+                             (uint64_t{key.interpolation} << 28));
+        return static_cast<size_t>(hash);
     }
-    bool operator<(const StageKey& other) const { return tie() < other.tie(); }
 };
 
 struct StageEntry {
@@ -198,7 +147,7 @@ struct DrawEntry {
 struct Cache {
     std::mutex mutex;
     uint64_t clock = 0;
-    std::map<StageKey, std::shared_ptr<StageEntry>> stages;
+    std::unordered_map<StageKey, std::shared_ptr<StageEntry>, StageKeyHash> stages;
     std::map<DrawKey, DrawEntry> draws;
     NggLiveDrawCacheStats stats;
 };
@@ -319,6 +268,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     NggLiveDrawResult result;
     const NggDrawAdmission admission = admit_ngg_draw(input.registers, input.facts, host);
     result.applies = admission.applies;
+    result.strip = admission.shape.topology == NggInputTopology::TriangleStrip;
     if (!admission.applies) return result;
     const auto refuse = [&](const char* reason, std::string detail = {}) {
         result.refusal = reason;
@@ -335,7 +285,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
 
     StageKey key;
     key.program = *input.linked;
-    key.resources = resource_shape(input.resources);
+    key.resources = resource_key(input.resources, input.linked);
     key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
     key.user_sgprs = admission.user_sgprs;
     key.lds_granules = admission.lds_granules;
@@ -411,6 +361,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         if (found != c.draws.end() && found->second.stage_owner == entry) {
             found->second.last_use = ++c.clock;
             ++c.stats.draw_hits;
+            c.stats.strip_draws += result.strip ? 1u : 0u;
             result.draw = found->second.draw;
             return result;
         }
@@ -449,6 +400,10 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         stored.last_use = ++c.clock;
         c.draws[std::move(draw_key)] = std::move(stored);
         evict(c.draws, kDrawEntries, nullptr);
+    }
+    if (result.strip) {
+        const std::lock_guard lock(c.mutex);
+        ++c.stats.strip_draws;
     }
     result.draw = std::move(draw);
     return result;
