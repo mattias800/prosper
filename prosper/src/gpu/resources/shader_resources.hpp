@@ -562,8 +562,8 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
     return valid_raw_register_snapshot_resource(resource, resource.host_data != nullptr);
 }
 
-// The immediate x1 source of a fold-proven wide offset owns the four bytes observed during
-// realization. Code-side provenance identifies its PC; replay must supply a complete hosted word
+// The immediate x1/x2 source of a fold-proven wide offset owns the 4 or 8 bytes observed during
+// realization. Code-side provenance identifies its PC; replay must supply the complete hosted words
 // at that PC instead of borrowing current guest memory or a legacy binding-2 buffer.
 inline bool valid_owned_raw_snapshot_shape(const ShaderResource& resource, uint32_t bytes) {
     return resource.cls == ResourceClass::ConstantBuffer && resource.format == DataFormat::Uint32 &&
