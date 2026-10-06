@@ -16,6 +16,7 @@
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
+#include "shared/live/unorm10_snapshot.hpp"
 #include "shared/live/bgra_seed_scratch.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
@@ -13030,7 +13031,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             } else if (bi.storage && layout_source && r->width && r->height &&
                        r->depth == 1 && !r->in_mip_tail &&
                        !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
-                if (const auto target_format = storage_target_format(*r)) {
+                if (r->format == DataFormat::Unorm2_10_10_10 && r->num_components == 4) {
+                    // No renderer pixel format carries 10:10:10:2 (storage_target_format declines
+                    // it), so the target kept its old pixels under a compute-composited picture.
+                    // Publish the result narrowed to the RGBA8 the renderer stores it as.
+                    auto rgba8 = std::make_shared<std::vector<uint8_t>>();
+                    if (prosper::frontend::unpack_unorm10_to_rgba8(
+                            layout_source, linear_bytes, r->width, r->height, *rgba8))
+                        notify_live_render_target_image_written({
+                            r->gpu_addr, r->width, r->height, LiveTargetPixelFormat::Rgba8Unorm,
+                            std::move(rgba8)});
+                } else if (const auto target_format = storage_target_format(*r)) {
                     // This snapshot is distinct from architectural guest writeback. This
                     // opt-in per-record diagnostic is intrusive: it times allocation plus copy
                     // and writes one line per snapshot. Bound its observation window externally.

@@ -6628,6 +6628,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
+  # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
+  prosper_add_gtest(test_unorm10_snapshot
+    SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
   target_link_libraries(test_guest_write_drain PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
