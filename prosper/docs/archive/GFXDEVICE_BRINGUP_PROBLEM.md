@@ -1,3 +1,8 @@
+---
+kind: archive
+status: historical
+---
+
 # The GfxDevice bring-up wall — ✅ RESOLVED 2026-07-06
 
 **Status: RESOLVED.** Root cause was NOT in Unity or the renderer: our async-exception / GC

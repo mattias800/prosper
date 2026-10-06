@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Little Nightmares III (`PPSA05143`) — status and evidence
 
 Unreal Engine 4. **Rung 2 — title screen** (2026-08-05, master `e98a8fdb`;

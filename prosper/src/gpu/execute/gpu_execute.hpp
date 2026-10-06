@@ -22,11 +22,13 @@
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
+#include "gpu/pm4/vgt_shader_stages.hpp"   // NGG shape in the refused-shader index
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
+#include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
@@ -2354,20 +2356,28 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const uint32_t gs_max_out = cx(P::VGT_GS_MAX_VERT_OUT, 9);
             const uint32_t max_output = cx(P::GE_MAX_OUTPUT_PER_SUBGROUP, 10);
             const uint32_t out_prim = cx(P::VGT_GS_OUT_PRIM_TYPE, 11);
+            // #3135 P0: the output/raster state the merged-NGG lowering must model or refuse.
+            const uint32_t vs_out_cntl = cx(P::PA_CL_VS_OUT_CNTL, 12);
+            const uint32_t su_mode = cx(P::PA_SU_SC_MODE_CNTL, 13);
+            const uint32_t pos_format = cx(P::SPI_SHADER_POS_FORMAT, 14);
+            const uint32_t color0_view = cx(P::CB_COLOR0_VIEW, 15);
+            const uint32_t clip_cntl = cx(P::PA_CL_CLIP_CNTL, 16);
+            const uint32_t primitiveid_en = cx(P::VGT_PRIMITIVEID_EN, 17);
             std::fprintf(stderr,
-                "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
-                "vertices=%u instances=%u topo=%u present=%03x rsrc1=%08x rsrc2=%08x "
-                "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
-                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
-                "max-output=%08x out-prim=%08x\n",
-                static_cast<unsigned long long>(rs.es_addr),
-                static_cast<unsigned long long>(chain_addr),
-                static_cast<unsigned long long>(rs.color0_base),
-                static_cast<unsigned long long>(draw ? draw->command_order : 0),
-                vcount_hint, draw ? draw->instance_count : ds.num_instances,
-                rs.prim_type, present,
-                rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
-                primitive, gs_instance, gs_max_out, max_output, out_prim);
+                         "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
+                         "vertices=%u instances=%u topo=%u present=%05x rsrc1=%08x rsrc2=%08x "
+                         "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
+                         "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
+                         "max-output=%08x out-prim=%08x vs-out-cntl=%08x su-mode=%08x "
+                         "pos-format=%08x color0-view=%08x clip-cntl=%08x primitiveid-en=%08x\n",
+                         static_cast<unsigned long long>(rs.es_addr),
+                         static_cast<unsigned long long>(chain_addr),
+                         static_cast<unsigned long long>(rs.color0_base),
+                         static_cast<unsigned long long>(draw ? draw->command_order : 0),
+                         vcount_hint, draw ? draw->instance_count : ds.num_instances, rs.prim_type,
+                         present, rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
+                         primitive, gs_instance, gs_max_out, max_output, out_prim, vs_out_cntl,
+                         su_mode, pos_format, color0_view, clip_cntl, primitiveid_en);
         }
     }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
@@ -2398,6 +2408,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
         : rs.es_addr;
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
+    // The refused-shader index records each refused draw's NGG shape and link kind (#3135 P0).
+    const char* const refused_ngg_class = [&] {
+        const auto it = ds.cx.find(prosper::agc::Pm4::VGT_SHADER_STAGES_EN);
+        return ngg_stage_class(VgtShaderStages{it == ds.cx.end() ? 0u : it->second});
+    }();
+    const char* const refused_link =
+        vertex_chain ? "prolog" : (vs_program_addr != rs.es_addr ? "fused" : "none");
     const auto* producer_header = vs_program_addr == rs.es_addr ? vertex_header : fused_back;
     const auto* pixel_header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(rs.ps_addr));
@@ -2429,10 +2446,32 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                                       vcount_hint, float_transport, raw_context,
                                                       owned_waves, owned_indices, refusal)) {
             if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
-            report_dropped_draw_target(rs.color0_base,
-                                       vertex_chain ? "owned-wave-chained-stage-unimplemented"
-                                                    : refusal.c_str(),
-                                       rs.cb_target_mask, rs.cb_shader_mask);
+            const char* const reason =
+                vertex_chain ? "owned-wave-chained-stage-unimplemented" : refusal.c_str();
+            report_dropped_draw_target(rs.color0_base, reason, rs.cb_target_mask,
+                                       rs.cb_shader_mask);
+            // The drop is counted under the same label as a recompile reject, but no recompile
+            // ran, so nothing kept the program. Keep it here: the owned stage is the one whose
+            // classification and gate somebody has to look at next (#4555).
+            note_refused_draw_shaders(
+                {{},
+                 {},
+                 checked_fragment ? checked_graphics_source_analysis(checked_fragment.get())
+                                  : SharedShaderAnalysis{},
+                 vs_program_addr,
+                 rs.ps_addr,
+                 rs.es_addr,
+                 draw ? draw->command_order : 0,
+                 max_shader_dwords,
+                 0,
+                 0,
+                 0,
+                 owned_vertex,
+                 owned_fragment,
+                 reason,
+                 refused_ngg_class,
+                 refused_link,
+                 vertex_chain ? chain_addr : 0});
             prosper::diagnostics::perf::drop_draw_at_realization(
                 owned_vertex ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
                              : prosper::diagnostics::perf::DropReason::ShaderRecompileFragment);
@@ -2823,7 +2862,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                    rs.ps_addr, rs.es_addr, draw ? draw->command_order : 0,
                                    max_shader_dwords, vs_words.size(), gs.size(), fs_words.size(),
                                    vs_words.empty() && !owned_vertex,
-                                   fs_words.empty() && !owned_fragment});
+                                   fs_words.empty() && !owned_fragment, nullptr, refused_ngg_class,
+                                   refused_link, vertex_chain ? chain_addr : 0});
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
@@ -2891,6 +2931,19 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
     ps.color_write_mask = ps.color_targets[0].write_mask;
     ps.color1_write_mask = ps.color_targets[1].write_mask;
+    // #1588: CB_COLOR_CONTROL.MODE = ELIMINATE_FAST_CLEAR on AGC's own rectangle is a colour-block
+    // metadata operation, not a shaded draw. prosper keeps render targets uncompressed, so the
+    // expansion it performs is already complete and the inherited pixel shader's export must not
+    // reach the target. Identified by the operation's vertex program (efc_helper_program.hpp), never
+    // by MODE alone: titles latch MODE=2 onto ordinary draws that must still write.
+    if (is_agc_eliminate_fast_clear_operation(
+            rs.cb_color_control,
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr)),
+            vs_program_dwords)) {
+        for (auto& target : ps.color_targets) target.write_mask = 0;
+        ps.color_write_mask = 0;
+        ps.color1_write_mask = 0;
+    }
     // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
     // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never

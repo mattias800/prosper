@@ -428,6 +428,10 @@ if(Python3_Interpreter_FOUND)
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_hle_handler_map.py")
   # ...and reconciled against the registry the compiled binary actually builds, so a registration
   # SHAPE the parser does not recognise fails loudly instead of quietly shrinking the census.
+  # The HLE progress census counts per registered NID on top of hle_handler_map's parser; its
+  # fixtures are the registration shapes an HLE()-regex census miscounted (#4532).
+  add_test(NAME progress_census
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/progress/test_progress.py")
   add_test(NAME re_hle_handler_map_reconcile
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/re/test_hle_registry_reconcile.py"
@@ -749,6 +753,10 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_wrapper_identity
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/revision/test_compiler_wrapper.py")
+    set_tests_properties(compiler_wrapper_identity PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compiler_source_identity
              COMMAND "${Python3_EXECUTABLE}"
                "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
@@ -1264,6 +1272,23 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_dcc_helper_program
     SOURCES tests/gpu/execute/test_dcc_helper_program.cpp
     INCLUDES src)
+
+  # #1588: AGC's eliminate-fast-clear rectangle writes no colour; a latched MODE=2 on an ordinary
+  # draw still does. Matcher arms plus realize_draw_item arms (no device needed).
+  prosper_add_gtest(test_efc_helper_program
+    SOURCES tests/gpu/execute/test_efc_helper_program.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_srt_publication_dedupe
+    SOURCES tests/gpu/execute/test_srt_publication_dedupe.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_ngg_subgroup_plan
+    SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
@@ -2342,6 +2367,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
     LIBRARIES prosper_core)
+  # The wording of the Wave64 host line and of a refusal line: a recompile refusal must not read
+  # as a GPU limitation, and a narrow-subgroup device must be told what it will be missing.
+  prosper_add_gtest(test_wave64_host_line
+    SOURCES tests/diagnostics/test_wave64_host_line.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
@@ -3092,6 +3122,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_wqm_into_vcc_execution
+      SOURCES tests/gpu/execute/test_compute_wqm_into_vcc.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
@@ -3171,6 +3206,11 @@ if(TARGET prosper_core)
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
+  prosper_add_gtest(test_raw_wide_replayed_load
+    SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
@@ -3285,6 +3325,9 @@ endif()
   # fires would otherwise pass the suite.
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_s_movrels_read_range
+    SOURCES tests/gpu/recompiler/test_s_movrels_read_range.cpp
     LIBRARIES prosper_core)
 
   prosper_add_gtest(test_fragment_draw_capacity
@@ -3996,6 +4039,12 @@ endif()
 
   prosper_add_gtest(test_agc_submit
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
+    LIBRARIES prosper_core)
+
+  # sceAgcCbBranch is a builder (#4540): packet layout, patchers, condition, and the ordering
+  # contract (the target runs inside the buffer that carries the branch).
+  prosper_add_gtest(test_cb_branch
+    SOURCES tests/gpu/pm4/test_cb_branch.cpp
     LIBRARIES prosper_core)
 
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
@@ -5000,11 +5049,45 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A wave-empty EXEC guard around a counted loop in UE4's save-then-v_cmpx form (#4427):
+      # compile-level positives/negatives plus two executed kernels.
+      prosper_add_gtest(test_counted_loop_cmpx_guard
+        SOURCES tests/gpu/recompiler/test_counted_loop_cmpx_guard.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
+      # counted-loop route declines and the general route lowers both loops, executed per lane.
+      prosper_add_gtest(test_counted_loop_prelude_exec_loop
+        SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
+      # positives/negatives, plus the program rendered with both back-edge polarities.
+      prosper_add_gtest(test_scc_do_while_loops
+        SOURCES tests/gpu/execute/test_scc_do_while_loops.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_recompiled_fragment
         SOURCES tests/gpu/recompiler/test_recompiled_fragment.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A fragment loop whose body recycles VCC as scalar scratch, compiled and executed (#4508:
+      # Space Adventure Cobra's per-pixel light loop).
+      prosper_add_gtest(test_fragment_loop_vcc_scratch
+        SOURCES tests/gpu/recompiler/test_fragment_loop_vcc_scratch.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The renderer's start-up Wave64 host line, on whatever device runs the test.
+      prosper_add_gtest(test_wave64_host_announcement
+        SOURCES tests/gpu/execute/test_wave64_host_announcement.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -6583,6 +6666,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     SOURCES tests/shared/live/test_live_target_format.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+  # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
+  prosper_add_gtest(test_unorm10_snapshot
+    SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
 
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)

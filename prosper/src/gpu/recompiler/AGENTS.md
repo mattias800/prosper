@@ -9,6 +9,15 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
+- `rdna2_counted_loop_guard` — the counted-loop lowering's proof that a wave-empty
+  `s_cbranch_execz` guard around or inside the loop may be linearized (the `s_and_saveexec` form
+  and UE4's `s_mov sN, exec … v_cmpx` form). A shape it does not prove is left to `emit_alu`,
+  which refuses the branch under narrowed EXEC.
+- `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
+  every compute and fragment shell runs before emission; it only fills `RegState` facts.
+- `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
+  it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
+  the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
   votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,

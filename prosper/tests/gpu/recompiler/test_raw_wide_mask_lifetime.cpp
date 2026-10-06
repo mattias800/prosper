@@ -385,9 +385,19 @@ int main(int argc, char** argv) {
         saved_numeric(conditional_save,
                 "pre-load saved EXEC must dominate every reaching path");
         auto unknown_prefix = saved_exec;
-        unknown_prefix.insert(unknown_prefix.begin() + 3, 0xbea82828u); // relative SGPR write
-        check(rdna2_raw_wide_data_loads(decode(unknown_prefix)) == std::vector<uint32_t>{4u},
+        // s_movreld_b32 s40, s40 (SOP1 0x30): writes SGPR[40 + M0], which may be the saved pair.
+        // This arm used 0xbea82828 under the same comment until #4529; that word is
+        // s_orn2_saveexec_b64 s[40:41], s[40:41], an ordinary mask write that names its
+        // destination, and it is the control below.
+        unknown_prefix.insert(unknown_prefix.begin() + 3, 0xbea83028u);
+        check(decode(unknown_prefix).at(3).opcode == kSop1OpcodeMovreldB32 &&
+                  rdna2_raw_wide_data_loads(decode(unknown_prefix)) == std::vector<uint32_t>{4u},
               name, "unknown relative prefix write cannot seed a textual saved EXEC alias");
+        auto saveexec_prefix = saved_exec;
+        saveexec_prefix.insert(saveexec_prefix.begin() + 3, 0xbea82828u);
+        check(decode(saveexec_prefix).at(3).opcode == 0x28u &&
+                  rdna2_raw_wide_data_loads(decode(saveexec_prefix)).empty(),
+              name, "a saveexec prefix names its destination: the saved EXEC alias survives it");
         auto before_load_expired = saved_exec;
         before_load_expired.insert(before_load_expired.begin() + 3, 0xbea10314u);
         saved_numeric(before_load_expired,

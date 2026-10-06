@@ -8,6 +8,8 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
+#include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -1084,31 +1086,6 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
     return proven;
 }
 
-// Scalar registers that MAY be overwritten while a loop executes. This is deliberately separate
-// from loop_written_regs: mask-pair destinations overwrite physical SGPRs (and therefore descriptor
-// provenance) but their values live in sreg_bool rather than the scalar-data SSA domain.
-void loop_scalar_may_writes(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
-                            std::set<int>& sregs) {
-    for (const auto& in : ins) {
-        if (in.pc < lo || in.pc >= hi) continue;
-        for_each_scalar_write(in, [&](int base, uint32_t width) {
-            for (uint32_t word = 0; word < width; ++word)
-                sregs.insert(base + static_cast<int>(word));
-        });
-    }
-}
-
-void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
-    for (int reg : sregs) {
-        rs.sreg_written.insert(reg);
-        rs.sreg_input.erase(reg);
-        rs.sreg_srt.erase(reg);
-        // A loop body that may write this register must not leave a copy alias standing: the alias
-        // was established on one iteration's path and says nothing about the next one (#1773).
-        rs.sreg_ud_alias.erase(reg);
-    }
-}
-
 // Complex CFG dispatch and the narrow loop structurizers persist B64 mask values, but not the
 // separate one-word-validity state required by Wave32 aliases. Conservatively find any B32 mask
 // copy that the region could create. The source set is deliberately path-insensitive: a pair made a
@@ -1283,37 +1260,6 @@ namespace {
 // cross-lane events that each get their own block, shortens the window rather than widening it.
 
 }  // namespace
-
-void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins) {
-    if (rs.smem_pointer_analysis_done) return;
-    rs.smem_pointer_loads = rdna2_proven_smem_pointer_loads(ins);
-    rs.smem_owned_raw_x2_chains = rdna2_owned_raw_x2_chains(ins);
-    for (const auto& chain : rs.smem_owned_raw_x2_chains) {
-        rs.smem_raw_x2_data_loads.insert(chain.parent_pc);
-        rs.smem_raw_x2_data_loads.insert(chain.child_pc);
-    }
-    const auto raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
-    rs.smem_raw_x2_data_loads.insert(raw_x2_data.begin(), raw_x2_data.end());
-    const auto raw_immediate_wide_data = rdna2_proven_raw_immediate_wide_data_loads(ins);
-    rs.smem_raw_immediate_wide_data_loads.insert(raw_immediate_wide_data.begin(),
-                                                raw_immediate_wide_data.end());
-    const auto owned_wide_data = rdna2_owned_raw_wide_data_loads(ins);
-    rs.smem_raw_owned_wide_data_loads.insert(owned_wide_data.begin(), owned_wide_data.end());
-    std::vector<uint32_t> raw_offset_scalar_sources;
-    const auto raw_register_wide_data =
-        rdna2_proven_raw_register_wide_data_loads(ins, &raw_offset_scalar_sources);
-    rs.smem_raw_offset_scalar_source_pcs.insert(raw_offset_scalar_sources.begin(),
-                                               raw_offset_scalar_sources.end());
-    rs.smem_raw_register_wide_data_loads.insert(raw_register_wide_data.begin(),
-                                               raw_register_wide_data.end());
-    const auto raw_nested_wide_data = rdna2_proven_raw_nested_wide_data_loads(ins);
-    rs.smem_owned_nested_wide_chains = rdna2_owned_nested_wide_chains(ins);
-    rs.smem_raw_nested_wide_data_loads.insert(raw_nested_wide_data.begin(),
-                                              raw_nested_wide_data.end());
-    const auto raw_wide_data = rdna2_raw_wide_data_loads(ins);
-    rs.smem_raw_wide_data_loads.insert(raw_wide_data.begin(), raw_wide_data.end());
-    rs.smem_pointer_analysis_done = true;
-}
 
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
@@ -2907,10 +2853,10 @@ bool emit_cfg_state_machine(
                         return false;
                 return true;
             };
-            bool scalar_sources = true;
+            bool scalar_sources = true;   // not asked of a relative read: see the predicate
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const uint32_t width = scalar_alu_source_words(in, source);
-                if (width != UINT32_MAX)
+                if (width != UINT32_MAX && !s_movrels_b32_result_is_scalar_data(in))
                     scalar_sources &= source_is_scalar_range(in.src[source], width);
             }
             bool implicit_scalar_source = true;
@@ -3167,18 +3113,12 @@ bool emit_cfg_state_machine(
                         (mask_write < 0 ||
                          (b.is_compute && b32_vcc_complete_scalar_pair));
             } else if (in.fmt == Rdna2Format::SOP1) {
-                const bool preserves_scc =
-                    in.opcode == kSop1OpcodeMovB32 ||
-                    in.opcode == kSop1OpcodeMovB64 ||
-                    in.opcode == kSop1OpcodeCmovB32 ||
-                    in.opcode == kSop1OpcodeCmovB64 ||
-                    in.opcode == kSop1OpcodeBrevB32 ||
-                    in.opcode == kSop1OpcodeFf1I32B64 ||
-                    in.opcode == kSop1OpcodeFlbitI32B32 ||
-                    in.opcode == kSop1OpcodeFlbitI32B64 ||
-                    in.opcode == kSop1OpcodeBitset0B32 ||
-                    in.opcode == kSop1OpcodeBitset1B32 ||
-                    in.opcode == kSop1OpcodeGetpcB64;
+                // The shared list, less S_BITREPLICATE (this transfer never carried it), plus the
+                // relative read: rdna2_movrels.cpp lowers it without touching SCC, and leaving it
+                // out poisoned the SCC of a compare that ran before it (#4559).
+                const bool preserves_scc = (sop1_opcode_leaves_scc_unmodified(in.opcode) &&
+                                            in.opcode != kSop1OpcodeBitreplicateB64B32) ||
+                                           in.opcode == kSop1OpcodeMovrelsB32;
                 const bool saveexec =
                     (in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                      in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
@@ -6990,81 +6930,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return true;
     };
     auto& safe_branches = effective_safe;
-    if (L.found) {
-        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
-        bool guarded_narrow_entry = false;
-        // saveexec -> execz -> matching EXEC restore around a side-effect-free counted region is a
-        // whole-wave empty-work optimization. In the per-invocation shell we may run the uniform
-        // scalar loop for every invocation while narrowed EXEC predicates vector writes; inactive
-        // lanes retain their old VGPRs until the exact restore. Reject stores/exports/barriers and
-        // unclassified memory so this never becomes a general branch-linearization escape hatch.
-        // Scan inside-out so an already-proven nested guard may contribute its balanced save/restore
-        // pair without making an otherwise-safe outer guarded loop look like it leaks narrowed EXEC.
-        struct GuardedExecRegion { uint32_t save_pc, restore_pc; };
-        std::vector<GuardedExecRegion> guarded_exec_regions;
-        for (size_t branch_index = ins.size(); branch_index-- > 0;) {
-            const Rdna2Inst& branch = ins[branch_index];
-            if (branch.fmt != Rdna2Format::SOPP || branch.opcode != 0x08 || branch.simm16 <= 0)
-                continue;
-            size_t previous = branch_index;
-            while (previous > 0) {
-                --previous;
-                if (!sopp_is_noop(ins[previous])) break;
-            }
-            if (previous >= branch_index) continue;
-            const Rdna2Inst& saveexec = ins[previous];
-            if (saveexec.fmt != Rdna2Format::SOP1 ||
-                (saveexec.opcode != 0x24 && saveexec.opcode != 0x25) ||
-                saveexec.dst.kind != OperandKind::SGPR || saveexec.dst.value > 104) continue;
-            const uint32_t target = branch_target(branch);
-            const Rdna2Inst* restore = nullptr;
-            for (const auto& candidate : ins) if (candidate.pc == target) { restore = &candidate; break; }
-            if (!restore || restore->fmt != Rdna2Format::SOP1 || restore->opcode != 0x04 ||
-                restore->dst.value < 126 || !reg_operand(restore->src[0], saveexec.dst.value)) continue;
-            // A lexical save/restore pair is not necessarily balanced along the counted-loop CFG.
-            // In particular, a save in the body with its restore after the backedge leaves EXEC
-            // narrowed between iterations (EXEC has no loop phi), and a zero-trip path reaches an
-            // undominated restore. Accept only a pair contained in one straight-line loop segment,
-            // or a true preheader-to-postloop wrapper around the complete loop.
-            const bool same_preloop = saveexec.pc < L.header_pc && target < L.header_pc;
-            const bool same_condition = saveexec.pc >= L.header_pc && target < L.exit_branch_pc;
-            const bool same_body = saveexec.pc > L.exit_branch_pc && target < L.backedge_pc;
-            const bool same_postloop = saveexec.pc >= L.exit_pc;
-            const bool wraps_loop = saveexec.pc < L.header_pc && target >= L.exit_pc;
-            if (!same_preloop && !same_condition && !same_body && !same_postloop && !wraps_loop)
-                continue;
-            bool side_effect_free = true;
-            for (const auto& candidate : ins) {
-                if (candidate.pc <= branch.pc || candidate.pc >= target) continue;
-                bool clobbers_guard_mask = false;
-                for_each_scalar_write(candidate, [&](int base, uint32_t width) {
-                    clobbers_guard_mask |= base < saveexec.dst.value + 2 &&
-                        saveexec.dst.value < base + static_cast<int>(width);
-                });
-                bool balanced_nested_exec = false;
-                for (const auto& nested : guarded_exec_regions) {
-                    if (nested.save_pc > branch.pc && nested.restore_pc < target &&
-                        (candidate.pc == nested.save_pc || candidate.pc == nested.restore_pc)) {
-                        balanced_nested_exec = true;
-                        break;
-                    }
-                }
-                if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
-                    candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
-                    candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
-                    (rdna2_instruction_may_change_exec(candidate) && !balanced_nested_exec) ||
-                    clobbers_guard_mask ||
-                    (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0x0a)) {
-                    side_effect_free = false;
-                    break;
-                }
-            }
-            if (!side_effect_free) continue;
-            effective_safe.insert(branch.pc);
-            guarded_exec_regions.push_back({saveexec.pc, target});
-            if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
-        }
+    // The counted-loop route claims the whole program, but `detect_counted_loop` only counts
+    // s_branch and SCC back-edges: a bottom-tested EXEC loop (`s_andn2_b64 exec, exec, vcc;
+    // s_cbranch_execnz header`) in the prelude is invisible to it. Probe the prelude before
+    // committing, so a prelude this route cannot structure falls back to the general route below
+    // (divergent loops, forward ifs, then the CFG dispatcher), which does know that loop shape.
+    bool counted_route = L.found;
+    bool guarded_narrow_entry = false;
+    std::vector<ForwardIf> preloop_ifs;
+    Rdna2Inst preloop_end;
+    if (counted_route) {
+        // Proven wave-empty EXEC guards around or inside the loop (rdna2_counted_loop_guard.cpp).
+        guarded_narrow_entry = mark_counted_loop_exec_guards(ins, L, effective_safe);
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
         // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
         // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
@@ -7081,14 +6958,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 branch_target(in) >= L.header_pc) continue;
             preloop.push_back(in);
         }
-        Rdna2Inst preloop_end;
         preloop_end.pc = L.header_pc;
         preloop_end.is_end = true;
         preloop.push_back(preloop_end);
         bool preloop_rejected = false;
-        const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
-            preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
-            &preloop_rejected, /*compute_wave_branches*/b.is_compute, b.diagnostic);
+        preloop_ifs = detect_forward_ifs(preloop, /*allow_vcc*/ !b.is_compute, code, dwords,
+                                         &effective_safe, nullptr, &preloop_rejected,
+                                         /*compute_wave_branches*/ b.is_compute, b.diagnostic);
         // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
         // and records it as early_out. In this truncated prelude that can be a real branch over the
         // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
@@ -7097,13 +6973,38 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return branch.early_out ||
                     (branch.has_else ? branch.merge_pc : branch.target_pc) > L.header_pc;
             });
-        if (preloop_rejected || preloop_if_unsupported) {
-            log_recompile_diagnostic(
-                b.diagnostic, "recompile-reject", "terminal",
-                "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
-                preloop_rejected, preloop_ifs.size(), L.header_pc);
+        if (preloop_if_unsupported) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
+                                     preloop_rejected, preloop_ifs.size(), L.header_pc);
             return false;
         }
+        if (preloop_rejected) {
+            // The prelude holds control flow the forward-if scan refuses without loop information
+            // (Kena's 0x5006fb0000 carries a bottom-tested EXEC loop before its counted loop). Nothing
+            // has been emitted yet, so decline this route instead of refusing the program. Undo the
+            // guard marks above: they were proven for THIS route's loop structure, and the general
+            // route must start from the caller's linearization set, as it does for any program
+            // without a counted loop.
+            log_recompile_diagnostic(
+                b.diagnostic, "compute-struct-reject", "route-decline",
+                "counted-loop prelude cfg rejected header=%u: trying the general route",
+                L.header_pc);
+            effective_safe = safe;
+            guarded_narrow_entry = false;
+            preloop_ifs.clear();
+            counted_route = false;
+        }
+    }
+    if (counted_route) {
+        auto vget = [&](int r) {
+            auto it = rs.vreg.find(r);
+            return it == rs.vreg.end() ? b.uconst(0) : it->second;
+        };
+        auto sget = [&](int r) {
+            auto it = rs.sreg.find(r);
+            return it == rs.sreg.end() ? b.uconst(0) : it->second;
+        };
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
         } else if (preloop_ifs.size() > 1) {
@@ -7322,7 +7223,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         : pr.dom == 1 ? sget(pr.reg)
                         : pr.dom == 2 ? rs.scc
                         : pr.dom == 3 ? rs.vcc : rs.exec;
-            if (!nv && pr.dom == 3) return false;
+            if (!nv && pr.dom == 3) return LoopVccCarry::reject_counted_backedge(b, L.header_pc);
             if (!nv && pr.dom == 2)
                 nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);
@@ -7922,6 +7823,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : conds) conds_val[r] = sget(r);
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
+            LoopVccCarry vcc_carry(rs);   // #4508: a body may recycle VCC as scalar scratch
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec
                                : L.condition == DivLoop::Condition::Vcc ? rs.vcc : rs.scc;
             if (!loop_cond) return false;
@@ -7971,6 +7873,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                if (!nv && pr.dom == 3)
+                    nv = vcc_carry.backedge_value(b, ins, L.header_pc,
+                                                  L.direct_exec_breaks || L.direct_wave_breaks);
                 if (!nv && pr.dom == 3) return false;
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
@@ -7979,7 +7884,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             b.emit_label(merge);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
             for (auto& pr : phis) {
-                if (pr.dom == 3 && (!vcc_chk || !rs.vcc)) return false;
+                if (pr.dom == 3 && !vcc_carry.merge_has_mask(b, vcc_chk, rs.vcc, L.header_pc))
+                    return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
                                    : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
@@ -8004,6 +7910,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
+            vcc_carry.finish_exit(rs);
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {

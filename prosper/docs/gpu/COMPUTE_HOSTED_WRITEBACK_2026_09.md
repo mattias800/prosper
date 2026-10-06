@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Private hosted outputs and ordered writeback (2026-09)
 
 Fix for #3619, found during #3407's next comparison investigation. The implementation is based

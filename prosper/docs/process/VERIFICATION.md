@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Verification strategy (automated gates, reviewed baselines)
 
 Every milestone is gated by a self-checking test whose **exit code is the truth**. Routine checks do

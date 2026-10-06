@@ -318,6 +318,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_proven_raw_x2_data_loads",
      "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers positive, branch, "
      "pointer-only and SGPR-lifetime cases, and rdna2_to_spirv_exec validates a consuming module"},
+    {"rdna2_proven_raw_register_wide_entry_loads",
+     "returns proven raw-wide load PCs (the register proof's entry stage), not SPIR-V; "
+     "memory_fed_raw_wide covers it through rdna2_proven_raw_register_wide_data_loads"},
     {"rdna2_proven_raw_immediate_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers admission and refusal "
      "paths, and rdna2_to_spirv_exec validates a consuming module"},
@@ -1595,6 +1598,22 @@ int main(int argc, char** argv) {
                             0xBF860004u,0x060000FFu,0x3E800000u,0x81008100u,0xBF82FFFAu,
                             0x7E020300u,0x7E040300u,0xF800080Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_uniform_vcc_loop", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // Fragment: the same loop with VCC a live mask BEFORE it and a body that recycles vcc_lo/vcc_hi
+    // as scalar scratch (#4508, Space Adventure Cobra's per-light loop). The VCC header phi closes
+    // with a placeholder on the back-edge; test_fragment_loop_vcc_scratch executes the uniform form.
+    // The second module takes its bound from a lane-varying register, so the exit is a wave vote.
+    {
+        const uint32_t c[] = {0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u, 0x7D020200u,
+                              0x7D020200u, 0xBF860006u, 0x816A8100u, 0x876B8300u, 0x060000FFu,
+                              0x3E800000u, 0xBE80036Au, 0xBF82FFF8u, 0x7E020300u, 0x7E040300u,
+                              0xF800080Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_vcc_scratch_loop", recompile_fragment(c, sizeof(c) / 4, nullptr));
+        uint32_t voted[sizeof(c) / 4];
+        std::copy(std::begin(c), std::end(c), voted);
+        voted[2] = 0x7E020302u;
+        dump(dir, "fragment_vcc_scratch_loop_voted",
+             recompile_fragment(voted, sizeof(voted) / 4, nullptr));
+    }
     // Fragment: EXECNZ-back-edge loop with a mid-body vccz break (#273 — the scalar-indexed unroll).
     { const uint32_t c[] = {0xBE82047Eu,0xBE800380u,0xBE810383u,0x7E040280u,0x7E0A02F2u,0xBF880009u,
                             0xBF0A0100u,0x8584807Eu,0xBEEA0404u,0xBEFE0404u,0xBF860004u,0x060404FFu,

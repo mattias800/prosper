@@ -1,3 +1,8 @@
+---
+kind: reference
+status: current
+---
+
 # GFX10 `SW_4KB_S` texture tiling — the exact element-swizzle order
 
 **Status: SOLVED (2026-07). Pixel-verified against The Messenger's (PPSA24651) title art.**

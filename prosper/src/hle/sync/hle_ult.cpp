@@ -160,6 +160,7 @@ constexpr uint64_t kUltErrDeadlk      = hle::kSceKernelErrorEDEADLK;  // self-re
 constexpr uint64_t kUltErrNoMem       = hle::kSceKernelErrorENOMEM;
 constexpr uint64_t kUltErrInval       = hle::kSceKernelErrorEINVAL;
 constexpr uint64_t kUltErrAgain       = hle::kSceKernelErrorEAGAIN;   // runtime is at numMaxUlthread
+constexpr uint64_t kUltErrBusy        = hle::kSceKernelErrorEBUSY;    // runtime destroy with live ulthreads
 constexpr uint64_t kUltNotImplemented = hle::kSceKernelErrorENOSYS;   // the legacy/Phase 1 policy
 
 // A size-returning contract has no error channel (#1618): whatever these return is read as a byte
@@ -201,6 +202,8 @@ constexpr UltEntry kUlt[] = {
     {"byiceqcMvV0", "sceUltConditionVariableSignalAll", UltRet::Status},
     {"DsW+3FTXL0Q", "sceUltUlthreadTryJoin", UltRet::Status},
     {"HFd-lpjGxJA", "sceUltUlthreadYield", UltRet::Status},
+    {"or55417wcDk", "sceUltWaitingQueueResourcePoolDestroy", UltRet::Status},
+    {"-gxcs521SvA", "sceUltUlthreadRuntimeDestroy", UltRet::Status},
     {"TFHm6-N6vks", "_sceUltQueueDataResourcePoolCreate", UltRet::Status},
     {"evj9YPkS8s4", "sceUltQueueDataResourcePoolGetWorkAreaSize", UltRet::Size},
     {"dh11uAUWNyM", "sceUltQueueDataResourcePoolDestroy", UltRet::Status},
@@ -222,11 +225,12 @@ constexpr size_t kIdxRuntimeCreate = 0, kIdxRuntimeSize = 1, kIdxUlthreadCreate 
                  kIdxMutexDestroy = 7, kIdxCondCreate = 8, kIdxCondWait = 9, kIdxCondSignal = 10,
                  kIdxCondDestroy = 11, kIdxPoolCreate = 12, kIdxPoolSize = 13, kIdxInitialize = 14,
                  kIdxFinalize = 15, kIdxMutexTryLock = 16, kIdxCondSignalAll = 17,
-                 kIdxUlthreadTryJoin = 18, kIdxUlthreadYield = 19, kIdxDataPoolCreate = 20,
-                 kIdxDataPoolSize = 21, kIdxDataPoolDestroy = 22, kIdxQueueCreate = 23,
-                 kIdxQueuePush = 24, kIdxQueueTryPush = 25, kIdxQueuePop = 26, kIdxQueueTryPop = 27,
-                 kIdxQueueDestroy = 28, kIdxSemCreate = 29, kIdxSemAcquire = 30,
-                 kIdxSemTryAcquire = 31, kIdxSemRelease = 32, kIdxSemDestroy = 33;
+                 kIdxUlthreadTryJoin = 18, kIdxUlthreadYield = 19, kIdxPoolDestroy = 20,
+                 kIdxRuntimeDestroy = 21, kIdxDataPoolCreate = 22, kIdxDataPoolSize = 23,
+                 kIdxDataPoolDestroy = 24, kIdxQueueCreate = 25, kIdxQueuePush = 26,
+                 kIdxQueueTryPush = 27, kIdxQueuePop = 28, kIdxQueueTryPop = 29,
+                 kIdxQueueDestroy = 30, kIdxSemCreate = 31, kIdxSemAcquire = 32,
+                 kIdxSemTryAcquire = 33, kIdxSemRelease = 34, kIdxSemDestroy = 35;
 
 std::atomic<uint64_t> g_calls[kUltCount];
 std::atomic<uint64_t> g_next_report[kUltCount];   // 0 = "report the next call"
@@ -709,6 +713,36 @@ PROSPER_SYSV_ABI uint64_t ult_pool_create(uint64_t a0, uint64_t a1, uint64_t a2,
     return kUltOk;
 }
 
+// sceUltWaitingQueueResourcePoolDestroy(pool): unpublish and retire the pool. Objects bound
+// from it keep working: they resolve their pool through the generation-guarded id, which
+// misses once this clears it.
+//
+// What the firmware actually checks is NOT the number of bound objects. libSceUlt.sprx
+// (or55417wcDk, file offset 0x46c0) refuses with busy (0x80810006, at 0x473a) only while the
+// pool's waiting-queue resource counters differ (pool+0xb8 free != pool+0xbc capacity), i.e.
+// while some thread is currently WAITING on a pool-backed object -- only the contended slow
+// path of sceUltMutexLock (body 0x15330) takes one of those resources. Bound but idle objects
+// do not block destroy on hardware, so a bound mutex here is reported, not refused.
+// prosper has no per-wait resource accounting and cannot observe a waiting thread, so it
+// cannot model that busy refusal, nor the 0x80810007 a contended lock gets after the pool is
+// gone; both cases answer OK here. bound_sync_objects is diagnostic only.
+// CONFIDENCE: HIGH for idle-bound -> OK; LOW for the waiting-thread case (unmodelled).
+PROSPER_SYSV_ABI uint64_t ult_pool_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxPoolDestroy, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Pool, "sceUltWaitingQueueResourcePoolDestroy");
+    if (!o) return kUltErrSrch;
+    const uint32_t bound = o->bound_sync_objects.load(std::memory_order_relaxed);
+    if (bound != 0)
+        log_line("sceUltWaitingQueueResourcePoolDestroy on \"%s\" (0x%llx) with %u sync "
+                 "object(s) still bound -- they keep working, the pool does not",
+                 o->name.c_str(), (unsigned long long)a0, bound);
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
+    return kUltOk;
+}
+
 // =============================================================================================
 // Ulthread runtime
 // =============================================================================================
@@ -783,6 +817,39 @@ PROSPER_SYSV_ABI uint64_t ult_runtime_create(uint64_t a0, uint64_t a1, uint64_t 
              "numWorkerThread=%u workArea=0x%llx(%llu B) apiVersion=0x%x -> ok",
              o->name.c_str(), (unsigned long long)a0, num_max, num_worker,
              (unsigned long long)a4, (unsigned long long)need, o->api_version);
+    return kUltOk;
+}
+
+// sceUltUlthreadRuntimeDestroy(runtime): unpublish and retire the runtime -- but only once
+// every ulthread created on it has been joined. The firmware enforces that order:
+// libSceUlt.sprx's -gxcs521SvA is a thunk at file offset 0x1cf60 that jumps to the body at
+// 0x2bcb0, which loads runtime+0x30 (0x2bcf0) and, if it is above zero, returns 0x80810006
+// (busy, at 0x2be65) leaving the runtime untouched; otherwise it CASes the field to -1 and
+// tears the workers down. runtime+0x30 is the count of created-and-not-yet-joined ulthreads:
+// _sceUltUlthreadCreate increments it (0x2e1a4..0x2e1bb, bounded by runtime+0x34 =
+// numMaxUlthread), and Join (body 0x2e440, at 0x2e73a) and TryJoin (0x2e8c0, at 0x2e9aa)
+// decrement it. live_ulthreads is prosper's model of that field (incremented by create,
+// decremented by complete_ulthread_join).
+//
+// The refusal uses this file's libkernel-errno convention (EBUSY) rather than the raw
+// 0x80810006, like every other Ult error here. A second destroy answers ESRCH, where the
+// firmware would not refuse (-1 is not > 0); refusing is the safer answer for a dead object.
+// CONFIDENCE: HIGH that live ulthreads refuse and leave the runtime alive; LOW on the value.
+PROSPER_SYSV_ABI uint64_t ult_runtime_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
+                                              uint64_t) {
+    uint64_t out = 0;
+    if (!implement(kIdxRuntimeDestroy, &out)) return out;
+    UltObject* o = resolve(a0, UltType::Runtime, "sceUltUlthreadRuntimeDestroy");
+    if (!o) return kUltErrSrch;
+    const uint32_t live = o->live_ulthreads.load(std::memory_order_acquire);
+    if (live != 0) {
+        log_line("sceUltUlthreadRuntimeDestroy on \"%s\" (0x%llx) with %u ulthread(s) not yet "
+                 "joined -- refusing busy, the runtime stays alive",
+                 o->name.c_str(), (unsigned long long)a0, live);
+        return kUltErrBusy;
+    }
+    unpublish_object(a0);
+    o->alive.store(false, std::memory_order_release);
     return kUltOk;
 }
 
@@ -1991,10 +2058,14 @@ void register_ult_hle() {
     Hle::register_fn(kUlt[kIdxFinalize].nid,     (HleFn)ult_finalize,     kUlt[kIdxFinalize].name);
     Hle::register_fn(kUlt[kIdxPoolSize].nid,     (HleFn)ult_pool_work_area_size, kUlt[kIdxPoolSize].name);
     Hle::register_fn(kUlt[kIdxPoolCreate].nid,   (HleFn)ult_pool_create,  kUlt[kIdxPoolCreate].name);
+    Hle::register_fn(kUlt[kIdxPoolDestroy].nid, (HleFn)ult_pool_destroy,
+                     kUlt[kIdxPoolDestroy].name);
     Hle::register_fn(kUlt[kIdxRuntimeSize].nid,  (HleFn)ult_runtime_work_area_size,
                      kUlt[kIdxRuntimeSize].name);
     Hle::register_fn(kUlt[kIdxRuntimeCreate].nid, (HleFn)ult_runtime_create,
                      kUlt[kIdxRuntimeCreate].name);
+    Hle::register_fn(kUlt[kIdxRuntimeDestroy].nid, (HleFn)ult_runtime_destroy,
+                     kUlt[kIdxRuntimeDestroy].name);
     Hle::register_fn(kUlt[kIdxMutexCreate].nid,  (HleFn)ult_mutex_create,  kUlt[kIdxMutexCreate].name);
     Hle::register_fn(kUlt[kIdxMutexLock].nid, (HleFn)ult_mutex_lock, kUlt[kIdxMutexLock].name);
     Hle::register_fn(kUlt[kIdxMutexUnlock].nid, (HleFn)ult_mutex_unlock,

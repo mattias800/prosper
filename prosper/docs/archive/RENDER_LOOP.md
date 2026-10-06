@@ -1,3 +1,8 @@
+---
+kind: archive
+status: historical
+---
+
 # The render-loop frontier — post-boot-wall (2026-07-06)
 
 > **SUPERSEDED — historical bring-up log.** This document's "Status: open" below refers to July 2026.

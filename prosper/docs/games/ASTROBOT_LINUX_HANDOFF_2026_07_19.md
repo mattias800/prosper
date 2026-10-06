@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Astro Bot native-Linux graphics handoff (2026-07-19)
 
 > **Draft handoff — documentation only. Do not merge yet.** Tracks #1054 and continues the visual

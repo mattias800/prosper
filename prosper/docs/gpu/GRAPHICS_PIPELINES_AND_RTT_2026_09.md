@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Graphics pipeline and RTT investigation (2026-09-07)
 
 Issues: [#3378](https://github.com/mattias800/prosper/issues/3378),
