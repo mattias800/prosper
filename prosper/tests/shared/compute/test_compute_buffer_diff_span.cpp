@@ -26,18 +26,6 @@
 
 namespace {
 
-// Deterministic test-data generator (splitmix64). Not for any security purpose.
-struct SplitMix {
-    uint64_t state;
-    explicit SplitMix(uint64_t seed) : state(seed) {}
-    uint32_t operator()() {
-        uint64_t z = (state += 0x9e3779b97f4a7c15ull);
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-        return static_cast<uint32_t>((z ^ (z >> 31)) >> 16);
-    }
-};
-
 void check(bool ok, const std::string& message) { EXPECT_TRUE(ok) << message; }
 
 // The whole contract in one place: compare, copy only what it reported, and require the result to
@@ -159,7 +147,7 @@ TEST(ComputeBufferDiffSpan, SpanCopyReproducesFullCopy) {
 TEST(ComputeBufferBlockSync, ScatteredChangesReproduceAFullCopyAndCopyOnlyChangedBlocks) {
     using prosper::frontend::sync_compute_buffer_blocks;
     constexpr size_t kBytes = 12u << 20;   // over the parallel threshold
-    SplitMix rng(7);
+    std::mt19937 rng(7);
     std::vector<uint8_t> source(kBytes), destination;
     for (auto& b : source) b = static_cast<uint8_t>(rng());
     destination = source;
