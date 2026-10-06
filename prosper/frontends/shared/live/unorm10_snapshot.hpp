@@ -9,7 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
+
+#include "gpu/execute/gpu_execute.hpp"
 
 namespace prosper::frontend {
 
@@ -31,6 +34,17 @@ inline bool unpack_unorm10_to_rgba8(const uint8_t* packed, size_t packed_bytes, 
         rgba8[t * 4 + 3] = static_cast<uint8_t>((a * 255u + 1u) / 3u);
     }
     return true;
+}
+
+// Publish an exact RGB10A2 compute result into the renderer target at `addr` as RGBA8. No renderer
+// pixel format carries 10:10:10:2, so without this the target kept its old pixels under a picture the
+// compute chain had composited (a flipped display buffer stayed black).
+inline void publish_unorm10_as_rgba8(uint64_t addr, uint32_t width, uint32_t height,
+                                     const uint8_t* packed, size_t packed_bytes) {
+    auto rgba8 = std::make_shared<std::vector<uint8_t>>();
+    if (!unpack_unorm10_to_rgba8(packed, packed_bytes, width, height, *rgba8)) return;
+    prosper::gpu::notify_live_render_target_image_written(
+        {addr, width, height, prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm, std::move(rgba8)});
 }
 
 } // namespace prosper::frontend
