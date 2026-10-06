@@ -2917,7 +2917,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // reach the target. Identified by the operation's vertex program (efc_helper_program.hpp), never
     // by MODE alone: titles latch MODE=2 onto ordinary draws that must still write.
     if (is_agc_eliminate_fast_clear_operation(
-            rs.cb_color_control, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr)),
+            rs.cb_color_control,
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr)),
             vs_program_dwords)) {
         for (auto& target : ps.color_targets) target.write_mask = 0;
         ps.color_write_mask = 0;

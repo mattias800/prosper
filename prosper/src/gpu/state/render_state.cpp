@@ -191,9 +191,10 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // measurable for #1706. The atomic pre-increment gives every caller a distinct value, so no
     // power-of-two line is duplicated or lost when threads race here.
     if ((count & (count - 1u)) == 0u)
-        fprintf(stderr, "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
-                        "color-block operation -> executed as an ordinary color draw unless "
-                        "it is AGC's eliminate-fast-clear rectangle (count=%llu)\n",
+        fprintf(stderr,
+                "[gpu] resolve_pipeline_state: CB_COLOR_CONTROL.MODE=%u is an unmodeled "
+                "color-block operation -> executed as an ordinary color draw unless "
+                "it is AGC's eliminate-fast-clear rectangle (count=%llu)\n",
                 mode, static_cast<unsigned long long>(count));
 }
 
