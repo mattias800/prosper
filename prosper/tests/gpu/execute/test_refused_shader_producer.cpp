@@ -291,6 +291,7 @@ TEST_F(RefusedShaderProducer, OwnedWaveGateRefusalKeepsTheProgramAndItsReason) {
     GpuState::Draw packet;
     packet.index_count = 3;
     packet.command_order = 4555;
+    testing::internal::CaptureStderr();
     for (int repeat = 0; repeat < 3; ++repeat) {
         DrawItem item;
         OperationRealizationFailure failure;
@@ -298,6 +299,7 @@ TEST_F(RefusedShaderProducer, OwnedWaveGateRefusalKeepsTheProgramAndItsReason) {
             realize_draw_item(state, &packet, 3, std::size(vertex_words), false, item, &failure));
         EXPECT_EQ(failure.reason, RealizationFailureReason::ShaderRecompile);
     }
+    const std::string log = testing::internal::GetCapturedStderr();
     const std::vector<uint32_t> expected(std::begin(fragment), std::end(fragment));
     ASSERT_EQ(recorded_words(), (std::vector<std::vector<uint32_t>>{expected}))
         << "one copy of the refused fragment program, however many draws it lost";
@@ -308,6 +310,13 @@ TEST_F(RefusedShaderProducer, OwnedWaveGateRefusalKeepsTheProgramAndItsReason) {
     EXPECT_NE(lines.find("refusal=draw-wave-known-fragment64-launch-unavailable"),
               std::string::npos)
         << lines;
+    // The line a person reads in the run log names the reason too, not only index.txt (#4580).
+    const size_t announced = log.find("[refused-shader] ps 0x");
+    ASSERT_NE(announced, std::string::npos) << log;
+    const std::string line = log.substr(announced, log.find('\n', announced) - announced);
+    EXPECT_NE(line.find(" refusal=draw-wave-known-fragment64-launch-unavailable -> "),
+              std::string::npos)
+        << line;
 }
 
 TEST_F(RefusedShaderProducer, PreKeyGraphicsGuardsStillKeepOriginalEvidence) {
