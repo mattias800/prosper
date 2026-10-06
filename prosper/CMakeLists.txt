@@ -4973,6 +4973,14 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
+      # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
+      # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.
+      prosper_add_gtest(test_ngg_subgroup_backend
+        SOURCES tests/gpu/execute/test_ngg_subgroup_backend.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 240)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)

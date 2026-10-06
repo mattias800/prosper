@@ -30,6 +30,7 @@
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
 #include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
@@ -111,6 +112,9 @@ struct DrawItem {
     // does not mark a draw ready or promote host raster observations to guest entry values.
     std::shared_ptr<const RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
+    // A merged ES+GS NGG draw the backend runs through its subgroup shell (#3135 P4). No producer
+    // sets it yet: live admission is P5.
+    std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
     // Ordered source authority only. Never serialized or interpreted as ready resource backing.
     std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V

@@ -35,6 +35,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `ngg_subgroup_plan` — partitions a merged ES+GS NGG draw into guest subgroups and computes the
   launch SGPR s3 and VGPRs v0..v8 each wave receives (#3135 phase P1). Partition choices the public
   sources do not settle are an explicit, documented policy; anything unmodelled is a refusal.
+- `ngg_subgroup_draw` — the immutable description of one merged-NGG draw the backend runs (P4): the
+  plan, the shell and pass-through stages compiled per wave count, the launch records, and the runs
+  that draw the subgroups back in plan order. `build_ngg_subgroup_draw` is what a producer calls;
+  the Vulkan half is `tests/fixtures/ngg_subgroup_gpu.h`.
 - `srt_publication_dedupe.hpp` — which of those uses the graphics stage table publishes: once per
   key while the key resolves by `srt_offset`, once per consuming pc once it clashes. Getting this
   wrong leaves a consumer with no resource and refuses the whole program.

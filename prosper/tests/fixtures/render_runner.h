@@ -34,6 +34,7 @@
 #include "gpu/recompiler/original_graphics_draw_effects.hpp"
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ngg_subgroup_draw.hpp"   // #3135 P4: merged-NGG draws
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -1747,6 +1748,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         feats.vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics;
         feats.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
         r.fragment_stores_atomics = supported.fragmentStoresAndAtomics;
+        r.vertex_pipeline_stores = supported.vertexPipelineStoresAndAtomics;
         // Per-draw fragment-funnel diagnostic (PROSPER_DRAW_STATS): pipeline statistics + precise
         // occlusion. Enable only when advertised; costs nothing unless the diagnostic is used.
         feats.pipelineStatisticsQuery = supported.pipelineStatisticsQuery;
@@ -8383,6 +8385,7 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 #include "fixtures/fragment_draw_collect_gpu.h"
 #include "fixtures/fragment_draw_backend_transaction.h"
 #include "fixtures/owned_graphics_wave_gpu.h"
+#include "fixtures/ngg_subgroup_gpu.h"
 
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
@@ -8527,6 +8530,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         }
         draws = completed_owned_draws;
+    }
+    std::vector<BackendDraw> ngg_draws;   // #3135 P4: each merged-NGG draw becomes its run draws
+    std::shared_ptr<NggSubgroupBackendBatch> ngg_batch;
+    if (std::any_of(draws.begin(), draws.end(),
+                    [](const auto& d) { return bool(d.ngg_subgroup); })) {
+        std::string refusal;
+        if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal)) {
+            std::fprintf(stderr, "[ngg-backend] refused pass %s\n", refusal.c_str());
+            return out;
+        }
+        draws = ngg_draws;
     }
     bool avoid_cache_eviction = active_submission.pending() ||
                                 backend_has_unproven_submission();
@@ -10622,6 +10636,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         descriptor_sets += fragment_draw_batch->additional_sets();
         storage_buffers += fragment_draw_batch->additional_storage_descriptors();
     }
+    if (ngg_batch) descriptor_sets += ngg_batch->additional_sets();
+    if (ngg_batch) storage_buffers += ngg_batch->additional_storage_descriptors();
     const bool descriptor_pool_counts_fit =
         descriptor_sets <= UINT32_MAX && storage_buffers <= UINT32_MAX &&
         sampled_images <= UINT32_MAX && storage_images <= UINT32_MAX;
@@ -12870,7 +12886,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             buffer_resources_ready = false;
                             break;
                         }
-                        draw_dbi[draw_dbi_offset[i]] = {r.fragment_draw_buffer->buffer(), 0,
+                        draw_dbi[draw_dbi_offset[i]] = {r.fragment_draw_buffer->buffer(),
+                                                        r.fragment_draw_buffer->offset(),
                                                         r.fragment_draw_buffer->bytes()};
                         draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                         draw_wr[i].dstBinding = r.binding;
@@ -13051,7 +13068,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 draw_wr[i].dstSet = v.dsets[R[i].common().set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
         }
-        if (fragment_draw_batch && !fragment_draw_batch->allocate(di, shared_descriptor_pool)) {
+        if ((fragment_draw_batch && !fragment_draw_batch->allocate(di, shared_descriptor_pool)) ||
+            (ngg_batch && !ngg_batch->capture(di, v.dsets[0], draw_wr, shared_descriptor_pool))) {
             texture_path_census.skipped_draw();
             prosper::gpu::draw_disposition_census().note_dropped(
                 prosper::gpu::DrawDrop::PipelineCreation);
@@ -14023,9 +14041,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // The dst stage must cover every stage that samples this image. Set-0 textures are visible
         // to the vertex or mesh stage as well as fragment; a fragment-only barrier leaves those
         // reads unordered after the transfer write (SYNC-HAZARD-READ-AFTER-WRITE). Match the
-        // enabled binding stages, including optional mesh shaders (#454).
+        // enabled binding stages, including optional mesh shaders (#454), and the merged-NGG
+        // shell's compute stage when this pass dispatches one (#3135 P4).
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             graphics_shader_stages,
+                             graphics_shader_stages |
+                                 (ngg_batch ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u),
                              0, 0, nullptr, 0, nullptr, 1, &b1);
     }
     // Compute-owned typed storage results rest in GENERAL. Borrow each exact image once per call,
@@ -14344,6 +14364,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         record_pipeline_dynamic_state(command, v);
     };
     if (fragment_draw_batch) fragment_draw_batch->record(cmd, std::span<const DV>(dv));
+    if (ngg_batch) ngg_batch->record(cmd, active_submission);
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -14481,6 +14502,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    if (ngg_batch) ngg_batch->record_after_pass(cmd);
     if (fragment_draw_batch && flush_now)
         fragment_draw_batch->record_observations_after_replay(cmd, std::span<const DV>(dv));
     // #2944: the geometry probe maps both transform-feedback buffers below. Transform feedback does
@@ -16056,6 +16078,14 @@ inline size_t depth_feedback_split_index(std::span<const BackendDraw> draws,
     return draws.size();
 }
 
+// Where the first segment ends: a depth feedback transition (persistent depth only) or a merged-NGG
+// draw, which is always a segment of its own (#3135 P4, ngg_subgroup_gpu.h).
+inline size_t backend_segment_split_index(std::span<const BackendDraw> draws, uint32_t W,
+                                          uint32_t H, bool persist_depth_stencil) {
+    const size_t ngg = ngg_segment_split_index(draws);
+    return persist_depth_stencil ? std::min(ngg, depth_feedback_split_index(draws, W, H)) : ngg;
+}
+
 // The contract one SEGMENT of a depth-feedback-split pass renders under.
 //
 // Extracted so the segment decisions are testable at the site that makes them. Every field here was
@@ -16168,8 +16198,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         return {};
     }
-    if (!persist_depth_stencil ||
-        depth_feedback_split_index(all, W, H) == all.size())
+    if (backend_segment_split_index(all, W, H, persist_depth_stencil) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
                                      persist_depth_stencil, color_target, seed_rgba1,
                                      clear_rgba1, out_rgba1, submission_batch,
@@ -16322,7 +16351,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     size_t begin = 0;
     while (begin < all.size()) {
         const std::span<const BackendDraw> remaining = all.subspan(begin);
-        const size_t relative_end = depth_feedback_split_index(remaining, W, H);
+        const size_t relative_end =
+            backend_segment_split_index(remaining, W, H, persist_depth_stencil);
         const size_t end = begin + relative_end;
         const bool final = end == all.size();
 
@@ -16339,10 +16369,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         BackendMrtOutputs* segment_mrt = mrt_outputs
             ? (final ? mrt_outputs : &intermediate_mrt) : nullptr;
         std::vector<uint8_t> rendered = render_draw_pass_rgba(
-            all.subspan(begin, end - begin), W, H, next_seed0,
-            begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
-            begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
-            final ? flush_submission_batch : false, all,
+            all.subspan(begin, end - begin), W, H, next_seed0, begin ? nullptr : clear_rgba,
+            persist_depth_stencil, segment_target_ptr, next_seed1, begin ? nullptr : clear_rgba1,
+            segment_out1, submission_batch, final ? flush_submission_batch : false, all,
             segment_mrt, want_color_readback);
         add_stats();
 
