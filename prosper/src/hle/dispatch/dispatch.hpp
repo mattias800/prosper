@@ -344,6 +344,10 @@ void ult_dump_call_log(FILE* f);
 // Test seams for the return policies (PROSPER_ULT_RETURN_SUCCESS / PROSPER_ULT_LEGACY_ENOSYS) and
 // the counters. Each setter returns the previous policy. Production code must not call these.
 bool ult_set_return_success_for_test(bool return_success);
+// Called with the export name after every successful Ult object lookup, before the operation
+// takes the object's lock, so a test can hold it there deterministically. Returns the previous
+// hook. Production code must not call this.
+void (*ult_set_resolve_hook_for_test(void (*hook)(const char* fn)))(const char*);
 bool ult_set_legacy_enosys_for_test(bool legacy_enosys);
 // Highest number of ulthreads of this runtime observed RUNNING at once (the #1603 amendment-2b
 // deviation counter), and the last join's measured guest-stack high-water (amendment 6).
