@@ -522,7 +522,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     }
     SpirvCompute b;
     b.diagnostic = diagnostic;
-    b.ngg_workgroup_export_probe = true;
+    b.ngg_workgroup_shell = true;
     if (trace) {
         b.ngg_probe_trace_pc = trace_pc;
         b.ngg_probe_trace_vgpr = trace_vgpr;

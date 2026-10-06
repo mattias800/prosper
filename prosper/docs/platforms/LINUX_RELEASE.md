@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Using the Linux release
 
 The Linux archives contain the native `prosper-app` frontend: a Vulkan window with audio and

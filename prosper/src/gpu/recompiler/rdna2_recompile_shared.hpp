@@ -123,8 +123,11 @@ inline std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2I
         // block [br, target), then this execz is a data-dependent loop's EXIT, not an if/guard-to-end —
         // even when its target happens to be s_endpgm. Linearizing it here would strand the loop's
         // back-edge as a straight-line reject; instead leave it OUT of `safe` so detect_divergent_loops
-        // claims it and emit_divloop reconstructs the structured loop. Back-edges are the shapes that
-        // detector recognizes: unconditional s_branch (0x02) or s_cbranch_execnz (0x09).
+        // claims it and emit_divloop reconstructs the structured loop. Back-edges checked here are
+        // unconditional s_branch (0x02) and s_cbranch_execnz (0x09). The detector also accepts a
+        // bottom-tested s_cbranch_scc0/scc1 loop (#4518); an execz exit to the end inside one is
+        // deliberately still linearized, as for CountedLoop: the loop runs its scalar trip count with
+        // the exited lanes inactive, because the detector refuses any interior exit of an SCC do-while.
         bool is_loop_exit = false;
         for (const auto& bb : ins) {
             if (bb.fmt != Rdna2Format::SOPP || (bb.opcode != 0x02 && bb.opcode != 0x09)) continue;

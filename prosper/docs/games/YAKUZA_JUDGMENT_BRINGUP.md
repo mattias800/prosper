@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # *Yakuza Kiwami* (`PPSA31334`) and *Judgment* (`PPSA02739`) — Ryu Ga Gotoku bring-up
 
 Two SEGA / Ryu Ga Gotoku Studio titles that share an engine family (PAR archives, CRIWARE

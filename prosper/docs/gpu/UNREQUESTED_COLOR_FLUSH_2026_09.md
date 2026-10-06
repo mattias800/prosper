@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Unrequested color-readback synchronization (2026-09-07)
 
 Issue [#2283](https://github.com/mattias800/prosper/issues/2283) has two distinct parts. The

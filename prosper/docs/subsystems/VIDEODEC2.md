@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # `libSceVideodec2` — the access-unit video decoder
 
 `sceVideodec2` is a **raw elementary-stream decoder**, and that is the whole reason it needs its own

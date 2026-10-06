@@ -268,6 +268,92 @@ TEST(Rtc, TickAddCalendarClamps) {
     EXPECT_EQ(back.day, 29u) << "Feb 29 + 4 years stays on Feb 29";
 }
 
+// #4502: sceRtcGetTick must give the same tick on every host. It used the C library, whose
+// range depends on the host: glibc converts every year, macOS's timegm returned -1 for year 1,
+// and Windows' _mkgmtime64 returned -1 for year 1 and for year 9999. A -1 is "one second before
+// 1970", and the two tests below this one stepped from there. These are fixed answers, not a
+// comparison against the host's libc.
+TEST(Rtc, GetTickIsTheSameOnEveryHost) {
+    register_builtin_hle();
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    ASSERT_NE(get_tick, nullptr);
+    const auto tick_of = [&](DateTime t) {
+        uint64_t tick = 0x5A5A5A5A5A5A5A5Aull;
+        EXPECT_EQ(get_tick(addr(&t), addr(&tick), 0, 0, 0, 0), 0u);
+        return tick;
+    };
+    constexpr uint64_t kDay = 86400000000ull;
+    EXPECT_EQ(tick_of(ymd(1, 1, 1)), 0u) << "the RTC epoch";
+    EXPECT_EQ(tick_of(ymd(1970, 1, 1)), 62135596800000000ull) << "the unix epoch";
+    EXPECT_EQ(tick_of(ymd(2024, 1, 1)), kTick20240101);
+    EXPECT_EQ(tick_of(ymd(1601, 1, 1)), 0xb36168b6a58000ull) << "before 1970: the FILETIME epoch";
+    // 0001-01-01 to 10000-01-01 is 3,652,059 days; the last microsecond of year 9999 is one less.
+    EXPECT_EQ(tick_of(ymd(9999, 12, 31, 23, 59, 59, 999999)), 3652059ull * kDay - 1ull)
+        << "year 9999, where a 32-bit-era or bounded timegm gives up";
+
+    // The handler does not validate (#4462 tracks that), so an out-of-range field carries, as
+    // timegm carries it. Each expectation is a valid date's fixed tick.
+    EXPECT_EQ(tick_of(ymd(2023, 13, 1)), kTick20240101) << "month 13 is January of the next year";
+    EXPECT_EQ(tick_of(ymd(2024, 0, 1)), kTick20240101 - 31ull * kDay) << "month 0 is December";
+    EXPECT_EQ(tick_of(ymd(2022, 25, 1)), kTick20240101)
+        << "month 25 carries two whole years (the civil-day formula alone stops at month 14)";
+    EXPECT_EQ(tick_of(ymd(2024, 2, 31)), kTick20240101 + (31ull + 29ull + 1ull) * kDay)
+        << "February 31 of a leap year is March 2";
+    EXPECT_EQ(tick_of(ymd(2024, 1, 0)), kTick20240101 - kDay) << "day 0 is the day before";
+    // Day 0 of March in a year divisible by 400: the day must be added OUTSIDE the civil-day
+    // formula, whose unsigned day count would wrap here and nowhere else in this list.
+    EXPECT_EQ(tick_of(ymd(2000, 3, 0)), 63087379200000000ull) << "2000-03-00 is February 29";
+    EXPECT_EQ(tick_of(ymd(2024, 1, 1, 25, 61, 61)),
+              kTick20240101 + (25ull * 3600ull + 61ull * 60ull + 61ull) * 1000000ull)
+        << "hours, minutes and seconds carry linearly";
+    EXPECT_EQ(tick_of(ymd(0, 1, 1)), (uint64_t)(-366ll * (int64_t)kDay))
+        << "year 0 is a leap year before the epoch; the tick wraps as it always did";
+}
+
+#ifdef __GLIBC__
+// The same handler against glibc's own timegm over arbitrary field values: on Linux, where every
+// title has run so far, replacing the libc call must not change a single tick.
+TEST(Rtc, GetTickMatchesGlibcTimegmForArbitraryFields) {
+    register_builtin_hle();
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    ASSERT_NE(get_tick, nullptr);
+    uint32_t state = 0x4502u;
+    const auto next = [&](uint32_t bound) {
+        state = state * 1664525u + 1013904223u;
+        return (uint16_t)((state >> 8) % bound);
+    };
+    for (int i = 0; i < 20000; ++i) {
+        // Mostly plausible dates with out-of-range fields mixed in; every eighth draw uses the
+        // full 16-bit range for each field.
+        const bool wild = i % 8 == 7;
+        // One statement per field: argument evaluation order is unspecified, and the tuples
+        // must be the same under every compiler.
+        const uint16_t year = next(wild ? 65536u : 10001u);
+        const uint16_t month = next(wild ? 65536u : 16u);
+        const uint16_t day = next(wild ? 65536u : 34u);
+        const uint16_t hour = next(wild ? 65536u : 26u);
+        const uint16_t minute = next(wild ? 65536u : 62u);
+        const uint16_t second = next(wild ? 65536u : 62u);
+        const uint32_t microsecond = (uint32_t)next(1000u) * 1000u;
+        DateTime t = ymd(year, month, day, hour, minute, second, microsecond);
+        struct tm tmv{};
+        tmv.tm_year = (int)t.year - 1900;
+        tmv.tm_mon = (int)t.month - 1;
+        tmv.tm_mday = (int)t.day;
+        tmv.tm_hour = (int)t.hour;
+        tmv.tm_min = (int)t.minute;
+        tmv.tm_sec = (int)t.second;
+        const int64_t secs = (int64_t)timegm(&tmv);
+        const uint64_t want =
+            (uint64_t)(secs * 1000000ll + (int64_t)t.microsecond + 62135596800000000ll);
+        uint64_t got = 0;
+        ASSERT_EQ(get_tick(addr(&t), addr(&got), 0, 0, 0, 0), 0u);
+        ASSERT_EQ(got, want) << t.year << "-" << t.month << "-" << t.day << " " << t.hour << ":"
+                             << t.minute << ":" << t.second;
+    }
+}
+#endif
+
 TEST(Rtc, TickAddCalendarOutOfRangeIsSuccessWithoutAWrite) {
     // The module zeroes eax before its range checks: an out-of-range result returns SCE_OK and
     // leaves the output untouched. INVALID_POINTER is the only error either function returns.

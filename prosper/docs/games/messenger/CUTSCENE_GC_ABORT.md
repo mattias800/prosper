@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Cutscene blocker — IL2CPP GC "Unexpected state" abort on the level1 (intro) load (2026-07)
 
 After the title screen (`level0`) renders correctly, the game **always reaches the intro

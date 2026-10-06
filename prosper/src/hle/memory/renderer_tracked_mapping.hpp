@@ -19,3 +19,7 @@ prosper_renderer_guest_address_tracked(uint64_t addr);
 // need materialization before a host reader dereferences it. Reservations return no bytes.
 extern "C" uint64_t prosper_renderer_guest_mapped_readable_prefix(
     uint64_t addr, uint64_t bytes);
+
+// Advances whenever the set of tracked guest mappings changes. A result derived from the mapping table
+// (such as a window clamp) stays valid exactly while this value is unchanged.
+extern "C" uint64_t prosper_renderer_tracked_mapping_generation();

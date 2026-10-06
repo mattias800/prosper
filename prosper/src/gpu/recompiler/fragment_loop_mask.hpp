@@ -99,13 +99,7 @@ inline FragmentLoopMaskProof prove_fragment_loop_mask(
             return decline("unknown-instruction", in.pc);
         // Relative SGPR operations can touch a register not named by a decoded operand. Indirect
         // control and subvector calls likewise escape the direct CFG used by the liveness walk.
-        if ((in.fmt == Rdna2Format::SOP1 &&
-             ((in.opcode >= kSop1OpcodeSetpcB64 && in.opcode <= kSop1OpcodeRfeB64) ||
-              (in.opcode >= 0x2e && in.opcode <= 0x31) || in.opcode == 0x49)) ||
-            (in.fmt == Rdna2Format::SOPK &&
-             (in.opcode == kSopkOpcodeCallB64 ||
-              in.opcode == kSopkOpcodeSubvectorLoopBegin ||
-              in.opcode == kSopkOpcodeSubvectorLoopEnd)))
+        if (rdna2_escapes_decoded_effects(in))
             return decline("unmodelled-control-or-relative-sgpr", in.pc);
         if (in.fmt == Rdna2Format::SOPP) {
             if (sopp_opcode_is_direct_branch(in.opcode)) {

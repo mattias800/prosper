@@ -71,6 +71,19 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.reg_offset = pl[0]; c.reg_value = pl[1];
                 c.reg_count = npl - 1; c.reg_data = &pl[1];
             }
+        } else if (c.op == IT_INDIRECT_BUFFER && npl == 13) {
+            // sceAgcCbBranch's packet (#4540). Other lengths of this opcode are not emitted by any
+            // prosper builder and stay Unknown.
+            c.kind = K::CondIndirectBuffer;
+            c.cib_mode = pl[0] & 3u;
+            c.cib_func = (pl[0] >> 8) & 7u;
+            c.cib_compare_addr = lo_hi(&pl[1]) & ~7ull;
+            c.cib_mask = lo_hi(&pl[3]);
+            c.cib_reference = lo_hi(&pl[5]);
+            c.cib_then_addr = lo_hi(&pl[7]) & ~3ull;
+            c.cib_then_dwords = pl[9] & 0xfffffu;
+            c.cib_else_addr = lo_hi(&pl[10]) & ~3ull;
+            c.cib_else_dwords = pl[12] & 0xfffffu;
         } else if (c.op == IT_NOP) {
             switch (c.r) {
                 case R_DRAW_RESET:    c.kind = K::DrawReset;    break;

@@ -132,6 +132,15 @@ public:
                                    const char* name) {
         register_guest_abi_fn(nid, reinterpret_cast<HleFn>(fn), name);
     }
+    // The same escape hatch for a FIXED argument list too wide for the Windows integer prologue
+    // (kLegacyForwardedArgs). Its arguments past the sixth are guest stack words, which a guest-ABI
+    // handler reads in place; the converting bridge would drop those past the tenth, and a declared
+    // integer-only signature is placed by that same prologue (needs_conversion() is false).
+    template <class R, class... A>
+    static void register_guest_abi(const std::string& nid, PROSPER_GUEST_ABI R (*fn)(A...),
+                                   const char* name) {
+        register_guest_abi_fn(nid, reinterpret_cast<HleFn>(fn), name);
+    }
     static void  register_guest_abi_fn(const std::string& nid, HleFn fn, const char* name);
     // Whether the handler for a NID is compiled in the guest's convention. The Windows import stub
     // consults this and emits a bare tail-jump; every other platform emits one regardless.

@@ -282,11 +282,10 @@ int main(int argc, char** argv) {
     // nulled, as the register proof itself evaluates it) and register-proven.
     if (raw_wide_proof) {
         const auto needs = rdna2_raw_wide_data_loads(instructions);
-        auto nulled = instructions;
-        for (auto& in : nulled)
-            if (in.fmt == Rdna2Format::SMEM && (in.opcode == 0x2u || in.opcode == 0x3u))
-                in.src[1] = {OperandKind::Special, 125};
-        const auto entry = rdna2_proven_raw_immediate_wide_data_loads(nulled);
+        const auto diagnoses = rdna2_raw_wide_data_load_diagnoses(instructions);
+        // The register proof's own entry stage (pointer lifetime ends at the load), so the column
+        // never reports a blocker that proof no longer applies.
+        const auto entry = rdna2_proven_raw_register_wide_entry_loads(instructions);
         const auto registered = rdna2_proven_raw_register_wide_data_loads(instructions);
         const auto has = [](const std::vector<uint32_t>& set, uint32_t pc) {
             return std::find(set.begin(), set.end(), pc) != set.end();
@@ -296,10 +295,17 @@ int main(int argc, char** argv) {
             if (in.fmt != Rdna2Format::SMEM || (in.opcode != 0x2u && in.opcode != 0x3u)) continue;
             ++loads;
             std::printf("raw-wide-load pc=%u op=0x%x sbase=s%d soffset-kind=%d soffset=%d "
-                        "imm=0x%x needs-backing=%d entry-proven=%d register-proven=%d\n",
+                        "imm=0x%x needs-backing=%d entry-proven=%d register-proven=%d",
                         in.pc, in.opcode, in.src[0].value, static_cast<int>(in.src[1].kind),
                         in.src[1].value, in.literal, has(needs, in.pc) ? 1 : 0,
                         has(entry, in.pc) ? 1 : 0, has(registered, in.pc) ? 1 : 0);
+            // Appended only to a flagged row, so every existing consumer of the first nine
+            // fields reads the same text as before.
+            for (const RawWideLoadDiagnosis& why : diagnoses)
+                if (why.load_pc == in.pc)
+                    std::printf(" backing-blocker=%u:%s numeric-blocker=%u:%s", why.backing_pc,
+                                why.backing_kind, why.numeric_pc, why.numeric_kind);
+            std::printf("\n");
         }
         std::printf("raw-wide-proof-end instructions=%zu loads=%zu\n", instructions.size(), loads);
         return 0;

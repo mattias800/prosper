@@ -63,7 +63,11 @@ def toplevel():
     `--stdin-filename` against its cwd only, so both ruff and file reads run from here: from a
     subdirectory (ctest runs in the build tree) ruff would silently fall back to its defaults."""
     out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
     )
     return Path(out.stdout.strip())
 
@@ -75,6 +79,7 @@ def ruff(args, stdin=None):
         input=stdin,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
         cwd=toplevel(),
     )
@@ -112,7 +117,12 @@ def validate_ref(ref):
 def git(*args):
     """Run git at the checkout root and return stdout, raising on failure."""
     return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True, cwd=toplevel()
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        cwd=toplevel(),
     ).stdout
 
 

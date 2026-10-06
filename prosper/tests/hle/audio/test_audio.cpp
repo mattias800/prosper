@@ -1448,7 +1448,8 @@ int main(int argc, char** argv) {
     CHECK(call_raw("pgFAiLR5qT4", 0, PTR(&sys_info)) == 0); // SystemQueryBufferSize
     CHECK(sys_info.host_buffer == 0);
     CHECK(sys_info.host_buffer_size == 0x1000);
-    CHECK(sys_info.reserved[0] == 0 && sys_info.user_data == 0);
+    // The native query clears hostBuffer..reserved[4] (0x38 bytes); userData is the caller's.
+    CHECK(sys_info.reserved[0] == 0 && sys_info.user_data == 0xEEEEEEEEEEEEEEEEull);
     std::vector<uint8_t> sys_work(sys_info.host_buffer_size, 0);
     sys_info.host_buffer = PTR(sys_work.data());
     uint64_t system = 0xDEADBEEFDEADBEEFull;
@@ -1474,7 +1475,7 @@ int main(int argc, char** argv) {
     CHECK(call_raw("MwmHz8pAdAo", rack, 1, PTR(&voice)) == 0);
     CHECK(voice != 0 && voice != 0xDEADBEEFDEADBEEFull);
     uint64_t invalid_voice = 0xDEADBEEFDEADBEEFull;
-    CHECK((int32_t)call_raw("MwmHz8pAdAo", rack, 2, PTR(&invalid_voice)) == (int32_t)0x804A0302);
+    CHECK((int32_t)call_raw("MwmHz8pAdAo", rack, 2, PTR(&invalid_voice)) == (int32_t)0x804A8305);
     CHECK(invalid_voice == 0xDEADBEEFDEADBEEFull);
 
     // sceNgs2VoiceGetState fills SceNgs2SamplerVoiceState: state_flags@0x00 (Empty for an un-fed voice),
@@ -1490,14 +1491,14 @@ int main(int argc, char** argv) {
     for (int i = 0x20; i < 0x30; i++) CHECK(voice_state[i] == 0);   // user_data + waveform_data cleared
 
     uint8_t ngs_pcm[256]; memset(ngs_pcm, 0xA5, sizeof ngs_pcm);
-    RenderInfo render{PTR(ngs_pcm), sizeof ngs_pcm, 0, 2};
+    RenderInfo render{PTR(ngs_pcm), sizeof ngs_pcm, 0x18, 2};   // 0x18: a type the native module takes
     CHECK(call_raw("i0VnXM-C9fc", system, PTR(&render), 1) == 0);
     for (uint8_t b : ngs_pcm) CHECK(b == 0);               // silent backend produces silence
-    CHECK((int32_t)call_raw("i0VnXM-C9fc", 0, PTR(&render), 1) == (int32_t)0x804A0230);
-    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, 1, 1) == (int32_t)0x804A0053);
-    RenderInfo inaccessible_output{1, 16, 0, 2};
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", 0, PTR(&render), 1) == (int32_t)0x804A8201);
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", system, 1, 1) == (int32_t)0x804A8010);
+    RenderInfo inaccessible_output{1, 16, 0x18, 2};
     CHECK((int32_t)call_raw("i0VnXM-C9fc", system, PTR(&inaccessible_output), 1) ==
-          (int32_t)0x804A0053);
+          (int32_t)0x804A8010);
 
     uint8_t source[0xA8], listener[0xA0], listener_work[0x60];
     memset(source, 0xBB, sizeof source); memset(listener, 0xBB, sizeof listener);

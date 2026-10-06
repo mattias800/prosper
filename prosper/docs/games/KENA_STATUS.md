@@ -1,8 +1,55 @@
+---
+kind: status
+status: current
+---
+
 # Kena: Bridge of Spirits (`PPSA01802`) — status
 
 Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK `0x03000000`. Tracker
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
+
+## Linux/AMD shader refusals (2026-10-06)
+
+**Read this first.** Counts are distinct refused programs (vertex / fragment / compute), all on Linux/RADV with `prosper-app`, a default launch, `PROSPER_NULL_PAGE=1`, no input and `PROSPER_DBG=1`. Runs are 260 s unless noted, and each row is its own run or runs, measured on that fix's branch. The counts vary from run to run with what the title streams: the vertex column reads 6 or 8 for the same code. The title picture is unchanged, the menu over a black world, which is the zero colour LUT (#3135).
+
+| build | refused programs | what changed |
+|---|---|---|
+| main `9b223e64` (1 run, 240 s) | 26 / 25 / 5 | — |
+| #4576 (3 runs, 240 s) | 6 / 6 / 2, 6 / 6 / 2, 11 / 12 / 4 | `sceAgcCbBranch` targets used to be folded at record time and paired with the previous fold's pipeline; the branch now runs in-stream |
+| #4584 (1 clean run) | 8 / 0 / 2 | a V# read at two PCs under a clashed key left the second consumer without a resource (`unresolved-cbuf`). #4588 closes the unclashed variant and was not measured on Kena |
+| #4587 (1 run, without #4584) | 6 / 5 / 2 | an `s_load_dwordx2` index pair as the source of a raw-wide register offset; vertex dropped draws per 5 s window fell from 4,294 to about 800 |
+| main `b295a17a`, all of the above (2 runs) | 6 / 2 / 2, 6 / 1 / 2 | the fragment refusals are a new class, a base-0 T# in a direct sharp slot (#4592), absent from the earlier runs' scenes |
+
+What remains (each run's refused shaders are dumped under `PROSPER_CAPTURE_DIR/refused_shaders_*`):
+- **Fragment:** #4592.
+- **Vertex**, diagnosed 2026-10-06; shares are of about 650 dropped vertex draws per 5 s:
+  - **About 61%:** the merged ES+GS NGG chain (a 102-dword prolog linked to a 413-dword main). It is the same program as #3857's strip-layer producer, and it is refused at the main's `v_mbcnt` over a ballot mask, with LDS and `GS_ALLOC_REQ`. No proof rule fixes it; it needs the merged-NGG launch (#3135).
+  - **About 28%:** a 1,526-dword program (three copies). Its register-offset wide load's pointer pair is rewritten after the load, which the whole-program pointer-stability rule refuses.
+  - **About 11%:** two large NGG programs (pc 326/330). They hit the same pointer rule, plus the x1/x2 source proof refusing any branch before the source.
+- **Compute**, diagnosed 2026-10-06:
+  - **388 dwords:** a counted-loop route claims the program and refuses on a prelude EXEC do-while instead of falling back to the general CFG route.
+  - **2,060 dwords:** three stacked CFG-dispatcher gaps (entry-M0 save over an ambiguous pair; a spill slot classified mask program-wide; a mask reassembled from two spilled halves). With all three applied in a scratch build, it compiles and passes `spirv-val`.
+
+## Handoff to Linux/AMD (2026-10-05)
+
+**The sections below predate the 2026-10-06 entry above.** Measured on Windows/RTX 4090 with the normal
+`prosper-app` at 25% volume, one 150 s title-screen run per arm (needs `PROSPER_NULL_PAGE=1`). The
+title menu still renders over a black world.
+
+- **The largest dropped-draw cause is now vertex recompile, not Wave64.** After #4010's proven-vote
+  lowering, fragment `subgroup-contract` refusals fell from 37,118 to 11,636 uses over comparable runs.
+  `shader-recompile/vertex` became the top reason, at 26,211 draws on the pre-#4425 run.
+- **#4425 (main `0ebb929b`) removed two phantom raw-wide refusals.** One counted image reads as guest
+  writes; the other stopped the VCC walk at any VALU. Distinct refused NGG vertex programs went from
+  45 to 23. The world is still black.
+- **The remaining 23 are tracked in #4427.** 10 are blocked by the forward-only raw-wide proof (loops);
+  13 pass every code-side proof but are refused live for an untraced reason. Triage with
+  `shader_inspect <refused vs .bin> --raw-wide-proof`.
+- **Linux/AMD goes first** (maintainer decision), because native Wave64 removes the NVIDIA emulation
+  confound. The Windows-only Wave64 draft (#4384) is parked at `d23d963e`.
+- **Open alongside:** #4426 (`PROSPER_DBG=1` stalls Kena at startup on Windows) and #4419
+  (`DB_DEPTH_CONTROL` colour-on-depth bits are not applied).
 
 ## Current state — rung 2, gameplay reached with the world absent (2026-09-23)
 
@@ -149,7 +196,9 @@ PROSPER_PAD_SCRIPT=@scripts/kena/reach-first-gameplay-prompt.pad PROSPER_PAD_SCR
 anchors are pad reads — see `prosper/scripts/kena/README.md`. `tools/dump_hygiene.py` on the dump is clean; its
 `_original_files/` (the untouched encrypted originals) is retained and never read.
 
-About 2 in 12 launches hang before their first frame (no raw scanout either). Not yet investigated; relaunch.
+The launch hang before the first frame (no raw scanout either; recorded here as "about 2 in 12", measured
+6 of 28 on 2026-10-05) is fixed on Windows — see item 4 below. So is the boot-time crash that took about 1 launch
+in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## What was fixed to get here
 
@@ -167,6 +216,26 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
    ([#3816](https://github.com/mattias800/prosper/issues/3816), PR [#3817](https://github.com/mattias800/prosper/pull/3817)).
    Its lane test used `linear_localid`, which is id 0 in a fragment module; NVIDIA's driver dereferenced it while
    compiling the pipeline and the process died inside `nvoglv64.dll` on the first level load, 4 of 4 runs.
+4. **The launch hang: the host's own allocations sat inside the guest's address window**
+   ([#4426](https://github.com/mattias800/prosper/issues/4426), Windows only). Every prosper executable was
+   linked with `HIGH_ENTROPY_VA`, under which Windows draws the base of the process's bottom-up allocations
+   (stacks, heaps, every later `VirtualAlloc(NULL)`) from the low terabyte — the guest's window. UE4's 512 GiB
+   MallocBinned3 arena has to cover `[0x7c00000000, 0xa000000000)` wherever it lands, so a host allocation there
+   got it refused with ENOMEM; the title then re-entered `FMemory::GCreateMalloc` with `GMalloc` null and
+   blocked forever on that function's own `__cxa_guard`, before its first print. 6 of 28 launches as built,
+   0 of 12 with only that header bit cleared in the same binary. Executables that boot a guest are now linked
+   without the flag and steer their later allocations into `[4 GiB, 16 GiB)`, best effort
+   (`docs/platforms/WINDOWS_PORT_HANDOFF.md` § Gotchas); the refusal is reported (`[memhle] reserve FAILED …`)
+   instead of silent. This applies to every UE4 title, not this one.
+5. **The boot crash: prosper delivered an APR completion counter below one already delivered**
+   ([#4504](https://github.com/mattias800/prosper/issues/4504)). UE4's listener walks `last+1 ..= cnt` and then
+   stores `last := cnt` unconditionally, so a late lower counter rewinds it and the next event completes a token
+   a second time; its tracking entry is gone and the guest dereferences null (`eboot+0x16bd26b`). Two deferred
+   posts could read the ring's high-water mark as N and N+1 and post them in the opposite order. Reading the
+   mark and posting it are now one step. Before: 12 of 64 launches died this way (the 64 include launches that
+   hung first, so the rate among booted launches was higher). With the fix: 0 of 21 booted launches faulted, and
+   a detector built for that measurement (not in the tree) saw no out-of-order post in any of them, against 4 of
+   12 with the ordering removed. Shared code: any UE4 title using this listener.
 
 ## Ruled out
 
@@ -183,6 +252,13 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   modules created in a crashing run, `spirv-val` rejects exactly one — the last one created — and its only
   defect is an operand naming id 0 emitted by prosper's `s_bfm_b64` lowering (#3816). The driver crashing on
   invalid SPIR-V rather than rejecting it is a driver robustness gap, not the cause.
+- **`PROSPER_DBG=1` stalls this title at startup** — false. In an interleaved series the stall and the crash
+  both occur without it (control 1 stall + 1 crash of 8; `PROSPER_DBG=1` 2 + 2 of 8), and the stall happens
+  before any code that reads the variable runs. The three consecutive stalls that prompted #4426 were a small
+  sample of two unrelated intermittent defects (items 4 and 5 above).
+- **The UE4 arena landing at `0x2000000000` instead of `0x7c00000000` is caused by `PROSPER_DBG`** — false.
+  Control runs land at both. It is the reservation's whole-window fallback, taken when a host allocation
+  occupies the top band; the same cause as the launch hang, one notch less severe (#4426).
 - **Seconds-anchored pad pulses are enough for this title's menus** — false. An 11-press seconds-based route
   delivered 2 presses, because the guest reads the pad about once a second there and a 300 ms pulse mostly falls
   between reads; pad-read anchors (`pN`) deliver every press.

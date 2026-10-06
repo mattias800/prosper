@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # Guest-input memory-safety model
 
 prosper parses several classes of **untrusted, attacker-controllable input** entirely in the host

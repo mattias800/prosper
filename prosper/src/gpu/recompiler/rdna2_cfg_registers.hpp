@@ -9,4 +9,11 @@ int shader_max_vgpr(const std::vector<Rdna2Inst>&);
 // VINTRP, so it must reload VDST even for P1's inactive-word preservation and P2's OLD source.
 void loop_written_regs(const std::vector<Rdna2Inst>&, uint32_t lo, uint32_t hi,
                        std::set<int>& vgprs, std::set<int>& sgprs, bool owned_packet = false);
+// Scalar registers that MAY be overwritten in [lo, hi), mask-pair destinations included.
+void loop_scalar_may_writes(const std::vector<Rdna2Inst>&, uint32_t lo, uint32_t hi,
+                            std::set<int>& sgprs);
+struct RegState;
+// A loop body that may write these registers leaves no entry-time descriptor provenance or
+// user-data alias standing for them at the header.
+void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sgprs);
 } // namespace prosper::gpu

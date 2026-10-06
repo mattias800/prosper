@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # UE4 (PPSA17942 "DOLL") — APR / IoStore read bring-up (path to the first frame)
 
 Status as of this doc: the title boots from garbage-byte execution all the way through memory
@@ -11,6 +16,25 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
+- **The 2 ms deferral on a counter completion is what keeps UE4's listener from walking a token
+  whose tracking entry is not installed yet — false for Kena (`PPSA01802`), and it was not the
+  cause of that title's boot crash.** Its submit path (`eboot+0x16bfaa0`) takes the listener's
+  mutex, inserts the tracking entry (`0x16c0b30` on `obj+0x58`) and only then submits, still under
+  the lock; the per-token handler (`0x16bd070`) takes the same mutex. The guest cannot race its own
+  bookkeeping. The null dereference at `eboot+0x16bd26b` (12 of 64 launches, 5-10 s into the boot)
+  came from prosper itself delivering a counter BELOW one already delivered: two deferred posts
+  read the ring's high-water mark as N and N+1 and posted them in the opposite order, the listener
+  stored `last := N` unconditionally, and the next event walked N+1 a second time. Caught in the
+  act on unfixed code: `posted=4754 after=4784` on ring 4, then the fault on token 4755. Reading
+  the mark and posting it are now one step
+  ([#4504](https://github.com/mattias800/prosper/issues/4504)). Two halves of this row rest on
+  different evidence. That prosper posted a lower counter after a higher one is measured: with
+  the ordering mutex removed, 4 of 12 booted launches did it and one of the four then faulted on
+  the token after the rewind; with the mutex, 0 of 21 did and none faulted. That the guest
+  installs before it submits is read from this title's disassembly and cannot
+  be checked from the repository; and no launch was run with the deferral set to zero, so "the
+  deferral was not protecting this consumer" is an inference from that disassembly, not a
+  measurement. The deferral stays as modelled latency.
 - **Both `AndGetResult` outputs carry the event token — false.** Original callers read an
   eight-byte `{status32, failing_offset32}` result and a separate four-byte submit ID, which
   they pass to the wait function. Silent Hill 2 reads its status at `eboot+0x230e7d4` and the

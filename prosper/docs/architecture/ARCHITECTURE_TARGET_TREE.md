@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Target source tree and layer order
 
 > **Status: proposal.** The current-tree measurements and the layer order, which the ratchet
@@ -5,6 +10,10 @@
 > the new `src/guest/` layer, the move of the shipping Vulkan backend to `frontends/shared/backend/`,
 > and the "Planned moves" table. Read them as a plan to discuss, and don't start a move from this
 > document alone.
+>
+> Approval is now tracked per decision in `docs/adr/`: ADR 0003 (the `guest/` layer, moves 4-6
+> and 12) and ADR 0004 (the backend move, moves 1-3) are `proposed` until the owner accepts them.
+> The binding rules these moves serve are in `docs/spec/`.
 
 What the source tree looks like now, what it should look like, which way dependencies may point,
 and the planned moves that get from one to the other. Every move is a move-only PR made with the
@@ -96,6 +105,9 @@ first. `REFACTOR_PLAN_2026_09.md` Phase 2 leaves the same choice open. `CONFIDEN
 
 ## Layer order (allowed dependency direction)
 
+The authoritative table, generated from the constant, is `docs/spec/layers.md`; the table below adds
+the evidence for each rank.
+
 Enforced by the `layer-include` rule. `LAYER_ORDER` in `check_arch_ratchet.py` is the single
 source; this table must change in the same PR as that constant. Lowest first; a layer may include
 itself and anything **above it in this table**, never anything below.
@@ -171,31 +183,19 @@ Every structural cost identified in the ratchet work is either a rule in
 
 ## Standards
 
-The platform-arm rule in item 2 is current charter policy, with the partial mechanical guards
-named there. The guest placement and engine replay requirements in items 1 and 3 describe the
-**proposed** target tree and await owner approval; creating the `guest/` layer requires moves 4
-and 5 above. This section does not authorize an extraction or claim that those engines or replay
-tests already exist.
+The three standards are now spec rules with their own status and enforcement; the numbering is
+kept because the ratchet's `platform-stub` hint and other documents cite it.
 
-1. **`hle/` is the API surface; engines live in `guest/`.** A cross-cutting HLE area such as APR
-   (`sceAmpr*`, and the file reads and event-queue completions behind it, spread today over `hle/memory`,
-   `hle/fs` and `hle/kernel`) would keep only its NID handlers, argument decoding and return codes in
-   `hle/`. Its engine (command buffer model, executor, completion dialects) would live once in
-   `src/guest/`, because it implements guest-visible coprocessor semantics rather than API decoding.
-   This is the placement proposed in move 12, contingent on moves 4, 5 and 7 and owner approval.
-2. **Portable logic is written once; a platform arm holds primitives only.** An engine reaches the OS
-   through the `src/host/platform/` interfaces (`vm`, `file`, `clock`, ...) and nothing else, so no
-   platform arm can be a stub or reduced copy of another arm's logic. Enforced today only in part:
-   `platform-ifdef` and `layer-include` catch directives and includes, and `platform-stub` (a
-   name-based proxy landed in #4366) catches handlers named `HLE(*_stub)`; a
-   reduced copy that is not named as a stub is a review rule (see the stub-arm row in "Bad
-   practices").
-3. **Each engine ships a replay test that runs on both hosts.** A recorded command-buffer stream from a
-   real title is fed to the engine, and the test asserts what the guest can observe (memory contents
-   and delivered events). It extends the seam's one-test-per-interface rule from the OS services to
-   the engines above them. The aim is to detect an unported platform arm in a test rather than
-   discover it title by title. `CONFIDENCE: LOW` on how practical this is for large streams:
-   it has not been tried.
+1. **`hle/` is the API surface; engines live in `guest/`** -- spec `HLE-1`, proposed in ADR 0003
+   (APR, spread over `hle/memory`, `hle/fs` and `hle/kernel`, is the first extraction, move 12).
+2. **Portable logic is written once; a platform arm holds primitives only** -- spec `PLAT-1` and
+   `PLAT-2`, accepted, ADR 0002. Mechanically enforced only in part: `platform-ifdef` and
+   `layer-include` catch directives and includes, `platform-stub` (#4366) catches handlers named
+   `HLE(*_stub)`, and a reduced copy under another name remains a review rule (see the stub-arm row
+   in "Bad practices").
+3. **Each engine ships a replay test that runs on both hosts** -- ADR 0003, decision point 5. It
+   extends the seam's one-test-per-interface rule from the OS services to the engines above them,
+   so an unported platform arm is found by a test rather than title by title.
 
 ## Historical title observations
 

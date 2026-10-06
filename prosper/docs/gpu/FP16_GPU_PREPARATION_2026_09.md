@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # FP16 texture and storage preparation (#3407)
 
 This change extends the existing GPU cube detiler to ordinary single-mip 2D RG16F/RGBA16F
