@@ -236,6 +236,33 @@ NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primiti
     return r;
 }
 
+std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* prolog,
+                                                              size_t prefix_dwords,
+                                                              const uint32_t* main,
+                                                              size_t main_dwords) {
+    if (!prolog || !prefix_dwords || !main || !main_dwords) return nullptr;
+    const size_t main_span = rdna2_recompile_code_span(main, main_dwords);
+    if (!main_span) return nullptr;
+    std::vector<uint32_t> words(prolog, prolog + prefix_dwords);
+    words.insert(words.end(), main, main + main_span);
+    static std::mutex mutex;
+    static std::map<std::vector<uint32_t>, std::pair<std::shared_ptr<const std::vector<uint32_t>>,
+                                                     uint64_t>>
+        chains;
+    static uint64_t clock = 0;
+    const std::lock_guard lock(mutex);
+    auto& slot = chains[words];
+    if (!slot.first) slot.first = std::make_shared<const std::vector<uint32_t>>(words);
+    slot.second = ++clock;
+    while (chains.size() > 16u) {
+        auto oldest = chains.begin();
+        for (auto it = std::next(chains.begin()); it != chains.end(); ++it)
+            if (it->second.second < oldest->second.second) oldest = it;
+        chains.erase(oldest);
+    }
+    return chains[words].first;
+}
+
 bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint32_t>* words) {
     words->assign(count, 0u);
     for (uint32_t k = 0; k < count; ++k) {
@@ -261,17 +288,12 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     if (!admission.ok()) return refuse(admission.refusal);
     if (!input.user_data_complete || input.user_data.size() != admission.user_sgprs)
         return refuse("ngg-user-data-unavailable");
-    if (!input.prolog || !input.main || !input.prolog_prefix_dwords || !input.main_dwords)
-        return refuse("ngg-program-unavailable");
-    // The chain as the hardware runs it: the prolog up to its s_setpc, then the main program.
-    const size_t main_span = rdna2_recompile_code_span(input.main, input.main_dwords);
-    if (!main_span) return refuse("ngg-program-unavailable");
+    if (!input.linked || input.linked->empty()) return refuse("ngg-program-unavailable");
     const bool interpolation = input.interpolation.requires_geometry;
     if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
 
     StageKey key;
-    key.program.assign(input.prolog, input.prolog + input.prolog_prefix_dwords);
-    key.program.insert(key.program.end(), input.main, input.main + main_span);
+    key.program = *input.linked;
     key.resources = resource_shape(input.resources);
     key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
     key.user_sgprs = admission.user_sgprs;

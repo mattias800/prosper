@@ -45,11 +45,10 @@ struct NggLiveDrawInput {
     // when any of those registers is absent.
     std::vector<uint32_t> user_data;
     bool user_data_complete = false;
-    // The chain as the hardware runs it: the prolog up to its s_setpc, then the main program.
-    const uint32_t* prolog = nullptr;
-    size_t prolog_prefix_dwords = 0;
-    const uint32_t* main = nullptr;
-    size_t main_dwords = 0;
+    // The chain as the hardware runs it (ngg_linked_chain), and the resource table folded over
+    // exactly those words: the prolog alone cannot prove the raw register-offset loads that
+    // feed its vertex fetches, because its own analysis stops at the link (#3135 P5).
+    std::shared_ptr<const std::vector<uint32_t>> linked;
     const ShaderResourceTable* resources = nullptr;
     const PixelInputMapping* pixel_inputs = nullptr;
     FragmentInterpolationLayout interpolation;
@@ -63,6 +62,14 @@ struct NggLiveDrawResult {
     const char* refusal = nullptr;   // the rule that refused (a static string), null on success
     std::string detail;   // the compiler's full refusal text, when it refused
 };
+
+// The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded
+// content-keyed cache, so a repeated chain has one stable address (the stage-table fold's decode
+// cache is keyed by address). Null when the main has no code span.
+std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* prolog,
+                                                              size_t prefix_dwords,
+                                                              const uint32_t* main,
+                                                              size_t main_dwords);
 
 // Reads the registers admission takes from the draw's state.
 NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primitive_type);

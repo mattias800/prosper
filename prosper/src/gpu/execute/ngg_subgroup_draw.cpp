@@ -1,6 +1,8 @@
 // ngg_subgroup_draw.cpp -- see ngg_subgroup_draw.hpp.
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 
+#include "gpu/resources/shader_resources.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -100,8 +102,18 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     auto module = recompile_ngg_subgroup(request.linked_code, request.dwords, request.resources,
                                          shell, &stages->layout, request.diagnostic, &why);
     if (module.empty()) return refuse(why);
-    if (!ngg_shell_guest_bindings(module, &stages->guest_bindings))
+    std::vector<uint32_t> declared;
+    if (!ngg_shell_guest_bindings(module, &declared))
         return refuse("reason=ngg-draw-guest-resource-unsupported");
+    // Only the bindings the shell ACCESSES: the same reflection the frontend materializes set 0
+    // from, which leaves a declared-but-unread binding (a direct V# every load bypasses) unbuilt.
+    const DescriptorValidationReport used =
+        validate_spirv_descriptor_interface(module, nullptr, 0, SpirvShaderStage::Compute, false);
+    for (uint32_t binding : declared)
+        if (std::any_of(used.descriptors.begin(), used.descriptors.end(), [&](const auto& d) {
+                return d.set == 0 && d.binding == binding;
+            }))
+            stages->guest_bindings.push_back(binding);
     stages->shell_hash = ngg_words_hash(module);
     stages->shell = std::make_shared<const std::vector<uint32_t>>(std::move(module));
     NggRasterCommitConfig raster = request.raster;

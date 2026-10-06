@@ -304,10 +304,7 @@ NggLiveDrawInput kena_input(uint32_t instances = 32, uint32_t push_seed = 0) {
     in.facts = kena_facts(instances);
     in.user_data.assign(ngg::kKenaUserSgprs, push_seed);
     in.user_data_complete = true;
-    in.prolog = p.prolog.data();
-    in.prolog_prefix_dwords = p.prefix;
-    in.main = p.main.data();
-    in.main_dwords = p.main.size();
+    in.linked = ngg_linked_chain(p.prolog.data(), p.prefix, p.main.data(), p.main.size());
     in.resources = &p.table;
     in.program_address = 0x5009440000ull;
     return in;
@@ -365,6 +362,19 @@ TEST_F(NggLiveDraw, KenaMatchesTheDirectBuilder) {
     EXPECT_TRUE(a.native_wave64);
     EXPECT_EQ(a.lds_bytes, 17u * 512u);
     EXPECT_EQ(ngg_device_refusal(a, radv()), nullptr);
+}
+
+TEST_F(NggLiveDraw, LinkedChainIsTheHardwareOrderAndStable) {
+    const KenaProgram& p = kena_program();
+    const auto linked = ngg_linked_chain(p.prolog.data(), p.prefix, p.main.data(), p.main.size());
+    ASSERT_TRUE(linked);
+    EXPECT_EQ(*linked, ngg::kena_linked(tests_root(__FILE__) / "data"));
+    EXPECT_EQ(ngg_linked_chain(p.prolog.data(), p.prefix, p.main.data(), p.main.size()), linked)
+        << "a repeated chain keeps one stable copy (the fold's decode cache keys by address)";
+    EXPECT_FALSE(ngg_linked_chain(p.prolog.data(), p.prefix, nullptr, 0));
+    auto in = kena_input();
+    in.linked.reset();
+    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-program-unavailable");
 }
 
 TEST_F(NggLiveDraw, NothingCompilesOnceWarm) {
@@ -471,3 +481,4 @@ TEST_F(NggLiveDraw, DeviceRefusals) {
 }
 
 }   // namespace
+
