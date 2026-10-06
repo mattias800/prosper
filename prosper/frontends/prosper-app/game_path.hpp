@@ -88,6 +88,14 @@ inline bool picked_folder_is_title(const std::string& picked, const GamePathProb
     return resolve_app0_root(picked, probe) == strip_trailing_separators(picked);
 }
 
+// Whether the library may offer to delete `dir` from disk. Only a title inside a parent
+// directory qualifies: a drive root (or any parentless path) is refused no matter what it
+// holds, because "remove the game" must never mean "wipe the drive".
+inline bool can_remove_game_dir(const std::string& dir) {
+    if (dir.empty()) return false;
+    return !parent_directory(dir).empty();
+}
+
 // A guest cannot be torn down in-process: run_entry() never observes prosper_request_stop(), so the
 // app exits rather than joining it (#352). Until that lands, a second title needs a second process.
 //

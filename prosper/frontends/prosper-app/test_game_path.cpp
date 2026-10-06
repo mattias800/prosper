@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 
+using prosper::frontend::can_remove_game_dir;
 using prosper::frontend::GameOpenAction;
 using prosper::frontend::GamePathProbe;
 using prosper::frontend::StartupPickInputs;
@@ -145,6 +146,13 @@ int main() {
         CHECK(!picked_folder_is_title("F:\\missing", drive), "a missing path boots nothing");
         CHECK(!picked_folder_is_title("", drive), "an empty pick boots nothing");
     }
+
+    // --- can_remove_game_dir -------------------------------------------------------------------
+    CHECK(can_remove_game_dir("/games/T-app0"), "a title inside a folder may be removed");
+    CHECK(can_remove_game_dir("C:\\games\\T-app0"), "a Windows title inside a folder may be removed");
+    CHECK(!can_remove_game_dir("F:\\"), "a drive root is never removed, whatever it holds");
+    CHECK(!can_remove_game_dir("/"), "a POSIX root is never removed");
+    CHECK(!can_remove_game_dir(""), "an empty path removes nothing");
 
     // --- decide_open_action --------------------------------------------------------------------
     CHECK(decide_open_action(kRoot, /*boot_attempted=*/false) == GameOpenAction::boot_in_process,

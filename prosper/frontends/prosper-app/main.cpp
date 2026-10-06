@@ -3575,6 +3575,37 @@ int main(int argc, char** argv) {
                 case prosper::frontend::LibraryAction::Kind::toggle_fullscreen:
                     toggle_fullscreen();
                     break;
+                case prosper::frontend::LibraryAction::Kind::show_in_explorer: {
+                    // A file:// URL opens the containing folder in the OS file manager on every
+                    // desktop OS; SDL picks the right handler, so this needs no platform branch.
+                    std::string url = act.app0_root;
+                    for (char& c : url)
+                        if (c == '\\') c = '/';
+                    if (!SDL_OpenURL(("file:///" + url).c_str()))
+                        fprintf(stderr, "[app] could not open %s: %s\n", act.app0_root.c_str(),
+                                SDL_GetError());
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::remove_game: {
+                    // Drive roots (and anything parentless) are refused even here: the UI disables
+                    // the item, but the action is re-checked at the point of deletion.
+                    if (!prosper::frontend::can_remove_game_dir(act.app0_root)) {
+                        libraryStatus = "Refusing to delete a drive root.";
+                    } else {
+                        std::error_code ec;
+                        const uintmax_t removed =
+                            std::filesystem::remove_all(act.app0_root, ec);
+                        if (ec) {
+                            libraryStatus = "Could not delete: " + ec.message();
+                        } else {
+                            fprintf(stderr, "[app] deleted %s (%llu entries)\n",
+                                    act.app0_root.c_str(),
+                                    static_cast<unsigned long long>(removed));
+                            rescan_library();
+                        }
+                    }
+                    break;
+                }
                 case prosper::frontend::LibraryAction::Kind::pick_game:
                     // Like Ctrl+O: the answer parks and boots via open_game() below, because no
                     // library flag claims it. The modal picker callback runs on any thread.

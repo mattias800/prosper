@@ -544,6 +544,8 @@ void LibraryUi::apply_filter() {
             filtered_.push_back(i);
     selected_ = 0;
     hovered_ = -1;
+    contextFi_ = -1;
+    contextArmed_ = false;
 }
 
 void LibraryUi::set_output_volume(float volume) {
@@ -849,6 +851,70 @@ void LibraryUi::draw_controls_content() {
     ImGui::TextDisabled("One cluster per hand at a time: WASD or TFGH left, IJKL or N M , . right.");
 }
 
+// Right-click detector for one row item: the popup itself is opened and drawn once per
+// frame after the table (draw_row_menu below), because BeginPopupContextItem binds the popup
+// to the calling item's ID scope and two call sites per row made that binding unreliable.
+void LibraryUi::note_row_right_click(int fi) {
+    if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+        selected_ = fi;
+        contextFi_ = fi;
+        contextArmed_ = true;
+    }
+}
+
+void LibraryUi::draw_row_menu(LibraryAction& action, int shown) {
+    if (contextArmed_) {
+        ImGui::OpenPopup("rowmenu");
+        contextArmed_ = false;
+    }
+    if (!ImGui::BeginPopup("rowmenu")) return;
+    // The filter may have moved under an open menu; a stale row closes it rather than acting
+    // on the wrong game.
+    if (contextFi_ < 0 || contextFi_ >= shown) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const GameEntry& game =
+        games_[static_cast<size_t>(filtered_[static_cast<size_t>(contextFi_)])];
+    if (ImGui::MenuItem("Play")) {
+        selected_ = contextFi_;
+        action.kind = LibraryAction::Kind::open;
+        action.app0_root = game.app0_root;
+    }
+    if (ImGui::MenuItem("Show in Explorer")) {
+        action.kind = LibraryAction::Kind::show_in_explorer;
+        action.app0_root = game.app0_root;
+    }
+    // Drive roots are never deletable (can_remove_game_dir): the item stays visible but
+    // disabled, so the rule is discoverable rather than a silent absence.
+    if (ImGui::MenuItem("Remove from disk...", nullptr, false,
+                        can_remove_game_dir(game.app0_root))) {
+        pendingRemoveRoot_ = game.app0_root;
+        ImGui::OpenPopup("confirm-remove");
+    }
+    ImGui::EndPopup();
+    // Deleting needs the root it was armed for, not the row under the cursor: the confirm
+    // intentionally survives moving the mouse away from the row.
+    if (!pendingRemoveRoot_.empty() &&
+        ImGui::BeginPopupModal("Delete game?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Delete this game from disk? The dump cannot be recovered.");
+        ImGui::TextDisabled("%s", pendingRemoveRoot_.c_str());
+        if (ImGui::Button("Delete")) {
+            action.kind = LibraryAction::Kind::remove_game;
+            action.app0_root = pendingRemoveRoot_;
+            pendingRemoveRoot_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            pendingRemoveRoot_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void LibraryUi::draw_settings_content(LibraryAction& action) {
     // The menu bar brought the user here; this is the way back. Tabs were the earlier shape —
     // menu-led navigation won, and two coexisting navigations were the duplication.
@@ -1057,8 +1123,10 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::SameLine();
         // Discoverable rather than env-only: someone who does not want a launcher making noise should
         // not have to find a variable name to stop it. Reported to the caller so it is persisted.
+        // No active paint: the note itself shows the state (slashed when off), and music
+        // defaults on, so an active highlight would read as permanently pressed.
         if (icon_button("music", musicToggle_ ? ToolbarIcon::music_on : ToolbarIcon::music_off,
-                        "Music", musicToggle_)) {
+                        "Music", false)) {
             musicToggle_ = !musicToggle_;
             media_.set_music_enabled(musicToggle_, nowMs);
             action.kind = LibraryAction::Kind::set_music;
@@ -1161,6 +1229,7 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                 else
                     ImGui::TextDisabled("--");
                 if (ImGui::IsItemClicked()) selected_ = fi;
+                note_row_right_click(fi);
                 ImGui::TableSetColumnIndex(1);
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 // SpanAllColumns makes the whole row one click target; the double-click opens.
@@ -1199,12 +1268,14 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                 ImGui::TextUnformatted((folder.empty() ? game.app0_root : folder).c_str());
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", game.app0_root.c_str());
+                note_row_right_click(fi);
                 ImGui::PopID();
                 // Follow a keyboard move; a mouse scroll is left alone so the two never fight.
                 if (moveKey && fi == selected_) ImGui::SetScrollHereY(0.5f);
             }
             hovered_ = hoverThisFrame;
             ImGui::EndTable();
+            draw_row_menu(action, shown);
         }
         if (shown == 0)
             ImGui::TextDisabled("No games match.");

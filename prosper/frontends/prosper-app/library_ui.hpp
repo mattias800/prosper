@@ -56,6 +56,8 @@ struct LibraryAction {
         set_restore_imports, // toggled patched-import repair to `restore_on`; persist + apply to next boot
         set_volume,          // dragged the volume slider to `value` (0-100); persist + apply live
         toggle_fullscreen,   // the Full Screen toolbar button (same path as F11)
+        show_in_explorer,    // reveal `app0_root` in the OS file manager
+        remove_game,         // delete `app0_root` from disk after the inline confirm
         quit,
     };
     Kind kind = Kind::none;
@@ -232,6 +234,14 @@ private:
     // Read-only keyboard map. The mapping itself lives in keyboard_pad_map.hpp — this table
     // mirrors its documented layout, so update both when the mapping changes.
     void draw_controls_content();
+    // Right-click detector for one row item: arms the menu below. Called at each clickable
+    // item of the row so the whole row answers.
+    void note_row_right_click(int fi);
+    // The row menu itself (Play, Show in Explorer, Remove from disk with confirm), drawn once
+    // per frame after the table at window scope, where OpenPopup/BeginPopup always agree.
+    void draw_row_menu(LibraryAction& action, int shown);
+    int contextFi_ = -1;      // row the menu was armed from
+    bool contextArmed_ = false;
 
     // Which view is showing. Games, settings and controls share the menu bar; only one draws.
     enum class LibraryTab { games, settings, controls };
@@ -287,6 +297,7 @@ private:
     std::vector<RecentGame> recentGames_;
     const LogRing*         logRing_ = nullptr;  // observed only; owned by main.cpp
     bool                   logFollow_ = true;
+    std::string            pendingRemoveRoot_;  // delete-confirm modal open for this root, "" = none
     std::string            gamesDir_;
     char                   filterBuf_[256] = {};
     std::string            filterApplied_;
