@@ -20,9 +20,9 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/env_submit.hpp"
-#include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
+#include "diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/refused_shader_dump.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
+#include "diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
 #include <cstdint>
 #include "gpu/capture/gpu_capture.hpp"

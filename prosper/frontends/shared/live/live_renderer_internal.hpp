@@ -10,7 +10,7 @@
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp" // #3253: a typo must not select a different setting
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
-#include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
+#include "diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
 #include "gpu/diagnostics/pass_break_census.hpp"         // why a pass stopped accepting draws
 #include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
@@ -62,7 +62,7 @@
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
-#include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
+#include "diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 #include "diagnostics/perf/perf_ledger.hpp"       // #3891: always-on alarm ledger

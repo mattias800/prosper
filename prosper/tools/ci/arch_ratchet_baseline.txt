@@ -100,10 +100,10 @@ getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
 # #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
 # This renames one existing site; no new raw environment read or switch was introduced.
 getenv|prosper/src/gpu/execute/gpu_executor.cpp 89
-getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/execute/index_expand.hpp 1
 getenv|prosper/src/gpu/execute/mb3_freelist.cpp 3
 getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3
+getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
@@ -252,7 +252,7 @@ platform-ifdef|prosper/src/hle/input/ime.cpp 11
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
 platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 59
-platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 10
+platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 9
 platform-ifdef|prosper/src/hle/kernel/sce_errno.hpp 1
 platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
@@ -274,10 +274,8 @@ platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
 platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
 platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
-layer-include|prosper/src/diagnostics/perf/perf_alarms.cpp|gpu 1
 layer-include|prosper/src/diagnostics/perf/wave64_refusal.hpp|gpu 1
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
-layer-include|prosper/src/diagnostics/readback_refusal.cpp|gpu 1
 layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
 layer-include|prosper/src/gpu/capture/gpu_capture.cpp|hle 1
 layer-include|prosper/src/gpu/capture/gpu_capture_internal.hpp|hle 1

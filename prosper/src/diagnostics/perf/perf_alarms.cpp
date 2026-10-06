@@ -3,7 +3,7 @@
 
 #include "diagnostics/env_numeric.hpp"
 #include "diagnostics/exit_reports.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
 
 #include "diagnostics/transfer_pressure.hpp"
 

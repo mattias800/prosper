@@ -1,4 +1,4 @@
-#include "gpu/diagnostics/watch_list.hpp"
+#include "diagnostics/watch_list.hpp"
 
 #include <cctype>
 #include <cstdlib>

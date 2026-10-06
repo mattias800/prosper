@@ -5,7 +5,7 @@
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
+#include "diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/diagnostics/fence_build_journal.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"

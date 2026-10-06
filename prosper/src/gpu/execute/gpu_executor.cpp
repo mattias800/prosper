@@ -18,8 +18,8 @@
 #include "gpu/execute/srt_publication_dedupe.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
-#include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
-#include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
+#include "diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
+#include "diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
 #include <cstdint>
 #include "gpu/capture/gpu_capture.hpp"
