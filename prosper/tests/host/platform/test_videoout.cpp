@@ -7,6 +7,7 @@
 #include "diagnostics/transfer_pressure.hpp"  // #3891: the guest-scanout host-copy site
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/texture/tile.hpp"              // tile/detile round trip for the flipped-buffer image
+#include "gpu/texture/guest_texture_layout.hpp"   // the row pitch a display buffer states (#4586)
 #include "host/memory/guest_memory_map.hpp" // the registered-mapping proof for the padded read
 #include "host/platform/precise_sleep.hpp"    // #1765: which primitive WaitVblank actually waited on
 #include <algorithm>
@@ -1123,4 +1124,69 @@ TEST(Videoout, Contract) {
     }
 
     EXPECT_EQ(fails, 0);
+}
+
+// A display buffer's linear row pitch is the one its VideoOut attribute states (the legacy
+// attribute's pitch_in_pixel), or its width when the attribute states none. Registration publishes
+// that pitch as the allocation's linear layout -- so a compute or graphics pass writing the buffer
+// uses the same rows the presenter reads -- and the presenter gathers rows from it (#4586).
+TEST(VideooutPitch, StatedPitchIsPublishedAndPresented) {
+    register_builtin_hle();
+    auto open = Hle::lookup(nid_hash("sceVideoOutOpen"));
+    auto setba = reinterpret_cast<Hle7Fn>(Hle::lookup(nid_hash("sceVideoOutSetBufferAttribute")));
+    auto regb = Hle::lookup(nid_hash("sceVideoOutRegisterBuffers"));
+    auto setba2 = reinterpret_cast<Hle8Fn>(Hle::lookup("PjS5uASwcV8"));   // SetBufferAttribute2
+    auto regb2 = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
+    auto unreg = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
+    ASSERT_TRUE(open && setba && regb && setba2 && regb2 && unreg);
+    const uint64_t handle = open(0, 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)handle, 0);
+
+    // Legacy attribute: 100 x 4 at a 128-pixel (512-byte) pitch; rows hold distinct bytes, padding
+    // holds 0xEE so a tight read would pull padding into row 1.
+    constexpr uint32_t kW = 100, kH = 4, kPitchPixels = 128, kPitch = kPitchPixels * 4;
+    std::vector<uint8_t> fb(size_t(kPitch) * kH, 0xEE);
+    for (uint32_t y = 0; y < kH; ++y)
+        for (uint32_t b = 0; b < kW * 4; ++b) fb[size_t(y) * kPitch + b] = uint8_t(y * 31 + b);
+    uint8_t legacy_attr[0x28] = {};
+    setba((uint64_t)(uintptr_t)legacy_attr, 0x80002200u, 1 /*LINEAR*/, 0, kW, kH, kPitchPixels);
+    const void* legacy_buffers[1] = {fb.data()};
+    const uint64_t group = regb(handle, 0, (uint64_t)(uintptr_t)legacy_buffers, 1,
+                                (uint64_t)(uintptr_t)legacy_attr, 0);
+    ASSERT_EQ(group, 0u);
+    const uint64_t address = (uint64_t)(uintptr_t)fb.data();
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), kPitch)
+        << "registration states the attribute's pitch to every reader and writer";
+    VideoOutBufferSnapshot front;
+    ASSERT_TRUE(videoout_select_buffer(0, front, 1));
+    EXPECT_EQ(front.row_pitch_bytes, kPitch);
+    VideoOutLinearRead read;
+    ASSERT_TRUE(videoout_read_front_linear(read));
+    std::vector<uint8_t> expected(size_t(kW) * kH * 4);
+    for (uint32_t y = 0; y < kH; ++y)
+        std::memcpy(expected.data() + size_t(y) * kW * 4, fb.data() + size_t(y) * kPitch,
+                    size_t{kW} * 4);
+    EXPECT_EQ(read.pixels, expected) << "the presenter gathers rows from the stated pitch";
+    std::vector<uint8_t> raw;
+    VideoOutBufferSnapshot raw_meta;
+    ASSERT_TRUE(videoout_copy_front_buffer(raw, raw_meta));
+    EXPECT_EQ(raw, expected) << "the raw front-buffer copy uses the same pitch";
+    ASSERT_EQ(unreg(handle, group, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), 0u)
+        << "unregistering retires the stated layout";
+
+    // Attribute2 states no pitch: the rows are `width` apart, and that is what gets published.
+    uint8_t attr2[0x50] = {};
+    setba2((uint64_t)(uintptr_t)attr2, 0x8000000000000000ull, 0 /*LINEAR*/, kW, kH, 0, 0, 0);
+    struct VOB {
+        const void* data;
+        const void* metadata;
+        const void* reserved[2];
+    };
+    std::vector<uint8_t> fb2(size_t(kW) * kH * 4, 0x33);
+    VOB buffers[1] = {{fb2.data(), nullptr, {nullptr, nullptr}}};
+    ASSERT_EQ(regb2(handle, 1, 0, (uint64_t)(uintptr_t)buffers, 1, (uint64_t)(uintptr_t)attr2), 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch((uint64_t)(uintptr_t)fb2.data(), kW * 4), kW * 4)
+        << "no pitch attribute: the published pitch is the tight row the presenter reads";
+    ASSERT_EQ(unreg(handle, 1, 0, 0, 0, 0), 0u);
 }

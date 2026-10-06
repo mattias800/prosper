@@ -4,8 +4,8 @@
 // `test_linear_image_pitch` and `test_sampled_dcc_fast_clear` pin the helpers; these cases pin the
 // call sites in live_compute.cpp that use them, so reverting a call site turns a case red.
 //
-// Every padded image here STATES its pitch through register_guest_linear_texture_layout, the way
-// AvPlayer registers its planes: the pitch is never inferred from the 256-byte alignment (#4606).
+// Uint32 at 100 px is a 400-byte row, which GFX10 pads to a 512-byte pitch: no image here states a
+// pitch except StatedPitchOverridesTheRule, which registers one the way AvPlayer does.
 //
 // WHAT EACH TEST KILLS:
 //   SampledUploadDropsRowPadding        the sampled upload reads a padded linear image as tight rows
@@ -22,12 +22,11 @@
 //                                       chain goes through guest memory: the storage writeback must
 //                                       write rows at the padded pitch the consumer reads
 //                                       (registered twice; see CMakeLists.txt)
-//   UnstatedPitchStaysTight             the 256-byte alignment is inferred at a live call site: an
-//                                       unregistered 400-byte-row image is written back padded
-//   RendererOwnedTargetStaysTight       a renderer-owned target is written back at a stated pitch,
-//                                       although the renderer's own pixels and readers are tight
-//   StatedPitchResultKeepsItsLayout     a stated-pitch result is mirrored into a (tight) renderer
-//                                       target, so the next dispatch writes the address tight
+//   StatedPitchOverridesTheRule         a registered pitch loses to the 256-byte alignment on either
+//                                       the producer or the consumer side
+//   RendererTouchedAddressKeepsOneLayout an address the renderer owns (seeded, or handed a compute
+//                                       result) is written back tight while plain memory is padded,
+//                                       so one address changes layout between dispatches
 //   SampledRendererTargetRegistersPlane a compute pass that samples a renderer target through a
 //                                       DCC-compressed T# does not tell the renderer about the
 //                                       control plane, so a later plane write leaves stale pixels
@@ -64,9 +63,8 @@ std::vector<uint8_t>& keep_alive(size_t bytes, uint8_t fill) {
     return *owned.back();
 }
 
-// The guest STATES this allocation's row pitch, as AvPlayer does for its planes. Only a stated
-// pitch is honoured (#4606); an unregistered allocation keeps tight rows.
-std::vector<uint8_t>& stated_pitch(std::vector<uint8_t>& backing, uint32_t pitch = Pitch) {
+// The guest STATES this allocation's row pitch, as AvPlayer does for its planes.
+std::vector<uint8_t>& stated_pitch(std::vector<uint8_t>& backing, uint32_t pitch) {
     register_guest_linear_texture_layout(reinterpret_cast<uint64_t>(backing.data()), backing.size(),
                                          pitch);
     return backing;
@@ -188,7 +186,7 @@ bool sample_into(const ShaderResource& image, std::vector<uint32_t>& out, uint32
 }   // namespace
 
 TEST(ComputeLinearRowPitch, SampledUploadDropsRowPadding) {
-    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
     write_padded(backing, 0x10000000u);
     std::vector<uint32_t> out;
     ASSERT_TRUE(sample_into(linear_image(backing, ResourceClass::Texture), out, 1));
@@ -197,7 +195,7 @@ TEST(ComputeLinearRowPitch, SampledUploadDropsRowPadding) {
 }
 
 TEST(ComputeLinearRowPitch, SampledSpanCoversThePaddedLastRow) {
-    auto& backing = stated_pitch(keep_alive(PaddedSpan, Poison));
+    auto& backing = keep_alive(PaddedSpan, Poison);
     write_padded(backing, 0x20000000u);
     const ShaderResource image = linear_image(backing, ResourceClass::Texture);
     std::vector<uint32_t> out;
@@ -275,7 +273,7 @@ void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base
 }   // namespace
 
 TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
-    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
     constexpr uint32_t Base = 0x30000000u;
     std::vector<uint32_t> out;
     EXPECT_EQ(produce_then_consume(backing, Base, out, 4), 1u)
@@ -286,7 +284,7 @@ TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
 
 TEST(ComputeLinearRowPitch, StorageSeedReadsPaddedRows) {
     // A storage binding that is only read: its seed must gather the rows from the padded pitch.
-    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
     constexpr uint32_t Base = 0x40000000u;
     write_padded(backing, Base);
     const std::vector<uint8_t> before = backing;
@@ -311,7 +309,7 @@ TEST(ComputeLinearRowPitchDefaults, ProducerConsumerThroughGuestMemory) {
         std::getenv("PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB"))
         GTEST_SKIP()
             << "needs the default cache thresholds; see the _default_thresholds registration";
-    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, Poison));
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
     constexpr uint32_t Base = 0x50000000u;
     std::vector<uint32_t> out;
     EXPECT_EQ(produce_then_consume(backing, Base, out, 8), 0u)
@@ -387,22 +385,6 @@ TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
            "rewritten";
 }
 
-TEST(ComputeLinearRowPitch, UnstatedPitchStaysTight) {
-    // No registration: the same producer/consumer chain must keep tight rows end to end.
-    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
-    constexpr uint32_t Base = 0x60000000u;
-    std::vector<uint32_t> out;
-    (void)produce_then_consume(backing, Base, out, 12);
-    EXPECT_EQ(out, expected_values(Base));
-    for (uint32_t i = 0; i < W * H; ++i) {
-        uint32_t value = 0;
-        std::memcpy(&value, backing.data() + size_t(i) * Bpt, Bpt);
-        ASSERT_EQ(value, texel_value(Base, i % W, i / W)) << "tight guest texel " << i;
-    }
-    for (size_t b = size_t(W) * H * Bpt; b < backing.size(); ++b)
-        ASSERT_EQ(backing[b], Poison) << "byte " << b << " lies past a tight image";
-}
-
 namespace {
 
 // An RGBA8 storage image over `backing`, written with every channel = 1.0 (0xff) or 0.0 by one lane
@@ -443,42 +425,12 @@ ComputeItem rgba8_fill(std::vector<uint8_t>& backing, bool ones, uint32_t index)
 
 }   // namespace
 
-TEST(ComputeLinearRowPitch, RendererOwnedTargetStaysTight) {
-    // A renderer-owned RGBA8 target whose address ALSO carries a stated 512-byte pitch: the renderer
-    // owns those pixels and reads them tight, so the compute writeback must stay tight.
+TEST(ComputeLinearRowPitch, RendererTouchedAddressKeepsOneLayout) {
     // NOLINTNEXTLINE(concurrency-mt-unsafe): set before the renderer starts any thread
     ::setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
     prosper::frontend::register_live_renderer("", false);
-    auto& target = stated_pitch(keep_alive(size_t(Pitch) * H, 0x11));
-    const uint64_t address = reinterpret_cast<uint64_t>(target.data());
-    GpuCaptureRttSeed seed;
-    seed.guest_addr = address;
-    seed.width = W;
-    seed.height = H;
-    seed.format = GpuCaptureColorFormat::Rgba8Unorm;
-    seed.rgba.assign(size_t(W) * H * 4u, 0x40);
-    std::string error;
-    ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
-    ASSERT_TRUE(is_live_render_target(address));
-
-    const ComputeItem item = rgba8_fill(target, true, 14);
-    ASSERT_FALSE(item.spirv.empty());
-    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
-    const size_t tight = size_t(W) * H * 4u;
-    for (size_t b = 0; b < tight; ++b) ASSERT_EQ(target[b], 0xffu) << "tight byte " << b;
-    for (size_t b = tight; b < target.size(); ++b)
-        ASSERT_EQ(target[b], 0x11u) << "byte " << b << " lies past the tight target";
-}
-
-TEST(ComputeLinearRowPitch, StatedPitchResultKeepsItsLayout) {
-    // A stated-pitch full overwrite must not be mirrored into a renderer target: the renderer's
-    // targets are tight, so the next dispatch would see a renderer-owned address and write it tight.
-    // NOLINTNEXTLINE(concurrency-mt-unsafe): set before the renderer starts any thread
-    ::setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
-    prosper::frontend::register_live_renderer("", false);
-    auto& backing = stated_pitch(keep_alive(size_t(Pitch) * H, 0x11));
-    const uint64_t address = reinterpret_cast<uint64_t>(backing.data());
-    const auto expect_rows = [&](uint8_t texel, const char* when) {
+    const auto expect_rows = [](const std::vector<uint8_t>& backing, uint8_t texel,
+                                const char* when) {
         for (uint32_t y = 0; y < H; ++y) {
             for (size_t b = 0; b < size_t(W) * 4u; ++b)
                 ASSERT_EQ(backing[size_t(y) * Pitch + b], texel) << when << " row " << y;
@@ -486,14 +438,51 @@ TEST(ComputeLinearRowPitch, StatedPitchResultKeepsItsLayout) {
                 ASSERT_EQ(backing[size_t(y) * Pitch + b], 0x11u) << when << " padding, row " << y;
         }
     };
-    const ComputeItem first = rgba8_fill(backing, true, 16);
+
+    // (1) Plain memory: the first result is handed to the renderer, which then owns the address.
+    auto& plain = keep_alive(size_t(Pitch) * H, 0x11);
+    const uint64_t plain_address = reinterpret_cast<uint64_t>(plain.data());
+    const ComputeItem first = rgba8_fill(plain, true, 16);
     ASSERT_FALSE(first.spirv.empty());
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({first}));
-    expect_rows(0xffu, "first dispatch");
-    EXPECT_FALSE(is_live_render_target(address))
-        << "a stated-pitch result became a renderer target";
-    const ComputeItem second = rgba8_fill(backing, false, 17);
+    expect_rows(plain, 0xffu, "first dispatch");
+    ASSERT_TRUE(is_live_render_target(plain_address))
+        << "control: the result must reach the renderer, or the second dispatch tests nothing";
+    const ComputeItem second = rgba8_fill(plain, false, 17);
     ASSERT_FALSE(second.spirv.empty());
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({second}));
-    expect_rows(0x00u, "second dispatch");
+    expect_rows(plain, 0x00u, "second dispatch, renderer-owned");
+
+    // (2) An address the renderer owned before any compute pass.
+    auto& seeded = keep_alive(size_t(Pitch) * H, 0x11);
+    const uint64_t seeded_address = reinterpret_cast<uint64_t>(seeded.data());
+    GpuCaptureRttSeed seed;
+    seed.guest_addr = seeded_address;
+    seed.width = W;
+    seed.height = H;
+    seed.format = GpuCaptureColorFormat::Rgba8Unorm;
+    seed.rgba.assign(size_t(W) * H * 4u, 0x40);
+    std::string error;
+    ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
+    ASSERT_TRUE(is_live_render_target(seeded_address));
+    const ComputeItem third = rgba8_fill(seeded, true, 18);
+    ASSERT_FALSE(third.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({third}));
+    expect_rows(seeded, 0xffu, "renderer-seeded target");
+}
+
+TEST(ComputeLinearRowPitch, StatedPitchOverridesTheRule) {
+    // A registered 1,024-byte pitch, wider than the 512-byte alignment: both sides must use it.
+    constexpr uint32_t Stated = 1024;
+    auto& backing = stated_pitch(keep_alive(size_t(Stated) * H, Poison), Stated);
+    constexpr uint32_t Base = 0x70000000u;
+    std::vector<uint32_t> out;
+    (void)produce_then_consume(backing, Base, out, 20);
+    EXPECT_EQ(out, expected_values(Base));
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            uint32_t value = 0;
+            std::memcpy(&value, backing.data() + size_t(y) * Stated + size_t(x) * Bpt, Bpt);
+            ASSERT_EQ(value, texel_value(Base, x, y)) << "guest texel (" << x << ", " << y << ")";
+        }
 }

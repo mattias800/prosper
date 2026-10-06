@@ -30,6 +30,11 @@ struct VideoOutBufferSnapshot {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t tiling_mode = 0;
+    // Bytes between rows of a LINEAR buffer in guest memory: the pitch the guest stated in its
+    // VideoOut attribute (pitch_in_pixel), or width*4. The same pitch is registered as the
+    // allocation's linear layout (register_guest_linear_texture_layout), so a compute or graphics
+    // pass writing the display buffer and the presenter reading it agree (#4586).
+    uint32_t row_pitch_bytes = 0;
 };
 
 // A GPU blit may outlive the lock-coherent snapshot that selected its source. A later flip or

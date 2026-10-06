@@ -104,17 +104,6 @@
 // The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
 extern "C" int prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
-
-namespace {
-// The guest row pitch the compute backend uses for a linear 2D image; see linear_image_pitch.hpp.
-size_t live_guest_row_pitch(const prosper::gpu::ShaderResource& r, uint32_t bpt,
-                            bool renderer_owned) {
-    const size_t pitch = renderer_owned ? 0 : prosper::frontend::compute_linear_row_pitch(r, bpt);
-    for (int i = 0, n = pitch && r.gpu_addr ? prosper_vo_buffer_count() : 0; i < n; ++i)
-        if (prosper_vo_buffer_addr(i) == r.gpu_addr) return 0;   // the presenter reads it tight
-    return pitch;
-}
-}   // namespace
 #include "shared/live/live_compute_storage_codec.hpp"
 
 namespace prosper::frontend {
@@ -4040,8 +4029,8 @@ struct BoundImage {
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
     bool direct_storage_detile_used = false;
-    // A guest-backed linear 2D image whose row pitch the guest stated (live_guest_row_pitch):
-    // bytes between row starts in guest memory, or 0 for tight rows. The
+    // A guest-backed linear 2D image's row pitch in guest memory (compute_linear_row_pitch), or 0
+    // for tight rows. The
     // sampled upload and the storage seed gather rows from this pitch; the CPU storage writeback
     // scatters them back to it.
     size_t guest_row_pitch = 0;
@@ -8440,7 +8429,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         sampled_guest_need =
                             layer_stride * (sampled_layers - 1u) + level_offset + slice;
                     } else {
-                        const size_t row_pitch = live_guest_row_pitch(*r, bpt, renderer_owned);
+                        const size_t row_pitch = compute_linear_row_pitch(*r, bpt);
                         bi.guest_row_pitch = row_pitch;
                         sampled_guest_need =
                             r->tile_mode
@@ -8841,7 +8830,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.exact_result_bytes = bi.exact_storage_bytes()
                     ? static_cast<VkDeviceSize>(linear_guest_bytes) : sbytes;
                 const size_t storage_row_pitch =
-                    live_guest_row_pitch(*r, static_cast<uint32_t>(guest_texel), renderer_owned);
+                    compute_linear_row_pitch(*r, static_cast<uint32_t>(guest_texel));
                 bi.guest_row_pitch = storage_row_pitch;
                 size_t guest_bytes =
                     r->tile_mode
@@ -10922,10 +10911,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (r->in_mip_tail) return ExactResultDecline::MipTail;
             if (r->mip_chain_base_level) return ExactResultDecline::MipBaseLevel;
             if (r->layer_mip_offset_bytes) return ExactResultDecline::LayerMipOffset;
-            // A stated pitch (descriptor or HLE registration) keeps the guest layout padded; the
-            // renderer's targets are tight, so mirroring would change this address's layout.
-            if (r->linear_row_pitch_bytes || bi.guest_row_pitch)
-                return ExactResultDecline::LinearPitch;
+            if (r->linear_row_pitch_bytes) return ExactResultDecline::LinearPitch;
             if (r->layer_stride_bytes) return ExactResultDecline::LayerStride;
             if (!r->width || !r->height) return ExactResultDecline::ZeroExtent;
             if (!staging[i]) return ExactResultDecline::NoStaging;
@@ -13050,10 +13036,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  "binding=%u addr=0x%llx extent=%ux%u\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  mirror.imported_width, mirror.imported_height);
-            } else if (
-                bi.storage && layout_source && r->width && r->height && r->depth == 1 &&
-                !r->in_mip_tail && !r->layer_mip_offset_bytes && !r->mip_chain_base_level &&
-                !bi.guest_row_pitch) {   // a stated pitch stays guest-owned: see linear_image_pitch.hpp
+            } else if (bi.storage && layout_source && r->width && r->height && r->depth == 1 &&
+                       !r->in_mip_tail && !r->layer_mip_offset_bytes && !r->mip_chain_base_level) {
                 if (r->format == DataFormat::Unorm2_10_10_10 && r->num_components == 4) {
                     prosper::frontend::publish_unorm10_as_rgba8(
                         r->gpu_addr, r->width, r->height, layout_source, linear_bytes);
