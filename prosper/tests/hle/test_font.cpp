@@ -7,8 +7,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 using namespace prosper;
 
@@ -777,4 +780,675 @@ TEST(Font, WritingMaskInvisibleWritesTheInvertedBit) {
     uint8_t foreign[0x100]{};
     EXPECT_EQ(mask(addr(foreign), 0, 0, 0, 0, 0), 0x8046000au) << "no writing magic";
     EXPECT_EQ(foreign[0x18], 0) << "a refused call writes nothing";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resolution and glyph-form queries (libSceFont.native.sprx 0x6b70, 0xe660, 0xe6b0).
+// ---------------------------------------------------------------------------------------------
+TEST(Font, ResolutionAndGlyphFormNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontGetResolutionDpi"), "8REoLjNGCpM");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetGlyphForm"), "PXlA0M8ax40");
+    EXPECT_EQ(nid_hash("sceFontGlyphGetMetricsForm"), "XUfSWpLhrUw");
+}
+
+TEST(Font, ResolutionDpiDefaultsToSeventyTwoAndFailsToSeventyTwo) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn get_dpi = Hle::lookup("8REoLjNGCpM");
+    ASSERT_NE(get_dpi, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+
+    uint32_t h = 0, v = 0;
+    EXPECT_EQ(get_dpi(addr(handle), addr(&h), addr(&v), 0, 0, 0), 0u);
+    EXPECT_EQ(h, 72u) << "a new face starts at 72 dpi, where points and pixels coincide";
+    EXPECT_EQ(v, 72u);
+    h = 0;
+    EXPECT_EQ(get_dpi(addr(handle), addr(&h), 0, 0, 0, 0), 0u) << "one output is enough";
+    EXPECT_EQ(h, 72u);
+    EXPECT_EQ(get_dpi(addr(handle), 0, 0, 0, 0, 0), 0x80460002u) << "both outputs NULL";
+
+    uint8_t decoy[64]{};
+    h = v = 1234;
+    EXPECT_EQ(get_dpi(addr(decoy), addr(&h), addr(&v), 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(h, 72u) << "the failure path writes 72, not 0";
+    EXPECT_EQ(v, 72u);
+    h = 1234;
+    EXPECT_EQ(get_dpi(0, addr(&h), 0, 0, 0, 0), 0x80460005u);
+    EXPECT_EQ(h, 72u);
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+// The forms are what GenerateCharGlyph recorded from its parameter block (+6 glyph form, +7 metrics
+// form); the getters answer 0 -- a form number, not a status -- for anything that is not a glyph.
+TEST(Font, GlyphFormsReadBackWhatGenerateRecorded) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn generate = Hle::lookup("C-4Qw5Srlyw");
+    HleFn remove = Hle::lookup("LHDoRWVFGqk");
+    HleFn glyph_form = Hle::lookup("PXlA0M8ax40");
+    HleFn metrics_form = Hle::lookup("XUfSWpLhrUw");
+    for (HleFn f : {generate, remove, glyph_form, metrics_form}) ASSERT_NE(f, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* face = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&face), 0), 0u);
+
+    uint8_t params[16]{};
+    params[6] = 1;   // glyph form: outline
+    params[7] = 2;   // metrics form
+    void* g = nullptr;
+    ASSERT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0u);
+    ASSERT_NE(g, nullptr);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 1u);
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 2u);
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    params[6] = 2;
+    params[7] = 0x85;   // a negative byte reads back as 0
+    ASSERT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0u);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 2u);
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 0u) << "a negative form is reported as 0";
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    ASSERT_EQ(generate(addr(face), 'A', 0, addr(&g), 0, 0), 0u);
+    EXPECT_EQ(glyph_form(addr(g), 0, 0, 0, 0, 0), 0u) << "no parameter block: form 0";
+    EXPECT_EQ(metrics_form(addr(g), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(remove(0, addr(&g), 0, 0, 0, 0), 0u);
+
+    params[6] = 3;
+    g = &g;
+    EXPECT_EQ(generate(addr(face), 'A', addr(params), addr(&g), 0, 0), 0x80460002u)
+        << "glyph forms are 0, 1 and 2";
+    EXPECT_EQ(g, nullptr) << "a refused generate clears the out";
+
+    uint8_t decoy[64]{};
+    decoy[4] = 1;
+    decoy[5] = 1;
+    EXPECT_EQ(glyph_form(addr(decoy), 0, 0, 0, 0, 0), 0u) << "not a glyph: 0, not an error code";
+    EXPECT_EQ(metrics_form(addr(decoy), 0, 0, 0, 0, 0), 0u);
+    // A face whose bytes at +8/+9 are non-zero, so reading it as a glyph would report a form.
+    using SetScaleFn = int32_t (*)(void*, float, float);
+    auto set_pixel = reinterpret_cast<SetScaleFn>(Hle::lookup("N1EBMeGhf7E"));
+    ASSERT_NE(set_pixel, nullptr);
+    const uint32_t bits = 0x41800101u;   // 16.00006f: low bytes 0x01, 0x01
+    float odd_width = 0.0f;
+    std::memcpy(&odd_width, &bits, sizeof(odd_width));
+    ASSERT_EQ(set_pixel(face, odd_width, 16.0f), 0);
+    EXPECT_EQ(glyph_form(addr(face), 0, 0, 0, 0, 0), 0u) << "a face is not a glyph";
+    EXPECT_EQ(metrics_form(addr(face), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(glyph_form(0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(metrics_form(0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(font.close_font(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Library queries: pixel resolution and the device cache (libSceFont.native.sprx 0x2750, 0x13f0,
+// 0x1560, 0x17f0). prosper has one library object, so every arm below leaves it detached.
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr uint64_t kLibErrInvalidParam = 0x80460002u;
+constexpr uint64_t kLibErrInvalidLibrary = 0x80460004u;
+constexpr uint64_t kLibErrCacheAttached = 0x80460022u;
+constexpr uint64_t kLibErrNoCache = 0x80460025u;
+struct LibraryApi {
+    HleFn create = nullptr, destroy = nullptr, pixel_resolution = nullptr, attach = nullptr,
+          detach = nullptr, clear = nullptr;
+    void* library = nullptr;
+    bool ready() const {
+        return create && destroy && pixel_resolution && attach && detach && clear && library;
+    }
+};
+LibraryApi library_api() {
+    register_builtin_hle();
+    LibraryApi api;
+    api.create = Hle::lookup("n590hj5Oe-k");
+    api.destroy = Hle::lookup("FXP359ygujs");
+    api.pixel_resolution = Hle::lookup("BozJej5T6fs");
+    api.attach = Hle::lookup("CUKn5pX-NVY");
+    api.detach = Hle::lookup("UuY-OJF+f0k");
+    api.clear = Hle::lookup("I9R5VC6eZWo");
+    static uint8_t mem[64]{};
+    if (api.create) api.create(addr(mem), 0, 0, addr(&api.library), 0, 0);
+    // Start from a detached library whatever an earlier arm left behind.
+    if (api.detach && api.library) api.detach(addr(api.library), 0, 0, 0, 0, 0);
+    return api;
+}
+}   // namespace
+
+TEST(Font, LibraryQueryNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontGetPixelResolution"), "BozJej5T6fs");
+    EXPECT_EQ(nid_hash("sceFontClearDeviceCache"), "I9R5VC6eZWo");
+    EXPECT_EQ(nid_hash("sceFontAttachDeviceCacheBuffer"), "CUKn5pX-NVY");
+    EXPECT_EQ(nid_hash("sceFontDettachDeviceCacheBuffer"), "UuY-OJF+f0k");
+}
+
+TEST(Font, PixelResolutionIsTheFreeTypeEditionsSixtyFour) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    uint32_t res = 0;
+    EXPECT_EQ(api.pixel_resolution(addr(api.library), addr(&res), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(res, 64u) << "the FreeType edition's driver callback answers 0x40 (26.6 fixed point)";
+    EXPECT_EQ(api.pixel_resolution(addr(api.library), 0, 0, 0, 0, 0), kLibErrInvalidParam);
+    uint8_t decoy[64]{};
+    res = 0xdeadbeef;
+    EXPECT_EQ(api.pixel_resolution(addr(decoy), addr(&res), 0, 0, 0, 0), kLibErrInvalidLibrary)
+        << "a bad library is the LIBRARY code, not the face's 0x80460005";
+    EXPECT_EQ(res, 0u) << "the failure path zeroes the output";
+    res = 0xdeadbeef;
+    EXPECT_EQ(api.pixel_resolution(0, addr(&res), 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(res, 0u);
+    EXPECT_EQ(api.pixel_resolution(0, 0, 0, 0, 0, 0), kLibErrInvalidLibrary)
+        << "the library is checked before the output";
+}
+
+TEST(Font, DeviceCacheAttachClearDetachRoundTrip) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    uint8_t decoy[64]{};
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache)
+        << "clearing with nothing attached is refused, not acknowledged";
+    EXPECT_EQ(api.clear(addr(decoy), 0, 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(api.clear(0, 0, 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(api.attach(addr(decoy), 0, 0x4000, 0, 0, 0), kLibErrInvalidLibrary);
+
+    alignas(8) uint32_t cache[0x3000 / 4];
+    std::memset(cache, 0xcc, sizeof(cache));
+    EXPECT_EQ(api.attach(addr(api.library), addr(cache), 0x101f, 0, 0, 0), kLibErrInvalidParam)
+        << "a cache under 0x1020 bytes";
+    EXPECT_EQ(cache[0], 0xccccccccu) << "...is refused before the header is written";
+    ASSERT_EQ(api.attach(addr(api.library), addr(cache), 0x3000, 0, 0, 0), 0u);
+    EXPECT_EQ(cache[0], 0x3000u) << "header: size";
+    EXPECT_EQ(cache[1], 2u) << "header: (size - 0x1000) >> 12 pages";
+    EXPECT_EQ(cache[2], 0u) << "header: nothing used";
+    EXPECT_EQ(cache[3], 2u) << "header: every page free";
+    uint64_t tail = 0;
+    std::memcpy(&tail, &cache[4], sizeof(tail));
+    EXPECT_EQ(tail, 0xff800001000ull);
+    EXPECT_EQ(api.attach(addr(api.library), addr(cache), 0x3000, 0, 0, 0), kLibErrCacheAttached)
+        << "one cache per library";
+
+    cache[2] = 5;   // the cache in use, as rendering would leave it
+    cache[3] = 0;
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(cache[2], 0u) << "Clear empties the cache...";
+    EXPECT_EQ(cache[3], 2u) << "...and frees every page";
+
+    void* back = nullptr;
+    uint32_t size = 0;
+    ASSERT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), 0u);
+    EXPECT_EQ(back, static_cast<void*>(cache)) << "the guest's own buffer is handed back";
+    EXPECT_EQ(size, 0x3000u);
+    EXPECT_EQ(cache[0], 0x3000u) << "the size word survives the detach";
+    EXPECT_EQ(cache[1], 0u) << "the rest of the header is cleared";
+    EXPECT_EQ(cache[5], 0u);
+    back = &back;
+    size = 7;
+    EXPECT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), kLibErrNoCache);
+    EXPECT_EQ(back, nullptr);
+    EXPECT_EQ(size, 0u);
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache) << "detached again";
+}
+
+TEST(Font, DeviceCacheEdgeCasesAndLibraryOwnedCaches) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    alignas(8) uint32_t small[0x1800 / 4];
+    std::memset(small, 0xcc, sizeof(small));
+    EXPECT_EQ(api.attach(addr(api.library), addr(small), 0x1800, 0, 0, 0), kLibErrInvalidParam)
+        << "a size that yields no page is refused";
+    EXPECT_EQ(small[0], 0x1800u) << "...after the header was written, exactly as the firmware does";
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache) << "and not attached";
+
+    // A NULL buffer is allocated by the library; detaching frees it and hands nothing back.
+    ASSERT_EQ(api.attach(addr(api.library), 0, 0x8000, 0, 0, 0), 0u);
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), 0u);
+    void* back = &back;
+    uint32_t size = 7;
+    EXPECT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), 0u);
+    EXPECT_EQ(back, nullptr) << "a library-owned cache is freed, not handed back";
+    EXPECT_EQ(size, 0u);
+
+    // DestroyLibrary takes the attachment down with it.
+    alignas(8) uint32_t cache[0x2000 / 4]{};
+    ASSERT_EQ(api.attach(addr(api.library), addr(cache), 0x2000, 0, 0, 0), 0u);
+    void* doomed = api.library;
+    ASSERT_EQ(api.destroy(addr(&doomed), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(doomed, nullptr);
+    // prosper's library is one object, so the pointer still names it -- with no cache attached.
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache)
+        << "a destroyed library leaves no cache behind";
+}
+
+// Kerning, library back-link, text-source rewind and character back-link (libSceFont.native.sprx).
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr uint64_t kErrInvalidParam = 0x80460002u;
+constexpr uint64_t kErrInvalidHandle = 0x80460005u;
+constexpr uint64_t kErrInvalidTextSource = 0x80460008u;
+constexpr uint64_t kErrNoGlyph = 0x80460041u;
+constexpr uint64_t kErrNoRenderer = 0x80460061u;
+
+void be16(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)x);
+}
+void be32(std::vector<uint8_t>& v, uint32_t x) {
+    be16(v, x >> 16);
+    be16(v, x & 0xffff);
+}
+
+// A minimal TrueType font: .notdef, 'A' (glyph 1) and 'V' (glyph 2), unitsPerEm 1000, ascent 800,
+// descent -200, so at the default 16 px face scale one font unit is 16/1000 px. Optionally a format-0
+// `kern` table and/or a GPOS pair-adjustment lookup, each kerning the pair (A, V) by its own amount, so
+// a test can tell which table answered.
+std::vector<uint8_t> kerning_font(int kern_units, bool with_kern, int gpos_units, bool with_gpos) {
+    struct Table {
+        uint32_t tag;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Table> t;
+    auto tag = [](const char* s) {
+        return (uint32_t)s[0] << 24 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 8 | (uint32_t)s[3];
+    };
+    {   // cmap: one (3,1) format-6 subtable over 'A'..'V'; A -> 1, V -> 2, the rest -> 0
+        std::vector<uint8_t> d;
+        be16(d, 0);
+        be16(d, 1);
+        be16(d, 3);
+        be16(d, 1);
+        be32(d, 12);
+        const uint32_t count = 'V' - 'A' + 1;
+        be16(d, 6);
+        be16(d, 10 + 2 * count);
+        be16(d, 0);
+        be16(d, 'A');
+        be16(d, count);
+        for (uint32_t c = 'A'; c <= 'V'; ++c) be16(d, c == 'A' ? 1 : c == 'V' ? 2 : 0);
+        t.push_back({tag("cmap"), d});
+    }
+    {   // glyf: three empty glyphs are enough -- kerning never reads an outline
+        t.push_back({tag("glyf"), {}});
+    }
+    {   // head
+        std::vector<uint8_t> d;
+        be32(d, 0x00010000);
+        be32(d, 0x00010000);
+        be32(d, 0);
+        be32(d, 0x5F0F3CF5);
+        be16(d, 0);
+        be16(d, 1000);
+        for (int i = 0; i < 16; ++i) d.push_back(0);
+        for (int i = 0; i < 4; ++i) be16(d, 0);
+        be16(d, 0);
+        be16(d, 8);
+        be16(d, 2);
+        be16(d, 0);
+        be16(d, 0);
+        t.push_back({tag("head"), d});
+    }
+    {   // hhea
+        std::vector<uint8_t> d;
+        be32(d, 0x00010000);
+        be16(d, 800);
+        be16(d, (uint16_t)-200);
+        be16(d, 0);
+        be16(d, 800);
+        for (int i = 0; i < 11; ++i) be16(d, 0);
+        be16(d, 3);
+        t.push_back({tag("hhea"), d});
+    }
+    {   // hmtx
+        std::vector<uint8_t> d;
+        for (int i = 0; i < 3; ++i) {
+            be16(d, 800);
+            be16(d, 0);
+        }
+        t.push_back({tag("hmtx"), d});
+    }
+    {   // loca (short): every glyph empty
+        std::vector<uint8_t> d;
+        for (int i = 0; i < 4; ++i) be16(d, 0);
+        t.push_back({tag("loca"), d});
+    }
+    {   // maxp
+        std::vector<uint8_t> d;
+        be32(d, 0x00010000);
+        be16(d, 3);
+        for (int i = 0; i < 13; ++i) be16(d, 0);
+        t.push_back({tag("maxp"), d});
+    }
+    if (with_kern) {   // kern v0, one horizontal format-0 subtable, one pair (1, 2)
+        std::vector<uint8_t> d;
+        be16(d, 0);
+        be16(d, 1);
+        be16(d, 0);
+        be16(d, 6 + 8 + 6);
+        be16(d, 0x0001);
+        be16(d, 1);
+        be16(d, 6);
+        be16(d, 0);
+        be16(d, 0);
+        be16(d, 1);
+        be16(d, 2);
+        be16(d, (uint16_t)kern_units);
+        t.push_back({tag("kern"), d});
+    }
+    if (with_gpos) {   // GPOS 1.0: one type-2 lookup, PairPos format 1, XAdvance on the first glyph
+        std::vector<uint8_t> d;
+        be16(d, 1);
+        be16(d, 0);
+        be16(d, 10);
+        be16(d, 12);
+        be16(d, 14);
+        be16(d, 0);   // ScriptList @10: no scripts
+        be16(d, 0);   // FeatureList @12: no features
+        be16(d, 1);
+        be16(d, 4);   // LookupList @14: one lookup at +4
+        be16(d, 2);
+        be16(d, 0);
+        be16(d, 1);
+        be16(d, 8);   // Lookup @18: type 2, one subtable at +8
+        // PairPosFormat1 @26: coverage at +12, valueFormat1 = XAdvance, one PairSet at +18
+        be16(d, 1);
+        be16(d, 12);
+        be16(d, 4);
+        be16(d, 0);
+        be16(d, 1);
+        be16(d, 18);
+        be16(d, 1);
+        be16(d, 1);
+        be16(d, 1);   // Coverage format 1: glyph 1
+        be16(d, 1);
+        be16(d, 2);
+        be16(d, (uint16_t)gpos_units);   // PairSet: (2, xAdvance)
+        t.push_back({tag("GPOS"), d});
+    }
+    std::sort(t.begin(), t.end(), [](const Table& a, const Table& b) { return a.tag < b.tag; });
+    std::vector<uint8_t> out;
+    const uint32_t n = (uint32_t)t.size();
+    be32(out, 0x00010000);
+    be16(out, n);
+    be16(out, 0);
+    be16(out, 0);
+    be16(out, 0);
+    uint32_t offset = 12 + 16 * n;
+    for (const Table& tb : t) {
+        be32(out, tb.tag);
+        be32(out, 0);
+        be32(out, offset);
+        be32(out, (uint32_t)tb.data.size());
+        offset += ((uint32_t)tb.data.size() + 3) & ~3u;
+    }
+    for (const Table& tb : t) {
+        out.insert(out.end(), tb.data.begin(), tb.data.end());
+        while (out.size() % 4) out.push_back(0);
+    }
+    return out;
+}
+
+struct KerningApi {
+    HleFn create_library = nullptr, create_renderer = nullptr, open_set = nullptr,
+          open_memory = nullptr, bind = nullptr, close = nullptr, kerning = nullptr,
+          render_kerning = nullptr, get_library = nullptr;
+    void* library = nullptr;
+    bool ready() const {
+        return create_library && create_renderer && open_set && open_memory && bind && close &&
+               kerning && render_kerning && get_library && library;
+    }
+};
+KerningApi kerning_api() {
+    register_builtin_hle();
+    KerningApi api;
+    api.create_library = Hle::lookup("n590hj5Oe-k");
+    api.create_renderer = Hle::lookup("u5fZd3KZcs0");
+    api.open_set = Hle::lookup("cKYtVmeSTcw");
+    api.open_memory = Hle::lookup("KXUpebrFk1U");
+    api.bind = Hle::lookup("3OdRkSjOcog");
+    api.close = Hle::lookup("vzHs3C8lWJk");
+    api.kerning = Hle::lookup("sDuhHGNhHvE");
+    api.render_kerning = Hle::lookup("ryPlnDDI3rU");
+    api.get_library = Hle::lookup("LzmHDnlcwfQ");
+    static uint8_t mem[64]{};
+    if (api.create_library) api.create_library(addr(mem), 0, 0, addr(&api.library), 0, 0);
+    return api;
+}
+// The face opened over `font`, or nullptr.
+void* open_memory_face(const KerningApi& api, const std::vector<uint8_t>& font) {
+    void* handle = nullptr;
+    if (api.open_memory(addr(api.library), addr(font.data()), font.size(), 0, addr(&handle), 0))
+        return nullptr;
+    return handle;
+}
+}   // namespace
+
+TEST(Font, KerningNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontGetKerning"), "sDuhHGNhHvE");
+    EXPECT_EQ(nid_hash("sceFontGetRenderScaledKerning"), "ryPlnDDI3rU");
+    EXPECT_EQ(nid_hash("sceFontGetLibrary"), "LzmHDnlcwfQ");
+    EXPECT_EQ(nid_hash("sceFontTextSourceRewind"), "VRFd3diReec");
+    EXPECT_EQ(nid_hash("sceFontCharacterRefersTextBack"), "6Gqlv5KdTbU");
+}
+
+// The native core's checks, in its order, and the 12-byte zeroing of every error path: out[3] is a
+// poison the error paths must NOT touch, because the core writes a qword and a dword and no more.
+TEST(Font, KerningFollowsTheNativeCheckOrder) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    float out[4];
+    auto poison = [&] { out[0] = out[1] = out[2] = out[3] = 7.0f; };
+    auto zeroed12 = [&] {
+        return out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f && out[3] == 7.0f;
+    };
+
+    uint8_t decoy[64]{};
+    poison();
+    EXPECT_EQ(api.kerning(addr(decoy), 'A', 'V', addr(out), 0, 0), kErrInvalidHandle);
+    EXPECT_TRUE(zeroed12()) << "a foreign face is refused and the first 12 bytes cleared";
+    EXPECT_EQ(api.kerning(0, 'A', 'V', 0, 0, 0), kErrInvalidHandle) << "the face is checked first";
+    poison();
+    EXPECT_EQ(api.kerning(addr(face), 'A', 0, addr(out), 0, 0), kErrNoGlyph) << "code == 0";
+    EXPECT_TRUE(zeroed12());
+    EXPECT_EQ(api.kerning(addr(face), 'A', 0, 0, 0, 0), kErrNoGlyph)
+        << "code == 0 is checked before the NULL out";
+    EXPECT_EQ(api.kerning(addr(face), 'A', 'V', 0, 0, 0), kErrInvalidParam) << "NULL out";
+    poison();
+    EXPECT_EQ(api.kerning(addr(face), 0, 'V', addr(out), 0, 0), 0u) << "preCode == 0 is success";
+    EXPECT_TRUE(zeroed12()) << "...with the first 12 bytes cleared";
+    poison();
+    EXPECT_EQ(api.kerning(addr(face), 'A', 'V', addr(out), 0, 0), 0u);
+    EXPECT_EQ(out[0], 0.0f) << "a system-font face has no table to kern from";
+    EXPECT_EQ(out[3], 0.0f) << "a success writes all sixteen bytes";
+
+    void* orphan = nullptr;
+    ASSERT_EQ(api.open_set(0, 0, 0, 0, addr(&orphan), 0), 0u);
+    poison();
+    EXPECT_EQ(api.kerning(addr(orphan), 'A', 'V', addr(out), 0, 0), kErrInvalidHandle)
+        << "a face with no library (face+0x28 == 0)";
+    EXPECT_TRUE(zeroed12());
+    EXPECT_EQ(api.close(addr(orphan), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(api.close(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Font, RenderScaledKerningNeedsABoundRenderer) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    float out[4] = {7.0f, 7.0f, 7.0f, 7.0f};
+    EXPECT_EQ(api.render_kerning(addr(face), 0, 'V', addr(out), 0, 0), kErrNoRenderer)
+        << "no renderer answers 0x80460061 even when preCode is 0";
+    EXPECT_EQ(out[0], 0.0f);
+    EXPECT_EQ(out[3], 7.0f);
+    EXPECT_EQ(api.kerning(addr(face), 'A', 'V', addr(out), 0, 0), 0u)
+        << "the plain variant does not need one";
+    uint8_t mem[64]{};
+    void* renderer = nullptr;
+    ASSERT_EQ(api.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    ASSERT_EQ(api.bind(addr(face), addr(renderer), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(api.render_kerning(addr(face), 0, 'V', addr(out), 0, 0), 0u);
+    EXPECT_EQ(api.render_kerning(addr(face), 'A', 'V', addr(out), 0, 0), 0u);
+    EXPECT_EQ(api.close(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+// The value itself, out of the title's own font file. The FreeType driver prefers the classic kern
+// table and only falls back to GPOS when there is none; stb's public helper does the opposite, so the
+// "both tables" arm is the one that separates the two precedences.
+TEST(Font, KerningReadsTheKernTableBeforeGpos) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    const float unit = 16.0f / 1000.0f;   // default 16 px face, ascent - descent = 1000 units
+
+    const std::vector<uint8_t> kern_only = kerning_font(-100, true, 0, false);
+    const std::vector<uint8_t> both = kerning_font(-100, true, -40, true);
+    const std::vector<uint8_t> gpos_only = kerning_font(0, false, -40, true);
+    void* faces[3] = {open_memory_face(api, kern_only), open_memory_face(api, both),
+                      open_memory_face(api, gpos_only)};
+    for (void* f : faces) ASSERT_NE(f, nullptr) << "the synthesized font parses";
+    const float expected[3] = {-100.0f * unit, -100.0f * unit, -40.0f * unit};
+    const char* what[3] = {"kern only", "kern and GPOS: kern wins", "GPOS only: the fallback"};
+    for (int i = 0; i < 3; ++i) {
+        float out[4] = {7.0f, 7.0f, 7.0f, 7.0f};
+        ASSERT_EQ(api.kerning(addr(faces[i]), 'A', 'V', addr(out), 0, 0), 0u) << what[i];
+        EXPECT_FLOAT_EQ(out[0], expected[i]) << what[i];
+        EXPECT_EQ(out[1], 0.0f) << what[i];
+        EXPECT_EQ(out[2], 0.0f) << what[i];
+        EXPECT_EQ(out[3], 0.0f) << what[i];
+        ASSERT_EQ(api.kerning(addr(faces[i]), 'V', 'A', addr(out), 0, 0), 0u);
+        EXPECT_EQ(out[0], 0.0f) << what[i] << ": a pair the table does not list";
+    }
+    for (void* f : faces) EXPECT_EQ(api.close(addr(f), 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Font, GetLibraryValidatesBeforeAnswering) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    void* back = nullptr;
+    EXPECT_EQ(api.get_library(addr(face), addr(&back), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(back, api.library) << "GetLibrary reports the opening library";
+    EXPECT_EQ(api.get_library(addr(face), 0, 0, 0, 0, 0), kErrInvalidParam) << "NULL out";
+
+    uint8_t decoy[64]{};
+    back = &back;
+    EXPECT_EQ(api.get_library(addr(decoy), addr(&back), 0, 0, 0, 0), kErrInvalidHandle);
+    EXPECT_EQ(back, nullptr) << "a refused call clears the out";
+    EXPECT_EQ(api.get_library(addr(decoy), 0, 0, 0, 0, 0), kErrInvalidHandle)
+        << "the face is checked before the out";
+
+    void* orphan = nullptr;
+    ASSERT_EQ(api.open_set(0, 0, 0, 0, addr(&orphan), 0), 0u);
+    back = &back;
+    EXPECT_EQ(api.get_library(addr(orphan), addr(&back), 0, 0, 0, 0), kErrInvalidHandle)
+        << "a face with no library is refused, not answered with NULL";
+    EXPECT_EQ(back, nullptr);
+    uint8_t not_a_library[64]{};
+    void* stranger = nullptr;
+    ASSERT_EQ(api.open_set(addr(not_a_library), 0, 0, 0, addr(&stranger), 0), 0u);
+    EXPECT_EQ(api.get_library(addr(stranger), addr(&back), 0, 0, 0, 0), kErrInvalidHandle)
+        << "a library pointer without the library magic";
+    EXPECT_EQ(api.get_library(addr(stranger), 0, 0, 0, 0, 0), kErrInvalidHandle)
+        << "the library is checked before the out";
+    for (void* f : {face, orphan, stranger}) EXPECT_EQ(api.close(addr(f), 0, 0, 0, 0, 0), 0u);
+}
+
+// TextSourceInit takes a snapshot that Rewind restores in full (native +0xf640 / +0xf7f0), and
+// SetDefaultFont writes both copies. Offsets are the native layout: magic +0, form +4, start +8,
+// end +0x10, current +0x18, parser +0x20, object +0x28, default font +0x30.
+TEST(Font, TextSourceRewindRestoresTheInitSnapshot) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn rewind = Hle::lookup("VRFd3diReec");
+    HleFn set_default = Hle::lookup("eCRMCSk96NU");
+    HleFn set_form = Hle::lookup("OqQKX0h5COw");
+    ASSERT_NE(rewind, nullptr);
+    ASSERT_NE(set_default, nullptr);
+    ASSERT_NE(set_form, nullptr);
+    uint64_t src[12];
+    std::memset(src, 0xcc, sizeof(src));
+    const char text[] = "ASTRO";
+    int parser = 0, object = 0, font_a = 0, font_b = 0;
+    ASSERT_EQ(font.text_init(addr(src), addr(text), sizeof(text), addr(&parser), addr(&object), 0),
+              0u);
+    EXPECT_EQ(src[0] & 0xffff, 0x0f04u) << "Init stamps the text-source magic";
+    EXPECT_EQ(src[0] >> 32, 0x10u) << "...and the default writing form";
+    ASSERT_EQ(set_default(addr(src), addr(&font_a), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(src[6], addr(&font_a));
+
+    // Move every live field, the way a consumer and a later SetDefaultFont-less edit would.
+    src[1] = 0x1111;
+    src[2] = 0x2222;
+    src[3] = 0x3333;
+    src[4] = 0x4444;
+    src[5] = 0x5555;
+    src[6] = addr(&font_b);
+    ASSERT_EQ(rewind(addr(src), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(src[1], addr(text)) << "start restored";
+    EXPECT_EQ(src[2], addr(text) + sizeof(text)) << "end restored";
+    EXPECT_EQ(src[3], addr(text)) << "the cursor is back at the start";
+    EXPECT_EQ(src[4], addr(&parser)) << "parser restored";
+    EXPECT_EQ(src[5], addr(&object)) << "object restored";
+    EXPECT_EQ(src[6], addr(&font_a)) << "the default font SetDefaultFont recorded is restored";
+
+    EXPECT_EQ(set_form(addr(src), 0x11, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(src[0] & 0xffff, 0x0f04u) << "SetWritingForm leaves the magic alone";
+    EXPECT_EQ(src[0] >> 32, 0x11u) << "...and writes the form at +4";
+    EXPECT_EQ(set_form(addr(src), 0x13, 0, 0, 0, 0), kErrInvalidParam) << "forms are 0x10..0x12";
+    EXPECT_EQ(set_form(addr(src), 0x0f, 0, 0, 0, 0), kErrInvalidParam);
+
+    EXPECT_EQ(rewind(0, 0, 0, 0, 0, 0), kErrInvalidParam) << "NULL source";
+    uint64_t foreign[12]{};
+    EXPECT_EQ(rewind(addr(foreign), 0, 0, 0, 0, 0), kErrInvalidTextSource) << "no magic";
+    EXPECT_EQ(set_default(addr(foreign), addr(&font_a), 0, 0, 0, 0), kErrInvalidTextSource);
+    EXPECT_EQ(foreign[6], 0u) << "a refused SetDefaultFont writes nothing";
+    EXPECT_EQ(set_default(0, addr(&font_a), 0, 0, 0, 0), kErrInvalidParam);
+    EXPECT_EQ(set_form(addr(foreign), 0x11, 0, 0, 0, 0), kErrInvalidTextSource);
+    EXPECT_EQ(set_form(0, 0x11, 0, 0, 0, 0), kErrInvalidParam);
+}
+
+// RefersTextNext / RefersTextBack follow their own link and step over characters flagged at +0x31 or
+// +0x33. The chain is built in test memory with the native TextCharacter layout.
+TEST(Font, CharacterLinksWalkTheirOwnDirectionAndSkipFlagged) {
+    register_builtin_hle();
+    HleFn next = Hle::lookup("BkjBP+YC19w");
+    HleFn back = Hle::lookup("6Gqlv5KdTbU");
+    ASSERT_NE(next, nullptr);
+    ASSERT_NE(back, nullptr);
+    struct Character {
+        Character* prev;
+        Character* next;
+        void* order;
+        void* font;
+        void* shape;
+        uint32_t code;
+        uint8_t reserved[5];
+        uint8_t flag_0x31;
+        uint8_t reserved_0x32;
+        uint8_t flag_0x33;
+        uint8_t tail[12];
+    };
+    static_assert(offsetof(Character, flag_0x31) == 0x31 && offsetof(Character, flag_0x33) == 0x33);
+    Character c[4]{};
+    for (int i = 0; i < 4; ++i) {
+        c[i].prev = i > 0 ? &c[i - 1] : nullptr;
+        c[i].next = i < 3 ? &c[i + 1] : nullptr;
+    }
+    EXPECT_EQ(next(addr(&c[0]), 0, 0, 0, 0, 0), addr(&c[1]));
+    EXPECT_EQ(back(addr(&c[2]), 0, 0, 0, 0, 0), addr(&c[1])) << "back follows prev, not next";
+    EXPECT_EQ(back(addr(&c[0]), 0, 0, 0, 0, 0), 0u) << "the head has nothing before it";
+    EXPECT_EQ(next(addr(&c[3]), 0, 0, 0, 0, 0), 0u);
+    c[1].flag_0x31 = 1;
+    c[2].flag_0x33 = 1;
+    EXPECT_EQ(next(addr(&c[0]), 0, 0, 0, 0, 0), addr(&c[3]))
+        << "flagged characters are stepped over";
+    EXPECT_EQ(back(addr(&c[3]), 0, 0, 0, 0, 0), addr(&c[0]));
+    EXPECT_EQ(next(0, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(back(0, 0, 0, 0, 0, 0), 0u);
 }
