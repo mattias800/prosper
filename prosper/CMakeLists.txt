@@ -1665,6 +1665,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_manager.cpp
     LIBRARIES prosper_core)
 
+  # libSceNetCtl / libSceNpManager state callbacks: registered on every host (they were POSIX-only,
+  # so a Windows title's boot registration answered 0 over an unwritten callback id). Delivery of the
+  # honest offline / signed-out state, capacity and null-argument cases, on host-function callbacks.
+  prosper_add_gtest(test_np_state_callbacks
+    SOURCES tests/hle/np/test_np_state_callbacks.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.
@@ -6806,6 +6813,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
   prosper_add_gtest(test_unorm10_snapshot
     SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
+  prosper_add_gtest(test_retirement_queue
+    SOURCES tests/shared/compute/test_retirement_queue.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 

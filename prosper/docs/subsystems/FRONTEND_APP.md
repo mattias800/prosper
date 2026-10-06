@@ -179,7 +179,9 @@ Design points that are deliberate rather than incidental:
   whatever a newer build had stored.
 - **`scan_game_library` reuses `resolve_app0_root()`** from the interactive-open path above, so all three
   entry points agree on what a title is. The listing is "what a drop or the picker would accept", which
-  is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone.
+  is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone. The games directory
+  itself is listed when it is a title root (a dump at a drive root); the library-browse answer still
+  boots such a folder directly instead of scanning inside it.
 - **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
   exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
 

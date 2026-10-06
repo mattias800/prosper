@@ -4,7 +4,7 @@
 #include "fixtures/render_runner.h"                  // render_vk_ctx()
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // free_device_memory
 #include "gpu/diagnostics/memory_placement_log.hpp"  // allocate_gpu_only_memory
-#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
 #include "gpu/execute/gpu_execute.hpp"               // shared_present_submit_mutex
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/texture/tile.hpp"                      // videoout_scanout_tile_mode

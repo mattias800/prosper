@@ -1,6 +1,6 @@
 #include "gpu/diagnostics/draw_disposition.hpp"
 
-#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: dropped-draws alarm
 
