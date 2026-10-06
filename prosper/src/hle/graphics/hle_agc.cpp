@@ -64,14 +64,6 @@ extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t 
 #define HLE9(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
                                        uint64_t a7, uint64_t a8)
-// sceAgcCbBranch takes twelve arguments, beyond the Windows legacy prologue's ten
-// (kLegacyForwardedArgs). Its handler is therefore registered with Hle::register_typed, whose
-// deduced signature lets the import bridge place all twelve; the (HleFn) cast form would drop two.
-#define HLE12(name)                                                                                \
-    static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,      \
-                                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,      \
-                                          uint64_t a8, uint64_t a9, uint64_t a10, uint64_t a11)
-
 namespace {
 
 // --- PM4 encoding (Kyty Pm4.h) ---------------------------------------------------------------
@@ -2646,9 +2638,10 @@ static void report_short_fold(const char* who, uint64_t submit_no, const uint32_
 //
 // prosper folds every submit synchronously inside the caller's HLE handler, serialised by
 // g_agc_state_mu. That makes the FOLD order a property of lock acquisition, not of the guest's
-// program order — and #305 turns on exactly that distinction: a q3 (SubmitDcbFinal) fold appears
-// immediately after a q1 (SubmitDcb) bind, and the question is whether hardware would have run them
-// in that order at all. Nikoderiko additionally issues its two submits from two DIFFERENT guest
+// program order — and #305 turned on exactly that distinction: a q3 (SubmitDcbFinal) fold appeared
+// immediately after a q1 (SubmitDcb) bind. #4540 answered whether hardware would run them in that
+// order: q3 was sceAgcCbBranch's target, folded when recorded instead of where its packet sits, and
+// no longer exists. Nikoderiko additionally issues its two submits from two DIFFERENT guest
 // functions (eboot+0xfb0c10 and eboot+0xfb04b0), not one loop over a buffer array as the DOLL
 // derivation assumed, so the ordering prosper inherits has never been checked against this title.
 //
@@ -2686,14 +2679,9 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
     if (!submitorder_on()) return;
     struct Census { std::atomic<uint64_t> n{0}, threads{0}; };
     static std::atomic<uint64_t> last_call{0}, out_of_order{0}, total{0};
-    static std::atomic<uint64_t> per_thread[8]{};        // count by thread token (1..7 observed)
-    static std::atomic<uint64_t> final_per_thread[8]{};  // ...for SubmitDcbFinal specifically
-    const bool is_final = strcmp(who, "SubmitDcbFinal") == 0;
+    static std::atomic<uint64_t> per_thread[8]{};   // count by thread token (1..7 observed)
     const uint64_t n = total.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (st.thread < 8) {
-        per_thread[st.thread].fetch_add(1, std::memory_order_relaxed);
-        if (is_final) final_per_thread[st.thread].fetch_add(1, std::memory_order_relaxed);
-    }
+    if (st.thread < 8) per_thread[st.thread].fetch_add(1, std::memory_order_relaxed);
     const uint64_t prev = last_call.exchange(st.call_seq, std::memory_order_acq_rel);
     const bool inverted = st.call_seq < prev;
     if (inverted) {
@@ -2722,11 +2710,9 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
             const uint64_t c = per_thread[i].load(std::memory_order_relaxed);
             if (!c) continue;
             const int before = o;
-            const int m = o < (int)sizeof(tb)
-                ? snprintf(tb + o, sizeof(tb) - o, " t%d=%llu/%llu", i,
-                           (unsigned long long)c,
-                           (unsigned long long)final_per_thread[i].load(std::memory_order_relaxed))
-                : -1;
+            const int m = o < (int)sizeof(tb) ? snprintf(tb + o, sizeof(tb) - o, " t%d=%llu", i,
+                                                         (unsigned long long)c)
+                                              : -1;
             if (m > 0 && before + m < (int)sizeof(tb)) { o = before + m; continue; }
             tb[before] = '\0';
             ++tb_dropped;
@@ -2785,8 +2771,8 @@ static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buf
     // graphics Dcb stream from the async-compute Acb stream. The queues share ordered memory
     // effects, but not register files: folding Acb SH writes into graphics state overwrote live
     // vertex user-data bindings before the next Dcb draw (Plucky's first gameplay scene).
-    gpu::prosper_gpu_set_fold_origin(async_compute                         ? 2
-                                     : strcmp(who, "SubmitDcbFinal") == 0 ? 3 : 1);
+    // Origin 3 (SubmitDcbFinal) is no longer produced: that fold was sceAgcCbBranch's (#4540).
+    gpu::prosper_gpu_set_fold_origin(async_compute ? 2 : 1);
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
     state.draws.clear();
@@ -2886,13 +2872,20 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // PPSA01802: 0 of 19 sampled draws matched the program actually used, while their user data matched
 // the next bind of the same shape), which the recompiler then refused as unresolved descriptors.
 // It also wrote no packet, so the carrying buffer reached SubmitDcb without its tail branch.
-// Measured on Kena: 61 of the first 64 recorded branches sit at the exact end of a buffer the guest
+// Measured on Kena: 61 of the first 64 recorded branches are the last packet of a buffer the guest
 // later submits through sceAgcDriverSubmitDcb, so emitting the packet hands the target to the
 // command processor in guest order. The #232 dependency (DOLL's final-buffer EOP fences) is served
 // the same way: the fences run when the carrying buffer is folded. CONFIDENCE: HIGH on the packet
 // layout and size (read from the firmware stores); MED on the condition encoding (see
 // pm4_decode.hpp CondIndirectBuffer).
-HLE12(agc_cb_branch) {
+// The writer runs in the host convention. Null targets: the firmware writes 0 to a target's
+// dwords/flags word when that target's address is 0, so an absent target carries no stale size
+// (`test %r15` at 0x5e9f on a7 and `test %r10` at 0x5ec7 on a10 select a zeroed word).
+__attribute__((noinline)) static uint64_t cb_branch_write(uint64_t a0, uint64_t a1, uint64_t a2,
+                                                          uint64_t a3, uint64_t a4, uint64_t a5,
+                                                          uint64_t a6, uint64_t a7, uint64_t a8,
+                                                          uint64_t a9, uint64_t a10,
+                                                          uint64_t a11) noexcept {
     uint32_t* cmd;
     if (!begin_packet(a0, kDwCbBranch, IT_INDIRECT_BUFFER, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 3u) | ((uint32_t)(a2 & 7u) << 8);
@@ -2904,11 +2897,25 @@ HLE12(agc_cb_branch) {
     cmd[7] = (uint32_t)(a5 >> 32);
     cmd[8] = (uint32_t)(a7 & 0xfffffffcu);
     cmd[9] = (uint32_t)(a7 >> 32);
-    cmd[10] = (uint32_t)(a8 & 0xfffffu) | ((uint32_t)(a6 & 3u) << 28);
+    cmd[10] = a7 ? (uint32_t)(a8 & 0xfffffu) | ((uint32_t)(a6 & 3u) << 28) : 0u;
     cmd[11] = (uint32_t)(a10 & 0xfffffffcu);
     cmd[12] = (uint32_t)(a10 >> 32);
-    cmd[13] = (uint32_t)(a11 & 0xfffffu) | ((uint32_t)(a9 & 3u) << 28);
+    cmd[13] = a10 ? (uint32_t)(a11 & 0xfffffu) | ((uint32_t)(a9 & 3u) << 28) : 0u;
+    // Reached by a bare tail-jump on Windows (below), so the import stub's pending-guest-exception
+    // checkpoint does not run; make the poll here, as the libc guest-ABI handlers do.
+    dispatch_pending_guest_exception();
     return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcCbBranch takes TWELVE arguments. The Windows converting bridge forwards only ten
+// (kLegacyForwardedArgs), and a declared integer-only signature is placed by that same prologue, so
+// the entry is compiled in the guest's convention (PROSPER_GUEST_ABI) and registered with
+// Hle::register_guest_abi: the stub is a bare tail-jump and a6..a11 are read from the guest's own
+// stack. Per PROSPER_GUEST_ABI's rule this frame owns nothing and only forwards to the writer.
+static PROSPER_GUEST_ABI uint64_t agc_cb_branch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                                uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                                                uint64_t a8, uint64_t a9, uint64_t a10,
+                                                uint64_t a11) {
+    return cb_branch_write(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 }
 constexpr uint32_t kCbBranchBytes = kDwCbBranch * 4u;   // firmware GetSize: mov $0x38,%eax
 HLE(agc_cb_branch_get_size) {
@@ -3971,11 +3978,12 @@ void register_agc_hle() {
     RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
     RN_SUBMIT_NAMED("6UzEidRZwkg", agc_driver_submit_multi_dcbs, "sceAgcDriverSubmitMultiDcbs");
     // sceAgcCbBranch and its family (#2173, #4540). The branch is a builder, not a submit, so it
-    // carries no submit-scope return hook. It takes twelve arguments, so it is registered with its
-    // declared signature: the (HleFn) cast form forwards only ten on Windows (kLegacyForwardedArgs).
+    // carries no submit-scope return hook. It takes twelve arguments, so its handler is guest-ABI:
+    // see agc_cb_branch for why neither the (HleFn) cast nor a declared signature reaches all twelve
+    // on Windows.
     // GetSize is registered in the same change as the packet, as the #1756 rule requires: a guest
     // that asks reserves exactly the 0x38 bytes the builder writes.
-    Hle::register_typed("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");
+    Hle::register_guest_abi("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");
     Hle::register_fn("uZW-mqsxkrM", (HleFn)agc_cb_branch_get_size, "sceAgcCbBranchGetSize");
     Hle::register_fn("GXBlM-ekzrI", (HleFn)agc_branch_patch_set_compare_address,
                      "sceAgcBranchPatchSetCompareAddress");

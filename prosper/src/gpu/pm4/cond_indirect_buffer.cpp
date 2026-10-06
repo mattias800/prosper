@@ -17,6 +17,24 @@ bool report_now(std::atomic<uint64_t>& counter, uint64_t& ordinal) {
 }  // namespace
 
 Pm4Command cond_indirect_buffer_jump(const Pm4Command& c) {
+    Pm4Command j = c;
+    j.kind = Pm4Command::Kind::Jump;
+    j.jump_addr = 0;
+    j.jump_dwords = 0;
+    j.jump_pred = 0;
+    j.jump_valid = true;
+    if (c.cib_mode != kCibModeIfThen && c.cib_mode != kCibModeIfThenElse) {
+        static std::atomic<uint64_t> reserved{0};
+        uint64_t k = 0;
+        if (report_now(reserved, k))
+            std::fprintf(stderr,
+                         "[agc] conditional branch REFUSED #%llu: reserved mode=%u func=%u "
+                         "then=0x%llx/%u else=0x%llx/%u -- neither target runs (#4540)\n",
+                         (unsigned long long)k, c.cib_mode, c.cib_func,
+                         (unsigned long long)c.cib_then_addr, c.cib_then_dwords,
+                         (unsigned long long)c.cib_else_addr, c.cib_else_dwords);
+        return j;
+    }
     bool take_then = true;
     if (c.cib_func != 0) {
         uint64_t value = 0;
@@ -43,12 +61,13 @@ Pm4Command cond_indirect_buffer_jump(const Pm4Command& c) {
                          (unsigned long long)c.cib_mask, (unsigned long long)c.cib_reference,
                          take_then ? "then" : "else");
     }
-    Pm4Command j = c;
-    j.kind = Pm4Command::Kind::Jump;
-    j.jump_addr = take_then ? c.cib_then_addr : c.cib_else_addr;
-    j.jump_dwords = take_then ? c.cib_then_dwords : c.cib_else_dwords;
-    j.jump_pred = 0;
-    j.jump_valid = true;
+    if (take_then) {
+        j.jump_addr = c.cib_then_addr;
+        j.jump_dwords = c.cib_then_dwords;
+    } else if (c.cib_mode == kCibModeIfThenElse) {
+        j.jump_addr = c.cib_else_addr;
+        j.jump_dwords = c.cib_else_dwords;
+    }   // if-then with a false condition runs nothing: the else fields are not a target
     return j;
 }
 

@@ -324,7 +324,7 @@ TEST(AgcSubmit, Contract) {
         auto submit_hook = Hle::return_hook_of("UglJIZjGssM");
         CHECK(submit_hook && submit_hook == Hle::return_hook_of("gSRnr79F8tQ"),
               "the tagged submit imports expose their shared return hook");
-        CHECK(Hle::lookup("w1KFAHVqpaU") && !Hle::return_hook_of("w1KFAHVqpaU"),
+        CHECK(Hle::lookup_address("w1KFAHVqpaU") && !Hle::return_hook_of("w1KFAHVqpaU"),
               "sceAgcCbBranch is registered as a builder, without the submit return hook");
         prosper_gpu_enable_post_submit_visibility();
         CHECK(submit(0, 0, 0, 0, 0, 0) != 0 && prosper_gpu_submit_scope_active(),

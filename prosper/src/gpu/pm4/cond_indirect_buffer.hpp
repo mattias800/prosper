@@ -8,11 +8,18 @@
 
 namespace prosper::gpu {
 
+// Packet modes (dword1 bits 1:0), as AMD's COND_INDIRECT_BUFFER defines them: 1 = if-then (a false
+// condition runs nothing), 2 = if-then-else. 0 and 3 are reserved. Every branch traced on Kena
+// (PPSA01802, 331 calls) is mode 1, function 0.
+inline constexpr uint32_t kCibModeIfThen = 1;
+inline constexpr uint32_t kCibModeIfThenElse = 2;
+
 // The Jump command a CondIndirectBuffer resolves to when the command processor reaches it: the
-// then-target when the condition holds, otherwise the else-target (which may be empty: a Jump with
-// no address or no dwords is a no-op). Function 0 is "always"; functions 1-6 compare
-// (mem64 & mask) <, <=, ==, !=, >=, > reference, read at this moment, and are reported because no
-// title has been observed using them (CONFIDENCE: LOW).
+// then-target when the condition holds; otherwise the else-target in mode 2 and nothing in mode 1.
+// A reserved mode runs neither target and is reported. A Jump with no address or no dwords is a
+// no-op. Function 0 is "always"; functions 1-6 compare (mem64 & mask) <, <=, ==, !=, >=, >
+// reference, read at this moment, and are reported because no title has been observed using them
+// (CONFIDENCE: LOW for functions 1-6 and for refusing the reserved modes; HIGH for mode 1/2, func 0).
 Pm4Command cond_indirect_buffer_jump(const Pm4Command& c);
 
 // The Jump segment guards, each reporting a refusal before the caller drops the segment: every draw

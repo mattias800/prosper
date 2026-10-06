@@ -2129,9 +2129,19 @@ own register file left reject counts within variance and the 3D world identicall
 
 The earlier GS-versus-PS acceptance test is retired. The signature follows window size across the
 measured failure population: vertex windows 8/12/28 lose, vertex windows 30/32 do not, and every
-pixel stage with a declared pointer also has a 30-dword window. The open question is the hardware
+pixel stage with a declared pointer also has a 30-dword window. The open question was the hardware
 ordering/ring contract that prevents a larger required block from being paired with a smaller bound
 pipeline window; neither provenance nor stage identity answers it.
+
+**Update (#4540): the q3 "DcbFinal" fold was not a hardware queue.** It was prosper executing
+`sceAgcCbBranch` (`w1KFAHVqpaU`) targets at the moment the guest *recorded* the branch, against
+whatever pipeline the previous fold left bound. The firmware writes a 14-dword conditional
+indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the same and runs the
+target when the command processor reaches the packet inside the buffer that carries it. So there is
+no separate ring whose ordering contract was unknown, and the split-register-file lever
+(`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
+26/25/5 to 6/6/2 (vertex/fragment/compute, `tools/screenshot` default route, two runs; a third read
+11/12/4).
 
 **Instruments** (`PROSPER_UDPROV`, `PROSPER_BINDTRACE`, `[udcand]`, `PROSPER_SHADER_HEADER_NEWEST`,
 and the deliberately-off `PROSPER_UD_TAIL_ALIGN`) are on PR #1639, with queue/fold/jump-depth write
@@ -2143,9 +2153,9 @@ them rather than rebuilding the measurement.
 ~112 s rather than ~90 s. A 200 s window times out in the pre-title load with **zero rejects** and
 looks deceptively like the issue is fixed. Budget ~440 s per run.
 
-Estimated cost is **not currently bounded**: the condition and its provenance are cheap to detect,
-but the hardware ordering/ring contract is still unknown. Do not turn the negative DcbFinal split A/B
-into a default fix or claim rung 3 from this diagnostic hardening.
+The DcbFinal split A/B stays negative and its lever is gone (#4540, above); the in-stream branch is
+the change that replaced it. Nikoderiko's world has not been re-measured since, so do not claim rung 3
+from it.
 
 ## Suggested allocation for a new orchestrator
 

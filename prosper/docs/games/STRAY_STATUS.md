@@ -616,6 +616,17 @@ independently: `[udmap] … specials raw=[0,20) seeded=0 implied=0`, i.e. the im
 no better offset. What is new is that the corruption is a **partial, mid-descriptor overwrite from the
 following frame's fold**, which is a sharper statement than "the block is wrong".
 
+**Update (#4540): the q3 "DcbFinal" fold was not a hardware queue.** It was prosper executing
+`sceAgcCbBranch` (`w1KFAHVqpaU`) targets at the moment the guest *recorded* the branch, against
+whatever pipeline the previous fold left bound. The firmware writes a 14-dword conditional
+indirect-buffer packet (opcode `0x3F`) and submits nothing; prosper now does the same and runs the
+target when the command processor reaches the packet inside the buffer that carries it. So there is
+no separate ring whose ordering contract was unknown, and the split-register-file lever
+(`PROSPER_AGC_SPLIT_FINAL_STATE`) is removed. On Kena (`PPSA01802`) refused programs went from
+26/25/5 to 6/6/2 (vertex/fragment/compute, `tools/screenshot` default route, two runs; a third read
+11/12/4). That is the likely producer of the "following frame's fold" overwrite above; **not yet
+re-measured on this title**.
+
 **Two things here bear on #305 and belong in that issue, not this one.** First, the recorded frontier
 signature — "the pipeline was bound in a `q1` (Dcb) fold *N*, while the … user-data block was written
 in the following `q3` (DcbFinal) fold *N+1*" — reproduces here on a third title, and the decisive

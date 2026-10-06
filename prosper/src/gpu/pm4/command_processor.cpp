@@ -777,7 +777,7 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     uint32_t first = n > 16 ? n - 16 : 0;
     size_t off = (size_t)snprintf(out, cap, "events(total=%u):", n);
     // Exec events carry the folding submit entry point (#1226): D=SubmitDcb A=SubmitAcb
-    // F=SubmitDcbFinal, absent when unknown/build-side — the cross-queue discriminator.
+    // F=SubmitDcbFinal (not produced since #4540; kept so old logs decode), absent when unknown.
     static const char* qn[] = {"", "(D)", "(A)", "(F)"};
     // #2192: the reserve was 52 while one entry can reach 63 bytes
     // (" %s%s@%llu/f%u:0x%llx" = 1 + 7 + 3 + 1 + 20 + 2 + 10 + 3 + 16), so the last admitted
@@ -5402,7 +5402,7 @@ void GpuState::apply(const Pm4Command& c) {
     }
 }
 
-// #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb, 3=SubmitDcbFinal).
+// #1226: the submit entry point currently folding (1=SubmitDcb, 2=SubmitAcb; 3 unused since #4540).
 // Set by hle_agc under g_agc_state_mu (all folds are serialized), stamped onto every decoded
 // command so deferred/pended effects retain their queue of origin and barrier scheduling can keep
 // Dcb/DcbFinal ordered independently from Acb.

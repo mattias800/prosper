@@ -8,7 +8,11 @@
 //   * recording a branch executes nothing;
 //   * submitting the buffer that carries the branch executes the target at the branch's position,
 //     so a register written before the branch is visible to the target's draw;
-//   * the condition selects the then- or else-target, and an empty else-target is a no-op;
+//   * the condition selects the then-target, or in mode 2 only the else-target; mode 1 with a false
+//     condition and the reserved modes run nothing;
+//   * a null target's size/flags word is zero, as the firmware writes it;
+//   * the twelve-argument entry is guest-ABI, so the Windows import stub hands it the guest's frame
+//     instead of a converting bridge that forwards ten arguments;
 //   * GetSize and the three BranchPatch* patchers match the firmware.
 #include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/command_processor.hpp"
@@ -40,8 +44,10 @@ struct Packet {
     uint8_t pad[4];
 };
 using Hle6 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-using Hle12 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+// sceAgcCbBranch is compiled in the guest's convention, so it is called through a guest-ABI pointer.
+using Hle12 = uint64_t(PROSPER_GUEST_ABI*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                           uint64_t, uint64_t);
 
 constexpr uint32_t kShReg = 0x4c;   // an SH user-data register offset; any value works
 
@@ -62,7 +68,8 @@ Builders builders() {
     b.setsh = reinterpret_cast<Hle6>(Hle::lookup("pFLArOT53+w"));   // DcbSetShRegisterDirect
     b.draw = reinterpret_cast<Hle6>(Hle::lookup("Yw0jKSqop+E"));   // DcbDrawIndexAuto
     b.submit = reinterpret_cast<Hle6>(Hle::lookup("UglJIZjGssM"));   // DriverSubmitDcb
-    b.branch = reinterpret_cast<Hle12>(Hle::lookup("w1KFAHVqpaU"));   // sceAgcCbBranch
+    // Hle::lookup refuses a guest-ABI handler; take the address and type it as one.
+    b.branch = reinterpret_cast<Hle12>(const_cast<void*>(Hle::lookup_address("w1KFAHVqpaU")));
     b.get_size = reinterpret_cast<Hle6>(Hle::lookup("uZW-mqsxkrM"));   // sceAgcCbBranchGetSize
     b.patch_compare = reinterpret_cast<Hle6>(Hle::lookup("GXBlM-ekzrI"));
     b.patch_then = reinterpret_cast<Hle6>(Hle::lookup("xb8VgcXQhvI"));
@@ -115,6 +122,35 @@ TEST(CbBranch, BuilderWritesTheFirmwarePacket) {
     EXPECT_EQ(w[12], 0x00000099u);
     EXPECT_EQ(w[13], 0xedcbau | (1u << 28)) << "else size masked to 20 bits, flags & 3 at 28";
     EXPECT_EQ(b.get_size(0, 0, 0, 0, 0, 0), 0x38u) << "firmware GetSize: 14 dwords, in bytes";
+}
+
+TEST(CbBranch, NullTargetsCarryAZeroSizeWord) {
+    const Builders b = builders();
+    ASSERT_TRUE(b.ok());
+    Cb cb;
+    // Both addresses 0, sizes and flags nonzero: the firmware zeroes each size/flags word.
+    ASSERT_NE(b.branch(cb.handle(), 2, 0, 0, 0, 0, 3, 0, 0x55, 3, 0, 0x66), 0u);
+    EXPECT_EQ(cb.words[10], 0u) << "null then-target";
+    EXPECT_EQ(cb.words[13], 0u) << "null else-target";
+    // One present, one absent: only the absent one is zeroed.
+    Cb mixed;
+    ASSERT_NE(b.branch(mixed.handle(), 2, 0, 0, 0, 0, 1, 0x1000, 0x55, 1, 0, 0x66), 0u);
+    EXPECT_EQ(mixed.words[10], 0x55u | (1u << 28)) << "present then-target keeps its size";
+    EXPECT_EQ(mixed.words[13], 0u) << "absent else-target";
+    Cb mixed2;
+    ASSERT_NE(b.branch(mixed2.handle(), 2, 0, 0, 0, 0, 1, 0, 0x55, 1, 0x2000, 0x66), 0u);
+    EXPECT_EQ(mixed2.words[10], 0u) << "absent then-target";
+    EXPECT_EQ(mixed2.words[13], 0x66u | (1u << 28)) << "present else-target keeps its size";
+    EXPECT_EQ(mixed2.words[11], 0x2000u) << "...and its address";
+}
+
+TEST(CbBranch, TheTwelveArgumentEntryIsGuestAbi) {
+    register_builtin_hle();
+    // On Windows the converting import bridge forwards ten arguments (kLegacyForwardedArgs), and a
+    // declared integer-only signature takes that same path. Only a guest-ABI entry, reached by a
+    // bare tail-jump, receives a10 and a11 (else address and else size).
+    EXPECT_TRUE(Hle::guest_abi_nid("w1KFAHVqpaU"));
+    EXPECT_FALSE(Hle::signature_of_nid("w1KFAHVqpaU").needs_conversion());
 }
 
 TEST(CbBranch, FullBufferWritesNothing) {
@@ -207,23 +243,26 @@ TEST(CbBranch, ConditionSelectsThenOrElse) {
     alignas(8) static uint64_t value = 0x0000000700000005ull;
 
     struct Arm {
-        uint64_t function, mask, reference;
+        uint64_t mode, function, mask, reference;
         bool with_else;
         size_t draws;
         const char* what;
     };
     const Arm arms[] = {
-        {0, 0, 0, true, 1, "function 0 always takes the then-target"},
-        {3, 0xffffffffull, 5, true, 1, "== on the masked value takes then"},
-        {3, 0xffffffffull, 6, true, 2, "a false compare takes the else-target"},
-        {4, ~0ull, 5, true, 1, "!= on the full 64-bit value takes then"},
-        {1, 0xffffffffull, 5, true, 2, "< is false for equal values"},
-        {3, 0xffffffffull, 6, false, 0, "a false compare with no else-target runs nothing"},
+        {1, 0, 0, 0, true, 1, "if-then, function 0 always takes the then-target"},
+        {2, 3, 0xffffffffull, 5, true, 1, "== on the masked value takes then"},
+        {2, 3, 0xffffffffull, 6, true, 2, "if-then-else: a false compare takes the else-target"},
+        {1, 3, 0xffffffffull, 6, true, 0, "if-then: a false compare runs nothing, else or not"},
+        {2, 4, ~0ull, 5, true, 1, "!= on the full 64-bit value takes then"},
+        {2, 1, 0xffffffffull, 5, true, 2, "< is false for equal values"},
+        {2, 3, 0xffffffffull, 6, false, 0, "a false compare with no else-target runs nothing"},
+        {0, 0, 0, 0, true, 0, "reserved mode 0 runs neither target"},
+        {3, 0, 0, 0, true, 0, "reserved mode 3 runs neither target"},
     };
     for (const Arm& a : arms) {
         Cb parent;
-        ASSERT_NE(b.branch(parent.handle(), 1, a.function, addr_of(&value), a.mask, a.reference, 0,
-                           addr_of(then_target.words), then_target.used(), 0,
+        ASSERT_NE(b.branch(parent.handle(), a.mode, a.function, addr_of(&value), a.mask,
+                           a.reference, 0, addr_of(then_target.words), then_target.used(), 0,
                            a.with_else ? addr_of(else_target.words) : 0,
                            a.with_else ? else_target.used() : 0),
                   0u);
