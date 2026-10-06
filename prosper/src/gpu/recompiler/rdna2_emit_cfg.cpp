@@ -3131,6 +3131,11 @@ bool emit_cfg_state_machine(
                                               /*record_compare*/ false))
                     return false;
             }
+            // Which SGPR holds a reloaded half is block-local: emit_alu's per-lane mask for a
+            // v_readlane'd half does not survive a dispatcher edge, so a move into VCC after the
+            // edge would copy data words while the analysis called it a mask (#4603 review). The
+            // spill-slot and pair-definition facts describe memory and stay valid across edges.
+            halves.sregs.clear();
             for (uint32_t successor : successors[block]) {
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;

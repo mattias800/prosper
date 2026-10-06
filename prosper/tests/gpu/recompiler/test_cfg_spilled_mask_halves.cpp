@@ -70,6 +70,23 @@ const uint32_t kHighHalfOverwritten[] = {
     0x00010F12u, 0xBE830380u, 0xBEEA0402u, 0x7DA80090u, 0xBF880001u, 0x7E060287u,
     0xBEFE046Au, 0x4A0606FFu, 0x00000064u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
 };
+// The positive with `v_cmp_gt_u32 vcc, 8, v0` after the spills, so VCC holds a DIFFERENT set of
+// lanes (x < 8) than the spilled mask (x < 40) when the halves are moved back into it. A move that
+// left VCC untouched would read 0 for lanes 8..39 instead of 100.
+const uint32_t kReassembledOverStaleVcc[] = {
+    0x7E060280u, 0x7D8800A8u, 0x87946A7Eu, 0xD7610012u, 0x00010E15u, 0xD7610012u,
+    0x00010C14u, 0xBE940380u, 0xBE950380u, 0x7D880088u, 0xD7600002u, 0x00010D12u,
+    0xD7600003u, 0x00010F12u, 0xBEEA0402u, 0x7DA80090u, 0xBF880001u, 0x7E060287u,
+    0xBEFE046Au, 0x4A0606FFu, 0x00000064u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
+};
+// The positive with `s_branch 0` between the reloads and the move, forcing a dispatcher block edge:
+// the reloaded halves' masks do not survive it, so the move must not count as a mask write.
+const uint32_t kEdgeBetweenReloadAndMove[] = {
+    0x7E060280u, 0x7D8800A8u, 0x87946A7Eu, 0xD7610012u, 0x00010E15u, 0xD7610012u,
+    0x00010C14u, 0xBE940380u, 0xBE950380u, 0xD7600002u, 0x00010D12u, 0xD7600003u,
+    0x00010F12u, 0xBF820000u, 0xBEEA0402u, 0x7DA80090u, 0xBF880001u, 0x7E060287u,
+    0xBEFE046Au, 0x4A0606FFu, 0x00000064u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
+};
 const uint32_t kTail[] = {
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
     0xbf870001u, 0xbf82fffdu, 0x7e040d02u, 0xbf810000u,
@@ -128,7 +145,26 @@ TEST(CfgSpilledMaskHalves, AMaskRebuiltFromBothSpilledHalvesRestoresExecAcrossTh
         EXPECT_EQ(out[lane], lane < 16 ? 107u : lane < 40 ? 100u : 0u) << "lane " << lane;
 }
 
+TEST(CfgSpilledMaskHalves, TheRebuiltMaskReplacesAStaleVcc) {
+    const std::vector<uint32_t> spv = compile(kReassembledOverStaleVcc);
+    ASSERT_FALSE(spv.empty());
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    std::vector<uint32_t> out;
+    prosper::test::run_compute(spv, std::vector<float>(kLanes, 0.0f), kLanes, kLanes, {},
+                               std::vector<uint32_t>(kLanes, 0xdeadbeefu), &out, kLanes, nullptr,
+                               nullptr, nullptr, 64u);
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane < 16   ? 107u
+                             : lane < 40 ? 100u
+                                         : 0u)
+            << "lane " << lane << ": EXEC is the rebuilt mask, not the stale VCC (x < 8)";
+}
+
 TEST(CfgSpilledMaskHalves, HalvesThatAreNotOneProvenPairStayRefused) {
+    EXPECT_TRUE(compile(kEdgeBetweenReloadAndMove).empty())
+        << "a dispatcher edge between the reloads and the move ends the reloaded halves' facts";
     EXPECT_TRUE(compile(kHalvesOfTwoInstances).empty())
         << "halves spilled from two different saved-mask instances are not one mask";
     EXPECT_TRUE(compile(kSwappedHalves).empty()) << "the halves must be low in sN, high in sN+1";
