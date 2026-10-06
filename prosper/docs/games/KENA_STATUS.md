@@ -4,9 +4,31 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Linux/AMD shader refusals (2026-10-06)
+
+**Read this first.** All counts below are distinct refused programs (vertex / fragment / compute). Each was measured on Linux/RADV with `prosper-app`, a default launch, `PROSPER_NULL_PAGE=1`, 260 s, no input and `PROSPER_DBG=1`. The title picture is unchanged: the menu still renders over a black world, because of the zero colour LUT (#3135).
+
+| fix | refused programs | what it was |
+|---|---|---|
+| main `9b223e64` | 26 / 25 / 5 | — |
+| #4576 | 6 / 6 / 2 (two runs; one read 11 / 12 / 4) | `sceAgcCbBranch` targets were folded at record time and paired with the previous fold's pipeline; the branch now runs in-stream |
+| #4584, #4588 | 8 / 0 / 2 | a V# read at two PCs, under a key that clashed or that the recompiler never tags, left the second consumer without a resource (`unresolved-cbuf`) |
+| #4587 | 6 vertex | an `s_load_dwordx2` index pair as the source of a raw-wide register offset; vertex dropped draws per 5 s window fell from 4,294 to about 800 |
+
+What remains:
+- **Vertex:**
+  - a chained vertex prolog with register-SOFFSET loads (`vs` 184 dwords);
+  - a V# loaded through a shader-loaded pointer with a VCC offset (1,526 dwords, pc 52);
+  - two large NGG programs (pc 326/330).
+- **Compute:**
+  - a counted-loop prelude CFG rejection (388 dwords);
+  - an unresolved operand at pc 29 (2,060 dwords).
+
+The refused shaders of each run are dumped under `PROSPER_CAPTURE_DIR/refused_shaders_*`.
+
 ## Handoff to Linux/AMD (2026-10-05)
 
-**Read this first; the sections below predate it.** Measured on Windows/RTX 4090 with the normal
+**The sections below predate the 2026-10-06 entry above.** Measured on Windows/RTX 4090 with the normal
 `prosper-app` at 25% volume, one 150 s title-screen run per arm (needs `PROSPER_NULL_PAGE=1`). The
 title menu still renders over a black world.
 
