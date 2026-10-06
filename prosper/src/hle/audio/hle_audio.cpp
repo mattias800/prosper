@@ -4160,6 +4160,15 @@ bool ngs2_grain_ok(uint32_t grain, uint32_t max) {
 // below, and numChannels (+0x78) in [1, 37]. The four job-scheduler option pointers at +0x48..+0x60
 // are not inspected (their struct is unpinned). CONFIDENCE: HIGH on the checks and their order.
 struct Ngs2SystemOption { uint32_t max_grain = 512, num_grain = 256; };
+// The ten sample rates the native module accepts, both in a SystemOption (+0x74, checked at
+// 0x1ec7d) and in sceNgs2SystemSetSampleRate's command validator (0x1dae8, a compare tree over the
+// same ten constants that falls through to 0x804a8051 at 0x1dc56). One list for both, so the two
+// entry points cannot drift apart. CONFIDENCE: HIGH (read from the firmware).
+bool ngs2_rate_ok(uint32_t rate) {
+    static constexpr uint32_t kRates[] = {11025, 12000, 22050, 24000,  44100,
+                                          48000, 88200, 96000, 176400, 192000};
+    return std::find(std::begin(kRates), std::end(kRates), rate) != std::end(kRates);
+}
 uint64_t ngs2_check_system_option(uint64_t option, Ngs2SystemOption& out) {
     out = {};
     if (!option) return 0;
@@ -4169,10 +4178,7 @@ uint64_t ngs2_check_system_option(uint64_t option, Ngs2SystemOption& out) {
     if (!audio_read_bytes(option + 0x6c, fields, sizeof fields)) return kNgs2ErrOptionSize;
     if (!ngs2_grain_ok(fields[0], 2048)) return kNgs2ErrInvalidMaxGrain;
     if (!ngs2_grain_ok(fields[1], fields[0])) return kNgs2ErrInvalidGrain;
-    static constexpr uint32_t kRates[] = {11025, 12000, 22050, 24000,  44100,
-                                          48000, 88200, 96000, 176400, 192000};
-    if (std::find(std::begin(kRates), std::end(kRates), fields[2]) == std::end(kRates))
-        return kNgs2ErrSampleRate;
+    if (!ngs2_rate_ok(fields[2])) return kNgs2ErrSampleRate;
     if (fields[3] < 1 || fields[3] > 37) return kNgs2ErrNumChannels;
     out.max_grain = fields[0];
     out.num_grain = fields[1];
@@ -4357,6 +4363,40 @@ HLE(ngs2_system_set_grain_samples) {
     if (!ngs2_grain_ok(g, g_ngs2_max_grain[(a0 & 0xff) - 1])) return kNgs2ErrInvalidGrain;
     g_ngs2_grain = g;
     return 0;
+}
+// sceNgs2SystemLock / Unlock / SetSampleRate. Each native export (gThZqM5PYlQ 0x1e560, JXRC5n0RQls
+// 0x1e5c0, -tbc2SxQD60 0x1e6f0) is a thin wrapper that queues one command -- 0, 1 and 4 -- through
+// SystemRunCommands (0x1d9e0). That core checks the handle first (0x804a8201, 0x1da29), then
+// validates every command (jump table 0x547b0), then executes them (jump table 0x547cc):
+//   * Lock / Unlock are not validated. Lock (0x1dcbc) takes the pthread mutex at sys+0x130 and counts
+//     the hold at sys+0x1d4; Unlock (0x1dcdc) releases it and IGNORES the unlock result, so Unlock
+//     without a prior Lock still answers 0. The lock is real on the console: SystemRender (core
+//     0x13d70) trylocks sys+0x130 (0x13d9e) and, while the guest holds it, skips the grain and
+//     returns 0.
+//   * SetSampleRate accepts exactly the ten rates in ngs2_rate_ok (0x804a8051 otherwise) and stores
+//     the rate at sys+0x1e8, which the render core reads (0x130e8, 0x13423).
+// prosper APPROXIMATES both behaviours. Lock/Unlock validate the handle and hold nothing: holding a
+// host mutex across a return to the guest would risk deadlock against g_ngs2_mx, and the thread
+// that unlocks need not be the one that locked -- so render does not pause while a guest "holds" the
+// system. SetSampleRate validates and acknowledges; prosper's mixer renders at 48 kHz whatever the
+// system rate is, so the value has no consumer to store it for. CONFIDENCE: HIGH on the return codes
+// and their order; whether the native mutex is recursive is not pinned (it does not change a
+// return code).
+HLE(ngs2_system_lock) {
+    NGS2_LOG("sceNgs2SystemLock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    return ngs2_valid_system(a0) ? 0 : kNgs2ErrInvalidSystem;
+}
+HLE(ngs2_system_unlock) {
+    NGS2_LOG("sceNgs2SystemUnlock");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    return ngs2_valid_system(a0) ? 0 : kNgs2ErrInvalidSystem;
+}
+HLE(ngs2_system_set_sample_rate) {
+    NGS2_LOG("sceNgs2SystemSetSampleRate");
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    return ngs2_rate_ok((uint32_t)a1) ? 0 : kNgs2ErrSampleRate;
 }
 HLE(ngs2_rack_create_with_allocator) {
     NGS2_LOG("sceNgs2RackCreateWithAllocator");
@@ -4788,6 +4828,9 @@ void register_audio_hle() {
                      "sceNgs2SystemCreateWithAllocator");
     Hle::register_fn("u-WrYDaJA3k", ngs2_system_destroy, "sceNgs2SystemDestroy");
     Hle::register_fn("l4Q2dWEH6UM", ngs2_system_set_grain_samples, "sceNgs2SystemSetGrainSamples");
+    Hle::register_fn("gThZqM5PYlQ", ngs2_system_lock, "sceNgs2SystemLock");
+    Hle::register_fn("JXRC5n0RQls", ngs2_system_unlock, "sceNgs2SystemUnlock");
+    Hle::register_fn("-tbc2SxQD60", ngs2_system_set_sample_rate, "sceNgs2SystemSetSampleRate");
     Hle::register_fn("U546k6orxQo", ngs2_rack_create_with_allocator,
                      "sceNgs2RackCreateWithAllocator");
     Hle::register_fn("MzTa7VLjogY", ngs2_rack_lock, "sceNgs2RackLock");
