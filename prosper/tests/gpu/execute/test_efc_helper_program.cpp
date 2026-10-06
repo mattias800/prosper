@@ -119,6 +119,30 @@ TEST(EfcHelperProgram, TheOperationWritesNoColourAndOrdinaryDrawsUnderAStaleMode
     EXPECT_EQ(normal.mask, 0xFu);
 }
 
+// AGC's "Decompress Htile" helper draws the same rectangle with the colour block DISABLED and no
+// colour state of its own, so it inherits the parent's target and masks. Hardware writes no colour;
+// an ordinary program under a latched MODE=0 must still write (#1724).
+TEST(EfcHelperProgram, TheRectangleUnderColourDisableWritesNoColour) {
+    std::copy(std::begin(kAgcEfcRectVertexA), std::end(kAgcEfcRectVertexA), kHelperBlock);
+    constexpr uint32_t kRectList = 7, kTriangleList = 4;
+    const uint32_t disable = P::CB_COLOR_CONTROL_MODE_DISABLE;
+    const auto block = with_metadata(kAgcEfcRectVertexA, std::size(kAgcEfcRectVertexA));
+    EXPECT_TRUE(is_agc_colour_disabled_helper_operation(mode_word(disable), block.data(),
+                                                        block.size()));
+    for (uint32_t other : {1u, 2u, 3u, 6u})
+        EXPECT_FALSE(
+            is_agc_colour_disabled_helper_operation(mode_word(other), block.data(), block.size()))
+            << "mode " << other;
+
+    const Realized helper = realize(state(kHelperBlock, kRectList, disable));
+    EXPECT_FALSE(helper.made) << "the helper has no colour and no depth/stencil effect";
+    EXPECT_EQ(helper.reason, RealizationFailureReason::NoEffect);
+
+    const Realized stale = realize(state(kVs, kTriangleList, disable));
+    EXPECT_TRUE(stale.made) << "an ordinary program under a latched MODE=0 still draws";
+    EXPECT_EQ(stale.mask, 0xFu);
+}
+
 TEST(EfcHelperProgram, TheOperationKeepsItsDepthStencilEffect) {
     std::copy(std::begin(kAgcEfcRectVertexA), std::end(kAgcEfcRectVertexA), kHelperBlock);
     GpuState st = state(kHelperBlock, 7u, P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR);

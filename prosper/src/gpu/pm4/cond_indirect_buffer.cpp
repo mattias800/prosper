@@ -96,4 +96,39 @@ bool jump_segment_readable(uint64_t addr, uint32_t dwords) {
     return false;
 }
 
+// Whether a packet-predicated Jump is skipped, given the enclosing SetPredication window's op and
+// the 64-bit condition word read at fold time.
+//
+// PRED_OP 3 is the hardware BOOL64 predicate. sceAgcDcbSetPredication(dcb, 1, 3, 1, addr) opens it
+// with DRAW_VISIBLE semantics: the guarded work runs when the condition is NON-ZERO and is
+// discarded when it is zero (the AMD contract for a boolean predicate; Vulkan's non-inverted
+// conditional rendering is built on the same packet).
+//
+// Evidence on Dragon Quest VII Reimagined (PPSA17942), whose predicated segments are AGC's own
+// labelled helpers ("Decompress Htile", "Eliminate Fast Clear"), each guarded by a per-surface
+// "needs it" word. Per title frame: the main 3840x2160 depth surface's decompress reads 1 and the
+// decompress of a 1x1 scratch depth surface reads 0. The previous rule ("skip when non-zero", #319)
+// ran exactly the wrong one: it skipped the real decompress and ran the 1x1 one, whose 1x1
+// viewport and VPORT scissor then stayed in the context registers -- the parent stream never
+// re-programs them, because on hardware that helper does not run -- and every later draw of the
+// frame (sky clouds, water, scene-colour copy, fog) rasterised to one pixel. #319 pinned the old
+// rule on segments it read as the backbuffer composite; on the current route the only segments
+// with full-screen colour state are AGC's "Eliminate Fast Clear" rectangles, which write no colour
+// here (#1588), and the title still composites to scanout under this rule.
+//
+// Other ops (ZPASS/PRIMCOUNT read an occlusion or stream-out result, not a boolean) have no title
+// evidence and keep the previous rule, reported once so the gap is not silent.
+// CONFIDENCE: MED-HIGH for op 3 (hardware contract + the per-surface pattern above); LOW for others.
+bool predicated_jump_skips(uint32_t pred_op, uint64_t cond) {
+    constexpr uint32_t kPredOpBool64 = 3;
+    if (pred_op == kPredOpBool64) return cond == 0;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true))
+        std::fprintf(stderr,
+                     "[agc] predicated Jump under SetPredication op=%u: only BOOL64 (3) has a "
+                     "verified polarity; skipping on a non-zero condition as before\n",
+                     pred_op);
+    return cond != 0;
+}
+
 }  // namespace prosper::gpu

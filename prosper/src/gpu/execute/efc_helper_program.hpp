@@ -23,8 +23,9 @@
 // entries (live census of every MODE=2 vertex program: Dragon Quest VII runs exactly one, the first
 // entry; Astro Bot runs the second plus five ordinary vertex programs with 2-23 vertex resources
 // each, which this deliberately does not match). The rectangle itself is shared: Astro Bot draws it
-// under MODE 2 and 6 with one pixel program, and Dragon Quest VII also draws it under MODE 0 as an
-// ordinary copy, so the vertex program alone is not the operation either -- both halves are needed.
+// under MODE 2 and 6 with one pixel program, and Dragon Quest VII also draws it under MODE 0 for
+// AGC's "Decompress Htile" helper (below; an earlier revision read those as ordinary copies), so the
+// vertex program alone is not the operation either -- both halves are needed.
 #pragma once
 
 #include <algorithm>
@@ -82,6 +83,26 @@ inline bool is_agc_eliminate_fast_clear_operation(uint32_t cb_color_control,
     const uint32_t mode =
         (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
     return mode == P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR &&
+           is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
+}
+
+// The draw is an AGC helper operation run with the colour block DISABLED: AGC's own rectangle under
+// CB_COLOR_CONTROL.MODE = 0. AGC draws the same rectangle for its depth-metadata helpers -- Dragon
+// Quest VII's command segments are labelled "Decompress Htile" -- which program MODE = DISABLE,
+// DB_RENDER_CONTROL's compress-disable bits and no colour state of their own, so the colour target
+// and masks are whatever the parent stream left bound. Hardware writes no colour under CB_DISABLE;
+// running the rectangle as an ordinary draw paints the parent's pixel shader over the parent's
+// target. Like the eliminate pass this is keyed on the helper's vertex program, never on MODE alone:
+// MODE = 0 latched onto an ordinary title draw must keep writing (#1724, Astro Bot).
+// CONFIDENCE: HIGH that the hardware operation writes no colour; MED that every MODE = 0 use of
+// the rectangle is a metadata helper (every one observed is inside a labelled AGC helper segment).
+inline bool is_agc_colour_disabled_helper_operation(uint32_t cb_color_control,
+                                                    const uint32_t* vertex_code,
+                                                    size_t vertex_dwords) {
+    namespace P = prosper::agc::Pm4;
+    const uint32_t mode =
+        (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
+    return mode == P::CB_COLOR_CONTROL_MODE_DISABLE &&
            is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
 }
 
