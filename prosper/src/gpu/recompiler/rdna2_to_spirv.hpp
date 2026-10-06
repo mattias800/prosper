@@ -210,7 +210,12 @@ struct Rdna2Inst;
 std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst>& instructions);
 // Non-null raw x4/x8 SMEM loads whose words have an ordinary scalar/vector data reader before
 // replacement. Such loads cannot use the descriptor-only zero-placeholder lowering.
-std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
+// `wave64` is for a caller that knows the program runs 64 lanes wide: a compare or a carry-out
+// into a register pair then writes both words, so the high word of a pair recycled as a mask is
+// no longer assumed to hold what was loaded (#4555). `false` is unknown or 32 lanes. The 64-lane
+// answer is always a subset of the default one.
+std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions,
+                                                bool wave64 = false);
 // WHY each of those loads is classified as numeric data: the first instruction that stopped the
 // "may the words be replaced by a descriptor placeholder" walk, and the first that stopped the
 // "is there a numeric reader or an uncertain path" walk. Diagnostics only (#4499) -- it runs the
@@ -223,7 +228,7 @@ struct RawWideLoadDiagnosis {
     const char* numeric_kind = "none";
 };
 std::vector<RawWideLoadDiagnosis>
-rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions);
+rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& instructions, bool wave64 = false);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
 // The entry-pointer stage of the register-offset proof: each x4/x8 load evaluated with SOFFSET
@@ -256,7 +261,11 @@ std::vector<RawWaveWideCertificate>
 rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& original);
 // Conservative original-code obligation, independent of bounded admission. A refused proof
 // cannot authorize stored native modules for a READFIRST-containing numeric-load program.
-std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original);
+// `wave64` as for rdna2_raw_wide_data_loads. Pass it only for a launch whose width is known and
+// is the width the stage compiler will use; every site that asks this question about one draw
+// has to pass the same value.
+std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original,
+                                                     bool wave64 = false);
 // One-hop raw x4/x8 data loads through a pointer from an earlier proven immediate load.
 // A dispatch must additionally own the parent/child bytes and exclude writable aliases.
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(

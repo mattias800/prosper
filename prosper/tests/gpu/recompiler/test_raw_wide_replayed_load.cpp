@@ -79,8 +79,9 @@ const Rdna2Inst& at(const std::vector<Rdna2Inst>& instructions, uint32_t pc) {
 }
 
 // The single diagnosis row for the load, or an empty kind when the classifier cleared it.
-std::string numeric_blocker(const std::vector<Rdna2Inst>& instructions, uint32_t* pc = nullptr) {
-    for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions))
+std::string numeric_blocker(const std::vector<Rdna2Inst>& instructions, uint32_t* pc = nullptr,
+                            bool wave64 = false) {
+    for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions, wave64))
         if (row.load_pc == kLoadPc) {
             if (pc) *pc = row.numeric_pc;
             return row.numeric_kind;
@@ -99,8 +100,8 @@ RawWideLoadDiagnosis diagnosis(const std::vector<Rdna2Inst>& instructions, bool*
     return {};
 }
 
-bool flagged(const std::vector<Rdna2Inst>& instructions) {
-    const auto loads = rdna2_raw_wide_data_loads(instructions);
+bool flagged(const std::vector<Rdna2Inst>& instructions, bool wave64 = false) {
+    const auto loads = rdna2_raw_wide_data_loads(instructions, wave64);
     return std::find(loads.begin(), loads.end(), kLoadPc) != loads.end();
 }
 
@@ -882,4 +883,122 @@ TEST(RawWideReplayedLoad, ACarryOutEndsAVccRootUnlessEverythingItIsMadeOfIsOne) 
                                          &offset));
     EXPECT_EQ(kind, "implicit-vcc-reader");
     EXPECT_EQ(offset, 9u) << "s_cbranch_vccz";
+}
+
+TEST(RawWideReplayedLoad, AtSixtyFourLanesACompareReplacesBothWordsOfThePair) {
+    // #4555, MOUSE: P.I. For Hire. The walks assume a compare into a register pair may write only
+    // the low word, which is what happens at 32 lanes, so the high word of a pair the shader
+    // recycles as a mask is taken to still hold what was loaded. A 64-bit mask operation on that
+    // pair then "reads" the loaded word, and the branch on its SCC stops the walk:
+    //   .  v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17]
+    //   8  s_and_b64 s[40:41], s[16:17], exec      SCC = (result != 0), over both words
+    //   9  s_cbranch_scc1 +0
+    // A caller that knows the program runs 64 lanes wide says so, and the compare is then a write
+    // of both words.
+    const auto mouse = program({.after_mask = {0x87a87e10u, 0xbf850000u}});
+    ASSERT_EQ(at(mouse, 8).fmt, Rdna2Format::SOP2);
+    ASSERT_EQ(at(mouse, 8).opcode, 0x0fu);
+    ASSERT_EQ(at(mouse, 8).dst.value, 40);
+    ASSERT_EQ(at(mouse, 8).src[0].value, 16);
+    ASSERT_EQ(at(mouse, 9).fmt, Rdna2Format::SOPP);
+    ASSERT_EQ(at(mouse, 9).opcode, 0x05u);
+    uint32_t pc = 0;
+    EXPECT_TRUE(flagged(mouse));
+    EXPECT_EQ(numeric_blocker(mouse, &pc), "scc-branch-on-derived-value");
+    EXPECT_EQ(pc, 9u);
+    EXPECT_FALSE(flagged(mouse, /*wave64*/ true)) << numeric_blocker(mouse, nullptr, true);
+    // The obligation that sends a draw to the owned-wave path follows: this program has a
+    // v_readfirstlane, so by default the load needs logical-wave admission, and at 64 lanes not.
+    EXPECT_EQ(rdna2_raw_wave_wide_data_loads(mouse), std::vector<uint32_t>{kLoadPc});
+    EXPECT_TRUE(rdna2_raw_wave_wide_data_loads(mouse, /*wave64*/ true).empty());
+
+    // The same for a compare into VCC itself, whose destination no writer inventory names:
+    //   5  s_mov_b64 vcc, s[18:19]            VCC holds two loaded words
+    //   6  v_cmp_lt_u32 vcc, s4, v1           at 32 lanes vcc_hi still does
+    //   7  s_and_b64 s[40:41], vcc, exec ; s_cbranch_scc1 +0
+    const auto through_vcc =
+        program({.in_loop = {0xbeea0412u, 0x7d820204u, 0x87a87e6au, 0xbf850000u}});
+    ASSERT_EQ(at(through_vcc, 6).fmt, Rdna2Format::VOPC);
+    ASSERT_EQ(at(through_vcc, 6).dst.value, 106);
+    ASSERT_EQ(at(through_vcc, 7).src[0].value, 106);
+    EXPECT_EQ(numeric_blocker(through_vcc, &pc), "scc-branch-on-derived-value");
+    EXPECT_EQ(pc, 8u);
+    EXPECT_FALSE(flagged(through_vcc, /*wave64*/ true))
+        << numeric_blocker(through_vcc, nullptr, true);
+
+    // In the first program above the cheaper walk clears the load at 64 lanes by itself, since
+    // nothing else reads a loaded word. (In the second it stops at the copy into VCC at any
+    // width, and the numeric walk is what clears it.) Give the first something to hold on to
+    // (s_mov_b32 s50, s18, a copy nobody reads, which the cheaper walk counts and the numeric
+    // walk does not) and the numeric walk is the one that has to know the width.
+    const auto held = program({.in_loop = {0xbeb20312u}, .after_mask = {0x87a87e10u, 0xbf850000u}});
+    ASSERT_EQ(at(held, 5).opcode, kSop1OpcodeMovB32);
+    ASSERT_EQ(at(held, 5).dst.value, 50);
+    ASSERT_EQ(at(held, 5).src[0].value, 18);
+    EXPECT_EQ(numeric_blocker(held, &pc), "scc-branch-on-derived-value");
+    EXPECT_EQ(pc, 10u);
+    EXPECT_FALSE(flagged(held, /*wave64*/ true)) << numeric_blocker(held, nullptr, true);
+
+    // The cheaper walk makes the same assumption, and it is the binding one here: this load has
+    // a register offset inside a loop, so the numeric walk answers "re-executed" at any width,
+    // and what keeps the load flagged by default is the B64 move of the recycled pair reading a
+    // high word the compare is not known to have replaced (DiagnosisNamesBothBlockers).
+    const auto replayed = program({.load_offset_word = 0x28000000u});
+    EXPECT_TRUE(flagged(replayed));
+    EXPECT_EQ(numeric_blocker(replayed), "load-re-executed");
+    EXPECT_FALSE(flagged(replayed, /*wave64*/ true));
+    // A carry-out is a mask write too, and the cheaper walk treats it the same way: the pair is
+    // recycled by v_addc_co_u32 v3, s[16:17], 0, v3, vcc instead of by a compare.
+    const auto carried = program(
+        {.load_offset_word = 0x28000000u, .in_loop = {0xd5281003u, 0x01aa0680u}, .compare = false});
+    ASSERT_EQ(at(carried, 5).fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(at(carried, 5).opcode, 0x128u);
+    ASSERT_EQ(at(carried, 5).sdst.value, 16);
+    ASSERT_EQ(at(carried, 5).src[2].value, 106);
+    EXPECT_TRUE(flagged(carried));
+    EXPECT_FALSE(flagged(carried, /*wave64*/ true));
+
+    // The move into EXEC of a pair a not-fresh compare recycled (the case above that stops at
+    // pc 8 "right at 32 lanes and conservative at 64") is the same assumption, and clears too.
+    const auto not_fresh =
+        program({.in_loop = {0xbefe0428u},
+                 .move_mask_to_vcc = false,
+                 .after_mask = {0xbefe0410u, 0xbefe04c1u, 0xbe900480u, 0xbe920480u}});
+    EXPECT_TRUE(flagged(not_fresh));
+    EXPECT_FALSE(flagged(not_fresh, /*wave64*/ true)) << numeric_blocker(not_fresh, nullptr, true);
+}
+
+TEST(RawWideReplayedLoad, TheSixtyFourLaneAnswerIsNeverLargerAndKeepsRealReaders) {
+    // Width knowledge only removes the "the high word may survive a compare" assumption. A load
+    // with a reader that has nothing to do with a recycled pair stays numeric at any width:
+    //   5  v_mov_b32 v0, s18
+    const auto reader = program({.in_loop = {0x7e000212u}});
+    EXPECT_TRUE(flagged(reader, /*wave64*/ true));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(reader, &pc, true), "numeric-reader");
+    EXPECT_EQ(pc, 5u);
+    EXPECT_FALSE(rdna2_raw_wave_wide_data_loads(reader, true).empty());
+    // And a plain copy of loaded words into EXEC is one at any width (#4574).
+    const auto copied = program({.in_loop = {0xbefe0412u, 0x7e000301u, 0xbefe04c1u}});
+    EXPECT_EQ(numeric_blocker(copied, &pc, true), "derived-value-enters-exec");
+    // Over every shape this file builds a few of, the 64-lane set is a subset of the default.
+    const std::vector<Shape> shapes{
+        {},
+        {.in_loop = {0x7e000212u}},
+        {.load_offset_word = 0x28000000u},
+        {.in_loop = {0xbefe0412u, 0x7e000301u, 0xbefe04c1u}},
+        {.after_mask = {0x87a87e10u, 0xbf850000u}},
+        {.in_loop = {0xbeea0412u, 0x7d820204u, 0x87a87e6au, 0xbf850000u}},
+        {.in_loop = {0xbefe0428u},
+         .move_mask_to_vcc = false,
+         .after_mask = {0xbefe0410u, 0xbefe04c1u, 0xbe900480u, 0xbe920480u}},
+        {.compare = false},
+    };
+    for (size_t index = 0; index < shapes.size(); ++index) {
+        const auto instructions = program(shapes[index]);
+        const auto narrow = rdna2_raw_wide_data_loads(instructions, true);
+        const auto wide = rdna2_raw_wide_data_loads(instructions);
+        EXPECT_TRUE(std::includes(wide.begin(), wide.end(), narrow.begin(), narrow.end()))
+            << "shape " << index;
+    }
 }

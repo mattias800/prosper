@@ -48,11 +48,16 @@ public:
     const Blocker& backing_blocker() const { return backing_blocker_; }
     const Blocker& numeric_blocker() const { return numeric_blocker_; }
 
+    // `wave64`: the caller knows the program runs 64 lanes wide. A compare or a carry-out into a
+    // register pair then writes both words. Unknown, or 32 lanes, is `false`: it may write only
+    // the low word, so the high word of a recycled pair has to be assumed to still hold what was
+    // loaded. That one assumption is all the width changes here, and it only ever removes marks,
+    // so a load the 64-lane walk calls numeric is numeric at any width.
     RawWideLifetime(const std::vector<Rdna2Inst>& instructions,
-                    const std::unordered_map<uint32_t, size_t>& pc_indices,
-                    size_t load_index, uint32_t word_count)
+                    const std::unordered_map<uint32_t, size_t>& pc_indices, size_t load_index,
+                    uint32_t word_count, bool wave64 = false)
         : ins(instructions), by_pc(pc_indices), start(load_index),
-          first(instructions[load_index].dst.value), words(word_count) {}
+          first(instructions[load_index].dst.value), words(word_count), wave64_(wave64) {}
 
     bool requires_backing() const {
         const auto blocked = [&](uint32_t pc, const char* kind) {
@@ -384,21 +389,24 @@ public:
                  // listed, so a register v_readfirstlane had just replaced kept its old mark.
                  (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u) ||
                  (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u));
-            for_each_scalar_write(in, [&](int base, uint32_t width) {
-                for (uint32_t k = 0; k < width; ++k) {
-                    const int reg = base + static_cast<int>(k);
-                    if (reg < 0 || reg >= 128) continue;
-                    if (definite_scalar_write)
-                        state.regs.reset(static_cast<size_t>(reg));
-                    if (derived_read && scalar_result &&
-                        (in.dst.kind == OperandKind::SGPR || independent_transfer) &&
-                        base == in.dst.value)
-                        produced.set(static_cast<size_t>(reg));
-                }
-            }, /*wave32_one_word_masks*/true);
-            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
-                !vopc_is_cmpx(in.opcode))
-                state.regs.reset(106); // only the guaranteed VCC low word, no width assumption
+            for_each_scalar_write(
+                in,
+                [&](int base, uint32_t width) {
+                    for (uint32_t k = 0; k < width; ++k) {
+                        const int reg = base + static_cast<int>(k);
+                        if (reg < 0 || reg >= 128) continue;
+                        if (definite_scalar_write) state.regs.reset(static_cast<size_t>(reg));
+                        if (derived_read && scalar_result &&
+                            (in.dst.kind == OperandKind::SGPR || independent_transfer) &&
+                            base == in.dst.value)
+                            produced.set(static_cast<size_t>(reg));
+                    }
+                },
+                /*wave32_one_word_masks*/ !wave64_);
+            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 && !vopc_is_cmpx(in.opcode)) {
+                state.regs.reset(106);   // the guaranteed VCC low word at any width
+                if (wave64_) state.regs.reset(107);
+            }
             state.regs |= produced;
             // The load itself, reached again round a back-edge, reading the same bytes as before
             // (checked on entry). It was processed like any other instruction on the way here:
@@ -513,6 +521,7 @@ private:
     size_t start;
     int first;
     uint32_t words;
+    bool wave64_;
     mutable Blocker backing_blocker_, numeric_blocker_;
 
     // Whether every execution of this load reads the same bytes: an immediate offset from a base
@@ -695,13 +704,16 @@ private:
     }
 
     uint16_t kill_written_words(const Rdna2Inst& in, uint16_t live) const {
-        for_each_scalar_write(in, [&](int base, uint32_t width) {
-            if (base < 0) return;
-            for (uint32_t word = 0; word < words; ++word)
-                if (base <= first + static_cast<int>(word) &&
-                    first + static_cast<int>(word) < base + static_cast<int>(width))
-                    live &= static_cast<uint16_t>(~(1u << word));
-        }, /*wave32_one_word_masks*/true);
+        for_each_scalar_write(
+            in,
+            [&](int base, uint32_t width) {
+                if (base < 0) return;
+                for (uint32_t word = 0; word < words; ++word)
+                    if (base <= first + static_cast<int>(word) &&
+                        first + static_cast<int>(word) < base + static_cast<int>(width))
+                        live &= static_cast<uint16_t>(~(1u << word));
+            },
+            /*wave32_one_word_masks*/ !wave64_);
         return live;
     }
 
@@ -734,7 +746,7 @@ private:
 
 } // namespace
 
-std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& ins, bool wave64) {
     std::vector<uint32_t> data_loads;
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t index = 0; index < ins.size(); ++index)
@@ -749,7 +761,7 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
             load.dst.value + (load.opcode == 0x2u ? 4 : 8) > 128)
             continue;
         const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
-        const RawWideLifetime lifetime(ins, by_pc, index, words);
+        const RawWideLifetime lifetime(ins, by_pc, index, words, wave64);
         const bool register_offset = load.src[1].kind != OperandKind::Special ||
             load.src[1].value != 125;
         // Scalar arithmetic may assemble a descriptor even when SOFFSET is a register.
@@ -769,7 +781,7 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
 // The same two walks as rdna2_raw_wide_data_loads, reporting where each one stopped. One row per
 // load the classifier calls numeric data; a load it clears has no row. Diagnostics only.
 std::vector<RawWideLoadDiagnosis>
-rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins) {
+rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins, bool wave64) {
     std::vector<RawWideLoadDiagnosis> rows;
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t index = 0; index < ins.size(); ++index) by_pc.emplace(ins[index].pc, index);
@@ -780,7 +792,7 @@ rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins) {
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
             load.dst.value + (load.opcode == 0x2u ? 4 : 8) > 128)
             continue;
-        const RawWideLifetime lifetime(ins, by_pc, index, load.opcode == 0x2u ? 4u : 8u);
+        const RawWideLifetime lifetime(ins, by_pc, index, load.opcode == 0x2u ? 4u : 8u, wave64);
         if (!lifetime.requires_backing()) continue;
         const bool numeric = lifetime.has_numeric_reader_or_uncertain_path();
         const bool register_offset =
@@ -1076,12 +1088,16 @@ std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(const std::vector<Rdna2Ins
     return owned;
 }
 
-std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& ins,
+                                                     bool wave64) {
     if (std::none_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 2u;
         }))
         return {};
-    const auto numeric = rdna2_raw_wide_data_loads(ins);
+    // Only the numeric set takes the width. The three proofs below decide which loads get real
+    // bytes on the ordinary path, and the front half and the emitter both read them without a
+    // width; a load they own is not in this obligation at either width.
+    const auto numeric = rdna2_raw_wide_data_loads(ins, wave64);
     const auto immediate = rdna2_proven_raw_immediate_wide_data_loads(ins);
     const auto ordinary = rdna2_proven_raw_register_wide_data_loads(ins);
     const auto nested = rdna2_proven_raw_nested_wide_data_loads(ins);
