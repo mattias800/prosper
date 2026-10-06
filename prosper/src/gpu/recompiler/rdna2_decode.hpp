@@ -279,6 +279,44 @@ inline constexpr bool emitted_vop3_opcode_has_two_data_sources(uint32_t opcode) 
            opcode == 0x368u || opcode == 0x369u || opcode == 0x36au;
 }
 
+// How many of a VOP3 encoding's three source fields its opcode architecturally reads, where the
+// opcode's FORM settles it; 3 otherwise. The decoder exposes all three fields for most VOP3 opcodes
+// (emitted_vop3_opcode_has_two_data_sources above is its narrower, emitter-driven list), and an
+// unused field decodes as s0. Analyses that must not see that phantom read (the merged-NGG launch
+// ABI admission, where s0 is a launch register) cap their source loop with this.
+//   * 0x180..0x1ff, VOP3-encoded VOP1: SRC0 only.
+//   * 0x101..0x13f, VOP3-encoded VOP2: SRC0 and SRC1, except the forms whose SRC2 is an operand --
+//     v_cndmask_b32 (lane mask), v_add/sub/subrev_co_ci_u32 (carry-in) -- and the accumulating
+//     MAC/FMAC/DOT and literal FMAMK/FMAAK forms, which are left at three (fail-closed).
+//   * the two-source list the decoder already applies.
+// Everything else (VOP3-only operations, interpolation, unassigned space) stays at three.
+// CONFIDENCE: HIGH on the VOP1/VOP2 forms (RDNA2 ISA, VOP1/VOP2 have one/two source fields).
+inline constexpr uint32_t vop3_architectural_source_count(uint32_t opcode) {
+    if (opcode >= 0x180u && opcode < 0x200u) return 1;
+    if (opcode > 0x100u && opcode < 0x140u) {
+        switch (opcode - 0x100u) {
+            case 0x01u:   // v_cndmask_b32
+            case 0x02u:   // v_dot2c_f32_f16
+            case 0x06u:   // v_fmac_legacy_f32
+            case 0x0du:   // v_dot4c_i32_i8
+            case 0x1fu:   // v_mac_f32
+            case 0x28u:
+            case 0x29u:
+            case 0x2au:   // v_add/sub/subrev_co_ci_u32
+            case 0x2bu:   // v_fmac_f32
+            case 0x2cu:
+            case 0x2du:   // v_fmamk/fmaak_f32
+            case 0x36u:   // v_fmac_f16
+            case 0x37u:
+            case 0x38u:   // v_fmamk/fmaak_f16
+            case 0x3cu:   // v_pk_fmac_f16
+                return 3;
+            default: return 2;
+        }
+    }
+    return emitted_vop3_opcode_has_two_data_sources(opcode) ? 2u : 3u;
+}
+
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
 // admission, and emission. These inline constants compile to the same immediate comparisons as raw
 // literals.

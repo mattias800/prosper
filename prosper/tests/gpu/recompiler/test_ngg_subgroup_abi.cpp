@@ -306,3 +306,21 @@ TEST(NggSubgroupAbi, Xor3ReadsThirtyTwoBitSources) {
     EXPECT_EQ(analyze(program({0xd579000au, 0x040a0300u})).reason,
               "ngg-abi-unclassified-vector-width");
 }
+
+// A VOP3 encoding always carries three source fields, and the ones the opcode does not read decode
+// as s0. Without a known user-data address s0 is not a launch value, so counting that phantom read
+// refused programs that never touch s0.
+TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
+    EXPECT_EQ(vop3_architectural_source_count(0x181), 1u) << "VOP3-encoded VOP1";
+    EXPECT_EQ(vop3_architectural_source_count(0x125), 2u) << "VOP3-encoded VOP2";
+    EXPECT_EQ(vop3_architectural_source_count(0x101), 3u) << "cndmask reads its mask from SRC2";
+    EXPECT_EQ(vop3_architectural_source_count(0x14b), 3u) << "v_fma_f32";
+    // v_mov_b32_e64 v10, v0: SRC1 and SRC2 are zero fields, i.e. s0.
+    EXPECT_TRUE(analyze(program({0xd581000au, 0x00000100u})).ok());
+    // v_add_nc_u32_e64 v10, v0, v1: SRC2 is a zero field.
+    EXPECT_TRUE(analyze(program({0xd525000au, 0x00020300u})).ok());
+    // v_cndmask_b32_e64 v10, v0, v1, s0: the mask is a real read of s0.
+    EXPECT_EQ(analyze(program({0xd501000au, 0x00020300u})).reason, "ngg-abi-read-s0-s1");
+    // A real read of s0 is still counted: v_add_nc_u32_e64 v10, s0, v1 reads it through SRC0.
+    EXPECT_EQ(analyze(program({0xd525000au, 0x00020200u})).reason, "ngg-abi-read-s0-s1");
+}
