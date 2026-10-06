@@ -232,8 +232,18 @@ public:
                 (in.opcode == 0x0fu || in.opcode == 0x11u || in.opcode == 0x13u ||
                  in.opcode == 0x15u || in.opcode == 0x17u || in.opcode == 0x19u ||
                  in.opcode == 0x1bu || in.opcode == 0x1du);
-            const bool mask_move = in.fmt == Rdna2Format::SOP1 &&
-                in.opcode == kSop1OpcodeMovB64;
+            // The unary B64 mask transfers: S_MOV, S_NOT and S_WQM. From an independent mask each
+            // produces an independent mask, and the emitter keeps all three in the Bool domain
+            // (into VCC as well: all three update the VCC the branches read).
+            // S_WQM is the one that matters: nearly every pixel shader opens with
+            // `s_wqm_b64 exec, exec`, and while only S_MOV was listed, that instruction left EXEC
+            // "dependent" for every load fetched ABOVE it -- the walk starts at the load with
+            // EXEC independent, so a load below the prologue never saw it. For those early loads
+            // no later compare counted as fresh and every consumer of a recycled pair was a
+            // numeric reader (#4555: GTA V's V# loads at pc 4, above the prologue at pc 9).
+            const bool mask_move = in.fmt == Rdna2Format::SOP1 && (in.opcode == kSop1OpcodeMovB64 ||
+                                                                   in.opcode == kSop1OpcodeNotB64 ||
+                                                                   in.opcode == kSop1OpcodeWqmB64);
             const bool mask_saveexec = in.fmt == Rdna2Format::SOP1 &&
                 in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                 in.opcode <= kSop1OpcodeXnorSaveexecB64;
@@ -338,7 +348,8 @@ public:
                   in.opcode == kSop1OpcodeCmovB64)) ||
                 (in.fmt == Rdna2Format::SOPK &&
                  in.opcode == kSopkOpcodeCmovkI32);
-            const bool definite_scalar_write = !conditional_write &&
+            const bool definite_scalar_write =
+                !conditional_write &&
                 (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                  in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
                  (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
