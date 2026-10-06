@@ -994,7 +994,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
                         } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
                     } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true;
-                             mask_write_clobbers_pair(rs, in.dst.value); }  // conservative: WQM widens
+                        mask_write_clobbers_pair(rs, in.dst.value);   // conservative: WQM widens
+                        // Into VCC this is a VCC write, as it is for s_mov_b64 and s_not_b64
+                        // below: branches and the e32 selects read rs.vcc, not sreg_bool[106].
+                        if (in.dst.value == 106) rs.vcc = m;
+                    }
                     return true;
                 }
                 // Narrowed-state carried alongside a saved mask: restoring EXEC from a mask that was saved

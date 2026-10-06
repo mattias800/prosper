@@ -3108,6 +3108,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_wqm_into_vcc_execution
+      SOURCES tests/gpu/execute/test_compute_wqm_into_vcc.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
