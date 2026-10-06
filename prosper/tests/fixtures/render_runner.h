@@ -8555,7 +8555,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::string refusal;
         if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal))
             return out;   // counted and logged (bounded) by expand
-
         draws = ngg_draws;
     }
     bool avoid_cache_eviction = active_submission.pending() ||
