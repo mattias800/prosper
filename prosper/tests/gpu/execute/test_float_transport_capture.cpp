@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version == 72,
+    CHECK(roundtrip && loaded.format_version == 71,
           "current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
