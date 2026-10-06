@@ -9,6 +9,36 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The merged-NGG LUT producer runs (2026-10-06, #3135 P5)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` and the default launch
+(`PROSPER_NULL_PAGE=1`, no input, `PROSPER_DBG=1`), 260 s, on branch `feat/ngg-live-p5`. The
+merged ES+GS LUT producer (`es 0x5009440000`, chain `0x5009470000`) now runs through the
+subgroup shell instead of being dropped.
+
+| | before (same branch, producer refused) | after |
+|---|---|---|
+| refused vertex programs | 1 (the merged chain) | **0** |
+| `dropped-draws` alarm | 46 of 48 windows; `shader-recompile/vertex:16874` | **did not fire** |
+| `skipped-dispatches` alarm | 1 of 48 windows; `backend-declined:1` | 44 of 45 windows; `backend-declined:398` (#4625) |
+| 32³ LUT `0x509cff0000` | never written | **131,072 bytes, 90,212 non-zero** |
+| title-menu world | black | **still black** |
+
+- **The LUT matches #3857's.** #3857's layered fallback read back 131,072 bytes with 90,212
+  non-zero, byte-identical across its two arms. This path reads back the same size and the same
+  non-zero count (`PROSPER_DUMP_PERSISTENT=ms:190000 PROSPER_DUMP_PERSISTENT_EXTENT=32x32`, which
+  now reads volumes). The count was compared, not the bytes: #3857 kept no copy of its LUT.
+- **Two things had to change for the chain to run live.**
+  - The resource table is folded over the LINKED program. The prolog's own analysis stops at
+    its `s_setpc` link, so it could not prove the raw register-offset V# loads at pc 33 and 66.
+    On the linked program they are entry- and register-proven.
+  - The shell's guest bindings are the ones it accesses. The direct V# at s8 is declared but
+    never read.
+- **The world is still black, so something downstream is also wrong.** One candidate: compute
+  program `0x5007bc0000` binds the now renderer-written 64³ volume `0x5013f30000` as a storage
+  image, and every such dispatch is skipped (#4625). Before P5 it ran over guest bytes no prosper
+  draw had written.
+
 ## Linux/AMD shader refusals (2026-10-06)
 
 **Read this first.** Counts are distinct refused programs (vertex / fragment / compute), all on Linux/RADV with `prosper-app`, a default launch, `PROSPER_NULL_PAGE=1`, no input and `PROSPER_DBG=1`. Runs are 260 s unless noted, and each row is its own run or runs, measured on that fix's branch. The counts vary from run to run with what the title streams: the vertex column reads 6 or 8 for the same code. The title picture is unchanged, the menu over a black world, which is the zero colour LUT (#3135).
@@ -246,6 +276,13 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
   What this does NOT show: whether the polarity is right for Kena. A recognised helper writes nothing under
   either polarity, so this result is polarity-blind. Kena's predicate words were not traced, and no per-helper
   lever was run on Kena.
+- **The black title-menu world is the zero colour LUT alone** — false. With the merged-NGG
+  producer running and the 32³ LUT read back live at 131,072 bytes / 90,212 non-zero (#3857's
+  figures), the world is still black (#3135 P5, 2026-10-06).
+- **The live chain's prolog-only resource table is enough for the subgroup shell** — false. The
+  shell refused at prolog pc 6 (`unresolved-operand`) and, with pc 6 supplied, at pc 33. The
+  raw register-offset V# loads at pc 33/66 are provable only on the linked program, which is now
+  what the NGG candidate's table is folded over (#3135 P5).
 - **The black pre-menu screen is a renderer failure** — false. The composite was black because the logo movie was
   never started (unregistered `sceAvPlayerStartEx`, #3781); registering it reaches the menu with no renderer change.
 - **The BatchMap ENOMEM is #2424's too-small free placeholder** — false. `VirtualQuery` on the failing range shows
