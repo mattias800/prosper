@@ -9,10 +9,10 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 MAX_UNITS, MAX_PATHS, MAX_BYTES = 1024, 16384, 256 * 1024 * 1024
@@ -37,46 +37,78 @@ def argv(command):
 
 
 DRIVER = re.compile(r"(?:[\w.-]+-)?(?:g\+\+|gcc|c\+\+|clang\+\+|clang)(?:-\d+(?:\.\d+)*)?(?:\.exe)?")
-WRAPPER = re.compile(r"(?:ccache|sccache)(?:\.exe)?")
+WRAPPER = re.compile(r"ccache(?:\.exe)?")
+# ccache settings that replace the compiler lookup this module reproduces. Any of them set means the
+# compiler that actually ran is not the one PATH names, so the identity refuses rather than guess.
+WRAPPER_OVERRIDES = ("compiler", "path", "prefix_command")
+
+
+@lru_cache(maxsize=8)   # once per wrapper binary, not once per compile command
+def wrapper_overrides_unset(wrapper):
+    for key in WRAPPER_OVERRIDES:
+        p = subprocess.run([str(wrapper), "-k", key], capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            raise ValueError("compiler wrapper configuration unavailable")
+        if p.stdout.strip():
+            raise ValueError("compiler wrapper configuration overrides the compiler")
+
+
+def find_on_path(name, search_path, wrapper):
+    """`name` on PATH as the wrapper finds it: the first match that is not the wrapper itself.
+
+    A relative or empty entry ahead of the match would be resolved against the compile's working
+    directory, not ours, and a DIFFERENT wrapper would be the next link of a chain; both refuse.
+    """
+    for entry in search_path.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            raise ValueError("relative PATH entry ahead of the wrapped compiler")
+        candidate = Path(entry) / name
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            continue
+        target = candidate.resolve(strict=True)
+        if target == wrapper:
+            continue
+        if WRAPPER.fullmatch(target.name) or target.name == "sccache":
+            raise ValueError("compiler wrapper chain unsupported")
+        return target
+    raise ValueError("wrapped compiler not found")
 
 
 def unwrap_compiler(args, search_path=None):
-    """The real compiler behind a compiler-cache wrapper, and the argv that compiler receives.
+    """The real compiler behind a ccache wrapper, and the argv that compiler receives.
 
     A cache wrapper does not change what is compiled, so the identity is the compiler it forwards
     to. Two spellings reach compile_commands.json (#4356): the explicit `ccache g++ ...`, and the
     masquerade `/usr/lib64/ccache/c++ ...`, a symlink to ccache that finds the real `c++` by
-    searching PATH and skipping every entry that is itself the wrapper. Both are resolved here the
-    same way the wrapper resolves them; anything else fails closed.
+    searching PATH and skipping links to itself. Both are resolved here the way ccache resolves
+    them, and only when none of ccache's own overrides (`compiler`, `path`, `prefix_command`) is
+    set; anything else fails closed. Other wrappers (sccache) are not recognised and so refuse as
+    unsupported drivers.
     """
     first = Path(args[0])
     resolved = first.resolve(strict=True)
     if not WRAPPER.fullmatch(resolved.name):
         return resolved, args
+    wrapper_overrides_unset(resolved)
+    search = search_path if search_path is not None else os.environ.get("PATH", "")
     if WRAPPER.fullmatch(first.name):
-        # Explicit form: the compiler is the next argument, found the way a shell would.
+        # Explicit form: the compiler is the next argument.
         if len(args) < 2 or args[1].startswith("-"):
             raise ValueError("compiler wrapper without a compiler")
-        named = shutil.which(args[1], path=search_path)
-        if not named:
-            raise ValueError("wrapped compiler not found")
-        real, rest = Path(named).resolve(strict=True), args[1:]
+        named = Path(args[1])
+        if named.is_absolute():
+            real = named.resolve(strict=True)
+            if real == resolved or WRAPPER.fullmatch(real.name) or real.name == "sccache":
+                raise ValueError("compiler wrapper chain unsupported")
+        elif len(named.parts) != 1:
+            raise ValueError("relative wrapped compiler path unsupported")
+        else:
+            real = find_on_path(args[1], search, resolved)
+        rest = args[1:]
     else:
-        # Masquerade: the same basename, later on PATH, that is not the wrapper itself.
-        real = None
-        for entry in (search_path if search_path is not None else os.environ.get("PATH", "")).split(os.pathsep):
-            candidate = Path(entry or ".") / first.name
-            if not (candidate.is_file() and os.access(candidate, os.X_OK)):
-                continue
-            target = candidate.resolve(strict=True)
-            if not WRAPPER.fullmatch(target.name):
-                real = target
-                break
-        if real is None:
-            raise ValueError("masqueraded compiler not found")
+        # Masquerade: the same basename, later on PATH.
+        real = find_on_path(first.name, search, resolved)
         rest = args
-    if WRAPPER.fullmatch(real.name):
-        raise ValueError("compiler wrapper chain unsupported")
     return real, [str(real)] + list(rest[1:])
 
 

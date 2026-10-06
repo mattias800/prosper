@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -72,7 +73,18 @@ def main() -> int:
         for d in (wrap, real_dir, empty):
             d.mkdir()
         ccache = wrap / "ccache"
-        ccache.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        # Answers `ccache -k <key>` from FAKE_CCACHE_<KEY> (empty when unset), like ccache's own
+        # config query; anything else is a compile, which this fixture must never be asked to do.
+        ccache.write_text(
+            '#!/bin/sh\nif [ "$1" = "-k" ]; then\n'
+            '  case "$2" in\n'
+            '    compiler) echo "$FAKE_CCACHE_COMPILER" ;;\n'
+            '    path) echo "$FAKE_CCACHE_PATH" ;;\n'
+            '    prefix_command) echo "$FAKE_CCACHE_PREFIX_COMMAND" ;;\n'
+            "    *) exit 1 ;;\n"
+            "  esac\n  exit 0\nfi\nexit 99\n",
+            encoding="utf-8",
+        )
         ccache.chmod(0o755)
         (wrap / "c++").symlink_to(ccache)
         (real_dir / "c++").symlink_to(real)
@@ -109,8 +121,45 @@ def main() -> int:
         )
         refuses(
             lambda: scanner.unwrap_compiler([str(ccache), "c++", "-c", "x.cpp"], str(wrap)),
-            "explicit wrapper naming another wrapper refuses",
+            "explicit wrapper that finds only itself refuses",
         )
+        compiler, _ = scanner.unwrap_compiler([str(ccache), str(real_dir / "c++"), "-c"], "")
+        check(compiler == real, "explicit wrapper with an absolute compiler path")
+
+        # A DIFFERENT wrapper later on PATH is the next link of a chain, not something to skip.
+        other = root / "other"
+        other.mkdir()
+        sccache = other / "sccache"
+        sccache.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        sccache.chmod(0o755)
+        (other / "c++").symlink_to(sccache)
+        chain = os.pathsep.join([str(wrap), str(other), str(real_dir)])
+        refuses(
+            lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], chain),
+            "a second wrapper behind the masquerade refuses",
+        )
+
+        # A relative or empty PATH entry ahead of the match would resolve against the compile's
+        # directory, not this process's, so the lookup refuses rather than pick one.
+        for label, entry in (("relative", "bin"), ("empty", "")):
+            refuses(
+                lambda entry=entry: scanner.unwrap_compiler(
+                    [str(wrap / "c++"), "-c", "x.cpp"],
+                    os.pathsep.join([str(wrap), entry, str(real_dir)]),
+                ),
+                f"{label} PATH entry ahead of the compiler refuses",
+            )
+
+        # ccache's own overrides replace the lookup; with any of them set the identity refuses.
+        for key in ("COMPILER", "PATH", "PREFIX_COMMAND"):
+            os.environ[f"FAKE_CCACHE_{key}"] = "clang++" if key != "PATH" else str(real_dir)
+            scanner.wrapper_overrides_unset.cache_clear()
+            refuses(
+                lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], search),
+                f"ccache {key.lower()} override refuses",
+            )
+            del os.environ[f"FAKE_CCACHE_{key}"]
+        scanner.wrapper_overrides_unset.cache_clear()
 
         # End to end through the scanner's real dependency scan, with the masquerade on PATH.
         source = root / "unit.cpp"
@@ -166,6 +215,21 @@ def main() -> int:
                 digest == scanner.fingerprint(commands, tree),
                 "a symlinked work tree has the same identity as its target",
             )
+
+        # The CLI's stderr is the build log's only diagnostic and must stay path-free: a missing
+        # commands file is reported by exception TYPE, never with the path the OSError carries.
+        missing = root / "private-name" / "compile_commands.json"
+        p = subprocess.run(
+            [sys.executable, str(module_path), str(missing), str(root)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        check(
+            p.returncode == 2
+            and p.stderr.strip() == "compiler dependency identity unavailable: FileNotFoundError",
+            "a missing commands file reports a path-free reason",
+        )
 
     print(f"compiler wrapper: {checks} checks, {failures} failures")
     return 1 if failures else 0

@@ -51,7 +51,13 @@ if(PROSPER_REVISION_WORK_TREE AND PROSPER_REVISION_CONFIG_ID)
     # The scanner's stderr is a single path-free reason; show it so an "unknown" identity can be
     # diagnosed from the build log (#4356) instead of by patching the script.
     if(NOT _dependencies_result EQUAL 0)
-      message(STATUS "prosper build revision: ${_dependencies_error}")
+      # Only the scanner's own reason line: an interpreter traceback would carry local paths.
+      string(REGEX MATCH "compiler dependency identity unavailable: [^\n]*" _dependencies_reason
+             "${_dependencies_error}")
+      if(NOT _dependencies_reason)
+        set(_dependencies_reason "compiler dependency identity unavailable (no reason reported)")
+      endif()
+      message(STATUS "prosper build revision: ${_dependencies_reason}")
     endif()
     string(APPEND _source_manifest "|dependencies=${_dependencies_hash}")
   endif()
