@@ -4821,6 +4821,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     mem.snapshot_prefix(bounded_scalar_words.data(),
                                         scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                // The recompiler tags an immediate-only s_load's destination with its immediate
+                // (sreg_srt), EXCEPT a raw immediate-wide data load, whose words it treats as data
+                // carrying no descriptor identity (rdna2_emit_alu.cpp, the wide-load tag). Key
+                // descriptor uses exactly as it will: a key no consumer carries publishes a resource
+                // no consumer can reach, and every consumer is then refused (#4585).
+                const bool emitter_srt_tag =
+                    imm_only && !is_buffer &&
+                    !((n == 4 || n == 8) &&
+                      std::binary_search(decoded->raw_immediate_wide_data_load_pcs.begin(),
+                                         decoded->raw_immediate_wide_data_load_pcs.end(), in.pc));
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
                     imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
@@ -4939,7 +4949,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                 }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
-                    const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
+                    const uint32_t key = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
                         val_srt_key[(size_t)(sdst + (int)k)] = key;
                         val_srt_key_known.set((size_t)(sdst + (int)k));
@@ -4987,8 +4997,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
                               descr_known.set((size_t)sdst);
                               // only s_load (not s_buffer_load) dests get the recompiler's sreg_srt tag
-                              descr_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr_key_known.set((size_t)sdst);
                 }
                 if (n == 8 && valid_reg(sdst)) {
@@ -4996,8 +5005,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                   mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
                               descr8_known.set((size_t)sdst);
                               descr8_from_x16.reset((size_t)sdst);
-                              descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
-                                  ? in.literal : 0xFFFFFFFFu;
+                              descr8_key[(size_t)sdst] = emitter_srt_tag ? in.literal : 0xFFFFFFFFu;
                               descr8_key_known.set((size_t)sdst);
                               // SGPR loads are typeless: a later scalar buffer load may consume the
                               // first four words of this eight-dword result as a V#. Keep both views;

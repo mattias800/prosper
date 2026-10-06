@@ -613,6 +613,53 @@ TEST(AgcShader, Contract) {
                   *narrow_scalar_resource) == 4u,
           "graphics stage table bounds scalar dwords by the V# byte footprint");
 
+    // #4585: a V# loaded by a RAW immediate-wide data load (its words are also read numerically)
+    // carries no recompiler SRT tag, so its consumers can resolve only by pc. The fold keyed the
+    // descriptor by the load immediate anyway and published a resource no consumer could reach;
+    // every s_buffer_load reading it was then refused as unresolved-cbuf.
+    alignas(16) static uint32_t untagged_payload[32]{};
+    alignas(16) static uint32_t untagged_table[8]{};
+    const uint64_t untagged_payload_addr = reinterpret_cast<uint64_t>(untagged_payload);
+    untagged_table[4] = static_cast<uint32_t>(untagged_payload_addr);
+    untagged_table[5] = static_cast<uint32_t>(untagged_payload_addr >> 32) & 0xffffu;
+    untagged_table[6] = sizeof(untagged_payload);   // stride 0: NUM_RECORDS counts bytes
+    untagged_table[7] = (22u << 12) | 0xfacu;
+    const uint32_t untagged_shader[] = {
+        0xF4080200u, 0xFA000010u,   // pc0: s_load_dwordx4 s[8:11], s[0:1], 0x10
+        0x7E000208u,   // pc2: v_mov_b32 v0, s8 -- a numeric reader: raw-wide data
+        0xF4200304u, 0xFA000000u,   // pc3: s_buffer_load_dword s12, s[8:11], 0x0
+        0xF4200344u, 0xFA000040u,   // pc5: s_buffer_load_dword s13, s[8:11], 0x40
+        0xBF810000u,
+    };
+    Shader untagged{};
+    untagged.file_header = 0x34333231u;
+    untagged.version = 0x18u;
+    untagged.shader_size = sizeof(untagged_shader);
+    untagged.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&untagged),
+                       reinterpret_cast<uint64_t>(untagged_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &untagged, "raw-wide V# pixel shader enters the AGC registry");
+    prosper::gpu::GpuState untagged_state;
+    const uint64_t untagged_table_addr = reinterpret_cast<uint64_t>(untagged_table);
+    untagged_state.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] =
+        static_cast<uint32_t>(untagged_table_addr);
+    untagged_state.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1] =
+        static_cast<uint32_t>(untagged_table_addr >> 32);
+    auto untagged_resources = prosper::gpu::build_stage_table(
+        untagged_state, reinterpret_cast<uint64_t>(untagged_shader), true, 3);
+    const auto untagged_cbuf = [&](uint32_t pc) -> const prosper::gpu::ShaderResource* {
+        const auto* r = untagged_resources ? untagged_resources->by_fetch_pc(pc) : nullptr;
+        return r && r->cls == prosper::gpu::ResourceClass::ConstantBuffer ? r : nullptr;
+    };
+    CHECK(untagged_cbuf(3u) && untagged_cbuf(3u)->gpu_addr == untagged_payload_addr,
+          "the first consumer of an untagged raw-wide V# resolves by its pc");
+    CHECK(untagged_cbuf(5u) && untagged_cbuf(5u)->gpu_addr == untagged_payload_addr,
+          "...and so does the second");
+    CHECK(!untagged_resources || !untagged_resources->by_srt_offset(0x10u) ||
+              untagged_resources->by_srt_offset(0x10u)->gpu_addr != untagged_payload_addr,
+          "no resource is keyed by an immediate the recompiler never tags");
+
     // #4584: a V# whose table key CLASHES is published key-less, so each scalar buffer load that
     // reads it resolves only through its own fetch_pc entry. Here a texture loaded from table A at
     // +0x20 holds key 0x20 first; the V# loaded from table B at the same +0x20 then clashes, and it is
