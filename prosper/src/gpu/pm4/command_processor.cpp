@@ -4404,7 +4404,7 @@ void GpuState::apply(const Pm4Command& c) {
                                 (int)c.reg_class, regs[i].offset, regs[i].value);
                     continue;
                 }
-                file[offset] = regs[i].value;
+                file.set(offset, regs[i].value);
                 if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                     sh_prov[offset] = command_order | kProvIndirect;
                     sh_prov_src[offset] = pack_prov_src(
@@ -4524,7 +4524,7 @@ void GpuState::apply(const Pm4Command& c) {
                 if (c.reg_offset >= kRegOffsetLimit) break;
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
-                file[c.reg_offset + k] = c.reg_data[k];
+                file.set(c.reg_offset + k, c.reg_data[k]);
             if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                 const uint64_t src = pack_prov_src(c.queue_origin, jump_depth,
                                                    g_fold_seq.load(std::memory_order_relaxed));
