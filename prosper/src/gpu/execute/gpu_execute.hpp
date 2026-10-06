@@ -22,6 +22,7 @@
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
+#include "gpu/pm4/vgt_shader_stages.hpp"   // NGG shape in the refused-shader index
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
@@ -2355,20 +2356,28 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const uint32_t gs_max_out = cx(P::VGT_GS_MAX_VERT_OUT, 9);
             const uint32_t max_output = cx(P::GE_MAX_OUTPUT_PER_SUBGROUP, 10);
             const uint32_t out_prim = cx(P::VGT_GS_OUT_PRIM_TYPE, 11);
+            // #3135 P0: the output/raster state the merged-NGG lowering must model or refuse.
+            const uint32_t vs_out_cntl = cx(P::PA_CL_VS_OUT_CNTL, 12);
+            const uint32_t su_mode = cx(P::PA_SU_SC_MODE_CNTL, 13);
+            const uint32_t pos_format = cx(P::SPI_SHADER_POS_FORMAT, 14);
+            const uint32_t color0_view = cx(P::CB_COLOR0_VIEW, 15);
+            const uint32_t clip_cntl = cx(P::PA_CL_CLIP_CNTL, 16);
+            const uint32_t primitiveid_en = cx(P::VGT_PRIMITIVEID_EN, 17);
             std::fprintf(stderr,
-                "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
-                "vertices=%u instances=%u topo=%u present=%03x rsrc1=%08x rsrc2=%08x "
-                "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
-                "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
-                "max-output=%08x out-prim=%08x\n",
-                static_cast<unsigned long long>(rs.es_addr),
-                static_cast<unsigned long long>(chain_addr),
-                static_cast<unsigned long long>(rs.color0_base),
-                static_cast<unsigned long long>(draw ? draw->command_order : 0),
-                vcount_hint, draw ? draw->instance_count : ds.num_instances,
-                rs.prim_type, present,
-                rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
-                primitive, gs_instance, gs_max_out, max_output, out_prim);
+                         "[ngg-launch-state] es=%llx chain=%llx target=%llx order=%llu "
+                         "vertices=%u instances=%u topo=%u present=%05x rsrc1=%08x rsrc2=%08x "
+                         "onchip=%08x esgs-itemsize=%08x ge-cntl=%08x subgroup=%08x "
+                         "stages=%08x primitive=%08x gs-instance=%08x gs-max-out=%08x "
+                         "max-output=%08x out-prim=%08x vs-out-cntl=%08x su-mode=%08x "
+                         "pos-format=%08x color0-view=%08x clip-cntl=%08x primitiveid-en=%08x\n",
+                         static_cast<unsigned long long>(rs.es_addr),
+                         static_cast<unsigned long long>(chain_addr),
+                         static_cast<unsigned long long>(rs.color0_base),
+                         static_cast<unsigned long long>(draw ? draw->command_order : 0),
+                         vcount_hint, draw ? draw->instance_count : ds.num_instances, rs.prim_type,
+                         present, rsrc1, rsrc2, onchip, esgs_itemsize, ge_cntl, subgroup, stages,
+                         primitive, gs_instance, gs_max_out, max_output, out_prim, vs_out_cntl,
+                         su_mode, pos_format, color0_view, clip_cntl, primitiveid_en);
         }
     }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
@@ -2399,6 +2408,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
         : rs.es_addr;
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
+    // The refused-shader index records each refused draw's NGG shape and link kind (#3135 P0).
+    const char* const refused_ngg_class = [&] {
+        const auto it = ds.cx.find(prosper::agc::Pm4::VGT_SHADER_STAGES_EN);
+        return ngg_stage_class(VgtShaderStages{it == ds.cx.end() ? 0u : it->second});
+    }();
+    const char* const refused_link =
+        vertex_chain ? "prolog" : (vs_program_addr != rs.es_addr ? "fused" : "none");
     const auto* producer_header = vs_program_addr == rs.es_addr ? vertex_header : fused_back;
     const auto* pixel_header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(rs.ps_addr));
@@ -2452,7 +2468,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                  0,
                  owned_vertex,
                  owned_fragment,
-                 reason});
+                 reason,
+                 refused_ngg_class,
+                 refused_link,
+                 vertex_chain ? chain_addr : 0});
             prosper::diagnostics::perf::drop_draw_at_realization(
                 owned_vertex ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
                              : prosper::diagnostics::perf::DropReason::ShaderRecompileFragment);
@@ -2843,7 +2862,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                    rs.ps_addr, rs.es_addr, draw ? draw->command_order : 0,
                                    max_shader_dwords, vs_words.size(), gs.size(), fs_words.size(),
                                    vs_words.empty() && !owned_vertex,
-                                   fs_words.empty() && !owned_fragment});
+                                   fs_words.empty() && !owned_fragment, nullptr, refused_ngg_class,
+                                   refused_link, vertex_chain ? chain_addr : 0});
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
