@@ -3,6 +3,7 @@
 
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
+#include "host/memory/guest_write_watch.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +68,13 @@ VolumePublication publish_volume_to_guest(const VolumePublicationSource& source,
     std::vector<uint8_t> linear;
     if (!readback || !readback(linear) || linear.size() != linear_bytes)
         return VolumePublication::ReadbackFailed;
+    // A host store into guest memory: open any write-watched page first, as compute's own storage
+    // writeback does, so the tile pass does not fault once per page (guest_write_watch.hpp).
+    struct PreparedHostWrite {
+        uint64_t address, bytes;
+        ~PreparedHostWrite() { host::guest_write_watch_notify_host_write_done(address, bytes); }
+    } const prepared{source.base, source.claimed_bytes};
+    host::guest_write_watch_notify_host_write(prepared.address, prepared.bytes);
     if (!tile_volume(guest, static_cast<size_t>(source.claimed_bytes), linear.data(), layout.width,
                      layout.height, layout.depth, layout.tile_mode, layout.bytes_per_texel))
         return VolumePublication::UnknownLayout;

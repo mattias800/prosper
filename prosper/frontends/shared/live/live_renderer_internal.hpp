@@ -17,6 +17,7 @@
 #include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
 #include "gpu/execute/renderer_volume_publication.hpp"   // #4625: a claimed volume's native layout
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/volume_publication_source.hpp"   // #4625: claim, alias and release rules
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/mrt_extent.hpp"

@@ -9,9 +9,14 @@
 //
 // Publication is the fix: read the retained image back, tile it into the producer's own native
 // layout, write it to the claimed guest footprint and release the claim. Guest memory is then the
-// only authority, and the dispatch runs through the ordinary guest-byte path. It costs a readback
-// the guest observes whenever the dispatch reads the volume or leaves any texel unwritten; nothing
-// here can prove a dispatch overwrites every texel, so it is paid for write-only bindings too.
+// only authority, and the dispatch runs through the ordinary guest-byte path.
+//
+// Steady-state invariant P1 (no CPU wait on the GPU inside a frame unless the guest observes the
+// result) permits the readback's fence wait: the dispatch reads the published bytes, and any texel
+// it leaves unwritten survives in guest memory. Nothing here can prove a dispatch overwrites every
+// texel, so a write-only clear pays it too. It is paid once per claimed volume, at its first
+// consuming binding, over exactly the claimed footprint. Follow-ups: #4652 (cheaper routes), #4653
+// (a guest write the drain never saw, overwritten by a lazy publication).
 //
 // Every refusal is named: a claim that cannot be published exactly keeps the dispatch skipped.
 #pragma once

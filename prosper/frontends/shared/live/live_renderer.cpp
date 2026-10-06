@@ -990,31 +990,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         if (bases.empty()) return VolumePublication::NothingToPublish;
         for (const uint64_t base : bases) {
             RttSurf& surface = g_rtt[base];
-            prosper::gpu::VolumePublicationSource source;
-            source.base = base;
-            source.claimed_bytes = surface.volume_guest_bytes;
-            source.footprint_proven = surface.volume_footprint_proven;
-            source.renderer_image_valid = surface.gpu_valid && surface.volume_depth != 0;
-            source.image_width = surface.w;
-            source.image_height = surface.h;
-            source.image_depth = surface.volume_depth;
-            source.layout = surface.volume_layout;
-            source.exact_representation = surface.guest_format == surface.format;
-            // The same overlap rule the guest-write drain applies to each entry: a 2D surface by
-            // address, another volume claim by physical topology as well.
-            uint64_t alias = 0, alias_bytes = 0;
-            for (const auto& [other, other_surface] : g_rtt) {
-                const uint64_t other_bytes = cpu_rtt_guest_write_bytes(other_surface, nullptr);
-                const bool overlaps =
-                    other_surface.volume_guest_bytes
-                        ? unpublished_volume_may_overlap(other, other_surface.volume_guest_bytes,
-                                                         base, surface.volume_guest_bytes)
-                        : prosper::frontend::live_rtt_ranges_overlap(other, other_bytes, base,
-                                                                     surface.volume_guest_bytes);
-                if (other == base || alias || !overlaps) continue;
-                alias = other;
-                alias_bytes = other_bytes;
-            }
+            auto source = prosper::frontend::volume_publication_source(base, surface);
+            const auto [alias, alias_bytes] = prosper::frontend::volume_publication_alias(
+                g_rtt, base, surface.volume_guest_bytes,
+                [](const RttSurf& other) { return cpu_rtt_guest_write_bytes(other, nullptr); },
+                unpublished_volume_may_overlap);
             source.overlapping_alias = alias != 0;
             const VolumePublication result = prosper::gpu::publish_volume_to_guest(
                 source,
@@ -1039,9 +1019,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (result != VolumePublication::Published) return result;
             // Guest memory now holds every slice. The queued notification erases this entry and
             // invalidates the retained image at the next drain.
-            surface.volume_guest_bytes = 0;
-            surface.volume_footprint_proven = false;
-            surface.volume_layout = {};
+            prosper::frontend::release_volume_claim(surface);
         }
         return VolumePublication::Published;
     });
