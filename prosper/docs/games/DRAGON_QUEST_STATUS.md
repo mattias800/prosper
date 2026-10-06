@@ -824,8 +824,9 @@ by that setting. No new runtime result or rung change is claimed here.
   label "Decompress Htile" and targets a 1x1 scratch depth surface. The parent stream never
   re-programs the viewport afterwards. Its per-surface condition word reads 0. The decompress of
   the real 3840x2160 depth reads 1. #319's polarity ("execute when the condition reads 0") therefore
-  ran the wrong helper. BOOL64 predication runs on a non-zero word; with that rule the frame has no
-  1x1 draw and the clouds, sea texture and sun glints render. #4610.
+  ran the wrong helper. The polarity is the hardware PRED_BOOL, not the op. The title passes 1 in
+  both flag arguments of `(dcb, 1, 3, 1, word)`, which is DRAW_VISIBLE: run on a non-zero word.
+  With that rule the frame has no 1x1 draw, and the clouds, sea texture and sun glints render. #4610.
 - **"#319's predication polarity is pinned by the backbuffer composite."** **Falsified 2026-10-06.**
   On the current route, the segments with full-screen colour state are AGC's "Eliminate Fast Clear"
   rectangles (labelled in the segment), not a composite. They write no colour here (#1588). The title
@@ -1061,8 +1062,9 @@ blocker.
   decode cache eligible again. This removed the synthetic `(u, v, u)` coordinate-ramp regression from
   retained title-frame replay without special-casing Dragon Quest.
 
-- **#4610** — BOOL64 predicated jumps run on a non-zero condition, and AGC's helper rectangle under
-  `CB_COLOR_CONTROL.MODE=DISABLE` ("Decompress Htile") writes no colour. Restored the title's
+- **#4610** — Predicated jumps follow the window's PRED_BOOL flag (the title's DRAW_VISIBLE runs on
+  a non-zero condition). AGC's "Decompress Htile" helper (its rectangle under
+  `CB_COLOR_CONTROL.MODE=DISABLE` with `DB_RENDER_CONTROL` compress-disable bits) writes no colour. Restored the title's
   clouds, sea waves and sun glints, which had been rasterising into a 1x1 viewport left behind by
   the wrongly selected helper.
 
