@@ -630,12 +630,14 @@ TEST(NggRasterCommit, InvalidBlocksAndOutOfRangeLayersDrawNothing) {
 // A line list: PRIM carries two indices. One horizontal line on layer 1, one vertical on layer 2,
 // one on an out-of-range layer, through every route that takes lines (the interpolation stage is
 // refused for them). A fourth line on layer 3 carries a different PARAM per endpoint into a FLAT
-// input: the first endpoint's by default, the second's under PROVOKING_VTX_LAST.
+// input: the first endpoint's by default, the second's under PROVOKING_VTX_LAST. A fifth line's
+// endpoints name layers 5 and 6: it lands on the provoking endpoint's layer, so a line path that
+// took the layer from corner 0 regardless would put it on layer 5 under PROVOKING_VTX_LAST.
 TEST(NggRasterCommit, LineListsRasterizeAsLines) {
     const auto routes = available_routes();
     if (routes.empty()) GTEST_SKIP() << "no layer route on this device";
     HandBlocks h;
-    h.add_block(8, 4);
+    h.add_block(10, 5);
     // Pixel row 4 has centre y = 4.5, i.e. clip y = 1 - 2 * 4.5 / 16 under the flipped viewport.
     const float row = 1.0f - 2.0f * 4.5f / kSize, column = -1.0f + 2.0f * 9.5f / kSize;
     // The endpoints lie past the target's edges, so every pixel of the row or column is crossed.
@@ -650,7 +652,10 @@ TEST(NggRasterCommit, LineListsRasterizeAsLines) {
     h.prim(0, 0, 0, 1);
     h.prim(0, 1, 2, 3);
     h.prim(0, 2, 4, 5);
+    h.vertex(0, 8, at(-1.5f, row, 5, 0.5f));
+    h.vertex(0, 9, at(1.5f, row, 6, 0.5f));
     h.prim(0, 3, 6, 7);
+    h.prim(0, 4, 8, 9);
     uint32_t ran = 0;
     for (NggLayerRoute route : routes) {
         if (route == NggLayerRoute::InterpolationGeometry) continue;
@@ -669,8 +674,10 @@ TEST(NggRasterCommit, LineListsRasterizeAsLines) {
             EXPECT_EQ(covered_pixels(r, 3), kSize);
             EXPECT_EQ(r.at(3, 7, 4)[0], last ? 0.375f : 0.125f) << "the provoking endpoint's PARAM";
             EXPECT_EQ(r.counters[kNggViolationLayerCulled], 1u);
+            EXPECT_EQ(covered_pixels(r, last ? 6 : 5), kSize) << "the provoking endpoint's layer";
             for (uint32_t layer = 4; layer < kLayers; ++layer)
-                EXPECT_EQ(covered_pixels(r, layer), 0u) << "layer " << layer;
+                if (layer != (last ? 6u : 5u))
+                    EXPECT_EQ(covered_pixels(r, layer), 0u) << "layer " << layer;
         }
     }
     EXPECT_GT(ran, 0u);
