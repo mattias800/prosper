@@ -3,6 +3,8 @@
 #include "shared/live/submit_renderer/image_resources.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
 
+#include "diagnostics/transfer_pressure.hpp"   // Transfer::DrawBufferStage
+
 namespace prosper::frontend::submit_renderer {
 
 
@@ -37,10 +39,10 @@ struct BufferResourceContext {
     prosper::test::FrameBufferResource & buffer_resource;
 };
 
-template <class CopyResource, class DirectResource>
-ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx,
-                                            CopyResource& copy_resource,
-                                            DirectResource& direct_resource) {
+template <class CopyResource, class DirectResource, class DirectResourceStart>
+ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx, CopyResource& copy_resource,
+                                            DirectResource& direct_resource,
+                                            DirectResourceStart& direct_resource_start) {
     // Every name the moved body used from build_draw_frame_resources, bound once to the same object.
     auto& draw = ctx.draw;
     auto& g_this_submit = ctx.g_this_submit;
@@ -195,6 +197,31 @@ ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx,
             if (!r.host_data && reinterpret_cast<uintptr_t>(source) == r.gpu_addr)
                 fr.direct_guest_buffer_addr = r.gpu_addr;
             resource_buffer_view = true;
+        } else if (const size_t readable = prosper::gpu::device_reads_zero_past_a_binding() &&
+                                                   !reflected_binding->writable &&
+                                                   !reflected_binding->atomic_access
+                                               ? direct_resource_start(r.gpu_addr, nb)
+                                               : 0;
+                   readable >= sizeof(uint32_t) && readable >= reflected_binding->required_bytes) {
+            // The declared range runs past readable guest memory, so it cannot be borrowed whole.
+            // The copy below would take exactly these readable bytes and leave zeros after them;
+            // borrow the readable bytes instead and leave the rest out of the binding. A load
+            // there then reads what the device gives for out-of-range, which is the same zero
+            // ONLY on a device certified for it (device_storage_reads.hpp) -- so only there. The
+            // zeros matter: realization grows a vertex buffer to the draw's range and counts on
+            // them past the mapping edge. A binding the shader writes keeps the copy as well,
+            // since a store past the readable bytes landed in the copy and has nowhere to land
+            // in a shorter binding.
+            //
+            // The saving is the whole copy AND the private upload behind it: a borrowed range is
+            // one the backend can share between every binding that points into the same guest
+            // buffer. A vertex attribute declared as "the whole vertex buffer, starting at my
+            // offset" overshoots the buffer by that offset, so this is the ordinary case for an
+            // interleaved vertex stream, not a corner (#4556).
+            fr.dwords_view = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(r.gpu_addr));
+            fr.dwords_view_count = readable / sizeof(uint32_t);
+            fr.direct_guest_buffer_addr = r.gpu_addr;
+            resource_buffer_view = true;
         }
         if (timing_enabled)
             resource_buffer_probe_ms =
@@ -203,24 +230,29 @@ ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx,
     }
     const auto copy_start = timing_enabled
         ? RenderClock::now() : RenderClock::time_point{};
-    if (!materialization.zero_padded_tail &&
-        !unavailable_guest_buffer && !fr.dwords_view_count &&
+    if (!materialization.zero_padded_tail && !unavailable_guest_buffer && !fr.dwords_view_count &&
         use_direct_buffer_views) {
         if (nb >= 4) {
             fr.dwords.assign(nb / sizeof(uint32_t), 0);
             if (!copy_resource(reinterpret_cast<uint8_t*>(fr.dwords.data()),
                                r.gpu_addr, nb))
                 fr.dwords.clear();
+            // The declared size, whatever part of it the copy filled: all of it was allocated
+            // and zeroed here, and all of it is uploaded unless the copy found nothing.
+            prosper::diagnostics::note_transfer(prosper::diagnostics::Transfer::DrawBufferStage,
+                                                nb);
         }
         if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-    } else if (!materialization.zero_padded_tail &&
-               !unavailable_guest_buffer && !use_direct_buffer_views) {
+    } else if (!materialization.zero_padded_tail && !unavailable_guest_buffer &&
+               !use_direct_buffer_views) {
         if (nb >= 4) {
             std::vector<uint8_t> tmp(nb, 0);
             if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
                 fr.dwords.assign(
                     reinterpret_cast<const uint32_t*>(tmp.data()),
                     reinterpret_cast<const uint32_t*>(tmp.data() + nb));
+            prosper::diagnostics::note_transfer(prosper::diagnostics::Transfer::DrawBufferStage,
+                                                nb);
         }
         if (fr.dwords.empty()) fr.dwords.assign(64, 0);
     }
@@ -243,9 +275,9 @@ ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx,
                     "addr=0x%llx declared=%u uploaded=%u class=%u direct=%d "
                     "probe=%.2f copy=%.2f total=%.2f ms\n",
                     (unsigned long long)draw.draw_index, set, r.binding,
-                    (unsigned long long)r.gpu_addr, requested_bytes, nb,
-                    static_cast<unsigned>(r.cls),
-                    static_cast<int>(resource_buffer_view),
+                    (unsigned long long)r.gpu_addr, requested_bytes,
+                    static_cast<uint32_t>(fr.buffer_word_count() * sizeof(uint32_t)),
+                    static_cast<unsigned>(r.cls), static_cast<int>(resource_buffer_view),
                     resource_buffer_probe_ms, resource_buffer_copy_ms, elapsed);
         }
     }
@@ -576,6 +608,23 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                   return nullptr;
               return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
           };
+          // How many bytes at `addr` can be borrowed when the `n` declared ones cannot all be: the
+          // readable start of a guest range whose end is not mapped, cut to whole words, or 0
+          // when there is nothing to borrow. Captured sources are left to the copy: their bytes
+          // are whatever the capture holds, and a short one is the capture's own statement.
+          // PROSPER_NO_SHORT_BUFFER_VIEW is the comparison arm: it restores the copy.
+          auto direct_resource_start = [&](uint64_t addr, size_t n) -> size_t {
+              // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
+              if (PROSPER_ENV_ON("PROSPER_NO_SHORT_BUFFER_VIEW")) return 0;
+              if (r.host_data || !n || n > UINT32_MAX || addr < 0x1000 || addr > UINT64_MAX - n ||
+                  (addr & (alignof(uint32_t) - 1)))
+                  return 0;
+              const size_t readable = safe_span(addr, n) & ~(sizeof(uint32_t) - 1);
+              if (!readable || readable >= n ||
+                  !prosper::gpu::guest_readable(addr, static_cast<uint32_t>(readable)))
+                  return 0;
+              return readable;
+          };
           auto copy_dcc_metadata = [&](uint8_t* dst, size_t n) -> size_t {
               return copy_shader_dcc_metadata(r, dst, n);
           };
@@ -643,7 +692,8 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                   .resource_buffer_copy_ms = resource_buffer_copy_ms,
                   .buffer_resource = buffer_resource};
               if (materialize_buffer_resource(materialize_buffer_resource_ctx, copy_resource,
-                                              direct_resource) == ResourceOutcome::Skip)
+                                              direct_resource,
+                                              direct_resource_start) == ResourceOutcome::Skip)
                   continue;
           }
           if (texref_census && full_resource) {

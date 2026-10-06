@@ -1,10 +1,15 @@
 // Exercise the shipping resource builder's rejection/skip/continuation contract before extraction.
 // These are seeded reflection-memo metadata arms: they observe real builder outputs and census/
 // timing hooks, not shader reflection, rendered pixels or GPU completion.
+#include "shared/live/submit_renderer/guest_reads.hpp"   // safe_span
 #include "shared/live/submit_renderer/image_resources.hpp"
+
+#include "diagnostics/transfer_pressure.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -172,6 +177,18 @@ static Input ordinary_buffer() {
     return input;
 }
 
+// A buffer binding in GUEST memory: `declared` bytes at `address`, of which the shader's own
+// layout needs `required`.
+static Input guest_buffer(uint64_t address, uint32_t declared, uint64_t required) {
+    Input input = ordinary_buffer();
+    input.resource.gpu_addr = address;
+    input.resource.size = declared;
+    input.resource.host_data = nullptr;
+    input.resource.host_data_size = 0;
+    input.descriptor.required_bytes = required;
+    return input;
+}
+
 static Input shape_rejection() {
     Input input = ordinary_image(4);
     input.resource.format = DataFormat::Float32;
@@ -283,7 +300,7 @@ static void check_tail(const char* arm, const BuiltFrameResources& result,
           "both stages actually consume the seeded manifests on the production memo path");
 }
 
-int main() {
+int main(int argc, char** argv) {
     check(prosper::frontend::TextureReferenceCensus::enabled(), "setup",
           "the census is armed before its first cached read");
     static FixtureState state;
@@ -340,6 +357,156 @@ int main() {
         check_tail(arm, result, state);
         std::printf("[arm-end] %s\n", arm);
         std::fflush(stdout);
+    }
+    // A draw buffer whose DECLARED range runs past the end of mapped guest memory (#4556). A
+    // vertex attribute declared as "the whole vertex buffer, from my offset" is one: it overshoots
+    // the buffer by that offset. The readable start is borrowed in place; only what cannot be
+    // borrowed is still copied into a zero-filled vector of the declared size.
+    {
+        using prosper::diagnostics::Transfer;
+        using prosper::diagnostics::transfer_bytes;
+        constexpr uint64_t kMapped = 0x10000, kReadable = 0x2000;
+        constexpr uint32_t kDeclared = 0x100000;
+        prosper::register_builtin_hle();
+        const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
+        uint64_t mapped = 0;
+        check(map &&
+                  map(reinterpret_cast<uint64_t>(&mapped), kMapped, 3, 0,
+                      reinterpret_cast<uint64_t>("draw-buffer-view"), 0) == 0 &&
+                  mapped,
+              "guest-buffer", "the arms below have tracked guest memory to point into");
+        if (mapped) {
+            auto* words = reinterpret_cast<uint32_t*>(mapped);
+            for (uint32_t i = 0; i < kMapped / 4; ++i) words[i] = 0xb0000000u | i;
+            const uint64_t start =
+                mapped + kMapped - kReadable;   // readable for kReadable, no more
+            const uint32_t first_word =
+                0xb0000000u | static_cast<uint32_t>((kMapped - kReadable) / 4);
+            check(safe_span(start, kDeclared) == kReadable && safe_span(mapped, 0x1000) == 0x1000,
+                  "guest-buffer", "the mapping ends where the arms assume, and nothing follows it");
+            state.use_direct_buffer_views = true;
+            // No device exists in this process; say what a certified one says (see the
+            // "uncertified-device" arm for the other answer).
+            prosper::gpu::device_reads_zero_past_a_binding() = true;
+            // The comparison arm of the measurement is its own ctest case: the same binary with
+            // the switch set and `--expect-copy`. The two must agree, so a switch left exported
+            // in the shell cannot quietly turn the default case into the comparison one.
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): one read in a single-threaded test
+            const bool borrows = std::getenv("PROSPER_NO_SHORT_BUFFER_VIEW") == nullptr;
+            const bool expect_copy = argc > 1 && std::strcmp(argv[1], "--expect-copy") == 0;
+            check(borrows != expect_copy, "guest-buffer",
+                  "PROSPER_NO_SHORT_BUFFER_VIEW is set exactly when --expect-copy is passed");
+            const auto staged = [] { return transfer_bytes(Transfer::DrawBufferStage); };
+            const auto one = [&](const char* arm, const Input& input) {
+                auto result = build(state, {}, {input});
+                check(result.complete && result.buffers.size() == 1, arm,
+                      "the binding is kept and the draw stays complete");
+                return result;
+            };
+            const auto borrowed = [&](const auto& result, uint64_t address, uint64_t bytes) {
+                if (result.buffers.size() != 1) return false;
+                const auto& buffer = result.buffers[0];
+                return buffer.dwords.empty() &&
+                       reinterpret_cast<uintptr_t>(buffer.buffer_words_data()) == address &&
+                       buffer.buffer_word_count() == bytes / 4 &&
+                       buffer.direct_guest_buffer_addr == address;
+            };
+            const auto copied = [&](const auto& result, uint32_t word0, size_t zero_from_word) {
+                if (result.buffers.size() != 1) return false;
+                const auto& buffer = result.buffers[0];
+                return buffer.dwords.size() == kDeclared / 4 && !buffer.direct_guest_buffer_addr &&
+                       buffer.dwords[0] == word0 && buffer.dwords[zero_from_word - 1] != 0 &&
+                       buffer.dwords[zero_from_word] == 0 && buffer.dwords.back() == 0;
+            };
+            {
+                const uint64_t before = staged();
+                const auto result = one("over-declared", guest_buffer(start, kDeclared, 16));
+                if (borrows) {
+                    check(borrowed(result, start, kReadable), "over-declared",
+                          "the readable start is borrowed in place, exactly as long as it is "
+                          "readable");
+                    check(staged() == before, "over-declared", "a borrowed range stages no bytes");
+                } else {
+                    check(copied(result, first_word, kReadable / 4), "over-declared",
+                          "with the switch set the declared range is copied and zero-filled as "
+                          "before");
+                    check(staged() == before + kDeclared, "over-declared",
+                          "the copy is charged at its declared size");
+                }
+            }
+            {
+                // The shader's own layout reaches past what is readable: a binding shorter than
+                // that would not be a valid one, so this still takes the copy.
+                const uint64_t before = staged();
+                const auto result =
+                    one("needs-more-than-readable", guest_buffer(start, kDeclared, kReadable + 4));
+                check(copied(result, first_word, kReadable / 4), "needs-more-than-readable",
+                      "a start shorter than the shader's layout is not borrowed");
+                check(staged() == before + kDeclared, "needs-more-than-readable",
+                      "the copy is charged at its declared size");
+            }
+            {
+                // A binding the shader WRITES: a store past the readable bytes landed in the
+                // copy, and a shorter binding has nowhere for it to land.
+                Input written = guest_buffer(start, kDeclared, 16);
+                written.descriptor.writable = true;
+                const auto result = one("writable", written);
+                check(copied(result, first_word, kReadable / 4), "writable",
+                      "a binding the shader writes is copied at its declared size");
+                Input atomic = guest_buffer(start, kDeclared, 16);
+                atomic.descriptor.atomic_access = true;
+                check(copied(one("atomic", atomic), first_word, kReadable / 4), "atomic",
+                      "a binding the shader updates atomically is copied at its declared size");
+            }
+            {
+                // A device that does not promise zero past a binding's end: the explicit zeros
+                // of the copy are the only way to keep them.
+                prosper::gpu::device_reads_zero_past_a_binding() = false;
+                const auto result = one("uncertified-device", guest_buffer(start, kDeclared, 16));
+                prosper::gpu::device_reads_zero_past_a_binding() = true;
+                check(copied(result, first_word, kReadable / 4), "uncertified-device",
+                      "without the device's zero guarantee the declared range is copied");
+            }
+            {
+                // Two bytes in: not a word-aligned source, so no view of it can be handed out.
+                const auto result = one("misaligned", guest_buffer(start + 2, kDeclared, 16));
+                check(result.buffers.size() == 1 && !result.buffers[0].dwords.empty() &&
+                          !result.buffers[0].direct_guest_buffer_addr,
+                      "misaligned", "an unaligned start is copied, never borrowed");
+            }
+            {
+                // The control: a range that is readable to its declared end was always borrowed
+                // whole, and still is at its declared length.
+                const uint64_t before = staged();
+                const auto result = one("fully-readable", guest_buffer(mapped, 0x1000, 16));
+                check(borrowed(result, mapped, 0x1000), "fully-readable",
+                      "a fully readable range is borrowed at its declared length");
+                check(staged() == before, "fully-readable", "and stages no bytes");
+            }
+            {
+                // A CAPTURED source that is shorter than its declared size, at an address where
+                // guest memory happens to be readable too. Its bytes are the capture's, so the
+                // guest's must not be borrowed in their place.
+                Input captured = guest_buffer(start, kDeclared, 16);
+                captured.resource.host_data = reinterpret_cast<uint8_t*>(BufferWords.data());
+                captured.resource.host_data_size = sizeof(BufferWords);
+                const auto result = one("captured-short", captured);
+                check(copied(result, BufferWords[0], BufferWords.size()), "captured-short",
+                      "a short captured source is copied from the capture, not borrowed from guest "
+                      "memory");
+            }
+            state.use_direct_buffer_views = false;
+            {
+                // With views switched off altogether every guest buffer is copied, and that
+                // route charges its copy too.
+                const uint64_t before = staged();
+                const auto result = one("views-off", guest_buffer(start, kDeclared, 16));
+                check(copied(result, first_word, kReadable / 4), "views-off",
+                      "without buffer views the declared range is copied and zero-filled");
+                check(staged() == before + kDeclared, "views-off",
+                      "and the copy is charged at its declared size");
+            }
+        }
     }
     std::printf("draw resource status: %d failures (seeded builder metadata; no rendered-pixel claim)\n",
                 failures);
