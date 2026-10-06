@@ -173,23 +173,27 @@ TEST(DrawDisposition, Contract) {
     std::condition_variable changed;
     bool ready = false, release = false, worker_finished = false;
     const uint64_t seen_before_worker = c.seen();
+    // The worker runs a REAL pass: per-pass figures are thread-local, so a pass must open and
+    // report on its own thread. Counting on the worker and reporting from this thread would read
+    // this thread's empty counters, and the joined-pass check below could then never fail.
     std::thread worker([&] {
-        c.note_seen();
-        std::unique_lock lock(mutex);
-        ready = true;
-        changed.notify_one();
-        changed.wait(lock, [&] { return release; });
-        lock.unlock();
-        c.note_recorded();
-        lock.lock();
+        {
+            DrawDispositionPassScope pass(1);
+            std::unique_lock lock(mutex);
+            ready = true;
+            changed.notify_one();
+            changed.wait(lock, [&] { return release; });
+            lock.unlock();
+            c.note_recorded();
+        }   // the worker's own report_pass(), inside the capture around the join below
+        std::scoped_lock lock(mutex);
         worker_finished = true;
     });
     {
         std::unique_lock lock(mutex);
         changed.wait(lock, [&] { return ready; });
-        // Per-pass figures are the worker's own (thread-local); the process total sees its draw.
-        check(!worker_finished && c.seen() == seen_before_worker + 1 &&
-                  c.pass_seen_for_scope() == 0,
+        // The process total sees the worker's in-flight draw.
+        check(!worker_finished && c.seen() == seen_before_worker + 1,
               "counter-producing worker remains live with an in-flight pass before flush");
     }
     const uint64_t exit_before = unaccounted();
@@ -205,8 +209,10 @@ TEST(DrawDisposition, Contract) {
         release = true;
     }
     changed.notify_one();
-    worker.join();
-    check(capture_pass().empty() && unaccounted() == exit_before,
+    // Capture the worker's own pass report (stderr is process-wide), so a worker pass that lost
+    // its recorded draw prints UNACCOUNTED here and raises the counter.
+    const std::string worker_report = capture_report([&] { worker.join(); });
+    check(worker_report.empty() && unaccounted() == exit_before,
           "joined healthy pass retains quiet completed-pass accounting");
     const std::string joined = capture_report([&] { c.report_totals(); });
     check(joined.find("snapshot-delta=") == std::string::npos &&
