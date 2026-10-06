@@ -101,6 +101,12 @@ public:
             std::bitset<128> masks;
         };
         if (start + 1 >= ins.size()) return false;
+        // A destination that reaches past s105 loads VCC, M0 or EXEC themselves. Those are
+        // read by instructions that never name them, and the walk below starts from an EXEC
+        // that does not depend on the load; neither holds for such a load, so it is numeric
+        // without a walk. requires_backing() already answers the same way.
+        if (first + static_cast<int>(words) > 106)
+            return blocked(ins[start].pc, "destination-above-s105");
         State initial{start + 1, {}, false, {}};
         initial.masks = saved_exec_masks_at_load();
         initial.masks.set(126); // entry EXEC cannot depend on this subsequent, unreplayed load
@@ -325,6 +331,18 @@ public:
                 vopc_is_cmpx(in.opcode) && !derived_read && state.masks.test(126);
             const bool fresh_exec = independent_cmpx || (independent_transfer &&
                 (mask_saveexec || mask_register(in.dst) == 126));
+            // The e32 add/sub-with-carry forms write their carry-out to VCC without naming it,
+            // so no writer inventory reports it. The emitter builds it as it builds a compare
+            // result, a Bool with the bit of an inactive lane written 0, out of the two operands,
+            // the carry-in (the VCC it replaces) and EXEC. A derived operand has already stopped
+            // the walk as a numeric reader, so VCC is kept as an independent root afterwards
+            // only when it was one before and EXEC is one.
+            // Only the compare was handled here, so a VCC that held a saved EXEC kept that fact
+            // across a carry-out formed under an EXEC nothing vouched for (#4574); the pass that
+            // seeds a load already ended the save there.
+            const bool carry_out =
+                in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28u && in.opcode <= 0x2au;
+            const bool root_carry = carry_out && state.masks.test(126) && state.masks.test(106);
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
                     const int reg = base + static_cast<int>(k);
@@ -332,10 +350,12 @@ public:
                     if (reg > 0 && reg <= 128) state.masks.reset(static_cast<size_t>(reg - 1));
                 }
             });
-            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
-                !vopc_is_cmpx(in.opcode)) state.masks.reset(106);
+            if ((in.fmt == Rdna2Format::VOPC && in.dst.value == 106 && !vopc_is_cmpx(in.opcode)) ||
+                carry_out)
+                state.masks.reset(106);
             if (rdna2_instruction_may_change_exec(in)) state.masks.reset(126);
             if (fresh_compare) state.masks.set(static_cast<size_t>(compare_root));
+            if (root_carry) state.masks.set(106);
             if (independent_transfer) state.masks.set(static_cast<size_t>(mask_register(in.dst)));
             if (fresh_exec) state.masks.set(126);
 
@@ -405,6 +425,23 @@ public:
             // consumed as a number by whichever of them runs next, and no operand scan can see
             // that, so it is counted here, where the word goes in.
             if (state.regs.test(124)) return blocked(in.pc, "derived-value-enters-m0");
+            // EXEC is read by nearly everything and named by nothing: every lane write below
+            // is predicated by it, and a compare run under it folds it into the mask it
+            // produces. Every other way a derived word can reach EXEC is stopped above (the
+            // scalar forms as derived-value-leaves-scalar-data, a v_cmpx on a derived operand as
+            // numeric-reader), but a plain s_mov takes the copy path, where nothing is a reader.
+            // It marked EXEC and went on, and the mark did nothing: the lanes written under
+            // that EXEC were not readers, and a mask formed under it carried no mark at all, so
+            // it could outlive the walk (#4574). So the copy itself is the numeric use, as it is
+            // for M0.
+            // A transfer from an independent root is not one. Its high word may still be the
+            // load's on a 32-lane view, and the copy marks EXEC's accordingly, but what the
+            // emitter installs is the root's Bool.
+            if (plain_copy && !independent_transfer)
+                for (uint32_t k = 0; k < copy_words; ++k)
+                    if (copied[k] && (in.dst.value + static_cast<int>(k) == 126 ||
+                                      in.dst.value + static_cast<int>(k) == 127))
+                        return blocked(in.pc, "derived-value-enters-exec");
             if (const SccEffect effect = scc_effect(in); effect == SccEffect::Replaces)
                 state.scc = derived_read;
             else if (effect == SccEffect::Unknown)
@@ -535,13 +572,11 @@ private:
         // that holds outright: everything was written before the load ran. On a later arrival
         // it holds only as far as every value that depends on the load carries a mark while it
         // lives, because then a pair rewritten from such a value is a write the walk reaches,
-        // and it drops the fact there. The marks are known to be incomplete in one place
-        // (#4574): a plain copy of loaded words into EXEC marks EXEC and nothing formed under
-        // it, so a compare run under that EXEC yields an unmarked mask, and the same goes for
-        // the VCC a carry-out leaves under it. Moved into a seeded pair after the walk has
-        // stopped and brought back round a loop, that mask is restored as an independent
-        // EXEC. The sweep this replaces cleared the same program; closing it belongs to the
-        // EXEC copy, which has to become a reader.
+        // and it drops the fact there. The one known way round that was a plain copy of loaded
+        // words into EXEC: a compare run under that EXEC yields a mask with no mark, which
+        // could be moved into a seeded pair after the walk had stopped and come back round a
+        // loop as an independent EXEC (#4574). The walk now stops at that copy, and ends a
+        // VCC-held root at a carry-out formed under an EXEC that is not one.
         std::vector<std::bitset<128>> incoming(start + 1);
         std::vector<bool> reached(start + 1);
         reached[0] = true;
