@@ -555,7 +555,7 @@ struct SpirvCompute {
     uint32_t vertex_general_mask_mbcnt_pc = UINT32_MAX;
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
-    bool     ngg_workgroup_export_probe=false;       // test-only 64-lane guest wave/export shell
+    bool     ngg_workgroup_shell=false;       // merged-NGG workgroup shell: guest waves share LDS
     uint32_t ngg_probe_trace_pc = UINT32_MAX;        // optional offline VGPR milestone
     uint32_t ngg_probe_trace_vgpr = UINT32_MAX;
     bool     ngg_probe_trace_seen = false;
@@ -2356,12 +2356,12 @@ struct SpirvCompute {
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() {
-        if (ngg_workgroup_export_probe && ngg_vertex_index_value)
+        if (ngg_workgroup_shell && ngg_vertex_index_value)
             return ngg_vertex_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r);
     }
     uint32_t load_instance_index() {
-        if (ngg_workgroup_export_probe && ngg_instance_index_value)
+        if (ngg_workgroup_shell && ngg_instance_index_value)
             return ngg_instance_index_value;
         uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r);
     }

@@ -1168,7 +1168,7 @@ bool emit_cfg_state_machine(
          !packet_masks->source_words || packet_masks->source_words->data() != code ||
          packet_masks->source_words->size() != dwords))
         return reject_cfg(ins.front().pc, "packet-mask-program-requirements-mismatch");
-    if (b.ngg_workgroup_export_probe && b.is_compute && b.local_count == 64 &&
+    if (b.ngg_workgroup_shell && b.is_compute && b.local_count == 64 &&
         std::all_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             if (in.is_end) return true;
             if (in.fmt == Rdna2Format::SOPP &&
@@ -1189,7 +1189,7 @@ bool emit_cfg_state_machine(
             if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeBcnt1I32B64)
                 b.ngg_uniform_wave_reduction_pcs.insert(in.pc);
     }
-    if (b.ngg_workgroup_export_probe && b.is_compute && b.wave_size == 64 &&
+    if (b.ngg_workgroup_shell && b.is_compute && b.wave_size == 64 &&
         !initial.vcc && initial.terminal_wave64_scalar_words.contains(106) &&
         initial.terminal_wave64_scalar_words.contains(107) &&
         initial.sreg.contains(106) && initial.sreg.contains(107)) {
@@ -1387,7 +1387,7 @@ bool emit_cfg_state_machine(
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
         return b.is_compute &&
                (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
-                (b.ngg_workgroup_export_probe && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
+                (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -6641,7 +6641,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               (b.ngg_workgroup_export_probe &&
+                               (b.ngg_workgroup_shell &&
                                 is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
