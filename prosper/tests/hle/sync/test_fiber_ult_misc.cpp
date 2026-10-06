@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -667,4 +668,144 @@ TEST(FiberUltMisc, StaleWaiterDoesNotJoinTheNextIncarnation) {
     }
     EXPECT_EQ(stolen_items, 0) << "a stale popper took the next queue's item";
     EXPECT_EQ(stolen_units, 0) << "a stale acquirer took the next semaphore's unit";
+}
+
+// An operation that looked its object up BEFORE a destroy but takes the object's lock only AFTER
+// a Create reused the slot must answer ESRCH and leave the new object alone. The resolve hook
+// holds the worker between lookup and lock, so the interleaving is forced, not raced.
+namespace stale_lookup {
+std::atomic<const char*> g_target{nullptr};
+std::atomic<std::thread::id> g_worker{};
+std::atomic<int> g_paused{0}, g_resume{0};
+void hook(const char* fn) {
+    const char* target = g_target.load();
+    if (!target || std::strcmp(fn, target) != 0 || std::this_thread::get_id() != g_worker.load())
+        return;
+    g_paused.store(1);
+    while (!g_resume.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+uint32_t slot_of(const UltBlob& blob) {
+    uint64_t id = 0;
+    std::memcpy(&id, blob.bytes + 8, sizeof(id));   // header {magic, id}; id = generation:slot
+    return (uint32_t)id;
+}
+// Run `op` on a worker that stops after resolving `name`; while it is stopped run `swap` (destroy
+// the object `op` names, create its replacement in the same slot); then let the worker finish.
+uint64_t run_held(const char* name, const std::function<uint64_t()>& op,
+                  const std::function<void()>& swap) {
+    g_paused.store(0);
+    g_resume.store(0);
+    g_target.store(name);
+    std::atomic<uint64_t> rc{~0ull};
+    std::thread worker([&] {
+        g_worker.store(std::this_thread::get_id());
+        rc.store(op());
+    });
+    for (int i = 0; i < 5000 && !g_paused.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(g_paused.load()) << name << " never reached the lookup hook";
+    swap();
+    g_resume.store(1);
+    worker.join();
+    g_target.store(nullptr);
+    return rc.load();
+}
+}   // namespace stale_lookup
+
+TEST(FiberUltMisc, OperationResolvedBeforeDestroyDoesNotTouchTheNextObject) {
+    using namespace stale_lookup;
+    register_builtin_hle();
+    std::memset(&g_pool, 0, sizeof(g_pool));
+    std::memset(&g_dpool, 0, sizeof(g_dpool));
+    std::memset(&g_queue, 0, sizeof(g_queue));
+    make_data_pool_and_queue(8);
+    ASSERT_EQ(call_nid("PP9nZxpSKLY", addr(&g_queue)), 0u);   // leaves exactly one dead queue slot
+    ult_set_resolve_hook_for_test(&hook);
+    const auto queue_at = [&](UltBlob& blob) {
+        std::memset(&blob, 0, sizeof(blob));
+        EXPECT_EQ(call7_nid("9Y5keOvb6ok", addr(&blob), 0, 8, addr(&g_pool), addr(&g_dpool), 0,
+                            0x12000000ull),
+                  0u);
+    };
+    const auto sem_at = [&](UltBlob& blob, uint64_t initial) {
+        std::memset(&blob, 0, sizeof(blob));
+        EXPECT_EQ(call_nid("h5QlIYj+Ro8", addr(&blob), 0, initial, addr(&g_pool), 0, 0x12000000ull),
+                  0u);
+    };
+    uint8_t item[8] = {5, 5, 5, 5, 5, 5, 5, 5}, out[8] = {};
+
+    // Push / TryPush: the stale item must not land in the replacement queue.
+    for (const char* name : {"sceUltQueuePush", "sceUltQueueTryPush"}) {
+        const char* nid = std::strcmp(name, "sceUltQueuePush") == 0 ? "dUwpX3e5NDE" : "6Mc2Xs7pI1I";
+        UltBlob first, second;
+        queue_at(first);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), addr(item)); },
+            [&] {
+                EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&first)), 0u);
+                queue_at(second);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed queue";
+        EXPECT_EQ(call_nid("uZz3ci7XYqc", addr(&second), addr(out)), hle::kSceKernelErrorEAGAIN)
+            << name << " put the destroyed queue's item into the replacement";
+        EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&second)), 0u);
+    }
+    // Pop / TryPop: the stale call must not take the replacement queue's item.
+    for (const char* name : {"sceUltQueuePop", "sceUltQueueTryPop"}) {
+        const char* nid = std::strcmp(name, "sceUltQueuePop") == 0 ? "RVSq2tsm2yw" : "uZz3ci7XYqc";
+        UltBlob first, second;
+        queue_at(first);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), addr(out)); },
+            [&] {
+                EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&first)), 0u);
+                queue_at(second);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+                EXPECT_EQ(call_nid("dUwpX3e5NDE", addr(&second), addr(item)), 0u);
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed queue";
+        EXPECT_EQ(call_nid("uZz3ci7XYqc", addr(&second), addr(out)), 0u)
+            << name << " took the replacement queue's item";
+        EXPECT_EQ(call_nid("PP9nZxpSKLY", addr(&second)), 0u);
+    }
+    // Acquire / TryAcquire: the stale call must not take the replacement's unit.
+    for (const char* name : {"sceUltSemaphoreAcquire", "sceUltSemaphoreTryAcquire"}) {
+        const char* nid =
+            std::strcmp(name, "sceUltSemaphoreAcquire") == 0 ? "QAH1ofI97vU" : "HA1Ldbi3lPY";
+        UltBlob first, second;
+        sem_at(first, 0);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            name, [&] { return call_nid(nid, addr(&first), 1); },
+            [&] {
+                EXPECT_EQ(call_nid("izXyehpoZGo", addr(&first)), 0u);
+                sem_at(second, 1);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << name << " on the destroyed semaphore";
+        EXPECT_EQ(call_nid("HA1Ldbi3lPY", addr(&second), 1), 0u)
+            << name << " took the replacement semaphore's unit";
+        EXPECT_EQ(call_nid("izXyehpoZGo", addr(&second)), 0u);
+    }
+    // Release: the stale call must not add a unit to the replacement.
+    {
+        UltBlob first, second;
+        sem_at(first, 0);
+        const uint32_t slot = slot_of(first);
+        const uint64_t rc = run_held(
+            "sceUltSemaphoreRelease", [&] { return call_nid("lbtk5X1mecw", addr(&first), 1); },
+            [&] {
+                EXPECT_EQ(call_nid("izXyehpoZGo", addr(&first)), 0u);
+                sem_at(second, 0);
+                EXPECT_EQ(slot_of(second), slot) << "control: the Create reused the slot";
+            });
+        EXPECT_EQ(rc, hle::kSceKernelErrorESRCH) << "release on the destroyed semaphore";
+        EXPECT_EQ(call_nid("HA1Ldbi3lPY", addr(&second), 1), hle::kSceKernelErrorEAGAIN)
+            << "release added a unit to the replacement semaphore";
+        EXPECT_EQ(call_nid("izXyehpoZGo", addr(&second)), 0u);
+    }
+    ult_set_resolve_hook_for_test(nullptr);
 }

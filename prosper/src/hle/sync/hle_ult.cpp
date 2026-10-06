@@ -354,10 +354,12 @@ struct UltObject {
     uint64_t queue_capacity = 0;
     // Semaphore count, guarded by mtx like everything else on this object.
     int64_t sem_count = 0;
-    // Queue / Semaphore: bumped under mtx by every Create that (re)uses this slot. A waiter
-    // parked on an earlier incarnation compares it after every wake, so a destroy followed by a
-    // create in the same slot cannot hand the new object's items or units to the old waiter.
-    uint64_t incarnation = 0;
+    // Queue / Semaphore: the generation of the Create that last (re)used this slot, written
+    // under mtx. Every operation resolves the guest handle to (object, generation) and, under
+    // mtx, refuses with ESRCH unless this still equals that generation -- so an operation that
+    // resolved before a destroy can never act on the object a later Create put in the slot,
+    // whether it was already parked or had not yet taken the lock.
+    uint32_t incarnation = 0;
     // QueueDataResourcePool sizing, echoed back by the work-area query.
     uint64_t dp_num_data = 0, dp_data_size = 0, dp_num_queues = 0;
 };
@@ -438,8 +440,15 @@ void unpublish_object(uint64_t guest_addr) {
     h->id = 0;
 }
 
+// Test seam: called after every successful resolve, before the caller takes any object lock.
+// Lets a test hold an operation between lookup and lock deterministically. Null in production.
+std::atomic<void (*)(const char*)> g_resolve_hook_for_test{nullptr};
+
 // Resolve a guest object pointer to prosper's object, or nullptr with a loud, deduplicated report.
-UltObject* resolve(uint64_t guest_addr, UltType type, const char* fn) {
+// `generation`, when given, receives the generation the guest handle named; an operation that
+// then takes the object's lock compares it against the slot's `incarnation`.
+UltObject* resolve(uint64_t guest_addr, UltType type, const char* fn,
+                   uint32_t* generation = nullptr) {
     if (!guest_object_writable(guest_addr)) {
         log_line("%s: unusable object pointer 0x%llx (null, misaligned, or unmapped)", fn,
                  (unsigned long long)guest_addr);
@@ -455,12 +464,15 @@ UltObject* resolve(uint64_t guest_addr, UltType type, const char* fn) {
                      fn, (unsigned long long)guest_addr, type_name(type), (unsigned long long)magic);
         return nullptr;
     }
-    UltObject* o = object_from_id(h->id, type);
+    const uint64_t id = h->id;
+    UltObject* o = object_from_id(id, type);
     if (!o) {
         log_line("%s: object 0x%llx carries a stale %s id 0x%llx", fn,
-                 (unsigned long long)guest_addr, type_name(type), (unsigned long long)h->id);
+                 (unsigned long long)guest_addr, type_name(type), (unsigned long long)id);
         return nullptr;
     }
+    if (generation) *generation = (uint32_t)(id >> 32);
+    if (auto hook = g_resolve_hook_for_test.load(std::memory_order_relaxed)) hook(fn);
     return o;
 }
 
@@ -1605,20 +1617,23 @@ PROSPER_SYSV_ABI uint64_t ult_cond_signal_all(uint64_t a0, uint64_t, uint64_t, u
 // CONFIDENCE: MED on shapes (one secondary implementation; no title in the local corpus
 // imports these NIDs, so no call site confirms arity or order); HIGH on the registry
 // mechanics; MED on the per-queue reading of numData.
+// True (o->mtx held) when the object the caller's handle named is gone: destroy has begun, it
+// is no longer alive, or a Create has reused the slot (`incarnation` is not the generation the
+// handle carried). Every queue/semaphore critical section starts with this check.
+bool ult_stale_locked(const UltObject* o, uint32_t generation) {
+    return o->incarnation != generation || o->destroying.load(std::memory_order_acquire) ||
+           !o->alive.load(std::memory_order_acquire);
+}
+
 // Park on o->cond (o->mtx held) until pred() holds, with this file's watchdog discipline: one
 // bounded timed wait first (warn once), then unbounded. pred() is re-checked after every
-// wake, so a spurious wakeup consumes nothing. The object counts as destroyed once destroy
-// has begun, once it is no longer alive, or once a Create has reused the slot (`incarnation`
-// moved past the value the waiter entered with); a waiter from an earlier incarnation must
-// never consume the new object's state.
+// wake, so a spurious wakeup consumes nothing. `generation` is the one the caller's handle
+// carried; once the object is stale (ult_stale_locked) the wait reports Destroyed, so a waiter
+// never consumes the state of the object a later Create put in the slot.
 enum class UltWait { Ready, Destroyed, Failed };
 template <typename Pred>
-UltWait ult_wait_pred(UltObject* o, Pred pred, const char* fn) {
-    const uint64_t entered = o->incarnation;
-    const auto gone = [&] {
-        return o->incarnation != entered || o->destroying.load(std::memory_order_acquire) ||
-               !o->alive.load(std::memory_order_acquire);
-    };
+UltWait ult_wait_pred(UltObject* o, uint32_t generation, Pred pred, const char* fn) {
+    const auto gone = [&] { return ult_stale_locked(o, generation); };
     const uint64_t warn_ms = block_warn_ms();
     struct timespec deadline;
     abstime_in_ms(deadline, warn_ms);
@@ -1631,6 +1646,8 @@ UltWait ult_wait_pred(UltObject* o, Pred pred, const char* fn) {
             rc = pthread_cond_timedwait(&o->cond, &o->mtx, &deadline);
             if (rc == ETIMEDOUT) {
                 warned = true;
+                // A stale object's name may be being reassigned by a Create; never read it.
+                if (gone()) return UltWait::Destroyed;
                 log_line("BLOCKED >%llums: %s on \"%s\" (0x%llx) -- still waiting. "
                          "(PROSPER_ULT_BLOCK_WARN_MS)",
                          (unsigned long long)warn_ms, fn, o->name.c_str(),
@@ -1820,7 +1837,7 @@ PROSPER_SYSV_ABI uint64_t ult_queue_create(uint64_t a0, uint64_t a1, uint64_t a2
     // Under mtx: a waiter from this slot's previous incarnation may still be inside
     // ult_wait_pred, and must see either the old state or the new incarnation, never a mix.
     pthread_mutex_lock(&o->mtx);
-    ++o->incarnation;
+    o->incarnation = o->generation;
     o->queue_data_size = a2;
     o->queue_data_pool_id = data_pool_id;
     o->queue_capacity = capacity;
@@ -1849,19 +1866,30 @@ PROSPER_SYSV_ABI uint64_t ult_queue_create(uint64_t a0, uint64_t a1, uint64_t a2
 // Copy one item into the queue and wake any parked popper. The guest bytes are copied
 // before the lock is taken, so a slow or hostile mapping cannot hold the queue mutex. A full
 // queue makes Push wait for a pop and TryPush answer EAGAIN. The caller holds HostTcbScope.
-uint64_t ult_queue_push_impl(UltObject* o, uint64_t data, const char* fn, bool blocking) {
+uint64_t ult_queue_push_impl(UltObject* o, uint32_t gen, uint64_t data, const char* fn,
+                             bool blocking) {
+    pthread_mutex_lock(&o->mtx);
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
     const uint64_t size = o->queue_data_size;
+    pthread_mutex_unlock(&o->mtx);
     if (!data || !gpu::guest_readable(data, (uint32_t)size)) {
-        log_line("%s on \"%s\" (0x%llx): unreadable item pointer 0x%llx", fn, o->name.c_str(),
-                 (unsigned long long)o->guest_addr, (unsigned long long)data);
+        log_line("%s: unreadable item pointer 0x%llx", fn, (unsigned long long)data);
         return kUltErrInval;
     }
     std::vector<uint8_t> item((size_t)size);
     std::memcpy(item.data(), (const void*)(uintptr_t)data, (size_t)size);
     pthread_mutex_lock(&o->mtx);
+    // The copy ran unlocked: the queue may have been destroyed and its slot reused meanwhile.
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
     const auto has_room = [&] { return o->queue_items.size() < o->queue_capacity; };
     if (blocking) {
-        const UltWait waited = ult_wait_pred(o, has_room, fn);
+        const UltWait waited = ult_wait_pred(o, gen, has_room, fn);
         if (waited != UltWait::Ready) {
             pthread_mutex_unlock(&o->mtx);
             return waited == UltWait::Destroyed ? kUltErrSrch : kUltErrInval;
@@ -1881,9 +1909,10 @@ PROSPER_SYSV_ABI uint64_t ult_queue_push(uint64_t a0, uint64_t a1, uint64_t, uin
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxQueuePush, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueuePush");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueuePush", &gen);
     if (!o) return kUltErrSrch;
-    return ult_queue_push_impl(o, a1, "sceUltQueuePush", true);
+    return ult_queue_push_impl(o, gen, a1, "sceUltQueuePush", true);
 }
 
 PROSPER_SYSV_ABI uint64_t ult_queue_trypush(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
@@ -1891,21 +1920,33 @@ PROSPER_SYSV_ABI uint64_t ult_queue_trypush(uint64_t a0, uint64_t a1, uint64_t, 
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxQueueTryPush, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueueTryPush");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueueTryPush", &gen);
     if (!o) return kUltErrSrch;
-    return ult_queue_push_impl(o, a1, "sceUltQueueTryPush", false);
+    return ult_queue_push_impl(o, gen, a1, "sceUltQueueTryPush", false);
 }
 
-uint64_t ult_queue_pop_impl(UltObject* o, uint64_t a0, uint64_t a1, const char* fn, bool blocking) {
-    const uint64_t size = o->queue_data_size;
+uint64_t ult_queue_pop_impl(UltObject* o, uint32_t gen, uint64_t a0, uint64_t a1, const char* fn,
+                            bool blocking) {
+    pthread_mutex_lock(&o->mtx);
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
+    const uint64_t size = o->queue_data_size;   // fixed for this incarnation
+    pthread_mutex_unlock(&o->mtx);
     if (!a1 || !gpu::guest_writable(a1, (uint32_t)size)) {
-        log_line("%s on \"%s\" (0x%llx): unwritable item pointer 0x%llx", fn, o->name.c_str(),
-                 (unsigned long long)a0, (unsigned long long)a1);
+        log_line("%s on queue 0x%llx: unwritable item pointer 0x%llx", fn, (unsigned long long)a0,
+                 (unsigned long long)a1);
         return kUltErrInval;
     }
     pthread_mutex_lock(&o->mtx);
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
     if (blocking) {
-        const UltWait waited = ult_wait_pred(o, [&] { return !o->queue_items.empty(); }, fn);
+        const UltWait waited = ult_wait_pred(o, gen, [&] { return !o->queue_items.empty(); }, fn);
         if (waited != UltWait::Ready) {
             pthread_mutex_unlock(&o->mtx);
             return waited == UltWait::Destroyed ? kUltErrSrch : kUltErrInval;
@@ -1932,9 +1973,10 @@ PROSPER_SYSV_ABI uint64_t ult_queue_pop(uint64_t a0, uint64_t a1, uint64_t, uint
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxQueuePop, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueuePop");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueuePop", &gen);
     if (!o) return kUltErrSrch;
-    return ult_queue_pop_impl(o, a0, a1, "sceUltQueuePop", true);
+    return ult_queue_pop_impl(o, gen, a0, a1, "sceUltQueuePop", true);
 }
 
 PROSPER_SYSV_ABI uint64_t ult_queue_trypop(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
@@ -1942,9 +1984,10 @@ PROSPER_SYSV_ABI uint64_t ult_queue_trypop(uint64_t a0, uint64_t a1, uint64_t, u
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxQueueTryPop, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueueTryPop");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Queue, "sceUltQueueTryPop", &gen);
     if (!o) return kUltErrSrch;
-    return ult_queue_pop_impl(o, a0, a1, "sceUltQueueTryPop", false);
+    return ult_queue_pop_impl(o, gen, a0, a1, "sceUltQueueTryPop", false);
 }
 
 PROSPER_SYSV_ABI uint64_t ult_queue_destroy(uint64_t a0, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -2004,7 +2047,7 @@ PROSPER_SYSV_ABI uint64_t ult_sem_create(uint64_t a0, uint64_t a1, uint64_t a2, 
     o->guest_addr = a0;
     o->api_version = (uint32_t)a5;
     pthread_mutex_lock(&o->mtx);   // see ult_queue_create: a previous incarnation's waiter
-    ++o->incarnation;
+    o->incarnation = o->generation;
     o->sem_count = initial;
     o->destroying.store(false, std::memory_order_relaxed);
     o->alive.store(true, std::memory_order_release);
@@ -2025,17 +2068,21 @@ PROSPER_SYSV_ABI uint64_t ult_sem_create(uint64_t a0, uint64_t a1, uint64_t a2, 
     return kUltOk;
 }
 
-uint64_t ult_sem_acquire_impl(UltObject* o, uint64_t a0, uint64_t a1, const char* fn,
+uint64_t ult_sem_acquire_impl(UltObject* o, uint32_t gen, uint64_t a0, uint64_t a1, const char* fn,
                               bool blocking) {
     const int64_t num = (int64_t)(int32_t)(uint32_t)a1;
     if (num <= 0) {
-        log_line("%s on \"%s\" (0x%llx): non-positive count %lld", fn, o->name.c_str(),
-                 (unsigned long long)a0, (long long)num);
+        log_line("%s on semaphore 0x%llx: non-positive count %lld", fn, (unsigned long long)a0,
+                 (long long)num);
         return kUltErrInval;
     }
     pthread_mutex_lock(&o->mtx);
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
     if (blocking) {
-        const UltWait waited = ult_wait_pred(o, [&] { return o->sem_count >= num; }, fn);
+        const UltWait waited = ult_wait_pred(o, gen, [&] { return o->sem_count >= num; }, fn);
         if (waited != UltWait::Ready) {
             pthread_mutex_unlock(&o->mtx);
             return waited == UltWait::Destroyed ? kUltErrSrch : kUltErrInval;
@@ -2054,9 +2101,10 @@ PROSPER_SYSV_ABI uint64_t ult_sem_acquire(uint64_t a0, uint64_t a1, uint64_t, ui
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxSemAcquire, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreAcquire");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreAcquire", &gen);
     if (!o) return kUltErrSrch;
-    return ult_sem_acquire_impl(o, a0, a1, "sceUltSemaphoreAcquire", true);
+    return ult_sem_acquire_impl(o, gen, a0, a1, "sceUltSemaphoreAcquire", true);
 }
 
 PROSPER_SYSV_ABI uint64_t ult_sem_tryacquire(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
@@ -2064,9 +2112,10 @@ PROSPER_SYSV_ABI uint64_t ult_sem_tryacquire(uint64_t a0, uint64_t a1, uint64_t,
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxSemTryAcquire, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreTryAcquire");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreTryAcquire", &gen);
     if (!o) return kUltErrSrch;
-    return ult_sem_acquire_impl(o, a0, a1, "sceUltSemaphoreTryAcquire", false);
+    return ult_sem_acquire_impl(o, gen, a0, a1, "sceUltSemaphoreTryAcquire", false);
 }
 
 PROSPER_SYSV_ABI uint64_t ult_sem_release(uint64_t a0, uint64_t a1, uint64_t, uint64_t, uint64_t,
@@ -2074,15 +2123,20 @@ PROSPER_SYSV_ABI uint64_t ult_sem_release(uint64_t a0, uint64_t a1, uint64_t, ui
     HostTcbScope host_tcb;
     uint64_t out = 0;
     if (!implement(kIdxSemRelease, &out)) return out;
-    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreRelease");
+    uint32_t gen = 0;
+    UltObject* o = resolve(a0, UltType::Semaphore, "sceUltSemaphoreRelease", &gen);
     if (!o) return kUltErrSrch;
     const int64_t num = (int64_t)(int32_t)(uint32_t)a1;
     if (num <= 0) {
-        log_line("sceUltSemaphoreRelease on \"%s\" (0x%llx): non-positive count %lld",
-                 o->name.c_str(), (unsigned long long)a0, (long long)num);
+        log_line("sceUltSemaphoreRelease on semaphore 0x%llx: non-positive count %lld",
+                 (unsigned long long)a0, (long long)num);
         return kUltErrInval;
     }
     pthread_mutex_lock(&o->mtx);
+    if (ult_stale_locked(o, gen)) {
+        pthread_mutex_unlock(&o->mtx);
+        return kUltErrSrch;
+    }
     o->sem_count += num;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->mtx);
@@ -2178,6 +2232,10 @@ uint64_t ult_call_count(const char* nid) {
     for (size_t i = 0; i < kUltCount; ++i)
         if (std::strcmp(nid, kUlt[i].nid) == 0) return g_calls[i].load(std::memory_order_relaxed);
     return 0;
+}
+
+void (*ult_set_resolve_hook_for_test(void (*hook)(const char* fn)))(const char*) {
+    return g_resolve_hook_for_test.exchange(hook, std::memory_order_relaxed);
 }
 
 bool ult_set_return_success_for_test(bool return_success) {
