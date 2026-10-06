@@ -503,9 +503,11 @@ namespace {
 //      v_cmp_*_sdwa s[16:17], 0, s10 ; s_mov_b64 vcc, s[16:17]
 //      s_cbranch_vccz +1 ; s_branch L
 //      v_readfirstlane vcc_lo, v1 ; s_endpgm
-// Returns whether the load is flagged, and its numeric blocker through `kind`.
+// Returns whether the load is flagged, and its numeric blocker through `kind`, with how far past
+// the load that blocker is through `offset`.
 bool prefixed_load_is_flagged(const std::vector<uint32_t>& prefix,
-                              const std::vector<uint32_t>& in_loop, std::string* kind = nullptr) {
+                              const std::vector<uint32_t>& in_loop, std::string* kind = nullptr,
+                              uint32_t* offset = nullptr) {
     std::vector<uint32_t> code = prefix;
     const uint32_t load_pc = static_cast<uint32_t>(code.size());
     code.insert(code.end(), {0xf408040eu, 0xfa0000f0u, 0xf4280208u, 0xfa0000c0u});
@@ -518,7 +520,10 @@ bool prefixed_load_is_flagged(const std::vector<uint32_t>& prefix,
     EXPECT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
     if (kind) kind->clear();
     for (const RawWideLoadDiagnosis& row : rdna2_raw_wide_data_load_diagnoses(instructions))
-        if (row.load_pc == load_pc && kind) *kind = row.numeric_kind;
+        if (row.load_pc == load_pc) {
+            if (kind) *kind = row.numeric_kind;
+            if (offset) *offset = row.numeric_pc - load_pc;
+        }
     const auto loads = rdna2_raw_wide_data_loads(instructions);
     return std::find(loads.begin(), loads.end(), load_pc) != loads.end();
 }
@@ -709,4 +714,145 @@ TEST(RawWideReplayedLoad, DiagnosisNamesBothBlockers) {
     EXPECT_EQ(rows[0].numeric_pc, kLoadPc);
     // A cleared load has no row at all.
     EXPECT_TRUE(rdna2_raw_wide_data_load_diagnoses(program({})).empty());
+}
+
+TEST(RawWideReplayedLoad, APlainCopyOfLoadedWordsIntoExecIsANumericUse) {
+    // #4574. s_mov_b64 exec, s[18:19] ; v_mov_b32 v0, v1 ; s_mov_b64 exec, -1. Which lanes the
+    // v_mov writes is decided by two words of the load, and nothing names EXEC as an operand, so
+    // the walk used to mark EXEC, find no reader, and clear the load when EXEC was put back.
+    const uint32_t lane_write = 0x7e000301u, all_lanes = 0xbefe04c1u;
+    const auto copied = program({.in_loop = {0xbefe0412u, lane_write, all_lanes}});
+    ASSERT_EQ(at(copied, 5).opcode, kSop1OpcodeMovB64);
+    ASSERT_EQ(at(copied, 5).dst.value, 126);
+    ASSERT_EQ(at(copied, 5).src[0].value, 18);
+    ASSERT_EQ(at(copied, 6).fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(at(copied, 7).dst.value, 126);
+    EXPECT_TRUE(flagged(copied));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(copied, &pc), "derived-value-enters-exec");
+    EXPECT_EQ(pc, 5u);
+    // One half is enough, either half: s_mov_b32 exec_lo, s18 and s_mov_b32 exec_hi, s19.
+    for (const uint32_t half : {0xbefe0312u, 0xbeff0313u}) {
+        const auto one_word = program({.in_loop = {half, lane_write, all_lanes}});
+        ASSERT_EQ(at(one_word, 5).opcode, kSop1OpcodeMovB32);
+        EXPECT_TRUE(flagged(one_word)) << std::hex << half;
+        EXPECT_EQ(numeric_blocker(one_word, &pc), "derived-value-enters-exec") << std::hex << half;
+        EXPECT_EQ(pc, 5u);
+    }
+    // Control: moving a pair into EXEC is not the objection. s[40:41] is nothing the load
+    // produced, and the same body is cleared.
+    const auto unrelated = program({.in_loop = {0xbefe0428u, lane_write, all_lanes}});
+    ASSERT_EQ(at(unrelated, 5).src[0].value, 40);
+    EXPECT_FALSE(flagged(unrelated)) << numeric_blocker(unrelated);
+    // Control: nor is restoring a saved EXEC, the move every guarded sample ends with.
+    const auto restored = program(
+        {.first_word = kSaveExecInS96, .in_loop = {kRestoreExecFromS96, lane_write, all_lanes}});
+    EXPECT_FALSE(flagged(restored)) << numeric_blocker(restored);
+    // Control: nor a move from the recycled pair once a fresh compare has made it a mask. Its
+    // high word still MAY be the load's, and the move marks EXEC's accordingly, but the source
+    // is an independent root and what the emitter installs is that root's Bool.
+    const auto from_fresh = program({.after_mask = {0xbefe0410u}});   // s_mov_b64 exec, s[16:17]
+    ASSERT_EQ(at(from_fresh, 8).opcode, kSop1OpcodeMovB64);
+    ASSERT_EQ(at(from_fresh, 8).dst.value, 126);
+    ASSERT_EQ(at(from_fresh, 8).src[0].value, 16);
+    EXPECT_FALSE(flagged(from_fresh)) << numeric_blocker(from_fresh);
+    // The same move when the compare was NOT fresh, because EXEC had been taken from a pair
+    // nothing vouches for: s_mov_b64 exec, s[40:41] ; (compare) ; s_mov_b64 exec, s[16:17] ;
+    // then EXEC and the loaded words are put back. The pair is no root, and its high word is
+    // still marked, since a 32-lane compare writes only the low one. So this stops, which is
+    // right at 32 lanes and conservative at 64: the walk does not know the width (#4555).
+    const auto not_fresh =
+        program({.in_loop = {0xbefe0428u},
+                 .move_mask_to_vcc = false,
+                 .after_mask = {0xbefe0410u, all_lanes, 0xbe900480u, 0xbe920480u}});
+    ASSERT_EQ(at(not_fresh, 8).dst.value, 126);
+    ASSERT_EQ(at(not_fresh, 8).src[0].value, 16);
+    EXPECT_TRUE(flagged(not_fresh));
+    EXPECT_EQ(numeric_blocker(not_fresh, &pc), "derived-value-enters-exec");
+    EXPECT_EQ(pc, 8u);
+    // And through a register the decoder does not call an SGPR: s_mov_b64 vcc, s[18:19] ;
+    // s_mov_b64 exec, vcc.
+    const auto through_vcc = program({.in_loop = {0xbeea0412u, kRestoreExecFromVcc}});
+    ASSERT_EQ(at(through_vcc, 5).dst.value, 106);
+    ASSERT_EQ(at(through_vcc, 6).src[0].kind, OperandKind::Special);
+    ASSERT_EQ(at(through_vcc, 6).src[0].value, 106);
+    EXPECT_EQ(numeric_blocker(through_vcc, &pc), "derived-value-enters-exec");
+    EXPECT_EQ(pc, 6u);
+}
+
+TEST(RawWideReplayedLoad, AMaskFormedUnderCopiedExecCannotReachASavedExecSeed) {
+    // The second case on #4574, from the re-review of #4569. The copy does more than predicate
+    // lanes: a compare run under that EXEC produces a mask that depends on the load and carries
+    // no mark. Here it is moved into the pair the load's seed names, after the walk has run out
+    // of derived words, and the loop brings it back to the load as an "independent" EXEC.
+    //    0  s_mov_b64 s[96:97], exec            the seed
+    //    1  s_load_dwordx4 s[16:19], ...
+    //    3  s_buffer_load_dwordx4 s[8:11], s[16:19], 0xc0
+    //    5  s_mov_b64 exec, s[96:97]            restore from the seeded pair
+    //    6  v_cmp_*_sdwa s[16:17], 0, s10       counted as fresh
+    //    8  v_cndmask_b32 v0, 0, 1.0, s[16:17]  an exempt Bool consumer
+    //   10  s_mov_b64 exec, s[18:19]            EXEC := two loaded words
+    //   11  v_cmp_*_sdwa s[40:41], 0, s10       a mask formed under them
+    //   13  s_mov_b64 exec, -1
+    //   14  s_mov_b64 s[16:17], 0
+    //   15  s_mov_b64 s[18:19], 0               nothing derived is left
+    //   16  s_mov_b64 s[96:97], s[40:41]        the seeded pair now depends on the load
+    //   17  s_cbranch_vccz +1 ; s_branch 1
+    const auto instructions =
+        program({.first_word = kSaveExecInS96,
+                 .in_loop = {kRestoreExecFromS96, 0x7c1a14f9u, 0x86869080u, 0xd5010000u,
+                             0x0041e480u, 0xbefe0412u, 0x7c1a14f9u, 0x8686a880u, 0xbefe04c1u,
+                             0xbe900480u, 0xbe920480u, 0xbee00428u},
+                 .compare = false,
+                 .move_mask_to_vcc = false});
+    ASSERT_EQ(at(instructions, 6).fmt, Rdna2Format::VOPC);
+    ASSERT_EQ(at(instructions, 6).dst.value, 16);
+    ASSERT_EQ(at(instructions, 8).fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(at(instructions, 8).opcode, 0x101u);
+    ASSERT_EQ(at(instructions, 10).dst.value, 126);
+    ASSERT_EQ(at(instructions, 10).src[0].value, 18);
+    ASSERT_EQ(at(instructions, 11).dst.value, 40);
+    ASSERT_EQ(at(instructions, 14).dst.value, 16);
+    ASSERT_EQ(at(instructions, 15).dst.value, 18);
+    ASSERT_EQ(at(instructions, 16).dst.value, 96);
+    ASSERT_EQ(at(instructions, 16).src[0].value, 40);
+    EXPECT_TRUE(flagged(instructions));
+    uint32_t pc = 0;
+    EXPECT_EQ(numeric_blocker(instructions, &pc), "derived-value-enters-exec");
+    EXPECT_EQ(pc, 10u);
+}
+
+TEST(RawWideReplayedLoad, ACarryOutEndsAVccRootUnlessEverythingItIsMadeOfIsOne) {
+    // v_addc_co_u32 v4, vcc, 0, v3, vcc writes its carry-out to VCC and names VCC nowhere a
+    // writer inventory looks. The pass that seeds a load knew that; the walk did not, so a VCC
+    // holding a saved EXEC went on counting as one after a carry-out had replaced it. In the
+    // loop the instructions sit at these offsets from the load:
+    //   +4 (in_loop) ... v_cmp s[16:17] ; s_mov_b64 vcc, s[16:17] ; s_cbranch_vccz ; s_branch
+    constexpr uint32_t kAddWithCarry = 0x50080680u, kExecFromUnknownPair = 0xbefe0428u;
+    std::string kind;
+    uint32_t offset = 0;
+    // Formed under an EXEC nothing vouches for, the carry-out is not an independent root. The
+    // EXEC then taken from it makes the loop's compare prove nothing, and the branch on the
+    // recycled pair is the reader.
+    EXPECT_TRUE(prefixed_load_is_flagged({kSaveExecInVcc},
+                                         {kExecFromUnknownPair, kAddWithCarry, kRestoreExecFromVcc},
+                                         &kind, &offset));
+    EXPECT_EQ(kind, "implicit-vcc-reader");
+    EXPECT_EQ(offset, 10u) << "s_cbranch_vccz";
+    // Control: without the carry-out VCC is still the save, and the restore is a restore.
+    EXPECT_FALSE(prefixed_load_is_flagged({kSaveExecInVcc},
+                                          {kExecFromUnknownPair, kRestoreExecFromVcc}, &kind))
+        << kind;
+    // Under an independent EXEC, with an independent root as its carry-in, the carry-out is one
+    // too: ending the root at every carry-out would refuse this.
+    EXPECT_FALSE(
+        prefixed_load_is_flagged({kSaveExecInVcc}, {kAddWithCarry, kRestoreExecFromVcc}, &kind))
+        << kind;
+    // But it does not make a root out of a VCC that was not one: the carry-in is part of it.
+    // Stopped in the first pass round the loop, at the branch; if the carry-out counted as a
+    // root here, the walk would get round once and stop at the carry-in instead.
+    EXPECT_TRUE(prefixed_load_is_flagged({0x7e020280u}, {kAddWithCarry, kRestoreExecFromVcc}, &kind,
+                                         &offset));
+    EXPECT_EQ(kind, "implicit-vcc-reader");
+    EXPECT_EQ(offset, 9u) << "s_cbranch_vccz";
 }
