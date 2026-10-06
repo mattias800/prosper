@@ -10,12 +10,23 @@
 // This is a proof about the mapping table at one instant, not a size heuristic: any mapped page after
 // the leading run (an island), or a leading run that is itself over the cap, returns "no clamp" and the
 // descriptor stays refused as before.
+//
+// WHERE IT RUNS. Not inside the descriptor fold. `resolve_dynamic_fetch`'s fold routes every
+// environmental read through a FoldReader so a `.prfold` capture replays offline to the same outputs;
+// the mapping table is not one of those recorded reads. So the fold only MARKS an over-cap raw use
+// (`SrtUse::oversize_window`, with its V# unchanged), and `resolve_dynamic_fetch` resolves the marks
+// against the live table after the fold returns: clamp, or drop the use exactly as it was dropped
+// before this existed.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace prosper::gpu {
+
+struct SrtUse;
 
 // The two mapping queries the proof needs, injectable so the logic is testable without a live
 // guest address space.
@@ -26,18 +37,49 @@ struct MappedMemoryProbe {
     std::function<bool(uint64_t addr, uint64_t bytes)> any_mapped;
 };
 
-// Smallest guest mapping granule: the step at which the tail is scanned for islands.
+// Smallest guest mapping granule: the step at which the tail is scanned for islands. The scan probes
+// both ends of every granule, so it assumes every tracked mapping is at least one granule long and
+// granule aligned (guest mappings are 16 KiB pages). A mapping smaller than a granule lying strictly
+// inside one would touch neither probe.
 constexpr uint64_t kMappingGranule = 0x4000;
 
-// On success returns true and sets `clamped_bytes` to the mapped leading run, rounded down to a multiple
-// of `stride` (at least one record). Returns false when the window needs no clamp (already within `cap`),
-// has no mapped bytes at all, has a leading run over `cap`, or maps anything after the leading run.
+// The largest window the island scan will walk. The scan is linear in the window (two probes per
+// granule, each a locked table lookup on the live path), so a window past this is refused rather
+// than scanned. 4 GiB covers every window measured so far (2 GiB and 1000 MiB).
+constexpr uint64_t kMaxScannedWindow = 0x100000000ull;
+
+// A V#'s true window in bytes, computed in 64 bits from the raw words. `decode_buffer_descriptor`
+// saturates `size_bytes` at 0xFFFFFFFF, so a whole-aperture descriptor (NUM_RECORDS 0xFFFFFFFF,
+// stride 16: 64 GiB) reads there as a 4 GiB window; the proof must never use that value.
+uint64_t buffer_descriptor_window_bytes(const uint32_t v[4]);
+
+// On success returns true and sets `run_bytes` to the mapped leading run of [base, base + window).
+// Returns false when the window needs no clamp (already within `cap`), is larger than
+// kMaxScannedWindow, has no mapped bytes at all, has a leading run over `cap`, or maps anything after
+// the leading run.
+bool oversized_window_mapped_run(uint64_t base, uint64_t window_bytes, uint64_t cap,
+                                 const MappedMemoryProbe& probe, uint64_t& run_bytes);
+
+// The same proof, with the run rounded down to a multiple of `stride` (at least one record).
 bool clamp_oversized_buffer_window(uint64_t base, uint64_t window_bytes, uint64_t stride,
                                    uint64_t cap, const MappedMemoryProbe& probe,
                                    uint64_t& clamped_bytes);
 
-// The same proof against the live mapping table, cached per (base, window) until the table changes.
+// The proof for a raw V#: its true 64-bit window, clamped to whole records. On success sets
+// `clamped_records` to the NUM_RECORDS the descriptor should be published with.
+bool clamp_oversized_buffer_descriptor(const uint32_t v[4], uint64_t cap,
+                                       const MappedMemoryProbe& probe, uint32_t& clamped_records);
+
+// The window proof against the live mapping table, cached per (base, window) until the table
+// changes. The cached value is the mapped run, so descriptors with different strides share it.
 bool clamp_oversized_buffer_window_live(uint64_t base, uint64_t window_bytes, uint64_t stride,
                                         uint64_t cap, uint64_t& clamped_bytes);
 
-} // namespace prosper::gpu
+// Resolve the uses the fold marked `oversize_window` in uses[first..]: each is re-published with
+// NUM_RECORDS clamped to its mapped run under `probe` (the live mapping table when omitted), or
+// removed. Order of the surviving uses is preserved. Returns the number of uses clamped.
+size_t resolve_oversized_buffer_windows(std::vector<SrtUse>& uses, size_t first);
+size_t resolve_oversized_buffer_windows(std::vector<SrtUse>& uses, size_t first,
+                                        const MappedMemoryProbe& probe);
+
+}   // namespace prosper::gpu

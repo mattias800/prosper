@@ -435,6 +435,12 @@ struct SrtUse {
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;
+    // A raw MUBUF/MTBUF use whose fully-known V# declares a window over the 256 MiB resource cap.
+    // The fold publishes it with the V# unchanged and this mark set; it never reaches a consumer so:
+    // resolve_dynamic_fetch resolves every mark against the live mapping table after the fold
+    // (oversize_buffer_window.hpp), clamping NUM_RECORDS to the mapped run or dropping the use. Kept
+    // out of the fold because the mapping table is not a FoldReader-recorded input.
+    bool oversize_window = false;
 };
 
 // Materialization half of the IMAGE_*_MIP specialization contract. Kept observable so regression
@@ -443,6 +449,16 @@ bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view);
 std::vector<DynFetch> resolve_dynamic_fetch(
+    const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
+    uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses = nullptr,
+    uint32_t pcrel_dispatch_target = UINT32_MAX, const PcrelDispatchInfo* pcrel_dispatch = nullptr,
+    const uint32_t* system_sgprs = nullptr, uint32_t nsystem_sgprs = 0,
+    FoldReader* reader = nullptr, const CheckedGraphicsSource* checked_source = nullptr);
+// The fold alone: a pure function of its inputs and the reads `reader` records, so a `.prfold`
+// capture replays to identical outputs. It may leave SrtUse::oversize_window marks, which
+// resolve_dynamic_fetch (= this fold, then those marks resolved against the live mapping table)
+// never returns. Only the fold capture/replay workbench should call this directly.
+std::vector<DynFetch> resolve_dynamic_fetch_fold(
     const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
     uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses = nullptr,
     uint32_t pcrel_dispatch_target = UINT32_MAX, const PcrelDispatchInfo* pcrel_dispatch = nullptr,

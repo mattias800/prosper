@@ -29,12 +29,12 @@ template<class A, class T> void fetch(A& a, T& d) {
 }
 template<class A, class T> void use(A& a, T& d) {
     a(d.kind, d.key, d.t8, d.descriptor_source_addr, d.v4, d.table_record_count,
-      d.table_entry_stride, d.table_element_offset, d.table_load_pc, d.table_base,
-      d.bvh4, d.instruction_format, d.zero_record_raw, d.scalar_oob_offset_known,
-      d.scalar_oob_byte_offset, d.scalar_buffer_dword_count, d.optional_null_raw_load,
-      d.proven_null_guarded_raw_store, d.proven_null_nullable_raw_buffer,
-      d.has_samp, d.s4, d.required_size, d.atomic_x2_record_count, d.use_pc,
-      d.is_storage_image, d.mimg_dim, d.proven_zero_mip, d.is_depth_compare);
+      d.table_entry_stride, d.table_element_offset, d.table_load_pc, d.table_base, d.bvh4,
+      d.instruction_format, d.zero_record_raw, d.scalar_oob_offset_known, d.scalar_oob_byte_offset,
+      d.scalar_buffer_dword_count, d.optional_null_raw_load, d.proven_null_guarded_raw_store,
+      d.proven_null_nullable_raw_buffer, d.has_samp, d.s4, d.required_size,
+      d.atomic_x2_record_count, d.use_pc, d.is_storage_image, d.mimg_dim, d.proven_zero_mip,
+      d.is_depth_compare, d.oversize_window);
 }
 template<class A, class T> void event(A& a, T& e) {
     a(e.kind, e.probe, e.pc, e.bytes, e.address, e.readable);
@@ -130,7 +130,7 @@ std::vector<uint8_t> encode_fold_capture(const FoldCapture& capture) {
     validate_fold_capture(capture);
     Writer writer;
     const uint8_t magic[8] = {'P','R','F','O','L','D',0,0};
-    writer(magic, uint32_t(1), code_checksum(capture.input.code));
+    writer(magic, uint32_t(2), code_checksum(capture.input.code));
     capsule(writer, capture);
     writer.value(checksum(writer.bytes));
     return std::move(writer.bytes);
@@ -143,7 +143,7 @@ FoldCapture decode_fold_capture(std::span<const uint8_t> bytes) {
     uint8_t magic[8]{}; uint32_t version{}; uint64_t code_hash{};
     reader(magic, version, code_hash);
     const uint8_t wanted[8] = {'P','R','F','O','L','D',0,0};
-    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) && version == 1,
+    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) && version == 2,
           "unsupported fold schema");
     FoldCapture capture; capsule(reader, capture);
     check(reader.position == reader.bytes.size(), "trailing fold data");
