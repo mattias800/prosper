@@ -96,7 +96,8 @@ struct NggSubgroupDrawRequest {
 // ngg-draw-empty (no subgroups), ngg-draw-layout-varies (the shells' record layouts differ by W),
 // ngg-draw-guest-resource-unsupported (a shell declares an image, sampler or non-storage block, or
 // a set other than 0 and 2), ngg-draw-geometry-unavailable (the route needs a geometry stage that
-// could not be built), ngg-draw-push-constants (the words disagree with the shell configuration).
+// could not be built), ngg-draw-push-constants (the words disagree with the shell configuration),
+// ngg-interpolation-geometry-needs-triangles (an interpolation stage for a line list).
 std::shared_ptr<const NggSubgroupDraw> build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
                                                                std::string* refusal = nullptr);
 

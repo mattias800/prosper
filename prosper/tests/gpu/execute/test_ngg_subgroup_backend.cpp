@@ -54,6 +54,7 @@ const RenderVkCtx* backend() {
 // The route this backend would choose for a layered triangle draw.
 NggLayerRoute backend_route(const RenderVkCtx& ctx) {
     NggLayerRouteQuery query;
+    query.topology = NggOutputTopology::TriangleList;
     query.layer_from_pos1 = true;
     query.shader_output_layer = ctx.shader_output_layer_enabled;
     query.geometry_shader = ctx.geometry_shader_enabled;
@@ -291,6 +292,82 @@ TEST(NggSubgroupBackend, DescriptionGroupsWaveCountsAndOrdersRuns) {
     NggSubgroupDrawRequest bad;
     EXPECT_FALSE(build_ngg_subgroup_draw(bad, &why));
     EXPECT_NE(why.find("reason=ngg-draw-plan"), std::string::npos) << why;
+}
+
+// The builder's own refusals, each beside an accepted twin.
+TEST(NggSubgroupBackend, DescriptionRefusals) {
+    const KenaInputs& in = kena_inputs();
+    NggSubgroupDrawRequest request;
+    request.linked_code = in.linked.data();
+    request.dwords = in.linked.size();
+    request.resources = &in.table;
+    request.shell.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(ngg::kKenaRsrc2Gs);
+    request.shell.user_sgprs = ngg::kKenaUserSgprs;
+    request.limits = ngg::kena_limits();
+    request.shape.topology = NggInputTopology::TriangleStrip;
+    request.shape.vertex_count = 4;
+    request.raster.layer_from_pos1 = true;
+    request.raster.layer_slices = 32;
+    request.raster.route = NggLayerRoute::ForwardingGeometry;
+    request.push_constants.assign(ngg::kKenaUserSgprs, 0u);
+    std::string why;
+    ASSERT_TRUE(build_ngg_subgroup_draw(request, &why)) << why;
+
+    NggSubgroupDrawRequest words = request;
+    words.push_constants.pop_back();
+    EXPECT_FALSE(build_ngg_subgroup_draw(words, &why));
+    EXPECT_EQ(why, "reason=ngg-draw-push-constants");
+
+    NggSubgroupDrawRequest lines = request;
+    lines.raster.topology = NggOutputTopology::LineList;
+    lines.raster.route = NggLayerRoute::InterpolationGeometry;
+    lines.interpolation_geometry = [](const NggRasterCommitInterface&) {
+        return std::vector<uint32_t>{1u};
+    };
+    EXPECT_FALSE(build_ngg_subgroup_draw(lines, &why));
+    EXPECT_EQ(why, "reason=ngg-interpolation-geometry-needs-triangles");
+    // No layer read, but the pixel stage still needs the interpolation stage: the raster commit
+    // itself has no route to refuse here, so the builder must.
+    lines.raster.layer_from_pos1 = false;
+    lines.raster.route = NggLayerRoute::None;
+    EXPECT_FALSE(build_ngg_subgroup_draw(lines, &why));
+    EXPECT_EQ(why, "reason=ngg-interpolation-geometry-needs-triangles");
+
+    NggSubgroupDrawRequest no_stage = request;
+    no_stage.raster.route = NggLayerRoute::InterpolationGeometry;
+    EXPECT_FALSE(build_ngg_subgroup_draw(no_stage, &why)) << "no interpolation stage supplied";
+    EXPECT_EQ(why, "reason=ngg-draw-geometry-unavailable");
+}
+
+// Plain storage buffers in set 0 are the only guest resources the backend binds for the shell.
+TEST(NggSubgroupBackend, ShellGuestBindingReflection) {
+    const auto module = [](std::initializer_list<std::vector<uint32_t>> instructions) {
+        std::vector<uint32_t> m = {0x07230203u, 0x00010300u, 0u, 32u, 0u};
+        for (const auto& instruction : instructions) m.insert(m.end(), instruction.begin(), instruction.end());
+        return m;
+    };
+    const auto op = [](uint32_t code, std::initializer_list<uint32_t> operands) {
+        std::vector<uint32_t> words = {static_cast<uint32_t>(operands.size() + 1u) << 16 | code};
+        words.insert(words.end(), operands);
+        return words;
+    };
+    // %3 = struct { uint }, %4 = StorageBuffer pointer to it, %5 = an array of it, %6 its pointer.
+    const auto buffer = [&](uint32_t set, uint32_t binding, bool array, uint32_t storage) {
+        return module({op(71, {10, 34, set}), op(71, {10, 33, binding}), op(21, {2, 32, 0}),
+                       op(30, {3, 2}), op(43, {2, 7, 2}), op(28, {5, 3, 7}),
+                       op(32, {4, storage, 3}), op(32, {6, storage, 5}),
+                       op(59, {array ? 6u : 4u, 10, storage})});
+    };
+    std::vector<uint32_t> bindings;
+    ASSERT_TRUE(ngg_shell_guest_bindings(buffer(0, 5, false, 12), &bindings));
+    EXPECT_EQ(bindings, std::vector<uint32_t>{5});
+    EXPECT_TRUE(ngg_shell_guest_bindings(buffer(2, 1, false, 12), &bindings)) << "the shell's set";
+    EXPECT_TRUE(bindings.empty());
+    EXPECT_FALSE(ngg_shell_guest_bindings(buffer(1, 5, false, 12), nullptr)) << "set 1";
+    EXPECT_FALSE(ngg_shell_guest_bindings(buffer(0, 5, true, 12), nullptr)) << "descriptor array";
+    EXPECT_FALSE(ngg_shell_guest_bindings(buffer(0, 5, false, 2), nullptr)) << "uniform block";
+    EXPECT_FALSE(ngg_shell_guest_bindings(module({op(25, {9, 2, 1, 0, 0, 0, 1, 0})}), nullptr))
+        << "an image";
 }
 
 // ---- Kena end to end ------------------------------------------------------------------------------

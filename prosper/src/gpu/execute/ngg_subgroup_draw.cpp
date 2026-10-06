@@ -93,6 +93,12 @@ std::shared_ptr<const NggSubgroupDraw> build_ngg_subgroup_draw(const NggSubgroup
     draw->route = request.raster.route;
     draw->count_violations = request.raster.count_violations;
     draw->native_wave64 = request.shell.native_wave64;
+    // The interpolation stage's input is Triangles (select_ngg_layer_route refuses the same case).
+    const bool interpolation =
+        request.raster.route == NggLayerRoute::InterpolationGeometry ||
+        (request.raster.route == NggLayerRoute::None && request.interpolation_geometry);
+    if (interpolation && request.raster.topology != NggOutputTopology::TriangleList)
+        return fail(refusal, "ngg-interpolation-geometry-needs-triangles");
 
     // One group per distinct wave count, ascending.
     std::map<uint32_t, uint32_t> group_of;   // W -> group index
