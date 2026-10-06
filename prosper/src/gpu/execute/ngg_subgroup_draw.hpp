@@ -39,13 +39,26 @@
 
 namespace prosper::gpu {
 
+// The stages compiled for one wave count W. Immutable and shared: a live producer caches them per
+// program and register state (ngg_live_draw.hpp), so every draw of that shape reuses one copy.
+struct NggSubgroupStages {
+    uint32_t waves = 0;   // W, 1..4
+    std::shared_ptr<const std::vector<uint32_t>> shell;   // compute module, LocalSize 64W
+    std::shared_ptr<const std::vector<uint32_t>> raster_vertex;   // pass-through vertex stage
+    std::vector<uint32_t> raster_geometry;   // the route's geometry stage, or empty
+    // FNV-1a of `shell`, computed once here so the backend's pipeline cache never hashes the
+    // module per draw.
+    uint64_t shell_hash = 0;
+    NggExportRecordLayout layout;   // what the shell writes
+    std::vector<uint32_t> guest_bindings;   // set-0 storage-buffer bindings the shell reads
+    uint32_t vertices_per_primitive = 3;   // K, as the vertex stage published it
+};
+
 // The subgroups of one wave count W.
 struct NggSubgroupWaveGroup {
     uint32_t waves = 0;   // W, 1..4
     uint32_t blocks = 0;   // subgroups of this W = workgroups dispatched = export blocks
-    std::vector<uint32_t> shell;   // compute module, LocalSize 64W
-    std::vector<uint32_t> raster_vertex;   // pass-through vertex stage for W
-    std::vector<uint32_t> raster_geometry;   // the route's geometry stage, or empty
+    std::shared_ptr<const NggSubgroupStages> stages;
     // kNggLaunchWordsPerLane words per invocation, blocks * 64W invocations, plan order.
     std::vector<uint32_t> launch_words;
     uint32_t export_words = 0;   // blocks * layout.block_words(waves)
@@ -66,6 +79,7 @@ struct NggSubgroupDraw {
     uint32_t vertices_per_primitive = 3;   // K
     bool count_violations = true;   // the vertex stage writes set 2 binding 2
     bool native_wave64 = false;   // every shell requires a 64-lane subgroup
+    uint32_t lds_bytes = 0;   // the shell's workgroup LDS (RSRC2_GS.LDS_SIZE), for device admission
     std::vector<NggSubgroupWaveGroup> groups;   // ascending W: the dispatch order
     std::vector<NggSubgroupRun> runs;   // plan order: the draw order
     std::vector<uint32_t> guest_bindings;   // set-0 storage-buffer bindings the shells read
@@ -100,6 +114,28 @@ struct NggSubgroupDrawRequest {
 // ngg-interpolation-geometry-needs-triangles (an interpolation stage for a line list).
 std::shared_ptr<const NggSubgroupDraw>
 build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refusal = nullptr);
+
+// The two halves of build_ngg_subgroup_draw, for a producer that caches the compiled half.
+//
+// compile_ngg_subgroup_stages compiles the shell and the raster stages for one wave count. It reads
+// the request's program, resources, shell, raster and interpolation fields only -- never the draw
+// shape, the budget or the push constant VALUES -- so its result can be shared by every draw whose
+// compile inputs are equal.
+std::shared_ptr<const NggSubgroupStages>
+compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t waves,
+                            std::string* refusal = nullptr);
+
+// Plans the draw and lays it out over the stages `stages_for(W)` supplies for each wave count the
+// plan uses (null with its refusal set when that W cannot be compiled).
+using NggSubgroupStagesSource = std::function<std::shared_ptr<const NggSubgroupStages>(
+    uint32_t waves, std::string* refusal)>;
+std::shared_ptr<const NggSubgroupDraw>
+assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
+                           const NggSubgroupStagesSource& stages_for,
+                           std::string* refusal = nullptr);
+
+// FNV-1a over 32-bit words (the shell pipeline key).
+uint64_t ngg_words_hash(const std::vector<uint32_t>& words);
 
 // The set-0 bindings a shell module declares, or false when it declares anything the backend
 // cannot bind as a plain storage buffer (see ngg-draw-guest-resource-unsupported).

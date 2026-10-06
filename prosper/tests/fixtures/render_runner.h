@@ -36,7 +36,7 @@
 #include "gpu/recompiler/original_graphics_draw_effects.hpp"
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
-#include "gpu/execute/ngg_subgroup_draw.hpp"   // #3135 P4: merged-NGG draws
+#include "gpu/execute/ngg_draw_admission.hpp"   // #3135 P4/P5: merged-NGG draws
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -1455,6 +1455,7 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
     return backend_render_timing_stats_storage();
 }
 #include "render_vk_context.h"
+inline void publish_ngg_backend_capabilities(const RenderVkCtx& ctx);   // ngg_subgroup_gpu.h
 inline std::atomic<const RenderVkCtx*>& published_render_cache_context() {
     static std::atomic<const RenderVkCtx*> context{nullptr};
     return context;
@@ -2127,6 +2128,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &queue_family_count, queue_families.data());
         r.queue_supports_compute = r.qfi < queue_families.size() &&
             (queue_families[r.qfi].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        publish_ngg_backend_capabilities(r);   // #3135 P5: merged-NGG admission reads it
         if (!std::getenv("PROSPER_NO_SHARED_VULKAN_DEVICE")) {
             prosper::gpu::SharedVulkanContext shared;
             shared.instance = r.inst;
@@ -8551,10 +8553,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (std::any_of(draws.begin(), draws.end(),
                     [](const auto& d) { return bool(d.ngg_subgroup); })) {
         std::string refusal;
-        if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal)) {
-            std::fprintf(stderr, "[ngg-backend] refused pass %s\n", refusal.c_str());
-            return out;
-        }
+        if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal))
+            return out;   // counted and logged (bounded) by expand
+
         draws = ngg_draws;
     }
     bool avoid_cache_eviction = active_submission.pending() ||
@@ -14379,7 +14380,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         record_pipeline_dynamic_state(command, v);
     };
     if (fragment_draw_batch) fragment_draw_batch->record(cmd, std::span<const DV>(dv));
-    if (ngg_batch) ngg_batch->record(cmd, active_submission);
+    if (ngg_batch) ngg_batch->record(cmd, active_submission, std::span<DV>(dv));
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -16200,7 +16201,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               bool flush_submission_batch = true,
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
-    const std::span<const BackendDraw> all(draws);
+    std::vector<BackendDraw> ngg_kept;   // #3135 P5: NGG draws this call cannot run are dropped
+    const std::span<const BackendDraw> all =
+        ngg_admit_backend_draws(draws, persist_depth_stencil, color_target, ngg_kept);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
     if (!backend_compact_resource_orders_valid(all)) {

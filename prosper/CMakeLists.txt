@@ -1301,6 +1301,13 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  # #3135 P5: live admission of merged-NGG draws -- the register table, the device half and the
+  # cached live producer. Pure CPU; the Kena arms compile the captured chain from tests/data.
+  prosper_add_gtest(test_ngg_draw_admission
+    SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
