@@ -142,7 +142,6 @@ getenv|prosper/src/hle/kernel/hle_kernel.cpp 39
 getenv|prosper/src/hle/kernel/hle_kernel_time.cpp 17
 getenv|prosper/src/hle/kernel/timedwait_census.hpp 1
 getenv|prosper/src/hle/memory/hle_kernel_mem.cpp 20
-getenv|prosper/src/hle/np/np.cpp 1
 getenv|prosper/src/hle/service/hle_service.cpp 4
 getenv|prosper/src/hle/service/service_trace.hpp 1
 getenv|prosper/src/hle/sync/hle_fiber.cpp 2
@@ -253,9 +252,9 @@ platform-ifdef|prosper/src/hle/fs/hle_file.cpp 70
 platform-ifdef|prosper/src/hle/fs/save_capacity.cpp 1
 platform-ifdef|prosper/src/hle/fs/save_param.cpp 3
 platform-ifdef|prosper/src/hle/fs/save_paths.cpp 3
-platform-ifdef|prosper/src/hle/fs/savedata.cpp 6
+platform-ifdef|prosper/src/hle/fs/savedata.cpp 3
 platform-ifdef|prosper/src/hle/graphics/hle_agc.cpp 5
-platform-ifdef|prosper/src/hle/input/ime.cpp 11
+platform-ifdef|prosper/src/hle/input/ime.cpp 8
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
 platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 59
@@ -270,16 +269,16 @@ platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
 # #4349: bounded Windows tracking bridge for committed-direct section fault safety; native VM
 # policy lives in a companion. Linux granule proof and unsupported-host refusal remain separate.
 platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 20
-platform-ifdef|prosper/src/hle/np/np.cpp 10
-platform-ifdef|prosper/src/hle/service/hle_service.cpp 7
+platform-ifdef|prosper/src/hle/np/np.cpp 2
+platform-ifdef|prosper/src/hle/service/hle_service.cpp 4
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
 platform-ifdef|prosper/src/hle/sync/hle_fiber.cpp 24
 platform-ifdef|prosper/src/hle/sync/hle_ult.cpp 3
 platform-ifdef|prosper/src/hle/sync/host_tcb_scope.hpp 1
 platform-ifdef|prosper/src/hle/sync/sync_futex.cpp 23
 platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
-platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
-platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
+platform-ifdef|prosper/src/hle/video/avplayer.cpp 23
+platform-ifdef|prosper/src/hle/video/videodec2.cpp 3
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
 layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
