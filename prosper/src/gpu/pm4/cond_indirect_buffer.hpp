@@ -1,5 +1,6 @@
-// cond_indirect_buffer.hpp -- execution helpers for sceAgcCbBranch's packet and for refused Jump
-// segments (#4540). Kept beside command_processor.cpp, which is past the ratchet's line cap.
+// cond_indirect_buffer.hpp -- execution helpers for sceAgcCbBranch's packet, for refused Jump
+// segments (#4540) and for the predication decision of a packet-predicated Jump. Kept beside
+// command_processor.cpp, which is past the ratchet's line cap.
 #pragma once
 
 #include "gpu/pm4/pm4_decode.hpp"
@@ -28,5 +29,28 @@ Pm4Command cond_indirect_buffer_jump(const Pm4Command& c);
 //   readable: the whole segment is mapped guest memory.
 bool jump_segment_within_limits(uint64_t addr, uint32_t dwords, uint32_t depth);
 bool jump_segment_readable(uint64_t addr, uint32_t dwords);
+
+// The control word of prosper's SetPredication packet (dword 3). sceAgcDcbSetPredication(dcb, a1, op,
+// a3, cond) carries the PRED_OP in `op` and two flag arguments that hold the hardware's PRED_BOOL
+// (DRAW_VISIBLE / DRAW_NOT_VISIBLE) and HINT -- which one is which is not identified, because every
+// observed call passes 1 for both. All three are kept: op in bits 0-7, a1 in 8-15, a3 in 16-23
+// (a flag wider than 8 bits saturates to 0xff, an unobserved shape), and bit 31 marks a word that
+// carries the flags at all. A word without bit 31 is a packet from a capture recorded before the
+// flags were kept.
+inline constexpr uint32_t kSetPredicationFlagsPresent = 0x80000000u;
+inline constexpr uint32_t pack_set_predication_control(uint64_t op, uint64_t a1, uint64_t a3) {
+    const auto byte = [](uint64_t v) { return static_cast<uint32_t>(v > 0xffu ? 0xffu : v); };
+    return byte(op) | (byte(a1) << 8) | (byte(a3) << 16) | kSetPredicationFlagsPresent;
+}
+
+// Whether a packet-predicated Jump is skipped under a SetPredication window with control word
+// `control` (above), given the 64-bit condition word read at fold time. The polarity comes from the
+// PRED_BOOL flag, not from the op: see the evidence block in cond_indirect_buffer.cpp. Every shape
+// other than the observed BOOL64 (1, 3, 1) is reported once per distinct shape.
+bool predicated_jump_skips(uint32_t control, uint64_t cond);
+
+// A predicated Jump whose condition word is misaligned or unreadable runs (the fold cannot read a
+// word to decide on). Reported once per address, because under BOOL64 that is a fail-open choice.
+void report_unreadable_predicate_condition(uint64_t addr);
 
 }   // namespace prosper::gpu

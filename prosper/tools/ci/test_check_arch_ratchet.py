@@ -4,6 +4,8 @@ Every rule gets a positive instance written here by hand rather than drawn from 
 so a matcher that quietly stops matching fails a test instead of reporting a clean tree forever.
 """
 
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -235,12 +237,68 @@ class BaselineFormat(unittest.TestCase):
 
     def test_round_trip(self):
         text = "# head\n\ngetenv|a.cpp 3  # why\ntitle-id|b.cpp 1\n"
-        header, rows = car.parse_baseline(text)
+        header, rows, footer = car.parse_baseline(text)
         self.assertEqual(["# head"], header)
         self.assertEqual("why", rows["getenv|a.cpp"].note)
         self.assertEqual(
-            car.parse_baseline(car.format_baseline(header, rows.values())), (header, rows)
+            car.parse_baseline(car.format_baseline(header, rows.values(), footer)),
+            (header, rows, footer),
         )
+
+    def test_standalone_notes_survive_round_trip(self):
+        text = (
+            "# head\n"
+            "\n"
+            "title-id|b.cpp 1\n"
+            "# note: raised with a reason a reviewer read (#1).\n"
+            "# second line of the same justification.\n"
+            "getenv|a.cpp 3  # why\n"
+            "# trailing remark, attached to no row.\n"
+        )
+        header, rows, footer = car.parse_baseline(text)
+        self.assertEqual(
+            (
+                "# note: raised with a reason a reviewer read (#1).",
+                "# second line of the same justification.",
+            ),
+            rows["getenv|a.cpp"].above,
+        )
+        self.assertEqual(("# trailing remark, attached to no row.",), footer)
+        self.assertEqual(text, car.format_baseline(header, rows.values(), footer))
+
+    def test_update_keeps_standalone_notes_on_their_row(self):
+        rows = {
+            "getenv|a.cpp": car.Row(
+                "getenv|a.cpp", 5, "kept note", ("# raised with a reason (#1).",)
+            ),
+        }
+        found = {"getenv|a.cpp": car.Finding("getenv|a.cpp", 2)}
+        repaired = car.apply_repairs(rows, car.compare(found, rows))
+        out = car.format_baseline(["# head"], repaired.values())
+        self.assertIn("# raised with a reason (#1).\ngetenv|a.cpp 2", out)
+
+    def test_noted_repairs_names_lowered_and_deleted_rows_with_notes(self):
+        rows = {
+            "getenv|a.cpp": car.Row("getenv|a.cpp", 5, "", ("# raised for #1.",)),
+            "getenv|b.cpp": car.Row("getenv|b.cpp", 4, "inline why"),
+            "getenv|c.cpp": car.Row("getenv|c.cpp", 3, "", ("# only for c.",)),
+            "getenv|d.cpp": car.Row("getenv|d.cpp", 2),
+        }
+        found = {
+            "getenv|a.cpp": car.Finding("getenv|a.cpp", 2),
+            "getenv|b.cpp": car.Finding("getenv|b.cpp", 1),
+            "getenv|d.cpp": car.Finding("getenv|d.cpp", 1),
+        }
+        lines = car.noted_repairs(rows, car.compare(found, rows))
+        text = "\n".join(lines)
+        self.assertIn("lowered getenv|a.cpp 5 -> 2", text)
+        self.assertIn("    # raised for #1.", text)
+        self.assertIn("lowered getenv|b.cpp 4 -> 1", text)
+        self.assertIn("    # inline why", text)
+        self.assertIn("deleted getenv|c.cpp 3", text)
+        self.assertIn("    # only for c.", text)
+        # A lowered row with no note is not worth a line.
+        self.assertNotIn("getenv|d.cpp", text)
 
     def test_refusals(self):
         for bad in ("getenv|a 1 2\n", "nonsense|a 1\n", "getenv|a 1\ngetenv|a 2\n", "getenv|a 0\n"):
@@ -297,6 +355,26 @@ class Cli(unittest.TestCase):
         self.assertEqual(car.EXIT_VIOLATION, self.gate())
         self.assertEqual(car.EXIT_OK, self.gate("--update"))
         self.assertIn("getenv|prosper/src/e.cpp 1\n", self.baseline.read_text(encoding="utf-8"))
+        self.assertEqual(car.EXIT_OK, self.gate())
+
+    def test_update_preserves_standalone_notes(self):
+        lines = self.baseline.read_text(encoding="utf-8").splitlines(keepends=True)
+        noted = []
+        for line in lines:
+            if line.startswith("getenv|prosper/src/e.cpp"):
+                noted.append("# note: raised with a reason a reviewer read.\n")
+            noted.append(line)
+        self.baseline.write_text("".join(noted), encoding="utf-8")
+        self.write("prosper/src/e.cpp", 'auto v = getenv("X");\n')
+        self.assertEqual(car.EXIT_VIOLATION, self.gate())
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(car.EXIT_OK, self.gate("--update"))
+        self.assertIn("note check: lowered getenv|prosper/src/e.cpp", printed.getvalue())
+        self.assertIn(
+            "# note: raised with a reason a reviewer read.\ngetenv|prosper/src/e.cpp 1\n",
+            self.baseline.read_text(encoding="utf-8"),
+        )
         self.assertEqual(car.EXIT_OK, self.gate())
 
     def test_unevaluable_is_two_not_zero(self):
@@ -466,7 +544,7 @@ class Delta(unittest.TestCase):
         self.baseline.write_text(car.format_baseline(["# t"], rows.values()), encoding="utf-8")
 
     def raise_row(self, key, value):
-        _header, rows = car.parse_baseline(self.baseline.read_text(encoding="utf-8"))
+        _header, rows, _footer = car.parse_baseline(self.baseline.read_text(encoding="utf-8"))
         rows[key] = car.Row(key, value, "justified")
         self.write_rows(rows)
 

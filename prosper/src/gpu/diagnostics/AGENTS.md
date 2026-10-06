@@ -69,8 +69,6 @@ time and retains diagnostic metadata. It does not validate or complete a guest f
   wrong answer rather than a missing one, on a draw that did produce primitives (#3248). Note what
   it tests: the WORDS, not the environment variable that was supposed to have caused them. The env
   var says what was asked for; the two diverged.
-- `diag_ratelimit` — rate limiting. **Check a diagnostic's rate limit before quoting its volume as a
-  frequency**; several phantom findings came from reading a capped count as a real one.
 - `gpu_breadcrumbs` / `gpu_breadcrumbs_vk` — `PROSPER_GPU_BREADCRUMBS`: where did the GPU STOP? A
   marker is written before and after every draw and dispatch (`VK_AMD_buffer_marker`, or
   `VK_NV_device_diagnostic_checkpoints`), and after a device loss the last markers that reached
@@ -90,8 +88,9 @@ time and retains diagnostic metadata. It does not validate or complete a guest f
   by default and free when off; an absent extension makes every call a no-op. Numbers and hashes only.
   Tested against recording entry points, so what is proved is what is recorded, not how a capture
   tool displays it.
-- `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
-  parentage.
+- `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute parentage.
+  The address-list parser they share, `watch_list`, and the rate limiter `diag_ratelimit` live one
+  layer down in `src/diagnostics/`, because the diagnostics layer uses them too.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
   that uses it.
 - `refused_shader_dump` — on by default: each distinct refused shader (vertex, pixel or compute) is written once per run, with an index line naming its first unsupported instruction, into `refused_shaders_*/` under `PROSPER_CAPTURE_DIR`. Bounded and deduplicated by code hash, so it costs nothing on a clean run. `PROSPER_SHADER_DUMP` remains the unbounded opt-in.

@@ -7,6 +7,12 @@ The dump is a launcher plus three self-contained games under `1/`, `2/` and `3/`
 has to say *which* game it drives as well as which screen. Everything below is Tomb Raider I unless
 the filename says otherwise.
 
+**`reach-gameplay.pad` does not keep that promise by itself.** It is timed in seconds, and which
+game it enters has changed with the frame rate of the build running it: Tomb Raider II in 2026-08,
+Tomb Raider I on 2026-10-06. The two games' `Lara's Home` are in very different states (#4637), so
+check the subtitle or the scene before reading a run of it. `reach-tr2-laras-home.pad` presses Down
+on the title screen on purpose and names its destination.
+
 ## What a route has to get past
 
 **The EULA gate.** A default launch opens on a 40-page EULA and holds there forever — it is the

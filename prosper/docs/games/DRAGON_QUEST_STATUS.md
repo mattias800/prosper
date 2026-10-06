@@ -814,6 +814,32 @@ route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1`
 by that setting. No new runtime result or rung change is claimed here.
 
 ## Ruled out — eliminated, do not re-run these
+- **"The title's flat sky (no clouds) and flat sea (no waves, no glints) come from wrong shader
+  values: a missing texture, a black seed, a format or a recompiler miscompile."** **Falsified
+  2026-10-06.** The draws were not shading wrongly. They were rasterising into **one pixel**. In the
+  F9 capture every draw from the scene-colour copy onwards (19 cloud cards, the water, the fog, the
+  scene-colour copy) carries `viewport=1 0.0,1.0 1.0x-1.0` and `scissor=[0,0)-[1,1)`, and
+  `PROSPER_DRAW_STATS` gives each `samples=0`. A `PROSPER_REGWATCH` trace shows that viewport is
+  written by a predicated `sceAgcDcbJump` segment (bind depth `j1`). The segment carries AGC's own
+  label "Decompress Htile" and targets a 1x1 scratch depth surface. The parent stream never
+  re-programs the viewport afterwards. Its per-surface condition word reads 0. The decompress of
+  the real 3840x2160 depth reads 1. #319's polarity ("execute when the condition reads 0") therefore
+  ran the wrong helper. The polarity is the hardware PRED_BOOL, not the op. The title passes 1 in
+  both flag arguments of `(dcb, 1, 3, 1, word)`, which is DRAW_VISIBLE: run on a non-zero word.
+  With that rule the frame has no 1x1 draw, and the clouds, sea texture and sun glints render. #4610.
+- **"#319's predication polarity is pinned by the backbuffer composite."** **Falsified 2026-10-06.**
+  On the current route, the segments with full-screen colour state are AGC's "Eliminate Fast Clear"
+  rectangles (labelled in the segment), not a composite. They write no colour here (#1588). The title
+  still composites to scanout under the corrected rule. #4610.
+- **"The depth prepass and the base pass disagree on position (EQUAL-test invariance)."**
+  **Falsified for the sky/ocean dome, 2026-10-06.** `PROSPER_GEOM_PROBE_DUMP`, printed at `%.9g`
+  (float32 round-trip), gives the prepass dome (draw 0) and the base-pass dome (draw 40) the same
+  1,562 positions bit for bit. An offline replay still reports the EQUAL base-pass draws as
+  `samples=0`. That is a **replay** observation. Under replay, `PROSPER_DSLOG` shows the persistent
+  depth invalidated by unrelated compute write-backs (`htile_hit=1` at disjoint addresses, so the
+  topology is unknown offline), and the base pass then begins from depth 1.0. The live frame redraws
+  its sky every frame. Do not take EQUAL kills from a bundle replay of this title as live evidence.
+  #4610.
 - **"Holding a queue's EOP completion pulse while a default-model WaitRegMem is unsatisfied stops the
   guest recycling the label block (the Windows `FMallocBinned3 ... unrecognized block 7c00000001`
   death)."** **Not supported, 2026-10-05.** Windows/NVIDIA, field route, fresh saves, two builds of the
@@ -1035,6 +1061,12 @@ blocker.
 - **#1529** — kept live owner-backed RTT snapshots authoritative when DCC metadata made the guest
   decode cache eligible again. This removed the synthetic `(u, v, u)` coordinate-ramp regression from
   retained title-frame replay without special-casing Dragon Quest.
+
+- **#4610** — Predicated jumps follow the window's PRED_BOOL flag (the title's DRAW_VISIBLE runs on
+  a non-zero condition). AGC's "Decompress Htile" helper (its rectangle under
+  `CB_COLOR_CONTROL.MODE=DISABLE` with `DB_RENDER_CONTROL` compress-disable bits) writes no colour. Restored the title's
+  clouds, sea waves and sun glints, which had been rasterising into a 1x1 viewport left behind by
+  the wrongly selected helper.
 
 ## Known-good diagnostics for this title
 

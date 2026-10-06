@@ -187,12 +187,11 @@ bool storage_image_materialize_raw_uvec4(
 // compact guest format and then its linear, tiled-surface, mip-tail, or tiled-volume layout. The
 // destination must cover the complete footprint returned by storage_image_raw_uvec4_source_bytes.
 bool storage_image_writeback_raw_uvec4(
-    const uint32_t* channels, size_t channel_dwords,
-    prosper::gpu::DataFormat format, uint32_t components,
-    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
-    bool in_mip_tail, uint32_t mip_tail_bytes,
-    uint32_t mip_tail_x, uint32_t mip_tail_y,
-    uint8_t* destination, size_t destination_bytes);
+    const uint32_t* channels, size_t channel_dwords, prosper::gpu::DataFormat format,
+    uint32_t components, uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes, uint32_t mip_tail_x, uint32_t mip_tail_y,
+    uint8_t* destination, size_t destination_bytes,
+    size_t linear_row_pitch = 0);   // untiled 2D: guest row pitch when padded (#4618); 0 = tight
 
 // A typed Vulkan storage image already exposes the guest format as exact row-major bytes. For a
 // tiled guest surface the tiler can therefore read the mapped staging image directly, unless a
@@ -399,8 +398,10 @@ uint64_t live_compute_storage_result_snapshot_bytes();
 uint64_t live_compute_image_result_snapshot_bytes();
 // A cold, proven-full guest target has no observable old seed. Large targets may defer their exact
 // source baseline until an address actually repeats; replay-owned and partial targets may not.
-bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
-                                            size_t guest_bytes, size_t minimum_bytes);
+constexpr bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
+                                                      size_t guest_bytes, size_t minimum_bytes) {
+    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
+}
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.

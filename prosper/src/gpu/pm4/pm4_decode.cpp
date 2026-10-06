@@ -277,7 +277,8 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     break;
                 case R_SET_PRED:
                     // sceAgcDcbSetPredication (#319): begin/end a predication window.
-                    // payload: [0..1]=condition addr lo/hi (0 = end), [2]=raw op.
+                    // payload: [0..1]=condition addr lo/hi (0 = end), [2]=control word
+                    // (op + flag arguments, pack_set_predication_control).
                     c.kind = K::SetPredication;
                     if (npl >= 3) {
                         c.pred_addr  = lo_hi(pl);

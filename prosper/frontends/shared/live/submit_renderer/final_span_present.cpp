@@ -32,7 +32,7 @@ void select_final_span_present(FinalSpanPresentContext& ctx) {
     // counter simply stopped while the guest kept submitting. Never expected, so it reports
     // unconditionally; capped per the rate-limit contract (ordinal on every line so the last
     // one bounds the population from below, plus a power-of-two tail so the tail exists at
-    // all — src/gpu/diagnostics/diag_ratelimit.hpp, instrument trap 49).
+    // all — src/diagnostics/diag_ratelimit.hpp, instrument trap 49).
     //
     // The two totals on every line settle a question the frame counter cannot: whether a title
     // whose publish rate looks healthy is publishing FRESH frames or re-serving one retained

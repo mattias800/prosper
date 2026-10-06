@@ -3,7 +3,7 @@
 // This is separate from the lock-free ledger: only a REFUSAL pays the bounded identity lookup
 // and first-observation log. Accepted uses add only a coarse counter; no guest reads or clocks.
 #include "diagnostics/perf/perf_ledger.hpp"
-#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include "diagnostics/perf/fragment_vote_diagnostic.hpp"
 #include <array>
 #include <cstdio>
 #include <mutex>

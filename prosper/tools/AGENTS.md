@@ -1362,7 +1362,7 @@ remain because they are what deduplicates, and one program compiled against diff
 tables legitimately yields several variants under the same address. An address of
 `0000000000000000` means no address was available at that emit site, not an unusual address.
 
-The filter is default-OFF, parsed by the strict `0x`-only parser in `gpu/diagnostics/watch_list.hpp`
+The filter is default-OFF, parsed by the strict `0x`-only parser in `diagnostics/watch_list.hpp`
 (so a bare decimal arms nothing rather than arming 5,008), and announces itself once:
 
 ```text

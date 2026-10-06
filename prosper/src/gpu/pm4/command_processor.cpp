@@ -5,7 +5,7 @@
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
+#include "diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/diagnostics/fence_build_journal.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
@@ -4404,7 +4404,7 @@ void GpuState::apply(const Pm4Command& c) {
                                 (int)c.reg_class, regs[i].offset, regs[i].value);
                     continue;
                 }
-                file[offset] = regs[i].value;
+                file.set(offset, regs[i].value);
                 if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                     sh_prov[offset] = command_order | kProvIndirect;
                     sh_prov_src[offset] = pack_prov_src(
@@ -4524,7 +4524,7 @@ void GpuState::apply(const Pm4Command& c) {
                 if (c.reg_offset >= kRegOffsetLimit) break;
             }
             for (uint32_t k = 0; k < c.reg_count && c.reg_offset + k < kRegOffsetLimit; k++)
-                file[c.reg_offset + k] = c.reg_data[k];
+                file.set(c.reg_offset + k, c.reg_data[k]);
             if (udprov_collection_enabled() && c.reg_class == RegClass::Sh) {
                 const uint64_t src = pack_prov_src(c.queue_origin, jump_depth,
                                                    g_fold_seq.load(std::memory_order_relaxed));
@@ -5167,6 +5167,7 @@ void GpuState::apply(const Pm4Command& c) {
             // address; the end form carries 0. A short-decoded packet conservatively ENDS the
             // window (never leaves a stale condition gating later jumps).
             pred_cond_addr = c.pred_valid ? c.pred_addr : 0;
+            pred_op = c.pred_valid ? c.pred_op : 0;
             break;
         case K::CondIndirectBuffer: {   // sceAgcCbBranch's packet (#4540): runs as a Jump segment
             const Pm4Command j = cond_indirect_buffer_jump(c);
@@ -5179,12 +5180,8 @@ void GpuState::apply(const Pm4Command& c) {
             // size, no jump-back packet, and the parent stream continues after the jump).
             //
             // Predication: a packet-predicated jump (jump_pred, set by sceAgcSetPacketPredication)
-            // inside an open SetPredication window executes only when the 64-bit condition reads 0
-            // at fold time. POLARITY (CONFIDENCE: MED, empirically pinned on DOLL's title): the
-            // predicated jump segments are the game's per-frame backbuffer composite draws — a
-            // title frame REQUIRES the composite every frame on real hardware, and the condition
-            // memory reads 0 throughout the title steady state, so 0 must mean "execute" here
-            // ("skip when non-zero", matching PM4 SET_PREDICATION's draw-discard-on-set model).
+            // inside an open SetPredication window is executed or skipped on the 64-bit condition
+            // read at fold time; `predicated_jump_skips` owns the polarity and its evidence.
             // #1982: decline only on a REAL overlap, the way the two sibling readers already do.
             //
             // This used to reject the whole submit whenever ANY DMA was retained, without asking
@@ -5336,7 +5333,9 @@ void GpuState::apply(const Pm4Command& c) {
                                 (unsigned long long)last_dispatch_order);
                 }
                 memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
-                skip = (cond != 0);
+                skip = predicated_jump_skips(pred_op, cond);
+            } else if (c.jump_pred && pred_cond_addr) {
+                report_unreadable_predicate_condition(pred_cond_addr);
             }
             if (PROSPER_ENV_ON("PROSPER_PREDLOG")) {
                 // A flat first-N cap answers only about start-up. On a routed GTA V boot the 3D

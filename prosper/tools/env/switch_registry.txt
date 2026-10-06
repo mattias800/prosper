@@ -682,6 +682,7 @@ PROSPER_NO_REFUSED_SHADER_DUMP  unclassified
 PROSPER_NO_RENDERER_MIP_CHAIN  unclassified
 PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE  unclassified
 PROSPER_NO_RENDERPASS_EXTERNAL_DEPS  unclassified
+PROSPER_NO_RENDER_STATE_MEMO  diagnostic  # comparison arm: extract_render_state computes on every call
 PROSPER_NO_RESOLVE  unclassified
 PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR  unclassified
 PROSPER_NO_ROBUST_BUFFER_ACCESS2  unclassified
@@ -698,6 +699,7 @@ PROSPER_NO_SHADER_DECODE_CACHE  unclassified
 PROSPER_NO_SHADER_KEY_SCRATCH  unclassified
 PROSPER_NO_SHADER_KEY_WORD_HASH  unclassified
 PROSPER_NO_SHARED_VULKAN_DEVICE  unclassified
+PROSPER_NO_SHORT_BUFFER_VIEW  diagnostic  # comparison arm: an over-declared draw buffer is copied instead of borrowed
 PROSPER_NO_SKIP_SEED  unclassified
 PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH  unclassified
 PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE  unclassified
