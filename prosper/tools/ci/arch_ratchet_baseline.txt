@@ -147,7 +147,7 @@ getenv|prosper/src/hle/video/avplayer.cpp 6
 getenv|prosper/src/hle/video/videodec2.cpp 10
 getenv|prosper/src/host/image/boot_program.cpp 3
 getenv|prosper/src/host/image/exec_image_linux.cpp 70
-getenv|prosper/src/host/image/exec_image_win.cpp 14
+getenv|prosper/src/host/image/exec_image_win.cpp 10
 getenv|prosper/src/host/image/runtime_module_load.cpp 1
 getenv|prosper/src/host/memory/guest_write_watch.cpp 9
 getenv|prosper/src/host/symbols/il2cpp_symbols.cpp 1
