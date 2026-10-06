@@ -29,7 +29,9 @@
 // two never disagree; this file publishes the device's answers (publish_ngg_backend_capabilities).
 // render_draws_rgba also drops an NGG draw whose own segment would lose transient depth
 // (persist_depth_stencil false) or force a colour readback between segments (no persistent colour
-// target: a CPU wait per split, CLAUDE.md P1). Every drop is counted under backend/ngg-subgroup.
+// target, or any MRT call: a CPU wait per split, CLAUDE.md P1), and asks the structure and the
+// shell pipelines before the split too, so only a scratch allocation failure can still refuse
+// inside a segment. Every drop is counted under backend/ngg-subgroup.
 //
 // ALL OR NOTHING. A prelude is recorded only when every one of its run draws is ready to record;
 // otherwise none of its runs draw, and each is counted under ngg-subgroup.
@@ -269,6 +271,9 @@ ngg_shell_pipeline(const RenderVkCtx& ctx, const prosper::gpu::NggSubgroupStages
     // device.
     static auto& cache = *new std::unordered_multimap<uint64_t, Entry>();
     static uint64_t clock = 0;
+    // Asked both inside a pass and before render_draws_rgba splits a batch (N5 of #4634).
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
     auto& stats = ngg_shell_pipeline_cache_stats();
     const auto& shell = *stages.shell;
     std::vector<uint32_t> key = {stages.waves, push_words, native_wave64 ? 1u : 0u,
@@ -347,6 +352,38 @@ ngg_shell_pipeline(const RenderVkCtx& ctx, const prosper::gpu::NggSubgroupStages
     cache.emplace(stages.shell_hash, Entry{entry, std::move(key), ++clock});
     stats.entries = cache.size();
     return entry;
+}
+
+// Whether `draw`, an NGG draw, has the shape and resources the backend can expand: a plain draw,
+// exactly one plain buffer per guest binding of set 0, and set 2 free for the export and counter
+// views. Null when it does. Asked before the batch is split as well as at expansion, so a
+// refusal never lands inside a segment (where it would lose that segment's clear).
+inline const char* ngg_backend_draw_structure_refusal(const BackendDraw& draw) {
+    if (draw.mesh_draw || draw.owned_waves || draw.fragment_draw_inputs || draw.raster_quads ||
+        draw.index_count())
+        return "ngg-backend-draw-shape";
+    const auto plain_buffers = [&](uint32_t binding) {
+        uint32_t count = 0;
+        bool buffer = false;
+        for (const FrameResource& r : draw.R)
+            if (r.set == 0 && r.binding == binding) {
+                ++count;
+                buffer = !r.is_texture() && r.table_entries.empty() && !r.is_internal_gds;
+            }
+        for (const FrameBufferResource& r : draw.B)
+            if (r.set == 0 && r.binding == binding) {
+                ++count;
+                buffer = r.table_entries.empty() && !r.is_internal_gds && !r.fragment_draw_buffer;
+            }
+        return count == 1 && buffer;
+    };
+    for (uint32_t binding : draw.ngg_subgroup->guest_bindings)
+        if (!plain_buffers(binding)) return "ngg-backend-guest-binding";
+    for (const FrameResource& r : draw.R)
+        if (r.set == prosper::gpu::kNggRasterDescriptorSet) return "ngg-backend-set2-taken";
+    for (const FrameBufferResource& r : draw.B)
+        if (r.set == prosper::gpu::kNggRasterDescriptorSet) return "ngg-backend-set2-taken";
+    return nullptr;
 }
 
 // ---- The per-pass batch ---------------------------------------------------------------------------
@@ -610,39 +647,8 @@ private:
         // The device half of admission, shared with the producer (ngg_draw_admission.hpp).
         if (const char* device = ngg_device_refusal(ngg, ngg_host_capabilities(ctx_)))
             return refuse(refusal, device);
-        if (draw.mesh_draw || draw.owned_waves || draw.fragment_draw_inputs || draw.raster_quads ||
-            draw.index_count())
-            return refuse(refusal, "ngg-backend-draw-shape");
-        // The shell's guest inputs: exactly one plain buffer per declared set-0 binding, and set 2
-        // free for the export and counter views.
-        const auto resource_count = [&](uint32_t set, uint32_t binding, bool* buffer) {
-            uint32_t count = 0;
-            for (const FrameResource& r : draw.R)
-                if (r.set == set && r.binding == binding) {
-                    ++count;
-                    *buffer = !r.is_texture() && r.table_entries.empty() && !r.is_internal_gds;
-                }
-            for (const FrameBufferResource& r : draw.B)
-                if (r.set == set && r.binding == binding) {
-                    ++count;
-                    *buffer =
-                        r.table_entries.empty() && !r.is_internal_gds && !r.fragment_draw_buffer;
-                }
-            return count;
-        };
-        for (uint32_t binding : ngg.guest_bindings) {
-            bool buffer = false;
-            const uint32_t count = resource_count(0, binding, &buffer);
-            if (count != 1 || !buffer) {
-                refusal = "ngg-backend-guest-binding binding=" + std::to_string(binding) +
-                          " count=" + std::to_string(count) + " buffer=" + (buffer ? "1" : "0");
-                return false;
-            }
-        }
-        for (const FrameResource& r : draw.R)
-            if (r.set == kNggRasterDescriptorSet) return refuse(refusal, "ngg-backend-set2-taken");
-        for (const FrameBufferResource& r : draw.B)
-            if (r.set == kNggRasterDescriptorSet) return refuse(refusal, "ngg-backend-set2-taken");
+        if (const char* shape = ngg_backend_draw_structure_refusal(draw))
+            return refuse(refusal, shape);
 
         Prelude prelude;
         prelude.ngg = draw.ngg_subgroup;
@@ -814,15 +820,28 @@ inline size_t ngg_segment_split_index(std::span<const BackendDraw> draws) {
 }
 
 // Why render_draws_rgba cannot run `draw` (an NGG draw) in a call of `draws` draws, or null.
+// `colors` is the call's attachment count: a split of an MRT call carries slots 1+ between its
+// segments by readback whatever their identities (split_segment_contract), so only a single
+// persistent attachment splits without a CPU wait. Everything the expansion can refuse except a
+// scratch allocation (device memory exhaustion) is asked here, before the split, so it never lands
+// inside a segment and loses that segment's clear: the structure, and the shell pipelines (created
+// here once, then cached).
 inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
                                             const prosper::gpu::NggHostCapabilities& host,
                                             size_t draws, bool persist_depth_stencil,
-                                            const BackendColorTarget* color_target) {
+                                            const BackendColorTarget* color_target,
+                                            uint32_t colors = 1) {
     if (!draw.ngg_subgroup) return nullptr;
-    if (const char* device = prosper::gpu::ngg_device_refusal(*draw.ngg_subgroup, host))
-        return device;
-    const bool splits_safely =
-        draws == 1u || (persist_depth_stencil && color_target && color_target->persistent_id);
+    const prosper::gpu::NggSubgroupDraw& ngg = *draw.ngg_subgroup;
+    if (const char* device = prosper::gpu::ngg_device_refusal(ngg, host)) return device;
+    if (const char* shape = ngg_backend_draw_structure_refusal(draw)) return shape;
+    for (const prosper::gpu::NggSubgroupWaveGroup& group : ngg.groups)
+        if (!ngg_shell_pipeline(render_vk_ctx(), *group.stages, ngg.guest_bindings,
+                                static_cast<uint32_t>(ngg.push_constants.size()),
+                                ngg.native_wave64))
+            return "ngg-backend-pipeline";
+    const bool splits_safely = draws == 1u || (persist_depth_stencil && colors == 1u &&
+                                               color_target && color_target->persistent_id);
     if (!persist_depth_stencil && !splits_safely) return "ngg-backend-transient-depth-split";
     if (!splits_safely) return "ngg-backend-readback-split";
     return nullptr;
@@ -837,13 +856,19 @@ inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
 inline std::span<const BackendDraw> ngg_admit_backend_draws(const std::vector<BackendDraw>& draws,
                                                             bool persist_depth_stencil,
                                                             const BackendColorTarget* color_target,
+                                                            const BackendMrtOutputs* mrt_outputs,
+                                                            const std::vector<uint8_t>* out_rgba1,
                                                             std::vector<BackendDraw>& kept) {
+    const uint32_t colors = mrt_outputs ? std::max(1u, mrt_outputs->color_count)
+                            : out_rgba1 ? 2u
+                                        : 1u;
     if (std::none_of(draws.begin(), draws.end(),
                      [](const BackendDraw& d) { return bool(d.ngg_subgroup); }))
         return draws;
     const prosper::gpu::NggHostCapabilities host = ngg_host_capabilities(render_vk_ctx());
     const auto refusal = [&](const BackendDraw& d) {
-        return ngg_backend_draw_refusal(d, host, draws.size(), persist_depth_stencil, color_target);
+        return ngg_backend_draw_refusal(d, host, draws.size(), persist_depth_stencil, color_target,
+                                        colors);
     };
     if (std::none_of(draws.begin(), draws.end(), refusal)) return draws;
     kept.clear();

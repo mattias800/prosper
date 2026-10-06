@@ -16201,8 +16201,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               BackendMrtOutputs* mrt_outputs = nullptr,
                                               bool want_color_readback = true) {   // #2283
     std::vector<BackendDraw> ngg_kept;   // #3135 P5: NGG draws this call cannot run are dropped
-    const std::span<const BackendDraw> all =
-        ngg_admit_backend_draws(draws, persist_depth_stencil, color_target, ngg_kept);
+    const std::span<const BackendDraw> all = ngg_admit_backend_draws(
+        draws, persist_depth_stencil, color_target, mrt_outputs, out_rgba1, ngg_kept);
     // One preflight over the logical batch, before splitting or any render-pass state. A malformed
     // later segment must not leave earlier producer work submitted or speculative cache state live.
     if (!backend_compact_resource_orders_valid(all)) {

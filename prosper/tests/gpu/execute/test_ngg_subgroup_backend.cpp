@@ -637,6 +637,39 @@ TEST(NggSubgroupBackend, DeviceRefusedDrawIsDroppedBeforeTheSplitAndCounted) {
     EXPECT_EQ(texel(bytes, 1, 3, 5)[0], -1.0f) << "the refused LUT draw drew nothing";
 }
 
+// A refusal the device check cannot see (set 2 taken) is still asked before the split, so the
+// NGG draw is dropped from the call and the call's clear survives (#4634 N5): before, the
+// expansion refused the NGG segment after the split and the clear went with it.
+TEST(NggSubgroupBackend, StructureRefusalBeforeTheSplitKeepsTheClear) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 4, 4, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw lut = ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
+    FrameBufferResource taken;
+    taken.set = kNggRasterDescriptorSet;
+    taken.binding = 1;
+    taken.dwords = {0u};
+    lut.B.push_back(taken);
+    lut.resource_order.push_back(0x80000000u | static_cast<uint32_t>(lut.B.size() - 1u));
+    EXPECT_STREQ(ngg_backend_draw_structure_refusal(lut), "ngg-backend-set2-taken");
+    ResolvedPipelineState blue_alpha = flipped_state();
+    blue_alpha.color_write_mask = 0xC;
+    BackendDraw b;
+    b.vs = full_screen_vertex();
+    b.fs = constant_fragment(0.75f);
+    b.ps = &blue_alpha;
+    const BackendColorTarget target = volume_target(0x4e4747340013ull, 4);
+    const auto bytes = render_draws_rgba({lut, b}, kSize, kSize, nullptr, kClear, true, &target);
+    ASSERT_EQ(bytes.size(), 4u * kSize * kSize * 16u);
+    const float* p = texel(bytes, 0, 3, 5);
+    EXPECT_EQ(p[0], -1.0f) << "the call's clear survived the dropped NGG draw";
+    EXPECT_EQ(p[2], 0.75f) << "B drew";
+}
+
 // A split this call cannot make safely: transient depth (persist_depth_stencil false, the
 // PROSPER_DUMP_DRAWSTEPS diagnostic's call) and, separately, no persistent colour target (each
 // split would read the pass back with a CPU wait). A lone NGG draw needs no split and runs.
@@ -664,20 +697,33 @@ TEST(NggSubgroupBackend, UnsafeSplitsDropTheNggDraw) {
     EXPECT_EQ(ngg_backend_draw_refusal(lut, host, 2, true, &target), nullptr);
     EXPECT_EQ(ngg_backend_draw_refusal(lut, host, 1, false, nullptr), nullptr) << "no split";
     EXPECT_EQ(ngg_backend_draw_refusal(a, host, 2, false, nullptr), nullptr) << "not NGG";
-    EXPECT_EQ(ngg_admit_backend_draws(pair, false, &target, kept).size(), 1u)
+    // An MRT call carries slots 1+ across a split by readback whatever their identities.
+    EXPECT_STREQ(ngg_backend_draw_refusal(lut, host, 2, true, &target, 2),
+                 "ngg-backend-readback-split");
+    BackendMrtOutputs mrt;
+    mrt.color_count = 3;
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, &mrt, nullptr, kept).size(), 1u);
+    std::vector<uint8_t> out1;
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, nullptr, &out1, kept).size(), 1u);
+    mrt.color_count = 1;
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, &mrt, nullptr, kept).data(),
+              pair.data());
+    EXPECT_EQ(ngg_admit_backend_draws(pair, false, &target, nullptr, nullptr, kept).size(), 1u)
         << "transient depth across a split";
     ASSERT_EQ(kept.size(), 1u);
     EXPECT_FALSE(kept[0].ngg_subgroup);
-    EXPECT_EQ(ngg_admit_backend_draws(pair, true, nullptr, kept).size(), 1u)
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, nullptr, nullptr, nullptr, kept).size(), 1u)
         << "no persistent colour target: a readback per split";
     BackendColorTarget unnamed = target;
     unnamed.persistent_id = 0;
-    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &unnamed, kept).size(), 1u);
-    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, kept).data(), pair.data())
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &unnamed, nullptr, nullptr, kept).size(), 1u);
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, nullptr, nullptr, kept).data(),
+              pair.data())
         << "persistent depth and colour: nothing dropped, the caller's vector itself";
 
     const std::vector<BackendDraw> lone = {lut};
-    EXPECT_EQ(ngg_admit_backend_draws(lone, false, &target, kept).data(), lone.data())
+    EXPECT_EQ(ngg_admit_backend_draws(lone, false, &target, nullptr, nullptr, kept).data(),
+              lone.data())
         << "a lone NGG draw is not split";
     const StatsSnapshot before = stats_now();
     const auto bytes = render_draws_rgba(lone, kSize, kSize, nullptr, kClear, false, &target);
