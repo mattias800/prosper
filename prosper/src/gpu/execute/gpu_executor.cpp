@@ -7932,9 +7932,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // it (one Kena run published 28,012), so report the first 8 and then
                         // powers of two.
                         static std::atomic<uint64_t> null_images{0};
-                        // PROSPER_ENV_ON reads the environment once, in a static initializer.
-                        const bool dbg =
-                            PROSPER_ENV_ON("PROSPER_DBG");   // NOLINT(concurrency-mt-unsafe)
+                        // A live read, not PROSPER_ENV_ON: tests arm PROSPER_DBG at run time, and a
+                        // cached read would never see it (cached_env_arming_logic, #4602).
+                        // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only diagnostic switch
+                        const bool dbg = std::getenv("PROSPER_DBG") != nullptr;
                         const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
                         if (null_ordinal &&
                             (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))
