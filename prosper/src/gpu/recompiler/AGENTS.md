@@ -32,6 +32,13 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_spilled_mask_halves` — a CFG MUST fact the dispatcher's Wave64 mask analysis carries:
   which saved-mask instance each `v_writelane` slot and reloaded SGPR holds a half of, so a pair
   reassembled from both halves of one mask stays a mask across a block edge.
+- `rdna2_mask_half_alias` — the companion MUST analysis for exact native Wave64: which physical
+  half (LO/HI) of EXEC a spill slot or reloaded SGPR holds, so a reload can publish that ballot
+  word as scalar data.
+- `rdna2_spill_slot_domain` — whether each `v_writelane` slot holds data or a mask on every path,
+  so the dispatcher types a `v_readlane` reload the way `emit_alu` did. The dispatcher's two
+  Function variables per slot carry no runtime tag; without this a reload read the other domain's
+  placeholder (#4600).
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.
