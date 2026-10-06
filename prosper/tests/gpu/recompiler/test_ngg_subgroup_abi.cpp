@@ -191,6 +191,12 @@ TEST(NggSubgroupAbi, ExportShapesOutsideTheRecordAreRefused) {
               "ngg-export-target-unsupported");   // POS2
     EXPECT_EQ(analyze(program({}, true, with({0xf80000cfu, 0x03020100u}))).reason,
               "ngg-export-duplicate-target");
+    // POS1.z (the layer) is admitted; POS1.x (point size) and POS1.w (viewport) are not.
+    EXPECT_TRUE(analyze(program({}, true, with({0xf80000d4u, 0x00090000u}))).ok());
+    EXPECT_EQ(analyze(program({}, true, with({0xf80000d1u, 0x00000009u}))).reason,
+              "ngg-export-pos1-channels");
+    EXPECT_EQ(analyze(program({}, true, with({0xf80000d8u, 0x09000000u}))).reason,
+              "ngg-export-pos1-channels");
     EXPECT_EQ(
         analyze(program({}, true, {0xf8000943u, 0x00000009u, 0xf80000cfu, 0x03020100u})).reason,
         "ngg-export-prim-channels");

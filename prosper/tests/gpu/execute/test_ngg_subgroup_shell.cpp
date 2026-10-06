@@ -28,6 +28,8 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <string>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -310,6 +312,91 @@ TEST(NggSubgroupShell, ExecPredicatesRecordWordsAndFlags) {
         EXPECT_EQ(r[6], active ? launch_word(0, thread, 5) : 0u) << "thread " << thread;
         EXPECT_EQ(r[0] & kNggFlagPos0, kNggFlagPos0) << "POS0 ran under full EXEC";
     }
+}
+
+// A fetch through an untouched ABI index reads VertexID from v5 and InstanceID from v8: one
+// vertex-rate and one instance-rate stream, each returning a value that names its index.
+TEST(NggSubgroupShell, VertexAndInstanceFetchesUseTheirLaunchIndices) {
+    const std::vector<uint32_t> code = {
+        0xbefe04c1u,   // s_mov_b64 exec, -1
+        0xe0002000u,
+        0x80020a00u,   // buffer_load_format_x v10, v0, s[8:11], 0 idxen (vertex rate)
+        0xe0002000u,
+        0x80030b00u,   // buffer_load_format_x v11, v0, s[12:15], 0 idxen (instance rate)
+        0xbf8c0000u,   // s_waitcnt 0
+        0x7e120280u,   // v_mov_b32 v9, 0
+        0xf8000941u,
+        0x00000009u,   // exp prim v9
+        0xf80000cfu,
+        0x03020100u,   // exp pos0 v0..v3
+        0xf800020fu,
+        0x08050b0au,   // exp param0 v10, v11, v5, v8
+        0xbf810000u,
+    };
+    ShaderResourceTable table;
+    std::map<uint32_t, std::vector<uint32_t>> buffers;
+    for (const auto& [binding, pc, base, mode] :
+         {std::tuple<uint32_t, uint32_t, float, VertexFetchIndexMode>{3, 1, 100.0f,
+                                                                      VertexFetchIndexMode::Vertex},
+          {4, 3, 1000.0f, VertexFetchIndexMode::Instance}}) {
+        ShaderResource stream;
+        stream.cls = ResourceClass::VertexBuffer;
+        stream.binding = binding;
+        stream.size = 4 * 64;
+        stream.stride = 4;
+        stream.format = DataFormat::Float32;
+        stream.num_components = 1;
+        stream.fetch_pc = pc;
+        stream.sgpr_base = binding == 3 ? 8 : 12;
+        stream.fetch_index_mode = mode;
+        table.resources.push_back(stream);
+        auto& words = buffers[binding];
+        for (uint32_t i = 0; i < 64; ++i)
+            words.push_back(std::bit_cast<uint32_t>(base + static_cast<float>(i)));
+    }
+    NggSubgroupShellConfig config;
+    config.user_sgprs = 8;
+    NggExportRecordLayout layout;
+    std::string why;
+    const auto module =
+        recompile_ngg_subgroup(code.data(), code.size(), &table, config, &layout,
+                               {RecompileDiagnosticStage::Vertex, 0x5a5a1000ull}, &why);
+    ASSERT_FALSE(module.empty()) << why;
+    const auto vertex_id = [](uint32_t block, uint32_t lane) { return (lane * 7u + block) % 41u; };
+    const auto instance_id = [](uint32_t block, uint32_t lane) {
+        return 3u + block * 5u + lane % 2u;
+    };
+    NggSubgroupDispatch dispatch;
+    dispatch.spirv = module;
+    dispatch.workgroups = 2;
+    for (uint32_t block = 0; block < 2; ++block)
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t v[9] = {
+                0, 0, 0, 0, 0, vertex_id(block, lane), 0, 0, instance_id(block, lane)};
+            dispatch.launch.insert(dispatch.launch.end(), v, v + 9);
+            dispatch.launch.push_back(1u << 28 | 64u << 8 | 64u);
+        }
+    dispatch.export_words = 2 * layout.block_words(1);
+    dispatch.guest_buffers = buffers;
+    dispatch.push_constants.assign(8, 0u);
+    const auto out = run_ngg_subgroup(dispatch).value_or(std::vector<uint32_t>{});
+    ASSERT_FALSE(out.empty());
+    uint32_t bad = 0;
+    for (uint32_t block = 0; block < 2; ++block)
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t* r = &out[layout.record_offset(1, block, lane) + layout.param_word(0)];
+            const bool right =
+                r[0] ==
+                    std::bit_cast<uint32_t>(100.0f + static_cast<float>(vertex_id(block, lane))) &&
+                r[1] == std::bit_cast<uint32_t>(1000.0f +
+                                                static_cast<float>(instance_id(block, lane))) &&
+                r[2] == vertex_id(block, lane) && r[3] == instance_id(block, lane);
+            if (!right && bad++ < 3)
+                ADD_FAILURE() << "block " << block << " lane " << lane << " vertex fetch "
+                              << std::bit_cast<float>(r[0]) << " instance fetch "
+                              << std::bit_cast<float>(r[1]);
+        }
+    EXPECT_EQ(bad, 0u);
 }
 
 TEST(NggSubgroupShell, NativeWave64MatchesPortableOnTheSyntheticProgram) {
