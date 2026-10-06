@@ -11,7 +11,7 @@
 
 #include <vulkan/vulkan.h>
 
-#include "shared/compute/compute_buffer_cache_key.hpp"
+#include "shared/live/compute_buffer_cache_key.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_image_cache_key.hpp"
 #include "shared/live/gpu_retile.hpp"
