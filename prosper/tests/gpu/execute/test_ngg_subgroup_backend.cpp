@@ -37,6 +37,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -81,7 +82,8 @@ const KenaInputs& kena_inputs() {
 
 std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_t vertices,
                                                  uint32_t instances, uint32_t slices,
-                                                 std::string* why) {
+                                                 std::string* why,
+                                                 std::optional<NggLayerRoute> route = {}) {
     const KenaInputs& in = kena_inputs();
     NggSubgroupDrawRequest request;
     request.linked_code = in.linked.data();
@@ -96,7 +98,7 @@ std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_
     request.raster.topology = NggOutputTopology::TriangleList;
     request.raster.layer_from_pos1 = true;
     request.raster.layer_slices = slices;
-    request.raster.route = backend_route(ctx);
+    request.raster.route = route ? *route : backend_route(ctx);
     request.raster.count_violations = ngg_backend_counts_violations(ctx);
     request.push_constants.assign(ngg::kKenaUserSgprs, 0u);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x5009440000ull};
@@ -561,6 +563,232 @@ TEST(NggSubgroupBackend, ViolationCountersAreReadOnlyWhenTheBatchCompletes) {
     const BackendColorTarget target = volume_target(0x4e4747340007ull, 16);
     const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
     EXPECT_TRUE(lut_layers(bytes, 16, 16));
+}
+
+// ---- P5: the backend half of live admission ---------------------------------------------------------
+
+// The forwarding geometry route through the real backend (RADV picks ShaderOutputLayer, so the
+// tests above never assemble a pipeline with the GS): the same bytes as the P3 offline result.
+TEST(NggSubgroupBackend, ForwardingGeometryRouteMatchesTheOfflineResult) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (!ctx->geometry_shader_enabled) GTEST_SKIP() << "no geometry shaders";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 32, 32, &why, NggLayerRoute::ForwardingGeometry);
+    ASSERT_TRUE(ngg) << why;
+    ASSERT_EQ(ngg->route, NggLayerRoute::ForwardingGeometry);
+    ASSERT_FALSE(ngg->groups[0].stages->raster_geometry.empty());
+    const ResolvedPipelineState state = flipped_state();
+    const BackendDraw draw = ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
+    const BackendColorTarget target = volume_target(0x4e4747340010ull, 32);
+    const StatsSnapshot before = stats_now();
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    EXPECT_EQ(stats_now().draws - before.draws, 1u);
+    ASSERT_EQ(bytes.size(), 32u * kSize * kSize * 16u);
+    EXPECT_TRUE(lut_layers(bytes, 32, 32));
+    const std::vector<float> reference = offline_kena_lut(NggLayerRoute::ForwardingGeometry);
+    ASSERT_EQ(reference.size() * 4u, bytes.size());
+    EXPECT_EQ(std::memcmp(reference.data(), bytes.data(), bytes.size()), 0);
+}
+
+// A draw the device cannot run is dropped before render_draws_rgba splits the batch, counted under
+// backend/ngg-subgroup, and the ordinary draws around it render in one pass.
+TEST(NggSubgroupBackend, DeviceRefusedDrawIsDroppedBeforeTheSplitAndCounted) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 4, 4, &why);
+    ASSERT_TRUE(ngg) << why;
+    auto refused = std::make_shared<NggSubgroupDraw>(*ngg);
+    refused->lds_bytes = 1u << 30;   // more workgroup memory than any device has
+    ASSERT_STREQ(ngg_device_refusal(*refused, ngg_host_capabilities(*ctx)),
+                 "ngg-backend-lds-limit");
+    const ResolvedPipelineState state = flipped_state();
+    ResolvedPipelineState blue_alpha = flipped_state();
+    blue_alpha.color_write_mask = 0xC;
+    BackendDraw a;
+    a.vs = full_screen_vertex();
+    a.fs = constant_fragment(0.25f);
+    BackendDraw b = a;
+    b.fs = constant_fragment(0.75f);
+    b.ps = &blue_alpha;
+    const std::vector<BackendDraw> draws = {
+        a, ngg_backend_draw(refused, ngg::vertex_records(ngg::kLutQuad), &state), b};
+    const BackendColorTarget target = volume_target(0x4e4747340011ull, 4);
+    namespace perf = prosper::diagnostics::perf;
+    const size_t reason = static_cast<size_t>(perf::DropReason::BackendNggSubgroup);
+    const uint64_t ledger_before = perf::ledger().drop_reasons[reason].load();
+    const uint64_t refused_before = ngg_subgroup_backend_stats().refused.load();
+    const StatsSnapshot before = stats_now();
+    const auto bytes = render_draws_rgba(draws, kSize, kSize, nullptr, kClear, true, &target);
+    EXPECT_EQ(perf::ledger().drop_reasons[reason].load() - ledger_before, 1u);
+    EXPECT_EQ(ngg_subgroup_backend_stats().refused.load() - refused_before, 1u);
+    EXPECT_EQ(stats_now().draws - before.draws, 0u) << "no prelude recorded";
+    EXPECT_EQ(backend_color_target_stats().writes, 1u) << "A and B share one pass: no split";
+    ASSERT_EQ(bytes.size(), 4u * kSize * kSize * 16u);
+    const float* p = texel(bytes, 0, 3, 5);
+    EXPECT_EQ(p[0], 0.25f);
+    EXPECT_EQ(p[1], 0.25f);
+    EXPECT_EQ(p[2], 0.75f);
+    EXPECT_EQ(p[3], 0.75f);
+    EXPECT_EQ(texel(bytes, 1, 3, 5)[0], -1.0f) << "the refused LUT draw drew nothing";
+}
+
+// A split this call cannot make safely: transient depth (persist_depth_stencil false, the
+// PROSPER_DUMP_DRAWSTEPS diagnostic's call) and, separately, no persistent colour target (each
+// split would read the pass back with a CPU wait). A lone NGG draw needs no split and runs.
+TEST(NggSubgroupBackend, UnsafeSplitsDropTheNggDraw) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 4, 4, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw a;
+    a.vs = full_screen_vertex();
+    a.fs = constant_fragment(0.25f);
+    const BackendDraw lut = ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
+    std::vector<BackendDraw> kept;
+
+    const BackendColorTarget target = volume_target(0x4e4747340012ull, 4);
+    const std::vector<BackendDraw> pair = {a, lut};
+    EXPECT_EQ(ngg_admit_backend_draws(pair, false, &target, kept).size(), 1u)
+        << "transient depth across a split";
+    ASSERT_EQ(kept.size(), 1u);
+    EXPECT_FALSE(kept[0].ngg_subgroup);
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, nullptr, kept).size(), 1u)
+        << "no persistent colour target: a readback per split";
+    BackendColorTarget unnamed = target;
+    unnamed.persistent_id = 0;
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &unnamed, kept).size(), 1u);
+    EXPECT_EQ(ngg_admit_backend_draws(pair, true, &target, kept).data(), pair.data())
+        << "persistent depth and colour: nothing dropped, the caller's vector itself";
+
+    const std::vector<BackendDraw> lone = {lut};
+    EXPECT_EQ(ngg_admit_backend_draws(lone, false, &target, kept).data(), lone.data())
+        << "a lone NGG draw is not split";
+    const StatsSnapshot before = stats_now();
+    const auto bytes = render_draws_rgba(lone, kSize, kSize, nullptr, kClear, false, &target);
+    EXPECT_EQ(stats_now().draws - before.draws, 1u);
+    EXPECT_TRUE(lut_layers(bytes, 4, 4));
+    const StatsSnapshot dropped = stats_now();
+    (void)render_draws_rgba(pair, kSize, kSize, nullptr, kClear, false, &target);
+    EXPECT_EQ(stats_now().draws - dropped.draws, 0u) << "the split under transient depth";
+}
+
+// Set 0 rides on the FIRST run draw only: it alone feeds the shell's guest set.
+TEST(NggSubgroupBackend, OnlyTheFirstRunCarriesSetZero) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 76, 2, 2, &why);
+    ASSERT_TRUE(ngg) << why;
+    ASSERT_EQ(ngg->runs.size(), 4u);
+    const ResolvedPipelineState state = flipped_state();
+    const std::vector<BackendDraw> in = {
+        ngg_backend_draw(ngg, ngg::vertex_records(band_strip()), &state)};
+    std::vector<BackendDraw> out;
+    std::shared_ptr<NggSubgroupBackendBatch> batch;
+    std::string refusal;
+    ASSERT_TRUE(NggSubgroupBackendBatch::expand(*ctx, in, out, batch, refusal)) << refusal;
+    ASSERT_EQ(out.size(), 4u);
+    const auto set_count = [](const BackendDraw& d, uint32_t set) {
+        size_t n = 0;
+        for (const auto& r : d.R) n += r.set == set;
+        for (const auto& r : d.B) n += r.set == set;
+        return n;
+    };
+    EXPECT_EQ(set_count(out[0], 0), ngg->guest_bindings.size());
+    for (size_t i = 1; i < out.size(); ++i) {
+        EXPECT_EQ(set_count(out[i], 0), 0u) << "run " << i;
+        EXPECT_GE(set_count(out[i], kNggRasterDescriptorSet), 1u) << "run " << i;
+        for (uint32_t token : out[i].resource_order)
+            EXPECT_LT(token & 0x7fffffffu, (token & 0x80000000u) ? out[i].B.size()
+                                                                 : out[i].R.size());
+    }
+    EXPECT_EQ(out[0].vs_shared, ngg->groups[ngg->runs[0].group].stages->raster_vertex)
+        << "the pass-through stage is shared, not copied";
+}
+
+// All or nothing: a prelude records only when armed and every run draw it owns is ready; when it
+// cannot, record() turns every one of its ready runs off and counts each.
+TEST(NggSubgroupBackend, APartialNggDrawRecordsNothing) {
+    struct Fake {
+        bool ok = true;
+    };
+    const std::vector<int> owner = {-1, 0, 0, 1};
+    std::vector<Fake> draws(4);
+    const auto ready = [&](bool armed, int prelude) {
+        return NggSubgroupBackendBatch::prelude_ready(armed, prelude, owner,
+                                                      std::span<Fake>(draws));
+    };
+    EXPECT_TRUE(ready(true, 0));
+    EXPECT_TRUE(ready(true, 1));
+    EXPECT_FALSE(ready(false, 0)) << "unarmed";
+    EXPECT_FALSE(ready(true, 2)) << "a prelude with no run draw";
+    draws[2].ok = false;
+    EXPECT_FALSE(ready(true, 0)) << "one of its two runs failed setup";
+    EXPECT_TRUE(ready(true, 1)) << "another prelude is unaffected";
+
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 76, 2, 2, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    const std::vector<BackendDraw> in = {
+        ngg_backend_draw(ngg, ngg::vertex_records(band_strip()), &state)};
+    std::vector<BackendDraw> out;
+    std::shared_ptr<NggSubgroupBackendBatch> batch;
+    std::string refusal;
+    ASSERT_TRUE(NggSubgroupBackendBatch::expand(*ctx, in, out, batch, refusal)) << refusal;
+    std::vector<Fake> runs(out.size());
+    const uint64_t census = prosper::gpu::draw_disposition_census().dropped(
+        prosper::gpu::DrawDrop::NggSubgroup);
+    BackendSubmissionBatch submission;
+    // Never captured, so never armed: nothing is recorded and every run is turned off.
+    batch->record(VK_NULL_HANDLE, submission, std::span<Fake>(runs));
+    for (const Fake& run : runs) EXPECT_FALSE(run.ok);
+    EXPECT_EQ(prosper::gpu::draw_disposition_census().dropped(prosper::gpu::DrawDrop::NggSubgroup) -
+                  census,
+              runs.size());
+    EXPECT_FALSE(submission.pending());
+}
+
+// The shell pipeline cache: keyed by the hash computed when the stages were built, hit by an equal
+// module in another allocation, and bounded.
+TEST(NggSubgroupBackend, ShellPipelineCacheIsKeyedOnceAndBounded) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 4, 4, &why);
+    ASSERT_TRUE(ngg) << why;
+    const NggSubgroupStages& stages = *ngg->groups[0].stages;
+    const uint32_t push = static_cast<uint32_t>(ngg->push_constants.size());
+    auto& stats = ngg_shell_pipeline_cache_stats();
+    const auto first = ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, push, false);
+    ASSERT_TRUE(first);
+    const uint64_t creations = stats.creations, hits = stats.hits;
+    EXPECT_EQ(ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, push, false), first);
+    NggSubgroupStages copy = stages;
+    copy.shell = std::make_shared<const std::vector<uint32_t>>(*stages.shell);
+    EXPECT_EQ(ngg_shell_pipeline(*ctx, copy, ngg->guest_bindings, push, false), first)
+        << "an equal module in another allocation";
+    EXPECT_EQ(stats.creations, creations);
+    EXPECT_EQ(stats.hits, hits + 2);
+
+    const uint64_t evictions = stats.evictions;
+    for (uint32_t words = push; words <= push + 40; ++words)
+        for (bool native : {false, true})
+            if (native && !ngg_host_capabilities(*ctx).native_wave64) continue;
+            else (void)ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, words, native);
+    EXPECT_LE(stats.entries, kNggShellPipelineCacheEntries);
+    EXPECT_GT(stats.evictions, evictions);
+    EXPECT_TRUE(first->pipeline) << "an evicted entry a holder still owns stays valid";
 }
 
 }   // namespace

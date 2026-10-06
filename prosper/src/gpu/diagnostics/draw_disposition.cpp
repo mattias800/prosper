@@ -26,6 +26,7 @@ constexpr std::array<const char*, kReasonCount> kNames{
     "shader-rejected",
     "pipeline-creation",
     "target-memory",
+    "ngg-subgroup",
 };
 static_assert(kNames.size() == kReasonCount,
               "every DrawDrop needs a stable name; logs are grepped by these strings");

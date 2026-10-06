@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -78,8 +79,62 @@ bool ngg_shell_guest_bindings(const std::vector<uint32_t>& spirv, std::vector<ui
     return true;
 }
 
+uint64_t ngg_words_hash(const std::vector<uint32_t>& words) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t word : words) hash = (hash ^ word) * 1099511628211ull;
+    return hash;
+}
+
+std::shared_ptr<const NggSubgroupStages>
+compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t waves,
+                            std::string* refusal) {
+    const auto refuse = [&](std::string reason) -> std::shared_ptr<const NggSubgroupStages> {
+        if (refusal) *refusal = std::move(reason);
+        return nullptr;
+    };
+    auto stages = std::make_shared<NggSubgroupStages>();
+    stages->waves = waves;
+    NggSubgroupShellConfig shell = request.shell;
+    shell.waves = waves;
+    std::string why;
+    auto module = recompile_ngg_subgroup(request.linked_code, request.dwords, request.resources,
+                                         shell, &stages->layout, request.diagnostic, &why);
+    if (module.empty()) return refuse(why);
+    if (!ngg_shell_guest_bindings(module, &stages->guest_bindings))
+        return refuse("reason=ngg-draw-guest-resource-unsupported");
+    stages->shell_hash = ngg_words_hash(module);
+    stages->shell = std::make_shared<const std::vector<uint32_t>>(std::move(module));
+    NggRasterCommitConfig raster = request.raster;
+    raster.layout = stages->layout;
+    raster.waves = waves;
+    NggRasterCommitInterface published;
+    auto vertex = build_ngg_raster_commit_vertex(raster, &published, &why);
+    if (vertex.empty()) return refuse(why);
+    stages->raster_vertex = std::make_shared<const std::vector<uint32_t>>(std::move(vertex));
+    stages->vertices_per_primitive = published.vertices_per_primitive;
+    if (raster.route == NggLayerRoute::ForwardingGeometry)
+        stages->raster_geometry = build_ngg_layer_forward_geometry(published, raster.float_transport);
+    // The interpolation stage is built whenever the request supplies it: for its own layer route,
+    // and for a draw that needs it although no layer is read (route None).
+    if ((raster.route == NggLayerRoute::InterpolationGeometry ||
+         raster.route == NggLayerRoute::None) &&
+        request.interpolation_geometry)
+        stages->raster_geometry = request.interpolation_geometry(published);
+    if ((raster.route == NggLayerRoute::ForwardingGeometry ||
+         raster.route == NggLayerRoute::InterpolationGeometry ||
+         (raster.route == NggLayerRoute::None && request.interpolation_geometry)) &&
+        stages->raster_geometry.empty())
+        return refuse("reason=ngg-draw-geometry-unavailable");
+    return stages;
+}
+
 std::shared_ptr<const NggSubgroupDraw>
-build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refusal) {
+assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
+                           const NggSubgroupStagesSource& stages_for, std::string* refusal) {
+    // The launch record is v0..v8 then s3 (ngg_subgroup_shell.hpp).
+    static_assert(kNggLaunchWordsPerLane == std::size(NggLaneLaunch{}.v) + 1u &&
+                      kNggLaunchS3Word == std::size(NggLaneLaunch{}.v),
+                  "a launch record is the lane's VGPRs v0..v8 followed by s3");
     auto draw = std::make_shared<NggSubgroupDraw>();
     draw->plan = plan_ngg_subgroups(request.shape, request.limits, request.budget);
     if (!draw->plan.ok()) return fail(refusal, "ngg-draw-plan " + draw->plan.refusal);
@@ -93,6 +148,7 @@ build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refu
     draw->route = request.raster.route;
     draw->count_violations = request.raster.count_violations;
     draw->native_wave64 = request.shell.native_wave64;
+    draw->lds_bytes = request.shell.rsrc2_gs_lds_size * kNggLdsGranuleDwords * 4u;
     // The interpolation stage's input is Triangles (select_ngg_layer_route refuses the same case).
     const bool interpolation =
         request.raster.route == NggLayerRoute::InterpolationGeometry ||
@@ -107,54 +163,23 @@ build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refu
         index = static_cast<uint32_t>(draw->groups.size());
         NggSubgroupWaveGroup group;
         group.waves = waves;
-        draw->groups.push_back(std::move(group));
-    }
-
-    for (NggSubgroupWaveGroup& group : draw->groups) {
-        NggSubgroupShellConfig shell = request.shell;
-        shell.waves = group.waves;
-        NggExportRecordLayout layout;
         std::string why;
-        group.shell = recompile_ngg_subgroup(request.linked_code, request.dwords, request.resources,
-                                             shell, &layout, request.diagnostic, &why);
-        if (group.shell.empty()) {
-            if (refusal) *refusal = why;
+        group.stages = stages_for(waves, &why);
+        if (!group.stages || group.stages->waves != waves) {
+            if (refusal) *refusal = why.empty() ? "reason=ngg-draw-stages-unavailable" : why;
             return nullptr;
         }
-        if (&group == &draw->groups.front()) {
-            draw->layout = layout;
-            if (!ngg_shell_guest_bindings(group.shell, &draw->guest_bindings))
-                return fail(refusal, "ngg-draw-guest-resource-unsupported");
+        if (draw->groups.empty()) {
+            draw->layout = group.stages->layout;
+            draw->guest_bindings = group.stages->guest_bindings;
+            draw->vertices_per_primitive = group.stages->vertices_per_primitive;
         } else {
-            std::vector<uint32_t> bindings;
-            if (!same_layout(layout, draw->layout)) return fail(refusal, "ngg-draw-layout-varies");
-            if (!ngg_shell_guest_bindings(group.shell, &bindings) ||
-                bindings != draw->guest_bindings)
+            if (!same_layout(group.stages->layout, draw->layout))
+                return fail(refusal, "ngg-draw-layout-varies");
+            if (group.stages->guest_bindings != draw->guest_bindings)
                 return fail(refusal, "ngg-draw-guest-resource-unsupported");
         }
-        NggRasterCommitConfig raster = request.raster;
-        raster.layout = draw->layout;
-        raster.waves = group.waves;
-        NggRasterCommitInterface published;
-        group.raster_vertex = build_ngg_raster_commit_vertex(raster, &published, &why);
-        if (group.raster_vertex.empty()) {
-            if (refusal) *refusal = why;
-            return nullptr;
-        }
-        draw->vertices_per_primitive = published.vertices_per_primitive;
-        if (raster.route == NggLayerRoute::ForwardingGeometry)
-            group.raster_geometry =
-                build_ngg_layer_forward_geometry(published, raster.float_transport);
-        // The interpolation stage is built whenever the request supplies it: for its own layer
-        // route, and for a draw that needs it although no layer is read (route None).
-        if ((raster.route == NggLayerRoute::InterpolationGeometry ||
-             raster.route == NggLayerRoute::None) &&
-            request.interpolation_geometry)
-            group.raster_geometry = request.interpolation_geometry(published);
-        if ((raster.route == NggLayerRoute::ForwardingGeometry ||
-             raster.route == NggLayerRoute::InterpolationGeometry) &&
-            group.raster_geometry.empty())
-            return fail(refusal, "ngg-draw-geometry-unavailable");
+        draw->groups.push_back(std::move(group));
     }
 
     // Launch records per group in plan order, and the runs that draw them in plan order.
@@ -165,7 +190,8 @@ build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refu
             const uint32_t s3 = ngg_merged_wave_info(subgroup, wave);
             for (uint32_t lane = 0; lane < kWaveLanes; ++lane) {
                 const NggLaneLaunch launch = ngg_lane_launch(subgroup, request.limits, wave, lane);
-                group.launch_words.insert(group.launch_words.end(), launch.v, launch.v + 9);
+                group.launch_words.insert(group.launch_words.end(), std::begin(launch.v),
+                                          std::end(launch.v));
                 group.launch_words.push_back(s3);
             }
         }
@@ -178,6 +204,16 @@ build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refu
     for (NggSubgroupWaveGroup& group : draw->groups)
         group.export_words = group.blocks * draw->layout.block_words(group.waves);
     return draw;
+}
+
+std::shared_ptr<const NggSubgroupDraw>
+build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refusal) {
+    return assemble_ngg_subgroup_draw(
+        request,
+        [&](uint32_t waves, std::string* why) {
+            return compile_ngg_subgroup_stages(request, waves, why);
+        },
+        refusal);
 }
 
 }   // namespace prosper::gpu

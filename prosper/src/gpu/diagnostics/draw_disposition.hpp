@@ -75,6 +75,7 @@ enum class DrawDrop : uint8_t {
     ShaderRejected,          // the recompiler produced no SPIR-V for a required stage
     PipelineCreation,        // vkCreateGraphicsPipelines declined the draw's pipeline
     TargetMemory,            // no memory type could hold a pass attachment (#3901): whole pass
+    NggSubgroup,             // a merged-NGG draw the backend could not run whole (#3135 P5)
     Count
 };
 

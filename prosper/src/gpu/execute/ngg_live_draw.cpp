@@ -1,0 +1,408 @@
+// ngg_live_draw.cpp -- see ngg_live_draw.hpp.
+#include "gpu/execute/ngg_live_draw.hpp"
+
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/resources/shader_resources.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace prosper::gpu {
+
+namespace {
+
+namespace P = prosper::agc::Pm4;
+
+constexpr size_t kStageEntries = 64;
+constexpr size_t kDrawEntries = 128;
+constexpr uint32_t kMaxWaves = 4;
+
+uint64_t mix(uint64_t hash, uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) hash = (hash ^ ((value >> (8 * i)) & 0xffu)) * 1099511628211ull;
+    return hash;
+}
+
+uint64_t interpolation_hash(const FragmentInterpolationLayout& layout) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const auto& locations : layout.parameter_locations)
+        for (uint32_t location : locations) hash = mix(hash, location);
+    for (uint32_t location : layout.system_locations) hash = mix(hash, location);
+    hash = mix(hash, layout.attribute_mask);
+    hash = mix(hash, layout.smooth_mask);
+    hash = mix(hash, layout.passthrough_mask);
+    hash = mix(hash, layout.flat_mask);
+    hash = mix(hash, (layout.requires_geometry ? 1u : 0u) | (layout.valid ? 2u : 0u));
+    return hash;
+}
+
+// The compile-relevant shape of the resource table: every field the recompiler may read, and
+// none that is per-draw data (addresses, host bytes) -- the same partition the ordinary shader
+// cache's ShaderResourceCompileKey makes, taken conservatively wide. A size enters only through
+// the size-derived markers the emitter specializes on (zero records, a one-record 16-bit tail,
+// an exact atomic x2 record count).
+std::vector<uint32_t> resource_shape(const ShaderResourceTable* table) {
+    std::vector<uint32_t> out;
+    if (!table) return out;
+    out.push_back(1u);
+    out.push_back(table->vertices_per_instance);
+    for (const auto& [pc, bytes] : table->owned_raw_snapshot_requirements) {
+        out.push_back(pc);
+        out.push_back(bytes);
+    }
+    out.push_back(0xfffffff0u);
+    for (const auto& [pc, bytes] : table->owned_nested_snapshot_requirements) {
+        out.push_back(pc);
+        out.push_back(bytes);
+    }
+    out.push_back(0xfffffff1u);
+    for (const ShaderResource& r : table->resources) {
+        const auto& relocation = r.indirect_pointer_relocation;
+        const uint32_t flags = (r.nested_raw_snapshot_admitted ? 1u : 0u) |
+                               (r.bvh_sort_enabled ? 2u : 0u) | (r.in_mip_tail ? 4u : 0u) |
+                               (r.proven_zero_mip ? 8u : 0u) | (r.srgb ? 16u : 0u) |
+                               (r.depth_compare ? 32u : 0u) | (r.compression_enabled ? 64u : 0u) |
+                               (r.raw_register_snapshot ? 128u : 0u) | (r.size == 0 ? 256u : 0u) |
+                               (r.size == 2 ? 512u : 0u) |
+                               (uint64_t{r.atomic_x2_record_count} * 8u == r.size ? 1024u : 0u) |
+                               (r.host_data ? 2048u : 0u);
+        out.insert(out.end(),
+                   {static_cast<uint32_t>(r.cls), static_cast<uint32_t>(r.format),
+                    r.num_components, r.binding, r.stride, r.srt_offset, r.sgpr_base,
+                    r.table_index_count, r.table_entry_stride, r.table_index_sgpr,
+                    static_cast<uint32_t>(r.table_selector_mode), r.table_load_pc,
+                    static_cast<uint32_t>(r.table_entries.size()),
+                    r.direct_vsharp_sh_register_base, r.fetch_pc,
+                    static_cast<uint32_t>(r.fetch_index_mode), r.bvh_box_grow, r.flat_base_sgpr,
+                    r.img_dim, r.width, r.height, r.depth, r.sample_count, r.tile_mode,
+                    r.declared_mip_levels, r.mag_filter, r.min_filter, r.mip_filter,
+                    r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2], r.border_color_type,
+                    r.depth_compare_func, r.unnormalized, r.swizzle[0], r.swizzle[1],
+                    r.swizzle[2], r.swizzle[3], r.atomic_x2_record_count,
+                    r.selected_sbuffer_soffset, r.selected_sbuffer_words[0],
+                    r.selected_sbuffer_words[1], r.selected_sbuffer_words[2],
+                    r.selected_sbuffer_words[3], r.indirect_buffer_contract_tag,
+                    r.indirect_buffer_binding_bytes, r.indirect_buffer_slot_count,
+                    r.indirect_buffer_header_bytes, r.indirect_buffer_slot_bytes,
+                    relocation.carrier_version, relocation.proof_schema, relocation.binding_bytes,
+                    relocation.record_count, relocation.segment_count,
+                    relocation.segment_directory_byte_offset,
+                    static_cast<uint32_t>(relocation.proof_fingerprint),
+                    static_cast<uint32_t>(relocation.proof_fingerprint >> 32),
+                    r.scalar_buffer_dword_count, r.owned_raw_snapshot_bytes,
+                    r.owned_nested_snapshot_bytes, flags});
+    }
+    return out;
+}
+
+std::vector<uint32_t> pixel_input_shape(const PixelInputMapping* mapping) {
+    std::vector<uint32_t> out;
+    if (!mapping) return out;
+    out.assign(mapping->controls.begin(), mapping->controls.end());
+    out.insert(out.end(), {mapping->valid_mask, mapping->passthrough_mask, mapping->consumed_mask,
+                           mapping->consumed_known ? 1u : 0u});
+    return out;
+}
+
+// Everything a compiled stage depends on besides W (see the header's CACHING note).
+struct StageKey {
+    std::vector<uint32_t> program;   // the linked chain, compared exactly
+    std::vector<uint32_t> resources;   // resource_shape()
+    std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
+    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
+    uint8_t topology = 0, route = 0, float_transport = 0;
+    bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
+    bool count_violations = false, interpolation = false;
+    uint64_t interpolation_layout = 0;
+    auto tie() const {
+        return std::tie(program, resources, pixel_inputs, user_sgprs, lds_granules, layer_slices, topology, route,
+                        float_transport, native_wave64, provoking_vertex_last, layer_from_pos1,
+                        count_violations, interpolation, interpolation_layout);
+    }
+    bool operator<(const StageKey& other) const { return tie() < other.tie(); }
+};
+
+struct StageEntry {
+    std::mutex compile;   // held while one W compiles; other entries proceed in parallel
+    std::array<std::shared_ptr<const NggSubgroupStages>, kMaxWaves + 1> stages{};
+    std::array<std::string, kMaxWaves + 1> refusal{};   // cached refusal per W
+    std::array<bool, kMaxWaves + 1> attempted{};
+    uint64_t last_use = 0;
+};
+
+struct DrawKey {
+    const StageEntry* stages = nullptr;   // pinned by the stage cache entry, see `stage_owner`
+    uint32_t vertices = 0, instances = 0;
+    uint8_t topology = 0;
+    std::array<uint32_t, 7> limits{};
+    std::vector<uint32_t> push_constants;
+    auto tie() const {
+        return std::tie(stages, vertices, instances, topology, limits, push_constants);
+    }
+    bool operator<(const DrawKey& other) const { return tie() < other.tie(); }
+};
+
+struct DrawEntry {
+    std::shared_ptr<StageEntry> stage_owner;
+    std::shared_ptr<const NggSubgroupDraw> draw;
+    uint64_t last_use = 0;
+};
+
+struct Cache {
+    std::mutex mutex;
+    uint64_t clock = 0;
+    std::map<StageKey, std::shared_ptr<StageEntry>> stages;
+    std::map<DrawKey, DrawEntry> draws;
+    NggLiveDrawCacheStats stats;
+};
+
+Cache& cache() {
+    static Cache instance;
+    return instance;
+}
+
+uint64_t last_use_of(const std::shared_ptr<StageEntry>& entry) { return entry->last_use; }
+uint64_t last_use_of(const DrawEntry& entry) { return entry.last_use; }
+
+template <typename Map>
+void evict(Map& map, size_t bound, uint64_t* evictions) {
+    while (map.size() > bound) {
+        auto oldest = map.begin();
+        for (auto it = std::next(map.begin()); it != map.end(); ++it)
+            if (last_use_of(it->second) < last_use_of(oldest->second)) oldest = it;
+        map.erase(oldest);
+        if (evictions) ++*evictions;
+    }
+}
+
+// The rule a compiler refusal ("reason=<name> ...") names, as a string that lives for the process.
+const char* intern_reason(const std::string& text) {
+    static std::mutex mutex;
+    static std::set<std::string> names;
+    std::string name = "ngg-compile-refused";
+    const size_t at = text.find("reason=");
+    if (at != std::string::npos) {
+        const size_t begin = at + 7;
+        const size_t end = text.find(' ', begin);
+        name = text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (name.empty()) name = "ngg-compile-refused";
+    }
+    const std::lock_guard lock(mutex);
+    return names.insert(std::move(name)).first->c_str();
+}
+
+uint32_t reg(const RegisterFile& file, uint32_t offset, const char* name, const char** missing) {
+    const auto it = file.find(offset);
+    if (it == file.end()) {
+        if (missing && !*missing) *missing = name;
+        return 0;
+    }
+    return it->second;
+}
+
+}   // namespace
+
+NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primitive_type) {
+    NggDrawRegisters r;
+    const char** m = &r.missing;
+    r.vgt_shader_stages_en = reg(state.cx, P::VGT_SHADER_STAGES_EN, "VGT_SHADER_STAGES_EN", m);
+    r.vgt_gs_onchip_cntl = reg(state.cx, P::VGT_GS_ONCHIP_CNTL, "VGT_GS_ONCHIP_CNTL", m);
+    r.ge_cntl = reg(state.uc, P::GE_CNTL, "GE_CNTL", m);
+    r.ge_max_output_per_subgroup =
+        reg(state.cx, P::GE_MAX_OUTPUT_PER_SUBGROUP, "GE_MAX_OUTPUT_PER_SUBGROUP", m);
+    r.vgt_gs_max_vert_out = reg(state.cx, P::VGT_GS_MAX_VERT_OUT, "VGT_GS_MAX_VERT_OUT", m);
+    r.vgt_esgs_ring_itemsize =
+        reg(state.cx, P::VGT_ESGS_RING_ITEMSIZE, "VGT_ESGS_RING_ITEMSIZE", m);
+    r.spi_shader_pgm_rsrc2_gs =
+        reg(state.sh, P::SPI_SHADER_PGM_RSRC2_GS, "SPI_SHADER_PGM_RSRC2_GS", m);
+    r.vgt_gs_out_prim_type = reg(state.cx, P::VGT_GS_OUT_PRIM_TYPE, "VGT_GS_OUT_PRIM_TYPE", m);
+    // Reset value 0 when absent.
+    r.vgt_gs_instance_cnt = reg(state.cx, P::VGT_GS_INSTANCE_CNT, nullptr, nullptr);
+    r.pa_su_sc_mode_cntl = reg(state.cx, P::PA_SU_SC_MODE_CNTL, nullptr, nullptr);
+    r.pa_cl_vs_out_cntl = reg(state.cx, P::PA_CL_VS_OUT_CNTL, nullptr, nullptr);
+    r.pa_cl_clip_cntl = reg(state.cx, P::PA_CL_CLIP_CNTL, nullptr, nullptr);
+    r.spi_ps_input_ena = reg(state.cx, P::SPI_PS_INPUT_ENA, nullptr, nullptr);
+    r.primitive_type = primitive_type;
+    return r;
+}
+
+bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint32_t>* words) {
+    words->assign(count, 0u);
+    for (uint32_t k = 0; k < count; ++k) {
+        const auto it = state.sh.find(P::SPI_SHADER_USER_DATA_GS_0 + k);
+        if (it == state.sh.end()) return false;
+        (*words)[k] = it->second;
+    }
+    return true;
+}
+
+NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
+                                        const NggHostCapabilities& host) {
+    NggLiveDrawResult result;
+    const NggDrawAdmission admission = admit_ngg_draw(input.registers, input.facts, host);
+    result.applies = admission.applies;
+    if (!admission.applies) return result;
+    const auto refuse = [&](const char* reason, std::string detail = {}) {
+        result.refusal = reason;
+        result.detail = std::move(detail);
+        result.draw.reset();
+        return result;
+    };
+    if (!admission.ok()) return refuse(admission.refusal);
+    if (!input.user_data_complete || input.user_data.size() != admission.user_sgprs)
+        return refuse("ngg-user-data-unavailable");
+    if (!input.prolog || !input.main || !input.prolog_prefix_dwords || !input.main_dwords)
+        return refuse("ngg-program-unavailable");
+    // The chain as the hardware runs it: the prolog up to its s_setpc, then the main program.
+    const size_t main_span = rdna2_recompile_code_span(input.main, input.main_dwords);
+    if (!main_span) return refuse("ngg-program-unavailable");
+    const bool interpolation = input.interpolation.requires_geometry;
+    if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
+
+    StageKey key;
+    key.program.assign(input.prolog, input.prolog + input.prolog_prefix_dwords);
+    key.program.insert(key.program.end(), input.main, input.main + main_span);
+    key.resources = resource_shape(input.resources);
+    key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
+    key.user_sgprs = admission.user_sgprs;
+    key.lds_granules = admission.lds_granules;
+    key.layer_slices = admission.layer_slices;
+    key.topology = static_cast<uint8_t>(admission.topology);
+    key.route = static_cast<uint8_t>(admission.route);
+    key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
+    key.native_wave64 = admission.native_wave64;
+    key.provoking_vertex_last = admission.provoking_vertex_last;
+    key.layer_from_pos1 = admission.layer_from_pos1;
+    key.count_violations = admission.count_violations;
+    key.interpolation = interpolation;
+    key.interpolation_layout = interpolation ? interpolation_hash(input.interpolation) : 0u;
+
+    NggSubgroupDrawRequest request;
+    request.resources = input.resources;
+    request.shell.rsrc2_gs_lds_size = admission.lds_granules;
+    request.shell.user_sgprs = admission.user_sgprs;
+    request.shell.native_wave64 = admission.native_wave64;
+    request.limits = admission.limits;
+    request.shape = admission.shape;
+    request.raster.topology = admission.topology;
+    request.raster.provoking_vertex_last = admission.provoking_vertex_last;
+    request.raster.layer_from_pos1 = admission.layer_from_pos1;
+    request.raster.layer_slices = admission.layer_slices;
+    request.raster.route = admission.route;
+    request.raster.pixel_inputs = input.pixel_inputs;
+    request.raster.float_transport = input.float_transport;
+    request.raster.count_violations = admission.count_violations;
+    if (admission.route == NggLayerRoute::InterpolationGeometry)
+        request.raster.reserved_locations = input.interpolation.attribute_mask;
+    if (interpolation) {
+        const FragmentInterpolationLayout layout = input.interpolation;
+        const FloatTransportConfig transport = input.float_transport;
+        request.interpolation_geometry = [layout, transport](const NggRasterCommitInterface& i) {
+            return recompile_interpolation_geometry(layout, false, false, transport, false,
+                                                    i.layer_location);
+        };
+    }
+    request.push_constants = input.user_data;
+    request.diagnostic = {RecompileDiagnosticStage::Vertex, input.program_address};
+
+    request.linked_code = key.program.data();
+    request.dwords = key.program.size();
+    Cache& c = cache();
+    std::shared_ptr<StageEntry> entry;
+    {
+        const std::lock_guard lock(c.mutex);
+        auto& slot = c.stages[key];
+        if (!slot) slot = std::make_shared<StageEntry>();
+        slot->last_use = ++c.clock;
+        entry = slot;
+        evict(c.stages, kStageEntries, &c.stats.stage_evictions);
+    }
+
+    // The draw cache: a repeated shape with the same push-constant words reuses its description.
+    DrawKey draw_key;
+    draw_key.stages = entry.get();
+    draw_key.vertices = admission.shape.vertex_count;
+    draw_key.instances = admission.shape.instance_count;
+    draw_key.topology = static_cast<uint8_t>(admission.shape.topology);
+    draw_key.limits = {admission.limits.es_verts_per_subgroup,
+                       admission.limits.gs_prims_per_subgroup,
+                       admission.limits.prim_group_size,
+                       admission.limits.vert_group_size,
+                       admission.limits.max_out_verts_per_subgroup,
+                       admission.limits.gs_max_vert_out,
+                       admission.limits.esgs_item_size};
+    draw_key.push_constants = input.user_data;
+    {
+        const std::lock_guard lock(c.mutex);
+        const auto found = c.draws.find(draw_key);
+        if (found != c.draws.end() && found->second.stage_owner == entry) {
+            found->second.last_use = ++c.clock;
+            ++c.stats.draw_hits;
+            result.draw = found->second.draw;
+            return result;
+        }
+    }
+
+    const auto stages_for = [&](uint32_t waves,
+                                std::string* why) -> std::shared_ptr<const NggSubgroupStages> {
+        if (!waves || waves > kMaxWaves) {
+            if (why) *why = "reason=ngg-draw-stages-unavailable";
+            return nullptr;
+        }
+        const std::lock_guard compile_lock(entry->compile);
+        if (!entry->attempted[waves]) {
+            entry->stages[waves] =
+                compile_ngg_subgroup_stages(request, waves, &entry->refusal[waves]);
+            entry->attempted[waves] = true;
+            const std::lock_guard lock(c.mutex);
+            ++c.stats.stage_compiles;
+        } else {
+            const std::lock_guard lock(c.mutex);
+            ++c.stats.stage_hits;
+        }
+        if (!entry->stages[waves] && why) *why = entry->refusal[waves];
+        return entry->stages[waves];
+    };
+    std::string why;
+    auto draw = assemble_ngg_subgroup_draw(request, stages_for, &why);
+    if (!draw) return refuse(intern_reason(why), why);
+    if (const char* device = ngg_device_refusal(*draw, host)) return refuse(device);
+    {
+        const std::lock_guard lock(c.mutex);
+        ++c.stats.draw_assemblies;
+        DrawEntry stored;
+        stored.stage_owner = entry;
+        stored.draw = draw;
+        stored.last_use = ++c.clock;
+        c.draws[std::move(draw_key)] = std::move(stored);
+        evict(c.draws, kDrawEntries, nullptr);
+    }
+    result.draw = std::move(draw);
+    return result;
+}
+
+NggLiveDrawCacheStats ngg_live_draw_cache_stats() {
+    Cache& c = cache();
+    const std::lock_guard lock(c.mutex);
+    return c.stats;
+}
+
+void reset_ngg_live_draw_cache_for_test() {
+    Cache& c = cache();
+    const std::lock_guard lock(c.mutex);
+    c.draws.clear();
+    c.stages.clear();
+    c.stats = {};
+}
+
+}   // namespace prosper::gpu
