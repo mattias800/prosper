@@ -78,6 +78,10 @@ def test_the_repository_itself_is_clean():
             "broken link `../screenshots/a.png`",
         ),
         ({"README.md": "[x](prosper/docs/missing.md)\n"}, "README.md: broken link"),
+        # Exact-name resolution: Windows would call both of these present.
+        ({"prosper/docs/gpu/B.md": FM + "[a](a.md)\n"}, "broken link `a.md`"),
+        ({"prosper/docs/gpu/B.md": FM + "[a](A.md.)\n"}, "broken link `A.md.`"),
+        ({"prosper/docs/gpu/B.md": FM + "[a](..../A.md)\n"}, "broken link `..../A.md`"),
     ],
 )
 def test_each_violation_is_reported(tmp_path, files, expect):
@@ -88,6 +92,20 @@ def test_each_violation_is_reported(tmp_path, files, expect):
 def test_code_is_not_a_link(tmp_path):
     body = FM + "`vtbl[0](this)` and\n```\n[x](nowhere.md)\n```\n"
     assert cdm.evaluate(build(tmp_path, {"prosper/docs/gpu/B.md": body})) == []
+
+
+@pytest.mark.parametrize("target", ["...", "....", "\u2026"])
+def test_an_elided_placeholder_is_not_a_link(tmp_path, target):
+    # CLAUDE.md's prose reads `"Generated with [Claude Code](...)" footers`: the `(...)` elides a
+    # URL. On Windows `<dir>/...` resolves to `<dir>` and hid this; on Linux it was a finding.
+    for rel in ("CLAUDE.md", "prosper/docs/gpu/B.md"):
+        body = (FM if rel.startswith("prosper/docs") else "") + f"[Claude Code]({target})\n"
+        assert cdm.evaluate(build(tmp_path, {rel: body})) == [], rel
+
+
+def test_links_are_counted(tmp_path):
+    problems, links = cdm.evaluate_counted(build(tmp_path, {}))
+    assert problems == [] and links == 2  # A.md -> B.md, README.md -> A.md; URL/anchor skipped
 
 
 def test_a_complete_design_template_passes(tmp_path):

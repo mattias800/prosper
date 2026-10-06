@@ -29,7 +29,12 @@ A document in `archive/` is `kind: archive`, and an `archive` document lives in 
 LINKS. Every relative link `[text](path)` in a tracked Markdown file, anywhere in the repository,
 must point at a file or directory that exists. Code spans and fenced blocks are skipped (a C++
 expression such as `vtbl[0](this)` is not a link); URLs, mail links and same-page anchors are not
-checked; an anchor after a path is ignored and only the path is checked. The motivating case:
+checked; an anchor after a path is ignored and only the path is checked. A target made only of
+dots, such as `(...)`, is an elided placeholder in prose, not a path, and is skipped. A path is
+resolved component by component against the real directory listing, so a link resolves the same way
+on every host: a wrong-case name, or a component ending in a dot or a space (which Win32 silently
+strips, so `foo.md.` and `...` "exist" on Windows), is broken everywhere, as it is on CI's Linux
+runner. The motivating case:
 `tools/screenshots/shrink.py` re-encoded committed screenshots from PNG to WebP, and four links
 across three documents kept pointing at the `.png` names, rendering as broken images with every
 gate green.
@@ -43,6 +48,7 @@ EXIT STATUS: 0 clean, 1 violation, 2 could not evaluate.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -70,6 +76,8 @@ LINK_RE = re.compile(r"!?\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.M | re.S)
 CODE_SPAN_RE = re.compile(r"(`+)(?:(?!\1).)+?\1", re.S)
 EXTERNAL_RE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|#|//)")
+# `[Claude Code](...)` in prose elides a URL; three or more dots (or an ellipsis) are never a path.
+PLACEHOLDER_RE = re.compile(r"^(?:\.{3,}|\u2026)$")
 # Generated from the tracker issues by gen_progress_tracker.py: a broken link there is fixed in the
 # issue it came from, never by editing this file, which the next regeneration would overwrite.
 GENERATED = {Path("PROGRESS_TRACKER.md")}
@@ -141,37 +149,76 @@ def check_meta(root: Path, rel: Path, text: str) -> list[str]:
     return out
 
 
-def check_links(root: Path, rel: Path, text: str) -> list[str]:
+def resolves(base: Path, path: str, listings: dict[Path, set[str]]) -> bool:
+    """Walk `path` from `base` one component at a time against the real directory listing.
+
+    `Path.exists()` asks the host, and hosts disagree: Windows is case-insensitive and strips
+    trailing dots and spaces from a component, so `...`, `B.md.` and `b.md` all "exist" there while
+    CI's Linux runner reports them missing. Matching each name exactly against `os.listdir` gives
+    one answer on every host: no listing holds `B.md.` or `b.md` when the file is `B.md`.
+    """
+    cur = base
+    for part in path.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent
+            continue
+        names = listings.get(cur)
+        if names is None:
+            try:
+                names = set(os.listdir(cur))
+            except OSError:
+                names = set()
+            listings[cur] = names
+        if part not in names:
+            return False
+        cur = cur / part
+    return True
+
+
+def check_links(
+    root: Path, rel: Path, text: str, listings: dict[Path, set[str]] | None = None
+) -> tuple[list[str], int]:
+    """Return (problems, number of relative links checked)."""
     body = CODE_SPAN_RE.sub("", FENCE_RE.sub("", text))
-    out = []
+    listings = {} if listings is None else listings
+    out, checked = [], 0
     for m in LINK_RE.finditer(body):
         target = m.group(1)
-        if EXTERNAL_RE.match(target):
+        if EXTERNAL_RE.match(target) or PLACEHOLDER_RE.match(target):
             continue
         path = target.split("#", 1)[0].split("?", 1)[0]
         if not path:
             continue
-        resolved = (root / rel).parent / path
-        if not resolved.exists():
+        checked += 1
+        if not resolves((root / rel).parent, path, listings):
             out.append(f"{rel.as_posix()}: broken link `{target}`")
-    return out
+    return out, checked
 
 
 def evaluate(root: Path) -> list[str]:
+    return evaluate_counted(root)[0]
+
+
+def evaluate_counted(root: Path) -> tuple[list[str], int]:
+    """Return (problems, relative links checked); the count makes a collapsed LINK_RE visible."""
     if not (root / DOCS).is_dir():
         raise EvaluationError(f"{DOCS} not found under {root}")
     files = tracked_markdown(root)
     if not files:
         raise EvaluationError("no tracked Markdown files; is --root a checkout?")
-    problems = []
+    problems, links, listings = [], 0, {}
     for path in files:
         rel = path.relative_to(root)
         text = path.read_text(encoding="utf-8", errors="replace")
         if under(rel, DOCS):
             problems += check_meta(root, rel, text)
         if rel not in GENERATED:
-            problems += check_links(root, rel, text)
-    return problems
+            found, n = check_links(root, rel, text, listings)
+            problems += found
+            links += n
+    return problems, links
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--github", action="store_true", help="emit GitHub annotations")
     args = ap.parse_args(argv)
     try:
-        problems = evaluate(args.root.resolve())
+        problems, links = evaluate_counted(args.root.resolve())
     except EvaluationError as exc:
         print(f"check_doc_meta: could not evaluate: {exc}", file=sys.stderr)
         return EXIT_UNEVALUATED
@@ -189,7 +236,10 @@ def main(argv: list[str] | None = None) -> int:
     if problems:
         print(f"check_doc_meta: {len(problems)} problem(s)", file=sys.stderr)
         return EXIT_VIOLATION
-    print("check_doc_meta: every document has a kind, every relative link resolves")
+    print(
+        f"check_doc_meta: every document has a kind, every relative link resolves "
+        f"({links} relative links checked)"
+    )
     return EXIT_OK
 
 

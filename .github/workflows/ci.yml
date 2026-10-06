@@ -659,9 +659,6 @@ jobs:
       # when an ACCEPTED ADR's text is edited or deleted instead of superseded. Its pytest suite runs
       # in the Python quality job. Base selection mirrors the ratchet step; without a base the
       # immutability check is skipped and says so.
-      - name: Verify every document declares its kind and every relative link resolves
-        run: python3 prosper/tools/docs/check_doc_meta.py --github --root .
-
       - name: Verify the architecture spec and ADRs are consistent
         env:
           EVENT: ${{ github.event_name }}
@@ -681,6 +678,13 @@ jobs:
             echo "::notice::architecture docs: no base commit for this $EVENT event; ADR immutability skipped"
             python3 prosper/tools/docs/check_arch_docs.py --github --root .
           fi
+
+      # Same job, same reason: every document under prosper/docs/ declares its kind and status, and
+      # every relative Markdown link in the repository resolves. Links are resolved by exact name
+      # against the directory listing, so the answer here matches a Windows checkout's. Its pytest
+      # suite runs in the Python quality job.
+      - name: Verify every document declares its kind and every relative link resolves
+        run: python3 prosper/tools/docs/check_doc_meta.py --github --root .
 
       # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
       # the "needing nothing built" part is the point, because the defect this catches is visible
