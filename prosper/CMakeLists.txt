@@ -6752,6 +6752,17 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 
+  # Overlapping windows of a read-only buffer share one resident arena (ADR 0010).
+  prosper_add_gtest(test_buffer_arena_plan
+    SOURCES tests/shared/compute/test_buffer_arena_plan.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # CPU microbenchmark (not a ctest): validation work of nine overlapping windows, private copies vs one arena.
+  add_executable(bench_buffer_arena tests/shared/compute/bench_buffer_arena.cpp)
+  target_include_directories(bench_buffer_arena PRIVATE frontends src tests)
+  target_link_libraries(bench_buffer_arena PRIVATE prosper_core)
+
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
   target_link_libraries(test_guest_write_drain PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
