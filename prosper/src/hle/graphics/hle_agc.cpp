@@ -14,6 +14,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
+#include "gpu/pm4/cond_indirect_buffer.hpp"   // #4610: SetPredication control word
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "gpu/present/videoout_present.hpp"
@@ -803,7 +804,8 @@ HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_a
     }
     uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_SET_PRED, &cmd)) return 0;
     cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
-    cmd[3] = (uint32_t)a2;
+    // The op AND both flag arguments: one of a1/a3 carries PRED_BOOL, the polarity (#4610).
+    cmd[3] = prosper::gpu::pack_set_predication_control(a2, a1, a3);
     return (uint64_t)(uintptr_t)cmd;
 }
 // #2157: every patcher below dereferences a caller-supplied `cmd` behind nothing but a null check,

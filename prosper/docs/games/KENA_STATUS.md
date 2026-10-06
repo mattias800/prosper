@@ -239,6 +239,13 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Kena's black frames from about t=100 s under #4610 (first-gameplay route) are caused by the BOOL64
+  polarity** — false. They came from Kena's own compile of AGC's helper rectangle. #1588's exact list did not
+  recognise it, so the eliminate-fast-clear pass painted the inherited pixel shader over the finished scanout.
+  With the rectangle recognised, the forest loading art renders through 320 s on the same polarity (#4610).
+  What this does NOT show: whether the polarity is right for Kena. A recognised helper writes nothing under
+  either polarity, so this result is polarity-blind. Kena's predicate words were not traced, and no per-helper
+  lever was run on Kena.
 - **The black pre-menu screen is a renderer failure** — false. The composite was black because the logo movie was
   never started (unregistered `sceAvPlayerStartEx`, #3781); registering it reaches the menu with no renderer change.
 - **The BatchMap ENOMEM is #2424's too-small free placeholder** — false. `VirtualQuery` on the failing range shows

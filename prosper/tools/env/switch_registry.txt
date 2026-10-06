@@ -683,6 +683,7 @@ PROSPER_NO_REFUSED_SHADER_DUMP  unclassified
 PROSPER_NO_RENDERER_MIP_CHAIN  unclassified
 PROSPER_NO_RENDERER_SEEDED_RESULT_CACHE  unclassified
 PROSPER_NO_RENDERPASS_EXTERNAL_DEPS  unclassified
+PROSPER_NO_RENDER_STATE_MEMO  diagnostic  # comparison arm: extract_render_state computes on every call
 PROSPER_NO_RESOLVE  unclassified
 PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR  unclassified
 PROSPER_NO_ROBUST_BUFFER_ACCESS2  unclassified

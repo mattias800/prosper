@@ -1117,9 +1117,10 @@ TEST(RenderState, Contract) {
 #else
         setenv("PROSPER_CLEARLOG", "1", 1);
 #endif
-        const std::string clear_diag = capture_stderr([&] {
-            (void)extract_render_state(st);
-        });
+        // Computed, not reused: `st` was extracted above, and the diagnostic lives inside the
+        // computation, which a reused answer does not run again.
+        const std::string clear_diag =
+            capture_stderr([&] { (void)extract_render_state_uncached(st); });
 #ifdef _WIN32
         _putenv_s("PROSPER_CLEARLOG", "");
 #else

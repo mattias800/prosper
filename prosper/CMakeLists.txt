@@ -2879,6 +2879,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
+            tests/gpu/state/test_render_state_memo.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -4062,6 +4063,12 @@ endif()
   # contract (the target runs inside the buffer that carries the branch).
   prosper_add_gtest(test_cb_branch
     SOURCES tests/gpu/pm4/test_cb_branch.cpp
+    LIBRARIES prosper_core)
+
+  # A packet-predicated Jump under a BOOL64 SetPredication window runs only on a non-zero
+  # condition (Dragon Quest VII's AGC helper segments).
+  prosper_add_gtest(test_predicated_jump
+    SOURCES tests/gpu/pm4/test_predicated_jump.cpp
     LIBRARIES prosper_core)
 
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
