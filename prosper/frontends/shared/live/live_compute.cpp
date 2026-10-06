@@ -7019,34 +7019,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !resource->host_data && !materialization.zero_padded_tail &&
                     materialization.logical_bytes == materialization.binding_bytes) {
                     const uint64_t window = resource->gpu_addr, span = buffers[i].bytes;
-                    BufferArenaDecision plan =
-                        ctx.buffer_arenas.find(window, span, ctx.storage_buffer_offset_alignment);
-                    if (plan.action == BufferArenaAction::Private) {
-                        // Not inside a known arena: probe the readable slack around the window.
-                        const auto readable_slack = [&](uint64_t at_up, bool down) {
-                            for (uint64_t slack = kBufferArenaSlackBytes; slack; slack >>= 1) {
-                                if (down ? at_up < slack : at_up > UINT64_MAX - slack) continue;
-                                if (guest_readable(down ? at_up - slack : at_up,
-                                                   static_cast<uint32_t>(slack)))
-                                    return slack;
-                            }
-                            return uint64_t{0};
-                        };
-                        const uint64_t down = readable_slack(window, true);
-                        const uint64_t up = readable_slack(window + span, false);
-                        plan = ctx.buffer_arenas.plan(window, span, window - down, window + span + up,
-                                                      ctx.storage_buffer_offset_alignment);
-                        ctx.buffer_arenas.commit(plan);
-                    }
+                    const BufferArenaDecision plan = select_buffer_arena(
+                        ctx.buffer_arenas, window, span, ctx.storage_buffer_offset_alignment,
+                        guest_readable);
                     if (plan.action != BufferArenaAction::Private) {
                         upload_bytes = static_cast<size_t>(plan.arena.bytes);
                         upload_source = reinterpret_cast<const uint8_t*>(plan.arena.base);
                         buffers[i].buffer_offset = plan.offset;
-                        ComputeBufferMaterializationDiscriminator arena_shape =
-                            buffers[i].cache_key.materialization;
-                        arena_shape.logical_bytes = arena_shape.binding_bytes = upload_bytes;
-                        buffers[i].cache_key = {plan.arena.base, 0,
-                                                static_cast<uint32_t>(upload_bytes), arena_shape};
+                        buffers[i].cache_key = buffer_arena_cache_key(buffers[i].cache_key, plan);
                     }
                 }
                 if (cache_candidate && ctx.acquire_cached_buffer(

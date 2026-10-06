@@ -56,4 +56,36 @@ private:
     std::vector<BufferArenaExtent> extents_;
 };
 
+// Decide where a read-only window lives: find it in a known arena, else probe the readable slack
+// around it (`readable(addr, bytes)`), plan and commit a new arena. Private means "own copy".
+template <class Readable>
+BufferArenaDecision select_buffer_arena(BufferArenaRegistry& registry, uint64_t window, uint64_t span,
+                                        uint64_t offset_alignment, Readable&& readable) {
+    BufferArenaDecision plan = registry.find(window, span, offset_alignment);
+    if (plan.action != BufferArenaAction::Private) return plan;
+    const auto slack_at = [&](uint64_t at, bool down) {
+        for (uint64_t slack = kBufferArenaSlackBytes; slack; slack >>= 1) {
+            if (down ? at < slack : at > UINT64_MAX - slack) continue;
+            if (readable(down ? at - slack : at, static_cast<uint32_t>(slack))) return slack;
+        }
+        return uint64_t{0};
+    };
+    const uint64_t down = slack_at(window, true);
+    const uint64_t up = slack_at(window + span, false);
+    plan = registry.plan(window, span, window - down, window + span + up, offset_alignment);
+    registry.commit(plan);
+    return plan;
+}
+
+// The cache key of an arena: its extent, with the materialization discriminator resized to match.
+template <class Key>
+Key buffer_arena_cache_key(const Key& window_key, const BufferArenaDecision& plan) {
+    Key key = window_key;
+    key.materialization.logical_bytes = key.materialization.binding_bytes = plan.arena.bytes;
+    key.gpu_addr = plan.arena.base;
+    key.host_data = 0;
+    key.bytes = static_cast<uint32_t>(plan.arena.bytes);
+    return key;
+}
+
 }  // namespace prosper::frontend
