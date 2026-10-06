@@ -3094,10 +3094,16 @@ int main(int argc, char** argv) {
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
             // a title to boot. Without this the result went to open_game(), which resolves an app0 root
             // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
+            // One exception: the folder IS a title itself (a dump at a drive root, where F:\ holds
+            // eboot.bin directly). That falls through to open_game() below and boots like a
+            // drop or a Ctrl+O pick instead of scanning inside it for titles it cannot hold.
             if (!picked.empty() && libraryBrowsePending) {
                 libraryBrowsePending = false;
-                if (!host_path_probe().is_dir(picked)) {
+                if (prosper::frontend::picked_folder_is_title(picked, host_path_probe())) {
+                    fprintf(stderr, "[app] picked folder is a game itself; opening it\n");
+                } else if (!host_path_probe().is_dir(picked)) {
                     libraryStatus = "That is not a folder.";
+                    picked.clear();
                 } else {
                     prosper::frontend::AppConfig cfg = load_app_config();
                     cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
@@ -3106,8 +3112,9 @@ int main(int argc, char** argv) {
                                                         : "Could not save the games folder setting.";
                     fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
                     rescan_library();
+                    picked.clear();
                 }
-                picked.clear();
+                // No clear on the is-title path: `picked` survives so open_game() below boots it.
             }
 #endif
             if (!picked.empty() && !testPattern) {

@@ -79,6 +79,15 @@ inline std::string resolve_app0_root(const std::string& picked, const GamePathPr
     return "";
 }
 
+// True when the picked folder IS a title root itself — a dump can sit at a drive root (F:\
+// holds eboot.bin directly), where the folder is the game rather than a folder of games. The
+// library's games-folder answer boots in that case instead of scanning inside it for titles;
+// anything else (including a subdirectory OF a title) stays a games-directory answer.
+inline bool picked_folder_is_title(const std::string& picked, const GamePathProbe& probe) {
+    if (picked.empty()) return false;
+    return resolve_app0_root(picked, probe) == strip_trailing_separators(picked);
+}
+
 // A guest cannot be torn down in-process: run_entry() never observes prosper_request_stop(), so the
 // app exits rather than joining it (#352). Until that lands, a second title needs a second process.
 //
