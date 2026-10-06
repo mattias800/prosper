@@ -1289,7 +1289,7 @@ ShaderCompileKey make_shader_compile_key(
                                        scalar_source_proof->raw_offset_scalar_source_pcs.end(),
                                        resource.fetch_pc) &&
                     valid_raw_offset_scalar_snapshot_resource(resource))
-                    compiled.raw_offset_scalar_snapshot_bytes = sizeof(uint32_t);
+                    compiled.raw_offset_scalar_snapshot_bytes = resource.size;
                 if (scalar_source_proof && std::binary_search(
                         scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
                         scalar_source_proof->raw_owned_wide_data_load_pcs.end(), resource.fetch_pc)) {
@@ -4460,8 +4460,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((n == 4 || n == 8) && std::binary_search(
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
-                const bool latched_offset_source = !is_buffer && n == 1u &&
-                    soff_field == 125u && in.literal == 0u &&
+                const bool latched_offset_source =
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -4867,9 +4867,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     SrtUse source;
                     source.kind = 5;
                     source.key = UINT32_MAX;
+                    // v4[2..3] carry the observed words (x1 leaves v4[3] zero).
                     source.v4 = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u),
-                                 bounded_scalar_words[0], 0u};
-                    source.required_size = sizeof(uint32_t);
+                                 bounded_scalar_words[0], n == 2u ? bounded_scalar_words[1] : 0u};
+                    source.required_size = n * sizeof(uint32_t);
                     source.use_pc = in.pc;
                     srt_uses->push_back(source);
                 }
@@ -6037,13 +6038,14 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
     return result;
 }
 
-// A memory-fed register offset must use the exact x1 word observed by the fold. Re-reading
+// A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero x1 read point; the table owns its four bytes.
+// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
+    const bool x2 = use.required_size == 2u * sizeof(uint32_t);
     if (use.kind != 5 || use.key != UINT32_MAX || use.use_pc >= dwords ||
-        use.required_size != sizeof(uint32_t) || use.v4[3] ||
+        (use.required_size != sizeof(uint32_t) && !x2) || (!x2 && use.v4[3]) ||
         use.scalar_buffer_dword_count || use.zero_record_raw || use.table_record_count ||
         use.instruction_format != UINT32_MAX)
         return;
@@ -6053,16 +6055,18 @@ static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const Srt
         return;
     const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
                              (static_cast<uint64_t>(use.v4[1]) << 32u);
-    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - sizeof(uint32_t))
-        return;
-    auto bytes = std::make_shared<std::vector<uint8_t>>(sizeof(uint32_t));
-    std::memcpy(bytes->data(), &use.v4[2], sizeof(uint32_t));
+    const uint32_t size = use.required_size;
+    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - size) return;
+    // The source's opcode must agree with the observed width: x1 with 4 bytes, x2 with 8.
+    if (rdna2_decode_one(code + use.use_pc, dwords - use.use_pc).opcode != (x2 ? 1u : 0u)) return;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(size);
+    std::memcpy(bytes->data(), &use.v4[2], size);
     ShaderResource resource;
     resource.cls = ResourceClass::ConstantBuffer;
     resource.format = DataFormat::Uint32;
     resource.num_components = 1;
     resource.gpu_addr = address;
-    resource.size = sizeof(uint32_t);
+    resource.size = size;
     resource.fetch_pc = use.use_pc;
     resource.host_data = bytes->data();
     resource.host_data_size = bytes->size();

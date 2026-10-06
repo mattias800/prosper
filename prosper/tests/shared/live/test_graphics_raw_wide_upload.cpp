@@ -37,7 +37,22 @@ constexpr uint32_t W = 8, H = 8;
 constexpr uint32_t Fullscreen[]{0x36020081u, 0x2c040081u, 0x7e020d01u,
     0x7e040d02u, 0x7e0a02f6u, 0x7e0c02f2u, 0x10020b01u, 0x08020d01u,
     0x10040b02u, 0x08040d02u, 0x7e060280u, 0x7e0802f2u};
-enum class Load { None, Numeric, MemorySelector, OwnedSelector, Nested, Descriptor, DescriptorMask, RuntimeSelector };
+enum class Load {
+    None,
+    Numeric,
+    MemorySelector,
+    OwnedSelector,
+    Nested,
+    Descriptor,
+    DescriptorMask,
+    RuntimeSelector,
+    MemorySelectorX2
+};
+// The selector is loaded from memory as one dword, or (#4578, UE4's vertex-factory index) as the
+// low word of an s_load_dwordx2 pair. Both are latched scalar sources the proof owns.
+static bool memory_selector(Load load) {
+    return load == Load::MemorySelector || load == Load::MemorySelectorX2;
+}
 struct Program {
     alignas(256) std::array<uint32_t, 64> code{};
     AgcShaderSharp sharp{4u}; // independent metadata V# at user offset4, not a raw load source
@@ -48,7 +63,7 @@ struct Program {
 };
 // The process-lifetime registry retains header/code addresses. Give every variant a distinct,
 // immobile, aligned owner that remains alive until all fixture work and backend waits finish.
-using ProgramOwners = std::array<Program, 32>;
+using ProgramOwners = std::array<Program, 40>;
 static ProgramOwners* programs = nullptr;
 static size_t next_program = 0;
 static Program& register_program(bool vertex, Load load, bool wide8, uint32_t writer_position = 0,
@@ -70,9 +85,10 @@ static Program& register_program(bool vertex, Load load, bool wide8, uint32_t wr
     }
     if (load == Load::RuntimeSelector)
         code.push_back(0x7e000500u | ((base + 2u) << 17u)); // s offset <- real lane's v0
-    if (load == Load::MemorySelector) {
+    if (memory_selector(load)) {
         p.scalar_pc = static_cast<uint32_t>(code.size());
-        code.insert(code.end(), {0xf4000580u | ((base + 8u) / 2u), 0xfa000000u});
+        const uint32_t opcode = load == Load::MemorySelectorX2 ? 1u << 18u : 0u;   // x2: s[22:23]
+        code.insert(code.end(), {0xf4000580u | opcode | ((base + 8u) / 2u), 0xfa000000u});
     }
     if (load == Load::OwnedSelector) {
         p.scalar_pc = static_cast<uint32_t>(code.size());
@@ -82,8 +98,9 @@ static Program& register_program(bool vertex, Load load, bool wide8, uint32_t wr
         code.push_back(0xbe800380u | ((base + 9u) << 16u)); // pointer overwritten AFTER read
     }
     if (load != Load::None && load != Load::Nested) {
-        const uint32_t selector = load == Load::MemorySelector ? 22u :
-            load == Load::OwnedSelector ? (wide8 ? 47u : 43u) : base + 2u;
+        const uint32_t selector = memory_selector(load)         ? 22u
+                                  : load == Load::OwnedSelector ? (wide8 ? 47u : 43u)
+                                                                : base + 2u;
         code.push_back(0x8f148400u | selector); // s20 = selector << 4
         p.load_pc = static_cast<uint32_t>(code.size());
         code.insert(code.end(), {(wide8 ? 0xf40c0600u : 0xf4080600u) | (base / 2u),
@@ -103,8 +120,8 @@ static Program& register_program(bool vertex, Load load, bool wide8, uint32_t wr
             const uint32_t last = wide8 ? 31u : 27u;
             code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | last);
         }
-        if (vertex && (load == Load::MemorySelector || load == Load::OwnedSelector)) {
-            const uint32_t source = load == Load::MemorySelector ? 22u : (wide8 ? 47u : 43u);
+        if (vertex && (memory_selector(load) || load == Load::OwnedSelector)) {
+            const uint32_t source = memory_selector(load) ? 22u : (wide8 ? 47u : 43u);
             code.insert(code.end(), {0x7e100c00u | source, 0x101010f0u, 0x060e1107u});
             // v7 += float(s22) * 0.5. Make the selector upload itself observable beside the selected
             // wide bytes: a guest selector reread after realization moves this triangle offscreen.
@@ -118,11 +135,11 @@ static Program& register_program(bool vertex, Load load, bool wide8, uint32_t wr
         code.insert(code.end(), {0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
                                 0xf800180fu, 0x03020100u, 0xbf810000u});
     } else {
-        if (load == Load::MemorySelector || load == Load::OwnedSelector) {
-            const uint32_t source = load == Load::MemorySelector ? 22u : (wide8 ? 47u : 43u);
+        if (memory_selector(load) || load == Load::OwnedSelector) {
+            const uint32_t source = memory_selector(load) ? 22u : (wide8 ? 47u : 43u);
             code.insert(code.end(), {0x7e020c00u | source, 0x100202ffu, 0x3e000000u}); // green=selector/8
-        }
-        else code.insert(code.end(), {0x7e0202ffu, 0x3f000000u});
+        } else
+            code.insert(code.end(), {0x7e0202ffu, 0x3f000000u});
         code.insert(code.end(), {0x7e0402ffu, 0x3f400000u, 0x7e0602f2u,
                                 0xf800180fu, 0x03020100u, 0xbf810000u});
     }
@@ -1304,37 +1321,51 @@ int main(int argc, char** argv) {
             if (next_made) observe_pixels(next_owned, vertex,
                 vertex ? second + 1.5f : second, arm, 0.375f);
         }
-        auto& latched = register_program(vertex, Load::MemorySelector, false);
-        data[11u] = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
-        data[15u] = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);
-        *selector = 2u; notify_guest_gpu_write(guest, 0x2004u);
-        auto state = state_for(vertex ? latched : plain_vs, vertex ? plain_ps : latched,
-                               guest, reinterpret_cast<uint64_t>(selector), metadata);
-        DrawItem draw;
-        const bool made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, draw);
-        const auto table = vertex ? draw.vrt : draw.prt;
-        const auto* scalar = table ? table->by_fetch_pc(latched.scalar_pc) : nullptr;
-        uint32_t owned = UINT32_MAX;
-        if (scalar && scalar->host_data && scalar->host_data_size >= sizeof(owned))
-            std::memcpy(&owned, scalar->host_data, sizeof(owned));
-        *selector = 3u; notify_guest_gpu_write(reinterpret_cast<uint64_t>(selector), sizeof(*selector));
-        check(made && scalar && valid_raw_offset_scalar_snapshot_resource(*scalar) && owned == 2u &&
-              table->by_fetch_pc(latched.load_pc) &&
-              table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 32u, arm,
-              "real draw owns the x1 selector paired with its selected wide range");
-        if (made) observe_pixels(draw, vertex, vertex ? 1.5f : 0.25f, arm, 0.25f);
-        DrawItem next;
-        const bool next_made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, next);
-        const auto next_table = vertex ? next.vrt : next.prt;
-        uint32_t next_owned = UINT32_MAX;
-        const auto* next_scalar = next_table ? next_table->by_fetch_pc(latched.scalar_pc) : nullptr;
-        if (next_scalar && next_scalar->host_data && next_scalar->host_data_size >= sizeof(next_owned))
-            std::memcpy(&next_owned, next_scalar->host_data, sizeof(next_owned));
-        check(next_made && next_owned == 3u && next_table->by_fetch_pc(latched.load_pc) &&
-              next_table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 48u, arm,
-              "next draw realizes the new memory selector instead of reusing the old range");
-        if (next_made) observe_pixels(next, vertex, vertex ? 1.5f : 0.75f, arm, 0.375f);
+        for (const Load source_load : {Load::MemorySelector, Load::MemorySelectorX2}) {
+            const bool x2 = source_load == Load::MemorySelectorX2;
+            const uint32_t source_bytes = x2 ? 8u : 4u;
+            auto& latched = register_program(vertex, source_load, false);
+            data[11u] = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
+            data[15u] = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);
+            selector[0] = 2u;
+            selector[1] = 0x5a5a0001u;   // the x2 pair's high word: owned, but never a selector
+            notify_guest_gpu_write(guest, 0x2008u);
+            auto state = state_for(vertex ? latched : plain_vs, vertex ? plain_ps : latched, guest,
+                                   reinterpret_cast<uint64_t>(selector), metadata);
+            DrawItem draw;
+            const bool made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, draw);
+            const auto table = vertex ? draw.vrt : draw.prt;
+            const auto* scalar = table ? table->by_fetch_pc(latched.scalar_pc) : nullptr;
+            uint32_t owned[2] = {UINT32_MAX, UINT32_MAX};
+            if (scalar && scalar->host_data && scalar->host_data_size == source_bytes)
+                std::memcpy(owned, scalar->host_data, source_bytes);
+            selector[0] = 3u;
+            notify_guest_gpu_write(reinterpret_cast<uint64_t>(selector), sizeof(*selector));
+            check(made && scalar && valid_raw_offset_scalar_snapshot_resource(*scalar) &&
+                      scalar->size == source_bytes && owned[0] == 2u &&
+                      (!x2 || owned[1] == 0x5a5a0001u) && table->by_fetch_pc(latched.load_pc) &&
+                      table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 32u,
+                  arm,
+                  x2 ? "real draw owns the x2 selector pair paired with its selected wide range"
+                     : "real draw owns the x1 selector paired with its selected wide range");
+            if (made) observe_pixels(draw, vertex, vertex ? 1.5f : 0.25f, arm, 0.25f);
+            DrawItem next;
+            const bool next_made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, next);
+            const auto next_table = vertex ? next.vrt : next.prt;
+            uint32_t next_owned = UINT32_MAX;
+            const auto* next_scalar =
+                next_table ? next_table->by_fetch_pc(latched.scalar_pc) : nullptr;
+            if (next_scalar && next_scalar->host_data &&
+                next_scalar->host_data_size >= sizeof(next_owned))
+                std::memcpy(&next_owned, next_scalar->host_data, sizeof(next_owned));
+            check(next_made && next_owned == 3u && next_table->by_fetch_pc(latched.load_pc) &&
+                      next_table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 48u,
+                  arm,
+                  "next draw realizes the new memory selector instead of reusing the old range");
+            if (next_made) observe_pixels(next, vertex, vertex ? 1.5f : 0.75f, arm, 0.375f);
+        }
 
+        GpuState state;
         for (bool wide8 : {false, true}) {
             auto& refused = register_program(vertex, Load::RuntimeSelector, wide8);
             state = state_for(vertex ? refused : plain_vs, vertex ? plain_ps : refused,

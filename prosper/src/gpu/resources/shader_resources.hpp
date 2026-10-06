@@ -562,8 +562,8 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
     return valid_raw_register_snapshot_resource(resource, resource.host_data != nullptr);
 }
 
-// The immediate x1 source of a fold-proven wide offset owns the four bytes observed during
-// realization. Code-side provenance identifies its PC; replay must supply a complete hosted word
+// The immediate x1/x2 source of a fold-proven wide offset owns the 4 or 8 bytes observed during
+// realization. Code-side provenance identifies its PC; replay must supply the complete hosted words
 // at that PC instead of borrowing current guest memory or a legacy binding-2 buffer.
 inline bool valid_owned_raw_snapshot_shape(const ShaderResource& resource, uint32_t bytes) {
     return resource.cls == ResourceClass::ConstantBuffer && resource.format == DataFormat::Uint32 &&
@@ -590,8 +590,10 @@ inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, ui
     return valid_owned_raw_snapshot_resource(resource, bytes, resource.host_data != nullptr);
 }
 
+// An x1 or x2 offset source (#4578): the snapshot is exactly the words the source load wrote.
 inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
-    return valid_owned_raw_snapshot_resource(resource, sizeof(uint32_t));
+    return (resource.size == 4u || resource.size == 8u) &&
+           valid_owned_raw_snapshot_resource(resource, resource.size);
 }
 
 // Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a
