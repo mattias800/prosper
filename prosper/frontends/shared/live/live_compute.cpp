@@ -9,6 +9,7 @@
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
+#include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
@@ -154,35 +155,6 @@ LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
     plan.total_descriptor_count = static_cast<uint32_t>(total);
     plan.valid = true;
     return plan;
-}
-
-bool compute_sampled_dcc_fast_clear_rgba8(
-    const prosper::gpu::ShaderResource& resource,
-    bool ordinary_guest_backed_sampled_view,
-    bool arrayed_sampled_view,
-    bool disabled,
-    uint8_t* rgba,
-    size_t texel_count,
-    const uint8_t* metadata,
-    size_t metadata_bytes,
-    uint8_t* clear_code) {
-    const uint32_t components = resource.num_components ? resource.num_components : 1u;
-    if (disabled || !ordinary_guest_backed_sampled_view || arrayed_sampled_view ||
-        resource.cls != prosper::gpu::ResourceClass::Texture ||
-        resource.format != prosper::gpu::DataFormat::Float16 || components != 4u ||
-        resource.img_dim != 1u || resource.depth != 1u ||
-        resource.declared_mip_levels != 1u || resource.in_mip_tail ||
-        resource.layer_stride_bytes || resource.layer_mip_offset_bytes ||
-        resource.srgb || resource.depth_compare || !resource.compression_enabled ||
-        !resource.metadata_addr || !rgba || !texel_count)
-        return false;
-    const uint64_t expected_metadata = prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
-    if (!expected_metadata || expected_metadata > SIZE_MAX ||
-        metadata_bytes != static_cast<size_t>(expected_metadata))
-        return false;
-    return prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-        rgba, texel_count, metadata, metadata_bytes, components,
-        resource.alpha_is_on_msb, clear_code);
 }
 
 uint8_t storage_pack_unorm8(uint32_t float_bits) {
