@@ -255,7 +255,7 @@ constexpr uint32_t live_target_guest_format_bytes(VkFormat format) {
 // Can the cached renderer-owned target at a sampled descriptor's base serve that descriptor? The
 // extent must match (or be the configured render-scale reduction), and for a single-layer 2D target
 // the descriptor's format must not need more bytes per texel than the GUEST target format
-// (cached_guest_format; the host format when that is unset) stores: a larger view
+// (cached_guest_format; an unset one never refuses) stores: a larger view
 // runs past what the renderer wrote, so the cache holds a stale occupant of reused memory (#4197,
 // AC Black Flag Resynced: a 4-component 8-bit view over a 2-byte R16_FLOAT target). A volume keeps
 // its own contract, and a zero size on either side never refuses.
@@ -265,14 +265,20 @@ constexpr bool live_rtt_serves_sampled_view(uint32_t requested_w, uint32_t reque
                                             VkFormat cached_format, VkFormat cached_guest_format,
                                             uint32_t cached_volume_depth,
                                             uint32_t view_bytes_per_texel) {
+    // No recorded guest format means no evidence about the guest's bytes per texel, so the footprint
+    // rule does not apply and the target is admitted, as before #4648. The host format is NOT a
+    // substitute: it is the renderer's canonical storage, which folds most guest formats into RGBA8,
+    // and judging by it refused real views (an RGBA8-host target sampled through a Float32x4 view,
+    // test_gpu_capture_render's dim-5 selected-address case). `cached_format` stays in the signature
+    // for callers; only the guest format can ground a refusal.
+    // CONFIDENCE: HIGH that an unset guest format is not refusal evidence; the #4197 refusal keeps
+    // its guest format (R16_SFLOAT) and is unaffected.
+    (void)cached_format;
     return rtt_sampled_extent_compatible(requested_w, requested_h, cached_w, cached_h,
                                          render_scale, normalized_sampling) &&
-           (cached_volume_depth != 0u ||
+           (cached_volume_depth != 0u || cached_guest_format == VK_FORMAT_UNDEFINED ||
             rtt_sampled_texel_footprint_compatible(
-                view_bytes_per_texel,
-                cached_guest_format != VK_FORMAT_UNDEFINED
-                    ? live_target_guest_format_bytes(cached_guest_format)
-                    : live_target_vk_format_bytes(cached_format)));
+                view_bytes_per_texel, live_target_guest_format_bytes(cached_guest_format)));
 }
 
 // Packed-HDR render targets can be the independently rendered levels of one sampled mip chain.

@@ -389,3 +389,24 @@ TEST(LiveTargetFormat, FootprintJudgedByGuestFormatNotHostStorage) {
     EXPECT_FALSE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
         VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16_UNORM, 0u, 4u));
 }
+
+// A cached target with NO recorded guest format (VK_FORMAT_UNDEFINED) is admitted whatever the view
+// asks. Its only size evidence is the renderer's canonical host storage, which folds most guest
+// formats into RGBA8, so a footprint judged by it refuses real views of the target -- the
+// dim-5 selected-address RTT case in test_gpu_capture_render samples an RGBA8-host target through a
+// Float32x4 view and must keep reading the renderer's pixels. Pre-#4648 behaviour for this branch.
+TEST(LiveTargetFormat, UnsetGuestFormatAdmitsAWiderView) {
+    using prosper::frontend::live_rtt_serves_sampled_view;
+    // RGBA8 host storage, 16 B/texel view: refused by a host-format fallback, admitted here.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(2, 2, 2, 2, 1, false, VK_FORMAT_R8G8B8A8_UNORM,
+                                             VK_FORMAT_UNDEFINED, 0u, 16u));
+    // R16F host storage, RGBA8 view: the #4197 footprint, but with no guest format to prove it.
+    EXPECT_TRUE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                             VK_FORMAT_R16_SFLOAT, VK_FORMAT_UNDEFINED, 0u, 4u));
+    // A recorded guest format still refuses the same view (the #4197 shape stays refused).
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1920, 1080, 1920, 1080, 1, false,
+                                              VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, 0u, 4u));
+    // The extent rule is unchanged for an unset guest format.
+    EXPECT_FALSE(live_rtt_serves_sampled_view(1216, 684, 960, 540, 1, false, VK_FORMAT_R8G8B8A8_UNORM,
+                                              VK_FORMAT_UNDEFINED, 0u, 16u));
+}

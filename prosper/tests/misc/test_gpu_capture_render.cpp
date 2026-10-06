@@ -980,8 +980,10 @@ int main(int argc, char** argv) {
             producer_resource.num_components = 4;
             array_rtt_producer.prt = std::move(producer_table);
             // The consumer views the renderer's RGBA8 target through an RGBA8 descriptor. The shared
-            // `array_draw` carries a Float32x4 view (16 B/texel), which is wider than the 4 B/texel
-            // producer and, since #4197, is refused as a reused-memory alias rather than served.
+            // `array_draw` carries a Float32x4 view (16 B/texel), wider than the 4 B/texel producer.
+            // That view is still served here (the producer records no guest format, and an unset
+            // guest format never refuses; LiveTargetFormat.UnsetGuestFormatAdmitsAWiderView), but a
+            // matching descriptor keeps this case about RTT freshness rather than view width.
             DrawItem array_rtt_consumer = array_draw;
             auto consumer_table = std::make_shared<ShaderResourceTable>(*array_draw.prt);
             consumer_table->resources[0].format = DataFormat::Unorm8;
