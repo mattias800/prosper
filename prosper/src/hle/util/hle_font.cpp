@@ -863,6 +863,11 @@ uint32_t font_string_terminate(void* string) {
     auto* s = static_cast<FontString*>(string);
     return s && s->magic == kStringMagic ? s->terminate_code : 0;
 }
+void* font_string_terminate_order(void* string) {
+    auto* s = static_cast<FontString*>(string);
+    if (!s || s->magic != kStringMagic) return nullptr;
+    return nullptr;
+}
 TextCharacter* font_string_characters(void*, uint32_t* count) {
     if (count) *count = 0;
     return nullptr;
@@ -976,6 +981,7 @@ void register_font_hle() {
     R("OqQKX0h5COw", (HleFn)font_text_writing_form, "sceFontTextSourceSetWritingForm");
     R("MO24vDhmS4E", (HleFn)font_create_string, "sceFontCreateString");
     R("ObkDGDBsVtw", (HleFn)font_string_terminate, "sceFontStringGetTerminateCode");
+    R("+B-xlbiWDJ4", (HleFn)font_string_terminate_order, "sceFontStringGetTerminateOrder");
     R("Avv7OApgCJk", (HleFn)font_string_characters, "sceFontStringRefersTextCharacters");
     R("hq5LffQjz-s", (HleFn)font_string_render_characters, "sceFontStringRefersRenderCharacters");
     R("o1vIEHeb6tw", (HleFn)font_string_writing_form, "sceFontStringGetWritingForm");

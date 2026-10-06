@@ -363,3 +363,25 @@ TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
         << "DestroyString returns success";
     EXPECT_EQ(string, nullptr) << "DestroyString releases and clears the opaque string handle";
 }
+
+TEST(Font, TerminateOrderIsRegisteredAndNull) {
+    register_builtin_hle();
+    EXPECT_EQ(nid_hash("sceFontStringGetTerminateOrder"), "+B-xlbiWDJ4");
+    auto fn = Hle::lookup("+B-xlbiWDJ4");
+    ASSERT_NE(fn, nullptr) << "GetTerminateOrder is registered";
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    uint8_t mem[64]{};
+    uint8_t source[0x60]{};
+    const char text[] = "ASTRO";
+    ASSERT_EQ(font.text_init(addr(source), addr(text), sizeof(text), 0, 0, 0), 0u);
+    void* string = nullptr;
+    ASSERT_EQ(font.create_string(addr(mem), addr(source), 0, addr(&string), 0, 0), 0u);
+    ASSERT_NE(string, nullptr);
+    using OrderFn = void* (*)(void*);
+    auto order = reinterpret_cast<OrderFn>(fn);
+    EXPECT_EQ(order((void*)addr(string)), nullptr)
+        << "GetTerminateOrder returns null for prosper's minimal string";
+    EXPECT_EQ(fn(0, 0, 0, 0, 0, 0), 0u) << "GetTerminateOrder on null handle returns null";
+    EXPECT_EQ(font.destroy_string(addr(&string), 0, 0, 0, 0, 0), 0u);
+}
