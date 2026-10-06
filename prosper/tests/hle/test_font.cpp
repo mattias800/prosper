@@ -3,6 +3,7 @@
 // a non-zero metric), not merely a success code. Looked up by raw NID, which is how the guest
 // imports them: there is no recovered name for this library.
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <gtest/gtest.h>
 
@@ -562,4 +563,142 @@ TEST(Font, RenderSurfaceSetStyleFrameRecordsTheFrame) {
         ASSERT_EQ(surface[i], 0xccu) << "a refused frame writes nothing, byte " << i;
     EXPECT_EQ(api.set_surface(0, addr(frame), 0, 0, 0, 0), 0x80460002u)
         << "a null surface is refused";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Library queries: pixel resolution and the device cache (libSceFont.native.sprx 0x2750, 0x13f0,
+// 0x1560, 0x17f0). prosper has one library object, so every arm below leaves it detached.
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr uint64_t kLibErrInvalidParam = 0x80460002u;
+constexpr uint64_t kLibErrInvalidLibrary = 0x80460004u;
+constexpr uint64_t kLibErrCacheAttached = 0x80460022u;
+constexpr uint64_t kLibErrNoCache = 0x80460025u;
+struct LibraryApi {
+    HleFn create = nullptr, destroy = nullptr, pixel_resolution = nullptr, attach = nullptr,
+          detach = nullptr, clear = nullptr;
+    void* library = nullptr;
+    bool ready() const {
+        return create && destroy && pixel_resolution && attach && detach && clear && library;
+    }
+};
+LibraryApi library_api() {
+    register_builtin_hle();
+    LibraryApi api;
+    api.create = Hle::lookup("n590hj5Oe-k");
+    api.destroy = Hle::lookup("FXP359ygujs");
+    api.pixel_resolution = Hle::lookup("BozJej5T6fs");
+    api.attach = Hle::lookup("CUKn5pX-NVY");
+    api.detach = Hle::lookup("UuY-OJF+f0k");
+    api.clear = Hle::lookup("I9R5VC6eZWo");
+    static uint8_t mem[64]{};
+    if (api.create) api.create(addr(mem), 0, 0, addr(&api.library), 0, 0);
+    // Start from a detached library whatever an earlier arm left behind.
+    if (api.detach && api.library) api.detach(addr(api.library), 0, 0, 0, 0, 0);
+    return api;
+}
+}   // namespace
+
+TEST(Font, LibraryQueryNidsMatchTheFirmwareDump) {
+    EXPECT_EQ(nid_hash("sceFontGetPixelResolution"), "BozJej5T6fs");
+    EXPECT_EQ(nid_hash("sceFontClearDeviceCache"), "I9R5VC6eZWo");
+    EXPECT_EQ(nid_hash("sceFontAttachDeviceCacheBuffer"), "CUKn5pX-NVY");
+    EXPECT_EQ(nid_hash("sceFontDettachDeviceCacheBuffer"), "UuY-OJF+f0k");
+}
+
+TEST(Font, PixelResolutionIsTheFreeTypeEditionsSixtyFour) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    uint32_t res = 0;
+    EXPECT_EQ(api.pixel_resolution(addr(api.library), addr(&res), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(res, 64u) << "the FreeType edition's driver callback answers 0x40 (26.6 fixed point)";
+    EXPECT_EQ(api.pixel_resolution(addr(api.library), 0, 0, 0, 0, 0), kLibErrInvalidParam);
+    uint8_t decoy[64]{};
+    res = 0xdeadbeef;
+    EXPECT_EQ(api.pixel_resolution(addr(decoy), addr(&res), 0, 0, 0, 0), kLibErrInvalidLibrary)
+        << "a bad library is the LIBRARY code, not the face's 0x80460005";
+    EXPECT_EQ(res, 0u) << "the failure path zeroes the output";
+    res = 0xdeadbeef;
+    EXPECT_EQ(api.pixel_resolution(0, addr(&res), 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(res, 0u);
+    EXPECT_EQ(api.pixel_resolution(0, 0, 0, 0, 0, 0), kLibErrInvalidLibrary)
+        << "the library is checked before the output";
+}
+
+TEST(Font, DeviceCacheAttachClearDetachRoundTrip) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    uint8_t decoy[64]{};
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache)
+        << "clearing with nothing attached is refused, not acknowledged";
+    EXPECT_EQ(api.clear(addr(decoy), 0, 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(api.clear(0, 0, 0, 0, 0, 0), kLibErrInvalidLibrary);
+    EXPECT_EQ(api.attach(addr(decoy), 0, 0x4000, 0, 0, 0), kLibErrInvalidLibrary);
+
+    alignas(8) uint32_t cache[0x3000 / 4];
+    std::memset(cache, 0xcc, sizeof(cache));
+    EXPECT_EQ(api.attach(addr(api.library), addr(cache), 0x101f, 0, 0, 0), kLibErrInvalidParam)
+        << "a cache under 0x1020 bytes";
+    EXPECT_EQ(cache[0], 0xccccccccu) << "...is refused before the header is written";
+    ASSERT_EQ(api.attach(addr(api.library), addr(cache), 0x3000, 0, 0, 0), 0u);
+    EXPECT_EQ(cache[0], 0x3000u) << "header: size";
+    EXPECT_EQ(cache[1], 2u) << "header: (size - 0x1000) >> 12 pages";
+    EXPECT_EQ(cache[2], 0u) << "header: nothing used";
+    EXPECT_EQ(cache[3], 2u) << "header: every page free";
+    uint64_t tail = 0;
+    std::memcpy(&tail, &cache[4], sizeof(tail));
+    EXPECT_EQ(tail, 0xff800001000ull);
+    EXPECT_EQ(api.attach(addr(api.library), addr(cache), 0x3000, 0, 0, 0), kLibErrCacheAttached)
+        << "one cache per library";
+
+    cache[2] = 5;   // the cache in use, as rendering would leave it
+    cache[3] = 0;
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(cache[2], 0u) << "Clear empties the cache...";
+    EXPECT_EQ(cache[3], 2u) << "...and frees every page";
+
+    void* back = nullptr;
+    uint32_t size = 0;
+    ASSERT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), 0u);
+    EXPECT_EQ(back, static_cast<void*>(cache)) << "the guest's own buffer is handed back";
+    EXPECT_EQ(size, 0x3000u);
+    EXPECT_EQ(cache[0], 0x3000u) << "the size word survives the detach";
+    EXPECT_EQ(cache[1], 0u) << "the rest of the header is cleared";
+    EXPECT_EQ(cache[5], 0u);
+    back = &back;
+    size = 7;
+    EXPECT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), kLibErrNoCache);
+    EXPECT_EQ(back, nullptr);
+    EXPECT_EQ(size, 0u);
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache) << "detached again";
+}
+
+TEST(Font, DeviceCacheEdgeCasesAndLibraryOwnedCaches) {
+    const LibraryApi api = library_api();
+    ASSERT_TRUE(api.ready());
+    alignas(8) uint32_t small[0x1800 / 4];
+    std::memset(small, 0xcc, sizeof(small));
+    EXPECT_EQ(api.attach(addr(api.library), addr(small), 0x1800, 0, 0, 0), kLibErrInvalidParam)
+        << "a size that yields no page is refused";
+    EXPECT_EQ(small[0], 0x1800u) << "...after the header was written, exactly as the firmware does";
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache) << "and not attached";
+
+    // A NULL buffer is allocated by the library; detaching frees it and hands nothing back.
+    ASSERT_EQ(api.attach(addr(api.library), 0, 0x8000, 0, 0, 0), 0u);
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), 0u);
+    void* back = &back;
+    uint32_t size = 7;
+    EXPECT_EQ(api.detach(addr(api.library), addr(&back), addr(&size), 0, 0, 0), 0u);
+    EXPECT_EQ(back, nullptr) << "a library-owned cache is freed, not handed back";
+    EXPECT_EQ(size, 0u);
+
+    // DestroyLibrary takes the attachment down with it.
+    alignas(8) uint32_t cache[0x2000 / 4]{};
+    ASSERT_EQ(api.attach(addr(api.library), addr(cache), 0x2000, 0, 0, 0), 0u);
+    void* doomed = api.library;
+    ASSERT_EQ(api.destroy(addr(&doomed), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(doomed, nullptr);
+    // prosper's library is one object, so the pointer still names it -- with no cache attached.
+    EXPECT_EQ(api.clear(addr(api.library), 0, 0, 0, 0, 0), kLibErrNoCache)
+        << "a destroyed library leaves no cache behind";
 }

@@ -65,7 +65,16 @@ struct FontMemory {
 };
 static_assert(sizeof(FontMemory) == 64);
 
-struct FontLibrary { uint64_t magic = kLibraryMagic; };
+// A font library. Besides its magic it carries the one piece of library state a guest can observe
+// back: the device-cache attachment (native library+0xb0), which sceFontAttachDeviceCacheBuffer
+// records, sceFontClearDeviceCache resets and sceFontDettachDeviceCacheBuffer / DestroyLibrary
+// release. prosper hands out a single library (g_library), so every library a title creates shares
+// this one attachment -- CONFIDENCE: MED that no title attaches through two libraries at once.
+struct FontLibrary {
+    uint64_t magic = kLibraryMagic;
+    uint8_t* device_cache = nullptr;   // the cache header, or null when none is attached
+    bool device_cache_owned = false;   // allocated by the library rather than passed by the guest
+};
 struct FontRenderer { uint64_t magic = kRendererMagic; };
 
 // A parsed memory font. Shared, because `sceFontOpenFontInstance` clones a face and both clones
@@ -448,6 +457,25 @@ int32_t font_create_renderer(const FontMemory*, const void*, uint64_t, void** ou
 int32_t font_destroy_handle(void** handle) {
     if (handle) *handle = nullptr;
     return 0;
+}
+FontLibrary* font_library(void* handle) {
+    auto* l = static_cast<FontLibrary*>(handle);
+    return l && l->magic == kLibraryMagic ? l : nullptr;
+}
+// Release whatever device cache the library holds: a library-owned header is freed, a guest buffer is
+// simply forgotten (the guest owns it).
+void release_device_cache(FontLibrary* l) {
+    if (l->device_cache_owned) std::free(l->device_cache);
+    l->device_cache = nullptr;
+    l->device_cache_owned = false;
+}
+// sceFontDestroyLibrary: the native export (0x2800) also takes down the device-cache attachment at
+// library+0xb0 (0x28e8), so a library created afterwards starts with none.
+int32_t font_destroy_library(void** handle) {
+    if (handle) {
+        if (auto* l = font_library(*handle)) release_device_cache(l);
+    }
+    return font_destroy_handle(handle);
 }
 // sceFontMemoryTerm(FontMemory*). `font_memory_init` allocates nothing -- it only fills in the
 // caller's own descriptor -- so releasing it IS clearing that descriptor, and there is no hidden
@@ -958,7 +986,11 @@ int32_t font_create_renderer_plain(const FontMemory* memory, const void* params,
 }
 constexpr int32_t kFontErrInvalidRenderer = static_cast<int32_t>(0x80460001u);
 constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
+constexpr int32_t kFontErrInvalidLibrary = static_cast<int32_t>(0x80460004u);
 constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
+constexpr int32_t kFontErrNoMemory = static_cast<int32_t>(0x80460010u);
+constexpr int32_t kFontErrCacheAttached = static_cast<int32_t>(0x80460022u);
+constexpr int32_t kFontErrNoCache = static_cast<int32_t>(0x80460025u);
 constexpr int32_t kFontErrNoRenderer = static_cast<int32_t>(0x80460061u);
 int32_t font_rebind_renderer(void* handle) {
     const auto* f = face(handle);
@@ -1016,6 +1048,103 @@ int32_t font_get_render_weight(void* handle, float* out_x, float* out_y, uint32_
         return kFontErrNoRenderer;
     }
     return font_get_weight(handle, out_x, out_y, out_mode);
+}
+
+// sceFontGetPixelResolution (BozJej5T6fs, 0x2750): a NULL library or one without its magic answers
+// 0x80460004 (the LIBRARY code; 0x80460005 is the face's); so does a library whose edition driver
+// (library+0x80) or its +0x10 callback is missing. A NULL out is 0x80460002, and every failure path
+// zeroes a non-NULL out. Otherwise the answer is the driver's +0x10 callback. prosper implements one
+// edition, FreeType: sceFontSelectLibraryFt (libSceFontFt 0x6cf0) returns its table at 0x1c000, whose
+// +0x10 entry relocates to 0xe1d0, `mov eax,0x40; ret` -- 64 sub-pixel units per pixel, i.e. the 26.6
+// fixed point FreeType works in. CONFIDENCE: HIGH.
+constexpr uint32_t kFtPixelResolution = 64;
+int32_t font_get_pixel_resolution(void* handle, uint32_t* out) {
+    if (!font_library(handle)) {
+        if (out) *out = 0;
+        return kFontErrInvalidLibrary;
+    }
+    if (!out) return kFontErrInvalidParam;
+    *out = kFtPixelResolution;
+    return 0;
+}
+
+// The device cache, native 0x13f0 (Attach) / 0x1560 (Clear) / 0x17f0 (Dettach -- Sony's spelling).
+// Attach(library, buffer, size): a bad library 0x80460004; a cache already attached 0x80460022; a size
+// under 0x1020 0x80460002. A NULL buffer is allocated by the library (0x80460010 when that fails).
+// The cache starts with a 0x18-byte header: {u32 size, u32 pages, u32 used, u32 free_pages,
+// u64 0xff800001000}, pages = (size - 0x1000) >> 12; a size that yields no page (under 0x2000) is
+// refused with 0x80460002 AFTER the header has been written, which is why that write comes first.
+// Clear(library): 0x80460004 for a bad library, 0x80460025 with nothing attached, otherwise
+// free_pages = pages and used = 0. Dettach(library, buffer*, size*): 0x80460004 / 0x80460025 as above
+// (both outs zeroed), otherwise the header after the size is zeroed and the guest's own buffer and
+// size are handed back; a library-owned cache is freed and both outs are zeroed instead.
+// prosper rasterizes without a glyph cache, so the pages are never used -- but the attachment, its
+// header and the error codes are what a title can observe, and they are modelled exactly. A
+// library-owned cache needs only its header on the host, since no guest pointer to it ever escapes.
+// CONFIDENCE: HIGH on the codes and the header; MED on the single shared library (see FontLibrary).
+constexpr size_t kDeviceCacheHeader = 0x18;
+int32_t font_attach_device_cache(void* handle, void* buffer, uint32_t size) {
+    auto* l = font_library(handle);
+    if (!l) return kFontErrInvalidLibrary;
+    if (l->device_cache) return kFontErrCacheAttached;
+    if (size < 0x1020) return kFontErrInvalidParam;
+    auto* cache = static_cast<uint8_t*>(buffer);
+    const bool owned = cache == nullptr;
+    if (owned) {
+        cache = static_cast<uint8_t*>(std::calloc(1, kDeviceCacheHeader));
+        if (!cache) return kFontErrNoMemory;
+    }
+    const uint32_t pages = (size - 0x1000u) >> 12;
+    const uint32_t header[4] = {size, pages, 0, pages};
+    const uint64_t tail = 0xff800001000ull;
+    std::memcpy(cache, header, sizeof(header));
+    std::memcpy(cache + sizeof(header), &tail, sizeof(tail));
+    if (pages == 0) {
+        if (owned) std::free(cache);
+        return kFontErrInvalidParam;
+    }
+    l->device_cache = cache;
+    l->device_cache_owned = owned;
+    return 0;
+}
+int32_t font_clear_device_cache(void* handle) {
+    auto* l = font_library(handle);
+    if (!l) return kFontErrInvalidLibrary;
+    if (!l->device_cache) return kFontErrNoCache;
+    uint32_t pages = 0;
+    std::memcpy(&pages, l->device_cache + 4, sizeof(pages));
+    const uint32_t used = 0;
+    std::memcpy(l->device_cache + 8, &used, sizeof(used));
+    std::memcpy(l->device_cache + 12, &pages, sizeof(pages));
+    return 0;
+}
+int32_t font_detach_device_cache(void* handle, void** out_buffer, uint32_t* out_size) {
+    auto clear_outs = [&] {
+        if (out_buffer) *out_buffer = nullptr;
+        if (out_size) *out_size = 0;
+    };
+    auto* l = font_library(handle);
+    if (!l) {
+        clear_outs();
+        return kFontErrInvalidLibrary;
+    }
+    uint8_t* cache = l->device_cache;
+    if (!cache) {
+        clear_outs();
+        return kFontErrNoCache;
+    }
+    uint32_t size = 0;
+    std::memcpy(&size, cache, sizeof(size));
+    std::memset(cache + 4, 0, kDeviceCacheHeader - 4);
+    const bool owned = l->device_cache_owned;
+    release_device_cache(l);
+    if (owned) {
+        clear_outs();
+        return 0;
+    }
+    if (out_buffer) *out_buffer = cache;
+    if (out_size) *out_size = size;
+    return 0;
 }
 
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
@@ -1112,7 +1241,7 @@ void register_font_hle() {
     R("n590hj5Oe-k", (HleFn)font_create_library, "sceFontCreateLibraryWithEdition");
     R("WaSFJoRWXaI", (HleFn)font_create_renderer, "sceFontCreateRendererWithEdition");
     R("exAxkyVLt0s", (HleFn)font_destroy_handle, "sceFontDestroyRenderer");
-    R("FXP359ygujs", (HleFn)font_destroy_handle, "sceFontDestroyLibrary");
+    R("FXP359ygujs", (HleFn)font_destroy_library, "sceFontDestroyLibrary");
     R("h6hIgxXEiEc", (HleFn)font_memory_term, "sceFontMemoryTerm");
     R("SSCaczu2aMQ", (HleFn)font_destroy_string, "sceFontDestroyString");
     R("PEjv7CVDRYs", (HleFn)font_ok, "sceFontDestroyWritingLine");
@@ -1153,10 +1282,14 @@ void register_font_hle() {
     Hle::register_typed("i6UNdSig1uE", font_render_char_glyph_image_vertical,
                         "sceFontRenderCharGlyphImageVertical");
     Hle::register_typed("sw65+7wXCKE", font_set_scale, "sceFontSetScalePoint");
+    // The library's device-cache attachment and its pixel resolution (see font_attach_device_cache).
+    R("CUKn5pX-NVY", (HleFn)font_attach_device_cache, "sceFontAttachDeviceCacheBuffer");
+    R("UuY-OJF+f0k", (HleFn)font_detach_device_cache, "sceFontDettachDeviceCacheBuffer");
+    R("I9R5VC6eZWo", (HleFn)font_clear_device_cache, "sceFontClearDeviceCache");
+    R("BozJej5T6fs", (HleFn)font_get_pixel_resolution, "sceFontGetPixelResolution");
     // Intentional no-op lifecycle/capability surface used during Astro's initialization.
     R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
     R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
-    R("CUKn5pX-NVY", (HleFn)font_ok, "sceFontAttachDeviceCacheBuffer");
     R("7rogx92EEyc", (HleFn)font_ok, "sceFontCreateWritingLine");
     R("1+DgKL0haWQ", (HleFn)font_ok, "sceFontWritingLineClear");
     R("JQKWIsS9joE", (HleFn)font_ok, "sceFontWritingLineGetOrderingSpace");
