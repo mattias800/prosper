@@ -6,6 +6,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+- `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
+  shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
+  buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`
+  is the static admission over the linked program (launch SGPR/VGPR reads, EXEC, side effects,
+  messages, export shapes), each refusal named; `ngg_export_record` is the record layout the
+  pass-through draw consumes. Compile and offline execution only; nothing live dispatches it.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
@@ -15,6 +21,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   which refuses the branch under narrowed EXEC.
 - `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
   every compute and fragment shell runs before emission; it only fills `RegState` facts.
+- `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask
+  logical whose result no observable read can reach.
+- `rdna2_spilled_mask_halves` — a CFG MUST fact the dispatcher's Wave64 mask analysis carries:
+  which saved-mask instance each `v_writelane` slot and reloaded SGPR holds a half of, so a pair
+  reassembled from both halves of one mask stays a mask across a block edge.
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.

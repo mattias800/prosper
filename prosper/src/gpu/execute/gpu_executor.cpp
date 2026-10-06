@@ -37,6 +37,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
+#include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -3032,6 +3033,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                       uint32_t pcrel_dispatch_target, const PcrelDispatchInfo* pcrel_dispatch,
                       const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader,
                       const CheckedGraphicsSource* checked_source) {
+    const size_t srt_before = srt_uses ? srt_uses->size() : 0;
+    std::vector<DynFetch> out = resolve_dynamic_fetch_fold(
+        code, dwords, user_sgprs, nsgpr, user_sgpr_base, srt_uses, pcrel_dispatch_target,
+        pcrel_dispatch, system_sgprs, nsystem_sgprs, reader, checked_source);
+    // After the fold, never inside it: the mapping table is not a FoldReader-recorded input, so a
+    // clamp decided inside the fold would make a `.prfold` replay disagree with its capture.
+    if (srt_uses) resolve_oversized_buffer_windows(*srt_uses, srt_before);
+    return out;
+}
+
+std::vector<DynFetch>
+// NOLINTNEXTLINE(readability-function-size): the pre-existing fold body, renamed here, not grown.
+resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs,
+                           uint32_t nsgpr, uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
+                           uint32_t pcrel_dispatch_target, const PcrelDispatchInfo* pcrel_dispatch,
+                           const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader,
+                           const CheckedGraphicsSource* checked_source) {
     dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     if (checked_source && (!checked_source->current() ||
                            checked_source->address() != reinterpret_cast<uint64_t>(code) ||
@@ -5249,9 +5267,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         const bool same_code = code && decoded->code.size() <= dwords &&
                             std::memcmp(code, decoded->code.data(),
                                         decoded->code.size() * sizeof(uint32_t)) == 0;
-                        mapped_t8 = same_code && mapped_split_t8_reaches_use(
-                            code, std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u), in.pc, tbase,
-                            mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr, user_sgpr_base);
+                        // Earlier storage-image uses already published, with a footprint bound each.
+                        std::vector<ImageWriteExtent> image_writes;
+                        if (srt_uses)
+                            for (const SrtUse& earlier : *srt_uses) {
+                                ImageWriteExtent extent;
+                                if (earlier.kind == 0 && earlier.is_storage_image &&
+                                    storage_image_write_extent(earlier.t8, extent.lo, extent.hi)) {
+                                    extent.pc = earlier.use_pc;
+                                    image_writes.push_back(extent);
+                                }
+                            }
+                        mapped_t8 =
+                            same_code &&
+                            mapped_split_t8_reaches_use(
+                                code,
+                                std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u),
+                                in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
+                                user_sgpr_base, image_writes);
                     }
                     const std::array<uint32_t, 8>* t8 =
                         live_t8_known && (!branchy_x16 || mapped_t8) &&
@@ -5461,7 +5494,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             // must then resolve through this consuming instruction's exact pc.
                             if (have_common_key) u.key = common_key;
                         }
-                        DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                         const uint32_t atomic_x2_record_count = atomic_x2_candidate
                             ? exact_atomic_x2_record_count(in, d, u.v4.data()) : 0u;
                         if (atomic_x2_record_count)
@@ -5546,12 +5579,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             gta5_null_pointer_at_guard &&
                             gta5_null_raw_store_descriptor(u.v4) &&
                             rdna2_gta5_null_guarded_raw_store_site(in);
-                        if (proven_null_guarded_raw_store || zero_record_raw ||
-                            optional_null_raw_load || proven_null_nullable_raw_buffer ||
+                        const bool special_raw_use = proven_null_guarded_raw_store ||
+                                                     zero_record_raw || optional_null_raw_load ||
+                                                     proven_null_nullable_raw_buffer;
+                        // A "view of guest memory" window far past the 256 MiB cap is, in practice,
+                        // one mapped run. Publish it MARKED with its V# unchanged; whether the
+                        // mapping table proves it is that run is decided after the fold, where the
+                        // table may be read (oversize_buffer_window.hpp). Atomic x2 shapes, whose
+                        // record count is itself a proof, stay refused.
+                        const bool oversize_window_use = !special_raw_use && !format_load_use &&
+                                                         !atomic_x2_candidate && d.base > 0x10000 &&
+                                                         d.size_bytes > 0x10000000u &&
+                                                         stride_supported && format_supported;
+                        if (special_raw_use || oversize_window_use ||
                             (!format_load_use &&
-                            (d.base > 0x10000 && d.size_bytes != 0 &&
-                             d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
-                             (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
+                             (d.base > 0x10000 && d.size_bytes != 0 &&
+                              d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
+                              (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
+                            u.oversize_window = oversize_window_use;
                             u.zero_record_raw = zero_record_raw;
                             u.optional_null_raw_load = optional_null_raw_load;
                             u.proven_null_guarded_raw_store =
@@ -7932,9 +7977,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // it (one Kena run published 28,012), so report the first 8 and then
                         // powers of two.
                         static std::atomic<uint64_t> null_images{0};
-                        // PROSPER_ENV_ON reads the environment once, in a static initializer.
-                        const bool dbg =
-                            PROSPER_ENV_ON("PROSPER_DBG");   // NOLINT(concurrency-mt-unsafe)
+                        // A live read, not PROSPER_ENV_ON: tests arm PROSPER_DBG at run time, and a
+                        // cached read would never see it (cached_env_arming_logic, #4602).
+                        // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only diagnostic switch
+                        const bool dbg = std::getenv("PROSPER_DBG") != nullptr;
                         const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
                         if (null_ordinal &&
                             (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))

@@ -879,20 +879,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         reduced_wave_mask = true;
                     }
                 }
-                if (!reduced_wave_mask && b.ngg_workgroup_export_probe &&
-                    b.wave_size == 64 && b.local_count == 64 &&
+                if (!reduced_wave_mask && b.ngg_workgroup_shell && b.wave_size == 64 &&
+                    b.local_count == 64 &&
                     (allow_wave || b.ngg_uniform_wave_reduction_pcs.contains(in.pc)) &&
-                    in.src[0].kind == OperandKind::SGPR &&
-                    mask != rs.sreg_bool.end() &&
-                    !rs.sreg.contains(in.src[0].value) &&
-                    !rs.sreg.contains(in.src[0].value + 1) &&
+                    in.src[0].kind == OperandKind::SGPR && mask != rs.sreg_bool.end() &&
+                    !rs.sreg.contains(in.src[0].value) && !rs.sreg.contains(in.src[0].value + 1) &&
                     !rs.sreg_input.contains(in.src[0].value) &&
                     !rs.sreg_input.contains(in.src[0].value + 1)) {
-                    // This test-only workgroup shell has one complete guest Wave64. Its LDS
-                    // reduction can count a saved VOPC mask without a native Wave64 subgroup.
+                    // A one-wave merged-NGG workgroup shell holds one complete guest Wave64. Its
+                    // LDS reduction can count a saved VOPC mask without a native Wave64 subgroup.
                     // The compact walk supplies allow_wave only for straight-line execution; the
-                    // dispatcher has a separate branch-free region proof. A production graphics
-                    // path still needs a workgroup/draw ABI proof before executing this module.
+                    // dispatcher has a separate branch-free region proof. The shell's static ABI
+                    // admission (ngg_subgroup_abi) is what makes its launch state trustworthy.
                     result = b.guest_wave_popcount(mask->second);
                     reduced_wave_mask = true;
                 }
@@ -5467,11 +5465,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // so accepting them as no-ops would silently execute the wrong path.
             switch (in.opcode) {
                 // Hints / sync with no effect in our synchronous SSA model — safe no-ops.
+                case 0x10:   // s_sendmsg: no-op, except GS_ALLOC_REQ in the NGG subgroup shell
+                    if (b.ngg_alloc_request) ok = b.ngg_alloc_request(rs, in);
+                    break;
                 case 0x00:   // s_nop
                 case 0x0c:   // s_waitcnt        (no async memory latency to wait on)
-                case 0x10:   // s_sendmsg        (NGG GS_ALLOC_REQ etc. — no wave/primitive allocation in
-                             //                   our per-invocation model; only meaningful for NGG/GS,
-                             //                   which we lower per-invocation, so it's a safe no-op)
                 case 0x16:   // s_ttracedata     (sends M0 to the thread-trace stream — a profiling side
                              //                   channel with no architectural effect: it writes no SGPR,
                              //                   VGPR, or memory and does not branch. Prosper models no

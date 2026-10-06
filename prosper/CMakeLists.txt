@@ -927,6 +927,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_split_t8_sop2_width.cpp
     INCLUDES src
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_split_t8_image_write_extent
+    SOURCES tests/gpu/recompiler/test_split_t8_image_write_extent.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_tail_blocks
     SOURCES tests/gpu/recompiler/test_split_t8_tail_blocks.cpp
     INCLUDES src
@@ -1287,6 +1291,13 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_ngg_subgroup_plan
     SOURCES tests/gpu/execute/test_ngg_subgroup_plan.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
+  # #3135 P2: static admission of a linked merged-NGG program for the subgroup shell. Pure decode
+  # and dataflow; the captured Kena chain is read from tests/data.
+  prosper_add_gtest(test_ngg_subgroup_abi
+    SOURCES tests/gpu/recompiler/test_ngg_subgroup_abi.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
 
@@ -2618,6 +2629,12 @@ if(TARGET prosper_core)
   # free aligned block in the search window and writes both out-params (was a total-size stub).
   prosper_add_gtest(test_dmem
     SOURCES tests/host/test_dmem.cpp
+    LIBRARIES prosper_core)
+
+  # An over-cap buffer window publishes clamped to its mapped run, outside the replayable fold.
+  prosper_add_gtest(test_oversize_buffer_window
+    SOURCES tests/gpu/execute/test_oversize_buffer_window.cpp
+    INCLUDES src
     LIBRARIES prosper_core)
 
   # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
@@ -4934,6 +4951,13 @@ endif()
         SOURCES tests/gpu/execute/test_memory_fed_raw_wide_exec.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
+      # #3135 P2: the merged-NGG subgroup shell executed offline on Kena's linked LUT producer,
+      # with the planner's launch and the discriminating launch-model controls.
+      prosper_add_gtest(test_ngg_subgroup_shell
+        SOURCES tests/gpu/execute/test_ngg_subgroup_shell.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
       add_executable(test_ngg_workgroup_contract
                      tests/gpu/execute/test_ngg_workgroup_contract.cpp)
       target_include_directories(test_ngg_workgroup_contract PRIVATE tests)
@@ -5060,6 +5084,20 @@ endif()
       # counted-loop route declines and the general route lowers both loops, executed per lane.
       prosper_add_gtest(test_counted_loop_prelude_exec_loop
         SOURCES tests/gpu/recompiler/test_counted_loop_prelude_exec_loop.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The CFG dispatcher's spill-slot domain is decided per V_WRITELANE (Kena 0x5008ec0000):
+      # a data spill of an SGPR that holds a mask elsewhere survives a block edge, executed.
+      prosper_add_gtest(test_cfg_spill_slot_domain
+        SOURCES tests/gpu/recompiler/test_cfg_spill_slot_domain.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A Wave64 mask rebuilt from its two spilled halves stays a mask across a CFG-dispatcher
+      # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
+      prosper_add_gtest(test_cfg_spilled_mask_halves
+        SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
