@@ -63,15 +63,14 @@ bool emit_portable_compute_dpp_row_shr_phase(SpirvCompute& b,
     b.barrier();
 
     const uint32_t dpp_control = b.load_function(b.t_u32, variables.amount);
-    // The bounded form belongs to the compile-only NGG probe. Preserve the established GTA
-    // unbounded reduction's generated graph and invalid-source write rule outside that probe.
+    // The bounded form belongs to the merged-NGG workgroup shell. Preserve the established GTA
+    // unbounded reduction's generated graph and invalid-source write rule outside that shell.
     const uint32_t dpp_bounded =
         b.ngg_workgroup_shell
             ? b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0x100)), zero)
             : no;
-    const uint32_t dpp_amount = b.ngg_workgroup_shell
-                                    ? b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0xf))
-                                    : dpp_control;
+    const uint32_t dpp_amount =
+        b.ngg_workgroup_shell ? b.ibin(Op_BitwiseAnd, dpp_control, b.uconst(0xf)) : dpp_control;
     const uint32_t dpp_row_lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(15));
     const uint32_t dpp_in_bounds = b.ucmp(Op_UGreaterThanEqual, dpp_row_lane, dpp_amount);
     // Keep even the disabled lane's scratch address valid. BOUND_CTRL=0 uses the validity gate
@@ -88,18 +87,18 @@ bool emit_portable_compute_dpp_row_shr_phase(SpirvCompute& b,
         b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, dpp_source_metadata, b.uconst(1)), zero);
     uint32_t dpp_valid_source = b.land(dpp_in_bounds, dpp_source_active);
     dpp_valid_source = b.land(dpp_valid_source, b.ucmp(Op_IEqual, dpp_source_event, dpp_event));
-    uint32_t dpp_result = b.ibin(
-        Op_IAdd, dpp_source,
-        b.ngg_workgroup_shell ? b.sel(dpp_valid_source, dpp_shifted, zero) : dpp_shifted);
+    uint32_t dpp_result =
+        b.ibin(Op_IAdd, dpp_source,
+               b.ngg_workgroup_shell ? b.sel(dpp_valid_source, dpp_shifted, zero) : dpp_shifted);
     // Allocate and consume an operation field only for streams containing MAX. An ADD-only
     // stream retains its previous IDs and graph exactly. Static events isolate different sites.
     if (variables.maximum) {
         const uint32_t maximum = b.load_function(b.t_bool, variables.maximum);
         dpp_result = b.sel(maximum, b.uext2(Glsl_UMax, dpp_source, dpp_shifted), dpp_result);
     }
-    const uint32_t dpp_write = b.land(
-        b.land(dpp_pending, dpp_active),
-        b.ngg_workgroup_shell ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);
+    const uint32_t dpp_write =
+        b.land(b.land(dpp_pending, dpp_active),
+               b.ngg_workgroup_shell ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);
     const uint32_t dpp_dst = b.load_function(b.t_u32, variables.destination);
     for (int reg : destinations) {
         const auto kv = vv.find(reg);
