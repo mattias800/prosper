@@ -1269,6 +1269,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_dcc_helper_program.cpp
     INCLUDES src)
 
+  # #1588: AGC's eliminate-fast-clear rectangle writes no colour; a latched MODE=2 on an ordinary
+  # draw still does. Matcher arms plus realize_draw_item arms (no device needed).
+  prosper_add_gtest(test_efc_helper_program
+    SOURCES tests/gpu/execute/test_efc_helper_program.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
