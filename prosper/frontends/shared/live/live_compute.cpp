@@ -1468,7 +1468,7 @@ struct VulkanComputeContext {
     ComputeMemoryPool memory_pool;
     std::unordered_map<ComputeBufferCacheKey, CachedComputeBuffer,
                        ComputeBufferCacheKeyHash> buffer_cache;
-    BufferArenaRegistry buffer_arenas;   // ADR 0010: shared resident copies of overlapping windows
+    BufferArenaRegistry buffer_arenas;   // shared resident copies of overlapping windows (interim, see buffer_arena_plan.hpp)
     VkDeviceSize buffer_cache_bytes = 0;
     uint64_t buffer_cache_clock = 0;
     std::unordered_map<ComputeImageCacheKey, CachedComputeImage,
@@ -2232,6 +2232,20 @@ struct VulkanComputeContext {
             buffer_cache.erase(victim);
         }
         return true;
+    }
+
+    // A replaced arena's entry is dead weight against the cache budget; drop it unless a dispatch
+    // still holds it.
+    void drop_cached_buffer(const ComputeBufferCacheKey& key) {
+        const auto found = buffer_cache.find(key);
+        if (found == buffer_cache.end() || found->second.pins) return;
+        found->second.write_watches.clear();
+        if (found->second.buffer) vkDestroyBuffer(device, found->second.buffer, nullptr);
+        if (found->second.memory) release_memory(found->second.memory);
+        if (found->second.result_buffer) vkDestroyBuffer(device, found->second.result_buffer, nullptr);
+        if (found->second.result_memory) release_memory(found->second.result_memory);
+        buffer_cache_bytes -= found->second.allocation_bytes;
+        buffer_cache.erase(found);
     }
 
     bool acquire_cached_buffer(const ComputeBufferCacheKey& key, const uint8_t* source,
@@ -6795,6 +6809,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          (unsigned long long)(resource ? resource->gpu_addr : 0),
                          resource ? resource->size : 0, why);
         };
+        // Settle which bindings alias a WRITABLE one before any arena is chosen: the loop below
+        // discovers aliases one binding at a time, and a later writable alias would otherwise turn an
+        // already arena-backed owner writable.
+        std::vector<BufferAliasKey> alias_keys(buffers.size());
+        for (size_t k = 0; k < buffers.size(); ++k) {
+            const ShaderResource& r = buffer_resources[k];
+            alias_keys[k] = {r.gpu_addr, r.size, reinterpret_cast<uintptr_t>(r.host_data),
+                             r.host_data_size, descriptors[buffers[k].descriptor_index].writable};
+        }
         for (size_t i = 0; i < buffers.size(); i++) {
             const size_t descriptor_index = buffers[i].descriptor_index;
             const SpirvDescriptorBinding& descriptor = descriptors[descriptor_index];
@@ -6987,12 +7010,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool cache_candidate = !buffers[i].atomic_image &&
                     persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
                 timing.cache = "ineligible";
-                // ADR 0010: a read-only, plain, guest-backed window shares one resident arena with
-                // its overlapping neighbours instead of owning a copy (see buffer_arena_plan.hpp).
+                // A read-only, plain, guest-backed window that overlaps windows already seen shares one
+                // resident arena with them (see buffer_arena_plan.hpp). Never when a binding of this
+                // dispatch aliasing the same guest range is writable: the shader would write through
+                // the shared arena while the writeback and result paths address the window at offset 0.
                 size_t upload_bytes = buffers[i].bytes;
                 const uint8_t* upload_source = source;
                 static const bool arenas_enabled = !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_BUFFER_ARENA");
                 if (arenas_enabled && cache_candidate && !buffers[i].writable &&
+                    !buffer_alias_group_has_writer(alias_keys, i) &&
                     !resource->host_data && !materialization.zero_padded_tail &&
                     materialization.logical_bytes == materialization.binding_bytes) {
                     const uint64_t window = resource->gpu_addr, span = buffers[i].bytes;
@@ -7000,10 +7026,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ctx.buffer_arenas, window, span, ctx.storage_buffer_offset_alignment,
                         guest_readable);
                     if (plan.action != BufferArenaAction::Private) {
+                        const ComputeBufferCacheKey window_key = buffers[i].cache_key;
+                        for (const BufferArenaExtent& gone : plan.replaces)
+                            ctx.drop_cached_buffer(buffer_arena_cache_key(window_key, gone));
                         upload_bytes = static_cast<size_t>(plan.arena.bytes);
                         upload_source = reinterpret_cast<const uint8_t*>(plan.arena.base);
                         buffers[i].buffer_offset = plan.offset;
-                        buffers[i].cache_key = buffer_arena_cache_key(buffers[i].cache_key, plan);
+                        buffers[i].cache_key = buffer_arena_cache_key(window_key, plan.arena);
                     }
                 }
                 if (cache_candidate && ctx.acquire_cached_buffer(
