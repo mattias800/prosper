@@ -7,14 +7,18 @@ source identity became "unknown", and every fragment compile case was then marke
 `fragment_compile_case`, `fragment_compile_case_cli` and `spv_validate` failed on such a build
 while passing in CI.
 
-The arms build real wrapper layouts on disk (a fake `ccache` and a `c++` symlink to it, in front of
+The tests build real wrapper layouts on disk (a fake `ccache` and a `c++` symlink to it, in front of
 a directory holding the real compiler) and assert both directions: each supported spelling resolves
 to the real compiler, and each layout with no real compiler behind the wrapper still fails closed.
-The end-to-end arm runs `dependencies()` itself, so it fails if the unwrapping is not wired in.
+The end-to-end test runs `dependencies()` itself, so it fails if the unwrapping is not wired in.
+
+pytest collects the `test_*` functions. ctest runs this file directly, without pytest, through the
+small runner at the bottom; a host with no POSIX symlinks or no C++ compiler skips (exit 77).
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -22,59 +26,63 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 SKIP = 77
-failures = 0
-checks = 0
+MODULE_PATH = pathlib.Path(__file__).with_name("compiler_dependencies.py")
 
 
-def check(condition: bool, label: str) -> None:
-    global failures, checks
-    checks += 1
-    if not condition:
-        failures += 1
-        print(f"[FAIL] {label}")
+class _Skip(Exception):
+    pass
 
 
-def refuses(call, label: str) -> None:
-    try:
-        call()
-    except ValueError:
-        check(True, label)
-    else:
-        check(False, label)
+# Set by the ctest runner below. The skip mechanism follows how the file was started, never whether
+# pytest happens to import: pytest.skip raises a BaseException the runner must not have to catch.
+_UNDER_RUNNER = False
 
 
-def main() -> int:
+def _skip(reason: str) -> None:
+    if _UNDER_RUNNER:
+        raise _Skip(reason)
+    import pytest
+
+    pytest.skip(reason)
+
+
+def _scanner():
+    spec = importlib.util.spec_from_file_location("compiler_dependencies", MODULE_PATH)
+    scanner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scanner)
+    return scanner
+
+
+def _real_compiler() -> pathlib.Path:
+    """A real compiler, not a wrapper: a ccache build host may well put the masquerade first."""
     if os.name == "nt":
-        print("compiler wrapper: SKIP (POSIX symlink layouts only)")
-        return SKIP
-    # A real compiler, not a wrapper: a ccache build host may well put the masquerade first.
-    real = None
+        _skip("POSIX symlink layouts only")
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         for name in ("c++", "g++", "clang++"):
             candidate = pathlib.Path(entry or ".") / name
-            if real is None and candidate.is_file() and os.access(candidate, os.X_OK):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
                 target = candidate.resolve(strict=True)
                 if target.name not in ("ccache", "sccache"):
-                    real = target
-    if real is None:
-        print("compiler wrapper: SKIP (no C++ compiler on PATH)")
-        return SKIP
+                    return target
+    _skip("no C++ compiler on PATH")
+    raise AssertionError("unreachable")
 
-    module_path = pathlib.Path(__file__).with_name("compiler_dependencies.py")
-    spec = importlib.util.spec_from_file_location("compiler_dependencies", module_path)
-    scanner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(scanner)
 
+@contextlib.contextmanager
+def _layout():
+    """wrap/ccache (answers `-k <key>` from FAKE_CCACHE_<KEY>), wrap/c++ -> ccache, real/c++."""
+    real = _real_compiler()
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
         root = pathlib.Path(scratch)
         wrap, real_dir, empty = root / "wrap", root / "real", root / "empty"
         for d in (wrap, real_dir, empty):
             d.mkdir()
         ccache = wrap / "ccache"
-        # Answers `ccache -k <key>` from FAKE_CCACHE_<KEY> (empty when unset), like ccache's own
-        # config query; anything else is a compile, which this fixture must never be asked to do.
+        # Like ccache's own config query; anything else is a compile, which this fixture must never
+        # be asked to do.
         ccache.write_text(
             '#!/bin/sh\nif [ "$1" = "-k" ]; then\n'
             '  case "$2" in\n'
@@ -88,152 +96,190 @@ def main() -> int:
         ccache.chmod(0o755)
         (wrap / "c++").symlink_to(ccache)
         (real_dir / "c++").symlink_to(real)
-        search = os.pathsep.join([str(wrap), str(real_dir)])
-
-        # Undecorated drivers pass through untouched.
-        compiler, args = scanner.unwrap_compiler([str(real_dir / "c++"), "-c", "x.cpp"], search)
-        check(compiler == real and args[0] == str(real_dir / "c++"), "a plain driver is unchanged")
-
-        # Masquerade: the wrapper's own directory is skipped and the later `c++` is the compiler.
-        compiler, args = scanner.unwrap_compiler([str(wrap / "c++"), "-O2", "-c", "x.cpp"], search)
-        check(compiler == real, "masquerade resolves to the real compiler")
-        check(args == [str(real), "-O2", "-c", "x.cpp"], "masquerade keeps every flag")
-
-        # Explicit: `ccache c++ ...` drops the wrapper argument.
-        compiler, args = scanner.unwrap_compiler(
-            [str(ccache), "c++", "-O2", "-c", "x.cpp"], os.pathsep.join([str(real_dir)])
+        yield SimpleNamespace(
+            root=root,
+            wrap=wrap,
+            real_dir=real_dir,
+            empty=empty,
+            ccache=ccache,
+            real=real,
+            search=os.pathsep.join([str(wrap), str(real_dir)]),
+            scanner=_scanner(),
         )
-        check(compiler == real, "explicit wrapper resolves to the real compiler")
-        check(args == [str(real), "-O2", "-c", "x.cpp"], "explicit wrapper argument is dropped")
 
-        # Fail closed where the wrapper has nothing real behind it.
-        refuses(
-            lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], str(wrap)),
-            "masquerade with only the wrapper on PATH refuses",
-        )
-        refuses(
-            lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], str(empty)),
-            "masquerade with no compiler on PATH refuses",
-        )
-        refuses(
-            lambda: scanner.unwrap_compiler([str(ccache), "-O2", "-c", "x.cpp"], search),
-            "explicit wrapper followed by a flag refuses",
-        )
-        refuses(
-            lambda: scanner.unwrap_compiler([str(ccache), "c++", "-c", "x.cpp"], str(wrap)),
-            "explicit wrapper that finds only itself refuses",
-        )
-        compiler, _ = scanner.unwrap_compiler([str(ccache), str(real_dir / "c++"), "-c"], "")
-        check(compiler == real, "explicit wrapper with an absolute compiler path")
 
+def _refuses(call) -> bool:
+    try:
+        call()
+    except ValueError:
+        return True
+    return False
+
+
+def test_a_plain_driver_is_unchanged():
+    with _layout() as lay:
+        driver = str(lay.real_dir / "c++")
+        compiler, args = lay.scanner.unwrap_compiler([driver, "-c", "x.cpp"], lay.search)
+        assert compiler == lay.real and args[0] == driver
+
+
+def test_masquerade_resolves_to_the_real_compiler_and_keeps_every_flag():
+    with _layout() as lay:
+        compiler, args = lay.scanner.unwrap_compiler(
+            [str(lay.wrap / "c++"), "-O2", "-c", "x.cpp"], lay.search
+        )
+        assert compiler == lay.real
+        assert args == [str(lay.real), "-O2", "-c", "x.cpp"]
+
+
+def test_explicit_wrapper_drops_its_argument():
+    with _layout() as lay:
+        compiler, args = lay.scanner.unwrap_compiler(
+            [str(lay.ccache), "c++", "-O2", "-c", "x.cpp"], str(lay.real_dir)
+        )
+        assert compiler == lay.real
+        assert args == [str(lay.real), "-O2", "-c", "x.cpp"]
+        compiler, _ = lay.scanner.unwrap_compiler(
+            [str(lay.ccache), str(lay.real_dir / "c++"), "-c"], ""
+        )
+        assert compiler == lay.real, "an absolute compiler path after the wrapper"
+
+
+def test_a_wrapper_with_nothing_real_behind_it_refuses():
+    with _layout() as lay:
+        s = lay.scanner
+        masquerade = [str(lay.wrap / "c++"), "-c", "x.cpp"]
+        assert _refuses(lambda: s.unwrap_compiler(masquerade, str(lay.wrap))), "only the wrapper"
+        assert _refuses(lambda: s.unwrap_compiler(masquerade, str(lay.empty))), "no compiler"
+        assert _refuses(
+            lambda: s.unwrap_compiler([str(lay.ccache), "-O2", "-c", "x.cpp"], lay.search)
+        ), "explicit wrapper followed by a flag"
+        assert _refuses(
+            lambda: s.unwrap_compiler([str(lay.ccache), "c++", "-c", "x.cpp"], str(lay.wrap))
+        ), "explicit wrapper that finds only itself"
+
+
+def test_a_second_wrapper_behind_the_masquerade_refuses():
+    with _layout() as lay:
         # A DIFFERENT wrapper later on PATH is the next link of a chain, not something to skip.
-        other = root / "other"
+        other = lay.root / "other"
         other.mkdir()
         sccache = other / "sccache"
         sccache.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
         sccache.chmod(0o755)
         (other / "c++").symlink_to(sccache)
-        chain = os.pathsep.join([str(wrap), str(other), str(real_dir)])
-        refuses(
-            lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], chain),
-            "a second wrapper behind the masquerade refuses",
+        chain = os.pathsep.join([str(lay.wrap), str(other), str(lay.real_dir)])
+        assert _refuses(
+            lambda: lay.scanner.unwrap_compiler([str(lay.wrap / "c++"), "-c", "x.cpp"], chain)
         )
 
-        # A relative or empty PATH entry ahead of the match would resolve against the compile's
-        # directory, not this process's, so the lookup refuses rather than pick one.
-        for label, entry in (("relative", "bin"), ("empty", "")):
-            refuses(
-                lambda entry=entry: scanner.unwrap_compiler(
-                    [str(wrap / "c++"), "-c", "x.cpp"],
-                    os.pathsep.join([str(wrap), entry, str(real_dir)]),
-                ),
-                f"{label} PATH entry ahead of the compiler refuses",
-            )
 
-        # ccache's own overrides replace the lookup; with any of them set the identity refuses.
+def test_a_relative_or_empty_path_entry_ahead_of_the_compiler_refuses():
+    # It would resolve against the compile's directory, not this process's.
+    with _layout() as lay:
+        for entry in ("bin", ""):
+            search = os.pathsep.join([str(lay.wrap), entry, str(lay.real_dir)])
+            assert _refuses(
+                lambda search=search: lay.scanner.unwrap_compiler(
+                    [str(lay.wrap / "c++"), "-c", "x.cpp"], search
+                )
+            ), repr(entry)
+
+
+def test_ccache_overrides_refuse():
+    # ccache's own settings replace the lookup; with any of them set the identity refuses.
+    with _layout() as lay:
         for key in ("COMPILER", "PATH", "PREFIX_COMMAND"):
-            os.environ[f"FAKE_CCACHE_{key}"] = "clang++" if key != "PATH" else str(real_dir)
-            scanner.wrapper_overrides_unset.cache_clear()
-            refuses(
-                lambda: scanner.unwrap_compiler([str(wrap / "c++"), "-c", "x.cpp"], search),
-                f"ccache {key.lower()} override refuses",
-            )
-            del os.environ[f"FAKE_CCACHE_{key}"]
-        scanner.wrapper_overrides_unset.cache_clear()
+            os.environ[f"FAKE_CCACHE_{key}"] = "clang++" if key != "PATH" else str(lay.real_dir)
+            lay.scanner.wrapper_overrides_unset.cache_clear()
+            try:
+                assert _refuses(
+                    lambda: lay.scanner.unwrap_compiler(
+                        [str(lay.wrap / "c++"), "-c", "x.cpp"], lay.search
+                    )
+                ), key
+            finally:
+                del os.environ[f"FAKE_CCACHE_{key}"]
+        lay.scanner.wrapper_overrides_unset.cache_clear()
 
-        # End to end through the scanner's real dependency scan, with the masquerade on PATH.
-        source = root / "unit.cpp"
-        header = root / "unit.hpp"
+
+def test_the_dependency_scan_sees_through_the_masquerade():
+    with _layout() as lay:
+        source = lay.root / "unit.cpp"
+        header = lay.root / "unit.hpp"
         header.write_text("constexpr int unit_value = 3;\n", encoding="utf-8")
-        source.write_text(
-            '#include "unit.hpp"\nint unit() { return unit_value; }\n', encoding="utf-8"
-        )
+        source.write_text('#include "unit.hpp"\nint unit() { return unit_value; }\n', "utf-8")
         command = {
-            "directory": str(root),
-            "arguments": [str(wrap / "c++"), "-c", str(source), "-o", str(root / "unit.o")],
+            "directory": str(lay.root),
+            "arguments": [str(lay.wrap / "c++"), "-c", str(source), "-o", str(lay.root / "u.o")],
         }
         saved = os.environ.get("PATH", "")
-        os.environ["PATH"] = os.pathsep.join([search, saved])
+        os.environ["PATH"] = os.pathsep.join([lay.search, saved])
         try:
-            paths = scanner.dependencies(command)
-        except ValueError as error:
-            check(False, f"masqueraded command scans (refused: {error})")
-        else:
-            check(real in paths, "the real compiler is part of the identity")
-            check(ccache.resolve() not in paths, "the wrapper is not")
-            check(header.resolve() in paths, "the scan still sees the source's headers")
+            paths = lay.scanner.dependencies(command)
         finally:
             os.environ["PATH"] = saved
+        assert lay.real in paths, "the real compiler is part of the identity"
+        assert lay.ccache.resolve() not in paths, "the wrapper is not"
+        assert header.resolve() in paths, "the scan still sees the source's headers"
 
-        # A work tree reached through a symlink still owns its sources: fingerprint() resolves
-        # every source path, so it has to resolve the root it compares them against as well.
-        tree = root / "tree"
+
+def test_a_symlinked_work_tree_has_the_same_identity():
+    # fingerprint() resolves every source path, so it must resolve the root it compares against.
+    with _layout() as lay:
+        tree = lay.root / "tree"
         (tree / "prosper/src").mkdir(parents=True)
         unit = tree / "prosper/src/unit.cpp"
         unit.write_text("int unit() { return 4; }\n", encoding="utf-8")
         commands = tree / "compile_commands.json"
-        commands.write_text(
-            json.dumps(
-                [
-                    {
-                        "directory": str(tree),
-                        "file": str(unit),
-                        "arguments": [str(real), "-c", str(unit)],
-                    }
-                ]
-            ),
-            encoding="utf-8",
-        )
-        alias = root / "alias"
+        entry = {
+            "directory": str(tree),
+            "file": str(unit),
+            "arguments": [str(lay.real), "-c", str(unit)],
+        }
+        commands.write_text(json.dumps([entry]), encoding="utf-8")
+        alias = lay.root / "alias"
         alias.symlink_to(tree)
-        try:
-            digest = scanner.fingerprint(alias / "compile_commands.json", alias)
-        except ValueError as error:
-            check(False, f"a symlinked work tree fingerprints (refused: {error})")
-        else:
-            check(
-                digest == scanner.fingerprint(commands, tree),
-                "a symlinked work tree has the same identity as its target",
-            )
+        assert lay.scanner.fingerprint(alias / "compile_commands.json", alias) == (
+            lay.scanner.fingerprint(commands, tree)
+        )
 
-        # The CLI's stderr is the build log's only diagnostic and must stay path-free: a missing
-        # commands file is reported by exception TYPE, never with the path the OSError carries.
-        missing = root / "private-name" / "compile_commands.json"
+
+def test_the_cli_reports_a_path_free_reason():
+    # The build log's only diagnostic: a missing commands file is reported by exception TYPE, never
+    # with the path its OSError carries.
+    with _layout() as lay:
+        missing = lay.root / "private-name" / "compile_commands.json"
         p = subprocess.run(
-            [sys.executable, str(module_path), str(missing), str(root)],
+            [sys.executable, str(MODULE_PATH), str(missing), str(lay.root)],
             capture_output=True,
             text=True,
             timeout=60,
         )
-        check(
-            p.returncode == 2
-            and p.stderr.strip() == "compiler dependency identity unavailable: FileNotFoundError",
-            "a missing commands file reports a path-free reason",
-        )
+        assert p.returncode == 2
+        assert p.stderr.strip() == "compiler dependency identity unavailable: FileNotFoundError"
 
-    print(f"compiler wrapper: {checks} checks, {failures} failures")
-    return 1 if failures else 0
+
+def _main() -> int:
+    """Run every test without pytest (ctest has none); 77 when the host cannot run them."""
+    global _UNDER_RUNNER
+    _UNDER_RUNNER = True
+    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    failures = skipped = 0
+    for name, fn in tests:
+        try:
+            fn()
+        except _Skip as skip:
+            skipped += 1
+            print(f"[SKIP] {name}: {skip}")
+        except Exception as error:  # an unexpected error is a failure, not an abort of the run
+            failures += 1
+            print(f"[FAIL] {name}: {type(error).__name__}: {error}")
+    print(f"compiler wrapper: {len(tests)} tests, {failures} failures, {skipped} skipped")
+    if failures:
+        return 1
+    return SKIP if skipped == len(tests) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main())
