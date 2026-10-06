@@ -2466,12 +2466,22 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     std::vector<uint32_t> owned_indices;
     if (owned_vertex || owned_fragment) {
         std::string refusal;
-        if (vertex_chain || !prepare_draw_owned_waves(ds, draw, vs_program_addr, rs.ps_addr,
+        const bool prepared =
+            !vertex_chain && prepare_draw_owned_waves(ds, draw, vs_program_addr, rs.ps_addr,
                                                       vcount_hint, float_transport, raw_context,
-                                                      owned_waves, owned_indices, refusal)) {
+                                                      owned_waves, owned_indices, refusal);
+        // The preparation decides for itself which stages are owned, from the registered program,
+        // and answers "prepared" with no owner when it finds none. This routing can read a
+        // checked source instead, and both now take a launch width. If the two ever disagree,
+        // a stage would go on with neither a native module nor an owner, or with both, and the
+        // draw would be wrong without a word in the log. Refuse it by name instead.
+        const bool agreed =
+            prepared && owned_wave_owner_matches(owned_waves.get(), owned_vertex, owned_fragment);
+        if (!agreed) {
             if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
-            const char* const reason =
-                vertex_chain ? "owned-wave-chained-stage-unimplemented" : refusal.c_str();
+            const char* const reason = vertex_chain ? "owned-wave-chained-stage-unimplemented"
+                                       : !prepared  ? refusal.c_str()
+                                                    : "owned-wave-routing-disagreement";
             report_dropped_draw_target(rs.color0_base, reason, rs.cb_target_mask,
                                        rs.cb_shader_mask);
             // The drop is counted under the same label as a recompile reject, but no recompile
