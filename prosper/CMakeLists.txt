@@ -5325,6 +5325,16 @@ endif()
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         ENVIRONMENT PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
         PROPERTIES TIMEOUT 60)
+      # The same binary at the DEFAULT cache thresholds: below 4 KiB nothing is retained, so a
+      # compute -> compute chain goes through guest memory (the discovered copy of this case skips).
+      add_test(NAME compute_linear_row_pitch_default_thresholds
+               COMMAND ${CMAKE_COMMAND} -E env
+                       --unset=PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB
+                       --unset=PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB
+                       $<TARGET_FILE:test_compute_linear_row_pitch>
+                       --gtest_filter=ComputeLinearRowPitchDefaults.*)
+      set_tests_properties(compute_linear_row_pitch_default_thresholds PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)

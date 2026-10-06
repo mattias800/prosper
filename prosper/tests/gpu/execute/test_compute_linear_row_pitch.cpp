@@ -10,11 +10,15 @@
 //   SampledSpanCoversThePaddedLastRow   the sampled backing span stays tight, so a write to the
 //                                       last row's texels beyond `width*height*bpt` is not part of
 //                                       the image's identity and a stale cached upload is reused
-//   ComputeProducerSeedsComputeConsumer the transfer borrow is keyed by the padded span while the
-//                                       storage producer keyed its result by tight rows: the borrow
-//                                       misses and the upload reads the tight writeback at a padded
-//                                       pitch, shearing a compute -> compute chain that renders
-//                                       correctly without the pitch rule
+//   ComputeProducerSeedsComputeConsumer the producer and the consumer key the retained result by
+//                                       different spans, so the borrow misses; also checks the
+//                                       writeback's guest rows sit at the padded pitch
+//   StorageSeedReadsPaddedRows          the storage seed reads a padded image as tight rows
+//   ComputeLinearRowPitchDefaults.ProducerConsumerThroughGuestMemory
+//                                       at default cache thresholds nothing is retained, so the
+//                                       chain goes through guest memory: the storage writeback must
+//                                       write rows at the padded pitch the consumer reads
+//                                       (registered twice; see CMakeLists.txt)
 //   SampledRendererTargetRegistersPlane a compute pass that samples a renderer target through a
 //                                       DCC-compressed T# does not tell the renderer about the
 //                                       control plane, so a later plane write leaves stale pixels
@@ -193,26 +197,30 @@ TEST(ComputeLinearRowPitch, SampledSpanCoversThePaddedLastRow) {
     EXPECT_EQ(out, expected) << "a cached upload keyed by the tight span hid the last-row write";
 }
 
-TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
-    auto& backing = keep_alive(size_t(Pitch) * H, 0);
-    constexpr uint32_t Base = 0x30000000u;
+namespace {
+
+// Dispatch 1 writes base + y*W + x through a storage binding of `backing`; dispatch 2 samples the
+// same padded linear image into `out`. Returns how many retained-result transfer seeds the
+// consumer took (1 = it borrowed the producer's native image, 0 = it read guest memory).
+uint64_t produce_then_consume(std::vector<uint8_t>& backing, uint32_t base,
+                              std::vector<uint32_t>& out, uint32_t first_index) {
     const ShaderResource storage = linear_image(backing, ResourceClass::StorageImage);
     ShaderResourceTable writer_table;
     writer_table.resources = {storage};
     std::vector<ComputeItem> items{
-        compile(writer_program(Base), writer_table, 4,
+        compile(writer_program(base), writer_table, first_index,
                 native_storage_format_support_bit(DataFormat::Uint32, 1))};
-    std::vector<uint32_t> out(size_t(W) * H, 0xdeadbeefu);
+    out.assign(size_t(W) * H, 0xdeadbeefu);
     ShaderResourceTable reader_table;
     reader_table.resources = {output_buffer(out), linear_image(backing, ResourceClass::Texture)};
-    items.push_back(compile(reader_program(), reader_table, 5, 0u));
-    for (const auto& item : items) ASSERT_FALSE(item.spirv.empty());
+    items.push_back(compile(reader_program(), reader_table, first_index + 1u, 0u));
+    for (const auto& item : items) EXPECT_FALSE(item.spirv.empty());
 
     std::vector<SubmitOperation> operations;
     for (const auto& item : items)
         operations.push_back(
             {SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order});
-    uint64_t consumer_seeds = 0;
+    uint64_t consumer_seeds = ~0ull;
     bool all_ok = true;
     const auto result = execute_ordered_items(
         operations, {}, items,
@@ -221,15 +229,73 @@ TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
             const auto before = prosper::frontend::live_compute_storage_transfer_seeds();
             const bool ok = prosper::frontend::execute_live_compute_items(batch);
             all_ok &= ok;
-            if (batch.size() == 1u && batch[0].dispatch_index == 5u)
+            if (batch.size() == 1u && batch[0].dispatch_index == first_index + 1u)
                 consumer_seeds = prosper::frontend::live_compute_storage_transfer_seeds() - before;
             return ok;
         },
         1, 1);
-    ASSERT_TRUE(result.compute_executed && all_ok);
-    EXPECT_EQ(consumer_seeds, 1u)
+    EXPECT_TRUE(result.compute_executed && all_ok);
+    return consumer_seeds;
+}
+
+// The storage writeback must lay rows at the padded pitch and leave the padding alone.
+void expect_padded_guest_rows(const std::vector<uint8_t>& backing, uint32_t base, uint8_t padding) {
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            uint32_t value = 0;
+            std::memcpy(&value, backing.data() + size_t(y) * Pitch + size_t(x) * Bpt, Bpt);
+            ASSERT_EQ(value, texel_value(base, x, y)) << "guest texel (" << x << ", " << y << ")";
+        }
+        if (y + 1u == H) break;   // the last row's padding is outside the image's span
+        for (size_t b = size_t(W) * Bpt; b < Pitch; ++b)
+            ASSERT_EQ(backing[size_t(y) * Pitch + b], padding) << "row " << y << " padding byte " << b;
+    }
+}
+
+}  // namespace
+
+TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
+    constexpr uint32_t Base = 0x30000000u;
+    std::vector<uint32_t> out;
+    EXPECT_EQ(produce_then_consume(backing, Base, out, 4), 1u)
         << "the consumer must borrow the producer's retained native image, not re-read guest bytes";
     EXPECT_EQ(out, expected_values(Base));
+    expect_padded_guest_rows(backing, Base, Poison);
+}
+
+TEST(ComputeLinearRowPitch, StorageSeedReadsPaddedRows) {
+    // A storage binding that is only read: its seed must gather the rows from the padded pitch.
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
+    constexpr uint32_t Base = 0x40000000u;
+    write_padded(backing, Base);
+    const std::vector<uint8_t> before = backing;
+    std::vector<uint32_t> out(size_t(W) * H, 0xdeadbeefu);
+    ShaderResourceTable table;
+    table.resources = {output_buffer(out), linear_image(backing, ResourceClass::StorageImage)};
+    const ComputeItem item = compile(reader_program(), table, 7,
+                                     native_storage_format_support_bit(DataFormat::Uint32, 1));
+    ASSERT_FALSE(item.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
+    EXPECT_EQ(out, expected_values(Base)) << "the storage seed read tight rows out of padded ones";
+    EXPECT_EQ(backing, before) << "a read-only storage pass must leave the guest layout as it was";
+}
+
+// Registered a second time WITHOUT the zero cache minimums (CMakeLists.txt), so it runs at the
+// default 4 KiB thresholds: a 1,600-byte image is never retained, the consumer cannot borrow, and
+// the chain goes through guest memory -- the path every sub-4 KiB image takes on a default run.
+TEST(ComputeLinearRowPitchDefaults, ProducerConsumerThroughGuestMemory) {
+    if (std::getenv("PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB") ||
+        std::getenv("PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB"))
+        GTEST_SKIP() << "needs the default cache thresholds; see the _default_thresholds registration";
+    auto& backing = keep_alive(size_t(Pitch) * H, Poison);
+    constexpr uint32_t Base = 0x50000000u;
+    std::vector<uint32_t> out;
+    EXPECT_EQ(produce_then_consume(backing, Base, out, 8), 0u)
+        << "control: below the cache minimum the consumer reads guest memory";
+    expect_padded_guest_rows(backing, Base, Poison);
+    EXPECT_EQ(out, expected_values(Base))
+        << "the producer's guest layout and the consumer's read pitch disagree";
 }
 
 TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
