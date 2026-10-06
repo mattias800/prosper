@@ -51,6 +51,7 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
 // too. They briefly did not, which compiled only because CMake defines that macro unconditionally
@@ -1164,8 +1165,9 @@ static CaptureTitle capture_title_for(const std::string& dump) {
     return out;
 }
 
-// "prosper - <game name>" for a booted game (name from param.json, falling back to the app0
-// basename), else a label that says what the empty window is waiting for.
+// "Prosper - <game name>" for a booted game (name from param.json, falling back to the app0
+// basename), else just "Prosper" — the idle library view already says what it is waiting for,
+// so the title bar does not need to repeat it.
 static std::string window_title_for(const std::string& dump, bool test_pattern) {
     if (!dump.empty()) {
         std::string name = read_game_title(dump);
@@ -1173,10 +1175,10 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
             const auto sl = dump.find_last_of("/\\");
             name = (sl == std::string::npos ? dump : dump.substr(sl + 1));
         }
-        return "prosper - " + name;
+        return "Prosper - " + name;
     }
-    if (test_pattern) return "prosper - test pattern";
-    return "prosper - no game (drop a game folder here, or press Ctrl+O)";
+    if (test_pattern) return "Prosper - test pattern";
+    return "Prosper";
 }
 
 // The guest, and the one boot this process gets. run_entry() never observes prosper_request_stop(),
@@ -1770,8 +1772,8 @@ int main(int argc, char** argv) {
         return exit_startup_failure();
     }
 #endif
-    // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
-    // is waiting for. A title opened later replaces this (#1469).
+    // Title: "Prosper - <game name>" for a booted game, else just "Prosper" — the idle library
+    // view says what it waits for. A title opened later replaces this (#1469).
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
@@ -1780,6 +1782,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
         if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
         return exit_startup_failure();
+    }
+    // Title-bar + taskbar icon from the baked-in mark. Cosmetic: a failure keeps the default
+    // icon and is said once, never fatal. The bytes are already RGBA, so no decode is needed.
+    {
+        SDL_Surface* icon = SDL_CreateSurfaceFrom(
+            prosper::frontend::kProsperLogoSize, prosper::frontend::kProsperLogoSize,
+            SDL_PIXELFORMAT_RGBA32,
+            const_cast<unsigned char*>(prosper::frontend::kProsperLogoRgba),
+            prosper::frontend::kProsperLogoSize * 4);
+        if (icon) {
+            SDL_SetWindowIcon(win, icon);
+            SDL_DestroySurface(icon);
+        } else {
+            fprintf(stderr, "[app] window icon unavailable: %s\n", SDL_GetError());
+        }
     }
 
     Vk vk;
@@ -2741,7 +2758,7 @@ int main(int argc, char** argv) {
             // boot_program links and maps the whole module set inline, which takes seconds on a
             // large title and pumps no events meanwhile. Say so in the title bar first, or the
             // window just stops responding.
-            SDL_SetWindowTitle(win, "prosper - loading...");
+            SDL_SetWindowTitle(win, "Prosper - loading...");
             std::string err;
             if (!start_guest(root, &err)) {
                 fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
