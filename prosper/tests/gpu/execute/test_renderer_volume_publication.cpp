@@ -7,14 +7,24 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include "shared/rtt/volume_publication_source.hpp"
 #include "shared/live/live_compute.hpp"
 
 #include <gtest/gtest.h>
+
+#if defined(__linux__)
+#include <csignal>
+#include <sys/ucontext.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -194,6 +204,174 @@ TEST(RendererVolumePublication, ComputeGateAsksThePublisherAndRechecksTheClaim) 
     EXPECT_NE(std::strstr(why, "no publisher"), nullptr) << why;
 }
 
+// The renderer's own claim, alias and release rules (live_renderer.cpp drives these with RttSurf).
+struct FakeSurface {
+    uint32_t w = 0, h = 0, volume_depth = 0;
+    uint64_t volume_guest_bytes = 0;
+    bool volume_footprint_proven = false;
+    VolumeGuestLayout volume_layout;
+    int format = 0, guest_format = 0;
+    bool gpu_valid = false;
+};
+
+TEST(RendererVolumePublication, RendererClaimBecomesThePublicationSource) {
+    FakeSurface claim{kW, kH, kD, 4096, true, {kW, kH, kD, kMode, kBpe}, 97, 97, true};
+    auto source = prosper::frontend::volume_publication_source(0x5013f30000ull, claim);
+    EXPECT_EQ(source.base, 0x5013f30000ull);
+    EXPECT_EQ(source.claimed_bytes, 4096u);
+    EXPECT_TRUE(source.footprint_proven && source.renderer_image_valid &&
+                source.exact_representation);
+    EXPECT_EQ(source.layout, claim.volume_layout);
+    EXPECT_EQ(source.image_depth, kD);
+
+    auto two_d_over_claim = claim;   // a later 2D pass at the base keeps the claim, not the volume
+    two_d_over_claim.volume_depth = 0;
+    EXPECT_FALSE(
+        prosper::frontend::volume_publication_source(1, two_d_over_claim).renderer_image_valid);
+    auto tombstone = claim;
+    tombstone.gpu_valid = false;
+    EXPECT_FALSE(prosper::frontend::volume_publication_source(1, tombstone).renderer_image_valid);
+    auto canonicalised = claim;   // e.g. BGRA guest bytes in an RGBA renderer image
+    canonicalised.guest_format = 44;
+    EXPECT_FALSE(
+        prosper::frontend::volume_publication_source(1, canonicalised).exact_representation);
+
+    prosper::frontend::release_volume_claim(claim);
+    EXPECT_EQ(claim.volume_guest_bytes, 0u);
+    EXPECT_FALSE(claim.volume_footprint_proven);
+    EXPECT_EQ(claim.volume_layout, VolumeGuestLayout{});
+}
+
+TEST(RendererVolumePublication, AliasRuleIsTheGuestWriteDrains) {
+    constexpr uint64_t base = 0x5013f30000ull, claim = 4u << 20;
+    std::map<uint64_t, FakeSurface> cache;
+    cache[base] = FakeSurface{64, 64, 64, claim, true};
+    // Kena's case: an unrelated 3200x1800 RGBA8 target, disjoint by address, whose physical
+    // topology is unproven ("may overlap" for every pair). It must not block the publication.
+    cache[0x5002dc0000ull] = FakeSurface{3200, 1800};
+    const auto bytes = [](const FakeSurface& s) {
+        return std::max<uint64_t>(uint64_t{s.w} * s.h * 4u, s.volume_guest_bytes);
+    };
+    int topology_asks = 0;
+    const auto unproven_topology = [&](uint64_t, uint64_t, uint64_t, uint64_t) {
+        ++topology_asks;
+        return true;
+    };
+    auto alias =
+        prosper::frontend::volume_publication_alias(cache, base, claim, bytes, unproven_topology);
+    EXPECT_EQ(alias.first, 0u) << "a 2D surface is an alias by address only";
+    EXPECT_EQ(topology_asks, 0);
+
+    cache[base + 0x100000] = FakeSurface{256, 256};   // a 2D surface inside the footprint
+    alias =
+        prosper::frontend::volume_publication_alias(cache, base, claim, bytes, unproven_topology);
+    EXPECT_EQ(alias.first, base + 0x100000);
+    EXPECT_EQ(alias.second, 256u * 256u * 4u);
+    cache.erase(base + 0x100000);
+
+    cache[0x7000000000ull] = FakeSurface{64, 64, 64, claim, true};   // another claim, far by VA
+    alias =
+        prosper::frontend::volume_publication_alias(cache, base, claim, bytes, unproven_topology);
+    EXPECT_EQ(alias.first, 0x7000000000ull) << "another claim is an alias by physical topology too";
+    const auto disjoint = [](uint64_t, uint64_t, uint64_t, uint64_t) { return false; };
+    EXPECT_EQ(
+        prosper::frontend::volume_publication_alias(cache, base, claim, bytes, disjoint).first, 0u);
+}
+
+#if defined(__linux__)
+namespace {
+volatile sig_atomic_t g_watch_faults = 0;
+void watch_fault(int signal, siginfo_t* info, void* context) {
+    const bool write =
+        context && (static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_ERR] & 2);
+    if (signal == SIGSEGV && write && info && info->si_addr &&
+        prosper::host::guest_write_watch_handle_fault(reinterpret_cast<uint64_t>(info->si_addr))) {
+        g_watch_faults = g_watch_faults + 1;
+        return;
+    }
+    _exit(86);
+}
+}   // namespace
+
+// A publication is a host store into guest memory: it must open write-watched pages before it
+// writes (no page fault per page), and the watch must still read Dirty afterwards.
+TEST(RendererVolumePublication, PublicationAnnouncesItsHostWriteToTheWriteWatch) {
+    static uint8_t alt_stack[256 * 1024];
+    stack_t stack{}, old_stack{};
+    stack.ss_sp = alt_stack;
+    stack.ss_size = sizeof(alt_stack);
+    struct sigaction action{}, old_action{};
+    action.sa_sigaction = watch_fault;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaltstack(&stack, &old_stack), 0);
+    ASSERT_EQ(sigaction(SIGSEGV, &action, &old_action), 0);
+    prosper::host::guest_write_watch_set_fault_onstack(true);
+    struct Restore {
+        stack_t stack;
+        struct sigaction action;
+        ~Restore() {
+            prosper::host::guest_write_watch_set_fault_onstack(false);
+            sigaction(SIGSEGV, &action, nullptr);
+            sigaltstack(&stack, nullptr);
+        }
+    } restore{old_stack, old_action};
+
+    prosper::register_builtin_hle();
+    const auto allocate = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+    const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+    const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+    const auto release = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+    ASSERT_TRUE(allocate && map && unmap && release);
+    const uint64_t mapping_bytes = (tiled_bytes() + 0xffffu) & ~uint64_t{0xffff};
+    uint64_t physical = 0, guest_address = 0;
+    ASSERT_EQ(allocate(0, 0x200000000ull, mapping_bytes, 0x10000, 0,
+                       reinterpret_cast<uint64_t>(&physical)),
+              0);
+    struct Backing {
+        prosper::HleFn unmap, release;
+        uint64_t physical, guest, bytes;
+        ~Backing() {
+            if (guest) unmap(guest, bytes, 0, 0, 0, 0);
+            release(physical, bytes, 0, 0, 0, 0);
+        }
+    } backing{unmap, release, physical, 0, mapping_bytes};
+    ASSERT_EQ(
+        map(reinterpret_cast<uint64_t>(&guest_address), mapping_bytes, 2, 0, physical, 0x10000), 0);
+    backing.guest = guest_address;
+
+    auto watch = prosper::host::GuestWriteWatch::create(guest_address, tiled_bytes());
+    if (!watch) GTEST_SKIP() << "page-protection write watches are unavailable here";
+    ASSERT_EQ(watch.query(), prosper::host::GuestWriteWatchQuery::Unchanged);
+    const auto rendered = pattern(linear_bytes(), 313u, 7u);
+    VolumePublicationSource source;
+    source.base = guest_address;
+    source.claimed_bytes = tiled_bytes();
+    source.footprint_proven = source.renderer_image_valid = source.exact_representation = true;
+    source.image_width = kW;
+    source.image_height = kH;
+    source.image_depth = kD;
+    source.layout = {kW, kH, kD, kMode, kBpe};
+    const auto faults_before = g_watch_faults;
+    ASSERT_EQ(publish_volume_to_guest(
+                  source,
+                  [&](std::vector<uint8_t>& linear) {
+                      linear = rendered;
+                      return true;
+                  },
+                  reinterpret_cast<uint8_t*>(guest_address)),
+              VolumePublication::Published);
+    EXPECT_EQ(g_watch_faults, faults_before) << "the host write must open armed pages first";
+    EXPECT_EQ(watch.query(), prosper::host::GuestWriteWatchQuery::Dirty);
+    std::vector<uint8_t> expected(tiled_bytes());
+    ASSERT_TRUE(
+        tile_volume(expected.data(), expected.size(), rendered.data(), kW, kH, kD, kMode, kBpe));
+    EXPECT_EQ(
+        std::memcmp(reinterpret_cast<const void*>(guest_address), expected.data(), expected.size()),
+        0);
+}
+#endif
+
 // The executed case. The guest bytes under the source volume are stale ("before the renderer drew
 // it"); the renderer holds the current volume. The copy kernel moves row (x, 0, 0) of the source
 // into the destination, so the destination row says which of the two the dispatch actually read.
@@ -255,9 +433,9 @@ TEST(RendererVolumePublication, ClaimedVolumeIsPublishedThenTheDispatchReadsIt) 
     item.launch.local_y = item.launch.local_z = 1;
     item.code_addr = 0x4625000000ull;
 
-    // Positive control first: unclaimed, the dispatch reads the guest bytes it is given. This also
-    // warms the backend's retained source image, so the published arm below must be told the bytes
-    // changed (the publication's write notification) or it would reuse the stale upload.
+    // Positive control first: unclaimed, the dispatch reads the guest bytes it is given. This arm
+    // does not depend on the publication's write notification (mutation M3 leaves it green: the
+    // backend re-uploads this small source); PublishTiles... pins the notification instead.
     if (!prosper::frontend::execute_live_compute_items({item}))
         GTEST_SKIP() << "no live compute device";
     std::vector<uint8_t> result(linear_bytes());
