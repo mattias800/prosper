@@ -313,7 +313,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   `proposed (adr:NNNN)` is a target, not policy: **only the project owner moves an ADR to
   `accepted`**, and the moves it describes wait for that. Read the spec page for the layer you are
   changing before you change it, and propose a new rule as an ADR rather than as prose here.
-- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds eleven
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds
   per-file counts to "down, never up": title ids and title-named directories in shared code, raw
   `getenv` reads, blocking GPU syncs, files over 5,000 lines, `prosper::test::` in the frontends,
   host-platform `#if` directives and `HLE(*_stub)` platform-arm handlers outside `src/host`,
