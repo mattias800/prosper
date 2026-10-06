@@ -333,3 +333,38 @@ TEST_F(RefusedShaderProducer, PreKeyGraphicsGuardsStillKeepOriginalEvidence) {
     EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 2u);
     EXPECT_EQ(recorded_words().size(), 2u) << "the same source refused at VS and PS is distinct";
 }
+
+// #3135 P0: a refused draw's index line names its NGG shape and link kind, and a chained vertex
+// program's main is dumped beside its prolog ("vsmain"), so the merged-NGG work can see both halves.
+TEST_F(RefusedShaderProducer, ChainedVertexRefusalRecordsNggShapeAndDumpsTheMain) {
+    static const uint32_t prolog[] = {0x7e000280u, 0xbe804a06u, 0xbf810000u};
+    static const uint32_t main_body[] = {0x7e020282u, 0x7e040284u, 0xbf810000u};
+    const auto prolog_address = reinterpret_cast<uint64_t>(prolog);
+    const auto main_address = reinterpret_cast<uint64_t>(main_body);
+    RefusedDrawShaders shaders{
+        {}, {}, {}, prolog_address, 0,    prolog_address, 3135, std::size(prolog),
+        0,  0,  0,  true,           false};
+    shaders.ngg_class = ngg_stage_class(VgtShaderStages{0x2030u});
+    shaders.link = "prolog";
+    shaders.chain_address = main_address;
+    note_refused_draw_shaders(shaders);
+    const auto words = recorded_words();
+    const std::vector<uint32_t> expected_prolog(std::begin(prolog), std::end(prolog));
+    const std::vector<uint32_t> expected_main(std::begin(main_body), std::end(main_body));
+    EXPECT_NE(std::find(words.begin(), words.end(), expected_prolog), words.end());
+    EXPECT_NE(std::find(words.begin(), words.end(), expected_main), words.end())
+        << "the chained main is dumped too";
+    std::ifstream index(fs::path(refused_shader_dump_directory()) / "index.txt");
+    const std::string lines((std::istreambuf_iterator<char>(index)), {});
+    EXPECT_NE(lines.find("vsmain addr=0x"), std::string::npos) << lines;
+    EXPECT_NE(lines.find("ngg=merged-gs link=prolog"), std::string::npos) << lines;
+}
+
+TEST(VgtShaderStages, ClassifiesTheNggShape) {
+    EXPECT_STREQ(ngg_stage_class(VgtShaderStages{0x2030u}), "merged-gs")
+        << "Kena's merged ES+GS NGG draw";
+    EXPECT_STREQ(ngg_stage_class(VgtShaderStages{0x2000u}), "ngg-vs");
+    EXPECT_STREQ(ngg_stage_class(VgtShaderStages{0x0030u}), "legacy") << "GS without PRIMGEN";
+    EXPECT_TRUE(VgtShaderStages{1u << 22}.gs_wave32());
+    EXPECT_EQ(VgtShaderStages{0x2030u}.es_stage(), 2u);
+}
