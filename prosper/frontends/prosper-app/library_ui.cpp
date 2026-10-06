@@ -268,7 +268,9 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     // of changes that carry that — geometry and a PlayStation-blue accent, not a second theme.
     {
         ImGuiStyle& style = ImGui::GetStyle();
-        style.WindowRounding = 10.0f;
+        // The library window sits flush against the OS window edge, so rounded content corners
+        // would frame a square window with gaps. Widgets keep their rounding; windows do not.
+        style.WindowRounding = 0.0f;
         style.FrameRounding = 6.0f;
         style.GrabRounding = 6.0f;
         style.WindowPadding = ImVec2(16, 14);
