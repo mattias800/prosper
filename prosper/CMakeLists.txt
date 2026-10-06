@@ -6804,6 +6804,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 
+  # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
+  prosper_add_gtest(test_retirement_queue
+    SOURCES tests/shared/compute/test_retirement_queue.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
   # A fast-cleared compressed RGBA8 T# is its clear colour (Black Flag's warning-screen background).
   prosper_add_gtest(test_sampled_dcc_fast_clear
     SOURCES tests/shared/compute/test_sampled_dcc_fast_clear.cpp
