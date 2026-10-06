@@ -191,6 +191,22 @@ int main(int argc, char** argv) {
     check(!is_live_render_target(A) &&
               guest_write_drain_work_for_thread().rtt_dcc == precedence_before.rtt_dcc,
           "color overlap takes precedence when the same bytes also name metadata");
+    // A compute pass learns a target's DCC plane only from its own T#. Registering it there must
+    // give a later write to the plane the same effect as a plane a draw registered, and an
+    // unregistered plane must stay inert (the target has no reason to watch it).
+    clear();
+    seed(A);
+    constexpr uint64_t ComputePlane = 0x90000;
+    notify_guest_gpu_write(ComputePlane, 4);
+    notify_guest_gpu_write(Miss, 4);
+    drain();
+    check(is_live_render_target(A), "a write to an unregistered DCC plane leaves the target alone");
+    register_live_rtt_dcc_plane(A, ComputePlane, 256);
+    notify_guest_gpu_write(ComputePlane, 4);
+    notify_guest_gpu_write(Miss, 4);
+    drain();
+    check(!is_live_render_target(A),
+          "a plane registered through the compute path revokes the target's pixels when rewritten");
     seed(A);
     clear();
     check(!is_live_render_target(A) && !is_live_render_target(B),

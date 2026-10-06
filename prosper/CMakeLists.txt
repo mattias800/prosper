@@ -4159,6 +4159,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4568,6 +4569,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -5395,6 +5397,25 @@ endif()
                PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
                $<TARGET_FILE:test_compute_transfer_mip_chain>)
       set_tests_properties(compute_transfer_mip_chain PROPERTIES TIMEOUT 60)
+
+      # Live dispatches over a padded linear 2D image (sampled upload, sampled span, compute ->
+      # compute transfer borrow) and a compute pass naming a renderer target's DCC plane.
+      prosper_add_gtest(test_compute_linear_row_pitch
+        SOURCES tests/gpu/execute/test_compute_linear_row_pitch.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        ENVIRONMENT PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB=0 PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB=0
+        PROPERTIES TIMEOUT 60)
+      # The same binary at the DEFAULT cache thresholds: below 4 KiB nothing is retained, so a
+      # compute -> compute chain goes through guest memory (the discovered copy of this case skips).
+      add_test(NAME compute_linear_row_pitch_default_thresholds
+               COMMAND ${CMAKE_COMMAND} -E env
+                       --unset=PROSPER_COMPUTE_IMAGE_CACHE_MIN_KB
+                       --unset=PROSPER_COMPUTE_STORAGE_IMAGE_CACHE_MIN_KB
+                       $<TARGET_FILE:test_compute_linear_row_pitch>
+                       --gtest_filter=ComputeLinearRowPitchDefaults.*)
+      set_tests_properties(compute_linear_row_pitch_default_thresholds PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
       add_executable(test_near_full_storage_authority
                      tests/gpu/execute/test_near_full_storage_authority.cpp)
@@ -6762,6 +6783,18 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   add_executable(bench_buffer_arena tests/shared/compute/bench_buffer_arena.cpp)
   target_include_directories(bench_buffer_arena PRIVATE frontends src tests)
   target_link_libraries(bench_buffer_arena PRIVATE prosper_core)
+
+  # A fast-cleared compressed RGBA8 T# is its clear colour (Black Flag's warning-screen background).
+  prosper_add_gtest(test_sampled_dcc_fast_clear
+    SOURCES tests/shared/compute/test_sampled_dcc_fast_clear.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # A padded linear image is read row by row by the compute backend too (Black Flag's video planes).
+  prosper_add_gtest(test_linear_image_pitch
+    SOURCES tests/shared/compute/test_linear_image_pitch.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
 
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)

@@ -945,6 +945,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             return prosper::gpu::correlate_compression_metadata_kind(request, depth, color);
         });
 
+    prosper::gpu::set_live_rtt_dcc_plane_registrar(
+        [](uint64_t addr, uint64_t metadata_addr, uint64_t metadata_bytes) {
+            auto surface = g_rtt.find(addr);
+            if (surface == g_rtt.end() || !metadata_addr || !metadata_bytes) return;
+            surface->second.dcc_metadata_addr = metadata_addr;
+            surface->second.dcc_metadata_bytes = metadata_bytes;
+            surface->second.dcc_guest_origins.observe(metadata_addr, metadata_bytes);
+        });
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
         auto it = g_rtt.find(addr);
