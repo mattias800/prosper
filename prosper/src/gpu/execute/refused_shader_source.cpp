@@ -38,7 +38,7 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
                           source_dwords));
         }
         if (refused_shader_already_noted(tag, original)) continue;
-        char detail[320];
+        char detail[512];
         std::snprintf(detail, sizeof detail,
                       "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx ngg=%s link=%s "
                       "main=0x%llx%s%s",

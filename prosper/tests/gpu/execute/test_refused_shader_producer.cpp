@@ -358,6 +358,12 @@ TEST_F(RefusedShaderProducer, ChainedVertexRefusalRecordsNggShapeAndDumpsTheMain
     const std::string lines((std::istreambuf_iterator<char>(index)), {});
     EXPECT_NE(lines.find("vsmain addr=0x"), std::string::npos) << lines;
     EXPECT_NE(lines.find("ngg=merged-gs link=prolog"), std::string::npos) << lines;
+    // The same refused draw on the next frame must not rehash either half: the main has its own
+    // memo bit, like vs/ps/cs.
+    const uint64_t hashed = refused_shader_dump_stats().hash_evaluations;
+    note_refused_draw_shaders(shaders);
+    EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, hashed)
+        << "a repeated chained refusal is answered by the memo";
 }
 
 TEST(VgtShaderStages, ClassifiesTheNggShape) {
