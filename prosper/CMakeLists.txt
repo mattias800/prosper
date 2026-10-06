@@ -2879,6 +2879,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
+            tests/gpu/state/test_render_state_memo.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
