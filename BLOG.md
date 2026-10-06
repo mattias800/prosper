@@ -21,6 +21,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-06
 
+### Dragon Quest VII's title gets its clouds and sea back
+
+The title screen's sky now has clouds and the sea has waves and sun glints, where it used to be two flat gradients ([tracker #1874](https://github.com/mattias800/prosper/issues/1874)). Before, then after:
+
+<p align="center"><img src="assets/screenshots/dq7-title-sky-sea-before-predication.webp" alt="Dragon Quest VII Reimagined title screen before the fix: logo over a flat blue sky gradient and a smooth flat blue sea; Linux prosper-app F9 grab, RADV, Cross pulses at 3-18 s, about 42 s"></p>
+<p align="center"><img src="assets/screenshots/dq7-title-sky-sea-after-predication.webp" alt="Dragon Quest VII Reimagined title screen after the fix: clouds in the sky and a textured sea with bright sun glints; Linux prosper-app F9 grab, RADV, Cross pulses at 3-18 s, about 75 s"></p>
+
+The clouds are still fainter than on a PS5.
+
 ### MOUSE: P.I. For Hire: the room is there
 
 *MOUSE: P.I. For Hire* now renders its first gameplay scene: a pair of doors, and behind them the room, its furniture and lamps, under the HUD that used to sit over black.
