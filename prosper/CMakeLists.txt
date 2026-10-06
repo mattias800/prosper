@@ -2021,6 +2021,13 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_diagnostic_window.cpp
     INCLUDES frontends)
 
+  # The Game Log panel's bounded line buffer: capacity eviction and single-line truncation are the
+  # defects that would otherwise show up only as a runaway deque behind a per-frame snapshot.
+  # Pure std::mutex/deque — no SDL, no ImGui, no window.
+  prosper_add_gtest(test_frontend_log_ring
+    SOURCES frontends/prosper-app/test_log_ring.cpp
+    INCLUDES frontends/prosper-app)
+
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
   prosper_add_gtest(test_persistent_readback_filter

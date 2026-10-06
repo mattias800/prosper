@@ -30,6 +30,14 @@
 // implementation needs it, and the app's other translation units should not pick it up.
 struct ImFont;
 
+namespace prosper {
+namespace frontend {
+// The Game Log line buffer (log_ring.hpp); owned by main.cpp, only observed here. Forward
+// declared so this header stays free of <mutex>/<deque>.
+class LogRing;
+} // namespace frontend
+} // namespace prosper
+
 namespace prosper::frontend {
 
 // What the user did on this frame.
@@ -47,6 +55,7 @@ struct LibraryAction {
         set_savedata_dir,  // picked save location `value` ("" clears); persist + apply to the next boot
         set_restore_imports, // toggled patched-import repair to `restore_on`; persist + apply to next boot
         set_volume,          // dragged the volume slider to `value` (0-100); persist + apply live
+        toggle_fullscreen,   // the Full Screen toolbar button (same path as F11)
         quit,
     };
     Kind kind = Kind::none;
@@ -103,6 +112,10 @@ public:
     // Seed File > Recent games from the persisted settings. Seeded once before the first frame;
     // boots only happen from here pre-guest, after which the menu is gone with the library.
     void set_recent(std::vector<RecentGame> recent) { recentGames_ = std::move(recent); }
+
+    // Point the Game Log panel at main.cpp's capture ring (null: capture unavailable, the panel
+    // says so). Seeded once before the first frame; the ring outlives the UI.
+    void set_log_ring(const LogRing* ring) { logRing_ = ring; }
 
     // prosper-app's `--volume`, as a linear factor in [0,1] (#3499). It attenuates the launcher music
     // as well as the title (launcher_music_output_gain). Live once init() has run: the media layer
@@ -216,9 +229,12 @@ private:
     // inline in the main window (a floating dialog over a game library is the wrong shape — the
     // library IS the window, so settings is one of its tabs, not a popup above it).
     void draw_settings_content(LibraryAction& action);
+    // Read-only keyboard map. The mapping itself lives in keyboard_pad_map.hpp — this table
+    // mirrors its documented layout, so update both when the mapping changes.
+    void draw_controls_content();
 
-    // Which half of the window is showing. Games and settings share the header; only one draws.
-    enum class LibraryTab { games, settings };
+    // Which view is showing. Games, settings and controls share the menu bar; only one draws.
+    enum class LibraryTab { games, settings, controls };
 
     ImFont*                boldFont_ = nullptr;    // section headers; null while on the bitmap fallback
 
@@ -264,7 +280,13 @@ private:
     std::vector<GameEntry> games_;
     std::vector<Cover>     covers_;
     std::vector<int>       filtered_;
+    // Row hovered last frame. The highlight is painted at row start, but hover is only
+    // knowable after the row's items — so it trails by one frame, which is imperceptible and
+    // always spans the whole row (unlike a Selectable's own cell-sized hover paint).
+    int                    hovered_ = -1;
     std::vector<RecentGame> recentGames_;
+    const LogRing*         logRing_ = nullptr;  // observed only; owned by main.cpp
+    bool                   logFollow_ = true;
     std::string            gamesDir_;
     char                   filterBuf_[256] = {};
     std::string            filterApplied_;

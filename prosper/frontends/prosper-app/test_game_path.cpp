@@ -180,27 +180,23 @@ int main() {
     CHECK(windows_command_line({}).empty(), "no arguments produce an empty command line");
 
     // --- should_pick_at_startup ------------------------------------------------------------------
+    // Only --pick asks: a bare launch opens the library window, which offers the picker itself.
     StartupPickInputs in{};
-    in.bare_launch = true;
-    CHECK(should_pick_at_startup(in), "a no-argument launch offers the picker");
-    in.bare_launch = false;
-    CHECK(!should_pick_at_startup(in), "an argument-bearing launch does not pop a dialog on its own");
+    CHECK(!should_pick_at_startup(in), "a no-argument launch does not pop a dialog on its own");
     in.forced = true;
-    CHECK(should_pick_at_startup(in), "--pick opens the picker without a bare launch");
+    CHECK(should_pick_at_startup(in), "--pick opens the picker");
     in.suppressed = true;
     CHECK(!should_pick_at_startup(in), "--no-pick overrides --pick");
-    in = {}; in.bare_launch = true; in.suppressed = true;
-    CHECK(!should_pick_at_startup(in), "--no-pick suppresses the bare-launch picker");
-    in = {}; in.bare_launch = true; in.has_dump = true;
+    in = {}; in.suppressed = true;
+    CHECK(!should_pick_at_startup(in), "--no-pick stays quiet");
+    in = {}; in.has_dump = true;
     CHECK(!should_pick_at_startup(in), "a run given a dump is never interrupted by a dialog");
     in = {}; in.forced = true; in.has_dump = true;
     CHECK(!should_pick_at_startup(in), "an explicit dump wins over --pick");
-    in = {}; in.bare_launch = true; in.test_pattern = true;
+    in = {}; in.test_pattern = true;
     CHECK(!should_pick_at_startup(in), "--test-pattern already knows what to show");
     in = {}; in.forced = true; in.test_pattern = true;
     CHECK(!should_pick_at_startup(in), "--test-pattern wins over --pick");
-    in = {};
-    CHECK(!should_pick_at_startup(in), "nothing implicit happens without a bare launch");
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");

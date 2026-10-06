@@ -51,6 +51,7 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#include "log_ring.hpp"                  // bounded Game Log line buffer (pure, unit-tested)
 #include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
@@ -150,6 +151,7 @@ static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = 
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>                // IFileOpenDialog: the Explorer folder picker below
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
@@ -157,6 +159,25 @@ extern char** environ;                 // the child inherits this process's envi
 #ifdef __APPLE__
 #include <mach-o/dyld.h>               // _NSGetExecutablePath (macOS has no /proc/self/exe)
 #endif
+#endif
+
+// Pipe/dup shims for the Game Log capture below. MinGW and POSIX agree on everything except the
+// spelling and the open mode: _O_BINARY keeps CRLF translation out of the capture path (the
+// reader strips carriage returns itself, so console bytes stay exactly what printf emitted).
+#ifdef _WIN32
+#include <io.h>        // _pipe/_dup2/_read/_write
+#include <fcntl.h>     // _O_BINARY
+#define prosper_pipe(fds) _pipe(fds, 4096, _O_BINARY)
+#define prosper_dup(fd) _dup(fd)
+#define prosper_dup2(a, b) _dup2(a, b)
+#define prosper_read(fd, buf, n) _read(fd, buf, static_cast<unsigned>(n))
+#define prosper_write(fd, buf, n) _write(fd, buf, static_cast<unsigned>(n))
+#else
+#define prosper_pipe(fds) ::pipe(fds)
+#define prosper_dup(fd) ::dup(fd)
+#define prosper_dup2(a, b) ::dup2(a, b)
+#define prosper_read(fd, buf, n) ::read(fd, buf, n)
+#define prosper_write(fd, buf, n) ::write(fd, buf, n)
 #endif
 
 using namespace prosper;
@@ -176,6 +197,64 @@ bool clear_environment(const char* name) {
 #else
     return unsetenv(name) == 0;
 #endif
+}
+
+// ---- Game Log capture ------------------------------------------------------------------------
+// The library's Game Log panel shows this process's own stdout/stderr tail. Both streams are
+// re-pointed at pipes whose reader threads forward every byte to the real console AND keep a
+// bounded copy in a LogRing. Forwarding preserves every contract a consumer relies on
+// (--list-games TSV on stdout, log text on stderr); the ring only observes.
+//
+// Process-lifetime by design: the ring and the reader threads are heap-owned and never joined or
+// freed, so the normal-return paths (which skip _Exit and run static destructors) cannot race a
+// reader blocked in read(). The write ends stay open for process life, so read() never sees EOF
+// and the threads never exit.
+static void log_capture_reader(prosper::frontend::LogRing* ring, int src_fd, int forward_fd) {
+    std::string carry;
+    char buf[4096];
+    for (;;) {
+        const long n = prosper_read(src_fd, buf, sizeof buf);
+        if (n <= 0) return;   // never expected; exit quietly rather than spin if so
+        // Forward first: the console stays the primary record, the ring the observer.
+        long done = 0;
+        while (done < n) {
+            const long w = prosper_write(forward_fd, buf + done, n - done);
+            if (w <= 0) break;
+            done += w;
+        }
+        carry.append(buf, static_cast<size_t>(n));
+        size_t pos = 0;
+        while ((pos = carry.find('\n')) != std::string::npos) {
+            std::string line = carry.substr(0, pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            ring->push(line);
+            carry.erase(0, pos + 1);
+        }
+        // A run that prints without newlines must not grow the carry without bound.
+        if (carry.size() > 65536) {
+            ring->push(carry);
+            carry.clear();
+        }
+    }
+}
+
+static prosper::frontend::LogRing* install_log_capture() {
+    int out_pipe[2], err_pipe[2];
+    if (prosper_pipe(out_pipe) != 0 || prosper_pipe(err_pipe) != 0) return nullptr;
+    fflush(stdout);
+    fflush(stderr);
+    const int saved_out = prosper_dup(1);
+    const int saved_err = prosper_dup(2);
+    if (saved_out < 0 || saved_err < 0) return nullptr;
+    if (prosper_dup2(out_pipe[1], 1) < 0 || prosper_dup2(err_pipe[1], 2) < 0) return nullptr;
+    auto* ring = new prosper::frontend::LogRing();
+    std::thread([ring, out_pipe, saved_out] {
+        log_capture_reader(ring, out_pipe[0], saved_out);
+    }).detach();
+    std::thread([ring, err_pipe, saved_err] {
+        log_capture_reader(ring, err_pipe[0], saved_err);
+    }).detach();
+    return ring;
 }
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
@@ -1452,7 +1531,65 @@ static bool open_folder_picker(SDL_Window* win) {
         if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
+#ifdef _WIN32
+    // Native Explorer folder picker (IFileOpenDialog + FOS_PICKFOLDERS) on its own thread.
+    // SDL 3.2's Windows folder dialog is still the legacy SHBrowseForFolder tree, which hides
+    // drives inside a namespace modern users no longer recognize; the Explorer dialog shows
+    // This PC, the address bar and search. Same park-and-consume contract as picked_folder_cb;
+    // any COM failure falls back to the SDL dialog rather than failing the pick.
+    std::thread([win] {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        bool shown = false;
+        if (SUCCEEDED(hr)) {
+            IFileOpenDialog* dialog = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                           IID_PPV_ARGS(&dialog)))) {
+                DWORD opts = 0;
+                if (SUCCEEDED(dialog->GetOptions(&opts)))
+                    dialog->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+                HWND parent = nullptr;
+                if (win)
+                    parent = (HWND)SDL_GetPointerProperty(
+                        SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+                const HRESULT show = dialog->Show(parent);
+                if (SUCCEEDED(show)) {
+                    IShellItem* item = nullptr;
+                    if (SUCCEEDED(dialog->GetResult(&item))) {
+                        wchar_t* path = nullptr;
+                        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                            const int n = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0,
+                                                              nullptr, nullptr);
+                            if (n > 1) {
+                                std::string picked(static_cast<size_t>(n) - 1, '\0');
+                                WideCharToMultiByte(CP_UTF8, 0, path, -1, picked.data(), n,
+                                                    nullptr, nullptr);
+                                const char* files[2] = {picked.c_str(), nullptr};
+                                picked_folder_cb(nullptr, files, -1);
+                                shown = true;
+                            }
+                            CoTaskMemFree(path);
+                        }
+                        item->Release();
+                    }
+                } else if (show != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+                    // A cancel parks nothing below; any other failure is said once here (the
+                    // callback below still runs to clear the outstanding flag).
+                    fprintf(stderr, "[app] folder picker failed.\n");
+                }
+                dialog->Release();
+            }
+            CoUninitialize();
+        }
+        if (!shown) {
+            // Cancelled, or COM never got off the ground: SDL delivers the cancel notice (or its
+            // own legacy dialog) through the same callback, which also clears the outstanding flag.
+            const char* files[1] = {nullptr};
+            picked_folder_cb(nullptr, files, -1);
+        }
+    }).detach();
+#else
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+#endif
     return true;
 }
 
@@ -1545,6 +1682,10 @@ int main(int argc, char** argv) {
     // AFTER hours' worth of unbuffered stderr in a merged `> log 2>&1`, making the log read as
     // if the modules loaded at shutdown (misled a #2981 FMV measurement session).
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    // Game Log panel: tee stdout/stderr into a bounded ring from here on. A null return keeps
+    // the app fully working, minus the panel.
+    prosper::frontend::LogRing* logRing = install_log_capture();
+    if (!logRing) fprintf(stderr, "[app] log capture unavailable; the Game Log panel stays empty\n");
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
     // Whether the run named a policy on the command line. The persisted file applies only when
@@ -1571,7 +1712,6 @@ int main(int argc, char** argv) {
     bool showFps = false;   // --fps
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
-    pick.bare_launch = (argc <= 1);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
@@ -2767,6 +2907,19 @@ int main(int argc, char** argv) {
     const SDL_WindowFlags initialWindowFlags = SDL_GetWindowFlags(win);
     bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
     windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
+    // One fullscreen path for the F11 hotkey and the toolbar button alike.
+    auto toggle_fullscreen = [&]() {
+        // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
+        // target instead of reading a flag that can still describe the old state.
+        const bool targetFullscreen = !fullscreenRequested;
+        if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
+            fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
+        } else {
+            fullscreenRequested = targetFullscreen;
+            swapchainDirty = true;
+            fprintf(stderr, "[app] fullscreen %s requested\n", targetFullscreen ? "on" : "off");
+        }
+    };
 
     // --fps. Brought up lazily, on the first frame that actually reaches the swapchain: at this
     // point the swapchain may not be final (the window can still be resized into fullscreen), and
@@ -2817,6 +2970,7 @@ int main(int argc, char** argv) {
         // file into these), so what it shows is what the next boot gets — never a stale default.
         libraryUi.set_host_settings(prosper::frontend::present_mode_name(requestedPresentMode),
                                     effDisplayMode, effSavedataDir, effRestoreImports);
+        libraryUi.set_log_ring(logRing);
         // Recent rows show game names, not raw paths: read each root's own param.json the
         // same way the library scan does (no boot, no guest). Unreadable roots keep their
         // basename so a removed dump still says which entry died.
@@ -2834,8 +2988,11 @@ int main(int argc, char** argv) {
                     label = name;
                 else if (!id.empty())
                     label = id;
-                else
-                    label = prosper::frontend::path_basename(root);
+                else {
+                    // A drive root has no basename; there the root itself is the name.
+                    const std::string folder = prosper::frontend::path_basename(root);
+                    label = folder.empty() ? root : folder;
+                }
                 recents.push_back({root, label});
             }
             libraryUi.set_recent(std::move(recents));
@@ -3179,20 +3336,9 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "[app] %s at guest flip boundary\n",
                             paused ? "pause requested" : "resumed");
                     break;
-                case prosper::frontend::AppWindowCommand::toggle_fullscreen: {
-                    // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
-                    // target instead of reading a flag that can still describe the old state.
-                    const bool targetFullscreen = !fullscreenRequested;
-                    if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
-                        fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
-                    } else {
-                        fullscreenRequested = targetFullscreen;
-                        swapchainDirty = true;
-                        fprintf(stderr, "[app] fullscreen %s requested\n",
-                                targetFullscreen ? "on" : "off");
-                    }
+                case prosper::frontend::AppWindowCommand::toggle_fullscreen:
+                    toggle_fullscreen();
                     break;
-                }
                 case prosper::frontend::AppWindowCommand::none:
                     break;
                 }
@@ -3425,6 +3571,9 @@ int main(int argc, char** argv) {
                     break;
                 case prosper::frontend::LibraryAction::Kind::rescan:
                     rescan_library();
+                    break;
+                case prosper::frontend::LibraryAction::Kind::toggle_fullscreen:
+                    toggle_fullscreen();
                     break;
                 case prosper::frontend::LibraryAction::Kind::pick_game:
                     // Like Ctrl+O: the answer parks and boots via open_game() below, because no

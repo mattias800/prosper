@@ -140,18 +140,18 @@ struct StartupPickInputs {
     bool test_pattern = false;  // --test-pattern
     bool forced = false;        // --pick
     bool suppressed = false;    // --no-pick
-    bool bare_launch = false;   // the process was started with no arguments at all
 };
 
 // Whether to open the host folder picker at startup. A run that was already told what to show is
 // never interrupted by a dialog, and --no-pick wins over --pick so a script can hard-disable it.
-// The only implicit case is a launch with no arguments at all — a double-click, where argv cannot
-// carry a game and an empty window would be a dead end.
+// Only an explicit --pick asks: a bare launch opens the library window itself, which explains the
+// empty state and offers the picker, a drop and the File menu — a modal dialog over an unseen
+// window is not how the app introduces itself.
 inline bool should_pick_at_startup(const StartupPickInputs& in) {
     if (in.has_dump || in.test_pattern) return false;
     if (in.suppressed) return false;
     if (in.forced) return true;
-    return in.bare_launch;
+    return false;
 }
 
 } // namespace prosper::frontend

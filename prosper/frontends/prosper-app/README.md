@@ -74,8 +74,9 @@ otherwise face an empty window, so a dump path can also arrive interactively (#1
 - **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
   guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
   something feeding the present layer.
-- **A launch with no arguments at all** opens that picker straight away, so a double-clicked app is not
-  a dead end. `--pick` forces it for any launch; `--no-pick` disables it entirely.
+- **A launch with no arguments at all** opens the library window itself, which explains the
+  empty state and offers the picker, a drop target and the File menu. `--pick` forces the picker
+  for any launch; `--no-pick` disables it entirely.
 
 A PS5 title is a *directory*, so this is a folder picker, not a file picker. A folder that is not a
 title is reported and changes nothing — including the folder that merely *contains* your games, which

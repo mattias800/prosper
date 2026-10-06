@@ -1,6 +1,7 @@
 // library_ui.cpp — see library_ui.hpp. Draws the library grid with Dear ImGui on the app's existing
 // Vulkan device, and decodes cover art with stb_image (#1471).
 #include "library_ui.hpp"
+#include "log_ring.hpp"   // Game Log snapshot; the ring itself is owned by main.cpp
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
@@ -14,6 +15,7 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +25,117 @@ namespace {
 
 // Table thumbnails sample the square icon0.png down, so they cannot show resampling artefacts.
 constexpr float kThumbSize = 56.0f;
+
+// Toolbar icons, drawn as vectors: no font file, no license baggage, crisp at any scale.
+// Each is centered on `c` within roughly radius `s`, in the shadPS4 toolbar spirit.
+enum class ToolbarIcon { play, folder, rescan, fullscreen, keyboard, music_on, music_off };
+void draw_toolbar_icon(ImDrawList* dl, ImVec2 c, float s, ToolbarIcon icon, ImU32 col) {
+    const float t = s / 11.0f;   // icon units: every glyph lives in an 11-unit box
+    switch (icon) {
+    case ToolbarIcon::play: {
+        // Right-pointing triangle.
+        dl->AddTriangleFilled(ImVec2(c.x - 4 * t, c.y - 6 * t), ImVec2(c.x - 4 * t, c.y + 6 * t),
+                              ImVec2(c.x + 6 * t, c.y), col);
+        break;
+    }
+    case ToolbarIcon::folder: {
+        // Outline body with a tab nub: one stroke weight throughout, no fill tricks.
+        dl->AddRect(ImVec2(c.x - 8 * t, c.y - 3 * t), ImVec2(c.x + 8 * t, c.y + 6 * t), col,
+                    1.5f * t, 0, 2 * t);
+        dl->AddLine(ImVec2(c.x - 8 * t, c.y - 3 * t), ImVec2(c.x - 8 * t, c.y - 6 * t), col,
+                    2 * t);
+        dl->AddLine(ImVec2(c.x - 8 * t, c.y - 6 * t), ImVec2(c.x - 1 * t, c.y - 6 * t), col,
+                    2 * t);
+        dl->AddLine(ImVec2(c.x - 1 * t, c.y - 6 * t), ImVec2(c.x - 1 * t, c.y - 3 * t), col,
+                    2 * t);
+        break;
+    }
+    case ToolbarIcon::rescan: {
+        // Circular arrow. The head sits at the arc's end, pointing along the tangent, so the
+        // eye reads rotation rather than a blob.
+        const float end = 5.0f;
+        dl->PathArcTo(c, 6 * t, 0.8f, end, 24);
+        dl->PathStroke(col, 0, 2.2f * t);
+        const ImVec2 dir(std::cos(end), std::sin(end));    // radial
+        const ImVec2 tan(-dir.y, dir.x);                   // direction of travel
+        const ImVec2 base(c.x + dir.x * 6 * t, c.y + dir.y * 6 * t);
+        dl->AddTriangleFilled(ImVec2(base.x + tan.x * 5.5f * t, base.y + tan.y * 5.5f * t),
+                              ImVec2(base.x - tan.x * 0.5f * t + dir.x * 3.5f * t,
+                                     base.y - tan.y * 0.5f * t + dir.y * 3.5f * t),
+                              ImVec2(base.x - tan.x * 0.5f * t - dir.x * 3.5f * t,
+                                     base.y - tan.y * 0.5f * t - dir.y * 3.5f * t),
+                              col);
+        break;
+    }
+    case ToolbarIcon::fullscreen: {
+        // Four corner brackets pushing outward.
+        const float e = 7 * t, l = 4 * t, w = 2 * t;
+        dl->AddLine(ImVec2(c.x - e, c.y - e + l), ImVec2(c.x - e, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y - e), ImVec2(c.x - e + l, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x + e - l, c.y - e), ImVec2(c.x + e, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x + e, c.y - e), ImVec2(c.x + e, c.y - e + l), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y + e - l), ImVec2(c.x - e, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y + e), ImVec2(c.x - e + l, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x + e - l, c.y + e), ImVec2(c.x + e, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x + e, c.y + e), ImVec2(c.x + e, c.y + e - l), col, w);
+        break;
+    }
+    case ToolbarIcon::keyboard: {
+        // Key well with three key rows.
+        dl->AddRect(ImVec2(c.x - 9 * t, c.y - 5 * t), ImVec2(c.x + 9 * t, c.y + 5 * t), col,
+                    2 * t, 0, 1.8f * t);
+        for (int row = 0; row < 3; row++)
+            for (int k = 0; k < 5; k++)
+                dl->AddRectFilled(ImVec2(c.x - 7 * t + k * 3 * t, c.y - 3 * t + row * 2.6f * t),
+                                  ImVec2(c.x - 5 * t + k * 3 * t, c.y - 1.4f * t + row * 2.6f * t),
+                                  col);
+        break;
+    }
+    case ToolbarIcon::music_on:
+    case ToolbarIcon::music_off: {
+        // One beamed note, drawn large: stem, head and flag with no hairlines to blur away.
+        // The stem lands through the head's middle, so the two are one mark at any size.
+        // The off state adds the universal slash.
+        dl->AddLine(ImVec2(c.x + 2 * t, c.y - 7 * t), ImVec2(c.x + 2 * t, c.y + 4 * t), col,
+                    2.6f * t);
+        dl->AddEllipseFilled(ImVec2(c.x + 1 * t, c.y + 4 * t), ImVec2(4 * t, 3.2f * t),
+                             col);
+        dl->AddTriangleFilled(ImVec2(c.x + 2 * t, c.y - 7 * t),
+                              ImVec2(c.x + 7.5f * t, c.y - 4.5f * t),
+                              ImVec2(c.x + 2 * t, c.y - 1.5f * t), col);
+        if (icon == ToolbarIcon::music_off)
+            dl->AddLine(ImVec2(c.x - 9 * t, c.y - 7 * t), ImVec2(c.x + 9 * t, c.y + 7 * t), col,
+                        2.4f * t);
+        break;
+    }
+    }
+}
+
+// An icon-over-label toolbar button in the shadPS4 spirit. Behaves like a button (hover/active
+// painting included); `active` pins the active paint for toggle state.
+bool icon_button(const char* id, ToolbarIcon icon, const char* label, bool active = false) {
+    ImGui::BeginGroup();
+    ImGui::PushID(id);
+    const ImVec2 size(64.0f, 52.0f);
+    const bool clicked = ImGui::InvisibleButton("btn", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool pressed = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetItemRectMin();
+    if (hovered || pressed || active)
+        dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y),
+                          ImGui::GetColorU32(pressed || active ? ImGuiCol_ButtonActive
+                                                              : ImGuiCol_ButtonHovered),
+                          6.0f);
+    const ImU32 glyph =
+        ImGui::GetColorU32((hovered || pressed || active) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    draw_toolbar_icon(dl, ImVec2(p0.x + size.x * 0.5f, p0.y + 20.0f), 11.0f, icon, glyph);
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p0.x + (size.x - textSize.x) * 0.5f, p0.y + 34.0f), glyph, label);
+    ImGui::PopID();
+    ImGui::EndGroup();
+    return clicked;
+}
 
 std::string read_file_bytes(const std::string& path) {
     std::string out;
@@ -428,6 +541,7 @@ void LibraryUi::apply_filter() {
         if (game_entry_matches_filter(games_[static_cast<size_t>(i)], filterApplied_))
             filtered_.push_back(i);
     selected_ = 0;
+    hovered_ = -1;
 }
 
 void LibraryUi::set_output_volume(float volume) {
@@ -694,6 +808,45 @@ void LibraryUi::draw_backdrop() {
     }
 }
 
+void LibraryUi::draw_controls_content() {
+    if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
+    ImGui::Separator();
+    ImGui::TextWrapped("Keyboard controls. A connected controller just works as pad 0 — "
+                       "this map is composed over it.");
+    const ImGuiTableFlags flags =
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV;
+    if (ImGui::BeginTable("controls", 2, flags)) {
+        ImGui::TableSetupColumn("Keys", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+        ImGui::TableSetupColumn("Guest control", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        // Mirrors keyboard_pad_map.hpp's documented layout; update both together.
+        static const char* kRows[][2] = {
+            {"W A S D / arrows", "D-pad"},
+            {"T F G H", "Left stick (up / left / down / right)"},
+            {"I J K L", "Right stick (up / left / down / right)"},
+            {"N M , .", "Square / Cross / Circle / Triangle"},
+            {"Space", "Cross"},
+            {"Z X C V", "L1 / L2 / R1 / R2"},
+            {"B / Slash", "L3 / R3 (stick clicks)"},
+            {"Enter", "Options"},
+            {"Pause / F10", "Pause / resume at a flip boundary"},
+            {"F11 / Alt+Enter", "Fullscreen"},
+            {"F8", "Performance capture"},
+            {"F9", "Frame capture for offline replay"},
+            {"Esc", "Exit"},
+        };
+        for (const auto (&row)[2] : kRows) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(row[0]);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(row[1]);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("One cluster per hand at a time: WASD or TFGH left, IJKL or N M , . right.");
+}
+
 void LibraryUi::draw_settings_content(LibraryAction& action) {
     // The menu bar brought the user here; this is the way back. Tabs were the earlier shape —
     // menu-led navigation won, and two coexisting navigations were the duplication.
@@ -860,6 +1013,8 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
 
     if (tab_ == LibraryTab::settings) {
         draw_settings_content(action);
+    } else if (tab_ == LibraryTab::controls) {
+        draw_controls_content();
     } else if (games_.empty()) {
         ImGui::Spacing();
         if (gamesDir_.empty()) {
@@ -879,19 +1034,36 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::SameLine();
         ImGui::TextDisabled("or press Enter, or drop a game folder on this window");
     } else {
-        // Toolbar: folder management left, search right.
-        if (ImGui::Button("Change folder...")) action.kind = LibraryAction::Kind::browse;
+        // Toolbar: icon buttons left, search right. Icon behavior matches the old text buttons
+        // exactly; only the pixels changed. The slider and the search box are vertically centered
+        // against the 52 px icon buttons rather than riding their top edge.
+        const float toolbarTop = ImGui::GetCursorPosY();
+        const float centerPad = 14.0f;
+        bool playClicked = false;
+        if (icon_button("play", ToolbarIcon::play, "Play")) playClicked = true;
         ImGui::SameLine();
-        if (ImGui::Button("Rescan")) action.kind = LibraryAction::Kind::rescan;
+        if (icon_button("folder", ToolbarIcon::folder, "Add folder"))
+            action.kind = LibraryAction::Kind::browse;
+        ImGui::SameLine();
+        if (icon_button("rescan", ToolbarIcon::rescan, "Refresh list"))
+            action.kind = LibraryAction::Kind::rescan;
+        ImGui::SameLine();
+        if (icon_button("fullscreen", ToolbarIcon::fullscreen, "Full screen"))
+            action.kind = LibraryAction::Kind::toggle_fullscreen;
+        ImGui::SameLine();
+        if (icon_button("keyboard", ToolbarIcon::keyboard, "Keyboard")) tab_ = LibraryTab::controls;
         ImGui::SameLine();
         // Discoverable rather than env-only: someone who does not want a launcher making noise should
         // not have to find a variable name to stop it. Reported to the caller so it is persisted.
-        if (ImGui::Checkbox("Music", &musicToggle_)) {
+        if (icon_button("music", musicToggle_ ? ToolbarIcon::music_on : ToolbarIcon::music_off,
+                        "Music", musicToggle_)) {
+            musicToggle_ = !musicToggle_;
             media_.set_music_enabled(musicToggle_, nowMs);
             action.kind = LibraryAction::Kind::set_music;
             action.music_on = musicToggle_;
         }
         ImGui::SameLine();
+        ImGui::SetCursorPosY(toolbarTop + centerPad);
         ImGui::SetNextItemWidth(120.0f);
         int vol = volumePercent_;
         // Live while dragging (the gain applies on this thread), persisted on release: writing
@@ -907,6 +1079,7 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Volume");
         ImGui::SameLine(ImGui::GetContentRegionMax().x - 260.0f);
+        ImGui::SetCursorPosY(toolbarTop + centerPad);
         ImGui::SetNextItemWidth(260.0f);
         if (ImGui::InputTextWithHint("##search", "Search...", filterBuf_, sizeof filterBuf_))
             apply_filter();
@@ -932,8 +1105,8 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
             selected_ = shown - 1;
             moveKey = true;
         }
-        if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-             ImGui::IsKeyPressed(ImGuiKey_Space)) &&
+        if ((playClicked || ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) || ImGui::IsKeyPressed(ImGuiKey_Space)) &&
             selected_ >= 0 && selected_ < shown) {
             action.kind = LibraryAction::Kind::open;
             action.app0_root = games_[static_cast<size_t>(filtered_[static_cast<size_t>(selected_)])].app0_root;
@@ -942,7 +1115,12 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                            ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable |
                                            ImGuiTableFlags_ScrollY;
-        const float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
+        // The footer and the Game Log panel below take their share first; a tiny window
+        // collapses the table rather than pushing the log off-screen.
+        static constexpr float kLogPanelH = 140.0f;
+        float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f -
+                       kLogPanelH - ImGui::GetStyle().ItemSpacing.y * 3.0f;
+        if (tableH < 0.0f) tableH = 0.0f;
         if (ImGui::BeginTable("games", 6, tableFlags, ImVec2(0, tableH))) {
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, kThumbSize);
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
@@ -951,15 +1129,29 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
             ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
+            // Single-line cells center against the thumbnail row; without this every text
+            // column rides the row's top edge while the art fills it.
+            const float textPadY = (kThumbSize + 8.0f - ImGui::GetTextLineHeight()) * 0.5f;
+            int hoverThisFrame = -1;
             for (int fi = 0; fi < shown; fi++) {
                 const GameEntry& game =
                     games_[static_cast<size_t>(filtered_[static_cast<size_t>(fi)])];
                 ImGui::TableNextRow(0, kThumbSize + 8.0f);
-                if (fi == selected_)
+                // One highlight per row, painted up front so it always spans the whole width.
+                // Three states so hover is visible even over the selection: solid for selected,
+                // brightest for selected+hovered, translucent wash for hovered-only.
+                if (fi == selected_ && fi == hovered_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonHovered));
+                else if (fi == selected_)
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                            ImGui::GetColorU32(ImGuiCol_ButtonActive));
+                else if (fi == hovered_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonHovered, 0.45f));
                 ImGui::TableSetColumnIndex(0);
                 ImGui::PushID(fi);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
                 const VkDescriptorSet cover = cover_for(game);
                 if (cover)
                     ImGui::Image(reinterpret_cast<ImTextureID>(cover),
@@ -968,9 +1160,18 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                     ImGui::TextDisabled("--");
                 if (ImGui::IsItemClicked()) selected_ = fi;
                 ImGui::TableSetColumnIndex(1);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 // SpanAllColumns makes the whole row one click target; the double-click opens.
-                if (ImGui::Selectable(game.title_name.c_str(), fi == selected_,
-                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                // The Selectable itself paints nothing — no selected, no hover — because the row
+                // background below is the single highlight. A Selectable left to its own devices
+                // paints its cell a different shade on hover, which reads as a second selection.
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+                const bool rowClicked = ImGui::Selectable(game.title_name.c_str(), false,
+                                                          ImGuiSelectableFlags_SpanAllColumns);
+                if (ImGui::IsItemHovered()) hoverThisFrame = fi;
+                ImGui::PopStyleColor(2);
+                if (rowClicked) {
                     selected_ = fi;
                     if (ImGui::IsMouseDoubleClicked(0)) {
                         action.kind = LibraryAction::Kind::open;
@@ -978,22 +1179,29 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                     }
                 }
                 ImGui::TableSetColumnIndex(2);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 ImGui::TextUnformatted(game.title_id.c_str());
                 ImGui::TableSetColumnIndex(3);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 ImGui::TextUnformatted(game.region.c_str());
                 ImGui::TableSetColumnIndex(4);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 ImGui::TextUnformatted(game.version.c_str());
                 ImGui::TableSetColumnIndex(5);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
                 // The FOLDER NAME, not the absolute path: the folder name is what identifies the
                 // dump while the rest of the path is the user's home directory — which would
-                // otherwise end up in every screenshot anyone shares of their library.
-                ImGui::TextDisabled("%s", path_basename(game.app0_root).c_str());
+                // otherwise end up in every screenshot anyone shares of their library. A drive
+                // root has no basename, so there the root itself is the name.
+                const std::string folder = path_basename(game.app0_root);
+                ImGui::TextUnformatted((folder.empty() ? game.app0_root : folder).c_str());
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", game.app0_root.c_str());
                 ImGui::PopID();
                 // Follow a keyboard move; a mouse scroll is left alone so the two never fight.
                 if (moveKey && fi == selected_) ImGui::SetScrollHereY(0.5f);
             }
+            hovered_ = hoverThisFrame;
             ImGui::EndTable();
         }
         if (shown == 0)
@@ -1001,7 +1209,31 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::Separator();
         ImGui::Text("%d game%s", shown, shown == 1 ? "" : "s");
         ImGui::SameLine();
-        ImGui::TextDisabled("Enter opens  |  double-click opens  |  Esc quits");
+        ImGui::TextDisabled("Play / Enter opens  |  double-click opens  |  Esc quits");
+        ImGui::Spacing();
+
+        // Game Log: this process's own stdout/stderr tail, tailed live. Rendered, never stored
+        // here — the ring owns the lines and caps them.
+        ImGui::Separator();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Game Log");
+        ImGui::SameLine();
+        ImGui::Checkbox("Follow", &logFollow_);
+        if (ImGui::BeginChild("gamelog", ImVec2(0, kLogPanelH), true,
+                              ImGuiWindowFlags_HorizontalScrollbar)) {
+            if (!logRing_) {
+                ImGui::TextDisabled("Log capture unavailable.");
+            } else {
+                const std::vector<std::string> lines = logRing_->snapshot();
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(lines.size()));
+                while (clipper.Step())
+                    for (int li = clipper.DisplayStart; li < clipper.DisplayEnd; li++)
+                        ImGui::TextUnformatted(lines[static_cast<size_t>(li)].c_str());
+                if (logFollow_ && !lines.empty()) ImGui::SetScrollHereY(1.0f);
+            }
+        }
+        ImGui::EndChild();
     }
 
     if (!status.empty()) {
