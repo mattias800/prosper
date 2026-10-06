@@ -5836,9 +5836,11 @@ static void notify_unchanged_buffer_for(const KnownFillProof* known_fill, const 
     prosper::gpu::set_guest_gpu_write_origin(previous);
 }
 
-// ADR 0009 Stage 1, step 1: everything the part of a dispatch AFTER its fence wait reads or writes,
-// named explicitly so that part can later run at a deferred retirement point. Every member is a
-// reference to execute_item's own variable; nothing is copied, so behaviour is unchanged.
+// ADR 0009 (proposed), preparatory step: everything the part of a dispatch AFTER its fence wait
+// reads or writes, named explicitly so that part COULD later run at a deferred retirement point if
+// the ADR is accepted. Every member is a reference to execute_item's own variable; nothing is
+// copied, so behaviour is unchanged. Designated initializers at the one construction site make a
+// swapped or misordered member a compile error rather than a silently re-bound reference.
 struct DispatchTailState {
     VulkanComputeContext& ctx;
     const prosper::gpu::ComputeItem& item;
@@ -13249,8 +13251,45 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             break;
         }
-        DispatchTailState tail_state{
-            ctx, item, known_fill, ok, trace, completion_proven, device_indirect, cached_fill_enabled, buffers, images, staging, staging_memory, staging_bytes, compare_flags_memory, compare_targets, timing_program_hash, transfer_gate_census, transfer_gate_observation, authority_census, authority_observation, image_timing, perf_gpu_timing, ledger_gpu_timing, timestamp_count, storage_timestamp_spans, phase_dispatch, phase_writeback, image_cache_ms, image_map_ms, image_notify_ms, image_prepare_ms, image_watch_ms, layout_ms, pack_ms, retile_copy_ms, writeback_buffers_ms, writeback_images_ms, writeback_prepare_ms, writeback_publish_ms};
+        DispatchTailState tail_state{.ctx = ctx,
+                                     .item = item,
+                                     .known_fill = known_fill,
+                                     .ok = ok,
+                                     .trace = trace,
+                                     .completion_proven = completion_proven,
+                                     .device_indirect = device_indirect,
+                                     .cached_fill_enabled = cached_fill_enabled,
+                                     .buffers = buffers,
+                                     .images = images,
+                                     .staging = staging,
+                                     .staging_memory = staging_memory,
+                                     .staging_bytes = staging_bytes,
+                                     .compare_flags_memory = compare_flags_memory,
+                                     .compare_targets = compare_targets,
+                                     .timing_program_hash = timing_program_hash,
+                                     .transfer_gate_census = transfer_gate_census,
+                                     .transfer_gate_observation = transfer_gate_observation,
+                                     .authority_census = authority_census,
+                                     .authority_observation = authority_observation,
+                                     .image_timing = image_timing,
+                                     .perf_gpu_timing = perf_gpu_timing,
+                                     .ledger_gpu_timing = ledger_gpu_timing,
+                                     .timestamp_count = timestamp_count,
+                                     .storage_timestamp_spans = storage_timestamp_spans,
+                                     .phase_dispatch = phase_dispatch,
+                                     .phase_writeback = phase_writeback,
+                                     .image_cache_ms = image_cache_ms,
+                                     .image_map_ms = image_map_ms,
+                                     .image_notify_ms = image_notify_ms,
+                                     .image_prepare_ms = image_prepare_ms,
+                                     .image_watch_ms = image_watch_ms,
+                                     .layout_ms = layout_ms,
+                                     .pack_ms = pack_ms,
+                                     .retile_copy_ms = retile_copy_ms,
+                                     .writeback_buffers_ms = writeback_buffers_ms,
+                                     .writeback_images_ms = writeback_images_ms,
+                                     .writeback_prepare_ms = writeback_prepare_ms,
+                                     .writeback_publish_ms = writeback_publish_ms};
         finish_dispatch_tail(tail_state);
     } while (false);
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
