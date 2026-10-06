@@ -31,8 +31,8 @@ namespace prosper::gpu {
 // outright, and only a pointer register that was never written counts as entry-rooted (a copy,
 // even of itself, drops that identity). A loop that re-runs a COPY is admitted when the copied
 // word still carries the same load tag, since a copy captures bits.
-bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc,
-                                 int tbase, const std::array<uint32_t, 8>& source_pc,
+bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
+                                 const std::array<uint32_t, 8>& source_pc,
                                  const std::array<uint64_t, 8>& source_addr,
                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                  uint32_t user_sgpr_base,
@@ -290,7 +290,8 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
     Gen5ImageFormatInfo format;
     if (!d.base || !d.width || !d.height || !gen5_image_format(d.format, &format) ||
         !format.bytes_per_block || d.compression_enabled || d.write_compress_enabled ||
-        d.metadata_addr) return false;
+        d.metadata_addr)
+        return false;
     // Only layouts whose slices are separate 2D surfaces are bounded here. A 3D surface (TYPE 10) in
     // a thick swizzle mode is tiled in 3D blocks (a 64 KiB block at 4 bytes per texel is 32x32x16
     // texels), so its depth pads to the block depth: 1024x1024x2 R32 occupies 64 MiB, not 8. A 3D

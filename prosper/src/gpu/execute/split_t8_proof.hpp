@@ -29,8 +29,8 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
 
 // `image_writes` lists the earlier storage-image uses whose extents are known. A write through one of
 // them that cannot reach the descriptor bytes does not revoke the proof; any other writer still does.
-bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc,
-                                 int tbase, const std::array<uint32_t, 8>& source_pc,
+bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
+                                 const std::array<uint32_t, 8>& source_pc,
                                  const std::array<uint64_t, 8>& source_addr,
                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                  uint32_t user_sgpr_base,

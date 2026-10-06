@@ -42,7 +42,14 @@ alignas(64) uint32_t g_table[16];
 
 // Captured shape of a 960x540 2D image T# (base is patched per test) and a 240x136 one.
 std::array<uint32_t, 8> store_t8(uint64_t base) {
-    return { static_cast<uint32_t>(base >> 8), 0xc0d00000u | static_cast<uint32_t>((base >> 40) & 0xffu), 0x0086c0efu, 0x90900204u, 0, 0x00700000u, 0, 0 };
+    return {static_cast<uint32_t>(base >> 8),
+            0xc0d00000u | static_cast<uint32_t>((base >> 40) & 0xffu),
+            0x0086c0efu,
+            0x90900204u,
+            0,
+            0x00700000u,
+            0,
+            0};
 }
 // The same surface reinterpreted with another SQ_RSRC_IMG TYPE (WORD3[31:28]) and WORD4 DEPTH field.
 std::array<uint32_t, 8> with_type(std::array<uint32_t, 8> t8, uint32_t type, uint32_t depth_field) {
@@ -57,7 +64,7 @@ uint64_t bytes_per_block_of(const std::array<uint32_t, 8>& t8) {
     return format.bytes_per_block;
 }
 std::array<uint32_t, 8> load_t8() {
-    return { 0x421abe00u, 0xc1400000u, 0x0021c03bu, 0x90900004u, 0, 0x00700000u, 0, 0 };
+    return {0x421abe00u, 0xc1400000u, 0x0021c03bu, 0x90900004u, 0, 0x00700000u, 0, 0};
 }
 
 // pc0      s_cbranch_execz +0           (makes the program branchy, so the CFG proof owns the load)
@@ -67,6 +74,7 @@ std::array<uint32_t, 8> load_t8() {
 // pc6-7    image_load  ... s[12:19]     (the consumer)
 // pc8      s_endpgm
 std::vector<uint32_t> program() {
+    // clang-format off: one line per instruction, matching the pc table above
     return {
         0xBF880000u,
         0xF4100101u, 0xFA000000u,
@@ -75,13 +83,16 @@ std::vector<uint32_t> program() {
         0xF0000208u, 0x00030704u,
         0xBF810000u,
     };
+    // clang-format on
 }
 
-std::vector<SrtUse> uses_for(const std::array<uint32_t, 8>& first, const std::array<uint32_t, 8>& second) {
+std::vector<SrtUse> uses_for(const std::array<uint32_t, 8>& first,
+                             const std::array<uint32_t, 8>& second) {
     std::copy(first.begin(), first.end(), g_table);
     std::copy(second.begin(), second.end(), g_table + 8);
     const uint64_t base = reinterpret_cast<uint64_t>(g_table);
-    const uint32_t seed[4] = { 0u, 0u, static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u) };
+    const uint32_t seed[4] = {0u, 0u, static_cast<uint32_t>(base),
+                              static_cast<uint32_t>(base >> 32u)};
     std::vector<SrtUse> result;
     const auto code = program();
     resolve_dynamic_fetch(code.data(), code.size(), seed, 4, 0, &result);
@@ -93,7 +104,7 @@ bool has_use(const std::vector<SrtUse>& uses, uint32_t pc) {
                        [pc](const SrtUse& u) { return u.kind == 0 && u.use_pc == pc; });
 }
 
-}  // namespace
+}   // namespace
 
 TEST(SplitT8ImageWriteExtent, StoreToDistantImageKeepsProof) {
     EXPECT_TRUE(has_use(uses_for(store_t8(0x421c4d0000ull), load_t8()), 6u))
@@ -113,8 +124,10 @@ TEST(SplitT8ImageWriteExtent, ExtentIsASupersetOfTheSurface) {
     EXPECT_EQ(lo, 0x421c4d0000ull);
     // 960x540 padded to 256x256 tiles is 1024x768, one slice, one sample, no mip chain.
     const uint64_t bpb = bytes_per_block_of(store_t8(0x421c4d0000ull));
-    ASSERT_GT(bpb, 1u) << "the captured format must have more than one byte per texel for this to bite";
-    EXPECT_EQ(hi - lo, 1024ull * 768ull * bpb) << "the footprint is the padded surface at its texel size";
+    ASSERT_GT(bpb, 1u)
+        << "the captured format must have more than one byte per texel for this to bite";
+    EXPECT_EQ(hi - lo, 1024ull * 768ull * bpb)
+        << "the footprint is the padded surface at its texel size";
 }
 
 TEST(SplitT8ImageWriteExtent, ExtentCountsSlicesAndMips) {
@@ -149,14 +162,16 @@ TEST(SplitT8ImageWriteExtent, StoreToThickThreeDImageRefused) {
     const auto naive_t8 = with_type(store_t8(base), 9u, 0u);
     uint64_t lo = 0, hi = 0;
     ASSERT_TRUE(storage_image_write_extent(naive_t8, lo, hi));
-    ASSERT_LT(2u * (hi - lo), 16ull << 20) << "the two-slice naive bound must stop short of the table";
+    ASSERT_LT(2u * (hi - lo), 16ull << 20)
+        << "the two-slice naive bound must stop short of the table";
     EXPECT_FALSE(has_use(uses_for(with_type(store_t8(base), 10u, 1u), load_t8()), 6u))
         << "a 3D store's footprint is unknown, so it must still revoke the proof";
 }
 
 TEST(SplitT8ImageWriteExtent, CompressedSurfaceHasNoExtent) {
     auto t8 = store_t8(0x421c4d0000ull);
-    t8[6] |= 1u << 21;   // WORD6 COMPRESSION_EN: the surface owns a metadata plane this bound ignores
+    t8[6] |=
+        1u << 21;   // WORD6 COMPRESSION_EN: the surface owns a metadata plane this bound ignores
     uint64_t lo = 0, hi = 0;
     EXPECT_FALSE(storage_image_write_extent(t8, lo, hi));
 }
@@ -173,7 +188,8 @@ TEST(SplitT8ImageWriteExtent, SamplerPredicate) {
     EXPECT_FALSE(rdna2_mimg_reads_sampler(mimg(0x0e))) << "image_get_resinfo has no sampler";
     EXPECT_FALSE(rdna2_mimg_reads_sampler(mimg(0x11))) << "image atomics have no sampler";
     EXPECT_TRUE(rdna2_mimg_reads_sampler(mimg(0x20))) << "image_sample reads its sampler";
-    EXPECT_TRUE(rdna2_mimg_reads_sampler(mimg(0x7f))) << "an unknown opcode fails closed to sampled";
+    EXPECT_TRUE(rdna2_mimg_reads_sampler(mimg(0x7f)))
+        << "an unknown opcode fails closed to sampled";
     Rdna2Inst smem{};
     smem.fmt = Rdna2Format::SMEM;
     EXPECT_FALSE(rdna2_mimg_reads_sampler(smem));
@@ -183,6 +199,7 @@ TEST(SplitT8ImageWriteExtent, SamplerPredicate) {
 // s[0:7] and image_store through s[8:15]. Each store's SSAMP field encodes s0, which neither reads.
 //   pc0-1 load   pc2 waitcnt   pc3-4 store s[0:7]   pc5-6 store s[8:15]   pc7 endpgm
 TEST(SplitT8ImageWriteExtent, X16ProofAdmitsTwoStoresDespiteUnusedSamplerField) {
+    // clang-format off: one line per instruction, matching the pc table above
     const std::vector<uint32_t> code = {
         0xF4100001u, 0xFA000000u,
         0xBF8CC07Fu,
@@ -190,6 +207,7 @@ TEST(SplitT8ImageWriteExtent, X16ProofAdmitsTwoStoresDespiteUnusedSamplerField) 
         0xF0200108u, 0x00020204u,
         0xBF810000u,
     };
+    // clang-format on
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
     ShaderResourceTable table;

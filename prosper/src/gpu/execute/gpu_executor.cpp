@@ -5225,9 +5225,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                     image_writes.push_back(extent);
                                 }
                             }
-                        mapped_t8 = same_code && mapped_split_t8_reaches_use(
-                            code, std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u), in.pc, tbase,
-                            mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr, user_sgpr_base, image_writes);
+                        mapped_t8 =
+                            same_code &&
+                            mapped_split_t8_reaches_use(
+                                code,
+                                std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u),
+                                in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
+                                user_sgpr_base, image_writes);
                     }
                     const std::array<uint32_t, 8>* t8 =
                         live_t8_known && (!branchy_x16 || mapped_t8) &&
