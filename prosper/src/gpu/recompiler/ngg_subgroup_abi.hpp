@@ -21,6 +21,7 @@
 //   ngg-sendmsg-m0-unproven            GS_ALLOC_REQ whose M0 is not written on every path by a
 //                                      scalar ALU instruction
 //   ngg-export-in-cycle / ngg-export-compressed / ngg-export-target-unsupported /
+//   ngg-export-pos1-channels (POS1 other than the layer, z) /
 //   ngg-export-duplicate-target / ngg-export-prim-channels / ngg-export-missing-prim /
 //   ngg-export-missing-pos0 / ngg-export-too-many-params
 //   ngg-abi-control-transfer           s_setpc/s_swappc/s_call/M0-relative moves/subvector loops

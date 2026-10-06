@@ -543,6 +543,13 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
                    static_cast<int>(in.exp_en));
             return facts;
         }
+        // POS1 carries point size (x), edge flag (y), the layer (z) and the viewport index (w);
+        // only the layer is modelled downstream, so any other channel is refused here.
+        if (target == kExpTargetPos1 && (in.exp_en & ~0x4u) != 0) {
+            refuse(facts, "ngg-export-pos1-channels", in.pc, "en=0x%x",
+                   static_cast<int>(in.exp_en));
+            return facts;
+        }
         if (!exports.emplace(target, &in).second) {
             refuse(facts, "ngg-export-duplicate-target", in.pc, "target=%d",
                    static_cast<int>(target));
