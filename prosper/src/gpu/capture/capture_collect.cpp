@@ -726,6 +726,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             return false;
         }
         c.owned_waves = d.owned_waves;
+        c.ngg_subgroup = d.ngg_subgroup;
         if (d.owned_waves && d.owned_waves->vertex_pending) {
             if (d.owned_waves->vertex.packets.empty() ||
                 !store_raw_shader_version(d.owned_waves->vertex.packets.front().guest_code, true,
