@@ -89,7 +89,8 @@ LutSummary summarize(const std::vector<uint32_t>& out, const NggExportRecordLayo
         const uint32_t base = block * layout.block_words(waves);
         const uint32_t verts = out[base + kNggHeaderVertsAlloc];
         const uint32_t prims = out[base + kNggHeaderPrimsAlloc];
-        if (out[base + kNggHeaderAllocRequests] != 1 || out[base + kNggHeaderStrayRequests] != 0)
+        if (out[base + kNggHeaderAllocRequests] != 1 || out[base + kNggHeaderStrayRequests] != 0 ||
+            out[base + kNggHeaderLaunchMismatches] != 0)
             continue;
         ++summary.valid_headers;
         const auto record = [&](uint32_t thread) {
@@ -181,7 +182,7 @@ KenaRun compile_kena(uint32_t waves, bool native, uint32_t vertices = 4) {
     const ShaderResourceTable table = kena_resources(vertices);
     NggSubgroupShellConfig config;
     config.waves = waves;
-    config.lds_bytes = kKenaLds;
+    config.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(kKenaRsrc2Gs);
     config.user_sgprs = kKenaUserSgprs;
     config.native_wave64 = native;
     run.module =
@@ -219,19 +220,27 @@ uint32_t launch_word(uint32_t block, uint32_t thread, uint32_t reg) {
     return 0x10000000u + block * 0x100000u + thread * 0x100u + reg;
 }
 
-std::vector<uint32_t> synthetic_launch(uint32_t blocks, uint32_t waves) {
+// s3 normally names the dispatch's wave count and each wave's index; a test can misstate either.
+struct LaunchSkew {
+    uint32_t waves_field = 0;   // nonzero: write this as s3[31:28] instead of the real W
+    bool swap_wave_index = false;   // write wave 1's index into wave 0 and wave 0's into wave 1
+};
+
+std::vector<uint32_t> synthetic_launch(uint32_t blocks, uint32_t waves, LaunchSkew skew = {}) {
     std::vector<uint32_t> words;
     for (uint32_t block = 0; block < blocks; ++block)
         for (uint32_t thread = 0; thread < 64u * waves; ++thread) {
             for (uint32_t reg = 0; reg < 9; ++reg) words.push_back(launch_word(block, thread, reg));
-            words.push_back(waves << 28 | (thread / 64u) << 24 | 64u << 8 | 64u);
+            const uint32_t w = skew.waves_field ? skew.waves_field : waves;
+            const uint32_t index = skew.swap_wave_index ? (thread / 64u) ^ 1u : thread / 64u;
+            words.push_back(w << 28 | index << 24 | 64u << 8 | 64u);
         }
     return words;
 }
 
 std::vector<uint32_t> run_synthetic(const std::vector<uint32_t>& code, uint32_t waves, bool native,
                                     uint32_t blocks, NggExportRecordLayout* layout,
-                                    std::string* refusal = nullptr) {
+                                    std::string* refusal = nullptr, LaunchSkew skew = {}) {
     const ShaderResourceTable table = synthetic_resources();
     NggSubgroupShellConfig config;
     config.waves = waves;
@@ -247,7 +256,7 @@ std::vector<uint32_t> run_synthetic(const std::vector<uint32_t>& code, uint32_t 
     dispatch.spirv = module;
     dispatch.local_size = 64 * waves;
     dispatch.workgroups = blocks;
-    dispatch.launch = synthetic_launch(blocks, waves);
+    dispatch.launch = synthetic_launch(blocks, waves, skew);
     dispatch.export_words = blocks * layout->block_words(waves);
     dispatch.guest_buffers = {{0, {kSyntheticCbuf, 2, 3, 4}}};
     dispatch.push_constants.assign(4, 0u);
@@ -269,6 +278,7 @@ TEST(NggSubgroupShell, SyntheticTwoWaveRecordsCarryLaunchValuesAndTheHeader) {
         EXPECT_EQ(out[base + kNggHeaderPrimsAlloc], 3u) << "block " << block;
         EXPECT_EQ(out[base + kNggHeaderAllocRequests], 1u) << "block " << block;
         EXPECT_EQ(out[base + kNggHeaderStrayRequests], 0u) << "block " << block;
+        EXPECT_EQ(out[base + kNggHeaderLaunchMismatches], 0u) << "block " << block;
         uint32_t bad = 0;
         for (uint32_t thread = 0; thread < 128; ++thread) {
             const uint32_t* r = &out[layout.record_offset(2, block, thread)];
@@ -293,10 +303,14 @@ TEST(NggSubgroupShell, AllocationRequestsAreCountedPerWave) {
     ASSERT_FALSE(every_wave.empty());
     EXPECT_EQ(every_wave[kNggHeaderAllocRequests], 1u);
     EXPECT_EQ(every_wave[kNggHeaderStrayRequests], 1u) << "wave 1's request is a stray";
-    const auto silent = run_synthetic(synthetic_program(true, false), 2, false, 2, &layout);
-    ASSERT_FALSE(silent.empty());
-    EXPECT_EQ(silent[kNggHeaderAllocRequests], 0u);
-    EXPECT_EQ(silent[kNggHeaderVertsAlloc], 0u);
+    // s_cbranch_scc1: wave 0 skips, wave 1 requests. Wave 0 never allocates.
+    auto wave1_only = synthetic_program();
+    wave1_only[4] = 0xbf850002u;
+    const auto stray_only = run_synthetic(wave1_only, 2, false, 2, &layout);
+    ASSERT_FALSE(stray_only.empty());
+    EXPECT_EQ(stray_only[kNggHeaderAllocRequests], 0u);
+    EXPECT_EQ(stray_only[kNggHeaderStrayRequests], 1u);
+    EXPECT_EQ(stray_only[kNggHeaderVertsAlloc], 0u);
 }
 
 TEST(NggSubgroupShell, ExecPredicatesRecordWordsAndFlags) {
@@ -324,6 +338,8 @@ TEST(NggSubgroupShell, VertexAndInstanceFetchesUseTheirLaunchIndices) {
         0xe0002000u,
         0x80030b00u,   // buffer_load_format_x v11, v0, s[12:15], 0 idxen (instance rate)
         0xbf8c0000u,   // s_waitcnt 0
+        0xb07c3005u,   // s_movk_i32 m0, 0x3005
+        0xbf900009u,   // s_sendmsg GS_ALLOC_REQ
         0x7e120280u,   // v_mov_b32 v9, 0
         0xf8000941u,
         0x00000009u,   // exp prim v9
@@ -402,6 +418,18 @@ TEST(NggSubgroupShell, VertexAndInstanceFetchesUseTheirLaunchIndices) {
 TEST(NggSubgroupShell, NativeWave64MatchesPortableOnTheSyntheticProgram) {
     if (!prosper::test::ngg_native_wave64_supported(2))
         GTEST_SKIP() << "device cannot require full 64-lane compute subgroups";
+    const auto code = synthetic_program();
+    const auto table = synthetic_resources();
+    NggSubgroupShellConfig config;
+    config.waves = 2;
+    config.user_sgprs = 4;
+    const auto portable_module =
+        recompile_ngg_subgroup(code.data(), code.size(), &table, config, nullptr);
+    config.native_wave64 = true;
+    const auto native_module =
+        recompile_ngg_subgroup(code.data(), code.size(), &table, config, nullptr);
+    ASSERT_FALSE(portable_module.empty() || native_module.empty());
+    ASSERT_NE(portable_module, native_module) << "the two shells must differ to compare anything";
     NggExportRecordLayout portable_layout, native_layout;
     const auto portable = run_synthetic(synthetic_program(), 2, false, 2, &portable_layout);
     const auto native = run_synthetic(synthetic_program(), 2, true, 2, &native_layout);
@@ -496,8 +524,9 @@ TEST(NggSubgroupShell, KenaControlMutatedVertexInputChangesOnlyParam) {
 }
 
 // A 34-vertex strip has 32 triangles and 96 output vertices per instance, so the planner gives it
-// two waves. A 1-wave launch of the same subgroup has no lanes for output vertices 64..95.
-TEST(NggSubgroupShell, KenaControlOneWaveLosesOutputVertices) {
+// two waves. The same subgroup launched as one wave tells the guest, through s3, that it has 64
+// lanes.
+TEST(NggSubgroupShell, KenaControlOneWaveLaunchChangesTheGuestsAllocation) {
     std::vector<std::array<float, 2>> strip;
     strip.reserve(34);
     for (uint32_t k = 0; k < 34; ++k)
@@ -517,12 +546,21 @@ TEST(NggSubgroupShell, KenaControlOneWaveLosesOutputVertices) {
                                     vertex_records(strip));
     ASSERT_FALSE(lost.empty());
     const LutSummary lost_summary = summarize(lost, one_wave.layout, 1, 2);
-    // Measured: the guest sizes its own allocation from s3's wave count, so it requests 64
-    // vertices for 32 triangles and the triangles past the 21st lose their vertices (they
-    // reference the wrong, repeated slots).
+    // Measured: the guest sizes its own allocation from s3's wave count. It requests 64 vertices
+    // (one wave's lanes) for its 32 triangles, every index still lands on a written vertex, and
+    // the triangles whose output vertices would lie past slot 63 reference repeated slots instead
+    // (for example (63, 1, 1)): 22 of the 64 triangles, 11 per subgroup, are degenerate.
+    for (uint32_t block = 0; block < 2; ++block) {
+        const uint32_t base = block * one_wave.layout.block_words(1);
+        EXPECT_EQ(lost[base + kNggHeaderVertsAlloc], 64u) << "block " << block;
+        EXPECT_EQ(lost[base + kNggHeaderPrimsAlloc], 32u) << "block " << block;
+        EXPECT_EQ(lost[base + kNggHeaderLaunchMismatches], 0u)
+            << "s3 is consistent with the 1-wave dispatch, so the self-check cannot see this";
+    }
     EXPECT_FALSE(is_complete_lut(lost_summary, 2, 32));
-    EXPECT_GT(lost_summary.degenerate + lost_summary.bad_connectivity, 0u)
-        << "a 1-wave subgroup has no lanes for output vertices 64..95";
+    EXPECT_EQ(lost_summary.non_null, 64u);
+    EXPECT_EQ(lost_summary.bad_connectivity, 0u);
+    EXPECT_EQ(lost_summary.degenerate, 22u);
 
     if (!prosper::test::ngg_native_wave64_supported(2))
         GTEST_SKIP() << "the two-wave positive needs native Wave64";
@@ -532,4 +570,49 @@ TEST(NggSubgroupShell, KenaControlOneWaveLosesOutputVertices) {
         two_wave, 2, true, 2, launch_records(plan, kena_limits(), 2), vertex_records(strip));
     ASSERT_FALSE(complete.empty());
     EXPECT_TRUE(is_complete_lut(summarize(complete, two_wave.layout, 2, 2), 2, 32));
+}
+
+// Lane 0 of each wave compares its s3 with the compiled shell; a mismatch marks the block.
+TEST(NggSubgroupShell, ALaunchThatMisstatesTheSubgroupIsMarkedInvalid) {
+    NggExportRecordLayout layout;
+    std::string why;
+    const auto wrong_waves =
+        run_synthetic(synthetic_program(), 2, false, 2, &layout, &why, LaunchSkew{1, false});
+    ASSERT_FALSE(wrong_waves.empty()) << why;
+    const auto wrong_index =
+        run_synthetic(synthetic_program(), 2, false, 2, &layout, &why, LaunchSkew{0, true});
+    ASSERT_FALSE(wrong_index.empty()) << why;
+    for (uint32_t block = 0; block < 2; ++block) {
+        const uint32_t base = block * layout.block_words(2);
+        EXPECT_EQ(wrong_waves[base + kNggHeaderLaunchMismatches], 2u) << "both waves say W=1";
+        EXPECT_EQ(wrong_index[base + kNggHeaderLaunchMismatches], 2u) << "both indices swapped";
+    }
+}
+
+// A program that uses LDS must say how much it has; the RSRC2_GS field is decoded in one place.
+TEST(NggSubgroupShell, LdsMustBeSizedFromTheRsrc2GsField) {
+    EXPECT_EQ(ngg_rsrc2_gs_lds_size(kKenaRsrc2Gs), 17u)
+        << "Kena's 2176 dwords, in 128-dword granules";
+    const auto linked = kena_linked(prosper::test::tests_root(__FILE__) / "data");
+    const ShaderResourceTable table = kena_resources(4);
+    NggSubgroupShellConfig config;
+    config.user_sgprs = kKenaUserSgprs;
+    std::string why;
+    EXPECT_TRUE(recompile_ngg_subgroup(linked.data(), linked.size(), &table, config, nullptr,
+                                       {RecompileDiagnosticStage::Vertex, 0x5009440000ull}, &why)
+                    .empty());
+    EXPECT_NE(why.find("reason=ngg-shell-config"), std::string::npos) << why;
+    EXPECT_NE(why.find("cause=lds-unsized"), std::string::npos) << why;
+    config.rsrc2_gs_lds_size = kNggMaxLdsGranules + 1u;
+    EXPECT_TRUE(
+        recompile_ngg_subgroup(linked.data(), linked.size(), &table, config, nullptr, {}, &why)
+            .empty());
+    // The synthetic program has no DS instruction, so it needs no size.
+    const auto code = synthetic_program();
+    const auto synthetic_table = synthetic_resources();
+    NggSubgroupShellConfig plain;
+    plain.waves = 2;
+    plain.user_sgprs = 4;
+    EXPECT_FALSE(
+        recompile_ngg_subgroup(code.data(), code.size(), &synthetic_table, plain, nullptr).empty());
 }

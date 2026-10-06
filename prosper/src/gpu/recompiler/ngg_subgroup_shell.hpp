@@ -23,7 +23,8 @@
 //
 // GS_ALLOC_REQ (`s_sendmsg 9`) stores M0[11:0] / M0[23:12] into the block header from lane 0 of
 // wave 0, and counts every request so the consumer can reject a subgroup whose program requested
-// zero times, twice, or from another wave. Barriers keep the barrier-phase proof
+// zero times, twice, or from another wave. Lane 0 of every wave also checks its s3 against the
+// compiled shell (s3[31:28] == waves, s3[27:24] == its wave index) and counts a mismatch. Barriers keep the barrier-phase proof
 // (`analyze_barrier_phased_compute`), which refuses a per-wave terminal guard before a barrier.
 //
 // Everything ngg_subgroup_abi.hpp refuses is refused here first, with its named reason in
@@ -47,9 +48,20 @@ inline constexpr uint32_t kNggShellDescriptorSet = 2;
 inline constexpr uint32_t kNggShellLaunchBinding = 0;
 inline constexpr uint32_t kNggShellExportBinding = 1;
 
+inline constexpr uint32_t kNggLdsGranuleDwords = 128;   // RSRC2_GS.LDS_SIZE unit (512 bytes)
+inline constexpr uint32_t kNggMaxLdsGranules = 128;   // 64 KiB
+
+// The LDS_SIZE field [26:19] of a raw SPI_SHADER_PGM_RSRC2_GS value.
+inline uint32_t ngg_rsrc2_gs_lds_size(uint32_t spi_shader_pgm_rsrc2_gs) {
+    return (spi_shader_pgm_rsrc2_gs >> 19) & 0xffu;
+}
+
 struct NggSubgroupShellConfig {
     uint32_t waves = 1;   // 1..4 Wave64 waves; LocalSize is 64 * waves
-    uint32_t lds_bytes = 0;   // SPI_SHADER_PGM_RSRC2_GS.LDS_SIZE in bytes (at most 64 KiB)
+    // The RAW SPI_SHADER_PGM_RSRC2_GS.LDS_SIZE field: 512-byte (128-dword) granules, at most 128.
+    // Decode it with ngg_rsrc2_gs_lds_size(); never pass bytes or dwords here. A program that uses
+    // LDS with this left at 0 is refused (ngg-shell-config cause=lds-unsized).
+    uint32_t rsrc2_gs_lds_size = 0;
     uint32_t user_sgprs = 0;   // s8.. count (AGC user_data_range_end); one push-constant word each
     bool user_data_address_known = false;   // two more push-constant words supply s0:s1
     // Require one exact 64-lane Vulkan subgroup per guest wave. The pipeline must then be created

@@ -512,7 +512,7 @@ static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& s
         prosper::test::ngg::kena_linked(std::filesystem::path(src_root) / "tests" / "data");
     const auto kena_rt = prosper::test::ngg::kena_resources(4);
     NggSubgroupShellConfig kena_cfg;
-    kena_cfg.lds_bytes = prosper::test::ngg::kKenaLds;
+    kena_cfg.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(prosper::test::ngg::kKenaRsrc2Gs);
     kena_cfg.user_sgprs = prosper::test::ngg::kKenaUserSgprs;
     dump(dir, "ngg_subgroup_kena_lut",
          recompile_ngg_subgroup(kena.data(), kena.size(), &kena_rt, kena_cfg),
