@@ -8,9 +8,23 @@ status: current
 Tracker: [#2990](https://github.com/mattias800/prosper/issues/2990).
 Route files and the menu map: `prosper/scripts/tomb-raider-PPSA16901/AGENTS.md`.
 
-**Rung 3** — Croft Manor runs with real GPU draws and the scene renders with correct geometry.
-Every surface is still untextured ([#2998](https://github.com/mattias800/prosper/issues/2998)),
-which is what keeps this below a rung-4 claim.
+**Rung 3** — Tomb Raider II's Croft Manor runs with real GPU draws and the scene renders with
+correct geometry and, since [#2998](https://github.com/mattias800/prosper/issues/2998) was fixed,
+its textures. Nobody has confirmed it by eye against the console, which is what a rung-4 claim
+needs.
+
+**Which manor (2026-10-06).** Everything this document says about Croft Manor is **Tomb Raider
+II's** `Lara's Home`, and so is every committed screenshot of it. Re-run on 2026-10-06 on `main`
+`cba35a254` plus the branch of #4624:
+`assets/screenshots/tomb-raider-2-laras-home-steps.webp`, route
+`scripts/tomb-raider-PPSA16901/reach-tr2-laras-home.pad`.
+
+**Tomb Raider I's** `Lara's Home` does not render: a handful of huge triangles radiating from a
+point, on every build tried back to the `v0.2.2` release
+([#4637](https://github.com/mattias800/prosper/issues/4637),
+`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`). That is where
+`reach-gameplay.pad` arrives today, which is how it was found: a routine run of the documented
+route showed an exploded world and read as a regression. It is not one. See the route's header.
 
 Prior to 2026-08-26 the title had no record anywhere in this repository — no `COMPATIBILITY.md`
 row, no tracker, no mention in any source file or script. It reached rung 2 with **no prosper code
@@ -32,7 +46,8 @@ submit-race signature ever shows up here, though nothing so far points that way.
 | Tomb Raider I title screen | logo, Lara portrait, animated ring menu and labels all correct |
 | Tomb Raider II title screen | logo, Lara model, villain silhouette and background all correct |
 | Tomb Raider III title screen | art correct; ring area is a solid violet block |
-| Croft Manor (`Lara's Home`) | correct geometry, correct character models, **untextured** (#2998) |
+| Croft Manor (`Lara's Home`), Tomb Raider II | correct geometry, correct character models, **untextured** (#2998; textured as of 2026-10-06) |
+| `Lara's Home`, Tomb Raider I | exploded geometry on every build tried (#4637) |
 
 ## The one fix that produced rung 3: an unannounced 32-bit index buffer with large indices
 
@@ -437,4 +452,10 @@ beside both readings of its own bytes, and must be run **live**.
 - Why `reach-title-screen.pad` arrives on Tomb Raider I while `reach-gameplay.pad` arrives on
   Tomb Raider II. Each is internally consistent across runs (3 of 3 for the gameplay route), so both
   are reproducible, but the reason they differ is unexplained and no mechanism should be assumed.
+  **Partly answered 2026-10-06:** the title screen switches game on Up/Down, both files are timed in
+  seconds, and on today's builds `reach-gameplay.pad` arrives on Tomb Raider I instead. A Down that
+  lands on the title screen is enough to switch (`reach-tr2-laras-home.pad` does it on purpose).
+  Which press of the old route used to land there was not traced.
+- Tomb Raider I's `Lara's Home` (#4637): no diagnosis. Both unannounced-32-bit detectors fire
+  during the run, so it is not simply the pre-fix defect with detection off.
 - Tomb Raider III beyond its title screen.

@@ -1,6 +1,6 @@
 #include "gpu/diagnostics/link_list_census.hpp"
 
-#include "gpu/diagnostics/watch_list.hpp"
+#include "diagnostics/watch_list.hpp"
 
 #include <algorithm>
 #include <cstdio>

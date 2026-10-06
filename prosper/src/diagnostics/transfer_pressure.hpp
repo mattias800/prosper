@@ -43,15 +43,21 @@ namespace prosper::diagnostics {
 
 // Coarse on purpose. A category exists when a reader would act differently on seeing it.
 enum class Transfer : unsigned char {
-    StorageMaterialize = 0,  // guest storage images copied/unpacked host-side for a dispatch
-    BufferUpload,            // compute buffer bindings uploaded to the device
-    BufferCompare,           // bytes read only to decide whether something changed
-    RenderTargetSnapshot,    // CPU copies of render targets for later sampling
-    Detile,                  // CPU detiling of tiled guest surfaces
+    StorageMaterialize = 0,   // guest storage images copied/unpacked host-side for a dispatch
+    BufferUpload,   // compute buffer bindings uploaded to the device
+    BufferCompare,   // bytes read only to decide whether something changed
+    RenderTargetSnapshot,   // CPU copies of render targets for later sampling
+    Detile,   // CPU detiling of tiled guest surfaces
     // The guest's front (scanout) buffer read back to the CPU: the copy out of guest memory plus
     // its de-swizzle (videoout_read_front_linear). Its own site so a host-copy alarm on the CPU
     // present fallback names the present path instead of reading as texture detiling (#3891).
     GuestScanout,
+    // A draw's buffer binding (vertex, constant or storage data) copied into a zero-filled host
+    // vector because no view of the guest's own memory could be borrowed for it, and then uploaded
+    // from there. The whole vector is charged: it is allocated and zeroed whatever part of it
+    // the guest's bytes fill (and uploaded unless they fill none). Per DRAW: MOUSE: P.I. For Hire's
+    // menus staged 9.4 MiB for each of three vertex attributes of every draw and no site showed it.
+    DrawBufferStage,
     Count
 };
 

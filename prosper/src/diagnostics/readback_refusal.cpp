@@ -1,7 +1,7 @@
 #include "diagnostics/readback_refusal.hpp"
 
 #include "diagnostics/exit_reports.hpp"
-#include "gpu/diagnostics/watch_list.hpp"
+#include "diagnostics/watch_list.hpp"
 
 #include <algorithm>
 #include <atomic>

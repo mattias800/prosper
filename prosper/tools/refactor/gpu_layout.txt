@@ -52,4 +52,4 @@ present: videoout_present
 timeline: gpu_timeline
 
 # --- observation only: nothing here is on a rendering path -------------------------------------
-diagnostics: diagnostic_selectors diag_ratelimit watch_list compute_tree_watch compute_parent_walk
+diagnostics: diagnostic_selectors compute_tree_watch compute_parent_walk

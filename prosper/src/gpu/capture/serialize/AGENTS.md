@@ -11,6 +11,7 @@ contract: a change here is a change to a format that already-written captures ar
 - `capture_codecs` — the `Writer`/`Reader` byte cursors, and one `write_*`/`read_*` pair per field
   group (pipeline, colour target, scissor, logic op, resource, table). A header because both entry
   points use them, and the only place a field's on-disk shape is spelled.
+- `ngg_subgroup_codec` — the v72 record of a realized merged-NGG draw description (#3135 P5).
 - `capture_serialize` — `serialize_gpu_capture`.
 - `capture_deserialize` — `deserialize_gpu_capture`, plus the legacy-alias restoration older
   versions need.

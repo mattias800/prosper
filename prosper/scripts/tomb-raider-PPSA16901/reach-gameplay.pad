@@ -1,5 +1,10 @@
 # PPSA16901: EULA gate, then select the ring's default item ("Lara's Home",
 # TR1's playable mansion level) on the Tomb Raider I title screen.
+#
+# WHICH GAME THIS ARRIVES IN HAS CHANGED. When TOMB_RAIDER_STATUS.md was written (2026-08) this
+# file arrived on Tomb Raider II, three runs of three. On 2026-10-06 it arrives on Tomb Raider I,
+# on every build tried back to the v0.2.2 release, and Tomb Raider I's home renders as exploded
+# geometry (#4637). For the scene the rung-3 claim is about use reach-tr2-laras-home.pad.
 # The ring is a 5-item cycle with no New Game item on it (run05/run06), so this
 # is the shortest route from a default launch to a real playable level.
 6-14:down

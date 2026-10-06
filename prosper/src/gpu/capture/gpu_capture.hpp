@@ -232,6 +232,8 @@ struct GpuCapturedDraw {
     // proof grants admission: materialization/compiler independently rederive original-PC bounds
     // and initialization; stored and raw rendering use the same owned execution transaction.
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
+    // v72 (#3135 P5): the merged-NGG description the live renderer ran this draw through.
+    std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
 };
 
 struct GpuCapturedCompute {

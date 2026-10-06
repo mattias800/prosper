@@ -47,6 +47,15 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
+`diag_ratelimit.hpp` and `watch_list.{hpp,cpp}` are here for the same reason: they are shared
+helpers that diagnostics in several layers use (gpu, frontends, and this folder's own
+`readback_refusal` and `perf/perf_alarms`), so they sit in the lowest layer that needs them rather
+than in `src/gpu/diagnostics/`. `diag_ratelimit` is rate limiting for diagnostic lines. **Check a
+diagnostic's rate limit before quoting its volume as a frequency**; several phantom findings came
+from reading a capped count as a real one. `watch_list` is the strict hex address-list parser behind
+the `0xaddr[,0xaddr...]` selector switches. It still declares `prosper::gpu::parse_hex_watch_list`;
+the namespace did not move with the file.
+
 `native_host_wait.{hpp,cpp}` is the Windows observation-only companion to the guest-thread dump
 (#4330). `PROSPER_HOST_WAIT_OBSERVE` is a process-start presence switch, default off. It records
 only the actual empty-equeue and contended-pthread-once native condition-wait CALL scopes,
@@ -252,7 +261,14 @@ before adding a parallel one.
 
 **The 2026-09-28 queue rules** (#3891) each hang off an event path that already existed, so none
 costs anything on an accepted draw, reference or present: `unaccounted-draws` is the
-`draw_disposition` census's own `UNACCOUNTED` blind spot, added once per pass; `unimplemented-hle-calls`
+`draw_disposition` census's own `UNACCOUNTED` blind spot, added once per pass. Its `seen` is
+counted ONCE, at the backend pass's entry (`DrawDispositionPassScope` at the top of
+`render_draw_pass_rgba`, plus `refuse_draw_pass` for `render_draws_rgba`'s whole-batch preflight),
+not per draw inside the setup loop: counted there, any `return` before the loop left
+seen = recorded = dropped = 0 and the pass balanced trivially, which is how #4643's two-target
+volume draws were lost for weeks with this alarm silent. So a refusal site must name its cause
+(`return disposition.refuse(DD::X, out)`, a `DrawDrop` reason), and any exit that names nothing is
+UNACCOUNTED by construction. Passes on a thread inside `SuppressDrawDropCounting` count nothing; `unimplemented-hle-calls`
 counts the dispatcher's `prosper_on_unimpl` and fires on the FIRST call of an unregistered NID after
 the first flip (boot-time ones are before the engine's baseline); `diagnostic-path-active` is a
 gauge the live renderer sets once, naming the switch that turned GPU-resident colour targets off;

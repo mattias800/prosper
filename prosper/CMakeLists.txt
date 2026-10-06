@@ -1301,6 +1301,18 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  # #3135 P5: live admission of merged-NGG draws -- the register table, the device half and the
+  # cached live producer. Pure CPU; the Kena arms compile the captured chain from tests/data.
+  prosper_add_gtest(test_ngg_draw_admission
+    SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  # #3135 P5: the v72 capture record of a merged-NGG draw description.
+  prosper_add_gtest(test_ngg_subgroup_codec
+    SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
@@ -4740,6 +4752,11 @@ endif()
       add_test(NAME draw_resource_status COMMAND test_draw_resource_status)
       set_tests_properties(draw_resource_status PROPERTIES
         ENVIRONMENT "PROSPER_TEXREF_CENSUS=1" TIMEOUT 45)
+      # The comparison arm of the over-declared buffer view (#4556): the same arms expect the copy.
+      add_test(NAME draw_resource_status_no_short_buffer_view
+               COMMAND test_draw_resource_status --expect-copy)
+      set_tests_properties(draw_resource_status_no_short_buffer_view PROPERTIES
+        ENVIRONMENT "PROSPER_TEXREF_CENSUS=1;PROSPER_NO_SHORT_BUFFER_VIEW=1" TIMEOUT 45)
       prosper_add_gtest(test_float32_array_upload
         SOURCES tests/shared/live/test_float32_array_upload.cpp
         INCLUDES frontends src tests
@@ -4988,6 +5005,13 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #4625: a compute binding of a renderer-claimed volume publishes it to guest memory first,
+      # then runs a real 3D storage dispatch on the published bytes through the live backend.
+      prosper_add_gtest(test_renderer_volume_publication
+        SOURCES tests/gpu/execute/test_renderer_volume_publication.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
       # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
       # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
       # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.
