@@ -90,6 +90,9 @@ struct FontFace {
     float weight_x = 1.0f;
     float weight_y = 1.0f;
     void* renderer = nullptr;
+    // The library the face was opened from (native face+0x28), as the guest passed it. Read back by
+    // sceFontGetLibrary, which validates it before answering, and tested for NULL by the kerning core.
+    void* library = nullptr;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
     std::shared_ptr<FontData> data;
@@ -137,17 +140,34 @@ struct HorizontalLayout { float baseline, advance, decoration; };
 struct VerticalLayout { float baseline, advance, decoration; };
 struct WritingMetrics { float advance_x, advance_y, top, bottom, left, right; };
 
+// The guest's own 0x60-byte text source, laid out as libSceFont.native.sprx's TextSourceInit
+// (+0xf640) writes it: a 0x0f04 magic, the writing form (Init seeds 0x10), the live cursor state, and
+// at +0x38 a snapshot of start/end/parser/object/default-font that sceFontTextSourceRewind (+0xf7f0)
+// restores. sceFontTextSourceSetDefaultFont (+0xf700) writes the font into both the live slot and the
+// snapshot, which is why a rewound source keeps its default font.
 struct TextSource {
-    uint64_t system;
+    uint16_t magic;
+    uint16_t reserved0;
+    uint32_t writing_form;
     const void* start;
     const void* end;
     const void* current;
     void* parser;
     void* object;
     void* default_font;
-    void* reserved[5];
+    const void* snap_start;
+    const void* snap_end;
+    void* snap_parser;
+    void* snap_object;
+    void* snap_default_font;
 };
 static_assert(sizeof(TextSource) == 0x60);
+static_assert(offsetof(TextSource, writing_form) == 0x04);
+static_assert(offsetof(TextSource, current) == 0x18);
+static_assert(offsetof(TextSource, default_font) == 0x30);
+static_assert(offsetof(TextSource, snap_start) == 0x38);
+static_assert(offsetof(TextSource, snap_default_font) == 0x58);
+constexpr uint16_t kTextSourceMagic = 0x0F04;
 
 struct TextCharacter {
     TextCharacter* prev;
@@ -156,7 +176,18 @@ struct TextCharacter {
     void* font;
     void* shape;
     uint32_t code;
+    uint8_t reserved_0x2c[5];
+    // Two flag bytes the native text walkers test: sceFontCharacterRefersTextNext (+0x124e0) and
+    // RefersTextBack (+0x12510) step over any character whose byte at +0x31 or +0x33 is non-zero, and
+    // StringRefersTextCharacters (+0x11c90) applies the same skip to the head. What sets them is not
+    // derived; prosper builds no character chains yet, so nothing does today.
+    uint8_t skip_0x31;
+    uint8_t reserved_0x32;
+    uint8_t skip_0x33;
 };
+static_assert(offsetof(TextCharacter, code) == 0x28);
+static_assert(offsetof(TextCharacter, skip_0x31) == 0x31);
+static_assert(offsetof(TextCharacter, skip_0x33) == 0x33);
 
 struct FontStyleFrame {
     uint16_t magic = 0;
@@ -459,10 +490,11 @@ int32_t font_memory_term(FontMemory* mem) {
     return 0;
 }
 
-int32_t font_open(void*, uint64_t, uint64_t, const void*, void** out) {
+int32_t font_open(void* library, uint64_t, uint64_t, const void*, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     auto* f = new (std::nothrow) FontFace;
     if (!f) return static_cast<int32_t>(0x80540001u);
+    f->library = library;
     *out = f;
     return 0;
 }
@@ -959,6 +991,8 @@ int32_t font_create_renderer_plain(const FontMemory* memory, const void* params,
 constexpr int32_t kFontErrInvalidRenderer = static_cast<int32_t>(0x80460001u);
 constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
 constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
+constexpr int32_t kFontErrInvalidTextSource = static_cast<int32_t>(0x80460008u);
+constexpr int32_t kFontErrNoGlyph = static_cast<int32_t>(0x80460041u);
 constexpr int32_t kFontErrNoRenderer = static_cast<int32_t>(0x80460061u);
 int32_t font_rebind_renderer(void* handle) {
     const auto* f = face(handle);
@@ -1018,21 +1052,127 @@ int32_t font_get_render_weight(void* handle, float* out_x, float* out_y, uint32_
     return font_get_weight(handle, out_x, out_y, out_mode);
 }
 
+// sceFontGetKerning (sDuhHGNhHvE, 0x9450) and sceFontGetRenderScaledKerning (ryPlnDDI3rU, 0x9460)
+// are one native body (0x8d20) entered with r8 = 0 or 1. Its checks, in order:
+//   * a NULL face or one without the face magic   -> 0x80460005
+//   * code == 0                                   -> 0x80460041 (0x8d62)
+//   * a NULL out                                  -> 0x80460002, nothing written (0x8d6a)
+//   * a face with no library (face+0x28 == 0)     -> 0x80460005
+//   * Render variant only: no renderer bound      -> 0x80460061, even when preCode is 0
+//   * preCode == 0                                -> 0, out zeroed
+// Every error path zeroes the first TWELVE bytes of out (a qword and a dword at 0x9400); only the
+// success path writes all sixteen, because the value comes from the font driver's kerning slot, which
+// stores four floats. The FreeType driver (libSceFontFt selection table +0xc8 -> 0xb5e0) PREFERS the
+// classic `kern` table: with FT_FACE_FLAG_KERNING set and horizontal writing it answers from
+// FT_Get_Kerning(FT_KERNING_UNFITTED) as {x/64, y/64, 0, 0} and never looks further; only a face
+// without that table falls back to an OpenType GPOS `kern` feature lookup ('vkrn' vertically).
+// stb_truetype's public stbtt_GetGlyphKernAdvance has the opposite precedence (GPOS first), so the two
+// table readers are called directly here in the driver's order.
+// CONFIDENCE: HIGH on the checks, their order and the precedence. MED on the magnitude: the value
+// inherits face_scale()'s ascent-to-descent pixel scale, where FreeType scales by the em square. LOW on
+// a code point the font has no glyph for, which the native core may refuse; prosper answers 0 there.
+// prosper keeps one scale state for the face and its render state, so the two variants differ only in
+// the renderer check.
+int32_t kerning_core(void* handle, uint32_t pre, uint32_t code, float* out, bool render) {
+    auto fail = [out](int32_t rc) {
+        if (out) std::memset(out, 0, 12);
+        return rc;
+    };
+    const auto* f = face(handle);
+    if (!f) return fail(kFontErrInvalidHandle);
+    if (code == 0) return fail(kFontErrNoGlyph);
+    if (!out) return kFontErrInvalidParam;
+    if (!f->library) return fail(kFontErrInvalidHandle);
+    if (render && !f->renderer) return fail(kFontErrNoRenderer);
+    if (pre == 0) return fail(0);
+    std::memset(out, 0, 16);
+    float sx = 0.0f, sy = 0.0f;
+    // A system-font-set face has no font behind it, so there is no table to read: zero, honestly.
+    if (!f->data || !face_scale(f, &sx, &sy)) return 0;
+    const stbtt_fontinfo* info = &f->data->info;
+    const int g1 = stbtt_FindGlyphIndex(info, (int)pre);
+    const int g2 = stbtt_FindGlyphIndex(info, (int)code);
+    const int units = info->kern   ? stbtt__GetGlyphKernInfoAdvance(info, g1, g2)
+                      : info->gpos ? (int)stbtt__GetGlyphGPOSInfoAdvance(info, g1, g2)
+                                   : 0;
+    out[0] = (float)units * sx;
+    return 0;
+}
+int32_t font_get_kerning(void* handle, uint32_t pre, uint32_t code, float* out) {
+    return kerning_core(handle, pre, code, out, /*render=*/false);
+}
+int32_t font_get_render_scaled_kerning(void* handle, uint32_t pre, uint32_t code, float* out) {
+    return kerning_core(handle, pre, code, out, /*render=*/true);
+}
+
+// sceFontGetLibrary (LzmHDnlcwfQ, 0x54e0): a bad face, then a NULL library, a library without its
+// magic or one with no driver, all answer 0x80460005 and clear a non-NULL out; only then is a NULL out
+// 0x80460002. The library pointer was stored unvalidated at open, so checking its magic here is also
+// what makes reading it safe. Every library prosper hands out has a driver. CONFIDENCE: HIGH.
+int32_t font_get_library(void* handle, void** out) {
+    const auto* f = face(handle);
+    const auto* lib = f ? static_cast<const FontLibrary*>(f->library) : nullptr;
+    if (!lib || lib->magic != kLibraryMagic) {
+        if (out) *out = nullptr;
+        return kFontErrInvalidHandle;
+    }
+    if (!out) return kFontErrInvalidParam;
+    *out = f->library;
+    return 0;
+}
+
+// TextSourceInit stamps the magic and the default writing form and takes the rewind snapshot. Its
+// argument checks are unchanged from before: the native module also refuses a NULL parser
+// (0x80460002, zeroing the source), which prosper does not model -- CONFIDENCE: MED that no title
+// depends on that.
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     std::memset(out, 0, sizeof(*out));
+    out->magic = kTextSourceMagic;
+    out->writing_form = 0x10;
     out->start = text; out->current = text;
     out->end = text ? static_cast<const uint8_t*>(text) + size : nullptr;
     out->parser = parser; out->object = object;
+    out->snap_start = out->start;
+    out->snap_end = out->end;
+    out->snap_parser = parser;
+    out->snap_object = object;
     return 0;
 }
+TextSource* text_source(TextSource* source) {
+    return source && source->magic == kTextSourceMagic ? source : nullptr;
+}
+// SetDefaultFont (+0xf700): NULL 0x80460002, no magic 0x80460008, else the font goes to both the live
+// slot and the snapshot.
 int32_t font_text_default(TextSource* source, void* handle) {
-    if (source) source->default_font = handle;
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    source->default_font = handle;
+    source->snap_default_font = handle;
     return 0;
 }
-int32_t font_text_writing_form(TextSource* source, int32_t form) {
-    if (source) source->system = (uint32_t)form;
+// SetWritingForm (+0xf6d0): NULL 0x80460002, no magic 0x80460008, a form outside 0x10..0x12
+// 0x80460002; otherwise the u32 at +4 -- not the whole first qword, which would overwrite the magic.
+int32_t font_text_writing_form(TextSource* source, uint32_t form) {
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    if (form - 0x10u > 2u) return kFontErrInvalidParam;
+    source->writing_form = form;
+    return 0;
+}
+// sceFontTextSourceRewind (VRFd3diReec, +0xf7f0): NULL 0x80460002, no magic 0x80460008, else every
+// live field is restored from the snapshot Init took, with the cursor back at the start.
+// CONFIDENCE: HIGH (read from the firmware).
+int32_t font_text_source_rewind(TextSource* source) {
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    source->start = source->snap_start;
+    source->end = source->snap_end;
+    source->current = source->snap_start;
+    source->parser = source->snap_parser;
+    source->object = source->snap_object;
+    source->default_font = source->snap_default_font;
     return 0;
 }
 
@@ -1091,7 +1231,23 @@ uint32_t font_character_whitespace(TextCharacter* ch) {
     if (!ch) return 0;
     return ch->code == ' ' || ch->code == '\t' || ch->code == '\n' || ch->code == '\r';
 }
-TextCharacter* font_character_next(TextCharacter* ch) { return ch ? ch->next : nullptr; }
+// RefersTextNext / RefersTextBack follow the link and step over every character flagged at +0x31 or
+// +0x33 (see TextCharacter).
+bool character_skipped(const TextCharacter* ch) {
+    return ch->skip_0x33 || ch->skip_0x31;
+}
+TextCharacter* font_character_next(TextCharacter* ch) {
+    if (!ch) return nullptr;
+    TextCharacter* c = ch->next;
+    while (c && character_skipped(c)) c = c->next;
+    return c;
+}
+TextCharacter* font_character_back(TextCharacter* ch) {
+    if (!ch) return nullptr;
+    TextCharacter* c = ch->prev;
+    while (c && character_skipped(c)) c = c->prev;
+    return c;
+}
 
 uint64_t font_ok(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
 
@@ -1133,6 +1289,11 @@ void register_font_hle() {
     R("Gqa5Pp7y4MU", (HleFn)font_get_render_slant, "sceFontGetRenderEffectSlant");
     R("d7dDgRY+Bzw", (HleFn)font_get_weight, "sceFontGetEffectWeight");
     R("woOjHrkjIYg", (HleFn)font_get_render_weight, "sceFontGetRenderEffectWeight");
+    R("sDuhHGNhHvE", (HleFn)font_get_kerning, "sceFontGetKerning");
+    R("ryPlnDDI3rU", (HleFn)font_get_render_scaled_kerning, "sceFontGetRenderScaledKerning");
+    R("LzmHDnlcwfQ", (HleFn)font_get_library, "sceFontGetLibrary");
+    R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
+    R("6Gqlv5KdTbU", (HleFn)font_character_back, "sceFontCharacterRefersTextBack");
     Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
     Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
     Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");
