@@ -5005,6 +5005,13 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #4625: a compute binding of a renderer-claimed volume publishes it to guest memory first,
+      # then runs a real 3D storage dispatch on the published bytes through the live backend.
+      prosper_add_gtest(test_renderer_volume_publication
+        SOURCES tests/gpu/execute/test_renderer_volume_publication.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
       # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
       # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
       # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.

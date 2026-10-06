@@ -49,6 +49,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `ngg_live_draw` — the live producer (P5), called only where a linked vertex chain just failed the
   ordinary per-vertex compile. It owns the bounded compile and description caches, so no draw
   compiles once warm.
+- `renderer_volume_publication` — writing a renderer-claimed volume back to guest memory so a
+  compute binding can read guest bytes (#4625). The plan names every refusal before any readback.
+  The live renderer registers the publisher, and compute asks through
+  `compute_renderer_volume_refusal`. Only a claim that is actually released admits the binding.
 - `srt_publication_dedupe.hpp` — which of those uses the graphics stage table publishes: once per
   key while the key resolves by `srt_offset`, once per consuming pc once it clashes. Getting this
   wrong leaves a consumer with no resource and refuses the whole program.
