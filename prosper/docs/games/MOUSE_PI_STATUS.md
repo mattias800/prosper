@@ -134,11 +134,15 @@ flip figure understates the difference.
 
 ## Instrument notes specific to this title
 
-- **A replayed frame of this title is faithful up to the end of the lighting pass and not after
-  it**, and nothing in its output says where the line is. `gpu_replay` discards every retained
-  depth image on every guest write ([#4619]), so the fog pass reads zero depth and the replayed
-  frame comes out nearly white (mean luma 171.7) where the live frame is nearly black (4.82).
-  Before that pass the replay matches the live run's own targets.
+- **A replayed frame of this title does not show the fix for its black world.** The replay
+  process cannot read a metadata plane through a guest address, so it does not take the decal
+  buffer's clear and the replayed frame is the old picture, on any build ([#4627]). Check
+  `PROSPER_DCCLOG=1`: the live run prints the decode for `0x…5c10000`, the replay does not.
+- **Until [#4619] was fixed, a replay of this title was faithful only up to the end of the
+  lighting pass**, and nothing in its output said where the line was. `gpu_replay` discarded
+  every retained depth image on every guest write, so the fog pass read zero depth and the
+  replayed frame came out nearly white (mean luma 171.7) where the live frame was nearly black
+  (4.82). With the fix the same replay is 2.74.
 - **A frame bundle's seeds are the live run's own intermediate targets**, one frame old, and
   `gpu_replay --dump-rtt-seed 0xADDR out.bmp` reads them without executing anything. That is what
   showed the G-buffer's first target was black while its normals were a complete room: no replay
@@ -159,6 +163,7 @@ flip figure understates the difference.
   `actual_f*.bmp` rather than assuming.
 
 [#4619]: https://github.com/mattias800/prosper/issues/4619
+[#4627]: https://github.com/mattias800/prosper/issues/4627
 [#4622]: https://github.com/mattias800/prosper/pull/4622
 
 ## What the next lane should do

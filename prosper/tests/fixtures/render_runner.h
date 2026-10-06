@@ -6401,8 +6401,7 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
                                            bool malformed = false) {
             if (!base) return false;
             if (malformed || base > UINT64_MAX - offset) return true;
-            return prosper::guest_memory_topology_relation(addr, size, base + offset, bytes) !=
-                   prosper::GuestMemoryTopologyRelation::Disjoint;
+            return prosper::gpu::guest_write_may_alias_plane(addr, size, base + offset, bytes);
         };
         const bool malformed_depth = slice_offset_overflow || (!learned && depth_extent_overflow);
         const bool depth_overlap =

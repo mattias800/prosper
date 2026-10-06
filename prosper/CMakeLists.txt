@@ -5035,6 +5035,12 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A replay process, which has no guest mapping table, compares guest addresses (#4619).
+      prosper_add_gtest(test_ds_replay_alias
+        SOURCES tests/render/test_ds_replay_alias.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # The per-draw internal-GDS scan memo (#2334). Two registrations of ONE binary: the second
       # sets the opt-out, so the pair proves the memo both fires and can be turned off, on a single
       # build. Both must PASS -- the binary flips its own expectation from the environment.
