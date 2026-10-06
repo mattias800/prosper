@@ -487,11 +487,13 @@ TEST(Font, StyleFrameEffectWeightIsStoredAsAClampedOffset) {
     using WeightFn = int32_t (*)(void*, float, float, uint32_t);
     auto set_weight = reinterpret_cast<WeightFn>(api.set_weight);
     ASSERT_NE(set_weight, nullptr);
-    struct Case { float in_x, in_y, want_x, want_y; };
+    struct Case {
+        float in_x, in_y, want_x, want_y;
+    };
     const Case cases[] = {
-        {1.0f, 1.0f, 1.0f, 1.0f},     // neutral round-trips
+        {1.0f, 1.0f, 1.0f, 1.0f},   // neutral round-trips
         {1.5f, 0.5f, 1.04f, 0.96f},   // clamped to the band on both sides
-        {1.02f, 0.99f, 1.02f, 0.99f}, // inside the band, kept
+        {1.02f, 0.99f, 1.02f, 0.99f},   // inside the band, kept
     };
     for (const Case& c : cases) {
         uint8_t frame[0x60]{};

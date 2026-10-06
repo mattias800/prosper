@@ -806,8 +806,10 @@ int32_t font_style_frame_get_effect_weight(const FontStyleFrame* frame, float* o
 int32_t font_surface_set_style_frame(RenderSurface* surface, FontStyleFrame* frame) {
     if (!surface) return static_cast<int32_t>(0x80460002u);
     if (frame && !style_frame(frame)) return static_cast<int32_t>(0x80460002u);
-    if (frame) surface->style |= 0x1u;
-    else surface->style &= (uint8_t)~0x1u;
+    if (frame)
+        surface->style |= 0x1u;
+    else
+        surface->style &= (uint8_t)~0x1u;
     surface->style_frame = frame;
     surface->style_state = 0;
     return 0;
