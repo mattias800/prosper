@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include <algorithm>
 #include <map>
 
@@ -57,6 +58,7 @@ bool inventoried(const Rdna2Inst& in) {
                    in.opcode <= kSmemOpcodeBufferLoadDwordX4;
         case Rdna2Format::MIMG: return in.opcode == 0x24 || in.opcode == 0x27;
         case Rdna2Format::EXP: return true;
+        case Rdna2Format::DS: return !packet_quad_swizzle_gap(in);
         default: return false;
     }
 }
@@ -121,6 +123,7 @@ fragment_packet_mask_requirements(const std::vector<uint32_t>& code,
         const bool branch = in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode);
         if ((branch && (branch_target(in) <= in.pc || !indices.contains(branch_target(in)))) ||
             (in.fmt == Rdna2Format::SOPP && !branch && !in.is_end && in.opcode != 0 &&
+             !rdna2_is_valid_instruction_prefetch(in) &&
              !(in.opcode == 0x0c && rdna2_waitcnt_effects_known(uint16_t(in.simm16)))) ||
             (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20 && in.opcode <= 0x22) ||
             (in.fmt == Rdna2Format::SOPK &&
@@ -165,7 +168,7 @@ fragment_packet_mask_requirements(const std::vector<uint32_t>& code,
         const bool vector = in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 ||
                             in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOPC ||
                             in.fmt == Rdna2Format::VINTRP || in.fmt == Rdna2Format::MIMG ||
-                            in.fmt == Rdna2Format::EXP;
+                            in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::DS;
         if (vector && !readlane) reads |= exec;
         if (in.fmt == Rdna2Format::SOPP && in.opcode >= 4 && in.opcode <= 9)
             reads |= in.opcode <= 5 ? scc : in.opcode <= 7 ? vcc : exec;

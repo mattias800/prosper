@@ -1,6 +1,7 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include <bitset>
 #include <tuple>
 
@@ -60,6 +61,7 @@ const char* image_gap(const FragmentPacketImageRead& image) {
 
 const char* packet_resource_instruction_gap(const Rdna2Inst& in) {
     if (modifiers(in)) return "packet-resource-modifier-unimplemented";
+    if (in.fmt == Rdna2Format::DS) return packet_quad_swizzle_gap(in);
     if (in.fmt == Rdna2Format::VINTRP) {
         // RDNA2 70648 12.11: P1 destination/source alias is not independent of HALF_LDS mode.
         // This API owns parameter tuples but does not supply that launch-mode authority.
@@ -241,6 +243,7 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
             if (wait.drains_vector_reads()) pending.vector.reset();
         } else {
             for (uint32_t source = 0; source < in.n_src; ++source) {
+                if (in.fmt == Rdna2Format::DS && source) continue;
                 if (in.fmt == Rdna2Format::EXP &&
                     !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << source)))
                     continue;

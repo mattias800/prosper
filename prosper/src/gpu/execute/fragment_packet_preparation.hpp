@@ -9,6 +9,7 @@
 
 namespace prosper::gpu {
 struct RasterQuadInputs;
+class FragmentRasterLaunchSource;
 struct FragmentPacketVgprRequirements;
 struct FragmentPacketMaskRequirements;
 struct FragmentPacketScalarReadRequirements;
@@ -25,6 +26,8 @@ FragmentPacketResources own_fragment_packet_resources(const ShaderResourceTable*
 
 struct FragmentPacketPreparation {
     std::shared_ptr<const RasterQuadInputs> inputs;
+    // Exact realizer observation, not masks/system/helper/scheduling or graphics authority.
+    std::shared_ptr<const FragmentRasterLaunchSource> launch_source;
     std::vector<std::string> unmet;
     // Only the source-associated, canonical PS launch can supply the user prefix. These owned
     // raw words are suitable for FragmentInvocationPacket::sgprs, but do not initialize system

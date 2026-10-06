@@ -106,3 +106,41 @@ TEST(RasterLaunchFacts, UnobservedPayloadIsNotCanonical) {
         EXPECT_TRUE(facts.canonical());
     }
 }
+
+TEST(RasterLaunchFacts, CompleteCoverageWordsKeepTheirOwnPhysicalPresence) {
+    constexpr uint32_t registers[]{0x200, 0x003, 0x004, 0x201, 0x2f9, 0x313, 0x30e, 0x30f, 0x2fe,
+                                   0x2ff, 0x300, 0x301, 0x302, 0x303, 0x304, 0x305, 0x306, 0x307,
+                                   0x308, 0x309, 0x30a, 0x30b, 0x30c, 0x30d, 0x2f5, 0x2f6, 0x000};
+    static_assert(std::size(registers) == RasterCoverageFacts::count);
+    for (uint32_t observed = 0; observed < std::size(registers); ++observed) {
+        for (uint32_t value : {0u, 0x89abcdefu}) {
+            GpuState state;
+            write_control(state, registers[observed], value);
+            const auto coverage = extract_render_state(state).ps_raster_launch.coverage;
+            EXPECT_EQ(coverage.available, uint32_t{1} << observed);
+            for (uint32_t index = 0; index < std::size(registers); ++index)
+                EXPECT_EQ(coverage.words[index], index == observed ? value : 0u);
+            EXPECT_TRUE(coverage.canonical());
+            EXPECT_EQ(state.cx.size(), 1u);
+        }
+    }
+}
+
+TEST(RasterLaunchFacts, CoverageCannotBorrowShaderFileOrAbsentStorage) {
+    GpuState state;
+    for (uint32_t reg : {0x200u, 0x003u, 0x004u, 0x201u, 0x2f9u, 0x313u, 0x30eu, 0x30fu, 0x2feu,
+                         0x30du, 0x2f5u, 0x2f6u, 0x000u})
+        write_control(state, reg, UINT32_MAX, 0x76);
+    EXPECT_EQ(extract_render_state(state).ps_raster_launch.coverage, RasterCoverageFacts{});
+    EXPECT_TRUE(state.cx.empty());
+    for (uint32_t index = 0; index < 27; ++index) {
+        RasterCoverageFacts facts;
+        facts.words[index] = 1;
+        EXPECT_FALSE(facts.canonical());
+        facts.available = uint32_t{1} << index;
+        EXPECT_TRUE(facts.canonical());
+    }
+    RasterCoverageFacts unknown;
+    unknown.available = uint32_t{1} << 27;
+    EXPECT_FALSE(unknown.canonical());
+}

@@ -1,4 +1,5 @@
 #include "gpu/execute/fragment_packet_preparation.hpp"
+#include "gpu/execute/fragment_raster_launch.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/original_fragment_producer.hpp"
@@ -41,12 +42,16 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
         return result;
     }
     const auto& in = *result->inputs;
+    if (producing_modules_match && in.launch_source && in.launch_source->matches(in))
+        result->launch_source = in.launch_source;
+    const bool pending_original =
+        in.owned_wave_pending && in.source_fs && in.source_fs->empty() && result->launch_source;
     const bool original_bank_source = producing_modules_match && in.original_fragment_producer &&
                                       in.original_fragment_producer->matches(in);
     const bool source_available =
         original_bank_source ||
         (producing_modules_match && in.raw_matches_producing_source && in.raw_code &&
-         !in.raw_code->empty() && in.source_fs && !in.source_fs->empty());
+         !in.raw_code->empty() && in.source_fs && (!in.source_fs->empty() || pending_original));
     const bool entry_available = in.entry.observed && in.entry.canonical();
     if (!source_available) gap("packet-producing-source-unavailable");
     if (!entry_available) gap("packet-entry-register-observation-unavailable");

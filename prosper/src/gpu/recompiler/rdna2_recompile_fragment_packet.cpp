@@ -6,6 +6,7 @@
 #include "gpu/recompiler/fragment_packet_exports_internal.hpp"
 #include "gpu/recompiler/fragment_packet_export_timing.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -594,6 +595,20 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
             in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
             gap = rdna2_waitcnt_execution_gap(uint16_t(in.simm16));
+        // Only the architectural original-program route consumes the canonical I-cache hint.
+        // This includes Architectural resource callers. It grants no additional resource/input
+        // authority; LegacyRaw admission and unproved clause scheduling remain unchanged.
+        if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
+            in.fmt == Rdna2Format::SOPP && in.opcode == 0x20)
+            gap = rdna2_is_valid_instruction_prefetch(in) ? nullptr
+                                                          : "packet-prefetch-mode-unimplemented";
+        if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
+            in.fmt == Rdna2Format::SOPP && in.opcode == 0x21)
+            gap = "packet-clause-unimplemented";
+        if (packet.stage == GraphicsPacketStage::Fragment &&
+            packet.export_observation == FragmentPacketExportObservation::Architectural &&
+            in.fmt == Rdna2Format::DS)
+            gap = packet_quad_swizzle_gap(in);
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
         else if (services && (in.fmt == Rdna2Format::SMEM ||
                               (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)))
@@ -614,7 +629,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         if (gap) return reject(gap, in.pc);
         if (!services && in.fmt == Rdna2Format::SMEM && !windows.contains(in.pc))
             return reject("packet-raw-window-unavailable", in.pc);
-        if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a &&
+        if (((in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a) || in.fmt == Rdna2Format::DS) &&
             packet.quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)
             return reject("packet-quad-topology-unavailable", in.pc);
         if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
@@ -739,7 +754,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     if (packet.export_observation == FragmentPacketExportObservation::Architectural)
         if (const auto* gap = fragment_packet_export_timing_gap(ins, scalar_failure_pc))
             return reject(gap, scalar_failure_pc);
-    bool runtime_definedness = wave_data != nullptr;
+    if (const auto* gap = packet_quad_swizzle_completion_gap(ins, scalar_failure_pc))
+        return reject(gap, scalar_failure_pc);
+    bool runtime_definedness =
+        wave_data != nullptr || std::any_of(ins.begin(), ins.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::DS;
+        });
     for (uint32_t reg = 0; reg < 256; ++reg)
         if (requirements.storage.test(reg)) {
             const auto column = columns.find(reg);

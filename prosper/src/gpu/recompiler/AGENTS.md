@@ -72,6 +72,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   scalar-origin/mask inventory may preserve canonical partial WAITs without granting readiness,
   while execution still refuses intermediate thresholds until a count/order proof exists.
   Unmodeled bit7 is retained and named unsupported, not declared ISA-invalid.
+- `fragment_packet_quad_swizzle` supplies only basic quad-mode DS_SWIZZLE_B32 for the owned
+  logical64 executor. Its all-path pending destination proof requires LGKM0 before reads,
+  overwrites or END; VM/EXP waits cannot supply that completion. Uniform workgroup phases
+  snapshot selected sources before aliasing writes and retain actual current peer EXEC/value
+  availability. This is not general LDS/DS or arbitrary inactive-source semantics. Native
+  swizzle stays in the separately extracted unchanged `rdna2_cfg_swizzle` phase.
+  `fragment_quad_composition` and `_parameters` hold explicit composition/reference and genuine
+  per-vertex coefficient contracts; structural fields do not mint a live scheduling permission.
 - `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
   logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
   all-wave status validation precedes any publication. Shared image bindings remain a bounded

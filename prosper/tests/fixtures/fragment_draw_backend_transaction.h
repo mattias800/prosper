@@ -35,8 +35,17 @@ public:
                            *inputs->source_fs == draw.fs_words());
             const auto prepared =
                 prosper::gpu::prepare_fragment_packet_inputs(inputs, producing_match);
-            const prosper::gpu::FragmentPacketDeviceContract device{
+            prosper::gpu::FragmentPacketDeviceContract device{
                 reinterpret_cast<uintptr_t>(context.dev), context.shader_int64_enabled, false};
+            device.raster = prosper::gpu::FragmentPacketRasterDeviceContract{
+                context.geometry_shader_enabled,
+                context.detile_limits.maxVertexOutputComponents,
+                context.detile_limits.maxGeometryInputComponents,
+                context.detile_limits.maxGeometryOutputComponents,
+                context.detile_limits.maxGeometryTotalOutputComponents,
+                context.detile_limits.maxGeometryOutputVertices,
+                context.detile_limits.maxGeometryShaderInvocations,
+                context.detile_limits.maxFragmentInputComponents};
             const auto program =
                 prosper::gpu::cached_fragment_draw_program(*inputs, *prepared, device, 4096);
             if (!program->rejection_reason().empty()) {
@@ -90,10 +99,20 @@ public:
                                 *value.fragment_draw_inputs) &&
                             value.fragment_draw_inputs->original_fragment_producer->matches_modules(
                                 value.vs_shared, value.gs_words(), value.fs_words());
+                        const auto& input = value.fragment_draw_inputs;
+                        const bool proved_pending_fs =
+                            value.fs_words().empty() && input && input->launch_source &&
+                            input->source_fs && input->source_fs->empty() && input->source_vs &&
+                            *input->source_vs == value.vs_words() && input->source_gs &&
+                            *input->source_gs == value.gs_words() &&
+                            !value.raster_quad_contract_modified &&
+                            input->launch_source->matches(*input) &&
+                            input->launch_source->pending_original_has_no_external_effects();
                         return backend_module_has_readonly_buffers(value.vs_words(),
                                                                    value.vs_shared) &&
-                               (original_bank_fragment || backend_module_has_readonly_buffers(
-                                                              value.fs_words(), value.fs_shared)) &&
+                               (original_bank_fragment || proved_pending_fs ||
+                                backend_module_has_readonly_buffers(value.fs_words(),
+                                                                    value.fs_shared)) &&
                                (value.gs_words().empty() ||
                                 backend_module_has_readonly_buffers(value.gs_words()));
                     });

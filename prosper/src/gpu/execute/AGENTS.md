@@ -52,6 +52,14 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   and pipeline payloads. Live working sets stay resident without a shader-count admission cap;
   genuinely dead generations retire only on cold insertion, while completion leases retain their
   payloads. A cached payload must not strongly retain the source owner whose expiry it observes.
+- `fragment_raster_launch` retains a privately minted actual-realizer source/launch association;
+  public empty-stage or pending flags grant nothing. `fragment_raster_program` proves the complete
+  original saved-live/WQM/basic-quad helper class independently of native FS support. The distinct
+  draw recipe consumes real packed position rows, separate backing/live/export masks, and the
+  original packet kernel before whole-draw validation/replay. It does not authorize arbitrary
+  wave placement, BC-enabled centroid, system SGPR/M0 defaults or wider interpolation/resources.
+  `fragment_raster_contract` names the necessary physical coverage exclusions, while collection
+  binds selected pre-raster modules and both enabled output/input device budgets.
 - `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
   backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
   get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values

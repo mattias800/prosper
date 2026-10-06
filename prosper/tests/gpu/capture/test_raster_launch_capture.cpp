@@ -61,6 +61,9 @@ constexpr size_t record_bytes = 25; // independent wire oracle: five (u8 present
 size_t tail_bytes(const GpuCaptureFile& capture) {
     return 4 + record_bytes * capture.draws.size();
 }
+size_t coverage_tail_bytes(const GpuCaptureFile& capture) {
+    return 4 + 112 * capture.draws.size(); // u32 presence + 27 complete raw words per draw
+}
 }   // namespace
 
 TEST(RasterLaunchCapture, CurrentRoundTripAndReplayKeepPerDrawRawKnownness) {
@@ -69,7 +72,7 @@ TEST(RasterLaunchCapture, CurrentRoundTripAndReplayKeepPerDrawRawKnownness) {
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     ASSERT_GT(bytes.size(), tail_bytes(capture));
-    EXPECT_EQ(bytes[8], 71);
+    EXPECT_EQ(bytes[8], 72);
     GpuCaptureFile loaded;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
     ASSERT_EQ(loaded.draws.size(), 2u);
@@ -90,7 +93,7 @@ TEST(RasterLaunchCapture, LegacyV70RetainsSpiButNeverInventsNewControls) {
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     ASSERT_GT(bytes.size(), tail_bytes(capture) + 16);
-    bytes.resize(bytes.size() - tail_bytes(capture));
+    bytes.resize(bytes.size() - coverage_tail_bytes(capture) - tail_bytes(capture));
     bytes[8] = 70; // unchanged complete official v70 prefix, only version header lowered
     GpuCaptureFile loaded;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
@@ -117,7 +120,7 @@ TEST(RasterLaunchCapture, EveryNewFlagRejectsNonBooleanWireValues) {
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
-    const size_t base = bytes.size() - tail_bytes(capture) + 4;
+    const size_t base = bytes.size() - coverage_tail_bytes(capture) - tail_bytes(capture) + 4;
     for (size_t draw = 0; draw < capture.draws.size(); ++draw) {
         for (size_t word = 0; word < controls.size(); ++word) {
             auto malformed = bytes;
@@ -145,7 +148,7 @@ TEST(RasterLaunchCapture, UnavailableRawPayloadIsRejectedOnBothSidesOfCodec) {
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
-    const size_t base = bytes.size() - tail_bytes(capture) + 4;
+    const size_t base = bytes.size() - coverage_tail_bytes(capture) - tail_bytes(capture) + 4;
     for (size_t word = 0; word < controls.size(); ++word) {
         auto malformed = bytes;
         const size_t at = base + 5 * word;
@@ -162,7 +165,7 @@ TEST(RasterLaunchCapture, DrawCountCannotBorrowAnotherDrawsControlWords) {
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
-    const size_t at = bytes.size() - tail_bytes(capture);
+    const size_t at = bytes.size() - coverage_tail_bytes(capture) - tail_bytes(capture);
     for (uint32_t count : {0u, 1u, 3u, UINT32_MAX}) {
         auto malformed = bytes;
         for (uint32_t byte = 0; byte < 4; ++byte)
@@ -178,6 +181,9 @@ TEST(RasterLaunchCapture, EveryTruncatedNewTailIsRejected) {
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
+    bytes.resize(bytes.size() - coverage_tail_bytes(capture));
+    bytes[8] =
+        71; // the complete historical v71 frame; test its own tail, not only v72 truncation
     for (size_t removed = 1; removed <= tail_bytes(capture); ++removed) {
         auto truncated = bytes;
         truncated.resize(truncated.size() - removed);
@@ -185,6 +191,58 @@ TEST(RasterLaunchCapture, EveryTruncatedNewTailIsRejected) {
         EXPECT_FALSE(deserialize_gpu_capture(truncated, rejected, error)) << removed;
         EXPECT_FALSE(error.empty());
     }
+}
+
+TEST(RasterLaunchCapture, CoverageRoundTripRetainsAllWordsAndLegacyAbsence) {
+    auto capture = capsule();
+    auto& coverage = capture.draws[0].ps_raster_launch.coverage;
+    coverage.available = 0x07ffffffu;
+    for (uint32_t index = 0; index < 27; ++index)
+        coverage.words[index] = index == 5 ? 0u : 0x80001000u + index;
+    std::vector<uint8_t> bytes;
+    std::string error;
+    ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
+    GpuCaptureFile loaded;
+    ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
+    ASSERT_EQ(loaded.draws.size(), 2u);
+    EXPECT_EQ(loaded.draws[0].ps_raster_launch.coverage, coverage);
+    EXPECT_EQ(loaded.draws[1].ps_raster_launch.coverage, RasterCoverageFacts{});
+    GpuReplayFrame replay;
+    ASSERT_TRUE(materialize_gpu_replay(loaded, replay, error)) << error;
+    ASSERT_EQ(replay.items.size(), 2u);
+    EXPECT_EQ(replay.items[0].ps_raster_launch.coverage, coverage);
+    bytes.resize(bytes.size() - coverage_tail_bytes(capture));
+    bytes[8] = 71;
+    ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
+    for (const auto& draw : loaded.draws)
+        EXPECT_EQ(draw.ps_raster_launch.coverage, RasterCoverageFacts{});
+}
+
+TEST(RasterLaunchCapture, CoverageRejectsUnknownAbsentAndTruncatedWire) {
+    const auto capture = capsule();
+    std::vector<uint8_t> bytes;
+    std::string error;
+    ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
+    const size_t base = bytes.size() - coverage_tail_bytes(capture);
+    for (size_t at : {base + 4 + 3, base + 8}) {
+        auto corrupt = bytes;
+        corrupt[at] = 0x80; // unknown presence bit, or nonzero unobserved raw payload
+        GpuCaptureFile rejected;
+        EXPECT_FALSE(deserialize_gpu_capture(corrupt, rejected, error));
+        EXPECT_EQ(error, "invalid realized-draw raster coverage");
+    }
+    for (size_t removed = 1; removed <= coverage_tail_bytes(capture); ++removed) {
+        auto truncated = bytes;
+        truncated.resize(truncated.size() - removed);
+        GpuCaptureFile rejected;
+        EXPECT_FALSE(deserialize_gpu_capture(truncated, rejected, error)) << removed;
+        EXPECT_FALSE(error.empty());
+    }
+    auto corrupt = bytes;
+    corrupt[base] = 1; // two draws cannot consume a one-draw tail
+    GpuCaptureFile rejected;
+    EXPECT_FALSE(deserialize_gpu_capture(corrupt, rejected, error));
+    EXPECT_EQ(error, "invalid realized-draw raster coverage count");
 }
 
 TEST(RasterLaunchCapture, CompleteNewTailCannotHideTrailingGarbage) {

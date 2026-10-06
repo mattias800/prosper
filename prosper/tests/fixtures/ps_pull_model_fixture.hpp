@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -108,7 +109,8 @@ inline bool register_program(Program& out, bool vertex, const std::vector<uint32
            out.registers[1].value == uint32_t((address >> 40) & 255);
 }
 
-inline bool realize(const Case& c, g::DrawItem& draw) {
+inline bool realize(const Case& c, g::DrawItem& draw,
+                    std::optional<uint32_t> ps_rsrc1 = std::nullopt) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     constexpr uint64_t bytes = 0x10000;
@@ -134,6 +136,9 @@ inline bool realize(const Case& c, g::DrawItem& draw) {
     state.cx[p::SPI_BARYC_CNTL] = 0;
     state.cx[p::SPI_PS_INPUT_ENA] = c.ena;
     state.cx[p::SPI_PS_INPUT_ADDR] = c.addr;
+    // Only callers supplying a physical mode get that observation. Existing native pull
+    // fixtures intentionally retain their absent RSRC1; do not stamp a consumer-side default.
+    if (ps_rsrc1) state.sh[p::SPI_SHADER_PGM_RSRC1_PS] = *ps_rsrc1;
     state.sh[p::SPI_SHADER_PGM_RSRC2_PS] = 0;
     if (c.words != Words::Pull) state.cx[p::SPI_PS_INPUT_CNTL_0] = 0;
     g::GpuState::Draw packet;

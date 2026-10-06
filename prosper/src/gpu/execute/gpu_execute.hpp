@@ -10,6 +10,8 @@
 #pragma once
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
 #include "gpu/execute/shader_source_window.hpp"
+#include "gpu/execute/fragment_raster_launch.hpp"
+#include "gpu/execute/derived_interpolation_geometry.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
@@ -2702,18 +2704,26 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
     const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
+    // A separately proved original register-only helper program can defer to the draw-bound
+    // logical64 transaction. Empty native FS alone, captures, or owned-wave flags grant nothing.
+    const bool raster_fragment_pending =
+        !owned_vertex && !owned_fragment && fs_words.empty() && !rs.ps_wave32 && !dcc_decompress &&
+        fragment_raster_pending_original(ds, rs.ps_raster_launch, fragment_analysis, system_inputs);
     if (rs.ps_addr)
         prosper::diagnostics::perf::observe_wave64_shader(rs.ps_wave32 ? 32u : 64u, false);
     std::vector<uint32_t> gs;
+    SharedShaderWords gs_shared;
     if ((interpolation.requires_geometry || rect_list_synthesis) && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
         // provide the three AMD vertex parameters and remain fail-visible.
         const bool triangle_topology = resolved_pipeline.topology >= 3u &&
                                        resolved_pipeline.topology <= 5u;
-        if (triangle_topology)
-            gs = recompile_interpolation_geometry(
-                interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
+        if (triangle_topology) {
+            gs_shared = acquire_derived_interpolation_geometry(
+                fragment_analysis, vs_shared, interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
                 rect_list_synthesis, float_transport);
+            gs = *gs_shared;   // Preserve the existing native/capture owned-vector contract.
+        }
     }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
@@ -2751,7 +2761,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         }
     }
     if ((vs_words.empty() && !owned_vertex) ||
-        (fs_words.empty() && !owned_fragment && !scalar_bank) ||
+        (fs_words.empty() && !owned_fragment && !raster_fragment_pending && !scalar_bank) ||
         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
         if (PROSPER_ENV_ON("PROSPER_PROLOGLOG")) {
             // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
@@ -2881,7 +2891,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     if ((!owned_vertex &&
          !validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0,
                                                SpirvShaderStage::Vertex, validate_mode)) ||
-        (!owned_fragment && !scalar_bank &&
+        (!owned_fragment && !raster_fragment_pending && !scalar_bank &&
          !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1,
                                                SpirvShaderStage::Fragment, validate_mode))) {
         report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
@@ -3282,7 +3292,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         if (pinned->fragment_pending) {
             auto inputs = std::make_shared<RasterQuadInputs>();
             inputs->source_vs = std::make_shared<const std::vector<uint32_t>>(out.vs_words());
-            inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(out.gs);
+            inputs->source_gs =
+                gs_shared ? gs_shared : std::make_shared<const std::vector<uint32_t>>(out.gs);
             inputs->source_fs = std::make_shared<const std::vector<uint32_t>>();
             inputs->raw_code = pinned->fragment_code;
             inputs->raw_matches_producing_source = true;
@@ -3312,11 +3323,15 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         auto inputs = std::make_shared<RasterQuadInputs>();
         inputs->source_vs = out.vs_shared ? out.vs_shared :
             std::make_shared<const std::vector<uint32_t>>(out.vs);
-        inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(out.gs);
-        inputs->source_fs = out.fs_shared ? out.fs_shared :
-            std::make_shared<const std::vector<uint32_t>>(out.fs);
-        inputs->raw_code = shader_analysis_owned_words(fragment_analysis);
-        inputs->vgpr_requirements = shader_analysis_packet_vgpr_requirements(fragment_analysis);
+        inputs->source_gs = gs_shared ? gs_shared
+                            : out.gs.empty()
+                                ? FragmentRasterLaunchSource::selected_empty_words()
+                                : std::make_shared<const std::vector<uint32_t>>(out.gs);
+        inputs->source_fs = out.fs_words().empty()
+                                ? FragmentRasterLaunchSource::selected_empty_words()
+                            : out.fs_shared ? out.fs_shared
+                                            : std::make_shared<const std::vector<uint32_t>>(out.fs);
+        inputs->owned_wave_pending = raster_fragment_pending;
         inputs->raw_matches_producing_source = bool(fragment_analysis) && !dcc_decompress;
         if (scalar_bank) {
             // The original packet manifest is coupled to the registered pre-fold version, not
@@ -3328,7 +3343,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         }
         inputs->has_pixel_inputs = out.has_pixel_inputs; inputs->pixel_inputs = out.pixel_inputs;
         inputs->has_system_inputs = out.has_system_inputs; inputs->system_inputs = out.system_inputs;
-        inputs->interpolation = interpolation; inputs->launch = rs.ps_raster_launch;
+        inputs->interpolation = interpolation;
+        inputs->launch = rs.ps_raster_launch;
         inputs->generated_interpolation_geometry = !out.gs.empty() &&
             interpolation.requires_geometry && !rect_list_synthesis;
         inputs->float_transport = float_transport;
@@ -3336,6 +3352,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         inputs->float_mode = out.ps_float_mode;
         inputs->float_flags = out.ps_float_flags;
         inputs->launch_rsrc1 = out.ps_launch_rsrc1;
+        // Distinct private authorities: a scalar snapshot cannot mint raster helper entry, and
+        // the raster source cannot authorize a read bank or replace its pre-fold lineage.
+        if (!scalar_bank)
+            FragmentRasterLaunchSource::bind(ds, rs.ps_raster_launch, fragment_analysis, *inputs);
         if (scalar_bank) {
             inputs->original_fragment_producer = seal_original_fragment_draw_producer(
                 *scalar_read_point, ds, scalar_order, out.native_vs_source, scalar_bank);

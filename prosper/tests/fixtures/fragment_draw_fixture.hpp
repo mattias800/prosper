@@ -37,9 +37,7 @@ struct Owners {
     ps_pull::Program vs, ps;
 };
 
-inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
-                    const std::vector<uint32_t>& ps_words = fragment_words(),
-                    uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u) {
+inline const Owners* register_programs(const std::vector<uint32_t>& ps_words = fragment_words()) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     uint64_t address = 0;
@@ -49,13 +47,22 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
         map(reinterpret_cast<uint64_t>(&address), bytes, 2, 0,
             reinterpret_cast<uint64_t>("fragment-draw-programs"), 0) != 0 ||
         address < 0x100000000ull || address % alignof(Owners))
-        return false;
+        return nullptr;
     // AGC owns registered addresses until process exit. Each rail owns a fresh mapping, never
     // rewrites registered words, and never treats released VA as another producer generation.
     auto& owner = *std::construct_at(reinterpret_cast<Owners*>(address));
     if (!ps_pull::register_program(owner.vs, true, vertex_words()) ||
         !ps_pull::register_program(owner.ps, false, ps_words))
-        return false;
+        return nullptr;
+    return &owner;
+}
+
+// Repeated draws may use one authentic immutable registration while observing different entry
+// words. Sharing copied raw bytes or replacing a retained source after realization is not reuse.
+inline bool realize_registered(g::DrawItem& draw, const Owners& owner,
+                               const std::array<float, 4>& color = color_a,
+                               uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u,
+                               std::span<const std::pair<uint32_t, uint32_t>> context_words = {}) {
     g::GpuState state;
     for (const auto* program : {&owner.vs, &owner.ps})
         for (const auto& reg : program->registers) state.sh[reg.offset] = reg.value;
@@ -72,12 +79,22 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
     state.sh[p::SPI_SHADER_PGM_RSRC2_PS] = 4u << p::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT;
     for (uint32_t word = 0; word < color.size(); ++word)
         state.sh[p::SPI_SHADER_USER_DATA_PS_0 + word] = std::bit_cast<uint32_t>(color[word]);
+    // Distinct launch fixtures supply authentic physical context writes before the same normal
+    // realizer. Existing input-free callers retain their original register observations.
+    for (const auto [reg, value] : context_words) state.cx[reg] = value;
     g::GpuState::Draw packet;
     packet.index_count = 3;
     packet.instance_count = 1;
     packet.command_order = 1;
     state.draws.push_back(packet);
     return g::realize_draw_item(state, &state.draws[0], 3, 64, false, draw, nullptr, true);
+}
+inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
+                    const std::vector<uint32_t>& ps_words = fragment_words(),
+                    uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u,
+                    std::span<const std::pair<uint32_t, uint32_t>> context_words = {}) {
+    const auto* owner = register_programs(ps_words);
+    return owner && realize_registered(draw, *owner, color, ps_rsrc1, color_masks, context_words);
 }
 inline std::shared_ptr<const g::FragmentPacketPreparation> prepare(const g::DrawItem& draw) {
     return g::prepare_fragment_packet_inputs(

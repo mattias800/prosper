@@ -984,6 +984,49 @@ int main(int argc, char** argv) {
                  build_fragment_draw_replay(*draw_capacity, draw_collector),
                  "build_fragment_draw_replay");
         }
+        // A distinct original saved-EXEC/WQM/basic-quad/LGKM0/restore/EXP stream exercises the
+        // helper consumer, not a stripped resource fixture or a fabricated native FS. This is
+        // an offline dynamic-entry schema: actual values/backing/live facts are supplied by the
+        // shipping assembler, whose real draw-bound producer is covered by separate tests.
+        auto helper_schema = resources::base();
+        auto& helper_invocation = helper_schema.invocation;
+        helper_invocation.export_observation = FragmentPacketExportObservation::Architectural;
+        helper_invocation.mask_state_available = false;
+        helper_invocation.exec_available = true;
+        helper_invocation.sgprs.clear();
+        helper_invocation.vgprs.clear();
+        FragmentPacketVgpr helper_position;
+        helper_position.reg = 0;
+        helper_position.available_mask = 0;   // per-lane validity comes from the dynamic entry
+        helper_invocation.vgprs.push_back(helper_position);
+        helper_invocation.guest_code = {0xbe94047eu, 0xbefe0a7eu, 0xd8d480ffu,
+                                        0x00000000u, 0xbf8cc07fu, 0xbefe0414u,
+                                        0xf800180fu, 0x00000000u, 0xbf810000u};
+        const auto helper_kernel = std::make_shared<const FragmentPacketKernel>(
+            recompile_fragment_packet_capacity_kernel(helper_schema));
+        dump(dir, "fragment_draw_helper_capacity_kernel", helper_kernel->program.packet.spirv,
+             "recompile_fragment_packet_capacity_kernel");
+        std::string helper_rejection;
+        const auto helper_capacity = fragment_draw_capacity(
+            helper_kernel, draw_collector, helper_rejection,
+            FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks, {{0, 5}});
+        if (!helper_capacity) {
+            printf("  [FAIL] fragment draw helper capacity: %s\n", helper_rejection.c_str());
+            ++fails;
+        } else {
+            dump(dir, "fragment_draw_helper_count",
+                 build_fragment_draw_count(*helper_capacity, draw_collector),
+                 "build_fragment_draw_count");
+            dump(dir, "fragment_draw_helper_assembly",
+                 build_fragment_draw_assembly(*helper_capacity, draw_collector),
+                 "build_fragment_draw_assembly");
+            dump(dir, "fragment_draw_helper_validation",
+                 build_fragment_draw_validation(*helper_capacity, draw_collector),
+                 "build_fragment_draw_validation");
+            dump(dir, "fragment_draw_helper_replay",
+                 build_fragment_draw_replay(*helper_capacity, draw_collector),
+                 "build_fragment_draw_replay");
+        }
         namespace architectural = prosper::test::fragment_packet_exports;
         for (const auto& [name, input] :
              std::vector<std::pair<const char*, FragmentResourcePacket>>{

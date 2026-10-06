@@ -1,6 +1,8 @@
 // Actual registered guest PS -> same backend collector/compute transaction -> normal attachments.
-// These finite input-free rails prove the first recipe only, never Kena/helper/console packing.
+// The original input-free rails and the draw-bound quad-local helper rail remain distinct.
+// Neither is full Wave64, a Kena oracle, or evidence of the console's undocumented append order.
 #include "fixtures/fragment_draw_fixture.hpp"
+#include "fixtures/fragment_raster_fixture.hpp"
 #include "fixtures/render_runner.h"
 #include <gtest/gtest.h>
 #include <cmath>
@@ -127,6 +129,33 @@ TEST_F(FragmentDrawExec, APartialHostQuadRefusesTheWholeDrawAfterAPooledSuccess)
     // no earlier full quad may mutate ANY attachment pixel; stale pooled gate1 must not survive.
     pixels(render({original}, f::width - 1), f::width - 1, f::height, seed);
     pixels(render({original}), f::width, f::height, f::color_a);
+}
+TEST_F(FragmentDrawExec, SavedLiveWqmReadsActualUncoveredHelperPositionThenRestoresExportMask) {
+    namespace helper = r::fragment_raster;
+    g::DrawItem draw;
+    ASSERT_TRUE(helper::realize(draw));
+    ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source);
+    ASSERT_EQ(*draw.fragment_draw_inputs->raw_code, helper::original());
+    const auto original = backend(draw);
+    for (uint32_t width : {f::width, f::width - 1, f::width}) {
+        const auto raw = render({original}, width);
+        ASSERT_EQ(raw.size(), size_t(width) * f::height * sizeof(std::array<float, 4>));
+        for (uint32_t y = 0; y < f::height; ++y)
+            for (uint32_t x = 0; x < width; ++x) {
+                std::array<float, 4> actual{};
+                std::memcpy(actual.data(), raw.data() + (size_t(y) * width + x) * sizeof(actual),
+                            sizeof(actual));
+                const float expected = float((x & ~1u) + 1) + .5f;
+                for (uint32_t channel = 0; channel < 4; ++channel)
+                    EXPECT_EQ(actual[channel], expected)
+                        << "pixel=" << x << ',' << y
+                        << " helper3's original POS_X must survive alias+LGKM+live restoration";
+            }
+    }
+    // At width15 the last live pixel14 selects helper3 at uncovered X15.5. The same normal
+    // collector must gather that invocation through unconditional quad broadcasts before the
+    // elected nonhelper publishes it; Vulkan helpers cannot publish SSBO stores. No fabricated
+    // padding or CPU-readback assembly can satisfy both the nonconstant full and odd extents.
 }
 TEST_F(FragmentDrawExec, SeventeenOriginalProgramsKeepVulkanObjectsWarmAcrossFrames) {
     std::array<g::DrawItem, 17> draws;

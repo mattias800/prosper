@@ -60,6 +60,11 @@ TEST_F(FragmentDrawPlan, SameOriginalCachedCodeConsumesDistinctCurrentUserWords)
     ASSERT_TRUE(tb.rejection().empty()) << tb.rejection();
     EXPECT_NE(ta.entry_words(), tb.entry_words());
     EXPECT_EQ(code_a->capacity_owner()->kernel()->guest_code, f::fragment_words());
+    EXPECT_EQ(code_a->entry_schema(),
+              g::FragmentDrawEntryRecipe::OwnedUserPrefixAndShaderDefinedMasks);
+    EXPECT_EQ(code_a->capacity_owner()->entry_recipe(), code_a->entry_schema());
+    EXPECT_EQ(code_a->capacity_owner()->kernel()->program.packet.initial_mask_availability, 0u)
+        << "the old recipe never borrows raster initial EXEC authority";
     EXPECT_EQ(code_a->capacity_owner()->kernel()->program.packet.export_observation,
               g::FragmentPacketExportObservation::Architectural);
     ASSERT_EQ(code_a->capacity_owner()->export_sites().size(), 1u);

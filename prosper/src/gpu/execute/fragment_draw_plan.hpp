@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/execute/fragment_draw_residency.hpp"
+#include "gpu/execute/fragment_raster_launch_collection.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include <memory>
 #include <span>
@@ -11,8 +12,10 @@ namespace prosper::gpu {
 // The first recipe additionally proves the original program insensitive to inter-quad placement
 // and to private unexportable scratch workers in the last workgroup. Future recipes may support
 // observable guest composition only with the additional authority they actually require.
-enum class FragmentDrawScheduling : uint8_t { PackingUnobservableCompleteQuads };
-enum class FragmentDrawEntryRecipe : uint8_t { OwnedUserPrefixAndShaderDefinedMasks };
+enum class FragmentDrawScheduling : uint8_t {
+    PackingUnobservableCompleteQuads,
+    QuadLocalObservationalEquivalence
+};
 struct FragmentDrawMaskWord {
     bool user_word = false;
     uint32_t word = 0; // owned prefix index, or original inline/literal word
@@ -39,10 +42,24 @@ public:
     const auto& replay_owner() const { return replay_shared; }
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
+    const auto& raster_launch_collection() const { return raster_collection; }
+    bool matches_raster_vertex(const std::shared_ptr<const std::vector<uint32_t>>& vertex) const {
+        if (!raster_collection) return true;   // legacy input-free plans have no raster association
+        const auto& selected = raster_module_generations[0];
+        return vertex && selected.lock().get() == vertex.get() && !selected.owner_before(vertex) &&
+               !vertex.owner_before(selected);
+    }
+    FragmentDrawEntryRecipe entry_schema() const { return entry_recipe; }
     bool requires_scalar_bank() const {
         return capacity && !capacity->kernel()->program.scalar_bank_sites.empty();
     }
-    bool source_live() const { return source_generations->live(); }
+    bool source_live() const {
+        if (!source_generations->live()) return false;
+        if (device.raster)
+            for (const auto& generation : raster_module_generations)
+                if (generation.expired()) return false;
+        return true;
+    }
 
 private:
     friend FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs&,
@@ -79,6 +96,12 @@ private:
     FragmentLaunchRsrc1 launch_rsrc1{};
     FloatTransportConfig transport{};
     FragmentPacketDeviceContract device{};
+    RasterLaunchFacts raster_profile{};
+    // Cold copied collector/coefficient code only, never the draw's strong launch/source owner.
+    // Until the distinct workitem and scheduling obligations are proved this plan still refuses
+    // before any device allocation/attachment change; structural code is not an admission token.
+    std::shared_ptr<const FragmentRasterLaunchCollection> raster_collection;
+    std::array<std::weak_ptr<const std::vector<uint32_t>>, 3> raster_module_generations;
     std::vector<FragmentDrawFullMask> full_masks;
     std::string rejection;
 };

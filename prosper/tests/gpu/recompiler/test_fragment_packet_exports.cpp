@@ -1,3 +1,5 @@
+// Architectural hint admission must reach the actual dispatcher without changing logical64
+// sinks or lending support to reserved encodings, CLAUSE, or the independent LegacyRaw policy.
 #include "fixtures/fragment_packet_exports_fixture.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
@@ -84,6 +86,100 @@ TEST(FragmentPacketExports, EntirelyInactiveMayHaveNoPayloadButKeepsControl) {
         EXPECT_FALSE(lane.valid_mask);
         EXPECT_FALSE(lane.commit_eligible);
         EXPECT_FALSE(lane.events[0].source_words[0].has_value());
+    }
+}
+TEST(FragmentPacketExports, CanonicalPrefetchPreservesArchitecturalPacketAndResourceSinks) {
+    for (uint32_t wave : {0u, 1u}) {
+        SCOPED_TRACE(wave); // nonzero and genuinely present zero are distinct inputs
+        auto expected = f::scratch_records(wave);
+        for (uint32_t lane = 0; lane < 64; ++lane) expected[lane * 14 + 12] = 2;
+        for (uint32_t mode : {1u, 2u, 3u}) {
+            SCOPED_TRACE(mode);
+            auto input = f::scratch(wave);
+            input.invocation.guest_code.insert(input.invocation.guest_code.begin(),
+                                               0xbfa00000u | mode);
+            const auto check_program = [&](const FragmentPacketProgram& program) {
+                ASSERT_FALSE(program.spirv.empty()) << program.rejection;
+                EXPECT_EQ(program.export_observation,
+                          FragmentPacketExportObservation::Architectural);
+                EXPECT_EQ(program.demanded_initial_masks, kPacketInitialExec);
+                const auto words = execute(program);
+                ASSERT_GE(words.size(), expected.size());
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
+                const auto decoded = decode_fragment_packet(program, words, true);
+                ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+                ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+                for (uint32_t lane = 0; lane < 64; ++lane) {
+                    const auto& out = decoded.architectural_exports[lane];
+                    ASSERT_EQ(out.events.size(), 1u);
+                    EXPECT_EQ(out.events[0].site.pc, 2u);
+                    EXPECT_EQ(out.colors[0][0].has_value(), f::active(lane));
+                    EXPECT_EQ(out.commit_eligible, f::active(lane) && lane != 40);
+                    if (f::active(lane)) {
+                        ASSERT_TRUE(out.colors[0][0].has_value());
+                        EXPECT_EQ(out.colors[0][0]->bits, f::value(wave));
+                    }
+                }
+            };
+            const auto scenario = std::to_string(wave) + "_" + std::to_string(mode);
+            const auto packet = compile(input.invocation, ("prefetch_packet_" + scenario).c_str());
+            check_program(packet);
+            const auto resource = recompile_fragment_resource_packet(input);
+            retain(resource.packet.spirv, ("prefetch_resource_" + scenario).c_str());
+            check_program(resource.packet);
+            ASSERT_FALSE(resource.packet.spirv.empty()) << resource.packet.rejection;
+            const auto decoded = decode_fragment_resource_packet(
+                resource, execute(resource.packet), true, input.device.device_identity);
+            ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+            EXPECT_EQ(decoded.architectural_exports.size(), 64u);
+        }
+    }
+}
+TEST(FragmentPacketExports, ReservedPrefetchAndClauseRefuseAtTheActualArchitecturalDispatcher) {
+    for (bool resource_route : {false, true}) {
+        SCOPED_TRACE(resource_route);
+        auto input = f::scratch();
+        input.invocation.guest_code.insert(input.invocation.guest_code.begin(), 0xbfa00003u);
+        const auto compile_route = [&] {
+            return resource_route ? recompile_fragment_resource_packet(input).packet
+                                  : recompile_fragment_packet(input.invocation);
+        };
+        ASSERT_FALSE(compile_route().spirv.empty()) << "same original with canonical PREFETCH3";
+        for (uint32_t word : {0xbfa00000u, 0xbfa00004u, 0xbfa00103u, 0xbfa08003u, 0xbfa10000u,
+                              0xbfa10001u, 0xbfa1ffffu}) {
+            SCOPED_TRACE(word);
+            input.invocation.guest_code[0] = word;   // only the first original instruction differs
+            const auto refused = compile_route();
+            EXPECT_EQ(refused.rejection, (word & 0xffff0000u) == 0xbfa00000u
+                                             ? "packet-prefetch-mode-unimplemented"
+                                             : "packet-clause-unimplemented");
+            EXPECT_TRUE(refused.spirv.empty());
+            EXPECT_TRUE(refused.input_words.empty());
+            EXPECT_TRUE(refused.output_words.empty());
+        }
+    }
+}
+TEST(FragmentPacketExports, ArchitecturalPrefetchDoesNotExpandLegacyRawPacketOrResourcePolicy) {
+    for (bool resource_route : {false, true}) {
+        SCOPED_TRACE(resource_route);
+        auto input = f::scratch();
+        input.invocation.export_observation = FragmentPacketExportObservation::LegacyRaw;
+        input.invocation.guest_code.insert(input.invocation.guest_code.begin(), 0xbf800000u);
+        const auto compile_route = [&] {
+            return resource_route ? recompile_fragment_resource_packet(input).packet
+                                  : recompile_fragment_packet(input.invocation);
+        };
+        ASSERT_FALSE(compile_route().spirv.empty()) << "same LegacyRaw original with a NOP";
+        for (uint32_t word : {0xbfa00001u, 0xbfa00002u, 0xbfa00003u, 0xbfa00000u, 0xbfa00004u,
+                              0xbfa00103u, 0xbfa08003u, 0xbfa10001u}) {
+            SCOPED_TRACE(word);
+            input.invocation.guest_code[0] = word;
+            const auto refused = compile_route();
+            EXPECT_EQ(refused.rejection, "packet-control-unimplemented");
+            EXPECT_TRUE(refused.spirv.empty());
+            EXPECT_TRUE(refused.input_words.empty());
+            EXPECT_TRUE(refused.output_words.empty());
+        }
     }
 }
 TEST(FragmentPacketExports, OnlyDemandedInitialMasksSupplyArchitecturalAuthority) {

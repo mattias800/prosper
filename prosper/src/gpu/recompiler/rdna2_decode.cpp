@@ -19,6 +19,10 @@ bool sop_has_literal(uint32_t w, int nsrc) {
 bool vop_has_literal(uint32_t w) { return (w & 0x1FFu) == LITERAL; }   // src0 is 9 bits
 }  // namespace
 
+bool rdna2_is_valid_instruction_prefetch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP && in.opcode == 0x20 && in.simm16 >= 1 && in.simm16 <= 3;
+}
+
 float inline_float_value(uint32_t code) {
     switch (code) {
         case 240: return 0.5f;  case 241: return -0.5f;

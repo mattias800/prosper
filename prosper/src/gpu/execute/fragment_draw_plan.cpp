@@ -1,4 +1,8 @@
 #include "gpu/execute/fragment_draw_plan.hpp"
+#include "gpu/execute/fragment_raster_launch.hpp"
+#include "gpu/execute/fragment_raster_launch_collection.hpp"
+#include "gpu/execute/fragment_raster_contract.hpp"
+#include "gpu/execute/fragment_raster_program.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/recompiler/original_fragment_producer.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
@@ -15,9 +19,12 @@ bool producing_owner(const RasterQuadInputs& in, const FragmentPacketPreparation
         return prepared.vgpr_requirements && prepared.vgpr_requirements == in.vgpr_requirements &&
                in.vgpr_requirements->source_words == in.raw_code.get() &&
                in.vgpr_requirements->rejection.empty();
+    const bool pending_original = in.owned_wave_pending && in.source_fs && in.source_fs->empty() &&
+                                  in.launch_source && prepared.launch_source == in.launch_source &&
+                                  in.launch_source->matches(in);
     return prepared.inputs.get() == &in && in.raw_matches_producing_source && in.raw_code &&
            !in.raw_code->empty() && in.raw_code->size() <= 4096 && in.source_vs &&
-           !in.source_vs->empty() && in.source_fs && !in.source_fs->empty() &&
+           !in.source_vs->empty() && in.source_fs && (!in.source_fs->empty() || pending_original) &&
            prepared.vgpr_requirements && prepared.vgpr_requirements == in.vgpr_requirements &&
            in.vgpr_requirements->source_words == in.raw_code.get() &&
            in.vgpr_requirements->rejection.empty();
@@ -202,7 +209,12 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
 std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                                   const FragmentPacketPreparation& prepared,
                                   FragmentPacketDeviceContract device, uint32_t max_quads) {
-    if (!producing_owner(in, prepared) || !launch_owned(in, prepared) || !input_free_layout(in))
+    const bool raster_launch_available = device.raster && in.launch_source &&
+                                         prepared.launch_source == in.launch_source &&
+                                         in.launch_source->matches(in);
+    if (!producing_owner(in, prepared) || !launch_owned(in, prepared) ||
+        (!scalar_bank_program(in) && !resource_free(in)) ||
+        (!input_free_layout(in) && !raster_launch_available))
         return {};
     std::vector<uint32_t> key{max_quads,
                               prepared.user_sgpr_count,
@@ -220,6 +232,42 @@ std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                               uint32_t(device.rgba32_sfloat_sampled),
                               uint32_t(scalar_bank_program(in)),
                               uint32_t(!scalar_bank_program(in) && resource_free(in))};
+    key.push_back(bool(device.raster));
+    if (device.raster) {
+        // Even an input-free original can require the raster recipe. Its private launch proof
+        // must not be borrowed from a warm plan or let an invalid cold query poison valid reuse.
+        key.push_back(uint32_t(raster_launch_available));
+        const auto& raster = *device.raster;
+        key.insert(key.end(),
+                   {uint32_t(raster.geometry_shader_enabled), raster.max_vertex_output_components,
+                    raster.max_geometry_input_components, raster.max_geometry_output_components,
+                    raster.max_geometry_total_output_components,
+                    raster.max_geometry_output_vertices, raster.max_geometry_shader_invocations,
+                    raster.max_fragment_input_components});
+        // Only cold profile/shape facts enter the key, never dynamic USER_DATA values. A different
+        // native varying/GS profile cannot reuse a complete-coefficient collection module.
+        for (const auto* module : {in.source_vs.get(), in.source_gs.get(), in.source_fs.get()}) {
+            const uint64_t identity = reinterpret_cast<uintptr_t>(module);
+            key.insert(key.end(), {uint32_t(identity), uint32_t(identity >> 32)});
+        }
+        key.insert(key.end(), {in.launch.input_ena, in.launch.input_addr,
+                               in.interpolation.attribute_mask, in.interpolation.smooth_mask,
+                               in.interpolation.flat_mask, in.interpolation.passthrough_mask,
+                               uint32_t(in.generated_interpolation_geometry)});
+        for (const auto& locations : in.interpolation.parameter_locations)
+            key.insert(key.end(), locations.begin(), locations.end());
+        key.insert(key.end(), in.interpolation.system_locations.begin(),
+                   in.interpolation.system_locations.end());
+        key.insert(key.end(),
+                   {uint32_t(in.owned_wave_pending),
+                    uint32_t(in.launch.sc_shader_control_available), in.launch.sc_shader_control,
+                    uint32_t(in.launch.sc_mode_cntl_0_available), in.launch.sc_mode_cntl_0,
+                    uint32_t(in.launch.sc_mode_cntl_1_available), in.launch.sc_mode_cntl_1,
+                    uint32_t(in.launch.sc_aa_config_available), in.launch.sc_aa_config,
+                    uint32_t(in.launch.db_shader_control_available), in.launch.db_shader_control,
+                    in.launch.coverage.available});
+        key.insert(key.end(), in.launch.coverage.words.begin(), in.launch.coverage.words.end());
+    }
     return key;
 }
 struct SourceProfileKey {
@@ -244,14 +292,32 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     ++fragment_draw_cache_stats().program_compile_calls;
     FragmentDrawProgramPlan result;
     result.source_generations->remember(in.raw_code);
+    if (device.raster)
+        result.raster_module_generations = {in.source_vs, in.source_gs, in.source_fs};
     const auto refuse = [&](const std::string& reason) {
         FragmentDrawProgramPlan failed;
         failed.source_generations = result.source_generations;
+        failed.raster_module_generations = result.raster_module_generations;
+        failed.device = device;
         failed.rejection = reason;
         return failed;
     };
     if (!producing_owner(in, prepared)) return refuse("fragment-draw-producing-owner-unavailable");
-    if (!launch_owned(in, prepared)) return refuse("fragment-draw-original-launch-unavailable");
+    if (!launch_owned(in, prepared)) {
+        if (device.raster) {
+            if (!in.float_transport.explicit_nonfinite32())
+                return refuse("fragment-draw-enabled-float-transport-unavailable");
+            if (!in.float_mode.available || !in.float_mode.canonical())
+                return refuse("fragment-draw-original-float-mode-unavailable");
+            if (!in.float_flags.available || !in.float_flags.canonical())
+                return refuse("fragment-draw-original-float-flags-unavailable");
+            if (!in.launch_rsrc1.available || !in.launch_rsrc1.canonical())
+                return refuse("fragment-draw-original-rsrc1-unavailable");
+            if (!prepared.user_sgpr_count_available)
+                return refuse("fragment-draw-original-user-prefix-count-unavailable");
+        }
+        return refuse("fragment-draw-original-launch-unavailable");
+    }
     if (!device.device_identity || !device.shader_int64_enabled)
         return refuse("fragment-draw-enabled-device-unavailable");
     const bool scalar_bank = scalar_bank_program(in);
@@ -262,7 +328,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
         (scalar_reads.source_words != in.raw_code.get() || !scalar_reads.rejection.empty() ||
          scalar_reads.sites.empty() || scalar_reads.sites.size() > 64))
         return refuse("fragment-draw-scalar-bank-original-site-schema-unproved");
-    if (!input_free_layout(in))
+    if (scalar_bank && !input_free_layout(in))
         return refuse("fragment-draw-parameter-system-entry-recipe-unimplemented");
     result.user_prefix_count = prepared.user_sgpr_count;
     result.user_prefix_presence = user_presence(prepared);
@@ -271,18 +337,55 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     if (const auto pc = attachment_export_recipe_gap(instructions))
         return refuse("fragment-draw-attachment-export-recipe-unimplemented:pc=" +
                       std::to_string(*pc));
-    if (!packing_unobservable(instructions, static_cast<uint32_t>(in.raw_code->size()),
-                              result.user_prefix_presence, result.full_masks,
-                              scalar_bank ? std::span{scalar_reads.sites}
-                                          : std::span<const FragmentPacketScalarReadSite>{}))
-        return refuse("fragment-draw-entry-and-composition-recipe-unproved");
-    result.collect = build_raster_quad_collector(in, max_quads, result.collector);
-    if (result.collect.empty()) {
-        result.rejection = result.collector.rejection;
+    std::vector<FragmentDrawRasterInput> raster_inputs;
+    const auto raster_recipe = [&]() {
+        if (!device.raster || !in.launch_source || prepared.launch_source != in.launch_source ||
+            !in.launch_source->matches(in))
+            return refuse("fragment-draw-draw-bound-launch-source-unavailable");
+        const auto original =
+            fragment_raster_program(instructions, static_cast<uint32_t>(in.raw_code->size()),
+                                    in.system_inputs, result.user_prefix_presence);
+        if (!original.rejection.empty()) return refuse(original.rejection);
+        if (const auto* gap = fragment_raster_workitem_gap(in.launch)) return refuse(gap);
+        auto collection = compile_fragment_raster_launch_collection(in, device, max_quads);
+        if (!collection.rejection.empty()) return refuse(collection.rejection);
+        result.raster_collection =
+            std::make_shared<const FragmentRasterLaunchCollection>(std::move(collection));
+        result.raster_module_generations = {in.source_vs, in.source_gs, in.source_fs};
+        result.entry_recipe = FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks;
+        result.scheduling = FragmentDrawScheduling::QuadLocalObservationalEquivalence;
+        result.raster_profile = in.launch;
+        result.device = device;
+        result.collect = result.raster_collection->collector;
+        result.collector = result.raster_collection->shape;
+        for (const auto& row : original.positions)
+            raster_inputs.push_back({row.reg, row.collector_word});
         return result;
+    };
+    const bool old_recipe =
+        (scalar_bank || !in.source_fs->empty()) && input_free_layout(in) &&
+        packing_unobservable(instructions, static_cast<uint32_t>(in.raw_code->size()),
+                             result.user_prefix_presence, result.full_masks,
+                             scalar_bank ? std::span{scalar_reads.sites}
+                                         : std::span<const FragmentPacketScalarReadSite>{});
+    if (!old_recipe) {
+        result.full_masks.clear();
+        if (scalar_bank) return refuse("fragment-draw-entry-and-composition-recipe-unproved");
+        if (!device.raster)
+            return refuse(input_free_layout(in)
+                              ? "fragment-draw-entry-and-composition-recipe-unproved"
+                              : "fragment-draw-parameter-system-entry-recipe-unimplemented");
+        auto raster = raster_recipe();
+        if (!raster.rejection.empty()) return raster;
+    } else {
+        result.collect = build_raster_quad_collector(in, max_quads, result.collector);
+        if (result.collect.empty()) {
+            result.rejection = result.collector.rejection;
+            return result;
+        }
+        if (!result.collector.fields.empty())
+            return refuse("fragment-draw-parameter-system-entry-recipe-unimplemented");
     }
-    if (!result.collector.fields.empty())
-        return refuse("fragment-draw-parameter-system-entry-recipe-unimplemented");
     FragmentResourcePacket schema;
     if (scalar_bank) schema.scalar_bank_sites = scalar_reads.sites;
     auto& invocation = schema.invocation;
@@ -295,6 +398,15 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     invocation.float_mode = in.float_mode;
     invocation.float_flags = in.float_flags;
     invocation.float_transport = in.float_transport;
+    if (result.entry_recipe == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks) {
+        invocation.exec_available = true;   // values supplied only by the draw-bound GPU assembler
+        for (const auto& row : raster_inputs) {
+            FragmentPacketVgpr column;
+            column.reg = row.reg;
+            column.available_mask = 0;   // dynamic per-lane validity, never initial zero authority
+            invocation.vgprs.push_back(column);
+        }
+    }
     // Values are absent compile-time placeholders in a dynamically loaded schema. No initial
     // mask, VGPR, system SGPR, M0, coefficient, helper or resource word is manufactured here.
     for (uint32_t reg = 0; reg < 32; ++reg)
@@ -313,7 +425,8 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     }
     if (!fragment_draw_architectural_exports_match(*kernel))
         return refuse("fragment-draw-architectural-exp-required");
-    result.capacity = fragment_draw_capacity(kernel, result.collector, result.rejection);
+    result.capacity = fragment_draw_capacity(kernel, result.collector, result.rejection,
+                                             result.entry_recipe, std::move(raster_inputs));
     if (!result.capacity) return result;
     result.count = build_fragment_draw_count(*result.capacity, result.collector);
     result.assemble = build_fragment_draw_assembly(*result.capacity, result.collector);
@@ -346,22 +459,39 @@ cached_fragment_draw_program(const RasterQuadInputs& in, const FragmentPacketPre
         aliases;
     auto profile = profile_key(in, prepared, device, max_quads);
     const bool canonical = canonical_packet_owner(in);
+    const auto same_modules = [&](const FragmentDrawProgramPlan& resident) {
+        if (!device.raster) return true;
+        const std::array<std::shared_ptr<const std::vector<uint32_t>>, 3> modules{
+            in.source_vs, in.source_gs, in.source_fs};
+        for (size_t index = 0; index < modules.size(); ++index) {
+            const auto& retained = resident.raster_module_generations[index];
+            if (!modules[index] || retained.lock().get() != modules[index].get() ||
+                retained.owner_before(modules[index]) || modules[index].owner_before(retained))
+                return false;
+        }
+        return true;
+    };
     SourceProfileKey alias{in.raw_code, in.raw_code.get(), profile};
     if (canonical && !profile.empty())
         if (const auto found = aliases.find(alias); found != aliases.end())
             if (auto resident = found->second.lock()) {
-                ++fragment_draw_cache_stats().program_hits;
-                return resident;
+                if (resident->source_live() && same_modules(*resident)) {
+                    ++fragment_draw_cache_stats().program_hits;
+                    return resident;
+                }
             }
     auto key = std::move(profile);
     if (!key.empty()) key.insert(key.end(), in.raw_code->begin(), in.raw_code->end());
     if (!key.empty()) {
         const auto found = cache.find(key);
         if (found != cache.end()) {
-            found->second->source_generations->remember(in.raw_code);
-            if (canonical) aliases.insert_or_assign(std::move(alias), found->second);
-            ++fragment_draw_cache_stats().program_hits;
-            return found->second;
+            if (same_modules(*found->second)) {
+                found->second->source_generations->remember(in.raw_code);
+                if (canonical) aliases.insert_or_assign(std::move(alias), found->second);
+                ++fragment_draw_cache_stats().program_hits;
+                return found->second;
+            }
+            cache.erase(found);   // a reused address never stands in for the selected module owner
         }
     }
     retire_dead_fragment_draw_entries(cache, fragment_draw_cache_stats().program_retired);
@@ -389,8 +519,26 @@ FragmentDrawTransaction instantiate_fragment_draw_transaction(
     const auto refuse = [&](const char* reason) { return FragmentDrawTransaction(reason); };
     if (!program || !program->rejection.empty() || !program->capacity)
         return refuse("fragment-draw-program-unavailable");
+    if (program->entry_recipe != program->capacity->entry_recipe())
+        return refuse("fragment-draw-entry-recipe-mismatch");
+    if (program->entry_recipe == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks && in) {
+        const std::array<std::shared_ptr<const std::vector<uint32_t>>, 3> modules{
+            in->source_vs, in->source_gs, in->source_fs};
+        for (size_t index = 0; index < modules.size(); ++index) {
+            const auto& retained = program->raster_module_generations[index];
+            if (!modules[index] || retained.lock().get() != modules[index].get() ||
+                retained.owner_before(modules[index]) || modules[index].owner_before(retained))
+                return refuse("fragment-draw-producing-raster-module-generation-mismatch");
+        }
+    }
     if (!in || !producing_owner(*in, prepared) || !launch_owned(*in, prepared) ||
-        (!program->requires_scalar_bank() && !resource_free(*in)) || !input_free_layout(*in) ||
+        (!program->requires_scalar_bank() && !resource_free(*in)) ||
+        (program->entry_recipe == FragmentDrawEntryRecipe::OwnedUserPrefixAndShaderDefinedMasks
+             ? (!input_free_layout(*in) ||
+                (!program->requires_scalar_bank() && in->source_fs->empty()))
+             : (!in->launch_source || prepared.launch_source != in->launch_source ||
+                !in->launch_source->matches(*in) || in->launch != program->raster_profile ||
+                fragment_raster_workitem_gap(in->launch))) ||
         (!(canonical_packet_owner(*in) && program->source_generations->owns(in->raw_code)) &&
          *in->raw_code != program->capacity->kernel()->guest_code) ||
         prepared.user_sgpr_count != program->user_prefix_count ||

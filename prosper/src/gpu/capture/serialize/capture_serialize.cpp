@@ -1311,6 +1311,13 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(launch.db_shader_control_available ? 1u : 0u);
         w.u32(launch.db_shader_control);
     }
+    // v72 preserves every observed coverage/sample word. This is provenance, not EXEC authority.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        const auto& coverage = draw.ps_raster_launch.coverage;
+        w.u32(coverage.available);
+        for (uint32_t word : coverage.words) w.u32(word);
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

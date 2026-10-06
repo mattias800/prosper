@@ -97,7 +97,7 @@ const char* effect_gap(const Rdna2Inst& in, ShaderProgramStage stage,
                 return nullptr;
             // ISA Table72 and an actual gfx1030 LLVM roundtrip identify opcode32 as instruction
             // prefetch, NOT clause. It reads instruction cache state, not a guest data writer.
-            if (in.opcode == 0x20 && in.simm16 >= 1 && in.simm16 <= 3) return nullptr;
+            if (rdna2_is_valid_instruction_prefetch(in)) return nullptr;
             return "original-stage-control-or-program-effect-unimplemented";
         case Rdna2Format::Unknown: return "original-stage-unknown-encoding";
         default:
