@@ -4159,6 +4159,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4568,6 +4569,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
