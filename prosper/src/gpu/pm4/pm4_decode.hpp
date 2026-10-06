@@ -251,7 +251,7 @@ struct Pm4Command {
     // SetPredication (sceAgcDcbSetPredication -> R_SET_PRED; #319). Payload: [0..1]=condition
     // address lo/hi (0 = end the window), [2]=raw predication op (live capture: 3 on begin, 0 on end).
     uint64_t pred_addr = 0;              // SetPredication: 64-bit condition address (0 = window end)
-    uint32_t pred_op = 0;                // SetPredication: raw op field
+    uint32_t pred_op = 0;                // SetPredication: control word (op + PRED_BOOL flags)
     bool     pred_valid = false;         // SetPredication: payload carried the operands
 
     // DmaData (sceAgcDcbDmaData / sceAgcAcbDmaData -> R_DMA_DATA; issue #312). The CP-DMA engine

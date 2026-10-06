@@ -86,23 +86,34 @@ inline bool is_agc_eliminate_fast_clear_operation(uint32_t cb_color_control,
            is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
 }
 
-// The draw is an AGC helper operation run with the colour block DISABLED: AGC's own rectangle under
-// CB_COLOR_CONTROL.MODE = 0. AGC draws the same rectangle for its depth-metadata helpers -- Dragon
-// Quest VII's command segments are labelled "Decompress Htile" -- which program MODE = DISABLE,
-// DB_RENDER_CONTROL's compress-disable bits and no colour state of their own, so the colour target
-// and masks are whatever the parent stream left bound. Hardware writes no colour under CB_DISABLE;
-// running the rectangle as an ordinary draw paints the parent's pixel shader over the parent's
-// target. Like the eliminate pass this is keyed on the helper's vertex program, never on MODE alone:
-// MODE = 0 latched onto an ordinary title draw must keep writing (#1724, Astro Bot).
-// CONFIDENCE: HIGH that the hardware operation writes no colour; MED that every MODE = 0 use of
-// the rectangle is a metadata helper (every one observed is inside a labelled AGC helper segment).
-inline bool is_agc_colour_disabled_helper_operation(uint32_t cb_color_control,
-                                                    const uint32_t* vertex_code,
-                                                    size_t vertex_dwords) {
+// The draw is AGC's "Decompress Htile" helper: AGC's own rectangle under CB_COLOR_CONTROL.MODE = 0
+// (DISABLE) with DB_RENDER_CONTROL's depth and/or stencil compress-disable bits set, the register
+// signature of a depth-metadata decompress. Dragon Quest VII's helper segments carry that label
+// and program exactly this: CB_COLOR_CONTROL 0x00cc0000, DB_RENDER_CONTROL 0x60 (both compress-
+// disable bits), and no colour state of their own (no CB_COLOR0_BASE, no target mask). So the
+// colour target and masks are whatever the parent stream left bound, and running the rectangle as
+// an ordinary draw paints the parent's pixel shader over the parent's target. The operation is a
+// metadata expansion that prosper's uncompressed depth does not need, and it writes no colour.
+//
+// Keyed on all three halves, never on MODE alone. A decoded MODE = 0 is not by itself a reliable
+// "colour disabled" signal on this platform: #1724 measured Astro Bot draws under a latched
+// MODE = 0 that must write. The exact rectangle and the decompress bits are what identify the
+// helper. Limit: Dragon Quest VII never rewrites DB_RENDER_CONTROL after these helpers, so 0x60 is
+// latched on its ordinary draws too. The bits narrow the rule for other titles, not for that one.
+// The "Eliminate Fast Clear" helper uses the same rectangle under MODE = 2 and is the operation above.
+// CONFIDENCE: HIGH that the decompress writes no colour; MED that the signature never marks a
+// colour-writing use of the rectangle (every observed match is inside a labelled AGC helper segment).
+inline bool is_agc_decompress_htile_operation(uint32_t cb_color_control, uint32_t db_render_control,
+                                              const uint32_t* vertex_code, size_t vertex_dwords) {
     namespace P = prosper::agc::Pm4;
     const uint32_t mode =
         (cb_color_control >> P::CB_COLOR_CONTROL_MODE_SHIFT) & P::CB_COLOR_CONTROL_MODE_MASK;
-    return mode == P::CB_COLOR_CONTROL_MODE_DISABLE &&
+    const uint32_t compress_disable =
+        (P::DB_RENDER_CONTROL_DEPTH_COMPRESS_DISABLE_MASK
+         << P::DB_RENDER_CONTROL_DEPTH_COMPRESS_DISABLE_SHIFT) |
+        (P::DB_RENDER_CONTROL_STENCIL_COMPRESS_DISABLE_MASK
+         << P::DB_RENDER_CONTROL_STENCIL_COMPRESS_DISABLE_SHIFT);
+    return mode == P::CB_COLOR_CONTROL_MODE_DISABLE && (db_render_control & compress_disable) != 0 &&
            is_agc_efc_rect_vertex_program(vertex_code, vertex_dwords);
 }
 

@@ -119,27 +119,47 @@ TEST(EfcHelperProgram, TheOperationWritesNoColourAndOrdinaryDrawsUnderAStaleMode
     EXPECT_EQ(normal.mask, 0xFu);
 }
 
-// AGC's "Decompress Htile" helper draws the same rectangle with the colour block DISABLED and no
-// colour state of its own, so it inherits the parent's target and masks. Hardware writes no colour;
-// an ordinary program under a latched MODE=0 must still write (#1724).
-TEST(EfcHelperProgram, TheRectangleUnderColourDisableWritesNoColour) {
+// AGC's "Decompress Htile" helper draws the same rectangle with the colour block DISABLED, the
+// depth/stencil compress-disable bits set in DB_RENDER_CONTROL, and no colour state of its own, so
+// it inherits the parent's target and masks. It writes no colour. Each half of the signature is
+// load-bearing: without the decompress bits, or with an ordinary program, a latched MODE=0 draw
+// still writes (#1724).
+TEST(EfcHelperProgram, TheDecompressHtileHelperWritesNoColour) {
     std::copy(std::begin(kAgcEfcRectVertexA), std::end(kAgcEfcRectVertexA), kHelperBlock);
     constexpr uint32_t kRectList = 7, kTriangleList = 4;
+    constexpr uint32_t kDecompress = 0x60;   // Dragon Quest VII's helper value: both bits
     const uint32_t disable = P::CB_COLOR_CONTROL_MODE_DISABLE;
     const auto block = with_metadata(kAgcEfcRectVertexA, std::size(kAgcEfcRectVertexA));
-    EXPECT_TRUE(is_agc_colour_disabled_helper_operation(mode_word(disable), block.data(),
-                                                        block.size()));
+    EXPECT_TRUE(is_agc_decompress_htile_operation(mode_word(disable), kDecompress, block.data(),
+                                                  block.size()));
+    EXPECT_TRUE(is_agc_decompress_htile_operation(mode_word(disable), 0x40, block.data(),
+                                                  block.size()))
+        << "depth compress-disable alone";
+    EXPECT_TRUE(is_agc_decompress_htile_operation(mode_word(disable), 0x20, block.data(),
+                                                  block.size()))
+        << "stencil compress-disable alone";
+    EXPECT_FALSE(is_agc_decompress_htile_operation(mode_word(disable), 0x0, block.data(),
+                                                   block.size()))
+        << "MODE=0 on the rectangle without the decompress signature is not the helper";
     for (uint32_t other : {1u, 2u, 3u, 6u})
-        EXPECT_FALSE(
-            is_agc_colour_disabled_helper_operation(mode_word(other), block.data(), block.size()))
+        EXPECT_FALSE(is_agc_decompress_htile_operation(mode_word(other), kDecompress, block.data(),
+                                                       block.size()))
             << "mode " << other;
 
-    const Realized helper = realize(state(kHelperBlock, kRectList, disable));
+    GpuState helper_state = state(kHelperBlock, kRectList, disable);
+    helper_state.cx[P::DB_RENDER_CONTROL] = kDecompress;
+    const Realized helper = realize(helper_state);
     EXPECT_FALSE(helper.made) << "the helper has no colour and no depth/stencil effect";
     EXPECT_EQ(helper.reason, RealizationFailureReason::NoEffect);
 
-    const Realized stale = realize(state(kVs, kTriangleList, disable));
-    EXPECT_TRUE(stale.made) << "an ordinary program under a latched MODE=0 still draws";
+    const Realized no_signature = realize(state(kHelperBlock, kRectList, disable));
+    EXPECT_TRUE(no_signature.made) << "the rectangle under MODE=0 alone still draws";
+    EXPECT_EQ(no_signature.mask, 0xFu);
+
+    GpuState stale_state = state(kVs, kTriangleList, disable);
+    stale_state.cx[P::DB_RENDER_CONTROL] = kDecompress;
+    const Realized stale = realize(stale_state);
+    EXPECT_TRUE(stale.made) << "an ordinary program under a latched MODE=0 and 0x60 still draws";
     EXPECT_EQ(stale.mask, 0xFu);
 }
 
