@@ -780,6 +780,33 @@ TEST(RawWideReplayedLoad, APlainCopyOfLoadedWordsIntoExecIsANumericUse) {
     EXPECT_EQ(pc, 6u);
 }
 
+TEST(RawWideReplayedLoad, ALoadIntoTheSpecialRegistersIsNumericByItself) {
+    // s_load_dwordx4 s[124:127], s[28:29], 0xf0 loads M0 and EXEC themselves. The walk starts
+    // every load from an EXEC that does not depend on it, which is false here, and the only
+    // thing that used to stop it was the word in M0. Overwrite M0 first and the lanes written
+    // under the loaded EXEC went unnoticed:
+    //   0  s_load_dwordx4 s[124:127], s[28:29], 0xf0
+    //   2  s_mov_b32 m0, 0
+    //   3  v_mov_b32 v0, v1
+    //   4  s_mov_b64 exec, -1
+    //   5  v_readfirstlane vcc_lo, v1 ; s_endpgm
+    const std::vector<uint32_t> code{0xf4081f0eu, 0xfa0000f0u, 0xbefc0380u, 0x7e000301u,
+                                     0xbefe04c1u, 0x7ed40501u, 0xbf810000u};
+    std::vector<Rdna2Inst> instructions;
+    ASSERT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
+    ASSERT_EQ(at(instructions, 0).fmt, Rdna2Format::SMEM);
+    ASSERT_EQ(at(instructions, 0).dst.value, 124);
+    ASSERT_EQ(at(instructions, 2).dst.value, 124);
+    ASSERT_EQ(at(instructions, 4).dst.value, 126);
+    const auto rows = rdna2_raw_wide_data_load_diagnoses(instructions);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_STREQ(rows[0].backing_kind, "destination-above-s105");
+    EXPECT_STREQ(rows[0].numeric_kind, "destination-above-s105");
+    EXPECT_EQ(rows[0].numeric_pc, 0u);
+    const auto loads = rdna2_raw_wide_data_loads(instructions);
+    EXPECT_EQ(loads, std::vector<uint32_t>{0u});
+}
+
 TEST(RawWideReplayedLoad, AMaskFormedUnderCopiedExecCannotReachASavedExecSeed) {
     // The second case on #4574, from the re-review of #4569. The copy does more than predicate
     // lanes: a compare run under that EXEC produces a mask that depends on the load and carries

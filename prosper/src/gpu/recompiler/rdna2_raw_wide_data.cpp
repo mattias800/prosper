@@ -101,6 +101,12 @@ public:
             std::bitset<128> masks;
         };
         if (start + 1 >= ins.size()) return false;
+        // A destination that reaches past s105 loads VCC, M0 or EXEC themselves. Those are
+        // read by instructions that never name them, and the walk below starts from an EXEC
+        // that does not depend on the load; neither holds for such a load, so it is numeric
+        // without a walk. requires_backing() already answers the same way.
+        if (first + static_cast<int>(words) > 106)
+            return blocked(ins[start].pc, "destination-above-s105");
         State initial{start + 1, {}, false, {}};
         initial.masks = saved_exec_masks_at_load();
         initial.masks.set(126); // entry EXEC cannot depend on this subsequent, unreplayed load
