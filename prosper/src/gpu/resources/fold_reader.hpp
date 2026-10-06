@@ -33,7 +33,7 @@ struct FoldReader {
 
 // Preserve the evaluator's repeated full-load reads and short-circuit expressions. Only a
 // partially OOB scalar-buffer load snapshots its in-range prefix. An authenticated immediate-zero
-// x1 offset source snapshots its one observed word so GPU backing matches the selected wide range.
+// x1/x2 offset source snapshots its observed words so GPU backing matches the selected wide range.
 class FoldWords {
     FoldReader* reader_;
     uint32_t pc_;

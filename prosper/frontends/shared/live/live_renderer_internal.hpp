@@ -10,12 +10,14 @@
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp" // #3253: a typo must not select a different setting
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
-#include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
+#include "diagnostics/watch_list.hpp"   // strict 0x-only watch parsing
 #include "gpu/diagnostics/draw_program_skip.hpp"          // PROSPER_SKIP_DRAW_PROGRAM / census
 #include "gpu/diagnostics/pass_break_census.hpp"         // why a pass stopped accepting draws
 #include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
 #include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
+#include "gpu/execute/renderer_volume_publication.hpp"   // #4625: a claimed volume's native layout
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/volume_publication_source.hpp"   // #4625: claim, alias and release rules
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/mrt_extent.hpp"
@@ -62,7 +64,7 @@
 #include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "shared/diagnostics/persistent_readback_filter.hpp" // bounded retained-target readback
-#include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
+#include "diagnostics/diag_ratelimit.hpp"   // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 #include "diagnostics/perf/perf_ledger.hpp"       // #3891: always-on alarm ledger
@@ -148,6 +150,8 @@ struct RttSurf {
     // current 2D pixels, but cannot make the other volume slices valid guest bytes.
     uint64_t volume_guest_bytes = 0;
     bool volume_footprint_proven = false;
+    // The native layout the producer wrote, so the claim can be published to guest memory (#4625).
+    prosper::gpu::VolumeGuestLayout volume_layout;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     // Raw guest CB_COLOR format before backend_color_format() canonicalizes the Vulkan attachment.
     // Consumers need this to compose their T# DST_SEL with the host image's component order.
@@ -159,9 +163,61 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
+    // How that descriptor reads the metadata's clear codes (gfx10_dcc_fast_clear_rgba8's inputs)
+    // and the guest extent it described, kept so a pass that RENDERS to the cleared target can
+    // decode the clear without a descriptor, and only for the surface the descriptor was of.
+    uint32_t dcc_num_components = 0;
+    bool dcc_alpha_is_on_msb = false;
+    uint32_t dcc_width = 0, dcc_height = 0;
     prosper::test::BackendGuestProducerOrigins guest_origins;
     prosper::test::BackendGuestProducerOrigins dcc_guest_origins;
 };
+
+// Can this cached target serve a sampled descriptor of this extent and per-texel size? (#4197)
+// A refusal is logged (first 32, then powers of two) so a cross-title false refusal is visible.
+inline bool live_rtt_serves_sampled_view(const RttSurf& surf, uint64_t addr, uint32_t w, uint32_t h,
+                                         uint32_t render_scale, bool normalized_sampling,
+                                         uint32_t view_bytes_per_texel) {
+    const bool extent_ok = rtt_sampled_extent_compatible(w, h, surf.w, surf.h, render_scale,
+                                                         normalized_sampling);
+    const bool ok = live_rtt_serves_sampled_view(
+        w, h, surf.w, surf.h, render_scale, normalized_sampling, surf.format, surf.guest_format,
+        surf.volume_depth + (surf.volume_guest_bytes != 0u), view_bytes_per_texel);
+    if (extent_ok && !ok) {
+        static std::atomic<uint64_t> refusals{0};
+        const uint64_t n = ++refusals;
+        if (n <= 32u || (n & (n - 1u)) == 0u)
+            std::fprintf(stderr,
+                         "[rtt] footprint-alias refusal #%llu addr=0x%llx %ux%u view=%u B/texel "
+                         "cached guest_format=%d host_format=%d\n",
+                         (unsigned long long)n, (unsigned long long)addr, w, h,
+                         view_bytes_per_texel, (int)surf.guest_format, (int)surf.format);
+    }
+    return ok;
+}
+// What a retained colour target keeps from a descriptor that samples it with DCC enabled: where
+// its metadata is, and how the descriptor reads a clear code. `metadata_bytes` is that
+// descriptor's gpu_capture_dcc_metadata_footprint.
+inline void note_rtt_dcc_descriptor(RttSurf& surface, const prosper::gpu::ShaderResource& resource,
+                                    uint64_t metadata_bytes) {
+    surface.dcc_metadata_addr = resource.metadata_addr;
+    surface.dcc_metadata_bytes = metadata_bytes;
+    surface.dcc_num_components = resource.num_components;
+    surface.dcc_alpha_is_on_msb = resource.alpha_is_on_msb;
+    surface.dcc_width = resource.width;
+    surface.dcc_height = resource.height;
+    surface.dcc_guest_origins.observe(resource.metadata_addr, metadata_bytes);
+}
+// PROSPER_RENDER_SCALE as the renderer reads it: a positive integer, anything else 1.
+inline uint32_t configured_render_scale() {
+    static const uint32_t scale = [] {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): one cached read of a process-start setting
+        const char* value = PROSPER_ENV_VALUE("PROSPER_RENDER_SCALE");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 1;
+        return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
+    }();
+    return scale;
+}
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 inline bool g_ever_volume_target = false;
 // Keys of RTT-cache entries that may carry a nonzero volume_guest_bytes. A superset: every write

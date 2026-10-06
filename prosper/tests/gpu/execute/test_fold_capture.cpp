@@ -288,6 +288,7 @@ int main(int argc, char** argv) {
     u.proven_null_nullable_raw_buffer=true; u.has_samp=true; u.s4.fill(16);
     u.required_size=17; u.atomic_x2_record_count=18; u.use_pc=19; u.is_storage_image=true;
     u.mimg_dim=20; u.proven_zero_mip=true; u.is_depth_compare=true;
+    u.oversize_window = true;
     fields.uses={u}; fields.fetches[0].desc.dst_sel[0]=7;
     fields.fetches[0].desc.dst_sel[1]=3; fields.fetches[0].desc.dst_sel[2]=2;
     fields.fetches[0].desc.dst_sel[3]=0;

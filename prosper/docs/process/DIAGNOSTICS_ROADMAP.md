@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Diagnostics and measurement roadmap
 
 **Read this before building a new `PROSPER_*` diagnostic.** It is the plan for two linked tracks:

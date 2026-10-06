@@ -391,6 +391,12 @@ uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
     return effective_fragment_wave_size(requested_wave_size, program_dwords, program_hash);
 }
 
+bool rdna2_fragment_compiles_wave64(const uint32_t* code, size_t program_dwords) {
+    return code && program_dwords &&
+           effective_fragment_wave_size(64, program_dwords,
+                                        shader_program_hash(code, program_dwords)) == 64;
+}
+
 static std::vector<uint32_t> recompile_fragment_impl(
         const uint32_t* code, size_t dwords,
         const ShaderResourceTable* rt,

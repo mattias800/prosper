@@ -70,11 +70,12 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
             compute_shader_prefers_native_multiwave(facts->decoded, code, dwords, diagnostic);
         facts->probe_reject_reasons = capture.take();
     }
-    facts->uses_gds = std::any_of(facts->decoded.begin(), facts->decoded.end(),
-                                  [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::DS && in.ds_gds &&
-               (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
-    });
+    facts->uses_gds =
+        std::any_of(facts->decoded.begin(), facts->decoded.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::DS && in.ds_gds &&
+                   (in.opcode == 0x0d || in.opcode == 0x36 || in.opcode == 0x3d ||
+                    in.opcode == 0x3e);
+        });
     return facts;
 }
 

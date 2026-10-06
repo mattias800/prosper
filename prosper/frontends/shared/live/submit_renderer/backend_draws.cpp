@@ -222,11 +222,12 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.original_graphics_effects = it.original_graphics_effects;
         bd.raster_quad_contract_modified = refvs || fs_ov || nops ||
             (descriptor_validate_mode && !strcmp(descriptor_validate_mode, "poison"));
-        if (it.owned_waves && bd.raster_quad_contract_modified) {
+        if ((it.owned_waves || it.ngg_subgroup) && bd.raster_quad_contract_modified) {
             prosper::diagnostics::perf::drop_draw(DropReason::ContractMismatch);
             continue;
         }
         bd.owned_waves = it.owned_waves;
+        bd.ngg_subgroup = it.ngg_subgroup;
         // Five clock reads bounding four spans, only when timing is armed -- ~0.9% of
         // this bucket at 2,100 draws a submit. It inflates what it measures while
         // armed, as every timer here does; read the shares, not the totals.
@@ -246,9 +247,13 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         // it was declining to do.
         const bool contract_ok =
             (it.owned_waves && it.owned_waves->vertex_pending ||
-             prosper::gpu::validate_runtime_descriptor_contract(
-                 "VS/backend", bd.vs_words(), it.vrt.get(), 0,
-                 prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode)) &&
+             (it.ngg_subgroup
+                  ? prosper::gpu::validate_runtime_descriptor_contract(
+                        "NGG/backend", *it.ngg_subgroup->groups.front().stages->shell, it.vrt.get(),
+                        0, prosper::gpu::SpirvShaderStage::Compute, descriptor_validate_mode)
+                  : prosper::gpu::validate_runtime_descriptor_contract(
+                        "VS/backend", bd.vs_words(), it.vrt.get(), 0,
+                        prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode))) &&
             (it.owned_waves && it.owned_waves->fragment_pending ||
              (!bd.raster_quad_contract_modified && bd.fragment_draw_inputs &&
               bd.fragment_draw_inputs->original_fragment_producer &&

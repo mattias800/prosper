@@ -50,6 +50,7 @@ constexpr uint64_t kLibraryMagic = 0x5052464f4e544c49ull; // "PRFONTLI"
 constexpr uint64_t kFontMagic    = 0x5052464f4e54464eull; // "PRFONTFN"
 constexpr uint64_t kRendererMagic= 0x5052464f4e545244ull; // "PRFONTRD"
 constexpr uint64_t kStringMagic  = 0x5052464f4e545354ull; // "PRFONTST"
+constexpr uint64_t kGlyphMagic = 0x5052464f4e54474cull; // "PRFONTGL"
 
 struct FontMemory {
     uint16_t kind;
@@ -65,8 +66,31 @@ struct FontMemory {
 };
 static_assert(sizeof(FontMemory) == 64);
 
-struct FontLibrary { uint64_t magic = kLibraryMagic; };
-struct FontRenderer { uint64_t magic = kRendererMagic; };
+// A font library. Besides its magic it carries the one piece of library state a guest can observe
+// back: the device-cache attachment (native library+0xb0), which sceFontAttachDeviceCacheBuffer
+// records, sceFontClearDeviceCache resets and sceFontDettachDeviceCacheBuffer / DestroyLibrary
+// release. prosper hands out a single library (g_library), so every library a title creates shares
+// this one attachment -- CONFIDENCE: MED that no title attaches through two libraries at once.
+struct FontLibrary {
+    uint64_t magic = kLibraryMagic;
+    uint8_t* device_cache = nullptr;   // the cache header, or null when none is attached
+    bool device_cache_owned = false;   // allocated by the library rather than passed by the guest
+};
+// A renderer. Its only guest-observable state is the outline workspace policy (native renderer+0x90..
+// +0xa4, seeded at creation 0xa55b..0xa57a): a policy word (bit 0: 0 fixed, 1 growable; bits 8..23:
+// a granularity), the workspace size sceFontRendererGetOutlineBufferSize reports, and the basal size
+// and limit the policy recorded. A new renderer has a fixed 0x4000-byte workspace and no limit.
+// prosper hands out a single renderer (g_renderer), so this state is shared by every renderer a
+// title creates; DestroyRenderer resets it. CONFIDENCE: MED that no title keeps two renderers with
+// different policies alive at once.
+constexpr uint32_t kOutlineWorkspaceDefault = 0x4000;
+struct FontRenderer {
+    uint64_t magic = kRendererMagic;
+    uint32_t outline_policy = 0;
+    uint32_t outline_size = kOutlineWorkspaceDefault;
+    uint32_t outline_basal = kOutlineWorkspaceDefault;
+    uint32_t outline_limit = 0;
+};
 
 // A parsed memory font. Shared, because `sceFontOpenFontInstance` clones a face and both clones
 // must keep the same parsed outlines alive.
@@ -86,10 +110,20 @@ struct FontFace {
     uint64_t magic = kFontMagic;
     float width = 16.0f;
     float height = 16.0f;
+    // The unit width/height were given in (native face state +0x8): 0 pixels (SetScalePixel), 1 points
+    // (SetScalePoint). They are stored as given and converted on every read -- see face_pixel_w.
+    uint32_t scale_unit = 0;
     float slant = 0.0f;
     float weight_x = 1.0f;
     float weight_y = 1.0f;
+    // Resolution in dots per inch (native face state +0x40/+0x44). A new face starts at 72 x 72,
+    // the resolution at which a point and a pixel coincide.
+    uint32_t dpi_h = 72;
+    uint32_t dpi_v = 72;
     void* renderer = nullptr;
+    // The library the face was opened from (native face+0x28), as the guest passed it. Read back by
+    // sceFontGetLibrary, which validates it before answering, and tested for NULL by the kerning core.
+    void* library = nullptr;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
     std::shared_ptr<FontData> data;
@@ -125,7 +159,14 @@ uint8_t g_ft_selection[64]{};
 // blob, because the two are distinct editions and a title is entitled to tell them apart.
 uint8_t g_ft_renderer_selection[64]{};
 struct FontString { uint64_t magic = kStringMagic; uint32_t terminate_code = 0; };
-struct FontGlyph { uint64_t magic = kFontMagic; };
+// A generated glyph. The two forms are what sceFontGenerateCharGlyph recorded from its parameter
+// block (glyph form at +6, metrics form at +7; native 0xddba/0xddbe, stored at glyph+4/+5), and what
+// sceFontGlyphGetGlyphForm / GetMetricsForm read back. A NULL parameter block records 0 for both.
+struct FontGlyph {
+    uint64_t magic = kGlyphMagic;
+    uint8_t glyph_form = 0;
+    uint8_t metrics_form = 0;
+};
 
 struct GlyphMetrics {
     float width, height;
@@ -137,17 +178,34 @@ struct HorizontalLayout { float baseline, advance, decoration; };
 struct VerticalLayout { float baseline, advance, decoration; };
 struct WritingMetrics { float advance_x, advance_y, top, bottom, left, right; };
 
+// The guest's own 0x60-byte text source, laid out as libSceFont.native.sprx's TextSourceInit
+// (+0xf640) writes it: a 0x0f04 magic, the writing form (Init seeds 0x10), the live cursor state, and
+// at +0x38 a snapshot of start/end/parser/object/default-font that sceFontTextSourceRewind (+0xf7f0)
+// restores. sceFontTextSourceSetDefaultFont (+0xf700) writes the font into both the live slot and the
+// snapshot, which is why a rewound source keeps its default font.
 struct TextSource {
-    uint64_t system;
+    uint16_t magic;
+    uint16_t reserved0;
+    uint32_t writing_form;
     const void* start;
     const void* end;
     const void* current;
     void* parser;
     void* object;
     void* default_font;
-    void* reserved[5];
+    const void* snap_start;
+    const void* snap_end;
+    void* snap_parser;
+    void* snap_object;
+    void* snap_default_font;
 };
 static_assert(sizeof(TextSource) == 0x60);
+static_assert(offsetof(TextSource, writing_form) == 0x04);
+static_assert(offsetof(TextSource, current) == 0x18);
+static_assert(offsetof(TextSource, default_font) == 0x30);
+static_assert(offsetof(TextSource, snap_start) == 0x38);
+static_assert(offsetof(TextSource, snap_default_font) == 0x58);
+constexpr uint16_t kTextSourceMagic = 0x0F04;
 
 struct TextCharacter {
     TextCharacter* prev;
@@ -156,7 +214,46 @@ struct TextCharacter {
     void* font;
     void* shape;
     uint32_t code;
+    uint8_t reserved_0x2c[5];
+    // Two flag bytes the native text walkers test: sceFontCharacterRefersTextNext (+0x124e0) and
+    // RefersTextBack (+0x12510) step over any character whose byte at +0x31 or +0x33 is non-zero, and
+    // StringRefersTextCharacters (+0x11c90) applies the same skip to the head. What sets them is not
+    // derived; prosper builds no character chains yet, so nothing does today.
+    uint8_t skip_0x31;
+    uint8_t reserved_0x32;
+    uint8_t skip_0x33;
 };
+static_assert(offsetof(TextCharacter, code) == 0x28);
+static_assert(offsetof(TextCharacter, skip_0x31) == 0x31);
+static_assert(offsetof(TextCharacter, skip_0x33) == 0x33);
+
+struct FontStyleFrame {
+    uint16_t magic = 0;
+    uint8_t flags1 = 0;
+    uint8_t flags2 = 0;
+    uint32_t h_dpi = 0;
+    uint32_t v_dpi = 0;
+    uint32_t scale_unit = 0;
+    float base_scale = 0.0f;
+    float scale_pixel_w = 0.0f;
+    float scale_pixel_h = 0.0f;
+    float effect_weight_x = 0.0f;
+    float effect_weight_y = 0.0f;
+    float slant_ratio = 0.0f;
+    uint32_t reserved_0x28 = 0;
+    uint32_t layout_cache_state = 0;
+    uint32_t cache_flags_and_direction = 0;
+    uint8_t tail[0x60 - 0x34]{};
+};
+static_assert(sizeof(FontStyleFrame) == 0x60);
+constexpr uint16_t kStyleFrameMagic = 0x0F09;
+constexpr uint8_t kStyleFrameFlagScale = 0x01;
+constexpr uint8_t kStyleFrameFlagSlant = 0x02;
+constexpr uint8_t kStyleFrameFlagWeight = 0x04;
+// The effect weight is stored as an offset from the neutral 1.0 and clamped to a small band
+// (libSceFont.native.sprx +0xc3a0: constants -1.0 at +0x1aa4c, -0.04/+0.04 at +0x1aa58/+0x1aa5c);
+// the getter (+0xc600) adds the 1.0 back. CONFIDENCE: HIGH (read from the firmware).
+constexpr float kStyleFrameWeightLimit = 0.04f;
 
 struct RenderSurface {
     void* buffer;
@@ -168,9 +265,17 @@ struct RenderSurface {
     int32_t width;
     int32_t height;
     uint32_t scissor[4];
-    uint64_t reserved[11];
+    // sceFontRenderSurfaceSetStyleFrame writes both of these (libSceFont.native.sprx +0xabb0): the
+    // frame pointer, null or not, and a zeroed dword the firmware keeps beside it.
+    void* style_frame;
+    uint32_t style_state;
+    uint32_t pad2;
+    uint64_t reserved[9];
 };
 static_assert(sizeof(RenderSurface) == 128);
+static_assert(offsetof(RenderSurface, style) == 0xe);
+static_assert(offsetof(RenderSurface, style_frame) == 0x28);
+static_assert(offsetof(RenderSurface, style_state) == 0x30);
 
 FontFace* face(void* handle) {
     auto* f = static_cast<FontFace*>(handle);
@@ -241,6 +346,25 @@ static_assert(offsetof(RenderResult, height) == 0x3c);
 
 bool finite_positive(float v) { return std::isfinite(v) && v > 0.0f; }
 
+// A face's scale in pixels and in points. The getters convert at READ time through the face's dpi
+// (native +0xbff0 pixels, +0xc060 points): a pixel-sized face reports points as v * (72 / dpi), a
+// point-sized one reports pixels as v * (dpi / 72), and a dpi of 0 converts nothing. So a later
+// sceFontSetResolutionDpi changes the pixel size of a face scaled in points and leaves one scaled in
+// pixels alone. The firmware forms the ratio first and multiplies second; the rounding is kept.
+// Everything that rasterizes or lays out goes through the pixel form. CONFIDENCE: HIGH.
+float to_pixels(float v, uint32_t dpi, uint32_t unit) {
+    return unit != 0 && dpi != 0 ? v * ((float)dpi / 72.0f) : v;
+}
+float to_points(float v, uint32_t dpi, uint32_t unit) {
+    return unit == 0 && dpi != 0 ? v * (72.0f / (float)dpi) : v;
+}
+float face_pixel_w(const FontFace* f) {
+    return to_pixels(f->width, f->dpi_h, f->scale_unit);
+}
+float face_pixel_h(const FontFace* f) {
+    return to_pixels(f->height, f->dpi_v, f->scale_unit);
+}
+
 // Pixel scale for a face, in stb_truetype's units.
 //
 // CONFIDENCE: MED on the exact meaning of "scale pixel". Sony's name says pixels and gives two
@@ -252,12 +376,13 @@ bool finite_positive(float v) { return std::isfinite(v) && v > 0.0f; }
 // its cell as max(configured, measured) and so is correct under either.
 bool face_scale(const FontFace* f, float* sx, float* sy) {
     if (!f || !f->data) return false;
-    const float h = f->height;
+    const float h = face_pixel_h(f);
+    const float w = face_pixel_w(f);
     if (!finite_positive(h) || h > kMaxPixelScale) return false;
     const float y = stbtt_ScaleForPixelHeight(&f->data->info, h);
     if (!finite_positive(y)) return false;
     float x = y;
-    if (finite_positive(f->width) && f->width <= kMaxPixelScale) x = y * (f->width / h);
+    if (finite_positive(w) && w <= kMaxPixelScale) x = y * (w / h);
     if (!finite_positive(x)) return false;
     *sx = x; *sy = y;
     return true;
@@ -268,7 +393,7 @@ bool face_scale(const FontFace* f, float* sx, float* sy) {
 // subtracting the two, so a disagreement between the layout call and the renderer shows up as
 // text sliding off its own line.
 float face_baseline(const FontFace* f, float sy) {
-    return f->data ? (float)f->data->ascent * sy : f->height * 0.8f;
+    return f->data ? (float)f->data->ascent * sy : face_pixel_h(f) * 0.8f;
 }
 
 // Real metrics for one code point, out of the face's own font file. Returns false for a face that
@@ -413,6 +538,25 @@ int32_t font_destroy_handle(void** handle) {
     if (handle) *handle = nullptr;
     return 0;
 }
+FontLibrary* font_library(void* handle) {
+    auto* l = static_cast<FontLibrary*>(handle);
+    return l && l->magic == kLibraryMagic ? l : nullptr;
+}
+// Release whatever device cache the library holds: a library-owned header is freed, a guest buffer is
+// simply forgotten (the guest owns it).
+void release_device_cache(FontLibrary* l) {
+    if (l->device_cache_owned) std::free(l->device_cache);
+    l->device_cache = nullptr;
+    l->device_cache_owned = false;
+}
+// sceFontDestroyLibrary: the native export (0x2800) also takes down the device-cache attachment at
+// library+0xb0 (0x28e8), so a library created afterwards starts with none.
+int32_t font_destroy_library(void** handle) {
+    if (handle) {
+        if (auto* l = font_library(*handle)) release_device_cache(l);
+    }
+    return font_destroy_handle(handle);
+}
 // sceFontMemoryTerm(FontMemory*). `font_memory_init` allocates nothing -- it only fills in the
 // caller's own descriptor -- so releasing it IS clearing that descriptor, and there is no hidden
 // state left behind. Named rather than pointed at the generic ok-stub so the fact that this is
@@ -423,10 +567,11 @@ int32_t font_memory_term(FontMemory* mem) {
     return 0;
 }
 
-int32_t font_open(void*, uint64_t, uint64_t, const void*, void** out) {
+int32_t font_open(void* library, uint64_t, uint64_t, const void*, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     auto* f = new (std::nothrow) FontFace;
     if (!f) return static_cast<int32_t>(0x80540001u);
+    f->library = library;
     *out = f;
     return 0;
 }
@@ -493,10 +638,12 @@ int32_t font_unbind_renderer(void* handle) {
     if (auto* f = face(handle)) f->renderer = nullptr;
     return 0;
 }
-int32_t font_set_scale(void* handle, float width, float height) {
-    // Clamped at both ends. The floor was always here; the ceiling and the NaN rejection are new,
-    // because these two floats now size a real rasterization. See kMaxPixelScale for why a guest
-    // value reaching here cannot simply be trusted.
+// sceFontSetScalePixel / SetScalePoint (native +0xbf70 / +0xbfb0) store the two values as given and
+// the unit they were given in. Clamped at both ends. The floor was always here; the ceiling and the
+// NaN rejection are new, because these two floats now size a real rasterization. See kMaxPixelScale
+// for why a guest value reaching here cannot simply be trusted; face_scale() re-checks the CONVERTED
+// pixel size, so a point size at a high dpi cannot slip past the bound either.
+int32_t set_scale_in(void* handle, float width, float height, uint32_t unit) {
     auto sane = [](float v, float fallback) {
         if (!std::isfinite(v) || v < 1.0f) return fallback;
         return std::min(v, kMaxPixelScale);
@@ -504,8 +651,15 @@ int32_t font_set_scale(void* handle, float width, float height) {
     if (auto* f = face(handle)) {
         f->width = sane(width, f->width);
         f->height = sane(height, f->height);
+        f->scale_unit = unit;
     }
     return 0;
+}
+int32_t font_set_scale(void* handle, float width, float height) {
+    return set_scale_in(handle, width, height, /*unit=*/0);
+}
+int32_t font_set_scale_point(void* handle, float width, float height) {
+    return set_scale_in(handle, width, height, /*unit=*/1);
 }
 int32_t font_set_slant(void* handle, float slant) {
     if (auto* f = face(handle)) f->slant = slant;
@@ -522,8 +676,8 @@ int32_t font_set_weight(void* handle, float x, float y, uint32_t) {
 void fill_metrics(void* handle, GlyphMetrics* out) {
     if (!out) return;
     const auto* f = face(handle);
-    const float h = f ? f->height : 16.0f;
-    const float w = f ? f->width * 0.6f : 9.6f;
+    const float h = f ? face_pixel_h(f) : 16.0f;
+    const float w = f ? face_pixel_w(f) * 0.6f : 9.6f;
     *out = {w, h, 0.0f, h * 0.8f, w, w * 0.5f, h * 0.5f, h};
 }
 
@@ -551,12 +705,11 @@ int32_t font_get_horizontal(void* handle, HorizontalLayout* out) {
         // one. CONFIDENCE: HIGH on the derivation of baseline/advance from the font's tables --
         // but it INHERITS the MED above on what "scale pixel" means, and a label cannot exceed its
         // weakest input, so read the absolute values as MED. LOW on decoration.
-        *out = {(float)d.ascent * sy,
-                (float)(d.ascent - d.descent + d.line_gap) * sy,
-                f->height};
+        *out = {(float)d.ascent * sy, (float)(d.ascent - d.descent + d.line_gap) * sy,
+                face_pixel_h(f)};
         return 0;
     }
-    const float h = f ? f->height : 16.0f;
+    const float h = f ? face_pixel_h(f) : 16.0f;
     *out = {h * 0.8f, h * 1.2f, h};
     return 0;
 }
@@ -573,18 +726,35 @@ int32_t font_get_vertical(void* handle, VerticalLayout* out) {
         // **CONFIDENCE: LOW** on both -- they are conventions, not measurements, and *Astro Bot*
         // imports `sceFontGetVerticalLayout`, so unlike most of this file they do reach a title.
         // Nothing observed so far depends on them; if vertical text ever looks wrong, start here.
-        *out = {line * 0.5f, line, f->width};
+        *out = {line * 0.5f, line, face_pixel_w(f)};
         return 0;
     }
-    const float w = f ? f->width : 16.0f;
+    const float w = f ? face_pixel_w(f) : 16.0f;
     *out = {w * 0.5f, w * 1.2f, w};
     return 0;
 }
 
-int32_t font_generate_glyph(void*, uint32_t, const void*, void** out) {
+// The parameter block's glyph form must be 0, 1 or 2; any other value is refused with 0x80460002
+// and a cleared out (native 0xde16..0xde35, then 0xd883). The metrics form is recorded as given.
+// CONFIDENCE: HIGH on the two offsets and the form check; MED that a NULL block means form 0 on every
+// path (0xde81 does; a font-set face reaches a second store at 0xe389 whose source is not traced).
+int32_t font_generate_glyph(void*, uint32_t, const void* params, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
-    *out = new (std::nothrow) FontGlyph;
-    return *out ? 0 : static_cast<int32_t>(0x80540001u);
+    uint8_t glyph_form = 0, metrics_form = 0;
+    if (params) {
+        glyph_form = static_cast<const uint8_t*>(params)[6];
+        metrics_form = static_cast<const uint8_t*>(params)[7];
+        if (glyph_form > 2) {
+            *out = nullptr;
+            return static_cast<int32_t>(0x80460002u);
+        }
+    }
+    auto* g = new (std::nothrow) FontGlyph;
+    *out = g;
+    if (!g) return static_cast<int32_t>(0x80540001u);
+    g->glyph_form = glyph_form;
+    g->metrics_form = metrics_form;
+    return 0;
 }
 int32_t font_delete_glyph(const FontMemory*, void** glyph) {
     if (glyph) { delete static_cast<FontGlyph*>(*glyph); *glyph = nullptr; }
@@ -623,6 +793,159 @@ int32_t font_surface_set_scissor(RenderSurface* surface, int32_t x, int32_t y,
     };
     crop(x, w, &surface->scissor[0], &surface->scissor[2]);
     crop(y, h, &surface->scissor[1], &surface->scissor[3]);
+    return 0;
+}
+
+FontStyleFrame* style_frame(void* handle) {
+    auto* s = static_cast<FontStyleFrame*>(handle);
+    return s && s->magic == kStyleFrameMagic ? s : nullptr;
+}
+
+int32_t font_style_frame_init(FontStyleFrame* out) {
+    if (!out) return static_cast<int32_t>(0x80460002u);
+    std::memset(out, 0, sizeof(*out));
+    out->magic = kStyleFrameMagic;
+    out->h_dpi = 0x48;
+    out->v_dpi = 0x48;
+    return 0;
+}
+
+int32_t font_style_frame_set_scale_pixel(FontStyleFrame* frame, float w, float h) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->scale_unit = 0;
+    frame->scale_pixel_w = w;
+    frame->scale_pixel_h = h;
+    frame->flags1 |= kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_set_scale_point(FontStyleFrame* frame, float w, float h) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->scale_unit = 1;
+    frame->scale_pixel_w = w;
+    frame->scale_pixel_h = h;
+    frame->flags1 |= kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_set_resolution_dpi(FontStyleFrame* frame, uint32_t h_dpi, uint32_t v_dpi) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->h_dpi = h_dpi == 0 ? 0x48 : h_dpi;
+    frame->v_dpi = v_dpi == 0 ? 0x48 : v_dpi;
+    return 0;
+}
+
+int32_t font_style_frame_set_effect_slant(FontStyleFrame* frame, float slant) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->slant_ratio = std::clamp(slant, -1.0f, 1.0f);
+    frame->flags1 |= kStyleFrameFlagSlant;
+    return 0;
+}
+
+int32_t font_style_frame_set_effect_weight(FontStyleFrame* frame, float w_x, float w_y,
+                                           uint32_t mode) {
+    if (!style_frame(frame) || mode != 0) return static_cast<int32_t>(0x80460002u);
+    frame->effect_weight_x =
+        std::clamp(w_x - 1.0f, -kStyleFrameWeightLimit, kStyleFrameWeightLimit);
+    frame->effect_weight_y =
+        std::clamp(w_y - 1.0f, -kStyleFrameWeightLimit, kStyleFrameWeightLimit);
+    frame->flags1 |= kStyleFrameFlagWeight;
+    return 0;
+}
+
+int32_t font_style_frame_unset_scale(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagScale;
+    return 0;
+}
+
+int32_t font_style_frame_unset_effect_slant(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagSlant;
+    return 0;
+}
+
+int32_t font_style_frame_unset_effect_weight(FontStyleFrame* frame) {
+    if (!style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    frame->flags1 &= (uint8_t)~kStyleFrameFlagWeight;
+    return 0;
+}
+
+int32_t font_style_frame_get_scale_pixel(const FontStyleFrame* frame, float* out_w, float* out_h) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagScale) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_w && !out_h) return static_cast<int32_t>(0x80460002u);
+    float w = frame->scale_pixel_w;
+    float h = frame->scale_pixel_h;
+    if (frame->scale_unit != 0) {
+        // The firmware divides first and multiplies second (+0xc568); keep its rounding.
+        if (frame->h_dpi != 0) w = w * ((float)frame->h_dpi / 72.0f);
+        if (frame->v_dpi != 0) h = h * ((float)frame->v_dpi / 72.0f);
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+int32_t font_style_frame_get_scale_point(const FontStyleFrame* frame, float* out_w, float* out_h) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagScale) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_w && !out_h) return static_cast<int32_t>(0x80460002u);
+    float w = frame->scale_pixel_w;
+    float h = frame->scale_pixel_h;
+    if (frame->scale_unit == 0) {
+        // As above, ratio first (+0xc4cc).
+        if (frame->h_dpi != 0) w = w * (72.0f / (float)frame->h_dpi);
+        if (frame->v_dpi != 0) h = h * (72.0f / (float)frame->v_dpi);
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+int32_t font_style_frame_get_resolution_dpi(const FontStyleFrame* frame, uint32_t* h_dpi,
+                                            uint32_t* v_dpi) {
+    if (!style_frame((void*)frame) || (!h_dpi && !v_dpi)) return static_cast<int32_t>(0x80460002u);
+    if (h_dpi) *h_dpi = frame->h_dpi;
+    if (v_dpi) *v_dpi = frame->v_dpi;
+    return 0;
+}
+
+int32_t font_style_frame_get_effect_slant(const FontStyleFrame* frame, float* out) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagSlant) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out) return static_cast<int32_t>(0x80460002u);
+    *out = frame->slant_ratio;
+    return 0;
+}
+
+int32_t font_style_frame_get_effect_weight(const FontStyleFrame* frame, float* out_x, float* out_y,
+                                           uint32_t* out_mode) {
+    if (!style_frame((void*)frame)) return static_cast<int32_t>(0x80460002u);
+    if ((frame->flags1 & kStyleFrameFlagWeight) == 0) return static_cast<int32_t>(0x80460058u);
+    if (!out_x && !out_y && !out_mode) return static_cast<int32_t>(0x80460002u);
+    if (out_x) *out_x = frame->effect_weight_x + 1.0f;
+    if (out_y) *out_y = frame->effect_weight_y + 1.0f;
+    if (out_mode) *out_mode = 0;
+    return 0;
+}
+
+// libSceFont.native.sprx +0xabb0: a null surface, or a non-null frame without the magic, is
+// rejected with nothing written. Otherwise bit 0 of surface+0xe says whether a frame is attached,
+// the frame pointer (null included) goes to surface+0x28, and the dword at surface+0x30 is zeroed.
+//
+// CONFIDENCE: LOW that this is the whole effect. The frame is recorded exactly as the firmware
+// records it, but render_glyph never reads it: glyphs are drawn at the face's scale, with no slant
+// or weight, whatever the frame says. Tracked in #4591.
+int32_t font_surface_set_style_frame(RenderSurface* surface, FontStyleFrame* frame) {
+    if (!surface) return static_cast<int32_t>(0x80460002u);
+    if (frame && !style_frame(frame)) return static_cast<int32_t>(0x80460002u);
+    if (frame)
+        surface->style |= 0x1u;
+    else
+        surface->style &= (uint8_t)~0x1u;
+    surface->style_frame = frame;
+    surface->style_state = 0;
     return 0;
 }
 
@@ -754,8 +1077,8 @@ int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code, Ren
 // 0x9b70, RenderEffectWeight 0x99e0) differ in one check: with no renderer bound to the face they
 // answer 0x80460061 and zero their outputs like a failed handle. With a renderer bound they read the
 // face's render-state block (handle+0x68), which prosper simplifies to the face state.
-// The *ScalePoint aliases are exact only because prosper never registers sceFontSetResolutionDpi:
-// the firmware converts points to pixels by dpi/72 and a new face starts at 72x72 dpi.
+// The *ScalePoint exports are not aliases of the *ScalePixel ones: each converts through the face's
+// dpi (face_pixel_w / to_points), which sceFontSetResolutionDpi can move away from 72.
 int32_t font_render_char_glyph_image_vertical(void* handle, uint32_t code, RenderSurface* surface,
                                               float x, float y, GlyphMetrics* metrics,
                                               RenderResult* result) {
@@ -769,7 +1092,15 @@ int32_t font_create_renderer_plain(const FontMemory* memory, const void* params,
 }
 constexpr int32_t kFontErrInvalidRenderer = static_cast<int32_t>(0x80460001u);
 constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
+constexpr int32_t kFontErrInvalidLibrary = static_cast<int32_t>(0x80460004u);
 constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
+constexpr int32_t kFontErrInvalidRendererHandle = static_cast<int32_t>(0x80460007u);
+constexpr int32_t kFontErrInvalidWriting = static_cast<int32_t>(0x8046000Au);
+constexpr int32_t kFontErrNoMemory = static_cast<int32_t>(0x80460010u);
+constexpr int32_t kFontErrCacheAttached = static_cast<int32_t>(0x80460022u);
+constexpr int32_t kFontErrNoCache = static_cast<int32_t>(0x80460025u);
+constexpr int32_t kFontErrInvalidTextSource = static_cast<int32_t>(0x80460008u);
+constexpr int32_t kFontErrNoGlyph = static_cast<int32_t>(0x80460041u);
 constexpr int32_t kFontErrNoRenderer = static_cast<int32_t>(0x80460061u);
 int32_t font_rebind_renderer(void* handle) {
     const auto* f = face(handle);
@@ -781,8 +1112,15 @@ int32_t font_rebind_renderer(void* handle) {
 }
 int32_t font_get_scale(void* handle, float* out_w, float* out_h) {
     const auto* f = face(handle);
-    if (out_w) *out_w = f ? f->width : 0.0f;
-    if (out_h) *out_h = f ? f->height : 0.0f;
+    if (out_w) *out_w = f ? face_pixel_w(f) : 0.0f;
+    if (out_h) *out_h = f ? face_pixel_h(f) : 0.0f;
+    if (!f) return kFontErrInvalidHandle;
+    return (!out_w && !out_h) ? kFontErrInvalidParam : 0;
+}
+int32_t font_get_scale_point(void* handle, float* out_w, float* out_h) {
+    const auto* f = face(handle);
+    if (out_w) *out_w = f ? to_points(f->width, f->dpi_h, f->scale_unit) : 0.0f;
+    if (out_h) *out_h = f ? to_points(f->height, f->dpi_v, f->scale_unit) : 0.0f;
     if (!f) return kFontErrInvalidHandle;
     return (!out_w && !out_h) ? kFontErrInvalidParam : 0;
 }
@@ -810,6 +1148,15 @@ int32_t font_get_render_scale(void* handle, float* out_w, float* out_h) {
     }
     return font_get_scale(handle, out_w, out_h);
 }
+int32_t font_get_render_scale_point(void* handle, float* out_w, float* out_h) {
+    const auto* f = face(handle);
+    if (f && !f->renderer) {
+        if (out_w) *out_w = 0.0f;
+        if (out_h) *out_h = 0.0f;
+        return kFontErrNoRenderer;
+    }
+    return font_get_scale_point(handle, out_w, out_h);
+}
 int32_t font_get_render_slant(void* handle, float* out) {
     const auto* f = face(handle);
     if (f && !f->renderer) {
@@ -829,21 +1176,369 @@ int32_t font_get_render_weight(void* handle, float* out_x, float* out_y, uint32_
     return font_get_weight(handle, out_x, out_y, out_mode);
 }
 
+// sceFontSetResolutionDpi (I1acwR7Qp8E, 0x6ac0 -> core 0xc0e0): a NULL or invalid face answers
+// 0x80460005. Otherwise the core compares ONLY the new horizontal value, as passed, with the stored
+// one; if they are equal it changes nothing -- the vertical value included -- and if they differ it
+// stores both, a 0 standing for 72. That is a firmware quirk and it is guest-visible through
+// sceFontGetResolutionDpi and every point/pixel conversion, so it is kept. (On a change the export
+// also invalidates a cached value at face+0x94 that prosper does not keep.) CONFIDENCE: HIGH.
+int32_t font_set_resolution_dpi(void* handle, uint32_t h_dpi, uint32_t v_dpi) {
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    if (f->dpi_h == h_dpi) return 0;
+    f->dpi_h = h_dpi == 0 ? 72 : h_dpi;
+    f->dpi_v = v_dpi == 0 ? 72 : v_dpi;
+    return 0;
+}
+
+// The renderer's outline workspace (native 0xa630 SetOutlineBufferPolicy, 0xa860 GetOutlineBufferSize,
+// 0xa910 ResetOutlineBuffer). A NULL renderer or one without the renderer magic is 0x80460007 in all
+// three -- 0x80460001 is a different case, a valid renderer with no backing memory, which a prosper
+// renderer never is. 0x80460063 (the workspace allocation failed) cannot arise either: prosper's
+// rasterizer needs no workspace, so the size is bookkeeping the guest can read back, not memory.
+// CONFIDENCE: HIGH on the codes, their order and the size arithmetic.
+FontRenderer* font_renderer(void* handle) {
+    auto* r = static_cast<FontRenderer*>(handle);
+    return r && r->magic == kRendererMagic ? r : nullptr;
+}
+// SetOutlineBufferPolicy(renderer, policy, basal, limit). The policy word is validated BEFORE the
+// renderer magic: 0x1000000 (fixed) or 0x2000000 | n with n <= 0xffff (growable, granularity n);
+// anything else is 0x80460002, as is a non-zero limit below the basal size. The workspace is then
+// resized to `basal` when the policy demands it -- fixed: whenever its size differs from basal;
+// growable: when it is over a non-zero limit, under basal, differs from basal while the previous
+// policy was not growable, or its excess over basal is not a multiple of n + 1 -- and the policy
+// word, basal and limit are recorded.
+int32_t font_renderer_set_outline_buffer_policy(void* handle, uint64_t policy, uint32_t basal,
+                                                uint32_t limit) {
+    if (!handle) return kFontErrInvalidRendererHandle;
+    bool fixed = false;
+    uint32_t units = 0;
+    if (policy == 0x1000000u) {
+        fixed = true;
+    } else if ((policy & ~0xffffffull) == 0x2000000u && (policy & 0xffffffu) <= 0xffffu) {
+        units = (uint32_t)(policy & 0xffffu);
+    } else {
+        return kFontErrInvalidParam;
+    }
+    if (limit != 0 && basal > limit) return kFontErrInvalidParam;
+    auto* r = font_renderer(handle);
+    if (!r) return kFontErrInvalidRendererHandle;
+    const uint32_t cur = r->outline_size;
+    bool resize;
+    if (fixed) {
+        resize = cur != basal;
+    } else {
+        resize = (limit != 0 && cur > limit) || cur < basal ||
+                 (cur != basal && (r->outline_policy & 0xffu) != 1u) ||
+                 (units != 0 && (cur - basal) % (units + 1) != 0);
+    }
+    if (resize) r->outline_size = basal;
+    r->outline_policy = (fixed ? 0u : 1u) | (units << 8);
+    r->outline_basal = basal;
+    r->outline_limit = limit;
+    return 0;
+}
+// GetOutlineBufferSize(renderer, out): a NULL out is 0x80460007 when the renderer is NULL too and
+// 0x80460002 otherwise (the renderer's magic is not read on that path); a non-NULL out is zeroed
+// before the renderer is checked.
+int32_t font_renderer_get_outline_buffer_size(void* handle, uint32_t* out) {
+    if (!out) return handle ? kFontErrInvalidParam : kFontErrInvalidRendererHandle;
+    *out = 0;
+    const auto* r = font_renderer(handle);
+    if (!r) return kFontErrInvalidRendererHandle;
+    *out = r->outline_size;
+    return 0;
+}
+// ResetOutlineBuffer(renderer): shrink (or grow) the workspace back to the recorded basal size.
+int32_t font_renderer_reset_outline_buffer(void* handle) {
+    auto* r = font_renderer(handle);
+    if (!r) return kFontErrInvalidRendererHandle;
+    r->outline_size = r->outline_basal;
+    return 0;
+}
+// sceFontDestroyRenderer: the renderer's workspace goes with it, so the next renderer starts from the
+// creation defaults.
+int32_t font_destroy_renderer(void** handle) {
+    if (handle) {
+        if (auto* r = font_renderer(*handle)) *r = FontRenderer{};
+    }
+    return font_destroy_handle(handle);
+}
+
+// sceFontWritingSetMaskInvisible (BbCZjJizU4A, 0x13240): a NULL writing is 0x80460002, one without the
+// 0x0f06 writing magic 0x8046000a, a mask other than 0 or 1 0x80460002. The polarity is inverted: mask
+// 0 SETS bit 0 of writing+0x18 and mask 1 CLEARS it. prosper's writing engine does not read the bit
+// yet, but it is the guest's own structure, so the bit is written. CONFIDENCE: HIGH.
+constexpr uint16_t kWritingMagic = 0x0F06;
+int32_t font_writing_set_mask_invisible(void* writing, uint32_t mask) {
+    if (!writing) return kFontErrInvalidParam;
+    uint16_t magic = 0;
+    std::memcpy(&magic, writing, sizeof(magic));
+    if (magic != kWritingMagic) return kFontErrInvalidWriting;
+    auto* flags = static_cast<uint8_t*>(writing) + 0x18;
+    if (mask == 1) {
+        *flags &= (uint8_t)~0x1u;
+    } else if (mask == 0) {
+        *flags |= 0x1u;
+    } else {
+        return kFontErrInvalidParam;
+    }
+    return 0;
+}
+
+// sceFontGetResolutionDpi (8REoLjNGCpM, 0x6b70) reads the face's dpi pair (core 0xc100). A NULL or
+// invalid face answers 0x80460005 and writes 72 -- not 0 -- to every non-NULL output (0x6bec..
+// 0x6bfe); a valid face with both outputs NULL answers 0x80460002. Otherwise each non-NULL output
+// gets the face's value, 72 x 72 until sceFontSetResolutionDpi changes it. CONFIDENCE: HIGH.
+int32_t font_get_resolution_dpi(void* handle, uint32_t* h_dpi, uint32_t* v_dpi) {
+    const auto* f = face(handle);
+    if (!f || (!h_dpi && !v_dpi)) {
+        if (h_dpi) *h_dpi = 72;
+        if (v_dpi) *v_dpi = 72;
+        return f ? kFontErrInvalidParam : kFontErrInvalidHandle;
+    }
+    if (h_dpi) *h_dpi = f->dpi_h;
+    if (v_dpi) *v_dpi = f->dpi_v;
+    return 0;
+}
+
+// sceFontGlyphGetGlyphForm (PXlA0M8ax40, 0xe660) / GetMetricsForm (XUfSWpLhrUw, 0xe6b0) return a
+// small form number, not a status: 0 for a NULL glyph or one without the glyph magic, otherwise the
+// recorded byte, with a negative (top-bit-set) value reported as 0. CONFIDENCE: HIGH.
+const FontGlyph* glyph(const void* handle) {
+    const auto* g = static_cast<const FontGlyph*>(handle);
+    return g && g->magic == kGlyphMagic ? g : nullptr;
+}
+uint32_t form_byte(uint8_t form) {
+    return (form & 0x80u) ? 0u : form;
+}
+uint32_t font_glyph_get_glyph_form(const void* handle) {
+    const auto* g = glyph(handle);
+    return g ? form_byte(g->glyph_form) : 0u;
+}
+uint32_t font_glyph_get_metrics_form(const void* handle) {
+    const auto* g = glyph(handle);
+    return g ? form_byte(g->metrics_form) : 0u;
+}
+
+// sceFontGetPixelResolution (BozJej5T6fs, 0x2750): a NULL library or one without its magic answers
+// 0x80460004 (the LIBRARY code; 0x80460005 is the face's); so does a library whose edition driver
+// (library+0x80) or its +0x10 callback is missing. A NULL out is 0x80460002, and every failure path
+// zeroes a non-NULL out. Otherwise the answer is the driver's +0x10 callback. prosper implements one
+// edition, FreeType: sceFontSelectLibraryFt (libSceFontFt 0x6cf0) returns its table at 0x1c000, whose
+// +0x10 entry relocates to 0xe1d0, `mov eax,0x40; ret` -- 64 sub-pixel units per pixel, i.e. the 26.6
+// fixed point FreeType works in. CONFIDENCE: HIGH.
+constexpr uint32_t kFtPixelResolution = 64;
+int32_t font_get_pixel_resolution(void* handle, uint32_t* out) {
+    if (!font_library(handle)) {
+        if (out) *out = 0;
+        return kFontErrInvalidLibrary;
+    }
+    if (!out) return kFontErrInvalidParam;
+    *out = kFtPixelResolution;
+    return 0;
+}
+
+// The device cache, native 0x13f0 (Attach) / 0x1560 (Clear) / 0x17f0 (Dettach -- Sony's spelling).
+// Attach(library, buffer, size): a bad library 0x80460004; a cache already attached 0x80460022; a size
+// under 0x1020 0x80460002. A NULL buffer is allocated by the library (0x80460010 when that fails).
+// The cache starts with a 0x18-byte header: {u32 size, u32 pages, u32 used, u32 free_pages,
+// u64 0xff800001000}, pages = (size - 0x1000) >> 12; a size that yields no page (under 0x2000) is
+// refused with 0x80460002 AFTER the header has been written, which is why that write comes first.
+// Clear(library): 0x80460004 for a bad library, 0x80460025 with nothing attached, otherwise
+// free_pages = pages and used = 0. Dettach(library, buffer*, size*): 0x80460004 / 0x80460025 as above
+// (both outs zeroed), otherwise the header after the size is zeroed and the guest's own buffer and
+// size are handed back; a library-owned cache is freed and both outs are zeroed instead.
+// prosper rasterizes without a glyph cache, so the pages are never used -- but the attachment, its
+// header and the error codes are what a title can observe, and they are modelled exactly. A
+// library-owned cache needs only its header on the host, since no guest pointer to it ever escapes.
+// CONFIDENCE: HIGH on the codes and the header; MED on the single shared library (see FontLibrary).
+constexpr size_t kDeviceCacheHeader = 0x18;
+int32_t font_attach_device_cache(void* handle, void* buffer, uint32_t size) {
+    auto* l = font_library(handle);
+    if (!l) return kFontErrInvalidLibrary;
+    if (l->device_cache) return kFontErrCacheAttached;
+    if (size < 0x1020) return kFontErrInvalidParam;
+    auto* cache = static_cast<uint8_t*>(buffer);
+    const bool owned = cache == nullptr;
+    if (owned) {
+        cache = static_cast<uint8_t*>(std::calloc(1, kDeviceCacheHeader));
+        if (!cache) return kFontErrNoMemory;
+    }
+    const uint32_t pages = (size - 0x1000u) >> 12;
+    const uint32_t header[4] = {size, pages, 0, pages};
+    const uint64_t tail = 0xff800001000ull;
+    std::memcpy(cache, header, sizeof(header));
+    std::memcpy(cache + sizeof(header), &tail, sizeof(tail));
+    if (pages == 0) {
+        if (owned) std::free(cache);
+        return kFontErrInvalidParam;
+    }
+    l->device_cache = cache;
+    l->device_cache_owned = owned;
+    return 0;
+}
+int32_t font_clear_device_cache(void* handle) {
+    auto* l = font_library(handle);
+    if (!l) return kFontErrInvalidLibrary;
+    if (!l->device_cache) return kFontErrNoCache;
+    uint32_t pages = 0;
+    std::memcpy(&pages, l->device_cache + 4, sizeof(pages));
+    const uint32_t used = 0;
+    std::memcpy(l->device_cache + 8, &used, sizeof(used));
+    std::memcpy(l->device_cache + 12, &pages, sizeof(pages));
+    return 0;
+}
+int32_t font_detach_device_cache(void* handle, void** out_buffer, uint32_t* out_size) {
+    auto clear_outs = [&] {
+        if (out_buffer) *out_buffer = nullptr;
+        if (out_size) *out_size = 0;
+    };
+    auto* l = font_library(handle);
+    if (!l) {
+        clear_outs();
+        return kFontErrInvalidLibrary;
+    }
+    uint8_t* cache = l->device_cache;
+    if (!cache) {
+        clear_outs();
+        return kFontErrNoCache;
+    }
+    uint32_t size = 0;
+    std::memcpy(&size, cache, sizeof(size));
+    std::memset(cache + 4, 0, kDeviceCacheHeader - 4);
+    const bool owned = l->device_cache_owned;
+    release_device_cache(l);
+    if (owned) {
+        clear_outs();
+        return 0;
+    }
+    if (out_buffer) *out_buffer = cache;
+    if (out_size) *out_size = size;
+    return 0;
+}
+
+// sceFontGetKerning (sDuhHGNhHvE, 0x9450) and sceFontGetRenderScaledKerning (ryPlnDDI3rU, 0x9460)
+// are one native body (0x8d20) entered with r8 = 0 or 1. Its checks, in order:
+//   * a NULL face or one without the face magic   -> 0x80460005
+//   * code == 0                                   -> 0x80460041 (0x8d62)
+//   * a NULL out                                  -> 0x80460002, nothing written (0x8d6a)
+//   * a face with no library (face+0x28 == 0)     -> 0x80460005
+//   * Render variant only: no renderer bound      -> 0x80460061, even when preCode is 0
+//   * preCode == 0                                -> 0, out zeroed
+// Every error path zeroes the first TWELVE bytes of out (a qword and a dword at 0x9400); only the
+// success path writes all sixteen, because the value comes from the font driver's kerning slot, which
+// stores four floats. The FreeType driver (libSceFontFt selection table +0xc8 -> 0xb5e0) PREFERS the
+// classic `kern` table: with FT_FACE_FLAG_KERNING set and horizontal writing it answers from
+// FT_Get_Kerning(FT_KERNING_UNFITTED) as {x/64, y/64, 0, 0} and never looks further; only a face
+// without that table falls back to an OpenType GPOS `kern` feature lookup ('vkrn' vertically).
+// stb_truetype's public stbtt_GetGlyphKernAdvance has the opposite precedence (GPOS first), so the two
+// table readers are called directly here in the driver's order.
+// CONFIDENCE: HIGH on the checks, their order and the precedence. MED on the magnitude: the value
+// inherits face_scale()'s ascent-to-descent pixel scale, where FreeType scales by the em square. LOW on
+// a code point the font has no glyph for, which the native core may refuse; prosper answers 0 there.
+// prosper keeps one scale state for the face and its render state, so the two variants differ only in
+// the renderer check.
+int32_t kerning_core(void* handle, uint32_t pre, uint32_t code, float* out, bool render) {
+    auto fail = [out](int32_t rc) {
+        if (out) std::memset(out, 0, 12);
+        return rc;
+    };
+    const auto* f = face(handle);
+    if (!f) return fail(kFontErrInvalidHandle);
+    if (code == 0) return fail(kFontErrNoGlyph);
+    if (!out) return kFontErrInvalidParam;
+    if (!f->library) return fail(kFontErrInvalidHandle);
+    if (render && !f->renderer) return fail(kFontErrNoRenderer);
+    if (pre == 0) return fail(0);
+    std::memset(out, 0, 16);
+    float sx = 0.0f, sy = 0.0f;
+    // A system-font-set face has no font behind it, so there is no table to read: zero, honestly.
+    if (!f->data || !face_scale(f, &sx, &sy)) return 0;
+    const stbtt_fontinfo* info = &f->data->info;
+    const int g1 = stbtt_FindGlyphIndex(info, (int)pre);
+    const int g2 = stbtt_FindGlyphIndex(info, (int)code);
+    const int units = info->kern   ? stbtt__GetGlyphKernInfoAdvance(info, g1, g2)
+                      : info->gpos ? (int)stbtt__GetGlyphGPOSInfoAdvance(info, g1, g2)
+                                   : 0;
+    out[0] = (float)units * sx;
+    return 0;
+}
+int32_t font_get_kerning(void* handle, uint32_t pre, uint32_t code, float* out) {
+    return kerning_core(handle, pre, code, out, /*render=*/false);
+}
+int32_t font_get_render_scaled_kerning(void* handle, uint32_t pre, uint32_t code, float* out) {
+    return kerning_core(handle, pre, code, out, /*render=*/true);
+}
+
+// sceFontGetLibrary (LzmHDnlcwfQ, 0x54e0): a bad face, then a NULL library, a library without its
+// magic or one with no driver, all answer 0x80460005 and clear a non-NULL out; only then is a NULL out
+// 0x80460002. The library pointer was stored unvalidated at open, so checking its magic here is also
+// what makes reading it safe. Every library prosper hands out has a driver. CONFIDENCE: HIGH.
+int32_t font_get_library(void* handle, void** out) {
+    const auto* f = face(handle);
+    const auto* lib = f ? static_cast<const FontLibrary*>(f->library) : nullptr;
+    if (!lib || lib->magic != kLibraryMagic) {
+        if (out) *out = nullptr;
+        return kFontErrInvalidHandle;
+    }
+    if (!out) return kFontErrInvalidParam;
+    *out = f->library;
+    return 0;
+}
+
+// TextSourceInit stamps the magic and the default writing form and takes the rewind snapshot. Its
+// argument checks are unchanged from before: the native module also refuses a NULL parser
+// (0x80460002, zeroing the source), which prosper does not model -- CONFIDENCE: MED that no title
+// depends on that.
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     std::memset(out, 0, sizeof(*out));
+    out->magic = kTextSourceMagic;
+    out->writing_form = 0x10;
     out->start = text; out->current = text;
     out->end = text ? static_cast<const uint8_t*>(text) + size : nullptr;
     out->parser = parser; out->object = object;
+    out->snap_start = out->start;
+    out->snap_end = out->end;
+    out->snap_parser = parser;
+    out->snap_object = object;
     return 0;
 }
+TextSource* text_source(TextSource* source) {
+    return source && source->magic == kTextSourceMagic ? source : nullptr;
+}
+// SetDefaultFont (+0xf700): NULL 0x80460002, no magic 0x80460008, else the font goes to both the live
+// slot and the snapshot.
 int32_t font_text_default(TextSource* source, void* handle) {
-    if (source) source->default_font = handle;
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    source->default_font = handle;
+    source->snap_default_font = handle;
     return 0;
 }
-int32_t font_text_writing_form(TextSource* source, int32_t form) {
-    if (source) source->system = (uint32_t)form;
+// SetWritingForm (+0xf6d0): NULL 0x80460002, no magic 0x80460008, a form outside 0x10..0x12
+// 0x80460002; otherwise the u32 at +4 -- not the whole first qword, which would overwrite the magic.
+int32_t font_text_writing_form(TextSource* source, uint32_t form) {
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    if (form - 0x10u > 2u) return kFontErrInvalidParam;
+    source->writing_form = form;
+    return 0;
+}
+// sceFontTextSourceRewind (VRFd3diReec, +0xf7f0): NULL 0x80460002, no magic 0x80460008, else every
+// live field is restored from the snapshot Init took, with the cursor back at the start.
+// CONFIDENCE: HIGH (read from the firmware).
+int32_t font_text_source_rewind(TextSource* source) {
+    if (!source) return kFontErrInvalidParam;
+    if (!text_source(source)) return kFontErrInvalidTextSource;
+    source->start = source->snap_start;
+    source->end = source->snap_end;
+    source->current = source->snap_start;
+    source->parser = source->snap_parser;
+    source->object = source->snap_object;
+    source->default_font = source->snap_default_font;
     return 0;
 }
 
@@ -874,8 +1569,15 @@ const TextCharacter* font_string_render_characters(void*, TextCharacter*, TextCh
 }
 int32_t font_string_writing_form(void*) { return 0; }
 
+// The native WritingInit (0x13150) stamps the 0x0f06 writing magic at +0 after clearing the
+// structure; sceFontWritingSetMaskInvisible checks it. The rest of the native initialisation (the
+// writing form at +4, the string and its range at +8/+0x10) is not modelled.
 int32_t font_writing_init(void* writing, void*, const TextCharacter*) {
-    if (writing) std::memset(writing, 0, 0x100);
+    if (writing) {
+        std::memset(writing, 0, 0x100);
+        const uint16_t magic = 0x0F06;
+        std::memcpy(writing, &magic, sizeof(magic));
+    }
     return 0;
 }
 int32_t font_writing_metrics(void*, WritingMetrics* out) {
@@ -902,7 +1604,23 @@ uint32_t font_character_whitespace(TextCharacter* ch) {
     if (!ch) return 0;
     return ch->code == ' ' || ch->code == '\t' || ch->code == '\n' || ch->code == '\r';
 }
-TextCharacter* font_character_next(TextCharacter* ch) { return ch ? ch->next : nullptr; }
+// RefersTextNext / RefersTextBack follow the link and step over every character flagged at +0x31 or
+// +0x33 (see TextCharacter).
+bool character_skipped(const TextCharacter* ch) {
+    return ch->skip_0x33 || ch->skip_0x31;
+}
+TextCharacter* font_character_next(TextCharacter* ch) {
+    if (!ch) return nullptr;
+    TextCharacter* c = ch->next;
+    while (c && character_skipped(c)) c = c->next;
+    return c;
+}
+TextCharacter* font_character_back(TextCharacter* ch) {
+    if (!ch) return nullptr;
+    TextCharacter* c = ch->prev;
+    while (c && character_skipped(c)) c = c->prev;
+    return c;
+}
 
 uint64_t font_ok(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
 
@@ -922,8 +1640,8 @@ void register_font_hle() {
     R("Xx974EW-QFY", (HleFn)font_select_renderer_ft, "sceFontSelectRendererFt");
     R("n590hj5Oe-k", (HleFn)font_create_library, "sceFontCreateLibraryWithEdition");
     R("WaSFJoRWXaI", (HleFn)font_create_renderer, "sceFontCreateRendererWithEdition");
-    R("exAxkyVLt0s", (HleFn)font_destroy_handle, "sceFontDestroyRenderer");
-    R("FXP359ygujs", (HleFn)font_destroy_handle, "sceFontDestroyLibrary");
+    R("exAxkyVLt0s", (HleFn)font_destroy_renderer, "sceFontDestroyRenderer");
+    R("FXP359ygujs", (HleFn)font_destroy_library, "sceFontDestroyLibrary");
     R("h6hIgxXEiEc", (HleFn)font_memory_term, "sceFontMemoryTerm");
     R("SSCaczu2aMQ", (HleFn)font_destroy_string, "sceFontDestroyString");
     R("PEjv7CVDRYs", (HleFn)font_ok, "sceFontDestroyWritingLine");
@@ -937,13 +1655,29 @@ void register_font_hle() {
     R("nWrfPI4Okmg", (HleFn)font_create_library_plain, "sceFontCreateLibrary");
     R("u5fZd3KZcs0", (HleFn)font_create_renderer_plain, "sceFontCreateRenderer");
     R("CkVmLoCNN-8", (HleFn)font_get_scale, "sceFontGetScalePixel");
-    R("GoF2bhB7LYk", (HleFn)font_get_scale, "sceFontGetScalePoint");
+    R("GoF2bhB7LYk", (HleFn)font_get_scale_point, "sceFontGetScalePoint");
     R("EY38A01lq2k", (HleFn)font_get_render_scale, "sceFontGetRenderScalePixel");
-    R("FEafYUcxEGo", (HleFn)font_get_render_scale, "sceFontGetRenderScalePoint");
+    R("FEafYUcxEGo", (HleFn)font_get_render_scale_point, "sceFontGetRenderScalePoint");
     R("ynSqYL8VpoA", (HleFn)font_get_slant, "sceFontGetEffectSlant");
     R("Gqa5Pp7y4MU", (HleFn)font_get_render_slant, "sceFontGetRenderEffectSlant");
     R("d7dDgRY+Bzw", (HleFn)font_get_weight, "sceFontGetEffectWeight");
     R("woOjHrkjIYg", (HleFn)font_get_render_weight, "sceFontGetRenderEffectWeight");
+    R("I1acwR7Qp8E", (HleFn)font_set_resolution_dpi, "sceFontSetResolutionDpi");
+    R("ydF+WuH0fAk", (HleFn)font_renderer_set_outline_buffer_policy,
+      "sceFontRendererSetOutlineBufferPolicy");
+    R("amcmrY62BD4", (HleFn)font_renderer_get_outline_buffer_size,
+      "sceFontRendererGetOutlineBufferSize");
+    R("ai6AfGrBs4o", (HleFn)font_renderer_reset_outline_buffer,
+      "sceFontRendererResetOutlineBuffer");
+    R("BbCZjJizU4A", (HleFn)font_writing_set_mask_invisible, "sceFontWritingSetMaskInvisible");
+    R("8REoLjNGCpM", (HleFn)font_get_resolution_dpi, "sceFontGetResolutionDpi");
+    R("PXlA0M8ax40", (HleFn)font_glyph_get_glyph_form, "sceFontGlyphGetGlyphForm");
+    R("XUfSWpLhrUw", (HleFn)font_glyph_get_metrics_form, "sceFontGlyphGetMetricsForm");
+    R("sDuhHGNhHvE", (HleFn)font_get_kerning, "sceFontGetKerning");
+    R("ryPlnDDI3rU", (HleFn)font_get_render_scaled_kerning, "sceFontGetRenderScaledKerning");
+    R("LzmHDnlcwfQ", (HleFn)font_get_library, "sceFontGetLibrary");
+    R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
+    R("6Gqlv5KdTbU", (HleFn)font_character_back, "sceFontCharacterRefersTextBack");
     Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
     Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
     Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");
@@ -963,11 +1697,15 @@ void register_font_hle() {
                         "sceFontRenderCharGlyphImageHorizontal");
     Hle::register_typed("i6UNdSig1uE", font_render_char_glyph_image_vertical,
                         "sceFontRenderCharGlyphImageVertical");
-    Hle::register_typed("sw65+7wXCKE", font_set_scale, "sceFontSetScalePoint");
+    Hle::register_typed("sw65+7wXCKE", font_set_scale_point, "sceFontSetScalePoint");
+    // The library's device-cache attachment and its pixel resolution (see font_attach_device_cache).
+    R("CUKn5pX-NVY", (HleFn)font_attach_device_cache, "sceFontAttachDeviceCacheBuffer");
+    R("UuY-OJF+f0k", (HleFn)font_detach_device_cache, "sceFontDettachDeviceCacheBuffer");
+    R("I9R5VC6eZWo", (HleFn)font_clear_device_cache, "sceFontClearDeviceCache");
+    R("BozJej5T6fs", (HleFn)font_get_pixel_resolution, "sceFontGetPixelResolution");
     // Intentional no-op lifecycle/capability surface used during Astro's initialization.
     R("SsRbbCiWoGw", (HleFn)font_ok, "sceFontSupportSystemFonts");
     R("mz2iTY0MK4A", (HleFn)font_ok, "sceFontSupportExternalFonts");
-    R("CUKn5pX-NVY", (HleFn)font_ok, "sceFontAttachDeviceCacheBuffer");
     R("7rogx92EEyc", (HleFn)font_ok, "sceFontCreateWritingLine");
     R("1+DgKL0haWQ", (HleFn)font_ok, "sceFontWritingLineClear");
     R("JQKWIsS9joE", (HleFn)font_ok, "sceFontWritingLineGetOrderingSpace");
@@ -992,6 +1730,30 @@ void register_font_hle() {
     R("+FYcYefsVX0", (HleFn)font_ok, "sceFontWritingLineRefersRenderStep");
     R("wyKFUOWdu3Q", (HleFn)font_ok, "sceFontWritingLineWritesOrder");
     R("8-zmgsxkBek", (HleFn)font_ok, "sceFontGlyphDefineAttribute");
+    R("la2AOWnHEAc", (HleFn)font_style_frame_init, "sceFontStyleFrameInit");
+    Hle::register_typed("da4rQ4-+p-4", font_style_frame_set_scale_pixel,
+                        "sceFontStyleFrameSetScalePixel");
+    Hle::register_typed("O997laxY-Ys", font_style_frame_set_scale_point,
+                        "sceFontStyleFrameSetScalePoint");
+    R("dB4-3Wdwls8", (HleFn)font_style_frame_set_resolution_dpi,
+      "sceFontStyleFrameSetResolutionDpi");
+    Hle::register_typed("394sckksiCU", font_style_frame_set_effect_slant,
+                        "sceFontStyleFrameSetEffectSlant");
+    Hle::register_typed("faw77-pEBmU", font_style_frame_set_effect_weight,
+                        "sceFontStyleFrameSetEffectWeight");
+    R("bePC0L0vQWY", (HleFn)font_style_frame_unset_scale, "sceFontStyleFrameUnsetScale");
+    R("dUmABkAnVgk", (HleFn)font_style_frame_unset_effect_slant,
+      "sceFontStyleFrameUnsetEffectSlant");
+    R("hwsuXgmKdaw", (HleFn)font_style_frame_unset_effect_weight,
+      "sceFontStyleFrameUnsetEffectWeight");
+    R("2QfqfeLblbg", (HleFn)font_style_frame_get_scale_pixel, "sceFontStyleFrameGetScalePixel");
+    R("7x2xKiiB7MA", (HleFn)font_style_frame_get_scale_point, "sceFontStyleFrameGetScalePoint");
+    R("VSw18Aqzl0U", (HleFn)font_style_frame_get_resolution_dpi,
+      "sceFontStyleFrameGetResolutionDpi");
+    R("lOfduYnjgbo", (HleFn)font_style_frame_get_effect_slant, "sceFontStyleFrameGetEffectSlant");
+    R("HIUdjR-+Wl8", (HleFn)font_style_frame_get_effect_weight, "sceFontStyleFrameGetEffectWeight");
+    // Recorded on the surface but not yet applied by the renderer -- CONFIDENCE: LOW, see #4591.
+    R("0hr-w30SjiI", (HleFn)font_surface_set_style_frame, "sceFontRenderSurfaceSetStyleFrame");
 }
 
 } // namespace prosper

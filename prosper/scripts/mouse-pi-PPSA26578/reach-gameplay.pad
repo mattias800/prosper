@@ -1,0 +1,123 @@
+# MOUSE: P.I. For Hire (PPSA26578) -- boot to the first gameplay scene ("Big Mouse, Little Hope").
+#
+# VALIDATED 2026-10-06 on Linux with hardware Vulkan (RADV), frontend `prosper-app`, native
+# 1920x1080, PROSPER_RENDER=1, no render acceleration, twice: on `main` and on the #4609 head.
+# Both reach the difficulty select by flip 1300, the intro cinematic by flip 1600 and gameplay
+# by flip 2000 (144 s and 192 s into the two runs; the machine was loaded during the second).
+#
+# WHAT THE ROUTE HAS TO GET PAST. These are the screens seen in the captures of those runs; the
+# first four come before flip 1300 and their exact order was not recorded:
+#
+#   logos, auto-save notice             Cross
+#   LANGUAGE & SUBTITLES                Cross on NEXT
+#   the agreement (around flip 900)     has to be SCROLLED to the end before NEXT accepts it
+#   analytics prompt                    Cross on NEXT
+#   difficulty select (flip 1300)       Cross (the first portrait is preselected)
+#   intro cinematic (flip 1600)         plays through
+#
+# Cross every four seconds answers all of those but the agreement. For that one both sticks and
+# the d-pad are held down in flip-anchored windows, and ONLY there. The menus run at 2 to 7
+# flips/s, so a wall-clock window misses the screen on a loaded machine; and a version that kept
+# scrolling afterwards carried the selection down the main menu and opened the credits, which
+# looks like progress in a log and is not.
+#
+# The surplus Cross presses simply wait on whatever screen the boot is on, and in gameplay they
+# are the jump button, which is harmless standing still.
+#
+# What a run of this route shows today is the HUD, the objective text and one lit patch of floor
+# in an otherwise dark scene (tracker #4556). It is a route to the scene, not evidence that the
+# scene renders.
+4-5:cross
+8-9:cross
+12-13:cross
+16-17:cross
+20-21:cross
+24-25:cross
+28-29:cross
+32-33:cross
+36-37:cross
+40-41:cross
+44-45:cross
+48-49:cross
+52-53:cross
+56-57:cross
+60-61:cross
+64-65:cross
+68-69:cross
+72-73:cross
+76-77:cross
+80-81:cross
+84-85:cross
+88-89:cross
+92-93:cross
+96-97:cross
+100-101:cross
+104-105:cross
+108-109:cross
+112-113:cross
+116-117:cross
+120-121:cross
+124-125:cross
+128-129:cross
+132-133:cross
+136-137:cross
+140-141:cross
+144-145:cross
+148-149:cross
+152-153:cross
+156-157:cross
+160-161:cross
+164-165:cross
+168-169:cross
+172-173:cross
+176-177:cross
+180-181:cross
+184-185:cross
+188-189:cross
+192-193:cross
+196-197:cross
+200-201:cross
+204-205:cross
+208-209:cross
+212-213:cross
+216-217:cross
+220-221:cross
+224-225:cross
+228-229:cross
+232-233:cross
+236-237:cross
+240-241:cross
+244-245:cross
+248-249:cross
+252-253:cross
+256-257:cross
+260-261:cross
+264-265:cross
+268-269:cross
+272-273:cross
+276-277:cross
+280-281:cross
+284-285:cross
+288-289:cross
+292-293:cross
+296-297:cross
+300-301:cross
+304-305:cross
+308-309:cross
+312-313:cross
+316-317:cross
+320-321:cross
+324-325:cross
+328-329:cross
+332-333:cross
+336-337:cross
+340-341:cross
+344-345:cross
+348-349:cross
+352-353:cross
+356-357:cross
+f840+2.5:right-stick-down+left-stick-down+down
+f880+2.5:right-stick-down+left-stick-down+down
+f920+2.5:right-stick-down+left-stick-down+down
+f960+2.5:right-stick-down+left-stick-down+down
+f1000+2.5:right-stick-down+left-stick-down+down

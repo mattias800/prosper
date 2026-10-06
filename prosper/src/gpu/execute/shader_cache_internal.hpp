@@ -20,9 +20,9 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/env_submit.hpp"
-#include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
+#include "diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/refused_shader_dump.hpp"
-#include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
+#include "diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
 #include <cstdint>
 #include "gpu/capture/gpu_capture.hpp"
@@ -166,6 +166,15 @@ struct ShaderResourceCompileKey {
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
+
+// The per-resource half of a compile key: every resource-side fact the emitter's admission
+// reads, never a guest address or content byte. `code` is the program the resources belong to
+// (instruction-scoped snapshots are validated against it). make_shader_compile_key and the
+// merged-NGG stage cache (ngg_live_draw.cpp, #3135 P5) both build their keys with it.
+void append_shader_resource_compile_keys(ShaderProgramStage stage,
+                                         const ShaderResourceTable& resources,
+                                         const std::shared_ptr<const std::vector<uint32_t>>& code,
+                                         std::vector<ShaderResourceCompileKey>& out);
 
 // The DST_SEL word a resource contributes to its compile key: packed selectors for the classes whose
 // emitted SPIR-V reads them (storage-image stores, MUBUF format fetches), and 0 for every other
@@ -545,8 +554,24 @@ inline bool fold_control_cache_enabled() {
 }
 
 struct DecodedShader {
-    // Full ORIGINAL stream classification, derived cold before fold compaction.
+    // Full ORIGINAL stream classification, derived cold before fold compaction: the numeric wide
+    // loads that put a draw on the owned-wave path. There are two answers, because the
+    // classification depends on whether a compare into a register pair writes one word or both
+    // (#4555): the default, for a launch of unknown or 32-lane width, and the one for a fragment
+    // launch the compiler will run 64 lanes wide. The second is always a subset of the first.
+    // Ask through requires_owned_waves(); every site deciding this for one draw must agree.
     std::vector<uint32_t> raw_wave_wide_data_load_pcs;
+    std::vector<uint32_t> raw_wave_wide_data_load_pcs_wave64;
+    bool fragment_compiles_wave64 = false;   // rdna2_fragment_compiles_wave64 of this version
+    // `fragment_launch_wave64`: the stage asked about is the fragment stage and its launch state
+    // asks for 64 lanes (SPI_PS_IN_CONTROL.PS_W32_EN clear). Vertex launches pass false: their
+    // width is not plumbed.
+    bool requires_owned_waves(bool fragment_launch_wave64) const {
+        return !(fragment_launch_wave64 && fragment_compiles_wave64
+                     ? raw_wave_wide_data_load_pcs_wave64
+                     : raw_wave_wide_data_load_pcs)
+                    .empty();
+    }
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;

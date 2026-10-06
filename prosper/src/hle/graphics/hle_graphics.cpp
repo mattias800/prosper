@@ -18,6 +18,8 @@
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/execute/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
 #include "gpu/texture/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
+#include "gpu/texture/guest_texture_layout.hpp"   // state each display buffer's linear row pitch
+#include "gpu/resources/linear_row_pitch.hpp"   // copy_linear_rows
 #include "host/memory/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
 #include "host/platform/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
 #include "hle/graphics/display_mode.hpp"      // #3017: the one derived answer for "which display is this?"
@@ -237,6 +239,12 @@ namespace {
             uint64_t pixel_format = 0;
             uint32_t tiling_mode = 0;
             bool registered = false;
+            // The legacy attribute's pitch_in_pixel (0x14); 0 when the attribute states none
+            // (attribute2 has no pitch field), meaning rows are `width` pixels apart.
+            // CONFIDENCE: MED for that width default -- it is what the presenter has always read,
+            // and it is unverified for widths whose row is not a multiple of 256 bytes (1440, 720,
+            // 1366); 1280, 1920, 2560 and 3840 are unaffected.
+            uint32_t pitch_pixels = 0;
         } sets[4];
         uint32_t width = 0, height = 0;
         uint64_t pixel_format = 0;
@@ -443,6 +451,7 @@ bool videoout_buffer_snapshot_locked(int buffer_index, VideoOutBufferSnapshot& o
     out.width = config.width;
     out.height = config.height;
     out.tiling_mode = config.tiling_mode;
+    out.row_pitch_bytes = std::max(config.pitch_pixels, config.width) * 4u;
     return true;
 }
 
@@ -462,6 +471,21 @@ bool videoout_buffer_bytes(const VideoOutBufferSnapshot& buffer, size_t& bytes) 
     if (pixels > SIZE_MAX / 4) return false;
     bytes = (size_t)pixels * 4;
     return true;
+}
+
+// Copy a registered buffer's `width x height x 4` pixels out of guest memory into `dst`, gathering
+// rows from the buffer's stated pitch when it exceeds the tight row. Requires the registry lock.
+void videoout_copy_pixels_locked(uint8_t* dst, const VideoOutBufferSnapshot& buffer, size_t bytes) {
+    const auto* src = reinterpret_cast<const uint8_t*>((uintptr_t)buffer.address);
+    const size_t row = (size_t)buffer.width * 4u;
+    // A tiled buffer's bytes are a swizzle footprint, not rows: copy them as they are.
+    const bool linear =
+        !gpu::tile_mode_is_tiled(gpu::videoout_scanout_tile_mode(buffer.tiling_mode, 4));
+    if (!linear || buffer.row_pitch_bytes <= row) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    gpu::copy_linear_rows(dst, row, src, buffer.row_pitch_bytes, row, buffer.height);
 }
 
 // ---- Guest authorship of a registered scanout ----------------------------------------------------
@@ -614,6 +638,14 @@ static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t add
     uint64_t generation = ++g_display.next_generation;
     if (generation == 0) generation = ++g_display.next_generation;
     g_display.buffer_generation[slot] = generation;
+    // State this buffer's linear row pitch to every reader and writer of its guest memory (compute
+    // storage writeback, graphics and compute sampled reads), the same pitch the presenter uses.
+    const uint32_t pitch_bytes = std::max(config.pitch_pixels, config.width) * 4u;
+    const bool linear =
+        !gpu::tile_mode_is_tiled(gpu::videoout_scanout_tile_mode(config.tiling_mode, 4));
+    if (linear)   // only linear lookups consult the registry; a tiled buffer states no row pitch
+        gpu::register_guest_linear_texture_layout(address, (size_t)pitch_bytes * config.height,
+                                                  pitch_bytes);
     videoout_seed_authorship_locked(slot, address, config.width, config.height);
     static unsigned reported = 0;          // guarded by the registry lock, like everything here
     constexpr unsigned kReportCap = 64;
@@ -621,9 +653,10 @@ static void videoout_register_buffer_slot_locked(int slot, int set, uint64_t add
         ++reported;
         std::fprintf(stderr,
                      "[videoout] scanout buffer[%d] set=%d addr=0x%llx %ux%u fmt=0x%llx tile=%u "
-                     "bytes=%llu gen=%llu via=%s\n",
+                     "pitch=%u bytes=%llu gen=%llu via=%s\n",
                      slot, set, (unsigned long long)address, config.width, config.height,
                      (unsigned long long)config.pixel_format, (unsigned)config.tiling_mode,
+                     linear ? pitch_bytes : 0u,
                      (unsigned long long)config.width * (unsigned long long)config.height * 4ull,
                      (unsigned long long)generation, via);
         if (reported == kReportCap)
@@ -708,7 +741,7 @@ bool videoout_copy_buffer(const VideoOutBufferSnapshot& expected, std::vector<ui
     size_t bytes = 0;
     if (!videoout_buffer_bytes(current, bytes)) return false;
     out.resize(bytes);
-    std::memcpy(out.data(), reinterpret_cast<const void*>((uintptr_t)current.address), bytes);
+    videoout_copy_pixels_locked(out.data(), current, bytes);
     return true;
 }
 
@@ -718,7 +751,7 @@ bool videoout_copy_front_buffer(std::vector<uint8_t>& out, VideoOutBufferSnapsho
     size_t bytes = 0;
     if (!videoout_buffer_bytes(metadata, bytes)) return false;
     out.resize(bytes);
-    std::memcpy(out.data(), reinterpret_cast<const void*>((uintptr_t)metadata.address), bytes);
+    videoout_copy_pixels_locked(out.data(), metadata, bytes);
     return true;
 }
 
@@ -729,7 +762,7 @@ size_t videoout_copy_front_buffer(void* dst, size_t dst_cap, VideoOutBufferSnaps
     if (!videoout_front_snapshot_locked(current)) return 0;
     size_t bytes = 0;
     if (!videoout_buffer_bytes(current, bytes) || dst_cap < bytes) return 0;
-    std::memcpy(dst, reinterpret_cast<const void*>((uintptr_t)current.address), bytes);
+    videoout_copy_pixels_locked(static_cast<uint8_t*>(dst), current, bytes);
     if (metadata) *metadata = current;
     return bytes;
 }
@@ -825,8 +858,11 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
             read_bytes = footprint;
             out.padded_footprint = true;
         }
-        std::memcpy(raw.data(), reinterpret_cast<const void*>((uintptr_t)current.address),
-                    read_bytes);
+        if (tiled || read_bytes != linear_bytes)
+            std::memcpy(raw.data(), reinterpret_cast<const void*>((uintptr_t)current.address),
+                        read_bytes);
+        else
+            videoout_copy_pixels_locked(raw.data(), current, linear_bytes);
         out.guest_authored = videoout_buffer_authored_locked(current, linear_bytes);
     }
     // Host-copy accounting (#3891): the read out of guest memory and, below, its de-swizzle are
@@ -903,8 +939,20 @@ HLE(g_vo_open) {
     return (uint64_t)(int64_t)handle;
 }
 HLE(g_vo_close) {
-    std::lock_guard<std::mutex> lk(g_vo_handle_mx);
-    if (g_vo_handles.erase((int32_t)a0) != 1) return kVoErrorInvalidHandle;
+    bool last = false;
+    {
+        std::lock_guard<std::mutex> lk(g_vo_handle_mx);
+        if (g_vo_handles.erase((int32_t)a0) != 1) return kVoErrorInvalidHandle;
+        last = g_vo_handles.empty();
+    }
+    if (last) {
+        // With no VideoOut port left, the display buffers' stated row pitches no longer describe
+        // anything the presenter reads; retire them so reused memory does not inherit them.
+        std::lock_guard<std::mutex> lk(g_display_mx);
+        for (int i = 0; i < 16; ++i)
+            if (g_display.buffer_set[i])
+                gpu::unregister_guest_linear_texture_layout(g_display.buffer_addr[i]);
+    }
     return 0;
 }
 // sceVideoOutAddFlipEvent(eq, handle, udata): register a flip-completion event source on an equeue.
@@ -1299,10 +1347,11 @@ HLE(g_vo_register_buffers) {  // a0=handle a1=start a2=addresses a3=buffer_num a
         return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
 
     const uint8_t* attr = (const uint8_t*)(uintptr_t)a4;
-    const DisplayConfig::SetConfig config = {
+    DisplayConfig::SetConfig config = {
         *(const uint32_t*)(attr + 0x0c), *(const uint32_t*)(attr + 0x10),
-        *(const uint32_t*)(attr + 0x00), *(const uint32_t*)(attr + 0x04), true
-    };
+        *(const uint32_t*)(attr + 0x00), *(const uint32_t*)(attr + 0x04), true};
+    config.pitch_pixels =
+        *(const uint32_t*)(attr + 0x14);   // the legacy attribute's pitch_in_pixel
     const auto* addresses = (const void* const*)(uintptr_t)a2;
     std::lock_guard<std::mutex> lk(g_display_mx);
 
@@ -1452,6 +1501,7 @@ HLE(g_vo_unregister_buffers) {
             // old label identity now so a later flip cannot clear the new registration's label.
             g_buffer_labels[i] = 0;
             if (g_previous_buffer == i) g_previous_buffer = -1;
+            gpu::unregister_guest_linear_texture_layout(g_display.buffer_addr[i]);
             g_display.buffer_set[i] = 0;
             g_display.buffer_addr[i] = 0;
             g_display.buffer_generation[i] = 0;

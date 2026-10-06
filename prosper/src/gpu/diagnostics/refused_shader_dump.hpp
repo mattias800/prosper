@@ -7,7 +7,8 @@
 // first unsupported instruction. Bounded (kMaxPrograms) and deduplicated by code hash, so a title
 // that refuses one shader every frame writes one file. A draw the owned-wave gate refuses is
 // recorded too, although nothing was recompiled: its index line ends in `refusal=<reason>`, and
-// that field, not first_bad_*, is why the draw was lost (#4555). The directory is created
+// that field, not first_bad_*, is why the draw was lost (#4555). The [refused-shader] line on
+// stderr carries the same field. The directory is created
 // lazily under PROSPER_CAPTURE_DIR (default: the working directory, like the F9 grab), so a clean
 // run creates nothing. A diagnostic: it changes nothing the guest sees.
 // PROSPER_NO_REFUSED_SHADER_DUMP turns it off.

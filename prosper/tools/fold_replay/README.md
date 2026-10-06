@@ -54,7 +54,7 @@ size total process memory. Time uninstrumented replays separately from heap prof
 
 Missing, reordered, extra, malformed, oversized and incomplete input fails visibly.
 Limits are 65,536 code dwords/events, 16,384 outputs per kind, 4 MiB event payload and
-16 MiB per file. Files use explicit little-endian fields, version 1, a code checksum and
+16 MiB per file. Files use explicit little-endian fields, version 2 (2 added `SrtUse::oversize_window`; a version-1 file is refused), a code checksum and
 a whole-file checksum; these are corruption guards, not cryptographic authentication.
 Captured addresses are logical identities and are never mapped or dereferenced offline.
 Agreement proves reproduction of Prosper's current evaluator, not correct guest semantics.

@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # General FLAT_LOAD design (#1171) — raw 64-bit-address memory reads in the compute recompiler
 
 **Status:** implemented and regression-covered; retained as a historical design record (2026-07-22).

@@ -655,11 +655,15 @@ public:
         d.ps_entry = x.ps_entry;
         d.ps_raster_launch = x.ps_raster_launch;
         d.float_transport = x.float_transport;
+        d.ngg_subgroup = x.ngg_subgroup;   // v72 (#3135 P5)
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
         return true;
     }
     bool admit_draw(const GpuCapturedDraw& x, DrawItem& d) {
-        if (x.vs_chain_raw_shader_index != UINT32_MAX) {
+        // A merged-NGG draw's vertex stage is its stored description, not a native module compiled
+        // from the raw chain, so the raw vertex-stage obligations below do not apply to it.
+        const bool ngg = x.ngg_subgroup != nullptr;
+        if (!ngg && x.vs_chain_raw_shader_index != UINT32_MAX) {
             const auto* prolog = x.vs_raw_shader_index < c.raw_shader_versions.size()
                 ? &c.raw_shader_versions[x.vs_raw_shader_index].words : nullptr;
             const auto* main = x.vs_chain_raw_shader_index < c.raw_shader_versions.size()
@@ -752,11 +756,21 @@ public:
                 decoded.insert(decoded.end(), main.begin(), main.end());
             } else if (!inventory(code, vertex ? "vs" : "fs", decoded))
                 return false;
-            const auto required = rdna2_raw_wave_wide_data_loads(decoded);
+            // The width the live draw was routed by (realize_draw_item): a fragment launch that
+            // recorded its wave configuration and asked for 64 lanes, compiled at 64. Anything
+            // else, including a capture too old to have recorded it, keeps the default answer.
+            bool wave64 = false;
+            if (!vertex && x.fragment_wave_config_available && !x.ps_wave32) {
+                std::vector<Rdna2Inst> walked;
+                const size_t consumed = rdna2_walk(code.data(), code.size(), walked);
+                wave64 = rdna2_fragment_compiles_wave64(code.data(), consumed);
+            }
+            const auto required = rdna2_raw_wave_wide_data_loads(decoded, wave64);
             if (!required.empty()) pc = required.front();
             return true;
         };
         for (bool vertex : {true, false}) {
+            if (vertex && ngg) continue;
             uint32_t pc = UINT32_MAX;
             if (!needs_wave_owner(vertex ? x.vs_raw_shader_index : x.fs_raw_shader_index, vertex,
                                   pc))

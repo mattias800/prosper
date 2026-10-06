@@ -574,6 +574,12 @@ capture/replay without requiring an importable system Python module.
   `LAYER_ORDER` (`--write` regenerates it), and with `--base` an accepted ADR is never edited or
   deleted, only superseded. It proves references are live, not that a rule is true. Runs in the
   `Docs` CI job; tests are `docs/test_check_arch_docs.py` (pytest).
+- **`docs/check_doc_meta.py`** -- every document under `prosper/docs/` (outside `spec/` and
+  `adr/`, which `check_arch_docs.py` covers) opens with `kind:` and `status:` frontmatter, and every
+  relative Markdown link in a tracked `.md` file resolves. Code spans and fences are skipped, and
+  the generated `PROGRESS_TRACKER.md` is not link-checked (fix its links in the source issue). A
+  `template: design` document must carry the design-doc sections. Runs in the `Docs` CI job; tests
+  are `docs/test_check_doc_meta.py`.
 - **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
   reference in the repository must name a row that exists. `check_numbered_table.py` validates the
   TABLE and has no idea anything cites it, so until this existed a reference to a row that never
@@ -1353,7 +1359,7 @@ remain because they are what deduplicates, and one program compiled against diff
 tables legitimately yields several variants under the same address. An address of
 `0000000000000000` means no address was available at that emit site, not an unusual address.
 
-The filter is default-OFF, parsed by the strict `0x`-only parser in `gpu/diagnostics/watch_list.hpp`
+The filter is default-OFF, parsed by the strict `0x`-only parser in `diagnostics/watch_list.hpp`
 (so a bare decimal arms nothing rather than arming 5,008), and announces itself once:
 
 ```text

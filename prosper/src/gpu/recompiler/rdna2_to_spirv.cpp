@@ -189,13 +189,16 @@ void apply_fragment_consumption(PixelInputMapping& mapping,
     mapping.consumed_known = true;
 }
 
-std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout, bool capture_position,
-        bool synthesize_rect, FloatTransportConfig float_transport, bool publish_primitive_id) {
+std::vector<uint32_t> recompile_interpolation_geometry(const FragmentInterpolationLayout& layout,
+                                                       bool capture_position, bool synthesize_rect,
+                                                       FloatTransportConfig float_transport,
+                                                       bool publish_primitive_id,
+                                                       uint32_t layer_input_location) {
     if (!float_transport.canonical()) return {};
     SpirvCompute builder;
     builder.float_transport = float_transport;
-    return builder.build_interpolation_geometry(layout, capture_position, synthesize_rect, publish_primitive_id);
+    return builder.build_interpolation_geometry(layout, capture_position, synthesize_rect,
+                                                publish_primitive_id, layer_input_location);
 }
 
 namespace {

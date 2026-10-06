@@ -2,6 +2,7 @@
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -9,7 +10,11 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
+#include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
+#include "gpu/recompiler/rdna2_mask_half_alias.hpp"
+#include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
+#include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -69,121 +74,6 @@ inline std::string reject_words_text(const Rdna2Inst& in) {
         out += buf;
     }
     return out;
-}
-
-// Some GFX10 pixel shaders leave scheduled 64-bit mask operations whose VCC/SCC results feed only
-// other dead mask operations and are overwritten before an observable read. Astro Bot's SSAO shader does this with
-// `s_and_b64 vcc, s[0:1], vcc`, where s[0:1] is also a live T# descriptor; attempting to reinterpret
-// the descriptor bits as a per-lane mask is both impossible in descriptor-backed SPIR-V and pointless.
-// Elide only the mechanically proven dead form: the shader has no SCC consumer anywhere, and CFG
-// liveness proves the VCC pair cannot reach a non-mask read before redefinition. This deliberately
-// does not become a general scalar-pair-to-wave-mask fallback.
-std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>& ins) {
-    for (const auto& in : ins) {
-        const bool reads_scc =
-            (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05)) ||
-            (in.fmt == Rdna2Format::SOP2 &&
-             (in.opcode == 0x04 || in.opcode == 0x05 ||
-              in.opcode == 0x0a || in.opcode == 0x0b)) ||
-            (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x02);
-        if (reads_scc) return {};
-    }
-    auto is_mask = [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::SOP2 &&
-            (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 ||
-             in.opcode == 0x15 || in.opcode == 0x17 || in.opcode == 0x19 ||
-             in.opcode == 0x1b || in.opcode == 0x1d) &&
-            (in.dst.value == 106 || in.dst.value == 107);
-    };
-    std::unordered_map<uint32_t, size_t> by_pc;
-    for (size_t i = 0; i < ins.size(); ++i) by_pc[ins[i].pc] = i;
-    std::vector<std::vector<size_t>> succ(ins.size());
-    for (size_t i = 0; i < ins.size(); ++i) {
-        const auto& in = ins[i];
-        if (in.is_end) continue;
-        const bool branch = in.fmt == Rdna2Format::SOPP &&
-                            in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03;
-        if (!branch || in.opcode != 0x02) {
-            if (i + 1 < ins.size()) succ[i].push_back(i + 1);
-        }
-        if (branch) {
-            const uint32_t target = in.pc + in.len_dwords +
-                                    static_cast<uint32_t>(static_cast<int32_t>(in.simm16));
-            auto it = by_pc.find(target);
-            if (it == by_pc.end()) return {}; // malformed/unbounded CFG: make no dead-write claim
-            succ[i].push_back(it->second);
-        }
-    }
-    auto uses = [&](const Rdna2Inst& in) -> uint8_t {
-        uint8_t bits = 0;
-        for (uint8_t k = 0; k < in.n_src; ++k) {
-            if (in.src[k].kind != OperandKind::SGPR &&
-                in.src[k].kind != OperandKind::Special) continue;
-            if (in.src[k].value == 106) bits |= 1;
-            if (in.src[k].value == 107) bits |= 2;
-        }
-        if (is_mask(in) && bits) bits = 3; // every modeled mask logical reads a full B64 pair
-        if (in.fmt == Rdna2Format::VOP2 &&
-            (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))) bits |= 3;
-        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) bits |= 3;
-        return bits;
-    };
-    auto defs = [&](const Rdna2Inst& in) -> uint8_t {
-        if (is_mask(in)) return 3;
-        // A cmpx writes EXEC and has NO VCC destination, so it must NOT count as defining VCC —
-        // the decoder gives every VOPC e32 dst = 106 (VCC_LO), so without this exclusion a cmpx
-        // would satisfy both conjuncts and record a phantom definition. A private copy of the
-        // windows here listed three of the six, so every v_cmpx_*_f64/_i64/_u64/_u16 was recorded
-        // as defining VCC; a preceding live `s_and_b64 vcc` then looked overwritten before use,
-        // was classified dead and ELIDED, leaving stale VCC at the real consumer with no
-        // diagnostic. Kernel 32r13v pins it. Use the one shared predicate (#2120).
-        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-            (in.dst.value == 106 || in.dst.value == 107)) return 3;
-        if (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a)
-            return 3;
-        if (in.fmt == Rdna2Format::VOP3 &&
-            (in.sdst.value == 106 || in.sdst.value == 107)) return 3;
-        if (in.fmt == Rdna2Format::SOP1) {
-            if (in.dst.value == 106) return in.opcode == 0x04 ? 3 : 1;
-            if (in.dst.value == 107) return 2;
-        }
-        if (in.fmt == Rdna2Format::SMEM) {
-            uint32_t n = 0;
-            switch (in.opcode) {
-                case 0x0: case 0x8: n=1; break; case 0x1: case 0x9: n=2; break;
-                case 0x2: case 0xa: n=4; break; case 0x3: case 0xb: n=8; break;
-                case 0x4: case 0xc: n=16; break; default: break;
-            }
-            uint8_t bits = 0;
-            if (n && in.dst.value <= 106 && 106 < in.dst.value + static_cast<int>(n)) bits |= 1;
-            if (n && in.dst.value <= 107 && 107 < in.dst.value + static_cast<int>(n)) bits |= 2;
-            return bits;
-        }
-        return 0;
-    };
-    // Least-fixed-point dataflow rooted only in observable (non-candidate) VCC reads. A mask
-    // candidate propagates liveness to its B64 input only when its output is itself live; this also
-    // removes dead self-dependent mask chains inside loops without mistaking the cycle for a use.
-    std::vector<uint8_t> live_in(ins.size(), 0), live_out(ins.size(), 0);
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (size_t ri = ins.size(); ri-- > 0;) {
-            uint8_t out = 0;
-            for (size_t s : succ[ri]) out |= live_in[s];
-            const uint8_t def = defs(ins[ri]), use = uses(ins[ri]);
-            const uint8_t propagated_use = is_mask(ins[ri]) && !(out & def) ? 0 : use;
-            const uint8_t in = propagated_use | (out & static_cast<uint8_t>(~def));
-            if (out != live_out[ri] || in != live_in[ri]) {
-                live_out[ri] = out; live_in[ri] = in; changed = true;
-            }
-        }
-    }
-    std::unordered_set<uint32_t> dead;
-    for (size_t i = 0; i < ins.size(); ++i)
-        if (is_mask(ins[i]) && !(live_out[i] & 3)) dead.insert(ins[i].pc);
-    return dead;
 }
 
 namespace {
@@ -701,390 +591,6 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
     return proven;
 }
 
-// Prove the narrow S_LOAD_DWORDX16 descriptor-bundle shape used by compute kernels. A wide
-// scalar load is not intrinsically a descriptor fetch: accepting every x16 as two T#s would replace
-// real scalar data with zero placeholders. For each candidate, follow all sixteen loaded words to
-// overwrite/end and require BOTH aligned eight-word halves to be consumed as MIMG SRSRCs. Every such
-// consumer must have its own key-less exact-PC image resource; an SRT tag cannot name two descriptors
-// packed under the load's one immediate offset.
-//
-// The only scalar transformation admitted is the captured compiler's T#.word3 patch (with at most
-// one independent VOP scheduled between the two scalar operations):
-//
-//   s_and_b32 tmp, tword3, 0x0fffffff
-//   s_or_b32  tword3, tmp, 0xd0000000
-//
-// All ordinary scalar/vector reads, partial descriptor writes, samplers overlapping the bundle, and
-// scalar control flow reject the candidate. This is deliberately a use proof, not an opcode-wide
-// declaration that x16 loads are descriptors. CONFIDENCE: HIGH for the admitted shape: the front-half
-// snapshots both halves and publishes the live descriptor at each exact MIMG PC.
-bool smem_x16_patch_gap_reads_implicit_state(const Rdna2Inst& in, int temporary) {
-    // The AND's SCC is descriptor-derived until the matching OR overwrites it. Vector ALU can name
-    // SCC as the scalar source encoding even though it is outside the ordinary SGPR/special range.
-    for (uint32_t source = 0; source < in.n_src; ++source)
-        if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253)
-            return true;
-
-    // E32 cndmask and carry forms consume architectural VCC without exposing it in n_src. This is
-    // observable descriptor-derived data when the compiler chose VCC_LO as its word3 temporary.
-    return (temporary == 106 || temporary == 107) && in.fmt == Rdna2Format::VOP2 &&
-           (in.opcode == 0x01u || (in.opcode >= 0x28u && in.opcode <= 0x2au));
-}
-
-// Branches are common between a pair of descriptor loads and their final register overwrite.
-// This proof deliberately admits only unmodified x16 bundles. The separate linear proof below
-// owns the word3 patch shape; a branch through that patch needs a distinct path-sensitive proof.
-bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
-                                             const std::unordered_map<uint32_t, size_t>& by_pc,
-                                             size_t start, const ShaderResourceTable& rt,
-                                             uint32_t wave_size) {
-    // The exact-PC image resources describe dispatch-time CPU bytes. A preceding shader write
-    // could change the descriptor before this scalar load observes it, even when the load
-    // dominates every image use. Unknown aliases keep the ordinary unresolved path.
-    for (size_t i = 0; i < start; ++i)
-        if (rdna2_may_write_guest_memory(ins[i])) return false;
-    const int base = ins[start].dst.value;
-    struct State { size_t index; uint16_t live; };
-    std::vector<State> pending{{start + 1, 0xffffu}};
-    std::unordered_set<uint64_t> visited;
-    bool consumed[2] = {false, false};
-    std::unordered_set<size_t> consumer_indices;
-    auto overlaps = [base](uint16_t live, int first, uint32_t width) {
-        if (first < 0) return false;
-        for (uint32_t word = 0; word < 16; ++word)
-            if ((live & (1u << word)) && first <= base + static_cast<int>(word) &&
-                base + static_cast<int>(word) < first + static_cast<int>(width)) return true;
-        return false;
-    };
-    while (!pending.empty()) {
-        const State state = pending.back();
-        pending.pop_back();
-        if (!state.live) continue;
-        if (state.index >= ins.size()) return false;
-        const uint64_t key = (static_cast<uint64_t>(state.index) << 16u) | state.live;
-        if (!visited.insert(key).second) continue;
-        if (visited.size() > 8192) return false; // bound pathological branch/liveness products
-        const Rdna2Inst& in = ins[state.index];
-        if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
-            (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16u)) return false;
-        if (in.is_end) continue;
-
-        bool image_source = false;
-        if (in.fmt == Rdna2Format::MIMG) {
-            const int tbase = in.src[1].kind == OperandKind::SGPR ? in.src[1].value : -1;
-            const int half = tbase == base ? 0 : tbase == base + 8 ? 1 : -1;
-            if (overlaps(state.live, in.src[2].value,
-                         in.src[2].kind == OperandKind::SGPR ? 4u : 0u)) return false;
-            if (overlaps(state.live, tbase, 8)) {
-                const ShaderResource* resource = rt.by_fetch_pc(in.pc);
-                const uint16_t mask = static_cast<uint16_t>(0xffu << (half == 1 ? 8 : 0));
-                if (half < 0 || (state.live & mask) != mask || !resource ||
-                    resource->fetch_pc != in.pc || resource->srt_offset != 0xffffffffu ||
-                    resource->sgpr_base != 0xffffffffu ||
-                    (resource->cls != ResourceClass::Texture &&
-                     resource->cls != ResourceClass::StorageImage)) return false;
-                consumed[half] = true;
-                consumer_indices.insert(state.index);
-                image_source = true;
-            }
-        }
-        if (scalar_implicit_destination_read_width(in) &&
-            overlaps(state.live, in.dst.value, scalar_implicit_destination_read_width(in)))
-            return false;
-        if (in.fmt == Rdna2Format::SOPK && in.dst.kind == OperandKind::SGPR &&
-            overlaps(state.live, in.dst.value, 1)) return false;
-        for (uint32_t source = 0; source < in.n_src; ++source) {
-            const Operand& operand = in.src[source];
-            if (operand.kind != OperandKind::SGPR &&
-                !(operand.kind == OperandKind::Special &&
-                  operand.value >= 106 && operand.value <= 124)) continue;
-            if (image_source && source == 1) continue;
-            uint32_t width = 1;
-            if (in.fmt == Rdna2Format::MIMG && source == 2) width = 4;
-            else if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
-                     source == 1) width = 4;
-            else if (in.fmt == Rdna2Format::SMEM && source == 0)
-                width = in.opcode >= 8u ? 4u : 2u;
-            else if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                     in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3 ||
-                     in.fmt == Rdna2Format::VOPC) width = 2;
-            if (overlaps(state.live, operand.value, width)) return false;
-        }
-        uint16_t live = state.live;
-        for_each_scalar_write(in, [&](int first, uint32_t width) {
-            for (uint32_t word = 0; word < 16; ++word)
-                if (first <= base + static_cast<int>(word) &&
-                    base + static_cast<int>(word) < first + static_cast<int>(width))
-                    live &= static_cast<uint16_t>(~(1u << word));
-        }, /*wave32_one_word_masks*/wave_size == 32);
-        if (!live) continue;
-        if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
-            const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-            if (target < 0 || target > UINT32_MAX) return false;
-            const auto found = by_pc.find(static_cast<uint32_t>(target));
-            if (found == by_pc.end()) return false;
-            pending.push_back({found->second, live});
-            if (in.opcode == kSoppOpcodeBranch) continue;
-        } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
-                   in.opcode != kSoppOpcodeBarrier) return false;
-        if (state.index + 1 >= ins.size()) return false;
-        pending.push_back({state.index + 1, live});
-    }
-    if (!consumed[0] || !consumed[1]) return false;
-    // A valid descriptor lifetime after the load says nothing about a predecessor that skips
-    // that load. Prove every admitted image use is unreachable from entry with this producer
-    // removed. The executor normally makes the same check while constructing exact-PC resources,
-    // but the recompiler must also be safe with an independently supplied resource table.
-    std::vector<size_t> entry_pending{0};
-    std::vector<uint8_t> entry_seen(ins.size());
-    while (!entry_pending.empty()) {
-        const size_t index = entry_pending.back();
-        entry_pending.pop_back();
-        if (index == start || entry_seen[index]) continue;
-        entry_seen[index] = 1;
-        if (consumer_indices.contains(index)) return false;
-        const Rdna2Inst& in = ins[index];
-        if (in.is_end) continue;
-        if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
-            const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-            if (target < 0 || target > UINT32_MAX) return false;
-            const auto found = by_pc.find(static_cast<uint32_t>(target));
-            if (found == by_pc.end()) return false;
-            entry_pending.push_back(found->second);
-            if (in.opcode == kSoppOpcodeBranch) continue;
-        }
-        if (index + 1 < ins.size()) entry_pending.push_back(index + 1);
-    }
-    return true;
-}
-
-std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
-        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt,
-        uint32_t wave_size) {
-    std::unordered_set<uint32_t> proven;
-    if (!rt || ins.empty()) return proven;
-
-    // Alternate entries would require path-sensitive lifetime/provenance joins. Keep this first
-    // admission linear: hints, waits and barriers are transparent; every real scalar branch or
-    // indirect PC transfer makes the whole candidate ineligible.
-    bool branched = false;
-    for (const Rdna2Inst& in : ins) {
-        if (in.is_end) continue;
-        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
-            return proven;
-        if (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16u) return proven;
-        if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode))
-            branched = true;
-        else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) && in.opcode != 0x0au)
-            return proven;
-    }
-
-    if (branched) {
-        std::unordered_map<uint32_t, size_t> by_pc;
-        for (size_t i = 0; i < ins.size(); ++i)
-            if (ins[i].fmt == Rdna2Format::Unknown || !ins[i].len_dwords ||
-                !by_pc.emplace(ins[i].pc, i).second) return proven;
-        for (size_t i = 0; i < ins.size(); ++i) {
-            const Rdna2Inst& load = ins[i];
-            if (load.fmt != Rdna2Format::SMEM || load.opcode != 0x04u ||
-                load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
-                load.dst.value + 15 > 105 || load.src[1].kind != OperandKind::Special ||
-                load.src[1].value != 125 || static_cast<int32_t>(load.literal) < 0)
-                continue;
-            if (smem_x16_branch_lifetime_is_descriptors(ins, by_pc, i, *rt, wave_size))
-                proven.insert(load.pc);
-        }
-        return proven;
-    }
-
-    auto scalar_operand = [](const Operand& operand) {
-        return operand.kind == OperandKind::SGPR ||
-               (operand.kind == OperandKind::Special &&
-                operand.value >= 106 && operand.value <= 124);
-    };
-    auto literal_is = [](const Rdna2Inst& in, const Operand& operand, uint32_t value) {
-        return operand.kind == OperandKind::Literal && in.literal == value;
-    };
-
-    for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
-        const Rdna2Inst& load = ins[load_index];
-        if (load.is_end || load.fmt != Rdna2Format::SMEM || load.opcode != 0x04u ||
-            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
-            load.dst.value + 15 > 105 ||
-            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
-            static_cast<int32_t>(load.literal) < 0)
-            continue;
-        // The branch-free admission uses the same dispatch-time descriptor snapshot as the
-        // branched proof. A preceding shader store can make that snapshot stale at this load.
-        bool prior_guest_write = false;
-        for (size_t i = 0; i < load_index; ++i)
-            prior_guest_write |= rdna2_may_write_guest_memory(ins[i]);
-        if (prior_guest_write) continue;
-
-        const int base = load.dst.value;
-        uint16_t live = 0xffffu;
-        bool consumed[2] = {false, false};
-        bool valid = true;
-        auto live_overlap = [&](int first, uint32_t words) {
-            if (first < 0 || !words) return false;
-            for (uint32_t word = 0; word < words; ++word) {
-                const int relative = first + static_cast<int>(word) - base;
-                if (relative >= 0 && relative < 16 &&
-                    (live & static_cast<uint16_t>(1u << relative)))
-                    return true;
-            }
-            return false;
-        };
-        auto clear_written = [&](int first, uint32_t words) {
-            if (first < 0) return;
-            for (uint32_t word = 0; word < words; ++word) {
-                const int relative = first + static_cast<int>(word) - base;
-                if (relative >= 0 && relative < 16)
-                    live &= static_cast<uint16_t>(~(1u << relative));
-            }
-        };
-
-        for (size_t index = load_index + 1; valid && index < ins.size(); ++index) {
-            const Rdna2Inst& in = ins[index];
-            if (in.is_end) break;
-
-            // Recognize the complete word3 patch as one unit. One captured variant schedules an
-            // independent VOP between the two scalar instructions; admit that exact one-instruction
-            // gap only when it cannot observe or replace either the descriptor bundle or temporary.
-            bool patched = false;
-            if (index + 1 < ins.size() && in.fmt == Rdna2Format::SOP2 &&
-                in.opcode == 0x0eu && in.dst.kind == OperandKind::SGPR &&
-                in.src[0].kind == OperandKind::SGPR &&
-                literal_is(in, in.src[1], 0x0fffffffu)) {
-                const int descriptor_word = in.src[0].value;
-                const int half = descriptor_word == base + 3 ? 0
-                               : descriptor_word == base + 11 ? 1 : -1;
-                // The retained GTA V shape uses VCC_LO exactly. Do not generalize this to M0 or
-                // other architectural scalar registers: their implicit consumers are not all in the
-                // ordinary SGPR liveness inventory (DS observes M0 without a decoded scalar source).
-                const bool exact_patch_temporary = in.dst.value == 106;
-                size_t join_index = index + 1;
-                const Rdna2Inst& possible_gap = ins[join_index];
-                if (possible_gap.fmt != Rdna2Format::SOP2 || possible_gap.opcode != 0x10u) {
-                    bool transparent_gap = possible_gap.fmt == Rdna2Format::VOP1 ||
-                                           possible_gap.fmt == Rdna2Format::VOP2 ||
-                                           possible_gap.fmt == Rdna2Format::VOP3;
-                    if (transparent_gap &&
-                        smem_x16_patch_gap_reads_implicit_state(possible_gap, in.dst.value))
-                        transparent_gap = false;
-                    for (uint32_t source = 0;
-                         transparent_gap && source < possible_gap.n_src; ++source) {
-                        if (!scalar_operand(possible_gap.src[source])) continue;
-                        if (possible_gap.src[source].value == in.dst.value ||
-                            live_overlap(possible_gap.src[source].value, 2))
-                            transparent_gap = false;
-                    }
-                    for_each_scalar_write(possible_gap, [&](int first, uint32_t words) {
-                        if (live_overlap(first, words) ||
-                            (in.dst.value >= first &&
-                             in.dst.value < first + static_cast<int>(words)))
-                            transparent_gap = false;
-                    });
-                    if (transparent_gap) ++join_index;
-                }
-                const Rdna2Inst& join = join_index < ins.size() ? ins[join_index] : in;
-                const bool temporary_unobserved = join_index + 1 >= ins.size() ||
-                    sgpr_dead_at_merge(ins, ins[join_index + 1].pc, in.dst.value);
-                const bool exact_join = half >= 0 && exact_patch_temporary &&
-                    join_index < ins.size() && join.fmt == Rdna2Format::SOP2 &&
-                    join.opcode == 0x10u && join.dst.kind == OperandKind::SGPR &&
-                    join.dst.value == descriptor_word && scalar_operand(join.src[0]) &&
-                    join.src[0].value == in.dst.value &&
-                    literal_is(join, join.src[1], 0xd0000000u) && temporary_unobserved;
-                const uint16_t word_bit = half >= 0
-                    ? static_cast<uint16_t>(1u << (descriptor_word - base)) : 0u;
-                if (exact_join && (live & word_bit)) {
-                    patched = true;
-                    index = join_index;
-                }
-            }
-            if (patched) continue;
-
-            if (in.fmt == Rdna2Format::MIMG) {
-                const bool t_is_scalar = in.src[1].kind == OperandKind::SGPR;
-                const int half = t_is_scalar && in.src[1].value == base ? 0
-                               : t_is_scalar && in.src[1].value == base + 8 ? 1 : -1;
-                const bool touches_t = t_is_scalar && live_overlap(in.src[1].value, 8);
-                const bool touches_sampler = scalar_operand(in.src[2]) &&
-                                             live_overlap(in.src[2].value, 4);
-                if (touches_sampler) { valid = false; break; }
-                if (half >= 0) {
-                    const uint16_t half_mask = static_cast<uint16_t>(0xffu << (half * 8));
-                    const ShaderResource* resource = rt->by_fetch_pc(in.pc);
-                    const bool exact_image = resource && resource->fetch_pc == in.pc &&
-                        resource->srt_offset == 0xffffffffu &&
-                        resource->sgpr_base == 0xffffffffu &&
-                        (resource->cls == ResourceClass::Texture ||
-                         resource->cls == ResourceClass::StorageImage);
-                    if ((live & half_mask) != half_mask || !exact_image) {
-                        valid = false;
-                        break;
-                    }
-                    consumed[half] = true;
-                    continue;
-                }
-                if (touches_t) { valid = false; break; }
-            }
-
-            // Bound implicit descriptor/address reads before the generic decoded operands. These
-            // packet formats encode a base SGPR while consuming a wider range.
-            if (in.fmt == Rdna2Format::SMEM) {
-                const uint32_t base_words = in.opcode >= 0x08u ? 4u : 2u;
-                if (scalar_operand(in.src[0]) && live_overlap(in.src[0].value, base_words)) {
-                    valid = false;
-                    break;
-                }
-                if (scalar_operand(in.src[1]) && live_overlap(in.src[1].value, 1)) {
-                    valid = false;
-                    break;
-                }
-            } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
-                if ((in.src[1].kind == OperandKind::SGPR &&
-                     live_overlap(in.src[1].value, 4)) ||
-                    (scalar_operand(in.src[2]) && live_overlap(in.src[2].value, 1))) {
-                    valid = false;
-                    break;
-                }
-            } else {
-                for (uint32_t source = 0; source < in.n_src; ++source) {
-                    if (!scalar_operand(in.src[source])) continue;
-                    const uint32_t words =
-                        in.fmt == Rdna2Format::SOP1 ||
-                        in.fmt == Rdna2Format::SOP2 ||
-                        in.fmt == Rdna2Format::SOPC ||
-                        in.fmt == Rdna2Format::VOP3 ||
-                        in.fmt == Rdna2Format::VOPC ? 2u : 1u;
-                    if (live_overlap(in.src[source].value, words)) {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (!valid) break;
-            }
-
-            // SOPK read/modify/write forms do not expose their implicit destination read through
-            // n_src. Treat every live overlap conservatively; the target descriptor bundles use no
-            // SOPK writes, so widening this is unnecessary.
-            if (in.fmt == Rdna2Format::SOPK && in.dst.kind == OperandKind::SGPR &&
-                live_overlap(in.dst.value, 1)) {
-                valid = false;
-                break;
-            }
-            // A VOPC mask replaces both scalar words in Wave64 and only the low word in
-            // Wave32. Keep a surviving Wave32 high word live for later observations.
-            for_each_scalar_write(in, clear_written,
-                                  /*wave32_one_word_masks*/wave_size == 32);
-        }
-        if (valid && consumed[0] && consumed[1]) proven.insert(load.pc);
-    }
-    return proven;
-}
 
 // Complex CFG dispatch and the narrow loop structurizers persist B64 mask values, but not the
 // separate one-word-validity state required by Wave32 aliases. Conservatively find any B32 mask
@@ -1261,37 +767,6 @@ namespace {
 
 }  // namespace
 
-void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins) {
-    if (rs.smem_pointer_analysis_done) return;
-    rs.smem_pointer_loads = rdna2_proven_smem_pointer_loads(ins);
-    rs.smem_owned_raw_x2_chains = rdna2_owned_raw_x2_chains(ins);
-    for (const auto& chain : rs.smem_owned_raw_x2_chains) {
-        rs.smem_raw_x2_data_loads.insert(chain.parent_pc);
-        rs.smem_raw_x2_data_loads.insert(chain.child_pc);
-    }
-    const auto raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
-    rs.smem_raw_x2_data_loads.insert(raw_x2_data.begin(), raw_x2_data.end());
-    const auto raw_immediate_wide_data = rdna2_proven_raw_immediate_wide_data_loads(ins);
-    rs.smem_raw_immediate_wide_data_loads.insert(raw_immediate_wide_data.begin(),
-                                                raw_immediate_wide_data.end());
-    const auto owned_wide_data = rdna2_owned_raw_wide_data_loads(ins);
-    rs.smem_raw_owned_wide_data_loads.insert(owned_wide_data.begin(), owned_wide_data.end());
-    std::vector<uint32_t> raw_offset_scalar_sources;
-    const auto raw_register_wide_data =
-        rdna2_proven_raw_register_wide_data_loads(ins, &raw_offset_scalar_sources);
-    rs.smem_raw_offset_scalar_source_pcs.insert(raw_offset_scalar_sources.begin(),
-                                               raw_offset_scalar_sources.end());
-    rs.smem_raw_register_wide_data_loads.insert(raw_register_wide_data.begin(),
-                                               raw_register_wide_data.end());
-    const auto raw_nested_wide_data = rdna2_proven_raw_nested_wide_data_loads(ins);
-    rs.smem_owned_nested_wide_chains = rdna2_owned_nested_wide_chains(ins);
-    rs.smem_raw_nested_wide_data_loads.insert(raw_nested_wide_data.begin(),
-                                              raw_nested_wide_data.end());
-    const auto raw_wide_data = rdna2_raw_wide_data_loads(ins);
-    rs.smem_raw_wide_data_loads.insert(raw_wide_data.begin(), raw_wide_data.end());
-    rs.smem_pointer_analysis_done = true;
-}
-
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
@@ -1312,7 +787,7 @@ bool emit_cfg_state_machine(
          !packet_masks->source_words || packet_masks->source_words->data() != code ||
          packet_masks->source_words->size() != dwords))
         return reject_cfg(ins.front().pc, "packet-mask-program-requirements-mismatch");
-    if (b.ngg_workgroup_export_probe && b.is_compute && b.local_count == 64 &&
+    if (b.ngg_workgroup_shell && b.is_compute && b.local_count == 64 &&
         std::all_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             if (in.is_end) return true;
             if (in.fmt == Rdna2Format::SOPP &&
@@ -1333,14 +808,14 @@ bool emit_cfg_state_machine(
             if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeBcnt1I32B64)
                 b.ngg_uniform_wave_reduction_pcs.insert(in.pc);
     }
-    if (b.ngg_workgroup_export_probe && b.is_compute && b.wave_size == 64 &&
-        !initial.vcc && initial.terminal_wave64_scalar_words.contains(106) &&
-        initial.terminal_wave64_scalar_words.contains(107) &&
-        initial.sreg.contains(106) && initial.sreg.contains(107)) {
+    if (b.ngg_workgroup_shell && b.is_compute && b.wave_size == 64 && !initial.vcc &&
+        initial.terminal_wave64_scalar_words.contains(106) &&
+        initial.terminal_wave64_scalar_words.contains(107) && initial.sreg.contains(106) &&
+        initial.sreg.contains(107)) {
         // A barrier does not erase the architectural VCC bits. The preceding CFG phase proved
         // both physical words are scalar data on every terminal path; reconstruct this lane's
-        // mask bit instead of propagating a missing Bool-domain value. Keep the bridge confined
-        // to the compile-only NGG probe until its full workgroup ABI is validated.
+        // mask bit instead of propagating a missing Bool-domain value. Confined to the merged-NGG
+        // workgroup shell, whose launch ABI ngg_subgroup_abi admits.
         const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
         const uint32_t word = b.sel(
             b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
@@ -1531,7 +1006,7 @@ bool emit_cfg_state_machine(
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
         return b.is_compute &&
                (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
-                (b.ngg_workgroup_export_probe && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
+                (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -2556,6 +2031,31 @@ bool emit_cfg_state_machine(
                 if (reg <= 105) static_mask_keys.insert(reg);
     }
 
+    // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
+    std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
+    std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
+    analyze_wave64_mask_half_aliases(
+        b, ins, starts, successors,
+        [&](const Rdna2Inst& in, const std::function<void(int)>& visit) {
+            for_each_possible_vector_write(in, visit);
+        },
+        wave64_mask_half_sreg_in, wave64_mask_half_reachable);
+    // What each V_WRITELANE spill slot holds on every path (rdna2_spill_slot_domain.hpp), so a
+    // V_READLANE reload is typed as emit_alu typed it. Any Wave64 compute reload may receive a
+    // mask, so each destination gets a Bool variable; only the Wave64 analysis types reloads.
+    std::set<int> spill_mask_keys = static_mask_keys;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (b.is_compute && b.wave_size == 64 && in.fmt == Rdna2Format::VOP3 &&
+            in.opcode == 0x360 && in.dst.value <= 105)
+            spill_mask_keys.insert(in.dst.value);
+    }
+    const SpillSlotContext slot_context{
+        spill_mask_keys, b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64,
+        b.wave64_mask_readlane_half_for_pc, b.wave64_mask_writelane_alias_pcs};
+    std::vector<SpillSlotDomains> wave64_slot_domain_in(starts.size());
+    std::unordered_set<uint32_t> proven_mask_writelane_pcs;
+
     // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
     // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
     // membership look like a valid saved mask. Prove the B64 mask domain separately at every
@@ -2567,6 +2067,11 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> proven_wave64_mask_zero_compare_pcs;
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
     std::unordered_set<uint32_t> proven_wave64_mask_reduction_pcs;
+    // V_WRITELANE sites whose SGPR source is, on every path, ordinary scalar data: a MUST scalar
+    // word that is neither part of a mask pair nor ambiguous, and that no V_READLANE may have
+    // defined. A readlane is excluded because emit_alu reloads a mask slot into a Bool, which the
+    // scalar-word fact cannot see; spilling that word again stores the Bool, not data.
+    std::unordered_set<uint32_t> proven_scalar_data_writelane_pcs;
     std::unordered_map<uint32_t, int> proven_wave64_mbcnt_mask_root_for_pc;
     // Retain the entry facts beyond the consumer-specialization pass below. Function Bool
     // variables persist values only; this MUST set is the separate lifetime tag load_state needs
@@ -2580,6 +2085,22 @@ bool emit_cfg_state_machine(
     // This matters for GTA V's scalar scratch in VCC/ordinary mask pairs, where readfirstlane,
     // SMEM, or a B32 scalar ALU defines one half before a one-dword VALU/SALU consumer.
     std::vector<std::set<int>> wave64_scalar_word_in(starts.size());
+    // Words that hold an entry-M0 token (`s_mov_b32 sN, m0`, #3133) on every path, i.e. a definite
+    // NON-mask definition that carries no value. It is deliberately NOT a scalar word: `load_state`
+    // would then reload the Function variable's zero placeholder as data (the silent fabrication
+    // #3308/#3312 record). Its one consumer is the restore `s_mov_b32 m0, sN`, which the emitter
+    // lowers by consuming the token without reading a value, so that read cannot pick up the wrong
+    // domain of an ambiguous pair. Any other write of the word ends the fact.
+    std::vector<std::set<int>> wave64_m0_token_word_in(starts.size());
+    // Words a V_READLANE may have written last (a MAY fact, joined by union). See
+    // proven_scalar_data_writelane_pcs.
+    std::vector<std::set<int>> wave64_readlane_word_in(starts.size());
+    // Which saved-mask half each spill slot and reloaded SGPR holds (rdna2_spilled_mask_halves),
+    // so `s_mov_b64 dst, s[N:N+1]` over both reloaded halves of one mask stays a mask. Tracked only
+    // with an exact native Wave64 subgroup, where that move also materializes the ballot words.
+    std::vector<SpilledMaskHalves> wave64_spilled_halves_in(starts.size());
+    const bool track_spilled_halves =
+        b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64;
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
     // architectural SCC or the false placeholder stored for an unrepresentable wave-mask result.
     // Carry a separate CFG MUST-validity bit and use it both for scalar-word provenance and when
@@ -2643,7 +2164,17 @@ bool emit_cfg_state_machine(
         for (int reg : direct_descriptor_sregs)
             if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
+        for (int reg : inherited_entry_m0)
+            if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
         wave64_b64_reachable.front() = true;
+        // Initial slots are untyped, which keeps main's behaviour for them. The terminal
+        // load_state of a previous barrier phase loads BOTH variables of every slot, so map
+        // membership is not what a slot last held, and the mask-half facts start over (#4607
+        // review: seeding the Bool slots as masks refused an EXEC restored after a barrier).
+        for (const auto* slots : {&initial.vgpr_lane_slots, &initial.vgpr_lane_mask_slots})
+            for (const auto& [vgpr, lanes] : *slots)
+                for (const auto& lane : lanes)
+                    wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -2686,12 +2217,12 @@ bool emit_cfg_state_machine(
             }
         };
 
-        auto advance_wave64_b64_masks = [&](std::set<int>& masks,
-                                            std::set<int>& ambiguous,
-                                            std::set<int>& scalar_words,
-                                            bool& scalar_scc,
-                                            const Rdna2Inst& in,
-                                            bool record_compare) {
+        auto advance_wave64_b64_masks = [&](std::set<int>& masks, std::set<int>& ambiguous,
+                                            std::set<int>& scalar_words, std::set<int>& m0_tokens,
+                                            std::set<int>& readlane_words,
+                                            SpilledMaskHalves& halves,
+                                            SpillSlotDomains& slot_domains, bool& scalar_scc,
+                                            const Rdna2Inst& in, bool record_compare) {
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
                     case OperandKind::InlineInt:
@@ -2747,6 +2278,15 @@ bool emit_cfg_state_machine(
             // loading either the Bool's false placeholder or the scalar variable's zero placeholder
             // would silently choose one predecessor's domain for both paths.
             bool reads_ambiguous = false;
+            // `s_mov_b32 m0, sN` over a token word reads no value (see wave64_m0_token_word_in).
+            const bool m0_token_restore = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                                          in.dst.value == 124 &&
+                                          in.src[0].kind == OperandKind::SGPR;
+            // The save starts a token only while M0 itself is not scalar data, as in emit_alu.
+            const bool m0_token_save = in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03 &&
+                                       in.dst.value <= 105 &&
+                                       in.src[0].kind == OperandKind::Special &&
+                                       in.src[0].value == 124 && !scalar_words.contains(124);
             auto source_is_mask = [&](const Operand& source) {
                 if (source.kind == OperandKind::InlineInt) return true;
                 if (source.kind != OperandKind::SGPR &&
@@ -2799,7 +2339,8 @@ bool emit_cfg_state_machine(
                      operand.value == (in.opcode == 0x366 ? 107 : 106) ||
                      masks.contains(mbcnt_root));
                 if (b64_logical_mask_source || mbcnt_mask_source ||
-                    (source == 0 && packet_wqm_mask_source)) continue;
+                    (source == 0 && packet_wqm_mask_source))
+                    continue;
                 const ScalarSourceRead read = scalar_source_read(in, source);
                 if (read == ScalarSourceRead::None) continue;
                 const int first = operand.value;
@@ -2808,7 +2349,9 @@ bool emit_cfg_state_machine(
                     const int overlap_first = std::max(first, base);
                     const int overlap_last = std::min(last, base + 2);
                     for (int word = overlap_first; word < overlap_last; ++word)
-                        if (!scalar_words.contains(word)) reads_ambiguous = true;
+                        if (!scalar_words.contains(word) &&
+                            !(m0_token_restore && m0_tokens.contains(word)))
+                            reads_ambiguous = true;
                 }
             }
             const bool implicit_vcc_read =
@@ -2830,6 +2373,10 @@ bool emit_cfg_state_machine(
             }
             if (reads_ambiguous)
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
+            if (record_compare && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
+                in.src[1].kind == OperandKind::InlineInt &&
+                spill_source_is_scalar_data(in, masks, ambiguous, scalar_words, readlane_words))
+                proven_scalar_data_writelane_pcs.insert(in.pc);
 
             const int reduction_source = wave64_mask_reduction_source(in);
             // EXEC needs no saved-mask lifetime: it is architectural state that always holds a
@@ -2943,6 +2490,8 @@ bool emit_cfg_state_machine(
                     (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
                     source_is_mask(in.src[0]))
                     mask_write = in.dst.value;
+                else if (track_spilled_halves && reassembles_spilled_mask_pair(halves, in))
+                    mask_write = in.dst.value;   // emit_alu reloads the low half's Bool slot
                 else if ((in.opcode >= kSop1OpcodeAndSaveexecB64 &&
                           in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
                          in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
@@ -3190,6 +2739,26 @@ bool emit_cfg_state_machine(
                 native_b32_mask_scc_vote_pcs.contains(in.pc) ||
                 writes_exact_wave_scc)
                 scalar_scc = true;
+            for (const auto& [base, width] : scalar_writes)
+                for (uint32_t word = 0; word < width; ++word) {
+                    m0_tokens.erase(base + static_cast<int>(word));
+                    readlane_words.erase(base + static_cast<int>(word));
+                }
+            if (m0_token_save) m0_tokens.insert(in.dst.value);
+            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360)
+                for (const auto& [base, width] : scalar_writes)
+                    for (uint32_t word = 0; word < width; ++word)
+                        readlane_words.insert(base + static_cast<int>(word));
+            std::vector<int> vector_writes;
+            for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            if (track_spilled_halves)
+                advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
+                                            vector_writes, mask_write);
+            if (b.is_compute)
+                advance_spill_slot_domains(slot_domains, in,
+                                           {masks, ambiguous, scalar_words, readlane_words},
+                                           slot_context, vector_writes,
+                                           record_compare ? &proven_mask_writelane_pcs : nullptr);
             return true;
         };
 
@@ -3200,22 +2769,35 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            std::set<int> m0_tokens = wave64_m0_token_word_in[block];
+            std::set<int> readlane_words = wave64_readlane_word_in[block];
+            SpilledMaskHalves halves = wave64_spilled_halves_in[block];
+            SpillSlotDomains slot_domains = wave64_slot_domain_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
-                if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
-                        /*record_compare*/false))
+                if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
+                                              readlane_words, halves, slot_domains, scalar_scc, in,
+                                              /*record_compare*/ false))
                     return false;
             }
+            // Which SGPR holds a reloaded half is block-local: emit_alu's per-lane mask for a
+            // v_readlane'd half does not survive a dispatcher edge, so a move into VCC after the
+            // edge would copy data words while the analysis called it a mask (#4603 review). The
+            // spill-slot and pair-definition facts describe memory and stay valid across edges.
+            halves.sregs.clear();
             for (uint32_t successor : successors[block]) {
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;
                     wave64_b64_mask_in[successor] = masks;
                     wave64_b64_ambiguous_in[successor] = ambiguous;
                     wave64_scalar_word_in[successor] = scalar_words;
+                    wave64_m0_token_word_in[successor] = m0_tokens;
+                    wave64_readlane_word_in[successor] = readlane_words;
+                    wave64_spilled_halves_in[successor] = halves;
+                    wave64_slot_domain_in[successor] = slot_domains;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
                     continue;
@@ -3240,15 +2822,33 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor].end(),
                     scalar_words.begin(), scalar_words.end(),
                     std::inserter(joined_scalar_words, joined_scalar_words.end()));
-                const bool joined_scalar_scc =
-                    wave64_scalar_scc_valid_in[successor] && scalar_scc;
+                std::set<int> joined_m0_tokens;
+                std::set_intersection(wave64_m0_token_word_in[successor].begin(),
+                                      wave64_m0_token_word_in[successor].end(), m0_tokens.begin(),
+                                      m0_tokens.end(),
+                                      std::inserter(joined_m0_tokens, joined_m0_tokens.end()));
+                std::set<int> joined_readlane_words = wave64_readlane_word_in[successor];
+                joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
+                SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
+                meet_spilled_mask_halves(joined_halves, halves);
+                SpillSlotDomains joined_slots = wave64_slot_domain_in[successor];
+                meet_spill_slot_domains(joined_slots, slot_domains);
+                const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
                 if (joined != wave64_b64_mask_in[successor] ||
                     joined_ambiguous != wave64_b64_ambiguous_in[successor] ||
                     joined_scalar_words != wave64_scalar_word_in[successor] ||
+                    joined_m0_tokens != wave64_m0_token_word_in[successor] ||
+                    joined_readlane_words != wave64_readlane_word_in[successor] ||
+                    !(joined_halves == wave64_spilled_halves_in[successor]) ||
+                    joined_slots != wave64_slot_domain_in[successor] ||
                     joined_scalar_scc != wave64_scalar_scc_valid_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
                     wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
                     wave64_scalar_word_in[successor] = std::move(joined_scalar_words);
+                    wave64_m0_token_word_in[successor] = std::move(joined_m0_tokens);
+                    wave64_readlane_word_in[successor] = std::move(joined_readlane_words);
+                    wave64_spilled_halves_in[successor] = std::move(joined_halves);
+                    wave64_slot_domain_in[successor] = std::move(joined_slots);
                     wave64_scalar_scc_valid_in[successor] = joined_scalar_scc;
                     pending.push_back(successor);
                 }
@@ -3259,153 +2859,20 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            std::set<int> m0_tokens = wave64_m0_token_word_in[block];
+            std::set<int> readlane_words = wave64_readlane_word_in[block];
+            SpilledMaskHalves halves = wave64_spilled_halves_in[block];
+            SpillSlotDomains slot_domains = wave64_slot_domain_in[block];
             bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
-                if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, scalar_scc, in,
-                        /*record_compare*/true))
+                if (!advance_wave64_b64_masks(masks, ambiguous, scalar_words, m0_tokens,
+                                              readlane_words, halves, slot_domains, scalar_scc, in,
+                                              /*record_compare*/ true))
                     return false;
             }
-        }
-    }
-
-    // V_WRITELANE/V_READLANE scalar spills can carry one physical half of a Wave64 mask through a
-    // loop. The Bool slot alone loses whether it was LO or HI, while a dispatcher uint placeholder
-    // is not a validity tag. Track that identity as a CFG MUST fact and publish it only at exact
-    // native-Wave64 readlane PCs. Joins retain equal facts; every ordinary overwrite kills them.
-    std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
-    std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
-    if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && !starts.empty()) {
-        struct MaskHalfState {
-            std::map<int, uint32_t> sreg;
-            std::map<std::pair<int, int>, uint32_t> slot;
-            bool operator==(const MaskHalfState&) const = default;
-        };
-        auto special_half = [](const Operand& source) -> int {
-            if (source.kind != OperandKind::Special) return -1;
-            // EXEC is always a live mask in RegState. VCC_LO/HI may instead be scalar scratch, and
-            // their physical encodings do not carry a runtime domain tag; treating those words as
-            // masks here can turn a dispatcher placeholder into a ballot of false. Admit VCC only
-            // after a future proof is explicitly tied to the Wave64 mask-domain MUST analysis.
-            if (source.value == 126) return 0;
-            if (source.value == 127) return 1;
-            return -1;
-        };
-        auto meet = [](MaskHalfState& dst, const MaskHalfState& incoming) {
-            for (auto it = dst.sreg.begin(); it != dst.sreg.end();) {
-                const auto other = incoming.sreg.find(it->first);
-                if (other == incoming.sreg.end() || other->second != it->second)
-                    it = dst.sreg.erase(it);
-                else
-                    ++it;
-            }
-            for (auto it = dst.slot.begin(); it != dst.slot.end();) {
-                const auto other = incoming.slot.find(it->first);
-                if (other == incoming.slot.end() || other->second != it->second)
-                    it = dst.slot.erase(it);
-                else
-                    ++it;
-            }
-        };
-        auto transfer = [&](MaskHalfState& state, const Rdna2Inst& in, bool record) {
-            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) {
-                for_each_scalar_write(in, [&](int base, uint32_t width) {
-                    for (uint32_t word = 0; word < width; ++word)
-                        state.sreg.erase(base + static_cast<int>(word));
-                }, /*wave32_one_word_masks*/false);
-                if (in.src[1].kind == OperandKind::InlineInt &&
-                    in.src[1].value >= 0 && in.src[1].value <= 63) {
-                    const std::pair<int, int> key{in.src[0].value, in.src[1].value};
-                    const auto half = state.slot.find(key);
-                    if (half != state.slot.end()) {
-                        state.sreg[in.dst.value] = half->second;
-                        if (record)
-                            b.wave64_mask_readlane_half_for_pc[in.pc] = half->second;
-                    }
-                }
-                return;
-            }
-
-            for_each_scalar_write(in, [&](int base, uint32_t width) {
-                for (uint32_t word = 0; word < width; ++word)
-                    state.sreg.erase(base + static_cast<int>(word));
-            }, /*wave32_one_word_masks*/false);
-
-            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
-                // A dynamic selector may overwrite any lane and therefore kills every known slot
-                // in this VGPR. A constant selector updates only its named slot.
-                if (in.src[1].kind != OperandKind::InlineInt ||
-                    in.src[1].value < 0 || in.src[1].value > 63) {
-                    for (auto it = state.slot.begin(); it != state.slot.end();) {
-                        if (it->first.first == in.dst.value) it = state.slot.erase(it);
-                        else ++it;
-                    }
-                    return;
-                }
-                const std::pair<int, int> key{in.dst.value, in.src[1].value};
-                int half = special_half(in.src[0]);
-                if (half < 0 && in.src[0].kind == OperandKind::SGPR) {
-                    const auto source = state.sreg.find(in.src[0].value);
-                    if (source != state.sreg.end()) {
-                        half = source->second;
-                        if (record)
-                            b.wave64_mask_writelane_alias_pcs.insert(in.pc);
-                    }
-                }
-                if (half < 0) state.slot.erase(key);
-                else state.slot[key] = static_cast<uint32_t>(half);
-                return;
-            }
-
-            for_each_possible_vector_write(in, [&](int vgpr) {
-                for (auto it = state.slot.begin(); it != state.slot.end();) {
-                    if (it->first.first == vgpr) it = state.slot.erase(it);
-                    else ++it;
-                }
-            });
-        };
-
-        std::vector<MaskHalfState> half_in(starts.size());
-        std::vector<bool> half_reachable(starts.size(), false);
-        half_reachable.front() = true;
-        std::vector<uint32_t> pending{0};
-        while (!pending.empty()) {
-            const uint32_t block = pending.back();
-            pending.pop_back();
-            MaskHalfState state = half_in[block];
-            const uint32_t lo = starts[block];
-            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
-            for (const auto& in : ins)
-                if (in.pc >= lo && in.pc < hi && !in.is_end)
-                    transfer(state, in, /*record*/false);
-            for (uint32_t successor : successors[block]) {
-                if (!half_reachable[successor]) {
-                    half_reachable[successor] = true;
-                    half_in[successor] = state;
-                    pending.push_back(successor);
-                    continue;
-                }
-                MaskHalfState joined = half_in[successor];
-                meet(joined, state);
-                if (!(joined == half_in[successor])) {
-                    half_in[successor] = std::move(joined);
-                    pending.push_back(successor);
-                }
-            }
-        }
-        for (uint32_t block = 0; block < starts.size(); ++block) {
-            if (!half_reachable[block]) continue;
-            wave64_mask_half_reachable[block] = true;
-            wave64_mask_half_sreg_in[block] = half_in[block].sreg;
-            MaskHalfState state = half_in[block];
-            const uint32_t lo = starts[block];
-            const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
-            for (const auto& in : ins)
-                if (in.pc >= lo && in.pc < hi && !in.is_end)
-                    transfer(state, in, /*record*/true);
         }
     }
 
@@ -3546,7 +3013,7 @@ bool emit_cfg_state_machine(
     }
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
-    std::set<int> mask_keys = static_mask_keys;
+    std::set<int> mask_keys = spill_mask_keys;
     std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
@@ -3570,9 +3037,20 @@ bool emit_cfg_state_machine(
                 (static_mask_keys.count(in.src[0].value) ||
                  (in.src[0].value > 0 &&
                   static_mask_keys.count(in.src[0].value - 1)));
-            const bool is_mask = !fragment_physical_mask_word &&
-                (in.src[0].value == 106 || in.src[0].value == 107 ||
-                 in.src[0].value == 126 || in.src[0].value == 127 ||
+            // A compute spill whose source the Wave64 analysis proves is scalar data AT THIS WRITE is
+            // a data slot, even when the same physical SGPR holds a mask elsewhere in the program
+            // (Kena 0x5008ec0000 spills s30 at pc451 and saves EXEC into s[30:31] at pc1246). The
+            // static rule below would give it only a Bool variable and lose the value at the next
+            // dispatcher block. Undecided sources keep the static rule.
+            const bool proven_data_spill = b.is_compute &&
+                                           proven_scalar_data_writelane_pcs.contains(in.pc) &&
+                                           !b.wave64_mask_writelane_alias_pcs.contains(in.pc);
+            // A write the slot-domain analysis proves stores a Bool is a mask slot, including a
+            // re-spill of a reloaded mask whose SGPR is not otherwise a mask key (#4600).
+            const bool is_mask =
+                !fragment_physical_mask_word && !proven_data_spill &&
+                (proven_mask_writelane_pcs.contains(in.pc) || in.src[0].value == 106 ||
+                 in.src[0].value == 107 || in.src[0].value == 126 || in.src[0].value == 127 ||
                  (in.src[0].kind == OperandKind::SGPR &&
                   (static_mask_keys.count(in.src[0].value) ||
                    b.wave64_mask_writelane_alias_pcs.contains(in.pc))));
@@ -4158,12 +3636,27 @@ bool emit_cfg_state_machine(
                 high->second, low.second);
             state.sreg_bool_narrowed[base] = true;
         }
+        // A slot persisted in both domains holds only a placeholder in the one it did not last
+        // receive on every path here. Load just the live one, so emit_alu reloads the domain the
+        // CFG analysis typed (#4600); an untyped slot keeps both views.
+        const SpillSlotDomains* entry_slots =
+            dispatch != UINT32_MAX && b.is_compute && entry_wave64_b64
+                ? &wave64_slot_domain_in[entry_block]
+                : nullptr;
+        auto slot_holds = [&](const std::pair<int, int>& slot, bool mask) {
+            if (!entry_slots) return false;
+            const auto found = entry_slots->find(slot);
+            return found != entry_slots->end() &&
+                   (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
+        };
         for (const auto& kv : lv)
-            state.vgpr_lane_slots[kv.first.first][kv.first.second] =
-                b.load_function(b.t_u32, kv.second);
+            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true)))
+                state.vgpr_lane_slots[kv.first.first][kv.first.second] =
+                    b.load_function(b.t_u32, kv.second);
         for (const auto& kv : lmv)
-            state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
-                b.load_function(b.t_bool, kv.second);
+            if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
+                state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
+                    b.load_function(b.t_bool, kv.second);
         const bool filters_wave64_scalar_scc =
             (b.is_compute || b.is_fragment) && b.wave_size == 64;
         const bool live_scalar_scc = !filters_wave64_scalar_scc ||
@@ -6687,8 +6180,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               (b.ngg_workgroup_export_probe &&
-                                is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
+                               (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
@@ -6961,11 +6453,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return true;
     };
     auto& safe_branches = effective_safe;
-    if (L.found) {
-        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+    // The counted-loop route claims the whole program, but `detect_counted_loop` only counts
+    // s_branch and SCC back-edges: a bottom-tested EXEC loop (`s_andn2_b64 exec, exec, vcc;
+    // s_cbranch_execnz header`) in the prelude is invisible to it. Probe the prelude before
+    // committing, so a prelude this route cannot structure falls back to the general route below
+    // (divergent loops, forward ifs, then the CFG dispatcher), which does know that loop shape.
+    bool counted_route = L.found;
+    bool guarded_narrow_entry = false;
+    std::vector<ForwardIf> preloop_ifs;
+    Rdna2Inst preloop_end;
+    if (counted_route) {
         // Proven wave-empty EXEC guards around or inside the loop (rdna2_counted_loop_guard.cpp).
-        const bool guarded_narrow_entry = mark_counted_loop_exec_guards(ins, L, effective_safe);
+        guarded_narrow_entry = mark_counted_loop_exec_guards(ins, L, effective_safe);
         // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
         // counted loop (Evergate selects one of two constant blocks this way; Astro's NGG culling
         // prelude also has a one-arm conditional). Structure that choice with the same two-arm PHIs
@@ -6982,14 +6481,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 branch_target(in) >= L.header_pc) continue;
             preloop.push_back(in);
         }
-        Rdna2Inst preloop_end;
         preloop_end.pc = L.header_pc;
         preloop_end.is_end = true;
         preloop.push_back(preloop_end);
         bool preloop_rejected = false;
-        const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
-            preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
-            &preloop_rejected, /*compute_wave_branches*/b.is_compute, b.diagnostic);
+        preloop_ifs = detect_forward_ifs(preloop, /*allow_vcc*/ !b.is_compute, code, dwords,
+                                         &effective_safe, nullptr, &preloop_rejected,
+                                         /*compute_wave_branches*/ b.is_compute, b.diagnostic);
         // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
         // and records it as early_out. In this truncated prelude that can be a real branch over the
         // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
@@ -6998,13 +6496,38 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return branch.early_out ||
                     (branch.has_else ? branch.merge_pc : branch.target_pc) > L.header_pc;
             });
-        if (preloop_rejected || preloop_if_unsupported) {
-            log_recompile_diagnostic(
-                b.diagnostic, "recompile-reject", "terminal",
-                "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
-                preloop_rejected, preloop_ifs.size(), L.header_pc);
+        if (preloop_if_unsupported) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
+                                     preloop_rejected, preloop_ifs.size(), L.header_pc);
             return false;
         }
+        if (preloop_rejected) {
+            // The prelude holds control flow the forward-if scan refuses without loop information
+            // (Kena's 0x5006fb0000 carries a bottom-tested EXEC loop before its counted loop). Nothing
+            // has been emitted yet, so decline this route instead of refusing the program. Undo the
+            // guard marks above: they were proven for THIS route's loop structure, and the general
+            // route must start from the caller's linearization set, as it does for any program
+            // without a counted loop.
+            log_recompile_diagnostic(
+                b.diagnostic, "compute-struct-reject", "route-decline",
+                "counted-loop prelude cfg rejected header=%u: trying the general route",
+                L.header_pc);
+            effective_safe = safe;
+            guarded_narrow_entry = false;
+            preloop_ifs.clear();
+            counted_route = false;
+        }
+    }
+    if (counted_route) {
+        auto vget = [&](int r) {
+            auto it = rs.vreg.find(r);
+            return it == rs.vreg.end() ? b.uconst(0) : it->second;
+        };
+        auto sget = [&](int r) {
+            auto it = rs.sreg.find(r);
+            return it == rs.sreg.end() ? b.uconst(0) : it->second;
+        };
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
         } else if (preloop_ifs.size() > 1) {

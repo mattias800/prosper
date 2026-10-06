@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Earthion (`PPSA28061`) — status
 
 Ancient's own engine on direct AGC, presented inside a CRT bezel with a retro-collection style

@@ -286,3 +286,48 @@ TEST(Ngs2Lifecycle, RackVoiceAndRenderAnswerNativeCodes) {
     EXPECT_EQ(rack_destroy(rack, 0, 0, 0, 0, 0), kInvalidRack) << "a destroyed rack is not live";
     EXPECT_EQ(destroy(sys, 0, 0, 0, 0, 0), 0u);
 }
+
+// SystemLock / SystemUnlock / SystemSetSampleRate: commands 0, 1 and 4 through the native
+// SystemRunCommands core (0x1d9e0). Handle first (0x804a8201), then the rate against the ten-entry
+// set (0x804a8051); Lock and Unlock carry no validation and Unlock ignores its unlock result.
+TEST(Ngs2Lifecycle, SystemLockUnlockAndSampleRate) {
+    register_builtin_hle();
+    EXPECT_EQ(nid_hash("sceNgs2SystemLock"), "gThZqM5PYlQ");
+    EXPECT_EQ(nid_hash("sceNgs2SystemUnlock"), "JXRC5n0RQls");
+    EXPECT_EQ(nid_hash("sceNgs2SystemSetSampleRate"), "-tbc2SxQD60");
+    HleFn create = Hle::lookup(nid_hash("sceNgs2SystemCreateWithAllocator"));
+    HleFn destroy = Hle::lookup(nid_hash("sceNgs2SystemDestroy"));
+    HleFn lock = Hle::lookup(nid_hash("sceNgs2SystemLock"));
+    HleFn unlock = Hle::lookup(nid_hash("sceNgs2SystemUnlock"));
+    HleFn rate = Hle::lookup(nid_hash("sceNgs2SystemSetSampleRate"));
+    for (HleFn f : {create, destroy, lock, unlock, rate}) ASSERT_NE(f, nullptr);
+
+    uint64_t alloc[3] = {0x1000, 0x2000, 0};
+    uint64_t sys = 0;
+    ASSERT_EQ(create(0, addr(alloc), addr(&sys), 0, 0, 0), 0u);
+
+    EXPECT_EQ(unlock(sys, 0, 0, 0, 0, 0), 0u) << "Unlock without a prior Lock answers 0";
+    EXPECT_EQ(lock(sys, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(unlock(sys, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(lock(0xDEADu, 0, 0, 0, 0, 0), kInvalidSystem) << "foreign system refused";
+    EXPECT_EQ(unlock(0xDEADu, 0, 0, 0, 0, 0), kInvalidSystem) << "foreign system refused";
+
+    for (uint32_t ok :
+         {11025u, 12000u, 22050u, 24000u, 44100u, 48000u, 88200u, 96000u, 176400u, 192000u}) {
+        EXPECT_EQ(rate(sys, ok, 0, 0, 0, 0), 0u) << ok << " is one of the ten native rates";
+    }
+    EXPECT_EQ(rate(sys, 8000, 0, 0, 0, 0), kSampleRate) << "8000 is not in the native set";
+    // The arm that separates a SET from a RANGE: 32000 lies inside [8000, 192000] and inside
+    // [11025, 192000], so any range check accepts it; the native compare tree does not.
+    EXPECT_EQ(rate(sys, 32000, 0, 0, 0, 0), kSampleRate)
+        << "32000 is inside any range, not the set";
+    EXPECT_EQ(rate(sys, 0, 0, 0, 0, 0), kSampleRate);
+    EXPECT_EQ(rate(sys, 192001, 0, 0, 0, 0), kSampleRate);
+    EXPECT_EQ(rate(0xDEADu, 32000, 0, 0, 0, 0), kInvalidSystem)
+        << "the handle is checked before the rate";
+
+    ASSERT_EQ(destroy(sys, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(lock(sys, 0, 0, 0, 0, 0), kInvalidSystem) << "a destroyed system is refused";
+    EXPECT_EQ(unlock(sys, 0, 0, 0, 0, 0), kInvalidSystem) << "a destroyed system is refused";
+    EXPECT_EQ(rate(sys, 48000, 0, 0, 0, 0), kInvalidSystem) << "a destroyed system is refused";
+}

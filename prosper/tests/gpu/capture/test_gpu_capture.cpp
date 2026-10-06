@@ -4206,7 +4206,10 @@ int main(int argc, char** argv) {
     uint32_t future_version = 0;
     if (legacy_bytes.size() >= 12)
         for (unsigned i = 0; i < 4; ++i) future_version |= uint32_t(legacy_bytes[8 + i]) << (8u * i);
-    ++future_version; // derive the unknown version from this actual writer's header
+    // Derive the unknown version from this actual writer's header. A capture with no merged-NGG
+    // description is written one below the newest version (v72 exists only for those, #3135 P5),
+    // so the first version no reader knows is two above it.
+    future_version += 2;
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +

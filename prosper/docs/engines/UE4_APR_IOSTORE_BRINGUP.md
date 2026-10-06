@@ -1,3 +1,8 @@
+---
+kind: design
+status: current
+---
+
 # UE4 (PPSA17942 "DOLL") — APR / IoStore read bring-up (path to the first frame)
 
 Status as of this doc: the title boots from garbage-byte execution all the way through memory

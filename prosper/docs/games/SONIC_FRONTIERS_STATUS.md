@@ -1,3 +1,8 @@
+---
+kind: status
+status: current
+---
+
 # Sonic Frontiers (`PPSA03831`) — status
 
 Tracker: [#1891](https://github.com/mattias800/prosper/issues/1891). Engine: **Hedgehog Engine 2

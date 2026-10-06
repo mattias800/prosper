@@ -501,17 +501,17 @@ int main() {
         ShaderResource wrong_shape = clear_resource;
         wrong_shape.declared_mip_levels = 2;
         ShaderResource wrong_format = clear_resource;
-        wrong_format.format = DataFormat::Unorm8;
+        wrong_format.format = DataFormat::Unorm16;   // RGBA8 joined RGBA16F in the exact decode
         CHECK(!prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  clear_resource, true, false, false, rejected_pixel, 1,
-                  rejected.data(), rejected.size()) &&
-              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  wrong_shape, true, false, false, rejected_pixel, 1,
-                  clear_metadata.data(), clear_metadata.size()) &&
-              !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
-                  wrong_format, true, false, false, rejected_pixel, 1,
-                  clear_metadata.data(), clear_metadata.size()),
-              "uncompressed metadata, mip chains, and non-FP16 views fail closed");
+                  clear_resource, true, false, false, rejected_pixel, 1, rejected.data(),
+                  rejected.size()) &&
+                  !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                      wrong_shape, true, false, false, rejected_pixel, 1, clear_metadata.data(),
+                      clear_metadata.size()) &&
+                  !prosper::frontend::compute_sampled_dcc_fast_clear_rgba8(
+                      wrong_format, true, false, false, rejected_pixel, 1, clear_metadata.data(),
+                      clear_metadata.size()),
+              "uncompressed metadata, mip chains, and formats outside RGBA8/RGBA16F fail closed");
     }
 
     std::vector<uint32_t> half_storage_x4(65536u);
@@ -4289,8 +4289,11 @@ int main() {
 
             // The final metadata scan is an independent promotion gate.  Model an unresolved DCC
             // plane after otherwise successful data writeback and require both correct guest bytes
-            // and absence of cache/transfer publication.
-            std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+            // and absence of cache/transfer publication. 0x20 is GFX8-10's clear-to-register code:
+            // the colour lives in the clear-colour registers, not in the control plane, so the
+            // fast-clear decode does not own it and the plane stays unresolved. (A uniform 0x40 is a
+            // self-contained clear the decode now owns, so it no longer models an unresolved plane.)
+            std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x20);
             for (size_t index = 0; index < img_src.size(); ++index)
                 img_src[index] = static_cast<uint8_t>(index * 43u + 3u);
             tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);

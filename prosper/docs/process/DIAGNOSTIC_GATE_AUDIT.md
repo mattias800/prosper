@@ -1,3 +1,8 @@
+---
+kind: process
+status: current
+---
+
 # Diagnostic gate audit — when a `0` means "nobody was counting"
 
 Status: **live**. The numbers below are re-derivable, not quoted — regenerate them with the command

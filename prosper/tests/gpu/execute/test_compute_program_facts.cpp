@@ -89,6 +89,17 @@ TEST(ComputeProgramFacts, Contract) {
                   compute_shader_prefers_native_multiwave(linear.data(), linear.size()),
           "cached probe equals a direct probe (policy-negative program)");
     check(!first->uses_gds && !linear_facts->uses_gds, "no GDS access in either program");
+    // A program whose only GDS access is a plain read still needs the buffer bound (#4553), as
+    // one whose only access is a store does. An LDS read of the same opcode does not.
+    const std::vector<uint32_t> gds_read{0xd8da0000u, 0x00000000u, 0xbf810000u};
+    const std::vector<uint32_t> gds_write{0xd8360000u, 0x00000100u, 0xbf810000u};
+    const std::vector<uint32_t> lds_read{0xd8d80000u, 0x00000000u, 0xbf810000u};
+    check(compute_program_facts(gds_read.data(), gds_read.size(), at(0x6100))->uses_gds,
+          "a GDS read binds the GDS buffer");
+    check(compute_program_facts(gds_write.data(), gds_write.size(), at(0x6200))->uses_gds,
+          "a GDS store binds the GDS buffer");
+    check(!compute_program_facts(lds_read.data(), lds_read.size(), at(0x6300))->uses_gds,
+          "an LDS read does not");
 
     // 3: the same address with rewritten bytes (a recycled or patched program).
     std::vector<uint32_t> buffer = vote;

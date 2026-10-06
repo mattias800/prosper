@@ -1,3 +1,8 @@
+---
+kind: investigation
+status: current
+---
+
 # Compute buffer residency: reclaim idle owners for exact comparisons
 
 Continuation of #3407, based on main including #3621. This change keeps the existing 256 MiB

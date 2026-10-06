@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Refactoring plan — structure, size, and what a tool can actually do about it (2026-09-19)
 
 Measured on `origin/main` at `e7436666276f`, from the build's own compile database, with

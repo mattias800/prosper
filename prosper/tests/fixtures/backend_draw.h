@@ -13,6 +13,11 @@ struct BackendDraw {
     std::shared_ptr<const prosper::gpu::RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const prosper::gpu::OriginalGraphicsDrawEffects> original_graphics_effects;
     std::shared_ptr<const prosper::gpu::GraphicsOwnedWaveDraw> owned_waves;
+    // A merged ES+GS NGG draw (#3135 P4): the backend expands it into its pass-through run draws
+    // and dispatches its subgroup shell first (ngg_subgroup_gpu.h). Its set-0 resources are the
+    // shell's guest inputs; vs/gs/vcount/instance_count/vertex_offset are not used. No live
+    // producer sets it yet (P5).
+    std::shared_ptr<const prosper::gpu::NggSubgroupDraw> ngg_subgroup;
     bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
     // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts

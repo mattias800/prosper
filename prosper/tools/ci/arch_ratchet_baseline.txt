@@ -15,6 +15,10 @@
 # `--update` only ever lowers or deletes rows. Raising or adding one is a hand edit with a
 # `# note` saying why, so the reviewer sees it -- for blocking-sync, the note names the
 # guest-visible result the new wait or ALL_COMMANDS barrier delivers.
+# A standalone `#` note between rows belongs to the row DIRECTLY BELOW it, and only that row:
+# `--update` keeps it with that row when it re-sorts, and drops it with that row when the row
+# goes stale. So place a note immediately above the row it justifies, write one note per row, and
+# never put a row out of canonical order under a note meant for a different row.
 #
 # title-dir and file-size VALUES ARE LINE CAPS: growth past the cap fails, and a shrink reports
 # `decrease` only once it is more than 2% below the cap, so ordinary edits to a large file do not
@@ -97,13 +101,16 @@ getenv|prosper/src/gpu/diagnostics/memory_placement_log.hpp 2
 getenv|prosper/src/gpu/diagnostics/shader_dump_filter.cpp 1
 getenv|prosper/src/gpu/execute/compute_program_facts.cpp 1
 getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
-# #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
-# This renames one existing site; no new raw environment read or switch was introduced.
-getenv|prosper/src/gpu/execute/gpu_executor.cpp 89
-getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
+getenv|prosper/src/gpu/execute/gpu_executor.cpp 86
+# note: moved verbatim with diagnose_compute_dispatches from gpu_executor.cpp
+# (86 there, down from 89); tree total conserved, no new raw environment read.
+getenv|prosper/src/gpu/execute/gpu_executor_diagnostics.cpp 3
 getenv|prosper/src/gpu/execute/index_expand.hpp 1
 getenv|prosper/src/gpu/execute/mb3_freelist.cpp 3
 getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3
+# #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
+# This renames one existing site; no new raw environment read or switch was introduced.
+getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
@@ -147,7 +154,7 @@ getenv|prosper/src/hle/video/avplayer.cpp 6
 getenv|prosper/src/hle/video/videodec2.cpp 10
 getenv|prosper/src/host/image/boot_program.cpp 3
 getenv|prosper/src/host/image/exec_image_linux.cpp 70
-getenv|prosper/src/host/image/exec_image_win.cpp 14
+getenv|prosper/src/host/image/exec_image_win.cpp 10
 getenv|prosper/src/host/image/runtime_module_load.cpp 1
 getenv|prosper/src/host/memory/guest_write_watch.cpp 9
 getenv|prosper/src/host/symbols/il2cpp_symbols.cpp 1
@@ -175,8 +182,8 @@ blocking-sync|prosper/frontends/shared/present/present_blit.cpp|vkWaitForFences 
 blocking-sync|prosper/tests/fixtures/render_runner.h|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT 10
 blocking-sync|prosper/tests/fixtures/render_runner.h|vkQueueWaitIdle 2
 blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
-file-size|prosper/frontends/shared/live/live_compute.cpp 14900  # lowered: storage texel codec lifted into live_compute_storage_codec.hpp
-file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
+file-size|prosper/frontends/shared/live/live_compute.cpp 14775  # lowered: dispatch tail state (ADR 0009 (proposed), preparatory step) added with designated initializers, BoundBuffer/BoundImage and the buffer/image cache keys lifted into headers
+file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5501  # lowered: lazy sampled colour-target materializer moved to lazy_sampled_color_target.hpp
 # note: retain eleven upstream DST_SEL/refused-CS observation lines (#4290) alongside the finality reduction.
 # note #4328: 59 lines above that lowered cap connect real public-entry activity, borrowed private
 # helpers and checked draw/dependency boundaries; reusable issuance/version/consumer logic is in
@@ -184,22 +191,22 @@ file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
 file-size|prosper/src/gpu/execute/gpu_executor.cpp 13156
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 # note #3951: one caller line delegates checked logical64 raw-window emission to its companion.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9421
+file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 8197  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559)
+file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7814  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559)
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5561
 # note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
 # including changed-line formatting; other memory behavior is unchanged.
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
 # same-origin mapping windows under
 # the private HLE ledger lock; neither VMA remainder nor physical allocation size grants bytes.
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8757
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-table query templates moved to guest_mapping_queries.hpp
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
 file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
-test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
+test-dep|prosper/frontends/shared/live/live_renderer.cpp 74  # +1 #4625: the volume publisher reads a claimed 3D target back (readback_persistent_color_target); a compute dispatch consumes the published bytes
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.hpp 2
@@ -211,8 +218,9 @@ test-dep|prosper/frontends/shared/live/submit_renderer/callback_types.hpp 6
 test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.cpp 7
 test-dep|prosper/frontends/shared/live/submit_renderer/draw_resources.hpp 2
 test-dep|prosper/frontends/shared/live/submit_renderer/final_span_present.cpp 6
-test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 90
+test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 88  # lowered: two prosper::test:: references moved with the lazy sampled colour-target materializer
 test-dep|prosper/frontends/shared/live/submit_renderer/image_resources.hpp 2
+test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target.hpp 2  # moved from image_resources.cpp, net zero
 test-dep|prosper/frontends/shared/live/submit_renderer/mrt_slots.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.cpp 14
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.hpp 2
@@ -251,7 +259,7 @@ platform-ifdef|prosper/src/hle/input/ime.cpp 11
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
 platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 59
-platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 10
+platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 9
 platform-ifdef|prosper/src/hle/kernel/sce_errno.hpp 1
 platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
@@ -273,10 +281,7 @@ platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
 platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
 platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
-layer-include|prosper/src/diagnostics/perf/perf_alarms.cpp|gpu 1
-layer-include|prosper/src/diagnostics/perf/wave64_refusal.hpp|gpu 1
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
-layer-include|prosper/src/diagnostics/readback_refusal.cpp|gpu 1
 layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
 layer-include|prosper/src/gpu/capture/gpu_capture.cpp|hle 1
 layer-include|prosper/src/gpu/capture/gpu_capture_internal.hpp|hle 1
