@@ -8,6 +8,7 @@
 #include "shared/compute/compute_timing_selector.hpp"
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
+#include "shared/compute/compute_buffer_cache_key.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/linear_image_pitch.hpp"
 #include "shared/compute/sampled_dcc_fast_clear.hpp"
@@ -750,30 +751,6 @@ struct ComputeMemoryPoolStats {
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t discarded = 0;
-};
-
-struct ComputeBufferCacheKey {
-    uint64_t gpu_addr = 0;
-    uintptr_t host_data = 0;
-    uint32_t bytes = 0;
-    ComputeBufferMaterializationDiscriminator materialization;
-    bool operator==(const ComputeBufferCacheKey& other) const {
-        return gpu_addr == other.gpu_addr && host_data == other.host_data &&
-               bytes == other.bytes && materialization == other.materialization;
-    }
-};
-
-struct ComputeBufferCacheKeyHash {
-    size_t operator()(const ComputeBufferCacheKey& key) const {
-        size_t result = std::hash<uint64_t>{}(key.gpu_addr);
-        result ^= std::hash<uintptr_t>{}(key.host_data) << 1;
-        result ^= std::hash<uint32_t>{}(key.bytes) << 2;
-        result ^= std::hash<uint64_t>{}(key.materialization.logical_bytes) << 3;
-        result ^= std::hash<uint64_t>{}(key.materialization.binding_bytes) << 4;
-        result ^= std::hash<uint32_t>{}(
-            static_cast<uint32_t>(key.materialization.semantic)) << 5;
-        return result;
-    }
 };
 
 constexpr uint32_t kComputeBufferWriteWatchChunkBytes = 1u << 20;
@@ -2349,16 +2326,27 @@ struct VulkanComputeContext {
                 upload_skipped = !changed;
             } else {
                 g_write_watch_census.record_exact_compare(key.bytes);
-                // One pass: differing 64 KiB blocks are copied as they are found (compare and copy
-                // are fused, so the whole cost lands in upload_compare_ms).
-                uint64_t copied;
+                // Default: one pass copies each differing 64 KiB block as it is found, so compare and
+                // copy are fused and the whole cost lands in upload_compare_ms (upload_copy_ms stays
+                // 0). PROSPER_NO_COMPUTE_BLOCK_SYNC=1 restores the separate compare and full copy.
+                static const bool block_sync = !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_BLOCK_SYNC");
+                bool changed;
                 {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                    copied = sync_compute_buffer_blocks(mapped, source, key.bytes);
+                    if (block_sync) {
+                        const uint64_t copied = sync_compute_buffer_blocks(mapped, source, key.bytes);
+                        timing.uploaded_bytes += copied;
+                        changed = copied != 0;
+                    } else {
+                        changed = !compute_buffers_equal(mapped, source, key.bytes);
+                    }
                 }
                 timing.compared_bytes += key.bytes;
-                timing.uploaded_bytes += copied;
-                const bool changed = copied != 0;
+                if (changed && !block_sync) {
+                    ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
+                    copy_compute_buffer(mapped, source, key.bytes);
+                    timing.uploaded_bytes += key.bytes;
+                }
                 upload_skipped = !changed;
             }
             {
