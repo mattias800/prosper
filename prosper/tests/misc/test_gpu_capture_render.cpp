@@ -979,14 +979,24 @@ int main(int argc, char** argv) {
             producer_resource.format = DataFormat::Unorm8;
             producer_resource.num_components = 4;
             array_rtt_producer.prt = std::move(producer_table);
+            // The consumer views the renderer's RGBA8 target through an RGBA8 descriptor. The shared
+            // `array_draw` carries a Float32x4 view (16 B/texel), wider than the 4 B/texel producer.
+            // That view is still served here (the producer records no guest format, and an unset
+            // guest format never refuses; LiveTargetFormat.UnsetGuestFormatAdmitsAWiderView), but a
+            // matching descriptor keeps this case about RTT freshness rather than view width.
+            DrawItem array_rtt_consumer = array_draw;
+            auto consumer_table = std::make_shared<ShaderResourceTable>(*array_draw.prt);
+            consumer_table->resources[0].format = DataFormat::Unorm8;
+            consumer_table->resources[0].num_components = 4;
+            array_rtt_consumer.prt = std::move(consumer_table);
             render_submit_items({array_rtt_producer}, W, H);
             const std::vector<uint8_t> red_array_rtt =
-                render_submit_items({array_draw}, W, H);
+                render_submit_items({array_rtt_consumer}, W, H);
             producer_resource.host_data = const_cast<uint8_t*>(producer_green);
             producer_resource.host_data_size = sizeof(producer_green);
             render_submit_items({array_rtt_producer}, W, H);
             const std::vector<uint8_t> green_array_rtt =
-                render_submit_items({array_draw}, W, H);
+                render_submit_items({array_rtt_consumer}, W, H);
             const uint8_t* red_center = pixel_at(red_array_rtt, W / 2, H / 2);
             const uint8_t* green_center = pixel_at(green_array_rtt, W / 2, H / 2);
             CHECK(red(red_center) && green(green_center) &&

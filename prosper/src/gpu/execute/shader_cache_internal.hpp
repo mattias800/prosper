@@ -167,6 +167,15 @@ struct ShaderResourceCompileKey {
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
 
+// The per-resource half of a compile key: every resource-side fact the emitter's admission
+// reads, never a guest address or content byte. `code` is the program the resources belong to
+// (instruction-scoped snapshots are validated against it). make_shader_compile_key and the
+// merged-NGG stage cache (ngg_live_draw.cpp, #3135 P5) both build their keys with it.
+void append_shader_resource_compile_keys(ShaderProgramStage stage,
+                                         const ShaderResourceTable& resources,
+                                         const std::shared_ptr<const std::vector<uint32_t>>& code,
+                                         std::vector<ShaderResourceCompileKey>& out);
+
 // The DST_SEL word a resource contributes to its compile key: packed selectors for the classes whose
 // emitted SPIR-V reads them (storage-image stores, MUBUF format fetches), and 0 for every other
 // class so a texture's view-level swizzle never splits a module.

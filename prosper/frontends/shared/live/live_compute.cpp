@@ -49,6 +49,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
+#include "gpu/execute/renderer_volume_publication.hpp"   // #4625
 #include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -7483,9 +7484,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 ComputeClock::now() - query_start).count();
             const uint64_t resource_bytes = std::max<uint64_t>(
                 1u, gpu_capture_resource_footprint(*r));
-            if (overlaps_unpublished_renderer_volume(r->gpu_addr, resource_bytes) &&
-                (dim_3d || dim_2d_array || r->depth > 1u || !renderer_owned)) {
-                skip_image(r, "renderer volume has no complete guest publication");
+            if (const char* why = compute_renderer_volume_refusal(
+                    r->gpu_addr, resource_bytes,
+                    dim_3d || dim_2d_array || r->depth > 1u || !renderer_owned)) {
+                skip_image(r, why);
                 break;
             }
             // Exact write-only storage aliases already have a fully prepared canonical image.
@@ -14242,11 +14244,6 @@ uint64_t live_compute_storage_result_snapshot_bytes() {
 uint64_t live_compute_image_result_snapshot_bytes() {
     const VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     return context ? context->image_result_snapshot_bytes : 0;
-}
-
-bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
-                                            size_t guest_bytes, size_t minimum_bytes) {
-    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
 }
 
 void live_compute_fail_next_buffer_readback_for_test() {
