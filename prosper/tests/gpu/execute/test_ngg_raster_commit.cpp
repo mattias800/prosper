@@ -105,6 +105,28 @@ TEST(NggRasterCommit, LayerRouteOrder) {
     query.shader_output_layer = true;
     EXPECT_EQ(select_ngg_layer_route(query, &why), NggLayerRoute::ShaderOutputLayer)
         << "an interpolation stage the device cannot run is no route";
+
+    // A line list cannot feed the interpolation stage (its input is Triangles), and no other route
+    // stands in for it: refused by name, with or without the layer, whatever the device has.
+    query.topology = NggOutputTopology::LineList;
+    query.geometry_shader = true;
+    EXPECT_EQ(select_ngg_layer_route(query, &why), NggLayerRoute::None);
+    EXPECT_EQ(why, "reason=ngg-interpolation-geometry-needs-triangles");
+    query.layer_from_pos1 = false;
+    EXPECT_EQ(select_ngg_layer_route(query, &why), NggLayerRoute::None);
+    EXPECT_EQ(why, "reason=ngg-interpolation-geometry-needs-triangles");
+    // Without the interpolation stage a layered line list has the other two routes.
+    query.layer_from_pos1 = true;
+    query.interpolation_geometry_required = false;
+    EXPECT_EQ(select_ngg_layer_route(query, &why), NggLayerRoute::ShaderOutputLayer);
+    EXPECT_TRUE(why.empty()) << why;
+    query.shader_output_layer = false;
+    EXPECT_EQ(select_ngg_layer_route(query, &why), NggLayerRoute::ForwardingGeometry);
+    // And the vertex stage refuses the combination too, should a caller force it.
+    NggRasterCommitConfig config =
+        base_config(NggLayerRoute::InterpolationGeometry, NggOutputTopology::LineList);
+    EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty());
+    EXPECT_EQ(why, "reason=ngg-interpolation-geometry-needs-triangles");
 }
 
 TEST(NggRasterCommit, LayerConfigurationsThatCannotWorkAreRefused) {
@@ -129,6 +151,19 @@ TEST(NggRasterCommit, LayerConfigurationsThatCannotWorkAreRefused) {
     config.reserved_locations = ~1u;   // PARAM0 takes location 0 and everything else is reserved
     EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty());
     EXPECT_EQ(why, "reason=ngg-raster-layer-location-exhausted");
+    // Every word read must lie inside the 14-word record.
+    for (const auto& [pos1, param] :
+         {std::pair<uint32_t, uint32_t>{11u, 6u}, {6u, 11u}, {6u, 0xfffffff0u}}) {
+        config = base_config(NggLayerRoute::ForwardingGeometry);
+        config.layout.pos1_word = pos1;
+        config.layout.first_param_word = param;
+        EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty())
+            << pos1 << " " << param;
+        EXPECT_EQ(why, "reason=ngg-raster-config cause=layout-out-of-record");
+    }
+    config = base_config(NggLayerRoute::ForwardingGeometry);
+    config.layout.first_param_word = 10;   // the last word in range: PARAM0 at 10..13
+    EXPECT_FALSE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty()) << why;
 }
 
 // The Location of every Output variable a module declares, as a mask.
@@ -455,34 +490,41 @@ TEST(NggRasterCommit, TheLayerComesFromTheProvokingVertex) {
 // control gives corner 0's. The triangle is front-facing as exported, so it must still draw after
 // the rotation: a winding-reversing reorder would cull it.
 TEST(NggRasterCommit, ProvokingVertexLastRotatesTheCornersAndKeepsTheWinding) {
-    const NggLayerRoute route = first_route();
-    if (route == NggLayerRoute::None) GTEST_SKIP() << "no layer route on this device";
-    HandBlocks h;
-    h.add_block(3, 1);
-    // With the flipped viewport, (-1,-1) (3,-1) (-1,3) is clockwise on screen, which the
-    // pipeline's counter-clockwise front face plus y-flip makes front-facing.
-    h.vertex(0, 0, at(-1, -1, 0, 0.125f));
-    h.vertex(0, 1, at(3, -1, 0, 0.25f));
-    h.vertex(0, 2, at(-1, 3, 0, 0.375f));
-    h.prim(0, 0, 0, 1, 2);
-    const auto flat_value = [&](bool last, bool skip_rotation, VkCullModeFlags cull) {
-        NggRasterCommitConfig config = base_config(route);
-        config.provoking_vertex_last = last;
-        config.skip_provoking_rotation_for_test = skip_rotation;
-        const Rendered rendered = render(config, h.words, h.blocks, 0, true, cull);
-        EXPECT_TRUE(rendered.ok) << rendered.refusal;
-        if (!rendered.ok || covered_pixels(rendered.result, 0) != kSize * kSize) return -2.0f;
-        return rendered.result.at(0, 7, 7)[0];
-    };
-    // Which face is front is fixed by the target, not by the test: establish it unculled first.
-    const float none = flat_value(false, false, VK_CULL_MODE_NONE);
-    EXPECT_EQ(none, 0.125f) << "provoking first: corner 0's value";
-    const float front = flat_value(false, false, VK_CULL_MODE_BACK_BIT);
-    const float back = flat_value(false, false, VK_CULL_MODE_FRONT_BIT);
-    ASSERT_TRUE((front == 0.125f) != (back == 0.125f)) << "exactly one cull mode keeps it";
-    const VkCullModeFlags keep = front == 0.125f ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_FRONT_BIT;
-    EXPECT_EQ(flat_value(true, false, keep), 0.375f) << "rotated: corner 2's value, still drawn";
-    EXPECT_EQ(flat_value(true, true, keep), 0.125f) << "the unrotated control";
+    const auto routes = available_routes();
+    if (routes.empty()) GTEST_SKIP() << "no layer route on this device";
+    // Every route: the geometry routes re-emit the corners, which is where the provoking vertex
+    // and the winding could be lost.
+    for (NggLayerRoute route : routes) {
+        SCOPED_TRACE(static_cast<int>(route));
+        HandBlocks h;
+        h.add_block(3, 1);
+        // With the flipped viewport, (-1,-1) (3,-1) (-1,3) is clockwise on screen, which the
+        // pipeline's counter-clockwise front face plus y-flip makes front-facing.
+        h.vertex(0, 0, at(-1, -1, 0, 0.125f));
+        h.vertex(0, 1, at(3, -1, 0, 0.25f));
+        h.vertex(0, 2, at(-1, 3, 0, 0.375f));
+        h.prim(0, 0, 0, 1, 2);
+        const auto flat_value = [&](bool last, bool skip_rotation, VkCullModeFlags cull) {
+            NggRasterCommitConfig config = base_config(route);
+            config.provoking_vertex_last = last;
+            config.skip_provoking_rotation_for_test = skip_rotation;
+            const Rendered rendered = render(config, h.words, h.blocks, 0, true, cull);
+            EXPECT_TRUE(rendered.ok) << rendered.refusal;
+            if (!rendered.ok || covered_pixels(rendered.result, 0) != kSize * kSize) return -2.0f;
+            return rendered.result.at(0, 7, 7)[0];
+        };
+        // Which face is front is fixed by the target, not by the test: establish it unculled first.
+        const float none = flat_value(false, false, VK_CULL_MODE_NONE);
+        EXPECT_EQ(none, 0.125f) << "provoking first: corner 0's value";
+        const float front = flat_value(false, false, VK_CULL_MODE_BACK_BIT);
+        const float back = flat_value(false, false, VK_CULL_MODE_FRONT_BIT);
+        ASSERT_TRUE((front == 0.125f) != (back == 0.125f)) << "exactly one cull mode keeps it";
+        const VkCullModeFlags keep =
+            front == 0.125f ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_FRONT_BIT;
+        EXPECT_EQ(flat_value(true, false, keep), 0.375f)
+            << "rotated: corner 2's value, still drawn";
+        EXPECT_EQ(flat_value(true, true, keep), 0.125f) << "the unrotated control";
+    }
 }
 
 // Block 0: a valid quad on layer 1, and a well-formed primitive past prims_alloc. Block 1: primitive 0 indexes thread 5 >= verts_alloc 4 (a
@@ -554,8 +596,9 @@ TEST(NggRasterCommit, AnIndexMustNameAWrittenVertex) {
     EXPECT_LT(covered_layer1, kSize * kSize);
 }
 
-// A block whose header says the guest did not allocate exactly once draws nothing; it is counted
-// once. A primitive whose layer is past the target's slices draws nothing and is counted.
+// A block whose header says the guest did not allocate exactly once, or that allocated more vertices
+// or primitives than its 64W records hold, draws nothing; it is counted once. A primitive whose layer
+// is past the target's slices draws nothing and is counted.
 TEST(NggRasterCommit, InvalidBlocksAndOutOfRangeLayersDrawNothing) {
     const NggLayerRoute route = first_route();
     if (route == NggLayerRoute::None) GTEST_SKIP() << "no layer route on this device";
@@ -570,23 +613,29 @@ TEST(NggRasterCommit, InvalidBlocksAndOutOfRangeLayersDrawNothing) {
     quad(h, 2, kLayers + 8);
     h.add_block(4, 2);
     quad(h, 3, 6);
+    h.add_block(4, 65);   // prims_alloc past the 64 records: primitives 64.. would vanish
+    quad(h, 4, 7);
+    h.add_block(65, 2);   // verts_alloc past the 64 records
+    quad(h, 5, 8);
     const Rendered rendered = render(base_config(route), h.words, h.blocks);
     ASSERT_TRUE(rendered.ok) << rendered.refusal;
     for (uint32_t layer = 0; layer < kLayers; ++layer)
         EXPECT_EQ(covered_pixels(rendered.result, layer), layer == 6 ? kSize * kSize : 0u)
             << "layer " << layer;
-    EXPECT_EQ(rendered.result.counters[kNggViolationInvalidBlocks], 2u);
+    EXPECT_EQ(rendered.result.counters[kNggViolationInvalidBlocks], 4u);
     EXPECT_EQ(rendered.result.counters[kNggViolationLayerCulled], 2u) << "both triangles";
     EXPECT_EQ(rendered.result.counters[kNggViolationConnectivity], 0u);
 }
 
 // A line list: PRIM carries two indices. One horizontal line on layer 1, one vertical on layer 2,
-// one on an out-of-range layer.
+// one on an out-of-range layer, through every route that takes lines (the interpolation stage is
+// refused for them). A fourth line on layer 3 carries a different PARAM per endpoint into a FLAT
+// input: the first endpoint's by default, the second's under PROVOKING_VTX_LAST.
 TEST(NggRasterCommit, LineListsRasterizeAsLines) {
-    const NggLayerRoute route = first_route();
-    if (route == NggLayerRoute::None) GTEST_SKIP() << "no layer route on this device";
+    const auto routes = available_routes();
+    if (routes.empty()) GTEST_SKIP() << "no layer route on this device";
     HandBlocks h;
-    h.add_block(6, 3);
+    h.add_block(8, 4);
     // Pixel row 4 has centre y = 4.5, i.e. clip y = 1 - 2 * 4.5 / 16 under the flipped viewport.
     const float row = 1.0f - 2.0f * 4.5f / kSize, column = -1.0f + 2.0f * 9.5f / kSize;
     // The endpoints lie past the target's edges, so every pixel of the row or column is crossed.
@@ -596,20 +645,35 @@ TEST(NggRasterCommit, LineListsRasterizeAsLines) {
     h.vertex(0, 3, at(column, 1.5f, 2, 0.5f));
     h.vertex(0, 4, at(-1, row, kLayers, 0.5f));
     h.vertex(0, 5, at(1, row, kLayers, 0.5f));
+    h.vertex(0, 6, at(-1.5f, row, 3, 0.125f));
+    h.vertex(0, 7, at(1.5f, row, 3, 0.375f));
     h.prim(0, 0, 0, 1);
     h.prim(0, 1, 2, 3);
     h.prim(0, 2, 4, 5);
-    const Rendered rendered =
-        render(base_config(route, NggOutputTopology::LineList), h.words, h.blocks);
-    ASSERT_TRUE(rendered.ok) << rendered.refusal;
-    const NggRasterResult& r = rendered.result;
-    for (uint32_t x = 0; x < kSize; ++x) EXPECT_TRUE(covered(r, 1, x, 4)) << "x " << x;
-    for (uint32_t y = 0; y < kSize; ++y) EXPECT_TRUE(covered(r, 2, 9, y)) << "y " << y;
-    EXPECT_EQ(covered_pixels(r, 1), kSize) << "one row, not a triangle";
-    EXPECT_EQ(covered_pixels(r, 2), kSize) << "one column";
-    EXPECT_EQ(r.counters[kNggViolationLayerCulled], 1u);
-    for (uint32_t layer = 3; layer < kLayers; ++layer)
-        EXPECT_EQ(covered_pixels(r, layer), 0u) << "layer " << layer;
+    h.prim(0, 3, 6, 7);
+    uint32_t ran = 0;
+    for (NggLayerRoute route : routes) {
+        if (route == NggLayerRoute::InterpolationGeometry) continue;
+        SCOPED_TRACE(static_cast<int>(route));
+        ++ran;
+        for (bool last : {false, true}) {
+            NggRasterCommitConfig config = base_config(route, NggOutputTopology::LineList);
+            config.provoking_vertex_last = last;
+            const Rendered rendered = render(config, h.words, h.blocks, 0, /*flat=*/true);
+            ASSERT_TRUE(rendered.ok) << rendered.refusal;
+            const NggRasterResult& r = rendered.result;
+            for (uint32_t x = 0; x < kSize; ++x) EXPECT_TRUE(covered(r, 1, x, 4)) << "x " << x;
+            for (uint32_t y = 0; y < kSize; ++y) EXPECT_TRUE(covered(r, 2, 9, y)) << "y " << y;
+            EXPECT_EQ(covered_pixels(r, 1), kSize) << "one row, not a triangle";
+            EXPECT_EQ(covered_pixels(r, 2), kSize) << "one column";
+            EXPECT_EQ(covered_pixels(r, 3), kSize);
+            EXPECT_EQ(r.at(3, 7, 4)[0], last ? 0.375f : 0.125f) << "the provoking endpoint's PARAM";
+            EXPECT_EQ(r.counters[kNggViolationLayerCulled], 1u);
+            for (uint32_t layer = 4; layer < kLayers; ++layer)
+                EXPECT_EQ(covered_pixels(r, layer), 0u) << "layer " << layer;
+        }
+    }
+    EXPECT_GT(ran, 0u);
 }
 
 }   // namespace

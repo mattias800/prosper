@@ -79,7 +79,12 @@ inline NggRasterDevice ngg_raster_device() {
         device.present = true;
         device.geometry = features.geometryShader;
         device.vertex_stores = features.vertexPipelineStoresAndAtomics;
+        // As production gates it (render_runner.h): the extension AND Vulkan 1.2 shaderOutputLayer.
+        VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+        vkGetPhysicalDeviceFeatures2(devices[0], &features2);
         device.shader_output_layer =
+            v12.shaderOutputLayer &&
             ngg_raster_has_extension(devices[0], VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
     }
     vkDestroyInstance(instance, nullptr);
