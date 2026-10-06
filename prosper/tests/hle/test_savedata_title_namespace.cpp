@@ -294,7 +294,14 @@ TEST(SavedataTitleNamespace, Contract) {
     CHECK(default_root.rfind(fake_home.string(), 0) == 0 &&
               default_mem_root.rfind(fake_home.string(), 0) == 0,
           "with no override both roots follow the per-user data location");
-    CHECK(default_root.rfind("/tmp/", 0) != 0 && default_mem_root.rfind("/tmp/", 0) != 0,
+    // The old layout's fixed roots, not any /tmp prefix: the fake HOME lives in this case's
+    // scratch directory, which is under /tmp whenever the build directory is.
+    const auto under = [](const std::string& path, const char* root) {
+        const std::string prefix = root;
+        return path == prefix || path.rfind(prefix + "/", 0) == 0;
+    };
+    CHECK(!under(default_root, "/tmp/prosper-savedata0") &&
+              !under(default_mem_root, "/tmp/prosper-savedata-mem"),
           "and neither defaults onto the tmpfs the old layout used");
     CHECK(default_root != default_mem_root,
           "the /savedata0 mount and SaveDataMemory keep separate roots");
