@@ -87,7 +87,7 @@ constexpr uint64_t kGpuMemoryOffDevicePerWindow = 1;
 
 // host-copy-pressure: bytes this process copies host-side on the guest's behalf, per second -- the
 // sum over EVERY default-on [transfer-pressure] category (storage-materialize, buffer-upload,
-// buffer-compare, rtt-snapshot, detile, guest-scanout), the same total that census's HIGH line uses. Its
+// buffer-compare, rtt-snapshot, detile, guest-scanout, draw-buffer-stage), the same total that census's HIGH line uses. Its
 // `breakdown` is in whole MiB per category, not a count like the correctness rules' breakdowns, so
 // its summary "breakdown over fired windows" is MiB too. 256 MiB/s is that census's own HIGH line, which healthy titles sit
 // far below (GTA V on main: ~80 MiB/s over a whole route) and every defect it was written against
