@@ -65,8 +65,9 @@ TEST(SampledDccFastClear, Unorm8x4ClearIsMaterialized) {
 
 TEST(SampledDccFastClear, ClearCodesMapToTheirColours) {
     const ShaderResource r = compressed_rgba8();
-    struct Case { uint8_t code, rgb, alpha; } cases[] = {
-        {0x00, 0, 0}, {0x40, 0, 255}, {0x80, 255, 0}, {0xc0, 255, 255}};
+    struct Case {
+        uint8_t code, rgb, alpha;
+    } cases[] = {{0x00, 0, 0}, {0x40, 0, 255}, {0x80, 255, 0}, {0xc0, 255, 255}};
     for (const Case& c : cases) {
         uint8_t pixel[4] = {};
         uint8_t code = 0;

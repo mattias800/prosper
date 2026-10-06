@@ -35,7 +35,7 @@ ShaderResource r8_plane(uint32_t width) {
     return r;
 }
 
-}  // namespace
+}   // namespace
 
 TEST(LinearImagePitch, PaddedPlaneHasTheAlignedPitch) {
     EXPECT_EQ(compute_linear_row_pitch(r8_plane(1920), 1), 2048u);
@@ -59,13 +59,15 @@ TEST(LinearImagePitch, ExplicitAndRegisteredPitchWin) {
 
     ShaderResource tight_declared = r8_plane(1920);
     tight_declared.linear_row_pitch_bytes = 1920;
-    EXPECT_EQ(compute_linear_row_pitch(tight_declared, 1), 0u) << "an explicit tight pitch is tight";
+    EXPECT_EQ(compute_linear_row_pitch(tight_declared, 1), 0u)
+        << "an explicit tight pitch is tight";
 
     constexpr uint64_t base = 0x7000000000ull;
     register_guest_linear_texture_layout(base, 1u << 20, 3072);
     ShaderResource registered = r8_plane(1920);
     registered.gpu_addr = base + 0x1000;
-    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 3072u) << "an HLE-registered pitch outranks the rule";
+    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 3072u)
+        << "an HLE-registered pitch outranks the rule";
     unregister_guest_linear_texture_layout(base);
     EXPECT_EQ(compute_linear_row_pitch(registered, 1), 2048u);
 }
@@ -78,7 +80,10 @@ TEST(LinearImagePitch, OnlyPlainLinear2dQualifies) {
     };
     expect_tight("tiled", [](ShaderResource& r) { r.tile_mode = 27; });
     expect_tight("cube", [](ShaderResource& r) { r.img_dim = 3; });
-    expect_tight("array", [](ShaderResource& r) { r.img_dim = 5; r.depth = 4; });
+    expect_tight("array", [](ShaderResource& r) {
+        r.img_dim = 5;
+        r.depth = 4;
+    });
     expect_tight("layer stride", [](ShaderResource& r) { r.layer_stride_bytes = 4096; });
     expect_tight("mip chain", [](ShaderResource& r) { r.declared_mip_levels = 3; });
     expect_tight("mip tail", [](ShaderResource& r) { r.in_mip_tail = true; });

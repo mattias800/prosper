@@ -36,10 +36,10 @@ using namespace prosper::gpu;
 
 namespace {
 
-constexpr uint32_t W = 100;            // 400-byte rows: not a multiple of 256
+constexpr uint32_t W = 100;   // 400-byte rows: not a multiple of 256
 constexpr uint32_t H = 4;
-constexpr uint32_t Bpt = 4;            // Uint32 x1
-constexpr uint32_t Pitch = 512;        // GFX10 linear rows round up to 256 bytes
+constexpr uint32_t Bpt = 4;   // Uint32 x1
+constexpr uint32_t Pitch = 512;   // GFX10 linear rows round up to 256 bytes
 constexpr uint32_t PaddedSpan = Pitch * (H - 1u) + W * Bpt;
 constexpr uint8_t Poison = 0xee;
 
@@ -50,7 +50,9 @@ std::vector<uint8_t>& keep_alive(size_t bytes, uint8_t fill) {
     return *owned.back();
 }
 
-uint32_t texel_value(uint32_t base, uint32_t x, uint32_t y) { return base + y * W + x; }
+uint32_t texel_value(uint32_t base, uint32_t x, uint32_t y) {
+    return base + y * W + x;
+}
 
 ComputeItem compile(const std::vector<uint32_t>& code, const ShaderResourceTable& resources,
                     uint32_t index, uint32_t native_support) {
@@ -76,9 +78,14 @@ ComputeItem compile(const std::vector<uint32_t>& code, const ShaderResourceTable
 ShaderResource linear_image(std::vector<uint8_t>& backing, ResourceClass cls) {
     ShaderResource r{};
     r.cls = cls;
-    r.binding = 5; r.sgpr_base = 8; r.img_dim = 1;
-    r.format = DataFormat::Uint32; r.num_components = 1;
-    r.width = W; r.height = H; r.depth = 1;
+    r.binding = 5;
+    r.sgpr_base = 8;
+    r.img_dim = 1;
+    r.format = DataFormat::Uint32;
+    r.num_components = 1;
+    r.width = W;
+    r.height = H;
+    r.depth = 1;
     r.tile_mode = 0;
     r.declared_mip_levels = 1;
     r.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
@@ -89,14 +96,19 @@ ShaderResource linear_image(std::vector<uint8_t>& backing, ResourceClass cls) {
 
 ShaderResource output_buffer(std::vector<uint32_t>& out) {
     ShaderResource r{};
-    r.cls = ResourceClass::ConstantBuffer; r.binding = 2; r.sgpr_base = 0;
-    r.format = DataFormat::Uint32; r.num_components = 1; r.stride = 4;
+    r.cls = ResourceClass::ConstantBuffer;
+    r.binding = 2;
+    r.sgpr_base = 0;
+    r.format = DataFormat::Uint32;
+    r.num_components = 1;
+    r.stride = 4;
     r.gpu_addr = reinterpret_cast<uint64_t>(out.data());
     r.size = static_cast<uint32_t>(out.size() * sizeof(uint32_t));
     return r;
 }
 
 // One lane per column: for each row, image_load the texel at (x, y) and store it to out[y*W + x].
+// clang-format off: one instruction per line, with its disassembly
 std::vector<uint32_t> reader_program(uint32_t dmask = 1u) {
     std::vector<uint32_t> code{0x7e080300u};                 // v_mov_b32 v4, v0 (x)
     for (uint32_t y = 0; y < H; ++y)
@@ -110,8 +122,10 @@ std::vector<uint32_t> reader_program(uint32_t dmask = 1u) {
     code.push_back(0xbf810000u);                             // s_endpgm
     return code;
 }
+// clang-format on
 
 // One lane per column: for each row, image_store base + y*W + x at (x, y).
+// clang-format off: one instruction per line, with its disassembly
 std::vector<uint32_t> writer_program(uint32_t base) {
     std::vector<uint32_t> code{0x7e080300u};                 // v_mov_b32 v4, v0 (x)
     for (uint32_t y = 0; y < H; ++y)
@@ -123,6 +137,7 @@ std::vector<uint32_t> writer_program(uint32_t base) {
     code.push_back(0xbf810000u);
     return code;
 }
+// clang-format on
 
 void write_padded(std::vector<uint8_t>& backing, uint32_t base) {
     for (uint32_t y = 0; y < H; ++y)
@@ -148,7 +163,7 @@ bool sample_into(const ShaderResource& image, std::vector<uint32_t>& out, uint32
     return prosper::frontend::execute_live_compute_items({item});
 }
 
-}  // namespace
+}   // namespace
 
 TEST(ComputeLinearRowPitch, SampledUploadDropsRowPadding) {
     auto& backing = keep_alive(size_t(Pitch) * H, Poison);
@@ -184,8 +199,9 @@ TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
     const ShaderResource storage = linear_image(backing, ResourceClass::StorageImage);
     ShaderResourceTable writer_table;
     writer_table.resources = {storage};
-    std::vector<ComputeItem> items{compile(writer_program(Base), writer_table, 4,
-                                           native_storage_format_support_bit(DataFormat::Uint32, 1))};
+    std::vector<ComputeItem> items{
+        compile(writer_program(Base), writer_table, 4,
+                native_storage_format_support_bit(DataFormat::Uint32, 1))};
     std::vector<uint32_t> out(size_t(W) * H, 0xdeadbeefu);
     ShaderResourceTable reader_table;
     reader_table.resources = {output_buffer(out), linear_image(backing, ResourceClass::Texture)};
@@ -194,10 +210,12 @@ TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
 
     std::vector<SubmitOperation> operations;
     for (const auto& item : items)
-        operations.push_back({SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order});
+        operations.push_back(
+            {SubmitOperationKind::Dispatch, item.dispatch_index, item.command_order});
     uint64_t consumer_seeds = 0;
     bool all_ok = true;
-    const auto result = execute_ordered_items(operations, {}, items,
+    const auto result = execute_ordered_items(
+        operations, {}, items,
         [](const std::vector<DrawItem>&, uint32_t, uint32_t) { return RenderedFrame{}; },
         [&](const std::vector<ComputeItem>& batch) {
             const auto before = prosper::frontend::live_compute_storage_transfer_seeds();
@@ -206,7 +224,8 @@ TEST(ComputeLinearRowPitch, ComputeProducerSeedsComputeConsumer) {
             if (batch.size() == 1u && batch[0].dispatch_index == 5u)
                 consumer_seeds = prosper::frontend::live_compute_storage_transfer_seeds() - before;
             return ok;
-        }, 1, 1);
+        },
+        1, 1);
     ASSERT_TRUE(result.compute_executed && all_ok);
     EXPECT_EQ(consumer_seeds, 1u)
         << "the consumer must borrow the producer's retained native image, not re-read guest bytes";
@@ -236,9 +255,13 @@ TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
 
     ShaderResource sampled{};
     sampled.cls = ResourceClass::Texture;
-    sampled.binding = 5; sampled.sgpr_base = 8; sampled.img_dim = 1;
-    sampled.format = DataFormat::Unorm8; sampled.num_components = 4;
-    sampled.width = sampled.height = Side; sampled.depth = 1;
+    sampled.binding = 5;
+    sampled.sgpr_base = 8;
+    sampled.img_dim = 1;
+    sampled.format = DataFormat::Unorm8;
+    sampled.num_components = 4;
+    sampled.width = sampled.height = Side;
+    sampled.depth = 1;
     sampled.declared_mip_levels = 1;
     sampled.tile_mode = 27;
     sampled.gpu_addr = target_addr;
@@ -252,7 +275,9 @@ TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
     sampled.size = static_cast<uint32_t>(target.size());
 
     // Control: before any pass names the plane, the target has no reason to watch it.
-    notify_guest_gpu_write(sampled.metadata_addr, 4); notify_guest_gpu_write(miss_addr, 4); drain();
+    notify_guest_gpu_write(sampled.metadata_addr, 4);
+    notify_guest_gpu_write(miss_addr, 4);
+    drain();
     ASSERT_TRUE(is_live_render_target(target_addr))
         << "a write to a plane nobody registered must leave the target alone";
 
@@ -264,7 +289,10 @@ TEST(ComputeLinearRowPitch, SampledRendererTargetRegistersPlane) {
     (void)prosper::frontend::execute_live_compute_items({item});   // the binding is what matters
 
     ASSERT_TRUE(is_live_render_target(target_addr)) << "sampling must not itself revoke the target";
-    notify_guest_gpu_write(sampled.metadata_addr, 4); notify_guest_gpu_write(miss_addr, 4); drain();
+    notify_guest_gpu_write(sampled.metadata_addr, 4);
+    notify_guest_gpu_write(miss_addr, 4);
+    drain();
     EXPECT_FALSE(is_live_render_target(target_addr))
-        << "a plane the compute pass read through the T# revokes the target's pixels when rewritten";
+        << "a plane the compute pass read through the T# revokes the target's pixels when "
+           "rewritten";
 }
