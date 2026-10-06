@@ -726,6 +726,28 @@ def compare_delta(
     return failures, notices
 
 
+def noted_repairs(rows: dict[str, Row], problems: list[Problem]) -> list[str]:
+    """One line per row `--update` lowers or deletes while it carries a reviewer note.
+
+    A note justified the OLD value. After a lower it may no longer be true, and after a delete
+    the standalone lines above the row go with it, so the person running `--update` is told
+    which notes to re-read rather than discovering it in a later diff.
+    """
+    out: list[str] = []
+    for p in problems:
+        row = rows.get(p.key)
+        if row is None or p.kind not in ("decrease", "stale") or not (row.above or row.note):
+            continue
+        if p.kind == "decrease":
+            out.append(f"note check: lowered {p.key} {row.value} -> {p.current}; re-read its note")
+        else:
+            out.append(f"note check: deleted {p.key} {row.value} and the note it carried")
+        out.extend(f"    {line}" for line in row.above)
+        if row.note:
+            out.append(f"    # {row.note}")
+    return out
+
+
 def apply_repairs(rows: dict[str, Row], problems: list[Problem]) -> dict[str, Row]:
     """Lower `decrease` rows and delete `stale` ones. Never raises or adds a row."""
     out = {k: Row(r.key, r.value, r.note, r.above) for k, r in rows.items()}
@@ -1091,6 +1113,8 @@ def run(root: Path, baseline: Path, mode: str) -> int:
             )
             fixed = sum(p.kind in ("decrease", "stale") for p in problems)
             print(f"updated {baseline.name}: lowered or deleted {fixed} row(s)")
+            for line in noted_repairs(rows, problems):
+                print(line)
         rows = repaired
         problems = compare(found, rows)
     if not problems:

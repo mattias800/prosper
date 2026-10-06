@@ -4,6 +4,8 @@ Every rule gets a positive instance written here by hand rather than drawn from 
 so a matcher that quietly stops matching fails a test instead of reporting a clean tree forever.
 """
 
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -270,6 +272,29 @@ class BaselineFormat(unittest.TestCase):
         out = car.format_baseline(["# head"], repaired.values())
         self.assertIn("# raised with a reason (#1).\ngetenv|a.cpp 2", out)
 
+    def test_noted_repairs_names_lowered_and_deleted_rows_with_notes(self):
+        rows = {
+            "getenv|a.cpp": car.Row("getenv|a.cpp", 5, "", ("# raised for #1.",)),
+            "getenv|b.cpp": car.Row("getenv|b.cpp", 4, "inline why"),
+            "getenv|c.cpp": car.Row("getenv|c.cpp", 3, "", ("# only for c.",)),
+            "getenv|d.cpp": car.Row("getenv|d.cpp", 2),
+        }
+        found = {
+            "getenv|a.cpp": car.Finding("getenv|a.cpp", 2),
+            "getenv|b.cpp": car.Finding("getenv|b.cpp", 1),
+            "getenv|d.cpp": car.Finding("getenv|d.cpp", 1),
+        }
+        lines = car.noted_repairs(rows, car.compare(found, rows))
+        text = "\n".join(lines)
+        self.assertIn("lowered getenv|a.cpp 5 -> 2", text)
+        self.assertIn("    # raised for #1.", text)
+        self.assertIn("lowered getenv|b.cpp 4 -> 1", text)
+        self.assertIn("    # inline why", text)
+        self.assertIn("deleted getenv|c.cpp 3", text)
+        self.assertIn("    # only for c.", text)
+        # A lowered row with no note is not worth a line.
+        self.assertNotIn("getenv|d.cpp", text)
+
     def test_refusals(self):
         for bad in ("getenv|a 1 2\n", "nonsense|a 1\n", "getenv|a 1\ngetenv|a 2\n", "getenv|a 0\n"):
             with self.subTest(bad=bad), self.assertRaises(car.EvaluationError):
@@ -337,7 +362,10 @@ class Cli(unittest.TestCase):
         self.baseline.write_text("".join(noted), encoding="utf-8")
         self.write("prosper/src/e.cpp", 'auto v = getenv("X");\n')
         self.assertEqual(car.EXIT_VIOLATION, self.gate())
-        self.assertEqual(car.EXIT_OK, self.gate("--update"))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(car.EXIT_OK, self.gate("--update"))
+        self.assertIn("note check: lowered getenv|prosper/src/e.cpp", printed.getvalue())
         self.assertIn(
             "# note: raised with a reason a reviewer read.\ngetenv|prosper/src/e.cpp 1\n",
             self.baseline.read_text(encoding="utf-8"),
