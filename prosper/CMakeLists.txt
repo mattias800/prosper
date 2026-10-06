@@ -6656,6 +6656,12 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 
+  # A fast-cleared compressed RGBA8 T# is its clear colour (Black Flag's warning-screen background).
+  prosper_add_gtest(test_sampled_dcc_fast_clear
+    SOURCES tests/shared/compute/test_sampled_dcc_fast_clear.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
   target_link_libraries(test_guest_write_drain PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)

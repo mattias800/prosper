@@ -7608,6 +7608,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
+            if (renderer_owned && !bi.storage && r->compression_enabled && r->metadata_addr)
+                if (const uint64_t plane = prosper::gpu::gpu_capture_dcc_metadata_footprint(*r))
+                    prosper::gpu::register_live_rtt_dcc_plane(r->gpu_addr, r->metadata_addr, plane);
             if (!bi.storage && (renderer_owned || depth_import_eligible) &&
                 !dim_1d && !dim_3d && !dim_2d_array &&
                 r->depth == 1 && !r->depth_compare) {

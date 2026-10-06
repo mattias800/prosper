@@ -1391,6 +1391,14 @@ void set_metadata_kind_query(MetadataKindQueryFn fn);
 CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request);
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
+// A compute pass can sample a renderer-owned colour target through a DCC-compressed T#. The control
+// plane at `metadata_addr` then outranks the target's pixels, but the renderer only learns that plane
+// from graphics draws. This tells it, so a later write to the plane (even a byte-identical one) marks
+// the target's pixels stale instead of leaving them standing in for a fast clear.
+using LiveRttDccPlaneRegistrarFn = std::function<void(uint64_t gpu_addr, uint64_t metadata_addr,
+                                                      uint64_t metadata_bytes)>;
+void set_live_rtt_dcc_plane_registrar(LiveRttDccPlaneRegistrarFn fn);
+void register_live_rtt_dcc_plane(uint64_t gpu_addr, uint64_t metadata_addr, uint64_t metadata_bytes);
 // A renderer-produced volume can remain unpublished to guest memory after a 2D alias replaces
 // its current image. Layered compute cannot use the ordinary guest-byte fallback in that case.
 using UnpublishedVolumeQueryFn = std::function<bool(uint64_t gpu_addr, uint64_t bytes)>;

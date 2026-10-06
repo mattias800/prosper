@@ -28,7 +28,8 @@ inline bool compute_sampled_dcc_fast_clear_rgba8(
     const uint32_t components = resource.num_components ? resource.num_components : 1u;
     if (disabled || !ordinary_guest_backed_sampled_view || arrayed_sampled_view ||
         resource.cls != prosper::gpu::ResourceClass::Texture ||
-        resource.format != prosper::gpu::DataFormat::Float16 || components != 4u ||
+        (resource.format != prosper::gpu::DataFormat::Float16 &&
+         resource.format != prosper::gpu::DataFormat::Unorm8) || components != 4u ||
         resource.img_dim != 1u || resource.depth != 1u ||
         resource.declared_mip_levels != 1u || resource.in_mip_tail ||
         resource.layer_stride_bytes || resource.layer_mip_offset_bytes ||
