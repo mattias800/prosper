@@ -20,6 +20,7 @@
 #include "fixtures/ngg_raster_runner.h"
 #include "fixtures/ngg_subgroup_runner.h"
 #include "fixtures/test_data.h"
+#include "gpu/diagnostics/draw_disposition.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/ngg_subgroup_plan.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
@@ -806,8 +807,13 @@ TEST(NggSubgroupBackend, APartialNggDrawRecordsNothing) {
     const uint64_t census =
         prosper::gpu::draw_disposition_census().dropped(prosper::gpu::DrawDrop::NggSubgroup);
     BackendSubmissionBatch submission;
-    // Never captured, so never armed: nothing is recorded and every run is turned off.
-    batch->record(VK_NULL_HANDLE, submission, std::span<Fake>(runs));
+    {
+        // record()'s drops are in-pass: a pass scope (as render_draw_pass_rgba has) reports them on
+        // this thread, instead of leaving them to charge the next pass here.
+        prosper::gpu::DrawDispositionPassScope pass(runs.size());
+        // Never captured, so never armed: nothing is recorded and every run is turned off.
+        batch->record(VK_NULL_HANDLE, submission, std::span<Fake>(runs));
+    }
     for (const Fake& run : runs) EXPECT_FALSE(run.ok);
     EXPECT_EQ(prosper::gpu::draw_disposition_census().dropped(prosper::gpu::DrawDrop::NggSubgroup) -
                   census,

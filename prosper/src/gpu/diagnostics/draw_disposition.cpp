@@ -9,6 +9,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
+#include <utility>
 
 namespace prosper::gpu {
 namespace {
@@ -17,17 +19,58 @@ constexpr size_t kReasonCount = static_cast<size_t>(DrawDrop::Count);
 
 // Indexed by DrawDrop. Kept adjacent to the enum's declaration order on purpose: a reason added
 // to one and not the other is a compile error via the static_assert below.
+// clang-format off: one grepped name per line, in DrawDrop order
 constexpr std::array<const char*, kReasonCount> kNames{
-    "geometry-capability", "mesh-shape",       "subgroup-features",
-    "gds-allocation",      "buffer-resources", "shader-rejected",
-    "pipeline-creation",   "target-memory",    "ngg-subgroup",
+    "geometry-capability",
+    "mesh-shape",
+    "subgroup-features",
+    "gds-allocation",
+    "buffer-resources",
+    "shader-rejected",
+    "pipeline-creation",
+    "target-memory",
+    "resource-order",
+    "resource-contract",
+    "unproven-submission",
+    "device-unavailable",
+    "detile-device",
+    "owned-wave",
+    "ngg-expansion",
+    "volume-view",
+    "volume-not-persistent",
+    "volume-feedback",
+    "command-pool",
+    "volume-multi-target",
+    "volume-seeded",
+    "volume-target-limits",
+    "volume-depth-stencil",
+    "volume-budget",
+    "target-creation",
+    "render-pass-creation",
+    "framebuffer-creation",
+    "pressure-flush",
+    "ngg-subgroup",
 };
+// clang-format on
 static_assert(kNames.size() == kReasonCount,
               "every DrawDrop needs a stable name; logs are grepped by these strings");
 // The perf-alarm ledger mirrors DrawDrop as its backend/* drop reasons, in this order (#3891).
 static_assert(static_cast<size_t>(prosper::diagnostics::perf::kFirstBackendDropReason) +
                       kReasonCount == prosper::diagnostics::perf::kDropReasonCount,
               "perf::DropReason's backend range must mirror DrawDrop one-for-one");
+// The count check above cannot see ORDER: two branches each appending a reason can merge into
+// tables that compile and mislabel every reason after the insertion point. Compare the names.
+constexpr bool backend_names_mirror_draw_drop() {
+    constexpr std::string_view prefix = "backend/";
+    for (size_t i = 0; i < kReasonCount; i++) {
+        const std::string_view ledger = prosper::diagnostics::perf::kDropReasonNames
+            [static_cast<size_t>(prosper::diagnostics::perf::kFirstBackendDropReason) + i];
+        if (!ledger.starts_with(prefix) || ledger.substr(prefix.size()) != kNames[i]) return false;
+    }
+    return true;
+}
+static_assert(backend_names_mirror_draw_drop(),
+              "perf::kDropReasonNames' backend/* names must be DrawDrop's names, slot for slot");
 
 // Print EVERY pass, healthy or not. This exists because a silent instrument and an instrument
 // that was never reached are indistinguishable from outside -- the failure mode the charter's
@@ -73,11 +116,6 @@ struct DrawDispositionCensus::State {
     std::atomic<uint64_t> seen{0};
     std::atomic<uint64_t> recorded{0};
     std::array<std::atomic<uint64_t>, kReasonCount> dropped{};
-    // Per-pass figures. The backend serialises passes on one mutex, so plain counters would do;
-    // these are atomic anyway so a programmatic reader is never torn.
-    std::atomic<uint64_t> pass_seen{0};
-    std::atomic<uint64_t> pass_recorded{0};
-    std::array<std::atomic<uint64_t>, kReasonCount> pass_dropped{};
     // Per-reason print budget, so a high-volume reason cannot starve a rare one.
     std::array<std::atomic<uint64_t>, kReasonCount> printed{};
     // Pass wall time bucketed by draw count. Bucket i holds passes with kBucketLow[i] draws or
@@ -92,37 +130,79 @@ struct DrawDispositionCensus::State {
     std::atomic<uint64_t> unaccounted_passes{0};
 };
 
+// Per-pass figures are THREAD-LOCAL. A pass runs on one thread from its entry scope to its report
+// (every census call in the backend is on the pass's own thread; its memcpy workers count
+// nothing), but passes on different threads overlap: `seen` is counted at the pass entry, before
+// the backend's persistent-resource lock serialises them. A shared per-pass counter charged one
+// thread's entry draws to whichever pass reported first -- `backend_persistent_resource_lock`'s
+// concurrent arm read `seen=4 recorded=1 UNACCOUNTED=3` with nothing lost. Process totals stay in
+// the shared relaxed atomics above.
+struct PassCounters {
+    uint64_t seen = 0;
+    uint64_t recorded = 0;
+    std::array<uint64_t, kReasonCount> dropped{};
+};
+PassCounters& pass_counters() {
+    static thread_local PassCounters counters;
+    return counters;
+}
+
 DrawDispositionCensus::State& DrawDispositionCensus::state() const {
     static State s;
     return s;
 }
 
+// A capture or diagnostic re-realization is not live execution (#3951): its passes count nothing,
+// so it can neither raise `dropped-draws` nor `unaccounted-draws` while being used to investigate
+// them. One thread-local read per call; the counters stay relaxed atomics (P4).
+static bool suppressed() {
+    return prosper::diagnostics::perf::thread_draw_drop_suppression() != 0;
+}
+
 void DrawDispositionCensus::note_seen(uint64_t count) {
+    if (suppressed()) return;
     auto& s = state();
     s.seen.fetch_add(count, std::memory_order_relaxed);
-    s.pass_seen.fetch_add(count, std::memory_order_relaxed);
+    pass_counters().seen += count;
+}
+
+void DrawDispositionCensus::note_rebatched(uint64_t from, uint64_t to) {
+    if (suppressed() || from == to) return;
+    // Unsigned wrap-around makes the subtraction exact: the pass already holds `from` seen draws.
+    auto& s = state();
+    s.seen.fetch_add(to - from, std::memory_order_relaxed);
+    pass_counters().seen += to - from;
 }
 
 void DrawDispositionCensus::note_recorded(uint64_t count) {
+    if (suppressed()) return;
     auto& s = state();
     s.recorded.fetch_add(count, std::memory_order_relaxed);
-    s.pass_recorded.fetch_add(count, std::memory_order_relaxed);
+    pass_counters().recorded += count;
 }
 
-void DrawDispositionCensus::note_dropped(DrawDrop reason) {
+void DrawDispositionCensus::note_dropped(DrawDrop reason, uint64_t count) {
     const auto i = static_cast<size_t>(reason);
-    if (i >= kReasonCount) return;
+    if (i >= kReasonCount || !count || suppressed()) return;
     auto& s = state();
-    s.dropped[i].fetch_add(1, std::memory_order_relaxed);
-    s.pass_dropped[i].fetch_add(1, std::memory_order_relaxed);
+    s.dropped[i].fetch_add(count, std::memory_order_relaxed);
+    pass_counters().dropped[i] += count;
     // #3891: the same reason, in the alarm ledger's backend/* range.
     namespace perf = prosper::diagnostics::perf;
-    perf::drop_draw(static_cast<perf::DropReason>(
-        static_cast<size_t>(perf::kFirstBackendDropReason) + i));
+    perf::drop_draw(
+        static_cast<perf::DropReason>(static_cast<size_t>(perf::kFirstBackendDropReason) + i),
+        count);
 }
 
 uint64_t DrawDispositionCensus::pass_seen_for_scope() const {
-    return state().pass_seen.load(std::memory_order_relaxed);
+    return pass_counters().seen;
+}
+
+uint64_t DrawDispositionCensus::pass_unaccounted_for_scope() const {
+    const PassCounters& pass = pass_counters();
+    uint64_t accounted = pass.recorded;
+    for (size_t i = 0; i < kReasonCount; i++) accounted += pass.dropped[i];
+    return pass.seen > accounted ? pass.seen - accounted : 0;
 }
 
 uint64_t DrawDispositionCensus::seen() const { return state().seen.load(std::memory_order_relaxed); }
@@ -142,14 +222,12 @@ uint64_t DrawDispositionCensus::dropped_total() const {
 
 void DrawDispositionCensus::report_pass() {
     auto& s = state();
-    const uint64_t pass_seen = s.pass_seen.exchange(0, std::memory_order_relaxed);
-    const uint64_t pass_recorded = s.pass_recorded.exchange(0, std::memory_order_relaxed);
-    std::array<uint64_t, kReasonCount> pass_dropped{};
+    const PassCounters pass = std::exchange(pass_counters(), PassCounters{});
+    const uint64_t pass_seen = pass.seen;
+    const uint64_t pass_recorded = pass.recorded;
+    const std::array<uint64_t, kReasonCount>& pass_dropped = pass.dropped;
     uint64_t pass_dropped_total = 0;
-    for (size_t i = 0; i < kReasonCount; i++) {
-        pass_dropped[i] = s.pass_dropped[i].exchange(0, std::memory_order_relaxed);
-        pass_dropped_total += pass_dropped[i];
-    }
+    for (size_t i = 0; i < kReasonCount; i++) pass_dropped_total += pass_dropped[i];
     // #3891 unaccounted-draws: the census's blind spot as a perf-alarm counter, once per pass and
     // independent of the report switch below.
     if (pass_seen || pass_recorded || pass_dropped_total) {
@@ -222,14 +300,25 @@ void DrawDispositionCensus::note_pass_duration(uint64_t draws, uint64_t nanoseco
     s.last_pass_end_ns.store(end, std::memory_order_relaxed);
 }
 
-DrawDispositionPassScope::DrawDispositionPassScope() : start_ns_(now_ns()) {}
+DrawDispositionPassScope::DrawDispositionPassScope(uint64_t draws) : start_ns_(now_ns()) {
+    draw_disposition_census().note_seen(draws);
+}
 
 DrawDispositionPassScope::~DrawDispositionPassScope() {
     auto& census = draw_disposition_census();
+    // A named refusal drops whatever the pass had not yet recorded or dropped. Nothing named
+    // leaves the gap for report_pass() to call UNACCOUNTED.
+    if (refusal_ != DrawDrop::Count)
+        census.note_dropped(refusal_, census.pass_unaccounted_for_scope());
     // Read the pass's draw count BEFORE report_pass() resets the per-pass counters.
     const uint64_t drawn = census.pass_seen_for_scope();
     if (drawn) census.note_pass_duration(drawn, now_ns() - start_ns_);
     census.report_pass();
+}
+
+void refuse_draw_pass(uint64_t draws, DrawDrop reason) {
+    DrawDispositionPassScope scope(draws);
+    scope.refuse(reason);
 }
 
 bool DrawDispositionCensus::report_totals() {

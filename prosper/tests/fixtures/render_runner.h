@@ -8368,11 +8368,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
     BackendTexturePathCensus texture_path_census(draws.size());
-    // Declared at the TOP of the body, not next to the draw loop. It reports this pass on every
-    // exit including the early returns below, and it times the pass -- and the first version of
-    // this sat ~2,200 lines lower, so it measured only the tail of each pass and under-reported
-    // the renderer's share of the run. Anything moving it down again silently reintroduces that.
-    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
+    // Declared at the TOP of the body: it counts every draw handed to this pass as seen, reports
+    // the pass on every exit and times it. An early return names its cause (`return disposition.
+    // refuse(DD::X, out)`) or the draws it abandons are UNACCOUNTED. Moving this down reopens
+    // #4643's blind spot and makes the timing measure only the tail of each pass.
+    using DD = prosper::gpu::DrawDrop;
+    prosper::gpu::DrawDispositionPassScope disposition(draws.size());
     const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
@@ -8430,7 +8431,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 break;
             }
         if (draw_proven) proven_draws.push_back(&draw);
-        else if (!drop_only_unproven_draw) return out;
+        else if (!drop_only_unproven_draw)
+            return disposition.refuse(DD::ResourceContract, out);
     }
     std::vector<BackendDraw> proven_storage;
     if (drop_only_unproven_draw && proven_draws.size() != draws.size()) {
@@ -8439,6 +8441,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr,
                          "[render] DROP_UNPROVEN_DRAW: kept %zu of %zu draws in this batch\n",
                          proven_draws.size(), draws.size());
+        disposition.drop(DD::ResourceContract, draws.size() - proven_draws.size());
         if (proven_draws.empty()) return out;
         proven_storage.reserve(proven_draws.size());
         for (const BackendDraw* draw : proven_draws) proven_storage.push_back(*draw);
@@ -8446,7 +8449,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // proven_storage outlives that use because it is declared in this scope.
         draws = std::span<const BackendDraw>(proven_storage);
     }
-    if (backend_has_unproven_submission()) return out;
+    if (backend_has_unproven_submission()) return disposition.refuse(DD::UnprovenSubmission, out);
     // #2953. Everything from here on reads and writes the backend's persistent-resource domain --
     // the pipeline, pipeline-layout, colour-target, depth/stencil and texture caches, their byte
     // totals and their generation counters. Taken BEFORE `direct_submission` is constructed, so the
@@ -8456,7 +8459,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // lives here rather than being inherited from `g_agc_state_mu`.
     const BackendPersistentResourceGuard persistent_resource_guard;
     const RenderVkCtx& ctx = render_vk_ctx();
-    if (!ctx.ok) return out;
+    if (!ctx.ok) return disposition.refuse(DD::DeviceUnavailable, out);
     // Every graphics shader resource dependency must include the optional mesh stage when the
     // device enabled it. The stage bit is invalid on devices without that feature, so keep this
     // mask tied to the feature actually requested at device creation.
@@ -8465,9 +8468,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         (ctx.mesh_shader_enabled ? VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT : 0u);
     for (const auto& draw : draws)
         for (const auto& resource : draw.R)
-            if (resource.gpu_detile &&
-                (resource.gpu_detile->device != ctx.dev ||
-                 resource.gpu_detile->program->device != ctx.dev)) return out;
+            if (resource.gpu_detile && (resource.gpu_detile->device != ctx.dev ||
+                                        resource.gpu_detile->program->device != ctx.dev))
+                return disposition.refuse(DD::DetileDevice, out);
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
@@ -8481,7 +8484,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(
                     stderr, "[graphics-wave] refused draw=%llu reason=%s; no guest output commit\n",
                     static_cast<unsigned long long>(draw.draw_index), refusal.c_str());
-                return out;
+                return disposition.refuse(DD::OwnedWave, out);
             }
         }
         draws = completed_owned_draws;
@@ -8492,7 +8495,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     [](const auto& d) { return bool(d.ngg_subgroup); })) {
         std::string refusal;
         if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal))
-            return out;   // counted and logged (bounded) by expand
+            return disposition.refuse(DD::NggExpansion, out);   // logged (bounded) by expand
+        disposition.rebatch(draws.size(), ngg_draws.size());
         draws = ngg_draws;
     }
     bool avoid_cache_eviction = active_submission.pending() ||
@@ -8512,16 +8516,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         void release() { id = 0; }
     } volume_attempt{volume_color ? color_target->persistent_id : 0u};
-    if (color_target && !backend_color_volume_view_valid(*color_target)) return out;
+    if (color_target && !backend_color_volume_view_valid(*color_target))
+        return disposition.refuse(DD::VolumeView, out);
     // A volume cannot be represented by the historical transient 2D fallback. It must retain
     // one exact allocation through the later 3D sample, or the caller sees an explicit refusal.
-    if (volume_color && !persistent_color_enabled) return out;
+    if (volume_color && !persistent_color_enabled)
+        return disposition.refuse(DD::VolumeNotPersistent, out);
     if (volume_color)
         for (const BackendDraw& draw : draws)
             for (const FrameResource& resource : draw.R)
                 if (resource.persistent_render_target_id == color_target->persistent_id &&
                     resource.img_dim == 2u)
-                    return out; // same-pass 3D feedback has no prior-version snapshot yet
+                    return disposition.refuse(DD::VolumeFeedback, out);   // no prior snapshot
     const uint64_t color_target_generation = ++persistent_color_target_generation();
     VkInstance inst = ctx.inst; (void)inst; VkPhysicalDevice phys = ctx.phys;
     VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
@@ -8532,7 +8538,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // guard releases it on the early exits between here and the completion-gated cleanup below,
     // which is where ownership is handed on.
     RenderCommandPoolLeaseGuard command_pool_lease(dev, qfi);
-    if (!command_pool_lease) return out;
+    if (!command_pool_lease) return disposition.refuse(DD::CommandPool, out);
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
@@ -8550,7 +8556,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         : (use_color1 ? 2u : 1u);
     // Layered MRT and a layer-one DS attachment need a separate common-layer contract. Admit
     // only the proven single-color shape while the volume path is established.
-    if (volume_color && (color_count != 1u || seed_rgba)) return out;
+    if (volume_color && (color_count != 1u || seed_rgba))   // #4643
+        return disposition.refuse(seed_rgba ? DD::VolumeSeeded : DD::VolumeMultiTarget, out);
     const auto first_pipeline_format = [&](uint32_t slot) {
         for (const auto& draw : draws) {
             if (!draw.ps) continue;
@@ -8596,7 +8603,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     static_cast<int>(FMT), mesh_draw,
                     ctx.mesh_shader_properties.maxMeshOutputLayers,
                     ctx.image_view_2d_on_3d);
-            return out;
+            return disposition.refuse(DD::VolumeTargetLimits, out);
         }
     }
     std::array<VkFormat, prosper::gpu::kColorTargetCount> color_formats{};
@@ -8804,7 +8811,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
-    if (volume_color && use_ds) return out;
+    if (volume_color && use_ds) return disposition.refuse(DD::VolumeDepthStencil, out);
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
     // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
     // byte-identical (#264).
@@ -9092,7 +9099,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (create_color_target_image(dev, imgci, RenderColorTargetCreateSite::Slot0,
                                       &img) != VK_SUCCESS) {
             if (cached_color) persistent_color_target_cache().erase(color_key);
-            return out;
+            return disposition.refuse(DD::TargetCreation, out);
         }
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(dev, img, &ir);
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -9122,13 +9129,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().erase(color_key);
                 cached_color = nullptr;
                 persistent_color = false;
-                if (volume_color) return out;
+                if (volume_color) return disposition.refuse(DD::VolumeBudget, out);
                 imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                               (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
                 if (create_color_target_image(dev, imgci,
                                               RenderColorTargetCreateSite::Slot0Fallback,
                                               &img) != VK_SUCCESS)
-                    return out;
+                    return disposition.refuse(DD::TargetCreation, out);
                 vkGetImageMemoryRequirements(dev, img, &ir);
                 iai.allocationSize = ir.size;
             }
@@ -9159,7 +9166,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             } else if (imem) {
                 release_transient_render_memory(dev, imem);
             }
-            return out;
+            return disposition.refuse(imem ? DD::TargetCreation : DD::TargetMemory, out);
         }
         if (cached_color) {
             cached_color->image = img;
@@ -9183,7 +9190,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (create_render_image_view_checked(
                 dev, attachment, RenderVkObjectCreateSite::VolumeAttachmentView,
                 &view) != VK_SUCCESS)
-            return out;
+            return disposition.refuse(DD::TargetCreation, out);
         volume_attachment_view.view = view;
     }
     const bool load_cached_color = cached_color && color_target->load_existing && !seed_rgba &&
@@ -9252,7 +9259,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (create_color_target_image(dev, color1_ci, RenderColorTargetCreateSite::Slot1,
                                       &img1) != VK_SUCCESS) {
             if (cached_color1) persistent_color_target_cache().erase(color_key1);
-            return out;
+            return disposition.refuse(DD::TargetCreation, out);
         }
         VkMemoryRequirements color1_requirements{};
         vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
@@ -9290,7 +9297,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (create_color_target_image(dev, color1_ci,
                                               RenderColorTargetCreateSite::Slot1Fallback,
                                               &img1) != VK_SUCCESS)
-                    return out;
+                    return disposition.refuse(DD::TargetCreation, out);
                 vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
                 color1_allocation.allocationSize = color1_requirements.size;
             }
@@ -9317,7 +9324,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             } else if (imem1) {
                 release_transient_render_memory(dev, imem1);
             }
-            return out;
+            return disposition.refuse(imem1 ? DD::TargetCreation : DD::TargetMemory, out);
         }
         if (cached_color1) {
             cached_color1->image = img1;
@@ -9372,7 +9379,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().erase(extra_keys[slot]);
                 cached_extra[slot] = nullptr;
             }
-            return out;
+            return disposition.refuse(DD::TargetCreation, out);
         }
         VkMemoryRequirements requirements{};
         vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
@@ -9409,7 +9416,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (create_color_target_image(dev, ci,
                                               RenderColorTargetCreateSite::SlotExtraFallback,
                                               &extra_images[slot]) != VK_SUCCESS)
-                    return out;
+                    return disposition.refuse(DD::TargetCreation, out);
                 vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
                 allocation.allocationSize = requirements.size;
             }
@@ -9427,6 +9434,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCreateImageView(dev, &view_ci, nullptr, &extra_views[slot]) == VK_SUCCESS &&
             extra_views[slot];
         if (!ready) {
+            disposition.refuse(extra_memories[slot] ? DD::TargetCreation : DD::TargetMemory);
             if (extra_views[slot]) vkDestroyImageView(dev, extra_views[slot], nullptr);
             vkDestroyImage(dev, extra_images[slot], nullptr);
             if (cached_extra[slot]) {
@@ -9500,7 +9508,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     "[ds-create-failed] vkCreateImage result=%d extent=%ux%u fmt=%d\n",
                     (int)ds_image_result, W, H, (int)DFMT);
             if (cached_ds) persistent_ds_cache().erase(ds_key);
-            return out;
+            return disposition.refuse(DD::TargetCreation, out);
         }
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -9530,12 +9538,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     "dropping the pass\n",
                     dmem ? "vkBindImageMemory" : "no memory type could hold the depth target",
                     (int)ds_bind_result, (unsigned long long)dai.allocationSize, W, H, (int)DFMT);
-            // The pass's draws were never seen by the per-draw loop: count them seen and dropped
-            // together so the census's two routes still agree.
-            prosper::gpu::draw_disposition_census().note_seen(draws.size());
-            for (size_t i = 0; i < draws.size(); ++i)
-                prosper::gpu::draw_disposition_census().note_dropped(
-                    prosper::gpu::DrawDrop::TargetMemory);
+            disposition.refuse(DD::TargetMemory);   // every draw of the pass, seen at entry
             vkDestroyImage(dev, dimg, nullptr);
             dimg = VK_NULL_HANDLE;
             if (cached_ds) {
@@ -9558,6 +9561,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // every later LOAD of this identity, the same defect #1383 records for the color path.
         if (create_render_image_view_checked(dev, dvci, RenderVkObjectCreateSite::DepthStencilView,
                                              &dview) != VK_SUCCESS) {
+            disposition.refuse(DD::TargetCreation);
             vkDestroyImage(dev, dimg, nullptr);
             dimg = VK_NULL_HANDLE;
             if (cached_ds) {
@@ -9723,7 +9727,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the call, so the indeterminate read is gone whatever the driver does; here we drop the pass,
     // the same failure path the color-target creates above take.
     VkRenderPass rp = VK_NULL_HANDLE;
-    if (create_render_pass_checked(dev, rpci, &rp) != VK_SUCCESS) return out;
+    if (create_render_pass_checked(dev, rpci, &rp) != VK_SUCCESS)
+        return disposition.refuse(DD::RenderPassCreation, out);
     std::array<VkImageView, prosper::gpu::kColorTargetCount + 1> fbviews{};
     fbviews[0] = view;
     for (uint32_t slot = 1; slot < color_count; ++slot) fbviews[slot] = extra_views[slot];
@@ -9738,7 +9743,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // transient state (which the deferred cleanup below would have taken) it can and must be
         // destroyed here rather than leaked.
         vkDestroyRenderPass(dev, rp, nullptr);
-        return out;
+        return disposition.refuse(DD::FramebufferCreation, out);
     }
 
     // `stage` and `identity` are per-module, not per-draw: naming a vertex module with the
@@ -10037,7 +10042,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 pressure_flush_ms = std::chrono::duration<double, std::milli>(
                     TimingClock::now() - flush_begin).count();
             if (pressure_batch_result.submit_result != VK_SUCCESS ||
-                pressure_batch_result.wait_result != VK_SUCCESS) return out;
+                pressure_batch_result.wait_result != VK_SUCCESS)
+                return disposition.refuse(DD::PressureFlush, out);
             avoid_cache_eviction = false;
             persistent_texture_batch_floor = texture_generation;
             static std::atomic<uint64_t> pressure_flushes{0};
@@ -10721,7 +10727,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
-        prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd =
             fragment_draw_batch ? fragment_draw_batch->draw(di, draws[di]) : draws[di];
@@ -16151,6 +16156,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         backend_render_timing_stats_storage() = {};
         if (!all.empty())
             backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
+        prosper::gpu::refuse_draw_pass(all.size(), prosper::gpu::DrawDrop::ResourceOrder);
         return {};
     }
     if (backend_segment_split_index(all, W, H, persist_depth_stencil) == all.size())
