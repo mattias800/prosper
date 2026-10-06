@@ -138,6 +138,7 @@ of its manifest.
 | Bendy and the Ink Machine | `PPSA27616` | 3 | `123---` | - | - | none | [#1178](https://github.com/mattias800/prosper/issues/1178), [#1177](https://github.com/mattias800/prosper/issues/1177) | [#1881](https://github.com/mattias800/prosper/issues/1881) | - |
 | Beneath | `PPSA27640` | 3 | `123---` | - | - | none | [#2813](https://github.com/mattias800/prosper/issues/2813), [#2815](https://github.com/mattias800/prosper/issues/2815) | [#1898](https://github.com/mattias800/prosper/issues/1898) | [`BENEATH_STATUS.md`](prosper/docs/games/BENEATH_STATUS.md) |
 | Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | - | none | [#3407](https://github.com/mattias800/prosper/issues/3407), [#2542](https://github.com/mattias800/prosper/issues/2542), [#2690](https://github.com/mattias800/prosper/issues/2690), [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md) |
+| MOUSE: P.I. For Hire | `PPSA26578` | 3 | `123---` | - | - | - | [#4620](https://github.com/mattias800/prosper/issues/4620), [#4612](https://github.com/mattias800/prosper/issues/4612), [#4554](https://github.com/mattias800/prosper/issues/4554) | [#4556](https://github.com/mattias800/prosper/issues/4556) | [`MOUSE_PI_STATUS.md`](prosper/docs/games/MOUSE_PI_STATUS.md) |
 | R-Type Delta: HD Boosted | `PPSA26414` | 3 | `123---` | - | - | none | [#1746](https://github.com/mattias800/prosper/issues/1746), [#1591](https://github.com/mattias800/prosper/issues/1591) | [#1810](https://github.com/mattias800/prosper/issues/1810) | [`R_TYPE_DELTA_STATUS.md`](prosper/docs/games/R_TYPE_DELTA_STATUS.md) |
 | Rayman 30th Anniversary Edition | `PPSA33016` | 3 | `123---` | - | - | - | - | [#4552](https://github.com/mattias800/prosper/issues/4552) | - |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/games/SYBERIA_STATUS.md) |
@@ -153,7 +154,6 @@ of its manifest.
 | Hi-Fi RUSH | `PPSA17168` | 2 | `12----` | **0.5** fps · 9% active · 4K · title screen, default launch, no pad · tools/screenshot · 2026-08-21 | - | none | - | [#2891](https://github.com/mattias800/prosper/issues/2891) | - |
 | Kena: Bridge of Spirits | `PPSA01802` | 2 | `12----` | - | - | - | [#2147](https://github.com/mattias800/prosper/issues/2147) | [#3787](https://github.com/mattias800/prosper/issues/3787) | [`KENA_STATUS.md`](prosper/docs/games/KENA_STATUS.md) |
 | Little Nightmares III | `PPSA05143` | 2 | `12----` | - | - | none | [#2014](https://github.com/mattias800/prosper/issues/2014), [#2022](https://github.com/mattias800/prosper/issues/2022), [#2028](https://github.com/mattias800/prosper/issues/2028), [#1977](https://github.com/mattias800/prosper/issues/1977) | [#1893](https://github.com/mattias800/prosper/issues/1893) | [`LITTLE_NIGHTMARES_3_STATUS.md`](prosper/docs/games/LITTLE_NIGHTMARES_3_STATUS.md) |
-| MOUSE: P.I. For Hire | `PPSA26578` | 2 | `12----` | - | - | - | [#4554](https://github.com/mattias800/prosper/issues/4554), [#4612](https://github.com/mattias800/prosper/issues/4612) | [#4556](https://github.com/mattias800/prosper/issues/4556) | - |
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/games/NIKODERIKO_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/games/SONIC_FRONTIERS_STATUS.md) |
 | Sonic Origins | `PPSA05325` | 2 | `12----` | **4.7** fps · 47% active · 4K · default launch to the boot auto-save modal · tools/screenshot · 2026-08-22 | - | none | [#2919](https://github.com/mattias800/prosper/issues/2919), [#2920](https://github.com/mattias800/prosper/issues/2920), [#2267](https://github.com/mattias800/prosper/issues/2267), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/games/GRIS_SONIC_COBRA_BRINGUP.md) |
@@ -194,8 +194,8 @@ of its manifest.
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 5 -- PS5 hardware-oracle comparison | 1 |
 | 4 -- manual visual verification | 3 |
-| 3 -- gameplay with the scene rendering | 11 |
-| 2 -- title screen | 21 |
+| 3 -- gameplay with the scene rendering | 12 |
+| 2 -- title screen | 20 |
 | 1 -- any real graphics | 5 |
 | 0 -- not started | 16 |
 
