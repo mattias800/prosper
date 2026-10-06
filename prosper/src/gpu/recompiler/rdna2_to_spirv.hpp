@@ -262,8 +262,8 @@ rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& original);
 // Conservative original-code obligation, independent of bounded admission. A refused proof
 // cannot authorize stored native modules for a READFIRST-containing numeric-load program.
 // `wave64` as for rdna2_raw_wide_data_loads. Pass it only for a launch whose width is known and
-// is the width the stage compiler will use; every site that asks this question about one draw
-// has to pass the same value.
+// is the width the stage compiler will use (rdna2_fragment_compiles_wave64); every site that
+// asks this question about one draw has to pass the same value.
 std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original,
                                                      bool wave64 = false);
 // One-hop raw x4/x8 data loads through a pointer from an earlier proven immediate load.
@@ -888,6 +888,10 @@ bool fragment_vcc_branch_is_wave_uniform_for_test(
 uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
                                                size_t program_dwords,
                                                uint64_t program_hash);
+// Whether the fragment compiler runs this program 64 lanes wide when its launch asks for 64.
+// False only for the legacy capture above. `program_dwords` is the span rdna2_walk consumed, the
+// same span the compiler hashes.
+bool rdna2_fragment_compiles_wave64(const uint32_t* code, size_t program_dwords);
 
 // Recompiled fragment wave operations use native Vulkan subgroup instructions and therefore require
 // an exact guest-wave subgroup. Returns zero for ordinary modules and 32/64 for that contract.

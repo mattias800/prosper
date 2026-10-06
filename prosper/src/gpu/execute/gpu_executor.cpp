@@ -7063,10 +7063,10 @@ OwnedSnapshotNeeds owned_snapshot_needs(const GpuState& state,
                 needs.other = true;
                 continue;
             }
-            waves = !decoded->raw_wave_wide_data_load_pcs.empty();
+            waves = decoded->requires_owned_waves(fragment && !render.ps_wave32);
             needs.other |= !decoded->owned_nested_wide_chains.empty();
         } else {
-            waves = graphics_program_requires_owned_waves(address);
+            waves = graphics_program_requires_owned_waves(address, fragment && !render.ps_wave32);
             const auto* header = static_cast<const AgcShaderHeader*>(
                 prosper_agc_shader_header_for_code(address));
             const auto words = header ? registered_shader_dwords(*header, address) : 0;
