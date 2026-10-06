@@ -98,8 +98,8 @@ struct NggSubgroupDrawRequest {
 // a set other than 0 and 2), ngg-draw-geometry-unavailable (the route needs a geometry stage that
 // could not be built), ngg-draw-push-constants (the words disagree with the shell configuration),
 // ngg-interpolation-geometry-needs-triangles (an interpolation stage for a line list).
-std::shared_ptr<const NggSubgroupDraw> build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
-                                                               std::string* refusal = nullptr);
+std::shared_ptr<const NggSubgroupDraw>
+build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refusal = nullptr);
 
 // The set-0 bindings a shell module declares, or false when it declares anything the backend
 // cannot bind as a plain storage buffer (see ngg-draw-guest-resource-unsupported).

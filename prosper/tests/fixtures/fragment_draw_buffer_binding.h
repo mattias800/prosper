@@ -23,9 +23,10 @@ private:
                           std::shared_ptr<const void> owner, VkDeviceSize offset = 0)
         : device_(device), buffer_(buffer), offset_(offset), bytes_(bytes),
           owner_(std::move(owner)) {}
-    static std::shared_ptr<const FragmentDrawGpuBuffer>
-    view(VkDevice device, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes,
-         std::shared_ptr<const void> owner) {
+    static std::shared_ptr<const FragmentDrawGpuBuffer> view(VkDevice device, VkBuffer buffer,
+                                                             VkDeviceSize offset,
+                                                             VkDeviceSize bytes,
+                                                             std::shared_ptr<const void> owner) {
         return std::shared_ptr<const FragmentDrawGpuBuffer>(
             new FragmentDrawGpuBuffer(device, buffer, bytes, std::move(owner), offset));
     }

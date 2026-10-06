@@ -78,8 +78,8 @@ bool ngg_shell_guest_bindings(const std::vector<uint32_t>& spirv, std::vector<ui
     return true;
 }
 
-std::shared_ptr<const NggSubgroupDraw> build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
-                                                               std::string* refusal) {
+std::shared_ptr<const NggSubgroupDraw>
+build_ngg_subgroup_draw(const NggSubgroupDrawRequest& request, std::string* refusal) {
     auto draw = std::make_shared<NggSubgroupDraw>();
     draw->plan = plan_ngg_subgroups(request.shape, request.limits, request.budget);
     if (!draw->plan.ok()) return fail(refusal, "ngg-draw-plan " + draw->plan.refusal);
@@ -127,8 +127,7 @@ std::shared_ptr<const NggSubgroupDraw> build_ngg_subgroup_draw(const NggSubgroup
                 return fail(refusal, "ngg-draw-guest-resource-unsupported");
         } else {
             std::vector<uint32_t> bindings;
-            if (!same_layout(layout, draw->layout))
-                return fail(refusal, "ngg-draw-layout-varies");
+            if (!same_layout(layout, draw->layout)) return fail(refusal, "ngg-draw-layout-varies");
             if (!ngg_shell_guest_bindings(group.shell, &bindings) ||
                 bindings != draw->guest_bindings)
                 return fail(refusal, "ngg-draw-guest-resource-unsupported");

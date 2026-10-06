@@ -8533,7 +8533,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     std::vector<BackendDraw> ngg_draws;   // #3135 P4: each merged-NGG draw becomes its run draws
     std::shared_ptr<NggSubgroupBackendBatch> ngg_batch;
-    if (std::any_of(draws.begin(), draws.end(), [](const auto& d) { return bool(d.ngg_subgroup); })) {
+    if (std::any_of(draws.begin(), draws.end(),
+                    [](const auto& d) { return bool(d.ngg_subgroup); })) {
         std::string refusal;
         if (!NggSubgroupBackendBatch::expand(ctx, draws, ngg_draws, ngg_batch, refusal)) {
             std::fprintf(stderr, "[ngg-backend] refused pass %s\n", refusal.c_str());
@@ -16368,10 +16369,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         BackendMrtOutputs* segment_mrt = mrt_outputs
             ? (final ? mrt_outputs : &intermediate_mrt) : nullptr;
         std::vector<uint8_t> rendered = render_draw_pass_rgba(
-            all.subspan(begin, end - begin), W, H, next_seed0,
-            begin ? nullptr : clear_rgba, persist_depth_stencil, segment_target_ptr, next_seed1,
-            begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
-            final ? flush_submission_batch : false, all,
+            all.subspan(begin, end - begin), W, H, next_seed0, begin ? nullptr : clear_rgba,
+            persist_depth_stencil, segment_target_ptr, next_seed1, begin ? nullptr : clear_rgba1,
+            segment_out1, submission_batch, final ? flush_submission_batch : false, all,
             segment_mrt, want_color_readback);
         add_stats();
 
