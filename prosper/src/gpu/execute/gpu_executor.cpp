@@ -368,8 +368,9 @@ private:
     bool nested_ = false;
 };
 
-} // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
-  // the HLE diagnostic probes that chase raw guest pointers)
+}   // namespace
+// guest_readable below has external linkage — declared in gpu_execute.hpp, shared with the HLE
+// diagnostic probes that chase raw guest pointers.
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. Shared with the
