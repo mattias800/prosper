@@ -43,4 +43,4 @@ namespace prosper {
 // has returned and the host's own %fs is back in place, so the caller may log and take locks again.
 void call_guest_callback(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t guest_fs);
 
-}  // namespace prosper
+}   // namespace prosper

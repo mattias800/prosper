@@ -171,7 +171,7 @@ HLE(np_register_state_callback_a) {
     const int slot = g_np_callbacks.add(a0, a1, /*refuse_duplicate=*/true);
     if (slot == StateCallbackTable::kDuplicate) return sce_err(kNpErrCallbackAlreadyRegistered);
     if (slot < 0) return sce_err(kNpErrCallbackMax);
-    return static_cast<uint64_t>(slot + 1);
+    return static_cast<uint64_t>(slot) + 1;
 }
 
 // sceNpUnregisterStateCallbackA(int id) -> SCE_OK, freeing the slot.
@@ -201,12 +201,12 @@ PROSPER_HLE_ENTRY_WITH_GUEST_FS(prosper_np_check_callback_entry, prosper_np_chec
 
 #undef HLE
 
-}  // namespace
+}   // namespace
 
 void register_state_callbacks_hle() {
     auto reg = [](const char* name, HleFn fn) { Hle::register_fn(nid_hash(name), fn, name); };
     reg("sceNetCtlRegisterCallback",
-        reinterpret_cast<HleFn>(netctl_register_callback));  // UJ+Z7Q+4ck0
+        reinterpret_cast<HleFn>(netctl_register_callback));   // UJ+Z7Q+4ck0
     reg("sceNetCtlUnregisterCallback",
         reinterpret_cast<HleFn>(netctl_unregister_callback));   // Rqm2OnZMCz0
     reg("sceNetCtlCheckCallback",
