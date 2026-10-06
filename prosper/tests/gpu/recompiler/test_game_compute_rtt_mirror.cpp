@@ -1595,6 +1595,155 @@ static int run_destination_mirror_regression() {
                   "control: the 2D-only shape rule keeps one-layer arrays on CPU publication");
         }
     }
+    // R8Unorm (one 8-bit channel) is the same destination-mirror shape as RGBA8: the shader writes a
+    // native R8_UNORM storage image and the renderer's R8_UNORM image seeds and receives it by an
+    // exact copy, so a one-channel result no longer round-trips through the CPU (it used to be
+    // declined as "format-no-seed-path"). Rows are 256 texels = 256 bytes, GFX10's linear pitch.
+    {
+        constexpr uint32_t RW = 256, RH = 4;
+        std::vector<uint8_t> r8_guest(RW * RH, 0x9d);
+        const uint64_t r8_address = reinterpret_cast<uint64_t>(r8_guest.data());
+        DrawItem r8_producer = producer;
+        r8_producer.color0_base = r8_address;
+        r8_producer.color0_width = RW; r8_producer.color0_height = RH;
+        r8_producer.ps.color0_format = VK_FORMAT_R8_UNORM;
+        CHECK(!render_submit_items({r8_producer}, RW, RH).empty(),
+              "R8 destination mirror producer materializes a renderer target");
+        auto r8_cpu_newer = std::make_shared<std::vector<uint8_t>>(RW * RH, 0x11);
+        notify_live_render_target_image_written(
+            {r8_address, RW, RH, LiveTargetPixelFormat::R8Unorm, std::move(r8_cpu_newer)});
+        LiveTargetImageRequest r8_request{};
+        r8_request.width = RW; r8_request.height = RH;
+        LiveTargetImageImport r8_import;
+        CHECK(!import_live_render_target_image(r8_address, r8_request, r8_import),
+              "CPU-newer R8 target is refused as a strict source before its first mirror");
+
+        static const uint32_t store_zero_r8[] = {
+            0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
+            0x7E000280u,              // R=0
+            0xF0200108u, 0x00020004u, // image_store v0 (dmask R) at v4,v5 through s[8:15]
+            0xBF810000u,
+        };
+        static const uint32_t store_half_r8[] = {
+            0x7E080300u, 0x7E0A0301u,
+            0x7E0002F0u,              // R=0.5
+            0xF0200108u, 0x00020004u,
+            0xBF810000u,
+        };
+        ShaderResource r8_output{};
+        r8_output.cls = ResourceClass::StorageImage; r8_output.format = DataFormat::Unorm8;
+        r8_output.num_components = 1; r8_output.binding = 5; r8_output.sgpr_base = 8;
+        r8_output.img_dim = 1; r8_output.width = RW; r8_output.height = RH; r8_output.depth = 1;
+        r8_output.gpu_addr = r8_address; r8_output.size = static_cast<uint32_t>(r8_guest.size());
+        ShaderResourceTable r8_table; r8_table.resources.push_back(r8_output);
+        ComputeShaderConfig r8_config;
+        r8_config.user_sgprs.resize(16); r8_config.local_x = RW; r8_config.local_y = RH; r8_config.local_z = 1;
+        r8_config.threads_x = RW; r8_config.threads_y = RH; r8_config.threads_z = 1;
+        r8_config.tidig_comp_cnt = 1;
+        r8_config.native_storage_format_support = native_storage_format_support_bit(DataFormat::Unorm8, 1);
+        const auto r8_full_spirv = recompile_compute(
+            store_zero_r8, std::size(store_zero_r8), &r8_table, r8_config);
+        // The partial writer's workgroup is one row tall (the shader's local size comes from its config).
+        ComputeShaderConfig r8_row_config = r8_config;
+        r8_row_config.local_y = 1; r8_row_config.threads_y = 1;
+        const auto r8_half_spirv = recompile_compute(
+            store_half_r8, std::size(store_half_r8), &r8_table, r8_row_config);
+        CHECK(!r8_full_spirv.empty() && !r8_half_spirv.empty(), "R8 storage writers recompile");
+        ComputeItem r8_full;
+        r8_full.spirv = r8_full_spirv;
+        r8_full.resources = std::make_shared<ShaderResourceTable>(r8_table);
+        r8_full.launch.threads_x = RW; r8_full.launch.threads_y = RH; r8_full.launch.threads_z = 1;
+        r8_full.launch.local_x = RW; r8_full.launch.local_y = RH; r8_full.launch.local_z = 1;
+        r8_full.launch.groups_x = r8_full.launch.groups_y = r8_full.launch.groups_z = 1;
+        r8_full.code_addr = 0x37310021u;
+
+        // 1. a failed completion must not leave readable authority (same contract as RGBA8).
+        const auto r8_fail_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+        CHECK(!prosper::frontend::execute_live_compute_items({r8_full}),
+              "failed R8 completion is reported");
+        const auto r8_fail_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(r8_fail_after.borrowed == r8_fail_before.borrowed + 1 &&
+                  r8_fail_after.failed == r8_fail_before.failed + 1 &&
+                  r8_fail_after.published == r8_fail_before.published &&
+                  !import_live_render_target_image(r8_address, r8_request, r8_import),
+              "failed R8 destination write never restores readable renderer authority");
+
+        // 2. a full overwrite is mirrored GPU-side and equals the guest bytes bit for bit.
+        const auto r8_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({r8_full}),
+              "R8 full-overwrite dispatch completes into an invalid renderer destination");
+        const auto r8_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(r8_after.candidates == r8_before.candidates + 1 &&
+                  r8_after.borrowed == r8_before.borrowed + 1 &&
+                  r8_after.published == r8_before.published + 1 &&
+                  r8_after.failed == r8_before.failed,
+              "R8 result is a destination-mirror candidate and publishes after writeback");
+        CHECK(std::all_of(r8_guest.begin(), r8_guest.end(), [](uint8_t b) { return b == 0; }),
+              "R8 full overwrite wrote 0 to every guest byte");
+        CHECK(import_live_render_target_image(r8_address, r8_request, r8_import) && r8_import.valid() &&
+                  r8_import.format == LiveTargetPixelFormat::R8Unorm &&
+                  r8_import.native_format == VK_FORMAT_R8_UNORM,
+              "completed R8 mirror leaves a readable R8_UNORM renderer image");
+        release_live_render_target_image(r8_address);
+        std::vector<uint8_t> r8_pixels;
+        std::string r8_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  r8_address, RW, RH, VK_FORMAT_R8_UNORM, r8_pixels, r8_error) &&
+                  r8_pixels == r8_guest,
+              "R8 renderer image equals the completed guest bytes");
+
+        // 3. a partial writer is seeded from the renderer image: repaint the renderer target
+        // differently from the stale guest bytes, write only row zero, rows below must be the seed.
+        CHECK(!render_submit_items({r8_producer}, RW, RH).empty(),
+              "R8 renderer repaints its target before the partial writer");
+        std::vector<uint8_t> r8_seed;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  r8_address, RW, RH, VK_FORMAT_R8_UNORM, r8_seed, r8_error) &&
+                  r8_seed.size() == r8_guest.size() &&
+                  !std::equal(r8_seed.begin() + RW, r8_seed.end(), r8_guest.begin() + RW),
+              "R8 renderer seed differs from the stale guest rows");
+        ComputeItem r8_partial = r8_full;
+        r8_partial.spirv = r8_half_spirv;
+        r8_partial.launch.threads_y = r8_partial.launch.local_y = r8_partial.launch.groups_y = 1;
+        r8_partial.code_addr = 0x37310022u;
+        const auto r8_seed_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({r8_partial}),
+              "R8 partial writer completes from the renderer GPU seed");
+        const auto r8_seed_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(r8_seed_after.r8_source_seed_recorded == r8_seed_before.r8_source_seed_recorded + 1 &&
+                  r8_seed_after.published == r8_seed_before.published + 1 &&
+                  r8_seed_after.failed == r8_seed_before.failed,
+              "R8 partial writer records an exact GPU seed copy and publishes");
+        CHECK(std::equal(r8_guest.begin() + RW, r8_guest.end(), r8_seed.begin() + RW) &&
+                  std::all_of(r8_guest.begin(), r8_guest.begin() + RW,
+                              [](uint8_t b) { return b == 127 || b == 128; }),
+              "R8 partial writer writes 0.5 to row zero and preserves the GPU-seeded rows");
+        CHECK(prosper::test::readback_persistent_color_target(
+                  r8_address, RW, RH, VK_FORMAT_R8_UNORM, r8_pixels, r8_error) &&
+                  r8_pixels == r8_guest,
+              "R8 renderer image equals the guest bytes after the partial result");
+
+        // 4. control: a shader that does NOT use native R8 storage must keep the CPU path. The
+        // mirror gate is "native storage AND R8", so this is declined before any borrow.
+        ComputeShaderConfig raw_config = r8_config;
+        raw_config.native_storage_format_support = 0;
+        const auto r8_raw_spirv = recompile_compute(
+            store_zero_r8, std::size(store_zero_r8), &r8_table, raw_config);
+        CHECK(!r8_raw_spirv.empty(), "raw (non-native) R8 storage writer recompiles");
+        ComputeItem r8_raw = r8_full;
+        r8_raw.spirv = r8_raw_spirv;
+        r8_raw.code_addr = 0x37310023u;
+        const auto r8_raw_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({r8_raw}),
+              "raw R8 storage writer still completes through the CPU path");
+        const auto r8_raw_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(r8_raw_after.borrowed == r8_raw_before.borrowed &&
+                  r8_raw_after.published == r8_raw_before.published &&
+                  std::all_of(r8_guest.begin(), r8_guest.end(), [](uint8_t b) { return b == 0; }),
+              "raw R8 storage is not mirrored but its guest bytes are still correct");
+    }
+
     return fails ? 1 : 0;
 }
 
