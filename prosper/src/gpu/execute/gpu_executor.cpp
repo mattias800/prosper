@@ -5210,8 +5210,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // the operation-class rule and admits only sampled reads as null Textures, while
                     // stores and atomics remain fail-visible. A partially-zero/nonzero seed still has
                     // to satisfy the normal image checks and cannot enter through this exception.
-                    // #4592: the same holds for any T# whose sampled reads are constant zero (see
-                    // t8_samples_constant_zero); the all-zero descriptor is one such.
+                    // #4592: for texel reads the same holds for any T# whose selected channels are
+                    // constant zero; t8_is_null_for_op applies the rule the consuming op allows.
                     const bool exact_null_seed =
                         seed_provenance && live_t8_known &&
                         t8_is_null_for_op(live_t8, mimg_op_returns_selected_texels(in.opcode));
