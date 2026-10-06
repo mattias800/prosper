@@ -22,21 +22,6 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-// Ordinary guest memory holding a linear 2D image has the GFX10 layout: each row starts at a
-// 256-byte pitch (#4606). These fixtures size such buffers to that span and compare their rows.
-constexpr size_t padded_linear_bytes(size_t row_bytes, size_t rows) {
-    return ((row_bytes + 255u) & ~size_t{255u}) * (rows - 1u) + row_bytes;
-}
-template <typename T>
-std::vector<uint8_t> gather_linear_rows(const std::vector<T>& guest, size_t row_bytes, size_t rows) {
-    const size_t pitch = (row_bytes + 255u) & ~size_t{255u};
-    std::vector<uint8_t> tight(row_bytes * rows);
-    const auto* bytes = reinterpret_cast<const uint8_t*>(guest.data());
-    for (size_t y = 0; y < rows; ++y)
-        std::memcpy(tight.data() + y * row_bytes, bytes + y * pitch, row_bytes);
-    return tight;
-}
-
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); ++fails; } } while (0)
 
 static int run_destination_mirror_regression() {
@@ -506,12 +491,7 @@ static int run_destination_mirror_regression() {
         0xF0200F08u, 0x00040004u, // ordinary 2D store through s[16:23]
         0xBF810000u,
     };
-    // The sibling is ordinary guest memory, not a renderer target, so it has the GFX10 linear
-    // layout: 8 RGBA16F texels are 64 bytes, and each row starts at a 256-byte pitch (#4606).
-    constexpr size_t kDistinctPitchWords = 256u / sizeof(uint16_t);
-    constexpr size_t kDistinctRowWords = size_t{W} * 4u;
-    std::vector<uint16_t> distinct_words(kDistinctPitchWords * (H - 1u) + kDistinctRowWords,
-                                         0x3555u);
+    std::vector<uint16_t> distinct_words(rgba16_words.size(), 0x3555u);
     for (bool reverse : {false, true}) {
         std::fill(rgba16_words.begin(), rgba16_words.end(), 0x3555u);
         std::fill(distinct_words.begin(), distinct_words.end(), 0x3555u);
@@ -546,14 +526,9 @@ static int run_destination_mirror_regression() {
         CHECK(prosper::frontend::execute_live_compute_items({mixed_item}),
               "mixed-view shader executes when its two outputs have distinct guest addresses");
         bool separate_outputs_black = true;
-        for (size_t i = 0; i < rgba16_words.size(); ++i)
-            separate_outputs_black &= rgba16_words[i] == rgba16_black[i % 4u];
-        for (size_t i = 0; i < distinct_words.size(); ++i) {
-            const size_t column = i % kDistinctPitchWords;
-            separate_outputs_black &= column < kDistinctRowWords
-                ? distinct_words[i] == rgba16_black[column % 4u]
-                : distinct_words[i] == 0x3555u;   // row padding is not part of the image
-        }
+        for (size_t i = 0; i < distinct_words.size(); ++i)
+            separate_outputs_black &= rgba16_words[i] == rgba16_black[i % 4u] &&
+                                      distinct_words[i] == rgba16_black[i % 4u];
         std::vector<uint8_t> mixed_renderer_pixels;
         std::string mixed_renderer_error;
         const bool first_renderer_black = prosper::test::readback_persistent_color_target(
@@ -725,7 +700,7 @@ static int run_destination_mirror_regression() {
     // This is Astro's hot shape: compute writes the packed image before any graphics pass
     // registers the address. A full overwrite may reserve an image, but an ordinary borrow or
     // failed completion must never make its uninitialized pixels readable.
-    std::vector<uint32_t> first_compute_r11(padded_linear_bytes(W * 4u, H) / 4u, 0xdeadbeefu);
+    std::vector<uint32_t> first_compute_r11(W * H, 0xdeadbeefu);
     const uint64_t first_compute_address =
         reinterpret_cast<uint64_t>(first_compute_r11.data());
     ShaderResourceTable first_compute_table = r11_table;
@@ -772,7 +747,9 @@ static int run_destination_mirror_regression() {
     CHECK(prosper::test::readback_persistent_color_target(
               first_compute_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
               first_compute_pixels, first_compute_error) &&
-              first_compute_pixels == gather_linear_rows(first_compute_r11, W * 4u, H),
+              first_compute_pixels.size() == first_compute_r11.size() * sizeof(uint32_t) &&
+              std::memcmp(first_compute_pixels.data(), first_compute_r11.data(),
+                          first_compute_pixels.size()) == 0,
           "first compute image equals completed packed guest words bit for bit");
     CHECK(!r11_full_spirv.empty() && prosper::frontend::execute_live_compute_items({r11_full}),
           "packed R11 first dispatch mirrors its exact words and removes CPU fallback authority");
@@ -1562,7 +1539,7 @@ static int run_destination_mirror_regression() {
         // first producer at a fresh address, so admission also exercises destination creation.
         const bool one_layer_array_disabled =
             std::getenv("PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST") != nullptr;
-        std::vector<uint8_t> array1(padded_linear_bytes(W * 4u, H), 0x5a);
+        std::vector<uint8_t> array1(W * H * 4, 0x5a);
         const uint64_t array1_address = reinterpret_cast<uint64_t>(array1.data());
         ShaderResource array1_output = output;
         array1_output.img_dim = 5;
@@ -1585,18 +1562,14 @@ static int run_destination_mirror_regression() {
               "one-layer 2D_ARRAY RGBA8 full overwrite completes");
         const auto array1_after =
             prosper::frontend::live_compute_rtt_destination_mirror_counters();
-        const std::vector<uint8_t> array1_rows = gather_linear_rows(array1, W * 4u, H);
         bool array1_black = true;
-        for (size_t i = 0; i < array1_rows.size(); i += 4)
-            array1_black &= array1_rows[i] == 0 && array1_rows[i + 1] == 0 &&
-                            array1_rows[i + 2] == 0 && array1_rows[i + 3] == 255;
-        for (size_t i = W * 4u; i < 256u; ++i)
-            array1_black &= array1[i] == 0x5a;   // row padding is not part of the image
+        for (size_t i = 0; i < array1.size(); i += 4)
+            array1_black &= array1[i] == 0 && array1[i + 1] == 0 && array1[i + 2] == 0 &&
+                            array1[i + 3] == 255;
         if (!array1_black)
             std::printf("  one-layer array guest texel0=%u,%u,%u,%u last=%u,%u,%u,%u\n",
-                        array1_rows[0], array1_rows[1], array1_rows[2], array1_rows[3],
-                        array1_rows[array1_rows.size() - 4], array1_rows[array1_rows.size() - 3],
-                        array1_rows[array1_rows.size() - 2], array1_rows.back());
+                        array1[0], array1[1], array1[2], array1[3], array1[array1.size() - 4],
+                        array1[array1.size() - 3], array1[array1.size() - 2], array1.back());
         CHECK(array1_black, "one-layer 2D_ARRAY writer still writes back exact guest bytes");
         if (!one_layer_array_disabled) {
             CHECK(array1_after.candidates == array1_before.candidates + 1 &&
@@ -1610,7 +1583,7 @@ static int run_destination_mirror_regression() {
             CHECK(prosper::test::readback_persistent_color_target(
                       array1_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, array1_pixels,
                       array1_error) &&
-                      array1_pixels == array1_rows,
+                      array1_pixels == array1,
                   "one-layer 2D_ARRAY mirror pixels equal the exact guest writeback");
         } else {
             CHECK(array1_after.candidates == array1_before.candidates &&

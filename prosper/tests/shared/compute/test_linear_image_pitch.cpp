@@ -1,16 +1,17 @@
 // test_linear_image_pitch -- which linear images the compute backend must read row by row.
 //
-// THE DEFECT. GFX10 pads a linear image's rows to 256 bytes (a 1920-wide R8 plane is 2048 bytes per
-// row). The graphics upload honoured that; the compute upload read the rows as tight, so each row
-// started 128 bytes early and the padding showed as a diagonal band. Black Flag's warning-screen
-// video planes (1920x1080 R8) came out in green stripes.
+// THE DEFECT. AvPlayer publishes 1920-wide R8 planes at a 2048-byte row pitch. The compute upload
+// read the rows as tight, so each row started 128 bytes early and the padding showed as a diagonal
+// band (Black Flag's warning-screen video planes came out in green stripes). The pitch is honoured
+// only where the guest STATES it; it is never inferred from the 256-byte alignment (#4606).
 //
 // WHAT EACH TEST KILLS:
-//   PaddedPlaneHasTheAlignedPitch   the 256-byte rule is not applied (the original defect)
-//   AlignedRowsAreTight             an already-aligned width gets a pitch, repacking needlessly
-//   ExplicitAndRegisteredPitchWin   a pitch the descriptor or an HLE producer states is overridden
-//   OnlyPlainLinear2dQualifies      the rule leaks onto tiled, layered, mipped, compressed or
-//                                   host-owned images, which have their own layouts
+//   UnstatedPitchIsTight            the 256-byte alignment is inferred for an image nobody padded,
+//                                   giving it a layout renderer targets and the presenter do not use
+//   RegisteredPitchIsHonoured       an HLE registration (AvPlayer) is ignored: the original defect
+//   DescriptorPitchIsHonoured       the descriptor's own pitch is ignored or loses to a registration
+//   OnlyPlainLinear2dQualifies      a stated pitch leaks onto tiled, layered, mipped or compressed
+//                                   images, which have their own layouts
 #include "shared/compute/linear_image_pitch.hpp"
 
 #include <gtest/gtest.h>
@@ -37,44 +38,58 @@ ShaderResource r8_plane(uint32_t width) {
 
 }   // namespace
 
-TEST(LinearImagePitch, PaddedPlaneHasTheAlignedPitch) {
-    EXPECT_EQ(compute_linear_row_pitch(r8_plane(1920), 1), 2048u);
+TEST(LinearImagePitch, UnstatedPitchIsTight) {
+    // No inference from the GFX10 256-byte alignment: an unregistered 1920-wide plane is tight.
+    EXPECT_EQ(compute_linear_row_pitch(r8_plane(1920), 1), 0u);
     ShaderResource rgba = r8_plane(100);
     rgba.num_components = 4;
-    EXPECT_EQ(compute_linear_row_pitch(rgba, 4), 512u) << "400 bytes round up to 512";
-    ShaderResource one_layer_array = r8_plane(1920);
+    EXPECT_EQ(compute_linear_row_pitch(rgba, 4), 0u) << "400-byte rows with no stated pitch";
+}
+
+TEST(LinearImagePitch, RegisteredPitchIsHonoured) {
+    constexpr uint64_t base = 0x7000000000ull;
+    register_guest_linear_texture_layout(base, 1u << 20, 2048);
+    ShaderResource plane = r8_plane(1920);
+    plane.gpu_addr = base + 0x1000;
+    EXPECT_EQ(compute_linear_row_pitch(plane, 1), 2048u) << "an AvPlayer-style registration";
+    ShaderResource one_layer_array = plane;
     one_layer_array.img_dim = 5;
     EXPECT_EQ(compute_linear_row_pitch(one_layer_array, 1), 2048u);
+    ShaderResource wider = r8_plane(1920);
+    wider.gpu_addr = base;
+    wider.num_components = 2;   // 3840-byte rows do not fit a 2048-byte registered pitch
+    EXPECT_EQ(compute_linear_row_pitch(wider, 2), 0u);
+    unregister_guest_linear_texture_layout(base);
+    EXPECT_EQ(compute_linear_row_pitch(plane, 1), 0u) << "the pitch goes with the registration";
 }
 
-TEST(LinearImagePitch, AlignedRowsAreTight) {
-    EXPECT_EQ(compute_linear_row_pitch(r8_plane(1024), 1), 0u);
-    EXPECT_EQ(compute_linear_row_pitch(r8_plane(3840), 1), 0u) << "3840 bytes is 15 x 256";
-}
-
-TEST(LinearImagePitch, ExplicitAndRegisteredPitchWin) {
+TEST(LinearImagePitch, DescriptorPitchIsHonoured) {
     ShaderResource explicit_pitch = r8_plane(1920);
     explicit_pitch.linear_row_pitch_bytes = 4096;
     EXPECT_EQ(compute_linear_row_pitch(explicit_pitch, 1), 4096u);
+    static uint8_t bytes[4] = {};
+    explicit_pitch.host_data = bytes;
+    EXPECT_EQ(compute_linear_row_pitch(explicit_pitch, 1), 4096u)
+        << "a replay resource keeps its capture-resolved pitch";
 
     ShaderResource tight_declared = r8_plane(1920);
     tight_declared.linear_row_pitch_bytes = 1920;
     EXPECT_EQ(compute_linear_row_pitch(tight_declared, 1), 0u)
         << "an explicit tight pitch is tight";
 
-    constexpr uint64_t base = 0x7000000000ull;
+    constexpr uint64_t base = 0x7100000000ull;
     register_guest_linear_texture_layout(base, 1u << 20, 3072);
-    ShaderResource registered = r8_plane(1920);
-    registered.gpu_addr = base + 0x1000;
-    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 3072u)
-        << "an HLE-registered pitch outranks the rule";
+    ShaderResource both = r8_plane(1920);
+    both.gpu_addr = base;
+    both.linear_row_pitch_bytes = 4096;
+    EXPECT_EQ(compute_linear_row_pitch(both, 1), 4096u) << "the descriptor outranks a registration";
     unregister_guest_linear_texture_layout(base);
-    EXPECT_EQ(compute_linear_row_pitch(registered, 1), 2048u);
 }
 
 TEST(LinearImagePitch, OnlyPlainLinear2dQualifies) {
     auto expect_tight = [](const char* why, auto&& edit) {
         ShaderResource r = r8_plane(1920);
+        r.linear_row_pitch_bytes = 2048;   // a stated pitch the shape must still refuse
         edit(r);
         EXPECT_EQ(compute_linear_row_pitch(r, 1), 0u) << why;
     };
@@ -91,8 +106,5 @@ TEST(LinearImagePitch, OnlyPlainLinear2dQualifies) {
     expect_tight("multisampled", [](ShaderResource& r) { r.sample_count = 4; });
     expect_tight("block compressed", [](ShaderResource& r) { r.format = DataFormat::Bc1; });
     expect_tight("buffer", [](ShaderResource& r) { r.cls = ResourceClass::ConstantBuffer; });
-    static uint8_t bytes[4] = {};
-    expect_tight("replay-owned bytes keep their capture's pitch",
-                 [](ShaderResource& r) { r.host_data = bytes; });
     expect_tight("zero width", [](ShaderResource& r) { r.width = 0; });
 }

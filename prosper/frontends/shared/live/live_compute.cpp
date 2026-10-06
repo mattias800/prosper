@@ -107,14 +107,15 @@ extern "C" uint64_t prosper_vo_buffer_addr(int i);
 
 namespace {
 // The row pitch of a guest-backed linear 2D image's bytes, for BOTH the sampled and the storage
-// side of the compute backend, so a compute producer and a compute consumer agree (#4606).
-// compute_linear_row_pitch applies the GFX10 256-byte rule. Two kinds of memory keep the tight
-// layout prosper has always used for them, because another part of prosper owns those bytes and
-// reads them tight: a renderer-owned colour target (its current pixels come from the renderer, and
-// test_game_compute_rtt_mirror pins its guest bytes as tight rows) and a registered VideoOut
-// display buffer (the presenter reads width x height x 4 with no pitch; test_compute_scanout).
-// CONFIDENCE: MED for the 256-byte rule (it is the graphics path's); LOW on whether hardware pads
-// those two cases too -- that question is recorded on #4606.
+// side of the compute backend, so a compute producer and a compute consumer agree (#4606). Only a
+// pitch the guest STATED counts (compute_linear_row_pitch: the descriptor's pitch field or an HLE
+// registration such as AvPlayer's planes); nothing is inferred. Two kinds of memory keep tight rows
+// even then, because another part of prosper owns those bytes and reads them tight: a
+// renderer-owned colour target and a registered VideoOut display buffer (the presenter reads
+// width x height x 4). A stated-pitch result is never mirrored into a new renderer target either
+// (exact_result_verdict's LinearPitch decline), so one address keeps one layout across dispatches.
+// CONFIDENCE: HIGH that a stated pitch is the guest's layout; MED that the two exemptions never
+// meet a stated pitch on a real title (none is measured).
 size_t live_guest_row_pitch(const prosper::gpu::ShaderResource& r, uint32_t bytes_per_texel,
                             bool renderer_owned) {
     const size_t pitch = prosper::frontend::compute_linear_row_pitch(r, bytes_per_texel);
@@ -4051,8 +4052,8 @@ struct BoundImage {
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
     bool direct_storage_detile_used = false;
-    // A guest-backed linear 2D image whose rows the guest pads to the GFX10 256-byte pitch
-    // (live_guest_row_pitch): bytes between row starts in guest memory, or 0 for tight rows. The
+    // A guest-backed linear 2D image whose row pitch the guest stated (live_guest_row_pitch):
+    // bytes between row starts in guest memory, or 0 for tight rows. The
     // sampled upload and the storage seed gather rows from this pitch; the CPU storage writeback
     // scatters them back to it.
     size_t guest_row_pitch = 0;
@@ -10944,7 +10945,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (r->in_mip_tail) return ExactResultDecline::MipTail;
             if (r->mip_chain_base_level) return ExactResultDecline::MipBaseLevel;
             if (r->layer_mip_offset_bytes) return ExactResultDecline::LayerMipOffset;
-            if (r->linear_row_pitch_bytes) return ExactResultDecline::LinearPitch;
+            // A stated pitch (descriptor or HLE registration) keeps the guest layout padded; the
+            // renderer's targets are tight, so mirroring would change this address's layout.
+            if (r->linear_row_pitch_bytes || bi.guest_row_pitch) return ExactResultDecline::LinearPitch;
             if (r->layer_stride_bytes) return ExactResultDecline::LayerStride;
             if (!r->width || !r->height) return ExactResultDecline::ZeroExtent;
             if (!staging[i]) return ExactResultDecline::NoStaging;
