@@ -199,7 +199,7 @@ file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-tab
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
 file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
-test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
+test-dep|prosper/frontends/shared/live/live_renderer.cpp 74  # +1 #4625: the volume publisher reads a claimed 3D target back (readback_persistent_color_target); a compute dispatch consumes the published bytes
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.hpp 2

@@ -15,6 +15,7 @@
 #include "gpu/diagnostics/pass_break_census.hpp"         // why a pass stopped accepting draws
 #include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
 #include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
+#include "gpu/execute/renderer_volume_publication.hpp"   // #4625: a claimed volume's native layout
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -148,6 +149,8 @@ struct RttSurf {
     // current 2D pixels, but cannot make the other volume slices valid guest bytes.
     uint64_t volume_guest_bytes = 0;
     bool volume_footprint_proven = false;
+    // The native layout the producer wrote, so the claim can be published to guest memory (#4625).
+    prosper::gpu::VolumeGuestLayout volume_layout;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     // Raw guest CB_COLOR format before backend_color_format() canonicalizes the Vulkan attachment.
     // Consumers need this to compose their T# DST_SEL with the host image's component order.
