@@ -53,7 +53,7 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
     const uint32_t prim_limit = std::min(
         {limits.gs_prims_per_subgroup, limits.prim_group_size,
          limits.gs_max_vert_out ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out : 0u});
-    const uint32_t es_limit = limits.vert_group_size >= 256u
+    const uint32_t es_limit = limits.vert_group_size == 256u
                                   ? limits.es_verts_per_subgroup
                                   : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
     const uint32_t max_waves = std::min(budget.max_waves_per_subgroup, 15u);

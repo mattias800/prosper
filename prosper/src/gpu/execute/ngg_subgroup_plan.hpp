@@ -40,7 +40,7 @@ struct NggSubgroupLimits {
     uint32_t prim_group_size = 0;   // GE_CNTL.PRIM_GRP_SIZE [8:0]
     // GE_CNTL.VERT_GRP_SIZE [17:9]. Taken as an ES-vertex limit (radv writes its NGG ES-vertex count
     // here; gfx11 renames the field VERTS_PER_SUBGRP). radv writes 256 to mean "vertex grouping off",
-    // which the planner reads as no extra limit; 0 (tessellation) leaves no usable limit and refuses.
+    // which the planner reads as no extra limit (exactly 256; other values are a limit); 0 (tessellation) leaves no usable limit and refuses.
     uint32_t vert_group_size = 0;
     uint32_t max_out_verts_per_subgroup = 0;   // GE_MAX_OUTPUT_PER_SUBGROUP [9:0]
     uint32_t gs_max_vert_out = 0;   // VGT_GS_MAX_VERT_OUT [10:0]
