@@ -73,7 +73,8 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     if (layout_out) *layout_out = {};
     const uint32_t push_words = config.user_sgprs + (config.user_data_address_known ? 2u : 0u);
     if (!linked_code || !dwords || config.waves == 0 || config.waves > kMaxShellWaves ||
-        config.lds_bytes > 65536u || config.user_sgprs > 98u || push_words > kMaxPushWords) {
+        config.rsrc2_gs_lds_size > kNggMaxLdsGranules || config.user_sgprs > 98u ||
+        push_words > kMaxPushWords) {
         fail(refusal, diagnostic, "ngg-shell-config");
         return {};
     }
@@ -105,6 +106,15 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
         fail(refusal, diagnostic, "ngg-lds-float-minmax-unsupported");
         return {};
     }
+    // LDS without a size would silently get the builder's 16 KiB default, and an address past
+    // a too-small allocation is undefined behaviour in Vulkan, not zeros.
+    const bool uses_lds = std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::DS && !in.ds_gds;
+    });
+    if (uses_lds && config.rsrc2_gs_lds_size == 0) {
+        fail(refusal, diagnostic, "ngg-shell-config", "cause=lds-unsized");
+        return {};
+    }
     const bool has_barrier = std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::SOPP && in.opcode == kSoppOpcodeBarrier;
     });
@@ -127,7 +137,7 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     b.diagnostic = diagnostic;
     b.ngg_workgroup_shell = true;
     b.shell_io_descriptor_set = kNggShellDescriptorSet;
-    if (config.lds_bytes) b.lds_dwords = std::max(1u, (config.lds_bytes + 3u) / 4u);
+    if (config.rsrc2_gs_lds_size) b.lds_dwords = config.rsrc2_gs_lds_size * kNggLdsGranuleDwords;
     b.native_subgroup_size = config.native_wave64 ? kGuestWaveLanes : 0u;
     b.begin(kNggLaunchWordsPerLane, resources, local, 1, 1, kGuestWaveLanes, push_words,
             /*raw_word_output*/ true, /*raw_word_input*/ true);
@@ -200,6 +210,19 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     const uint32_t block_base = b.ibin(Op_IMul, b.groupid[0], b.uconst(block_words));
     const uint32_t guest_lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(63));
     const uint32_t guest_wave = b.ibin(Op_ShiftRightLogical, b.linear_localid, b.uconst(6));
+    // The launch must describe this shell: a wave whose s3 disagrees on W or on its own index
+    // marks the block invalid rather than producing triangles sized for another subgroup.
+    {
+        const uint32_t s3 = rs.sreg[3];
+        const uint32_t waves_field = b.ibin(Op_ShiftRightLogical, s3, b.uconst(28));
+        const uint32_t index_field =
+            b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, s3, b.uconst(24)), b.uconst(0xfu));
+        const uint32_t mismatch = b.lor(b.ucmp(Op_INotEqual, waves_field, b.uconst(config.waves)),
+                                        b.ucmp(Op_INotEqual, index_field, guest_wave));
+        emit_if(b, b.land(b.ucmp(Op_IEqual, guest_lane, b.uconst(0)), mismatch), [&] {
+            atomic_increment(b, b.ibin(Op_IAdd, block_base, b.uconst(kNggHeaderLaunchMismatches)));
+        });
+    }
 
     std::string emit_refusal;
     bool saw_export = false;

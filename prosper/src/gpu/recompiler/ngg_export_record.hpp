@@ -9,10 +9,14 @@
 //   [1] prims_alloc        GS_ALLOC_REQ M0[23:12] (prims start at bit 12)
 //   [2] alloc_requests     how many times wave 0 sent GS_ALLOC_REQ (atomic count)
 //   [3] stray_requests     how many times any OTHER wave sent it (atomic count)
-//   [4 + t * words_per_lane ...]  the record of subgroup thread t = wave * 64 + lane, t < 64*W
+//   [4] launch_mismatches  how many waves launched with an s3 that disagrees with the compiled
+//                          shell: s3[31:28] != W or s3[27:24] != the wave's index (atomic count)
+//   [5 + t * words_per_lane ...]  the record of subgroup thread t = wave * 64 + lane, t < 64*W
 //
-// A block is valid only when alloc_requests == 1 and stray_requests == 0; anything else is a
-// guest-protocol violation the consumer must treat as "no primitives". The buffer is zeroed
+// A block is valid only when alloc_requests == 1, stray_requests == 0 and launch_mismatches == 0;
+// anything else is a guest-protocol or launch violation the consumer must treat as "no
+// primitives". The launch check matters because the guest sizes its own allocation from s3's wave
+// count: a block launched with the wrong W computes different triangles, not missing ones. The buffer is zeroed
 // before every dispatch (vkCmdFillBuffer), so an unwritten word is 0 and an unwritten flag bit
 // means "not exported".
 //
@@ -38,11 +42,12 @@
 namespace prosper::gpu {
 
 inline constexpr uint32_t kNggRecordAbsent = UINT32_MAX;
-inline constexpr uint32_t kNggSubgroupHeaderWords = 4;
+inline constexpr uint32_t kNggSubgroupHeaderWords = 5;
 inline constexpr uint32_t kNggHeaderVertsAlloc = 0;
 inline constexpr uint32_t kNggHeaderPrimsAlloc = 1;
 inline constexpr uint32_t kNggHeaderAllocRequests = 2;
 inline constexpr uint32_t kNggHeaderStrayRequests = 3;
+inline constexpr uint32_t kNggHeaderLaunchMismatches = 4;
 
 inline constexpr uint32_t kNggRecordFlagsWord = 0;
 inline constexpr uint32_t kNggRecordPrimWord = 1;

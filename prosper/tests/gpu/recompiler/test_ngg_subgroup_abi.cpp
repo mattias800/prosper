@@ -31,6 +31,8 @@ std::vector<uint32_t> program(std::initializer_list<uint32_t> body, bool exec_fi
     if (exec_first) code.push_back(kExecAllOnes);
     code.push_back(0x7e120280u);   // v_mov_b32 v9, 0
     code.insert(code.end(), body);
+    code.push_back(0xb07c3005u);   // s_movk_i32 m0, 0x3005
+    code.push_back(0xbf900009u);   // s_sendmsg GS_ALLOC_REQ
     code.insert(code.end(), exports.begin(), exports.end());
     code.push_back(kEnd);
     return code;
@@ -213,7 +215,8 @@ TEST(NggSubgroupAbi, AnExportInsideALoopIsRefused) {
                                           0x03020100u,  kEnd};
     EXPECT_EQ(analyze(looped).reason, "ngg-export-in-cycle");
     auto forward = looped;
-    forward[4] = 0xbf840000u;   // the same branch, forward by zero
+    forward[4] = 0xbf880000u;   // a forward branch (execz +0) in its place
+    forward.insert(forward.end() - 1, {0xb07c3005u, 0xbf900009u});   // m0; GS_ALLOC_REQ
     EXPECT_TRUE(analyze(forward).ok());
 }
 
@@ -235,4 +238,60 @@ TEST(NggSubgroupAbi, CapturedKenaChainNeedsItsEightUserSgprs) {
     // RSRC2 says USER_SGPR=0, but the ES part reads s8..s15 (open question 1 on #3135).
     EXPECT_EQ(analyze(linked, 7).reason, "ngg-abi-read-undefined-sgpr");
     EXPECT_EQ(analyze(linked, 0).reason, "ngg-abi-read-undefined-sgpr");
+}
+
+TEST(NggSubgroupAbi, AProgramWithoutGsAllocReqIsRefused) {
+    std::vector<uint32_t> code = program({});
+    // Drop the s_movk m0 / s_sendmsg pair program() adds before the exports.
+    code.erase(code.begin() + 2, code.begin() + 4);
+    EXPECT_EQ(analyze(code).reason, "ngg-sendmsg-missing");
+    EXPECT_TRUE(analyze(program({})).ok());
+}
+
+// Every lowered 64-bit vector source names two registers; reading v[3:4] reads launch v4.
+TEST(NggSubgroupAbi, SixtyFourBitVectorSourcesChargeTheirHighRegister) {
+    // v_cmp_eq_u64 vcc, 0, v[3:4] (VOPC e32) and its v[2:3] control.
+    EXPECT_EQ(analyze(program({0x7dc40680u})).reason, "ngg-abi-read-v4");
+    EXPECT_TRUE(analyze(program({0x7dc40480u})).ok());
+    // v_cmp_eq_u64 s[20:21], v[3:4], 0 (VOP3-encoded VOPC).
+    EXPECT_EQ(analyze(program({0xd4e20014u, 0x00010103u})).reason, "ngg-abi-read-v4");
+    EXPECT_TRUE(analyze(program({0xd4e20014u, 0x00010102u})).ok());
+    // v_cvt_f32_f64 v9, v[5:6] (VOP1) and its VOP3 form read v6.
+    EXPECT_EQ(analyze(program({0x7e121f05u})).reason, "ngg-abi-read-v6-v7");
+    EXPECT_TRUE(analyze(program({0x7e121f02u})).ok());
+    // The unused VOP3 source fields are inline 0: the decoder reports an encoded 0 as a read of s0.
+    EXPECT_EQ(analyze(program({0xd58f0009u, 0x02010105u})).reason, "ngg-abi-read-v6-v7");
+    EXPECT_TRUE(analyze(program({0xd58f0009u, 0x02010102u})).ok());
+    // v_qsad_pk_u16_u8 v[10:11], v[3:4], 0, v[0:1].
+    EXPECT_EQ(analyze(program({0xd572000au, 0x04010103u})).reason, "ngg-abi-read-v4");
+    EXPECT_TRUE(analyze(program({0xd572000au, 0x04010100u})).ok());
+}
+
+TEST(NggSubgroupAbi, AnUnclassifiedVectorWidthIsRefused) {
+    // VOP3 opcode 0x161 has no gfx10.3 entry; 0x16f (v_div_fmas_f32) is classified.
+    EXPECT_EQ(analyze(program({0xd5610009u, 0x040a0300u})).reason,
+              "ngg-abi-unclassified-vector-width");
+}
+
+TEST(NggSubgroupAbi, AMimgAddressIsChargedThroughV7) {
+    // image_load v[10:13], v0, s[8:15] dmask 0xf: a 2D address could run past v3.
+    const std::initializer_list<uint32_t> load = {0xf0000f08u, 0x00020a00u};
+    EXPECT_EQ(analyze(program(load), 8).reason, "ngg-abi-read-v4");
+    // v_mov v4, 0; v_mov v6, 0; v_mov v7, 0 first.
+    EXPECT_TRUE(
+        analyze(program({0x7e080280u, 0x7e0c0280u, 0x7e0e0280u, 0xf0000f08u, 0x00020a00u}), 8)
+            .ok());
+}
+
+TEST(NggSubgroupAbi, ImplicitSccAndVccReadsBeforeWriteAreRefused) {
+    // s_cbranch_scc0 +0 before any SCC write; control: s_cmp_eq_u32 0, 0 first.
+    EXPECT_EQ(analyze(program({0xbf840000u})).reason, "ngg-abi-read-undefined-scc");
+    EXPECT_TRUE(analyze(program({0xbf068080u, 0xbf840000u})).ok());
+    // v_cndmask_b32_sdwa v9, v0, v1 reads VCC; control: v_cmp_eq_u32 vcc, 0, v0 first.
+    const std::initializer_list<uint32_t> sdwa_cndmask = {0x021202f9u, 0x06060600u};
+    EXPECT_EQ(analyze(program(sdwa_cndmask)).reason, "ngg-abi-read-undefined-vcc");
+    EXPECT_TRUE(analyze(program({0x7d840080u, 0x021202f9u, 0x06060600u})).ok());
+    // v_div_fmas_f32 v9, v0, v1, v2 reads VCC.
+    EXPECT_EQ(analyze(program({0xd56f0009u, 0x040a0300u})).reason, "ngg-abi-read-undefined-vcc");
+    EXPECT_TRUE(analyze(program({0x7d840080u, 0xd56f0009u, 0x040a0300u})).ok());
 }

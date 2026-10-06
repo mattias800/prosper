@@ -27,8 +27,9 @@ using gpu::ResourceClass;
 using gpu::ShaderResource;
 using gpu::VertexFetchIndexMode;
 
-// SPI_SHADER_PGM_RSRC2_GS.LDS_SIZE of the capture: 2176 dwords.
-inline constexpr uint32_t kKenaLds = 2176u * 4u;
+// The capture's raw SPI_SHADER_PGM_RSRC2_GS: LDS_SIZE [26:19] = 17 granules = 2176 dwords,
+// ES_VGPR_COMP_CNT = 3, USER_SGPR = 0.
+inline constexpr uint32_t kKenaRsrc2Gs = 0x008b0000u;
 inline constexpr uint32_t kKenaUserSgprs = 8;
 
 inline std::vector<uint32_t> load_words(const std::filesystem::path& path) {

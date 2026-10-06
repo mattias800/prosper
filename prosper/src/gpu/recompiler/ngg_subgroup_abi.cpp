@@ -38,8 +38,10 @@ struct State {
     bool exec_full = false;   // EXEC is all-ones on every path
     uint8_t vall = 0;   // tracked VGPRs written for all 64 lanes on every path
     uint8_t vcur = 0;   // tracked VGPRs written for every lane active in the current EXEC
+    bool scc = false;   // SCC written on every path
     void meet(const State& o) {
         sdef &= o.sdef;
+        scc = scc && o.scc;
         s3_overwritten = s3_overwritten && o.s3_overwritten;
         exec_full = exec_full && o.exec_full;
         vall &= o.vall;
@@ -47,7 +49,7 @@ struct State {
     }
     bool operator==(const State& o) const {
         return sdef == o.sdef && s3_overwritten == o.s3_overwritten && exec_full == o.exec_full &&
-               vall == o.vall && vcur == o.vcur;
+               vall == o.vall && vcur == o.vcur && scc == o.scc;
     }
 };
 
@@ -183,35 +185,79 @@ bool vop_rmw_destination(const Rdna2Inst& in) {
     return false;
 }
 
-// Number of VGPRs a vector source names. The shared inventory knows the B64 shifts; the f64 and
-// 64-bit integer VOP3 forms are added here. CONFIDENCE: MED (an unlisted 64-bit form under-reports
-// its high register).
+// Number of VGPRs a vector source names, classified per form; 0 means "not classified", and the
+// caller refuses the program. Every 64-bit-operand form of the gfx10.3 VALU is listed (RDNA2 ISA,
+// VOPC/VOP1/VOP3 opcode tables); VOP2 and VOP3P have none. CONFIDENCE: MED on the completeness of
+// those lists, which is why the VOP3-only opcode space outside them is refused rather than charged.
 uint32_t vgpr_source_span(const Rdna2Inst& in, uint32_t index) {
     if (in.fmt == Rdna2Format::DS) return index == 0 ? 1u : ds_data_dwords(in.opcode);
-    const uint32_t span = rdna2_vgpr_source_span(in, index);
-    if (in.fmt == Rdna2Format::VOP3) {
+    const bool vop3 = in.fmt == Rdna2Format::VOP3;
+    // VOPC, natively or VOP3-encoded (opcode < 0x100): f64 compares and classes 0x20-0x3f, i64
+    // 0xa0-0xbf (class_f64 0xa8/0xb8 takes a 32-bit mask in src1), u64 0xe0-0xf7.
+    if (in.fmt == Rdna2Format::VOPC || (vop3 && in.opcode < 0x100)) {
+        const uint32_t op = in.opcode;
+        if ((op == 0xa8 || op == 0xb8) && index == 1) return 1;
+        if ((op >= 0x20 && op <= 0x3f) || (op >= 0xa0 && op <= 0xbf) || (op >= 0xe0 && op <= 0xf7))
+            return 2;
+        return 1;
+    }
+    // VOP1, natively or VOP3-encoded (0x180 + op): the f64 sources.
+    if (in.fmt == Rdna2Format::VOP1 || (vop3 && in.opcode >= 0x180 && in.opcode < 0x200)) {
+        const uint32_t op = in.fmt == Rdna2Format::VOP1 ? in.opcode : in.opcode - 0x180;
+        switch (op) {
+            case 0x03:
+            case 0x0f:
+            case 0x15:   // cvt_i32/f32/u32 from f64
+            case 0x17:
+            case 0x18:
+            case 0x19:
+            case 0x1a:   // trunc/ceil/rndne/floor_f64
+            case 0x2f:
+            case 0x31:
+            case 0x34:   // rcp/rsq/sqrt_f64
+            case 0x3c:
+            case 0x3d:
+            case 0x3e:   // frexp_exp/frexp_mant/fract_f64
+                return 2;
+            default: return 1;
+        }
+    }
+    if (in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3P) return 1;
+    if (!vop3) return 1;
+    if (in.opcode >= 0x100 && in.opcode < 0x140) return 1;   // VOP3-encoded VOP2
+    if (in.opcode >= 0x140 && in.opcode < 0x180) {
         switch (in.opcode) {
             case 0x14c:
             case 0x160:
+            case 0x16e:
+            case 0x170:   // fma/div_fixup/div_scale/div_fmas f64
+                return 2;
             case 0x164:
             case 0x165:
             case 0x166:
-            case 0x167:
-            case 0x16e:
-            case 0x170:
-            case 0x2ff:
-            case 0x300:
-            case 0x301: return std::max(span, 2u);
+            case 0x167:   // add/mul/min/max_f64
+                return index < 2 ? 2u : 1u;
             case 0x168:
-            case 0x174:   // ldexp_f64 / trig_preop: src0 is f64
-                return index == 0 ? std::max(span, 2u) : span;
+            case 0x174:   // ldexp_f64 / trig_preop_f64: src0 is f64
+                return index == 0 ? 2u : 1u;
+            case 0x172:
+            case 0x173:   // qsad_pk_u16_u8 / mqsad_pk_u16_u8: src0, src2 are b64
+                return index == 1 ? 1u : 2u;
+            case 0x175:   // mqsad_u32_u8: src0 b64, src2 b128
+                return index == 0 ? 2u : index == 2 ? 4u : 1u;
             case 0x176:
             case 0x177:   // mad_u64_u32 / mad_i64_i32: src2 is 64-bit
-                return index == 2 ? std::max(span, 2u) : span;
-            default: break;
+                return index == 2 ? 2u : 1u;
+            case 0x161:
+            case 0x162:
+            case 0x163: return 0;   // not in the gfx10.3 table
+            default: return in.opcode <= 0x177 ? 1u : 0u;   // 0x178-0x17f: not classified
         }
     }
-    return span;
+    if (in.opcode == 0x2ff || in.opcode == 0x300 || in.opcode == 0x301)   // b64 shifts: src1
+        return index == 1 ? 2u : 1u;
+    if (in.opcode >= 0x300) return 1;   // the 32-bit VOP3-only tail (add3, lshl_add, permlane...)
+    return 0;   // 0x200-0x2fe: VOP3 interpolation and unassigned space
 }
 
 // Definite full-dword VGPR results for the lanes in EXEC (under-reporting is the safe direction).
@@ -284,6 +330,8 @@ struct Reads {
     std::vector<ScalarRead> scalar;
     std::vector<int> vgpr;
     bool exec = false;
+    bool scc = false;
+    bool unclassified = false;   // a vector source whose width this inventory does not know
 };
 
 void add_scalar(Reads& reads, const Rdna2Inst& in, const Operand& op, uint32_t words,
@@ -308,9 +356,42 @@ void add_vgpr(Reads& reads, const Operand& op, uint32_t span) {
     for (uint32_t w = 0; w < span; ++w) reads.vgpr.push_back(op.value + static_cast<int>(w));
 }
 
+// SCC as an implicit input: s_cbranch_scc0/1, s_addc/s_subb, s_cselect, s_cmov, s_cmovk, and any
+// operand naming SCC (253).
+bool reads_scc(const Rdna2Inst& in) {
+    for (uint32_t k = 0; k < in.n_src; ++k)
+        if (in.src[k].kind == OperandKind::Special && in.src[k].value == 253) return true;
+    switch (in.fmt) {
+        case Rdna2Format::SOPP: return in.opcode == 0x04 || in.opcode == 0x05;
+        case Rdna2Format::SOP2:
+            return in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b;
+        case Rdna2Format::SOP1:
+            return in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64;
+        case Rdna2Format::SOPK: return in.opcode == kSopkOpcodeCmovkI32;
+        default: return false;
+    }
+}
+
+// SCC as a definite output. Under-reporting a writer only refuses more programs.
+bool writes_scc(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::SOPC: return true;
+        case Rdna2Format::SOP1: return sop1_opcode_writes_scc(in.opcode);
+        case Rdna2Format::SOP2:
+            // add/sub/min/max, the bitwise forms, shifts, bfe, absdiff and lshlN_add write SCC;
+            // cselect, bfm, mul_i32, pack and mul_hi do not.
+            return in.opcode <= 0x09 || (in.opcode >= 0x0e && in.opcode <= 0x23) ||
+                   (in.opcode >= 0x27 && in.opcode <= 0x2a) || in.opcode == 0x2c ||
+                   (in.opcode >= 0x2e && in.opcode <= 0x31);
+        case Rdna2Format::SOPK: return in.opcode >= 0x03 && in.opcode <= 0x0f;   // cmpk, addk
+        default: return false;
+    }
+}
+
 Reads instruction_reads(const Rdna2Inst& in) {
     Reads reads;
     reads.exec = vector_format(in.fmt);
+    reads.scc = reads_scc(in);
     switch (in.fmt) {
         case Rdna2Format::SOP1:
         case Rdna2Format::SOP2:
@@ -349,11 +430,17 @@ Reads instruction_reads(const Rdna2Inst& in) {
             for (uint32_t k = 0; k < in.n_src; ++k) {
                 const uint32_t words = scalar_alu_source_words(in, k);
                 if (words != UINT32_MAX) add_scalar(reads, in, in.src[k], words ? words : 2u, k);
-                add_vgpr(reads, in.src[k], std::max(1u, vgpr_source_span(in, k)));
+                if (in.src[k].kind != OperandKind::VGPR) continue;
+                const uint32_t span = vgpr_source_span(in, k);
+                if (!span) reads.unclassified = true;
+                add_vgpr(reads, in.src[k], std::max(1u, span));
             }
-            if (in.fmt == Rdna2Format::VOP2 && !in.has_sdwa &&
-                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))) {
-                reads.scalar.push_back({kVcc, 0xffffffffu});   // cndmask / carry-in e32
+            // Implicit VCC: VOP2 cndmask and carry-in in every encoding that has no src2 (e32,
+            // SDWA, DPP), and v_div_fmas_f32/f64.
+            if ((in.fmt == Rdna2Format::VOP2 &&
+                 (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))) ||
+                (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x16f || in.opcode == 0x170))) {
+                reads.scalar.push_back({kVcc, 0xffffffffu});
                 reads.scalar.push_back({kVcc + 1, 0xffffffffu});
             }
             if (vop_rmw_destination(in))
@@ -378,7 +465,10 @@ Reads instruction_reads(const Rdna2Inst& in) {
                 add_vgpr(reads, in.dst, std::max(1u, rdna2_vgpr_destination_span(in)));
             break;
         case Rdna2Format::MIMG:
-            add_vgpr(reads, in.src[0], 4);
+            // A non-NSA address runs from VADDR for up to 13 dwords depending on the opcode, dim
+            // and A16; charge it through v7, the highest launch VGPR this check guards.
+            add_vgpr(reads, in.src[0],
+                     in.src[0].value >= 0 && in.src[0].value < 7 ? 8u - in.src[0].value : 4u);
             for (uint32_t k = 0; k < in.mimg_nsa && k < 3; ++k)
                 for (uint32_t b = 0; b < 4; ++b)
                     reads.vgpr.push_back(static_cast<int>((in.words[2 + k] >> (8 * b)) & 0xffu));
@@ -404,6 +494,7 @@ Reads instruction_reads(const Rdna2Inst& in) {
 }
 
 void transfer(State& s, const Rdna2Inst& in) {
+    if (writes_scc(in)) s.scc = true;
     if (const uint32_t results = definite_vgpr_results(in)) {
         for (uint32_t w = 0; w < results; ++w) {
             const uint8_t bit = tracked_bit(in.dst.value + static_cast<int>(w));
@@ -628,6 +719,15 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
             refuse(facts, "ngg-abi-exec-read-before-write", in.pc);
             return facts;
         }
+        if (reads.unclassified) {
+            refuse(facts, "ngg-abi-unclassified-vector-width", in.pc, "op=0x%x",
+                   static_cast<int>(in.opcode));
+            return facts;
+        }
+        if (reads.scc && !s.scc) {
+            refuse(facts, "ngg-abi-read-undefined-scc", in.pc);
+            return facts;
+        }
         for (const ScalarRead& read : reads.scalar) {
             if (read.reg == 3 && !s.s3_overwritten && (read.demanded & kS3GsWaveId)) {
                 refuse(facts, "ngg-abi-read-s3-gs-wave-id", in.pc, "demanded=0x%08x",
@@ -652,9 +752,15 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
             return facts;
         }
     }
+    // A merged NGG program must allocate its outputs; without GS_ALLOC_REQ every block it writes
+    // would be invalid at runtime, so refuse it here where the refused-shader index can see it.
+    if (facts.alloc_request_pcs.empty()) {
+        refuse(facts, "ngg-sendmsg-missing", ins.back().pc);
+        return facts;
+    }
     // Every M0 writer must be a scalar ALU instruction, so the value GS_ALLOC_REQ sends is wave data
     // and not a lane-local or memory-loaded word.
-    if (!facts.alloc_request_pcs.empty()) {
+    {
         for (const auto& in : ins) {
             bool writes_m0 = false;
             for_each_scalar_write(in, [&](int base, uint32_t width) {

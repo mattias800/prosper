@@ -12,11 +12,13 @@
 //   ngg-abi-read-s4-s5                 off-chip LDS base / scratch offset
 //   ngg-abi-read-s6-s7                 the GS program address (only the link may use it)
 //   ngg-abi-read-undefined-sgpr        any other SGPR (s8+user_sgprs.. included) read before written
-//   ngg-abi-read-undefined-vcc / -m0 / ngg-abi-read-ttmp
+//   ngg-abi-read-undefined-vcc / -m0 / -scc / ngg-abi-read-ttmp
+//   ngg-abi-unclassified-vector-width  a vector source whose register count is not classified
 //   ngg-abi-exec-read-before-write     EXEC (explicitly, or implicitly by a vector instruction)
 //   ngg-abi-read-v4                    adjacency offsets 4/5 read before written on the lane
 //   ngg-abi-read-v6-v7                 ES user VGPRs read before written on the lane
 //   ngg-side-effect                    memory stores/atomics, GDS/GWS/ordered count, scratch
+//   ngg-sendmsg-missing                no GS_ALLOC_REQ at all
 //   ngg-sendmsg-unsupported            any s_sendmsg/s_sendmsghalt other than GS_ALLOC_REQ (msg 9)
 //   ngg-sendmsg-m0-unproven            GS_ALLOC_REQ whose M0 is not written on every path by a
 //                                      scalar ALU instruction
@@ -31,8 +33,11 @@
 // "Read before written" is a MUST analysis over the CFG: a register counts as written only when
 // every path from entry writes it. A VGPR counts as written for a lane only through a full-dword
 // write while that lane is in EXEC: either under a provably full EXEC, or under an EXEC that has only
-// narrowed since the write. CONFIDENCE: MED on the per-instruction read inventory (it is fail-closed
-// where it is unsure: an unknown source width reads two registers, DS data fields are always read).
+// narrowed since the write. The read inventory is fail-closed where it is unsure: an unknown scalar
+// source width reads two registers, DS data fields are always read, a MIMG address is charged
+// through v7, and a vector source whose width is not classified refuses the program. Not
+// inventoried: cross-lane reads (v_readlane, ds_bpermute, permlane) of lanes outside the EXEC a
+// definition covered. CONFIDENCE: MED on the completeness of the 64-bit opcode lists.
 #pragma once
 
 #include "gpu/recompiler/ngg_export_record.hpp"
