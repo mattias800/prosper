@@ -117,6 +117,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- refreshing ONE 59 MiB resident buffer after a sparse guest rewrite --------------------
+    // "span": compare, then copy the single [first,last] extent (the old path); "blocks": one pass that
+    // copies only the 64 KiB blocks that differ (sync_compute_buffer_blocks).
+    {
+        constexpr uint64_t kBig = 59 * kMiB;
+        std::vector<uint8_t> source(kBig, 0x5a), span_copy(kBig, 0x5a), block_copy(kBig, 0x5a);
+        double span_ms = 0, block_ms = 0;
+        uint64_t span_bytes = 0, block_bytes = 0;
+        for (unsigned frame = 0; frame < frames; ++frame) {
+            guest_frame(source, frame);
+            auto t0 = Clock::now();
+            size_t first = 0, last = 0;
+            if (!compute_buffers_diff_span(span_copy.data(), source.data(), kBig, &first, &last)) {
+                copy_compute_buffer(span_copy.data() + first, source.data() + first, last - first + 1);
+                span_bytes += last - first + 1;
+            }
+            span_ms += ms_since(t0);
+            t0 = Clock::now();
+            block_bytes += sync_compute_buffer_blocks(block_copy.data(), source.data(), kBig);
+            block_ms += ms_since(t0);
+        }
+        std::printf("refresh 59 MiB, sparse rewrite: span %6.2f ms/frame (copied %6.2f MiB)  "
+                    "blocks %6.2f ms/frame (copied %6.2f MiB)\n",
+                    span_ms / frames, static_cast<double>(span_bytes) / kMiB / frames,
+                    block_ms / frames, static_cast<double>(block_bytes) / kMiB / frames);
+    }
+
     const auto mib = [](uint64_t b) { return static_cast<double>(b) / kMiB; };
     std::printf("frames=%u windows/frame=%zu window=%.1f MiB\n", frames, std::size(kWindowOffsets),
                 mib(kWindow));
