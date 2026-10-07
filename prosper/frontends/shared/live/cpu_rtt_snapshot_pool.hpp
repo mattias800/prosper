@@ -120,8 +120,52 @@ public:
 
     CpuRttSnapshot copy(const uint8_t* source, size_t bytes) {
         if (!source || !bytes) return {};
-        std::vector<uint8_t> pixels;
         bool reused = false;
+        std::vector<uint8_t> pixels = take(bytes, reused);
+        count(reused, bytes);
+        // One path for both cases. `assign` reallocates only when capacity is insufficient, which
+        // the search in take() has already ruled out on the reuse path, and it never zero-fills. The
+        // previous split existed because the reuse path was guaranteed an exact size; with
+        // capacity matching, `assign` is what sets the published `size()` correctly.
+        prosper::diagnostics::note_transfer(
+            prosper::diagnostics::Transfer::RenderTargetSnapshot, bytes);
+        pixels.assign(source, source + bytes);
+        return publish(std::move(pixels), reused);
+    }
+
+    // Like copy(), but the caller produces the bytes straight into the pooled buffer: `fill` is called
+    // with a pointer to `bytes` writable bytes and MUST write every one of them (a recycled buffer
+    // holds a previous tenant's pixels). A steady-state caller asking for the same size each time gets
+    // the same buffer back with its size already right, so there is no allocation and no zero-fill --
+    // `resize` only touches bytes beyond the old size.
+    template <typename Fill>
+    CpuRttSnapshot build(size_t bytes, Fill&& fill) {
+        if (!bytes) return {};
+        bool reused = false;
+        std::vector<uint8_t> pixels = take(bytes, reused);
+        count(reused, bytes);
+        prosper::diagnostics::note_transfer(
+            prosper::diagnostics::Transfer::RenderTargetSnapshot, bytes);
+        pixels.resize(bytes);
+        fill(pixels.data());
+        return publish(std::move(pixels), reused);
+    }
+
+    size_t retained_bytes() const {
+        std::lock_guard lock(state_->mutex);
+        return state_->retained_bytes;
+    }
+
+    size_t retained_buffers() const {
+        std::lock_guard lock(state_->mutex);
+        return state_->free.size();
+    }
+
+private:
+    // Best-fit reuse of an idle buffer whose capacity holds `bytes`; an empty vector on a miss.
+    std::vector<uint8_t> take(size_t bytes, bool& reused) {
+        std::vector<uint8_t> pixels;
+        reused = false;
         {
             std::lock_guard lock(state_->mutex);
             // Match on CAPACITY, best fit -- not on an exact `size()`. What the reuse has to
@@ -154,20 +198,19 @@ public:
                 reused = true;
             }
         }
+        return pixels;
+    }
+
+    static void count(bool reused, size_t bytes) {
         {
             auto& stats = cpu_rtt_snapshot_pool_stats();
             (reused ? stats.hits : stats.misses).fetch_add(1, std::memory_order_relaxed);
             (reused ? stats.hit_bytes : stats.miss_bytes)
                 .fetch_add(bytes, std::memory_order_relaxed);
         }
-        // One path for both cases. `assign` reallocates only when capacity is insufficient, which
-        // the search above has already ruled out on the reuse path, and it never zero-fills. The
-        // previous split existed because the reuse path was guaranteed an exact size; with
-        // capacity matching, `assign` is what sets the published `size()` correctly.
-        prosper::diagnostics::note_transfer(
-            prosper::diagnostics::Transfer::RenderTargetSnapshot, bytes);
-        pixels.assign(source, source + bytes);
+    }
 
+    CpuRttSnapshot publish(std::vector<uint8_t>&& pixels, bool reused) {
         auto allocated = std::make_unique<std::vector<uint8_t>>(std::move(pixels));
         std::unique_ptr<std::vector<uint8_t>, ReturnToPool> owned(
             allocated.release(), ReturnToPool{state_});
@@ -175,17 +218,6 @@ public:
         return {std::move(published), reused};
     }
 
-    size_t retained_bytes() const {
-        std::lock_guard lock(state_->mutex);
-        return state_->retained_bytes;
-    }
-
-    size_t retained_buffers() const {
-        std::lock_guard lock(state_->mutex);
-        return state_->free.size();
-    }
-
-private:
     std::shared_ptr<State> state_;
 };
 

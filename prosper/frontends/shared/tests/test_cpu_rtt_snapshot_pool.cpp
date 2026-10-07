@@ -181,8 +181,39 @@ static void test_concurrent_release(Checks& checks) {
                   "concurrent release obeys the free-list bounds");
 }
 
+static void test_build_fills_pooled_buffers(Checks& checks) {
+    // build() hands the caller a pooled buffer to fill. A released one comes back (same capacity, no new
+    // allocation) and the new contents replace the old tenant's entirely.
+    CpuRttSnapshotPool pool(1024, 2);
+    auto fill = [](uint8_t value) {
+        return [value](uint8_t* out) { for (size_t i = 0; i < 64; ++i) out[i] = value; };
+    };
+    const uint8_t* first_data = nullptr;
+    {
+        auto first = pool.build(64, fill(0x11));
+        checks.expect(first.pixels && all_bytes_equal(*first.pixels, 64, 0x11), "first build holds its bytes");
+        checks.expect(!first.reused, "an empty pool misses");
+        first_data = first.pixels->data();
+    }  // released here: the buffer returns to the pool
+    checks.expect(pool.retained_buffers() == 1, "the released buffer is retained");
+    auto second = pool.build(64, fill(0x22));
+    checks.expect(second.reused, "the same size is served from the pool");
+    checks.expect(second.pixels && all_bytes_equal(*second.pixels, 64, 0x22),
+                  "a recycled buffer carries only the new bytes");
+    checks.expect(second.pixels->data() == first_data, "the allocation itself is reused, not just its size");
+
+    // A retained older version is never overwritten: while `second` is held, a third build gets another buffer.
+    auto third = pool.build(64, fill(0x33));
+    checks.expect(!third.reused, "a buffer still held by a consumer is not recycled");
+    checks.expect(all_bytes_equal(*second.pixels, 64, 0x22), "the held version keeps its pixels");
+
+    // Zero bytes publish nothing, like copy().
+    checks.expect(!pool.build(0, fill(0x44)).pixels, "an empty request yields no snapshot");
+}
+
 int main() {
     Checks checks;
+    test_build_fills_pooled_buffers(checks);
     test_immutable_versions(checks);
     test_budget_and_resolution_change(checks);
     test_wrapper_lifetime(checks);
