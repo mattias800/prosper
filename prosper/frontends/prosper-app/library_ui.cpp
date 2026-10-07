@@ -374,8 +374,8 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     // the developer's desktop by default.
     const char* musicEnv = SDL_getenv("PROSPER_LAUNCHER_MUSIC");
     musicToggle_ = resolve_launcher_music(musicEnv, musicToggle_, /*automated=*/stats_);
-    const float gain = launcher_music_output_gain(
-        resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME")), outputVolume_);
+    musicLevel_ = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
+    const float gain = launcher_music_output_gain(musicLevel_, outputVolume_);
     if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, &budget_, musicToggle_, gain))
         fprintf(stderr, "[library] background art and music unavailable\n");
     // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox
@@ -565,6 +565,16 @@ void LibraryUi::apply_filter() {
     hovered_ = -1;
     contextFi_ = -1;
     contextArmed_ = false;
+}
+
+void LibraryUi::set_output_volume(float volume) {
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    outputVolume_ = volume;
+    volumePercent_ = static_cast<int>(volume * 100.0f + 0.5f);
+    // Live once the media layer is up; before init() this only seeds what init() will use.
+    if (media_.ready())
+        media_.set_output_gain(launcher_music_output_gain(musicLevel_, outputVolume_));
 }
 
 void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
@@ -804,6 +814,74 @@ void LibraryUi::draw_backdrop() {
     }
 }
 
+void LibraryUi::draw_settings_content(LibraryAction& action) {
+    if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
+    ImGui::Separator();
+    const auto section = [&](const char* title) {
+        // Bold section headers when the system font supplied one; the bitmap fallback has no
+        // bold, and faking it with a second size would blur.
+        ImGui::Spacing();
+        if (boldFont_) ImGui::PushFont(boldFont_);
+        ImGui::TextUnformatted(title);
+        if (boldFont_) ImGui::PopFont();
+        ImGui::Separator();
+    };
+    const auto radio_row = [&](const char* label, const char* hint, const std::string& current,
+                               const char* value, LibraryAction::Kind kind) {
+        // The label names the choice, the dim line below names its consequence; the stored value
+        // stays the bare policy name the config file and flags use.
+        const bool selected = (current == value);
+        if (ImGui::RadioButton(label, selected) && !selected &&
+            action.kind == LibraryAction::Kind::none) {
+            action.kind = kind;
+            action.value = value;
+        }
+        if (hint) {
+            ImGui::Indent();
+            ImGui::TextDisabled("%s", hint);
+            ImGui::Unindent();
+        }
+    };
+
+    ImGui::TextWrapped("These apply to games you open from here -- never to a scripted launch. "
+                       "A command-line flag or an environment variable still wins over each one.");
+    section("Presentation");
+    radio_row("Vsync", "Smoothest picture, a little more input lag.", presentMode_, "fifo",
+              LibraryAction::Kind::set_present_mode);
+    radio_row("Low-latency vsync", "Still tear-free, wakes the game sooner.", presentMode_,
+              "mailbox", LibraryAction::Kind::set_present_mode);
+    radio_row("Tearing allowed", "Fastest response, the image can shear mid-frame.", presentMode_,
+              "immediate", LibraryAction::Kind::set_present_mode);
+    // Mirror the choice locally: the persisted value comes back through main.cpp, but the dot
+    // must move on the click, not on the next rescan.
+    if (action.kind == LibraryAction::Kind::set_present_mode) presentMode_ = action.value;
+
+    section("Display the game is told it is plugged into");
+    radio_row("Always 1080p", "What prosper has always answered. Safest.", displayMode_, "legacy",
+              LibraryAction::Kind::set_display_mode);
+    radio_row("Match this display", "EXPERIMENTAL, per title: lets games offer modes beyond 1080p, "
+                                   "but some pace themselves by this.",
+              displayMode_, "host", LibraryAction::Kind::set_display_mode);
+    radio_row("Match, including high refresh", "EXPERIMENTAL: some games run too fast past 60 Hz.",
+              displayMode_, "host-high-refresh", LibraryAction::Kind::set_display_mode);
+    if (action.kind == LibraryAction::Kind::set_display_mode) displayMode_ = action.value;
+
+    section("Save data folder");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputText("##savedata", savedataBuf_, sizeof savedataBuf_);
+    ImGui::SameLine();
+    if (ImGui::Button("Apply") && action.kind == LibraryAction::Kind::none) {
+        savedataDir_ = savedataBuf_;
+        savedataApplied_ = savedataDir_;
+        action.kind = LibraryAction::Kind::set_savedata_dir;
+        action.value = savedataDir_;
+    }
+    if (savedataApplied_.empty())
+        ImGui::TextDisabled("Using the default location.");
+    else
+        ImGui::TextDisabled("Now: %s", savedataApplied_.c_str());
+}
+
 void LibraryUi::draw_controls_content() {
     if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
     ImGui::Separator();
@@ -957,10 +1035,16 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
             if (ImGui::MenuItem("Exit")) action.kind = LibraryAction::Kind::quit;
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Settings")) {
+            if (ImGui::MenuItem("Open settings")) tab_ = LibraryTab::settings;
+            ImGui::EndMenu();
+        }
         ImGui::EndMenuBar();
     }
 
-    if (tab_ == LibraryTab::controls) {
+    if (tab_ == LibraryTab::settings) {
+        draw_settings_content(action);
+    } else if (tab_ == LibraryTab::controls) {
         draw_controls_content();
     } else if (games_.empty()) {
         ImGui::Spacing();
@@ -1008,8 +1092,24 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
             action.kind = LibraryAction::Kind::set_music;
             action.music_on = musicToggle_;
         }
-        // The search box rides the row's right edge, vertically centered against the 52 px
-        // icon buttons rather than their top edge.
+        // The volume slider rides with the icon buttons; the search box rides the row's
+        // right edge. Both vertically centered against the 52 px buttons, not their top edge.
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(toolbarTop + 14.0f);
+        ImGui::SetNextItemWidth(120.0f);
+        int vol = volumePercent_;
+        // Live while dragging (the gain applies on this thread), persisted on release: writing
+        // the settings file on every dragged frame would be a write per frame.
+        if (ImGui::SliderInt("##volume", &vol, 0, 100, "%d%%") && vol != volumePercent_) {
+            volumePercent_ = vol;
+            set_output_volume(static_cast<float>(vol) / 100.0f);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            action.kind == LibraryAction::Kind::none) {
+            action.kind = LibraryAction::Kind::set_volume;
+            action.value = std::to_string(volumePercent_);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Volume");
         ImGui::SameLine(ImGui::GetContentRegionMax().x - 260.0f);
         ImGui::SetCursorPosY(toolbarTop + 14.0f);
         ImGui::SetNextItemWidth(260.0f);

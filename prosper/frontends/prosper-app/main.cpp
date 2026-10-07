@@ -1508,6 +1508,9 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     for (int i = 1; i < argc; i++) args.emplace_back(argv[i]);
     args.emplace_back("--dump");
     args.push_back(app0_root);
+    // The child carries a --dump, so without this marker it would read as a scripted launch and
+    // skip the settings file — losing the policies the user chose in this library session.
+    args.emplace_back("--from-library");
     // If THIS process authored PROSPER_GUEST_ARGS from the config (see start_guest), the value
     // belongs to the title that is shutting down — a relaunch inherits environ verbatim, so leaving
     // it would apply the previous title's args to the new one (whose config entry may differ or
@@ -1563,6 +1566,14 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
     prosper::frontend::AppPresentMode requestedPresentMode = prosper::frontend::AppPresentMode::fifo;
+    // Which host policies the run named explicitly. The persisted file applies only where none of
+    // these (and no environment variable) did — it must never override an explicit request.
+    bool presentModeSeen = false;
+    bool displayModeSeen = false;
+    bool volumeSeen = false;
+    // Set by relaunch_with_dump() when the new process continues a library session: the child was
+    // given a --dump, but the file's host policies still apply to it (unlike a scripted launch).
+    bool fromLibrary = false;
     std::string dump;
     // The game library (#1471): where to look, and whether to just print what is there and exit.
     std::string gamesDirFlag;
@@ -1590,7 +1601,9 @@ int main(int argc, char** argv) {
             g_volume_percent = atoi(argv[++i]);
             if (g_volume_percent < 0) g_volume_percent = 0;
             if (g_volume_percent > 100) g_volume_percent = 100;
+            volumeSeen = true;
         }
+        else if (a == "--from-library") fromLibrary = true;   // relaunch marker, not user input
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
         else if (a == "--games-dir") {                       // where the titles are, this run only
@@ -1625,6 +1638,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: --present-mode requires fifo, mailbox, or immediate\n");
                 return 2;
             }
+            presentModeSeen = true;
         }
         else if (a == "--record") {
             if (i + 1 >= argc) {
@@ -1680,6 +1694,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_DISPLAY_MODE\n");
                 return 2;
             }
+            displayModeSeen = true;
         }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
@@ -1734,6 +1749,80 @@ int main(int argc, char** argv) {
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
         fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
         return games.empty() ? 1 : 0;
+    }
+
+    // Persisted host settings: savedata dir, present mode, display mode, volume. These apply ONLY
+    // to boots the library starts — a bare launch with no game, or a relaunch carrying
+    // --from-library. A scripted `prosper-app <dump>` run never reaches for the file, so its
+    // guest answers cannot depend on per-user state. A flag or the environment still wins over
+    // the file, exactly like games_dir above; misspelled values are ignored with a warning, so a
+    // typo costs the setting rather than a wrong behaviour.
+    //
+    // The precedence itself lives in resolve_host_policy() (app_config.hpp), which takes the flag
+    // and environment state as inputs — that is what the unit tests pin, including the env-wins
+    // arms. What follows only performs the resolved answer: validate, publish, remember for seed.
+    std::string effDisplayMode = "legacy";
+    std::string effSavedataDir;
+    const bool librarySession =
+        prosper::frontend::host_policy_applies(!dump.empty(), testPattern, fromLibrary);
+    if (librarySession) {
+        // One read per name for the whole run: env wins, the file fills the silence, and `eff*`
+        // carries the answer to the library seed below.
+        prosper::frontend::HostPolicyInputs policy_in;
+        policy_in.flag_present_mode = presentModeSeen;
+        policy_in.flag_display_mode = displayModeSeen;
+        policy_in.flag_volume = volumeSeen;
+        const char* savedataEnv = getenv("PROSPER_SAVEDATA_DIR");
+        const char* displayEnv = getenv("PROSPER_DISPLAY_MODE");
+        policy_in.env_savedata_dir = (savedataEnv && *savedataEnv) ? savedataEnv : "";
+        policy_in.env_display_mode = (displayEnv && *displayEnv) ? displayEnv : "";
+        policy_in.file = appConfig;
+        const prosper::frontend::HostPolicy policy =
+            prosper::frontend::resolve_host_policy(policy_in);
+        // No environment variable exists for volume, so this is flag > file: --volume wins,
+        // the persisted slider fills the silence. g_volume_percent feeds both the SDL sink gain
+        // at boot and the library seed below.
+        g_volume_percent = prosper::frontend::volume_after_policy(policy, g_volume_percent);
+        if (policy.volume_percent >= 0)
+            fprintf(stderr, "[app] volume (config): %d%%\n", g_volume_percent);
+        if (!policy_in.env_savedata_dir.empty()) {
+            effSavedataDir = policy_in.env_savedata_dir;
+        } else if (!policy.savedata_dir.empty()) {
+            if (set_environment("PROSPER_SAVEDATA_DIR", policy.savedata_dir.c_str())) {
+                fprintf(stderr, "[app] savedata dir (config): %s\n", policy.savedata_dir.c_str());
+                effSavedataDir = policy.savedata_dir;
+            } else {
+                fprintf(stderr, "[app] failed to set PROSPER_SAVEDATA_DIR from the settings\n");
+            }
+        }
+        if (!policy.present_mode.empty()) {
+            prosper::frontend::AppPresentMode fromFile = prosper::frontend::AppPresentMode::fifo;
+            if (prosper::frontend::parse_present_mode(policy.present_mode, fromFile)) {
+                requestedPresentMode = fromFile;
+                fprintf(stderr, "[app] present mode (config): %s\n", policy.present_mode.c_str());
+            } else {
+                fprintf(stderr, "[app] ignoring unknown present_mode \"%s\" in the settings (%s)\n",
+                        policy.present_mode.c_str(), app_config_path().c_str());
+            }
+        }
+        if (!policy_in.env_display_mode.empty()) {
+            effDisplayMode = policy_in.env_display_mode;
+        } else if (!policy.display_mode.empty()) {
+            prosper::hle::graphics::DisplayModePolicy displayPolicy{};
+            if (prosper::hle::graphics::parse_display_mode_policy(policy.display_mode,
+                                                                   displayPolicy)) {
+                if (set_environment("PROSPER_DISPLAY_MODE", policy.display_mode.c_str())) {
+                    fprintf(stderr, "[app] display mode (config): %s\n",
+                            policy.display_mode.c_str());
+                    effDisplayMode = policy.display_mode;
+                } else {
+                    fprintf(stderr, "[app] failed to set PROSPER_DISPLAY_MODE from the settings\n");
+                }
+            } else {
+                fprintf(stderr, "[app] ignoring unknown display_mode \"%s\" in the settings (%s)\n",
+                        policy.display_mode.c_str(), app_config_path().c_str());
+            }
+        }
     }
 
     // #3017: publish the host's REAL display mode before anything boots, so the VideoOut layer can
@@ -2767,6 +2856,11 @@ int main(int argc, char** argv) {
             }
             libraryUi.set_recent(std::move(recents));
         }
+        // The panel edits the run's EFFECTIVE policy (the apply block above already folded the
+        // file into these), so what it shows is what the next boot gets — never a stale default.
+        libraryUi.set_host_settings(
+            prosper::frontend::present_mode_name(requestedPresentMode),
+            effDisplayMode, effSavedataDir);
         if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
                            vk.scFormat, vk.scImages, vk.scExtent)) {
             rescan_library();
@@ -3380,6 +3474,62 @@ int main(int argc, char** argv) {
                     cfg.launcher_music = act.music_on;
                     if (!save_app_config(cfg))
                         fprintf(stderr, "[app] could not persist the music setting\n");
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_present_mode: {
+                    // Persist, then apply live: the not-yet-booted guest has no frames, and the
+                    // library owns the swapchain, so a recreate picks the new policy up at once.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.present_mode = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the present mode\n");
+                    prosper::frontend::AppPresentMode next = requestedPresentMode;
+                    if (prosper::frontend::parse_present_mode(act.value, next) &&
+                        next != requestedPresentMode) {
+                        requestedPresentMode = next;
+                        swapchainDirty = true;
+                    }
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_display_mode: {
+                    // VideoOut resolves its mode on first use during the boot, so setting the
+                    // environment now reaches the next game without a relaunch.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.display_mode = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the display mode\n");
+                    if (!set_environment("PROSPER_DISPLAY_MODE", act.value.c_str()))
+                        fprintf(stderr, "[app] failed to set PROSPER_DISPLAY_MODE\n");
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_savedata_dir: {
+                    // Save data is located at boot, so this reaches the next game; empty clears
+                    // back to the core default rather than pinning an empty path.
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.savedata_dir = act.value;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the savedata folder\n");
+                    if (act.value.empty())
+                        clear_environment("PROSPER_SAVEDATA_DIR");
+                    else if (!set_environment("PROSPER_SAVEDATA_DIR", act.value.c_str()))
+                        fprintf(stderr, "[app] failed to set PROSPER_SAVEDATA_DIR\n");
+                    break;
+                }
+                case prosper::frontend::LibraryAction::Kind::set_volume: {
+                    // Persist, then apply live everywhere: the SDL sink gain for the title that
+                    // boots next, and the launcher music still playing now.
+                    int vol = atoi(act.value.c_str());
+                    if (vol < 0) vol = 0;
+                    if (vol > 100) vol = 100;
+                    prosper::frontend::AppConfig cfg = load_app_config();
+                    cfg.volume_percent = vol;
+                    if (!save_app_config(cfg))
+                        fprintf(stderr, "[app] could not persist the volume\n");
+                    g_volume_percent = vol;
+#ifdef PROSPER_AUDIO_SDL3
+                    prosper::set_sdl3_audio_gain(static_cast<float>(vol) / 100.0f);
+#endif
+                    libraryUi.set_output_volume(static_cast<float>(vol) / 100.0f);
                     break;
                 }
                 case prosper::frontend::LibraryAction::Kind::set_games_dir:
