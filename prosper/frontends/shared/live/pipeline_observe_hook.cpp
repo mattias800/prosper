@@ -13,7 +13,10 @@ namespace prosper::frontend {
 namespace {
 
 PipelineObserver& observer() {
-    static PipelineObserver instance;
+    // Immortal: the atexit report below is registered before this is first constructed, so a
+    // function-local static would be destroyed BEFORE the report reads it, and an executor thread
+    // flushing during shutdown could reach it too (#4664 review). Never destroyed, never freed.
+    static PipelineObserver& instance = *new PipelineObserver;
     return instance;
 }
 
