@@ -9,6 +9,42 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## No refused fragment programs remain (2026-10-07, #4680)
+
+Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
+`PROSPER_DBG=1`, `PROSPER_DROPPED_DRAW_CENSUS=1`, `scripts/kena/linux-reach-level-load.pad`, 260 s.
+Before is `main` `a6453028c`; after is the #4680 branch.
+
+| | before | after |
+|---|---|---|
+| `dropped-draws` reasons | `volume-multi-target:7943`, `ngg-subgroup:3666`, `shader-recompile/fragment:717` | `volume-multi-target:6045`, `ngg-subgroup:2790` |
+| `unsupported-wave64-shaders` alarm | 47 of 48 windows, `fragment/recompile:717` | did not fire |
+| refused programs (`refused_shaders_*/index.txt`) | 2 fragment | none |
+
+The `shader-recompile/fragment` count was **two unrelated causes**, not the one program
+(`0x505c3d0000`) the entry below names. Program addresses are run-local.
+
+- **AGC helper rectangles with an inherited pixel shader.** These were most of the count. Every
+  draw had the helper's vertex program (`es=0x5007020000`). The helper binds no pixel shader, so it
+  runs with whatever the previous draw left bound, and the refused program changed from run to run
+  (295 dwords in one run, 182 in the next).
+  - The stale pixel user data held `00000092 00fff000 05000000` at `s[24:27]`, which the fold
+    cannot publish as a V#.
+  - Kena's helpers have no depth/stencil effect (`DB_DEPTH_CONTROL=0x70`). Their colour is
+    suppressed (#4610), so they were "no effect" anyway; the decision just came after the pixel
+    shader compile.
+  - The executor now decides it before any shader work. The census reports these draws as
+    `no-effect(agc-helper)`.
+- **A counted loop counting in VCC_HI** (140 dwords). It appears after New Game. Its header is
+  `s_cmp_lt_i32 vcc_hi, s34`, so VCC_HI is the induction variable. The counted-loop emitter now
+  closes VCC's mask phi with a placeholder when the mask is provably unread from the header. The
+  program compiles live (5,442 words, wave64).
+- **The title-menu picture does not change.** An F9 frame at 222 s matches
+  `assets/screenshots/kena-title-menu-world.webp`, apart from the falling leaf. That is expected:
+  the helper draws had no effect to lose, and the loop program draws after the menu. The
+  foliage, light shafts and grading are still missing; volume-multi-target (#4643) and
+  ngg-subgroup are the remaining drops.
+
 ## The title-menu world renders on `main` (2026-10-07, #3835)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, default launch
@@ -52,7 +88,7 @@ Linux/AMD title-menu investigations are recorded below.
   - The run's `dropped-draws` alarm fires in 42 of 43 windows. Its reasons are
     `backend/volume-multi-target:7722` (#4643), `backend/ngg-subgroup:3564` and
     `shader-recompile/fragment:595`. The fragment count is one refused Wave64 program,
-    `0x505c3d0000`.
+    `0x505c3d0000`. (Superseded by the entry above: it was two causes, and both are fixed.)
   - The volume passes are a likely cause of the fog and the missing light shafts, and the NGG
     subgroup drops of the missing foliage. Neither link has been checked per draw. **This is the
     next blocker.**
@@ -371,6 +407,12 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The `shader-recompile/fragment` drops are one refused Wave64 program that needs a recompiler
+  feature** — false. Most were AGC helper rectangles compiling the pixel shader the previous draw
+  left bound, against that draw's stale user data. The refused program changed from run to run
+  (295 dwords, then 182) and was always on `es=0x5007020000`. The helper has no depth/stencil
+  effect, so the draws had nothing to lose. The remainder was a separate counted-loop VCC_HI
+  refusal (2026-10-07, #4680).
 - **#3835's all-NaN 1600×900 half image is a float-semantics or interpolant defect in the
   recompiled pixel shader** — false as the cause of the black title world. It was AGC's helper
   rectangle drawn with the pixel shader the previous draw left bound. That shader reads PARAMs the
