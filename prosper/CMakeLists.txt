@@ -240,6 +240,11 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
 # src/diagnostics; any target including it needs `src` and that translation unit.
 find_package(Threads REQUIRED)
+# CPU microbenchmark (not a ctest): refreshing one resident compute buffer, single span vs differing blocks
+add_executable(bench_block_sync tests/shared/compute/bench_block_sync.cpp)
+target_include_directories(bench_block_sync PRIVATE frontends src tests)
+target_link_libraries(bench_block_sync PRIVATE prosper_core)
+
 prosper_add_gtest(test_compute_buffer_diff_span
   SOURCES tests/shared/compute/test_compute_buffer_diff_span.cpp
           src/diagnostics/worker_spawn_census.cpp
