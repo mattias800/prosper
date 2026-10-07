@@ -4918,14 +4918,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
                 // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
-                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP and
-                // OMOD keep rejecting too -- their denormal behaviour needs its own contract.
-                if (in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[1] || in.src_neg[2] ||
-                    in.clamp || in.omod) {
+                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP is
+                // the ordinary float saturate of the exact result via fresult() (Kena #4706,
+                // `d762800c,0001850c`; CONFIDENCE: HIGH). OMOD keeps rejecting: hardware ignores it
+                // on f32 with denormals enabled, so it needs the MODE contract.
+                if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = b.ldexp_f32_bits(fv(0), val(in.src[1]));
+                    vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
                 }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):

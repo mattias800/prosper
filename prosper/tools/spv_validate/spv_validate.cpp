@@ -1626,6 +1626,42 @@ int main(int argc, char** argv) {
                               0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
         dump(dir, "fragment_scalar_pair_mask_projection", recompile_fragment(c, std::size(c)));
     }
+    // #4706: v_ldexp_f32 with CLAMP (the float saturate routed through fresult).
+    {
+        const uint32_t c[] = {0xD7628000u, 0x0002030Du, 0xBF810000u};
+        dump(dir, "compute_ldexp_clamp", recompile_valu(c, sizeof(c) / 4, 14, 0));
+    }
+    // #4706: the dispatcher's entry-M0 KILL. s2 saves M0, is overwritten with data, and is read at
+    // a loop header (its own dispatcher case); the irreducible tail forces the dispatcher. Compute
+    // (native Wave64) and pixel forms.
+    {
+        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+                              0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0xBEFE04C1u, 0xE0702000u,
+                              0x80020300u, 0x7E040280u, 0x7C020300u, 0xBF860001u, 0x7E040281u,
+                              0x7D840100u, 0xBF870001u, 0xBF82FFFDu, 0x7E040D02u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource out{};
+        out.cls = ResourceClass::ConstantBuffer;
+        out.format = DataFormat::Uint32;
+        out.num_components = 1;
+        out.binding = 3;
+        out.stride = 4;
+        out.sgpr_base = 8;
+        rt.resources.push_back(out);
+        ComputeShaderConfig config;
+        config.local_x = 64;
+        config.wave_size = 64;
+        config.native_subgroup_size = 64;
+        dump(dir, "compute_entry_m0_kill", recompile_compute(c, std::size(c), &rt, config));
+    }
+    {
+        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+                              0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0x7E040280u, 0x7C020300u,
+                              0xBF860001u, 0x7E040281u, 0x7D840100u, 0xBF870001u, 0xBF82FFFDu,
+                              0x7E020D03u, 0x100202FFu, 0x3B808081u, 0x7E000280u, 0x7E040280u,
+                              0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_entry_m0_kill", recompile_fragment(c, std::size(c)));
+    }
     // GTA V Wave64 survivor-mask join: one arm retains scalar EXEC words while the other computes
     // the same physical pair through S_ANDN2_B64. Validate the native subgroup ballots that make
     // the logical result scalar-readable at the exact trailing S_CMP_EQ_U64.

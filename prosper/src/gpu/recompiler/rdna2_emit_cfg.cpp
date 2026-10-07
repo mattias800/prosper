@@ -1629,7 +1629,14 @@ bool emit_cfg_state_machine(
     // -- "over-rejects rather than fabricates ... left as the safe direction" -- and without a KILL
     // this dispatcher path now agrees with the emitter instead of being more permissive than it.
     // A precise KILL wants a value-publishing predicate shared with `emit_alu`, so that the two
-    // cannot drift; that is follow-up work, not a thing to approximate here.
+    // cannot drift. For Wave64 that predicate is the MUST set `wave64_scalar_word_in`, applied in
+    // `load_state` (#4706); Wave32 and the terminal call keep this MAY set unchanged. Where a token
+    // STARTS agrees too: the analysis's `m0_token_save` needs `!scalar_words.contains(124)`,
+    // emit_alu's needs `!rs.sreg.contains(124)`, and at each block entry `load_state` makes
+    // `state.sreg` (words <= 124) equal to the MUST set. Counting a word as data where the emitter
+    // has none would reload a fabricated zero for ANY register, an invariant the dispatcher already
+    // rests on; the converse starts a token only in the analysis, so the KILL does not fire and the
+    // read rejects (the safe side).
     //
     // BOTH BOUNDS ARE SCOPED TO ONE DISPATCHER REGION, and `emit_body` runs several: a
     // barrier-phased compute kernel calls this function once per phase with the SAME `RegState&`
@@ -3579,7 +3586,17 @@ bool emit_cfg_state_machine(
             entry_block != UINT32_MAX && entry_m0_reachable[entry_block];
         const std::set<int>& entry_m0_here =
             narrow ? entry_m0_in[entry_block] : entry_m0_may_hold;
+        // The Wave64 MUST scalar-word set is this MAY set's KILL (#4706): a word in it had a value-
+        // publishing write after the last save on every path here (a save of a value-less M0 drops
+        // the word from it), the same tag the filter below trusts for every reloaded scalar. Kena's
+        // compute `0x5008dc0000` saves M0 into s14 at pc85, reuses s14 as a loop counter, and was
+        // refused at pc491 without it.
+        const std::set<int>* m0_kill_words = nullptr;
+        if (narrow && (b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+            wave64_b64_reachable[entry_block])
+            m0_kill_words = &wave64_scalar_word_in[entry_block];
         for (int reg : entry_m0_here) {
+            if (m0_kill_words && m0_kill_words->contains(reg)) continue;
             state.sreg.erase(reg);
             state.sreg_entry_m0.insert(reg);
         }

@@ -5268,6 +5268,13 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
+      # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
+      prosper_add_gtest(test_entry_m0_wave64_kill
+        SOURCES tests/gpu/recompiler/test_entry_m0_wave64_kill.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops
