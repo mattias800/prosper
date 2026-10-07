@@ -48,6 +48,19 @@ constexpr uint32_t live_target_host_selector(uint32_t selector, bool component_o
 // order (below). An RGBA8 storage seed is instead recorded through BgraSeedScratch (#4428). Only a
 // sampled view can compose the swap into its selector (above).
 
+// Copies the guest byte range [offset, offset + bytes) of a BGRA target held as canonical RGBA8:
+// each byte comes from the canonical texel byte whose component lands at that guest byte, so the
+// range may start and end mid-texel. The caller has bounded the range by the surface (#4686 N1).
+inline void copy_canonical_rgba8_range_as_bgra(const uint8_t* canonical, uint64_t offset,
+                                               uint32_t bytes, std::vector<uint8_t>& out) {
+    out.resize(bytes);
+    for (uint32_t k = 0; k < bytes; ++k) {
+        const uint64_t i = offset + k;
+        const uint64_t component = i & 3u;
+        out[k] = canonical[i - component + (component == 0 ? 2 : component == 2 ? 0 : component)];
+    }
+}
+
 // Converts canonical RGBA8 texels to the guest's BGRA byte order (the swap is its own inverse). A
 // trailing partial texel is left alone; callers pass whole-image buffers.
 inline void swap_rgba8_red_blue(std::vector<uint8_t>& pixels) {

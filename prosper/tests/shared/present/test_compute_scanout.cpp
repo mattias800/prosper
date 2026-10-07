@@ -285,7 +285,7 @@ int main() {
         rgba.pixel_format = 0x80002200u;   // Gen4 A8B8G8R8: the mirror's BGRA order would be wrong
         const auto r =
             frontend::compute_scanout_publish(rgba, front.source_flip_seq, guest_only_inputs());
-        CHECK(r.decision == frontend::ComputeScanoutPresent::ExtentMismatch && !r.published,
+        CHECK(r.decision == frontend::ComputeScanoutPresent::FormatMismatch && !r.published,
               "a mirror is never presented for a buffer whose pixel format is not the one it took");
     }
     const auto published = frontend::compute_scanout_publish(front, front.source_flip_seq,

@@ -1460,8 +1460,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (!surface.rgba || surface.rgba->size() != target_bytes ||
                     bytes > target_bytes - offset)
                     return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
-                output.assign(surface.rgba->begin() + static_cast<size_t>(offset),
-                              surface.rgba->begin() + static_cast<size_t>(offset + bytes));
+                // A DMA copy reads GUEST memory: a CB_COLOR ALT target holds BGRA there, while the
+                // renderer keeps it as canonical RGBA8 (#4291). Hand over the guest's order (#4686 N1).
+                if (bpp == 4u && prosper::frontend::live_target_component_order_bgra(
+                                     surface.guest_format, format))
+                    prosper::frontend::copy_canonical_rgba8_range_as_bgra(surface.rgba->data(),
+                                                                          offset, bytes, output);
+                else
+                    output.assign(surface.rgba->begin() + static_cast<size_t>(offset),
+                                  surface.rgba->begin() + static_cast<size_t>(offset + bytes));
                 return prosper::gpu::LiveTargetByteReadResult::Success;
             }
             return prosper::gpu::LiveTargetByteReadResult::NotFound;

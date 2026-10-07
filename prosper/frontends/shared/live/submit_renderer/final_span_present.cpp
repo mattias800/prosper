@@ -226,6 +226,8 @@ void select_final_span_present(FinalSpanPresentContext& ctx) {
             gpu_outcome = GpuPresentOutcome::ComputeScanoutUnwatched; break;
         case ComputeScanoutPresent::ExtentMismatch:
             gpu_outcome = GpuPresentOutcome::ComputeScanoutExtentMismatch; break;
+        case ComputeScanoutPresent::FormatMismatch:
+            gpu_outcome = GpuPresentOutcome::ComputeScanoutFormatMismatch; break;
         case ComputeScanoutPresent::TileMismatch:
             gpu_outcome = GpuPresentOutcome::ComputeScanoutTileMismatch; break;
         case ComputeScanoutPresent::RendererSource:
