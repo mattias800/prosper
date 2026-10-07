@@ -40,7 +40,7 @@ Resynced* `PPSA28183`, a capture of the corrupted post-autosave frame, submit 38
    dwords). Fixed with a per-program cache.
 3. Two programs lose provenance at a CFG **join**. Still open.
 
-Fixes 1 and 2 are on branch `fix/split-t8-saveexec`, in review (no PR number yet). The pattern is
+Fixes 1 and 2 are #4712. The pattern is
 the point: each gap is a place where one proof's private approximation of "which instruction last
 wrote this SGPR on every path" disagreed with the ISA. Fixing them one at a time converges slowly
 and each fix lives in only one of several copies.
@@ -48,7 +48,7 @@ and each fix lives in only one of several copies.
 **Reference designs (verification-only; described, not copied).**
 
 - KytyPS5 lowers the shader to an SSA IR and tracks resources in a pass over it
-  (`src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp`, ~2,340 lines). A descriptor is
+  (`src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp`, ~2,440 lines). A descriptor is
   an SSA value, so a branch or `saveexec` cannot "kill" it: at a join it becomes a `Phi` whose
   operands are themselves traced. Where a descriptor is read from a table at a dynamic offset, the
   pass emits IR that computes a bounds-checked key at runtime and rewrites `Phi` edges onto that key
@@ -58,7 +58,15 @@ and each fix lives in only one of several copies.
   `resource_patching_pass.cpp`) and flattens the indirect user-data tree into a buffer the shader
   reads (`flatten_extended_userdata_pass.cpp`). Its discovery asserts that a sharp's producer is not
   a `Phi` (`resource_discover_pass.cpp:161`, `:178`), so it shows the SSA framing without solving the
-  join case this ADR targets. Neither is evidence of PS5 behaviour; both are design references.
+  join case this ADR targets.
+- AnyPS5 runs decode -> CFG -> structurizer -> SSA IR -> constant folding -> resource tracking
+  (`core/shader/recompiler/Recompiler.cpp`, `PrepareResourceProgram`) and handles the join case
+  explicitly: non-invariant descriptor phis are split per predecessor
+  (`Optimization/src/ResourceTracker.cpp`, `SplitDescriptorPhis`). It then specializes the IR against
+  the descriptor words in guest memory, one compiled variant per snapshot -- the recompile churn the
+  dynamic layer below is meant to avoid.
+
+None of the three is evidence of PS5 behaviour; all are design references.
 
 ## Decision
 
