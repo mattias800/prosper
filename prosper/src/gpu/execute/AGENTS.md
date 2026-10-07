@@ -43,6 +43,16 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   plan, the shell and pass-through stages compiled per wave count, the launch records, and the runs
   that draw the subgroups back in plan order. `build_ngg_subgroup_draw` is what a producer calls;
   the Vulkan half is `tests/fixtures/ngg_subgroup_gpu.h`.
+- `ngg_draw_admission` — which merged-NGG draws that path may run (P5): the register and
+  draw-shape table every refusal is named in, and the device half (`ngg_device_refusal`) the
+  producer, the backend and replay all ask. Vulkan-free; the backend publishes its capabilities.
+- `ngg_live_draw` — the live producer (P5), called only where a linked vertex chain just failed the
+  ordinary per-vertex compile. It owns the bounded compile and description caches, so no draw
+  compiles once warm.
+- `renderer_volume_publication` — writing a renderer-claimed volume back to guest memory so a
+  compute binding can read guest bytes (#4625). The plan names every refusal before any readback.
+  The live renderer registers the publisher, and compute asks through
+  `compute_renderer_volume_refusal`. Only a claim that is actually released admits the binding.
 - `srt_publication_dedupe.hpp` — which of those uses the graphics stage table publishes: once per
   key while the key resolves by `srt_offset`, once per consuming pc once it clashes. Getting this
   wrong leaves a consumer with no resource and refuses the whole program.

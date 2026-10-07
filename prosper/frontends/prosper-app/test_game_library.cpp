@@ -15,9 +15,16 @@ using prosper::frontend::GameEntry;
 using prosper::frontend::GameLibraryIo;
 using prosper::frontend::GamePathProbe;
 using prosper::frontend::parse_app_config;
+using prosper::frontend::game_entry_matches_filter;
+using prosper::frontend::parse_param_content_version;
+using prosper::frontend::parse_param_region;
 using prosper::frontend::parse_param_title_id;
 using prosper::frontend::parse_param_title_name;
 using prosper::frontend::path_basename;
+using prosper::frontend::HostPolicyInputs;
+using prosper::frontend::note_recent_game;
+using prosper::frontend::parse_volume_percent;
+using prosper::frontend::resolve_host_policy;
 using prosper::frontend::resolve_games_dir;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
@@ -170,6 +177,32 @@ int main() {
     CHECK(parse_param_title_id(kNoNameJson) == "PPSA00002", "titleId is read without a titleName");
     CHECK(parse_param_title_name("").empty(), "empty json yields no name");
     CHECK(parse_param_title_id("").empty(), "empty json yields no id");
+    // --- version + region: the list columns ------------------------------------------------
+    CHECK(parse_param_content_version(
+              "{\"contentVersion\":\"01.000.006\",\"titleId\":\"TEST19990\"}") == "01.000.006",
+          "contentVersion is read");
+    CHECK(parse_param_content_version("").empty(), "empty json yields no version");
+    CHECK(parse_param_content_version("{\"titleId\":\"TEST19990\"}").empty(),
+          "a dump without contentVersion yields empty, not garbage");
+    CHECK(parse_param_region(
+              "{\"contentId\":\"EP0700-TEST19990_00-SOME-GAME-00\"}") == "EP",
+          "the region is the two letters heading the contentId prefix");
+    CHECK(parse_param_region("{\"contentId\":\"nodashes\"}").empty(),
+          "a dashless contentId yields no region rather than the whole string");
+    CHECK(parse_param_region("").empty(), "empty json yields no region");
+    // --- search filter ---------------------------------------------------------------------
+    {
+        GameEntry e;
+        e.app0_root = "/games/TEST24651-app0";
+        e.title_id = "TEST24651";
+        e.title_name = "The Messenger";
+        CHECK(game_entry_matches_filter(e, ""), "an empty box matches everything");
+        CHECK(game_entry_matches_filter(e, "messenger"), "name matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "TEST24651"), "title id matches");
+        CHECK(game_entry_matches_filter(e, "test24651"), "title id matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "24651-app0"), "the path matches too");
+        CHECK(!game_entry_matches_filter(e, "zelda"), "an unrelated needle matches nothing");
+    }
     CHECK(parse_param_title_name("{\"localizedParameters\":{\"en-US\":{\"titleName\":\"Solo\"}}}")
               == "Solo",
           "a single language with no defaultLanguage falls back to the first titleName");
@@ -234,10 +267,20 @@ int main() {
     CHECK(scan_game_library("/empty", probe, io).empty(), "a directory with no titles yields nothing");
     CHECK(scan_game_library("/does/not/exist", probe, io).empty(), "a missing directory yields nothing");
     CHECK(scan_game_library("", probe, io).empty(), "an empty path yields nothing");
-    // The games dir itself is never treated as a title, even when it is one — documented behaviour, so
-    // pointing this at a single app0 folder yields nothing rather than one oddly-named entry.
-    CHECK(scan_game_library("/games/PPSA24651-app0", probe, io).empty(),
-          "a title root used as the games dir yields nothing (children only)");
+    // The games dir itself IS listed when it is a title root — a dump can sit at a drive
+    // root, where the folder is the game rather than a folder of games. A dedicated probe (not
+    // a PPSA-named fixture) so this test adds no title-id occurrences of its own.
+    {
+        GamePathProbe solo_probe;
+        solo_probe.is_dir = [](const std::string& s) { return s == "/solo"; };
+        solo_probe.is_file = [](const std::string& s) { return s == "/solo/eboot.bin"; };
+        GameLibraryIo solo_io;
+        solo_io.list_dir = [](const std::string&) { return std::vector<std::string>{}; };
+        const std::vector<GameEntry> self = scan_game_library("/solo", solo_probe, solo_io);
+        CHECK(self.size() == 1 && self[0].title_name == "solo" &&
+                  self[0].app0_root == "/solo",
+              "a title root used as the games dir lists itself");
+    }
     CHECK(scan_game_library("/games/", probe, io).size() == 7, "a trailing separator is tolerated");
     const GameLibraryIo empty_io;
     CHECK(scan_game_library("/games", probe, empty_io).empty(), "an unpopulated io scans nothing");
@@ -323,6 +366,148 @@ int main() {
         CHECK(after.games_dir == "/new", "a rewrite updates the setting it owns");
         CHECK(after.unknown_lines.size() == 1 && after.unknown_lines[0] == "ui_scale = 1.5",
               "a rewrite preserves a setting this build does not understand");
+    }
+
+    // --- recent games --------------------------------------------------------------------------
+    {
+        AppConfig rc;
+        note_recent_game(rc, "/games/B-app0");
+        note_recent_game(rc, "/games/A-app0");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0" &&
+                  rc.recent_games[1] == "/games/B-app0",
+              "recent games are most-recent-first");
+        note_recent_game(rc, "/games/A-app0/");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0",
+              "reopening moves to the head without duplicating, separators canonicalized");
+        note_recent_game(rc, "");
+        CHECK(rc.recent_games.size() == 2, "an empty path records nothing");
+        for (int i = 0; i < 12; i++)
+            note_recent_game(rc, "/games/G" + std::to_string(i) + "-app0");
+        CHECK(rc.recent_games.size() == AppConfig::kRecentGamesMax &&
+                  rc.recent_games[0] == "/games/G11-app0",
+              "the recent list is capped, newest head");
+        const AppConfig back = parse_app_config(serialize_app_config(rc));
+        CHECK(back.recent_games == rc.recent_games, "recent games survive a round trip in order");
+        CHECK(parse_app_config("recent = \nrecent = /a").recent_games.size() == 1,
+              "an empty recent line is not kept");
+    }
+
+    // --- volume --------------------------------------------------------------------------------
+    CHECK(parse_volume_percent("") == -1, "an empty value is unset, not muted");
+    CHECK(parse_volume_percent("0") == 0, "zero is a real choice (muted)");
+    CHECK(parse_volume_percent("75") == 75, "a plain percent is read");
+    CHECK(parse_volume_percent("100") == 100, "a hundred is read");
+    CHECK(parse_volume_percent("120") == 100, "overflow clamps like the --volume flag");
+    CHECK(parse_volume_percent("12x") == -1, "trailing junk is unset, not partial");
+    CHECK(parse_volume_percent("-5") == -1, "a sign is unset, not negative");
+    CHECK(parse_volume_percent(" 80") == -1, "surrounding space is unset (values arrive trimmed)");
+    {
+        AppConfig vc;
+        vc.volume_percent = 0;
+        CHECK(parse_app_config(serialize_app_config(vc)).volume_percent == 0,
+              "muted survives a round trip rather than reading as unset");
+        CHECK(parse_app_config(serialize_app_config(AppConfig{})).volume_percent == -1,
+              "an unset volume stays unset (no phantom key is written)");
+    }
+
+    // --- host policy: the precedence main.cpp ships ------------------------------------------------
+    // Every arm below feeds the environment THROUGH the inputs — including the env-wins arms the
+    // old resolve_* tests could not reach because main read the environment inline.
+    {
+        AppConfig file;
+        file.savedata_dir = "/saves";
+        file.present_mode = "mailbox";
+        file.display_mode = "host";
+        file.volume_percent = 75;
+        HostPolicyInputs in;
+        in.file = file;
+        const auto quiet = resolve_host_policy(in);
+        CHECK(quiet.savedata_dir == "/saves" && quiet.present_mode == "mailbox" &&
+                  quiet.display_mode == "host" && quiet.volume_percent == 75,
+              "a silent run takes everything from the file");
+        HostPolicyInputs loud = in;
+        loud.flag_present_mode = true;
+        loud.flag_display_mode = true;
+        loud.flag_volume = true;
+        loud.env_savedata_dir = "/env-saves";
+        loud.env_display_mode = "legacy";
+        const auto overridden = resolve_host_policy(loud);
+        CHECK(overridden.savedata_dir.empty() && overridden.present_mode.empty() &&
+                  overridden.display_mode.empty() && overridden.volume_percent == -1,
+              "a flag or environment on every source leaves nothing for the file");
+        HostPolicyInputs mixed = in;
+        mixed.env_savedata_dir = "/env-saves";
+        const auto mixed_out = resolve_host_policy(mixed);
+        CHECK(mixed_out.savedata_dir.empty() && mixed_out.present_mode == "mailbox",
+              "each source suppresses only its own file value");
+        CHECK(resolve_host_policy(HostPolicyInputs{}).savedata_dir.empty() &&
+                  resolve_host_policy(HostPolicyInputs{}).volume_percent == -1,
+              "an empty everything resolves to leave-everything-alone");
+    }
+
+    // --- display mode: the flag and the environment each suppress the file ON THEIR OWN ----------
+    // The `loud` arm above sets both, so each condition masks the other; these arms take one each.
+    {
+        HostPolicyInputs env_only;
+        env_only.file.display_mode = "host";
+        env_only.env_display_mode = "legacy";
+        CHECK(resolve_host_policy(env_only).display_mode.empty(),
+              "PROSPER_DISPLAY_MODE alone (no --display-mode) suppresses the file's display_mode");
+        HostPolicyInputs flag_only;
+        flag_only.file.display_mode = "host";
+        flag_only.flag_display_mode = true;
+        CHECK(resolve_host_policy(flag_only).display_mode.empty(),
+              "--display-mode alone (no PROSPER_DISPLAY_MODE) suppresses the file's display_mode");
+    }
+
+    // --- which runs take the persisted host settings at all ------------------------------------
+    // has_dump covers both `prosper-app <dump>` and `--dump <x>`: main.cpp passes !dump.empty().
+    {
+        namespace pf = prosper::frontend;
+        CHECK(!pf::host_policy_applies(/*has_dump=*/true, /*test_pattern=*/false,
+                                       /*from_library=*/false),
+              "a scripted dump run never takes the saved settings");
+        CHECK(!pf::host_policy_applies(/*has_dump=*/false, /*test_pattern=*/true,
+                                       /*from_library=*/false),
+              "a --test-pattern run never takes the saved settings");
+        CHECK(pf::host_policy_applies(/*has_dump=*/false, /*test_pattern=*/false,
+                                      /*from_library=*/false),
+              "a bare launch (the library) takes the saved settings");
+        CHECK(pf::host_policy_applies(/*has_dump=*/true, /*test_pattern=*/false,
+                                      /*from_library=*/true),
+              "a dump relaunched with --from-library takes the saved settings");
+    }
+
+    // --- volume: main.cpp applies the RESOLVER's answer, through volume_after_policy -------------
+    {
+        namespace pf = prosper::frontend;
+        HostPolicyInputs in;
+        in.file.volume_percent = 75;
+        CHECK(pf::volume_after_policy(resolve_host_policy(in), 100) == 75,
+              "with no --volume, the saved volume replaces the default");
+        HostPolicyInputs flagged = in;
+        flagged.flag_volume = true;
+        CHECK(pf::volume_after_policy(resolve_host_policy(flagged), 40) == 40,
+              "--volume wins: the flag's value survives a saved volume");
+        CHECK(pf::volume_after_policy(resolve_host_policy(HostPolicyInputs{}), 100) == 100,
+              "no saved volume leaves the current volume alone");
+        pf::HostPolicy muted;
+        muted.volume_percent = 0;
+        CHECK(pf::volume_after_policy(muted, 100) == 0,
+              "a saved volume of 0 (mute) is a real answer, not 'unset'");
+    }
+
+    // --- newline safety ----------------------------------------------------------------------------
+    {
+        AppConfig evil;
+        evil.games_dir = "/games\nplanted = 1";
+        evil.savedata_dir = "/saves\nplanted = 1";
+        evil.recent_games = {"/ok", "/bad\nplanted = 1"};
+        const std::string text = serialize_app_config(evil);
+        CHECK(text.find("planted") == std::string::npos,
+              "a newline in a path value cannot inject a key on rewrite");
+        CHECK(parse_app_config(text).games_dir.empty(),
+              "a dropped games_dir reads as unset, not as half a path");
     }
 
     // --- precedence -----------------------------------------------------------------------------

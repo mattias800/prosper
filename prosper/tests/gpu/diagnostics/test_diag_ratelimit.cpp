@@ -6,7 +6,7 @@
 // number trustworthy: the tail exists (so the ceiling is not the finding), and each key gets its
 // own budget (so a noisy key cannot starve the one under investigation).
 
-#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
 
 #include <cstdint>
 #include <cstdio>

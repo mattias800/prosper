@@ -36,6 +36,8 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
+#include "diagnostics/perf/perf_ledger.hpp"
+#include "gpu/diagnostics/draw_disposition.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -161,23 +163,25 @@ TEST(RenderObjectCreateFailure, Contract) {
         const ResolvedPipelineState* ps;
         bool drops_pass;             // true -> no frame at all; false -> a frame with no draw in it
         const char* extra;           // an extra substring the report must carry ("" -> none)
+        prosper::gpu::DrawDrop drop;   // the draw-disposition reason the lost draw is counted under
     };
+    using DD = prosper::gpu::DrawDrop;
     const Arm arms[] = {
-        {RenderVkObjectCreateSite::RenderPass,  "render-pass",  "vkCreateRenderPass",
-         &opaque,     true,  "subpasses=1"},
-        {RenderVkObjectCreateSite::Framebuffer, "framebuffer",  "vkCreateFramebuffer",
-         &opaque,     true,  "extent=64x64"},
-        {RenderVkObjectCreateSite::DepthStencilView, "ds-view", "vkCreateImageView",
-         &with_depth, true,  ""},
-        {RenderVkObjectCreateSite::ShaderModule, "shader-module", "vkCreateShaderModule",
-         &opaque,     false, ""},
+        {RenderVkObjectCreateSite::RenderPass, "render-pass", "vkCreateRenderPass", &opaque, true,
+         "subpasses=1", DD::RenderPassCreation},
+        {RenderVkObjectCreateSite::Framebuffer, "framebuffer", "vkCreateFramebuffer", &opaque, true,
+         "extent=64x64", DD::FramebufferCreation},
+        {RenderVkObjectCreateSite::DepthStencilView, "ds-view", "vkCreateImageView", &with_depth,
+         true, "", DD::TargetCreation},
+        {RenderVkObjectCreateSite::ShaderModule, "shader-module", "vkCreateShaderModule", &opaque,
+         false, "", DD::ShaderRejected},
         // #3721. Unlike its siblings this one is acquired FIRST, before any other resource, so the
         // pass is dropped with nothing yet built. The dedicated block after this loop is what
         // checks that "nothing yet built" claim; here it only has to report and drop.
-        {RenderVkObjectCreateSite::CommandPool, "command-pool", "vkCreateCommandPool",
-         &opaque,     true,  "queue-family="},
+        {RenderVkObjectCreateSite::CommandPool, "command-pool", "vkCreateCommandPool", &opaque,
+         true, "queue-family=", DD::CommandPool},
         {RenderVkObjectCreateSite::CommandBuffer, "command-buffer", "vkAllocateCommandBuffers",
-         &opaque,     true,  "queue-family="},
+         &opaque, true, "queue-family=", DD::CommandPool},
     };
 
     auto run_solid = [&](const Arm& arm, bool inject, std::vector<uint8_t>* px) -> std::string {
@@ -206,8 +210,26 @@ TEST(RenderObjectCreateFailure, Contract) {
         std::snprintf(msg, sizeof msg, "%s: an uninjected run logs no create failure", arm.name);
         CHECK(!has(control_log, "[render-object-create-failed]"), msg);
 
+        // The census half of the contract (#4643): `seen` is counted at the pass entry, so the
+        // lost draw must be dropped under a NAMED reason. Before, a dropped pass never reached the
+        // per-draw loop's seen count and balanced at 0 = 0 + 0 with no alarm.
+        auto& census = prosper::gpu::draw_disposition_census();
+        namespace perf = prosper::diagnostics::perf;
+        const auto unaccounted = [] {
+            return perf::ledger()
+                .counters[static_cast<size_t>(perf::Counter::DrawsUnaccounted)]
+                .load();
+        };
+        const uint64_t unaccounted_before = unaccounted();
+        const uint64_t named_before = census.dropped(arm.drop), seen_before = census.seen();
         std::vector<uint8_t> failed_px;
         const std::string failure_log = run_solid(arm, true, &failed_px);
+        std::snprintf(msg, sizeof msg, "%s: the draw is counted seen and dropped as %s", arm.name,
+                      prosper::gpu::draw_drop_name(arm.drop));
+        CHECK(census.seen() == seen_before + 1 && census.dropped(arm.drop) == named_before + 1,
+              msg);
+        std::snprintf(msg, sizeof msg, "%s: the dropped draw is not UNACCOUNTED", arm.name);
+        CHECK(unaccounted() == unaccounted_before, msg);
 
         // THE CONTRACT. Unfixed code prints nothing at all, so all of these go red.
         std::string expect_site =

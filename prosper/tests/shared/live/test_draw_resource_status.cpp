@@ -3,6 +3,10 @@
 // timing hooks, not shader reflection, rendered pixels or GPU completion.
 #include "shared/live/submit_renderer/guest_reads.hpp"   // safe_span
 #include "shared/live/submit_renderer/image_resources.hpp"
+#include "shared/live/submit_renderer/backend_draws.hpp"
+#include "gpu/execute/ngg_subgroup_draw.hpp"
+
+#include <memory>
 
 #include "diagnostics/transfer_pressure.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -300,6 +304,82 @@ static void check_tail(const char* arm, const BuiltFrameResources& result,
           "both stages actually consume the seeded manifests on the production memo path");
 }
 
+// #3135 P5: a merged-NGG draw's set 0 is reflected from its subgroup SHELL (memo identity: the
+// shell hash with bit 63 set, stage Compute), not from its (empty) vertex module, and the frontend
+// hands the description to the backend draw. The vertex memo is seeded EMPTY, so a builder that
+// still reflected the vertex module would build no set-0 buffer.
+static void ngg_arms(FixtureState& state) {
+    const char* arm = "ngg-set0-from-shell";
+    state.reset();
+    constexpr uint64_t kShellHash = 0x0123456789abcdefull;
+    auto stages = std::make_shared<NggSubgroupStages>();
+    stages->waves = 1;
+    stages->shell = std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{1, 2, 3});
+    stages->raster_vertex = stages->shell;
+    stages->shell_hash = kShellHash;
+    auto ngg = std::make_shared<NggSubgroupDraw>();
+    NggSubgroupWaveGroup group;
+    group.waves = 1;
+    group.blocks = 1;
+    group.stages = stages;
+    ngg->groups.push_back(group);
+    ngg->runs.push_back({0, 0, 1});
+
+    const Input buffer = [] {
+        Input input = ordinary_buffer();
+        input.resource.cls = ResourceClass::VertexBuffer;
+        return input;
+    }();
+    auto vrt = std::make_shared<ShaderResourceTable>();
+    vrt->resources.push_back(buffer.resource);
+    ReflectMemoEntry shell_entry;
+    shell_entry.set = 0;
+    shell_entry.stage = SpirvShaderStage::Compute;
+    auto descriptor = buffer.descriptor;
+    descriptor.set = 0;
+    descriptor.stage = SpirvShaderStage::Compute;
+    shell_entry.report.descriptors.push_back(descriptor);
+    state.reflect_memo.emplace(kShellHash | (1ull << 63), std::move(shell_entry));
+    ReflectMemoEntry empty_vertex;
+    empty_vertex.set = 0;
+    empty_vertex.stage = SpirvShaderStage::Vertex;
+    state.reflect_memo.emplace(1, std::move(empty_vertex));
+
+    DrawItem draw;
+    draw.vs_identity = 1;
+    draw.vrt = vrt;
+    draw.ngg_subgroup = ngg;
+    auto context = state.context();
+    const auto built = build_draw_frame_resources(context, draw, vrt.get(), nullptr, nullptr);
+    check(built.complete && built.buffers.size() == 1 && built.buffers[0].set == 0 &&
+              built.buffers[0].binding == 20,
+          arm, "the shell's reflected set-0 buffer is built");
+
+    arm = "ngg-frontend-copy";
+    state.reset();
+    state.reflect_memo.emplace(kShellHash | (1ull << 63), [&] {
+        ReflectMemoEntry entry;
+        entry.set = 0;
+        entry.stage = SpirvShaderStage::Compute;
+        entry.report.descriptors.push_back(descriptor);
+        return entry;
+    }());
+    const prosper::gpu::FragmentWavePolicy policy{};
+    const prosper::gpu::LiveRenderPhase phase{};
+    const bool off = false;
+    const char* const mode = nullptr;
+    auto overrides = load_shader_overrides();
+    auto resource_context = state.context();
+    BackendDrawContext backend_context{
+        policy, phase, off, state.pending_timing, off, off, mode, resource_context, overrides};
+    const std::vector<const DrawItem*> group_items = {&draw};
+    const auto bds = build_backend_draws(backend_context, group_items, nullptr);
+    check(bds.size() == 1 && bds[0].ngg_subgroup == draw.ngg_subgroup, arm,
+          "build_backend_draws hands the description to the backend draw");
+    check(bds.size() == 1 && bds[0].B.size() == 1 && bds[0].B[0].set == 0, arm,
+          "and the set-0 buffer the shell reads travels with it");
+}
+
 int main(int argc, char** argv) {
     check(prosper::frontend::TextureReferenceCensus::enabled(), "setup",
           "the census is armed before its first cached read");
@@ -508,6 +588,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    ngg_arms(state);
     std::printf("draw resource status: %d failures (seeded builder metadata; no rendered-pixel claim)\n",
                 failures);
     return failures ? 1 : 0;

@@ -240,6 +240,11 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
 # src/diagnostics; any target including it needs `src` and that translation unit.
 find_package(Threads REQUIRED)
+# CPU microbenchmark (not a ctest): refreshing one resident compute buffer, single span vs differing blocks
+add_executable(bench_block_sync tests/shared/compute/bench_block_sync.cpp)
+target_include_directories(bench_block_sync PRIVATE frontends src tests)
+target_link_libraries(bench_block_sync PRIVATE prosper_core)
+
 prosper_add_gtest(test_compute_buffer_diff_span
   SOURCES tests/shared/compute/test_compute_buffer_diff_span.cpp
           src/diagnostics/worker_spawn_census.cpp
@@ -1301,6 +1306,18 @@ if(TARGET prosper_core)
     INCLUDES src tests
     LIBRARIES prosper_core)
 
+  # #3135 P5: live admission of merged-NGG draws -- the register table, the device half and the
+  # cached live producer. Pure CPU; the Kena arms compile the captured chain from tests/data.
+  prosper_add_gtest(test_ngg_draw_admission
+    SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  # #3135 P5: the v72 capture record of a merged-NGG draw description.
+  prosper_add_gtest(test_ngg_subgroup_codec
+    SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
@@ -1648,6 +1665,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_manager.cpp
     LIBRARIES prosper_core)
 
+  # libSceNetCtl / libSceNpManager state callbacks: registered on every host (they were POSIX-only,
+  # so a Windows title's boot registration answered 0 over an unwritten callback id). Delivery of the
+  # honest offline / signed-out state, capacity and null-argument cases, on host-function callbacks.
+  prosper_add_gtest(test_np_state_callbacks
+    SOURCES tests/hle/np/test_np_state_callbacks.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.
@@ -1927,12 +1951,6 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
 
-  # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
-  # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
-  add_executable(test_prosper_app_library_nav frontends/prosper-app/test_library_nav.cpp)
-  target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
-  add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
-
   # Library descriptor-pool sizing and the exhaustion rule (#1649): the pool must follow the title count
   # instead of a fixed 256, and a set must never be allocated out of a full pool — ImGui's backend writes
   # to whatever vkAllocateDescriptorSets returned without checking it. Pure arithmetic plus a fake
@@ -2026,6 +2044,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_diagnostic_window
     SOURCES frontends/shared/tests/test_diagnostic_window.cpp
     INCLUDES frontends)
+
+  # The library list's keyboard gate: typing in the search box must never move the selection or
+  # boot a game. Pure predicate — no SDL, no ImGui, no window.
+  prosper_add_gtest(test_frontend_list_nav
+    SOURCES frontends/prosper-app/test_list_nav.cpp
+    INCLUDES frontends/prosper-app)
 
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
@@ -4167,6 +4191,7 @@ endif()
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
+                                               frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4577,6 +4602,7 @@ endif()
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
+                                               frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4993,6 +5019,13 @@ endif()
         INCLUDES src tests
         LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
+      # #4625: a compute binding of a renderer-claimed volume publishes it to guest memory first,
+      # then runs a real 3D storage dispatch on the published bytes through the live backend.
+      prosper_add_gtest(test_renderer_volume_publication
+        SOURCES tests/gpu/execute/test_renderer_volume_publication.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
       # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
       # for byte against the P3 offline result, two wave-count groups in one draw, a draw between
       # two ordinary draws, the zero-fill on slice reuse, and the lazily read violation counters.
@@ -6782,6 +6815,22 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   # An RGB10A2 compute result is narrowed to the RGBA8 renderer target (Black Flag's flip buffer).
   prosper_add_gtest(test_unorm10_snapshot
     SOURCES tests/shared/live/test_unorm10_snapshot.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
+  prosper_add_gtest(test_pipeline_observe_hook
+    SOURCES tests/shared/live/test_pipeline_observe_hook.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+  prosper_add_gtest(test_pipeline_observer
+    SOURCES tests/shared/compute/test_pipeline_observer.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_retirement_queue
+    SOURCES tests/shared/compute/test_retirement_queue.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 

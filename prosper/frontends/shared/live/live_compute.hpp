@@ -398,8 +398,10 @@ uint64_t live_compute_storage_result_snapshot_bytes();
 uint64_t live_compute_image_result_snapshot_bytes();
 // A cold, proven-full guest target has no observable old seed. Large targets may defer their exact
 // source baseline until an address actually repeats; replay-owned and partial targets may not.
-bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
-                                            size_t guest_bytes, size_t minimum_bytes);
+constexpr bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
+                                                      size_t guest_bytes, size_t minimum_bytes) {
+    return !host_data && full_overwrite && guest_bytes >= minimum_bytes;
+}
 
 // Deterministic failure injection for the storage-image recovery regression test. The next storage
 // readback fails after dispatch, exercising retained-image invalidation without a Vulkan fault.

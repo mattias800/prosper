@@ -1,7 +1,7 @@
 // Address admission for a bounded PROSPER_DUMP_PERSISTENT readback.
 #pragma once
 
-#include "gpu/diagnostics/watch_list.hpp"
+#include "diagnostics/watch_list.hpp"
 
 #include <algorithm>
 #include <cstddef>

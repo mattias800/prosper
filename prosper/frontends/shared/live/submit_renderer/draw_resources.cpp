@@ -905,8 +905,14 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
           }
       }
     };
-    add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex,
-        draw.vs_identity);
+    // #3135 P5: a merged-NGG draw's set 0 is what its subgroup shell, a compute module, reads.
+    // Its memo identity is the shell hash with the top bit set, apart from shader-cache identities.
+    const auto* ngg = draw.ngg_subgroup ? draw.ngg_subgroup->groups.front().stages.get() : nullptr;
+    if (ngg)
+        add(vrt, 0, *ngg->shell, prosper::gpu::SpirvShaderStage::Compute,
+            ngg->shell_hash | (1ull << 63));
+    else
+        add(vrt, 0, draw.vs_words(), prosper::gpu::SpirvShaderStage::Vertex, draw.vs_identity);
     add(prt, 1, draw.fs_words(), prosper::gpu::SpirvShaderStage::Fragment,
         draw.fs_identity);
     // VS resources -> descriptor set 0, PS -> set 1

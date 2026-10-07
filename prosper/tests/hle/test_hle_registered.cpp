@@ -142,13 +142,15 @@ TEST(HleRegistered, LibSceSaveDataAndDialog) {
          "sceSaveDataDialogInitialize", "sceSaveDataDialogOpen", "sceSaveDataDialogUpdateStatus"});
 }
 
-// The NP / online family (register_np_hle, src/hle/np/np.cpp). sceNpCheckCallback and
-// sceNpUnregisterStateCallbackA bind from inside an #ifndef _WIN32 / #else pair, to a
-// different handler on each arm, so this asserts the NID is bound on whichever is building.
+// The NP / online family (register_np_hle, src/hle/np/np.cpp). The state-callback NIDs
+// (sceNpCheckCallback, sceNpRegister/UnregisterStateCallbackA and the sceNetCtl*Callback
+// set) bind on every host from src/hle/np/state_callbacks.cpp.
 TEST(HleRegistered, NpAndOnline) {
     expect_family_registered(
         {"sceNpGetState", "sceNpGetNpReachabilityState", "sceNpCheckNpAvailability",
-         "sceNpCheckCallback", "sceNpRegisterStateCallback", "sceNetCtlGetInfo",
+         "sceNpCheckCallback", "sceNpRegisterStateCallback", "sceNpRegisterStateCallbackA",
+         "sceNpUnregisterStateCallbackA", "sceNetCtlRegisterCallback",
+         "sceNetCtlUnregisterCallback", "sceNetCtlCheckCallback", "sceNetCtlGetInfo",
          "sceNetCtlGetResult", "sceNpTrophy2GetGameInfo", "sceNpTrophy2CreateContext"});
 }
 

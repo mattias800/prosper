@@ -1,7 +1,7 @@
 #include "gpu/diagnostics/draw_program_skip.hpp"
 
-#include "gpu/diagnostics/diag_ratelimit.hpp"
-#include "gpu/diagnostics/watch_list.hpp"
+#include "diagnostics/diag_ratelimit.hpp"
+#include "diagnostics/watch_list.hpp"
 
 #include <algorithm>
 #include <cstdio>
