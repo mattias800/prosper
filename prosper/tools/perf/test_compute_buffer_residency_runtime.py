@@ -15,6 +15,8 @@ PREFIX = "[compute-buffer-timing] "
 FIXTURE = "[buffer-residency-fixture] "
 MIB = 1 << 20
 BYTES = 2 * MIB
+# sync_compute_buffer_blocks' granularity (compute_buffer_bytes.hpp).
+BLOCK = 64 << 10
 
 
 def require(condition, message):
@@ -47,7 +49,8 @@ def run(binary, mode, cap_mib, large_bytes=None):
                    if not key.startswith("PROSPER_COMPUTE") and
                    key not in {"PROSPER_NO_PERSISTENT_COMPUTE_BUFFERS",
                                "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS",
-                               "PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM"}}
+                               "PROSPER_NO_IDLE_COMPUTE_BUFFER_RECLAIM",
+                               "PROSPER_NO_COMPUTE_BLOCK_SYNC"}}
     command = [str(binary), mode, str(cap_mib)]
     if large_bytes is not None:
         command.append(str(large_bytes))
@@ -158,8 +161,12 @@ def pressure(binary, mode, primary, baseline, cap_mib):
     require(repeated["writeback"] in ("unchanged", "gpu-unchanged"),
             "changed result did not become the new unchanged result")
     repaired = grouped[changed + 2][0]
+    # A HIT: B's primary survived the pressure, so the refresh compares guest memory against that
+    # retained GPU buffer's own mapped bytes and, since #4660, copies only the differing 64 KiB
+    # blocks. The external write flips data[0], so exactly one block. A primary that had been
+    # evicted would be a miss with a fresh allocation and the diff-span upload instead.
     expect(repaired, addr=addresses[1], cache="hit", upload_skipped=0,
-           uploaded_bytes=BYTES, writeback="changed", guest_copied_bytes=BYTES,
+           uploaded_bytes=BLOCK, writeback="changed", guest_copied_bytes=BYTES,
            gpu_compare="ineligible")
     return witness
 
