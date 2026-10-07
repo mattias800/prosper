@@ -307,10 +307,10 @@ int main() {
         reset_output(out);
         const auto out_base = reinterpret_cast<uint64_t>(out);
         uint32_t output_writes = 0;
-        set_guest_gpu_write_observer([&output_writes, out_base](uint64_t address, uint64_t size,
-                                                                const char*) {
-            if (address < out_base + kOutputBytes && out_base < address + size) ++output_writes;
-        });
+        set_guest_gpu_write_observer(
+            [&output_writes, out_base](uint64_t address, uint64_t size, const char*) {
+                if (address < out_base + kOutputBytes && out_base < address + size) ++output_writes;
+            });
         ComputeItem zero = consumer(0, 0x36560065u);   // direct form: no indirect arguments
         zero.launch.groups_x = 0;
         zero.launch.groups_y = 0;
