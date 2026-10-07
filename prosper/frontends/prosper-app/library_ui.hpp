@@ -29,6 +29,14 @@
 // implementation needs it, and the app's other translation units should not pick it up.
 struct ImFont;
 
+namespace prosper {
+namespace frontend {
+// The Game Log line buffer (log_ring.hpp); owned by main.cpp, only observed here. Forward
+// declared so this header stays free of <mutex>/<deque>.
+class LogRing;
+} // namespace frontend
+} // namespace prosper
+
 namespace prosper::frontend {
 
 // What the user did on this frame.
@@ -84,6 +92,10 @@ public:
     // Seed File > Recent games from the persisted settings. Seeded once before the first frame;
     // boots only happen from here pre-guest, after which the menu is gone with the library.
     void set_recent(std::vector<RecentGame> recent) { recentGames_ = std::move(recent); }
+
+    // Point the Game Log panel at main.cpp's capture ring (null: capture unavailable, the panel
+    // says so). Seeded once before the first frame; the ring outlives the UI.
+    void set_log_ring(const LogRing* ring) { logRing_ = ring; }
 
     // prosper-app's `--volume`, as a linear factor in [0,1] (#3499). It attenuates the launcher music
     // as well as the title (launcher_music_output_gain). Must be set before init(); no effect after.
@@ -232,6 +244,8 @@ private:
     std::vector<Cover>     covers_;
     std::vector<int>       filtered_;
     std::vector<RecentGame> recentGames_;
+    const LogRing*         logRing_ = nullptr;  // observed only; owned by main.cpp
+    bool                   logFollow_ = true;
     // Row hovered last frame. The highlight is painted at row start, but hover is only
     // knowable after the row's items — so it trails by one frame, which is imperceptible and
     // always spans the whole row (unlike a Selectable's own cell-sized hover paint).

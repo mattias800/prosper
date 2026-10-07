@@ -2,6 +2,7 @@
 // Vulkan device, and decodes cover art with stb_image (#1471).
 #include "library_ui.hpp"
 #include "list_nav.hpp"   // pure keyboard gate: typing in the search box never drives the list
+#include "log_ring.hpp"   // Game Log snapshot; the ring itself is owned by main.cpp
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
@@ -1070,7 +1071,11 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                            ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable |
                                            ImGuiTableFlags_ScrollY;
-        float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
+        // The footer, the Game Log label row and the log panel below take their share first;
+        // a tiny window collapses the table rather than pushing them off-screen.
+        static constexpr float kLogPanelH = 140.0f;
+        float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f -
+                       kLogPanelH - ImGui::GetStyle().ItemSpacing.y * 3.0f;
         if (tableH < 0.0f) tableH = 0.0f;
         if (ImGui::BeginTable("games", 6, tableFlags, ImVec2(0, tableH))) {
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, kThumbSize);
@@ -1164,6 +1169,30 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::Text("%d game%s", shown, shown == 1 ? "" : "s");
         ImGui::SameLine();
         ImGui::TextDisabled("Play / Enter opens  |  double-click opens  |  Esc quits");
+        ImGui::Spacing();
+
+        // Game Log: this library session's own stdout/stderr tail, tailed live. Rendered, never
+        // stored here — the ring owns the lines and caps them.
+        ImGui::Separator();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Game Log");
+        ImGui::SameLine();
+        ImGui::Checkbox("Follow", &logFollow_);
+        if (ImGui::BeginChild("gamelog", ImVec2(0, kLogPanelH), true,
+                              ImGuiWindowFlags_HorizontalScrollbar)) {
+            if (!logRing_) {
+                ImGui::TextDisabled("Log capture unavailable.");
+            } else {
+                const std::vector<std::string> lines = logRing_->snapshot();
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(lines.size()));
+                while (clipper.Step())
+                    for (int li = clipper.DisplayStart; li < clipper.DisplayEnd; li++)
+                        ImGui::TextUnformatted(lines[static_cast<size_t>(li)].c_str());
+                if (logFollow_ && !lines.empty()) ImGui::SetScrollHereY(1.0f);
+            }
+        }
+        ImGui::EndChild();
     }
 
     if (!status.empty()) {

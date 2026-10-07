@@ -157,7 +157,9 @@ window: cover thumbnail, name, serial, region, version and folder, with a search
 list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
 opens the highlighted title (not while the search box has focus), and a double-click opens directly;
 **Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
-and offers the same folder picker on Enter or a click.
+and offers the same folder picker on Enter or a click. A Game Log panel below the list tails this
+session's own log lines; it exists only while the library is up and never affects what the console
+or a log file receives.
 
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
 the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either
