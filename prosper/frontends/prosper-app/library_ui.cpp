@@ -883,7 +883,7 @@ void LibraryUi::draw_settings_content(LibraryAction& action) {
 
     section("Game folders");
     if (gamesDirs_.empty()) {
-        ImGui::TextDisabled("None yet — File > Add games folder... starts the list.");
+        ImGui::TextDisabled("None yet -- File > Add games folder... starts the list.");
     }
     // One row per folder with its own Remove: adding appends, so removing must exist or a
     // misclick could only be undone by hand-editing the settings file.
