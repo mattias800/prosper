@@ -7167,11 +7167,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
         return decline("subgroup-contract-absent");
     }
-    const uint32_t dispatch_groups[3] = {
-        item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
+    const uint32_t dispatch_groups[3] = {item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
+    // Zero groups on any axis launch no wave: a hardware no-op, as on the indirect routes (#4131).
+    if (!device_indirect && !(dispatch_groups[0] && dispatch_groups[1] && dispatch_groups[2])) return true;
     for (uint32_t axis = 0; axis < 3 && !device_indirect; ++axis) {   // #3656: bounded on the device
-        if (dispatch_groups[axis] &&
-            dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis])
+        if (dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis])
             continue;
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
