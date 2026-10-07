@@ -190,6 +190,15 @@ family at a time, each family gated on byte-identical SPIR-V over a recorded cor
 Status: proposed (adr:0012)
 Enforcement: adr:0012
 
+### GPU-4 -- descriptor provenance has one analysis, shared by recompiler and executor
+
+Which guest descriptor a shader resource operand names is answered by one phi-aware analysis over
+the program's CFG, computed once per program version and consumed by both the recompiler and the
+executor. What it cannot prove is resolved at runtime through an emulator-maintained table or
+refused visibly; no path re-derives provenance on its own.
+Status: proposed (adr:0027)
+Enforcement: adr:0027
+
 ### SYNC-1 -- one wait model, no host-thread identity across a fiber switch
 
 Every blocking guest wait goes through one model that names what it waits for. No state keyed by
