@@ -6588,6 +6588,12 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
                                                    frontends)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
                                               prosper_performance_capture)
+    if(WIN32)
+      # The Explorer folder picker (IFileOpenDialog) calls CoInitializeEx/CoCreateInstance/
+      # CoTaskMemFree (ole32) and references CLSID_FileOpenDialog (libuuid on MinGW). A static
+      # FetchContent SDL3 brings both transitively; a shared, packaged SDL3 does not.
+      target_link_libraries(prosper-app PRIVATE ole32 uuid)
+    endif()
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
     # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
     if(TARGET prosper_live_renderer)

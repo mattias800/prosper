@@ -150,6 +150,7 @@ static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = 
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>   // IFileOpenDialog: the Explorer folder picker below
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
@@ -1460,6 +1461,90 @@ static void picked_folder_cb(void* /*userdata*/, const char* const* filelist, in
     g_picked_path = filelist[0];
 }
 
+#ifdef _WIN32
+// Set by the Explorer picker's worker when COM could not put its dialog on screen. g_picker_open
+// stays true meanwhile, so a pending library browse stays armed; the main loop consumes the flag and
+// opens SDL's dialog, which SDL3 documents as main-thread only.
+bool g_picker_sdl_fallback = false;
+
+struct ExplorerPick {
+    HRESULT hr = S_OK;   // the first failing step's result, or S_OK
+    const char* step = nullptr;   // which COM call produced hr
+    bool shown = false;   // the dialog was on screen (Show returned success)
+    std::string path;   // UTF-8, empty when nothing usable came back
+};
+
+// Native Explorer folder picker (IFileOpenDialog + FOS_PICKFOLDERS). Runs on a fresh thread so it
+// owns a single-threaded apartment. Blocks until the user answers.
+static ExplorerPick run_explorer_folder_picker(SDL_Window* win) {
+    ExplorerPick r;
+    auto failed = [&r](HRESULT hr, const char* step) {
+        r.hr = hr;
+        r.step = step;
+        return FAILED(hr);
+    };
+    if (failed(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE),
+               "CoInitializeEx"))
+        return r;
+    IFileOpenDialog* dialog = nullptr;
+    DWORD opts = 0;
+    if (!failed(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                 IID_PPV_ARGS(&dialog)),
+                "CoCreateInstance") &&
+        !failed(dialog->GetOptions(&opts), "GetOptions") &&
+        // Without FOS_PICKFOLDERS this would be a FILE picker, so a failure here is a COM failure.
+        !failed(dialog->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM), "SetOptions")) {
+        HWND parent = nullptr;
+        if (win)
+            parent = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win),
+                                                  SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        if (!failed(dialog->Show(parent), "Show")) {
+            r.shown = true;
+            IShellItem* item = nullptr;
+            if (!failed(dialog->GetResult(&item), "GetResult")) {
+                PWSTR wide = nullptr;
+                if (!failed(item->GetDisplayName(SIGDN_FILESYSPATH, &wide), "GetDisplayName") &&
+                    wide) {
+                    // Size first: a fixed buffer would silently drop a path past its length.
+                    const int n =
+                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+                    if (n > 1) {
+                        std::string utf8(static_cast<size_t>(n), '\0');
+                        if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8.data(), n, nullptr,
+                                                nullptr) == n) {
+                            utf8.resize(static_cast<size_t>(n - 1));   // drop the terminator
+                            r.path = std::move(utf8);
+                        }
+                    }
+                    if (r.path.empty()) {
+                        r.hr = HRESULT_FROM_WIN32(GetLastError());
+                        r.step = "WideCharToMultiByte";
+                    }
+                    CoTaskMemFree(wide);
+                }
+                item->Release();
+            }
+        }
+    }
+    if (dialog) dialog->Release();
+    CoUninitialize();
+    return r;
+}
+
+// Called by the main loop every iteration: opens SDL's folder dialog when the Explorer picker asked
+// for the fallback. Must run on the main thread.
+static void start_pending_sdl_folder_fallback(SDL_Window* win) {
+    {
+        std::lock_guard<std::mutex> lock(g_picked_mutex);
+        if (!g_picker_sdl_fallback) return;
+        g_picker_sdl_fallback = false;
+    }
+    SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+}
+#else
+static void start_pending_sdl_folder_fallback(SDL_Window*) {}
+#endif
+
 // Returns true when this call actually opened a dialog, so a caller can arm per-request state only
 // when its request is the one outstanding.
 static bool open_folder_picker(SDL_Window* win) {
@@ -1468,7 +1553,42 @@ static bool open_folder_picker(SDL_Window* win) {
         if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
+#ifdef _WIN32
+    // SDL 3.2's Windows folder dialog is still the legacy SHBrowseForFolder tree, which hides
+    // drives inside a namespace modern users no longer recognize; the Explorer dialog shows
+    // This PC, the address bar and search. Same park-and-consume contract as picked_folder_cb.
+    // A COM failure before the dialog is on screen falls back to the SDL dialog, which the main
+    // loop opens (start_pending_sdl_folder_fallback); a cancel is reported as a cancel.
+    std::thread([win] {
+        const ExplorerPick r = run_explorer_folder_picker(win);
+        std::lock_guard<std::mutex> lock(g_picked_mutex);
+        if (r.hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            g_picker_open = false;
+            fprintf(stderr, "[app] folder picker cancelled.\n");
+            return;
+        }
+        if (!r.shown) {
+            // g_picker_open stays true until the SDL dialog answers through picked_folder_cb.
+            fprintf(stderr,
+                    "[app] Explorer folder picker failed (%s, HRESULT 0x%08lx); "
+                    "falling back to the SDL dialog.\n",
+                    r.step, static_cast<unsigned long>(r.hr));
+            g_picker_sdl_fallback = true;
+            return;
+        }
+        g_picker_open = false;
+        if (r.path.empty()) {
+            // The user chose something we could not read back: leave the pick unclaimed, and the
+            // main loop's "empty path, closed dialog" branch disarms any pending browse.
+            fprintf(stderr, "[app] folder picker returned no usable path (%s, HRESULT 0x%08lx).\n",
+                    r.step ? r.step : "?", static_cast<unsigned long>(r.hr));
+            return;
+        }
+        g_picked_path = r.path;
+    }).detach();
+#else
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+#endif
     return true;
 }
 
@@ -3244,6 +3364,10 @@ int main(int argc, char** argv) {
             }
         }
         if (!running) break;
+
+        // The Windows Explorer picker cannot open SDL's dialog itself (main-thread only), so a COM
+        // failure there is turned into SDL's dialog here.
+        start_pending_sdl_folder_fallback(win);
 
         // The folder picker answers asynchronously and possibly on another thread, so it parks its
         // result. Consume it here, between frames, where booting is safe.
