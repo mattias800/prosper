@@ -561,6 +561,14 @@ jobs:
           python3 prosper/tools/screenshots/shrink.py --check \
             assets/screenshots prosper/docs/screenshots
 
+      # Paths, the other half of the screenshot convention: a new capture lives at
+      # assets/screenshots/<TITLE_ID>-<slug>|cross-title|app/<YYYY-MM-DD>-<what>[-i<issue>].webp
+      # (spec ASSET-1, ADR 0026). REPORT-ONLY while ADR 0026 is proposed: violations print as
+      # warnings and the step passes, so the rule is visible without being binding. Accepting the
+      # ADR removes --report-only. An unevaluable tree (exit 2) still fails.
+      - name: Report screenshots outside the path convention
+        run: python3 prosper/tools/screenshots/check_screenshot_paths.py --github --report-only --root .
+
       # The other half of the numbering contract, and until now nobody checked it. The table's value
       # is that other files point AT it by number, and roughly half of those references are
       # .cpp/.hpp/.py COMMENTS rather than prose -- the step prints the live counts, so no figure is
