@@ -168,6 +168,8 @@ opens the highlighted title (not while the search box has focus), and a double-c
 **Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
 and offers the same folder picker on Enter or a click.
 
+![The library view: toolbar, search box, and game list](../../docs/screenshots/issue-4665-library-table.webp)
+
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
 the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either
 exists on a dump, and a recursive size walk over a 100 GB title is not something the UI thread
