@@ -13,7 +13,6 @@ frontends/prosper-app/test_guest_end_status.cpp
 frontends/prosper-app/test_keyboard_pad_map.cpp
 frontends/prosper-app/test_launcher_media.cpp
 frontends/prosper-app/test_library_descriptor_budget.cpp
-frontends/prosper-app/test_library_nav.cpp
 frontends/prosper-app/test_pad_overlay.cpp
 frontends/prosper-app/test_performance_capture_schedule.cpp
 frontends/prosper-app/test_present_mode.cpp
