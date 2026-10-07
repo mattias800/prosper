@@ -843,7 +843,7 @@ void LibraryUi::draw_settings_content(LibraryAction& action) {
         }
     };
 
-    ImGui::TextWrapped("These apply to games you open from here — never to a scripted launch. "
+    ImGui::TextWrapped("These apply to games you open from here -- never to a scripted launch. "
                        "A command-line flag or an environment variable still wins over each one.");
     section("Presentation");
     radio_row("Vsync", "Smoothest picture, a little more input lag.", presentMode_, "fifo",
