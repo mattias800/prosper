@@ -19,6 +19,7 @@
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/split_t8_proof.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/refused_shader_dump.hpp"
@@ -574,6 +575,8 @@ struct DecodedShader {
     }
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
+    // Code-only split-T# proof results for this byte version (split_t8_proof.hpp).
+    std::shared_ptr<SplitT8ProofCache> split_t8_cache = make_split_t8_proof_cache();
     std::vector<uint32_t> code;
     // Canonical original-packet facts belong to this SAME immutable byte version. They are
     // derived cold from the full stream, never from compact/normalized native instructions.
