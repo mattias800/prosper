@@ -16,10 +16,16 @@
 //   ChangedTailAtTheSameAddressIsReanalysed  a hit trusts bytes past the first s_endpgm it never
 //                                       re-read (#4712 review B1: the decode cache validates only
 //                                       the body, so same body + new tail reached the old answer)
-//   ProducerThroughAnOutOfRangePointerIsRefused  the pointer-register bound leaves the code-only half
-//                                       (#4712 review B2: the dataflow then reads past its array)
+//   ProducerThroughAnOutOfRangePointerIsRefused  documents the bound; the later per-call check also
+//                                       refuses s106+, so only a sanitizer sees the code-only half's
+//                                       out-of-range read if its bound is dropped (#4712 review B2)
+//   SaveexecOverTheDescriptorIsRefusedByTheProof  a saveexec destination is not treated as written
+//   CacheKeyIncludesTheBaseAndProducers  the cache key drops tbase or the producer pcs
+//   FoldAnalysesPastTheOldCap            the call site clamps the program to 2048 dwords again
+//   SameLengthEditIsReanalysed           a cache hit is checked by length only
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/split_t8_proof.hpp"
+#include "split_t8_fold_harness.hpp"
 
 #include <gtest/gtest.h>
 
@@ -137,8 +143,9 @@ bool image_load_published(const uint32_t* tail, size_t tail_dwords) {
 TEST(SplitT8Cache, ChangedTailAtTheSameAddressIsReanalysed) {
     // s_mov_b32 exec_lo, 0; exp null; s_endpgm -- a closed discard block.
     constexpr uint32_t kClosed[] = {0xBEFE0480u, 0xF8001890u, 0x00000000u, 0xBF810000u};
-    // s_mov_b32 exec_lo, 0; s_branch pc3; s_endpgm; s_nop -- it can re-enter the body.
-    constexpr uint32_t kReenters[] = {0xBEFE0480u, 0xBF82FFECu, 0xBF810000u, 0xBF800000u};
+    // s_mov_b32 exec_lo, 0; s_branch pc3; s_nop; s_endpgm -- it can re-enter the body. The same
+    // length as kClosed, so a re-check that compares only lengths reuses the stale proof.
+    constexpr uint32_t kReenters[] = {0xBEFE0480u, 0xBF82FFECu, 0xBF800000u, 0xBF810000u};
     ASSERT_TRUE(image_load_published(kClosed, 4)) << "the closed tail proves the T#";
     EXPECT_FALSE(image_load_published(kReenters, 4))
         << "same address, same body, new tail: the cached proof must not be reused";
@@ -152,4 +159,59 @@ TEST(SplitT8Cache, ProducerThroughAnOutOfRangePointerIsRefused) {
     const auto cache = make_split_t8_proof_cache();
     EXPECT_FALSE(proves(code, inputs(), cache.get()));
     EXPECT_FALSE(proves(code, inputs(), nullptr));
+}
+
+TEST(SplitT8Cache, SaveexecOverTheDescriptorIsRefusedByTheProof) {
+    // pc 4 becomes s_and_saveexec_b64 s[8:9], vcc: it overwrites the first two T# words. Asked
+    // directly, so the fold's own bookkeeping cannot refuse it first.
+    auto code = program(8);
+    code[4] = 0xBE88246Au;
+    EXPECT_FALSE(proves(code, inputs(), nullptr));
+    const auto cache = make_split_t8_proof_cache();
+    EXPECT_FALSE(proves(code, inputs(), cache.get()));
+}
+
+TEST(SplitT8Cache, CacheKeyIncludesTheBaseAndProducers) {
+    const auto code = program(8);
+    const Inputs in = inputs();
+    const auto cache = make_split_t8_proof_cache();
+    ASSERT_TRUE(proves(code, in, cache.get()));
+    // The same words claimed for s[9:16]: s16 is never loaded, so this use does not prove.
+    EXPECT_FALSE(mapped_split_t8_reaches_use(code.data(), code.size(), 5u, 9, in.source_pc,
+                                             in.source_addr, in.user.data(), 4u, 0u, {},
+                                             cache.get()))
+        << "a different T# base is a different question";
+    // Lane 4 claimed from the first load at the second load's address. The cached entry's producers
+    // accept that address, so only a key that includes the producer pcs refuses it.
+    Inputs wrong = in;
+    wrong.source_pc[4] = 0u;
+    EXPECT_FALSE(proves(code, wrong, cache.get()))
+        << "different producers are a different question";
+    EXPECT_TRUE(proves(code, in, cache.get()));
+}
+
+TEST(SplitT8Cache, FoldAnalysesPastTheOldCap) {
+    // Through the real scalar fold, which clamps the span it hands the proof.
+    const auto code = program(3000);
+    ASSERT_GT(code.size(), 2048u);
+    EXPECT_TRUE(test::split_t8_has_image_use(test::split_t8_uses_for(code), 5u))
+        << "a 3008-dword program's split T# is published";
+}
+
+TEST(SplitT8Cache, SameLengthEditIsReanalysed) {
+    // One buffer, one cache: the second program has the same length and an EXEC save over s[8:9]
+    // where the first had an s_nop, so only a content check sees that the entry no longer applies.
+    alignas(16) static uint32_t code[16];
+    const auto original = program(8);
+    ASSERT_LE(original.size(), 16u);
+    std::copy(original.begin(), original.end(), code);
+    const Inputs in = inputs();
+    const auto cache = make_split_t8_proof_cache();
+    auto ask = [&] {
+        return mapped_split_t8_reaches_use(code, original.size(), 5u, 8, in.source_pc,
+                                           in.source_addr, in.user.data(), 4u, 0u, {}, cache.get());
+    };
+    ASSERT_TRUE(ask());
+    code[4] = 0xBE88246Au;   // s_and_saveexec_b64 s[8:9], vcc
+    EXPECT_FALSE(ask()) << "same length, different bytes: the cached proof must not be reused";
 }
