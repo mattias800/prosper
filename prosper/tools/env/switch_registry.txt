@@ -570,7 +570,9 @@ PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT  unclassified
 PROSPER_NO_COMPARE_POOL_REUSE  unclassified
 PROSPER_NO_COMPUTE  unclassified
 PROSPER_NO_COMPUTE_ALIAS_WRITEBACK  unclassified
+PROSPER_NO_COMPUTE_BUFFER_ARENA  diagnostic  # A/B control for ADR 0010: off = one private resident copy per window; guest-visible result identical
 PROSPER_NO_COMPUTE_DCC_FAST_CLEAR  unclassified
+PROSPER_NO_COMPUTE_BLOCK_SYNC  diagnostic  # A/B control: separate compare and full copy of a cached compute buffer; guest-visible result identical
 PROSPER_NO_COMPUTE_ITEMS_CENSUS  unclassified
 PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE  unclassified
 PROSPER_NO_COMPUTE_RTT_DEST_CREATE  unclassified

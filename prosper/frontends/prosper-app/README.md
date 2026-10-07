@@ -173,7 +173,14 @@ remembers it — adding never disturbs the folders already listed — while File
 folder...** adds one picked title the same way. Neither boots on pick — Play, Enter, or double-click
 is what starts a game. Settings → **Open settings** lists every remembered folder with a Remove
 button each. Esc quits. With no directory set yet, the window explains that
-and offers the same folder picker on Enter or a click.
+and offers the same folder picker on Enter or a click. A Game Log panel below the list tails this
+session's own log lines; it exists only while the library is up and never affects what the console
+or a log file receives. While it is up, stdout and stderr are pipes (so `isatty` is false), and in a
+merged `> log 2>&1` lines from the two streams may interleave in a different order. Leaving the
+library restores both streams before anything else happens, and never waits long for a program it
+started (a file manager opened by **Show in Explorer**) that still holds the inherited streams.
+
+![The library view: toolbar, search box, and game list](../../docs/screenshots/issue-4665-library-table.webp)
 
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
 the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either

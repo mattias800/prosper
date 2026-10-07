@@ -17,6 +17,7 @@
 
 #include "shared/compute/compute_buffer_bytes.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <cstring>
@@ -25,6 +26,18 @@
 #include <vector>
 
 namespace {
+
+// Deterministic test-data generator (splitmix64). Not for any security purpose.
+struct SplitMix {
+    uint64_t state;
+    explicit SplitMix(uint64_t seed) : state(seed) {}
+    uint32_t operator()() {
+        uint64_t z = (state += 0x9e3779b97f4a7c15ull);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return static_cast<uint32_t>((z ^ (z >> 31)) >> 16);
+    }
+};
 
 void check(bool ok, const std::string& message) { EXPECT_TRUE(ok) << message; }
 
@@ -140,5 +153,64 @@ TEST(ComputeBufferDiffSpan, SpanCopyReproducesFullCopy) {
         check(prosper::frontend::compute_buffers_diff_span(nullptr, nullptr, 0,
                                                                   &first, &last),
               "zero bytes compares equal");
+    }
+}
+
+// sync_compute_buffer_blocks: scattered rewrites cost the changed blocks, and the result is a full copy.
+TEST(ComputeBufferBlockSync, ScatteredChangesReproduceAFullCopyAndCopyOnlyChangedBlocks) {
+    using prosper::frontend::sync_compute_buffer_blocks;
+    constexpr size_t kBytes = 12u << 20;   // over the parallel threshold
+    SplitMix rng(7);
+    std::vector<uint8_t> source(kBytes), destination;
+    for (auto& b : source) b = static_cast<uint8_t>(rng());
+    destination = source;
+    EXPECT_EQ(sync_compute_buffer_blocks(destination.data(), source.data(), kBytes), 0u);
+
+    // Three scattered one-byte edits, in three different 64 KiB blocks, far apart.
+    for (const size_t at : {size_t{5}, size_t{6u << 20}, kBytes - 1}) source[at] ^= 0xff;
+    const uint64_t copied = sync_compute_buffer_blocks(destination.data(), source.data(), kBytes);
+    EXPECT_EQ(copied, 3u * (64u << 10));   // kBytes is a whole number of blocks
+    EXPECT_EQ(std::memcmp(destination.data(), source.data(), kBytes), 0);
+}
+
+TEST(ComputeBufferBlockSync, SmallAndRaggedSizesAreExact) {
+    using prosper::frontend::sync_compute_buffer_blocks;
+    for (const size_t bytes : {size_t{0}, size_t{1}, size_t{65535}, size_t{65537}, size_t{200001}}) {
+        std::vector<uint8_t> source(bytes, 0x11), destination(bytes, 0x22);
+        const uint64_t copied = sync_compute_buffer_blocks(destination.data(), source.data(), bytes);
+        EXPECT_EQ(copied, bytes) << bytes;
+        EXPECT_EQ(destination, source) << bytes;
+    }
+}
+
+// A destination of UNKNOWN contents -- a recycled allocation still holding a previous tenant's
+// bytes -- must come out byte-identical to the source. Block sync is safe there only because it
+// compares against the destination's actual bytes, never against a remembered baseline: every block
+// that happens to match is already right, and every other block is copied. Some blocks here match
+// by construction, so a sync that stopped after the first copy, or copied only the blocks it
+// expected to change, leaves the rest stale and fails the final comparison.
+TEST(ComputeBufferBlockSync, UnknownDestinationContentsBecomeAnExactCopy) {
+    using prosper::frontend::sync_compute_buffer_blocks;
+    constexpr size_t kBlock = 64u << 10;
+    for (const size_t bytes : {size_t{2u << 20}, size_t{12u << 20} + 4097}) {
+        SplitMix rng(bytes);
+        std::vector<uint8_t> source(bytes), destination(bytes);
+        for (auto& b : source) b = static_cast<uint8_t>(rng());
+        for (auto& b : destination) b = static_cast<uint8_t>(rng());
+        // Every third block already holds the source's bytes.
+        size_t matching = 0;
+        for (size_t at = 0; at < bytes; at += 3 * kBlock) {
+            const size_t step = std::min(kBlock, bytes - at);
+            std::memcpy(destination.data() + at, source.data() + at, step);
+            matching += step;
+        }
+        const uint64_t copied =
+            sync_compute_buffer_blocks(destination.data(), source.data(), bytes);
+        EXPECT_EQ(std::memcmp(destination.data(), source.data(), bytes), 0) << bytes;
+        // Above the parallel threshold the walk is per worker slice, whose blocks need not align
+        // with the ones seeded here, so the count is bounded rather than exact.
+        EXPECT_GE(copied, bytes - matching) << bytes;
+        EXPECT_LE(copied, bytes) << bytes;
+        if (bytes < (8u << 20)) EXPECT_EQ(copied, bytes - matching);
     }
 }
