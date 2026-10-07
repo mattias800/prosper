@@ -1162,14 +1162,18 @@ TEST(Tile, Contract) {
                                          clear_0001.size(), 4, true),
               "four-component 0x40 is still materialized");
         // Admission: narrow surfaces need an RGBA8 decode buffer AND a DCC plane (HTILE is not DCC).
-        CHECK(gfx10_dcc_fast_clear_admits(4, false, false) &&
-              gfx10_dcc_fast_clear_admits(3, false, false) &&
-              gfx10_dcc_fast_clear_admits(1, true, true) &&
-              gfx10_dcc_fast_clear_admits(2, true, true) &&
-              !gfx10_dcc_fast_clear_admits(1, true, false) &&
-              !gfx10_dcc_fast_clear_admits(2, false, true) &&
-              !gfx10_dcc_fast_clear_admits(1, false, false),
-              "narrow DCC fast-clear admission needs an RGBA8 buffer and a DCC metadata plane");
+        // args: components, decoded_rgba8, is_dcc, is_htile, format_cannot_be_depth
+        CHECK(gfx10_dcc_fast_clear_admits(4, false, false, false, false) &&
+              gfx10_dcc_fast_clear_admits(3, false, false, true, false) &&
+              gfx10_dcc_fast_clear_admits(1, true, true, false, false) &&
+              gfx10_dcc_fast_clear_admits(2, true, true, false, true) &&
+              gfx10_dcc_fast_clear_admits(1, true, false, false, true) &&   // unclassified, never depth
+              !gfx10_dcc_fast_clear_admits(1, true, false, false, false) && // unclassified, may be depth
+              !gfx10_dcc_fast_clear_admits(1, true, true, true, true) &&    // known HTILE always refused
+              !gfx10_dcc_fast_clear_admits(1, true, false, true, true) &&
+              !gfx10_dcc_fast_clear_admits(2, false, true, false, true) &&  // no RGBA8 buffer
+              !gfx10_dcc_fast_clear_admits(1, false, false, false, true),
+              "narrow DCC fast-clear admission: RGBA8 buffer, never HTILE, DCC or a never-depth format");
         CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                           mixed_clear.data(), mixed_clear.size(), 4, true) &&
               !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,

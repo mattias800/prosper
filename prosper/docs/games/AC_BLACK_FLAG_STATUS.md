@@ -319,7 +319,7 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
 - **"The white 128x128 rectangles are the stale R16F DCC read."** Falsified 2026-10-07 (n=1 per arm, on a
   box where runs exited with code -1 at 41-180 s for a reason not established): with the one- and
   two-component fast-clear fix (#4699) the `is unsupported` warnings for those surfaces are replaced
-  by `DCC fast-clear ... comps=1/2` lines and the black/white proportions of the corrupted frame are
+  by `DCC fast-clear ... comps=1` lines (observed at head #4699 after the gate fix: 2 admissions on the 1920x1080 R16F surfaces, 0 `is unsupported`; the `75abf97ed` run showed six fast-clear lines before the correlation gate, and the gate as first written, at `48c379168`, left them `UNCORRELATED` and unsupported) and the black/white proportions of the corrupted frame are
   unchanged. The fix is still correct (the surfaces were sampled as stale bytes); it is not the cause.
 - **"Publishing compute results into the renderer's images produces the garbage."** Falsified
   2026-10-07 (n=1 per arm, same caveat) with the three `PROSPER_NO_COMPUTE_RTT_DEST_*`-style switches

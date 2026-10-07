@@ -301,8 +301,10 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
 // surfaces were sampled as their stale base bytes instead of the clear colour (#4131). `alpha_is_on_msb` selects the raw component
 // that receives the clear alpha on four-component formats before the T# destination swizzle is applied.
 // Whether a surface may be handed to gfx10_dcc_fast_clear_rgba8 at all: three or more components,
-// or a narrow surface whose decoded upload buffer is RGBA8 and whose metadata plane is DCC.
-bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc);
+// or a narrow surface with an RGBA8 decode buffer whose plane is DCC, or is unclassified but cannot be
+// HTILE because its format is never a depth view. A plane known to be HTILE is always refused.
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc,
+                                 bool metadata_is_htile, bool format_cannot_be_depth);
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,
