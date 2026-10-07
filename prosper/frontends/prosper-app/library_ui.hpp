@@ -37,9 +37,12 @@ struct LibraryAction {
     enum class Kind {
         none,
         open,              // launch `app0_root`
-        browse,            // asked for the folder picker (no games directory, or wants another folder)
-        pick_game,         // asked for the folder picker for ONE game to boot right away (Ctrl+O path)
-        rescan,            // re-read the games directory now
+        browse,            // asked for the folder picker; the answer is APPENDED to the games
+                           // folders, never boots, and Play starts what it lists
+        pick_game,         // asked for the folder picker for ONE game; same append rule as browse
+                           // (Ctrl+O path) — listing, not booting
+        rescan,            // re-read the games folders now
+        forget_games_dir,  // stop listing `path`; persist it and rescan
         set_games_dir,     // chose `path` as the games directory; persist it and rescan
         set_music,         // toggled launcher music to `music_on`; persist it
         toggle_fullscreen,   // the Full Screen toolbar button (same path as F11)
@@ -52,7 +55,7 @@ struct LibraryAction {
     };
     Kind kind = Kind::none;
     std::string app0_root;   // Kind::open
-    std::string path;        // Kind::set_games_dir
+    std::string path;        // Kind::set_games_dir/forget_games_dir
     std::string value;       // Kind::set_present_mode/set_display_mode/set_savedata_dir/set_volume
     bool music_on = true;    // Kind::set_music
 };
@@ -124,7 +127,7 @@ public:
 
     // Replace the displayed titles. The visible rows and the selection are rebuilt from the search
     // box, so a rescan returns to the top rather than holding a row that may have moved.
-    void set_games(std::vector<GameEntry> games, const std::string& games_dir);
+    void set_games(std::vector<GameEntry> games, const std::vector<std::string>& games_dirs);
 
     // Build and draw one frame, and present it. `status` is shown under the list — used for the reason
     // a title failed to boot, so the message is visible in the UI rather than only on stderr.
@@ -275,7 +278,7 @@ private:
     int                    contextFi_ = -1;      // row the menu was armed from
     bool                   contextArmed_ = false;
     LibraryTab             tab_ = LibraryTab::games;
-    std::string            gamesDir_;
+    std::vector<std::string> gamesDirs_;
     char                   filterBuf_[256] = {};
     std::string            filterApplied_;
     int                    selected_  = 0;

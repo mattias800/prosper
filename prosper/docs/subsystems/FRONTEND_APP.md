@@ -157,9 +157,12 @@ Stage 1 adds the data behind a library view — and the app's first **persistent
 
 ```
 --games-dir  ─┐
-PROSPER_GAMES_DIR ─┼─> resolve_games_dir ─> scan_game_library ─> [GameEntry]  ─> --list-games
-config file  ─┘        (app_config.hpp)      (game_library.hpp)                  and, later, a grid
+PROSPER_GAMES_DIR ─┼─> resolve_games_dirs ─> scan_game_libraries ─> [GameEntry] ─> --list-games
+config file  ─┘        (app_config.hpp)       (game_library.hpp)                  and the list
 ```
+The file holds one `games_dir` line per folder, so the library accumulates folders: adding one
+appends a line and never disturbs the rest, and the Settings view lists each with a Remove button.
+The flag and the environment instead name the whole library (one folder) for that run only.
 
 Both headers are pure with injected filesystem IO, so the scan, the param.json metadata reading, and the
 settings precedence are unit-tested in the default core build — no window, no ImGui, no real dump. They
@@ -171,6 +174,7 @@ Design points that are deliberate rather than incidental:
 - **Precedence is `--games-dir` > `PROSPER_GAMES_DIR` > persisted setting.** The persisted value exists
   only so a GUI user is not asked for a folder every launch; it must never override a command line. This
   keeps the project's existing convention (a `PROSPER_*` override in front of a default) authoritative.
+  The flag and the environment select the whole library for the run; only the file accumulates.
 - **Persistence is only ever explicit** (`--set-games-dir`). Nothing infers a library location from a
   folder the user happened to open — that inference is wrong as often as right, and being wrong points
   the library somewhere the user never chose.

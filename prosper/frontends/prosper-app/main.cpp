@@ -1701,53 +1701,61 @@ int main(int argc, char** argv) {
     pick.has_dump = !dump.empty();
     pick.test_pattern = testPattern;
 
-    // --set-games-dir: record the games directory for future launches and exit. Persisting is always
-    // an explicit act — nothing here infers a library location from a folder the user happened to open,
-    // because guessing wrong would silently point the library somewhere they never chose.
+    // --set-games-dir: record the games directory for future launches and exit. This REPLACES the
+    // stored list with the one folder (an empty value clears it); adding without disturbing the
+    // rest is the library's own Add-folder path. Persisting is always an explicit act — nothing
+    // here infers a library location from a folder the user happened to open, because guessing
+    // wrong would silently point the library somewhere they never chose.
     if (setGamesDirSeen) {
         prosper::frontend::AppConfig cfg = load_app_config();   // keeps keys this build does not know
-        cfg.games_dir = prosper::frontend::strip_trailing_separators(setGamesDir);
+        cfg.games_dirs.clear();
+        prosper::frontend::note_games_dir(cfg, setGamesDir);
         // Warn but still store: configuring a path before mounting it is plausible, and refusing
         // would be more annoying than saying so.
-        if (!cfg.games_dir.empty() && !host_path_probe().is_dir(cfg.games_dir))
-            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dir.c_str());
+        if (!cfg.games_dirs.empty() && !host_path_probe().is_dir(cfg.games_dirs[0]))
+            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dirs[0].c_str());
         if (!save_app_config(cfg)) return 1;
-        if (cfg.games_dir.empty())
+        if (cfg.games_dirs.empty())
             fprintf(stderr, "prosper-app: games directory cleared (%s)\n", app_config_path().c_str());
         else
-            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dir.c_str(),
+            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dirs[0].c_str(),
                     app_config_path().c_str());
         return 0;
     }
 
-    // The games directory, by the documented precedence: --games-dir, then PROSPER_GAMES_DIR, then the
-    // persisted setting. Resolved before anything opens a window so --list-games stays headless.
+    // The games folders, by the documented precedence: --games-dir, then PROSPER_GAMES_DIR, then the
+    // persisted list. The flag and the environment name the whole library for the run (one folder);
+    // the file holds every folder the library accumulated. Resolved before anything opens a window
+    // so --list-games stays headless.
     const prosper::frontend::AppConfig appConfig = load_app_config();
     const char* gamesDirEnv = getenv("PROSPER_GAMES_DIR");
-    std::string gamesDir = prosper::frontend::resolve_games_dir(
+    std::vector<std::string> gamesDirs = prosper::frontend::resolve_games_dirs(
         gamesDirFlag, gamesDirEnv ? gamesDirEnv : "", appConfig);
 
     // --list-games: print the library as plain text and exit, with no window, no Vulkan and no guest.
     // One tab-separated record per line on stdout (content id, display name, app0 path) so a script or
     // an agent can consume it; everything explanatory goes to stderr.
     if (listGames) {
-        if (gamesDir.empty()) {
+        if (gamesDirs.empty()) {
             fprintf(stderr, "prosper-app: no games directory. Pass --games-dir <path>, set "
                             "PROSPER_GAMES_DIR, or record one in %s\n",
                     app_config_path().empty() ? "the settings file" : app_config_path().c_str());
             return 2;
         }
-        if (!host_path_probe().is_dir(gamesDir)) {
-            // Distinguish a wrong path from a real but empty library: both would otherwise print
-            // "0 title(s)" and exit 1, which hides a typo.
-            fprintf(stderr, "prosper-app: not a directory: %s\n", gamesDir.c_str());
-            return 2;
+        for (const std::string& dir : gamesDirs) {
+            if (!host_path_probe().is_dir(dir)) {
+                // Distinguish a wrong path from a real but empty library: both would otherwise print
+                // "0 title(s)" and exit 1, which hides a typo (or an unplugged drive).
+                fprintf(stderr, "prosper-app: not a directory: %s\n", dir.c_str());
+                return 2;
+            }
         }
         const std::vector<prosper::frontend::GameEntry> games =
-            prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+            prosper::frontend::scan_game_libraries(gamesDirs, host_path_probe(), host_library_io());
         for (const auto& g : games)
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
-        fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
+        fprintf(stderr, "prosper-app: %zu title(s) in %zu folder(s)\n", games.size(),
+                gamesDirs.size());
         return games.empty() ? 1 : 0;
     }
 
@@ -1868,11 +1876,11 @@ int main(int argc, char** argv) {
     } else if (!testPattern) {
         // The library view that will draw these is #1471 stage 2; for now report what was found so a
         // misconfigured games_dir is visible without waiting for the UI.
-        if (!gamesDir.empty()) {
+        for (const std::string& dir : gamesDirs) {
             const size_t found = prosper::frontend::scan_game_library(
-                gamesDir, host_path_probe(), host_library_io()).size();
+                dir, host_path_probe(), host_library_io()).size();
             fprintf(stderr, "[app] games directory %s holds %zu title(s); --list-games prints them.\n",
-                    gamesDir.c_str(), found);
+                    dir.c_str(), found);
         }
         fprintf(stderr, "[app] no game given; the window opens empty and can be given one "
                         "(drop a game folder on it, or press Ctrl+O).\n");
@@ -2821,11 +2829,19 @@ int main(int argc, char** argv) {
     bool libraryHasGames = false;
     auto rescan_library = [&]() {
         if (!libraryUi.ready()) return;
-        std::vector<prosper::frontend::GameEntry> found;
-        if (!gamesDir.empty())
-            found = prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+        size_t unavailable = 0;
+        for (const std::string& dir : gamesDirs)
+            if (!host_path_probe().is_dir(dir)) ++unavailable;
+        const std::vector<prosper::frontend::GameEntry> found =
+            prosper::frontend::scan_game_libraries(gamesDirs, host_path_probe(), host_library_io());
         libraryHasGames = !found.empty();
-        libraryUi.set_games(std::move(found), gamesDir);
+        // A folder that vanished (an unplugged drive) contributes nothing but is said aloud,
+        // or its titles would disappear without a word.
+        if (unavailable == 1)
+            libraryStatus = "One games folder is unavailable.";
+        else if (unavailable > 1)
+            libraryStatus = std::to_string(unavailable) + " games folders are unavailable.";
+        libraryUi.set_games(found, gamesDirs);
     };
     if (wantLibrary) {
         libraryUi.set_music_preference(appConfig.launcher_music);
@@ -3292,12 +3308,16 @@ int main(int argc, char** argv) {
                 if (!host_path_probe().is_dir(picked)) {
                     libraryStatus = "That is not a folder.";
                 } else {
+                    // Append, never replace: adding a folder must not disturb the folders
+                    // already listed.
                     prosper::frontend::AppConfig cfg = load_app_config();
-                    cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
-                    gamesDir = cfg.games_dir;
+                    prosper::frontend::note_games_dir(cfg, picked);
+                    gamesDirs = cfg.games_dirs;
                     libraryStatus = save_app_config(cfg) ? std::string()
                                                         : "Could not save the games folder setting.";
-                    fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
+                    fprintf(stderr, "[app] added games folder %s (%zu listed)\n",
+                            prosper::frontend::strip_trailing_separators(picked).c_str(),
+                            gamesDirs.size());
                     rescan_library();
                 }
                 picked.clear();
@@ -3457,6 +3477,19 @@ int main(int argc, char** argv) {
                     // for the same reason as browse above.
                     if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
+                case prosper::frontend::LibraryAction::Kind::forget_games_dir: {
+                    // Adding appends, so removing must exist: drop the folder from the stored
+                    // list and rescan. Forgetting the last one simply empties the library.
+                    prosper::frontend::AppConfig forgetCfg = load_app_config();
+                    prosper::frontend::forget_games_dir(forgetCfg, act.path);
+                    gamesDirs = forgetCfg.games_dirs;
+                    libraryStatus = save_app_config(forgetCfg) ? std::string()
+                                                              : "Could not save the games folder setting.";
+                    fprintf(stderr, "[app] forgot games folder %s (%zu listed)\n", act.path.c_str(),
+                            gamesDirs.size());
+                    rescan_library();
+                    break;
+                }
                 case prosper::frontend::LibraryAction::Kind::rescan:
                     rescan_library();
                     break;

@@ -167,9 +167,11 @@ With a games directory set, launching with no game shows a game list instead of 
 window: cover thumbnail, name, serial, region, version and folder, with a search box, a **Refresh
 list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
 opens the highlighted title (not while the search box has focus), and a double-click opens directly;
-**Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it,
-while File → **Open game folder...** shows one picked title as the list. Neither boots on pick — Play,
-Enter, or double-click is what starts a game. Esc quits. With no directory set yet, the window explains that
+**Add folder** (or File → **Add games folder...**) adds another games directory to the list and
+remembers it — adding never disturbs the folders already listed — while File → **Open game
+folder...** adds one picked title the same way. Neither boots on pick — Play, Enter, or double-click
+is what starts a game. Settings → **Open settings** lists every remembered folder with a Remove
+button each. Esc quits. With no directory set yet, the window explains that
 and offers the same folder picker on Enter or a click.
 
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from

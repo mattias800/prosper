@@ -22,10 +22,13 @@ using prosper::frontend::parse_param_title_id;
 using prosper::frontend::parse_param_title_name;
 using prosper::frontend::path_basename;
 using prosper::frontend::HostPolicyInputs;
+using prosper::frontend::forget_games_dir;
+using prosper::frontend::note_games_dir;
 using prosper::frontend::note_recent_game;
 using prosper::frontend::parse_volume_percent;
 using prosper::frontend::resolve_host_policy;
-using prosper::frontend::resolve_games_dir;
+using prosper::frontend::resolve_games_dirs;
+using prosper::frontend::scan_game_libraries;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
 using prosper::frontend::guest_args_for;
@@ -309,13 +312,26 @@ int main() {
     }
 
     // --- config parsing -------------------------------------------------------------------------
-    CHECK(parse_app_config("games_dir = /games").games_dir == "/games", "a setting is read");
-    CHECK(parse_app_config("games_dir=/games").games_dir == "/games", "spaces around = are optional");
-    CHECK(parse_app_config("  games_dir  =  /games  ").games_dir == "/games", "surrounding space trimmed");
-    CHECK(parse_app_config("# comment\n\ngames_dir = /games\n").games_dir == "/games",
+    CHECK(parse_app_config("games_dir = /games").games_dirs ==
+              std::vector<std::string>{"/games"},
+          "a setting is read");
+    CHECK(parse_app_config("games_dir=/games").games_dirs ==
+              std::vector<std::string>{"/games"},
+          "spaces around = are optional");
+    CHECK(parse_app_config("  games_dir  =  /games  ").games_dirs ==
+              std::vector<std::string>{"/games"},
+          "surrounding space trimmed");
+    CHECK(parse_app_config("# comment\n\ngames_dir = /games\n").games_dirs ==
+              std::vector<std::string>{"/games"},
           "comments and blank lines are ignored");
-    CHECK(parse_app_config("games_dir = /a\ngames_dir = /b").games_dir == "/b", "a later duplicate wins");
-    CHECK(parse_app_config("future_key = 1\ngames_dir = /games").games_dir == "/games",
+    CHECK(parse_app_config("games_dir = /a\ngames_dir = /b").games_dirs ==
+              (std::vector<std::string>{"/a", "/b"}),
+          "repeated games_dir lines accumulate in order; adding never drops");
+    CHECK(parse_app_config("games_dir = /a\ngames_dir = /a\n").games_dirs ==
+              std::vector<std::string>{"/a"},
+          "a hand-duplicated folder line still lists once");
+    CHECK(parse_app_config("future_key = 1\ngames_dir = /games").games_dirs ==
+              std::vector<std::string>{"/games"},
           "an unknown key does not break parsing");
     CHECK(parse_app_config("guest_args = -force-gfx-direct").guest_args_default == "-force-gfx-direct",
           "a default guest_args value is read");
@@ -342,18 +358,22 @@ int main() {
           "an unknown key is retained rather than discarded");
     CHECK(parse_app_config("games_dir = /g").unknown_lines.empty(),
           "a known key is not also retained as unknown");
-    CHECK(parse_app_config("games_dir = /my games/ps5 = final # 1").games_dir == "/my games/ps5 = final # 1",
+    CHECK(parse_app_config("games_dir = /my games/ps5 = final # 1").games_dirs ==
+              std::vector<std::string>{"/my games/ps5 = final # 1"},
           "the value is literal after the first = (spaces, =, and # all survive)");
-    CHECK(parse_app_config("").games_dir.empty(), "an empty file sets nothing");
-    CHECK(parse_app_config("nonsense").games_dir.empty(), "a line with no = sets nothing");
-    CHECK(parse_app_config("games_dir = /games\r\n").games_dir == "/games", "CRLF is tolerated");
+    CHECK(parse_app_config("").games_dirs.empty(), "an empty file sets nothing");
+    CHECK(parse_app_config("nonsense").games_dirs.empty(), "a line with no = sets nothing");
+    CHECK(parse_app_config("games_dir = /games\r\n").games_dirs ==
+              std::vector<std::string>{"/games"},
+          "CRLF is tolerated");
 
     // --- config round-trip ----------------------------------------------------------------------
     AppConfig cfg;
-    cfg.games_dir = "/my games/ps5";
-    CHECK(parse_app_config(serialize_app_config(cfg)).games_dir == "/my games/ps5",
-          "serialize -> parse round-trips a path with spaces");
-    CHECK(parse_app_config(serialize_app_config(AppConfig{})).games_dir.empty(),
+    cfg.games_dirs = {"/my games/ps5", "/more"};
+    CHECK(parse_app_config(serialize_app_config(cfg)).games_dirs ==
+              (std::vector<std::string>{"/my games/ps5", "/more"}),
+          "serialize -> parse round-trips several folders with spaces, in order");
+    CHECK(parse_app_config(serialize_app_config(AppConfig{})).games_dirs.empty(),
           "an unset config round-trips as unset");
     // --set-games-dir rewrites the whole file, so a key a NEWER build stored (stage 2 will add some)
     // must survive being read and written by an older one. Without unknown_lines this silently
@@ -361,9 +381,10 @@ int main() {
     {
         const AppConfig newer = parse_app_config("games_dir = /old\nui_scale = 1.5\n");
         AppConfig rewritten = newer;
-        rewritten.games_dir = "/new";
+        rewritten.games_dirs = {"/new"};
         const AppConfig after = parse_app_config(serialize_app_config(rewritten));
-        CHECK(after.games_dir == "/new", "a rewrite updates the setting it owns");
+        CHECK(after.games_dirs == std::vector<std::string>{"/new"},
+              "a rewrite updates the setting it owns");
         CHECK(after.unknown_lines.size() == 1 && after.unknown_lines[0] == "ui_scale = 1.5",
               "a rewrite preserves a setting this build does not understand");
     }
@@ -497,29 +518,75 @@ int main() {
               "a saved volume of 0 (mute) is a real answer, not 'unset'");
     }
 
+    // --- games folders: add, forget, merge ---------------------------------------------------------
+    {
+        AppConfig fc;
+        note_games_dir(fc, "/games/B");
+        note_games_dir(fc, "/games/A");
+        CHECK(fc.games_dirs == (std::vector<std::string>{"/games/B", "/games/A"}),
+              "added folders accumulate in order");
+        note_games_dir(fc, "/games/A/");
+        CHECK(fc.games_dirs.size() == 2 && fc.games_dirs[1] == "/games/A",
+              "re-adding a folder is a no-op, separators canonicalized");
+        note_games_dir(fc, "");
+        CHECK(fc.games_dirs.size() == 2, "an empty path adds nothing");
+        forget_games_dir(fc, "/games/B");
+        CHECK(fc.games_dirs == std::vector<std::string>{"/games/A"},
+              "forgetting removes that folder and keeps the rest");
+        forget_games_dir(fc, "/games/missing");
+        CHECK(fc.games_dirs == std::vector<std::string>{"/games/A"},
+              "forgetting a folder that was never listed changes nothing");
+        forget_games_dir(fc, "/games/A/");
+        CHECK(fc.games_dirs.empty(), "forgetting canonicalizes too, so the last folder goes");
+        const AppConfig back = parse_app_config(serialize_app_config(fc));
+        CHECK(back.games_dirs.empty(), "an emptied list round-trips as unset");
+    }
+    {
+        const GamePathProbe probe = fake_probe();
+        const GameLibraryIo io = fake_io();
+        const std::vector<GameEntry> one = scan_game_library("/games", probe, io);
+        const std::vector<GameEntry> merged =
+            scan_game_libraries({"/games", "/empty", "/missing"}, probe, io);
+        CHECK(merged.size() == one.size(), "a merge is the single scan plus empty and gone folders");
+        bool same = merged.size() == one.size();
+        for (size_t i = 0; same && i < one.size(); i++)
+            same = merged[i].app0_root == one[i].app0_root;
+        CHECK(same, "merging adds nothing and reorders nothing when the extras hold no titles");
+        CHECK(scan_game_libraries({"/games", "/games"}, probe, io).size() == one.size(),
+              "listing one folder twice still lists its titles once");
+        CHECK(scan_game_libraries({}, probe, io).empty(), "no folders is no titles");
+        CHECK(scan_game_libraries({"/missing"}, probe, io).empty(),
+              "a gone folder contributes nothing instead of hiding the rest");
+    }
+
     // --- newline safety ----------------------------------------------------------------------------
     {
         AppConfig evil;
-        evil.games_dir = "/games\nplanted = 1";
+        evil.games_dirs = {"/games\nplanted = 1"};
         evil.savedata_dir = "/saves\nplanted = 1";
         evil.recent_games = {"/ok", "/bad\nplanted = 1"};
         const std::string text = serialize_app_config(evil);
         CHECK(text.find("planted") == std::string::npos,
               "a newline in a path value cannot inject a key on rewrite");
-        CHECK(parse_app_config(text).games_dir.empty(),
+        CHECK(parse_app_config(text).games_dirs.empty(),
               "a dropped games_dir reads as unset, not as half a path");
     }
 
     // --- precedence -----------------------------------------------------------------------------
-    AppConfig from_file; from_file.games_dir = "/from-file";
-    CHECK(resolve_games_dir("/from-flag", "/from-env", from_file) == "/from-flag",
-          "--games-dir wins over everything");
-    CHECK(resolve_games_dir("", "/from-env", from_file) == "/from-env",
+    AppConfig from_file;
+    from_file.games_dirs = {"/from-file", "/also-file"};
+    CHECK(resolve_games_dirs("/from-flag", "/from-env", from_file) ==
+              std::vector<std::string>{"/from-flag"},
+          "--games-dir wins over everything, naming the whole library for the run");
+    CHECK(resolve_games_dirs("", "/from-env", from_file) ==
+              std::vector<std::string>{"/from-env"},
           "the environment wins over the persisted setting");
-    CHECK(resolve_games_dir("", "", from_file) == "/from-file",
-          "the persisted setting applies when nothing else does");
-    CHECK(resolve_games_dir("", "", AppConfig{}).empty(), "with no source there is no games dir");
-    CHECK(resolve_games_dir("/from-flag", "", AppConfig{}) == "/from-flag",
+    CHECK(resolve_games_dirs("", "", from_file) ==
+              (std::vector<std::string>{"/from-file", "/also-file"}),
+          "the persisted list applies whole when nothing else does");
+    CHECK(resolve_games_dirs("", "", AppConfig{}).empty(), "with no source there is no games dir");
+    CHECK(resolve_games_dirs("/from-flag", "", AppConfig{}) ==
+              std::vector<std::string>{"/from-flag"},
           "the flag alone is enough");
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

@@ -275,4 +275,25 @@ inline std::vector<GameEntry> scan_game_library(const std::string& games_dir,
     return games;
 }
 
+// Every PS5 title across several games folders, in display order: each folder contributes what
+// scan_game_library would report for it alone. Folders that are gone (an unplugged drive) simply
+// contribute nothing, so one missing folder cannot hide the rest. A title reachable through two
+// folders lists once, under its first spelling — the same dump mounted twice is still one game.
+inline std::vector<GameEntry> scan_game_libraries(const std::vector<std::string>& games_dirs,
+                                                  const GamePathProbe& probe,
+                                                  const GameLibraryIo& io) {
+    std::vector<GameEntry> games;
+    for (const std::string& dir : games_dirs) {
+        for (GameEntry& entry : scan_game_library(dir, probe, io)) {
+            const std::string canon = strip_trailing_separators(entry.app0_root);
+            bool seen = false;
+            for (const GameEntry& have : games)
+                if (strip_trailing_separators(have.app0_root) == canon) { seen = true; break; }
+            if (!seen) games.push_back(std::move(entry));
+        }
+    }
+    std::sort(games.begin(), games.end(), game_entry_display_less);
+    return games;
+}
+
 } // namespace prosper::frontend
