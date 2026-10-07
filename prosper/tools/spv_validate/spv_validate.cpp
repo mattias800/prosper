@@ -363,6 +363,13 @@ static const NotAnEmitter kNotEmitters[] = {
      "from its siblings: shader_recompile_cache pins its cache identity and reuse, but does NOT "
      "compare its words against the direct emitter, so this entry rests on the wrapper adding no "
      "emission of its own"},
+    {"seen_at",
+     "a local std::vector<uint32_t> in frontends/shared/compute/parent_scan.hpp's chain walk "
+     "(constructed as seen_at(records, UINT32_MAX)); the scan reads the constructor call as a "
+     "declaration. It is a visit table, not SPIR-V"},
+    {"depth",
+     "a local std::vector<uint32_t> in the same parent_scan.hpp walk (depth(records, 0)): "
+     "memoised chain depths, not SPIR-V"},
 };
 
 // Every declaration of a function returning SPIR-V words, whitespace-tolerant and with no
