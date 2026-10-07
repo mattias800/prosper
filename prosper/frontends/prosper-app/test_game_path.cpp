@@ -6,7 +6,9 @@
 #include <set>
 #include <string>
 
+using prosper::frontend::file_url_for_path;
 using prosper::frontend::GameOpenAction;
+using prosper::frontend::picked_folder_is_title;
 using prosper::frontend::GamePathProbe;
 using prosper::frontend::StartupPickInputs;
 using prosper::frontend::decide_open_action;
@@ -120,6 +122,41 @@ int main() {
     const GamePathProbe empty_probe;
     CHECK(resolve_app0_root(kRoot, empty_probe).empty(), "an unpopulated probe resolves nothing");
     CHECK(!is_app0_root(kRoot, empty_probe), "an unpopulated probe identifies no root");
+
+    // --- picked_folder_is_title ----------------------------------------------------------------
+    // A dump can sit at a drive root, where the folder IS the game. The library's games-folder
+    // answer boots in exactly that case instead of scanning inside it.
+    {
+        GamePathProbe drive;
+        drive.is_dir = [](const std::string& s) {
+            return s == "F:\\" || s == "F:\\games" || s == "F:\\games\\T-app0" ||
+                   s == "F:\\games\\T-app0\\sce_sys";
+        };
+        drive.is_file = [](const std::string& s) {
+            return s == "F:\\/eboot.bin" || s == "F:\\games\\T-app0/eboot.bin";
+        };
+        CHECK(picked_folder_is_title("F:\\", drive),
+              "a dump at a drive root is itself the game, not a games folder");
+        CHECK(picked_folder_is_title("F:\\games\\T-app0", drive),
+              "a picked title directory boots rather than scanning inside itself");
+        CHECK(!picked_folder_is_title("F:\\games", drive),
+              "a folder of titles stays a games-folder answer even beside a drive-root dump");
+        CHECK(!picked_folder_is_title("F:\\games\\T-app0\\sce_sys", drive),
+              "a subdirectory OF a title stays a games-folder answer");
+        CHECK(!picked_folder_is_title("F:\\missing", drive), "a missing path boots nothing");
+        CHECK(!picked_folder_is_title("", drive), "an empty pick boots nothing");
+    }
+
+    // --- file_url_for_path ---------------------------------------------------------------------
+    CHECK(file_url_for_path("F:\\games\\T-app0") == "file:///F:/games/T-app0",
+          "a drive-letter path gets three slashes and forward slashes");
+    CHECK(file_url_for_path("/games/T-app0") == "file:///games/T-app0",
+          "a POSIX path keeps its shape");
+    CHECK(file_url_for_path("\\\\server\\share\\T-app0") == "file://server/share/T-app0",
+          "a UNC root names the host");
+    CHECK(file_url_for_path("/my games/A #1 100%") == "file:///my%20games/A%20%231%20100%25",
+          "space, # and % are encoded");
+    CHECK(file_url_for_path("") == "file:///", "an empty path still forms a URL");
 
     // --- decide_open_action --------------------------------------------------------------------
     CHECK(decide_open_action(kRoot, /*boot_attempted=*/false) == GameOpenAction::boot_in_process,

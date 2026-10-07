@@ -5,7 +5,7 @@ macOS it is SysV too, so a guest call lands on an HLE handler with nothing in be
 Windows it is **Microsoft x64**, and every argument has to be moved before the handler can read it.
 This folder owns that translation, and only that translation.
 
-Three files. Two are the fixed-signature half of the problem:
+Four files. Two are the fixed-signature half of the problem:
 
 - `call_signature.hpp` — *what a handler's arguments are*. A `CallSignature` records which argument
   positions are floating-point and whether the return is, deduced from the handler's own C++
@@ -62,3 +62,11 @@ as `tools/probe_win_varargs.cpp`, which is not part of the build: it cross-compi
 sources with MinGW and runs them under wine, so the CRT, the ABI and the stub bytes are real. Its
 header carries the command. Run it at several `-O` levels — the SEH constraint above is
 optimization-dependent, so one level passing says little about the others.
+
+The fourth is the other direction, **host to guest**:
+
+- `guest_callback.hpp/.cpp` -- *an HLE handler calling a guest callback* (a state-change event, a
+  completion). On Linux/macOS it restores the caller's guest `%fs` around the call; on Windows it
+  enters the callback through `prosper_call_guest_sysv4` so the guest reads its arguments in System V
+  registers, and calls a host test double directly. `PROSPER_HLE_ENTRY_WITH_GUEST_FS` declares the
+  handler entry that can see the import-stub frame, so a library never needs its own platform `#if`.

@@ -8,8 +8,9 @@ status: current
 Tracker: [#4131](https://github.com/mattias800/prosper/issues/4131). This document is the technical
 record the tracker points at; the tracker holds the rung.
 
-**Rung 0 — nothing renders** (the guest now runs and flips, with every draw dropped; see
-§ Progress 2026-10-02 (later); the paragraphs below describe the original stall). First measured 2026-10-02 on Windows 11 (MinGW build, NVIDIA RTX 4070
+**Rung 0 at first measurement (historical). Since #4586 the title renders its health-warning screen and the
+intro cinematic** (capture: `assets/screenshots/ac-black-flag-warning-fixed.webp`); tracker #4131 holds the
+current rung. The paragraphs below describe the original stall (see also § Progress 2026-10-02 (later)). First measured 2026-10-02 on Windows 11 (MinGW build, NVIDIA RTX 4070
 SUPER) at main `deff140b8d4a`, then again with the thread-handle fix of #4129 applied.
 
 The guest boots in about 1.6 to 2.0 s and `prosper-app` opens its window, but no guest frame is
@@ -203,8 +204,35 @@ Unexplained and not yet shown to matter:
   Whether any is required to reach a frame is not known. Per the project's entitlement rule, answers
   must come from local inventory, never a blanket "owned".
 
+### Where the compute CPU time goes (graceful-exit census, 2026-10-06, 42.7 s, Windows/NVIDIA)
+
+`prosper-app` closed through its window (`CloseMainWindow`) prints the exit censuses that a `timeout` kill
+loses. Totals: host copies 8,241 MiB (193 MiB/s): `storage-materialize` 2,147 MiB/390 calls,
+`rtt-snapshot` 2,577 MiB/517 calls, `detile` 3,518 MiB/1,361 calls. The same census attributes the
+renderer-owned bindings' CPU round trip to `cpu-only-authority` (2,080 MiB/263 calls, one 7.9 MiB frame-sized
+image each): a compute result is published to the renderer as a CPU snapshot, so the next dispatch that
+samples it re-uploads it.
+
+The GPU-side mirror (no CPU copy) accepted 283 of about 1,800 compute results tested. The first failing
+field for the rest: `format-no-seed-path` 780 (R8Unorm results; the renderer-image storage seed path exists
+only for Rgba8, Rgba16F and R11G11B10), `format-unmapped` 611 (R10G10B10A2, which `storage_target_format`
+does not map and which is published through `publish_unorm10_as_rgba8`), `prior-output-conflict` 48,
+`mip-base-level` 30, `mip-tail` 25, `final-output-conflict` 24. Writebacks per submit are about 7: two
+R10G10B10A2 (8.8 MB), one RGBA8 (8.8 MB), one R8 (8.3 MB), plus small ones. So the frame's CPU round trips
+come from two result formats, not from many small leaks; removing them is a native-storage-image feature
+for those formats (recompiler typed storage view, renderer seed path, mirror), not a cache tweak.
+
 ## Ruled out
 
+- **"Write-watch can take over the per-frame compare of the constant ring on Windows."** Not available:
+  on Windows `GuestWriteWatch::create` always reports unsupported (page-protection watches corrupt the
+  guest SysV red zone, and direct memory is section-backed so `MEM_WRITE_WATCH` cannot see it), so every
+  CPU-written guest source is validated by a full compare. Measured 2026-10-06 with the arena on: the
+  guest rewrites 0.25-0.3 MiB of the ~59 MiB ring per frame, validation is `full` once per frame
+  (journal for the other windows), and forcing promotion with `PROSPER_COMPUTE_WATCH_DEFER_MIN_KB=0`
+  armed nothing (`watch=0` in the `PROSPER_WATCH_PROMOTE_CENSUS` totals). The remaining lever is the
+  compare itself (~11 ms/frame under load), not the copy: block-granular sync (#4635) took the upload
+  from ~49 MiB to ~0.3 MiB per frame.
 - **"The black window is a slow load or a hang in a long boot."** Falsified: the primary guest thread
   ended with `ACCESS-VIOLATION addr=0x3 rip=eboot+0x161ed91` at about 1.6 s while the process stayed up
   for 72 minutes with 32 s of CPU and no further log lines; `BOOT_COMPLETE` is reached at 1.6 to 2.0 s.
@@ -219,6 +247,15 @@ Unexplained and not yet shown to matter:
   faulting instruction; it does not rule out an earlier HLE error as the cause of the failed seek.
 - **"The boot or link phase is what stalls."** Falsified by the phase log: all seven phases complete
   (`PROCESS_START` through `BOOT_COMPLETE`) in under 2.1 s.
+- **"Bounding a read-only constant buffer by its shader's static extent removes the compute upload
+  cost."** Not applicable to this title (2026-10-06, #4631): the bound never engages. The 43 MiB
+  constant-buffer windows (`size=45088768`) reach `plan_storage_buffer_materialization` with
+  `dynamic_access=1` (`required_bytes=4`), because the shader indexes them at a runtime offset, so SPIR-V
+  reflection has no static bound to apply and both arms of the A/B ran the same path. The A/B (same
+  binary, opt-out switch as control, 3 runs of 60 s per arm: 2.2 / 3.2 / 3.8 flips/s on against
+  3.1 / 3.7 / 3.4 off) therefore only measured the noise floor and is **not** evidence against the
+  idea; a bound derived another way (for example from the descriptor range) was not tried. The switch
+  lived in a local branch that was never pushed and has been removed. The cost itself is real (below).
 - **"The refused compute programs (`0x407ed7a300`, `0x407ee26700`, `0x407ed65200`, `0x407ef88500`) cause the
   solid red frame."** Falsified: the red pass `0x407f7f9400` does not read their outputs. It samples
   `0x4202a00000` and `0x4203270000` and a constant ring (dwords 17 and 18 read `1.0`, sane), and the red
@@ -233,3 +270,31 @@ Unexplained and not yet shown to matter:
   but by erasing a real clear, which only moves the error.
 - **"Gating the last-pass present fallback until the first guest flip removes it"** Falsified earlier: the
   first guest flips already carry the red.
+
+## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
+
+The title reaches the warning screen, then the intro cinematic, at about 2.7 to 3.8 flips per second
+with the GPU about 10% busy. An F8 capture (5.2 s window, 14 flips) and
+`PROSPER_COMPUTE_PHASE_TIMING` / `PROSPER_COMPUTE_BUFFER_TIMING` runs attribute it:
+
+- Compute CPU time is about 270 ms of a ~370 ms frame; the GPU device time is about 39 ms. Of the
+  compute CPU time, setup is 60%, writeback 20%, fence wait 17%.
+- The dominant setup cost is the **read-only constant-buffer windows of 43 MiB** (`size=45088768`,
+  `persistent=1`, `upload-skipped=0`). In one 40 s run with `PROSPER_COMPUTE_BUFFER_TIMING=1` (timing
+  adds overhead; 69 submits, a #4635 build with `PROSPER_NO_COMPUTE_BUFFER_ARENA=1`) they were acquired 449 times, about 6.5 per
+  submit, with 185 distinct bases: 433 `cache=miss validation=pooled-full`, 15 `full`, 1 `journal`.
+  Each acquisition cost 13.7 ms of `setup_ms` on average (compare 8.0 + copy 5.6, `compared-bytes` =
+  45,088,768), i.e. about 89 ms per submit. Their bases
+  advance a few hundred bytes per dispatch (`0x406260b900`, `c300`, `c700`, `d100`, `d500`, ...), so
+  the compute buffer cache, keyed by window start, never hits, although the windows overlap almost
+  entirely and the bytes at a given guest address do not change. That is the case ADR 0010 (canonical
+  resource identity, `PERF-P9`) describes.
+- Renderer side: `setup_resources` buffer copy 423 ms per 14 flips (768 MiB copied against 4,464 MiB
+  avoided), and a GPU retile that is 78% of storage-copy device time.
+- Alarms on this title: `host-copy-per-flip` (~24 MiB/flip), `gpu-sync-wait` (about 110% of the
+  33 ms budget: every submit waits on its own fence, `PERF-P1` / `PERF-P6`, ADR 0009) and
+  `surface-readback` (~9 ms per readback).
+
+(All figures in this section are from a build with #4635 applied and its arena switched off
+(`PROSPER_NO_COMPUTE_BUFFER_ARENA=1`), per the #4631 measurements; #4635 changes more than the arena, so
+they are not figures for main, and the per-submit figures quoted in #4645 are from the same build with the arena on.)

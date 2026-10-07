@@ -53,4 +53,13 @@ int exc_pending_take(uint64_t tid) {
     return -1;
 }
 
+void exc_pending_drain(uint64_t tid, void (*deliver)(int type, void* ctx), void* ctx) {
+    int type = exc_pending_take(tid);
+    if (type < 0) {
+        deliver(type, ctx);
+        return;
+    }
+    do { deliver(type, ctx); } while ((type = exc_pending_take(tid)) >= 0);
+}
+
 } // namespace prosper

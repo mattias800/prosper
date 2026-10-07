@@ -25,3 +25,20 @@ read by the guest. Use fresh save roots for every run.
 
 On a 32-wide device (NVIDIA) the gameplay world behind the prompt is black; that is the renderer's wave64 gap
 (#2147), not the route.
+
+## `linux-reach-level-load.pad`
+
+The Linux/AMD equivalent of the route above, as far as the first level load. Its anchors are
+**seconds** from the first pad poll, each held for 1 s, because on Linux the title polls the pad
+quickly during boot. The pad-read anchors above therefore all fire about 40 s in, long before the
+menu appears at about 200 s.
+
+```bash
+PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= PROSPER_RENDER=1 \
+PROSPER_SAVE0=<FRESH>/save0 PROSPER_SAVEDATA_DIR=<FRESH>/savedata \
+PROSPER_PAD_SCRIPT=@scripts/kena/linux-reach-level-load.pad PROSPER_PAD_SCRIPT_LOG=1 \
+  ./build-linux/prosper-app <DUMP_ROOT>/PPSA01802-app0
+```
+
+As of 2026-10-07 it reaches "Choose Difficulty" and the level load. The Vulkan device is then lost,
+in 2 of 2 runs, before any gameplay frame was captured.

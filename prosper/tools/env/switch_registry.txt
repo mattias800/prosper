@@ -526,7 +526,6 @@ PROSPER_NATIVE_BC_LOG  unclassified
 PROSPER_NATIVE_COMPUTE_MULTIWAVE  unclassified
 PROSPER_NATIVE_R11_SAMPLED_LOG  unclassified
 PROSPER_NATIVE_R11_SAMPLED_ONLY  unclassified
-PROSPER_NETCTL_CB  unclassified
 PROSPER_NGG_LAUNCH_STATE_EXTENT  unclassified
 PROSPER_NGG_LAUNCH_STATE_INSTANCES  unclassified
 PROSPER_NGG_LAUNCH_STATE_PROGRAM  unclassified
@@ -571,7 +570,9 @@ PROSPER_NO_COMPACT_DEPTH_ARRAY_SNAPSHOT  unclassified
 PROSPER_NO_COMPARE_POOL_REUSE  unclassified
 PROSPER_NO_COMPUTE  unclassified
 PROSPER_NO_COMPUTE_ALIAS_WRITEBACK  unclassified
+PROSPER_NO_COMPUTE_BUFFER_ARENA  diagnostic  # A/B control for ADR 0010: off = one private resident copy per window; guest-visible result identical
 PROSPER_NO_COMPUTE_DCC_FAST_CLEAR  unclassified
+PROSPER_NO_COMPUTE_BLOCK_SYNC  diagnostic  # A/B control: separate compare and full copy of a cached compute buffer; guest-visible result identical
 PROSPER_NO_COMPUTE_ITEMS_CENSUS  unclassified
 PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE  unclassified
 PROSPER_NO_COMPUTE_RTT_DEST_CREATE  unclassified
@@ -760,6 +761,7 @@ PROSPER_PERF_CAPTURE_AT_FRAME  unclassified
 PROSPER_PHYSLOG  unclassified
 PROSPER_PIPEKEY_LOG  unclassified
 PROSPER_PIPELINE_CACHE_ENTRIES  unclassified
+PROSPER_PIPELINE_OBSERVE  diagnostic  # ADR 0009 step 2: report what pipelining would allow; observes only, changes nothing
 PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES  unclassified
 PROSPER_PIPELOG  unclassified
 PROSPER_PIPETRACE  unclassified

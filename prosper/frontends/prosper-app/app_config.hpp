@@ -11,6 +11,8 @@
 // Parsing and serializing are pure and unit-tested; choosing the file's location and touching the disk
 // stays in main.cpp.
 
+#include "game_path.hpp"   // strip_trailing_separators: recent roots compare canonically
+
 #include <map>
 #include <string>
 #include <vector>
@@ -18,7 +20,9 @@
 namespace prosper::frontend {
 
 struct AppConfig {
-    std::string games_dir;   // "" = not set
+    // Every folder the library scans, in the order it was added. Empty = not set. One `games_dir`
+    // line per folder in the file, so adding a folder appends a line and never disturbs the rest.
+    std::vector<std::string> games_dirs;
 
     // Whether the library plays the focused title's music (#1630). On by default — the console-like
     // presentation is the point of the feature — and PROSPER_LAUNCHER_MUSIC still overrides this the
@@ -37,7 +41,40 @@ struct AppConfig {
     // `guest_args_by_title` overrides per TITLE_ID (config key spelling: `guest_args.PPSA02664`).
     std::string guest_args_default;                                  // "" = none
     std::map<std::string, std::string> guest_args_by_title;
+
+    // Recently opened titles, most-recent-first, as app0 roots. Backs File > Recent games.
+    // Capped so the file cannot grow without bound; a root whose dump is gone stays listed
+    // (opening it says so) rather than being silently forgotten.
+    std::vector<std::string> recent_games;
+    static constexpr size_t kRecentGamesMax = 8;
+
+    // Host settings previously reachable only via a flag or the environment, so a released build
+    // started without a terminal (desktop icon, library picker) could never set them. Each applies
+    // ONLY to boots the library starts — never to a scripted `prosper-app <dump>` run, whose guest
+    // answers must not depend on a per-user file. "" means unset (the flag/env/default path is
+    // untouched); present/display spellings are validated at apply time, so a typo costs the
+    // setting rather than a wrong behaviour.
+    std::string savedata_dir;   // PROSPER_SAVEDATA_DIR; "" = not set
+    std::string present_mode;   // --present-mode; "" = unset, else fifo|mailbox|immediate
+    std::string display_mode;   // PROSPER_DISPLAY_MODE; "" = unset, else legacy|host|host-high-refresh
+
+    // Process volume in percent (--volume). -1 = unset, so the flag and the default path are
+    // untouched; 0 is a real choice (muted) and survives. Parsed strictly, clamped like the flag.
+    int volume_percent = -1;
 };
+
+// Strict decimal percent, clamped to [0,100]; anything unparseable is -1 (unset), so a typo
+// costs the setting rather than muting or deafening the run.
+inline int parse_volume_percent(const std::string& value) {
+    if (value.empty()) return -1;
+    int v = 0;
+    for (char c : value) {
+        if (c < '0' || c > '9') return -1;
+        v = v * 10 + (c - '0');
+        if (v > 100) return 100;
+    }
+    return v;
+}
 
 // Trim ASCII spaces and tabs from both ends.
 inline std::string config_trim(const std::string& s) {
@@ -47,9 +84,32 @@ inline std::string config_trim(const std::string& s) {
     return s.substr(b, e - b);
 }
 
+// Record another games folder at the end of the library's list: canonicalized, deduplicated
+// against what is already there (so re-adding a folder is a no-op), and ignoring empties. Pure
+// over the struct, so the rule is unit-tested.
+inline void note_games_dir(AppConfig& cfg, const std::string& dir) {
+    const std::string canon = strip_trailing_separators(dir);
+    if (canon.empty()) return;
+    for (const std::string& have : cfg.games_dirs)
+        if (strip_trailing_separators(have) == canon) return;
+    cfg.games_dirs.push_back(canon);
+}
+
+// Drop a games folder from the library's list (canonical compare, like note). A folder that was
+// never listed changes nothing. Pure over the struct, so the rule is unit-tested.
+inline void forget_games_dir(AppConfig& cfg, const std::string& dir) {
+    const std::string canon = strip_trailing_separators(dir);
+    if (canon.empty()) return;
+    std::vector<std::string> kept;
+    for (const std::string& have : cfg.games_dirs)
+        if (strip_trailing_separators(have) != canon) kept.push_back(have);
+    cfg.games_dirs = std::move(kept);
+}
+
 // Read a `key = value` file. Blank lines and `#` comments are ignored, unknown keys are ignored (so a
-// newer build's config does not break an older one), and a later duplicate wins. Values are taken
-// literally after the first `=`, so a path may contain spaces, `=`, or `#`.
+// newer build's config does not break an older one), and a later duplicate wins — except `games_dir`
+// and `recent`, which accumulate one entry per line so the file can hold a whole library. Values are
+// taken literally after the first `=`, so a path may contain spaces, `=`, or `#`.
 inline AppConfig parse_app_config(const std::string& text) {
     AppConfig cfg;
     size_t pos = 0;
@@ -63,13 +123,19 @@ inline AppConfig parse_app_config(const std::string& text) {
         if (eq == std::string::npos) continue;
         const std::string key = config_trim(line.substr(0, eq));
         const std::string value = config_trim(line.substr(eq + 1));
-        if (key == "games_dir") cfg.games_dir = value;
+        if (key == "games_dir") note_games_dir(cfg, value);
         else if (key == "launcher_music")
             // Anything other than an explicit off is on, so a hand-edited "yes" or "1" behaves.
             cfg.launcher_music = !(value == "0" || value == "false" || value == "off" || value == "no");
         else if (key == "guest_args") cfg.guest_args_default = value;
         else if (key.rfind("guest_args.", 0) == 0)
             cfg.guest_args_by_title[key.substr(11)] = value;
+        else if (key == "recent") {
+            if (!value.empty()) cfg.recent_games.push_back(value);
+        } else if (key == "savedata_dir") cfg.savedata_dir = value;
+        else if (key == "present_mode") cfg.present_mode = value;
+        else if (key == "display_mode") cfg.display_mode = value;
+        else if (key == "volume") cfg.volume_percent = parse_volume_percent(value);
         else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
@@ -81,7 +147,15 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
         "# prosper-app settings. Written by the app.\n"
         "# A --games-dir argument or PROSPER_GAMES_DIR in the environment overrides games_dir.\n"
         "# Editing by hand is fine; the app rewrites this file, so comments are not preserved.\n";
-    if (!cfg.games_dir.empty()) out += "games_dir = " + cfg.games_dir + "\n";
+    // A value carrying a newline would inject a key into the file on rewrite. Paths cannot
+    // contain one on any host here, so such a value is dropped rather than written. (Values
+    // read from the file can never carry one — parsing is line-based — so this only fires for
+    // hand-built configs.)
+    const auto path_safe = [](const std::string& v) {
+        return v.find('\n') == std::string::npos && v.find('\r') == std::string::npos;
+    };
+    for (const std::string& dir : cfg.games_dirs)
+        if (!dir.empty() && path_safe(dir)) out += "games_dir = " + dir + "\n";
     // Written unconditionally, unlike games_dir: "off" is a real choice and must survive a rewrite,
     // whereas an absent games_dir simply means nothing was chosen.
     out += std::string("launcher_music = ") + (cfg.launcher_music ? "1" : "0") + "\n";
@@ -89,15 +163,85 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     for (const auto& [title, args] : cfg.guest_args_by_title)
         out += "guest_args." + title + " = " + args + "\n";
     if (!cfg.guest_args_default.empty()) out += "guest_args = " + cfg.guest_args_default + "\n";
+    for (const std::string& recent : cfg.recent_games)
+        if (!recent.empty() && path_safe(recent)) out += "recent = " + recent + "\n";
+    if (!cfg.savedata_dir.empty() && path_safe(cfg.savedata_dir))
+        out += "savedata_dir = " + cfg.savedata_dir + "\n";
+    if (!cfg.present_mode.empty()) out += "present_mode = " + cfg.present_mode + "\n";
+    if (!cfg.display_mode.empty()) out += "display_mode = " + cfg.display_mode + "\n";
+    if (cfg.volume_percent >= 0) out += "volume = " + std::to_string(cfg.volume_percent) + "\n";
     return out;
 }
 
-// Apply the precedence above. Each argument is "" when that source said nothing.
-inline std::string resolve_games_dir(const std::string& flag, const std::string& env,
-                                     const AppConfig& file) {
-    if (!flag.empty()) return flag;
-    if (!env.empty()) return env;
-    return file.games_dir;
+// Apply the precedence above. Each argument is "" when that source said nothing. The flag and
+// the environment name the whole library for the run (a single folder); the file holds the
+// accumulated list.
+inline std::vector<std::string> resolve_games_dirs(const std::string& flag, const std::string& env,
+                                                   const AppConfig& file) {
+    if (!flag.empty()) return {flag};
+    if (!env.empty()) return {env};
+    return file.games_dirs;
+}
+
+// Everything a library-started boot needs from the persisted host settings, resolved in one
+// pure step so the precedence main.cpp ships is the precedence the tests pin — including the
+// "environment wins" arms, which take the env values as inputs rather than reading them.
+struct HostPolicyInputs {
+    bool flag_present_mode = false;   // --present-mode was given
+    bool flag_display_mode = false;   // --display-mode was given
+    bool flag_volume = false;         // --volume was given
+    std::string env_savedata_dir;     // PROSPER_SAVEDATA_DIR, or "" when unset
+    std::string env_display_mode;     // PROSPER_DISPLAY_MODE, or "" when unset
+    AppConfig file;
+};
+
+struct HostPolicy {
+    std::string savedata_dir;   // "" = leave the environment alone
+    std::string present_mode;   // "" = keep the default; validated (fifo|mailbox|immediate) by main
+    std::string display_mode;   // "" = keep the default; validated (legacy|host|...) by main
+    int volume_percent = -1;    // -1 = untouched
+};
+
+inline HostPolicy resolve_host_policy(const HostPolicyInputs& in) {
+    HostPolicy out;
+    // No --savedata-dir flag exists (the release scripts own that spelling), so this is env > file.
+    if (in.env_savedata_dir.empty()) out.savedata_dir = in.file.savedata_dir;
+    if (!in.flag_present_mode) out.present_mode = in.file.present_mode;
+    if (!in.flag_display_mode && in.env_display_mode.empty())
+        out.display_mode = in.file.display_mode;
+    if (!in.flag_volume) out.volume_percent = in.file.volume_percent;
+    return out;
+}
+
+// Whether the persisted host settings apply to this run at all. Only a boot the library starts
+// takes them: a bare launch (no game, no test pattern) or a relaunch carrying --from-library.
+// A scripted `prosper-app <dump>`, `--dump <x>` or `--test-pattern` run never does, so its guest
+// answers cannot depend on per-user state.
+inline bool host_policy_applies(bool has_dump, bool test_pattern, bool from_library) {
+    return (!has_dump && !test_pattern) || from_library;
+}
+
+// The volume a library session runs at: the resolved policy's answer when it has one, otherwise
+// whatever `current` already is (the --volume flag's value, or the built-in default). It reads
+// only the resolver's output, so the shipped volume precedence is the one the tests pin.
+inline int volume_after_policy(const HostPolicy& policy, int current) {
+    return policy.volume_percent >= 0 ? policy.volume_percent : current;
+}
+
+// Record a boot at `app0_root` at the head of the recent list: deduped, canonicalized,
+// capped at kRecentGamesMax. Pure over the struct, so the rule is unit-tested.
+inline void note_recent_game(AppConfig& cfg, const std::string& app0_root) {
+    const std::string root = strip_trailing_separators(app0_root);
+    if (root.empty()) return;
+    std::vector<std::string> kept;
+    kept.reserve(AppConfig::kRecentGamesMax);
+    kept.push_back(root);
+    for (const std::string& have : cfg.recent_games) {
+        if (kept.size() >= AppConfig::kRecentGamesMax) break;
+        if (have.empty() || strip_trailing_separators(have) == root) continue;
+        kept.push_back(have);
+    }
+    cfg.recent_games = std::move(kept);
 }
 
 // Per-title launch arguments for the guest: a `guest_args.<TITLE_ID>` entry wins over the global

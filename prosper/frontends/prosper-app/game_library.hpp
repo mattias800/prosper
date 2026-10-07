@@ -37,6 +37,8 @@ struct GameEntry {
     std::string title_id;    // e.g. "PPSA24651"; "" when param.json has none
     std::string title_name;  // e.g. "The Messenger"; falls back to the app0 basename
     std::string icon_path;   // sce_sys/icon0.png, or "" when absent
+    std::string version;     // contentVersion, e.g. "01.000.006"; "" when absent
+    std::string region;      // contentId prefix, e.g. "EP"; "" when absent
 };
 
 // The JSON string value following the first "titleName" in [from, limit). Returns "" when absent.
@@ -149,15 +151,37 @@ inline std::string parse_param_title_name(const std::string& json) {
     return title;
 }
 
-// The title's content id ("titleId": "PPSA24651"). Returns "" when absent.
-inline std::string parse_param_title_id(const std::string& json) {
-    size_t k = json.find("\"titleId\"");
+// The JSON string value for a top-level key ("titleId": "PPSA24651"). Returns "" when absent
+// or malformed. One helper rather than one scanner per key: titleId, contentId and
+// contentVersion are all read this way, and three copies of the quote walk would drift apart.
+inline std::string parse_param_string_value(const std::string& json, const std::string& key) {
+    size_t k = json.find("\"" + key + "\"");
     if (k == std::string::npos) return "";
     k = json.find(':', k); if (k == std::string::npos) return "";
     k = json.find('"', k); if (k == std::string::npos) return "";
     const size_t end = json.find('"', k + 1);
     if (end == std::string::npos) return "";
     return json.substr(k + 1, end - k - 1);
+}
+
+// The title's content id ("titleId": "PPSA24651"). Returns "" when absent.
+inline std::string parse_param_title_id(const std::string& json) {
+    return parse_param_string_value(json, "titleId");
+}
+
+// The application version ("contentVersion": "01.000.006"). Returns "" when absent.
+inline std::string parse_param_content_version(const std::string& json) {
+    return parse_param_string_value(json, "contentVersion");
+}
+
+// The store region from the content id ("contentId": "EP0700-PPSA19990_00-..."): the two
+// region letters heading the prefix ("EP"). Shown as-is rather than mapped to a flag — the code
+// is what the dump says, a flag would be prosper asserting what it means.
+inline std::string parse_param_region(const std::string& json) {
+    const std::string content_id = parse_param_string_value(json, "contentId");
+    const size_t dash = content_id.find('-');
+    if (dash == std::string::npos || dash < 2) return "";
+    return content_id.substr(0, 2);
 }
 
 // The last path component, used as the display name when param.json gives none.
@@ -184,6 +208,8 @@ inline GameEntry describe_game(const std::string& app0_root, const GamePathProbe
     if (!json.empty()) {
         entry.title_id = parse_param_title_id(json);
         entry.title_name = parse_param_title_name(json);
+        entry.version = parse_param_content_version(json);
+        entry.region = parse_param_region(json);
     }
     if (entry.title_name.empty()) entry.title_name = path_basename(entry.app0_root);
     // Record the resolved spelling, not the requested one: the probe corrects case, so storing the
@@ -210,18 +236,35 @@ inline bool game_entry_display_less(const GameEntry& a, const GameEntry& b) {
     return a.app0_root < b.app0_root;
 }
 
-// Every PS5 title directly inside `games_dir`, in display order.
+// Case-insensitive substring match over what the list shows (name, title id, path): the
+// search box. An empty needle matches everything, so a cleared box is the unfiltered list.
+inline bool game_entry_matches_filter(const GameEntry& e, const std::string& needle) {
+    if (needle.empty()) return true;
+    const auto fold = [](const std::string& s) {
+        std::string out = s;
+        std::transform(out.begin(), out.end(), out.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return out;
+    };
+    const std::string n = fold(needle);
+    return fold(e.title_name).find(n) != std::string::npos ||
+           fold(e.title_id).find(n) != std::string::npos ||
+           fold(e.app0_root).find(n) != std::string::npos;
+}
+
+// Every PS5 title at `games_dir`, in display order: the directory itself when IT is a title
+// root (a dump can sit at a drive root, where F:\ holds eboot.bin directly), plus every title
+// directly inside it.
 //
 // One level deep, deliberately: a title's own subdirectories hold its assets, so recursing would both
-// waste time and risk presenting an inner directory as a separate game. The directory itself is not
-// considered even when it is a title root — pointing this at a single app0 folder yields nothing
-// rather than one oddly-named entry, and #1469's picker already covers opening one specific game.
+// waste time and risk presenting an inner directory as a separate game.
 inline std::vector<GameEntry> scan_game_library(const std::string& games_dir,
-                                                const GamePathProbe& probe,
-                                                const GameLibraryIo& io) {
+                                                 const GamePathProbe& probe,
+                                                 const GameLibraryIo& io) {
     std::vector<GameEntry> games;
     const std::string dir = strip_trailing_separators(games_dir);
     if (dir.empty() || !io.list_dir || !probe.is_dir || !probe.is_dir(dir)) return games;
+    if (is_app0_root(dir, probe)) games.push_back(describe_game(dir, probe, io));
     for (const std::string& child : io.list_dir(dir)) {
         if (child.empty() || child == "." || child == "..") continue;
         const std::string path = dir + "/" + child;
@@ -230,6 +273,55 @@ inline std::vector<GameEntry> scan_game_library(const std::string& games_dir,
     }
     std::sort(games.begin(), games.end(), game_entry_display_less);
     return games;
+}
+
+// Every PS5 title across several games folders, in display order: each folder contributes what
+// scan_game_library would report for it alone. Folders that are gone (an unplugged drive) simply
+// contribute nothing, so one missing folder cannot hide the rest. A title reachable through two
+// folders lists once, under its first spelling — the same dump mounted twice is still one game.
+inline std::vector<GameEntry> scan_game_libraries(const std::vector<std::string>& games_dirs,
+                                                  const GamePathProbe& probe,
+                                                  const GameLibraryIo& io) {
+    std::vector<GameEntry> games;
+    for (const std::string& dir : games_dirs) {
+        for (GameEntry& entry : scan_game_library(dir, probe, io)) {
+            const std::string canon = strip_trailing_separators(entry.app0_root);
+            bool seen = false;
+            for (const GameEntry& have : games)
+                if (strip_trailing_separators(have.app0_root) == canon) { seen = true; break; }
+            if (!seen) games.push_back(std::move(entry));
+        }
+    }
+    std::sort(games.begin(), games.end(), game_entry_display_less);
+    return games;
+}
+
+// --list-games over several folders, under the same rule as the library: a missing folder (an
+// unplugged drive) is reported and contributes nothing, but does not hide the rest. `available` is
+// what to scan, `missing` what to warn about, both in the order given.
+struct GamesDirsAvailability {
+    std::vector<std::string> available;
+    std::vector<std::string> missing;
+};
+
+inline GamesDirsAvailability split_available_games_dirs(const std::vector<std::string>& games_dirs,
+                                                        const GamePathProbe& probe) {
+    GamesDirsAvailability out;
+    for (const std::string& dir : games_dirs) {
+        if (probe.is_dir && probe.is_dir(dir))
+            out.available.push_back(dir);
+        else
+            out.missing.push_back(dir);
+    }
+    return out;
+}
+
+// --list-games exit status: 2 when no folder is set or EVERY folder is missing, otherwise 0 when the
+// available folders held titles and 1 when they held none. With --games-dir / PROSPER_GAMES_DIR the
+// list is one folder, so "every folder missing" is that folder missing, as before.
+inline int list_games_exit_code(const GamesDirsAvailability& dirs, size_t title_count) {
+    if (dirs.available.empty()) return 2;
+    return title_count != 0 ? 0 : 1;
 }
 
 } // namespace prosper::frontend

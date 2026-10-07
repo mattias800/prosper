@@ -13,7 +13,6 @@ frontends/prosper-app/test_guest_end_status.cpp
 frontends/prosper-app/test_keyboard_pad_map.cpp
 frontends/prosper-app/test_launcher_media.cpp
 frontends/prosper-app/test_library_descriptor_budget.cpp
-frontends/prosper-app/test_library_nav.cpp
 frontends/prosper-app/test_pad_overlay.cpp
 frontends/prosper-app/test_performance_capture_schedule.cpp
 frontends/prosper-app/test_present_mode.cpp
@@ -127,7 +126,6 @@ tests/gpu/test_graphics_cache_persistence.cpp
 tests/gpu/test_rdna2_spirv_struct.cpp
 tests/gpu/test_recompile_coverage.cpp
 tests/gpu/test_texture_sample_render.cpp
-tests/gpu/texture/bench_detile.cpp
 tests/gpu/texture/test_bc_decode.cpp
 tests/gpu/texture/test_mip_tail.cpp
 tests/gpu/timeline/test_capture_tunables.cpp

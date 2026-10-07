@@ -1,5 +1,6 @@
 #pragma once
-// library_ui.hpp — the game library screen: a grid of cover art the user picks a title from (#1471).
+// library_ui.hpp — the game library screen: a game list (cover, name, serial, region, version,
+// path) the user picks a title from, plus a read-only controls view.
 //
 // This is the app's idle state. Once a guest boots, the library is torn down and the window goes back
 // to presenting game frames; prosper runs one game per launch (#352), so the library never draws over a
@@ -9,8 +10,8 @@
 // adding only a render pass and per-image framebuffers — no second device, no second window. Cover art
 // is decoded from each dump's sce_sys/icon0.png with stb_image.
 //
-// The selection rules live in library_nav.hpp, which is pure and unit-tested; this file owns pixels,
-// resources, and event translation.
+// Filtering and keyboard gating are pure (game_library.hpp, list_nav.hpp) and unit-tested; this file
+// owns pixels, resources, and event translation.
 
 #include "game_library.hpp"
 #include "library_descriptor_budget.hpp"
@@ -20,6 +21,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstddef>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -28,21 +30,41 @@
 // implementation needs it, and the app's other translation units should not pick it up.
 struct ImFont;
 
+namespace prosper {
+namespace frontend {
+// The Game Log line buffer (log_ring.hpp); owned by main.cpp, only observed here. Forward
+// declared so this header stays free of <mutex>/<deque>.
+class LogRing;
+}   // namespace frontend
+}   // namespace prosper
+
 namespace prosper::frontend {
 
 // What the user did on this frame.
 struct LibraryAction {
     enum class Kind {
         none,
-        open,          // launch `app0_root`
-        browse,        // asked for the folder picker (no games directory, or wants another folder)
-        set_games_dir, // chose `path` as the games directory; persist it and rescan
-        set_music,     // toggled launcher music to `music_on`; persist it
+        open,              // launch `app0_root`
+        browse,            // asked for the folder picker; the answer is APPENDED to the games
+                           // folders, never boots, and Play starts what it lists
+        pick_game,         // asked for the folder picker for ONE game; same append rule as browse
+                           // (Ctrl+O path) — listing, not booting
+        rescan,            // re-read the games folders now
+        forget_games_dir,  // stop listing `path`; persist it and rescan
+        set_games_dir,     // chose `path` as the games directory; persist it and rescan
+        set_music,         // toggled launcher music to `music_on`; persist it
+        toggle_fullscreen,   // the Full Screen toolbar button (same path as F11)
+        show_in_explorer,    // reveal `app0_root` in the OS file manager
+        set_present_mode,    // picked swapchain policy `value` (fifo|mailbox|immediate); persist + apply
+        set_display_mode,    // picked guest display policy `value`; persist + apply to the next boot
+        set_savedata_dir,    // picked save location `value` ("" clears); persist + apply to the next boot
+        set_volume,          // dragged the volume slider to `value` (0-100); persist + apply live
         quit,
     };
     Kind kind = Kind::none;
     std::string app0_root;   // Kind::open
-    std::string path;        // Kind::set_games_dir
+    std::string path;        // Kind::set_games_dir/forget_games_dir
+    std::string value;       // Kind::set_present_mode/set_display_mode/set_savedata_dir/set_volume
     bool music_on = true;    // Kind::set_music
 };
 
@@ -69,9 +91,37 @@ public:
     // app_config.hpp is layered. Has no effect once init() has run.
     void set_music_preference(bool on) { musicToggle_ = on; }
 
+    // One File > Recent games row: the root to boot, and the label to show for it. The label is
+    // resolved where the filesystem is available (main.cpp at seed); the menu only displays.
+    struct RecentGame {
+        std::string root;
+        std::string label;
+    };
+
+    // Seed File > Recent games from the persisted settings. Seeded once before the first frame;
+    // boots only happen from here pre-guest, after which the menu is gone with the library.
+    void set_recent(std::vector<RecentGame> recent) { recentGames_ = std::move(recent); }
+
+    // Point the Game Log panel at main.cpp's capture ring (null: capture unavailable, the panel
+    // says so). Seeded once before the first frame; the ring outlives the UI.
+    void set_log_ring(const LogRing* ring) { logRing_ = ring; }
+
+    // Seed the settings view with the run's EFFECTIVE host settings (flag > env > file, resolved
+    // by main.cpp at startup through resolve_host_policy). The view edits these live and reports
+    // changes as actions; main.cpp persists them. Seeded once before the first frame.
+    void set_host_settings(const std::string& present_mode, const std::string& display_mode,
+                           const std::string& savedata_dir) {
+        presentMode_ = present_mode.empty() ? "fifo" : present_mode;
+        displayMode_ = display_mode.empty() ? "legacy" : display_mode;
+        savedataDir_ = savedata_dir;
+        savedataApplied_ = savedata_dir;
+        std::snprintf(savedataBuf_, sizeof savedataBuf_, "%s", savedata_dir.c_str());
+    }
+
     // prosper-app's `--volume`, as a linear factor in [0,1] (#3499). It attenuates the launcher music
-    // as well as the title (launcher_music_output_gain). Must be set before init(); no effect after.
-    void set_output_volume(float volume) { outputVolume_ = volume; }
+    // as well as the title (launcher_music_output_gain). Live once init() has run: the media layer
+    // reads its gain per chunk on this same thread.
+    void set_output_volume(float volume);
 
     // Release every Vulkan object. Safe to call twice, and safe to call without a successful init.
     void shutdown();
@@ -87,11 +137,11 @@ public:
     // on it). The app still sees window close, resize and its own hotkeys.
     bool handle_event(const SDL_Event& ev);
 
-    // Replace the displayed titles. Keeps the selection on the same app0 root when it is still present,
-    // so a rescan does not jump the cursor somewhere else under the user.
-    void set_games(std::vector<GameEntry> games, const std::string& games_dir);
+    // Replace the displayed titles. The visible rows and the selection are rebuilt from the search
+    // box, so a rescan returns to the top rather than holding a row that may have moved.
+    void set_games(std::vector<GameEntry> games, const std::vector<std::string>& games_dirs);
 
-    // Build and draw one frame, and present it. `status` is shown under the grid — used for the reason
+    // Build and draw one frame, and present it. `status` is shown under the list — used for the reason
     // a title failed to boot, so the message is visible in the UI rather than only on stderr.
     LibraryAction render_frame(const std::string& status);
 
@@ -167,15 +217,46 @@ private:
     std::vector<VkImageView>   views_;
     std::vector<VkFramebuffer> framebuffers_;
 
-    // Paint the focused title's own art behind the grid, and darken it enough that the UI stays
+    // Paint the focused title's own art behind the list, and darken it enough that the UI stays
     // readable over arbitrary artwork (#1630).
     void draw_backdrop();
 
-    ImFont*                titleFont_ = nullptr;   // 2x atlas entry used only for the game titles
+    // Read-only keyboard map, drawn as its own view. The mapping itself lives in
+    // keyboard_pad_map.hpp — this table mirrors its documented layout, so update both when the
+    // mapping changes.
+    void draw_controls_content();
+    // Right-click detector for one row item: arms the menu below. Called at each clickable
+    // item of the row so the whole row answers.
+    void note_row_right_click(int fi);
+    // The row menu itself (Play, Show in Explorer), drawn once per frame after the table at
+    // window scope, where OpenPopup/BeginPopup always agree.
+    void draw_row_menu(LibraryAction& action, int shown);
+
+    // The settings view: host settings a terminal-free launch could never reach. Drawn
+    // inline, selected from the Settings menu with a back button (a floating dialog over a game
+    // library is the wrong shape — the library IS the window).
+    void draw_settings_content(LibraryAction& action);
+
+    // Which view is showing. Games, settings and controls share the menu bar; only one draws.
+    enum class LibraryTab { games, settings, controls };
+
+    ImFont*                boldFont_ = nullptr;    // section headers; null while on the bitmap fallback
 
     LibraryMedia           media_;
     bool                   musicToggle_ = true;   // mirrors the persisted setting for the in-UI switch
     float                  outputVolume_ = 1.0f;  // --volume, applied on top of the music's own level
+    float                  musicLevel_ = kDefaultMusicGain;  // the launcher's own mix level under --volume
+    int                    volumePercent_ = 100;  // toolbar slider position, mirrors outputVolume_
+
+    // The settings view. The radio state mirrors the run's effective policy; changing one emits
+    // an action main.cpp persists and applies live to the not-yet-booted guest. The save path
+    // edits a buffer and applies explicitly, so half-typed paths never reach the config;
+    // `savedataApplied_` is what the last Apply wrote.
+    std::string            presentMode_ = "fifo";
+    std::string            displayMode_ = "legacy";
+    std::string            savedataDir_;
+    std::string            savedataApplied_;
+    char                   savedataBuf_[1024] = {};
 
     // PROSPER_LIBRARY_STATS=1: per-frame timing for the library view, reported at shutdown. A mean
     // cannot detect a stutter — a 40 ms frame among 5 ms ones averages away — so what is kept is the
@@ -194,11 +275,27 @@ private:
     static constexpr size_t kMaxFrameSamples = 200000;
     std::vector<double>    frameSamples_;
 
+    // Rebuild the visible rows: every game matching the search box, as indices into games_.
+    // Selection is a position in this list, reset whenever it is rebuilt.
+    void apply_filter();
+
     std::vector<GameEntry> games_;
     std::vector<Cover>     covers_;
-    std::string            gamesDir_;
+    std::vector<int>       filtered_;
+    std::vector<RecentGame> recentGames_;
+    const LogRing* logRing_ = nullptr;   // observed only; owned by main.cpp
+    bool logFollow_ = true;
+    // Row hovered last frame. The highlight is painted at row start, but hover is only
+    // knowable after the row's items — so it trails by one frame, which is imperceptible and
+    // always spans the whole row (unlike a Selectable's own cell-sized hover paint).
+    int                    hovered_ = -1;
+    int                    contextFi_ = -1;      // row the menu was armed from
+    bool                   contextArmed_ = false;
+    LibraryTab             tab_ = LibraryTab::games;
+    std::vector<std::string> gamesDirs_;
+    char                   filterBuf_[256] = {};
+    std::string            filterApplied_;
     int                    selected_  = 0;
-    int                    firstRow_  = 0;
     bool                   ready_     = false;
     bool                   imguiCtx_   = false;   // unwound independently so a part-failed init leaks nothing
     bool                   sdlInit_    = false;

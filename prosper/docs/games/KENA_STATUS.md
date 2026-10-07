@@ -9,11 +9,80 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The title-menu world renders on `main` (2026-10-07, #3835)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, default launch
+(`PROSPER_NULL_PAGE=1`, no input), `main` at `97917c5f`.
+
+- **The shrine and forest draw behind the title menu.** An F9 screenshot at 235 s shows the Kena
+  wordmark, the `New Game / Load Game / Options` menu and `Version 1.16` over the 3D scene, 95% of
+  the frame non-black. A RenderDoc capture of three guest frames at 215 s shows the same scene in
+  all three. In those three frames, no 1600×900 RGBA16F target holds a NaN or Inf, and no draw
+  reads a fragment input that its vertex program does not write (every draw from the scene pass to
+  the scanout was checked). `tools/evidence/prerender_check.py` finds no dump asset that explains
+  the frame.
+- **The NaN half image came from AGC's helper rectangle.** #3835's 2026-10-06 chain was measured on
+  `feat/ngg-live-p5` and `fix/issue-4625-compute-renderer-volume`. Neither branch contains #4610,
+  which landed on `main` the same day.
+  - The half target's writer was ES `0x3007060000`, a 112-byte vertex program that exports only
+    the primitive and the position. That is Kena's compile of AGC's helper rectangle, whose words
+    are `kKenaRect` in `tests/gpu/execute/test_efc_helper_program.cpp`.
+  - The pixel shader on that draw is the one the previous draw left bound. It is
+    `0x30096e0000`/`0x50096a0000`, a 132-dword program that reads five flat PARAM inputs and
+    samples one 32×32 texture four times. Its own vertex program, `0x5009660000`, exports
+    PARAM0–6.
+  - That helper is a metadata operation (here AGC's "Decompress Htile") that writes no colour, so
+    the inherited pixel shader's output must not reach the target. #4610 recognises the helper by
+    its program family and draws it with no colour write. Live, it reports
+    `helper rectangle recognised by family: vs=0x5007020000 … op=decompress-htile`.
+- **The A/B.** Both arms used one scratch binary: `main` plus a local switch that skips only
+  the helper's colour suppression. The switch was never committed. Each arm took one F9 frame at
+  235 s:
+
+  | arm | runs | F9 frame non-black |
+  |---|---|---|
+  | suppression on (`main`'s behaviour) | 2 (one on this binary, one on the `main` build) | 95.2%, 95.1%: world and menu |
+  | suppression skipped | 2 | 0.0%, 0.0%: the whole frame is black, menu text included |
+
+  With suppression skipped, a draw-program census shows the helper drawing with several inherited
+  pixel shaders. Two of those draws target the scanout at `0xbfc0000000`.
+- **What is still wrong.** Compared with the 1.04 oracle (#3781), the grass, ferns and flowers in
+  the foreground are missing, so the ground is black. The light shafts are missing, and the scene
+  is foggier and less saturated.
+  - The run's `dropped-draws` alarm fires in 42 of 43 windows. Its reasons are
+    `backend/volume-multi-target:7722` (#4643), `backend/ngg-subgroup:3564` and
+    `shader-recompile/fragment:595`. The fragment count is one refused Wave64 program,
+    `0x505c3d0000`.
+  - The volume passes are a likely cause of the fog and the missing light shafts, and the NGG
+    subgroup drops of the missing foliage. Neither link has been checked per draw. **This is the
+    next blocker.**
+  - The refused fragment program was logged on a draw whose vertex program is the helper
+    (`es=0x5007020000`), so some of those 595 uses may be helper draws that write nothing anyway.
+- **The lit scene filling only the top-left two thirds of its target is not a defect.** The scene
+  target is 3200×1800, and the complete view covers about 2133×1200 of it. The next pass writes a
+  full-frame 3200×1800 image from it, and the final 3840×2160 frame is correct. This is UE4's
+  screen-percentage rendering followed by an upscale.
+- **Rung.** The title screen's 3D layer now renders, which is still rung 2. Gameplay was not
+  reached on Linux.
+  - `scripts/kena/reach-first-gameplay-prompt.pad` does not carry over. Linux polls the pad
+    quickly during boot, so all seven of its pad-read anchors fire within the first 40 s, long
+    before the menu appears at about 200 s.
+  - The new `scripts/kena/linux-reach-level-load.pad` uses seconds anchors held for 1 s. It reaches
+    "Choose Difficulty", seen on screen at pad flip 1000, and then the first level load.
+  - **The level load then loses the Vulkan device, in 2 of 2 runs**, at about 500 s and 640 s.
+    RADV reports `context is guilty of a hard recovery`. The first failing submit is compute
+    `0x500a380000`, dispatch 22. That only names the submit that saw the loss, not the work that
+    hung. In those runs, 13 vertex, 4 vertex-main, 9–14 fragment and 4 compute programs were
+    refused. The next run should arm `PROSPER_GPU_BREADCRUMBS=1` or `RADV_DEBUG=hang`. **This is
+    the gameplay blocker on Linux.**
+
 ## The volume clear runs; the next blocker is #3835's NaN half image (2026-10-06, #4625)
 
-**Read this first.** Measured on Linux/RADV, stacked on #3135 P5 (`feat/ngg-live-p5`). The runs were
-`prosper-app` default launches (`PROSPER_NULL_PAGE=1`, no input, 260 s) and one `tools/screenshot`
-run (26 samples, 10 s apart).
+**The 2026-10-07 entry above supersedes this one's conclusion.** The NaN half image below was AGC's
+helper rectangle drawing with a pixel shader the previous draw left bound. These runs were on
+branches without #4610, and `main` no longer writes colour for that draw. Measured on Linux/RADV,
+stacked on #3135 P5 (`feat/ngg-live-p5`). The runs were `prosper-app` default launches
+(`PROSPER_NULL_PAGE=1`, no input, 260 s) and one `tools/screenshot` run (26 samples, 10 s apart).
 
 - **What #4625 was.** Compute `0x5007bc0000` is a clear: four 64×64×64 RGBA16F storage volumes, 16³
   groups of 4×4×4 threads, all writes zero. Once the NGG producer drew into one of the volumes, the
@@ -302,6 +371,17 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **#3835's all-NaN 1600×900 half image is a float-semantics or interpolant defect in the
+  recompiled pixel shader** — false as the cause of the black title world. It was AGC's helper
+  rectangle drawn with the pixel shader the previous draw left bound. That shader reads PARAMs the
+  helper never exports, and hardware writes no colour for that draw. #4610 suppresses the
+  helper's colour. With that suppression skipped in one scratch binary, 2 of 2 frames are black;
+  with it on, 2 of 2 show the world. What this leaves open: the value hardware returns for a
+  selected PARAM that was never exported. No draw in a current title frame depends on it
+  (2026-10-07, #3835, #4610).
+- **The lit scene being "tiled" (the view filling the top-left two thirds of its target) corrupts
+  the picture** — false. It is UE4's screen percentage: the next pass upscales the view to a
+  full-frame 3200×1800 image, and the final frame is correct (2026-10-07, #3835).
 - **Kena's black frames from about t=100 s under #4610 (first-gameplay route) are caused by the BOOL64
   polarity** — false. They came from Kena's own compile of AGC's helper rectangle. #1588's exact list did not
   recognise it, so the eliminate-fast-clear pass painted the inherited pixel shader over the finished scanout.

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -154,7 +155,21 @@ struct PipelineCacheFile {
         out.close();
         if (!out) return false;
 #ifdef _WIN32
-        return MoveFileExW(payload.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        // MoveFileExW cannot replace a file a peer has open or is itself replacing: it fails with
+        // ACCESS_DENIED / SHARING_VIOLATION until that handle closes. Concurrent prosper processes
+        // (and a scanner touching the fresh file) make that routine, and each such failure lost a
+        // cache the process had computed. The conditions are transient, so wait them out for a
+        // bounded time; a destination that stays obstructed (a directory) still fails.
+        for (unsigned attempt = 0; attempt < 200; ++attempt) {
+            if (MoveFileExW(payload.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0)
+                return true;
+            const DWORD error = GetLastError();
+            if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION &&
+                error != ERROR_LOCK_VIOLATION)
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1 + attempt / 20));
+        }
+        return false;
 #else
         std::filesystem::rename(payload, path, ec);
         return !ec;

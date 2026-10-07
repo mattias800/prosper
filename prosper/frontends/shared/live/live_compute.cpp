@@ -8,9 +8,14 @@
 #include "shared/compute/compute_timing_selector.hpp"
 #include "diagnostics/exit_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
+#include "shared/compute/buffer_arena_registry.hpp"
+#include "shared/compute/compute_transfer_gate_stats.hpp"
+#include "shared/compute/gpu_retile_census.hpp"
+#include "shared/compute/parent_scan.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/linear_image_pitch.hpp"
 #include "shared/live/live_compute_bound_resources.hpp"
+#include "shared/live/pipeline_observe_hook.hpp"
 #include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -508,10 +513,12 @@ inline RefusalCensus& destination_refusal_census() {
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
     RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded, bgra_source_seed_recorded;
+    RttMirrorCounter r8_source_seed_recorded;
     LiveComputeRttDestinationMirrorCounters snapshot() const {
         return {candidates.value(), borrowed.value(), recorded.value(), published.value(),
                 failed.value(), r11_source_seed_recorded.value(),
-                rgba16_source_seed_recorded.value(), bgra_source_seed_recorded.value()};
+                rgba16_source_seed_recorded.value(), bgra_source_seed_recorded.value(),
+                r8_source_seed_recorded.value()};
     }
 };
 RttDestinationCensus& rtt_destination_census() {
@@ -1221,116 +1228,6 @@ struct CachedComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
-// Why a storage image took the CPU tiling path instead of the GPU retile compute shader.
-//
-// `layout_ms` -- the CPU tile_surface/tile_volume pass -- is one of the largest leaves in the compute
-// profile (about 7 s of a 33 s summed-thread total on a 70 s Sonic Frontiers route), and it runs
-// exactly when this admission declines. The admission has a dozen `continue`s and no counter on any of
-// them, so "the CPU path is hot" and "which condition sent it there" were separate questions with only
-// the first answerable. Nothing here changes a decision; each reason is recorded where the decision was
-// already being made.
-//
-// Counted per reason and per program, because the interesting quantity is which SHAPE a hot program
-// presents, not the global mix: a title can decline ten thousand times for a reason that costs nothing
-// and a hundred times for the one that owns the frame.
-enum class GpuRetileDecline : uint8_t {
-    Admitted = 0,
-    Aliased,               // this binding is an alias of an earlier one; the owner does the writeback
-    Imported,              // guest-imported image, not a storage result prosper produced
-    PartialWrite,          // a write mask means the result does not cover the whole surface
-    InexactBytes,          // staged bytes are not the guest's exact storage extent
-    MipTailOrOffset,       // in a mip tail, or at a nonzero layer/mip offset
-    NoResource,            // the binding carries no ShaderResource at all
-    NoStaging,             // no staging buffer for this image
-    UnsupportedShape,      // layer/depth/dimension combination outside the admitted set
-    PackedDisabled,        // packed byte/halfword words with the extension switched off
-    PackedUnsupported,     // array-and-not-packed, or a packed descriptor the layout cannot express
-    LayoutMismatch,        // parameters would not reproduce the guest's exact tiled/linear extents
-    PrepareFailed,         // pipeline/buffer/memory/descriptor setup declined at runtime
-    Disabled,              // PROSPER_NO_GPU_RETILE
-    Count
-};
-
-const char* gpu_retile_decline_name(GpuRetileDecline reason) {
-    switch (reason) {
-        case GpuRetileDecline::Admitted: return "admitted";
-        case GpuRetileDecline::Aliased: return "aliased";
-        case GpuRetileDecline::Imported: return "imported";
-        case GpuRetileDecline::PartialWrite: return "partial-write";
-        case GpuRetileDecline::InexactBytes: return "inexact-bytes";
-        case GpuRetileDecline::MipTailOrOffset: return "mip-tail-or-offset";
-        case GpuRetileDecline::NoResource: return "no-resource";
-        case GpuRetileDecline::NoStaging: return "no-staging";
-        case GpuRetileDecline::UnsupportedShape: return "unsupported-shape";
-        case GpuRetileDecline::PackedDisabled: return "packed-disabled";
-        case GpuRetileDecline::PackedUnsupported: return "packed-unsupported";
-        case GpuRetileDecline::LayoutMismatch: return "layout-mismatch";
-        case GpuRetileDecline::PrepareFailed: return "prepare-failed";
-        case GpuRetileDecline::Disabled: return "disabled";
-        default: return "?";
-    }
-}
-
-struct GpuRetileCensus {
-    struct Row {
-        std::array<uint64_t, static_cast<size_t>(GpuRetileDecline::Count)> reasons{};
-        // One representative shape PER REASON, and printed next to that reason's name. A single
-        // sample per program was the first shape of this and it is not enough to act on: it is
-        // whichever reason declined first, it carries no label saying which, and quoting it beside a
-        // count generalizes one image to every decline in the row. Per reason, first seen wins --
-        // a later one would need a policy for which is representative, and there is none.
-        std::array<std::array<char, 96>, static_cast<size_t>(GpuRetileDecline::Count)> samples{};
-    };
-    std::mutex mutex;
-    std::unordered_map<uint64_t, Row> by_code;   // guest code address of the dispatching program
-    std::atomic<bool> any{false};
-
-    void record(uint64_t code_addr, GpuRetileDecline reason,
-                const prosper::gpu::ShaderResource* r, uint32_t bpe) {
-        any.store(true, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(mutex);
-        Row& row = by_code[code_addr];
-        row.reasons[static_cast<size_t>(reason)]++;
-        auto& sample = row.samples[static_cast<size_t>(reason)];
-        if (reason != GpuRetileDecline::Admitted && !sample[0] && r) {
-            std::snprintf(sample.data(), sample.size(),
-                          "%ux%ux%u dim=%u tile=%u fmt=%u bpe=%u",
-                          r->width, r->height, r->depth, (unsigned)r->img_dim,
-                          (unsigned)r->tile_mode, (unsigned)r->format, bpe);
-        }
-    }
-
-    void report() {
-        if (!any.load(std::memory_order_relaxed)) return;
-        std::lock_guard<std::mutex> lock(mutex);
-        std::fprintf(stderr, "[gpu-retile-census] %zu program(s)\n", by_code.size());
-        for (const auto& [code, row] : by_code) {
-            std::string line;
-            uint64_t total = 0;
-            for (size_t i = 0; i < row.reasons.size(); ++i) {
-                if (!row.reasons[i]) continue;
-                total += row.reasons[i];
-                line += " ";
-                line += gpu_retile_decline_name(static_cast<GpuRetileDecline>(i));
-                line += "=" + std::to_string(row.reasons[i]);
-                // The sample belongs to THIS reason, and says so. A shape printed once per row with
-                // no label cannot be attributed to any bucket, and reads as representative of all of
-                // them. "first" rather than "e.g." because it is the first seen, not a typical one:
-                // nothing here establishes that the other declines in this bucket share its shape.
-                if (row.samples[i][0]) {
-                    line += "(first ";
-                    line += row.samples[i].data();
-                    line += ")";
-                }
-            }
-            std::fprintf(stderr, "[gpu-retile-census] code=0x%llx images=%llu%s\n",
-                         (unsigned long long)code, (unsigned long long)total, line.c_str());
-        }
-    }
-};
-
-GpuRetileCensus& gpu_retile_census() { static GpuRetileCensus* value = new GpuRetileCensus; return *value; }
-
 bool gpu_retile_census_enabled() {
     static const bool enabled = std::getenv("PROSPER_GPU_RETILE_CENSUS") != nullptr;
     return enabled;
@@ -1411,6 +1308,8 @@ struct VulkanComputeContext {
     ComputeMemoryPool memory_pool;
     std::unordered_map<ComputeBufferCacheKey, CachedComputeBuffer,
                        ComputeBufferCacheKeyHash> buffer_cache;
+    // Shared resident copies of overlapping windows (interim, see buffer_arena_plan.hpp).
+    BufferArenaRegistry buffer_arenas;
     VkDeviceSize buffer_cache_bytes = 0;
     uint64_t buffer_cache_clock = 0;
     std::unordered_map<ComputeImageCacheKey, CachedComputeImage,
@@ -2176,6 +2075,21 @@ struct VulkanComputeContext {
         return true;
     }
 
+    // A replaced arena's entry is dead weight against the cache budget; drop it unless a dispatch
+    // still holds it.
+    void drop_cached_buffer(const ComputeBufferCacheKey& key) {
+        const auto found = buffer_cache.find(key);
+        if (found == buffer_cache.end() || found->second.pins) return;
+        found->second.write_watches.clear();
+        if (found->second.buffer) vkDestroyBuffer(device, found->second.buffer, nullptr);
+        if (found->second.memory) release_memory(found->second.memory);
+        if (found->second.result_buffer)
+            vkDestroyBuffer(device, found->second.result_buffer, nullptr);
+        if (found->second.result_memory) release_memory(found->second.result_memory);
+        buffer_cache_bytes -= found->second.allocation_bytes;
+        buffer_cache.erase(found);
+    }
+
     bool acquire_cached_buffer(const ComputeBufferCacheKey& key, const uint8_t* source,
                                VkBuffer& buffer, VkDeviceMemory& memory, bool& upload_skipped,
                                uint32_t& dirty_watch_chunks, uint32_t& total_watch_chunks,
@@ -2269,13 +2183,23 @@ struct VulkanComputeContext {
                 upload_skipped = !changed;
             } else {
                 g_write_watch_census.record_exact_compare(key.bytes);
+                // Default: one pass copies each differing 64 KiB block as it is found, so compare and
+                // copy are fused and the whole cost lands in upload_compare_ms (upload_copy_ms stays
+                // 0). PROSPER_NO_COMPUTE_BLOCK_SYNC=1 restores the separate compare and full copy.
+                static const bool block_sync = !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_BLOCK_SYNC");
                 bool changed;
                 {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                    changed = !compute_buffers_equal(mapped, source, key.bytes);
+                    if (block_sync) {
+                        const uint64_t copied = sync_compute_buffer_blocks(mapped, source, key.bytes);
+                        timing.uploaded_bytes += copied;
+                        changed = copied != 0;
+                    } else {
+                        changed = !compute_buffers_equal(mapped, source, key.bytes);
+                    }
                 }
                 timing.compared_bytes += key.bytes;
-                if (changed) {
+                if (changed && !block_sync) {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
                     copy_compute_buffer(mapped, source, key.bytes);
                     timing.uploaded_bytes += key.bytes;
@@ -4022,50 +3946,6 @@ const char* compute_transfer_borrow_result_name(ComputeTransferBorrowResult resu
     return "unknown";
 }
 
-struct ComputeTransferGateStats {
-    uint64_t reflected_images = 0;
-    uint64_t reflected_storage = 0;
-    uint64_t reflected_sampled = 0;
-    uint64_t reflected_dim_2d = 0;
-    uint64_t reflected_nonarrayed = 0;
-    uint64_t reflected_nonmsaa = 0;
-    uint64_t ordinary_2d = 0;
-    uint64_t storage_float = 0;
-    uint64_t storage_native_semantic = 0;
-    uint64_t storage_native_device = 0;
-    uint64_t storage_cache_evaluated = 0;
-    uint64_t storage_renderer_owned = 0;
-    uint64_t storage_dcc_cache_safe = 0;
-    uint64_t storage_poison_verify = 0;
-    uint64_t storage_exact = 0;
-    uint64_t storage_write_only = 0;
-    uint64_t storage_persistent_enabled = 0;
-    uint64_t storage_cache_candidate = 0;
-    uint64_t storage_persistent_setup = 0;
-    uint64_t storage_publish_evaluated = 0;
-    uint64_t storage_publish_native = 0;
-    uint64_t storage_publish_unique = 0;
-    uint64_t storage_publish_candidate = 0;
-    uint64_t storage_publish_persistent = 0;
-    uint64_t storage_publish_authorized = 0;
-    uint64_t sampled_gate_evaluated = 0;
-    uint64_t sampled_cache_candidate = 0;
-    uint64_t sampled_persistent_setup = 0;
-    uint64_t sampled_ordinary_2d = 0;
-    uint64_t sampled_format_compatible = 0;
-    uint64_t sampled_transfer_dimension = 0;
-    uint64_t sampled_hostless = 0;
-    uint64_t sampled_format_match = 0;
-    uint64_t sampled_validation_enabled = 0;
-    uint64_t sampled_native_defined = 0;
-    uint64_t borrow_attempts = 0;
-    uint64_t borrow_hits = 0;
-    uint64_t borrow_no_cache = 0;
-    uint64_t borrow_invalid_cache = 0;
-    uint64_t borrow_authority_changed = 0;
-    uint64_t borrow_metadata_unproven = 0;
-};
-
 void increment_gate_counter(uint64_t& value, bool condition = true) {
     if (condition) value = saturating_increment(value);
 }
@@ -5448,102 +5328,6 @@ const std::set<uint64_t>& compute_skip_programs() {
         return parsed;
     }();
     return programs;
-}
-
-// PROSPER_COMPUTE_PARENTSCAN=0xADDR — CPU-side cyclicity census of a link/parent array, taken
-// PRE-dispatch from the exact bytes the dispatch is about to read.
-//
-// This exists because the obvious instrument does not work. Deciding whether a runaway dispatch's INPUT
-// is ALREADY cyclic needs the array and the runaway record from the SAME run, and arming
-// PROSPER_GPU_CAPTURE to obtain the array changes which dispatches run away — measured on GTA V's
-// 0x413dc6700: 11 dispatches of both parities without a capture, reproducibly, versus 5 odd-only
-// ordinals with one armed. An instrument that alters the phenomenon cannot establish its cause.
-//
-// A walk of bytes the front half has already materialized touches no GPU state, issues no submit and
-// cannot reorder one, so this can run alongside PROSPER_CFG_TRIP_BOUND's witness and be read against it.
-//
-// The link encoding is the title's own: next = (word >> 3) & 0x7FFFFFF, terminating on 0 or on an index
-// at/after the record count — an out-of-range RDNA2 buffer load returns zero, which is exactly what
-// exits the guest's pc88..97 walk. The line reports `records` and the encoding's shift/mask so a wrong
-// guess is visible rather than silent. CONFIDENCE: HIGH on the encoding (it is the guest's own
-// `v_bfe_u32 v1, v1, 3, 27` with NUM_RECORDS as the bound).
-struct ParentScanResult {
-    // `terminating + cyclic == records` -- index 0 is the terminator and is classified as
-    // terminating, not skipped. An earlier revision broke out of the walk before pushing it, so the
-    // two columns silently summed to records-1 on EVERY array (measured 400/400), which is the kind of
-    // off-by-one that reads as a rounding difference rather than a bug.
-    uint32_t records = 0, terminating = 0, cyclic = 0, cycle_nodes = 0;
-    // Longest terminating CHAIN, computed as a depth, not the longest walk this scan happened to take.
-    // The walk length depends on the order starts are visited -- memoisation truncates later walks --
-    // so a single 2047-link chain reports 1 or 2047 purely by link direction.
-    uint32_t longest = 0;
-    uint32_t sample_count = 0;
-    uint32_t sample_idx[6]{}, sample_word[6]{}, sample_next[6]{};
-};
-
-ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
-    ParentScanResult out;
-    if (!bytes || byte_count < 4) return out;
-    const uint32_t records = static_cast<uint32_t>(byte_count / 4);
-    out.records = records;
-    const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes);
-    // 0 = unclassified, 1 = reaches a terminator, 2 = enters a cycle. Memoized so the whole array is
-    // classified in O(records) rather than O(records * path length).
-    std::vector<uint8_t> state(records, 0);
-    std::vector<uint32_t> path;
-    std::vector<uint32_t> seen_at(records, UINT32_MAX);
-    std::set<uint32_t> cycle_nodes;
-    for (uint32_t start = 0; start < records; ++start) {
-        if (state[start]) continue;
-        path.clear();
-        uint32_t i = start;
-        uint8_t verdict = 1;
-        while (true) {
-            if (i == 0 || i >= records) { verdict = 1; break; }         // terminator / OOB read -> 0
-            if (state[i]) { verdict = state[i]; break; }                // already classified
-            if (seen_at[i] != UINT32_MAX) {                             // revisited on THIS walk
-                for (size_t k = seen_at[i]; k < path.size(); ++k) cycle_nodes.insert(path[k]);
-                verdict = 2;
-                break;
-            }
-            seen_at[i] = static_cast<uint32_t>(path.size());
-            path.push_back(i);
-            i = (words[i] >> 3) & 0x7FFFFFFu;
-        }
-        for (uint32_t node : path) { state[node] = verdict; seen_at[node] = UINT32_MAX; }
-    }
-    state[0] = 1;   // the terminator itself terminates
-    // Depth of each terminating node, memoised: depth(i) = 1 + depth(next(i)), 0 for a cyclic node.
-    // Independent of visit order, unlike the walk length it replaces.
-    std::vector<uint32_t> depth(records, 0);
-    for (uint32_t start = 0; start < records; ++start) {
-        if (state[start] != 1 || depth[start]) continue;
-        std::vector<uint32_t> chain;
-        uint32_t i = start;
-        while (i != 0 && i < records && state[i] == 1 && !depth[i]) {
-            chain.push_back(i);
-            i = (words[i] >> 3) & 0x7FFFFFFu;
-        }
-        uint32_t d = (i < records) ? depth[i] : 0u;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) { d += 1u; depth[*it] = d; }
-        if (d > out.longest) out.longest = d;
-    }
-    for (uint32_t k = 0; k < records; ++k) {
-        if (state[k] == 1) ++out.terminating;
-        else if (state[k] == 2) ++out.cyclic;
-    }
-    out.cycle_nodes = static_cast<uint32_t>(cycle_nodes.size());
-    // Keep a few actual ring members. A count says corruption happened; the entries say what SHAPE it
-    // is, and the shape is usually the mechanism -- a self-loop (parent[i]==i), a 2-cycle, or a ring of
-    // stale generation are three different bugs and the count cannot tell them apart.
-    for (uint32_t node : cycle_nodes) {
-        if (out.sample_count >= 6u) break;
-        out.sample_idx[out.sample_count] = node;
-        out.sample_word[out.sample_count] = words[node];
-        out.sample_next[out.sample_count] = (words[node] >> 3) & 0x7FFFFFFu;
-        ++out.sample_count;
-    }
-    return out;
 }
 
 // Retained pre-dispatch copies for PROSPER_COMPUTE_PARENTSCAN, keyed by guest address. Small and
@@ -7898,6 +7682,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          (unsigned long long)(resource ? resource->gpu_addr : 0),
                          resource ? resource->size : 0, why);
         };
+        // Settle which bindings alias a WRITABLE one before any arena is chosen: the loop below
+        // discovers aliases one binding at a time, and a later writable alias would otherwise turn an
+        // already arena-backed owner writable.
+        std::vector<BufferAliasKey> alias_keys(buffers.size());
+        for (size_t k = 0; k < buffers.size(); ++k) {
+            const ShaderResource& r = buffer_resources[k];
+            alias_keys[k] = {r.gpu_addr, r.size, reinterpret_cast<uintptr_t>(r.host_data),
+                             r.host_data_size, descriptors[buffers[k].descriptor_index].writable};
+        }
         for (size_t i = 0; i < buffers.size(); i++) {
             const size_t descriptor_index = buffers[i].descriptor_index;
             const SpirvDescriptorBinding& descriptor = descriptors[descriptor_index];
@@ -7974,6 +7767,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const BoundBuffer& owner = buffers[buffers[i].alias_of];
                 buffers[i].buffer = owner.buffer;
                 buffers[i].memory = owner.memory;
+                buffers[i].buffer_offset = owner.buffer_offset;
                 buffers[buffers[i].alias_of].writable |= buffers[i].writable;
                 break;
             }
@@ -8089,14 +7883,44 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool cache_candidate = !buffers[i].atomic_image &&
                     persistent_compute_buffer_enabled(static_cast<uint32_t>(buffers[i].bytes));
                 timing.cache = "ineligible";
-                if (cache_candidate && ctx.acquire_cached_buffer(
-                        buffers[i].cache_key, source, buffers[i].buffer, buffers[i].memory,
+                // A read-only, plain, guest-backed window that overlaps windows already seen shares one
+                // resident arena with them (see buffer_arena_plan.hpp). Never when a binding of this
+                // dispatch aliasing the same guest range is writable: the shader would write through
+                // the shared arena while the writeback and result paths address the window at offset 0.
+                size_t upload_bytes = buffers[i].bytes;
+                const uint8_t* upload_source = source;
+                // Read once, at first use; nothing in the process sets it.
+                // NOLINTBEGIN(concurrency-mt-unsafe)
+                static const bool arenas_enabled =
+                    !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_BUFFER_ARENA");
+                // NOLINTEND(concurrency-mt-unsafe)
+                if (arenas_enabled && cache_candidate && !buffers[i].writable &&
+                    !buffer_alias_group_has_writer(alias_keys, i) && !resource->host_data &&
+                    !materialization.zero_padded_tail &&
+                    materialization.logical_bytes == materialization.binding_bytes) {
+                    const uint64_t window = resource->gpu_addr, span = buffers[i].bytes;
+                    const BufferArenaDecision plan =
+                        select_buffer_arena(ctx.buffer_arenas, window, span,
+                                            ctx.storage_buffer_offset_alignment, guest_readable);
+                    if (plan.action != BufferArenaAction::Private) {
+                        const ComputeBufferCacheKey window_key = buffers[i].cache_key;
+                        for (const BufferArenaExtent& gone : plan.replaces)
+                            ctx.drop_cached_buffer(buffer_arena_cache_key(window_key, gone));
+                        upload_bytes = static_cast<size_t>(plan.arena.bytes);
+                        upload_source = reinterpret_cast<const uint8_t*>(plan.arena.base);
+                        buffers[i].buffer_offset = plan.offset;
+                        buffers[i].cache_key = buffer_arena_cache_key(window_key, plan.arena);
+                    }
+                }
+                if (cache_candidate &&
+                    ctx.acquire_cached_buffer(
+                        buffers[i].cache_key, upload_source, buffers[i].buffer, buffers[i].memory,
                         buffers[i].upload_skipped, buffers[i].dirty_watch_chunks,
                         buffers[i].total_watch_chunks, timing)) {
                     buffers[i].persistent = true;
                 } else {
                     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                    bci.size = buffers[i].bytes;
+                    bci.size = upload_bytes;
                     // A persistent buffer may later become writable through an exact alias binding
                     // and need to copy into its result baseline after an external guest update.
                     // Keep one canonical representation transfer-source capable from allocation.
@@ -8127,7 +7951,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     VkResult map_result;
                     {
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_map_ms);
-                        map_result = ctx.map_memory(buffers[i].memory, 0, buffers[i].bytes, &mapped);
+                        map_result = ctx.map_memory(buffers[i].memory, 0, upload_bytes, &mapped);
                     }
                     if (!vk_ok(map_result, "buffer-map"))
                         break;
@@ -8138,10 +7962,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     timing.validation = "pooled-full";
                     {
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                        equal = compute_buffers_diff_span(mapped, source, buffers[i].bytes,
+                        equal = compute_buffers_diff_span(mapped, upload_source, upload_bytes,
                                                           &diff_first, &diff_last);
                     }
-                    timing.compared_bytes += buffers[i].bytes;
+                    timing.compared_bytes += upload_bytes;
                     if (!equal) {
                         // Copy ONLY the bytes that differ. The comparison above established the
                         // exact inclusive extent, so writing the bytes outside it would be a no-op
@@ -8165,7 +7989,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
                         const size_t span = diff_last - diff_first + 1;
                         copy_compute_buffer(static_cast<uint8_t*>(mapped) + diff_first,
-                                            static_cast<const uint8_t*>(source) + diff_first, span);
+                                            upload_source + diff_first, span);
                         timing.uploaded_bytes += span;
                         if (timing.enabled) {
                             timing.diff_observed = true;
@@ -8852,6 +8676,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool exact_rgba8 = bi.native_float_storage &&
                     r->format == DataFormat::Unorm8 && descriptor_components == 4 &&
                     native_storage_format == VK_FORMAT_R8G8B8A8_UNORM;
+                // A single-channel R8 result is the same shape as RGBA8: the shader writes a native
+                // R8_UNORM storage image, so the renderer's R8_UNORM image seeds it by an exact copy.
+                const bool exact_r8 = bi.native_float_storage &&
+                    r->format == DataFormat::Unorm8 && descriptor_components == 1 &&
+                    native_storage_format == VK_FORMAT_R8_UNORM;
                 const bool exact_rgba16 = bi.native_float_storage &&
                     r->format == DataFormat::Float16 && descriptor_components == 4 &&
                     native_storage_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
@@ -8861,7 +8690,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // each 32-bit word without numeric conversion.
                 const bool exact_packed_r11 = bi.packed_r11_storage &&
                     r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
-                const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_packed_r11) &&
+                const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_r8 || exact_packed_r11) &&
                     !bi.storage_write_mask &&
                     image_descriptors[i].image_dim == 1 &&
                     (!image_descriptors[i].image_arrayed ||
@@ -8905,6 +8734,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     (exact_rgba16 &&
                                       source.format == LiveTargetPixelFormat::Rgba16Float &&
                                       source.native_format == VK_FORMAT_R16G16B16A16_SFLOAT) ||
+                                    (exact_r8 &&
+                                      source.format == LiveTargetPixelFormat::R8Unorm &&
+                                      source.native_format == VK_FORMAT_R8_UNORM) ||
                                     (exact_packed_r11 &&
                                       source.format == LiveTargetPixelFormat::R11G11B10Float &&
                                       source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
@@ -11572,7 +11404,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         image_infos.resize(images.size());
         writes.resize(descriptors.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
-            buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
+            buffer_infos[i] = {buffers[i].buffer, buffers[i].buffer_offset, buffers[i].bytes};
         }
         for (size_t descriptor_index = 0; descriptor_index < descriptors.size();
              ++descriptor_index) {
@@ -11998,12 +11830,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Only these exact formats currently have a renderer-image storage seed path.
             if (*format != LiveTargetPixelFormat::Rgba8Unorm &&
                 *format != LiveTargetPixelFormat::Rgba16Float &&
+                *format != LiveTargetPixelFormat::R8Unorm &&
                 *format != LiveTargetPixelFormat::R11G11B10Float) {
                 decline(ExactResultDecline::FormatNoSeedPath);
                 continue;
             }
             if ((*format == LiveTargetPixelFormat::Rgba16Float &&
                  (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
+                (*format == LiveTargetPixelFormat::R8Unorm && !bi.native_float_storage) ||
                 (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
                 decline(ExactResultDecline::FormatNotNative);
                 continue;
@@ -12078,6 +11912,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
+                 (*format == LiveTargetPixelFormat::R8Unorm && bi.native_float_storage) ||
                  (*format == LiveTargetPixelFormat::R11G11B10Float && bi.packed_r11_storage)) &&
                 bi.standalone_seed.valid() && bi.standalone_seed.image == destination.image &&
                 bi.standalone_seed.device == destination.device &&
@@ -12627,6 +12462,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (standalone &&
                         bi.standalone_seed.format == LiveTargetPixelFormat::Rgba16Float)
                         rtt_destination_census().rgba16_source_seed_recorded.add();
+                    else if (standalone &&
+                             bi.standalone_seed.format == LiveTargetPixelFormat::R8Unorm)
+                        rtt_destination_census().r8_source_seed_recorded.add();
                 }
 
                 VkImageMemoryBarrier ready[2]{};
@@ -13297,6 +13135,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
     // success paths, and the end of the truncated phase on every early break.
     const auto phase_loop_exit = ComputeClock::now();
+    if (ok && pipeline_observe_enabled()) pipeline_observe_dispatch(item, buffers, images, phase_start, phase_pipeline, phase_dispatch, phase_loop_exit);
 
     if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing

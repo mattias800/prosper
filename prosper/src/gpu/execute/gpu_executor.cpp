@@ -1590,12 +1590,16 @@ void append_shader_resource_compile_keys(ShaderProgramStage stage,
     // Guest addresses/content do not change module identity; admission state does.
     std::shared_ptr<const DecodedShader> scalar_source_proof;
     out.reserve(out.size() + resources.resources.size());
+    // One getenv per CALL, not per resource: a name that is ABSENT (the normal state of a
+    // diagnostic) costs a full scan of the environment block, and this loop runs once per resource
+    // of every draw -- 8% of the submit thread in a sampled Dragon Quest VII load. Re-sampled each
+    // submit (and live outside one), so a test that arms the switch between submits still sees it.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
+    const bool no_normalize = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
     for (const auto& resource : resources.resources) {
         const bool texture = resource.cls == ResourceClass::Texture;
         const bool storage_image = resource.cls == ResourceClass::StorageImage;
         const bool manual_compare = texture && resource.depth_compare;
-        // NOLINTNEXTLINE(concurrency-mt-unsafe): the read make_shader_compile_key always made
-        const char* const no_normalize = std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
         const bool normalize_unnormalized = texture && resource.unnormalized && !no_normalize;
         const bool atomic_extent =
             storage_image && resource.format == DataFormat::Uint32 && resource.num_components == 1;
@@ -9713,6 +9717,8 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
 
 namespace {
 
+std::atomic<OrderedOperationObserver> g_ordered_operation_observer{nullptr};
+
 template <typename DmaCopyRecord, typename ExecuteDma>
 OrderedSubmitResult execute_ordered_items_impl(
     const std::vector<SubmitOperation>& operations, const std::vector<DrawItem>& draws,
@@ -9779,6 +9785,8 @@ OrderedSubmitResult execute_ordered_items_impl(
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
+        if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+            observer(OrderedOperationKind::GraphicsSpan, static_cast<uint32_t>(span.size()));
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
@@ -9815,6 +9823,8 @@ OrderedSubmitResult execute_ordered_items_impl(
         } else {
             flush_span(dma_flush_authoritative(span, dma_copies[operation.item]));
             read_points.advance();
+            if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                observer(OrderedOperationKind::Dma, 1u);
             execute_dma(dma_copies[operation.item]);
             // This legacy callback reports no completion outcome. Do not turn its return into
             // successful ordered-source authority, while preserving its execution ABI.
@@ -11287,6 +11297,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                           bool final_span = false) {
         const bool has_draws = !span.empty();
         if (!render || (!has_draws && (!final_span || !result.render_spans))) return;
+        if (has_draws)
+            if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                observer(OrderedOperationKind::GraphicsSpan, static_cast<uint32_t>(span.size()));
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         g_live_phase.source_submit = submit_no;
@@ -12085,6 +12098,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
             }
             case RetainedSubmitKind::DmaCopy: {
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                    observer(OrderedOperationKind::Dma, 1u);
                 flush_span(dma_flush_authoritative(span, copy));
                 retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 // Source and destination are distinct ordered consumers: a disjoint source must not
@@ -12573,6 +12588,9 @@ GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
     return GuestGpuWriteQuery::Unchanged;
 }
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
+void set_ordered_operation_observer(OrderedOperationObserver observer) {
+    g_ordered_operation_observer.store(observer, std::memory_order_relaxed);
+}
 
 // #3948 stage 2: see LiveRenderPhase::defer_batch_completion.
 namespace {
@@ -12629,6 +12647,13 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     const GraphicsExecutionActivity execution;
     if ((!g_live && !g_compute && st.dma_copies.empty()) ||
         (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty())) return false;
+    // One per-submit sampling window around the WHOLE submit, both branches below. Without it a
+    // graphics-only submit (execute_ordered_guest_items) renders with no scope open -- the one in
+    // realize_gpustate_draws closes before rendering -- so every PROSPER_ENV_ON_PER_SUBMIT site in
+    // the backend and writer_provenance_enabled() fell back to a live getenv per pass/draw. Nested
+    // scopes (realize_gpustate_draws, execute_ordered_gpustate) only start fresher windows, which is
+    // never weaker than the contract. See diagnostics/env_submit.hpp.
+    const prosper::diag::SubmitEnvScope submit_env_scope;
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window.
     GuestReadableSubmitScope guest_readable_scope;
     // This submit's frame is headed for the publish gate below, so the renderer owes us a frame of
