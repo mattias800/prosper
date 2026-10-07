@@ -6941,10 +6941,22 @@ int main() {
                 CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
                       "first invalidated repeat repairs a deferred cold target");
 #if defined(_WIN32)
-                CHECK(cold_guest == cold_expected &&
-                          prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
-                              repeat_snapshots_before,
-                      "Windows exact mirror authorizes the repeat without recopying its baseline");
+                // PROSPER_NO_SKIP_SEED forces upload_skipped=false on the repeat, which withholds
+                // the exact mirror's unchanged proof, so the baseline is recopied -- the same
+                // contract Linux asserts for its first repeat. The control's own expectation sits
+                // beside the default one, which also proves the requested mode ran.
+                if (seed_skip_enabled)
+                    CHECK(cold_guest == cold_expected &&
+                              prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                                  repeat_snapshots_before,
+                          "Windows exact mirror authorizes the repeat without recopying its "
+                          "baseline");
+                else
+                    CHECK(cold_guest == cold_expected &&
+                              prosper::frontend::live_compute_storage_result_snapshot_bytes() >=
+                                  repeat_snapshots_before + fill_guest_bytes,
+                          "PROSPER_NO_SKIP_SEED: forced upload withholds the exact-mirror proof, "
+                          "so the repeat recopies its baseline (the control ran)");
 #else
                 CHECK(cold_guest == cold_expected &&
                           prosper::frontend::live_compute_storage_result_snapshot_bytes() >=

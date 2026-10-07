@@ -1,4 +1,5 @@
 #include "shared/device/pipeline_cache_file.hpp"
+#include <atomic>
 #include <thread>
 #include <cassert>
 
@@ -38,6 +39,25 @@ int main(int argc, char** argv) {
     assert(a && b);
     auto loaded = file.load();
     assert(loaded == blob || loaded == second);
+    // Savers racing a loader and each other on ONE destination must all succeed. On Windows the
+    // replacement fails transiently while a peer holds the destination open; that lost a cache in
+    // the concurrent compute_cache_persistence arm (a second flush reporting failure).
+    {
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> failures{0};
+        std::thread reader([&] { while (!stop.load()) (void)file.load(); });
+        std::vector<std::thread> savers;
+        for (unsigned t = 0; t < 4; ++t)
+            savers.emplace_back([&] {
+                for (unsigned i = 0; i < 100; ++i)
+                    if (!file.save(blob)) failures.fetch_add(1);
+            });
+        for (auto& t : savers) t.join();
+        stop = true;
+        reader.join();
+        assert(failures.load() == 0);
+        assert(file.load() == blob);
+    }
     // A failed replacement must leave the destination intact, including non-file destinations.
     auto obstructed = file; obstructed.path += ".directory";
     std::filesystem::create_directories(obstructed.path);

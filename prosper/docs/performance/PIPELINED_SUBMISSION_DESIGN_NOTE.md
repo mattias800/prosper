@@ -1,3 +1,8 @@
+---
+kind: plan
+status: current
+---
+
 # Pipelined submission: design note for ADR 0009 Stage 1 (compute)
 
 Status: proposal for the project owner. Nothing here changes behaviour; the only code is a pure model
@@ -86,6 +91,70 @@ about the backend, since the backend does not use the queue yet.
 
 One Windows run per row; the logs are on the author's machine and the summary is posted on #4631. Treat
 them as indicative, not as a measurement protocol.
+
+## Step 2 result: what pipelining would have allowed (observe-only, 2026-10-06)
+
+`PROSPER_PIPELINE_OBSERVE=1` (diagnostic; changes nothing) feeds every completed dispatch's guest read and
+write ranges, and the graphics spans and DMA copies the executor runs between dispatches, to the
+`RetirementQueue` contract, and reports four models: ranges-only (optimistic: a graphics span is assumed not
+to read a pending result) and barriers (pessimistic: every graphics span and DMA is a retirement point), each
+at depth 4 and depth 64. "Overlapped" means the dispatch would have been admitted while an older one was still
+pending; "wait-overlapped" is the share of today's measured dispatch time (record + submit + fence wait)
+belonging to such dispatches. Read it with `prosper-app` closed through its window (a `timeout` kill loses the
+exit report; a periodic report prints every 256 dispatches).
+
+*Assassin's Creed Black Flag Resynced*, Windows/NVIDIA, `prosper-app`, default route, 1,792 dispatches in about
+45 s, two runs with identical counts, 655 graphics spans/DMA copies seen between them:
+
+| model | overlapped | wait-overlapped | max pending |
+| --- | --- | --- | --- |
+| ranges-only, depth 4 | 69.6% | 76.8% | 4 |
+| ranges-only, depth 64 | 69.6% | 76.8% | 22 |
+| barriers, depth 4 | 47.5% | 50.0% | 4 |
+| barriers, depth 64 | 47.5% | 50.0% | 22 |
+
+What it says, and what it does not:
+- About half to three quarters of dispatch time belongs to dispatches that could run concurrently with an
+  older one, so overlap exists. Most dispatches still conflict with an earlier one (conflict retirements are
+  about 0.25 per dispatch with barriers, 0.9 without), so the depth that pays is shallow: depth 4 loses
+  nothing against depth 64 in "overlapped".
+- Dispatch time is only part of a submit's compute CPU time (about 20 ms of about 113 ms in the same title;
+  setup and writeback are the larger parts). Hiding half to three quarters of it is about 10-15 ms per submit.
+  **Overlapping the CPU setup and writeback of the next dispatch with the GPU running the previous one is not
+  measured here**, and is where the larger gain would have to come from; this step cannot see it.
+- Ranges come from the bindings' guest addresses; GPU-internal hazards (image-cache aliasing, renderer-owned
+  targets reached through the live-target bridge) are not modelled, and the barrier model assumes every
+  graphics span reads everything. The truth lies between the two rows.
+- One title, one machine, one route. The compute-only submits Black Flag uses on its own mean the barrier
+  model's graphics spans are rare there; a title that interleaves draws and dispatches will sit near the
+  barrier row.
+
+### Predicted gain from overlapping CPU and GPU work (timeline model)
+
+Each dispatch is also reported with its measured setup (entry to command recording), GPU span (record, submit
+and fence wait, an upper bound on what the GPU needs) and writeback. The models replay them on a CPU/GPU
+timeline: the CPU sets a dispatch up and submits it, the GPU runs it after what it is already running, and the
+writeback is paid when the queue retires it. The first rows are what pipelining would have allowed under the
+contract; sequential is today's sum.
+
+Same title, machine and route, 2,560 dispatches in about 50 s:
+
+| model | sequential | pipelined | pipelined / sequential |
+| --- | --- | --- | --- |
+| ranges-only, depth 4 | 30,954 ms | 27,156 ms | 88% |
+| ranges-only, depth 64 | 30,954 ms | 27,137 ms | 88% |
+| barriers, depth 4 | 30,954 ms | 27,539 ms | 89% |
+| barriers, depth 64 | 30,954 ms | 27,534 ms | 89% |
+
+**Pipelining ADR 0009 step 3 would cut at most about 11-12% of the compute critical path on this title (an
+optimistic upper bound, see the limits below), and the two bounds agree to within a point.** The reason is structural: the CPU work (setup plus writeback) is about 85%
+of each dispatch's time, and overlap can only hide the GPU/wait part. The floor is the CPU work itself, so a
+bigger gain needs that work reduced, not overlapped. Limits: only compute dispatches are on the timeline
+(graphics spans have no measured cost here); the span the model treats as GPU time runs from pipeline
+creation to the fence, so it also holds CPU work (compare and baseline preparation, descriptor writes,
+staging, command recording and `vkQueueSubmit`). The model lets that CPU work overlap the next setup, which
+it cannot, so it OVERSTATES the overlap: the 11-12% is optimistic. A CPU timestamp right after
+`vkQueueSubmit` would split the span and tighten the bound; one title.
 
 ## What this note does not claim
 

@@ -3988,17 +3988,8 @@ void exc_deliver(int type, void* uc_);
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
 #ifdef __APPLE__
     (void)si;
-    // pthread_self reads %gs TSD, never %fs. Plain signals COALESCE: two raises that reach this
-    // thread before it runs the handler arrive as ONE delivery, so drain every request pending for
-    // this thread rather than one -- otherwise the second stays in the table, undelivered and
-    // unacknowledged. A delivery with nothing pending is still reported (as dropped) once.
-    const uint64_t self = (uint64_t)pthread_self();
-    int type = exc_pending_take(self);
-    if (type < 0) {
-        exc_deliver(type, uc_);
-        return;
-    }
-    do { exc_deliver(type, uc_); } while ((type = exc_pending_take(self)) >= 0);
+    // pthread_self reads %gs TSD, never %fs.
+    exc_pending_drain((uint64_t)pthread_self(), exc_deliver, uc_);
 #else
     exc_deliver(si->si_value.sival_int, uc_);
 #endif

@@ -75,6 +75,17 @@ public:
         return ids_prefix(count);
     }
 
+    // How many pending operations a RAW/WAW/WAR conflict alone would retire before `op` (the length
+    // of the prefix ending at the last conflicting one), ignoring the depth bound. required_before_admit
+    // minus this is what the depth bound added; diagnostics use it to say WHY an operation waited.
+    size_t conflict_prefix(const PendingOperation& op) const {
+        size_t last_conflict = npos;
+        if (policy_.retire_on_conflict)
+            for (size_t i = 0; i < pending_.size(); ++i)
+                if (conflicts(pending_[i], op)) last_conflict = i;
+        return last_conflict == npos ? 0 : last_conflict + 1;
+    }
+
     void admit(const PendingOperation& op) { pending_.push_back(op); }
 
     // A guest-visible effect with no range (label write, EOP, flip, submit end): everything retires.

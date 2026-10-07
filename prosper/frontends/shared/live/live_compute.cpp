@@ -15,6 +15,7 @@
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/linear_image_pitch.hpp"
 #include "shared/live/live_compute_bound_resources.hpp"
+#include "shared/live/pipeline_observe_hook.hpp"
 #include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -512,10 +513,12 @@ inline RefusalCensus& destination_refusal_census() {
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
     RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded, bgra_source_seed_recorded;
+    RttMirrorCounter r8_source_seed_recorded;
     LiveComputeRttDestinationMirrorCounters snapshot() const {
         return {candidates.value(), borrowed.value(), recorded.value(), published.value(),
                 failed.value(), r11_source_seed_recorded.value(),
-                rgba16_source_seed_recorded.value(), bgra_source_seed_recorded.value()};
+                rgba16_source_seed_recorded.value(), bgra_source_seed_recorded.value(),
+                r8_source_seed_recorded.value()};
     }
 };
 RttDestinationCensus& rtt_destination_census() {
@@ -2180,13 +2183,23 @@ struct VulkanComputeContext {
                 upload_skipped = !changed;
             } else {
                 g_write_watch_census.record_exact_compare(key.bytes);
+                // Default: one pass copies each differing 64 KiB block as it is found, so compare and
+                // copy are fused and the whole cost lands in upload_compare_ms (upload_copy_ms stays
+                // 0). PROSPER_NO_COMPUTE_BLOCK_SYNC=1 restores the separate compare and full copy.
+                static const bool block_sync = !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_BLOCK_SYNC");
                 bool changed;
                 {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_compare_ms);
-                    changed = !compute_buffers_equal(mapped, source, key.bytes);
+                    if (block_sync) {
+                        const uint64_t copied = sync_compute_buffer_blocks(mapped, source, key.bytes);
+                        timing.uploaded_bytes += copied;
+                        changed = copied != 0;
+                    } else {
+                        changed = !compute_buffers_equal(mapped, source, key.bytes);
+                    }
                 }
                 timing.compared_bytes += key.bytes;
-                if (changed) {
+                if (changed && !block_sync) {
                     ComputeBufferCostScope cost(timing.enabled, timing.upload_copy_ms);
                     copy_compute_buffer(mapped, source, key.bytes);
                     timing.uploaded_bytes += key.bytes;
@@ -8663,6 +8676,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool exact_rgba8 = bi.native_float_storage &&
                     r->format == DataFormat::Unorm8 && descriptor_components == 4 &&
                     native_storage_format == VK_FORMAT_R8G8B8A8_UNORM;
+                // A single-channel R8 result is the same shape as RGBA8: the shader writes a native
+                // R8_UNORM storage image, so the renderer's R8_UNORM image seeds it by an exact copy.
+                const bool exact_r8 = bi.native_float_storage &&
+                    r->format == DataFormat::Unorm8 && descriptor_components == 1 &&
+                    native_storage_format == VK_FORMAT_R8_UNORM;
                 const bool exact_rgba16 = bi.native_float_storage &&
                     r->format == DataFormat::Float16 && descriptor_components == 4 &&
                     native_storage_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
@@ -8672,7 +8690,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // each 32-bit word without numeric conversion.
                 const bool exact_packed_r11 = bi.packed_r11_storage &&
                     r->format == DataFormat::Float10_11_11 && descriptor_components == 3;
-                const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_packed_r11) &&
+                const bool exact_view = (exact_rgba8 || exact_rgba16 || exact_r8 || exact_packed_r11) &&
                     !bi.storage_write_mask &&
                     image_descriptors[i].image_dim == 1 &&
                     (!image_descriptors[i].image_arrayed ||
@@ -8716,6 +8734,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     (exact_rgba16 &&
                                       source.format == LiveTargetPixelFormat::Rgba16Float &&
                                       source.native_format == VK_FORMAT_R16G16B16A16_SFLOAT) ||
+                                    (exact_r8 &&
+                                      source.format == LiveTargetPixelFormat::R8Unorm &&
+                                      source.native_format == VK_FORMAT_R8_UNORM) ||
                                     (exact_packed_r11 &&
                                       source.format == LiveTargetPixelFormat::R11G11B10Float &&
                                       source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
@@ -11809,12 +11830,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Only these exact formats currently have a renderer-image storage seed path.
             if (*format != LiveTargetPixelFormat::Rgba8Unorm &&
                 *format != LiveTargetPixelFormat::Rgba16Float &&
+                *format != LiveTargetPixelFormat::R8Unorm &&
                 *format != LiveTargetPixelFormat::R11G11B10Float) {
                 decline(ExactResultDecline::FormatNoSeedPath);
                 continue;
             }
             if ((*format == LiveTargetPixelFormat::Rgba16Float &&
                  (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
+                (*format == LiveTargetPixelFormat::R8Unorm && !bi.native_float_storage) ||
                 (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
                 decline(ExactResultDecline::FormatNotNative);
                 continue;
@@ -11889,6 +11912,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
+                 (*format == LiveTargetPixelFormat::R8Unorm && bi.native_float_storage) ||
                  (*format == LiveTargetPixelFormat::R11G11B10Float && bi.packed_r11_storage)) &&
                 bi.standalone_seed.valid() && bi.standalone_seed.image == destination.image &&
                 bi.standalone_seed.device == destination.device &&
@@ -12438,6 +12462,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (standalone &&
                         bi.standalone_seed.format == LiveTargetPixelFormat::Rgba16Float)
                         rtt_destination_census().rgba16_source_seed_recorded.add();
+                    else if (standalone &&
+                             bi.standalone_seed.format == LiveTargetPixelFormat::R8Unorm)
+                        rtt_destination_census().r8_source_seed_recorded.add();
                 }
 
                 VkImageMemoryBarrier ready[2]{};
@@ -13108,6 +13135,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
     // success paths, and the end of the truncated phase on every early break.
     const auto phase_loop_exit = ComputeClock::now();
+    if (ok && pipeline_observe_enabled()) pipeline_observe_dispatch(item, buffers, images, phase_start, phase_pipeline, phase_dispatch, phase_loop_exit);
 
     if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing

@@ -136,6 +136,15 @@ engines need a specific graphics mode to render in this app — Unity titles cur
 `-force-gfx-direct` (their default MT gfx-jobs path is not emulated yet; #2973) — while others
 must not receive it, so the choice is explicit and per-title rather than a silent global.
 
+Four more keys remember host settings for games the library starts, and the Settings menu edits
+them without a text editor: `savedata_dir` (`PROSPER_SAVEDATA_DIR`), `present_mode`
+(`--present-mode`: `fifo`, `mailbox` or `immediate`), `display_mode` (`PROSPER_DISPLAY_MODE`:
+`legacy`, `host` or `host-high-refresh`) and `volume` (`--volume`, 0-100). These apply only to
+boots the library starts — never to a scripted `prosper-app <dump>` run. A flag or an
+environment variable still wins over each one, a misspelled value is ignored with a warning,
+and a choice made in the UI applies to the running process immediately. The `host` display
+modes are experimental and per-title: some games pace themselves by the advertised display.
+
 The scan looks **one level deep** and accepts a child directory as a title when
 `resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
 subdirectories are therefore never mistaken for separate games. When the games directory is itself a
@@ -152,18 +161,26 @@ points is worth more than pre-filtering the list.
 
 ### The library view
 
-With a games directory set, launching with no game shows a grid of cover art instead of an empty
-window. Arrow keys move the selection, Enter/Space opens the highlighted title, clicking a cover opens it
-directly, and **Change folder...** picks a different games directory and remembers it. Esc quits. With no
-directory set yet, the window explains that and offers the same folder picker on Enter or a click.
+With a games directory set, launching with no game shows a game list instead of an empty
+window: cover thumbnail, name, serial, region, version and folder, with a search box, a **Refresh
+list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
+opens the highlighted title (not while the search box has focus), and a double-click opens directly;
+**Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
+and offers the same folder picker on Enter or a click.
+
+![The library view: toolbar, search box, and game list](../../docs/screenshots/issue-4665-library-table.webp)
+
+Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
+the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either
+exists on a dump, and a recursive size walk over a 100 GB title is not something the UI thread
+does while you browse.
 
 Keyboard and mouse only for now — **controller navigation is not implemented** (tracked separately).
 Nothing initializes SDL's gamepad subsystem while the library is up: the pad backend does that inside
 the guest boot, by which point the library is gone.
 
 Cover art is each dump's `sce_sys/icon0.png`. A title whose icon is missing or undecodable still appears
-as a launchable button labelled with its content id — what matters is that it is bootable, not that it
-has a picture.
+as a launchable row — what matters is that it is bootable, not that it has a picture.
 
 The view is drawn with Dear ImGui on the app's existing Vulkan device and swapchain
 (`third_party/imgui`), and disappears the moment a guest boots: prosper runs one game per launch, so the
@@ -171,8 +188,9 @@ library never draws over a running title. If it cannot be brought up — no ImGu
 device that refuses the render pass — the window falls back to the flat idle colour and every
 command-line path keeps working.
 
-Selection movement lives in `library_nav.hpp`, which is pure and unit-tested, so the grid's behaviour is
-covered in ordinary CI rather than only by someone pressing arrow keys.
+Search matching lives in `game_entry_matches_filter` and the keyboard gate in `list_nav.hpp`, both
+pure and unit-tested, so they are covered in ordinary CI rather than only by someone typing in
+the box.
 
 #### Descriptor capacity
 

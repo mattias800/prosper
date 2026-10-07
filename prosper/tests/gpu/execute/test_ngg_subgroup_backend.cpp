@@ -843,13 +843,17 @@ TEST(NggSubgroupBackend, ShellPipelineCacheIsKeyedOnceAndBounded) {
     EXPECT_EQ(stats.creations, creations);
     EXPECT_EQ(stats.hits, hits + 2);
 
+    // More distinct keys than the cache holds, from the portable variant alone: a device without
+    // native Wave64 (CI's lavapipe) gets no second variant per key, so the count cannot rely on it.
+    // The keys differ by shell hash, not by push size: a push range past the device limit is invalid
+    // Vulkan (VUID-VkPushConstantRange-size-00298), which the validation scan reports.
     const uint64_t evictions = stats.evictions;
-    for (uint32_t words = push; words <= push + 40; ++words)
-        for (bool native : {false, true})
-            if (native && !ngg_host_capabilities(*ctx).native_wave64)
-                continue;
-            else
-                (void)ngg_shell_pipeline(*ctx, stages, ngg->guest_bindings, words, native);
+    const uint32_t keys = static_cast<uint32_t>(kNggShellPipelineCacheEntries) + 8u;
+    for (uint32_t i = 1; i <= keys; ++i) {
+        NggSubgroupStages other = stages;
+        other.shell_hash = stages.shell_hash + i;
+        (void)ngg_shell_pipeline(*ctx, other, ngg->guest_bindings, push, false);
+    }
     EXPECT_LE(stats.entries, kNggShellPipelineCacheEntries);
     EXPECT_GT(stats.evictions, evictions);
     EXPECT_TRUE(first->pipeline) << "an evicted entry a holder still owns stays valid";

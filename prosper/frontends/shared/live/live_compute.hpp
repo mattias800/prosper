@@ -458,6 +458,7 @@ struct LiveComputeRttDestinationMirrorCounters {
     uint64_t candidates = 0, borrowed = 0, recorded = 0, published = 0, failed = 0;
     uint64_t r11_source_seed_recorded = 0, rgba16_source_seed_recorded = 0;
     uint64_t bgra_source_seed_recorded = 0;   // BGRA target seeded through the blit scratch
+    uint64_t r8_source_seed_recorded = 0;     // single-channel R8 target seeded by an exact image copy
 };
 LiveComputeRttDestinationMirrorCounters live_compute_rtt_destination_mirror_counters();
 

@@ -1184,49 +1184,7 @@ HLE(s_savedata_dirsearch) {
 // waited forever (docs/games/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
 // real, network-disconnected, signed-out console gives.
 
-// --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------
-// A registered callback is guest code: under PROSPER_GUEST_FS the HLE runs on the HOST %fs (the
-// import swap-stub switched), so the guest callback must run with the GUEST %fs restored or its
-// TLS accesses (UE MallocBinned caches!) read host TLS garbage. The swap-stub saves the guest fs
-// base in its frame (push r11), so an asm entry shim (the f_apr_read_submit_entry pattern) hands
-// the handler its entry %rsp. The guest swap path re-pushes args7/8/9, an alignment pad, then the
-// saved r11: [rsp]=ret-to-stub, args at +8/+0x10/+0x18, pad at +0x20, guest fs at +0x28, and guest
-// RA at +0x30. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
-// host-context tail-jmp path (no swap happened) — call the callback on the current fs.
-// Mechanism proven live by the PROSPER_NETCTL_CB experiment (run 7/9: delivered + consumed
-// cleanly, no crash). CONFIDENCE: HIGH.
-namespace {
-#ifndef _WIN32
-#endif
-}
-
-// --- libSceNetCtl: a network-DISCONNECTED console (default ON since #306). ----------------------
-// DOLL registers a NetCtl state callback once at boot (sceNetCtlRegisterCallback) and then pumps
-// sceNetCtlCheckCallback EXACTLY once per frame forever (14,191 calls in a 240 s run). On real
-// hardware CheckCallback invokes the registered callback on the calling thread with the current
-// state — an offline console still delivers an immediate DISCONNECTED. Register records {func,arg}
-// and writes the callback id (Kyty Network.cpp NetCtlRegisterCallback); CheckCallback invokes the
-// callback ONCE with SCE_NET_CTL_EVENT_TYPE_DISCONNECTED (PS4-inherited constant = 1; identical
-// export names+NIDs on PS5 3.20 — CONFIDENCE MED on the PS5 value). Was the gated experiment
-// PROSPER_NETCTL_CB=1; proven correct+consumed live (DOLL run 7/9), now default ON.
-// PROSPER_NETCTL_CB=0 restores the old unimplemented behavior.
-namespace {
-#ifndef _WIN32
-#endif
-}
-
-// --- libSceNpManager state callback: deliver SIGNED_OUT once (#306). ----------------------------
-// DOLL registers its Np sign-in state callback via sceNpRegisterStateCallbackA and pumps
-// sceNpCheckCallback. shadPS4 (offline mode) queues exactly one SIGNED_OUT event for the initial
-// user and delivers it inside sceNpCheckCallback on the pumping thread; we mirror that. Callback-A
-// prototype (shadPS4 np_manager.h): void cb(s32 userId, s32 state, void* userdata); state
-// SIGNED_OUT = 1 (Unknown=0, SignedOut=1, SignedIn=2 — Kyty + shadPS4 agree). Register returns the
-// positive callback id (shadPS4 RegisterStateCallbackA returns slot+1). CONFIDENCE: HIGH on the
-// contract (two agreeing PS4 references, PS4-inherited surface; PS5 3.20 exports the same names).
-namespace {
-#ifndef _WIN32
-#endif
-}
+// --- NetCtl + NpManager state callbacks: hle/np/state_callbacks.cpp (every host). -------------
 
 // --- libSceErrorDialog: the real Initialize/Open/Close lifecycle (auto-dismiss, headless). ------
 // Status enum shared with CommonDialog: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3 (shadPS4
