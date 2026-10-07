@@ -3,80 +3,70 @@
 // The census exists to answer one decision question: what share of fully-compared guest bytes lives in
 // private memory, the only kind Windows `GetWriteWatch` can track. The test pins the figure the
 // decision turns on, including the failure modes that would quietly mislead it: a byte counted under
-// the wrong class, a changed validation not counted as changed, and a class outside the enum being
-// dropped instead of folded into "untracked".
-#include "shared/live/submit_renderer/validation_mapping_census.hpp"
+// the wrong class, a changed validation not counted as changed, a class outside the enum being dropped
+// instead of folded into "untracked", and a compute-side compare (whose outcome is unknown) being
+// reported with a `changed` figure it cannot have. The platform classifier is tested separately, under
+// tests/host/platform/.
+#include "shared/texture/validation_mapping_census.hpp"
 
 #include <gtest/gtest.h>
 #include <string>
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
+using prosper::frontend::ValidationMappingCensus;
+using prosper::host::MappingClass;
 
-using prosper::frontend::submit_renderer::ValidationMappingCensus;
+namespace {
+int cls(MappingClass c) { return static_cast<int>(c); }
+}  // namespace
 
 TEST(ValidationMappingCensus, CountsBytesAndChangesPerClass) {
     ValidationMappingCensus c;
-    const int priv = static_cast<int>(prosper::host::MappingClass::Private);
-    const int dmem = static_cast<int>(prosper::host::MappingClass::MappedView);
-    c.record(priv, 1000, true);
-    c.record(priv, 3000, false);
-    c.record(dmem, 6000, true);
+    c.record(cls(MappingClass::Private), 1000, /*changed=*/false);
+    c.record(cls(MappingClass::Private), 3000, /*changed=*/true);
+    c.record(cls(MappingClass::MappedView), 6000, /*changed=*/false);
 
-    EXPECT_EQ(c.row(priv).validations, 2u);
-    EXPECT_EQ(c.row(priv).bytes, 4000u);
-    EXPECT_EQ(c.row(priv).changed, 1u);
-    EXPECT_EQ(c.row(priv).changed_bytes, 3000u);
-    EXPECT_EQ(c.row(dmem).bytes, 6000u);
-    EXPECT_EQ(c.row(dmem).changed, 0u);
+    EXPECT_EQ(c.row(cls(MappingClass::Private)).validations, 2u);
+    EXPECT_EQ(c.row(cls(MappingClass::Private)).bytes, 4000u);
+    EXPECT_EQ(c.row(cls(MappingClass::Private)).changed, 1u);
+    EXPECT_EQ(c.row(cls(MappingClass::Private)).changed_bytes, 3000u);
+    EXPECT_EQ(c.row(cls(MappingClass::MappedView)).bytes, 6000u);
+    EXPECT_EQ(c.row(cls(MappingClass::MappedView)).changed, 0u);
+    EXPECT_EQ(c.total_validations(), 3u);
 }
 
 TEST(ValidationMappingCensus, CoverableShareIsPrivateBytesOverAllBytes) {
     ValidationMappingCensus c;
-    c.record(static_cast<int>(prosper::host::MappingClass::Private), 2500, true);
-    c.record(static_cast<int>(prosper::host::MappingClass::MappedView), 7500, true);
-    const std::string text = c.format();
-    EXPECT_NE(text.find("GetWriteWatch-coverable (private memory only) = 25.0% of 10000 compared bytes"),
-              std::string::npos) << text;
+    c.record(cls(MappingClass::Private), 2500, false);
+    c.record(cls(MappingClass::MappedView), 7500, false);
+    const std::string text = c.format("renderer", true);
+    EXPECT_NE(text.find("source=renderer GetWriteWatch-coverable (private memory only) = 25.0% of 10000 "
+                        "compared bytes"), std::string::npos) << text;
     EXPECT_NE(text.find("class=mapped-view validations=1 bytes=7500 (75.0%"), std::string::npos) << text;
 }
 
 TEST(ValidationMappingCensus, UnknownClassFoldsIntoUntrackedRatherThanVanishing) {
     ValidationMappingCensus c;
-    c.record(99, 500, true);
-    c.record(-1, 500, false);
-    EXPECT_EQ(c.row(static_cast<int>(prosper::host::MappingClass::Untracked)).bytes, 1000u);
-    EXPECT_EQ(c.row(static_cast<int>(prosper::host::MappingClass::Untracked)).changed, 1u);
+    c.record(99, 500, false);
+    c.record(-1, 500, true);
+    EXPECT_EQ(c.row(cls(MappingClass::Untracked)).bytes, 1000u);
+    EXPECT_EQ(c.row(cls(MappingClass::Untracked)).changed, 1u);
 }
 
 TEST(ValidationMappingCensus, EmptyCensusReportsZeroShareWithoutDividingByZero) {
     ValidationMappingCensus c;
-    EXPECT_NE(c.format().find("= 0.0% of 0 compared bytes"), std::string::npos);
+    EXPECT_NE(c.format("renderer", true).find("= 0.0% of 0 compared bytes"), std::string::npos);
 }
 
-#ifdef _WIN32
-// A hand-built positive control for the classifier itself. The census is only as good as the
-// answer to "is this address private or a section view?", and a control drawn from the census's own
-// input could only show the plumbing runs. So build one of each kind outside it.
-TEST(ValidationMappingCensus, ClassifiesPrivateMemoryAndSectionViewsApart) {
-    void* priv = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    ASSERT_NE(priv, nullptr);
-    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT, 0, 65536, nullptr);
-    ASSERT_NE(section, nullptr);
-    void* view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 65536);
-    ASSERT_NE(view, nullptr);
-
-    EXPECT_EQ(static_cast<int>(prosper::host::classify_host_mapping(reinterpret_cast<uintptr_t>(priv))),
-              static_cast<int>(prosper::host::MappingClass::Private));
-    EXPECT_EQ(static_cast<int>(prosper::host::classify_host_mapping(reinterpret_cast<uintptr_t>(view))),
-              static_cast<int>(prosper::host::MappingClass::MappedView));
-
-    UnmapViewOfFile(view);
-    CloseHandle(section);
-    VirtualFree(priv, 0, MEM_RELEASE);
-    // Freed memory is not committed host memory any more.
-    EXPECT_EQ(static_cast<int>(prosper::host::classify_host_mapping(reinterpret_cast<uintptr_t>(priv))),
-              static_cast<int>(prosper::host::MappingClass::Untracked));
+TEST(ValidationMappingCensus, ComputeSourceHasNoChangedFigure) {
+    // The compute buffer cache records a compare where it runs, before its verdict exists. Printing a
+    // `changed` count for it would claim a measurement nobody made.
+    ValidationMappingCensus c;
+    c.record(cls(MappingClass::MappedView), 4096, false);
+    const std::string compute = c.format("compute", false);
+    EXPECT_NE(compute.find("source=compute class=mapped-view validations=1 bytes=4096"), std::string::npos)
+        << compute;
+    EXPECT_NE(compute.find("changed=n/a"), std::string::npos) << compute;
+    EXPECT_EQ(compute.find("changed_bytes="), std::string::npos) << compute;
+    // ...and the renderer source, whose outcome is known, does print one.
+    EXPECT_NE(c.format("renderer", true).find("changed_bytes="), std::string::npos);
 }
-#endif

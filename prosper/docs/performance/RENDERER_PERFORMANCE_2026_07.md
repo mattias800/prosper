@@ -1265,16 +1265,24 @@ logically sound, but it cannot make Windows exception delivery ABI-safe. Re-enab
 fault delivery itself preserves all guest red-zone bytes. Direct memory now uses a delete-on-close sparse file,
 so the kernel demand-pages mapped file data without the unsafe user-mode `SEC_RESERVE` first-touch exceptions.
 
-**Ruled out (2026-10-07): `GetWriteWatch` as the fault-free replacement on Windows.** A standalone probe
-found it works only on private `VirtualAlloc(MEM_WRITE_WATCH)` allocations, including private memory that
-replaces a placeholder with `MEM_WRITE_WATCH`. Every section view (pagefile-backed, file-backed,
-placeholder-replaced) fails with `ERROR_INVALID_PARAMETER`, and `MapViewOfFile3` refuses the flag outright.
-`PROSPER_VALIDATION_MAPPING_CENSUS` then measured where Black Flag's fully-compared bytes live, in three
-~110 s runs: **100% were section views, 0% private** (999 validations / 3.78 GB; 1,004 / 4.43 GB with the
-final classifier, which asks `VirtualQuery` for `MEM_PRIVATE` vs `MEM_MAPPED` directly). There is nothing for
-`GetWriteWatch` to cover. The same runs show the compares almost never find a change: **5 of 999**
-validations (0.3% of the bytes) in one run and **0 of 1,004** in another. A sound unchanged-signal from
-another source would remove nearly all of this compare work.
+### Ruled out
+
+- **`GetWriteWatch` as the fault-free replacement for the retired write watch, on Black Flag
+  (2026-10-07, #4681, tracker #4131).** Two halves, both measured.
+  *The API.* Its documented contract is memory allocated with `VirtualAlloc(MEM_WRITE_WATCH)`; a probe
+  (`VirtualAlloc`, `VirtualAlloc2` placeholders, `CreateFileMapping`/`MapViewOfFile`, `MapViewOfFile3`)
+  found it works on private memory, including private memory that replaces a placeholder with
+  `MEM_WRITE_WATCH`, and returns `ERROR_INVALID_PARAMETER` (87) for every section view (pagefile-backed,
+  file-backed, placeholder-replaced); `MapViewOfFile3` refuses `MEM_WRITE_WATCH` with 87 too.
+  *The data.* `PROSPER_VALIDATION_MAPPING_CENSUS` classifies each fully-compared range with
+  `VirtualQuery` (`MEM_PRIVATE` vs `MEM_MAPPED`). One ~110 s Black Flag run: **100% section views, 0%
+  private**, on both compare paths -- the renderer's validations (1,180 compares, 5.21 GB) and the compute
+  buffer cache's full compares (5,955 compares, **66.07 GB**, about 12x the renderer's volume). Earlier
+  renderer-only runs agree (999 / 3.78 GB, 880 / 3.26 GB, 1,004 / 4.43 GB). Of the renderer's compares,
+  5, 5 and 0 found a change (0.3% of the bytes at most); the compute side records no outcome.
+  *Scope.* Black Flag only, one platform (Windows/NVIDIA). Dragon Quest VII never reached validation
+  traffic in the short runs. A sound unchanged-signal from another source would remove most of this
+  compare work, and the compute buffer cache is where most of the bytes are.
 
 ## Separate unresolved risk
 

@@ -143,8 +143,10 @@ prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOU
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(WIN32)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_unavailable\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/mapping_class_posix\\.cpp$")
 else()
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_win\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/mapping_class_win\\.cpp$")
 endif()
 if(PROSPER_NATIVE_CLANG_TLS)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
@@ -1918,16 +1920,31 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # Actual tracked mappings and direct comparison/window observations; no Vulkan device.
-  # The census arithmetic behind PROSPER_VALIDATION_MAPPING_CENSUS (which kind of host memory backs
-  # the fully-compared guest ranges). Header-only: nothing here reaches the HLE symbol it declares.
+  add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
+  target_include_directories(test_texture_direct_validation PRIVATE frontends)
+  target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)
+
+  # The census arithmetic behind PROSPER_VALIDATION_MAPPING_CENSUS (which kind of host memory backs the
+  # fully-compared guest ranges). Header-only apart from the platform classifier it declares, which
+  # prosper_core provides.
   prosper_add_gtest(test_validation_mapping_census
     SOURCES frontends/shared/tests/test_validation_mapping_census.cpp
     INCLUDES frontends src
     LIBRARIES prosper_core)
 
-  add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
-  target_include_directories(test_texture_direct_validation PRIVATE frontends)
-  target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)
+  # The host mapping classifier (src/host/platform/mapping_class.hpp): one test per backend, chosen the
+  # same way the backends are.
+  if(WIN32)
+    prosper_add_gtest(test_mapping_class
+      SOURCES tests/host/platform/test_mapping_class_win.cpp
+      INCLUDES src
+      LIBRARIES prosper_core)
+  else()
+    prosper_add_gtest(test_mapping_class
+      SOURCES tests/host/platform/test_mapping_class_posix.cpp
+      INCLUDES src
+      LIBRARIES prosper_core)
+  endif()
   add_test(NAME texture_direct_validation COMMAND test_texture_direct_validation texture-direct-validation.jsonl)
   add_test(NAME texture_direct_validation_disabled COMMAND test_texture_direct_validation texture-direct-validation-disabled.jsonl)
   set_tests_properties(texture_direct_validation_disabled PROPERTIES
