@@ -131,12 +131,13 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     while (!reject.empty() && reject.back() == ' ') reject.pop_back();
     if (reject.size() > 240) reject.resize(240);
     if (FILE* index = std::fopen((std::filesystem::path(dir) / "index.txt").string().c_str(), "a")) {
-        std::fprintf(index, "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
-                            "first_bad_op=0x%x unsupported=%u file=%s %s%s%s%s\n",
+        std::fprintf(index,
+                     "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
+                     "first_bad_op=0x%x unsupported=%u file=%s %s%s%s%s\n",
                      stage, (unsigned long long)address, dwords, (unsigned long long)hash,
                      coverage.first_bad_fmt, coverage.first_bad_op, coverage.unsupported, file,
-                     detail.c_str(), reject.empty() ? "" : " reject=\"",
-                     reject.c_str(), reject.empty() ? "" : "\"");
+                     detail.c_str(), reject.empty() ? "" : " reject=\"", reject.c_str(),
+                     reject.empty() ? "" : "\"");
         std::fclose(index);
     }
     // A draw a gate refused was never recompiled, so its "first unsupported" instruction is only

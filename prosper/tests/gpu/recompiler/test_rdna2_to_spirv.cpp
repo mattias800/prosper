@@ -7413,20 +7413,21 @@ int main() {
     // answer except the in-range rows, so a dropped CLAMP fails rows 0/1/3/4/5 and a clamp applied
     // to the SOURCE instead of the result fails row 0 (1.5 -> 1.0 -> 4.0, not 6 -> 1.0) and row 2.
     const uint32_t code32r19d[] = {
-        0xd7628000u, 0x0002030du,
+        0xd7628000u,
+        0x0002030du,
         0xbf810000u,
     };
     const LdexpVector ldexp_clamp_vectors[] = {
-        {0x3fc00000u,  2, 0x3f800000u}, // 1.5 * 4 = 6 -> 1.0
-        {0xbfc00000u, -1, 0x00000000u}, // -0.75 -> +0
-        {0x3fc00000u, -2, 0x3ec00000u}, // 1.5 / 4 = 0.375 stays
-        {0x7fc12345u,  3, 0x00000000u}, // NaN -> 0
-        {0x7f800000u, -5, 0x3f800000u}, // +Inf -> 1.0
-        {0xff800000u,  5, 0x00000000u}, // -Inf -> 0
-        {0x3f800000u,  0, 0x3f800000u}, // exactly 1.0 stays
+        {0x3fc00000u, 2, 0x3f800000u},   // 1.5 * 4 = 6 -> 1.0
+        {0xbfc00000u, -1, 0x00000000u},   // -0.75 -> +0
+        {0x3fc00000u, -2, 0x3ec00000u},   // 1.5 / 4 = 0.375 stays
+        {0x7fc12345u, 3, 0x00000000u},   // NaN -> 0
+        {0x7f800000u, -5, 0x3f800000u},   // +Inf -> 1.0
+        {0xff800000u, 5, 0x00000000u},   // -Inf -> 0
+        {0x3f800000u, 0, 0x3f800000u},   // exactly 1.0 stays
     };
-    const std::vector<uint32_t> spv32r19d = recompile_valu(
-        code32r19d, std::size(code32r19d), 14, 0);
+    const std::vector<uint32_t> spv32r19d =
+        recompile_valu(code32r19d, std::size(code32r19d), 14, 0);
     CHECK(!spv32r19d.empty(), "recompiled kernel 32r19d (v_ldexp_f32 with CLAMP) -> SPIR-V");
     std::vector<float> in32r19d(std::size(ldexp_clamp_vectors) * 14, 0.0f);
     for (size_t i = 0; i < std::size(ldexp_clamp_vectors); ++i) {
@@ -7434,13 +7435,15 @@ int main() {
         in32r19d[i * 14 + 1] =
             std::bit_cast<float>(static_cast<uint32_t>(ldexp_clamp_vectors[i].exponent));
     }
-    const std::vector<float> got32r19d = spv32r19d.empty()
-        ? std::vector<float>()
-        : prosper::test::run_compute(spv32r19d, in32r19d, std::size(ldexp_clamp_vectors),
-                                     std::size(ldexp_clamp_vectors));
+    const std::vector<float> got32r19d =
+        spv32r19d.empty()
+            ? std::vector<float>()
+            : prosper::test::run_compute(spv32r19d, in32r19d, std::size(ldexp_clamp_vectors),
+                                         std::size(ldexp_clamp_vectors));
     uint32_t bad32r19d = 0;
-    for (size_t i = 0; i < std::size(ldexp_clamp_vectors) &&
-                       got32r19d.size() == std::size(ldexp_clamp_vectors); ++i) {
+    for (size_t i = 0;
+         i < std::size(ldexp_clamp_vectors) && got32r19d.size() == std::size(ldexp_clamp_vectors);
+         ++i) {
         const uint32_t got_bits = bits_of(got32r19d[i]);
         if (got_bits != ldexp_clamp_vectors[i].expected) {
             ++bad32r19d;

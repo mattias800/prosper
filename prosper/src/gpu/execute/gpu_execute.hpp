@@ -2955,22 +2955,21 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const std::lock_guard lock(ngg_shape_mutex);
             if (ngg_shape_logged.size() < 32 &&
                 ngg_shape_logged.emplace(rs.es_addr, ngg_refusal).second)
-                std::fprintf(stderr,
-                             "[ngg-refused] es=0x%llx chain=0x%llx ps=0x%llx reason=%s "
-                             "order=%llu prim=%u vertices=%u instances=%u indexed=%d "
-                             "index-count=%u index-type=%u indirect=%d vertex-offset=%d "
-                             "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u\n",
-                             static_cast<unsigned long long>(rs.es_addr),
-                             static_cast<unsigned long long>(chain_addr),
-                             static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
-                             static_cast<unsigned long long>(draw ? draw->command_order : 0),
-                             rs.prim_type, ngg.facts.vertex_count, ngg.facts.instance_count,
-                             ngg.facts.indexed ? 1 : 0, draw ? draw->index_count : 0u,
-                             ds.index_type, ngg.facts.indirect ? 1 : 0,
-                             ngg.facts.vertex_offset ? 1 : 0, ngg.registers.vgt_gs_out_prim_type,
-                             ngg.registers.vgt_shader_stages_en,
-                             static_cast<unsigned long long>(rs.color0_base),
-                             ngg.facts.target_slices);
+                std::fprintf(
+                    stderr,
+                    "[ngg-refused] es=0x%llx chain=0x%llx ps=0x%llx reason=%s "
+                    "order=%llu prim=%u vertices=%u instances=%u indexed=%d "
+                    "index-count=%u index-type=%u indirect=%d vertex-offset=%d "
+                    "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(chain_addr),
+                    static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
+                    static_cast<unsigned long long>(draw ? draw->command_order : 0), rs.prim_type,
+                    ngg.facts.vertex_count, ngg.facts.instance_count, ngg.facts.indexed ? 1 : 0,
+                    draw ? draw->index_count : 0u, ds.index_type, ngg.facts.indirect ? 1 : 0,
+                    ngg.facts.vertex_offset ? 1 : 0, ngg.registers.vgt_gs_out_prim_type,
+                    ngg.registers.vgt_shader_stages_en,
+                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices);
         }
         // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit

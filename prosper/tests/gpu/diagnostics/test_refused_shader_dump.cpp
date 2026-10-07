@@ -191,5 +191,6 @@ TEST(RefusedShaderDump, IndexNamesTranslatorReject) {
            "flattened so the line stays one parseable record\n"
         << text;
     EXPECT_NE(text.find("draw-order=2\n"), std::string::npos)
-        << "a program with no recorded reason carries no reject field\n" << text;
+        << "a program with no recorded reason carries no reject field\n"
+        << text;
 }

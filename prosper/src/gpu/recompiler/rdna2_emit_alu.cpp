@@ -2038,8 +2038,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Both halves must exist. A Wave64 fragment's guest_lane_id() is exact (#4706).
                     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
                         (o.kind == OperandKind::SGPR ||
-                         (o.kind == OperandKind::Special &&
-                          (o.value == 106 || o.value == 107)))) {
+                         (o.kind == OperandKind::Special && (o.value == 106 || o.value == 107)))) {
                         auto scalar_word = [&](int reg, uint32_t& value) {
                             auto current = rs.sreg.find(reg);
                             if (current != rs.sreg.end()) {

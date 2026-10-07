@@ -53,10 +53,10 @@ constexpr uint32_t kOpSwitch = 251;
 //   pc7 s_cbranch_scc1 L
 //   s_mov_b64 exec, -1 | buffer_store_dword v3 -> out[x]
 constexpr uint32_t kWrite = 0xBE8203A9u;   // s_mov_b32 s2, 41
-constexpr uint32_t kNop = 0xBF800000u;     // s_nop 0
-#define LOOP_KERNEL(before, inside)                                                              \
-    {0xBE82037Cu, before, 0xBE830380u, 0x7E060202u, inside, 0x80038103u, 0xBF0A8203u,           \
-     0xBF85FFFBu, 0xBEFE04C1u, 0xE0702000u, 0x80020300u}
+constexpr uint32_t kNop = 0xBF800000u;   // s_nop 0
+#define LOOP_KERNEL(before, inside)                                                                \
+    {0xBE82037Cu, before,      0xBE830380u, 0x7E060202u, inside,     0x80038103u,                  \
+     0xBF0A8203u, 0xBF85FFFBu, 0xBEFE04C1u, 0xE0702000u, 0x80020300u}
 // Written before the loop: data on both edges into the header.
 const uint32_t kDataWriteOnEveryPath[] = LOOP_KERNEL(kWrite, kNop);
 // Never written: the token on both edges.
