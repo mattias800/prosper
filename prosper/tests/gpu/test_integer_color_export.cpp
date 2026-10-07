@@ -173,6 +173,12 @@ TEST(IntegerColorExport, NormalizedKeyKeepsHistoricalValue) {
     EXPECT_EQ(kena.compressed_format(0), ColorExportFormat::Uint16Abgr);
     EXPECT_EQ(kena.compressed_format(1), ColorExportFormat::Fp16Abgr);
     EXPECT_TRUE(kena.canonical());
+    // A ZERO slot exports nothing, so its target class is not part of the key (#4715 R1): a stale
+    // integer CB_COLOR2_INFO must not move an unchanged draw to a new cache entry.
+    FragmentOutputClass stale[8]{};
+    stale[0] = FragmentOutputClass::Uint;
+    stale[2] = FragmentOutputClass::Sint;
+    EXPECT_EQ(make_fragment_export_formats(0x7u, stale), kena) << "slot 2's col_format is ZERO";
     FragmentExportFormats both = kena;
     both.sint_outputs = 1u;
     EXPECT_FALSE(both.canonical());

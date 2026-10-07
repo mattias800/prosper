@@ -62,7 +62,8 @@ struct FragmentExportFormats {
     bool operator==(const FragmentExportFormats&) const = default;
 };
 
-// Build the normalized value from the raw register and each MRT's output class.
+// Build the normalized value from the raw register and each MRT's output class. A slot whose
+// col_format is ZERO contributes nothing, whatever its target's class.
 constexpr FragmentExportFormats
 make_fragment_export_formats(uint32_t spi_shader_col_format,
                              const FragmentOutputClass (&classes)[8]) {
@@ -70,10 +71,15 @@ make_fragment_export_formats(uint32_t spi_shader_col_format,
     for (uint32_t mrt = 0; mrt < 8u; ++mrt) {
         const uint32_t code = (spi_shader_col_format >> (mrt * 4u)) & 0xFu;
         if (code >= 5u && code <= 8u) out.compressed_formats |= code << (mrt * 4u);
+        // SPI_SHADER_ZERO: the hardware exports nothing to this slot (Mesa's color export returns
+        // early), so its CB format -- often a stale CB_COLORn_INFO left by an earlier pass -- says
+        // nothing about this shader. Counting it changed the cache key of draws whose module is
+        // unchanged and refused owned-wave draws that export only a float MRT0 (#4715 review R1).
+        if (code == 0u) continue;
         if (classes[mrt] == FragmentOutputClass::Uint) out.uint_outputs |= uint8_t(1u << mrt);
         if (classes[mrt] == FragmentOutputClass::Sint) out.sint_outputs |= uint8_t(1u << mrt);
     }
     return out;
 }
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

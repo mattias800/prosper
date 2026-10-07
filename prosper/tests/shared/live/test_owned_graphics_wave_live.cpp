@@ -610,10 +610,25 @@ TEST_P(OwnedGraphicsWaveLive, StateRefusedOwnedWavesSkipThePublication) {
     auto integer = state(*vs, *ps, false);
     integer.cx[P::CB_COLOR0_INFO] = (0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT) |
                                     (4u << P::CB_COLOR0_INFO_NUMBER_TYPE_SHIFT);   // RGBA8_UINT
+    integer.cx[P::SPI_SHADER_COL_FORMAT] = 0x9u;   // MRT0 exported as 32_ABGR
     EXPECT_STREQ(owned_wave_draw_state_refusal(integer, true),
                  "draw-wave-integer-color-output-unimplemented");
     EXPECT_EQ(owned_wave_draw_state_refusal(integer, false), nullptr)
         << "a vertex-only owned draw writes through the native fragment module";
+    // A stale integer CB_COLOR2_INFO from an earlier pass, with slot 2's col_format ZERO, is not
+    // a target this shader exports to: the float-MRT0 draw must still be admitted (#4715 R1).
+    // Mutation: count ZERO slots in make_fragment_export_formats -> this arm goes red.
+    auto stale = state(*vs, *ps, false);
+    stale.cx[P::CB_COLOR0_INFO + 2u * 0xfu] =
+        (0x2u << P::CB_COLOR0_INFO_FORMAT_SHIFT) | (4u << P::CB_COLOR0_INFO_NUMBER_TYPE_SHIFT);
+    stale.cx[P::SPI_SHADER_COL_FORMAT] = 0x4u;   // FP16 in slot 0, ZERO in slots 1..7
+    EXPECT_EQ(owned_wave_draw_state_refusal(stale, true), nullptr);
+    auto exported = stale;
+    exported.cx[P::SPI_SHADER_COL_FORMAT] = 0x104u;   // slot 2 now exported as 32_R
+    EXPECT_STREQ(owned_wave_draw_state_refusal(exported, true),
+                 "draw-wave-integer-color-output-unimplemented")
+        << "control: the same integer slot IS refused once the shader exports to it";
+
     auto unorm16 = state(*vs, *ps, false);
     unorm16.cx[P::SPI_SHADER_COL_FORMAT] = 0x5u;   // UNORM16_ABGR
     EXPECT_STREQ(owned_wave_draw_state_refusal(unorm16, true),
