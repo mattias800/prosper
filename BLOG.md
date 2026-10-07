@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-07
+
+### Kena: Bridge of Spirits draws its title-menu world
+
+The shrine and forest now draw behind Kena's title menu on Linux. The foreground grass and the light shafts are still missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787), [#3835](https://github.com/mattias800/prosper/issues/3835)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-world.webp" alt="Kena: Bridge of Spirits title menu, New Game / Load Game / Options and Version 1.16, over the forest shrine with its blue deer mask, lanterns and stone cairns; Linux prosper-app, default launch, F9 frame at 235 s"></p>
+
 ## 2026-10-06
 
 ### Assassin's Creed Black Flag Resynced no longer opens on solid red
