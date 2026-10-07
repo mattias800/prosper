@@ -91,6 +91,14 @@ never dropped, and an optimized pipeline replaces the link in the background.
 Status: proposed (adr:0029)
 Enforcement: runtime:shader-compile, adr:0029
 
+### PERF-P13 -- write protection is armed over guest memory only where its fault is red-zone safe
+
+The guest memory tracker is portable and each host supplies only the primitive. A host whose write
+fault is delivered below the guest thread's RSP (Windows) tracks guest-writable memory with a
+fault-free primitive or falls back to a counted compare, never with a page-protection guard.
+Status: proposed (adr:0032)
+Enforcement: runtime:host-copy-pressure, adr:0032
+
 ### PERF-G1 -- releases are compared on the reference workloads
 
 Each release candidate is measured against the previous release on the reference workloads, and a
