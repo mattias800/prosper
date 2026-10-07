@@ -91,7 +91,21 @@ Two layers, behind the existing provenance interface.
    that select a view), mapping to a bindless index of a host resource the emulator has already
    materialised (detiled, format-converted). A miss returns a defined fallback and is **counted and
    logged** with the program and pc; the dispatch is refused only when the table cannot be built for
-   it at all. This is a fail-visible path, never a silent skip (`FAIL-1`).
+   it at all. This is a fail-visible path, never a silent skip (`FAIL-1`). Two shapes refine it,
+   and each is chosen per operand by what layer 1 proves about the descriptor's *source*:
+   - **Guarded specialization (descriptor words vary rarely).** Compile the variant specialized to
+     the descriptor observed, with a guard that compares the live T#/V#/S# words in the shader. A
+     guard failure takes the generic runtime-lookup path in the same module; it does not recompile.
+     After a small fixed number of distinct variants for one program, only the generic path is
+     emitted. This is the inline-cache/deoptimization pattern of JIT compilers, and it avoids both
+     per-snapshot recompile churn (AnyPS5's model) and a lookup on every access.
+   - **Descriptor-table mirroring (the guest indexes a table: guest-side bindless).** When layer 1
+     proves an operand is `table_base + 32 * index` read from an entry-rooted table, prosper keeps a
+     host table mirroring that guest table index for index. The shader indexes the mirror with the
+     guest's own index, so no hash lookup is needed. Guest writes to the table update the mirror;
+     where the host cannot watch writes (Windows today), the table's bytes are compared at the
+     submit that uses it. This follows how vkd3d-proton maps D3D12 descriptor heaps onto Vulkan.
+     The generic keyed table remains for descriptors with no table structure.
 5. **What bindless does not solve, stated so nobody treats it as the fix.** Descriptor indexing,
    bindless arrays and `VK_EXT_descriptor_buffer` replace *binding*, not *provenance*. A guest T# is
    not a host descriptor: its encoding differs, and the image it names must still be detiled and
@@ -119,6 +133,9 @@ descriptor crosses a join (gap 3) become bindable.
   any proof is deleted.
 - *Runtime (layer 2 only):* an extra table read and compare per access through an unresolved
   descriptor, and host work to keep the table populated. Only paid where layer 1 says "unknown".
+  A guarded specialization costs one compare of the descriptor words per access on the hit path.
+  A mirrored table costs one indexed host-descriptor read, plus keeping the mirror current (a
+  write-watch or a per-submit compare of the table bytes).
 
 **Risks.** A wrong static answer binds the wrong resource -- worse than a refusal, because it
 renders. The analysis therefore answers only what it proves; anything else is "unknown" and goes to
@@ -156,7 +173,10 @@ ADR 0006 (pure recompiler) makes the cached answer a property of the program byt
    title's output changes unexplained.
 4. Delete the proofs one by one, each in its own PR with the A/B showing it is subsumed.
 5. Layer 2 last, for the residue the analysis cannot prove, with a counter in the
-   `[perf-alarm]` summary for runtime-table misses.
+   `[perf-alarm]` summary for runtime-table misses. Build order within it: descriptor-table
+   mirroring first (it is exact and has the clearest model), then guarded specialization for the
+   rare-variant case, then the generic keyed table for what remains. Each shape is A/B'd as above,
+   with guard-failure and miss counts reported.
 
 ## Evidence still needed / open questions
 
