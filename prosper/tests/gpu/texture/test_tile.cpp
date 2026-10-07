@@ -1127,13 +1127,35 @@ TEST(Tile, Contract) {
               "three-component DCC clears materialize RGB with sampled alpha one");
         std::vector<uint8_t> mixed_clear(16, 0); mixed_clear.back() = 0x40;
         const std::vector<uint8_t> uncompressed(16, 0xff);
+        // One- and two-component surfaces: the clear colour fills the components that exist and
+        // the absent ones read (0,0,0,1). Before this, a fast-cleared R16F surface was sampled as
+        // its stale base bytes (Black Flag, #4131); a one-component code 0x00 must read zero.
+        std::vector<uint8_t> narrow(8, 0xaa);
+        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(),
+                                         1, true) &&
+              narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}) &&
+              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
+                                         1, true) &&
+              narrow == std::vector<uint8_t>({255, 0, 0, 255, 255, 0, 0, 255}),
+              "one-component DCC clears fill R only; absent components read (0,0,0,1)");
+        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
+                                         2, true) &&
+              narrow == std::vector<uint8_t>({255, 255, 0, 255, 255, 255, 0, 255}) &&
+              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0001.data(), clear_0001.size(),
+                                         2, true) &&
+              narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
+              "two-component DCC clears fill RG; absent components read (0,0,0,1)");
         CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                           mixed_clear.data(), mixed_clear.size(), 4, true) &&
               !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                           uncompressed.data(), uncompressed.size(), 4, true) &&
               !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          clear_0001.data(), clear_0001.size(), 2, true),
-              "mixed, uncompressed, and unvalidated component layouts remain unsupported");
+                                          mixed_clear.data(), mixed_clear.size(), 1, true) &&
+              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                          clear_0001.data(), clear_0001.size(), 0, true) &&
+              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                          clear_0001.data(), clear_0001.size(), 5, true),
+              "mixed, uncompressed, and impossible component layouts remain unsupported");
         CHECK(tiled_volume_bytes(120, 68, 32, M, 8) == (size_t)1 * 2 * 32 * 65536,
               "120x68x32 @ 8 B uses 1x2 padded 2D blocks per Z slice");
         auto rt_volume = [&](uint32_t bpe) {
