@@ -55,7 +55,8 @@ Spec rule `ASSET-1`:
 A title's visual history is one folder in time order, a capture's age is in its name, and a new
 capture cannot arrive outside the scheme. The migration touches every document that cites a
 screenshot, including status pages other lanes edit, so it lands in a quiet window as a single
-mechanical PR. Until then, new captures follow the convention and old ones stay where they are.
+mechanical PR. If this ADR is accepted, new captures follow the convention from then on and old ones stay where they
+are until that migration.
 
 ## Alternatives considered
 
