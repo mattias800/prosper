@@ -417,9 +417,10 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
 //   2. Definite assignment. The structured emitter's if-merges and loop phis fill a register that
 //      is absent on one edge with a fabricated zero. `sreg_merge_placeholder` marks such words and
 //      every word computed from one: through explicit sources, a destination's own old bits
-//      (s_bitset*, s_cmov*), SCC (s_cmp -> s_cselect, s_addc/s_subb), a spill slot, a VCC data
-//      half, and a source that was never written (operand_bits' zero). A loop exit takes the
-//      marks its check block had. A marked word refuses instead of projecting.
+//      (s_bitset*, s_cmov*), SCC (s_cmp -> s_cselect, s_addc/s_subb), a spill slot, the special
+//      data words (VCC, ttmp, M0), and a source that was never written (operand_bits' zero).
+//      Spill-slot marks are joined at merges and loop exits like SGPR marks, and a loop exit
+//      takes the marks its check block had. A marked word refuses instead of projecting.
 //   3. Not a memory pattern. A per-lane pattern loaded from memory (SMEM, or scalar ALU over one)
 //      is not a ballot of this wave: unless it is all-0 or all-1, it would select different pixels
 //      than on PS5, because the host's pixel-to-lane assignment is not the PS5's. Such a word

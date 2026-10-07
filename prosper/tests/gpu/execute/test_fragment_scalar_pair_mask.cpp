@@ -20,6 +20,9 @@
 //   ReviewProbesRefuse                the second review's routes: an in-place partial write, SCC,
 //                                     s_cmov, a never-written source, a loop exit whose value is the
 //                                     check block's, and a VCC data half copied after a merge
+//   ThirdReviewProbesRefuse           #4725's review: a spill slot overwritten on one arm only, a
+//                                     marked word copied through M0 or ttmp, and a loop-carried slot at
+//                                     the header and at the exit
 //   MemoryPatternRefuses              projecting a pattern loaded from memory onto host lanes,
 //                                     directly and through a spill slot; its control overwrites the
 //                                     loaded words and must compile
@@ -133,6 +136,52 @@ constexpr uint32_t kProbeLoopExitControl[] = LOOP_PROBE(0xbf800000u);
 constexpr uint32_t kProbeVccHalfCopy[] = {
     0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u, 0xbf068000u, 0xbf850002u,
     0xbeea03c1u, 0xbeeb03c1u, 0xbe84036au, 0xbe85036bu, 0x87860204u, PROBE_TAIL(0x0019e480u)};
+// #4725's review, verbatim. Spill slot: v12[1] is written from never-written s20 before a scalar
+// if and overwritten from a clean s21 on the taken arm only; reloaded into s[4:5] after the merge.
+// The control drops the taken-arm overwrite (two s_nop), so the slot is marked on both edges.
+#define SLOT_PROBE(w0, w1)                                                                         \
+    {0x7e0a0280u,                                                                                  \
+     0x7e000505u,                                                                                  \
+     0xd4c20002u,                                                                                  \
+     0x00010080u,                                                                                  \
+     0xd761000cu,                                                                                  \
+     0x00010214u,                                                                                  \
+     0xbf068000u,                                                                                  \
+     0xbf850003u,                                                                                  \
+     0xbe9503c1u,                                                                                  \
+     w0,                                                                                           \
+     w1,                                                                                           \
+     0xd7600004u,                                                                                  \
+     0x0001030cu,                                                                                  \
+     0xd7600005u,                                                                                  \
+     0x0001030cu,                                                                                  \
+     0x87860204u,                                                                                  \
+     PROBE_TAIL(0x0019e480u)}
+constexpr uint32_t kProbeSlotJoin[] = SLOT_PROBE(0xd761000cu, 0x00010215u);
+constexpr uint32_t kProbeSlotJoinControl[] = SLOT_PROBE(0xbf800000u, 0xbf800000u);
+#undef SLOT_PROBE
+// A loop-carried spill slot: written from a clean s21 before a counted loop, reloaded into s[4:5]
+// in the loop's CONDITION region, and overwritten from never-written s20 in the body, so from the
+// second trip the condition region reloads a fabricated word. The header must mark the slots the
+// loop writes, as it marks loop-carried SGPRs.
+constexpr uint32_t kProbeLoopSlot[] = {
+    0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u, 0xbe9503c1u, 0xd761000cu,
+    0x00010215u, 0xd7600004u, 0x0001030cu, 0xd7600005u, 0x0001030cu, 0xbf068000u,
+    0xbf850003u, 0xd761000cu, 0x00010214u, 0xbf82fff7u, 0x87860204u, PROBE_TAIL(0x0019e480u)};
+// A slot marked before a counted loop (from never-written s20), overwritten clean in the body only,
+// and reloaded AFTER the loop: a zero-trip exit leaves the marked word, so the exit must union the
+// check block's slot marks with the body end's.
+constexpr uint32_t kProbeLoopExitSlot[] = {
+    0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u, 0xd761000cu, 0x00010214u,
+    0xbf068000u, 0xbf850004u, 0xbe9503c1u, 0xd761000cu, 0x00010215u, 0xbf82fffau,
+    0xd7600004u, 0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860204u, PROBE_TAIL(0x0019e480u)};
+// The merge-marked pair copied through M0, and through ttmp0/ttmp1, then ANDed.
+constexpr uint32_t kProbeThroughM0[] = {
+    PROBE_PREFIX,           0xbefc0304u, 0xbe86037cu, 0xbefc0305u, 0xbe87037cu, 0x87880206u,
+    PROBE_TAIL(0x0021e480u)};
+constexpr uint32_t kProbeThroughTtmp[] = {
+    PROBE_PREFIX,           0xbeec0304u, 0xbe86036cu, 0xbeed0305u, 0xbe87036du, 0x87880206u,
+    PROBE_TAIL(0x0021e480u)};
 #undef PROBE_TAIL
 #undef PROBE_PREFIX
 
@@ -310,4 +359,22 @@ TEST(FragmentScalarPairMask, ReviewProbesRefuse) {
         << "E control: no body write";
     EXPECT_TRUE(refuses(kProbeVccHalfCopy, std::size(kProbeVccHalfCopy)))
         << "a VCC data half written on one path, then copied";
+}
+
+TEST(FragmentScalarPairMask, ThirdReviewProbesRefuse) {
+    const auto refuses = [](const uint32_t* words, size_t n) {
+        return recompile_fragment(words, n).empty();
+    };
+    EXPECT_TRUE(refuses(kProbeSlotJoin, std::size(kProbeSlotJoin)))
+        << "slot: a spill slot marked on the skipped edge stays marked after the merge";
+    EXPECT_TRUE(refuses(kProbeSlotJoinControl, std::size(kProbeSlotJoinControl)))
+        << "slot control: marked on both edges";
+    EXPECT_TRUE(refuses(kProbeLoopSlot, std::size(kProbeLoopSlot)))
+        << "loop slot: a slot the loop body writes is marked at the header";
+    EXPECT_TRUE(refuses(kProbeLoopExitSlot, std::size(kProbeLoopExitSlot)))
+        << "loop exit slot: the exit keeps the check block's slot marks";
+    EXPECT_TRUE(refuses(kProbeThroughM0, std::size(kProbeThroughM0)))
+        << "m0: a marked word copied through M0 keeps its mark";
+    EXPECT_TRUE(refuses(kProbeThroughTtmp, std::size(kProbeThroughTtmp)))
+        << "ttmp: a marked word copied through ttmp0/ttmp1 keeps its mark";
 }

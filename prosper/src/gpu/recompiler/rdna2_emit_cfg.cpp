@@ -6643,7 +6643,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg[reg] = b.emit_phi_2way(
                         b.t_u32, then_s[reg], then_block, else_value, else_block);
             }
-            join_merge_scc(rs, then_marks);   // #4706, before SCC becomes the phi
+            join_merge_scc_and_slots(rs, then_marks);   // #4706, before SCC becomes the phi
             if (then_scc != rs.scc)
                 // A poisoned (0) input degrades to bfalse across the merge — no invalid SPIR-V and
                 // no stricter rejection than the pre-poison behavior; straight-line consumers of a
@@ -6733,7 +6733,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        mark_loop_carried(rs, cs);   // #4706
+        mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -6827,6 +6827,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // body scratch its header phi carries; leave it untracked so a data read takes the exact
         // ballot or refuses loudly (#4680, the counted-loop form of #4526).
         cond_vcc_halves.finish_exit(rs);
+        mark_loop_exit_slots(rs, check_marks);   // #4706
         if (carry_vertex_exec) rs.exec_narrowed = cond_exec_narrowed;
         // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
@@ -7369,7 +7370,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            mark_loop_carried(rs, cs);   // #4706
+            mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -7501,6 +7502,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
             vcc_carry.finish_exit(rs);
+            mark_loop_exit_slots(rs, check_marks);   // #4706
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
@@ -7634,7 +7636,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         if (!join_entry_m0(rs, r, pre_entry_m0.count(r) != 0)) continue;   // #3133
                         rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
                     }
-                    join_merge_scc(rs, pre_marks);   // #4706
+                    join_merge_scc_and_slots(rs, pre_marks);   // #4706
                     if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
@@ -7720,7 +7722,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         // `rs` is the else edge here (the then arm's state was rolled back).
                         if (!join_entry_m0(rs, r, then_entry_m0.count(r) != 0)) continue;   // #3133
                         if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
-                    join_merge_scc(rs, then_marks);   // #4706
+                    join_merge_scc_and_slots(rs, then_marks);   // #4706
                     if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
                                                  rs.scc ? rs.scc : b.bfalse(), elseEnd);
