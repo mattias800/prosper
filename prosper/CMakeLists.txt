@@ -1924,7 +1924,7 @@ if(TARGET prosper_core)
   target_include_directories(test_texture_direct_validation PRIVATE frontends)
   target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)
 
-  # The census arithmetic behind PROSPER_VALIDATION_MAPPING_CENSUS (which kind of host memory backs the
+  # The census arithmetic behind the [validation-census] exit summary (which kind of host memory backs the
   # fully-compared guest ranges). Header-only apart from the platform classifier it declares, which
   # prosper_core provides.
   prosper_add_gtest(test_validation_mapping_census

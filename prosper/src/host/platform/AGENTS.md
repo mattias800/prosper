@@ -34,7 +34,7 @@ fake clock on every platform. Put the next one here too rather than inline at a 
 
 **`mapping_class.hpp`** answers one diagnostic question straight from the OS: is an address `MEM_PRIVATE` or a
 `MEM_MAPPED` section view? Windows `GetWriteWatch` covers only the former, so the answer bounds what a
-fault-free write watch could ever track (`PROSPER_VALIDATION_MAPPING_CENSUS`).
+fault-free write watch could ever track (the `[validation-census]` exit summary).
 
 **This folder is also where the host-platform seam grows**: one interface per OS service (virtual
 memory, futex, threads, fibers, fault install, clocks, files) with one backend file per OS, so

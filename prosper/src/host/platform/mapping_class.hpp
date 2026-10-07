@@ -5,7 +5,7 @@
 // ERROR_INVALID_PARAMETER, so a fault-free write watch there is bounded by how much of the guest's
 // memory is MEM_PRIVATE versus MEM_MAPPED. This answers that question straight from the OS, with no
 // dependence on how the memory HLE tracks its own mappings. Used by the validation census
-// (PROSPER_VALIDATION_MAPPING_CENSUS).
+// (the [validation-census] exit summary).
 #include <cstdint>
 
 namespace prosper::host {
@@ -18,5 +18,9 @@ enum class MappingClass : int {
 };
 
 MappingClass classify_host_mapping(uint64_t address);
+
+// Whether the classes distinguish anything on this platform. False where every address is `Other`, so a
+// report need not print rows that read like a measurement but are a constant.
+bool host_mapping_classification_informative();
 
 }  // namespace prosper::host
