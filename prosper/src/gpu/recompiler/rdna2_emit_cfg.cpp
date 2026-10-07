@@ -3579,7 +3579,24 @@ bool emit_cfg_state_machine(
             entry_block != UINT32_MAX && entry_m0_reachable[entry_block];
         const std::set<int>& entry_m0_here =
             narrow ? entry_m0_in[entry_block] : entry_m0_may_hold;
+        // The MAY set above has no KILL, so a register that saved entry M0 once keeps its token at
+        // every later block entry, even after the program has reused it for ordinary data. The
+        // Wave64 MUST analysis below is that KILL for the dispatcher blocks it covers: a word in
+        // `wave64_scalar_word_in` had a value-publishing scalar write after the last save on EVERY
+        // path to this entry (the save itself leaves the word out of that set while M0 has no
+        // value, and records it in `wave64_m0_token_word_in` instead). That is the same validity
+        // tag the filter below relies on to trust every other reloaded scalar, so the reloaded
+        // Function variable is the register's real value, not the save's zero placeholder.
+        // Kena's compute program `0x5008dc0000` saves M0 into s14 at pc85, uses s14 as a mask
+        // half and then as a loop counter (`s_mov_b32 s14, 0` at pc490), and was refused at the
+        // counter's first read in the next block (pc491). The terminal call keeps the whole-stream
+        // set for the reason given above.
+        const std::set<int>* m0_kill_words = nullptr;
+        if (narrow && (b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+            wave64_b64_reachable[entry_block])
+            m0_kill_words = &wave64_scalar_word_in[entry_block];
         for (int reg : entry_m0_here) {
+            if (m0_kill_words && m0_kill_words->contains(reg)) continue;
             state.sreg.erase(reg);
             state.sreg_entry_m0.insert(reg);
         }

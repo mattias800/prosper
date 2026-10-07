@@ -2035,8 +2035,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // used for wave masks: select this guest lane's 32-bit half, then extract its bit.
                     // GTA copies EXEC_LO/HI ballots into scalar scratch and intersects that pair with
                     // VCC at pc1467; Sonic Frontiers Cyber Space uses s[0:1]={1,1} intersected with VCC.
-                    // Both halves must exist.
-                    if (b.is_compute && b.wave_size == 64 &&
+                    // Both halves must exist. A Wave64 fragment's guest_lane_id() is exact (#4706).
+                    if ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
                         (o.kind == OperandKind::SGPR ||
                          (o.kind == OperandKind::Special &&
                           (o.value == 106 || o.value == 107)))) {
@@ -4950,14 +4950,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
                 // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
-                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP and
-                // OMOD keep rejecting too -- their denormal behaviour needs its own contract.
-                if (in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[1] || in.src_neg[2] ||
-                    in.clamp || in.omod) {
+                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP is
+                // the ordinary float saturate of the exact result via fresult() (Kena #4706,
+                // `d762800c,0001850c`; CONFIDENCE: HIGH). OMOD keeps rejecting: hardware ignores it
+                // on f32 with denormals enabled, so it needs the MODE contract.
+                if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = b.ldexp_f32_bits(fv(0), val(in.src[1]));
+                    vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
                 }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):

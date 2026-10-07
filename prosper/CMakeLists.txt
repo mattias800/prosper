@@ -5261,6 +5261,20 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
+      # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
+      prosper_add_gtest(test_entry_m0_wave64_kill
+        SOURCES tests/gpu/recompiler/test_entry_m0_wave64_kill.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A Wave64 pixel shader's B64 mask logical over a scalar DATA pair projects the pair onto
+      # the pixel's own lane bit (Kena 0x5008cc0000, #4706); rendered where 64 lanes can be required.
+      prosper_add_gtest(test_fragment_scalar_pair_mask
+        SOURCES tests/gpu/execute/test_fragment_scalar_pair_mask.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops
