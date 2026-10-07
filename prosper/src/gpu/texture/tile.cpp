@@ -93,11 +93,14 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
 }
 
 bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8,
-                                 bool metadata_is_dcc) {
-    // The materializer writes RGBA8 texels, so a narrow surface is admitted only when its decoded
-    // buffer really is RGBA8, and only for a DCC plane: HTILE bytes (a depth view) are not clear
-    // codes even when they happen to look uniform (#4699 review N1).
-    return num_components >= 3u || (decoded_rgba8 && metadata_is_dcc);
+                                 bool metadata_is_dcc, bool metadata_is_htile,
+                                 bool format_cannot_be_depth) {
+    if (num_components >= 3u) return true;
+    // The materializer writes RGBA8 texels, so a narrow surface needs a decoded RGBA8 buffer. HTILE
+    // bytes (a depth view) are not clear codes even when they look uniform, so a plane known to be
+    // HTILE is refused, and a plane nobody could classify (guest-produced, not retained by the
+    // renderer) is taken as DCC only when its format cannot be a depth view at all (#4699 N1).
+    return decoded_rgba8 && !metadata_is_htile && (metadata_is_dcc || format_cannot_be_depth);
 }
 
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
