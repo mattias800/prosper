@@ -1126,18 +1126,46 @@ static prosper::frontend::AppConfig load_app_config() {
 
 // Persist the settings. Best-effort: failing to write is reported and otherwise ignored, since the
 // app is perfectly usable without persistence and a read-only home must not stop a game running.
+//
+// Written atomically through a sibling temp file plus rename: the previous fopen("wb") truncated
+// the file first, so a second process reading (or a kill landing) mid-write saw an empty file and
+// wrote back a config holding only its own entry — silently deleting games_dir, guest_args and
+// everything else. A rename is atomic on both POSIX and Windows (MoveFileEx REPLACE_EXISTING),
+// so a reader sees the old file or the new one, never a half.
 static bool save_app_config(const prosper::frontend::AppConfig& cfg) {
     const std::string path = app_config_path();
     if (path.empty()) return false;
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     const std::string text = prosper::frontend::serialize_app_config(cfg);
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) { fprintf(stderr, "[app] could not write settings to %s\n", path.c_str()); return false; }
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) { fprintf(stderr, "[app] could not write settings to %s\n", tmp.c_str()); return false; }
     const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool flushed = ok && std::fflush(f) == 0;
     std::fclose(f);
-    if (!ok) fprintf(stderr, "[app] settings write to %s was incomplete\n", path.c_str());
-    return ok;
+    if (!flushed) {
+        fprintf(stderr, "[app] settings write to %s was incomplete\n", tmp.c_str());
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+#ifdef _WIN32
+    if (!MoveFileExA(tmp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        fprintf(stderr, "[app] could not install settings to %s\n", path.c_str());
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+#else
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp, path, rename_ec);
+    if (rename_ec) {
+        fprintf(stderr, "[app] could not install settings to %s\n", path.c_str());
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+#endif
+    return true;
 }
 
 // The title component of an F9 capture's filename, plus the label its log line says.
@@ -2636,6 +2664,19 @@ int main(int argc, char** argv) {
     const SDL_WindowFlags initialWindowFlags = SDL_GetWindowFlags(win);
     bool fullscreenRequested = (initialWindowFlags & SDL_WINDOW_FULLSCREEN) != 0;
     windowControls.set_app_focus((initialWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
+    // One fullscreen path for the F11 hotkey and the toolbar button alike.
+    auto toggle_fullscreen = [&]() {
+        // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
+        // target instead of reading a flag that can still describe the old state.
+        const bool targetFullscreen = !fullscreenRequested;
+        if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
+            fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
+        } else {
+            fullscreenRequested = targetFullscreen;
+            swapchainDirty = true;
+            fprintf(stderr, "[app] fullscreen %s requested\n", targetFullscreen ? "on" : "off");
+        }
+    };
 
     // --fps. Brought up lazily, on the first frame that actually reaches the swapchain: at this
     // point the swapchain may not be final (the window can still be resized into fullscreen), and
@@ -2683,6 +2724,32 @@ int main(int argc, char** argv) {
     if (wantLibrary) {
         libraryUi.set_music_preference(appConfig.launcher_music);
         libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
+        // Recent rows show game names, not raw paths: read each root's own param.json the
+        // same way the library scan does (no boot, no guest). Unreadable roots keep their
+        // basename so a removed dump still says which entry died; a drive root has no
+        // basename, so there the root itself is the name.
+        {
+            std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
+            for (const std::string& root : appConfig.recent_games) {
+                const std::string json =
+                    host_library_io().read_file(root + "/sce_sys/param.json");
+                const std::string name = prosper::frontend::parse_param_title_name(json);
+                const std::string id = prosper::frontend::parse_param_title_id(json);
+                std::string label;
+                if (!name.empty() && !id.empty())
+                    label = name + "  (" + id + ")";
+                else if (!name.empty())
+                    label = name;
+                else if (!id.empty())
+                    label = id;
+                else {
+                    const std::string folder = prosper::frontend::path_basename(root);
+                    label = folder.empty() ? root : folder;
+                }
+                recents.push_back({root, label});
+            }
+            libraryUi.set_recent(std::move(recents));
+        }
         if (libraryUi.init(win, vk.instance, vk.phys, vk.device, vk.qfamily, vk.queue, vk.swapchain,
                            vk.scFormat, vk.scImages, vk.scExtent)) {
             rescan_library();
@@ -2701,6 +2768,15 @@ int main(int argc, char** argv) {
     // folder of photos should not mean a dialog per file). Reset at the top of each batch.
     bool openedThisBatch = false;
     bool rejectedThisBatch = false;
+
+    // Remember an interactive open in File > Recent games. Best-effort and interactive-only:
+    // argv boots never pass through here, so scripted and agent runs leave no trace in the menu.
+    auto record_recent = [](const std::string& root) {
+        prosper::frontend::AppConfig cfg = load_app_config();
+        prosper::frontend::note_recent_game(cfg, root);
+        if (!save_app_config(cfg))
+            fprintf(stderr, "[app] could not record the recent game\n");
+    };
 
     // Returns true when the path actually started something (booted here, or handed off to a new
     // process) — false when it was rejected or the start failed, so a caller can tell an ignored
@@ -2729,6 +2805,7 @@ int main(int argc, char** argv) {
                     root.c_str());
             if (relaunch_with_dump(argc, argv, root)) {
                 running = false;
+                record_recent(root);
                 return true;
             }
             fprintf(stderr, "[app] could not start the new process\n");
@@ -2768,6 +2845,7 @@ int main(int argc, char** argv) {
                 libraryUi.shutdown();
             }
 #endif
+            record_recent(root);
             return true;
         }
         }
@@ -3021,20 +3099,9 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "[app] %s at guest flip boundary\n",
                             paused ? "pause requested" : "resumed");
                     break;
-                case prosper::frontend::AppWindowCommand::toggle_fullscreen: {
-                    // SDL may apply fullscreen requests asynchronously. Toggle the last accepted
-                    // target instead of reading a flag that can still describe the old state.
-                    const bool targetFullscreen = !fullscreenRequested;
-                    if (!SDL_SetWindowFullscreen(win, targetFullscreen)) {
-                        fprintf(stderr, "[app] fullscreen toggle failed: %s\n", SDL_GetError());
-                    } else {
-                        fullscreenRequested = targetFullscreen;
-                        swapchainDirty = true;
-                        fprintf(stderr, "[app] fullscreen %s requested\n",
-                                targetFullscreen ? "on" : "off");
-                    }
+                case prosper::frontend::AppWindowCommand::toggle_fullscreen:
+                    toggle_fullscreen();
                     break;
-                }
                 case prosper::frontend::AppWindowCommand::none:
                     break;
                 }
@@ -3265,6 +3332,26 @@ int main(int argc, char** argv) {
                     // raised while another picker is already up would claim that picker's answer.
                     if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
+                case prosper::frontend::LibraryAction::Kind::pick_game:
+                    // Like Ctrl+O: the answer parks and boots via open_game() below, because no
+                    // library flag claims it.
+                    open_folder_picker(win);
+                    break;
+                case prosper::frontend::LibraryAction::Kind::rescan:
+                    rescan_library();
+                    break;
+                case prosper::frontend::LibraryAction::Kind::toggle_fullscreen:
+                    toggle_fullscreen();
+                    break;
+                case prosper::frontend::LibraryAction::Kind::show_in_explorer: {
+                    // A file:// URL opens the containing folder in the OS file manager on every
+                    // desktop OS; SDL picks the right handler, so this needs no platform branch.
+                    if (!SDL_OpenURL(
+                            prosper::frontend::file_url_for_path(act.app0_root).c_str()))
+                        fprintf(stderr, "[app] could not open %s: %s\n", act.app0_root.c_str(),
+                                SDL_GetError());
+                    break;
+                }
                 case prosper::frontend::LibraryAction::Kind::quit:
                     running = false;
                     break;

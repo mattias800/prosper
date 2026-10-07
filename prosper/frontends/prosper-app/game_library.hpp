@@ -37,6 +37,8 @@ struct GameEntry {
     std::string title_id;    // e.g. "PPSA24651"; "" when param.json has none
     std::string title_name;  // e.g. "The Messenger"; falls back to the app0 basename
     std::string icon_path;   // sce_sys/icon0.png, or "" when absent
+    std::string version;     // contentVersion, e.g. "01.000.006"; "" when absent
+    std::string region;      // contentId prefix, e.g. "EP"; "" when absent
 };
 
 // The JSON string value following the first "titleName" in [from, limit). Returns "" when absent.
@@ -149,15 +151,37 @@ inline std::string parse_param_title_name(const std::string& json) {
     return title;
 }
 
-// The title's content id ("titleId": "PPSA24651"). Returns "" when absent.
-inline std::string parse_param_title_id(const std::string& json) {
-    size_t k = json.find("\"titleId\"");
+// The JSON string value for a top-level key ("titleId": "PPSA24651"). Returns "" when absent
+// or malformed. One helper rather than one scanner per key: titleId, contentId and
+// contentVersion are all read this way, and three copies of the quote walk would drift apart.
+inline std::string parse_param_string_value(const std::string& json, const std::string& key) {
+    size_t k = json.find("\"" + key + "\"");
     if (k == std::string::npos) return "";
     k = json.find(':', k); if (k == std::string::npos) return "";
     k = json.find('"', k); if (k == std::string::npos) return "";
     const size_t end = json.find('"', k + 1);
     if (end == std::string::npos) return "";
     return json.substr(k + 1, end - k - 1);
+}
+
+// The title's content id ("titleId": "PPSA24651"). Returns "" when absent.
+inline std::string parse_param_title_id(const std::string& json) {
+    return parse_param_string_value(json, "titleId");
+}
+
+// The application version ("contentVersion": "01.000.006"). Returns "" when absent.
+inline std::string parse_param_content_version(const std::string& json) {
+    return parse_param_string_value(json, "contentVersion");
+}
+
+// The store region from the content id ("contentId": "EP0700-PPSA19990_00-..."): the two
+// region letters heading the prefix ("EP"). Shown as-is rather than mapped to a flag — the code
+// is what the dump says, a flag would be prosper asserting what it means.
+inline std::string parse_param_region(const std::string& json) {
+    const std::string content_id = parse_param_string_value(json, "contentId");
+    const size_t dash = content_id.find('-');
+    if (dash == std::string::npos || dash < 2) return "";
+    return content_id.substr(0, 2);
 }
 
 // The last path component, used as the display name when param.json gives none.
@@ -184,6 +208,8 @@ inline GameEntry describe_game(const std::string& app0_root, const GamePathProbe
     if (!json.empty()) {
         entry.title_id = parse_param_title_id(json);
         entry.title_name = parse_param_title_name(json);
+        entry.version = parse_param_content_version(json);
+        entry.region = parse_param_region(json);
     }
     if (entry.title_name.empty()) entry.title_name = path_basename(entry.app0_root);
     // Record the resolved spelling, not the requested one: the probe corrects case, so storing the
@@ -208,6 +234,22 @@ inline bool game_entry_display_less(const GameEntry& a, const GameEntry& b) {
     if (an != bn) return an < bn;
     if (a.title_id != b.title_id) return a.title_id < b.title_id;
     return a.app0_root < b.app0_root;
+}
+
+// Case-insensitive substring match over what the list shows (name, title id, path): the
+// search box. An empty needle matches everything, so a cleared box is the unfiltered list.
+inline bool game_entry_matches_filter(const GameEntry& e, const std::string& needle) {
+    if (needle.empty()) return true;
+    const auto fold = [](const std::string& s) {
+        std::string out = s;
+        std::transform(out.begin(), out.end(), out.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return out;
+    };
+    const std::string n = fold(needle);
+    return fold(e.title_name).find(n) != std::string::npos ||
+           fold(e.title_id).find(n) != std::string::npos ||
+           fold(e.app0_root).find(n) != std::string::npos;
 }
 
 // Every PS5 title at `games_dir`, in display order: the directory itself when IT is a title

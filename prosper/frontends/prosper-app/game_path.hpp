@@ -88,6 +88,25 @@ inline bool picked_folder_is_title(const std::string& picked, const GamePathProb
     return resolve_app0_root(picked, probe) == strip_trailing_separators(picked);
 }
 
+// A file:// URL that opens `path` in the OS file manager: forward slashes throughout, the
+// drive-letter, POSIX and UNC shapes each prefixed correctly, and the three characters that
+// break a URL (space, #, and the escape itself) percent-encoded.
+inline std::string file_url_for_path(const std::string& path) {
+    std::string slashes = path;
+    for (char& c : slashes)
+        if (c == '\\') c = '/';
+    std::string encoded;
+    for (unsigned char c : slashes) {
+        if (c == '%') encoded += "%25";
+        else if (c == ' ') encoded += "%20";
+        else if (c == '#') encoded += "%23";
+        else encoded += static_cast<char>(c);
+    }
+    if (encoded.rfind("//", 0) == 0) return "file:" + encoded;   // UNC \\server\share
+    if (!encoded.empty() && encoded[0] == '/') return "file://" + encoded;
+    return "file:///" + encoded;                                 // drive-letter path
+}
+
 // A guest cannot be torn down in-process: run_entry() never observes prosper_request_stop(), so the
 // app exits rather than joining it (#352). Until that lands, a second title needs a second process.
 //

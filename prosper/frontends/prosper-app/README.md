@@ -152,18 +152,24 @@ points is worth more than pre-filtering the list.
 
 ### The library view
 
-With a games directory set, launching with no game shows a grid of cover art instead of an empty
-window. Arrow keys move the selection, Enter/Space opens the highlighted title, clicking a cover opens it
-directly, and **Change folder...** picks a different games directory and remembers it. Esc quits. With no
-directory set yet, the window explains that and offers the same folder picker on Enter or a click.
+With a games directory set, launching with no game shows a game list instead of an empty
+window: cover thumbnail, name, serial, region, version and folder, with a search box, a Rescan
+button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space opens
+the highlighted title, and a double-click opens directly; **Change folder...** picks a different
+games directory and remembers it. Esc quits. With no directory set yet, the window explains that
+and offers the same folder picker on Enter or a click.
+
+Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
+the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either
+exists on a dump, and a recursive size walk over a 100 GB title is not something the UI thread
+does while you browse.
 
 Keyboard and mouse only for now — **controller navigation is not implemented** (tracked separately).
 Nothing initializes SDL's gamepad subsystem while the library is up: the pad backend does that inside
 the guest boot, by which point the library is gone.
 
 Cover art is each dump's `sce_sys/icon0.png`. A title whose icon is missing or undecodable still appears
-as a launchable button labelled with its content id — what matters is that it is bootable, not that it
-has a picture.
+as a launchable row — what matters is that it is bootable, not that it has a picture.
 
 The view is drawn with Dear ImGui on the app's existing Vulkan device and swapchain
 (`third_party/imgui`), and disappears the moment a guest boots: prosper runs one game per launch, so the
@@ -171,8 +177,9 @@ library never draws over a running title. If it cannot be brought up — no ImGu
 device that refuses the render pass — the window falls back to the flat idle colour and every
 command-line path keeps working.
 
-Selection movement lives in `library_nav.hpp`, which is pure and unit-tested, so the grid's behaviour is
-covered in ordinary CI rather than only by someone pressing arrow keys.
+Search matching lives in `game_entry_matches_filter` and the keyboard gate in `list_nav.hpp`, both
+pure and unit-tested, so they are covered in ordinary CI rather than only by someone typing in
+the box.
 
 #### Descriptor capacity
 
