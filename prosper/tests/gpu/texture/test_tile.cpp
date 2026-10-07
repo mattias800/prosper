@@ -1097,6 +1097,7 @@ TEST(Tile, Contract) {
               clear_pixels == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
               "uniform DCC_CLEAR_0001 materializes color zero and MSB alpha one");
         const std::vector<uint8_t> clear_0000(16, 0x00);
+        const std::vector<uint8_t> clear_1110(16, 0x80);
         const std::vector<uint8_t> clear_1111(16, 0xc0);
         CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                          clear_0000.data(), clear_0000.size(), 4, true) &&
@@ -1107,7 +1108,6 @@ TEST(Tile, Contract) {
               clear_pixels[0] == 255 && clear_pixels[1] == 255 &&
               clear_pixels[2] == 255 && clear_pixels[3] == 255,
               "uniform DCC_CLEAR_0000 and DCC_CLEAR_1111 materialize all-zero/all-one");
-        const std::vector<uint8_t> clear_1110(16, 0x80);
         CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                          clear_1110.data(), clear_1110.size(),
                                          4, false) &&
@@ -1141,10 +1141,35 @@ TEST(Tile, Contract) {
         CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
                                          2, true) &&
               narrow == std::vector<uint8_t>({255, 255, 0, 255, 255, 255, 0, 255}) &&
-              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0001.data(), clear_0001.size(),
-                                         2, true) &&
+              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(),
+                                         2, false) &&
               narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
               "two-component DCC clears fill RG; absent components read (0,0,0,1)");
+        // Codes 0x40 (0001) and 0x80 (1110) give colour and alpha different values, and a narrow
+        // surface has no alpha channel to say which component takes which: refuse, for every
+        // component count and both ALPHA_IS_ON_MSB settings, rather than guess (#4699 review B1).
+        bool narrow_split_refused = true;
+        for (uint32_t comps = 1; comps <= 2; ++comps)
+            for (bool msb : {false, true})
+                narrow_split_refused &=
+                    !gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0001.data(),
+                                                clear_0001.size(), comps, msb) &&
+                    !gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1110.data(),
+                                                clear_1110.size(), comps, msb);
+        CHECK(narrow_split_refused, "one/two-component 0x40 and 0x80 clears stay refused");
+        // The four-component alpha mapping is unchanged by the narrow rule.
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, clear_0001.data(),
+                                         clear_0001.size(), 4, true),
+              "four-component 0x40 is still materialized");
+        // Admission: narrow surfaces need an RGBA8 decode buffer AND a DCC plane (HTILE is not DCC).
+        CHECK(gfx10_dcc_fast_clear_admits(4, false, false) &&
+              gfx10_dcc_fast_clear_admits(3, false, false) &&
+              gfx10_dcc_fast_clear_admits(1, true, true) &&
+              gfx10_dcc_fast_clear_admits(2, true, true) &&
+              !gfx10_dcc_fast_clear_admits(1, true, false) &&
+              !gfx10_dcc_fast_clear_admits(2, false, true) &&
+              !gfx10_dcc_fast_clear_admits(1, false, false),
+              "narrow DCC fast-clear admission needs an RGBA8 buffer and a DCC metadata plane");
         CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                           mixed_clear.data(), mixed_clear.size(), 4, true) &&
               !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,

@@ -297,9 +297,12 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
 // 0000/0001/1110/1111 codes; register clears, single-color codes, uncompressed (0xff), and actual
 // compressed blocks return false. Formats without an alpha channel receive the sampled-format
 // default alpha of one, and absent colour components the default zero (one component -> (c,0,0,1),
-// two -> (c,c,0,1)). One and two components were added when Black Flag's fast-cleared R16F pool
+// two -> (c,c,0,1)); on those the codes 0x40/0x80, whose colour and alpha differ, stay refused. One and two components were added when Black Flag's fast-cleared R16F pool
 // surfaces were sampled as their stale base bytes instead of the clear colour (#4131). `alpha_is_on_msb` selects the raw component
 // that receives the clear alpha on four-component formats before the T# destination swizzle is applied.
+// Whether a surface may be handed to gfx10_dcc_fast_clear_rgba8 at all: three or more components,
+// or a narrow surface whose decoded upload buffer is RGBA8 and whose metadata plane is DCC.
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc);
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,

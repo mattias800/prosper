@@ -1,5 +1,6 @@
 #pragma once
 // Private image materialization interface; references retain the draw builder's ownership.
+#include "shared/live/submit_renderer/dcc_fast_clear_admission.hpp"
 #include "shared/live/submit_renderer/draw_resources.hpp"
 
 namespace prosper::frontend::submit_renderer {

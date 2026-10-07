@@ -92,6 +92,14 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
     return bytes <= std::numeric_limits<size_t>::max() ? static_cast<size_t>(bytes) : 0;
 }
 
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8,
+                                 bool metadata_is_dcc) {
+    // The materializer writes RGBA8 texels, so a narrow surface is admitted only when its decoded
+    // buffer really is RGBA8, and only for a DCC plane: HTILE bytes (a depth view) are not clear
+    // codes even when they happen to look uniform (#4699 review N1).
+    return num_components >= 3u || (decoded_rgba8 && metadata_is_dcc);
+}
+
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,
@@ -106,12 +114,16 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                      [=](uint8_t value) { return value == code; }))
         return false;
 
+    // 0x40 / 0x80 give colour and alpha different values (0001 / 1110). Which narrow component is
+    // the alpha channel is the descriptor's call, and a one- or two-component surface has no
+    // alpha to give it a meaning, so only the codes where colour == alpha (0x00, 0xc0) are
+    // materialized there; the others stay refused instead of guessing (#4699 review B1).
+    if (num_components < 3 && (code == 0x40 || code == 0x80))
+        return false;
     const uint8_t color = (code == 0x80 || code == 0xc0) ? 255 : 0;
     uint8_t pixel[4] = {color, color, color, 255};
     // One- and two-component surfaces: the clear colour fills the components that exist, and the
     // absent ones read the sampled-format default (0,0,0,1) like every other narrow decode here.
-    // The embedded code is format-independent (it names "all colour channels 0/1" and alpha 0/1),
-    // so only which output channels carry the colour changes.
     if (num_components == 1) { pixel[1] = 0; pixel[2] = 0; }
     else if (num_components == 2) { pixel[2] = 0; }
     if (num_components == 4) {
