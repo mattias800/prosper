@@ -6,10 +6,9 @@ A fresh probe process discovers those sizes before the two pressure processes se
 """
 
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 PREFIX = "[compute-buffer-timing] "
 FIXTURE = "[buffer-residency-fixture] "
@@ -55,7 +54,7 @@ def run(binary, mode, cap_mib, large_bytes=None):
     if large_bytes is not None:
         command.append(str(large_bytes))
     result = subprocess.run(command, env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            capture_output=True,
                             text=True, timeout=120, check=False)
     # Preserve validation-layer messages for the outer suite's scanner on success as well.
     sys.stdout.write(result.stdout)

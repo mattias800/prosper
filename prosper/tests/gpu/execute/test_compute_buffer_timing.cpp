@@ -109,10 +109,10 @@ struct GuestBuffer {
     uint32_t last_word = 0xababababu;
     bool correct() const {
         constexpr size_t words = bytes / sizeof(uint32_t);
-        return std::equal(std::begin(fill), std::end(fill), data) &&
-            std::all_of(data + 4, data + words - 1,
-                        [](uint32_t word) { return word == 0xababababu; }) &&
-            data[words - 1] == last_word;
+        if (!std::equal(std::begin(fill), std::end(fill), data)) return false;
+        const auto untouched = [](uint32_t word) { return word == 0xababababu; };
+        if (!std::all_of(data + 4, data + words - 1, untouched)) return false;
+        return data[words - 1] == last_word;
     }
 };
 } // namespace

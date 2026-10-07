@@ -8,13 +8,12 @@ positive arm. Each process starts with a fresh buffer cache and lazy diagnostic 
 
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from compute_buffer_cache_report import summarize
-
 
 PREFIX = "[compute-buffer-timing] "
 FIXTURE = "[buffer-timing-fixture] "
@@ -269,7 +268,7 @@ def check_census(lines, rows):
             elif address in last:
                 require(number(row, "last-use") > last[address], "active owner lost reuse evidence")
             last[address] = number(row, "last-use")
-    require(all(a < b for a, b in zip(clocks, clocks[1:])), "cache clock did not advance")
+    require(all(a < b for a, b in zip(clocks, clocks[1:], strict=False)), "cache clock did not advance")
     require(len(owners) == 10, "census owner population mismatch")
     report = summarize(lines)
     require(report["snapshots"] == 8 and len(report["owners"]) == 2,
@@ -344,7 +343,7 @@ def run_fixture(binary, mode, directory, block_sync=True):
     if mode != "selected":
         environment["PROSPER_COMPUTE_BUFFER_CACHE_CENSUS"] = "1"
     result = subprocess.run([str(binary), mode, str(directory)], env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            capture_output=True,
                             text=True, timeout=120, check=False)
     # Keep all layer messages visible to the outer suite's validation scanner, including success.
     sys.stdout.write(result.stdout)
