@@ -2904,20 +2904,6 @@ struct RegState {
     // statically observed SGPR and may load a zero placeholder where no scalar lifetime reaches the
     // block. Keep that distinction explicit so a narrow prefix proof cannot weaken either route.
     bool scalar_presence_has_no_placeholders = true;
-    // The per-register form of that fact (#4706). An SGPR is here when its current value may be
-    // the structured emitter's fabricated zero on some path: an if-merge or loop-header phi took
-    // `sget()`'s `uconst(0)` from an edge where the register had no value, or the value was computed
-    // from such a register. A scalar write whose scalar sources are all definite clears the mark.
-    // `lane_slot_merge_placeholder` carries the same mark through a v_writelane/v_readlane spill.
-    // The dispatcher needs neither: its `load_state` drops every word the Wave64 MUST analysis
-    // cannot prove. Consumers that turn scalar DATA into lane bits consult it (mask()).
-    std::set<int> sreg_merge_placeholder;
-    std::set<std::pair<int, int>> lane_slot_merge_placeholder;
-    // Same propagation, second fact: the SGPR's bits came from MEMORY (an SMEM load, or scalar ALU
-    // over one). Such a word is not a ballot of this wave, so projecting it onto host lanes would
-    // select different pixels than the PS5 does whenever the pattern is not uniform.
-    std::set<int> sreg_memory_pattern;
-    std::set<std::pair<int, int>> lane_slot_memory_pattern;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
@@ -3438,120 +3424,9 @@ inline bool join_entry_m0(RegState& rs, int r, bool other_edge_token) {
     return true;
 }
 
-// Whether the word an edge holds for SGPR `r` may be fabricated: marked, or absent from `sreg`
-// while no mask covers it (absence reads as `sget()`/`operand_bits`'s `uconst(0)`). A Bool-domain
-// mask is a real value; its ballot words are materialized where a data read needs them.
-inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
-    if (r < 0 || r > 105) return false;   // VCC/EXEC/M0/specials: never merge-seeded data here
-    if (rs.sreg_merge_placeholder.contains(r)) return true;
-    if (rs.sreg.contains(r)) return false;
-    return !rs.sreg_bool.contains(r) &&
-           !(r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
-}
-
-// Set a merged register's marks from its two incoming edges (#4706). `rs` is one edge; the caller
-// supplies what the other edge held. The merge-placeholder mark is decided from both edges here;
-// the memory mark is a union, so the other edge's mark is added to `rs`'s own.
-inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabricated,
-                                   bool other_edge_memory) {
-    if (either_edge_fabricated)
-        rs.sreg_merge_placeholder.insert(r);
-    else
-        rs.sreg_merge_placeholder.erase(r);
-    if (other_edge_memory) rs.sreg_memory_pattern.insert(r);
-}
-
-// One structured-merge edge's marks (#4706), captured before the other edge is emitted.
-struct MergeEdgeMarks {
-    std::set<int> fabricated;   // registers this edge may hold as a fabricated zero
-    std::set<int> memory;   // this edge's memory-pattern marks
-};
-template <class Registers>
-MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) {
-    MergeEdgeMarks marks;
-    for (int r : registers)
-        if (sreg_word_may_be_fabricated(rs, r)) marks.fabricated.insert(r);
-    marks.memory = rs.sreg_memory_pattern;
-    return marks;
-}
-// Join register `r` at a two-edge merge: `rs` is one edge, `other` the captured other edge.
-inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
-    join_merge_placeholder(rs, r,
-                           other.fabricated.contains(r) || sreg_word_may_be_fabricated(rs, r),
-                           other.memory.contains(r));
-}
-// Every loop-carried SGPR is marked at its loop header: the phi takes the preheader value (the
-// fabricated zero when absent) and the back edge, whose marks are unknown until the body has been
-// emitted. A body write from definite sources clears the mark. At the loop exit a body-only
-// register leaves as that (marked) phi; a condition-region write leaves with its own write's mark.
-template <class Registers>
-void mark_loop_carried(RegState& rs, const Registers& carried) {
-    for (int r : carried) join_merge_placeholder(rs, r, true, false);
-}
-inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition) {
-    join_merge_placeholder(rs, r, !written_in_condition || rs.sreg_merge_placeholder.contains(r),
-                           false);
-}
-
-// Propagate both marks through one emitted instruction (#4706). Runs first in
-// record_scalar_write, after emission but before that function's own bookkeeping; emit_alu does
-// not touch the marks, so `rs` still shows the sources' marks here. Conservative: a scalar source
-// taints both words of a pair it might name, and every destination word of a tainted write is
-// marked. An SMEM load is memory by definition and never a merge placeholder. Not tracked: a value
-// that crosses through a VGPR (v_readfirstlane, a dynamic-lane v_readlane shuffle).
-inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 && in.dst.kind == OperandKind::VGPR &&
-        in.src[1].kind == OperandKind::InlineInt) {
-        const std::pair<int, int> slot{in.dst.value, in.src[1].value};
-        const bool sgpr = in.src[0].kind == OperandKind::SGPR;
-        const auto set_slot = [&](std::set<std::pair<int, int>>& slots, bool marked) {
-            if (marked)
-                slots.insert(slot);
-            else
-                slots.erase(slot);
-        };
-        set_slot(rs.lane_slot_merge_placeholder,
-                 sgpr && sreg_word_may_be_fabricated(rs, in.src[0].value));
-        set_slot(rs.lane_slot_memory_pattern,
-                 sgpr && rs.sreg_memory_pattern.contains(in.src[0].value));
-        return;
-    }
-    bool placeholder = false, memory = in.fmt == Rdna2Format::SMEM;
-    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) {
-        // A constant-lane read of a spill slot inherits the slot's marks.
-        if (in.src[1].kind == OperandKind::InlineInt) {
-            const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
-            placeholder = rs.lane_slot_merge_placeholder.contains(slot);
-            memory = rs.lane_slot_memory_pattern.contains(slot);
-        }
-    } else if (in.fmt != Rdna2Format::SMEM) {
-        for (uint32_t k = 0; k < in.n_src && k < 3; ++k) {
-            const Operand& o = in.src[k];
-            if (o.kind != OperandKind::SGPR) continue;
-            for (int r = o.value; r <= o.value + 1; ++r) {
-                placeholder = placeholder || rs.sreg_merge_placeholder.contains(r);
-                memory = memory || rs.sreg_memory_pattern.contains(r);
-            }
-        }
-    }
-    for_each_scalar_write(in, [&](int base, uint32_t width) {
-        for (int r = base; r < base + static_cast<int>(width); ++r) {
-            if (placeholder)
-                rs.sreg_merge_placeholder.insert(r);
-            else
-                rs.sreg_merge_placeholder.erase(r);
-            if (memory)
-                rs.sreg_memory_pattern.insert(r);
-            else
-                rs.sreg_memory_pattern.erase(r);
-        }
-    });
-}
-
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          bool allow_compute_scalar_vcc_bridge,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
-    propagate_merge_placeholder(rs, in);
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
     // keeping either would let a later descriptor use observe the pre-overwrite value.

@@ -9,14 +9,16 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
-## Past New Game: three refusals fixed; the rest are image descriptors and indexed NGG (2026-10-07, #4706)
+## Past New Game: two refusals fixed; the rest are image descriptors, indexed NGG and one fragment mask (2026-10-07, #4706)
 
 Measured on Linux/RADV with `prosper-app` in a visible window, default launch
 (`PROSPER_NULL_PAGE=1`, `scripts/kena/linux-reach-level-load.pad`), 660 s per arm. Before is `main`
 `74e97be0` plus the `reject=` index field below; after is the #4706 branch. Both arms lose the
 Vulkan device at the first level load (compute program `0x500a380000`, the loss this route already
 records), so the counts below are the programs refused **before** that loss. Program addresses are
-run-local; hashes are stable.
+run-local; hashes are stable. The "#4706" arm also carried the fragment scalar-pair projection.
+That projection has since been split out of #4706 (see below), so without it the pixel
+count is 7, not 6: `f1d1baa8` refuses again.
 
 | | `main` | #4706 |
 |---|---|---|
@@ -28,35 +30,39 @@ run-local; hashes are stable.
   the compute-safe coverage pass. The fragment translator already handles both programs'
   constant-lane spills. `index.txt` and the `[refused-shader]` line now carry the translator's own
   `reject="..."`, so a default run says why without `PROSPER_DBG`.
-- **Fixed, all general:**
+- **Fixed in #4706, all general:**
   - pixel `e8a1ce3b` (2009 dwords): `v_ldexp_f32 v12, v12, -2 clamp` at pc1951. CLAMP on
     `v_ldexp_f32` is now the ordinary float saturate.
-  - pixel `f1d1baa8` (1361): `s_and_b64 s[30:31], s[30:31], s[36:37]` at pc308. s[30:31] is a
-    compare mask (written at pc226), spilled with `v_writelane` at pc252/262 and reloaded with
-    `v_readlane` at pc295/297; s[36:37] is a fresh compare mask. The `s_buffer_load_dwordx2` into
-    s[30:31] at pc219 is overwritten by those reloads. A Wave64 fragment now projects such a data
-    pair onto its lane bit. It does that only when the pair is definitely assigned and does not
-    come from memory (`RECOMPILER_REMAINING.md`, #2790's row). That is exact here because the spill
-    stored the ballot words under the enforced 64-lane subgroup. `eb07b9cf` (1471) has the same
-    instruction shape at pc326 (`s_and_b64 s[42:43], s[40:41], s[42:43]`); its operands were not
-    traced. It was refused after the device loss on `main` and not at all on #4706.
   - compute `0x5008dc0000` (1504): s14 still carried the entry-M0 token from `s_mov_b32 s14, m0` at
     pc85 when pc491 read it as a loop counter. The dispatcher's token now dies where the Wave64 MUST
     analysis proves a data write on every path. The program now refuses later, at pc577, on an
     image descriptor (next bullet).
+- **Not fixed in #4706: pixel `f1d1baa8` (1361).** It refuses at pc308,
+  `s_and_b64 s[30:31], s[30:31], s[36:37]`:
+  - s[30:31] is a compare mask written at pc226, spilled with `v_writelane` at pc252/262 and
+    reloaded with `v_readlane` at pc295/297. The `s_buffer_load_dwordx2` into s[30:31] at pc219 is
+    overwritten by those reloads.
+  - s[36:37] is a fresh compare mask.
+  - The fragment stage refuses to project a scalar data pair onto the lane bit. That stays the case
+    until the projection can prove the pair is definitely assigned (`RECOMPILER_REMAINING.md`,
+    #2790's row). #4711's review found four routes by which a fabricated zero still reached the
+    projection, so it moved to its own PR.
+  - `eb07b9cf` (1471) has the same instruction shape at pc326; its operands were not traced.
 - **What remains before the device loss:**
   - six pixel and six compute programs refused at an image instruction whose descriptor the fold
     cannot resolve (`pc_res=null`). The set is the same on both arms and in 3 of 3 runs. #4710.
   - two indexed merged-NGG draws (`refusal=ngg-indexed`): 6 or 18 16-bit indices, up to 41
-    instances, into 64-slice volumes. This is #3135 P6, recorded there and not started. The
-    `b77161c6` draw became visible only now: before, its pixel program `f1d1baa8` was refused first.
+    instances, into 64-slice volumes. This is #3135 P6, recorded there and not started. With the
+    fragment projection, the `b77161c6` draw reaches this refusal; without it, its pixel program
+    `f1d1baa8` is refused first.
 - **After the device loss** compute is off for the process. About ten NGG VS-only programs are
   refused on `mbcnt-cross-lane` (#4427's class), alongside more image-descriptor refusals. Neither
   arm's post-loss counts are comparable.
 - `[perf-alarm] summary` over each whole run, so including the post-loss part: `dropped-draws`
   `shader-recompile/fragment` 22,952 → 872, `shader-recompile/vertex` 50,544 → 18,615.
   `skipped-dispatches` `shader-recompile` 411 → 184. The arms reached the device loss at different
-  times, so read these as direction, not size.
+  times, so read these as direction, not size. The after arm also carried the split-out fragment
+  projection.
 - **No picture change is claimed.** The route does not reach gameplay on either arm. Frames at host
   frame 1100 land on different scenes (the brightness screen on #4706, the loading screen on
   `main`), so they compare nothing.
@@ -537,8 +543,9 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **Kena's post-New-Game pixel programs `0x5052b20000` / `0x5008cc0000` need `v_writelane_b32` in
   fragment programs** — false. `index.txt`'s `first_bad_op=0x361` came from the compute-safe
   coverage census. The fragment translator accepts both programs' constant-lane spills. The real
-  rejects were `v_ldexp_f32 ... clamp` (pc1951) and `s_and_b64` of a reloaded mask spill with a
-  VOPC mask (pc308), both fixed (2026-10-07, #4706).
+  rejects were `v_ldexp_f32 ... clamp` (pc1951, fixed by #4706) and `s_and_b64` of a reloaded
+  mask spill with a VOPC mask (pc308, still refused: the fragment scalar-pair projection needs a
+  definite-assignment proof first) (2026-10-07, #4706).
 - **The image-descriptor refusals at the first level load are caused by the F9 bundle capture** —
   false. A run with `PROSPER_GRAB_BUNDLE_AFTER_MS` refused them all inside the capture window, but
   a run with no capture and a `main` run refused the same set (2026-10-07, #4710).
