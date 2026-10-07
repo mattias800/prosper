@@ -24,6 +24,8 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -186,7 +188,12 @@ struct HookFixture {
     UnchangedPublicationCensus census;
     int inner_calls = 0;
     const prosper::gpu::LiveTargetImageWrite* last = nullptr;
-    std::filesystem::path dir = std::filesystem::temp_directory_path() / "prosper_unchanged_hook_test";
+    // One directory per test and per run: ctest runs these tests in parallel processes (and other
+    // lanes may run the same binary), so a shared directory would be deleted under a sibling's capture.
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("prosper_unchanged_hook_test_" +
+         std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_" +
+         std::to_string(std::random_device{}()));
     HookFixture() { std::filesystem::create_directories(dir); }
     ~HookFixture() {
         capture.cancel();
