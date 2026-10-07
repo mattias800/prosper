@@ -109,9 +109,8 @@ bool gfx10_dcc_format_never_depth(DataFormat format) {
     }
 }
 
-bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8,
-                                 bool metadata_is_dcc, bool metadata_is_htile,
-                                 bool format_cannot_be_depth) {
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc,
+                                 bool metadata_is_htile, bool format_cannot_be_depth) {
     if (num_components >= 3u) return true;
     // The materializer writes RGBA8 texels, so a narrow surface needs a decoded RGBA8 buffer. HTILE
     // bytes (a depth view) are not clear codes even when they look uniform, so a plane known to be
@@ -124,8 +123,8 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,
                                 uint8_t* clear_code) {
-    if (!metadata || !metadata_bytes ||
-        num_components < 1 || num_components > 4 || (!dst && texel_count))
+    if (!metadata || !metadata_bytes || num_components < 1 || num_components > 4 ||
+        (!dst && texel_count))
         return false;
     const uint8_t code = metadata[0];
     if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0)
@@ -138,14 +137,17 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
     // the alpha channel is the descriptor's call, and a one- or two-component surface has no
     // alpha to give it a meaning, so only the codes where colour == alpha (0x00, 0xc0) are
     // materialized there; the others stay refused instead of guessing (#4699 review B1).
-    if (num_components < 3 && (code == 0x40 || code == 0x80))
-        return false;
+    if (num_components < 3 && (code == 0x40 || code == 0x80)) return false;
     const uint8_t color = (code == 0x80 || code == 0xc0) ? 255 : 0;
     uint8_t pixel[4] = {color, color, color, 255};
     // One- and two-component surfaces: the clear colour fills the components that exist, and the
     // absent ones read the sampled-format default (0,0,0,1) like every other narrow decode here.
-    if (num_components == 1) { pixel[1] = 0; pixel[2] = 0; }
-    else if (num_components == 2) { pixel[2] = 0; }
+    if (num_components == 1) {
+        pixel[1] = 0;
+        pixel[2] = 0;
+    } else if (num_components == 2) {
+        pixel[2] = 0;
+    }
     if (num_components == 4) {
         const uint8_t alpha = (code == 0x40 || code == 0xc0) ? 255 : 0;
         const uint32_t alpha_component = alpha_is_on_msb ? 3u : 0u;
