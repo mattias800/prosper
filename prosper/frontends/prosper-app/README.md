@@ -73,13 +73,15 @@ otherwise face an empty window, so a dump path can also arrive interactively (#1
   `--test-pattern`, which already has something feeding the present layer.
 - **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
   guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
-  something feeding the present layer.
+  something feeding the present layer. With the library up the answer is listed, not booted; Play
+  (or Enter/double-click on its row) is what starts it.
 - **A launch with no arguments at all** opens that picker straight away, so a double-clicked app is not
   a dead end. `--pick` forces it for any launch; `--no-pick` disables it entirely.
 
-A PS5 title is a *directory*, so this is a folder picker, not a file picker. A folder that is not a
-title is reported and changes nothing — including the folder that merely *contains* your games, which
-a library view would scan but this does not.
+A PS5 title is a *directory*, so this is a folder picker, not a file picker. Without the library
+up, a folder that is not a title is reported and changes nothing — including the folder that merely
+*contains* your games, which a library view would scan but this does not. With the library up the
+picked folder becomes the games directory either way, and the list shows what it holds.
 
 **One boot per launch.** `run_entry` does not observe `prosper_request_stop()` yet (#352), so a booted
 guest cannot be torn down. Opening a title after this process has already tried to boot one therefore
@@ -165,7 +167,9 @@ With a games directory set, launching with no game shows a game list instead of 
 window: cover thumbnail, name, serial, region, version and folder, with a search box, a **Refresh
 list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
 opens the highlighted title (not while the search box has focus), and a double-click opens directly;
-**Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
+**Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it,
+while File → **Open game folder...** shows one picked title as the list. Neither boots on pick — Play,
+Enter, or double-click is what starts a game. Esc quits. With no directory set yet, the window explains that
 and offers the same folder picker on Enter or a click.
 
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from

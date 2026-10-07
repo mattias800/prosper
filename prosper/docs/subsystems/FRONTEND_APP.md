@@ -180,8 +180,9 @@ Design points that are deliberate rather than incidental:
 - **`scan_game_library` reuses `resolve_app0_root()`** from the interactive-open path above, so all three
   entry points agree on what a title is. The listing is "what a drop or the picker would accept", which
   is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone. The games directory
-  itself is listed when it is a title root (a dump at a drive root); the library-browse answer still
-  boots such a folder directly instead of scanning inside it.
+  itself is listed when it is a title root (a dump at a drive root); a library picker answer is
+  likewise stored as the games directory and listed — a title picked directly shows as one row —
+  instead of booting. Only Play (or Enter/double-click on a row) boots; drops still boot on arrival.
 - **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
   exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
 

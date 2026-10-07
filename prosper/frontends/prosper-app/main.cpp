@@ -2976,7 +2976,14 @@ int main(int argc, char** argv) {
 #endif
     if (offerPicker) {
         fprintf(stderr, "[app] no game given; opening the folder picker.\n");
-        open_folder_picker(win);
+        const bool pickerClaimed = open_folder_picker(win);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+        // With the library up the answer becomes its games directory (listed, not
+        // booted); Play boots. Without it the answer below boots as before.
+        if (pickerClaimed && libraryUi.ready()) libraryBrowsePending = true;
+#else
+        (void)pickerClaimed;
+#endif
     }
 
     // The automatic capture delay starts at app-loop entry, not process start or guest boot. This
@@ -3177,7 +3184,14 @@ int main(int argc, char** argv) {
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_O && (ev.key.mod & SDL_KMOD_CTRL) &&
                     !g_guest_started && !testPattern) {
-                    open_folder_picker(win);
+                    const bool pickerClaimed = open_folder_picker(win);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+                    // With the library up the answer becomes its games directory (listed,
+                    // not booted); Play boots. Without it the answer below boots as before.
+                    if (pickerClaimed && libraryUi.ready()) libraryBrowsePending = true;
+#else
+                    (void)pickerClaimed;
+#endif
                     continue;
                 }
                 // #1093: forward app-window keys to the guest's IME keyboard path. Titles like
@@ -3270,18 +3284,13 @@ int main(int argc, char** argv) {
             if (libraryBrowsePending && picked.empty() && !pickerStillOpen)
                 libraryBrowsePending = false;
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
-            // a title to boot. Without this the result went to open_game(), which resolves an app0 root
-            // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
-            // One exception: the folder IS a title itself (a dump at a drive root, where F:\ holds
-            // eboot.bin directly). That falls through to open_game() below and boots like a
-            // drop or a Ctrl+O pick instead of scanning inside it for titles it cannot hold.
+            // a title to boot: it is stored and rescanned, and the list shows what it holds — a title
+            // picked directly simply lists as one row. Only Play (or Enter/double-click on a row)
+            // boots; drops still boot on arrival.
             if (!picked.empty() && libraryBrowsePending) {
                 libraryBrowsePending = false;
-                if (prosper::frontend::picked_folder_is_title(picked, host_path_probe())) {
-                    fprintf(stderr, "[app] picked folder is a game itself; opening it\n");
-                } else if (!host_path_probe().is_dir(picked)) {
+                if (!host_path_probe().is_dir(picked)) {
                     libraryStatus = "That is not a folder.";
-                    picked.clear();
                 } else {
                     prosper::frontend::AppConfig cfg = load_app_config();
                     cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
@@ -3290,9 +3299,8 @@ int main(int argc, char** argv) {
                                                         : "Could not save the games folder setting.";
                     fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
                     rescan_library();
-                    picked.clear();
                 }
-                // No clear on the is-title path: `picked` survives so open_game() below boots it.
+                picked.clear();
             }
 #endif
             if (!picked.empty() && !testPattern) {
@@ -3444,9 +3452,10 @@ int main(int argc, char** argv) {
                     if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
                 case prosper::frontend::LibraryAction::Kind::pick_game:
-                    // Like Ctrl+O: the answer parks and boots via open_game() below, because no
-                    // library flag claims it.
-                    open_folder_picker(win);
+                    // Like browse: the answer joins the library as its games directory and is
+                    // listed, not booted — Play boots. Arm only the dialog this request opened,
+                    // for the same reason as browse above.
+                    if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
                 case prosper::frontend::LibraryAction::Kind::rescan:
                     rescan_library();
