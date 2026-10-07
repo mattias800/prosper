@@ -112,30 +112,15 @@ TEST(SplitT8Cache, ProgramPastTheMemoryGuardIsRefused) {
 
 namespace {
 
-// The tail-block program of test_split_t8_tail_blocks: pc3 x8 + pc5 x4 load the T# in s[4:11] through
-// the entry pointer s[10:11]; pc10 image_load; pc16 branches to the block after the first s_endpgm.
-constexpr uint32_t kBody[] = {
-    0xBFA00001u, 0x7E000F02u, 0x7E020F03u, 0xF40C0005u, 0xFA000000u, 0xF4080205u, 0xFA000020u,
-    0xBF8CC07Fu, 0xF4201A80u, 0xFA000000u, 0xF0000108u, 0x00010000u, 0xBF8C0070u, 0x3600006Au,
-    0x7D840080u, 0x8AEA6A7Eu, 0xBF840004u, 0xBEFE046Au, 0xF8001890u, 0x00000000u, 0xBF810000u,
-};
-constexpr size_t kBodyDwords = sizeof(kBody) / sizeof(kBody[0]);
-
 // One fixed buffer, so both programs live at the same address and reach the same decoded program.
 alignas(256) uint32_t g_code[64];
 
 bool image_load_published(const uint32_t* tail, size_t tail_dwords) {
-    std::copy(kBody, kBody + kBodyDwords, g_code);
-    std::copy(tail, tail + tail_dwords, g_code + kBodyDwords);
-    for (uint32_t i = 0; i < 16; ++i) g_table[i] = 0xD1000000u + i;
-    const auto base = reinterpret_cast<uint64_t>(g_table);
-    uint32_t seed[12] = {};
-    seed[10] = static_cast<uint32_t>(base);
-    seed[11] = static_cast<uint32_t>(base >> 32u);
-    std::vector<SrtUse> uses;
-    resolve_dynamic_fetch(g_code, kBodyDwords + tail_dwords, seed, 12, 0, &uses);
-    return std::any_of(uses.begin(), uses.end(),
-                       [](const SrtUse& u) { return u.kind == 0 && u.use_pc == 10u; });
+    const auto& body = test::split_t8_tail_block_body();
+    std::copy(body.begin(), body.end(), g_code);
+    std::copy(tail, tail + tail_dwords, g_code + body.size());
+    return test::split_t8_has_image_use(
+        test::split_t8_uses_for(g_code, body.size() + tail_dwords, 10, 12u), 10u);
 }
 
 }   // namespace
