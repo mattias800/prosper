@@ -92,7 +92,7 @@ enum class DrawDrop : uint8_t {
     VolumeNotPersistent,     // a volume target with persistent colour targets disabled
     VolumeFeedback,          // a volume pass samples the volume it writes (no snapshot yet)
     CommandPool,             // no command pool could be leased for the pass
-    VolumeMultiTarget,       // a volume pass with more than one colour target (#4643)
+    VolumeMultiTarget,       // RETIRED (#4643): multi-target volume passes now render
     VolumeSeeded,            // a single-target volume pass with a CPU seed (multi-target wins)
     VolumeTargetLimits,      // the device cannot hold the volume target or its layer count
     VolumeDepthStencil,      // a volume pass with a depth/stencil attachment
@@ -102,6 +102,7 @@ enum class DrawDrop : uint8_t {
     FramebufferCreation,     // vkCreateFramebuffer failed
     PressureFlush,           // the cache-pressure flush before the pass failed to submit or wait
     NggSubgroup,             // a merged-NGG draw the backend could not run whole (#3135 P5)
+    VolumeMixedTarget,       // colour slots one layered framebuffer cannot hold together (#4643)
     Count
 };
 // clang-format on

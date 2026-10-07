@@ -4,6 +4,7 @@
 #include "shared/live/submit_renderer/resolve_pass.hpp"     // resolve_pass (#3892)
 #include "shared/live/submit_renderer/pass_diagnostics.hpp" // the pass-loop diagnostics (#3892)
 #include "shared/live/submit_renderer/mrt_slots.hpp"        // color_binding, active_format, active_color(_count) (#3892)
+#include "shared/rtt/volume_producer_shape.hpp"   // each volume slot's guest claim (#4643)
 
 namespace prosper::frontend::submit_renderer {
 
@@ -250,22 +251,23 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 return false;
             // One 3D allocation can be written through several bounded slice views.
             // Grouping them into one framebuffer would route later draws to the
-            // first view even though their guest addresses and 2D extents match.
-            const auto& first_view = pass_head.color_targets[0];
-            const auto& next_view = draw.color_targets[0];
-            if (std::tuple(first_view.selected_mip_depth,
-                           first_view.first_slice, first_view.slice_count) !=
-                std::tuple(next_view.selected_mip_depth,
-                           next_view.first_slice, next_view.slice_count))
-                return false;
-            if (first_view.selected_mip_depth &&
-                std::tuple(first_view.tile_mode, first_view.mip_level,
-                           first_view.in_mip_tail,
-                           first_view.native_layout_known) !=
-                std::tuple(next_view.tile_mode, next_view.mip_level,
-                           next_view.in_mip_tail,
-                           next_view.native_layout_known))
-                return false;
+            // first view even though their guest addresses and 2D extents match. Every
+            // slot of a layered pass carries its own view (#4643).
+            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+                const auto& first_view = pass_head.color_targets[slot];
+                const auto& next_view = draw.color_targets[slot];
+                if (std::tuple(first_view.selected_mip_depth, first_view.first_slice,
+                               first_view.slice_count) != std::tuple(next_view.selected_mip_depth,
+                                                                     next_view.first_slice,
+                                                                     next_view.slice_count))
+                    return false;
+                if (first_view.selected_mip_depth &&
+                    std::tuple(first_view.tile_mode, first_view.mip_level, first_view.in_mip_tail,
+                               first_view.native_layout_known) !=
+                        std::tuple(next_view.tile_mode, next_view.mip_level, next_view.in_mip_tail,
+                                   next_view.native_layout_known))
+                    return false;
+            }
             if (ds_identity(draw) != ds0) return false;
             return true;
         };
@@ -500,32 +502,19 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         const bool seed_rtt0 = seed_target(base);
         const VkFormat pass_format = format0;
         const auto& primary_volume_view = pass.front()->color_targets[0];
-        const uint32_t producer_volume_depth =
-            primary_volume_view.selected_mip_depth;
-        g_ever_volume_target |= producer_volume_depth != 0u;
-        const uint32_t volume_bpp =
-            prosper::test::backend_color_bytes_per_pixel(format0);
         const uint32_t volume_native_w = native_w ? native_w : gw;
         const uint32_t volume_native_h = native_h ? native_h : gh;
-        const bool producer_volume_layout_supported = producer_volume_depth &&
-            primary_volume_view.native_layout_known &&
-            !primary_volume_view.mip_level &&
-            !primary_volume_view.in_mip_tail &&
-            prosper::gpu::tile_mode_supports_volume(primary_volume_view.tile_mode);
-        const uint64_t producer_volume_physical_bytes =
-            producer_volume_layout_supported
-                ? prosper::gpu::tiled_volume_bytes(
-                      volume_native_w, volume_native_h, producer_volume_depth,
-                      primary_volume_view.tile_mode, volume_bpp)
-                : 0u;
-        const bool producer_volume_footprint_proven =
-            producer_volume_physical_bytes != 0u;
-        const uint64_t producer_volume_guard_bytes =
-            producer_volume_footprint_proven
-                ? producer_volume_physical_bytes
-                : prosper::frontend::live_rtt_color_footprint_bytes(
-                      volume_native_w, volume_native_h,
-                      producer_volume_depth, volume_bpp);
+        // Every volume slot claims its own guest footprint by one rule (#4643).
+        const auto slot_volume_shape = [&](uint32_t slot) {
+            return prosper::frontend::volume_producer_shape(
+                pass.front()->color_targets[slot], volume_native_w, volume_native_h,
+                prosper::test::backend_color_bytes_per_pixel(pass_formats[slot]));
+        };
+        const prosper::frontend::VolumeProducerShape producer_volume = slot_volume_shape(0);
+        const uint32_t producer_volume_depth = producer_volume.depth;
+        const uint64_t producer_volume_physical_bytes = producer_volume.physical_bytes;
+        const bool producer_volume_footprint_proven = producer_volume.proven();
+        const uint64_t producer_volume_guard_bytes = producer_volume.guard_bytes;
         uint32_t mrt_count = requested_color_count;
         if (PROSPER_ENV_ON("PROSPER_NO_MRT1") || PROSPER_ENV_ON("PROSPER_NO_MRT")) mrt_count = 1;
         if (!render_pass.empty()) {
@@ -562,6 +551,13 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             }
         }
         const bool use_color1 = mrt_count > 1;
+        std::array<prosper::frontend::VolumeProducerShape, prosper::gpu::kColorTargetCount>
+            slot_volumes{};
+        slot_volumes[0] = producer_volume;
+        for (uint32_t slot = 1; slot < mrt_count; ++slot)
+            if (pass_bases[slot]) slot_volumes[slot] = slot_volume_shape(slot);
+        for (const auto& slot_volume : slot_volumes)
+            g_ever_volume_target |= slot_volume.depth != 0u;
         const VkFormat pass_format1 = use_color1 ? format1 : VK_FORMAT_UNDEFINED;
         const size_t pass_bytes = static_cast<size_t>(gw) * gh *
             prosper::test::backend_color_bytes_per_pixel(pass_format);
@@ -613,7 +609,8 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         // pass_i has advanced past the current pass, so scanned items are genuine.
         // Cross-batch consumers materialize on demand at bind/seed/compute/DMA time
         // (#1284).
-        const auto inspect_later_consumers = [&](uint64_t target_base) {
+        const auto inspect_later_consumers = [&](uint64_t target_base,
+                                                 uint32_t target_volume_depth) {
             LaterTargetConsumers result;
             if (!live_gpu_targets || !target_base) return result;
             static const uint32_t render_scale = [] {
@@ -625,11 +622,9 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 auto inspect = [&](const prosper::gpu::ShaderResourceTable* table) {
                     if (!table) return;
                     for (const auto& resource : table->resources) {
-                        if ((resource.cls != RC::Texture &&
-                             resource.cls != RC::StorageImage) ||
+                        if ((resource.cls != RC::Texture && resource.cls != RC::StorageImage) ||
                             resource.gpu_addr != target_base ||
-                            (resource.img_dim == 2u &&
-                             (!producer_volume_depth || target_base != base)))
+                            (resource.img_dim == 2u && !target_volume_depth))
                             continue;
                         const uint32_t rw = resource.width ? resource.width : 4u;
                         const uint32_t rh = resource.height ? resource.height : 4u;
@@ -642,16 +637,13 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                         const bool sampled_extent_compatible =
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 rw, rh, gw, gh, render_scale, false);
-                        const bool sampled_shape = producer_volume_depth &&
-                                                   target_base == base
-                            ? resource.img_dim == 2u &&
-                              resource.depth == producer_volume_depth &&
-                              resource.sample_count == 1u &&
-                              resource.declared_mip_levels == 1u &&
-                              !resource.in_mip_tail
-                            : prosper::frontend::rtt_single_layer_sample_shape(
-                                  resource.img_dim, resource.depth,
-                                  resource.sample_count);
+                        const bool sampled_shape =
+                            target_volume_depth
+                                ? resource.img_dim == 2u && resource.depth == target_volume_depth &&
+                                      resource.sample_count == 1u &&
+                                      resource.declared_mip_levels == 1u && !resource.in_mip_tail
+                                : prosper::frontend::rtt_single_layer_sample_shape(
+                                      resource.img_dim, resource.depth, resource.sample_count);
                         if (sampled_shape && sampled_extent_compatible) {
                             result.sampled_exact = true;
                             result.feedback |= same_pass_target;
@@ -708,20 +700,31 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             }
             return result;
         };
-        const LaterTargetConsumers consumers0 = inspect_later_consumers(base);
-        const LaterTargetConsumers consumers1 = use_color1
-            ? inspect_later_consumers(base1) : LaterTargetConsumers{};
+        const LaterTargetConsumers consumers0 =
+            inspect_later_consumers(base, producer_volume_depth);
+        const LaterTargetConsumers consumers1 =
+            use_color1 ? inspect_later_consumers(base1, slot_volumes[1].depth)
+                       : LaterTargetConsumers{};
         std::array<LaterTargetConsumers, prosper::gpu::kColorTargetCount>
             consumers_slots{};
         for (uint32_t slot = 2; slot < mrt_count; ++slot)
-            consumers_slots[slot] = inspect_later_consumers(pass_bases[slot]);
+            consumers_slots[slot] =
+                inspect_later_consumers(pass_bases[slot], slot_volumes[slot].depth);
         const bool sampled_exact_later = consumers0.sampled_exact;
         const bool feedback_later = consumers0.feedback;
         const bool cpu_needed_same_batch = consumers0.cpu_needed;
-        if (producer_volume_depth &&
-            (!producer_volume_footprint_proven || !live_gpu_targets ||
-             phase.authoritative_readback ||
-             cpu_needed_same_batch)) {
+        // The first volume slot the renderer cannot produce in a form a consumer here
+        // can read, or mrt_count. One such slot declines the whole layered pass.
+        uint32_t declined_volume_slot = mrt_count;
+        for (uint32_t slot = 0; slot < mrt_count && declined_volume_slot == mrt_count; ++slot) {
+            const auto& consumers = slot == 0   ? consumers0
+                                    : slot == 1 ? consumers1
+                                                : consumers_slots[slot];
+            if (slot_volumes[slot].depth && (!slot_volumes[slot].proven() || !live_gpu_targets ||
+                                             phase.authoritative_readback || consumers.cpu_needed))
+                declined_volume_slot = slot;
+        }
+        if (declined_volume_slot != mrt_count) {
             // No 3D guest publication or same-pass feedback snapshot exists yet, so
             // the renderer cannot produce this volume in a form a consumer here can
             // read. Decline the producer. With no image, the volume claims nothing and
@@ -730,20 +733,27 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             // samples it, which kept GTA V's menus black whenever live GPU targets are
             // off (PROSPER_DUMP_*, replay seeding, and PROSPER_GPU_CAPTURE before
             // #3895; #3890).
-            prosper::test::invalidate_persistent_color_target(base);
-            if (base)
-                note_volume_producer_denied(base, g_rtt[base], gw, gh,
-                                            producer_volume_depth, pass_format);
+            for (uint32_t slot = 0; slot < mrt_count; ++slot) {
+                if (!slot_volumes[slot].depth) continue;
+                prosper::test::invalidate_persistent_color_target(pass_bases[slot]);
+                if (pass_bases[slot])
+                    note_volume_producer_denied(pass_bases[slot], g_rtt[pass_bases[slot]], gw, gh,
+                                                slot_volumes[slot].depth, pass_formats[slot]);
+            }
+            const uint32_t declined = declined_volume_slot;
+            const auto& declined_consumers = declined == 0   ? consumers0
+                                             : declined == 1 ? consumers1
+                                                             : consumers_slots[declined];
             static std::atomic<uint32_t> volume_refusals{0};
             if (volume_refusals.fetch_add(1, std::memory_order_relaxed) < 16u)
                 std::fprintf(stderr,
-                    "[render-volume] guest-observed or unsupported volume pass "
-                    "target=0x%llx authoritative=%d cpu-consumer=%d live=%d "
-                    "physical=%d mode=%u\n",
-                    static_cast<unsigned long long>(base),
-                    phase.authoritative_readback, cpu_needed_same_batch,
-                    live_gpu_targets, producer_volume_footprint_proven,
-                    primary_volume_view.tile_mode);
+                             "[render-volume] guest-observed or unsupported volume pass "
+                             "target=0x%llx slot=%u authoritative=%d cpu-consumer=%d live=%d "
+                             "physical=%d mode=%u\n",
+                             static_cast<unsigned long long>(pass_bases[declined]), declined,
+                             phase.authoritative_readback, declined_consumers.cpu_needed,
+                             live_gpu_targets, slot_volumes[declined].proven(),
+                             pass.front()->color_targets[declined].tile_mode);
             prosper::test::backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
             continue;
         }
@@ -817,7 +827,9 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         const float* retained_uniform_clear1 = nullptr;
         bool gpu_seed1_available = false;
         const bool seed_rtt1 = seed_target(base1);
-        if (seed_rtt1 && use_color1) { auto sit = g_rtt.find(base1);
+        // A volume slot is never CPU-seeded: it LOADs its retained slices (#4643).
+        if (seed_rtt1 && use_color1 && !slot_volumes[1].depth) {
+            auto sit = g_rtt.find(base1);
             gpu_seed1_available = live_gpu_targets && sit != g_rtt.end() &&
                 sit->second.gpu_valid &&
                 sit->second.w == gw && sit->second.h == gh &&
@@ -834,7 +846,8 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 sit->second.w == gw && sit->second.h == gh &&
                 sit->second.format == pass_format1 &&
                 sit->second.has_uniform_color)
-                retained_uniform_clear1 = sit->second.uniform_color.data(); }
+                retained_uniform_clear1 = sit->second.uniform_color.data();
+        }
         if (base1 && !use_color1 && rtt_log) {
             const auto* first = render_pass.empty() ? nullptr : render_pass.front();
             fprintf(stderr,
@@ -850,21 +863,36 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         prosper::test::BackendColorTarget backend_target{
             base, seed_rtt0, base != 0 && !defer_readback, pass_format};
         const auto& volume_view = primary_volume_view;
-        if (base && volume_view.selected_mip_depth) {
-            if (!volume_view.volume_view_consistent() || !volume_view.slice_count) {
-                // This draw attempted to replace the retained version. Refusing
-                // its view must also revoke the earlier version, including when
-                // no backend call is made.
-                prosper::test::invalidate_persistent_color_target(base);
-                note_volume_producer_denied(base, g_rtt[base], gw, gh,
-                                            volume_view.selected_mip_depth,
-                                            pass_format);
-                std::fprintf(stderr,
-                    "[render-volume] invalid slot0 view target=0x%llx\n",
-                    static_cast<unsigned long long>(base));
-                prosper::test::backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
+        bool volume_view_refused = false;
+        for (uint32_t slot = 0; slot < mrt_count && !volume_view_refused; ++slot) {
+            const auto& slot_view = pass.front()->color_targets[slot];
+            const uint64_t slot_base = pass_bases[slot];
+            if (!slot_base || !slot_view.selected_mip_depth ||
+                (slot_view.volume_view_consistent() && slot_view.slice_count))
                 continue;
-            }
+            // This draw attempted to replace the retained version. Refusing its view
+            // must also revoke the earlier version, including when no backend call is
+            // made.
+            prosper::test::invalidate_persistent_color_target(slot_base);
+            note_volume_producer_denied(slot_base, g_rtt[slot_base], gw, gh,
+                                        slot_view.selected_mip_depth, pass_formats[slot]);
+            std::fprintf(stderr, "[render-volume] invalid slot%u view target=0x%llx\n", slot,
+                         static_cast<unsigned long long>(slot_base));
+            volume_view_refused = true;
+        }
+        if (volume_view_refused) {
+            prosper::test::backend_failed_publication_generation().fetch_add(
+                1, std::memory_order_release);
+            continue;
+        }
+        for (uint32_t slot = 1; slot < mrt_count; ++slot) {
+            const auto& slot_view = pass.front()->color_targets[slot];
+            if (pass_bases[slot] && slot_volumes[slot].depth)
+                backend_target.volume_slots[slot] = {slot_volumes[slot].depth,
+                                                     slot_view.first_slice, slot_view.slice_count,
+                                                     slot_volumes[slot].physical_bytes};
+        }
+        if (base && volume_view.selected_mip_depth) {
             backend_target.volume_depth = volume_view.selected_mip_depth;
             backend_target.volume_first_slice = volume_view.first_slice;
             backend_target.volume_slice_count = volume_view.slice_count;
@@ -883,7 +911,9 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             backend_target.guest_footprint_bytes[slot] = physical_bytes;
         }
         backend_target.load_existing1 = seed_rtt1;
-        backend_target.readback1 = use_color1 && base1 != 0 && !defer_readback1;
+        // A volume slot stays GPU-resident; consumers read it, or its publication (#4625).
+        backend_target.readback1 =
+            use_color1 && base1 != 0 && !defer_readback1 && !slot_volumes[1].depth;
         backend_target.format1 = pass_format1;
         // Slots 2..7 retain across render groups on the same terms as slots 0 and 1.
         // A G-buffer built by several groups against one set of allocations otherwise
@@ -892,7 +922,8 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         for (uint32_t slot = 2; slot < mrt_count; ++slot) {
             backend_target.persistent_id_slots[slot] = pass_bases[slot];
             backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
-            backend_target.readback_slots[slot] = pass_bases[slot] != 0 && !defer_readback_slots[slot];
+            backend_target.readback_slots[slot] =
+                pass_bases[slot] != 0 && !defer_readback_slots[slot] && !slot_volumes[slot].depth;
         }
         auto backend_draws = build_bds(
             render_pass, batch_backend_submits ? &backend_submission : nullptr);
@@ -1061,13 +1092,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             settle_volume_guest_footprint(base, surface, surface.gpu_valid,
                                           producer_volume_guard_bytes,
                                           producer_volume_footprint_proven);
-            if (backend_target.volume_depth)
-                surface.volume_layout =
-                    producer_volume_footprint_proven
-                        ? prosper::gpu::VolumeGuestLayout{volume_native_w, volume_native_h,
-                                                          producer_volume_depth,
-                                                          primary_volume_view.tile_mode, volume_bpp}
-                        : prosper::gpu::VolumeGuestLayout{};
+            if (backend_target.volume_depth) surface.volume_layout = producer_volume.layout;
             if (!pass_pixels->empty()) surface.rgba = pass_pixels;
             else surface.rgba.reset();
             // GTA V builds its packed-HDR bloom pyramid as separate CB_COLOR targets,
@@ -1187,16 +1212,25 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                     }
                 }
             }
+            const auto& slot_volume = slot_volumes[slot];
+            if (slot_volume.depth && !color_target_call.writes) {
+                // The backend refused the layered pass before recording (#4643): the
+                // renderer holds no image of this version, so guest memory stays
+                // authoritative, exactly as for slot 0 above.
+                note_volume_producer_denied(pass_bases[slot], g_rtt[pass_bases[slot]], gw, gh,
+                                            slot_volume.depth, pass_formats[slot]);
+                continue;
+            }
             RttSurf& surface = g_rtt[pass_bases[slot]];
             const auto* retained = prosper::test::find_persistent_color_target(
-                pass_bases[slot], gw, gh, pass_formats[slot]);
+                pass_bases[slot], gw, gh, pass_formats[slot], true, slot_volume.depth);
             if (retained && color_target_call.writes) surface.guest_origins.merge(retained->guest_origins);
             else surface.guest_origins.observe(pass_bases[slot], backend_target.guest_footprint_bytes[slot]);
             surface.w = gw;
             surface.h = gh;
             surface.samples = pass.empty()
                 ? 1u : 1u << pass.front()->ps.color_targets[slot].log2_samples;
-            surface.volume_depth = 0;
+            surface.volume_depth = slot_volume.depth;
             surface.format = pass_formats[slot];
             surface.guest_format = pass.empty()
                 ? pass_formats[slot]
@@ -1207,9 +1241,15 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             // Any slot with a retained target is GPU-valid, not only slot 1. The
             // `slot == 1` clause dated from when slots above 1 had no persistent image
             // to be valid about.
-            surface.gpu_valid =
-                prosper::test::find_persistent_color_target(
-                    pass_bases[slot], gw, gh, pass_formats[slot]) != nullptr;
+            surface.gpu_valid = retained != nullptr;
+            if (slot_volume.depth) {
+                // Each volume slot claims its own footprint on slot 0's terms, so a later
+                // consumer -- or the publication a compute binding asks for (#4625) --
+                // finds every volume a layered pass wrote, not only slot 0's (#4643).
+                settle_volume_guest_footprint(pass_bases[slot], surface, surface.gpu_valid,
+                                              slot_volume.guard_bytes, slot_volume.proven());
+                surface.volume_layout = slot_volume.layout;
+            }
             pin_renderer_mip_target(pass_bases[slot], gw, gh, pass_formats[slot],
                                     surface.gpu_valid);
             if (!pixels.empty())

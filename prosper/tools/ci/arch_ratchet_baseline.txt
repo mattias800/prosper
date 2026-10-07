@@ -206,7 +206,7 @@ file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-tab
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
-file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
+file-size|prosper/tests/fixtures/render_runner.h 16285  # #4643: the segment helpers moved to render_pass_segments.h and the volume contract lives in render_volume_slots.h
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 74  # +1 #4625: the volume publisher reads a claimed 3D target back (readback_persistent_color_target); a compute dispatch consumes the published bytes
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
@@ -225,7 +225,7 @@ test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target
 test-dep|prosper/frontends/shared/live/submit_renderer/mrt_slots.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.cpp 14
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.hpp 2
-test-dep|prosper/frontends/shared/live/submit_renderer/per_target_passes.cpp 48
+test-dep|prosper/frontends/shared/live/submit_renderer/per_target_passes.cpp 47
 test-dep|prosper/frontends/shared/live/submit_renderer/resolve_pass.cpp 24
 test-dep|prosper/frontends/shared/live/submit_renderer/resolve_pass.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/single_framebuffer.cpp 13

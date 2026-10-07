@@ -1,6 +1,15 @@
 #version 460
 layout(location = 0) out vec4 color;
-#if defined(PARAM_COLOR)
+#if defined(PARAM_MRT2)
+// Two colour targets from one layered draw (#4643): slot 1 carries the layer in GREEN and a
+// constant blue, so a swapped, dropped or slot-0-aliased attachment cannot pass the readback.
+layout(location = 0) in vec4 layer_param;
+layout(location = 1) out vec4 color1;
+void main() {
+    color = layer_param;
+    color1 = vec4(0.0, layer_param.r, 1.0, 1.0);
+}
+#elif defined(PARAM_COLOR)
 layout(location = 0) in vec4 layer_param;
 void main() { color = layer_param; }
 #elif defined(SAMPLE_VOLUME)

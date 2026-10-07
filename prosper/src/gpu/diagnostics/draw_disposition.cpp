@@ -50,6 +50,7 @@ constexpr std::array<const char*, kReasonCount> kNames{
     "framebuffer-creation",
     "pressure-flush",
     "ngg-subgroup",
+    "volume-mixed-target",
 };
 // clang-format on
 static_assert(kNames.size() == kReasonCount,

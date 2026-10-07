@@ -1,12 +1,14 @@
-`volume_target_probe.mesh` and `.frag` produce the seven arrays in
+`volume_target_probe.mesh` and `.frag` produce the eight arrays in
 `volume_target_spirv.h`. They test a layered mesh producer and a direct 3D sampled
 consumer in the production Vulkan backend. `param_mesh` writes a local-layer value
 and two barycentric channels to location 0; `param_fragment` reads that location.
 `wrong_param_mesh` preserves the geometry and layer but writes magenta to the varying.
+`param_mrt2_fragment` reads the same location and also writes MRT1 (layer in green, blue 1),
+for the two-target layered pass of #4643.
 
 Generate with glslangValidator targeting Vulkan 1.3. Compile the fragment source
-four times: no definitions, `-DGREEN=1`, `-DSAMPLE_VOLUME=1`, and
-`-DPARAM_COLOR=1`. Compile the mesh source three times: no definitions,
+five times: no definitions, `-DGREEN=1`, `-DSAMPLE_VOLUME=1`,
+`-DPARAM_COLOR=1`, and `-DPARAM_MRT2=1`. Compile the mesh source three times: no definitions,
 `-DPARAM_COLOR=1`, and `-DPARAM_COLOR=1 -DWRONG_PARAM=1`. In each mesh
 disassembly replace exactly one
 `OpExecutionModeId %main LocalSizeId %uint_32 %uint_1 %uint_1` with

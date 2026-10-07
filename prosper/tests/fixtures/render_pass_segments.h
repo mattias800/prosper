@@ -121,6 +121,12 @@ inline SplitSegmentContract split_segment_contract(
         for (uint32_t slot = 2; slot < out.color_count; ++slot)
             out.target.readback_slots[slot] = true;
         if (out.color_count > 1) out.target.readback1 = true;
+        // ...except a volume slot (#4643). It has no transient fallback -- it is retained or its
+        // pass is refused -- so the next segment's LOAD carries it, and reading a whole volume back
+        // per segment would be a CPU wait for nothing (CLAUDE.md P1).
+        for (uint32_t slot = 1; slot < out.color_count; ++slot)
+            if (backend_color_volume_slot(whole, slot).depth)
+                (slot == 1 ? out.target.readback1 : out.target.readback_slots[slot]) = false;
     } else if (!whole) {
         // A synthesised carrier target on the final segment represents a caller with whole == nullptr.
         // It must read back the requested outputs just as a whole == nullptr non-split pass does.
