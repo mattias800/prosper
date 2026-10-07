@@ -105,6 +105,20 @@ Two layers, behind the existing provenance interface.
      guest's own index, so no hash lookup is needed. Guest writes to the table update the mirror;
      where the host cannot watch writes (Windows today), the table's bytes are compared at the
      submit that uses it. This follows how vkd3d-proton maps D3D12 descriptor heaps onto Vulkan.
+
+   **Prior art for layer 2.** Local sources were read and nothing was copied; the rest is from
+   knowledge:
+   - KytyPS5 computes an indexed-table key in the shader (`index * stride + offset`). It guards that
+     key with `index < num_records && format != 0` and falls back to an invalid key, with no
+     recompile (`ResourceTracking.cpp:375-431`). That is the guard half of guarded specialization,
+     applied to a table index. Buffers go through buffer device addresses.
+   - AnyPS5 validates on the CPU and specializes one variant per descriptor snapshot, with a result
+     memo. When a sampled bindless image table fits its slot budget, it binds the whole table.
+   - shadPS4 flattens descriptors on the CPU for every draw: a JIT-compiled walker chases the
+     guest's pointer chains and copies what it reaches into a buffer the shader reads
+     (`flatten_extended_userdata_pass.cpp`).
+   - No PS5 emulator checked keeps a GPU-resident mirror of a guest descriptor table. The mirror
+     shape here comes from vkd3d-proton.
      The generic keyed table remains for descriptors with no table structure.
 5. **What bindless does not solve, stated so nobody treats it as the fix.** Descriptor indexing,
    bindless arrays and `VK_EXT_descriptor_buffer` replace *binding*, not *provenance*. A guest T# is
