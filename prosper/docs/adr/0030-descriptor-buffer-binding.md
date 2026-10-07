@@ -39,8 +39,11 @@ The second input is proposed ADR 0027 (open PR #4716). Its dynamic layer propose
 *descriptor-table mirroring*: a host table that mirrors a guest descriptor table index for index,
 so a shader whose resource is selected at run time indexes the host table with the guest's own
 index instead of the recompiler having to prove a constant provenance. With descriptor sets that
-mirror is an array binding that must be (re)written through `vkUpdateDescriptorSets` and is bounded
-by pool sizing and `maxPerStageDescriptor*` limits. With descriptor buffers it is plain memory: the
+mirror is an array binding that must be (re)written through `vkUpdateDescriptorSets`. With
+descriptor indexing and update-after-bind the size bound is not the obstacle: the
+`maxPerStageDescriptorUpdateAfterBind*` limits are orders of magnitude above the ordinary
+`maxPerStageDescriptor*` ones. The difference is the update model -- API calls into a pool-allocated
+set versus writes into memory. With descriptor buffers it is plain memory: the
 host writes each descriptor at `index * descriptorSize` with `vkGetDescriptorEXT`, the same shape
 the guest's own table has.
 
