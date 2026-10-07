@@ -150,6 +150,7 @@ static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = 
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>                // IFileOpenDialog: the Explorer folder picker below
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
@@ -1468,7 +1469,61 @@ static bool open_folder_picker(SDL_Window* win) {
         if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
+#ifdef _WIN32
+    // Native Explorer folder picker (IFileOpenDialog + FOS_PICKFOLDERS) on its own thread.
+    // SDL 3.2's Windows folder dialog is still the legacy SHBrowseForFolder tree, which hides
+    // drives inside a namespace modern users no longer recognize; the Explorer dialog shows
+    // This PC, the address bar and search. Same park-and-consume contract as picked_folder_cb;
+    // any COM failure falls back to the SDL dialog rather than failing the pick.
+    std::thread([win] {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        bool shown = false;
+        if (SUCCEEDED(hr)) {
+            IFileOpenDialog* dialog = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                           IID_PPV_ARGS(&dialog)))) {
+                DWORD opts = 0;
+                if (SUCCEEDED(dialog->GetOptions(&opts)))
+                    dialog->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+                HWND parent = nullptr;
+                if (win)
+                    parent = (HWND)SDL_GetPointerProperty(
+                        SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+                const HRESULT show = dialog->Show(parent);
+                if (SUCCEEDED(show)) {
+                    shown = true;
+                    IShellItem* item = nullptr;
+                    if (SUCCEEDED(dialog->GetResult(&item))) {
+                        PWSTR path = nullptr;
+                        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                            char buf[4096];
+                            const int n = WideCharToMultiByte(CP_UTF8, 0, path, -1, buf, sizeof buf,
+                                                              nullptr, nullptr);
+                            if (n > 0) {
+                                std::lock_guard<std::mutex> lock(g_picked_mutex);
+                                g_picked_path = buf;
+                            }
+                            CoTaskMemFree(path);
+                        }
+                        item->Release();
+                    }
+                }
+                dialog->Release();
+            }
+            CoUninitialize();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_picked_mutex);
+            g_picker_open = false;
+        }
+        if (!shown) {
+            const char* files[1] = {nullptr};
+            picked_folder_cb(nullptr, files, -1);
+        }
+    }).detach();
+#else
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+#endif
     return true;
 }
 
