@@ -1946,12 +1946,6 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
 
-  # Library grid selection movement (#1471): arithmetic only, so the navigation rules are covered in
-  # normal CI rather than by someone pressing arrow keys. No ImGui, no SDL, no window.
-  add_executable(test_prosper_app_library_nav frontends/prosper-app/test_library_nav.cpp)
-  target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
-  add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
-
   # Library descriptor-pool sizing and the exhaustion rule (#1649): the pool must follow the title count
   # instead of a fixed 256, and a set must never be allocated out of a full pool — ImGui's backend writes
   # to whatever vkAllocateDescriptorSets returned without checking it. Pure arithmetic plus a fake
@@ -2045,6 +2039,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_diagnostic_window
     SOURCES frontends/shared/tests/test_diagnostic_window.cpp
     INCLUDES frontends)
+
+  # The library list's keyboard gate: typing in the search box must never move the selection or
+  # boot a game. Pure predicate — no SDL, no ImGui, no window.
+  prosper_add_gtest(test_frontend_list_nav
+    SOURCES frontends/prosper-app/test_list_nav.cpp
+    INCLUDES frontends/prosper-app)
 
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.

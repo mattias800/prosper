@@ -198,8 +198,10 @@ there too.
 
 Dear ImGui (`third_party/imgui`, MIT) and stb_image (`third_party/stb`, public domain) are vendored
 **frontend-only** — `prosper_core` links neither, so the arrow above is unchanged and deleting
-`frontends/` still leaves CI unaffected. `library_ui.{hpp,cpp}` draws the grid; `library_nav.hpp` holds
-the selection rules and is pure and unit-tested, so the grid's behaviour is covered without a window.
+`frontends/` still leaves CI unaffected. `library_ui.{hpp,cpp}` draws the list (cover thumbnail,
+name, serial, region, version, path, with a search box and a toolbar); the search filter
+(`game_entry_matches_filter`) and the keyboard gate (`list_nav.hpp`) are pure and unit-tested,
+so matching and input handling are covered without a window.
 
 Decisions worth knowing:
 
@@ -215,9 +217,11 @@ Decisions worth knowing:
   dropped. The render pass still appears to clear, which makes it look like a UI bug rather than a
   swapchain one — Vulkan validation names it immediately
   (`VUID-VkFramebufferCreateInfo-pAttachments-00877`).
-- **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by `library_nav.hpp`, and
-  running both means the arrow keys move a widget focus as well as the selection, and Enter activates
-  whatever widget that focus landed on instead of launching the highlighted game. A consequence worth
+- **ImGui's own keyboard/gamepad nav is deliberately off.** Selection is driven by the list's own
+Up/Down/Home/End handling, gated on text input (`list_nav.hpp`) so typing in the search box never
+moves the selection or boots a game. Running both navs means the arrow keys move a widget focus
+as well as the selection, and Enter activates whatever widget that focus landed on instead of
+launching the highlighted game. A consequence worth
   knowing: turning off `NavEnableGamepad` also silences the SDL3 backend's gamepad feed, so
   `ImGuiKey_Gamepad*` is never set. Controller navigation therefore needs the pad read directly *and*
   `SDL_INIT_GAMEPAD` initialized while the library is alive — neither is true today (the pad backend

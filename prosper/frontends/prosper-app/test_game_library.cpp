@@ -15,9 +15,13 @@ using prosper::frontend::GameEntry;
 using prosper::frontend::GameLibraryIo;
 using prosper::frontend::GamePathProbe;
 using prosper::frontend::parse_app_config;
+using prosper::frontend::game_entry_matches_filter;
+using prosper::frontend::parse_param_content_version;
+using prosper::frontend::parse_param_region;
 using prosper::frontend::parse_param_title_id;
 using prosper::frontend::parse_param_title_name;
 using prosper::frontend::path_basename;
+using prosper::frontend::note_recent_game;
 using prosper::frontend::resolve_games_dir;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
@@ -170,6 +174,32 @@ int main() {
     CHECK(parse_param_title_id(kNoNameJson) == "PPSA00002", "titleId is read without a titleName");
     CHECK(parse_param_title_name("").empty(), "empty json yields no name");
     CHECK(parse_param_title_id("").empty(), "empty json yields no id");
+    // --- version + region: the list columns ------------------------------------------------
+    CHECK(parse_param_content_version(
+              "{\"contentVersion\":\"01.000.006\",\"titleId\":\"TEST19990\"}") == "01.000.006",
+          "contentVersion is read");
+    CHECK(parse_param_content_version("").empty(), "empty json yields no version");
+    CHECK(parse_param_content_version("{\"titleId\":\"TEST19990\"}").empty(),
+          "a dump without contentVersion yields empty, not garbage");
+    CHECK(parse_param_region(
+              "{\"contentId\":\"EP0700-TEST19990_00-SOME-GAME-00\"}") == "EP",
+          "the region is the two letters heading the contentId prefix");
+    CHECK(parse_param_region("{\"contentId\":\"nodashes\"}").empty(),
+          "a dashless contentId yields no region rather than the whole string");
+    CHECK(parse_param_region("").empty(), "empty json yields no region");
+    // --- search filter ---------------------------------------------------------------------
+    {
+        GameEntry e;
+        e.app0_root = "/games/TEST24651-app0";
+        e.title_id = "TEST24651";
+        e.title_name = "The Messenger";
+        CHECK(game_entry_matches_filter(e, ""), "an empty box matches everything");
+        CHECK(game_entry_matches_filter(e, "messenger"), "name matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "TEST24651"), "title id matches");
+        CHECK(game_entry_matches_filter(e, "test24651"), "title id matches case-insensitively");
+        CHECK(game_entry_matches_filter(e, "24651-app0"), "the path matches too");
+        CHECK(!game_entry_matches_filter(e, "zelda"), "an unrelated needle matches nothing");
+    }
     CHECK(parse_param_title_name("{\"localizedParameters\":{\"en-US\":{\"titleName\":\"Solo\"}}}")
               == "Solo",
           "a single language with no defaultLanguage falls back to the first titleName");
@@ -333,6 +363,30 @@ int main() {
         CHECK(after.games_dir == "/new", "a rewrite updates the setting it owns");
         CHECK(after.unknown_lines.size() == 1 && after.unknown_lines[0] == "ui_scale = 1.5",
               "a rewrite preserves a setting this build does not understand");
+    }
+
+    // --- recent games --------------------------------------------------------------------------
+    {
+        AppConfig rc;
+        note_recent_game(rc, "/games/B-app0");
+        note_recent_game(rc, "/games/A-app0");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0" &&
+                  rc.recent_games[1] == "/games/B-app0",
+              "recent games are most-recent-first");
+        note_recent_game(rc, "/games/A-app0/");
+        CHECK(rc.recent_games.size() == 2 && rc.recent_games[0] == "/games/A-app0",
+              "reopening moves to the head without duplicating, separators canonicalized");
+        note_recent_game(rc, "");
+        CHECK(rc.recent_games.size() == 2, "an empty path records nothing");
+        for (int i = 0; i < 12; i++)
+            note_recent_game(rc, "/games/G" + std::to_string(i) + "-app0");
+        CHECK(rc.recent_games.size() == AppConfig::kRecentGamesMax &&
+                  rc.recent_games[0] == "/games/G11-app0",
+              "the recent list is capped, newest head");
+        const AppConfig back = parse_app_config(serialize_app_config(rc));
+        CHECK(back.recent_games == rc.recent_games, "recent games survive a round trip in order");
+        CHECK(parse_app_config("recent = \nrecent = /a").recent_games.size() == 1,
+              "an empty recent line is not kept");
     }
 
     // --- precedence -----------------------------------------------------------------------------
