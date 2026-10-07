@@ -1,0 +1,38 @@
+# Kena: Bridge of Spirits (PPSA01802), Linux/AMD: main menu -> New Game -> difficulty -> brightness -> first level load.
+#
+# Anchors are SECONDS from the first pad poll, held for 1 s each. On Linux the title polls the pad
+# fast while it boots (pad read 54 arrives about 8 s in), so reach-first-gameplay-prompt.pad's
+# pad-read anchors all fire about 40 s in, before the menu appears at about 200 s. Each 1 s hold
+# below spans at least one menu read.
+#
+#   230 s  New Game on the main menu (the default selection)
+#   262 s  Next on "Choose Difficulty" (default: Spirit Guide), seen on screen at pad flip 1000
+#   300 s  Accept on the brightness calibration screen -> first level load
+#   340 s+ a Cross every 25 s for the intro narration. The guest stops polling during the level
+#          load, so the presses between about 300 s and 515 s are not read.
+#
+# Measured 2026-10-07 on Linux/RADV, prosper-app in a visible window, main 97917c5f (PROSPER_NULL_PAGE=1,
+# PROSPER_GUEST_ARGS= empty, fresh save roots). The first level load then loses the Vulkan device in
+# 2 of 2 runs, at about 500 s and 640 s (radv: "context is guilty of a hard recovery"). So this
+# route has not yet been seen to reach gameplay. See prosper/docs/games/KENA_STATUS.md.
+230+1.0:cross
+262+1.0:cross
+300+1.0:cross
+340+1.0:cross
+365+1.0:cross
+390+1.0:cross
+415+1.0:cross
+440+1.0:cross
+465+1.0:cross
+490+1.0:cross
+515+1.0:cross
+540+1.0:cross
+565+1.0:cross
+590+1.0:cross
+615+1.0:cross
+640+1.0:cross
+665+1.0:cross
+690+1.0:cross
+715+1.0:cross
+740+1.0:cross
+765+1.0:cross
