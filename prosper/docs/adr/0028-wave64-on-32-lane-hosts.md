@@ -36,7 +36,7 @@ today, read from the code on `origin/main`:
   "the default never approximates"; #4714 closes it.
 
 This already satisfies `FAIL-1` for refusals: nothing refused is skipped silently. What it does not
-do is run the programs. Evidence from *Assassin's Creed IV Black Flag Resynced* `PPSA28183` on
+do is run the programs. Evidence from *Assassin's Creed Black Flag Resynced* `PPSA28183` on
 Windows with an RTX 4070 SUPER, as recorded: `docs/games/AC_BLACK_FLAG_STATUS.md` records thirteen
 fragment programs refused by the recompiler and two by the backend (`subgroup-contract`,
 `unproved-vote`), eighteen refused compute programs, and one start-up fragment draw (`0x407edfaf00`)
