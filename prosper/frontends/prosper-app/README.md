@@ -166,7 +166,12 @@ window: cover thumbnail, name, serial, region, version and folder, with a search
 list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
 opens the highlighted title (not while the search box has focus), and a double-click opens directly;
 **Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
-and offers the same folder picker on Enter or a click.
+and offers the same folder picker on Enter or a click. A Game Log panel below the list tails this
+session's own log lines; it exists only while the library is up and never affects what the console
+or a log file receives. While it is up, stdout and stderr are pipes (so `isatty` is false), and in a
+merged `> log 2>&1` lines from the two streams may interleave in a different order. Leaving the
+library restores both streams before anything else happens, and never waits long for a program it
+started (a file manager opened by **Show in Explorer**) that still holds the inherited streams.
 
 ![The library view: toolbar, search box, and game list](../../docs/screenshots/issue-4665-library-table.webp)
 

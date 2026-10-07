@@ -51,6 +51,8 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#include "log_ring.hpp"   // bounded Game Log line buffer (pure, unit-tested)
+#include "log_capture.hpp"   // stdout/stderr capture feeding it, bounded teardown
 #include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
@@ -177,6 +179,42 @@ bool clear_environment(const char* name) {
 #else
     return unsetenv(name) == 0;
 #endif
+}
+
+// ---- Game Log capture ------------------------------------------------------------------------
+// The library's Game Log panel shows the library session's own stdout/stderr tail, through
+// LogCapture (log_capture.hpp): fds 1/2 point at pipes whose readers forward every byte to the
+// real console and keep a bounded copy in a LogRing. Capture runs ONLY while the library is up
+// (installed at library init, uninstalled before any boot and before every process exit below),
+// so scripted runs, guest execution and crash reports never pass through a pipe.
+//
+// Uninstall is bounded: a child spawned during the library session (SDL's xdg-open for "Show in
+// Explorer") inherits fds 1/2 and so holds the pipes' write ends, and waiting for their EOF would
+// hang the boot until that child exits. The ring is heap-owned and never freed, because a reader
+// left forwarding such a child's output may still push into it.
+static prosper::frontend::LogCapture g_log_capture;
+static constexpr std::chrono::milliseconds kLogCaptureDrainBound{500};
+
+// Returns the ring, or null when the capture could not start (the panel then says so and the
+// streams stay exactly as they were: install is all-or-nothing).
+static prosper::frontend::LogRing* install_log_capture() {
+    static prosper::frontend::LogRing* ring = nullptr;
+    if (g_log_capture.installed()) return ring;
+    auto* fresh = new prosper::frontend::LogRing();
+    if (!g_log_capture.install(fresh, {1, 2})) {
+        delete fresh;   // no reader was started, so nothing references it
+        return nullptr;
+    }
+    ring = fresh;
+    return ring;
+}
+
+// Restore the console fds and drain the pipes within kLogCaptureDrainBound. Idempotent.
+static void uninstall_log_capture() {
+    if (!g_log_capture.installed()) return;
+    if (!g_log_capture.uninstall(kLogCaptureDrainBound))
+        fprintf(stderr, "[app] game log: a child process still holds the log pipe; "
+                        "its output keeps forwarding in the background.\n");
 }
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
@@ -1258,6 +1296,10 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
         Sleep(10000);
         std::_Exit(prosper::app::kExitGuestFault);
     }
+    // Point stderr straight back at the console before the banner, so the fault report cannot sit
+    // in a pipe when _Exit below kills the forwarding threads. No drain and no wait: a crash
+    // report must never hang on a reader, and a few already-piped lines are an acceptable loss.
+    g_log_capture.restore_now(2);
     const CONTEXT* c = ep->ContextRecord;
     const uint64_t rip = c->Rip;
     fprintf(stderr, "%s\n",
@@ -1366,6 +1408,10 @@ static void install_host_backends() {
 // so a caller that ignored a failure cannot corrupt g_prog by trying again. Callers reach the
 // second-title case through relaunch_with_dump() instead.
 static bool start_guest(const std::string& app0_root, std::string* err) {
+    // The Game Log panel dies with the library view: restore the console streams before the boot
+    // so guest output, exit summaries and crash reports flow direct and can never be caught in a
+    // pipe when _Exit kills the forwarding threads.
+    uninstall_log_capture();
     if (g_boot_attempted) {
         if (err) *err = g_guest_started ? "a game is already running"
                                         : "this process has already used its one boot attempt";
@@ -1436,6 +1482,10 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
 // close the submit gate, bound the drain, flush the exit reports, _Exit. Before a guest exists this
 // is a plain `return 1`.
 int exit_startup_failure() {
+    // Drain first: everything below ends in _Exit, which would kill the forwarding threads
+    // with bytes still in the pipes. No-op unless a library session installed the capture
+    // (a guest always uninstalls it at boot).
+    uninstall_log_capture();
     if (!g_guest_thread.joinable()) return 1;
     g_guest_thread.detach();
     prosper::gpu_submit_gate_begin_shutdown();
@@ -2948,6 +2998,10 @@ int main(int argc, char** argv) {
         libraryUi.set_games(std::move(found), gamesDir);
     };
     if (wantLibrary) {
+        // Game Log capture starts here and only here: a library session is the only run with a
+        // panel to feed, so scripted runs, guest execution and crash reports never pass through
+        // a pipe. A null return keeps everything working, minus the panel.
+        libraryUi.set_log_ring(install_log_capture());
         libraryUi.set_music_preference(appConfig.launcher_music);
         libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
         // Recent rows show game names, not raw paths: read each root's own param.json the
@@ -3034,6 +3088,9 @@ int main(int argc, char** argv) {
             // and let this one shut down normally.
             fprintf(stderr, "[app] this process has already booted; starting a new one for %s\n",
                     root.c_str());
+            // Uninstall first: the child inherits this process's fds, and it must get the
+            // console, not our pipes (whose readers die with us).
+            uninstall_log_capture();
             if (relaunch_with_dump(argc, argv, root)) {
                 running = false;
                 record_recent(root);
@@ -4263,6 +4320,9 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_AUDIO_SDL3
     shutdown_sdl3_audio_sink(); // join diagnostics and destroy streams while SDL is alive
 #endif
+    // Drain the Game Log capture before the normal return: buffered pipe bytes would
+    // otherwise never reach the console. No-op unless a library session installed it.
+    uninstall_log_capture();
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;
 }
