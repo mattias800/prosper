@@ -159,11 +159,11 @@ class CollectLoopTests(unittest.TestCase):
         report = self.collect(0.1)
         self.assertEqual(report['terminal'], 'completed')
         self.assertEqual(report['candidate_tids'], [11])
-        # 0.1 s at 200 Hz is 20 ticks. Virtual time moves only by the loop's sleeps to each tick
-        # plus a 1 us read cost, so a loop that stopped pacing takes tens of thousands of samples
-        # and one that stopped early takes too few; neither lands in this range.
-        self.assertGreaterEqual(report['sample_count'], 20)
-        self.assertLessEqual(report['sample_count'], 21)
+        # 0.1 s at 200 Hz is 20 ticks, and the stop check runs before each sleep, so the loop
+        # also takes the sample whose tick is the stop time itself: exactly 21 on the virtual
+        # clock. A loop that stopped pacing takes tens of thousands; one that stopped early fewer.
+        self.assertEqual(report['sample_count'], 21)
+        self.assertEqual(report['overruns'], 0)
         self.assertEqual(report['matched_thread_rows'], report['sample_count'])
         self.assertEqual(report['read_failures'], 0)
         previous_after = None
@@ -202,6 +202,24 @@ class CollectLoopTests(unittest.TestCase):
         self.assertEqual(report['matched_thread_rows'], 5)
         self.assertEqual([len(row['threads']) for row in report['samples']],
                          [1] * 5 + [0] * (report['sample_count'] - 5))
+
+    def test_an_overrun_resynchronises_the_tick_instead_of_bursting_to_catch_up(self):
+        # Sample 5 is read three ticks late (the host stalled). That is one overrun, and the loop
+        # restarts its schedule from the late read; a loop that kept the old schedule would take
+        # the next samples back-to-back without sleeping and count each of them as an overrun.
+        def stall():
+            self.clock.now += 3 * STEP_NS
+
+        self.clock.before_sample(5, stall)
+        report = self.collect(0.2)
+        self.assertEqual(report['terminal'], 'completed')
+        self.assertEqual(report['overruns'], 1)
+        gaps = [later['before_ns'] - earlier['after_ns']
+                for earlier, later in zip(report['samples'], report['samples'][1:])]
+        # The late sample becomes the new schedule origin: the next read follows at once (its tick
+        # is that late read), and from there the loop sleeps a full tick again instead of bursting.
+        self.assertLess(gaps[5], STEP_NS // 2)
+        self.assertGreater(gaps[6], STEP_NS // 2)
 
     def test_sampling_rate_that_rounds_the_interval_to_zero_refuses(self):
         with self.assertRaisesRegex(ValueError, 'rounded to zero'):
