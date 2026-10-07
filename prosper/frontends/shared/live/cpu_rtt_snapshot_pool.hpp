@@ -39,27 +39,29 @@ struct CpuRttSnapshotPoolStats {
     std::atomic<uint64_t> miss_bytes{0};
 };
 
+// Prints one `[<label>]` line for `stats` at the end of the run (silent when it counted nothing).
+inline void print_cpu_rtt_snapshot_pool_stats(const char* label, const CpuRttSnapshotPoolStats& s) {
+    const uint64_t hits = s.hits.load(std::memory_order_relaxed);
+    const uint64_t misses = s.misses.load(std::memory_order_relaxed);
+    if (std::getenv("PROSPER_NO_RTT_POOL_CENSUS") || (hits + misses) == 0) return;
+    const uint64_t miss_bytes = s.miss_bytes.load(std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[%s] copies=%llu hit=%llu (%.1f%%) miss=%llu "
+                 "allocated=%.1f MiB reused=%.1f MiB\n",
+                 label, static_cast<unsigned long long>(hits + misses),
+                 static_cast<unsigned long long>(hits),
+                 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses),
+                 static_cast<unsigned long long>(misses),
+                 static_cast<double>(miss_bytes) / (1024.0 * 1024.0),
+                 static_cast<double>(s.hit_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
+    std::fflush(stderr);
+}
+
 inline CpuRttSnapshotPoolStats& cpu_rtt_snapshot_pool_stats() {
     static CpuRttSnapshotPoolStats stats;
     static const bool once = [] {
-        prosper::diagnostics::register_exit_report([] {
-            auto& s = cpu_rtt_snapshot_pool_stats();
-            const uint64_t hits = s.hits.load(std::memory_order_relaxed);
-            const uint64_t misses = s.misses.load(std::memory_order_relaxed);
-            if (std::getenv("PROSPER_NO_RTT_POOL_CENSUS") || (hits + misses) == 0) return;
-            const uint64_t miss_bytes = s.miss_bytes.load(std::memory_order_relaxed);
-            std::fprintf(stderr,
-                         "[rtt-pool] copies=%llu hit=%llu (%.1f%%) miss=%llu "
-                         "allocated=%.1f MiB reused=%.1f MiB\n",
-                         static_cast<unsigned long long>(hits + misses),
-                         static_cast<unsigned long long>(hits),
-                         100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses),
-                         static_cast<unsigned long long>(misses),
-                         static_cast<double>(miss_bytes) / (1024.0 * 1024.0),
-                         static_cast<double>(s.hit_bytes.load(std::memory_order_relaxed)) /
-                             (1024.0 * 1024.0));
-            std::fflush(stderr);
-        });
+        prosper::diagnostics::register_exit_report(
+            [] { print_cpu_rtt_snapshot_pool_stats("rtt-pool", cpu_rtt_snapshot_pool_stats()); });
         return true;
     }();
     (void)once;
@@ -78,7 +80,8 @@ struct CpuRttSnapshot {
 // the pool wrapper is destroyed. Reclamation is bounded and never needed for correctness.
 class CpuRttSnapshotPool {
     struct State {
-        State(size_t budget, size_t max) : budget_bytes(budget), max_retained(max) {}
+        State(size_t budget, size_t max, CpuRttSnapshotPoolStats* counters)
+            : budget_bytes(budget), max_retained(max), stats(counters) {}
 
         void recycle(std::unique_ptr<std::vector<uint8_t>> released) noexcept {
             const size_t charge = released->capacity();
@@ -105,6 +108,7 @@ class CpuRttSnapshotPool {
         size_t retained_bytes = 0;
         size_t budget_bytes;
         size_t max_retained;
+        CpuRttSnapshotPoolStats* stats;
     };
 
     struct ReturnToPool {
@@ -115,8 +119,12 @@ class CpuRttSnapshotPool {
     };
 
 public:
-    explicit CpuRttSnapshotPool(size_t budget_bytes, size_t max_retained = 4)
-        : state_(std::make_shared<State>(budget_bytes, max_retained)) {}
+    // `stats` receives this pool's hit/miss accounting. The default is the shared object behind the
+    // `[rtt-pool]` line; a pool whose traffic should be reported on its own passes another one.
+    explicit CpuRttSnapshotPool(size_t budget_bytes, size_t max_retained = 4,
+                                CpuRttSnapshotPoolStats* stats = nullptr)
+        : state_(std::make_shared<State>(budget_bytes, max_retained,
+                                         stats ? stats : &cpu_rtt_snapshot_pool_stats())) {}
 
     CpuRttSnapshot copy(const uint8_t* source, size_t bytes) {
         if (!source || !bytes) return {};
@@ -137,15 +145,17 @@ public:
     // with a pointer to `bytes` writable bytes and MUST write every one of them (a recycled buffer
     // holds a previous tenant's pixels). A steady-state caller asking for the same size each time gets
     // the same buffer back with its size already right, so there is no allocation and no zero-fill --
-    // `resize` only touches bytes beyond the old size.
+    // `resize` only touches bytes beyond the old size. Unlike copy(), it does not feed the transfer-pressure
+    // accounting (see below).
     template <typename Fill>
     CpuRttSnapshot build(size_t bytes, Fill&& fill) {
         if (!bytes) return {};
         bool reused = false;
         std::vector<uint8_t> pixels = take(bytes, reused);
         count(reused, bytes);
-        prosper::diagnostics::note_transfer(
-            prosper::diagnostics::Transfer::RenderTargetSnapshot, bytes);
+        // Deliberately no note_transfer(): the bytes are CONVERTED from another buffer by `fill`, not a host
+        // copy of guest data, and the always-on transfer-pressure alarm reads that counter. A caller whose
+        // fill is a copy should note it itself.
         pixels.resize(bytes);
         fill(pixels.data());
         return publish(std::move(pixels), reused);
@@ -201,9 +211,9 @@ private:
         return pixels;
     }
 
-    static void count(bool reused, size_t bytes) {
+    void count(bool reused, size_t bytes) const {
         {
-            auto& stats = cpu_rtt_snapshot_pool_stats();
+            auto& stats = *state_->stats;
             (reused ? stats.hits : stats.misses).fetch_add(1, std::memory_order_relaxed);
             (reused ? stats.hit_bytes : stats.miss_bytes)
                 .fetch_add(bytes, std::memory_order_relaxed);
@@ -227,6 +237,19 @@ inline CpuRttSnapshot copy_cpu_rtt_snapshot(CpuRttSnapshotPool& pool, bool poole
     if (pooled) return pool.copy(source, bytes);
     CpuRttSnapshot snapshot;
     snapshot.pixels = std::make_shared<std::vector<uint8_t>>(source, source + bytes);
+    return snapshot;
+}
+
+// Produce `bytes` into a snapshot through `pool` unless it is disabled, in which case a plain allocation is
+// filled instead (the same no-pool behaviour copy_cpu_rtt_snapshot has).
+template <typename Fill>
+inline CpuRttSnapshot build_cpu_rtt_snapshot(CpuRttSnapshotPool& pool, bool pooled, size_t bytes, Fill&& fill) {
+    if (pooled) return pool.build(bytes, std::forward<Fill>(fill));
+    CpuRttSnapshot snapshot;
+    if (!bytes) return snapshot;
+    auto pixels = std::make_shared<std::vector<uint8_t>>(bytes);
+    fill(pixels->data());
+    snapshot.pixels = std::move(pixels);
     return snapshot;
 }
 
