@@ -5,6 +5,7 @@
 
 #include "gpu/execute/gpu_execute.hpp"          // guest_readable
 #include "shared/live/guest_source_read.hpp"    // guest_source_readable_prefix / copy / equal
+#include "shared/texture/validation_mapping_census.hpp"   // PROSPER_VALIDATION_MAPPING_CENSUS
 
 #include <cstddef>
 #include <cstdint>
@@ -24,8 +25,15 @@ inline constexpr auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size
 inline constexpr auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
                                                 size_t& compared,
                                                 GuestSourceComparisonObservation* observation = nullptr) -> bool {
-    return equal_guest_source_prefix(
-        expected, a, n, compared, prosper::gpu::guest_readable, observation);
+    // The census needs the extent actually compared and the outcome, so observe even when the caller
+    // did not ask. Observations are never an equality authority, so the result is unchanged.
+    GuestSourceComparisonObservation local_observation;
+    GuestSourceComparisonObservation* const seen = observation ? observation : &local_observation;
+    const bool equal = equal_guest_source_prefix(
+        expected, a, n, compared, prosper::gpu::guest_readable, seen);
+    note_validation_mapping(a, seen->memcmp_extent_bytes,
+                            seen->outcome == GuestSourceComparisonOutcome::BytesDiffer);
+    return equal;
 };
 
 } // namespace prosper::frontend::submit_renderer
