@@ -83,6 +83,14 @@ is a counted fallback where tracking is unavailable, never the normal path.
 Status: proposed (adr:0010)
 Enforcement: runtime:host-copy-pressure, adr:0010
 
+### PERF-P12 -- guest textures are detiled, retiled and converted on the GPU
+
+Each tile mode and format prosper transforms has a GPU path driven by the shared tiling tables, and
+that path is the default. The host transform is the bit-for-bit test reference and a counted
+fallback, and a storage image stays resident across dispatches until the guest CPU writes it.
+Status: proposed (adr:0031)
+Enforcement: runtime:host-copy-per-flip, runtime:host-copy-pressure, adr:0031
+
 ### PERF-G1 -- releases are compared on the reference workloads
 
 Each release candidate is measured against the previous release on the reference workloads, and a
