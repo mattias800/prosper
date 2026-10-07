@@ -56,8 +56,9 @@ ADR does not compete with it; it names it as the fragment route and sets the pol
 routes together.
 
 Reference designs, read for verification only (no code taken; paths relative to each project).
-**These citations are not pinned to commits** and review could not re-check them (a local shadPS4
-checkout predates `lower_wave64_pass.cpp`); pin a commit before relying on any of them:
+Citations are pinned to the commits read (all 2026-10-07): AnyPS5 `400ba7f5ec01`, shadPS4
+`afde63182a38`, sharpemu `b02c06181a29`. Older checkouts differ; shadPS4 before that range may lack
+`lower_wave64_pass.cpp`.
 
 - **AnyPS5** emits each instruction once per half-lane context when `state.laneCount == 2`, sharing
   values proven uniform (`core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp:734-735`,
