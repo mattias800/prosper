@@ -1,6 +1,6 @@
 ---
 kind: adr
-status: proposed
+status: accepted
 date: 2026-10-05
 ---
 
@@ -41,7 +41,8 @@ parsing. A count of sites, not of escapes: several are caught before they leave 
 
 ## Consequences
 
-A class of silent failure, the guest catching prosper's error, cannot grow. Removing the existing
+A class of failure that ends far from its cause -- `std::terminate` (Linux) or a stack-dependent
+mis-unwind (Windows) instead of a logged error at the failing call -- cannot grow. Removing the existing
 sites is ordinary work on the files that hold them. The count is a proxy: it cannot tell a caught
 throw from an escaping one, which is why the rule allows a documented, caught throw.
 
@@ -54,4 +55,4 @@ throw from an escaping one, which is why the rule allows a documented, caught th
 
 ## Approval
 
-Requires the project owner's acceptance; it adds a twelfth ratchet rule.
+Accepted by the project owner on 2026-10-07; it adds a twelfth ratchet rule.

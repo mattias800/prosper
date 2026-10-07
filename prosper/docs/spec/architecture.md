@@ -250,7 +250,7 @@ Enforcement: adr:0021
 Code in `src/{hle,loader,self,gpu}` reports failure through return codes and the logging abort path.
 A `throw` there is allowed only when it is caught before leaving prosper code, with a comment saying
 where.
-Status: proposed (adr:0022)
+Status: accepted
 Enforcement: ratchet:host-throw, adr:0022
 
 ### LOCAL-1 -- everything derived from a title stays on the user's machine

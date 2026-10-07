@@ -40,10 +40,11 @@ The rules (every count is per file, over tracked files only, with comments strip
                  another platform's logic), so a stub that is not named `_stub` is not counted;
                  the standard it serves is in ARCHITECTURE_TARGET_TREE.md, section Standards.
   host-throw     `throw` expressions in the same roots as platform-ifdef (an exception
-                 specification `throw()` is not counted). Code there runs inside guest calls, and a
-                 host exception that unwinds into guest frames can be swallowed by the guest's own
-                 `catch (...)` or end in std::terminate instead of failing visibly. A count of
-                 throw sites, not a proof that one escapes: many are caught locally.
+                 specification `throw()` is not counted). Code there runs inside guest calls, and
+                 the host unwinder has no unwind info for guest frames, so an escaping host
+                 exception ends in std::terminate (or a stack-dependent mis-unwind on Windows) far
+                 from the call that failed, not as a logged error. A count of throw sites, not a
+                 proof that one escapes: many are caught locally.
   layer-include  an `#include` from one prosper/src top-level layer into a layer it may not depend
                  on, one row per (file, target layer), valued by the number of include lines.
                  LAYER_ORDER below is the table: a layer may include itself and any layer EARLIER
@@ -306,8 +307,8 @@ FIX_HINT = {
     ),
     "host-throw": (
         "A new throw in code that runs inside guest calls. Report the failure through the call's "
-        "return code or the logging abort path instead; a host exception that unwinds into guest "
-        "frames can be caught by the guest's own catch (...). If the throw is caught before it "
+        "return code or the logging abort path instead; a host exception that reaches guest frames "
+        "ends in std::terminate far from the failing call (ADR 0022). If the throw is caught before it "
         "leaves prosper code, say where in a comment and raise the row in the same PR."
     ),
     "layer-include": (
