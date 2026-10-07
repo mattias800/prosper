@@ -13,10 +13,17 @@
 //   CachedAndUncachedAgree              the cache changes an answer
 //   CacheHitStillChecksTheWordRead      a cache hit skips the per-call address check
 //   ProgramPastTheMemoryGuardIsRefused  the memory guard is dropped
+//   ChangedTailAtTheSameAddressIsReanalysed  a hit trusts bytes past the first s_endpgm it never
+//                                       re-read (#4712 review B1: the decode cache validates only
+//                                       the body, so same body + new tail reached the old answer)
+//   ProducerThroughAnOutOfRangePointerIsRefused  the pointer-register bound leaves the code-only half
+//                                       (#4712 review B2: the dataflow then reads past its array)
+#include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/split_t8_proof.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -94,5 +101,55 @@ TEST(SplitT8Cache, CacheHitStillChecksTheWordRead) {
 TEST(SplitT8Cache, ProgramPastTheMemoryGuardIsRefused) {
     const auto code = program(kSplitT8MaxDwords);
     ASSERT_GT(code.size(), kSplitT8MaxDwords);
+    EXPECT_FALSE(proves(code, inputs(), nullptr));
+}
+
+namespace {
+
+// The tail-block program of test_split_t8_tail_blocks: pc3 x8 + pc5 x4 load the T# in s[4:11] through
+// the entry pointer s[10:11]; pc10 image_load; pc16 branches to the block after the first s_endpgm.
+constexpr uint32_t kBody[] = {
+    0xBFA00001u, 0x7E000F02u, 0x7E020F03u, 0xF40C0005u, 0xFA000000u, 0xF4080205u, 0xFA000020u,
+    0xBF8CC07Fu, 0xF4201A80u, 0xFA000000u, 0xF0000108u, 0x00010000u, 0xBF8C0070u, 0x3600006Au,
+    0x7D840080u, 0x8AEA6A7Eu, 0xBF840004u, 0xBEFE046Au, 0xF8001890u, 0x00000000u, 0xBF810000u,
+};
+constexpr size_t kBodyDwords = sizeof(kBody) / sizeof(kBody[0]);
+
+// One fixed buffer, so both programs live at the same address and reach the same decoded program.
+alignas(256) uint32_t g_code[64];
+
+bool image_load_published(const uint32_t* tail, size_t tail_dwords) {
+    std::copy(kBody, kBody + kBodyDwords, g_code);
+    std::copy(tail, tail + tail_dwords, g_code + kBodyDwords);
+    for (uint32_t i = 0; i < 16; ++i) g_table[i] = 0xD1000000u + i;
+    const auto base = reinterpret_cast<uint64_t>(g_table);
+    uint32_t seed[12] = {};
+    seed[10] = static_cast<uint32_t>(base);
+    seed[11] = static_cast<uint32_t>(base >> 32u);
+    std::vector<SrtUse> uses;
+    resolve_dynamic_fetch(g_code, kBodyDwords + tail_dwords, seed, 12, 0, &uses);
+    return std::any_of(uses.begin(), uses.end(),
+                       [](const SrtUse& u) { return u.kind == 0 && u.use_pc == 10u; });
+}
+
+}   // namespace
+
+TEST(SplitT8Cache, ChangedTailAtTheSameAddressIsReanalysed) {
+    // s_mov_b32 exec_lo, 0; exp null; s_endpgm -- a closed discard block.
+    constexpr uint32_t kClosed[] = {0xBEFE0480u, 0xF8001890u, 0x00000000u, 0xBF810000u};
+    // s_mov_b32 exec_lo, 0; s_branch pc3; s_endpgm; s_nop -- it can re-enter the body.
+    constexpr uint32_t kReenters[] = {0xBEFE0480u, 0xBF82FFECu, 0xBF810000u, 0xBF800000u};
+    ASSERT_TRUE(image_load_published(kClosed, 4)) << "the closed tail proves the T#";
+    EXPECT_FALSE(image_load_published(kReenters, 4))
+        << "same address, same body, new tail: the cached proof must not be reused";
+    EXPECT_TRUE(image_load_published(kClosed, 4)) << "and the closed tail proves again";
+}
+
+TEST(SplitT8Cache, ProducerThroughAnOutOfRangePointerIsRefused) {
+    // The first producer reads its pointer from s[106:107] (VCC), outside the tracked SGPRs.
+    auto code = program(8);
+    code[0] = 0xF40C0135u;   // s_load_dwordx8 s[4:11], s[106:107], 0
+    const auto cache = make_split_t8_proof_cache();
+    EXPECT_FALSE(proves(code, inputs(), cache.get()));
     EXPECT_FALSE(proves(code, inputs(), nullptr));
 }

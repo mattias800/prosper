@@ -50,6 +50,9 @@ uint64_t load_tag(size_t producer, uint32_t word) {
 // image-write footprint misses those bytes -- is checked per call against this.
 struct SplitT8Structure {
     bool ok = false;
+    // Every dword the analysis read, including tail blocks past the first s_endpgm. The decoded
+    // program a cache hangs off is validated only up to that s_endpgm, so a hit must re-check these.
+    std::vector<uint32_t> analysed;
     std::array<uint64_t, 8> tags_at_use{};   // the meet-over-paths tag of each descriptor word
     struct Lane {
         size_t producer = 0;   // instruction index: the tag's producer field
@@ -96,6 +99,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
                                                          uint32_t use_pc, int tbase,
                                                          const std::array<uint32_t, 8>& source_pc) {
     auto result = std::make_shared<SplitT8Structure>();
+    result->analysed.assign(code, code + dwords);
     std::vector<Rdna2Inst> full;
     rdna2_walk(code, dwords, full);
     if (full.empty() || !full.back().is_end ||
@@ -185,7 +189,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u || load.opcode < 2u ||
             load.dst.kind != OperandKind::SGPR || load.src[0].kind != OperandKind::SGPR ||
             ((load.words[1] >> 25u) & 0x7fu) != 125u || static_cast<int32_t>(load.literal) < 0 ||
-            load.dst.value < 0)
+            load.dst.value < 0 || load.src[0].value < 0 || load.src[0].value + 1 >= kSgprs)
             return result;
         is_producer[producer] = 1;
         auto& out = result->lanes[static_cast<size_t>(lane)];
@@ -329,10 +333,15 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             const auto found = cache->entries.find(key);
             if (found != cache->entries.end()) structure = found->second;
         }
+        // Same body, different tail: the live bytes are no longer the ones the entry describes.
+        if (structure &&
+            (structure->analysed.size() != dwords ||
+             !std::equal(structure->analysed.begin(), structure->analysed.end(), code)))
+            structure.reset();
         if (!structure) {
             structure = analyze_split_t8(code, dwords, use_pc, tbase, source_pc);
             std::lock_guard<std::mutex> lock(cache->mutex);
-            cache->entries.emplace(key, structure);
+            cache->entries.insert_or_assign(key, structure);
         }
     } else {
         structure = analyze_split_t8(code, dwords, use_pc, tbase, source_pc);
