@@ -95,7 +95,7 @@ Performance claims are qualitative until measured. **No route becomes the defaul
 shaders until a same-binary A/B on real titles** (`.claude/skills/perf-change/`) shows its cost,
 the control arm being the route switched off (i.e. today's refusal or the cheaper route).
 
-Adds spec rule `GPU-4`.
+Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
 
 ## Consequences
 
@@ -122,8 +122,7 @@ Adds spec rule `GPU-4`.
   two halves disagree, which violates `FAIL-1` and turns a visible drop into an invisible defect.
 - **Refuse forever.** Today's state; correct but leaves every NVIDIA user without the refused draws
   and dispatches, and the refusals are in shipped titles' main passes.
-- **Require AMD hardware.** Abandons a large share of users, and the Windows release targets
-  NVIDIA hosts.
+- **Require AMD hardware.** Abandons every user on a 32-lane host.
 - **Two lanes per invocation for every compute program.** Exact and simple, but pays the occupancy
   cost on programs that need nothing; the per-shader choice confines it.
 - **Workgroup exchange for every compute program.** Cannot express divergent cross-lane operations

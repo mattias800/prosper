@@ -278,7 +278,7 @@ evidence only if each is a host-capability or diagnostic switch; a selector disq
 Status: proposed (adr:0023)
 Enforcement: adr:0023
 
-### GPU-4 -- a guest Wave64 program runs natively, by proof or exact emulation, or is refused visibly
+### GPU-5 -- a guest Wave64 program runs natively, by proof or exact emulation, or is refused visibly
 
 On a host without a native 64-lane subgroup for the stage, a Wave64 program runs only when its
 width independence is proven or an exact emulation route admits it; otherwise it is refused with a
