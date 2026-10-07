@@ -17,6 +17,7 @@
 // Encodings are assembled by hand from forms already used by the fixtures in this directory and
 // by the live shader; DecodesAsDescribed checks the three that matter through the project's own
 // decoder, so a mis-assembled word fails there instead of quietly changing what the arms test.
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
@@ -154,6 +155,37 @@ constexpr uint32_t kBreakFromScratchBody[] = {
     0xBE80036Au,   // 12  s_mov_b32 s0, vcc_lo
     0xBF82FFF7u,   // 13  s_branch 5
     0x7E020300u, 0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
+};
+
+//  #4680: a COUNTED loop (SCC exit, unconditional back-edge) whose induction variable lives in
+//  vcc_hi. Kena: Bridge of Spirits' wave64 light-list pixel shader, reduced to its scalar skeleton
+//  with the live body's exact scalar words (pc 60..64 there): the header is
+//  `s_cmp_lt_i32 vcc_hi, <bound>`, and the body turns the counter into a constant-buffer offset in
+//  vcc_lo and steps vcc_hi by two. VCC is a mask before the loop (the emitter then gives VCC a
+//  lane-mask header phi), and the body leaves the pair as scalar data, so that phi had no back-edge
+//  value and the shader was refused. The bound comes from a VGPR so the scalar fold cannot know it.
+constexpr uint32_t kCountedVccHiLoop[] = {
+    0xBE800380u,   //  0  s_mov_b32 s0, 0
+    0x7E000280u,   //  1  v_mov_b32 v0, 0
+    0x7E020288u,   //  2  v_mov_b32 v1, 8
+    0x7E0602F2u,   //  3  v_mov_b32 v3, 1.0
+    0x7D020200u,   //  4  v_cmp_lt_i32 vcc, s0, v1    VCC is a live mask before the loop
+    0xBEEB0380u,   //  5  s_mov_b32 vcc_hi, 0         the induction variable: scalar data
+    0x7E040501u,   //  6  v_readfirstlane_b32 s2, v1  the bound (8), unknown to the scalar fold
+    0xBF04026Bu,   //  7  HEADER: s_cmp_lt_i32 vcc_hi, s2   a scalar read of the carried half
+    0xBF840009u,   //  8  s_cbranch_scc0 18
+    0x916A9F6Bu,   //  9  s_ashr_i32 vcc_lo, vcc_hi, 31     Kena pc 60..64, word for word
+    0x876A816Au,   // 10  s_and_b32 vcc_lo, vcc_lo, 1
+    0x816A6A6Bu,   // 11  s_add_i32 vcc_lo, vcc_hi, vcc_lo
+    0x916A816Au,   // 12  s_ashr_i32 vcc_lo, vcc_lo, 1
+    0x816B826Bu,   // 13  s_add_i32 vcc_hi, vcc_hi, 2
+    0x060000FFu, 0x3E000000u,   // 14  v_add_f32 v0, 0.125, v0
+    0xBE83036Au,   // 16  s_mov_b32 s3, vcc_lo        the offset is consumed in the body
+    0xBF82FFF5u,   // 17  s_branch 7
+    0x7E020300u,   // 18  v_mov_b32 v1, v0
+    0x7E040300u,   // 19  v_mov_b32 v2, v0
+    0xF800080Fu, 0x03020100u,   // 20  exp mrt0 v0, v1, v2, v3
+    0xBF810000u,   // 22  s_endpgm
 };
 
 struct Compiled {
@@ -337,4 +369,95 @@ TEST(FragmentLoopVccScratch, MaskReadAfterTheLoopSeesTheExitMask) {
     EXPECT_LT(pixel[0], 0x10) << "red is the accumulator: zero trips";
     EXPECT_GT(pixel[1], 0xF0) << "green is selected by the mask the loop exited with";
     EXPECT_LT(pixel[2], 0x10);
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopDecodesAsDescribed) {
+    std::vector<Rdna2Inst> ins;
+    ASSERT_EQ(rdna2_walk(kCountedVccHiLoop, std::size(kCountedVccHiLoop), ins),
+              std::size(kCountedVccHiLoop));
+    const auto at = [&](uint32_t pc) -> const Rdna2Inst& {
+        for (const Rdna2Inst& in : ins)
+            if (in.pc == pc) return in;
+        ADD_FAILURE() << "no instruction at pc " << pc;
+        return ins.front();
+    };
+    EXPECT_EQ(at(5).fmt, Rdna2Format::SOP1);
+    EXPECT_EQ(at(5).dst.value, 107);
+    EXPECT_EQ(at(7).fmt, Rdna2Format::SOPC);
+    EXPECT_EQ(at(7).src[0].value, 107);
+    EXPECT_EQ(at(7).src[1].value, 2);
+    for (uint32_t pc : {9u, 10u, 11u, 12u}) {
+        EXPECT_EQ(at(pc).fmt, Rdna2Format::SOP2) << "pc " << pc;
+        EXPECT_EQ(at(pc).dst.value, 106) << "pc " << pc;
+    }
+    EXPECT_EQ(at(9).src[0].value, 107);
+    EXPECT_EQ(at(13).dst.value, 107);
+    EXPECT_EQ(at(13).src[0].value, 107);
+    EXPECT_EQ(at(16).src[0].value, 106);
+    EXPECT_EQ(static_cast<int64_t>(at(8).pc) + at(8).len_dwords + at(8).simm16, 18);
+    EXPECT_EQ(static_cast<int64_t>(at(17).pc) + at(17).len_dwords + at(17).simm16, 7);
+    const CountedLoop loop = detect_counted_loop(ins);
+    ASSERT_TRUE(loop.found) << "the fixture must take the counted-loop route";
+    EXPECT_EQ(loop.header_pc, 7u);
+    EXPECT_EQ(loop.backedge_pc, 17u);
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterCompiles) {
+    const Compiled loop = compile(kCountedVccHiLoop, 0x4686A001ull);
+    ASSERT_FALSE(loop.spirv.empty())
+        << "VCC's mask is dead from the header and its scalar halves are carried by their own "
+           "phis; reason: "
+        << loop.reason;
+    EXPECT_EQ(loop.spirv[0], 0x07230203u);
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterRunsExactlyFourIterations) {
+    const Compiled loop = compile(kCountedVccHiLoop, 0x4686A002ull);
+    ASSERT_FALSE(loop.spirv.empty()) << loop.reason;
+    if (!device_can_execute(loop.spirv))
+        GTEST_SKIP() << "device cannot execute the fragment wave64 contract this module declares";
+    const std::vector<uint8_t> pixel = centre_pixel(loop.spirv);
+    ASSERT_EQ(pixel.size(), 4u) << "the triangle did not render";
+    // vcc_hi = 0, 2, 4, 6: four trips of +0.125 are 0.5. A vcc_hi seeded with anything but its
+    // tracked 0 (the mask's dword, or an invented value) moves the trip count and leaves this band.
+    for (int channel = 0; channel < 3; ++channel) {
+        EXPECT_GT(pixel[channel], 0x70) << "channel " << channel;
+        EXPECT_LT(pixel[channel], 0x90) << "channel " << channel;
+    }
+    // Control: bound five must leave the band, or the band proves nothing.
+    uint32_t five_trips[std::size(kCountedVccHiLoop)];
+    std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), five_trips);
+    five_trips[2] = 0x7E02028Au;   // v_mov_b32 v1, 10
+    const Compiled longer = compile(five_trips, 0x4686A003ull);
+    ASSERT_FALSE(longer.spirv.empty()) << longer.reason;
+    const std::vector<uint8_t> longer_pixel = centre_pixel(longer.spirv);
+    ASSERT_EQ(longer_pixel.size(), 4u);
+    EXPECT_GT(longer_pixel[0], 0x98) << "five trips of +0.125 are 0.625";
+    EXPECT_LT(longer_pixel[0], 0xA8);
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopReadingAMaskHalfAsDataStillRejects) {
+    // vcc_hi is NOT scalar data before the loop: it is the high dword of the compare's mask. The
+    // header reads it as data, and its phi would be seeded with an invented zero.
+    uint32_t untracked[std::size(kCountedVccHiLoop)];
+    std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), untracked);
+    untracked[5] = 0xBE850380u;   // s_mov_b32 s5, 0 -- vcc_hi keeps the mask's dword
+    const Compiled loop = compile(untracked, 0x4686A004ull);
+    EXPECT_TRUE(loop.spirv.empty()) << "the entry value of vcc_hi is a mask dword, not data";
+    EXPECT_NE(loop.reason.find("s107 is read from header pc=7"), std::string::npos)
+        << loop.reason;
+    EXPECT_NE(loop.reason.find("tracked-at-entry=0"), std::string::npos) << loop.reason;
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopWithAMaskReadAfterTheExitStillRejects) {
+    // On the exit path the pair was never redefined, so a mask read there would observe the
+    // placeholder the back-edge carries round the loop.
+    uint32_t mask_read[std::size(kCountedVccHiLoop)];
+    std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), mask_read);
+    mask_read[18] = 0x02020105u;   // v_cndmask_b32 v1, v5, v0, vcc
+    const Compiled loop = compile(mask_read, 0x4686A005ull);
+    EXPECT_TRUE(loop.spirv.empty()) << "a mask read reachable from the header";
+    EXPECT_NE(loop.reason.find("from header pc=7"), std::string::npos) << loop.reason;
+    EXPECT_NE(loop.reason.find("blocker pc=18 kind=vop2-implicit-vcc"), std::string::npos)
+        << loop.reason;
 }

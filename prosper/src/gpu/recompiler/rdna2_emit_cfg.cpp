@@ -6672,6 +6672,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 ins, L.header_pc, L.backedge_pc, rs))
             return false;
         const uint32_t preheader = b.cur_block;
+        // Whether each VCC half holds tracked scalar data before the loop; the header phis below
+        // replace the entries, so this is the last point the entry state is visible (#4680).
+        const bool vcc_half_tracked_at_entry[2] = {rs.sreg.contains(106), rs.sreg.contains(107)};
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
         // Loop-carried PHIs likewise seed a missing preheader SGPR with zero.
         rs.scalar_presence_has_no_placeholders = false;
@@ -6746,7 +6749,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         : pr.dom == 1 ? sget(pr.reg)
                         : pr.dom == 2 ? rs.scc
                         : pr.dom == 3 ? rs.vcc : rs.exec;
-            if (!nv && pr.dom == 3) return LoopVccCarry::reject_counted_backedge(b, L.header_pc);
+            if (!nv && pr.dom == 3) {
+                nv = LoopVccCarry::counted_backedge_value(b, ins, L.header_pc,
+                                                          vcc_half_tracked_at_entry);
+                if (!nv) return false;
+            }
             if (!nv && pr.dom == 2)
                 nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);

@@ -92,16 +92,53 @@ struct LoopVccCarry {
         return false;
     }
 
-    // The counted-loop emitter keeps its own, older VCC phi and still refuses a body that leaves
-    // VCC as scalar data: no title has needed it, and its exit state differs (it hands on the
-    // header phi, not the check block's mask). This only gives that refusal a name, so the caller
-    // does not `return false` in silence.
-    static bool reject_counted_backedge(SpirvCompute& b, uint32_t header_pc) {
-        log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
-                                 "counted-loop body leaves VCC as scalar data at the back-edge "
-                                 "(header pc=%u)",
-                                 header_pc);
-        return false;
+    // The counted-loop emitter's VCC phi when its body leaves VCC as scalar data (#4680). The
+    // emitter keeps its own, older phi: a lane-mask Bool, created whenever VCC holds a mask before
+    // the loop. A body that rewrites vcc_lo/vcc_hi with scalar ops leaves no mask to close it with.
+    // Kena: Bridge of Spirits' wave64 light-list loop is exactly this, and it goes further than the
+    // divergent loop above: VCC_HI IS the induction variable, read by the header's own test.
+    //
+    //     s_mov_b32 vcc_hi, 2                ; before the loop: scalar data
+    //     header: s_cmp_lt_i32 vcc_hi, s34   ; scalar read of the half
+    //             s_cbranch_scc0 exit
+    //     body:   s_lshr_b32 vcc_lo, vcc_hi, 31 ... s_buffer_load_dwordx4 s[16:19], s[12:15], vcc_lo
+    //             s_add_u32 vcc_hi, vcc_hi, 2
+    //             s_branch header
+    //
+    // A placeholder Bool is a correct back-edge input when no MASK read of VCC is reachable from
+    // the header before the pair is redefined: then the phi's value is never observed, on any
+    // iteration or after the exit. Scalar reads are a different domain. The scalar halves are
+    // loop-carried by their own u32 phis (the body writes them, so `loop_written_regs` lists
+    // them), and operand_bits serves a tracked half before it considers the mask. So a half may be
+    // READ AS DATA from the header only if it already held tracked scalar data before the loop:
+    // otherwise its phi would be seeded with an invented zero where hardware holds the entry
+    // mask's dword. That is the AnyRead / MaskDomainOnly split the divergent loop's comment
+    // explains, applied per half: a half untracked at the preheader needs AnyRead, a tracked one
+    // needs only MaskDomainOnly.
+    //
+    // Returns the placeholder, or 0 after logging why the back-edge cannot be closed.
+    // CONFIDENCE: HIGH -- the placeholder is unobservable by the proof, and every scalar value the
+    // loop reads comes from its own phi seeded with the half's tracked entry value.
+    static uint32_t counted_backedge_value(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
+                                           uint32_t header_pc, const bool tracked_at_entry[2]) {
+        for (int half : {106, 107}) {
+            const ScalarMergeProof proof = tracked_at_entry[half - 106]
+                                               ? ScalarMergeProof::MaskDomainOnly
+                                               : ScalarMergeProof::AnyRead;
+            ScalarMergeBlocker blocker;
+            if (sgpr_dead_at_merge(ins, header_pc, half, proof, &blocker)) continue;
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop body leaves VCC as scalar data at the back-edge "
+                                     "and s%d is %s from header pc=%u (blocker pc=%d kind=%s, "
+                                     "tracked-at-entry=%d)",
+                                     half,
+                                     proof == ScalarMergeProof::AnyRead ? "read" : "mask-read",
+                                     header_pc,
+                                     blocker.pc == UINT32_MAX ? -1 : static_cast<int>(blocker.pc),
+                                     blocker.kind, tracked_at_entry[half - 106] ? 1 : 0);
+            return 0;
+        }
+        return b.bfalse();
     }
 
     // After the merge phis. A VCC half that the loop writes as scalar data is loop-carried, so the
