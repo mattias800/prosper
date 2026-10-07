@@ -64,8 +64,11 @@ views, 0% private, in every run. So `GetWriteWatch` alone tracks none of today's
    change in that step.
 2. **Write protection is armed over guest-writable memory only where `fault_is_red_zone_safe()`
    holds.** On Windows it does not, so a `VirtualProtect(PAGE_READONLY)` + vectored-handler guard is
-   **not** adopted for guest-written pages, at any default. A silent corruption of a leaf function's
-   locals is worse than any compare cost. (Spec rule `PERF-P13`.)
+   **not** adopted for guest-written pages until something makes the fault red-zone safe. A silent
+   corruption of a leaf function's locals is worse than any compare cost. (Spec rule `PERF-P13`.)
+   One such thing exists in practice and is evaluated in Migration step 5: statically rewriting the
+   guest instructions that can fault while red-zone bytes are live, so the fault is taken with RSP
+   already below the red zone (the shadPS4 design, below).
 3. **Windows' fault-free tracking comes from `harvest` over private memory.** The tracker asks the
    primitive first; a range the primitive cannot see stays on the counted full-compare fallback, and
    the fallback names the reason (`section-view`, `unsafe-fault`, `disabled`) in the census.
@@ -114,10 +117,26 @@ views, 0% private, in every run. So `GetWriteWatch` alone tracks none of today's
   O(size) like the compare (ADR 0010, Alternatives).
 - **Hypervisor dirty logging (Windows Hypervisor Platform) or a kernel driver.** Would move the guest
   into a VM or ship a driver; out of proportion to a cache-validation cost.
-- **How other emulators do it.** From knowledge, unverified: Ryujinx and yuzu protect host pages
-  backing guest memory and catch the fault, or instrument stores in their JIT. Their guest is
-  JIT-compiled ARM code that does not run on the host stack under the SysV ABI, so the red-zone
-  constraint does not arise for them and their design does not transfer to native x86-64 guests.
+- **How other emulators do it.**
+  - *Native x86-64 guests on Windows (the same constraint as prosper)*. Read from their sources;
+    these are design references only, and nothing was copied:
+    - shadPS4 uses `VirtualProtect` plus a vectored handler, over 4 KiB pages with per-page watcher
+      counts (`src/video_core/page_manager.cpp`, `src/core/address_space.cpp:268`). It makes that
+      safe with **static red-zone protection** (`src/core/cpu_patches.cpp:1128-1952`, enabled in
+      `src/emulator.cpp:554`). It computes a per-instruction 128-bit red-zone liveness mask over the
+      guest code, and rewrites each memory access that can fault while red-zone bytes are live into
+      a trampoline that runs it with `rsp` lowered by 128. The dispatch frame then lands below the
+      live bytes.
+    - KytyPS5 uses `VirtualProtect` plus a vectored handler (`common/hostException.cpp`,
+      `graphics/host_gpu/pageManager.cpp`). Whether it guards the red zone was not checked.
+  - *Fault-free, Linux:* AnyPS5 uses asynchronous userfaultfd write-protect plus the `PAGEMAP_SCAN`
+    ioctl (`GuestWriteWatch.cpp`), which is a natural `harvest` for the Linux arm. shadPS4 offers
+    synchronous uffd-wp as an opt-in.
+  - *Fault-free, Windows:* portps5 uses `MEM_WRITE_WATCH` arenas with a bounded `GetWriteWatch`
+    reset pass (`WriteTracker.hpp`). This is the shape of Decision 3.
+  - From knowledge, unverified: Ryujinx and yuzu protect host pages or instrument stores in their JIT.
+    Their guest is JIT-compiled ARM code that never runs on the host stack under the SysV ABI, so the
+    red-zone constraint does not arise for them.
 
 ## Migration order
 
@@ -132,6 +151,17 @@ views, 0% private, in every run. So `GetWriteWatch` alone tracks none of today's
 4. Only if step 2 shows single-alias direct memory carries the compared bytes: private backing for
    single-alias ranges, with the migration-to-section path specified and tested under concurrent
    guest writers. Then the A/B in Decision 5.
+5. Evaluate static red-zone protection as the way to make the protect/fault primitive red-zone safe
+   on Windows, for the memory `harvest` cannot see:
+   - Build a red-zone liveness analysis over the guest's executable segments.
+   - Rewrite the at-risk memory accesses through trampolines.
+   - Add a test that faults from a leaf with a live red zone and checks the bytes, with a mutation
+     arm that skips the rewrite and must corrupt them.
+
+   This step is gated on the step-2 census showing that section-backed memory carries the cost, and
+   on measuring the rewrite's own overhead and coverage (indirect branches and self-modifying code
+   must be refused, never guessed). Only after this does `fault_is_red_zone_safe()` answer yes on
+   Windows.
 
 ## Open questions
 
@@ -139,6 +169,9 @@ views, 0% private, in every run. So `GetWriteWatch` alone tracks none of today's
   or only reasoned? The code comments assert it; a test that faults from a leaf with a live red zone
   and checks the bytes would settle it on each Windows version. `CONFIDENCE: MED`.
 - What share of compared bytes is single-alias? Unknown until step 2.
+- How much guest code static red-zone protection must rewrite on a real title, and its runtime cost.
+  Its correctness depends on decoding every reachable instruction, which ties it to prosper's
+  existing guest-code analysis tools.
 - Does private backing change anything the guest can observe (`sceKernelVirtualQuery` results,
   commit accounting)? It must not; step 4 needs the HLE conformance tests (ADR 0020) to say so.
 
