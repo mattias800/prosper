@@ -1744,6 +1744,132 @@ static int run_destination_mirror_regression() {
               "raw R8 storage is not mirrored but its guest bytes are still correct");
     }
 
+    // R8 at a width that is not a multiple of 256: GFX10 pads each guest row to 256 bytes (#4586), but
+    // the renderer image is tight (width*height). The mirror must map padded guest rows <-> tight rows
+    // and never touch the guest padding between rows.
+    {
+        constexpr uint32_t PW = 192, PH = 4, PITCH = 256, SENT = 0xA5;
+        std::vector<uint8_t> pg(static_cast<size_t>(PITCH) * PH, SENT);
+        const uint64_t p_address = reinterpret_cast<uint64_t>(pg.data());
+        DrawItem p_producer = producer;
+        p_producer.color0_base = p_address;
+        p_producer.color0_width = PW; p_producer.color0_height = PH;
+        p_producer.ps.color0_format = VK_FORMAT_R8_UNORM;
+        CHECK(!render_submit_items({p_producer}, PW, PH).empty(),
+              "padded R8 producer materializes a renderer target");
+        auto p_cpu_newer = std::make_shared<std::vector<uint8_t>>(PW * PH, 0x11);
+        notify_live_render_target_image_written(
+            {p_address, PW, PH, LiveTargetPixelFormat::R8Unorm, std::move(p_cpu_newer)});
+        LiveTargetImageRequest p_request{};
+        p_request.width = PW; p_request.height = PH;
+        LiveTargetImageImport p_import;
+
+        static const uint32_t p_store_zero[] = {
+            0x7E080300u, 0x7E0A0301u, 0x7E000280u, 0xF0200108u, 0x00020004u, 0xBF810000u,
+        };
+        static const uint32_t p_store_half[] = {
+            0x7E080300u, 0x7E0A0301u, 0x7E0002F0u, 0xF0200108u, 0x00020004u, 0xBF810000u,
+        };
+        ShaderResource p_output{};
+        p_output.cls = ResourceClass::StorageImage; p_output.format = DataFormat::Unorm8;
+        p_output.num_components = 1; p_output.binding = 5; p_output.sgpr_base = 8;
+        p_output.img_dim = 1; p_output.width = PW; p_output.height = PH; p_output.depth = 1;
+        p_output.gpu_addr = p_address; p_output.size = static_cast<uint32_t>(pg.size());
+        ShaderResourceTable p_table; p_table.resources.push_back(p_output);
+        ComputeShaderConfig p_config;
+        p_config.user_sgprs.resize(16); p_config.local_x = PW; p_config.local_y = PH; p_config.local_z = 1;
+        p_config.threads_x = PW; p_config.threads_y = PH; p_config.threads_z = 1;
+        p_config.tidig_comp_cnt = 1;
+        p_config.native_storage_format_support = native_storage_format_support_bit(DataFormat::Unorm8, 1);
+        const auto p_full_spirv = recompile_compute(
+            p_store_zero, std::size(p_store_zero), &p_table, p_config);
+        ComputeShaderConfig p_row_config = p_config;
+        p_row_config.local_y = 1; p_row_config.threads_y = 1;
+        const auto p_half_spirv = recompile_compute(
+            p_store_half, std::size(p_store_half), &p_table, p_row_config);
+        CHECK(!p_full_spirv.empty() && !p_half_spirv.empty(), "padded R8 storage writers recompile");
+        ComputeItem p_full;
+        p_full.spirv = p_full_spirv;
+        p_full.resources = std::make_shared<ShaderResourceTable>(p_table);
+        p_full.launch.threads_x = PW; p_full.launch.threads_y = PH; p_full.launch.threads_z = 1;
+        p_full.launch.local_x = PW; p_full.launch.local_y = PH; p_full.launch.local_z = 1;
+        p_full.launch.groups_x = p_full.launch.groups_y = p_full.launch.groups_z = 1;
+        p_full.code_addr = 0x37310031u;
+
+        auto texels_are_zero = [&]() {
+            for (uint32_t y = 0; y < PH; ++y)
+                for (uint32_t x = 0; x < PW; ++x)
+                    if (pg[static_cast<size_t>(y) * PITCH + x] != 0) return false;
+            return true;
+        };
+        auto padding_is_sentinel = [&]() {
+            for (uint32_t y = 0; y < PH; ++y)
+                for (uint32_t x = PW; x < PITCH; ++x)
+                    if (pg[static_cast<size_t>(y) * PITCH + x] != SENT) return false;
+            return true;
+        };
+        // tight renderer image vs the padded guest, row by row.
+        auto tight_matches_guest = [&](const std::vector<uint8_t>& tight) {
+            if (tight.size() != static_cast<size_t>(PW) * PH) return false;
+            for (uint32_t y = 0; y < PH; ++y)
+                for (uint32_t x = 0; x < PW; ++x)
+                    if (tight[static_cast<size_t>(y) * PW + x] != pg[static_cast<size_t>(y) * PITCH + x])
+                        return false;
+            return true;
+        };
+
+        // 1. full overwrite is mirrored; guest texels written, padding preserved, image tight.
+        const auto p_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({p_full}),
+              "padded R8 full-overwrite dispatch completes");
+        const auto p_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(p_after.borrowed == p_before.borrowed + 1 &&
+                  p_after.published == p_before.published + 1 &&
+                  p_after.failed == p_before.failed,
+              "padded R8 result is mirrored (borrowed and published +1)");
+        CHECK(texels_are_zero(), "padded R8 guest texels are 0 row by row");
+        CHECK(padding_is_sentinel(), "padded R8 guest row padding bytes are preserved");
+        CHECK(import_live_render_target_image(p_address, p_request, p_import) && p_import.valid() &&
+                  p_import.format == LiveTargetPixelFormat::R8Unorm,
+              "padded R8 mirror leaves a readable R8_UNORM renderer image");
+        release_live_render_target_image(p_address);
+        std::vector<uint8_t> p_pixels;
+        std::string p_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  p_address, PW, PH, VK_FORMAT_R8_UNORM, p_pixels, p_error) &&
+                  p_pixels.size() == static_cast<size_t>(PW) * PH && tight_matches_guest(p_pixels),
+              "padded R8 renderer image is tight (width*height) and equals the guest texels");
+
+        // 2. partial writer: rows 1.. come from the tight renderer seed (distinct from the stale guest)
+        // and land at padded guest offsets with the padding untouched.
+        CHECK(!render_submit_items({p_producer}, PW, PH).empty(),
+              "padded R8 renderer repaints before the partial writer");
+        std::vector<uint8_t> p_seed;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  p_address, PW, PH, VK_FORMAT_R8_UNORM, p_seed, p_error) &&
+                  p_seed.size() == static_cast<size_t>(PW) * PH &&
+                  !std::all_of(p_seed.begin() + PW, p_seed.end(), [](uint8_t b) { return b == 0; }),
+              "padded R8 renderer seed is tight and differs from the stale guest rows");
+        ComputeItem p_partial = p_full;
+        p_partial.spirv = p_half_spirv;
+        p_partial.launch.threads_y = p_partial.launch.local_y = p_partial.launch.groups_y = 1;
+        p_partial.code_addr = 0x37310032u;
+        CHECK(prosper::frontend::execute_live_compute_items({p_partial}),
+              "padded R8 partial writer completes");
+        bool seed_rows_ok = true;
+        for (uint32_t y = 1; y < PH; ++y)
+            for (uint32_t x = 0; x < PW; ++x)
+                seed_rows_ok &= pg[static_cast<size_t>(y) * PITCH + x] == p_seed[static_cast<size_t>(y) * PW + x];
+        bool row0_ok = true;
+        for (uint32_t x = 0; x < PW; ++x) row0_ok &= pg[x] == 127 || pg[x] == 128;
+        CHECK(seed_rows_ok && row0_ok, "padded R8 guest rows 1.. equal the tight seed, row 0 is 0.5");
+        CHECK(padding_is_sentinel(), "padded R8 partial result preserves guest padding");
+        CHECK(prosper::test::readback_persistent_color_target(
+                  p_address, PW, PH, VK_FORMAT_R8_UNORM, p_pixels, p_error) &&
+                  tight_matches_guest(p_pixels),
+              "padded R8 renderer image is tight and equals the guest texels after the partial result");
+    }
+
     return fails ? 1 : 0;
 }
 
