@@ -41,4 +41,6 @@ Compare identically instrumented arms. Unsupported/failed queries contribute no 
 how much of what the compute chain publishes to the renderer is byte-identical to the previous publication of the
 same target? The census is a pure class (hash plus last-seen per target); the hook wraps the live renderer's
 written-notifier and runs the census only while `detailed_timing_active()`, so there is no switch and no cost
-outside a capture. The `[unchanged-census]` lines print at exit.
+outside a capture. The `[unchanged-census]` lines print at exit. Only publications carrying CPU pixels are counted;
+the hash runs on the publishing thread inside the span F8 is timing, so compute timings taken in the same window include it
+(reported as `hash_ms=`). History is per F8 window.

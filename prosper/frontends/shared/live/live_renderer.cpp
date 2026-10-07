@@ -1306,7 +1306,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 it->second.gpu_valid = false;
         });
     prosper::gpu::set_live_target_image_written_notifier(
-        prosper::perf::with_unchanged_publication_census([invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
+        prosper::perf::with_unchanged_publication_census(
+            [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
             const auto& residency_trace = rtt_residency_trace_selector();
             const bool trace_write = residency_trace.configured &&

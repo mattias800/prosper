@@ -10,11 +10,21 @@
 //   TargetsAreKeyedByAddressAndShape   one target's history leaking into another's, or a resized target at the
 //                                      same address being called unchanged
 //   EmptyOrNullPublishesNothing        a null or empty write skewing the counts
+//   NewWindowForgetsOldHistory         a repeat being claimed across two F8 windows
+//   ConcurrentNotesAreCounted          the lock in note() (lost updates under four threads)
+//   UnchangedPublicationHook.*         the F8-window gate (hashing outside a window), `inner` skipped or
+//                                      run conditionally, and CPU-pixel-less writes being counted
 //   ReportNamesTheBigTargetsFirst      the report listing small targets first, or printing when nothing was counted
 #include "shared/perf/unchanged_publication_census.hpp"
+#include "shared/perf/unchanged_publication_hook.hpp"
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <thread>
 #include <vector>
 
 using prosper::perf::UnchangedPublicationCensus;
@@ -125,4 +135,129 @@ TEST(UnchangedPublicationCensus, ReportNamesTheBigTargetsFirst) {
     const std::string text = c.format();
     EXPECT_NE(text.find("[unchanged-census] publications=5 identical=3 (60.0%)"), std::string::npos) << text;
     EXPECT_LT(text.find("addr=0x20"), text.find("addr=0x10")) << text;
+}
+
+TEST(UnchangedPublicationCensus, NewWindowForgetsOldHistory) {
+    UnchangedPublicationCensus c;
+    const std::vector<uint8_t> frame = pattern(4096);
+    c.note(0x1000, 32, 32, 0, frame.data(), frame.size(), 1);
+    EXPECT_TRUE(c.note(0x1000, 32, 32, 0, frame.data(), frame.size(), 1));
+    EXPECT_FALSE(c.note(0x1000, 32, 32, 0, frame.data(), frame.size(), 2)) << "first sight in a new window";
+    EXPECT_TRUE(c.note(0x1000, 32, 32, 0, frame.data(), frame.size(), 2));
+}
+
+TEST(UnchangedPublicationCensus, ReportsHashTime) {
+    UnchangedPublicationCensus c;
+    const std::vector<uint8_t> frame = pattern(1 << 20);
+    c.note(0x1, 512, 512, 0, frame.data(), frame.size());
+    EXPECT_GT(c.totals().hash_ns, 0u);
+    EXPECT_NE(c.format().find("hash_ms="), std::string::npos);
+}
+
+TEST(UnchangedPublicationCensus, ConcurrentNotesAreCounted) {
+    UnchangedPublicationCensus c;
+    const std::vector<uint8_t> frame = pattern(2048);
+    constexpr int kThreads = 4, kEach = 500;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kEach; ++i)
+                c.note(0x100 + static_cast<uint64_t>(t % 2), 32, 16, 0, frame.data(), frame.size());
+        });
+    for (auto& th : threads) th.join();
+    const auto totals = c.totals();
+    EXPECT_EQ(totals.publications, static_cast<uint64_t>(kThreads * kEach));
+    EXPECT_EQ(totals.bytes, static_cast<uint64_t>(kThreads * kEach) * frame.size());
+    EXPECT_EQ(totals.identical, totals.publications - 2) << "two distinct targets, one first sight each";
+}
+
+namespace {
+prosper::gpu::LiveTargetImageWrite make_write(uint64_t addr, const std::vector<uint8_t>& bytes) {
+    prosper::gpu::LiveTargetImageWrite w;
+    w.gpu_addr = addr;
+    w.width = 32;
+    w.height = 32;
+    w.linear_pixels = std::make_shared<const std::vector<uint8_t>>(bytes);
+    return w;
+}
+
+struct HookFixture {
+    prosper::perf::InteractivePerformanceCapture capture{prosper::perf::CaptureConfig{}};
+    UnchangedPublicationCensus census;
+    int inner_calls = 0;
+    const prosper::gpu::LiveTargetImageWrite* last = nullptr;
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "prosper_unchanged_hook_test";
+    HookFixture() { std::filesystem::create_directories(dir); }
+    ~HookFixture() {
+        capture.cancel();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    std::function<void(const prosper::gpu::LiveTargetImageWrite&)> hook() {
+        return prosper::perf::with_unchanged_publication_census(
+            [this](const prosper::gpu::LiveTargetImageWrite& w) {
+                ++inner_calls;
+                last = &w;
+            },
+            capture, census);
+    }
+    bool arm() {
+        return capture
+            .arm(dir.string(), "hook-test-id", "hook-test", "test-revision", 0,
+                 std::chrono::system_clock::now())
+            .ok;
+    }
+};
+}  // namespace
+
+TEST(UnchangedPublicationHook, ClosedWindowCountsNothingAndStillCallsInner) {
+    HookFixture f;
+    const auto write = make_write(0x40, pattern(4096));
+    auto hook = f.hook();
+    hook(write);
+    hook(write);
+    EXPECT_EQ(f.inner_calls, 2) << "the renderer must see every publication";
+    EXPECT_EQ(f.last, &write) << "and the very same write";
+    EXPECT_EQ(f.census.totals().publications, 0u) << "no hashing outside an F8 window";
+}
+
+TEST(UnchangedPublicationHook, OpenWindowCountsAndCancelStops) {
+    HookFixture f;
+    ASSERT_TRUE(f.arm());
+    const auto write = make_write(0x40, pattern(4096));
+    auto hook = f.hook();
+    hook(write);
+    hook(write);
+    EXPECT_EQ(f.inner_calls, 2);
+    EXPECT_EQ(f.census.totals().publications, 2u);
+    EXPECT_EQ(f.census.totals().identical, 1u);
+    f.capture.cancel();
+    hook(write);
+    EXPECT_EQ(f.inner_calls, 3) << "inner is called whatever the window state";
+    EXPECT_EQ(f.census.totals().publications, 2u) << "a closed window counts nothing more";
+}
+
+TEST(UnchangedPublicationHook, WritesWithoutCpuPixelsAreNotCounted) {
+    HookFixture f;
+    ASSERT_TRUE(f.arm());
+    prosper::gpu::LiveTargetImageWrite mirrored;
+    mirrored.gpu_addr = 0x80;
+    mirrored.width = mirrored.height = 16;
+    auto hook = f.hook();
+    hook(mirrored);
+    EXPECT_EQ(f.inner_calls, 1);
+    EXPECT_EQ(f.census.totals().publications, 0u);
+}
+
+TEST(UnchangedPublicationHook, EachWindowStartsFresh) {
+    HookFixture f;
+    const auto write = make_write(0x40, pattern(4096));
+    auto hook = f.hook();
+    ASSERT_TRUE(f.arm());
+    hook(write);
+    f.capture.cancel();
+    ASSERT_TRUE(f.arm());
+    hook(write);
+    EXPECT_EQ(f.census.totals().publications, 2u);
+    EXPECT_EQ(f.census.totals().identical, 0u) << "the same bytes across two windows are not a repeat";
 }
