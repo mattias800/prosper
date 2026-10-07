@@ -7965,7 +7965,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         equal = compute_buffers_diff_span(mapped, upload_source, upload_bytes,
                                                           &diff_first, &diff_last);
                     }
-                    timing.compared_bytes += upload_bytes;
+                    timing.compared_bytes += upload_bytes; prosper::frontend::note_compute_compare_mapping(upload_source, upload_bytes);
                     if (!equal) {
                         // Copy ONLY the bytes that differ. The comparison above established the
                         // exact inclusive extent, so writing the bytes outside it would be a no-op

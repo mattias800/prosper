@@ -1,4 +1,4 @@
-// test_validation_mapping_census -- the census arithmetic behind PROSPER_VALIDATION_MAPPING_CENSUS.
+// test_validation_mapping_census -- the census arithmetic behind the [validation-census] exit summary.
 //
 // The census exists to answer one decision question: what share of fully-compared guest bytes lives in
 // private memory, the only kind Windows `GetWriteWatch` can track. The test pins the figure the
@@ -69,4 +69,40 @@ TEST(ValidationMappingCensus, ComputeSourceHasNoChangedFigure) {
     EXPECT_EQ(compute.find("changed_bytes="), std::string::npos) << compute;
     // ...and the renderer source, whose outcome is known, does print one.
     EXPECT_NE(c.format("renderer", true).find("changed_bytes="), std::string::npos);
+}
+
+TEST(ValidationMappingCensus, SizeHistogramSeparatesFewBigRangesFromManySmallOnes) {
+    // 66 GB can be a handful of 43 MiB windows or thousands of small compares; the histogram says which.
+    ValidationMappingCensus c;
+    c.record(cls(MappingClass::MappedView), 4096, false);                 // <64 KiB
+    c.record(cls(MappingClass::MappedView), 200u << 10, false);           // <1 MiB
+    c.record(cls(MappingClass::MappedView), 8u << 20, false);             // <16 MiB
+    c.record(cls(MappingClass::MappedView), 45088768, false);             // the 43 MiB window: <64 MiB
+    c.record(cls(MappingClass::MappedView), 45088768, false);
+    c.record(cls(MappingClass::MappedView), 100ull << 20, false);         // >=64 MiB
+    EXPECT_EQ(c.size_validations(0), 1u);
+    EXPECT_EQ(c.size_validations(1), 1u);
+    EXPECT_EQ(c.size_validations(2), 1u);
+    EXPECT_EQ(c.size_validations(3), 2u);
+    EXPECT_EQ(c.size_validations(4), 1u);
+    EXPECT_EQ(c.size_bytes(3), 2u * 45088768u);
+    // Boundaries belong to the larger bucket.
+    EXPECT_EQ(ValidationMappingCensus::size_bucket(64u << 10), 1);
+    EXPECT_EQ(ValidationMappingCensus::size_bucket((64u << 10) - 1), 0);
+    EXPECT_NE(c.format("compute", false).find(" sizes: <64KiB n=1"), std::string::npos);
+    EXPECT_NE(c.format("compute", false).find("<64MiB n=2 0.09GB"), std::string::npos);
+}
+
+TEST(ValidationMappingCensus, SmallRangesAreCountedButNotClassified) {
+    // A 16-byte constant buffer is in the size histogram and the byte total, but not given a host class:
+    // classifying it would cost a syscall far larger than the compare it observes.
+    ValidationMappingCensus c;
+    c.record(ValidationMappingCensus::kSmall, 16, false);
+    c.record(cls(MappingClass::MappedView), 8192, false);
+    EXPECT_EQ(c.row(ValidationMappingCensus::kSmall).validations, 1u);
+    EXPECT_EQ(c.row(cls(MappingClass::MappedView)).validations, 1u);
+    EXPECT_EQ(c.size_validations(0), 2u);   // both are below 64 KiB
+    EXPECT_EQ(c.total_validations(), 2u);
+    EXPECT_NE(c.format("renderer", true).find("class=small-unclassified validations=1 bytes=16"), std::string::npos);
+    EXPECT_GE(prosper::frontend::kMinClassifiedBytes, 4096u);
 }

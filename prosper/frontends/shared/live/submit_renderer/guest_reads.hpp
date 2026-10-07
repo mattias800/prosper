@@ -5,7 +5,7 @@
 
 #include "gpu/execute/gpu_execute.hpp"          // guest_readable
 #include "shared/live/guest_source_read.hpp"    // guest_source_readable_prefix / copy / equal
-#include "shared/texture/validation_mapping_census.hpp"   // PROSPER_VALIDATION_MAPPING_CENSUS
+#include "shared/texture/validation_mapping_census.hpp"   // [validation-census] exit summary
 
 #include <cstddef>
 #include <cstdint>

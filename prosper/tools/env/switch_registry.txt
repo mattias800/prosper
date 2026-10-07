@@ -950,7 +950,6 @@ PROSPER_ULT_RETURN_SUCCESS  unclassified
 PROSPER_UNIFORMLOG  unclassified
 PROSPER_UNIMPL_STACK  unclassified
 PROSPER_UNWINDLOG  unclassified
-PROSPER_VALIDATION_MAPPING_CENSUS  diagnostic  # which kind of host memory backs fully-compared guest ranges
 PROSPER_VCC_SCALAR_DATA_MERGE  unclassified
 PROSPER_VDEC2_CONTRACT  unclassified
 PROSPER_VDEC2_DUMP_AU  unclassified

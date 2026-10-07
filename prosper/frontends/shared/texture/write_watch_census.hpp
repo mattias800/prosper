@@ -72,7 +72,7 @@ public:
     // actually runs, never where its result is consumed -- a short-circuited `&&` chain reaches the
     // consumer without having compared anything.
     void record_exact_compare(uint64_t bytes) { bump(exact_compares_); add(exact_compare_bytes_, bytes); }
-    // Same, and also classifies the host memory the compare reads (PROSPER_VALIDATION_MAPPING_CENSUS).
+    // Same, and also classifies the host memory the compare reads ([validation-census] exit summary).
     void record_exact_compare(uint64_t bytes, const void* source) {
         record_exact_compare(bytes);
         note_compute_compare_mapping(source, bytes);
