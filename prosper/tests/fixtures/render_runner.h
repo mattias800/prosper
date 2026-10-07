@@ -8400,6 +8400,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
     fragment_draw_backend_stats() =
         {};   // recorded transaction counters never imply GPU completion
+    backend_pipeline_cache_stats_storage() = {};   // before any early refusal, like the stats above
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -10535,7 +10536,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
-    pipeline_stats = {};
     auto& pipeline_cache = persistent_pipeline_cache();
     const uint64_t pipeline_generation = ++persistent_pipeline_generation();
     const bool pipeline_cache_enabled = persistent_pipeline_cache_enabled();
