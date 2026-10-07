@@ -146,12 +146,15 @@ Same title, machine and route, 2,560 dispatches in about 50 s:
 | barriers, depth 4 | 30,954 ms | 27,539 ms | 89% |
 | barriers, depth 64 | 30,954 ms | 27,534 ms | 89% |
 
-**Pipelining ADR 0009 step 3 would cut about 11-12% of the compute critical path on this title, and the two
-bounds agree to within a point.** The reason is structural: the CPU work (setup plus writeback) is about 85%
+**Pipelining ADR 0009 step 3 would cut at most about 11-12% of the compute critical path on this title (an
+optimistic upper bound, see the limits below), and the two bounds agree to within a point.** The reason is structural: the CPU work (setup plus writeback) is about 85%
 of each dispatch's time, and overlap can only hide the GPU/wait part. The floor is the CPU work itself, so a
 bigger gain needs that work reduced, not overlapped. Limits: only compute dispatches are on the timeline
-(graphics spans have no measured cost here); the GPU span is an upper bound, which if anything understates
-the overlap; one title.
+(graphics spans have no measured cost here); the span the model treats as GPU time runs from pipeline
+creation to the fence, so it also holds CPU work (compare and baseline preparation, descriptor writes,
+staging, command recording and `vkQueueSubmit`). The model lets that CPU work overlap the next setup, which
+it cannot, so it OVERSTATES the overlap: the 11-12% is optimistic. A CPU timestamp right after
+`vkQueueSubmit` would split the span and tighten the bound; one title.
 
 ## What this note does not claim
 
