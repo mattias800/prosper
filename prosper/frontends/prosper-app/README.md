@@ -136,6 +136,15 @@ engines need a specific graphics mode to render in this app — Unity titles cur
 `-force-gfx-direct` (their default MT gfx-jobs path is not emulated yet; #2973) — while others
 must not receive it, so the choice is explicit and per-title rather than a silent global.
 
+Four more keys remember host settings for games the library starts, and the Settings menu edits
+them without a text editor: `savedata_dir` (`PROSPER_SAVEDATA_DIR`), `present_mode`
+(`--present-mode`: `fifo`, `mailbox` or `immediate`), `display_mode` (`PROSPER_DISPLAY_MODE`:
+`legacy`, `host` or `host-high-refresh`) and `volume` (`--volume`, 0-100). These apply only to
+boots the library starts — never to a scripted `prosper-app <dump>` run. A flag or an
+environment variable still wins over each one, a misspelled value is ignored with a warning,
+and a choice made in the UI applies to the running process immediately. The `host` display
+modes are experimental and per-title: some games pace themselves by the advertised display.
+
 The scan looks **one level deep** and accepts a child directory as a title when
 `resolve_app0_root()` does — the same test the drop and picker paths use. A title's own asset
 subdirectories are therefore never mistaken for separate games. When the games directory is itself a

@@ -21,7 +21,10 @@ using prosper::frontend::parse_param_region;
 using prosper::frontend::parse_param_title_id;
 using prosper::frontend::parse_param_title_name;
 using prosper::frontend::path_basename;
+using prosper::frontend::HostPolicyInputs;
 using prosper::frontend::note_recent_game;
+using prosper::frontend::parse_volume_percent;
+using prosper::frontend::resolve_host_policy;
 using prosper::frontend::resolve_games_dir;
 using prosper::frontend::scan_game_library;
 using prosper::frontend::serialize_app_config;
@@ -387,6 +390,72 @@ int main() {
         CHECK(back.recent_games == rc.recent_games, "recent games survive a round trip in order");
         CHECK(parse_app_config("recent = \nrecent = /a").recent_games.size() == 1,
               "an empty recent line is not kept");
+    }
+
+    // --- volume --------------------------------------------------------------------------------
+    CHECK(parse_volume_percent("") == -1, "an empty value is unset, not muted");
+    CHECK(parse_volume_percent("0") == 0, "zero is a real choice (muted)");
+    CHECK(parse_volume_percent("75") == 75, "a plain percent is read");
+    CHECK(parse_volume_percent("100") == 100, "a hundred is read");
+    CHECK(parse_volume_percent("120") == 100, "overflow clamps like the --volume flag");
+    CHECK(parse_volume_percent("12x") == -1, "trailing junk is unset, not partial");
+    CHECK(parse_volume_percent("-5") == -1, "a sign is unset, not negative");
+    CHECK(parse_volume_percent(" 80") == -1, "surrounding space is unset (values arrive trimmed)");
+    {
+        AppConfig vc;
+        vc.volume_percent = 0;
+        CHECK(parse_app_config(serialize_app_config(vc)).volume_percent == 0,
+              "muted survives a round trip rather than reading as unset");
+        CHECK(parse_app_config(serialize_app_config(AppConfig{})).volume_percent == -1,
+              "an unset volume stays unset (no phantom key is written)");
+    }
+
+    // --- host policy: the precedence main.cpp ships ------------------------------------------------
+    // Every arm below feeds the environment THROUGH the inputs — including the env-wins arms the
+    // old resolve_* tests could not reach because main read the environment inline.
+    {
+        AppConfig file;
+        file.savedata_dir = "/saves";
+        file.present_mode = "mailbox";
+        file.display_mode = "host";
+        file.volume_percent = 75;
+        HostPolicyInputs in;
+        in.file = file;
+        const auto quiet = resolve_host_policy(in);
+        CHECK(quiet.savedata_dir == "/saves" && quiet.present_mode == "mailbox" &&
+                  quiet.display_mode == "host" && quiet.volume_percent == 75,
+              "a silent run takes everything from the file");
+        HostPolicyInputs loud = in;
+        loud.flag_present_mode = true;
+        loud.flag_display_mode = true;
+        loud.flag_volume = true;
+        loud.env_savedata_dir = "/env-saves";
+        loud.env_display_mode = "legacy";
+        const auto overridden = resolve_host_policy(loud);
+        CHECK(overridden.savedata_dir.empty() && overridden.present_mode.empty() &&
+                  overridden.display_mode.empty() && overridden.volume_percent == -1,
+              "a flag or environment on every source leaves nothing for the file");
+        HostPolicyInputs mixed = in;
+        mixed.env_savedata_dir = "/env-saves";
+        const auto mixed_out = resolve_host_policy(mixed);
+        CHECK(mixed_out.savedata_dir.empty() && mixed_out.present_mode == "mailbox",
+              "each source suppresses only its own file value");
+        CHECK(resolve_host_policy(HostPolicyInputs{}).savedata_dir.empty() &&
+                  resolve_host_policy(HostPolicyInputs{}).volume_percent == -1,
+              "an empty everything resolves to leave-everything-alone");
+    }
+
+    // --- newline safety ----------------------------------------------------------------------------
+    {
+        AppConfig evil;
+        evil.games_dir = "/games\nplanted = 1";
+        evil.savedata_dir = "/saves\nplanted = 1";
+        evil.recent_games = {"/ok", "/bad\nplanted = 1"};
+        const std::string text = serialize_app_config(evil);
+        CHECK(text.find("planted") == std::string::npos,
+              "a newline in a path value cannot inject a key on rewrite");
+        CHECK(parse_app_config(text).games_dir.empty(),
+              "a dropped games_dir reads as unset, not as half a path");
     }
 
     // --- precedence -----------------------------------------------------------------------------

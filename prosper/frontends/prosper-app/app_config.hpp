@@ -45,7 +45,34 @@ struct AppConfig {
     // (opening it says so) rather than being silently forgotten.
     std::vector<std::string> recent_games;
     static constexpr size_t kRecentGamesMax = 8;
+
+    // Host settings previously reachable only via a flag or the environment, so a released build
+    // started without a terminal (desktop icon, library picker) could never set them. Each applies
+    // ONLY to boots the library starts — never to a scripted `prosper-app <dump>` run, whose guest
+    // answers must not depend on a per-user file. "" means unset (the flag/env/default path is
+    // untouched); present/display spellings are validated at apply time, so a typo costs the
+    // setting rather than a wrong behaviour.
+    std::string savedata_dir;   // PROSPER_SAVEDATA_DIR; "" = not set
+    std::string present_mode;   // --present-mode; "" = unset, else fifo|mailbox|immediate
+    std::string display_mode;   // PROSPER_DISPLAY_MODE; "" = unset, else legacy|host|host-high-refresh
+
+    // Process volume in percent (--volume). -1 = unset, so the flag and the default path are
+    // untouched; 0 is a real choice (muted) and survives. Parsed strictly, clamped like the flag.
+    int volume_percent = -1;
 };
+
+// Strict decimal percent, clamped to [0,100]; anything unparseable is -1 (unset), so a typo
+// costs the setting rather than muting or deafening the run.
+inline int parse_volume_percent(const std::string& value) {
+    if (value.empty()) return -1;
+    int v = 0;
+    for (char c : value) {
+        if (c < '0' || c > '9') return -1;
+        v = v * 10 + (c - '0');
+        if (v > 100) return 100;
+    }
+    return v;
+}
 
 // Trim ASCII spaces and tabs from both ends.
 inline std::string config_trim(const std::string& s) {
@@ -80,7 +107,11 @@ inline AppConfig parse_app_config(const std::string& text) {
             cfg.guest_args_by_title[key.substr(11)] = value;
         else if (key == "recent") {
             if (!value.empty()) cfg.recent_games.push_back(value);
-        } else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
+        } else if (key == "savedata_dir") cfg.savedata_dir = value;
+        else if (key == "present_mode") cfg.present_mode = value;
+        else if (key == "display_mode") cfg.display_mode = value;
+        else if (key == "volume") cfg.volume_percent = parse_volume_percent(value);
+        else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
     return cfg;
@@ -91,7 +122,15 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
         "# prosper-app settings. Written by the app.\n"
         "# A --games-dir argument or PROSPER_GAMES_DIR in the environment overrides games_dir.\n"
         "# Editing by hand is fine; the app rewrites this file, so comments are not preserved.\n";
-    if (!cfg.games_dir.empty()) out += "games_dir = " + cfg.games_dir + "\n";
+    // A value carrying a newline would inject a key into the file on rewrite. Paths cannot
+    // contain one on any host here, so such a value is dropped rather than written. (Values
+    // read from the file can never carry one — parsing is line-based — so this only fires for
+    // hand-built configs.)
+    const auto path_safe = [](const std::string& v) {
+        return v.find('\n') == std::string::npos && v.find('\r') == std::string::npos;
+    };
+    if (!cfg.games_dir.empty() && path_safe(cfg.games_dir))
+        out += "games_dir = " + cfg.games_dir + "\n";
     // Written unconditionally, unlike games_dir: "off" is a real choice and must survive a rewrite,
     // whereas an absent games_dir simply means nothing was chosen.
     out += std::string("launcher_music = ") + (cfg.launcher_music ? "1" : "0") + "\n";
@@ -100,7 +139,12 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
         out += "guest_args." + title + " = " + args + "\n";
     if (!cfg.guest_args_default.empty()) out += "guest_args = " + cfg.guest_args_default + "\n";
     for (const std::string& recent : cfg.recent_games)
-        if (!recent.empty()) out += "recent = " + recent + "\n";
+        if (!recent.empty() && path_safe(recent)) out += "recent = " + recent + "\n";
+    if (!cfg.savedata_dir.empty() && path_safe(cfg.savedata_dir))
+        out += "savedata_dir = " + cfg.savedata_dir + "\n";
+    if (!cfg.present_mode.empty()) out += "present_mode = " + cfg.present_mode + "\n";
+    if (!cfg.display_mode.empty()) out += "display_mode = " + cfg.display_mode + "\n";
+    if (cfg.volume_percent >= 0) out += "volume = " + std::to_string(cfg.volume_percent) + "\n";
     return out;
 }
 
@@ -110,6 +154,36 @@ inline std::string resolve_games_dir(const std::string& flag, const std::string&
     if (!flag.empty()) return flag;
     if (!env.empty()) return env;
     return file.games_dir;
+}
+
+// Everything a library-started boot needs from the persisted host settings, resolved in one
+// pure step so the precedence main.cpp ships is the precedence the tests pin — including the
+// "environment wins" arms, which take the env values as inputs rather than reading them.
+struct HostPolicyInputs {
+    bool flag_present_mode = false;   // --present-mode was given
+    bool flag_display_mode = false;   // --display-mode was given
+    bool flag_volume = false;         // --volume was given
+    std::string env_savedata_dir;     // PROSPER_SAVEDATA_DIR, or "" when unset
+    std::string env_display_mode;     // PROSPER_DISPLAY_MODE, or "" when unset
+    AppConfig file;
+};
+
+struct HostPolicy {
+    std::string savedata_dir;   // "" = leave the environment alone
+    std::string present_mode;   // "" = keep the default; validated (fifo|mailbox|immediate) by main
+    std::string display_mode;   // "" = keep the default; validated (legacy|host|...) by main
+    int volume_percent = -1;    // -1 = untouched
+};
+
+inline HostPolicy resolve_host_policy(const HostPolicyInputs& in) {
+    HostPolicy out;
+    // No --savedata-dir flag exists (the release scripts own that spelling), so this is env > file.
+    if (in.env_savedata_dir.empty()) out.savedata_dir = in.file.savedata_dir;
+    if (!in.flag_present_mode) out.present_mode = in.file.present_mode;
+    if (!in.flag_display_mode && in.env_display_mode.empty())
+        out.display_mode = in.file.display_mode;
+    if (!in.flag_volume) out.volume_percent = in.file.volume_percent;
+    return out;
 }
 
 // Record a boot at `app0_root` at the head of the recent list: deduped, canonicalized,

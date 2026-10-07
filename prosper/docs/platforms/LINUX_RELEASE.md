@@ -85,7 +85,8 @@ that needs it.
 
 Presentation defaults to FIFO vsync. Pass `--present-mode mailbox` for low-latency vsync or
 `--present-mode immediate` to permit tearing; either optional mode falls back to FIFO when
-unsupported.
+unsupported. The library's Settings view can remember a mode for the games it starts, but a
+flag on the command line always wins over the remembered one.
 
 ## Point it at a library of titles
 
