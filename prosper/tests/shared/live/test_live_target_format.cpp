@@ -23,6 +23,7 @@
 #include "shared/live/live_renderer.hpp"
 #include "shared/live/live_target_format.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -322,6 +323,30 @@ TEST(LiveTargetComponentOrder, SwapExchangesRedAndBlueOfEveryTexel) {
     prosper::frontend::swap_rgba8_red_blue(pixels);
     EXPECT_EQ(pixels, (std::vector<uint8_t>{3, 2, 1, 4, 7, 6, 5, 8, 9}))
         << "G and A stay; a trailing partial texel is untouched";
+}
+
+// #4686 N1 (review B1 on #4695): a DMA read of a BGRA target held as canonical RGBA8 takes each
+// byte's component from its GUEST address, not from its position in the copied range. The source
+// bytes are all distinct, so a range-relative phase (`k & 3`), a missing swap, or a dropped final
+// byte each produce a different answer. Canonical texel t is (R,G,B,A) = (4t, 4t+1, 4t+2, 4t+3);
+// guest memory holds it as (B,G,R,A) = (4t+2, 4t+1, 4t, 4t+3). The four bytes after the 16-byte
+// surface are a guard: the function must never read them, and a mutant that does reads 0xEE.
+TEST(LiveTargetComponentOrder, DmaRangeTakesEachByteFromItsGuestAddress) {
+    std::array<uint8_t, 20> storage{};
+    for (uint8_t b = 0; b < 16; ++b) storage[b] = b;
+    for (size_t b = 16; b < storage.size(); ++b) storage[b] = 0xEE;
+    const auto range = [&](uint64_t offset, uint32_t bytes) {
+        std::vector<uint8_t> out;
+        prosper::frontend::copy_canonical_rgba8_range_as_bgra(storage.data(), offset, bytes, out);
+        return out;
+    };
+    EXPECT_EQ(range(0, 4), (std::vector<uint8_t>{2, 1, 0, 3})) << "an aligned texel: B,G,R,A";
+    EXPECT_EQ(range(1, 2), (std::vector<uint8_t>{1, 0}))
+        << "shorter than a texel, starting mid-texel: guest G(0), R(0)";
+    EXPECT_EQ(range(2, 4), (std::vector<uint8_t>{0, 3, 6, 5}))
+        << "a straddle: guest R(0), A(0), B(1), G(1)";
+    EXPECT_EQ(range(14, 2), (std::vector<uint8_t>{12, 15}))
+        << "ending on the surface's last byte: guest R(3), A(3), never the guard";
 }
 
 // The graphics sampled path keeps its own copy of the composition. Pin the two to one answer, so

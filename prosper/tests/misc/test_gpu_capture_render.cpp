@@ -1319,6 +1319,10 @@ int main(int argc, char** argv) {
     // #4686 N1: a CB_COLOR ALT (BGRA) target is kept as canonical RGBA8, but a DMA copy out of it
     // reads guest memory, which holds B in byte 0. The byte reader must hand over the guest's order,
     // including for a range that starts and ends mid-texel; an RGBA target is unchanged (above).
+    // These arms prove the WIRING (the reader swaps an ALT target at all). The producer samples one
+    // constant UV, so every texel is identical and texel t+1 cannot be told from t: the byte PHASE
+    // (guest address vs position in the range) is pinned by test_live_target_format's
+    // DmaRangeTakesEachByteFromItsGuestAddress over distinct bytes, not here.
     {
         DrawItem alt_producer = producer;
         alt_producer.color0_base = 0x100500000ull;

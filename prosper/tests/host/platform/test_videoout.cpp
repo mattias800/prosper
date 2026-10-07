@@ -1044,6 +1044,10 @@ TEST(Videoout, Contract) {
         // of the tolerance. A half-period error would be 8341 us.
         CHECK(skew < 1000,
               "the exported origin IS the status grid's epoch (within ABI us quantisation)");
+        // #4696: close the oracle's handle. Stated pitches retire only when the LAST port closes
+        // (hle_graphics.cpp g_vo_close), so a leaked handle kept them alive into VideooutPitch when
+        // the whole binary runs as one process.
+        CHECK(close(ohandle, 0, 0, 0, 0, 0) == 0, "the grid-origin oracle's handle closes");
     }
 
     // ---- #3075: the grid snap hides a dropped tick from PHASE; grid_boundaries_missed must not ---
