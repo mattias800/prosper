@@ -12,6 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <iterator>
 #include <vector>
 
@@ -19,6 +21,19 @@ using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
 namespace {
+
+// PROSPER_DROPPED_DRAW_CENSUS is read once per process (a plain getenv in a function-local static),
+// so it is armed at load time, before any test realizes a draw. It only adds stderr lines, which
+// the census-label arm below reads (#4680 review).
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): runs before main, single-threaded
+const bool kCensusArmed = [] {
+#ifdef _WIN32
+    return _putenv_s("PROSPER_DROPPED_DRAW_CENSUS", "1") == 0;
+#else
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): static initialization, before any thread exists
+    return setenv("PROSPER_DROPPED_DRAW_CENSUS", "1", 1) == 0;
+#endif
+}();
 
 constexpr uint32_t mode_word(uint32_t mode) {
     return (mode << P::CB_COLOR_CONTROL_MODE_SHIFT) | (0xCCu << P::CB_COLOR_CONTROL_ROP3_SHIFT);
@@ -352,6 +367,45 @@ TEST(EfcHelperProgram, AHelperWithoutDepthStencilEffectNeverCompilesItsInherited
     EXPECT_FALSE(depth_helper.made);
     EXPECT_EQ(depth_helper.reason, RealizationFailureReason::ShaderRecompile)
         << "a helper with a depth write still needs its shader, so the refusal stays visible";
+}
+
+// A stencil write is a depth/stencil effect too: the helper keeps going through the compiler, so a
+// gate narrowed to `depth_write_enable` turns this arm red (#4680 review).
+TEST(EfcHelperProgram, AStencilWritingHelperStillCompilesItsShader) {
+    constexpr uint32_t kRectList = 7;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+    GpuState st =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    st.cx[P::DB_RENDER_CONTROL] = 0x60;
+    // Kena's third observed helper state, with its stencil test switched on: ZFUNC=ALWAYS, no Z
+    // write, STENCILZPASS=REPLACE_TEST, write mask 0xff.
+    st.cx[P::DB_DEPTH_CONTROL] = 0x70u | (1u << P::DB_DEPTH_CONTROL_STENCIL_ENABLE_SHIFT);
+    st.cx[P::DB_STENCIL_CONTROL] = 3u << P::DB_STENCIL_CONTROL_STENCILZPASS_SHIFT;
+    st.cx[P::DB_STENCILREFMASK] = 0xFFu << P::DB_STENCILREFMASK_STENCILWRITEMASK_SHIFT;
+    const Realized helper = realize(st);
+    EXPECT_FALSE(helper.made);
+    EXPECT_EQ(helper.reason, RealizationFailureReason::ShaderRecompile)
+        << "a stencil-writing helper has an effect, so its shader is still compiled";
+}
+
+// The census names the early exit: a reader of [dropped-draw] lines must be able to tell helpers
+// skipped as no-effect from draws lost to a refused shader. The census prints at powers of two from
+// 256, so 512 realizations cross at least one report whatever earlier arms already counted.
+TEST(EfcHelperProgram, TheCensusNamesTheHelperExit) {
+    ASSERT_TRUE(kCensusArmed);
+    ASSERT_TRUE(dropped_draw_census_enabled());
+    constexpr uint32_t kRectList = 7;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+    GpuState st =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    st.cx[P::DB_RENDER_CONTROL] = 0x60;
+    st.cx[P::DB_DEPTH_CONTROL] = 0x70;
+    testing::internal::CaptureStderr();
+    for (int i = 0; i < 512; ++i) (void)realize(st);
+    const std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_NE(err.find("reason=no-effect(agc-helper)"), std::string::npos) << err;
 }
 
 }  // namespace

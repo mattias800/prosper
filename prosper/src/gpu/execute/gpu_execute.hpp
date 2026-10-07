@@ -2463,16 +2463,6 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         shader_source_dwords(vs_program_addr, max_shader_dwords, producer_header);
     const size_t fragment_dwords =
         shader_source_dwords(rs.ps_addr, max_shader_dwords, pixel_header);
-    if (!vs_program_dwords || !fragment_dwords) {
-        if (failure) {
-            failure->reason = RealizationFailureReason::MissingProgram;
-            add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, {}, {});
-            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
-        }
-        report_dropped_draw_target(rs.color0_base, "shader-source-window-unavailable",
-                                   rs.cb_target_mask, rs.cb_shader_mask);
-        return false;
-    }
     // #1588 / #4610: AGC's own rectangle under CB_COLOR_CONTROL.MODE = ELIMINATE_FAST_CLEAR, or under
     // MODE = DISABLE with DB_RENDER_CONTROL's compress-disable bits ("Decompress Htile"), is a
     // metadata operation that writes no colour (efc_helper_program.hpp). Its colour masks are
@@ -2487,10 +2477,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     const auto* helper_vs =
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
     const AgcHelperDrawShape helper_shape{rs.prim_type, vcount_hint, draw && draw->indexed};
-    const bool helper_eliminate = is_agc_eliminate_fast_clear_operation(
-        rs.cb_color_control, helper_vs, vs_program_dwords, helper_shape);
+    // Decided before the source-window check below: the helper never needs the inherited pixel
+    // shader, so a missing window for that shader is not a reason to count the helper as dropped.
+    const bool helper_eliminate = vs_program_dwords != 0 && is_agc_eliminate_fast_clear_operation(
+                                                                rs.cb_color_control, helper_vs,
+                                                                vs_program_dwords, helper_shape);
     const bool helper_decompress =
-        !helper_eliminate &&
+        vs_program_dwords != 0 && !helper_eliminate &&
         is_agc_decompress_htile_operation(rs.cb_color_control, rs.db_render_control, helper_vs,
                                           vs_program_dwords, helper_shape);
     if ((helper_eliminate || helper_decompress) &&
@@ -2520,6 +2513,16 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     helper_eliminate ? "eliminate-fast-clear" : "decompress-htile",
                     (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                     (unsigned long long)(draw ? draw->command_order : 0));
+        return false;
+    }
+    if (!vs_program_dwords || !fragment_dwords) {
+        if (failure) {
+            failure->reason = RealizationFailureReason::MissingProgram;
+            add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, {}, {});
+            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
+        }
+        report_dropped_draw_target(rs.color0_base, "shader-source-window-unavailable",
+                                   rs.cb_target_mask, rs.cb_shader_mask);
         return false;
     }
     const bool owned_vertex =
