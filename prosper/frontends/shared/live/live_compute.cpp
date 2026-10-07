@@ -25,6 +25,8 @@
 #include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/unorm10_snapshot.hpp"
+#include "shared/live/unorm10_mirror.hpp"
+#include "shared/live/staging_mirror_copy.hpp"
 #include "shared/live/bgra_seed_scratch.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
@@ -11824,7 +11826,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto decline = [](ExactResultDecline why) {
                 prosper::diagnostics::perf::note_exact_result(why);
             };
-            const auto format = storage_target_format(*r);
+            // Packed R10G10B10A2 mirrors into the renderer's RGBA8 image by blit (unorm10_mirror.hpp).
+            const bool unorm10_blit = prosper::frontend::is_unorm10_rgba_storage(*r);
+            const auto format = unorm10_blit
+                ? std::optional<LiveTargetPixelFormat>(LiveTargetPixelFormat::Rgba8Unorm)
+                : storage_target_format(*r);
             if (!format) { decline(ExactResultDecline::FormatUnmapped); continue; }
             // A GPU-authoritative result must remain readable by the next partial writer.
             // Only these exact formats currently have a renderer-image storage seed path.
@@ -11838,6 +11844,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if ((*format == LiveTargetPixelFormat::Rgba16Float &&
                  (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
                 (*format == LiveTargetPixelFormat::R8Unorm && !bi.native_float_storage) ||
+                (unorm10_blit && !bi.native_float_storage) ||
                 (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
                 decline(ExactResultDecline::FormatNotNative);
                 continue;
@@ -11909,7 +11916,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // sampled imports, including duplicate descriptors folded onto an earlier sampled
             // import, can share the destination when they name this same allocation. Their
             // reads end with the dispatch before the result copy below; each import owns a pin.
-            const bool own_seed_destination =
+            const bool own_seed_destination = !unorm10_blit &&
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
                  (*format == LiveTargetPixelFormat::R8Unorm && bi.native_float_storage) ||
@@ -11988,6 +11995,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             bi.mirror_destination = destination;
             bi.mirror_destination_shared_import = shares_read_only_import;
+            bi.mirror_unorm10_blit = unorm10_blit;
             mirror_census.borrowed.add();
         }
 
@@ -12665,51 +12673,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
                 }
             }
-            if (bi.mirror_result_to_imported) {
-                const BoundImage& mirror = images[bi.seed_from_imported];
-                VkImageMemoryBarrier mirror_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                mirror_to_dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                mirror_to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                mirror_to_dst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                mirror_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                mirror_to_dst.srcQueueFamilyIndex = mirror_to_dst.dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                mirror_to_dst.image = mirror.image;
-                mirror_to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     1, &mirror_to_dst);
-                VkImageCopy mirror_copy{};
-                mirror_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                mirror_copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                mirror_copy.extent = {r->width, r->height, r->depth};
-                vkCmdCopyImage(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               mirror.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                               1, &mirror_copy);
-                VkImageMemoryBarrier mirror_to_general = mirror_to_dst;
-                mirror_to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                mirror_to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                mirror_to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                mirror_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                                     nullptr, 1, &mirror_to_general);
-            }
+            if (bi.mirror_result_to_imported)
+                prosper::frontend::record_result_to_imported_copy(command, bi.image,
+                    images[bi.seed_from_imported].image, r->width, r->height, r->depth);
             if (bi.mirror_destination.valid()) {
-                // The direct-retile shader or image transfer already produced canonical packed
-                // row-major guest texels in staging[i]. A buffer-to-image copy preserves R11 bits
-                // even though its private storage image is typed R32_UINT rather than R11G11B10F.
-                VkBufferMemoryBarrier linear_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-                linear_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
-                                             VK_ACCESS_TRANSFER_WRITE_BIT;
-                linear_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                linear_ready.srcQueueFamilyIndex = linear_ready.dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                linear_ready.buffer = staging[i];
-                linear_ready.size = staging_bytes[i];
-                vkCmdPipelineBarrier(command,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linear_ready, 0, nullptr);
+                // staging[i] holds canonical row-major guest texels (staging_mirror_copy.hpp); a
+                // packed R10G10B10A2 result is converted from its storage image instead.
+                if (!bi.mirror_unorm10_blit)
+                    prosper::frontend::record_staging_ready_for_transfer(command, staging[i],
+                                                                         staging_bytes[i]);
                 VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 to_dst.srcAccessMask = bi.mirror_destination.fresh_uninitialized
                     ? 0u : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -12729,12 +12701,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_dst);
-                VkBufferImageCopy region{};
-                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.imageExtent = {r->width, r->height, 1};
-                vkCmdCopyBufferToImage(command, staging[i],
-                    static_cast<VkImage>(bi.mirror_destination.image),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                if (bi.mirror_unorm10_blit) {
+                    prosper::frontend::record_unorm10_mirror_blit(command, bi.image, transfer_image,
+                        static_cast<VkImage>(bi.mirror_destination.image), r->width, r->height);
+                } else {
+                    prosper::frontend::record_staging_to_image_copy(command, staging[i],
+                        static_cast<VkImage>(bi.mirror_destination.image), r->width, r->height);
+                }
                 VkImageMemoryBarrier restore = to_dst;
                 restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 restore.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;

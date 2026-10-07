@@ -1595,6 +1595,90 @@ static int run_destination_mirror_regression() {
                   "control: the 2D-only shape rule keeps one-layer arrays on CPU publication");
         }
     }
+    // Packed R10G10B10A2 UNORM: graphics holds this guest colour format as an RGBA8 image, while
+    // compute stores it natively as A2B10G10R10. The exact-result mirror converts with a GPU blit
+    // into the RGBA8 renderer image (unorm10_mirror.hpp) instead of unpacking every texel on the CPU
+    // (publish_unorm10_as_rgba8). Before that path these results were declined as "format-unmapped".
+    {
+        constexpr uint32_t PW = 64, PH = 4;
+        std::vector<uint8_t> p10_guest(PW * PH * 4, 0x5a);
+        const uint64_t p10_address = reinterpret_cast<uint64_t>(p10_guest.data());
+        DrawItem p10_producer = producer;
+        p10_producer.color0_base = p10_address;
+        p10_producer.color0_width = PW; p10_producer.color0_height = PH;
+        p10_producer.ps.color0_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        CHECK(!render_submit_items({p10_producer}, PW, PH).empty(),
+              "R10G10B10A2 producer materializes a renderer target");
+        static const uint32_t store_p10[] = {
+            0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
+            0x7E0002F2u,              // R=1.0
+            0x7E0202F0u,              // G=0.5
+            0x7E040280u,              // B=0
+            0x7E0602F2u,              // A=1.0
+            0xF0200F08u, 0x00020004u, // image_store v[0:3] (dmask RGBA) at v4,v5 through s[8:15]
+            0xBF810000u,
+        };
+        ShaderResource p10_output{};
+        p10_output.cls = ResourceClass::StorageImage; p10_output.format = DataFormat::Unorm2_10_10_10;
+        p10_output.num_components = 4; p10_output.binding = 5; p10_output.sgpr_base = 8;
+        p10_output.img_dim = 1; p10_output.width = PW; p10_output.height = PH; p10_output.depth = 1;
+        p10_output.gpu_addr = p10_address; p10_output.size = static_cast<uint32_t>(p10_guest.size());
+        ShaderResourceTable p10_table; p10_table.resources.push_back(p10_output);
+        ComputeShaderConfig p10_config;
+        p10_config.user_sgprs.resize(16); p10_config.local_x = PW; p10_config.local_y = PH; p10_config.local_z = 1;
+        p10_config.threads_x = PW; p10_config.threads_y = PH; p10_config.threads_z = 1;
+        p10_config.tidig_comp_cnt = 1;
+        p10_config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Unorm2_10_10_10, 4);
+        const auto p10_spirv = recompile_compute(store_p10, std::size(store_p10), &p10_table, p10_config);
+        CHECK(!p10_spirv.empty(), "R10G10B10A2 storage writer recompiles");
+        ComputeItem p10_full;
+        p10_full.spirv = p10_spirv;
+        p10_full.resources = std::make_shared<ShaderResourceTable>(p10_table);
+        p10_full.launch.threads_x = PW; p10_full.launch.threads_y = PH; p10_full.launch.threads_z = 1;
+        p10_full.launch.local_x = PW; p10_full.launch.local_y = PH; p10_full.launch.local_z = 1;
+        p10_full.launch.groups_x = p10_full.launch.groups_y = p10_full.launch.groups_z = 1;
+        p10_full.code_addr = 0x37310031u;
+
+        const auto p10_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({p10_full}),
+              "R10G10B10A2 full-overwrite dispatch completes");
+        const auto p10_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(p10_after.candidates == p10_before.candidates + 1 &&
+                  p10_after.borrowed == p10_before.borrowed + 1 &&
+                  p10_after.published == p10_before.published + 1 &&
+                  p10_after.failed == p10_before.failed,
+              "R10G10B10A2 result is mirrored on the GPU and publishes after writeback");
+        // Guest bytes stay the architectural packed words: R low 10 bits, A top 2 bits.
+        bool guest_ok = true;
+        for (size_t t = 0; t < PW * PH; ++t) {
+            uint32_t word = 0;
+            std::memcpy(&word, p10_guest.data() + t * 4, 4);
+            const uint32_t g = (word >> 10) & 0x3ffu;
+            guest_ok = guest_ok && (word & 0x3ffu) == 1023u && (g == 511u || g == 512u) &&
+                       ((word >> 20) & 0x3ffu) == 0u && (word >> 30) == 3u;
+        }
+        CHECK(guest_ok, "R10G10B10A2 guest writeback holds the packed result");
+        LiveTargetImageRequest p10_request{};
+        p10_request.width = PW; p10_request.height = PH;
+        LiveTargetImageImport p10_import;
+        CHECK(import_live_render_target_image(p10_address, p10_request, p10_import) &&
+                  p10_import.valid() && p10_import.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                  p10_import.native_format == VK_FORMAT_R8G8B8A8_UNORM,
+              "completed R10G10B10A2 mirror leaves a readable RGBA8 renderer image");
+        release_live_render_target_image(p10_address);
+        std::vector<uint8_t> p10_pixels;
+        std::string p10_error;
+        bool pixels_ok = prosper::test::readback_persistent_color_target(
+            p10_address, PW, PH, VK_FORMAT_R8G8B8A8_UNORM, p10_pixels, p10_error) &&
+            p10_pixels.size() == size_t{PW} * PH * 4;
+        // The CPU path's integer rounding gives (255, 128, 0, 255); a blit may differ by one step.
+        for (size_t t = 0; pixels_ok && t < size_t{PW} * PH; ++t) {
+            const uint8_t* px = p10_pixels.data() + t * 4;
+            pixels_ok = px[0] == 255 && (px[1] == 127 || px[1] == 128) && px[2] == 0 && px[3] == 255;
+        }
+        CHECK(pixels_ok, "R10G10B10A2 renderer image holds the converted RGBA8 result");
+    }
     // R8Unorm (one 8-bit channel) is the same destination-mirror shape as RGBA8: the shader writes a
     // native R8_UNORM storage image and the renderer's R8_UNORM image seeds and receives it by an
     // exact copy, so a one-channel result no longer round-trips through the CPU (it used to be
