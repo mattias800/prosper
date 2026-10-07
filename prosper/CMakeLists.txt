@@ -878,6 +878,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_scalar_reads
     SOURCES tests/gpu/recompiler/test_fragment_scalar_reads.cpp
     INCLUDES tests LIBRARIES prosper_core)
+  # [t8-dropped]: the bounded witness that keeps the words of an image descriptor the fold
+  # declined (#4700).
+  prosper_add_gtest(test_dropped_image_descriptor
+    SOURCES tests/gpu/diagnostics/test_dropped_image_descriptor.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
