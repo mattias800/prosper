@@ -194,8 +194,12 @@ Enforcement: adr:0012
 
 Which guest descriptor a shader resource operand names is answered by one phi-aware analysis over
 the program's CFG, computed once per program version and consumed by both the recompiler and the
-executor. What it cannot prove is resolved at runtime through an emulator-maintained table or
-refused visibly; no path re-derives provenance on its own.
+executor. What it cannot prove is refused visibly -- or, once ADR 0027's layer 2 is separately
+accepted, resolved at runtime through an emulator-maintained table. No path re-derives provenance
+on its own.
+Violated today: the executor's register fold (`resolve_dynamic_fetch`), the split-T# proof
+(`split_t8_proof.cpp`) and the x16 descriptor proof (`smem_x16_descriptor_proof.cpp`) each derive
+provenance with their own write model.
 Status: proposed (adr:0027)
 Enforcement: adr:0027
 

@@ -20,10 +20,12 @@ and the x16-load proof (`src/gpu/recompiler/smem_x16_descriptor_proof.cpp`). Eac
 reaching definitions over the decoded CFG in its own way, with its own write model and its own
 limits. `docs/gpu/RESOURCE_BINDING.md` (§ Descriptor provenance) describes the contract they serve.
 
-**Evidence (measured 2026-10-07, Windows / RTX 4070 SUPER, *Assassin's Creed IV Black Flag
+**Evidence (measured 2026-10-07, Windows / RTX 4070 SUPER, *Assassin's Creed Black Flag
 Resynced* `PPSA28183`, a capture of the corrupted post-autosave frame, submit 3816):**
 
-- **51 compute dispatches and 51 draws** in that one submit were refused at shader recompile.
+- **51 compute dispatches and 51 draws** in that one submit were refused at shader recompile
+  (the capture's failure records, `gpu_replay --inspect-only` on submit 3816: 51 `dispatch` and 51
+  `draw` entries with `reason=shader-recompile`).
 - About **26 distinct compute programs** refused; **12** failed at a MIMG op with
   `[mimg-unresolved] ... srt_tag=NONE pc_res=null written=1` -- the descriptor SGPRs *were*
   written, by a scalar load whose provenance the fold could not prove.
@@ -34,13 +36,14 @@ Resynced* `PPSA28183`, a capture of the corrupted post-autosave frame, submit 38
 
 1. The proof's `may_write` treated every SOP1 opcode `>= 0x20` -- which includes every
    `s_*_saveexec` -- as writing every SGPR, so the first structured branch erased all descriptor
-   provenance (4 programs). Fixed by calling the shared `rdna2_escapes_decoded_effects()`; #4529 had
-   already fixed the same drift in a different copy of the write model.
+   provenance (4 programs). The proposed fix (#4712, open) calls the shared
+   `rdna2_escapes_decoded_effects()`; #4529 had already fixed the same drift in a different copy of
+   the write model.
 2. The proof was capped at 2048 dwords because it re-ran per dispatch (2 programs, 3720 and 2912
-   dwords). Fixed with a per-program cache.
+   dwords). The proposed fix (#4712, open) caches the analysis per program and lifts the cap.
 3. Two programs lose provenance at a CFG **join**. Still open.
 
-Fixes 1 and 2 are #4712. The pattern is
+On `main` today both gaps are present; #4712 proposes the fixes. The pattern is
 the point: each gap is a place where one proof's private approximation of "which instruction last
 wrote this SGPR on every path" disagreed with the ISA. Fixing them one at a time converges slowly
 and each fix lives in only one of several copies.
@@ -48,18 +51,20 @@ and each fix lives in only one of several copies.
 **Reference designs (verification-only; described, not copied).**
 
 - KytyPS5 lowers the shader to an SSA IR and tracks resources in a pass over it
-  (`src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp`, ~2,440 lines). A descriptor is
+  (`src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp`, ~2,440 lines at KytyPS5
+  `038d2257de85`, 2026-10-07; older checkouts differ). A descriptor is
   an SSA value, so a branch or `saveexec` cannot "kill" it: at a join it becomes a `Phi` whose
   operands are themselves traced. Where a descriptor is read from a table at a dynamic offset, the
   pass emits IR that computes a bounds-checked key at runtime and rewrites `Phi` edges onto that key
   (the indirect-descriptor projection, around lines 374-430), i.e. a static analysis with a runtime
   path for what it cannot fold.
-- shadPS4 discovers sharps over its SSA IR (`src/shader_recompiler/ir/passes/resource_discover_pass.cpp`,
+- shadPS4 (at `afde63182a38`, 2026-10-07) discovers sharps over its SSA IR
+  (`src/shader_recompiler/ir/passes/resource_discover_pass.cpp`,
   `resource_patching_pass.cpp`) and flattens the indirect user-data tree into a buffer the shader
   reads (`flatten_extended_userdata_pass.cpp`). Its discovery asserts that a sharp's producer is not
   a `Phi` (`resource_discover_pass.cpp:161`, `:178`), so it shows the SSA framing without solving the
   join case this ADR targets.
-- AnyPS5 runs decode -> CFG -> structurizer -> SSA IR -> constant folding -> resource tracking
+- AnyPS5 (at `400ba7f5ec01`, 2026-10-07) runs decode -> CFG -> structurizer -> SSA IR -> constant folding -> resource tracking
   (`core/shader/recompiler/Recompiler.cpp`, `PrepareResourceProgram`) and handles the join case
   explicitly: non-invariant descriptor phis are split per predecessor
   (`Optimization/src/ResourceTracker.cpp`, `SplitDescriptorPhis`). It then specializes the IR against
@@ -110,7 +115,8 @@ Two layers, behind the existing provenance interface.
    knowledge:
    - KytyPS5 computes an indexed-table key in the shader (`index * stride + offset`). It guards that
      key with `index < num_records && format != 0` and falls back to an invalid key, with no
-     recompile (`ResourceTracking.cpp:375-431`). That is the guard half of guarded specialization,
+     recompile (`ResourceTracking.cpp:375-431` at `038d2257de85`: `ULessThan32(index, num_records)`
+     and `INotEqual32(format, 0)` feeding `SelectU32(valid, offset, UINT32_MAX)`). That is the guard half of guarded specialization,
      applied to a table index. Buffers go through buffer device addresses.
    - AnyPS5 validates on the CPU and specializes one variant per descriptor snapshot, with a result
      memo. When a sampled bindless image table fits its slot budget, it binds the whole table.
