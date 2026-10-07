@@ -821,8 +821,9 @@ by that setting. No new runtime result or rung change is claimed here.
   call-stack profile (ETW kernel sampling, 20 s) puts the guest's submit thread at 100% of one core with the
   renderer running synchronously inside it. **17% of that thread was `getenv` scanning the environment block**
   (8% from one per-resource read in `append_shader_resource_compile_keys`), ~20% was full-buffer `memcmp`
-  validation, and the rest was frontend and driver work. The `getenv` share is fixed by reading the
-  remaining hot diagnostic switches once per submit (`PROSPER_ENV_ON_PER_SUBMIT`); the `memcmp` share is
+  validation, and the rest was frontend and driver work. The `getenv` share is addressed by #4677, which reads
+  the remaining hot diagnostic switches once per submit (`PROSPER_ENV_ON_PER_SUBMIT`); the realised gain
+  is **not measured** (no after-profile, no same-binary A/B). The `memcmp` share is
   not removable by write tracking on Windows (red-zone corruption on exception dispatch), so it needs a
   cheaper compare, not a skip. Separate, and **not** caused by that change: the title can sit in its
   pre-input state (guest threads polling with short sleeps, 58 fps, picture unchanged) on every build

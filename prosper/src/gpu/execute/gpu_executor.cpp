@@ -1594,6 +1594,7 @@ void append_shader_resource_compile_keys(ShaderProgramStage stage,
     // diagnostic) costs a full scan of the environment block, and this loop runs once per resource
     // of every draw -- 8% of the submit thread in a sampled Dragon Quest VII load. Re-sampled each
     // submit (and live outside one), so a test that arms the switch between submits still sees it.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
     const bool no_normalize = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
     for (const auto& resource : resources.resources) {
         const bool texture = resource.cls == ResourceClass::Texture;
@@ -12646,6 +12647,13 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     const GraphicsExecutionActivity execution;
     if ((!g_live && !g_compute && st.dma_copies.empty()) ||
         (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty())) return false;
+    // One per-submit sampling window around the WHOLE submit, both branches below. Without it a
+    // graphics-only submit (execute_ordered_guest_items) renders with no scope open -- the one in
+    // realize_gpustate_draws closes before rendering -- so every PROSPER_ENV_ON_PER_SUBMIT site in
+    // the backend and writer_provenance_enabled() fell back to a live getenv per pass/draw. Nested
+    // scopes (realize_gpustate_draws, execute_ordered_gpustate) only start fresher windows, which is
+    // never weaker than the contract. See diagnostics/env_submit.hpp.
+    const prosper::diag::SubmitEnvScope submit_env_scope;
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window.
     GuestReadableSubmitScope guest_readable_scope;
     // This submit's frame is headed for the publish gate below, so the renderer owes us a frame of

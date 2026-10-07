@@ -527,8 +527,10 @@ RenderState extract_render_state_uncached(const GpuState& st) {
     // title's colour"), and the run could not have produced any other number. The dedup key was
     // built from the same unassigned field, so the "distinct combinations" it counted were really
     // just distinct (base, format) pairs.
-    if (const char* clearlog = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_CLEARLOG")
-                                    ? std::getenv("PROSPER_CLEARLOG") : nullptr) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
+    const bool clearlog_armed = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_CLEARLOG");
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): the value is read live, and only once armed
+    if (const char* clearlog = clearlog_armed ? std::getenv("PROSPER_CLEARLOG") : nullptr) {
         if (clearlog[0] == '1' && clearlog[1] == '\0') {
             static std::mutex clear_mutex;
             static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> clear_seen;

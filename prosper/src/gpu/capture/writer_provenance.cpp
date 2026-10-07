@@ -116,7 +116,10 @@ bool writer_provenance_enabled() {
     const bool enabled = explicitly_on || (dimension_mode && *dimension_mode) ||
                          (resource_hash_mode && *resource_hash_mode) ||
                          (timeline_depth_hash_mode && *timeline_depth_hash_mode);
-    if (window != 0) { memo_window = window; memo_value = enabled; }
+    if (window != 0) {
+        memo_window = window;
+        memo_value = enabled;
+    }
     return enabled;
 }
 

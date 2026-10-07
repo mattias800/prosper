@@ -4,7 +4,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
-#include "diagnostics/env_submit.hpp"  // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
+#include "diagnostics/env_submit.hpp"   // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -1223,6 +1223,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                 cached ? "authoritative" : "MISS");
                 }
             }
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
             if (PROSPER_ENV_ON("PROSPER_TEXLOG") || PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
                 fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u mips=%u:%u/%u swz=%u,%u,%u,%u "
@@ -1322,6 +1323,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // vertically in one 2D image (#273); everything else keeps the 2D default.
             r.img_dim       = image_type_to_dim(d.type);
             r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
             if (fi.srgb && PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG"))
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
@@ -1360,6 +1362,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     if (load_sharp(soff, 4, sm_buf) != 0xFFFFFFFFu) {
                         const uint32_t* sm = sm_buf;
                         apply_sampler_descriptor(r, sm);
+                        // NOLINTNEXTLINE(concurrency-mt-unsafe): per-submit sample (env_submit.hpp)
                         if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG"))
                             fprintf(stderr, "[s#] slot%u mag=%u min=%u mip=%u addr=%u,%u,%u | aniso=%u cmp=%u unnorm=%u "
                                     "lod=[%.3f,%.3f] bias=%.3f border=%u | raw %08x %08x %08x %08x\n",

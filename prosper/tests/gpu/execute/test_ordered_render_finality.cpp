@@ -1,5 +1,6 @@
 // Internal snapshot flushes are producer boundaries, not submit ends. A premature final callback
 // can publish an earlier draw and suppress the terminal scanout/timing callback for later work.
+#include "diagnostics/env_submit.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -41,6 +42,12 @@ protected:
             0x7e00022fu,             // numeric consumer of the final child word s47
             0x7e0202f2u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
         };
+        // The same export with no scalar loads: v0 = 1.0 instead of the nested child word, so a draw
+        // using it has no owned nested input and can take the graphics-only (unordered) path.
+        const std::vector<uint32_t> flat_ps{
+            0x7e0002f2u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u,
+        };
         const std::vector<uint32_t> cs{0x7e000280u, 0xbf810000u};
         const auto create = prosper::Hle::lookup("f3dg2CSgRKY");
         ASSERT_TRUE(create);
@@ -72,6 +79,8 @@ protected:
         register_program(vertex_, vs, 2, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES);
         register_program(fragment_, ps, 1, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS);
         register_program(compute_, cs, 0, P::COMPUTE_PGM_LO, P::COMPUTE_PGM_HI);
+        register_program(flat_fragment_, flat_ps, 1, P::SPI_SHADER_PGM_LO_PS,
+                         P::SPI_SHADER_PGM_HI_PS);
     }
 
     void SetUp() override {
@@ -218,7 +227,7 @@ protected:
         std::vector<uint32_t> draws;
         std::vector<uint32_t> words;
     };
-    static inline Program vertex_, fragment_, compute_;
+    static inline Program vertex_, fragment_, compute_, flat_fragment_;
     static inline OrderedRenderFinality* active_ = nullptr;
     static constexpr uint64_t page_ = 0x10000u;
     static constexpr uint64_t submit_ = 4280u;
@@ -394,6 +403,44 @@ TEST_F(OrderedRenderFinality, NoSuccessfulDrawDoesNotPublishAnEmptyFinalCallback
     EXPECT_FALSE(execute_ordered_and_present(state, 1, 1, submit_, true));
     EXPECT_TRUE(observations_.empty());
     EXPECT_FALSE(present_has_frame());
+}
+
+// #4677: execute_ordered_and_present opens ONE per-submit env window around both branches. A
+// graphics-only submit (no dispatch, DMA, indirect, nested or scalar-bank input) renders through
+// execute_ordered_guest_items, outside the window realize_gpustate_draws opens and closes, so
+// without the outer scope every PROSPER_ENV_ON_PER_SUBMIT site in the backend read getenv live per
+// pass. Mutation: delete that scope and the window observed inside the render callback is 0.
+TEST_F(OrderedRenderFinality, GraphicsOnlySubmitRendersInsideOneEnvWindow) {
+    GpuState state;
+    for (const Program* program : {&vertex_, &flat_fragment_})
+        for (const auto& reg : program->registers) state.sh[reg.offset] = reg.value;
+    state.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+    state.cx[P::CB_TARGET_MASK] = state.cx[P::CB_SHADER_MASK] = 15;
+    // Observed Wave32 launch metadata: without it the draw is routed ordered for the scalar bank.
+    state.cx[P::SPI_PS_IN_CONTROL] = 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+    GpuState::Draw draw;
+    draw.index_count = 3;
+    draw.instance_count = 1;
+    draw.command_order = 100;
+    state.draws.push_back(draw);
+    // Preconditions for the graphics-only branch (needs_ordered_realization false).
+    ASSERT_FALSE(draw_requires_owned_nested_snapshot(state));
+    ASSERT_FALSE(draw_requires_original_scalar_bank(state));
+    ASSERT_EQ(prosper::diag::submit_env_window(), 0u) << "no submit may be open before the call";
+
+    std::vector<uint64_t> windows;
+    size_t rendered_items = 0;
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        windows.push_back(prosper::diag::submit_env_window());
+        rendered_items += items.size();
+        return RenderedFrame{};
+    });
+    (void)execute_ordered_and_present(state, 1, 1, submit_, false);
+    ASSERT_FALSE(windows.empty()) << "the graphics-only submit never reached the renderer";
+    EXPECT_GT(rendered_items, 0u) << "the draw must actually be handed to the renderer";
+    for (const uint64_t window : windows)
+        EXPECT_NE(window, 0u) << "the backend rendered with no per-submit env window open";
+    EXPECT_EQ(prosper::diag::submit_env_window(), 0u) << "the window must close with the submit";
 }
 
 TEST(SingleFramebufferSubmitFrame, FinalConsumesExactProducerOnce) {
