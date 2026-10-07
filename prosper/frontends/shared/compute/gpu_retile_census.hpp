@@ -26,19 +26,19 @@ namespace prosper::frontend {
 // and a hundred times for the one that owns the frame.
 enum class GpuRetileDecline : uint8_t {
     Admitted = 0,
-    Aliased,               // this binding is an alias of an earlier one; the owner does the writeback
-    Imported,              // guest-imported image, not a storage result prosper produced
-    PartialWrite,          // a write mask means the result does not cover the whole surface
-    InexactBytes,          // staged bytes are not the guest's exact storage extent
-    MipTailOrOffset,       // in a mip tail, or at a nonzero layer/mip offset
-    NoResource,            // the binding carries no ShaderResource at all
-    NoStaging,             // no staging buffer for this image
-    UnsupportedShape,      // layer/depth/dimension combination outside the admitted set
-    PackedDisabled,        // packed byte/halfword words with the extension switched off
-    PackedUnsupported,     // array-and-not-packed, or a packed descriptor the layout cannot express
-    LayoutMismatch,        // parameters would not reproduce the guest's exact tiled/linear extents
-    PrepareFailed,         // pipeline/buffer/memory/descriptor setup declined at runtime
-    Disabled,              // PROSPER_NO_GPU_RETILE
+    Aliased,   // this binding is an alias of an earlier one; the owner does the writeback
+    Imported,   // guest-imported image, not a storage result prosper produced
+    PartialWrite,   // a write mask means the result does not cover the whole surface
+    InexactBytes,   // staged bytes are not the guest's exact storage extent
+    MipTailOrOffset,   // in a mip tail, or at a nonzero layer/mip offset
+    NoResource,   // the binding carries no ShaderResource at all
+    NoStaging,   // no staging buffer for this image
+    UnsupportedShape,   // layer/depth/dimension combination outside the admitted set
+    PackedDisabled,   // packed byte/halfword words with the extension switched off
+    PackedUnsupported,   // array-and-not-packed, or a packed descriptor the layout cannot express
+    LayoutMismatch,   // parameters would not reproduce the guest's exact tiled/linear extents
+    PrepareFailed,   // pipeline/buffer/memory/descriptor setup declined at runtime
+    Disabled,   // PROSPER_NO_GPU_RETILE
     Count
 };
 
@@ -76,16 +76,15 @@ struct GpuRetileCensus {
     std::unordered_map<uint64_t, Row> by_code;   // guest code address of the dispatching program
     std::atomic<bool> any{false};
 
-    void record(uint64_t code_addr, GpuRetileDecline reason,
-                const prosper::gpu::ShaderResource* r, uint32_t bpe) {
+    void record(uint64_t code_addr, GpuRetileDecline reason, const prosper::gpu::ShaderResource* r,
+                uint32_t bpe) {
         any.store(true, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(mutex);
         Row& row = by_code[code_addr];
         row.reasons[static_cast<size_t>(reason)]++;
         auto& sample = row.samples[static_cast<size_t>(reason)];
         if (reason != GpuRetileDecline::Admitted && !sample[0] && r) {
-            std::snprintf(sample.data(), sample.size(),
-                          "%ux%ux%u dim=%u tile=%u fmt=%u bpe=%u",
+            std::snprintf(sample.data(), sample.size(), "%ux%ux%u dim=%u tile=%u fmt=%u bpe=%u",
                           r->width, r->height, r->depth, (unsigned)r->img_dim,
                           (unsigned)r->tile_mode, (unsigned)r->format, bpe);
         }
@@ -120,6 +119,9 @@ struct GpuRetileCensus {
     }
 };
 
-inline GpuRetileCensus& gpu_retile_census() { static GpuRetileCensus* value = new GpuRetileCensus; return *value; }
+inline GpuRetileCensus& gpu_retile_census() {
+    static GpuRetileCensus* value = new GpuRetileCensus;
+    return *value;
+}
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

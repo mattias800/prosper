@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <vector>
 
 namespace prosper::frontend {
@@ -58,9 +59,15 @@ inline ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_coun
         uint32_t i = start;
         uint8_t verdict = 1;
         while (true) {
-            if (i == 0 || i >= records) { verdict = 1; break; }         // terminator / OOB read -> 0
-            if (state[i]) { verdict = state[i]; break; }                // already classified
-            if (seen_at[i] != UINT32_MAX) {                             // revisited on THIS walk
+            if (i == 0 || i >= records) {   // terminator / OOB read -> 0
+                verdict = 1;
+                break;
+            }
+            if (state[i]) {   // already classified
+                verdict = state[i];
+                break;
+            }
+            if (seen_at[i] != UINT32_MAX) {   // revisited on THIS walk
                 for (size_t k = seen_at[i]; k < path.size(); ++k) cycle_nodes.insert(path[k]);
                 verdict = 2;
                 break;
@@ -69,7 +76,10 @@ inline ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_coun
             path.push_back(i);
             i = (words[i] >> 3) & 0x7FFFFFFu;
         }
-        for (uint32_t node : path) { state[node] = verdict; seen_at[node] = UINT32_MAX; }
+        for (uint32_t node : path) {
+            state[node] = verdict;
+            seen_at[node] = UINT32_MAX;
+        }
     }
     state[0] = 1;   // the terminator itself terminates
     // Depth of each terminating node, memoised: depth(i) = 1 + depth(next(i)), 0 for a cyclic node.
@@ -84,12 +94,17 @@ inline ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_coun
             i = (words[i] >> 3) & 0x7FFFFFFu;
         }
         uint32_t d = (i < records) ? depth[i] : 0u;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) { d += 1u; depth[*it] = d; }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            d += 1u;
+            depth[*it] = d;
+        }
         if (d > out.longest) out.longest = d;
     }
     for (uint32_t k = 0; k < records; ++k) {
-        if (state[k] == 1) ++out.terminating;
-        else if (state[k] == 2) ++out.cyclic;
+        if (state[k] == 1)
+            ++out.terminating;
+        else if (state[k] == 2)
+            ++out.cyclic;
     }
     out.cycle_nodes = static_cast<uint32_t>(cycle_nodes.size());
     // Keep a few actual ring members. A count says corruption happened; the entries say what SHAPE it
@@ -105,4 +120,4 @@ inline ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_coun
     return out;
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

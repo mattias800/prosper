@@ -6838,6 +6838,17 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
 
+  # Overlapping windows of a read-only buffer share one resident arena (interim; not ADR 0010).
+  prosper_add_gtest(test_buffer_arena_plan
+    SOURCES tests/shared/compute/test_buffer_arena_plan.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # CPU microbenchmark (not a ctest): validation work of nine overlapping windows, private copies vs one arena.
+  add_executable(bench_buffer_arena tests/shared/compute/bench_buffer_arena.cpp)
+  target_include_directories(bench_buffer_arena PRIVATE frontends src tests)
+  target_link_libraries(bench_buffer_arena PRIVATE prosper_core)
+
   # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
   prosper_add_gtest(test_pipeline_observe_hook
     SOURCES tests/shared/live/test_pipeline_observe_hook.cpp

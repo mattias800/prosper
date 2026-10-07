@@ -204,8 +204,35 @@ Unexplained and not yet shown to matter:
   Whether any is required to reach a frame is not known. Per the project's entitlement rule, answers
   must come from local inventory, never a blanket "owned".
 
+### Where the compute CPU time goes (graceful-exit census, 2026-10-06, 42.7 s, Windows/NVIDIA)
+
+`prosper-app` closed through its window (`CloseMainWindow`) prints the exit censuses that a `timeout` kill
+loses. Totals: host copies 8,241 MiB (193 MiB/s): `storage-materialize` 2,147 MiB/390 calls,
+`rtt-snapshot` 2,577 MiB/517 calls, `detile` 3,518 MiB/1,361 calls. The same census attributes the
+renderer-owned bindings' CPU round trip to `cpu-only-authority` (2,080 MiB/263 calls, one 7.9 MiB frame-sized
+image each): a compute result is published to the renderer as a CPU snapshot, so the next dispatch that
+samples it re-uploads it.
+
+The GPU-side mirror (no CPU copy) accepted 283 of about 1,800 compute results tested. The first failing
+field for the rest: `format-no-seed-path` 780 (R8Unorm results; the renderer-image storage seed path exists
+only for Rgba8, Rgba16F and R11G11B10), `format-unmapped` 611 (R10G10B10A2, which `storage_target_format`
+does not map and which is published through `publish_unorm10_as_rgba8`), `prior-output-conflict` 48,
+`mip-base-level` 30, `mip-tail` 25, `final-output-conflict` 24. Writebacks per submit are about 7: two
+R10G10B10A2 (8.8 MB), one RGBA8 (8.8 MB), one R8 (8.3 MB), plus small ones. So the frame's CPU round trips
+come from two result formats, not from many small leaks; removing them is a native-storage-image feature
+for those formats (recompiler typed storage view, renderer seed path, mirror), not a cache tweak.
+
 ## Ruled out
 
+- **"Write-watch can take over the per-frame compare of the constant ring on Windows."** Not available:
+  on Windows `GuestWriteWatch::create` always reports unsupported (page-protection watches corrupt the
+  guest SysV red zone, and direct memory is section-backed so `MEM_WRITE_WATCH` cannot see it), so every
+  CPU-written guest source is validated by a full compare. Measured 2026-10-06 with the arena on: the
+  guest rewrites 0.25-0.3 MiB of the ~59 MiB ring per frame, validation is `full` once per frame
+  (journal for the other windows), and forcing promotion with `PROSPER_COMPUTE_WATCH_DEFER_MIN_KB=0`
+  armed nothing (`watch=0` in the `PROSPER_WATCH_PROMOTE_CENSUS` totals). The remaining lever is the
+  compare itself (~11 ms/frame under load), not the copy: block-granular sync (#4635) took the upload
+  from ~49 MiB to ~0.3 MiB per frame.
 - **"The black window is a slow load or a hang in a long boot."** Falsified: the primary guest thread
   ended with `ACCESS-VIOLATION addr=0x3 rip=eboot+0x161ed91` at about 1.6 s while the process stayed up
   for 72 minutes with 32 s of CPU and no further log lines; `BOOT_COMPLETE` is reached at 1.6 to 2.0 s.
