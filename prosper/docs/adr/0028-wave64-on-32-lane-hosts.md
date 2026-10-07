@@ -8,9 +8,10 @@ date: 2026-10-07
 
 ## Context
 
-PS5 shaders are compiled for 64-lane waves. A host whose subgroups are 32 lanes wide (every NVIDIA
-GPU, and AMD under drivers that do not expose a 64-lane fragment subgroup) cannot run a program
-whose result depends on that width. What prosper does today, read from the code on `origin/main`:
+PS5 shaders are compiled for 64-lane waves. A host whose subgroups are narrower than 64 lanes
+(every NVIDIA GPU at 32; AMD under drivers that do not expose a 64-lane fragment subgroup; Intel at
+8/16/32; lavapipe at 8) cannot run a program whose result depends on that width. What prosper does
+today, read from the code on `origin/main`:
 
 - **Fragment.** `lower_fragment_votes` (`src/gpu/recompiler/spirv_fragment_vote_lowering.hpp`) runs
   under `FragmentWavePolicy::ProvenVotes` and admits a program only when every vote carries a
@@ -22,25 +23,41 @@ whose result depends on that width. What prosper does today, read from the code 
 - **Compute.** `frontends/shared/live/live_compute.cpp` (the `subgroup-contract-absent` and
   `subgroup-too-narrow` declines) skips any dispatch whose required subgroup size, or whose lane
   operations, the host cannot satisfy, counted as `compute/subgroup-contract`. There is no
-  emulation of a 64-lane wave on a 32-lane compute subgroup.
+  emulation of a 64-lane wave on a narrower compute subgroup.
+- **Owned logical-Wave64 graphics draws** already exist: `src/gpu/execute/owned_graphics_wave_draw.cpp`
+  (#4270, #4421, #4555) runs owned per-wave graphics draws. The fragment route below (#4384) builds
+  on that path rather than beside it.
 - **Recompile failures** for either stage are reported separately as `fragment/recompile` and
   `compute/recompile`; those are prosper defects, not host limits, and are out of scope here.
+- **One known approximation on the default path.** The Wave64 scalar-pair projection (a 64-bit
+  scalar mask pair projected onto an invocation's own bit) is guarded against fabricated-zero halves
+  for fragment (#4711), but the compute projection does not consult that mark (#4714, open), so
+  `main` can use a synthetic zero as a lane mask today. That is a current exception to this ADR's
+  "the default never approximates"; #4714 closes it.
 
-This already satisfies `FAIL-1`: nothing is skipped silently. What it does not do is run the
-programs. Evidence from *Assassin's Creed IV Black Flag Resynced* `PPSA28183` on Windows with an
-RTX 4070 SUPER, 2026-10-07: four fragment draws refused `unproved-vote`, each a `v_cmp` vote whose
-only consumer is EXEC feeding an `s_cbranch_execz` skip; a later run refused about 11 fragment
-programs at `fragment/subgroup-contract` and 9 at `fragment/recompile`
-(`docs/games/AC_BLACK_FLAG_STATUS.md` records the refusal classes and that eighteen compute
-programs are refused as well). On RADV with 64-lane subgroups the same programs run natively.
+This already satisfies `FAIL-1` for refusals: nothing refused is skipped silently. What it does not
+do is run the programs. Evidence from *Assassin's Creed IV Black Flag Resynced* `PPSA28183` on
+Windows with an RTX 4070 SUPER, as recorded: `docs/games/AC_BLACK_FLAG_STATUS.md` records thirteen
+fragment programs refused by the recompiler and two by the backend (`subgroup-contract`,
+`unproved-vote`), eighteen refused compute programs, and one start-up fragment draw (`0x407edfaf00`)
+refused by the `unproved-vote` contract; the 2026-10-07 comment on #4131 (`main` `f2e5124a6`,
+Windows) records three fragment `subgroup-contract` refusals. The shape of the `unproved-vote` vote
+-- a `v_cmp` whose only consumer is EXEC feeding an `s_cbranch_execz` skip -- was read while
+drafting this ADR and is not yet in the status doc; it is recorded there with migration step 1.
+**Expectation, not measurement:** on RADV with 64-lane subgroups the `subgroup-contract` programs
+should run natively. No Black Flag RADV run is recorded, and the `fragment/recompile` refusals would
+fail there too.
 
-The owner's draft PR #4384 ("General Wave64 / Kena: durable partial-work checkpoint") opens the
-exact fragment route: collect the fragment quads, run the original pixel shader as an owned
-logical-64 wave in a compute-style pass, and replay its outputs. It currently admits only
-straight-line, quad-local programs, and its review is open. This ADR does not compete with it; it
-names it as the fragment route and sets the policy that ties all routes together.
+The owner's draft PR #4384 (currently titled "gpu: checkpoint general logical64 fragment helper
+launch") opens the exact fragment route on top of the owned-wave path: collect the fragment quads,
+run the original pixel shader as an owned logical-64 wave in a compute-style pass, and replay its
+outputs. It currently admits only straight-line, quad-local programs, and its review is open. This
+ADR does not compete with it; it names it as the fragment route and sets the policy that ties all
+routes together.
 
-Reference designs, read for verification only (no code taken; paths relative to each project):
+Reference designs, read for verification only (no code taken; paths relative to each project).
+**These citations are not pinned to commits** and review could not re-check them (a local shadPS4
+checkout predates `lower_wave64_pass.cpp`); pin a commit before relying on any of them:
 
 - **AnyPS5** emits each instruction once per half-lane context when `state.laneCount == 2`, sharing
   values proven uniform (`core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp:734-735`,
@@ -61,17 +78,36 @@ shadPS4 and sharpemu do workgroup exchange for compute only, and prosper does pr
 ## Decision
 
 One policy for every guest Wave64 program on a host that cannot offer a native 64-lane subgroup
-for that stage. Each program takes the first route that applies, chosen per shader by analysis,
-and every route is logged by name. The default never approximates.
+for that stage. Let W be the host subgroup width for the stage (W < 64; 32 on NVIDIA, as low as 8
+on Intel and lavapipe). Each program takes the first route that applies, chosen per shader by
+analysis, and every route is logged by name. The default never approximates (the #4714 exception
+above is a defect to close, not a precedent).
 
 1. **Native.** A host that offers a required 64-lane subgroup for the stage runs the program
    natively, always. Nothing below applies to it; AMD/RADV hosts see no change.
 2. **Proven width-independent: one lane per invocation, zero cost.** Programs with no cross-lane
    operation, or whose cross-lane operations are proven independent of wave width, run as plain
    one-lane-per-invocation code. The existing `ProvenVotes` certificates are this route; they are
-   extended with cheap exact cases, first: *an any-vote whose only consumer is EXEC guarding an
-   `s_cbranch_execz` skip of an EXEC-masked region is neutral*, because lanes outside the region
-   are masked off either way and the skip only elides work (the Black Flag case).
+   extended with cheap exact cases. The first candidate is *an any-vote whose only consumer is EXEC
+   guarding an `s_cbranch_execz` skip* (the Black Flag case). **Masking alone does not make that
+   vote neutral.** VALU work in the skipped region is EXEC-masked, but SALU and SMEM instructions
+   in it execute whenever any lane of the 64-lane guest wave is active and do not execute when the
+   whole wave skips. Forcing the vote TRUE runs that scalar work where hardware skipped it;
+   evaluating it per W-lane host subgroup lets one subgroup skip scalar writes that another, and the
+   hardware, performed. So the certificate is the existing one-arm condition
+   (`spirv_fragment_vote_lowering.hpp`: TRUE control only "after proving every extra operation
+   UB-free and every live merge export stable and unchanged under P=false"), made concrete for
+   this shape. The region, entered with an empty EXEC, must have:
+   - **no scalar live-out**: no SGPR, SCC, VCC, M0, or EXEC-derived scalar value written in the
+     region and read after the merge;
+   - **no scalar memory effect**: no `s_store`/`s_buffer_store`/`s_atomic`, and no scalar load whose
+     address or result is meaningful only when lanes are active and is read after the merge;
+   - **no wave-level side effect**: no `s_sendmsg`, `s_barrier`, `s_setreg`, `s_sleep`/trap or other
+     operation that is observable or UB under the forced arm;
+   - **no scalar-dependent exit**: no branch out of the region other than to the merge.
+   The conditions are checked on the guest program (the 64-lane wave is the semantic target), not
+   on the host lowering.
+
    **This route is where most of the performance is, so it is grown before any emulation.**
    Compiled code uses cross-lane operations mostly as optimisations, not as 64-lane semantics.
    With uniformity analysis (natural on `GPU-3`'s SSA IR), these become exact one-lane code:
@@ -82,15 +118,20 @@ and every route is logged by name. The default never approximates.
    - a vote over a wave-uniform predicate is that predicate.
 
    Each rewrite needs the same proof standard as a certificate: a positive arm and a mutation arm.
+   A rewrite that projects a 64-bit scalar mask pair onto the invocation's own bit must also prove
+   neither half is a fabricated zero (the #4711 mark, consulted in both stages once #4714 lands).
    A program it fully rewrites never reaches routes 3-5.
 3. **Compute, cross-lane operations only in uniform control flow: workgroup exchange.** One lane
-   per invocation; ballot, vote, readlane, `mbcnt` and DPP/permutes that cross the 32-lane half are
-   lowered to a cross-half exchange through workgroup memory with barriers (the shadPS4/sharpemu
-   shape). Near-native parallelism; cost is shared memory and barriers at each exchange.
-4. **Compute, cross-lane operations inside divergent control flow: two lanes per invocation.** Each
-   host invocation executes both halves of the guest lane pair (the AnyPS5 shape), exact under
-   divergence. It halves the thread count and doubles per-thread registers, so occupancy and
-   latency hiding drop; it is used only for programs that need it.
+   per invocation; ballot, vote, readlane, `mbcnt` and DPP/permutes that cross a W-lane boundary
+   are lowered to an exchange across the 64 / W host subgroups of one workgroup, through workgroup
+   memory with barriers (the shadPS4/sharpemu shape). Near-native parallelism; cost is shared
+   memory and barriers at each exchange.
+4. **Compute, cross-lane operations inside divergent control flow: N lanes per invocation.** Each
+   host invocation executes N = 64 / W guest lanes (two on a 32-lane host, four on 16, eight on 8;
+   the AnyPS5 shape generalised), exact under divergence. It divides the thread count by N and
+   multiplies per-thread registers by about N, so occupancy and latency hiding drop; it is used
+   only for programs that need it. A configuration whose register cost cannot be met (likely at
+   N = 8) falls to route 6.
 5. **Fragment, not proven.** Fragment invocations cannot be re-grouped by prosper and have no
    workgroup memory, so routes 3 and 4 do not apply to the fragment stage directly. Two ways in:
    - **Full-screen passes promoted to compute.** A draw proven to cover its target exactly once
@@ -103,9 +144,10 @@ and every route is logged by name. The default never approximates.
    `[wave64-unsupported]` line naming the stage, program and refusal class, and the counters in
    `perf_alarms`.
 
-An **approximate 32-lane vote** (evaluating a guest vote over the host subgroup) may exist only as
-an explicit, logged, default-OFF *guest-behaviour selector* under `CFG-1`, with an issue whose
-resolution settles its default and deletes the switch. A run with it set is not evidence (`VER-4`).
+An **approximate narrow-subgroup vote** (evaluating a guest vote over the host subgroup) may exist
+only as an explicit, logged, default-OFF *guest-behaviour selector* under `CFG-1`, with an issue
+whose resolution settles its default and deletes the switch. A run with it set is not evidence
+(`VER-4`).
 
 Performance claims are qualitative until measured. **No route becomes the default for a class of
 shaders until a same-binary A/B on real titles** (`.claude/skills/perf-change/`) shows its cost,
@@ -117,14 +159,18 @@ Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
 
 - **Cost by route.** Native and proven: none. Workgroup exchange: shared memory plus one barrier
   per exchange, and a workgroup size constraint (the 64 guest lanes must sit in one workgroup).
-  Two lanes per invocation: half the host threads, double the registers per thread, possibly
+  N lanes per invocation: 1/N of the host threads, about N times the registers per thread, possibly
   spills; correct but slowest. #4384's owned wave: an extra quad collection and replay pass per
   admitted draw.
 - **Tests.** Every proof extension gets a positive and a mutation arm (a vote that does reach a
-  live output must still be refused). Each compute route gets execution tests whose expected
-  values are produced by the same program run at native 64-lane width on RADV, compared bit for bit;
-  on lavapipe (8 lanes in CI) and 32-lane hosts the test exercises the emulated route. A hand-built
-  divergent ballot is the positive control for route 4, built outside the analysis that selects it.
+  live output must still be refused). The `s_cbranch_execz` certificate's mutation arms include,
+  by name, a skipped region with an **SGPR live-out read after the merge** and one with a **scalar
+  memory store**; both must be refused, and the positive arm is a hand-built region with VALU work
+  only. Each compute route gets execution tests whose expected values are produced by the same
+  program run at native 64-lane width on RADV, compared bit for bit. Lavapipe in CI (W = 8) and a
+  32-lane host (W = 32) are different configurations of the emulated route (N = 8 and N = 2), so a
+  green CI run does not cover the 32-lane case. A hand-built divergent ballot is the positive
+  control for route 4, built outside the analysis that selects it.
 - **Diagnostics.** The `[wave64-unsupported]` line gains a `route=` field for admitted programs, so
   a run shows which route each Wave64 program took and what is still refused.
 - **AMD hosts:** nothing changes; route 1 short-circuits before any analysis.
@@ -134,23 +180,26 @@ Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
 
 ## Alternatives considered
 
-- **Approximate 32-lane votes by default.** Makes more frames draw, but silently wrong whenever the
-  two halves disagree, which violates `FAIL-1` and turns a visible drop into an invisible defect.
+- **Approximate narrow-subgroup votes by default.** Makes more frames draw, but silently wrong
+  whenever the subgroups disagree, which violates `FAIL-1` and turns a visible drop into an
+  invisible defect.
 - **Refuse forever.** Today's state; correct but leaves every NVIDIA user without the refused draws
   and dispatches, and the refusals are in shipped titles' main passes.
-- **Require AMD hardware.** Abandons every user on a 32-lane host.
-- **Two lanes per invocation for every compute program.** Exact and simple, but pays the occupancy
+- **Require AMD hardware.** Abandons every user on a narrower host.
+- **N lanes per invocation for every compute program.** Exact and simple, but pays the occupancy
   cost on programs that need nothing; the per-shader choice confines it.
 - **Workgroup exchange for every compute program.** Cannot express divergent cross-lane operations
   exactly, which is why shadPS4 restricts it to uniform blocks.
 
 ## Migration order
 
-1. Land the `s_cbranch_execz` neutral-vote certificate with its tests (Black Flag's four draws).
+1. The `s_cbranch_execz` certificate under the scalar-effect conditions in route 2, with the
+   SGPR-live-out and scalar-store mutation arms (Black Flag's `unproved-vote` draw), and the vote's
+   shape recorded in `AC_BLACK_FLAG_STATUS.md`. See *Approval* for when it may land.
 2. Add the `route=` field and per-route counters, then census which refused programs the route-2
    rewrites (uniform `readlane`, compaction ballots, uniform votes) would admit.
 3. Compute workgroup exchange for uniform control flow, with RADV-native comparison tests.
-4. Two-lanes-per-invocation for the divergent remainder.
+4. N-lanes-per-invocation for the divergent remainder.
 5. Full-screen fragment-to-compute promotion, gated on its coverage proof and compared texel for
    texel against the fragment path where the latter runs (AMD).
 6. Grow #4384's admitted shapes, on the owner's schedule.
@@ -160,13 +209,15 @@ Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
 
 - Whether routes 3 and 4 share one IR lowering with a per-program parameter, or are two passes;
   `GPU-3` (SSA IR) may make the former natural.
-- How #4384's owned wave relates to route 4: its logical-64 wave in a compute-style pass may be the
-  same two-lane machinery, in which case fragment and compute converge on one implementation.
+- How #4384's owned wave and `owned_graphics_wave_draw.cpp` relate to route 4: the logical-64 wave
+  in a compute-style pass may be the same N-lane machinery, in which case fragment and compute
+  converge on one implementation.
 - Whether workgroup exchange is admissible when the guest's own LDS use leaves too little shared
   memory, or must fall to route 4.
 
 ## Approval
 
 Requires the project owner's acceptance, and the owner's agreement that #4384 is the fragment
-route this policy names. Acceptance unblocks migration steps 2-4; step 1 is a proof extension
-that fits today's policy and does not wait on it.
+route this policy names. Acceptance unblocks migration steps 1-5. Step 1 may land before
+acceptance only as its own PR that the owner reviews on its own terms, as a proof extension under
+today's `ProvenVotes` policy; it does not land on the strength of this proposal.

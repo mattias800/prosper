@@ -282,6 +282,9 @@ Enforcement: adr:0023
 
 On a host without a native 64-lane subgroup for the stage, a Wave64 program runs only when its
 width independence is proven or an exact emulation route admits it; otherwise it is refused with a
-`[wave64-unsupported]` line. An approximate vote is only a default-OFF selector.
+`[wave64-unsupported]` line. An approximate vote is only a default-OFF selector. Until the ADR is
+accepted the only admitting route is proof (`ProvenVotes`); the emulation routes do not exist yet.
+Violated today: the compute Wave64 scalar-pair projection does not consult the fabricated-zero
+mark, so a synthetic zero can stand in for a lane mask on the default path (#4714).
 Status: proposed (adr:0028)
 Enforcement: adr:0028
