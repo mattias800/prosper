@@ -3855,6 +3855,14 @@ bool graphics_deferred_wait_enabled();
 void set_graphics_deferred_wait_for_test(int enabled);
 LiveRenderPhase live_render_phase();
 
+// ADR 0009 Stage 1 step 2 (observe only). The ordered executor reports the operations that run
+// BETWEEN compute dispatches -- a flushed graphics span (`count` draws) or a DMA copy -- so a
+// diagnostic can tell "two dispatches ran back to back" from "a draw sat between them". It carries
+// no ranges and changes nothing; the hook is null unless a diagnostic installs it.
+enum class OrderedOperationKind : uint8_t { GraphicsSpan, Dma };
+using OrderedOperationObserver = void (*)(OrderedOperationKind kind, uint32_t count);
+void set_ordered_operation_observer(OrderedOperationObserver observer);
+
 // Invoke the registered live backend directly with already-realized draws. Used by the local capture
 // replayer; normal guest execution enters through execute_and_present(). Returns {} when unregistered.
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,

@@ -4186,6 +4186,7 @@ endif()
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
+                                               frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -4596,6 +4597,7 @@ endif()
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
+                                               frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
@@ -6812,6 +6814,16 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
+  prosper_add_gtest(test_pipeline_observe_hook
+    SOURCES tests/shared/live/test_pipeline_observe_hook.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+  prosper_add_gtest(test_pipeline_observer
+    SOURCES tests/shared/compute/test_pipeline_observer.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_retirement_queue
     SOURCES tests/shared/compute/test_retirement_queue.cpp
     INCLUDES frontends src tests

@@ -759,6 +759,7 @@ PROSPER_PERF_CAPTURE_AT_FRAME  unclassified
 PROSPER_PHYSLOG  unclassified
 PROSPER_PIPEKEY_LOG  unclassified
 PROSPER_PIPELINE_CACHE_ENTRIES  unclassified
+PROSPER_PIPELINE_OBSERVE  diagnostic  # ADR 0009 step 2: report what pipelining would allow; observes only, changes nothing
 PROSPER_PIPELINE_LAYOUT_CACHE_ENTRIES  unclassified
 PROSPER_PIPELOG  unclassified
 PROSPER_PIPETRACE  unclassified
