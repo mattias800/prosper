@@ -1100,14 +1100,14 @@ TEST(Tile, Contract) {
         const std::vector<uint8_t> clear_0000(16, 0x00);
         const std::vector<uint8_t> clear_1110(16, 0x80);
         const std::vector<uint8_t> clear_1111(16, 0xc0);
-        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                         clear_0000.data(), clear_0000.size(), 4, true) &&
-              clear_pixels[0] == 0 && clear_pixels[1] == 0 &&
-              clear_pixels[2] == 0 && clear_pixels[3] == 0 &&
-              gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                         clear_1111.data(), clear_1111.size(), 4, true) &&
-              clear_pixels[0] == 255 && clear_pixels[1] == 255 &&
-              clear_pixels[2] == 255 && clear_pixels[3] == 255,
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, clear_0000.data(),
+                                         clear_0000.size(), 4, true) &&
+                  clear_pixels[0] == 0 && clear_pixels[1] == 0 && clear_pixels[2] == 0 &&
+                  clear_pixels[3] == 0 &&
+                  gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, clear_1111.data(),
+                                             clear_1111.size(), 4, true) &&
+                  clear_pixels[0] == 255 && clear_pixels[1] == 255 && clear_pixels[2] == 255 &&
+                  clear_pixels[3] == 255,
               "uniform DCC_CLEAR_0000 and DCC_CLEAR_1111 materialize all-zero/all-one");
         CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                          clear_1110.data(), clear_1110.size(),
@@ -1132,19 +1132,19 @@ TEST(Tile, Contract) {
         // the absent ones read (0,0,0,1). Before this, a fast-cleared R16F surface was sampled as
         // its stale base bytes (Black Flag, #4131); a one-component code 0x00 must read zero.
         std::vector<uint8_t> narrow(8, 0xaa);
-        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(),
-                                         1, true) &&
-              narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}) &&
-              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
-                                         1, true) &&
-              narrow == std::vector<uint8_t>({255, 0, 0, 255, 255, 0, 0, 255}),
+        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(), 1,
+                                         true) &&
+                  narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}) &&
+                  gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
+                                             1, true) &&
+                  narrow == std::vector<uint8_t>({255, 0, 0, 255, 255, 0, 0, 255}),
               "one-component DCC clears fill R only; absent components read (0,0,0,1)");
-        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(),
-                                         2, true) &&
-              narrow == std::vector<uint8_t>({255, 255, 0, 255, 255, 255, 0, 255}) &&
-              gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(),
-                                         2, false) &&
-              narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
+        CHECK(gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_1111.data(), clear_1111.size(), 2,
+                                         true) &&
+                  narrow == std::vector<uint8_t>({255, 255, 0, 255, 255, 255, 0, 255}) &&
+                  gfx10_dcc_fast_clear_rgba8(narrow.data(), 2, clear_0000.data(), clear_0000.size(),
+                                             2, false) &&
+                  narrow == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
               "two-component DCC clears fill RG; absent components read (0,0,0,1)");
         // Codes 0x40 (0001) and 0x80 (1110) give colour and alpha different values, and a narrow
         // surface has no alpha channel to say which component takes which: refuse, for every
@@ -1165,43 +1165,47 @@ TEST(Tile, Contract) {
         // Admission: narrow surfaces need an RGBA8 decode buffer AND a DCC plane (HTILE is not DCC).
         // args: components, decoded_rgba8, is_dcc, is_htile, format_cannot_be_depth
         CHECK(gfx10_dcc_fast_clear_admits(4, false, false, false, false) &&
-              gfx10_dcc_fast_clear_admits(3, false, false, true, false) &&
-              gfx10_dcc_fast_clear_admits(1, true, true, false, false) &&
-              gfx10_dcc_fast_clear_admits(2, true, true, false, true) &&
-              gfx10_dcc_fast_clear_admits(1, true, false, false, true) &&   // unclassified, never depth
-              !gfx10_dcc_fast_clear_admits(1, true, false, false, false) && // unclassified, may be depth
-              !gfx10_dcc_fast_clear_admits(1, true, true, true, true) &&    // known HTILE always refused
-              !gfx10_dcc_fast_clear_admits(1, true, false, true, true) &&
-              !gfx10_dcc_fast_clear_admits(2, false, true, false, true) &&  // no RGBA8 buffer
-              !gfx10_dcc_fast_clear_admits(1, false, false, false, true),
-              "narrow DCC fast-clear admission: RGBA8 buffer, never HTILE, DCC or a never-depth format");
+                  gfx10_dcc_fast_clear_admits(3, false, false, true, false) &&
+                  gfx10_dcc_fast_clear_admits(1, true, true, false, false) &&
+                  gfx10_dcc_fast_clear_admits(2, true, true, false, true) &&
+                  gfx10_dcc_fast_clear_admits(1, true, false, false,
+                                              true) &&   // unclassified, never depth
+                  !gfx10_dcc_fast_clear_admits(1, true, false, false,
+                                               false) &&   // unclassified, may be depth
+                  !gfx10_dcc_fast_clear_admits(1, true, true, true,
+                                               true) &&   // known HTILE always refused
+                  !gfx10_dcc_fast_clear_admits(1, true, false, true, true) &&
+                  !gfx10_dcc_fast_clear_admits(2, false, true, false, true) &&   // no RGBA8 buffer
+                  !gfx10_dcc_fast_clear_admits(1, false, false, false, true),
+              "narrow DCC fast-clear admission: RGBA8 buffer, never HTILE, DCC or a never-depth "
+              "format");
         // The never-depth list is the depth-safety boundary: every depth/stencil sampled format must
         // stay off it, and Float16 (Black Flag's R16F pool) must stay on it (#4699 review).
         CHECK(gfx10_dcc_format_never_depth(DataFormat::Float16) &&
-              gfx10_dcc_format_never_depth(DataFormat::Snorm16) &&
-              gfx10_dcc_format_never_depth(DataFormat::Sint16) &&
-              gfx10_dcc_format_never_depth(DataFormat::Unorm8) &&
-              gfx10_dcc_format_never_depth(DataFormat::Snorm8) &&
-              gfx10_dcc_format_never_depth(DataFormat::Sint8),
+                  gfx10_dcc_format_never_depth(DataFormat::Snorm16) &&
+                  gfx10_dcc_format_never_depth(DataFormat::Sint16) &&
+                  gfx10_dcc_format_never_depth(DataFormat::Unorm8) &&
+                  gfx10_dcc_format_never_depth(DataFormat::Snorm8) &&
+                  gfx10_dcc_format_never_depth(DataFormat::Sint8),
               "formats no depth view uses are on the never-depth list");
         CHECK(!gfx10_dcc_format_never_depth(DataFormat::Float32) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Unorm16) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Uint16) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Uint8) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Uint32) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Sint32) &&
-              !gfx10_dcc_format_never_depth(DataFormat::Unknown),
+                  !gfx10_dcc_format_never_depth(DataFormat::Unorm16) &&
+                  !gfx10_dcc_format_never_depth(DataFormat::Uint16) &&
+                  !gfx10_dcc_format_never_depth(DataFormat::Uint8) &&
+                  !gfx10_dcc_format_never_depth(DataFormat::Uint32) &&
+                  !gfx10_dcc_format_never_depth(DataFormat::Sint32) &&
+                  !gfx10_dcc_format_never_depth(DataFormat::Unknown),
               "depth (D32 Float32, D16 Unorm16) and stencil/integer views stay off the list");
-        CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          mixed_clear.data(), mixed_clear.size(), 4, true) &&
-              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          uncompressed.data(), uncompressed.size(), 4, true) &&
-              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          mixed_clear.data(), mixed_clear.size(), 1, true) &&
-              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          clear_0001.data(), clear_0001.size(), 0, true) &&
-              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
-                                          clear_0001.data(), clear_0001.size(), 5, true),
+        CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, mixed_clear.data(),
+                                          mixed_clear.size(), 4, true) &&
+                  !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, uncompressed.data(),
+                                              uncompressed.size(), 4, true) &&
+                  !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, mixed_clear.data(),
+                                              mixed_clear.size(), 1, true) &&
+                  !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, clear_0001.data(),
+                                              clear_0001.size(), 0, true) &&
+                  !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1, clear_0001.data(),
+                                              clear_0001.size(), 5, true),
               "mixed, uncompressed, and impossible component layouts remain unsupported");
         CHECK(tiled_volume_bytes(120, 68, 32, M, 8) == (size_t)1 * 2 * 32 * 65536,
               "120x68x32 @ 8 B uses 1x2 padded 2D blocks per Z slice");
