@@ -37,6 +37,41 @@ struct VideoOutBufferSnapshot {
     uint32_t row_pitch_bytes = 0;
 };
 
+// The byte order of a 32-bit VideoOut pixel format in guest memory. prosper presents RGBA8, so a
+// reader that turns a display buffer's GUEST bytes into pixels converts by this (#4686).
+enum class VideoOutComponentOrder : uint8_t { Unknown, Rgba8, Bgra8 };
+
+// Which formats are mapped, and on what evidence. Anything else answers Unknown, and callers leave
+// those bytes as they are (the behaviour before this existed).
+//   * 0x8000000000000000 (Gen5, the format every PS5 title observed so far registers): BGRA.
+//     Guest evidence, CONFIDENCE: HIGH. The Messenger (PPSA24651) renders its display buffers in
+//     this format as CB COLOR_8_8_8_8 with COMP_SWAP=ALT (byte 0 = B), and Sonic Frontiers
+//     (PPSA03831) writes its display buffers from compute through a T# DST_SEL of (Z,Y,X,W), which
+//     also lands B in byte 0. Both look right on PS5 hardware.
+//   * 0x80000000 / 0x80002200 (Gen4 A8R8G8B8_SRGB / A8B8G8R8_SRGB): BGRA / RGBA, read off the
+//     enumerant names (A8R8G8B8 is the 32-bit word 0xAARRGGBB, little-endian). CONFIDENCE: MED,
+//     no title evidence yet.
+constexpr VideoOutComponentOrder videoout_component_order(uint64_t pixel_format) {
+    switch (pixel_format) {
+        case 0x8000000000000000ull: return VideoOutComponentOrder::Bgra8;
+        case 0x80000000ull: return VideoOutComponentOrder::Bgra8;
+        case 0x80002200ull: return VideoOutComponentOrder::Rgba8;
+        default: return VideoOutComponentOrder::Unknown;
+    }
+}
+
+// Converts linear guest scanout bytes of `order` to RGBA8 in place: a BGRA buffer swaps bytes 0 and
+// 2 of every texel, anything else is left alone. A trailing partial texel is untouched.
+inline void videoout_guest_bytes_to_rgba(std::vector<uint8_t>& pixels,
+                                         VideoOutComponentOrder order) {
+    if (order != VideoOutComponentOrder::Bgra8) return;
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+        const uint8_t b = pixels[i];
+        pixels[i] = pixels[i + 2];
+        pixels[i + 2] = b;
+    }
+}
+
 // A GPU blit may outlive the lock-coherent snapshot that selected its source. A later flip or
 // unregister/re-register must not let that copy retain certified producer lineage under the old
 // selected-front token. This compares identity, not pixel contents.
@@ -70,7 +105,9 @@ size_t videoout_copy_front_buffer(void* dst, size_t dst_cap,
 
 // The result of reading a registered scanout as an IMAGE rather than as bytes.
 struct VideoOutLinearRead {
-    std::vector<uint8_t> pixels;        // linear width*height*4 RGBA, de-swizzled
+    // Linear width*height*4 RGBA, de-swizzled, and converted from the buffer's pixel format
+    // (videoout_component_order). An Unknown format is passed through in guest byte order.
+    std::vector<uint8_t> pixels;
     VideoOutBufferSnapshot metadata{};
     // True when the buffer's contents have been observed to DIFFER from what they were at the
     // moment the guest registered it — the only evidence available in-process that the guest,

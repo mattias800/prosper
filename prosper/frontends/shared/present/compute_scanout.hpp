@@ -144,9 +144,11 @@ struct ComputeScanoutPresentInputs {
     uint8_t watch_state = 2;
     uint32_t mirror_width = 0, mirror_height = 0;
     uint32_t mirror_tile_mode = 0;
+    uint64_t mirror_pixel_format = 0;   // the VideoOut format the mirror's bytes were taken in
     // The flipped buffer.
     uint32_t front_width = 0, front_height = 0;
     uint32_t front_scanout_tile_mode = 0;  // videoout_scanout_tile_mode(front.tiling_mode, 4)
+    uint64_t front_pixel_format = 0;
 };
 
 constexpr ComputeScanoutPresent compute_scanout_present_decision(
@@ -157,7 +159,8 @@ constexpr ComputeScanoutPresent compute_scanout_present_decision(
         return ComputeScanoutPresent::ScaledPresent;
     if (!in.committed) return ComputeScanoutPresent::Absent;
     if (in.mirror_width != in.front_width || in.mirror_height != in.front_height ||
-        static_cast<uint64_t>(in.mirror_width) * in.mirror_height * 4u != in.display_bytes)
+        static_cast<uint64_t>(in.mirror_width) * in.mirror_height * 4u != in.display_bytes ||
+        in.mirror_pixel_format != in.front_pixel_format)   // also its byte order (#4686)
         return ComputeScanoutPresent::ExtentMismatch;
     if (in.mirror_tile_mode != in.front_scanout_tile_mode) return ComputeScanoutPresent::TileMismatch;
     if (in.watch_state == 1) return ComputeScanoutPresent::Stale;
@@ -190,6 +193,8 @@ bool compute_scanout_device_shared(VkDevice device);
 // Compute thread, while recording a dispatch. Drops any committed mirror at `address` (the dispatch
 // is about to replace those bytes; a null device ONLY does that) and returns an image of `width` x `height` to copy into. Returns
 // an invalid target if the renderer device is missing or `device` is not it, or allocation fails.
+// The display set's VideoOut pixel format picks the image's component order, so the verbatim guest
+// bytes present as RGBA (#4686).
 ComputeScanoutTarget compute_scanout_begin(VkDevice device, uint64_t address, uint32_t width,
                                            uint32_t height);
 

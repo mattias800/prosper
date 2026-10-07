@@ -9,6 +9,9 @@
 //     executed by the live compute backend with GPU present active;
 //   * compute_scanout_publish, then the present slot read back and compared with the guest bytes the
 //     CPU fallback would have presented.
+// The store goes through the T# DST_SEL Sonic's display buffers use, (Z,Y,X,W), into the Gen5 display
+// format, which is BGRA in guest memory: guest bytes are B,G,R,A and both present paths must show the
+// R,G,B the shader computed (#4686: they used to show the guest bytes as RGBA, red and blue swapped).
 // Then the arms that must NOT publish: a guest CPU store, a GPU write and a host write after the
 // commit (each makes the mirror stale), a tile-mode mismatch, a renderer-owned source, and a dispatch
 // with GPU present inactive.
@@ -52,8 +55,9 @@ using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
 constexpr uint32_t W = 32, H = 32;   // one 32x32 workgroup: v0/v1 are the local ids
 constexpr size_t kBytes = size_t{W} * H * 4;
 
-// R = x, G = y, B = 0, A = 255 -- what the compute store below writes. Distinct per row and column,
-// so a transposed, row-shifted or retiled copy cannot match.
+// R = x, G = y, B = 0, A = 255 -- the colour the compute store below computes, and so the RGBA a
+// present path must show. Distinct per row and column, so a transposed, row-shifted or retiled copy
+// cannot match.
 uint8_t expected_byte(size_t offset) {
     const size_t texel = offset / 4;
     switch (offset % 4) {
@@ -62,6 +66,15 @@ uint8_t expected_byte(size_t offset) {
     case 2: return 0;
     default: return 255;
     }
+}
+
+// The same texel as it sits in guest memory: the store's DST_SEL (Z,Y,X,W) puts B in byte 0.
+uint8_t expected_guest_byte(size_t offset) {
+    const size_t component = offset % 4;
+    return expected_byte(offset - component +
+                         (component == 0   ? 2
+                          : component == 2 ? 0
+                                           : component));
 }
 
 bool read_back_slot(const frontend::GpuScanoutFrame& frame, std::vector<uint8_t>& out) {
@@ -194,6 +207,10 @@ int main() {
     output.num_components = 4; output.binding = 5; output.sgpr_base = 8;
     output.img_dim = 1; output.width = W; output.height = H; output.depth = 1;
     output.gpu_addr = address; output.size = static_cast<uint32_t>(kBytes);
+    output.swizzle[0] = 6;
+    output.swizzle[1] = 5;
+    output.swizzle[2] = 4;
+    output.swizzle[3] = 7;
     ShaderResourceTable table; table.resources.push_back(output);
     ComputeShaderConfig config;
     config.user_sgprs.resize(16); config.local_x = W; config.local_y = H; config.local_z = 1;
@@ -210,7 +227,8 @@ int main() {
     item.code_addr = 0x39150001u; item.submit_no = 7;
 
     auto guest_matches_pattern = [&] {
-        for (size_t i = 0; i < kBytes; ++i) if (guest[i] != expected_byte(i)) return false;
+        for (size_t i = 0; i < kBytes; ++i)
+            if (guest[i] != expected_guest_byte(i)) return false;
         return true;
     };
     auto front_after_flip = [&](VideoOutBufferSnapshot& front) {
@@ -262,6 +280,14 @@ int main() {
         CHECK(r.decision == frontend::ComputeScanoutPresent::TileMismatch && !r.published,
               "a mirror is never presented where VideoOut would de-swizzle differently");
     }
+    {
+        VideoOutBufferSnapshot rgba = front;
+        rgba.pixel_format = 0x80002200u;   // Gen4 A8B8G8R8: the mirror's BGRA order would be wrong
+        const auto r =
+            frontend::compute_scanout_publish(rgba, front.source_flip_seq, guest_only_inputs());
+        CHECK(r.decision == frontend::ComputeScanoutPresent::ExtentMismatch && !r.published,
+              "a mirror is never presented for a buffer whose pixel format is not the one it took");
+    }
     const auto published = frontend::compute_scanout_publish(front, front.source_flip_seq,
                                                              guest_only_inputs());
     CHECK(published.decision == frontend::ComputeScanoutPresent::Publish && published.published,
@@ -278,7 +304,13 @@ int main() {
           "the GPU-presented frame is byte-identical to what the CPU fallback presents");
     bool pattern = shown.size() == kBytes;
     for (size_t i = 0; pattern && i < kBytes; ++i) pattern = shown[i] == expected_byte(i);
-    CHECK(pattern, "the GPU-presented frame is the pattern the dispatch wrote");
+    CHECK(pattern,
+          "the GPU-presented frame is the colour the dispatch computed, not its BGRA bytes");
+    bool cpu_pattern = cpu_path.pixels.size() == kBytes;
+    for (size_t i = 0; cpu_pattern && i < kBytes; ++i)
+        cpu_pattern = cpu_path.pixels[i] == expected_byte(i);
+    CHECK(cpu_pattern,
+          "the CPU fallback also presents the computed colour from the BGRA guest bytes");
 
     // ---- After the commit, any change to the guest bytes makes the mirror unpublishable.
     auto stale_after = [&](const char* what, auto&& mutate) {
