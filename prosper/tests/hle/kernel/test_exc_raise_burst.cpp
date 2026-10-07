@@ -191,4 +191,19 @@ TEST(ExcPendingTable, HoldsAFullBurstReleasesUnsentRequestsAndHandsEachOutOnce) 
         while (prosper::exc_pending_take(kBase + i * 0x1000) >= 0) {}
     while (prosper::exc_pending_take(kBase + 0xfff000) >= 0) {}
 }
+TEST(ExcPendingTable, DrainDeliversEveryPendingRequestOnceAndReportsAnEmptyDrainOnce) {
+    std::vector<int> seen;
+    auto record = [](int type, void* ctx) { static_cast<std::vector<int>*>(ctx)->push_back(type); };
+    prosper::exc_pending_drain(0x7001, record, &seen);   // nothing pending: one -1 report
+    ASSERT_EQ(seen, std::vector<int>({-1}));
+    seen.clear();
+    ASSERT_NE(prosper::exc_pending_put(0x7001, 5), 0u);
+    ASSERT_NE(prosper::exc_pending_put(0x7001, 9), 0u);
+    ASSERT_NE(prosper::exc_pending_put(0x7002, 3), 0u);   // another thread's request is untouched
+    prosper::exc_pending_drain(0x7001, record, &seen);
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_EQ(seen[0] + seen[1], 14);
+    EXPECT_EQ(prosper::exc_pending_take(0x7002), 3);
+    EXPECT_EQ(prosper::exc_pending_take(0x7001), -1);
+}
 }   // namespace

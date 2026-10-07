@@ -35,4 +35,10 @@ void exc_pending_release(size_t handle, uint64_t tid);
 // published (exc_pending_put is two-phase).
 int exc_pending_take(uint64_t tid);
 
+// Run `deliver(type, ctx)` for every request pending for `tid`. Plain signals COALESCE: two raises
+// that reach a thread before it runs its handler arrive as ONE delivery, so the handler drains the
+// table rather than taking one -- otherwise the second request stays undelivered and
+// unacknowledged. A delivery with nothing pending is still reported once, as `deliver(-1, ctx)`.
+void exc_pending_drain(uint64_t tid, void (*deliver)(int type, void* ctx), void* ctx);
+
 }   // namespace prosper
