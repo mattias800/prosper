@@ -1398,8 +1398,7 @@ BundleDsIdentity ds_identity(const prosper::gpu::ResolvedPipelineState& ps) {
 }
 
 bool uses_depth_stencil(const prosper::gpu::ResolvedPipelineState& ps) {
-    return ps.depth_test_enable || ps.depth_write_enable || ps.stencil_enable ||
-           ps.depth_clear_enable || ps.stencil_clear_enable;
+    return prosper::gpu::uses_depth_stencil_attachment(ps);
 }
 
 struct BundleDsProgramming {

@@ -567,8 +567,7 @@ public:
         }
         const DrawItem& selected = *it;
         if (selected.ps.cb_resolve || selected.ps.blend_enable ||
-            selected.ps.depth_test_enable || selected.ps.depth_write_enable ||
-            selected.ps.stencil_enable ||
+            prosper::gpu::uses_depth_stencil_attachment(selected.ps) ||
             !(selected.ps.color_write_mask || selected.ps.color_targets[0].write_mask)) {
             decline(MenuCaptureRefusal::UnsupportedAttachment,
                     "selected draw has attachment state requiring additional closure");

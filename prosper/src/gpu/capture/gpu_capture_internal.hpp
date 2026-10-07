@@ -203,11 +203,18 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v72 (#3135 P5): the realized merged-NGG draw description (ngg_subgroup_codec.hpp). A capture is
 // written as v72 ONLY when one of its draws carries one; every other capture is still written as
 // v71, byte for byte, so the v71 tail stays the last thing in it (gpu_capture_version_for).
-constexpr uint32_t kVersion = 72;
+// v73: each realized draw's depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE and the clamped
+// DB_DEPTH_BOUNDS_MIN/MAX). Written, after the v72 tail, ONLY when a draw enables the test; every
+// other capture keeps its v71/v72 bytes. An older capture reads the test as disabled, which is what
+// every renderer before it did.
+constexpr uint32_t kVersion = 73;
+constexpr uint32_t kVersionWithNgg = 72;
 constexpr uint32_t kVersionWithoutNgg = 71;
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
     for (const auto& draw : c.draws)
-        if (draw.ngg_subgroup) return kVersion;
+        if (draw.ps.depth_bounds_enable) return kVersion;
+    for (const auto& draw : c.draws)
+        if (draw.ngg_subgroup) return kVersionWithNgg;
     return kVersionWithoutNgg;
 }
 constexpr uint32_t kEndian = 0x01020304u;

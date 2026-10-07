@@ -1326,6 +1326,15 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 return false;
             }
     }
+    // v73: each draw's depth-bounds test. Written only into a capture where a draw enables it.
+    if (gpu_capture_version_for(c) >= 73u) {
+        w.u32(static_cast<uint32_t>(c.draws.size()));
+        for (const auto& draw : c.draws) {
+            w.u8(draw.ps.depth_bounds_enable ? 1u : 0u);
+            w.f32(draw.ps.depth_bounds_min);
+            w.f32(draw.ps.depth_bounds_max);
+        }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

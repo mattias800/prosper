@@ -730,7 +730,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         }
         c.owned_waves = d.owned_waves;
         c.ngg_subgroup = d.ngg_subgroup;
-        if (c.ngg_subgroup) out.format_version = kVersion;   // v72 only when one is carried
+        // v72 only when one is carried; v73 only when a draw enables the depth-bounds test.
+        if (c.ngg_subgroup) out.format_version = std::max(out.format_version, kVersionWithNgg);
+        if (c.ps.depth_bounds_enable) out.format_version = kVersion;
         if (d.owned_waves && d.owned_waves->vertex_pending) {
             if (d.owned_waves->vertex.packets.empty() ||
                 !store_raw_shader_version(d.owned_waves->vertex.packets.front().guest_code, true,

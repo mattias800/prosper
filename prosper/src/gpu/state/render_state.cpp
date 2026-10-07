@@ -661,6 +661,9 @@ RenderState extract_render_state_uncached(const GpuState& st) {
     rs.z_enable       = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
     rs.z_write_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
     rs.zfunc          = PM4_FIELD(dc, DB_DEPTH_CONTROL, ZFUNC);
+    rs.depth_bounds_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, DEPTH_BOUNDS_ENABLE) != 0;
+    rs.depth_bounds_min = flt(rd(st.cx, P::DB_DEPTH_BOUNDS_MIN));
+    rs.depth_bounds_max = flt(rd(st.cx, P::DB_DEPTH_BOUNDS_MAX));
 
     // Depth/stencil clear values (DB_DEPTH_CLEAR = IEEE-754 float, DB_STENCIL_CLEAR = 8-bit). Present
     // only when the game programmed them; the depth attachment's LOAD_OP_CLEAR must use the guest's
@@ -1100,6 +1103,18 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.depth_test_enable  = rs.z_enable;
     ps.depth_write_enable = rs.z_write_enable;
     ps.depth_compare_op   = vk_compare_op(rs.zfunc);
+    ps.depth_bounds_enable = rs.depth_bounds_enable;
+    if (ps.depth_bounds_enable) {
+        // Vulkan requires bounds inside [0, 1] (without VK_EXT_depth_range_unrestricted), and so
+        // does every stored depth a D32 attachment can hold here, so clamping changes no outcome.
+        // A NaN bound compares false on hardware: no stored depth can pass it, so it becomes an
+        // empty range rather than a test that silently passes everything.
+        const auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+        const bool nan_bound = rs.depth_bounds_min != rs.depth_bounds_min ||
+                               rs.depth_bounds_max != rs.depth_bounds_max;
+        ps.depth_bounds_min = nan_bound ? 1.0f : clamp01(rs.depth_bounds_min);
+        ps.depth_bounds_max = nan_bound ? 0.0f : clamp01(rs.depth_bounds_max);
+    }
     // Depth clear value (#371): use the guest's DB_DEPTH_CLEAR when programmed. Otherwise pick a default
     // matching the resolved compare op — LESS/LESS_OR_EQUAL clear to 1.0 (far), GREATER/GREATER_OR_EQUAL
     // (reversed-Z) clear to 0.0 (near) — the overwhelmingly common convention, and never a fixed 0.5
