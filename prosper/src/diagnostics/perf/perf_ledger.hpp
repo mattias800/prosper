@@ -273,6 +273,7 @@ enum class DropReason : uint8_t {
     BackendFramebufferCreation,
     BackendPressureFlush,
     BackendNggSubgroup,
+    BackendVolumeMixedTarget,
     Count
 };
 // clang-format on
@@ -330,6 +331,7 @@ constexpr const char* kDropReasonNames[kDropReasonCount] = {
     "backend/framebuffer-creation",
     "backend/pressure-flush",
     "backend/ngg-subgroup",
+    "backend/volume-mixed-target",
 };
 // clang-format on
 

@@ -735,6 +735,61 @@ TEST(NggSubgroupBackend, UnsafeSplitsDropTheNggDraw) {
     EXPECT_EQ(stats_now().draws - dropped.draws, 0u) << "the split under transient depth";
 }
 
+// #4643: a merged-NGG draw in a two-target VOLUME pass splits with both slots on the GPU. Each slot
+// is a retained volume -- it has no transient fallback -- so the later segment LOADs it and no
+// segment reads a slot back (CLAUDE.md P1); the same pass with a 2D slot 1 keeps the refusal.
+TEST(NggSubgroupBackend, VolumeMrtSplitKeepsTheNggDrawAndBothSlots) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_draw(*ctx, 4, 4, 4, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw a;
+    a.vs = full_screen_vertex();
+    a.fs = constant_fragment(0.25f);
+    const BackendDraw lut = ngg_backend_draw(ngg, ngg::vertex_records(ngg::kLutQuad), &state);
+    BackendColorTarget target = volume_target(0x4e4747340031ull, 4, false);
+    target.persistent_id1 = 0x4e4747340032ull;
+    target.load_existing1 = false;
+    target.readback1 = false;
+    target.format1 = target.format;
+    target.volume_slots[1] = {4, 0, 4, 0};
+    const auto host = ngg_host_capabilities(*ctx);
+    EXPECT_EQ(ngg_backend_draw_refusal(lut, host, 2, true, &target, 2), nullptr);
+    BackendColorTarget flat = target;
+    flat.volume_slots[1] = {};
+    EXPECT_STREQ(ngg_backend_draw_refusal(lut, host, 2, true, &flat, 2),
+                 "ngg-backend-readback-split")
+        << "a 2D slot 1 may be transient, so it would be carried by readback";
+
+    const StatsSnapshot before = stats_now();
+    BackendMrtOutputs mrt;
+    mrt.color_count = 2;
+    // want_color_readback=true, as the live renderer passes it: only the per-slot flags keep
+    // a slot from being copied back, so this arm sees a split that reads slot 1 back.
+    (void)render_draws_rgba({a, lut}, kSize, kSize, nullptr, kClear, true, &target, nullptr, kClear,
+                            nullptr, nullptr, true, &mrt, true);
+    // What catches a split that reads slot 1 back: its bytes would return as the next segment's
+    // slot-1 seed, and a seeded volume slot is refused (volume-seeded), so the NGG segment would
+    // record nothing and these two counts would fall.
+    EXPECT_EQ(stats_now().draws - before.draws, 1u) << "the NGG draw ran in its own segment";
+    EXPECT_EQ(backend_color_target_stats().writes, 2u) << "two segments, both recorded";
+    EXPECT_EQ(backend_color_target_stats().retained_slots, 0x3u) << "both slots retained";
+    std::vector<uint8_t> bytes;
+    std::string error;
+    ASSERT_TRUE(readback_persistent_color_target(target.persistent_id, kSize, kSize, target.format,
+                                                 bytes, error, 4))
+        << error;
+    EXPECT_TRUE(lut_layers(bytes, 4, 4));
+    // Slot 1: cleared by the first segment, LOADed (not cleared again, not seeded) by the second.
+    ASSERT_TRUE(readback_persistent_color_target(target.persistent_id1, kSize, kSize,
+                                                 target.format1, bytes, error, 4))
+        << error;
+    EXPECT_TRUE(lut_layers(bytes, 4, 0)) << "slot 1 holds its clear in every slice";
+}
+
 // Set 0 rides on the FIRST run draw only: it alone feeds the shell's guest set.
 TEST(NggSubgroupBackend, OnlyTheFirstRunCarriesSetZero) {
     const RenderVkCtx* ctx = backend();

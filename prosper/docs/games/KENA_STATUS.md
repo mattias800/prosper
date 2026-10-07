@@ -9,6 +9,40 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The translucency-lighting volumes draw; the fog and the foliage are not theirs (2026-10-07, #4643)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, default launch
+(`PROSPER_NULL_PAGE=1`, `scripts/kena/linux-reach-level-load.pad`, 260 s), branch
+`fix/issue-4643-multitarget-volume` against `main` at `a6453028`.
+
+- **What #4643 was.** Kena's translucency-lighting injection writes two 64³ RGBA16F volumes from one
+  layered pass: one in MRT0, one in MRT1. The backend refused every volume pass with more than one
+  colour target, so all of its draws were dropped. The merged-NGG producer in the same passes was
+  dropped too (`ngg-backend-readback-split`), because a split of an MRT pass carried its slots by
+  readback. The backend now attaches every slot's own volume through a 2D-array view of its slice
+  range (`tests/fixtures/render_volume_slots.h`). A split of such a pass carries every slot by LOAD,
+  with no readback.
+- **Result.** Dropped draws over 260 s, from the `[perf-alarm] summary` breakdown:
+
+  | | `main` | #4643 |
+  |---|---|---|
+  | `backend/volume-multi-target` | 9,984 | **0** |
+  | `backend/ngg-subgroup` | 4,608 | **0** |
+  | `shader-recompile/fragment` | 915 | 713 |
+
+  The `PROSPER_DUMP_PERSISTENT=ms:215000` census lists six populated 64³ volumes
+  (`0x50132f0000` … `0x50146f0000`, every texel non-zero, no non-finite value). `main` lists one,
+  `0x5013ef0000`, whose bytes differ in 1,641,440 of 2,097,152 bytes between the two runs.
+- **The picture barely changes.** F9 frames at 225 s differ in 0.7% of pixels by more than 30/765,
+  around candle flames, lanterns and particles. Part of that is animation. The fog, the washed-out
+  grading, the missing foliage and the missing light shafts are unchanged. So neither drop class was
+  the cause of those defects (see `## Ruled out`). What remains in the drop census is the refused
+  Wave64 fragment program (#4680).
+- **Cost.** The four-volume clear (`0x5007bc0000`) now publishes four claimed volumes per frame
+  instead of one. Surface readbacks rise from 2 to 5 per flip, each a fenced CPU wait. #4652 already
+  tracks avoiding that wait; this makes it four times as valuable on Kena.
+- **Rung.** Still 2.
+
 ## The title-menu world renders on `main` (2026-10-07, #3835)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, default launch
@@ -54,8 +88,8 @@ Linux/AMD title-menu investigations are recorded below.
     `shader-recompile/fragment:595`. The fragment count is one refused Wave64 program,
     `0x505c3d0000`.
   - The volume passes are a likely cause of the fog and the missing light shafts, and the NGG
-    subgroup drops of the missing foliage. Neither link has been checked per draw. **This is the
-    next blocker.**
+    subgroup drops of the missing foliage. Neither link has been checked per draw. **Superseded by
+    the #4643 entry above: both drop classes are now zero and none of those defects moved.**
   - The refused fragment program was logged on a draw whose vertex program is the helper
     (`es=0x5007020000`), so some of those 595 uses may be helper draws that write nothing anyway.
 - **The lit scene filling only the top-left two thirds of its target is not a defect.** The scene
@@ -371,6 +405,11 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The fog, the washed-out grading, the missing light shafts or the missing foliage come from the
+  dropped multi-target volume passes or the dropped merged-NGG producer** — false. With #4643 both
+  `backend/volume-multi-target` (9,984 per 260 s on `main`) and `backend/ngg-subgroup` (4,608) are
+  zero, six 64³ volumes hold content, and the title-menu frame changes in 0.7% of pixels (candle
+  glow and particles). The fog, the grading and the missing foliage are unchanged (2026-10-07, #4643).
 - **#3835's all-NaN 1600×900 half image is a float-semantics or interpolant defect in the
   recompiled pixel shader** — false as the cause of the black title world. It was AGC's helper
   rectangle drawn with the pixel shader the previous draw left bound. That shader reads PARAMs the

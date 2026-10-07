@@ -248,7 +248,7 @@ uint64_t backend_reason_counter(DrawDrop reason) {
 std::vector<uint8_t> synthetic_pass(size_t draws, bool name_the_refusal) {
     std::vector<uint8_t> out;
     DrawDispositionPassScope disposition(draws);
-    if (name_the_refusal) return disposition.refuse(DrawDrop::VolumeMultiTarget, out);
+    if (name_the_refusal) return disposition.refuse(DrawDrop::VolumeMixedTarget, out);
     return out;   // the bug's shape: an early return that names nothing
 }
 }   // namespace
@@ -267,15 +267,15 @@ TEST(DrawDisposition, EarlyReturnWithoutReasonIsUnaccounted) {
 TEST(DrawDisposition, EarlyReturnWithNamedReasonIsADrop) {
     auto& c = draw_disposition_census();
     const uint64_t before = unaccounted_counter();
-    const uint64_t named = c.dropped(DrawDrop::VolumeMultiTarget);
-    const uint64_t perf_named = backend_reason_counter(DrawDrop::VolumeMultiTarget);
+    const uint64_t named = c.dropped(DrawDrop::VolumeMixedTarget);
+    const uint64_t perf_named = backend_reason_counter(DrawDrop::VolumeMixedTarget);
     const std::string out = capture_report([] { (void)synthetic_pass(3, true); });
     EXPECT_EQ(unaccounted_counter(), before) << "a named refusal is accounted, not UNACCOUNTED";
-    EXPECT_EQ(c.dropped(DrawDrop::VolumeMultiTarget) - named, 3u)
+    EXPECT_EQ(c.dropped(DrawDrop::VolumeMixedTarget) - named, 3u)
         << "every draw the refused pass abandoned is dropped under the named reason";
-    EXPECT_EQ(backend_reason_counter(DrawDrop::VolumeMultiTarget) - perf_named, 3u)
-        << "...and reaches the dropped-draws alarm as backend/volume-multi-target";
-    EXPECT_NE(out.find("volume-multi-target=3"), std::string::npos) << out;
+    EXPECT_EQ(backend_reason_counter(DrawDrop::VolumeMixedTarget) - perf_named, 3u)
+        << "...and reaches the dropped-draws alarm as backend/volume-mixed-target";
+    EXPECT_NE(out.find("volume-mixed-target=3"), std::string::npos) << out;
     EXPECT_EQ(out.find("UNACCOUNTED"), std::string::npos) << out;
 }
 

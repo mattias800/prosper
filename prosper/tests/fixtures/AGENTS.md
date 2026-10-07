@@ -103,6 +103,13 @@ effects and helper/input/resource recipes must remain named refusals before atta
 original declaration sites. Their explicit enabled-device facts and owner lifetimes remain shared
 by the normal backend; neither is a new device, allocator policy or independent test context.
 
+`render_volume_slots.h` is the SHIPPING contract of a layered colour pass with any number of
+volume targets (#4643): which slots one layered framebuffer can hold together, the per-slot 2D-array
+attachment views and slice bookkeeping, and when a split of such a pass carries every slot on the
+GPU. `render_pass_segments.h` is where a logical batch is cut into physical render-pass segments
+(depth-feedback transitions, merged-NGG draws) and the per-segment contract; it was moved verbatim
+out of `render_runner.h`, which includes both at their original points.
+
 `raster_quad_collection_gpu.h` is a SHIPPING companion of `render_runner.h`, not a second device or
 test-only renderer. Development activation `PROSPER_FRAGMENT_QUAD_COLLECT=1` is pinned at real
 DrawItem realization. Only a refused exact-Wave64 draw can enter its scratch-only input pass;

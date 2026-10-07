@@ -10,3 +10,8 @@ and its renderer/backend integration. A matching extent or byte layout alone doe
 borrowing a live image. Generic format decoding belongs in `shared/texture`. CPU byte-oracle and
 policy tests belong in `shared/tests`; device ownership and ordered producer/consumer behavior
 need the corresponding live GPU integration tests.
+
+Renderer-claimed VOLUMES follow one rule per colour slot: `volume_producer_shape.hpp` derives the
+guest footprint a volume slot's producer pass claims from its proven native layout, for every slot
+of a layered pass (#4643), and `volume_publication_source.hpp` is what a claimed volume hands to
+its guest publication (#4625).
