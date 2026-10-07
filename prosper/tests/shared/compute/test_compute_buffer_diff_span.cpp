@@ -17,6 +17,7 @@
 
 #include "shared/compute/compute_buffer_bytes.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <cstring>
@@ -179,5 +180,37 @@ TEST(ComputeBufferBlockSync, SmallAndRaggedSizesAreExact) {
         const uint64_t copied = sync_compute_buffer_blocks(destination.data(), source.data(), bytes);
         EXPECT_EQ(copied, bytes) << bytes;
         EXPECT_EQ(destination, source) << bytes;
+    }
+}
+
+// A destination of UNKNOWN contents -- a recycled allocation still holding a previous tenant's
+// bytes -- must come out byte-identical to the source. Block sync is safe there only because it
+// compares against the destination's actual bytes, never against a remembered baseline: every block
+// that happens to match is already right, and every other block is copied. Some blocks here match
+// by construction, so a sync that stopped after the first copy, or copied only the blocks it
+// expected to change, leaves the rest stale and fails the final comparison.
+TEST(ComputeBufferBlockSync, UnknownDestinationContentsBecomeAnExactCopy) {
+    using prosper::frontend::sync_compute_buffer_blocks;
+    constexpr size_t kBlock = 64u << 10;
+    for (const size_t bytes : {size_t{2u << 20}, size_t{12u << 20} + 4097}) {
+        SplitMix rng(bytes);
+        std::vector<uint8_t> source(bytes), destination(bytes);
+        for (auto& b : source) b = static_cast<uint8_t>(rng());
+        for (auto& b : destination) b = static_cast<uint8_t>(rng());
+        // Every third block already holds the source's bytes.
+        size_t matching = 0;
+        for (size_t at = 0; at < bytes; at += 3 * kBlock) {
+            const size_t step = std::min(kBlock, bytes - at);
+            std::memcpy(destination.data() + at, source.data() + at, step);
+            matching += step;
+        }
+        const uint64_t copied =
+            sync_compute_buffer_blocks(destination.data(), source.data(), bytes);
+        EXPECT_EQ(std::memcmp(destination.data(), source.data(), bytes), 0) << bytes;
+        // Above the parallel threshold the walk is per worker slice, whose blocks need not align
+        // with the ones seeded here, so the count is bounded rather than exact.
+        EXPECT_GE(copied, bytes - matching) << bytes;
+        EXPECT_LE(copied, bytes) << bytes;
+        if (bytes < (8u << 20)) EXPECT_EQ(copied, bytes - matching);
     }
 }

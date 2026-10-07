@@ -8,17 +8,20 @@ positive arm. Each process starts with a fresh buffer cache and lazy diagnostic 
 
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from compute_buffer_cache_report import summarize
-
 
 PREFIX = "[compute-buffer-timing] "
 FIXTURE = "[buffer-timing-fixture] "
 BYTES = 2 << 20
+# sync_compute_buffer_blocks' granularity (compute_buffer_bytes.hpp).
+BLOCK = 64 << 10
+# The control switch that restores a full-binding copy on a cached refresh (#4660).
+BLOCK_SYNC_SWITCH = "PROSPER_NO_COMPUTE_BLOCK_SYNC"
 TIMERS = (
     "setup_ms validation_ms upload_compare_ms upload_copy_ms upload_map_ms "
     "upload_watch_ms writeback_ms result_compare_ms guest_copy_ms guest_layout_ms "
@@ -62,6 +65,19 @@ def check_upload_matches_reported_span(row):
                 f"upload copied {uploaded} bytes although no difference was reported")
 
 
+def refreshed_bytes(changed_blocks, block_sync):
+    """Bytes a cache HIT uploads by exact comparison when `changed_blocks` 64 KiB blocks changed.
+
+    A hit compares guest memory against the retained buffer's OWN mapped bytes -- the GPU buffer
+    itself, host-coherent, not a snapshot or a remembered baseline -- so a block that compares
+    equal there already holds the right bytes and needs no copy. Since #4660 the refresh therefore
+    copies only the differing blocks; the control switch restores the full-binding copy. Fresh and
+    recycled allocations never reach this path: a cache miss creates the buffer and takes the
+    pooled-full diff-span upload checked by check_upload_matches_reported_span.
+    """
+    return changed_blocks * BLOCK if block_sync else BYTES
+
+
 def expect(row, **wanted):
     for key, value in wanted.items():
         key = key.replace("_", "-")
@@ -71,7 +87,7 @@ def expect(row, **wanted):
                 f"{key}={actual!r}, expected {value!r}")
 
 
-def check_selected(rows, witness):
+def check_selected(rows, witness, block_sync=True):
     require(len(rows) == 8, f"expected eight unique owner records, got {len(rows)}")
     grouped = {}
     identities = set()
@@ -138,7 +154,8 @@ def check_selected(rows, witness):
     repaired = grouped[5][0]
     expect(repaired, cache="hit", validation="dirty-chunks" if watched else "full",
            upload_skipped=0, compared_bytes=(1 << 20) if watched else BYTES,
-           uploaded_bytes=(1 << 20) if watched else BYTES,
+           # The external write changes one word, in the first block.
+           uploaded_bytes=(1 << 20) if watched else refreshed_bytes(1, block_sync),
            gpu_compare="ineligible", writeback="changed",
            result_compared_bytes=BYTES, guest_copied_bytes=BYTES)
     if watched:
@@ -157,7 +174,7 @@ def check_selected(rows, witness):
            baseline="created", writeback="changed", guest_copied_bytes=BYTES)
 
 
-def check_promotion(rows, witness):
+def check_promotion(rows, witness, block_sync=True):
     require(len(rows) == 9, f"expected nine promotion owner records, got {len(rows)}")
     indexed = {number(row, "dispatch"): row for row in rows}
     require(set(indexed) == set(range(1, 10)), "duplicate/missing promotion dispatch")
@@ -196,8 +213,12 @@ def check_promotion(rows, witness):
             expect(row, validation="watch", dirty_watch_chunks=0, total_watch_chunks=2,
                    compared_bytes=0, uploaded_bytes=0)
         else:
+            # Dispatch 3 changes data[0] (first block) and the last word (last block); dispatch 8
+            # changes data[0] only. The fixture's correct() check proves the last-block word
+            # reached the GPU buffer, so these counts cannot be met by copying too little.
+            blocks = 2 if dispatch == 3 else 1
             expect(row, validation="full", compared_bytes=BYTES,
-                   uploaded_bytes=BYTES if changed else 0)
+                   uploaded_bytes=refreshed_bytes(blocks, block_sync) if changed else 0)
             if watched:
                 # 2: first unchanged validation; 3: mutation resets the ladder. 4 and 5
                 # accumulate two new validations. 6 arms before its third full comparison;
@@ -247,7 +268,7 @@ def check_census(lines, rows):
             elif address in last:
                 require(number(row, "last-use") > last[address], "active owner lost reuse evidence")
             last[address] = number(row, "last-use")
-    require(all(a < b for a, b in zip(clocks, clocks[1:])), "cache clock did not advance")
+    require(all(a < b for a, b in zip(clocks, clocks[1:], strict=False)), "cache clock did not advance")
     require(len(owners) == 10, "census owner population mismatch")
     report = summarize(lines)
     require(report["snapshots"] == 8 and len(report["owners"]) == 2,
@@ -309,17 +330,20 @@ def check_census(lines, rows):
             raise AssertionError("offline reader accepted corrupted/missing census")
 
 
-def run_fixture(binary, mode, directory):
+def run_fixture(binary, mode, directory, block_sync=True):
     # These tests intentionally control diagnostic/cache policy. Preserve driver/validation
     # settings so running the ctest under the validation-layer wrapper still validates Vulkan.
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("PROSPER_COMPUTE") and
                    key not in {"PROSPER_NO_PERSISTENT_COMPUTE_BUFFERS",
-                               "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS"}}
+                               "PROSPER_NO_PERSISTENT_COMPUTE_BUFFER_RESULTS",
+                               BLOCK_SYNC_SWITCH}}
+    if not block_sync:
+        environment[BLOCK_SYNC_SWITCH] = "1"
     if mode != "selected":
         environment["PROSPER_COMPUTE_BUFFER_CACHE_CENSUS"] = "1"
     result = subprocess.run([str(binary), mode, str(directory)], env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            capture_output=True,
                             text=True, timeout=120, check=False)
     # Keep all layer messages visible to the outer suite's validation scanner, including success.
     sys.stdout.write(result.stdout)
@@ -337,9 +361,9 @@ def run_fixture(binary, mode, directory):
         check_selected([r for r in rows if number(r, "dispatch") <= 7], witnesses[0])
         check_census(lines, rows)
     elif mode in ("selected", "capture-armed"):
-        check_selected(rows, witnesses[0])
+        check_selected(rows, witnesses[0], block_sync)
     elif mode in ("promotion", "promotion-cpu"):
-        check_promotion(rows, witnesses[0])
+        check_promotion(rows, witnesses[0], block_sync)
     else:
         require(not rows, f"{mode}: rejected selector/capture gate emitted buffer records")
     if mode in ("selected", "wrong-code", "wrong-hash", "disabled", "capture-idle"):
@@ -354,19 +378,24 @@ def main():
     with tempfile.TemporaryDirectory(prefix="compute-buffer-timing-") as scratch:
         witnesses = []
         errors = []
-        for mode in ("selected", "wrong-code", "wrong-hash", "disabled",
-                     "capture-idle", "capture-armed", "promotion", "promotion-cpu", "cache-census"):
-            directory = Path(scratch) / mode
+        # The full-copy control arm pins both sides of #4660's switch: the same fixture, the same
+        # mutations, and only the refresh granularity differs.
+        arms = [(mode, True) for mode in (
+            "selected", "wrong-code", "wrong-hash", "disabled", "capture-idle", "capture-armed",
+            "promotion", "promotion-cpu", "cache-census")] + [("promotion", False)]
+        for mode, block_sync in arms:
+            name = mode if block_sync else f"{mode}-full-copy"
+            directory = Path(scratch) / name
             directory.mkdir()
             try:
-                witnesses.append(run_fixture(binary, mode, directory))
+                witnesses.append(run_fixture(binary, mode, directory, block_sync))
             except AssertionError as error:
                 # Run both promotion implementations even when the first exposes a defect.
-                errors.append(f"{mode}: {error}")
+                errors.append(f"{name}: {error}")
         require(not errors, "\n".join(errors))
         require(len({row["hash"] for row in witnesses}) == 1,
                 "selector controls did not execute the same compiled guest shader")
-    print("compute buffer runtime: owner decisions, six selectors and two promotion arms passed")
+    print("compute buffer runtime: owner decisions, six selectors and three promotion arms passed")
 
 
 if __name__ == "__main__":
