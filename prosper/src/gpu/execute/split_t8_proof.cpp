@@ -43,7 +43,7 @@ uint64_t load_tag(size_t producer, uint32_t word) {
     return (static_cast<uint64_t>(producer) << 8u) | word;
 }
 
-}  // namespace
+}   // namespace
 
 // What the proof knows from the code bytes alone, for one (consumer pc, T# base, producer pcs). The
 // address-dependent half -- which word of each producer the CPU snapshot read, and whether a known
@@ -52,8 +52,8 @@ struct SplitT8Structure {
     bool ok = false;
     std::array<uint64_t, 8> tags_at_use{};   // the meet-over-paths tag of each descriptor word
     struct Lane {
-        size_t producer = 0;                 // instruction index: the tag's producer field
-        int base_reg = 0;                    // the entry pointer pair the load reads through
+        size_t producer = 0;   // instruction index: the tag's producer field
+        int base_reg = 0;   // the entry pointer pair the load reads through
         int dst = 0;
         uint32_t width = 0;
         uint32_t literal = 0;
@@ -63,7 +63,7 @@ struct SplitT8Structure {
         uint32_t pc = 0;
         bool image = false;
     };
-    std::vector<Writer> writers_before_use;  // every reachable memory writer the use can follow
+    std::vector<Writer> writers_before_use;   // every reachable memory writer the use can follow
 };
 
 struct SplitT8ProofCache {
@@ -98,12 +98,14 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
     auto result = std::make_shared<SplitT8Structure>();
     std::vector<Rdna2Inst> full;
     rdna2_walk(code, dwords, full);
-    if (full.empty() || !full.back().is_end || !rdna2_append_closed_tail_blocks(code, dwords, full) ||
-        has_indirect_control_flow(full)) return result;
+    if (full.empty() || !full.back().is_end ||
+        !rdna2_append_closed_tail_blocks(code, dwords, full) || has_indirect_control_flow(full))
+        return result;
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t i = 0; i < full.size(); ++i) {
         if (full[i].fmt == Rdna2Format::Unknown || !full[i].len_dwords ||
-            !by_pc.emplace(full[i].pc, i).second) return result;
+            !by_pc.emplace(full[i].pc, i).second)
+            return result;
     }
     const auto use_it = by_pc.find(use_pc);
     if (use_it == by_pc.end()) return result;
@@ -116,12 +118,10 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         if (in.is_end) continue;
         // The debug conditional branches have different predicates, and an indirect transfer
         // has no statically enumerable successor. Decline rather than treating either as fallthrough.
-        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a)
-            return result;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a) return result;
         // s_subvector_loop_begin/end (SOPK 0x1b/0x1c) branch by their SIMM16, which this CFG does
         // not model.
-        if (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c))
-            return result;
+        if (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c)) return result;
         if (sopp_is_branch(in)) {
             const int64_t target = sopp_branch_target(in);
             if (target < 0 || target > UINT32_MAX) return result;
@@ -182,11 +182,11 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         if (found == by_pc.end()) return result;
         const size_t producer = found->second;
         const Rdna2Inst& load = full[producer];
-        if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u ||
-            load.opcode < 2u || load.dst.kind != OperandKind::SGPR ||
-            load.src[0].kind != OperandKind::SGPR ||
-            ((load.words[1] >> 25u) & 0x7fu) != 125u ||
-            static_cast<int32_t>(load.literal) < 0 || load.dst.value < 0) return result;
+        if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u || load.opcode < 2u ||
+            load.dst.kind != OperandKind::SGPR || load.src[0].kind != OperandKind::SGPR ||
+            ((load.words[1] >> 25u) & 0x7fu) != 125u || static_cast<int32_t>(load.literal) < 0 ||
+            load.dst.value < 0)
+            return result;
         is_producer[producer] = 1;
         auto& out = result->lanes[static_cast<size_t>(lane)];
         out.producer = producer;
@@ -308,7 +308,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
     return result;
 }
 
-}  // namespace
+}   // namespace
 
 bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
                                  const std::array<uint32_t, 8>& source_pc,
@@ -343,8 +343,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     for (int lane = 0; lane < 8; ++lane) {
         const SplitT8Structure::Lane& l = structure->lanes[static_cast<size_t>(lane)];
         if (l.base_reg < static_cast<int>(user_sgpr_base) ||
-            l.base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) ||
-            l.base_reg + 1 >= kSgprs) return false;
+            l.base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) || l.base_reg + 1 >= kSgprs)
+            return false;
         const auto seed = static_cast<size_t>(l.base_reg - static_cast<int>(user_sgpr_base));
         const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
                               (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
@@ -352,7 +352,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const uint64_t first_addr = base + l.literal;
         const uint64_t addr = source_addr[static_cast<size_t>(lane)];
         if (addr < first_addr || addr - first_addr >= l.width * sizeof(uint32_t) ||
-            ((addr - first_addr) & 3u)) return false;
+            ((addr - first_addr) & 3u))
+            return false;
         const auto word = static_cast<uint32_t>((addr - first_addr) / sizeof(uint32_t));
         if (l.dst + static_cast<int>(word) >= kSgprs) return false;
         if (structure->tags_at_use[static_cast<size_t>(lane)] != load_tag(l.producer, word))

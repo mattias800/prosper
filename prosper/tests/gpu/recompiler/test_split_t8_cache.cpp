@@ -33,10 +33,7 @@ alignas(16) uint32_t g_table[16];
 // words 0..3 of the second.
 std::vector<uint32_t> program(size_t padding) {
     std::vector<uint32_t> code = {
-        0xF40C0101u, 0xFA000000u,
-        0xF4080301u, 0xFA000020u,
-        0xBF800000u,
-        0xF0200108u, 0x00020009u,
+        0xF40C0101u, 0xFA000000u, 0xF4080301u, 0xFA000020u, 0xBF800000u, 0xF0200108u, 0x00020009u,
     };
     code.insert(code.end(), padding, 0xBF800000u);
     code.push_back(0xBF810000u);
@@ -54,7 +51,7 @@ Inputs inputs() {
     const auto base = reinterpret_cast<uint64_t>(g_table);
     in.user = {0u, 0u, static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u)};
     for (uint32_t lane = 0; lane < 4; ++lane) {
-        in.source_addr[lane] = base + 16u + 4u * lane;          // first load, words 4..7
+        in.source_addr[lane] = base + 16u + 4u * lane;   // first load, words 4..7
         in.source_addr[lane + 4u] = base + 0x20u + 4u * lane;   // second load, words 0..3
     }
     return in;
@@ -65,7 +62,7 @@ bool proves(const std::vector<uint32_t>& code, const Inputs& in, SplitT8ProofCac
                                        in.source_addr, in.user.data(), 4u, 0u, {}, cache);
 }
 
-}  // namespace
+}   // namespace
 
 TEST(SplitT8Cache, ProgramPastTheOldCapIsProved) {
     const auto code = program(3000);

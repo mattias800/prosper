@@ -50,15 +50,12 @@ bool has_use(const std::vector<SrtUse>& uses, uint32_t pc) {
 // pc 5-6    image_store ... s[8:15]  (the consumer; its T# spans both loads)
 std::vector<uint32_t> program(uint32_t scalar_write) {
     return {
-        0xF40C0101u, 0xFA000000u,
-        0xF4080301u, 0xFA000020u,
-        scalar_write,
-        0xF0200108u, 0x00020009u,
-        0xBF810000u,
+        0xF40C0101u,  0xFA000000u, 0xF4080301u, 0xFA000020u,
+        scalar_write, 0xF0200108u, 0x00020009u, 0xBF810000u,
     };
 }
 
-}  // namespace
+}   // namespace
 
 TEST(SplitT8Saveexec, SaveexecBetweenLoadAndUseKeepsProof) {
     // s_and_saveexec_b64 s[20:21], vcc: writes s20, s21 and EXEC, nothing the T# lives in.
