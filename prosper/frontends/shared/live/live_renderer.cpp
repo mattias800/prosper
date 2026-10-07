@@ -30,6 +30,7 @@
 #include "shared/live/decode_scratch.hpp"     // pooled full-surface decode intermediates
 #include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
 #include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
+#include "shared/perf/unchanged_publication_hook.hpp"   // F8-window census of unchanged publications
 #include "shared/present/present_handoff_trace.hpp"
 #include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
 #include "shared/perf/performance_timing_policy.hpp" // retain timing across split semantic submits
@@ -1305,7 +1306,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 it->second.gpu_valid = false;
         });
     prosper::gpu::set_live_target_image_written_notifier(
-        [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
+        prosper::perf::with_unchanged_publication_census(
+            [invalidate_ds](const prosper::gpu::LiveTargetImageWrite& write) {
             auto it = g_rtt.find(write.gpu_addr);
             const auto& residency_trace = rtt_residency_trace_selector();
             const bool trace_write = residency_trace.configured &&
@@ -1408,7 +1410,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::fprintf(stderr,
                              "[rtt-residency] addr=0x%llx result=gpu-valid\n",
                              (unsigned long long)write.gpu_addr);
-        });
+        }));
     prosper::gpu::set_live_target_byte_range_reader(
         [invalidate_ds](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
             drain_guest_gpu_writes(g_rtt, invalidate_ds);

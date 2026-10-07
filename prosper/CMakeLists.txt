@@ -1968,6 +1968,14 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_texture_validation_census.cpp
     INCLUDES frontends)
 
+  # The census of compute publications that are byte-identical to the previous one for the same target (the
+  # F8-window hook is header-only; this covers the pure class and its hash and the hook gate).
+  prosper_add_gtest(test_unchanged_publication_census
+    SOURCES frontends/shared/tests/test_unchanged_publication_census.cpp
+            src/diagnostics/exit_census.cpp src/diagnostics/exit_reports.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_performance_capture)
+
   add_executable(test_performance_capture frontends/shared/tests/test_performance_capture.cpp)
   target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
   add_test(NAME performance_capture COMMAND test_performance_capture)
