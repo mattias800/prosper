@@ -1760,7 +1760,7 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   std::all_of(sampled_dcc_metadata.begin(), sampled_dcc_metadata.end(),
                               [](uint8_t code) { return code == 0xff; });
               uint8_t persistent_dcc_clear_pixel[4]{};
-              const bool persistent_dcc_fast_clear = r.compression_enabled &&
+              const bool persistent_dcc_fast_clear = r.compression_enabled && (r.num_components >= 3u || decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) &&
                   sampled_dcc_metadata_got == sampled_dcc_metadata.size() &&
                   prosper::gpu::gfx10_dcc_fast_clear_rgba8(
                       persistent_dcc_clear_pixel, 1,
@@ -3458,7 +3458,7 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   const size_t metadata_got = sampled_dcc_metadata_got;
                   uint8_t clear_code = 0;
                   dcc_uncompressed = persistent_dcc_uncompressed;
-                  if (!dcc_uncompressed && metadata_got == metadata.size() &&
+                  if (!dcc_uncompressed && (r.num_components >= 3u || decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) && metadata_got == metadata.size() &&
                       prosper::gpu::gfx10_dcc_fast_clear_rgba8(
                           texture_pixels.data(), texture_pixels.size() / 4,
                           metadata.data(), metadata.size(), r.num_components,
