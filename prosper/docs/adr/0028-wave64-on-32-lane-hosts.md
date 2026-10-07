@@ -72,6 +72,17 @@ and every route is logged by name. The default never approximates.
    extended with cheap exact cases, first: *an any-vote whose only consumer is EXEC guarding an
    `s_cbranch_execz` skip of an EXEC-masked region is neutral*, because lanes outside the region
    are masked off either way and the skip only elides work (the Black Flag case).
+   **This route is where most of the performance is, so it is grown before any emulation.**
+   Compiled code uses cross-lane operations mostly as optimisations, not as 64-lane semantics.
+   With uniformity analysis (natural on `GPU-3`'s SSA IR), these become exact one-lane code:
+   - a `readfirstlane`/`readlane` of a value proven wave-uniform is a move;
+   - a ballot whose result only feeds a popcount for a count, or `mbcnt` used only to hand out
+     unique slots whose consumer is proven order-insensitive (an append buffer, a counter
+     atomic), is a workgroup-scope prefix or reduction;
+   - a vote over a wave-uniform predicate is that predicate.
+
+   Each rewrite needs the same proof standard as a certificate: a positive arm and a mutation arm.
+   A program it fully rewrites never reaches routes 3-5.
 3. **Compute, cross-lane operations only in uniform control flow: workgroup exchange.** One lane
    per invocation; ballot, vote, readlane, `mbcnt` and DPP/permutes that cross the 32-lane half are
    lowered to a cross-half exchange through workgroup memory with barriers (the shadPS4/sharpemu
@@ -80,9 +91,14 @@ and every route is logged by name. The default never approximates.
    host invocation executes both halves of the guest lane pair (the AnyPS5 shape), exact under
    divergence. It halves the thread count and doubles per-thread registers, so occupancy and
    latency hiding drop; it is used only for programs that need it.
-5. **Fragment, not proven: the owned-wave route of #4384** as it grows to admit more program
-   shapes. Fragment invocations cannot be re-grouped by prosper, so routes 3 and 4 do not apply to
-   the fragment stage directly.
+5. **Fragment, not proven.** Fragment invocations cannot be re-grouped by prosper and have no
+   workgroup memory, so routes 3 and 4 do not apply to the fragment stage directly. Two ways in:
+   - **Full-screen passes promoted to compute.** A draw proven to cover its target exactly once
+     per pixel can run as a compute dispatch, which then takes route 3 or 4. That needs a single
+     full-target triangle or rect with no blending, no depth/stencil test or write, no discard
+     feeding a later pass and no MSAA. It writes the same texels, and post-processing chains,
+     common in UE4 and Anvil titles, are mostly this shape.
+   - **Everything else: the owned-wave route of #4384**, as it grows to admit more program shapes.
 6. **Everything else is refused visibly**, exactly as today: draw dropped or dispatch skipped, one
    `[wave64-unsupported]` line naming the stage, program and refusal class, and the counters in
    `perf_alarms`.
@@ -131,11 +147,14 @@ Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
 ## Migration order
 
 1. Land the `s_cbranch_execz` neutral-vote certificate with its tests (Black Flag's four draws).
-2. Add the `route=` field and per-route counters.
+2. Add the `route=` field and per-route counters, then census which refused programs the route-2
+   rewrites (uniform `readlane`, compaction ballots, uniform votes) would admit.
 3. Compute workgroup exchange for uniform control flow, with RADV-native comparison tests.
 4. Two-lanes-per-invocation for the divergent remainder.
-5. Grow #4384's admitted shapes, on the owner's schedule.
-6. Only after A/B data: decide per-class defaults; settle or delete any approximation selector.
+5. Full-screen fragment-to-compute promotion, gated on its coverage proof and compared texel for
+   texel against the fragment path where the latter runs (AMD).
+6. Grow #4384's admitted shapes, on the owner's schedule.
+7. Only after A/B data: decide per-class defaults; settle or delete any approximation selector.
 
 ## Open questions
 
