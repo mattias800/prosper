@@ -83,6 +83,14 @@ is a counted fallback where tracking is unavailable, never the normal path.
 Status: proposed (adr:0010)
 Enforcement: runtime:host-copy-pressure, adr:0010
 
+### PERF-P10 -- a first-use graphics pipeline costs a link, not a compile
+
+On a device with pipeline libraries, shader-stage libraries are built when a guest program is
+recompiled, off the submit thread; a draw that meets new fixed-function state fast-links them and is
+never dropped, and an optimized pipeline replaces the link in the background.
+Status: proposed (adr:0029)
+Enforcement: runtime:shader-compile, adr:0029
+
 ### PERF-G1 -- releases are compared on the reference workloads
 
 Each release candidate is measured against the previous release on the reference workloads, and a
