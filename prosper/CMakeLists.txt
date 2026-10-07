@@ -1976,10 +1976,6 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
     add_test(NAME schedstat_probe_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
-    # RUN_SERIAL: its fixture changes are wall-clock timers that must land inside a fixed sampling
-    # window, and under the CI's `ctest -j4` (#4116) they missed it on macOS and Windows in two
-    # different subtests while passing every serial run. A stopgap, NOT a fix -- #4142.
-    set_tests_properties(schedstat_probe_logic PROPERTIES RUN_SERIAL TRUE)
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
