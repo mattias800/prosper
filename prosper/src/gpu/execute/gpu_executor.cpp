@@ -5295,14 +5295,15 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                                 in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
                                 user_sgpr_base, image_writes);
                     }
-                    const std::array<uint32_t, 8>* t8 =
-                        live_t8_known && (!branchy_x16 || mapped_t8) &&
-                                (have_t8 || mapped_t8 || (seed_provenance &&
-                                             (plausible_seed || exact_null_seed)))
-                            ? &live_t8 : nullptr;
-                    if (!t8 && seed_provenance && live_t8_known)
+                    // The admission predicate lives in fold_t8_decline_reason so every decline
+                    // names its gate in the [t8-dropped] witness (#4700).
+                    const char* t8_decline = fold_t8_decline_reason(
+                        {live_t8_known, have_t8, mapped_t8, branchy_x16, seed_provenance,
+                         plausible_seed || exact_null_seed});
+                    const std::array<uint32_t, 8>* t8 = t8_decline ? nullptr : &live_t8;
+                    if (t8_decline)
                         note_dropped_image_descriptor(uint64_t(uintptr_t(code)), in.pc, tbase,
-                                                      live_t8, "direct-seed-implausible");
+                                                      live_t8, t8_decline);
                     uint32_t tkey = 0xFFFFFFFFu;
                     if (t8 && have_key) {
                         uint32_t common_key = 0;
@@ -8002,7 +8003,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         ? ResourceClass::StorageImage : ResourceClass::Texture;
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
-                        if (wanted == ResourceClass::StorageImage) continue;
+                        if (wanted == ResourceClass::StorageImage) {
+                            note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                          "unmapped-img-fmt-storage");
+                            continue;
+                        }
                         // Same policy as build_shader_resources: the normal per-target renderer can
                         // bind this as RGBA8 for RTT injection; legacy single-target mode skips it.
                         static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
@@ -8016,7 +8021,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         fi.block_width = fi.block_height = 1; fi.srgb = false; fi.snorm = false;
                     }
                     const bool is_bcn = fi.block_width > 1;
-                    if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
+                    if (is_bcn && fi.snorm) {   // signed BCn (SNORM / BC6H SF16): decode not wired
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, "signed-bcn");
+                        continue;
+                    }
                     const DecodedImageView view = image_base_level_view(d, fi);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);

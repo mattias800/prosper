@@ -28,13 +28,20 @@ One run on `main` `156714914` refused three pixel programs from t=16 s: `prosper
   program refused at an `image_sample_b` with `[mimg-unresolved] ... pc_res=null sgpr_res=cbuf`.
   The T# slots are AGC `ro[]` entries declared `size=0`. In that run the V# shape test claimed them
   as buffers; on default runs it does not.
-- **The words, not the claim, lost the draws.** The descriptor fold publishes any valid direct T#
-  keyed by its pc, and that route is tried first, so `pc_res=null` means the words were not a
-  usable T#. Leading hypothesis: another stage's V#s (#305's shape). #4592 recorded this program's
-  `s[8:15]` ending in `0004dfac`, the V# `dword3` constant RESOURCE_BINDING.md names.
-- **What landed:** the `[t8-dropped]` line prints the eight words, once per (program, pc, reason),
-  wherever the fold declines an image use. It was silent in all three runs above with this build.
-  The next reproduction keeps the evidence.
+- **The words changed, and V#-shaped words are not a T#.** The V# claim reads only the slot's
+  first four words, so its firing in that run and not on default runs shows the words themselves
+  were different. V#-shaped words decode to T# TYPE 0, which the texture checks refuse. Leading
+  hypothesis: another stage's V#s (#305's shape). #4592 recorded this program's `s[8:15]` ending in
+  `0004dfac`, the V# `dword3` constant RESOURCE_BINDING.md names. Not established: that the fold's
+  own publication failed on the words rather than on provenance or its early return.
+- **What landed:** the `[t8-dropped]` line prints the eight words and the failed gate, once per
+  (program, pc, reason), for every image-use decline in the fold's T# admission and every skip in
+  its texture publication. It does not cover the fold's whole-program early return (checked source
+  no longer current). It was silent in the runs above with the first version of this build. The next
+  reproduction keeps the evidence.
+- **Whether the RenderDoc layer matters is undecided.** 1 of 3 layer runs reproduced (the visuals
+  lane's, on `156714914`) against 0 of 2 default runs; this lane's two layer runs were on a
+  different binary. It has only ever appeared with the layer active.
 - **What these programs draw** is not established. They account for ~12–57 draws per flip from t=16 s,
   with NGG vertex programs `0x50409e0000` / `0x5040860000`, and sample one or two textures.
 - **Title menu unchanged.** An F9 screenshot at 222 s on the default run matches
@@ -479,11 +486,10 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
   `0x5040890000`) contain instructions the recompiler cannot translate** — false. Their
   `first_bad_fmt=4 op=0x8/0x7` is the generic census's SOPP branches, which the fragment path lowers.
   The refusal was an unresolved `image_sample_b` descriptor (#4700).
-- **The RenderDoc layer causes those refusals** — not supported. 1 of 3 container runs with the layer
-  active reproduced them; two 240 s layer runs with the same environment showed none (#4700).
 - **Keeping a V#-claimed `size=0` T# slot a texture when the code reads it only as an image fixes
-  them** — false. Implemented, proven on the three dumps, and withdrawn. The fold's pc route already
-  resolves valid words, and invalid words fail the same checks in the texture loop
+  them** — false for V#-shaped words, which is what the claim firing shows they were: they decode to
+  T# TYPE 0 and the texture loop rejects them. Implemented, proven on the three dumps, and withdrawn.
+  Not established for a valid T# whose fold publication failed on provenance or the early return
   (`docs/gpu/RESOURCE_BINDING.md` § Ruled out, #4700).
 - **The `shader-recompile/fragment` drops are one refused Wave64 program that needs a recompiler
   feature** — false. Most were AGC helper rectangles compiling the pixel shader the previous draw

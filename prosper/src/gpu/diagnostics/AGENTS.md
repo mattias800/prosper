@@ -33,6 +33,13 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
 The fourth default-path entry is `fence_build_journal`: it samples a label at packet build
 time and retains diagnostic metadata. It does not validate or complete a guest fence.
 
+The fifth is `dropped_image_descriptor`: default-on `[t8-dropped]` lines from the descriptor fold
+(`resolve_dynamic_fetch_fold`) and `build_stage_table`'s texture publication. They print the words
+of an image use the fold declined, once per (program, pc, reason), up to 64 sites a process. It
+also hosts `fold_t8_decline_reason`, which is the fold's T# admission predicate itself, so the
+reasons cannot drift from the decision. Editing it changes what the fold publishes. Printing
+changes nothing the guest sees (#4700).
+
 - `diagnostic_selectors` — choosing what to observe.
 - `fence_build_journal` — default-on, bounded build-time label observations used by the command
   processor's diagnostics. It never rewrites a packet or completes a fence. Lookup requires a

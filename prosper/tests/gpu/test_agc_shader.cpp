@@ -1016,14 +1016,29 @@ TEST(AgcShader, Contract) {
               constant_direct->gpu_addr == 0 && constant_direct->size == 0,
           "a direct base-zero T# with constant-zero selectors is the same null sampled image");
     direct_null_state.sh[kNullImagePsUser + 3] = 0xfacu;   // identity selectors: reads memory
+    testing::internal::CaptureStderr();
     auto mutated_direct_null_resources = prosper::gpu::build_stage_table(
         direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
+    const std::string mutated_direct_null_log = testing::internal::GetCapturedStderr();
     CHECK(!mutated_direct_null_resources || !mutated_direct_null_resources->by_fetch_pc(0),
           "a direct base-zero T# that selects a memory channel stays fail-visible");
+    // #4700 positive control for the call site: the fold declines this use, so [t8-dropped] must
+    // name the gate and keep the words. Deleting the fold's note call, or inverting its admission,
+    // leaves this line absent.
+    char t8_dropped_expect[160];
+    std::snprintf(
+        t8_dropped_expect, sizeof t8_dropped_expect,
+        "[t8-dropped] program=0x%llx pc=0 srsrc=s0 reason=direct-seed-implausible",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(direct_null_sample_shader)));
+    CHECK(mutated_direct_null_log.find(t8_dropped_expect) != std::string::npos &&
+              mutated_direct_null_log.find("raw 00000000 00fff000 06f00000 00000fac") !=
+                  std::string::npos,
+          "the declined direct T# is reported with its gate and its raw words");
     for (uint32_t k : {1u, 2u, 3u, 7u}) direct_null_state.sh.erase(kNullImagePsUser + k);
 
     const uint32_t direct_null_store_shader[] = {
-        0xF0200F08u, 0x00000000u,   // pc=0: image_store ..., s[0:7]
+        0xF0200F08u,
+        0x00000000u,   // pc=0: image_store ..., s[0:7]
         0xBF810000u,
     };
     Shader direct_null_store{};

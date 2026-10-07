@@ -5,6 +5,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <ios>
 #include <string>
 
 using namespace prosper::gpu;
@@ -48,4 +52,31 @@ TEST(DroppedImageDescriptor, OncePerSiteAndBounded) {
         printed +=
             note_dropped_image_descriptor(0x3000, pc, 0, kKenaNullShaped, "base-zero") ? 1 : 0;
     EXPECT_EQ(printed, kDroppedImageDescriptorMaxReports);
+}
+
+// fold_t8_decline_reason IS the fold's admission predicate, so it must admit exactly what the
+// expression it replaced admitted, over every input combination, and name a gate for every decline.
+TEST(DroppedImageDescriptor, DeclineReasonIsExactlyTheFoldAdmissionPredicate) {
+    for (uint32_t bits = 0; bits < 64; ++bits) {
+        const FoldT8Admission a{(bits & 1u) != 0, (bits & 2u) != 0,  (bits & 4u) != 0,
+                                (bits & 8u) != 0, (bits & 16u) != 0, (bits & 32u) != 0};
+        // The predicate as it stood in resolve_dynamic_fetch_fold before #4700.
+        const bool admitted =
+            a.words_known && (!a.branchy_x16 || a.mapped_t8) &&
+            (a.have_t8 || a.mapped_t8 || (a.seed_provenance && a.seed_publishable));
+        const char* reason = fold_t8_decline_reason(a);
+        EXPECT_EQ(reason == nullptr, admitted) << "inputs 0x" << std::hex << bits;
+    }
+    EXPECT_STREQ(fold_t8_decline_reason({false, true, true, false, true, true}), "words-unknown");
+    EXPECT_STREQ(fold_t8_decline_reason({true, true, false, true, false, false}),
+                 "branchy-x16-unproven");
+    EXPECT_STREQ(fold_t8_decline_reason({true, false, false, false, false, true}), "no-provenance");
+    EXPECT_STREQ(fold_t8_decline_reason({true, false, false, false, true, false}),
+                 "direct-seed-implausible");
+}
+
+TEST(DroppedImageDescriptor, PcNonePrintsForAWholeProgramDecline) {
+    const std::string line =
+        format_dropped_image_descriptor(0x10, UINT32_MAX, -1, kKenaNullShaped, "x");
+    EXPECT_NE(line.find("pc=none srsrc=unknown reason=x"), std::string::npos) << line;
 }
