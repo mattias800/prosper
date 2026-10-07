@@ -31,10 +31,15 @@ run-local; hashes are stable.
 - **Fixed, all general:**
   - pixel `e8a1ce3b` (2009 dwords): `v_ldexp_f32 v12, v12, -2 clamp` at pc1951. CLAMP on
     `v_ldexp_f32` is now the ordinary float saturate.
-  - pixel `f1d1baa8` (1361): `s_and_b64` of a buffer-loaded scalar pair with a VOPC mask at
-    pc308. A Wave64 fragment now projects the data pair onto its lane bit, as compute already did.
-    `eb07b9cf` (1471) has the same shape at pc326. It was refused after the device loss on `main`
-    and not at all on #4706.
+  - pixel `f1d1baa8` (1361): `s_and_b64 s[30:31], s[30:31], s[36:37]` at pc308. s[30:31] is a
+    compare mask (written at pc226), spilled with `v_writelane` at pc252/262 and reloaded with
+    `v_readlane` at pc295/297; s[36:37] is a fresh compare mask. The `s_buffer_load_dwordx2` into
+    s[30:31] at pc219 is overwritten by those reloads. A Wave64 fragment now projects such a data
+    pair onto its lane bit. It does that only when the pair is definitely assigned and does not
+    come from memory (`RECOMPILER_REMAINING.md`, #2790's row). That is exact here because the spill
+    stored the ballot words under the enforced 64-lane subgroup. `eb07b9cf` (1471) has the same
+    instruction shape at pc326 (`s_and_b64 s[42:43], s[40:41], s[42:43]`); its operands were not
+    traced. It was refused after the device loss on `main` and not at all on #4706.
   - compute `0x5008dc0000` (1504): s14 still carried the entry-M0 token from `s_mov_b32 s14, m0` at
     pc85 when pc491 read it as a loop counter. The dispatcher's token now dies where the Wave64 MUST
     analysis proves a data write on every path. The program now refuses later, at pc577, on an
@@ -532,8 +537,8 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **Kena's post-New-Game pixel programs `0x5052b20000` / `0x5008cc0000` need `v_writelane_b32` in
   fragment programs** — false. `index.txt`'s `first_bad_op=0x361` came from the compute-safe
   coverage census. The fragment translator accepts both programs' constant-lane spills. The real
-  rejects were `v_ldexp_f32 ... clamp` (pc1951) and `s_and_b64` of a data pair with a VOPC mask
-  (pc308), both fixed (2026-10-07, #4706).
+  rejects were `v_ldexp_f32 ... clamp` (pc1951) and `s_and_b64` of a reloaded mask spill with a
+  VOPC mask (pc308), both fixed (2026-10-07, #4706).
 - **The image-descriptor refusals at the first level load are caused by the F9 bundle capture** —
   false. A run with `PROSPER_GRAB_BUNDLE_AFTER_MS` refused them all inside the capture window, but
   a run with no capture and a `main` run refused the same set (2026-10-07, #4710).
