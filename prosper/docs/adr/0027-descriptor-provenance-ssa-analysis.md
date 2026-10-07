@@ -40,7 +40,8 @@ Resynced* `PPSA28183`, a capture of the corrupted post-autosave frame, submit 38
    `rdna2_escapes_decoded_effects()`; #4529 had already fixed the same drift in a different copy of
    the write model.
 2. The proof was capped at 2048 dwords because it re-ran per dispatch (2 programs, 3720 and 2912
-   dwords). The proposed fix (#4712, open) caches the analysis per program and lifts the cap.
+   dwords). The proposed fix (#4712, open) caches the analysis per program and raises the cap from 2048 to 16384
+   dwords.
 3. Two programs lose provenance at a CFG **join**. Still open.
 
 On `main` today both gaps are present; #4712 proposes the fixes. The pattern is
@@ -85,7 +86,8 @@ Two layers, behind the existing provenance interface.
    model is the one shared decoded-effects table (`rdna2_escapes_decoded_effects()` and its
    successors), never a per-proof copy.
 2. **Computed once per program version** and cached on the decoded program, like `FoldControlPlan`
-   and the split-T# per-program cache. No per-dispatch CFG walk and no size cap.
+   (and the per-program split-T# cache #4712 proposes). No per-dispatch CFG walk; the work is bounded
+   by program size and paid once per program version.
 3. **One source of truth.** The recompiler (what to bind and how to select) and the executor (which
    guest resource each slot names for this dispatch) both consume this analysis's answer. They may
    not re-derive provenance independently -- the charter's "answer the same question the same way
