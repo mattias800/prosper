@@ -101,13 +101,17 @@ struct LoopVccCarry {
     //     s_mov_b32 vcc_hi, 2                ; before the loop: scalar data
     //     header: s_cmp_lt_i32 vcc_hi, s34   ; scalar read of the half
     //             s_cbranch_scc0 exit
-    //     body:   s_lshr_b32 vcc_lo, vcc_hi, 31 ... s_buffer_load_dwordx4 s[16:19], s[12:15], vcc_lo
+    //     body:   s_ashr_i32 vcc_lo, vcc_hi, 31 ... s_buffer_load_dwordx4 s[16:19], s[12:15], vcc_lo
     //             s_add_u32 vcc_hi, vcc_hi, 2
     //             s_branch header
     //
     // A placeholder Bool is a correct back-edge input when no MASK read of VCC is reachable from
-    // the header before the pair is redefined: then the phi's value is never observed, on any
-    // iteration or after the exit. Scalar reads are a different domain. The scalar halves are
+    // the header before the pair is redefined: then no later iteration observes the phi. The EXIT
+    // is a separate obligation the proof alone does not meet: its walk stops at a compare in the
+    // condition region, so it never sees the code after the loop. The emitter therefore hands the
+    // merge the check block's VCC, never the header phi (rdna2_emit_cfg.cpp, step 6), and a
+    // half the check block overwrote with a mask leaves the merge untracked (finish_exit below).
+    // Without that, a post-loop v_cndmask read this placeholder (#4680 review). Scalar reads are a different domain. The scalar halves are
     // loop-carried by their own u32 phis (the body writes them, so `loop_written_regs` lists
     // them), and operand_bits serves a tracked half before it considers the mask. So a half may be
     // READ AS DATA from the header only if it already held tracked scalar data before the loop:
@@ -117,8 +121,10 @@ struct LoopVccCarry {
     // needs only MaskDomainOnly.
     //
     // Returns the placeholder, or 0 after logging why the back-edge cannot be closed.
-    // CONFIDENCE: HIGH -- the placeholder is unobservable by the proof, and every scalar value the
-    // loop reads comes from its own phi seeded with the half's tracked entry value.
+    // CONFIDENCE: MED -- inside the loop the placeholder is unobservable by the proof, and every
+    // scalar value the loop reads comes from its own phi seeded with the half's tracked entry value;
+    // at the exit it relies on the merge taking the check block's VCC, which the post-loop test arms
+    // pin for top-tested and bottom-tested loops.
     static uint32_t counted_backedge_value(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                            uint32_t header_pc, const bool tracked_at_entry[2]) {
         for (int half : {106, 107}) {

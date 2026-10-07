@@ -188,16 +188,75 @@ constexpr uint32_t kCountedVccHiLoop[] = {
     0xBF810000u,   // 22  s_endpgm
 };
 
+//  #4680 review: the same Kena body ops behind a HEADER COMPARE (counter in s4). The condition
+//  region redefines VCC on every check, so a post-loop mask read must see that compare -- (8 <= 8)
+//  is true in every lane at exit, so v1 = v0 = 0.5 and the pixel is 80 80 80. The header phi's
+//  back-edge input is the placeholder; an exit that handed it on drew 80 ff 80.
+constexpr uint32_t kCountedHeaderCompareThenMaskRead[] = {
+    0xBE800380u,   //  0  s_mov_b32 s0, 0
+    0x7E000280u,   //  1  v_mov_b32 v0, 0
+    0x7E020288u,   //  2  v_mov_b32 v1, 8
+    0x7E0602F2u,   //  3  v_mov_b32 v3, 1.0
+    0x7D020200u,   //  4  v_cmp_lt_i32 vcc, s0, v1    VCC is a live mask before the loop
+    0xBE840380u,   //  5  s_mov_b32 s4, 0
+    0x7E040501u,   //  6  v_readfirstlane_b32 s2, v1
+    0x7D060204u,   //  7  HEADER: v_cmp_le_i32 vcc, s4, v1   the exit's live-out mask
+    0xBF040204u,   //  8  s_cmp_lt_i32 s4, s2
+    0xBF84000Bu,   //  9  s_cbranch_scc0 21
+    0xBEEB0304u,   // 10  s_mov_b32 vcc_hi, s4
+    0x916A9F6Bu,   // 11  s_ashr_i32 vcc_lo, vcc_hi, 31     Kena pc 60..63
+    0x876A816Au,   // 12  s_and_b32 vcc_lo, vcc_lo, 1
+    0x816A6A6Bu,   // 13  s_add_i32 vcc_lo, vcc_hi, vcc_lo
+    0x916A816Au,   // 14  s_ashr_i32 vcc_lo, vcc_lo, 1
+    0x816B826Bu,   // 15  s_add_i32 vcc_hi, vcc_hi, 2
+    0x81048204u,   // 16  s_add_i32 s4, s4, 2
+    0x060000FFu, 0x3E000000u,   // 17  v_add_f32 v0, 0.125, v0
+    0xBE83036Au,   // 19  s_mov_b32 s3, vcc_lo
+    0xBF82FFF2u,   // 20  s_branch 7
+    0x02020103u,   // 21  v_cndmask_b32 v1, v3, v0, vcc   <<< the exit compare's mask
+    0x7E040300u,   // 22  v_mov_b32 v2, v0
+    0xF800080Fu, 0x03020100u,   // 23  exp mrt0 v0, v1, v2, v3
+    0xBF810000u,   // 25  s_endpgm
+};
+
+//  A BOTTOM-TESTED (do-while) counted loop: the whole body is the condition region, and it ends
+//  with VCC written by scalar ops -- 0 on every trip but the last, all-ones on the last
+//  (s_cselect_b32 on s4 < bound). Hardware's post-loop v_cndmask therefore selects v0 in every lane:
+//  80 80 80. The body leaves no mask (the B32 `s_and_b32 vcc_lo` drops it), so the header phi's
+//  back-edge input is the placeholder; an exit that handed the phi on drew 80 ff 80. With the exit
+//  taking the check block's VCC there is no mask to hand on, and the read refuses visibly.
+constexpr uint32_t kCountedDoWhileThenMaskRead[] = {
+    0xBE800380u,   //  0  s_mov_b32 s0, 0
+    0x7E000280u,   //  1  v_mov_b32 v0, 0
+    0x7E020288u,   //  2  v_mov_b32 v1, 8
+    0x7E0602F2u,   //  3  v_mov_b32 v3, 1.0
+    0x7D020200u,   //  4  v_cmp_lt_i32 vcc, s0, v1    VCC is a live mask before the loop
+    0xBE840380u,   //  5  s_mov_b32 s4, 0
+    0x7E040501u,   //  6  v_readfirstlane_b32 s2, v1  the bound (8)
+    0x81048204u,   //  7  HEADER: s_add_i32 s4, s4, 2
+    0xBF040204u,   //  8  s_cmp_lt_i32 s4, s2
+    0x856AC180u,   //  9  s_cselect_b32 vcc_lo, 0, -1  all-ones only on the last trip
+    0x876AC16Au,   // 10  s_and_b32 vcc_lo, vcc_lo, -1
+    0xBEEB036Au,   // 11  s_mov_b32 vcc_hi, vcc_lo
+    0x060000FFu, 0x3E000000u,   // 12  v_add_f32 v0, 0.125, v0
+    0xBF040204u,   // 14  s_cmp_lt_i32 s4, s2
+    0xBF85FFF7u,   // 15  s_cbranch_scc1 7
+    0x02020103u,   // 16  v_cndmask_b32 v1, v3, v0, vcc   <<< the last trip's VCC: all-ones
+    0x7E040300u,   // 17  v_mov_b32 v2, v0
+    0xF800080Fu, 0x03020100u,   // 18  exp mrt0 v0, v1, v2, v3
+    0xBF810000u,   // 20  s_endpgm
+};
+
 struct Compiled {
     std::vector<uint32_t> spirv;
     std::string reason;
 };
 
 template <size_t N>
-Compiled compile(const uint32_t (&words)[N], uint64_t address) {
+Compiled compile(const uint32_t (&words)[N], uint64_t address, bool wave32 = false) {
     Compiled out;
-    out.spirv = recompile_fragment(words, N, nullptr, nullptr, UINT32_MAX, nullptr,
-                                   /*wave32=*/false, {RecompileDiagnosticStage::Fragment, address});
+    out.spirv = recompile_fragment(words, N, nullptr, nullptr, UINT32_MAX, nullptr, wave32,
+                                   {RecompileDiagnosticStage::Fragment, address});
     out.reason = last_terminal_reject_reason(address);
     return out;
 }
@@ -459,4 +518,71 @@ TEST(FragmentLoopVccScratch, CountedLoopWithAMaskReadAfterTheExitStillRejects) {
     EXPECT_NE(loop.reason.find("from header pc=7"), std::string::npos) << loop.reason;
     EXPECT_NE(loop.reason.find("blocker pc=18 kind=vop2-implicit-vcc"), std::string::npos)
         << loop.reason;
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopExitHandsOnTheConditionCompareNotThePlaceholder) {
+    const Compiled loop = compile(kCountedHeaderCompareThenMaskRead, 0x4680A006ull);
+    if (loop.spirv.empty()) {
+        // A visible refusal is acceptable; a wrong value is not.
+        SUCCEED() << loop.reason;
+        return;
+    }
+    if (!device_can_execute(loop.spirv))
+        GTEST_SKIP() << "device cannot execute the fragment wave64 contract this module declares";
+    const std::vector<uint8_t> pixel = centre_pixel(loop.spirv);
+    ASSERT_EQ(pixel.size(), 4u) << "the triangle did not render";
+    // v0 = 0.5 after four trips; v1 = vcc ? v0 : 1.0 with the exit compare (8 <= 8) true.
+    for (int channel = 0; channel < 3; ++channel) {
+        EXPECT_GT(pixel[channel], 0x70) << "channel " << channel;
+        EXPECT_LT(pixel[channel], 0x90) << "channel " << channel;
+    }
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopExitDoesNotServeBodyScratchAsTheCompareDword) {
+    // Same loop; after the exit, vcc_lo is read as DATA. Hardware holds the exit compare's low
+    // dword there, not the body's scratch. A fragment invocation has no exact dword for that mask,
+    // so the read must refuse rather than compile from the previous iteration's scratch.
+    uint32_t data_read[std::size(kCountedHeaderCompareThenMaskRead)];
+    std::copy(std::begin(kCountedHeaderCompareThenMaskRead),
+              std::end(kCountedHeaderCompareThenMaskRead), data_read);
+    data_read[21] = 0xBE85036Au;   // s_mov_b32 s5, vcc_lo
+    data_read[22] = 0x7E040205u;   // v_mov_b32 v2, s5
+    const Compiled loop = compile(data_read, 0x4680A007ull);
+    EXPECT_TRUE(loop.spirv.empty()) << "compiled a data read of the exit mask from loop scratch";
+    EXPECT_NE(loop.reason.find("pc=21"), std::string::npos) << loop.reason;
+}
+
+TEST(FragmentLoopVccScratch, DoWhileCountedLoopExitDoesNotHandOnThePlaceholder) {
+    std::vector<Rdna2Inst> ins;
+    ASSERT_EQ(rdna2_walk(kCountedDoWhileThenMaskRead, std::size(kCountedDoWhileThenMaskRead), ins),
+              std::size(kCountedDoWhileThenMaskRead));
+    const CountedLoop shape = detect_counted_loop(ins);
+    ASSERT_TRUE(shape.found);
+    ASSERT_EQ(shape.exit_branch_pc, shape.backedge_pc) << "the fixture must be bottom-tested";
+    const Compiled loop = compile(kCountedDoWhileThenMaskRead, 0x4680A008ull);
+    if (loop.spirv.empty()) {
+        SUCCEED() << loop.reason;   // a visible refusal is acceptable; a wrong value is not
+        return;
+    }
+    if (!device_can_execute(loop.spirv))
+        GTEST_SKIP() << "device cannot execute the fragment wave64 contract this module declares";
+    const std::vector<uint8_t> pixel = centre_pixel(loop.spirv);
+    ASSERT_EQ(pixel.size(), 4u) << "the triangle did not render";
+    for (int channel = 0; channel < 3; ++channel) {
+        EXPECT_GT(pixel[channel], 0x70) << "channel " << channel;
+        EXPECT_LT(pixel[channel], 0x90) << "channel " << channel;
+    }
+}
+
+TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterInWave32) {
+    // In Wave32 the compare before the loop leaves VCC_LO a live B32 lane mask, and the body
+    // overwrites it with scalar data. The counted emitter refuses that before the placeholder is
+    // ever considered -- conservative, and now with a reason instead of in silence. (Without the
+    // compare, the Wave32 form is still refused with no logged reason at all; that is separate and
+    // filed as #4693.)
+    const Compiled masked = compile(kCountedVccHiLoop, 0x4680A009ull, /*wave32=*/true);
+    EXPECT_TRUE(masked.spirv.empty());
+    EXPECT_NE(masked.reason.find("scalar-writes s106 while it holds a live B32 lane mask"),
+              std::string::npos)
+        << masked.reason;
 }

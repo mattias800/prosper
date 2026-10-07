@@ -6665,12 +6665,25 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
         loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
         loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
+        // Both refusals below used to return in silence, so a Wave32 counted loop that recycles a
+        // live B32 mask register (VCC_LO after a compare) was refused with no reason at all.
         for (int reg : rs.sreg_bool_b32)
-            if (scalar_may_writes.contains(reg)) return false;
+            if (scalar_may_writes.contains(reg)) {
+                log_recompile_diagnostic(
+                    b.diagnostic, "recompile-reject", "terminal",
+                    "counted-loop body scalar-writes s%d while it holds a live "
+                    "B32 lane mask (header pc=%u)",
+                    reg, L.header_pc);
+                return false;
+            }
         if (b.allow_b32_masks &&
-            has_unpersisted_b32_mask_lifetime(
-                ins, L.header_pc, L.backedge_pc, rs))
+            has_unpersisted_b32_mask_lifetime(ins, L.header_pc, L.backedge_pc, rs)) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop B32 mask lifetime is not persisted across the "
+                                     "loop (header pc=%u)",
+                                     L.header_pc);
             return false;
+        }
         const uint32_t preheader = b.cur_block;
         // Whether each VCC half holds tracked scalar data before the loop; the header phis below
         // replace the entries, so this is the last point the entry state is visible (#4680).
@@ -6728,6 +6741,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : conds) conds_val[r] = sget(r);
         const uint32_t cond_exec = rs.exec;
         const bool cond_exec_narrowed = rs.exec_narrowed;
+        // VCC as the exit sees it (#4680). The merge's ONLY predecessor is this check block, so its
+        // VCC -- the header phi if the region leaves VCC alone, a compare's mask if it redefines the
+        // pair, 0 if it wrote a half as scalar data -- is what a post-loop reader must observe. The
+        // header phi is not: after one trip its back-edge input may be the placeholder.
+        const uint32_t cond_vcc = rs.vcc;
+        // Which VCC halves the check block still tracks as scalar data. A mask write there erases
+        // them, and the merge must then not hand on the body's scratch (#4526's finish_exit rule).
+        const LoopVccCarry cond_vcc_halves(rs);
         // s_cbranch_scc0 exits when SCC==0 (so the loop CONTINUES when SCC!=0); scc1 is the inverse.
         uint32_t loop_cond = L.exit_on_scc0 ? rs.scc : b.bsel(rs.scc, b.bfalse(), b.btrue());
         b.emit_condbranch(loop_cond, body, merge);
@@ -6760,19 +6781,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         b.emit_branch(hdr);
         // 6. Merge (loop exit): a condition-region reg keeps its exit-iteration (%check) value; a body-only
-        //    reg (and scc/vcc) takes the header phi (its value when the loop exited).
+        //    reg (and scc) takes the header phi (its value when the loop exited). VCC takes the check
+        //    block's value, which is the header phi unless the condition region redefined it (#4680).
         b.emit_label(merge);
         merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
         for (auto& pr : phis) {
-            if (pr.dom == 0)      rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
+            if (pr.dom == 0)
+                rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
             else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
-            // SCC/VCC take the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
+            // SCC takes the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
             // not a real codegen pattern (flags are transient, consumed by their branch), so the A-class
-            // exit-iteration refinement is intentionally omitted for them.
+            // exit-iteration refinement is intentionally omitted for it.
             else if (pr.dom == 2) rs.scc = pr.phi;
-            else if (pr.dom == 3) rs.vcc = pr.phi;
+            else if (pr.dom == 3)
+                rs.vcc = cond_vcc;
             else                  rs.exec = cond_exec;
         }
+        // A VCC half the check block overwrote with a mask holds that mask's dword on exit, not the
+        // body scratch its header phi carries; leave it untracked so a data read takes the exact
+        // ballot or refuses loudly (#4680, the counted-loop form of #4526).
+        cond_vcc_halves.finish_exit(rs);
         if (carry_vertex_exec) rs.exec_narrowed = cond_exec_narrowed;
         // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
