@@ -133,14 +133,16 @@ public:
             }
             out += line;
         }
-        const Row priv = row(mapping_class_index(prosper::host::MappingClass::Private));
-        const double private_share = total_bytes ? 100.0 * static_cast<double>(priv.bytes) /
-                                                       static_cast<double>(total_bytes) : 0.0;
-        std::snprintf(line, sizeof(line),
-                      "[validation-census] source=%s GetWriteWatch-coverable (private memory only) = "
-                      "%.1f%% of %llu compared bytes\n",
-                      source, private_share, static_cast<unsigned long long>(total_bytes));
-        out += line;
+        if (informative) {
+            const Row priv = row(mapping_class_index(prosper::host::MappingClass::Private));
+            const double private_share = total_bytes ? 100.0 * static_cast<double>(priv.bytes) /
+                                                           static_cast<double>(total_bytes) : 0.0;
+            std::snprintf(line, sizeof(line),
+                          "[validation-census] source=%s GetWriteWatch-coverable (private memory only) = "
+                          "%.1f%% of %llu compared bytes\n",
+                          source, private_share, static_cast<unsigned long long>(total_bytes));
+            out += line;
+        }
         static constexpr std::array<const char*, kSizeBuckets> size_names = {"<64KiB", "<1MiB", "<16MiB", "<64MiB", ">=64MiB"};
         std::string sizes = std::string("[validation-census] source=") + source + " sizes:";
         for (int b = 0; b < kSizeBuckets; ++b) {
@@ -186,7 +188,7 @@ inline bool report_validation_mapping_census() {
     return printed;
 }
 
-// Always on, like the perf observers whose summary lines it joins: four relaxed counters and, for ranges of
+// Always on, like the perf observers whose summary lines it joins: four atomic counters and, for ranges of
 // at least kMinClassifiedBytes, one VirtualQuery. A syscall (about a microsecond) is small against a memcmp of
 // 64 KiB or more, which takes tens of microseconds; below that it would cost as much as the compare it
 // observes, so smaller ranges are only counted. No switch, so nothing to register or retire.
