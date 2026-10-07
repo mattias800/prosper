@@ -993,6 +993,67 @@ std::vector<uint32_t> build_compute_rgba8_to_packed10() {
     return e.assemble();
 }
 
+std::vector<uint32_t> build_compute_packed10_to_rgba8_append() {
+    Emitter e;
+    const InPlaceWordComputeIds ids = make_in_place_word_compute_ids(e);
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
+                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
+                 push_word, push, main, entry, body, done] = ids;
+    emit_in_place_word_compute_header(e, ids);
+    // Constants must be unique per value and type.
+    std::vector<std::pair<uint32_t, uint32_t>> uints;
+    auto constant = [&](uint32_t value) {
+        for (auto [v, id] : uints) if (v == value) return id;
+        const auto id = e.id();
+        uints.emplace_back(value, id);
+        Emitter::put(e.types, Op_Constant, {uint_t, id, value});
+        return id;
+    };
+    auto binary = [&](uint32_t op, uint32_t a, uint32_t b) {
+        auto id = e.id();
+        Emitter::put(e.code, op, {uint_t, id, a, b});
+        return id;
+    };
+    const uint32_t zero = constant(0), ten_mask = constant(0x3ffu), scale = constant(255),
+                   half = constant(511), denominator = constant(1023), alpha_shift = constant(30),
+                   alpha_scale = constant(85);
+    uint32_t shift[4], byte_shift[4];
+    for (uint32_t c = 0; c < 4; ++c) {
+        shift[c] = constant(c * 10);
+        byte_shift[c] = constant(c * 8);
+    }
+    Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
+    Emitter::put(e.code, Op_Label, {entry});
+    const auto xyz = e.id(), index = e.id(), count_ptr = e.id(), count = e.id(), valid = e.id();
+    Emitter::put(e.code, Op_Load, {vec_t, xyz, gid});
+    Emitter::put(e.code, Op_CompositeExtract, {uint_t, index, xyz, 0});
+    Emitter::put(e.code, Op_AccessChain, {push_word, count_ptr, push, zero});
+    Emitter::put(e.code, Op_Load, {uint_t, count, count_ptr});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, valid, index, count});
+    Emitter::put(e.code, Op_SelectionMerge, {done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
+    Emitter::put(e.code, Op_Label, {body});
+    const auto source_ptr = e.id(), packed = e.id(), target_ptr = e.id();
+    Emitter::put(e.code, Op_AccessChain, {word_ptr, source_ptr, words, zero, index});
+    Emitter::put(e.code, Op_Load, {uint_t, packed, source_ptr});
+    auto rgba = zero;
+    for (uint32_t c = 0; c < 3; ++c) {
+        const auto v = binary(Op_BitwiseAnd, binary(Op_ShiftRightLogical, packed, shift[c]), ten_mask);
+        const auto q = binary(Op_UDiv, binary(Op_IAdd, binary(Op_IMul, v, scale), half), denominator);
+        rgba = binary(Op_BitwiseOr, rgba, binary(Op_ShiftLeftLogical, q, byte_shift[c]));
+    }
+    const auto a = binary(Op_IMul, binary(Op_ShiftRightLogical, packed, alpha_shift), alpha_scale);
+    rgba = binary(Op_BitwiseOr, rgba, binary(Op_ShiftLeftLogical, a, byte_shift[3]));
+    Emitter::put(e.code, Op_AccessChain,
+                 {word_ptr, target_ptr, words, zero, binary(Op_IAdd, index, count)});
+    Emitter::put(e.code, Op_Store, {target_ptr, rgba});
+    Emitter::put(e.code, Op_Branch, {done});
+    Emitter::put(e.code, Op_Label, {done});
+    Emitter::put(e.code, Op_Return, {});
+    Emitter::put(e.code, Op_FunctionEnd, {});
+    return e.assemble();
+}
+
 std::vector<uint32_t> build_compute_indirect_dispatch_validate() {
     Emitter e;
     const InPlaceWordComputeIds ids = make_in_place_word_compute_ids(e);

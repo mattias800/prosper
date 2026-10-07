@@ -5,6 +5,7 @@
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
 #include "shared/live/gpu_retile.hpp"
+#include "shared/live/unorm10_snapshot.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "fixtures/render_runner.h"
 #include "gpu/texture/tile.hpp"
@@ -1596,11 +1597,14 @@ static int run_destination_mirror_regression() {
         }
     }
     // Packed R10G10B10A2 UNORM: graphics holds this guest colour format as an RGBA8 image, while
-    // compute stores it natively as A2B10G10R10. The exact-result mirror converts with a GPU blit
-    // into the RGBA8 renderer image (unorm10_mirror.hpp) instead of unpacking every texel on the CPU
-    // (publish_unorm10_as_rgba8). Before that path these results were declined as "format-unmapped".
+    // compute stores it natively as A2B10G10R10. The exact-result mirror converts on the GPU with the
+    // CPU path's integer rounding (PackedRttConversion::record_packed10_to_rgba8) instead of unpacking
+    // every texel on the CPU (publish_unorm10_as_rgba8). Before it these results were declined as
+    // "format-unmapped". Every 10-bit value appears once per channel and every alpha value in a row,
+    // and each output byte is compared with the CPU table: a float conversion (a blit) rounds 48 of
+    // the 1,024 values one step low on RADV, which a single-value check cannot see.
     {
-        constexpr uint32_t PW = 64, PH = 4;
+        constexpr uint32_t PW = 256, PH = 4;
         std::vector<uint8_t> p10_guest(PW * PH * 4, 0x5a);
         const uint64_t p10_address = reinterpret_cast<uint64_t>(p10_guest.data());
         DrawItem p10_producer = producer;
@@ -1611,10 +1615,13 @@ static int run_destination_mirror_regression() {
               "R10G10B10A2 producer materializes a renderer target");
         static const uint32_t store_p10[] = {
             0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
-            0x7E0002F2u,              // R=1.0
-            0x7E0202F0u,              // G=0.5
-            0x7E040280u,              // B=0
-            0x7E0602F2u,              // A=1.0
+            0x340C0A88u,              // v6 = y << 8
+            0x4A0C0906u,              // v6 = v6 + x: every value 0..1023 once
+            0x7E000D06u,              // v0 = float(v6)
+            0x100000FFu, 0x3A802008u, // v0 *= 1/1023
+            0x7E020300u, 0x7E040300u, // v1 = v2 = v0
+            0x7E060D05u,              // v3 = float(y)
+            0x100606FFu, 0x3EAAAAABu, // v3 *= 1/3: alpha 0..3 by row
             0xF0200F08u, 0x00020004u, // image_store v[0:3] (dmask RGBA) at v4,v5 through s[8:15]
             0xBF810000u,
         };
@@ -1649,16 +1656,16 @@ static int run_destination_mirror_regression() {
                   p10_after.published == p10_before.published + 1 &&
                   p10_after.failed == p10_before.failed,
               "R10G10B10A2 result is mirrored on the GPU and publishes after writeback");
-        // Guest bytes stay the architectural packed words: R low 10 bits, A top 2 bits.
-        bool guest_ok = true;
-        for (size_t t = 0; t < PW * PH; ++t) {
-            uint32_t word = 0;
-            std::memcpy(&word, p10_guest.data() + t * 4, 4);
-            const uint32_t g = (word >> 10) & 0x3ffu;
-            guest_ok = guest_ok && (word & 0x3ffu) == 1023u && (g == 511u || g == 512u) &&
-                       ((word >> 20) & 0x3ffu) == 0u && (word >> 30) == 3u;
-        }
-        CHECK(guest_ok, "R10G10B10A2 guest writeback holds the packed result");
+        // Guest bytes stay the architectural packed words: R low 10 bits, A top 2 bits. The pixel check
+        // below is tied to these stored words, not to what the shader meant to store.
+        std::vector<uint32_t> p10_words(size_t{PW} * PH);
+        std::memcpy(p10_words.data(), p10_guest.data(), p10_guest.size());
+        size_t covered = 0;
+        for (size_t t = 0; t < p10_words.size(); ++t)
+            covered += (p10_words[t] & 0x3ffu) == t && ((p10_words[t] >> 10) & 0x3ffu) == t &&
+                       ((p10_words[t] >> 20) & 0x3ffu) == t && (p10_words[t] >> 30) == t / PW;
+        CHECK(covered == p10_words.size(),
+              "R10G10B10A2 guest writeback holds every 10-bit value and every alpha");
         LiveTargetImageRequest p10_request{};
         p10_request.width = PW; p10_request.height = PH;
         LiveTargetImageImport p10_import;
@@ -1669,15 +1676,20 @@ static int run_destination_mirror_regression() {
         release_live_render_target_image(p10_address);
         std::vector<uint8_t> p10_pixels;
         std::string p10_error;
-        bool pixels_ok = prosper::test::readback_persistent_color_target(
+        const bool read = prosper::test::readback_persistent_color_target(
             p10_address, PW, PH, VK_FORMAT_R8G8B8A8_UNORM, p10_pixels, p10_error) &&
             p10_pixels.size() == size_t{PW} * PH * 4;
-        // The CPU path's integer rounding gives (255, 128, 0, 255); a blit may differ by one step.
-        for (size_t t = 0; pixels_ok && t < size_t{PW} * PH; ++t) {
+        size_t exact = 0;
+        for (size_t t = 0; read && t < p10_words.size(); ++t) {
+            const uint32_t w = p10_words[t];
             const uint8_t* px = p10_pixels.data() + t * 4;
-            pixels_ok = px[0] == 255 && (px[1] == 127 || px[1] == 128) && px[2] == 0 && px[3] == 255;
+            exact += px[0] == prosper::frontend::kUnorm10To8[w & 0x3ffu] &&
+                     px[1] == prosper::frontend::kUnorm10To8[(w >> 10) & 0x3ffu] &&
+                     px[2] == prosper::frontend::kUnorm10To8[(w >> 20) & 0x3ffu] &&
+                     px[3] == prosper::frontend::kUnorm2To8[w >> 30];
         }
-        CHECK(pixels_ok, "R10G10B10A2 renderer image holds the converted RGBA8 result");
+        CHECK(read && exact == p10_words.size(),
+              "R10G10B10A2 renderer image equals the CPU path's conversion byte for byte");
     }
     // R8Unorm (one 8-bit channel) is the same destination-mirror shape as RGBA8: the shader writes a
     // native R8_UNORM storage image and the renderer's R8_UNORM image seeds and receives it by an

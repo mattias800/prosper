@@ -41,7 +41,7 @@ found Vulkan.
   now a shader write, including for host availability, comparison and baseline-copy dependencies.
   Image mirroring and borrowed-image layout restoration remain independent obligations.
   The exact-result mirror reaches the borrowed renderer image by a bit copy from staging
-  (`staging_mirror_copy.hpp`) when the encodings match, and by a converting blit when they do not:
+  (`staging_mirror_copy.hpp`) when the encodings match, and by an exact integer conversion pass when they do not:
   packed R10G10B10A2 results land in the RGBA8 image graphics keeps for that format (`unorm10_mirror.hpp`).
   Eligible retained 2D word outputs also compare/adopt their exact **linear** baseline inside
   retile. Padding is written deterministically but excluded from equality. Shared flags clear

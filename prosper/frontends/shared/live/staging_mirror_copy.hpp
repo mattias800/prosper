@@ -5,7 +5,7 @@
 // staging buffer already holds the destination's own texel encoding (RGBA8, RGBA16F, R8, packed R11) a
 // buffer-to-image copy moves the bits unchanged, even when the private storage image was typed differently
 // (R11 is stored as R32_UINT). A result whose encoding differs from the destination's goes through a
-// converting blit instead (unorm10_mirror.hpp). These helpers hold the first path's two commands so the
+// conversion pass instead (unorm10_mirror.hpp). These helpers hold the first path's two commands so the
 // caller reads as the choice between the two, plus the bit copy back into a seeding import.
 #include <cstdint>
 

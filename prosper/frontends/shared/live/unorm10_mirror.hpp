@@ -1,17 +1,17 @@
 #pragma once
-// unorm10_mirror.hpp -- keep a packed R10G10B10A2 compute result on the GPU.
+// unorm10_mirror.hpp -- which compute results take the packed R10G10B10A2 exact-result mirror.
 //
 // Graphics holds a guest 2_10_10_10 UNORM colour target as an RGBA8 image (backend_color_format folds
-// A2B10G10R10 to R8G8B8A8), while compute stores the same result natively as A2B10G10R10. Before this
-// path the only way from one to the other was the CPU: read the result back, unpack every texel to RGBA8
-// (publish_unorm10_as_rgba8) and have the renderer upload it again. A 1:1 blit does that conversion on the
-// GPU, straight into the borrowed renderer image, so the exact-result mirror can accept these results like
-// any other format. A bit copy cannot: the two formats share a texel size but not a meaning.
+// A2B10G10R10 to R8G8B8A8), while compute stores the same result natively as A2B10G10R10. Before the
+// mirror the only way from one to the other was the CPU: read the result back, unpack every texel to RGBA8
+// (publish_unorm10_as_rgba8) and have the renderer upload it again. The mirror converts on the GPU instead
+// (PackedRttConversion::record_packed10_to_rgba8) into a second half of the staging buffer, then bit-copies
+// that into the borrowed renderer image.
 //
-// Rounding: a blit converts UNORM through float and back. The CPU path rounds to nearest with integer
-// arithmetic; an implementation may differ from it by at most one 8-bit step, which is below what the
-// RGBA8 target can represent faithfully in the first place.
-#include <cstdint>
+// The conversion is integer arithmetic with the CPU path's rounding, not a blit: a blit converts UNORM
+// through float, and the driver may round a tie either way. Measured on RADV, 48 of the 1,024 10-bit values
+// convert one step low that way, so a blit would change guest-visible pixels by driver (#4709 review).
+#include <mutex>
 
 #include <vulkan/vulkan.h>
 
@@ -24,40 +24,32 @@ inline bool is_unorm10_rgba_storage(const prosper::gpu::ShaderResource& r) {
     return r.format == prosper::gpu::DataFormat::Unorm2_10_10_10 && r.num_components == 4;
 }
 
-// The blit region for a 1:1 copy of mip 0 / layer 0 of a width x height image.
-inline VkImageBlit unorm10_mirror_blit_region(uint32_t width, uint32_t height) {
-    VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
-    blit.dstOffsets[1] = blit.srcOffsets[1];
-    return blit;
+// Whether a writable storage binding should reserve the RGBA8 second half when its staging buffer is
+// created: a native packed-10 2D result whose staging is exactly one 32-bit word per texel.
+template <class Bound>
+bool unorm10_mirror_wants_scratch(const Bound& bi, const prosper::gpu::ShaderResource& r,
+                                  VkDeviceSize staging_bytes) {
+    return bi.storage_writeback && bi.native_float_storage && is_unorm10_rgba_storage(r) && r.depth == 1 &&
+           staging_bytes == VkDeviceSize{r.width} * r.height * 4u;
 }
 
-// Records the converting copy from the compute result `source` (A2B10G10R10, written by the dispatch) into
-// `destination` (RGBA8, already in TRANSFER_DST_OPTIMAL). `source_in_transfer_src` says whether the caller
-// has already moved `source` to TRANSFER_SRC_OPTIMAL; otherwise it is still GENERAL straight after the
-// dispatch and this orders the shader write before the transfer read. Both formats' blit features are
-// mandatory in Vulkan (A2B10G10R10_UNORM_PACK32: BLIT_SRC; R8G8B8A8_UNORM: BLIT_DST). CONFIDENCE: HIGH.
-inline void record_unorm10_mirror_blit(VkCommandBuffer command, VkImage source,
-                                       bool source_in_transfer_src, VkImage destination,
-                                       uint32_t width, uint32_t height) {
-    if (!source_in_transfer_src) {
-        VkImageMemoryBarrier written{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        written.oldLayout = written.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        written.srcQueueFamilyIndex = written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        written.image = source;
-        written.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &written);
-    }
-    const VkImageBlit blit = unorm10_mirror_blit_region(width, height);
-    vkCmdBlitImage(command, source,
-                   source_in_transfer_src ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                                          : VK_IMAGE_LAYOUT_GENERAL,
-                   destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+// The result can take the mirror only with its scratch half reserved and the integer conversion pass
+// ready. Prepares the pass and binds its descriptor set to the whole doubled staging buffer. `soft_ok`
+// is the caller's non-fatal Vulkan result check.
+template <class Context, class Bound, class SoftOk>
+bool unorm10_mirror_ready(Context& ctx, Bound& bi, VkBuffer staging, VkDeviceSize result_bytes,
+                          SoftOk&& soft_ok) {
+    if (!bi.unorm10_mirror_scratch || !staging) return false;
+    std::lock_guard cache_lock(ctx.pipeline_cache_mutex);
+    auto& conversion = ctx.unorm10_mirror_conversion;
+    if (!soft_ok(conversion.initialize(ctx.physical, ctx.device, ctx.pipeline_cache),
+                 "unorm10-mirror-pipeline") ||
+        !conversion.fits(result_bytes / 4u, 2u) ||
+        (!bi.unorm10_set &&
+         !soft_ok(conversion.allocate_binding(bi.unorm10_pool, bi.unorm10_set), "unorm10-mirror-descriptors")))
+        return false;
+    conversion.bind_buffer(bi.unorm10_set, staging, result_bytes * 2u);
+    return true;
 }
 
 }  // namespace prosper::frontend

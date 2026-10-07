@@ -174,9 +174,13 @@ struct BoundImage {
     // A read-only imported binding can sample the old image during this dispatch. The result copy
     // then leaves that image in GENERAL for the import owner's ordinary layout restoration.
     bool mirror_destination_shared_import = false;
-    // The result is packed R10G10B10A2 in native A2B10G10R10 storage while the renderer holds the target
-    // as RGBA8, so it reaches the destination by a converting blit rather than a bit copy.
-    bool mirror_unorm10_blit = false;
+    // The result is packed R10G10B10A2 while the renderer holds the target as RGBA8: staging is allocated
+    // twice the result size (`unorm10_mirror_scratch`) and the mirror converts into the second half
+    // before a bit copy (PackedRttConversion::record_packed10_to_rgba8).
+    bool unorm10_mirror_scratch = false;
+    bool mirror_unorm10_convert = false;
+    VkDescriptorPool unorm10_pool = VK_NULL_HANDLE;
+    VkDescriptorSet unorm10_set = VK_NULL_HANDLE;
     // #3915: GPU-present mirror of a complete display-buffer result (compute_scanout.hpp).
     prosper::frontend::ComputeScanoutTarget scanout_mirror{};
     bool scanout_mirror_recorded = false;

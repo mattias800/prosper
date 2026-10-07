@@ -1793,6 +1793,8 @@ int main(int argc, char** argv) {
         }
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
          "build_compute_rgba8_to_packed10");
+    dump(dir, "builder_packed10_to_rgba8_append", build_compute_packed10_to_rgba8_append(),
+         "build_compute_packed10_to_rgba8_append");
     dump(dir, "builder_depth_to_rgba8", build_compute_depth_to_rgba8(),
          "build_compute_depth_to_rgba8");
     dump(dir, "builder_indirect_dispatch_validate", build_compute_indirect_dispatch_validate(),
