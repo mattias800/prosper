@@ -403,7 +403,7 @@ TEST(FragmentLoopVccScratch, CountedLoopDecodesAsDescribed) {
 }
 
 TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterCompiles) {
-    const Compiled loop = compile(kCountedVccHiLoop, 0x4686A001ull);
+    const Compiled loop = compile(kCountedVccHiLoop, 0x4680A001ull);
     ASSERT_FALSE(loop.spirv.empty())
         << "VCC's mask is dead from the header and its scalar halves are carried by their own "
            "phis; reason: "
@@ -412,7 +412,7 @@ TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterCompiles) {
 }
 
 TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterRunsExactlyFourIterations) {
-    const Compiled loop = compile(kCountedVccHiLoop, 0x4686A002ull);
+    const Compiled loop = compile(kCountedVccHiLoop, 0x4680A002ull);
     ASSERT_FALSE(loop.spirv.empty()) << loop.reason;
     if (!device_can_execute(loop.spirv))
         GTEST_SKIP() << "device cannot execute the fragment wave64 contract this module declares";
@@ -428,7 +428,7 @@ TEST(FragmentLoopVccScratch, CountedLoopWithAVccHiCounterRunsExactlyFourIteratio
     uint32_t five_trips[std::size(kCountedVccHiLoop)];
     std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), five_trips);
     five_trips[2] = 0x7E02028Au;   // v_mov_b32 v1, 10
-    const Compiled longer = compile(five_trips, 0x4686A003ull);
+    const Compiled longer = compile(five_trips, 0x4680A003ull);
     ASSERT_FALSE(longer.spirv.empty()) << longer.reason;
     const std::vector<uint8_t> longer_pixel = centre_pixel(longer.spirv);
     ASSERT_EQ(longer_pixel.size(), 4u);
@@ -442,10 +442,9 @@ TEST(FragmentLoopVccScratch, CountedLoopReadingAMaskHalfAsDataStillRejects) {
     uint32_t untracked[std::size(kCountedVccHiLoop)];
     std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), untracked);
     untracked[5] = 0xBE850380u;   // s_mov_b32 s5, 0 -- vcc_hi keeps the mask's dword
-    const Compiled loop = compile(untracked, 0x4686A004ull);
+    const Compiled loop = compile(untracked, 0x4680A004ull);
     EXPECT_TRUE(loop.spirv.empty()) << "the entry value of vcc_hi is a mask dword, not data";
-    EXPECT_NE(loop.reason.find("s107 is read from header pc=7"), std::string::npos)
-        << loop.reason;
+    EXPECT_NE(loop.reason.find("s107 is read from header pc=7"), std::string::npos) << loop.reason;
     EXPECT_NE(loop.reason.find("tracked-at-entry=0"), std::string::npos) << loop.reason;
 }
 
@@ -455,7 +454,7 @@ TEST(FragmentLoopVccScratch, CountedLoopWithAMaskReadAfterTheExitStillRejects) {
     uint32_t mask_read[std::size(kCountedVccHiLoop)];
     std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), mask_read);
     mask_read[18] = 0x02020105u;   // v_cndmask_b32 v1, v5, v0, vcc
-    const Compiled loop = compile(mask_read, 0x4686A005ull);
+    const Compiled loop = compile(mask_read, 0x4680A005ull);
     EXPECT_TRUE(loop.spirv.empty()) << "a mask read reachable from the header";
     EXPECT_NE(loop.reason.find("from header pc=7"), std::string::npos) << loop.reason;
     EXPECT_NE(loop.reason.find("blocker pc=18 kind=vop2-implicit-vcc"), std::string::npos)

@@ -306,7 +306,7 @@ TEST(EfcHelperProgram, TheOperationKeepsItsDepthStencilEffect) {
 // depth-write arm proves a helper that still has an effect keeps going through the compiler.
 alignas(256) const uint32_t kStaleVSharpPs[] = {
     0xE0302004u, 0x80061701u,   // buffer_load_dword v23, v1, s[24:27], 0 offen
-    0xBF8C3F70u,                // s_waitcnt vmcnt(0)
+    0xBF8C3F70u,   // s_waitcnt vmcnt(0)
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
 
@@ -323,14 +323,14 @@ TEST(EfcHelperProgram, AHelperWithoutDepthStencilEffectNeverCompilesItsInherited
     std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
     std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
 
-    const Realized ordinary = realize(
-        with_stale_vsharp_ps(state(kVs, kTriangleList, P::CB_COLOR_CONTROL_MODE_NORMAL)));
+    const Realized ordinary =
+        realize(with_stale_vsharp_ps(state(kVs, kTriangleList, P::CB_COLOR_CONTROL_MODE_NORMAL)));
     EXPECT_FALSE(ordinary.made);
     ASSERT_EQ(ordinary.reason, RealizationFailureReason::ShaderRecompile)
         << "positive control: the inherited shader is refused under the stale user data";
 
-    GpuState decompress = with_stale_vsharp_ps(
-        state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    GpuState decompress =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
     decompress.cx[P::DB_RENDER_CONTROL] = 0x60;
     decompress.cx[P::DB_DEPTH_CONTROL] = 0x70;   // Kena's helper: ZFUNC=ALWAYS, Z test/write off
     const Realized decompress_helper = realize(decompress);

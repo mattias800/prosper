@@ -127,15 +127,14 @@ struct LoopVccCarry {
                                                : ScalarMergeProof::AnyRead;
             ScalarMergeBlocker blocker;
             if (sgpr_dead_at_merge(ins, header_pc, half, proof, &blocker)) continue;
-            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
-                                     "counted-loop body leaves VCC as scalar data at the back-edge "
-                                     "and s%d is %s from header pc=%u (blocker pc=%d kind=%s, "
-                                     "tracked-at-entry=%d)",
-                                     half,
-                                     proof == ScalarMergeProof::AnyRead ? "read" : "mask-read",
-                                     header_pc,
-                                     blocker.pc == UINT32_MAX ? -1 : static_cast<int>(blocker.pc),
-                                     blocker.kind, tracked_at_entry[half - 106] ? 1 : 0);
+            log_recompile_diagnostic(
+                b.diagnostic, "recompile-reject", "terminal",
+                "counted-loop body leaves VCC as scalar data at the back-edge "
+                "and s%d is %s from header pc=%u (blocker pc=%d kind=%s, "
+                "tracked-at-entry=%d)",
+                half, proof == ScalarMergeProof::AnyRead ? "read" : "mask-read", header_pc,
+                blocker.pc == UINT32_MAX ? -1 : static_cast<int>(blocker.pc), blocker.kind,
+                tracked_at_entry[half - 106] ? 1 : 0);
             return 0;
         }
         return b.bfalse();

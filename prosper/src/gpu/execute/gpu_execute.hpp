@@ -2484,20 +2484,28 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // dropped draw, although its result would have been "no effect" either way. Kena's live
     // helpers (DB_DEPTH_CONTROL 0x70, no stencil write) dropped several hundred draws per run this
     // way, through whichever pixel shader happened to be bound (#4680).
-    const auto* helper_vs = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
+    const auto* helper_vs =
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
     const AgcHelperDrawShape helper_shape{rs.prim_type, vcount_hint, draw && draw->indexed};
     const bool helper_eliminate = is_agc_eliminate_fast_clear_operation(
         rs.cb_color_control, helper_vs, vs_program_dwords, helper_shape);
-    const bool helper_decompress = !helper_eliminate &&
+    const bool helper_decompress =
+        !helper_eliminate &&
         is_agc_decompress_htile_operation(rs.cb_color_control, rs.db_render_control, helper_vs,
                                           vs_program_dwords, helper_shape);
     if ((helper_eliminate || helper_decompress) &&
         !is_agc_efc_rect_exact_program(helper_vs, vs_program_dwords))
         report_agc_rect_family_match(vs_program_addr, vs_program_dwords, rs.cb_color_control,
-                                     helper_eliminate ? "eliminate-fast-clear" : "decompress-htile");
+                                     helper_eliminate ? "eliminate-fast-clear"
+                                                      : "decompress-htile");
+    // The same two diagnostic overrides as the early no-effect gate above.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
+    const bool helper_force_colorwrite = PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE");
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
+    const bool helper_no_early_no_effect = PROSPER_ENV_ON("PROSPER_NO_EARLY_NO_EFFECT");
+    const bool helper_force_draw = helper_force_colorwrite || helper_no_early_no_effect;
     if ((helper_eliminate || helper_decompress) &&
-        !has_depth_stencil_side_effect(resolved_pipeline) &&
-        !PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE") && !PROSPER_ENV_ON("PROSPER_NO_EARLY_NO_EFFECT")) {
+        !has_depth_stencil_side_effect(resolved_pipeline) && !helper_force_draw) {
         report_dropped_draw_target(rs.color0_base, "no-effect(agc-helper)", rs.cb_target_mask,
                                    rs.cb_shader_mask);
         if (failure) {
@@ -2505,11 +2513,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, {}, {});
             add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
         }
-        if (log) fprintf(stderr, "[exec] skip draw early: AGC %s helper has no depth/stencil effect "
-                                 "es=0x%llx ps=0x%llx order=%llu\n",
-                         helper_eliminate ? "eliminate-fast-clear" : "decompress-htile",
-                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
-                         (unsigned long long)(draw ? draw->command_order : 0));
+        if (log)
+            fprintf(stderr,
+                    "[exec] skip draw early: AGC %s helper has no depth/stencil effect "
+                    "es=0x%llx ps=0x%llx order=%llu\n",
+                    helper_eliminate ? "eliminate-fast-clear" : "decompress-htile",
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)(draw ? draw->command_order : 0));
         return false;
     }
     const bool owned_vertex =
