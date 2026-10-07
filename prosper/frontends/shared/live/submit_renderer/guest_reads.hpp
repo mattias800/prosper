@@ -5,6 +5,7 @@
 
 #include "gpu/execute/gpu_execute.hpp"          // guest_readable
 #include "shared/live/guest_source_read.hpp"    // guest_source_readable_prefix / copy / equal
+#include "shared/live/submit_renderer/validation_mapping_census.hpp"   // PROSPER_VALIDATION_MAPPING_CENSUS
 
 #include <cstddef>
 #include <cstdint>
@@ -24,8 +25,10 @@ inline constexpr auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size
 inline constexpr auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
                                                 size_t& compared,
                                                 GuestSourceComparisonObservation* observation = nullptr) -> bool {
-    return equal_guest_source_prefix(
+    const bool equal = equal_guest_source_prefix(
         expected, a, n, compared, prosper::gpu::guest_readable, observation);
+    note_validation_mapping(a, n, equal);
+    return equal;
 };
 
 } // namespace prosper::frontend::submit_renderer

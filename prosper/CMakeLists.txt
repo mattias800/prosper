@@ -1918,6 +1918,13 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # Actual tracked mappings and direct comparison/window observations; no Vulkan device.
+  # The census arithmetic behind PROSPER_VALIDATION_MAPPING_CENSUS (which kind of host memory backs
+  # the fully-compared guest ranges). Header-only: nothing here reaches the HLE symbol it declares.
+  prosper_add_gtest(test_validation_mapping_census
+    SOURCES frontends/shared/tests/test_validation_mapping_census.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
   add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
   target_include_directories(test_texture_direct_validation PRIVATE frontends)
   target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)

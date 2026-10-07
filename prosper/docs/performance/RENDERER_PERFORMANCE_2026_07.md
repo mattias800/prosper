@@ -1265,6 +1265,17 @@ logically sound, but it cannot make Windows exception delivery ABI-safe. Re-enab
 fault delivery itself preserves all guest red-zone bytes. Direct memory now uses a delete-on-close sparse file,
 so the kernel demand-pages mapped file data without the unsafe user-mode `SEC_RESERVE` first-touch exceptions.
 
+**Ruled out (2026-10-07): `GetWriteWatch` as the fault-free replacement on Windows.** A standalone probe
+found it works only on private `VirtualAlloc(MEM_WRITE_WATCH)` allocations, including private memory that
+replaces a placeholder with `MEM_WRITE_WATCH`. Every section view (pagefile-backed, file-backed,
+placeholder-replaced) fails with `ERROR_INVALID_PARAMETER`, and `MapViewOfFile3` refuses the flag outright.
+`PROSPER_VALIDATION_MAPPING_CENSUS` then measured where Black Flag's fully-compared bytes live, in three
+~110 s runs: **100% were section views, 0% private** (999 validations / 3.78 GB; 1,004 / 4.43 GB with the
+final classifier, which asks `VirtualQuery` for `MEM_PRIVATE` vs `MEM_MAPPED` directly). There is nothing for
+`GetWriteWatch` to cover. The same runs show the compares almost never find a change: **5 of 999**
+validations (0.3% of the bytes) in one run and **0 of 1,004** in another. A sound unchanged-signal from
+another source would remove nearly all of this compare work.
+
 ## Separate unresolved risk
 
 Native Windows boot can still intermittently stop after exactly 75 submits while asset loading and
