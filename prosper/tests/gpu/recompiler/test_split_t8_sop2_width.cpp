@@ -11,6 +11,7 @@
 //   AddIntoRegisterBelowThePointerKeepsProof   the pair assumption comes back
 //   PairWriteOverlappingThePointerIsRefused    a 64-bit write stops being treated as a pair
 #include "gpu/execute/gpu_execute.hpp"
+#include "split_t8_fold_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <gtest/gtest.h>
@@ -23,23 +24,8 @@ using namespace prosper::gpu;
 
 namespace {
 
-alignas(16) uint32_t g_table[16];
-
-// The entry user data is s0..s3; the table pointer is s[2:3].
-std::vector<SrtUse> uses_for(const std::vector<uint32_t>& code) {
-    for (uint32_t i = 0; i < 16; ++i) g_table[i] = 0xD1000000u + i;
-    const uint64_t base = reinterpret_cast<uint64_t>(g_table);
-    const uint32_t seed[4] = { 0u, 0u, static_cast<uint32_t>(base),
-                               static_cast<uint32_t>(base >> 32u) };
-    std::vector<SrtUse> result;
-    resolve_dynamic_fetch(code.data(), code.size(), seed, 4, 0, &result);
-    return result;
-}
-
-bool has_use(const std::vector<SrtUse>& uses, uint32_t pc) {
-    return std::any_of(uses.begin(), uses.end(),
-                       [pc](const SrtUse& u) { return u.kind == 0 && u.use_pc == pc; });
-}
+using test::split_t8_has_image_use;
+using test::split_t8_uses_for;
 
 // pc 0      <scalar write>
 // pc 1-2    s_load_dwordx8 s[4:11], s[2:3], 0      pc 3-4  s_load_dwordx4 s[12:15], s[2:3], 0x20
@@ -69,13 +55,14 @@ TEST(SplitT8Sop2Width, Sop2DestWidths) {
 
 TEST(SplitT8Sop2Width, AddIntoRegisterBelowThePointerKeepsProof) {
     // s_add_i32 s1, 1, 1: a 32-bit write one register below the pointer pair s[2:3].
-    const auto uses = uses_for(program(0x81018181u));
-    EXPECT_TRUE(has_use(uses, 5u))
+    const auto uses = split_t8_uses_for(program(0x81018181u));
+    EXPECT_TRUE(split_t8_has_image_use(uses, 5u))
         << "a 32-bit scalar add into s1 does not touch the pointer in s[2:3]";
 }
 
 TEST(SplitT8Sop2Width, PairWriteOverlappingThePointerIsRefused) {
     // s_and_b64 into s[1:2]: a pair write that DOES overlap the pointer.
-    const auto uses = uses_for(program(0x87818181u));
-    EXPECT_FALSE(has_use(uses, 5u)) << "a 64-bit write that overlaps the pointer must be refused";
+    const auto uses = split_t8_uses_for(program(0x87818181u));
+    EXPECT_FALSE(split_t8_has_image_use(uses, 5u))
+        << "a 64-bit write that overlaps the pointer must be refused";
 }
