@@ -286,7 +286,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
     if (!reached[use]) return result;
     for (int lane = 0; lane < 8; ++lane)
         result->tags_at_use[static_cast<size_t>(lane)] =
-            in_state[use][static_cast<size_t>(tbase + lane)];
+            in_state[use][static_cast<size_t>(tbase) + static_cast<size_t>(lane)];
 
     // A guest-visible write that can execute before the consumer could alter descriptor backing
     // after the CPU snapshot. That is every reachable instruction from which the consumer can be

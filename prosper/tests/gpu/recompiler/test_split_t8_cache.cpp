@@ -64,8 +64,8 @@ Inputs inputs() {
     const auto base = reinterpret_cast<uint64_t>(g_table.data());
     in.user = {0u, 0u, static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u)};
     for (uint32_t lane = 0; lane < 4; ++lane) {
-        in.source_addr[lane] = base + 16u + 4u * lane;   // first load, words 4..7
-        in.source_addr[lane + 4u] = base + 0x20u + 4u * lane;   // second load, words 0..3
+        in.source_addr[lane] = base + 16u + uint64_t{4} * lane;   // first load, words 4..7
+        in.source_addr[lane + 4u] = base + 0x20u + uint64_t{4} * lane;   // second load, words 0..3
     }
     return in;
 }
