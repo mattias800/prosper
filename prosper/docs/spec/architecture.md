@@ -277,3 +277,11 @@ Screenshot and snapshot runs record every `PROSPER_*` switch set, and a run coun
 evidence only if each is a host-capability or diagnostic switch; a selector disqualifies it.
 Status: proposed (adr:0023)
 Enforcement: adr:0023
+
+### GPU-4 -- a guest Wave64 program runs natively, by proof or exact emulation, or is refused visibly
+
+On a host without a native 64-lane subgroup for the stage, a Wave64 program runs only when its
+width independence is proven or an exact emulation route admits it; otherwise it is refused with a
+`[wave64-unsupported]` line. An approximate vote is only a default-OFF selector.
+Status: proposed (adr:0028)
+Enforcement: adr:0028
