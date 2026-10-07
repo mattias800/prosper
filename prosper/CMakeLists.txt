@@ -219,6 +219,15 @@ add_executable(test_compute_timing_selector tests/shared/compute/test_compute_ti
 target_include_directories(test_compute_timing_selector PRIVATE frontends)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
 
+# prosper_add_gtest itself (#4682): a list-valued PROPERTIES value must reach every discovered case
+# whole. Forwarded through gtest_discover_tests it was split into words, which CMake 3.31 applied
+# wrongly and silently and which segfaulted CTest 4.4 before any test ran. No prosper code linked.
+prosper_add_gtest(test_gtest_registration_properties
+  SOURCES tests/misc/test_gtest_registration_properties.cpp
+  PROPERTIES ENVIRONMENT_MODIFICATION
+    "GTEST_REGISTRATION_PROBE_A=set:alpha;GTEST_REGISTRATION_PROBE_B=set:beta;GTEST_REGISTRATION_PROBE_C=set:gamma delta"
+    TIMEOUT 30)
+
 # execute_item()'s five CPU phases on a dispatch that breaks early (#3461): no negative interval,
 # no whole-item cleanup, and the parts still sum to the item.
 prosper_add_gtest(test_compute_phase_attribution
