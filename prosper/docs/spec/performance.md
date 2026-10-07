@@ -91,6 +91,16 @@ never dropped, and an optimized pipeline replaces the link in the background.
 Status: proposed (adr:0029)
 Enforcement: runtime:shader-compile, adr:0029
 
+### PERF-P12 -- guest textures are detiled, retiled and converted on the GPU
+
+Each tile mode and format prosper transforms has a GPU path driven by the shared tiling tables, and
+that path is the default. The host transform is the bit-for-bit test reference and a counted
+fallback, and a storage image stays resident across dispatches until the guest CPU writes it.
+Every host transform is charged to `Transfer::Detile` or a named sibling; until it is, the runtime
+instruments below see only the `detile_surface` shapes and cannot flag a regression elsewhere.
+Status: proposed (adr:0031)
+Enforcement: runtime:host-copy-per-flip, runtime:host-copy-pressure, adr:0031
+
 ### PERF-P13 -- write protection is armed over guest memory only where its fault is red-zone safe
 
 The guest memory tracker is portable and each host supplies only the primitive. A host whose write
