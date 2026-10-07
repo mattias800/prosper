@@ -109,6 +109,14 @@ fault-free primitive or falls back to a counted compare, never with a page-prote
 Status: proposed (adr:0032)
 Enforcement: runtime:host-copy-pressure, adr:0032
 
+### PERF-P14 -- the GPU reads guest buffers in place unless a copy is measured cheaper
+
+A buffer a draw or dispatch reads is imported from guest memory where the device accepts the
+pointer; a device-local copy is kept only where measured reads per change make it cheaper, and is
+invalidated by page tracking. Every remaining CPU copy of a guest buffer is counted.
+Status: proposed (adr:0033)
+Enforcement: runtime:host-copy-pressure, runtime:host-copy-per-flip, adr:0033
+
 ### PERF-G1 -- releases are compared on the reference workloads
 
 Each release candidate is measured against the previous release on the reference workloads, and a
