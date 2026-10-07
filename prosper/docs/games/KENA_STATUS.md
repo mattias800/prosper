@@ -32,7 +32,7 @@ never committed. The F9 bundle still aborts on this title (#3807: binding 32, ad
   - prosper unpacks every compressed export as FP16 and has no `R16_UINT` colour target, so the
     value 1 is stored as FP16 bits `0x0001` = 6e-8 in an `R8G8B8A8_UNORM` image, which rounds to 0.
   - This is a general gap, filed as **#4703** with the evidence and a suggested fix.
-- **The shadow-cascade projections covered every pixel (fixed in this change).** UE4 restricts each
+- **The shadow-cascade projections covered every pixel (fixed by #4704).** UE4 restricts each
   CSM cascade's projection to its depth slice with the depth-bounds test
   (`DB_DEPTH_CONTROL=0x8`, bounds [0.0005, 0.0016], [0.0015, 0.0065] and [0.0059, 1.0]). The local
   light volumes use it too (`0x6a`), and so does a near/far pair split at depth 0.00125.
@@ -484,8 +484,8 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 ## Ruled out
 
 - **The missing sunlight comes from the shadow projection shadowing every pixel** — false as the
-  cause. The projection did cover every pixel (the unimplemented depth-bounds test, fixed with
-  #4703's companion change). With the cascades partitioned, the sun pass still adds exactly 0,
+  cause. The projection did cover every pixel (the unimplemented depth-bounds test, fixed by
+  #4704). With the cascades partitioned, the sun pass still adds exactly 0,
   because its lighting-channel test fails (#4703, 2026-10-07).
 - **The CSM PCF reads the wrong texels because the gather offsets decode wrongly** — false. The
   recompiled SPIR-V decodes offsets 0x3e00, 0x3e3e, 0x3e02, 62, 2, 0x23e, 0x200 and 0x202 to the
