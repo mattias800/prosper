@@ -316,6 +316,15 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   but by erasing a real clear, which only moves the error.
 - **"Gating the last-pass present fallback until the first guest flip removes it"** Falsified earlier: the
   first guest flips already carry the red.
+- **"The white 128x128 rectangles are the stale R16F DCC read."** Falsified 2026-10-07 (n=1 per arm, on a
+  box where runs exited with code -1 at 41-180 s for a reason not established): with the one- and
+  two-component fast-clear fix (#4699) the `is unsupported` warnings for those surfaces are replaced
+  by `DCC fast-clear ... comps=1/2` lines and the black/white proportions of the corrupted frame are
+  unchanged. The fix is still correct (the surfaces were sampled as stale bytes); it is not the cause.
+- **"Publishing compute results into the renderer's images produces the garbage."** Falsified
+  2026-10-07 (n=1 per arm, same caveat) with the three `PROSPER_NO_COMPUTE_RTT_DEST_*`-style switches
+  off: the same black/white proportions after 250 s. The corruption is already present in guest
+  memory, i.e. in the guest's own compute-composite output, not added by the mirror.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 

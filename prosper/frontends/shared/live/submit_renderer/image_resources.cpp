@@ -1760,7 +1760,7 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   std::all_of(sampled_dcc_metadata.begin(), sampled_dcc_metadata.end(),
                               [](uint8_t code) { return code == 0xff; });
               uint8_t persistent_dcc_clear_pixel[4]{};
-              const bool persistent_dcc_fast_clear = r.compression_enabled && (r.num_components >= 3u || decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) &&
+              const bool persistent_dcc_fast_clear = r.compression_enabled && prosper::frontend::dcc_fast_clear_admitted(r, decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) &&
                   sampled_dcc_metadata_got == sampled_dcc_metadata.size() &&
                   prosper::gpu::gfx10_dcc_fast_clear_rgba8(
                       persistent_dcc_clear_pixel, 1,
@@ -3458,7 +3458,7 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   const size_t metadata_got = sampled_dcc_metadata_got;
                   uint8_t clear_code = 0;
                   dcc_uncompressed = persistent_dcc_uncompressed;
-                  if (!dcc_uncompressed && (r.num_components >= 3u || decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) && metadata_got == metadata.size() &&
+                  if (!dcc_uncompressed && prosper::frontend::dcc_fast_clear_admitted(r, decoded_texture_format == VK_FORMAT_R8G8B8A8_UNORM) && metadata_got == metadata.size() &&
                       prosper::gpu::gfx10_dcc_fast_clear_rgba8(
                           texture_pixels.data(), texture_pixels.size() / 4,
                           metadata.data(), metadata.size(), r.num_components,
@@ -3468,10 +3468,10 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                       if (decoded_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
                           fprintf(stderr,
                                   "[render] DCC fast-clear addr=0x%llx meta=0x%llx "
-                                  "%ux%ux%u fmt=%u code=0x%02x bytes=%zu\n",
+                                  "%ux%ux%u fmt=%u comps=%u code=0x%02x bytes=%zu\n",
                                   (unsigned long long)r.gpu_addr,
                                   (unsigned long long)r.metadata_addr,
-                                  tw, th, r.depth, (unsigned)r.format, clear_code,
+                                  tw, th, r.depth, (unsigned)r.format, r.num_components, clear_code,
                                   metadata.size());
                   } else if (!dcc_uncompressed) {
                       static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
