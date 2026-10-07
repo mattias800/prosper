@@ -11,6 +11,7 @@
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/linear_image_pitch.hpp"
 #include "shared/live/live_compute_bound_resources.hpp"
+#include "shared/live/pipeline_observe_hook.hpp"
 #include "shared/compute/sampled_dcc_fast_clear.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -13297,6 +13298,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
     // success paths, and the end of the truncated phase on every early break.
     const auto phase_loop_exit = ComputeClock::now();
+    if (ok && pipeline_observe_enabled()) pipeline_observe_dispatch(item, buffers, images, phase_pipeline, phase_dispatch);
 
     if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing

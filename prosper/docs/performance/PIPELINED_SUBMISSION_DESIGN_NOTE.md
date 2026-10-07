@@ -87,6 +87,43 @@ about the backend, since the backend does not use the queue yet.
 One Windows run per row; the logs are on the author's machine and the summary is posted on #4631. Treat
 them as indicative, not as a measurement protocol.
 
+## Step 2 result: what pipelining would have allowed (observe-only, 2026-10-06)
+
+`PROSPER_PIPELINE_OBSERVE=1` (diagnostic; changes nothing) feeds every completed dispatch's guest read and
+write ranges, and the graphics spans and DMA copies the executor runs between dispatches, to the
+`RetirementQueue` contract, and reports four models: ranges-only (optimistic: a graphics span is assumed not
+to read a pending result) and barriers (pessimistic: every graphics span and DMA is a retirement point), each
+at depth 4 and depth 64. "Overlapped" means the dispatch would have been admitted while an older one was still
+pending; "wait-overlapped" is the share of today's measured dispatch time (record + submit + fence wait)
+belonging to such dispatches. Read it with `prosper-app` closed through its window (a `timeout` kill loses the
+exit report; a periodic report prints every 256 dispatches).
+
+*Assassin's Creed Black Flag Resynced*, Windows/NVIDIA, `prosper-app`, default route, 1,792 dispatches in about
+45 s, two runs with identical counts, 655 graphics spans/DMA copies seen between them:
+
+| model | overlapped | wait-overlapped | max pending |
+| --- | --- | --- | --- |
+| ranges-only, depth 4 | 69.6% | 76.8% | 4 |
+| ranges-only, depth 64 | 69.6% | 76.8% | 22 |
+| barriers, depth 4 | 47.5% | 50.0% | 4 |
+| barriers, depth 64 | 47.5% | 50.0% | 22 |
+
+What it says, and what it does not:
+- About half to three quarters of dispatch time belongs to dispatches that could run concurrently with an
+  older one, so overlap exists. Most dispatches still conflict with an earlier one (conflict retirements are
+  about 0.25 per dispatch with barriers, 0.9 without), so the depth that pays is shallow: depth 4 loses
+  nothing against depth 64 in "overlapped".
+- Dispatch time is only part of a submit's compute CPU time (about 20 ms of about 113 ms in the same title;
+  setup and writeback are the larger parts). Hiding half to three quarters of it is about 10-15 ms per submit.
+  **Overlapping the CPU setup and writeback of the next dispatch with the GPU running the previous one is not
+  measured here**, and is where the larger gain would have to come from; this step cannot see it.
+- Ranges come from the bindings' guest addresses; GPU-internal hazards (image-cache aliasing, renderer-owned
+  targets reached through the live-target bridge) are not modelled, and the barrier model assumes every
+  graphics span reads everything. The truth lies between the two rows.
+- One title, one machine, one route. The compute-only submits Black Flag uses on its own mean the barrier
+  model's graphics spans are rare there; a title that interleaves draws and dispatches will sit near the
+  barrier row.
+
 ## What this note does not claim
 
 No speed-up is measured here. The ceiling for Stage 1 on GTA V was bounded at about 5 % of wall time in

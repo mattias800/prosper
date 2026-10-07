@@ -9713,6 +9713,8 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
 
 namespace {
 
+std::atomic<OrderedOperationObserver> g_ordered_operation_observer{nullptr};
+
 template <typename DmaCopyRecord, typename ExecuteDma>
 OrderedSubmitResult execute_ordered_items_impl(
     const std::vector<SubmitOperation>& operations, const std::vector<DrawItem>& draws,
@@ -9779,6 +9781,8 @@ OrderedSubmitResult execute_ordered_items_impl(
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
+        if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+            observer(OrderedOperationKind::GraphicsSpan, static_cast<uint32_t>(span.size()));
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
@@ -9815,6 +9819,8 @@ OrderedSubmitResult execute_ordered_items_impl(
         } else {
             flush_span(dma_flush_authoritative(span, dma_copies[operation.item]));
             read_points.advance();
+            if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                observer(OrderedOperationKind::Dma, 1u);
             execute_dma(dma_copies[operation.item]);
             // This legacy callback reports no completion outcome. Do not turn its return into
             // successful ordered-source authority, while preserving its execution ABI.
@@ -11287,6 +11293,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                           bool final_span = false) {
         const bool has_draws = !span.empty();
         if (!render || (!has_draws && (!final_span || !result.render_spans))) return;
+        if (has_draws)
+            if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                observer(OrderedOperationKind::GraphicsSpan, static_cast<uint32_t>(span.size()));
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         g_live_phase.source_submit = submit_no;
@@ -12085,6 +12094,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
             }
             case RetainedSubmitKind::DmaCopy: {
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                if (const auto observer = g_ordered_operation_observer.load(std::memory_order_relaxed))
+                    observer(OrderedOperationKind::Dma, 1u);
                 flush_span(dma_flush_authoritative(span, copy));
                 retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 // Source and destination are distinct ordered consumers: a disjoint source must not
@@ -12573,6 +12584,9 @@ GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
     return GuestGpuWriteQuery::Unchanged;
 }
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
+void set_ordered_operation_observer(OrderedOperationObserver observer) {
+    g_ordered_operation_observer.store(observer, std::memory_order_relaxed);
+}
 
 // #3948 stage 2: see LiveRenderPhase::defer_batch_completion.
 namespace {
