@@ -9,6 +9,40 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Three refused pixel programs in one run: descriptor words, not opcodes, and intermittent (2026-10-07, #4700)
+
+One run on `main` `156714914` refused three pixel programs from t=16 s: `prosper-app` inside the
+`ps5ys` container, RenderDoc layer active, capture scheduled at pad flip 430,
+`scripts/kena/linux-reach-level-load.pad`. `dropped-draws` fired in 30 of 35 windows, all
+`shader-recompile/fragment` (12,046 draws). Five other runs did not reproduce it.
+
+| run (all `linux-reach-level-load.pad`) | the three refusals |
+|---|---|
+| visuals lane, container, RenderDoc layer + capture | **yes** |
+| visuals lane, container, default | no |
+| this lane, container, RenderDoc layer + capture, 240 s (×2) | no, 0 `dropped-draws` windows |
+| this lane, container, default, 473 s span (past New Game) | no |
+
+- **Not an opcode gap.** `index.txt`'s `first_bad_fmt=4 op=0x8/0x7` is the compute-safe generic
+  census: SOPP `s_cbranch_execz` / `s_cbranch_vccnz`, which the fragment structurizer lowers. Each
+  program refused at an `image_sample_b` with `[mimg-unresolved] ... pc_res=null sgpr_res=cbuf`.
+  The T# slots are AGC `ro[]` entries declared `size=0`. In that run the V# shape test claimed them
+  as buffers; on default runs it does not.
+- **The words, not the claim, lost the draws.** The descriptor fold publishes any valid direct T#
+  keyed by its pc, and that route is tried first, so `pc_res=null` means the words were not a
+  usable T#. Leading hypothesis: another stage's V#s (#305's shape). #4592 recorded this program's
+  `s[8:15]` ending in `0004dfac`, the V# `dword3` constant RESOURCE_BINDING.md names.
+- **What landed:** the `[t8-dropped]` line prints the eight words, once per (program, pc, reason),
+  wherever the fold declines an image use. It was silent in all three runs above with this build.
+  The next reproduction keeps the evidence.
+- **What these programs draw** is not established. They account for ~12–57 draws per flip from t=16 s,
+  with NGG vertex programs `0x50409e0000` / `0x5040860000`, and sample one or two textures.
+- **Title menu unchanged.** An F9 screenshot at 222 s on the default run matches
+  `assets/screenshots/kena-title-menu-world.webp` apart from the falling leaf.
+- **Separate, after New Game** (default 473 s run): `ps 0x5052b20000` and `0x5008cc0000` (first
+  unsupported VOP3 `0x361`, `v_writelane_b32`), one compute program and two NGG vertex programs
+  (`refusal=ngg-indexed`) are refused, 38 fragment draws in 3 of 61 windows. Not investigated here.
+
 ## No refused fragment programs remain (2026-10-07, #4680)
 
 Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
@@ -441,6 +475,16 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Kena's three refused pixel programs of 2026-10-07 (`0x505b7f0000`, `0x5040eb0000`,
+  `0x5040890000`) contain instructions the recompiler cannot translate** — false. Their
+  `first_bad_fmt=4 op=0x8/0x7` is the generic census's SOPP branches, which the fragment path lowers.
+  The refusal was an unresolved `image_sample_b` descriptor (#4700).
+- **The RenderDoc layer causes those refusals** — not supported. 1 of 3 container runs with the layer
+  active reproduced them; two 240 s layer runs with the same environment showed none (#4700).
+- **Keeping a V#-claimed `size=0` T# slot a texture when the code reads it only as an image fixes
+  them** — false. Implemented, proven on the three dumps, and withdrawn. The fold's pc route already
+  resolves valid words, and invalid words fail the same checks in the texture loop
+  (`docs/gpu/RESOURCE_BINDING.md` § Ruled out, #4700).
 - **The `shader-recompile/fragment` drops are one refused Wave64 program that needs a recompiler
   feature** — false. Most were AGC helper rectangles compiling the pixel shader the previous draw
   left bound, against that draw's stale user data. The refused program changed from run to run

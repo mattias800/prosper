@@ -27,6 +27,7 @@
 #include "gpu/capture/capture_compute_policy.hpp"
 #include "gpu/diagnostics/compute_parent_walk.hpp"
 #include "gpu/diagnostics/shader_dump_filter.hpp"  // PROSPER_SHADER_DUMP_PROGRAM address filter
+#include "gpu/diagnostics/dropped_image_descriptor.hpp"   // [t8-dropped] (#4700)
 #include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
@@ -5299,6 +5300,9 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                                 (have_t8 || mapped_t8 || (seed_provenance &&
                                              (plausible_seed || exact_null_seed)))
                             ? &live_t8 : nullptr;
+                    if (!t8 && seed_provenance && live_t8_known)
+                        note_dropped_image_descriptor(uint64_t(uintptr_t(code)), in.pc, tbase,
+                                                      live_t8, "direct-seed-implausible");
                     uint32_t tkey = 0xFFFFFFFFu;
                     if (t8 && have_key) {
                         uint32_t common_key = 0;
@@ -7985,7 +7989,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         t.resources.push_back(rn);
                         continue;
                     }
-                    if (reject) continue;                                    // garbage/degenerate T#
+                    if (reject) {   // garbage/degenerate T#
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, reject);
+                        continue;
+                    }
                     // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
@@ -8000,7 +8007,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // bind this as RGBA8 for RTT injection; legacy single-target mode skips it.
                         static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
                                                      getenv("PROSPER_RTT_PERTARGET") != nullptr;
-                        if (!rtt_bind) continue;
+                        if (!rtt_bind) {
+                            note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                          "unmapped-img-fmt");
+                            continue;
+                        }
                         fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
                         fi.block_width = fi.block_height = 1; fi.srgb = false; fi.snorm = false;
                     }
@@ -8009,6 +8020,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     const DecodedImageView view = image_base_level_view(d, fi);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                      "unsupported-image-view");
                         continue;
                     }
                     const uint32_t img_dim = image_type_to_dim(d.type);
