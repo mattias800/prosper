@@ -16013,6 +16013,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
 }
 
 #include "fixtures/render_pass_segments.h"
+#include "fixtures/backend_call_stats_reset.h"
 
 // Logical multi-draw entry. Most calls remain one Vulkan render pass. A depth feedback transition
 // becomes multiple ordered passes without copying the (often large) BackendDraw shader/resource
@@ -16039,9 +16040,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (!backend_compact_resource_orders_valid(all)) {
         // This refusal never enters render_draw_pass_rgba, where these per-call results normally
         // reset. Do not let a preceding valid call masquerade as work done by this one.
-        backend_texture_upload_stats_storage() = {};
-        backend_resource_reuse_stats_storage() = {};
-        backend_render_timing_stats_storage() = {};
+        reset_backend_per_call_stats();   // every per-call stat, colour targets included (#4687)
         if (!all.empty())
             backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         prosper::gpu::refuse_draw_pass(all.size(), prosper::gpu::DrawDrop::ResourceOrder);
