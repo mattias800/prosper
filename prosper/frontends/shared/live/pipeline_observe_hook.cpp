@@ -51,19 +51,24 @@ std::vector<BindingRange> dispatch_binding_ranges(const std::vector<BoundBuffer>
 
 void pipeline_observe_dispatch(
     const prosper::gpu::ComputeItem& item, const std::vector<BoundBuffer>& buffers,
-    const std::vector<BoundImage>& images,
+    const std::vector<BoundImage>& images, std::chrono::steady_clock::time_point start,
     const std::optional<std::chrono::steady_clock::time_point>& pipeline_start,
-    const std::optional<std::chrono::steady_clock::time_point>& dispatch_end) {
+    const std::optional<std::chrono::steady_clock::time_point>& dispatch_end,
+    std::chrono::steady_clock::time_point loop_exit) {
     static const bool installed = [] {
         prosper::gpu::set_ordered_operation_observer(&on_ordered_operation);
         std::atexit([] { print_report("exit"); });
         return true;
     }();
     (void)installed;
-    const double wait_ms = pipeline_start && dispatch_end
-        ? std::chrono::duration<double, std::milli>(*dispatch_end - *pipeline_start).count() : 0.0;
-    observer().dispatch(item.submit_no, dispatch_binding_ranges(buffers, images),
-                        wait_ms > 0.0 ? wait_ms : 0.0);
+    const auto span_ms = [](auto from, auto to) {
+        return std::max(0.0, std::chrono::duration<double, std::milli>(to - from).count());
+    };
+    DispatchTimes times;
+    if (pipeline_start) times.setup_ms = span_ms(start, *pipeline_start);
+    if (pipeline_start && dispatch_end) times.gpu_ms = span_ms(*pipeline_start, *dispatch_end);
+    if (dispatch_end) times.writeback_ms = span_ms(*dispatch_end, loop_exit);
+    observer().dispatch(item.submit_no, dispatch_binding_ranges(buffers, images), times);
     static std::atomic<uint64_t> calls{0};
     if (calls.fetch_add(1, std::memory_order_relaxed) % 256 == 255) print_report("periodic");
 }

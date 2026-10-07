@@ -17,15 +17,18 @@ namespace prosper::frontend {
 // PROSPER_PIPELINE_OBSERVE, sampled once.
 bool pipeline_observe_enabled();
 
-// Report one completed dispatch. `pipeline_start` and `dispatch_end` are the backend's own phase
-// markers (before command recording, after the fence wait); either missing counts the wait as zero.
+// Report one completed dispatch with the backend's own phase markers: `start` (execute_item entry),
+// `pipeline_start` (before command recording), `dispatch_end` (after the fence wait) and `loop_exit`
+// (after writeback). A missing optional marker counts that span as zero. setup = start..pipeline_start,
+// gpu = pipeline_start..dispatch_end (record + submit + fence wait), writeback = dispatch_end..loop_exit.
 // The first call also installs the executor's ordered-operation hook, so graphics spans and DMA
 // copies between dispatches are seen from then on.
 void pipeline_observe_dispatch(
     const prosper::gpu::ComputeItem& item, const std::vector<BoundBuffer>& buffers,
-    const std::vector<BoundImage>& images,
+    const std::vector<BoundImage>& images, std::chrono::steady_clock::time_point start,
     const std::optional<std::chrono::steady_clock::time_point>& pipeline_start,
-    const std::optional<std::chrono::steady_clock::time_point>& dispatch_end);
+    const std::optional<std::chrono::steady_clock::time_point>& dispatch_end,
+    std::chrono::steady_clock::time_point loop_exit);
 
 // The ranges a dispatch's bindings occupy in guest memory, and how it uses them. Pure; the hook
 // above is this plus a call into the observer. Conservative on purpose: every buffer counts as read

@@ -13298,7 +13298,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Where the phase chain stopped: equal to phase_writeback (to the clock's resolution) on both
     // success paths, and the end of the truncated phase on every early break.
     const auto phase_loop_exit = ComputeClock::now();
-    if (ok && pipeline_observe_enabled()) pipeline_observe_dispatch(item, buffers, images, phase_pipeline, phase_dispatch);
+    if (ok && pipeline_observe_enabled()) pipeline_observe_dispatch(item, buffers, images, phase_start, phase_pipeline, phase_dispatch, phase_loop_exit);
 
     if (trace) {
         // #2790: dump this dispatch's SPIR-V when asked, INCLUDING when it failed. The existing

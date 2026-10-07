@@ -129,6 +129,30 @@ What it says, and what it does not:
   model's graphics spans are rare there; a title that interleaves draws and dispatches will sit near the
   barrier row.
 
+### Predicted gain from overlapping CPU and GPU work (timeline model)
+
+Each dispatch is also reported with its measured setup (entry to command recording), GPU span (record, submit
+and fence wait, an upper bound on what the GPU needs) and writeback. The models replay them on a CPU/GPU
+timeline: the CPU sets a dispatch up and submits it, the GPU runs it after what it is already running, and the
+writeback is paid when the queue retires it. The first rows are what pipelining would have allowed under the
+contract; sequential is today's sum.
+
+Same title, machine and route, 2,560 dispatches in about 50 s:
+
+| model | sequential | pipelined | pipelined / sequential |
+| --- | --- | --- | --- |
+| ranges-only, depth 4 | 30,954 ms | 27,156 ms | 88% |
+| ranges-only, depth 64 | 30,954 ms | 27,137 ms | 88% |
+| barriers, depth 4 | 30,954 ms | 27,539 ms | 89% |
+| barriers, depth 64 | 30,954 ms | 27,534 ms | 89% |
+
+**Pipelining ADR 0009 step 3 would cut about 11-12% of the compute critical path on this title, and the two
+bounds agree to within a point.** The reason is structural: the CPU work (setup plus writeback) is about 85%
+of each dispatch's time, and overlap can only hide the GPU/wait part. The floor is the CPU work itself, so a
+bigger gain needs that work reduced, not overlapped. Limits: only compute dispatches are on the timeline
+(graphics spans have no measured cost here); the GPU span is an upper bound, which if anything understates
+the overlap; one title.
+
 ## What this note does not claim
 
 No speed-up is measured here. The ceiling for Stage 1 on GTA V was bounded at about 5 % of wall time in
