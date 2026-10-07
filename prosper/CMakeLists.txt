@@ -7031,6 +7031,14 @@ if(TARGET gpu_replay)
     PROPERTIES TIMEOUT 60)
   target_compile_definitions(test_gpu_capture_observation_cli PRIVATE PROSPER_OBSERVATION_CLI_TESTS=1)
   add_dependencies(test_gpu_capture_observation_cli gpu_replay)
+  # #4703 review B2: both gpu_replay fragment-regeneration routes use the captured export formats.
+  prosper_add_gtest(test_replay_export_formats
+    SOURCES tests/gpu/capture/test_replay_export_formats.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    PROPERTIES TIMEOUT 60)
+  add_dependencies(test_replay_export_formats gpu_replay)
 endif()
 
 # CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links

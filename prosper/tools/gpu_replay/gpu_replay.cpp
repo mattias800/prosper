@@ -3398,10 +3398,12 @@ int main(int argc, char** argv) {
                     const auto fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
                         raw_fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
                     fs = prosper::gpu::recompile_fragment(
-                        raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
-                        UINT32_MAX, &interpolation, fragment_wave.wave32(),
-                        {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
-                        it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
+                        raw.words.data(), raw.words.size(), it.prt.get(), system_inputs, UINT32_MAX,
+                        &interpolation, fragment_wave.wave32(),
+                        {prosper::gpu::RecompileDiagnosticStage::Fragment, 0}, it.ps_float_mode,
+                        nullptr, it.float_transport, it.ps_float_flags,
+                        // #4703: the captured col_format and target classes, exactly as live.
+                        prosper::gpu::fragment_export_formats(it.ps));
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(
@@ -3608,13 +3610,12 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(),
                     it.has_system_inputs ? &it.system_inputs : nullptr,
                     it.has_pixel_inputs ? &it.pixel_inputs : nullptr);
-                auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
-                                                           it.prt.get(),
-                                                           it.has_system_inputs ? &it.system_inputs : nullptr,
-                                                           UINT32_MAX, &interpolation,
-                                                           fragment_wave.wave32(),
-                                                           {prosper::gpu::RecompileDiagnosticStage::Fragment,
-                                                            0}, it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
+                auto fs = prosper::gpu::recompile_fragment(
+                    raw.words.data(), raw.words.size(), it.prt.get(),
+                    it.has_system_inputs ? &it.system_inputs : nullptr, UINT32_MAX, &interpolation,
+                    fragment_wave.wave32(), {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
+                    it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags,
+                    prosper::gpu::fragment_export_formats(it.ps));
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -4153,12 +4154,20 @@ int main(int argc, char** argv) {
                     failure.ps_launch_rsrc1, "failure", static_cast<uint64_t>(failure_index), capture.format_version);
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
-                    raw.words.data(), raw.words.size(), resources,
-                    system_inputs, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    raw.words.data(), raw.words.size(), resources, system_inputs,
+                    /*pcrel_dispatch_target=*/UINT32_MAX,
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
-                    failure.ps_float_mode, nullptr, failure.float_transport, failure.ps_float_flags);
+                    failure.ps_float_mode, nullptr, failure.float_transport, failure.ps_float_flags,
+                    // #4703: a failure record without its pipeline cannot name the targets, so
+                    // it retries with the historical f16/float module and says so.
+                    failure.pipeline_present
+                        ? prosper::gpu::fragment_export_formats(failure.pipeline)
+                        : prosper::gpu::FragmentExportFormats{});
+                if (!failure.pipeline_present)
+                    std::fprintf(stderr, "[retry-failed-stage] fragment-export-formats=unavailable "
+                                         "(no captured pipeline; f16 decode, float outputs)\n");
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

@@ -32,6 +32,8 @@
 #include "gpu/state/vk_translate.hpp"
 #include "shared/live/live_target_format.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -228,6 +230,53 @@ TEST(IntegerColorExport, GuestAndBackendAgree) {
     EXPECT_EQ(prosper::test::backend_color_bytes_per_pixel(VK_FORMAT_R16_UINT), 2u);
 }
 
+// #4703 review B1. An integer fast clear stores the raw integer: CB_COLOR_CLEAR_WORD0 0xFF017F00
+// on an R8G8B8A8_UINT target is (0, 127, 1, 255), and on _SINT (0, 127, 1, -1). The decode used to
+// normalize every COLOR_8_8_8_8 byte by 255, so the by-value integer clear stored 255 as 1 and
+// 1..254 as 0. Mutation: drop the UINT/SINT arms of decode_clear_color -> this goes red. No GPU.
+TEST(IntegerColorExport, IntegerFastClearDecodesRawBytes) {
+    struct Arm {
+        uint32_t number_type;
+        VkFormat format;
+        int32_t expected[4];
+    };
+    const Arm arms[] = {{4u, VK_FORMAT_R8G8B8A8_UINT, {0, 127, 1, 255}},
+                        {5u, VK_FORMAT_R8G8B8A8_SINT, {0, 127, 1, -1}}};
+    for (const Arm& arm : arms) {
+        gpu::RenderState rs{};
+        rs.color0_format = 0xAu;   // COLOR_8_8_8_8
+        rs.color0_number_type = arm.number_type;
+        rs.color0_has_clear = true;
+        rs.color0_clear_word0 = 0xFF017F00u;
+        // The same word on MRT2 reaches the slot-2+ clear through color_targets.
+        auto& mrt2 = rs.color_targets[2];
+        mrt2.format = 0xAu;
+        mrt2.number_type = arm.number_type;
+        mrt2.has_clear = true;
+        mrt2.clear_word0 = 0xFF017F00u;
+        const ResolvedPipelineState ps = gpu::resolve_pipeline_state(rs);
+        ASSERT_TRUE(ps.has_clear_color);
+        ASSERT_EQ(ps.color0_format, static_cast<uint32_t>(arm.format));
+        ASSERT_TRUE(ps.color_targets[2].has_clear);
+        const VkClearColorValue slot0 =
+            prosper::test::backend_clear_color_value(arm.format, ps.clear_color);
+        const VkClearColorValue slot2 =
+            prosper::test::backend_clear_color_value(arm.format, ps.color_targets[2].clear);
+        for (int i = 0; i < 4; ++i) {
+            EXPECT_EQ(slot0.int32[i], arm.expected[i]) << "slot 0 channel " << i;
+            EXPECT_EQ(slot2.int32[i], arm.expected[i]) << "slot 2 channel " << i;
+        }
+    }
+    // Control: the UNORM row still normalizes (0x7F -> 127/255), so only integers changed.
+    gpu::RenderState rs{};
+    rs.color0_format = 0xAu;
+    rs.color0_has_clear = true;
+    rs.color0_clear_word0 = 0xFF017F00u;
+    const ResolvedPipelineState ps = gpu::resolve_pipeline_state(rs);
+    EXPECT_FLOAT_EQ(ps.clear_color[1], 127.0f / 255.0f);
+    EXPECT_FLOAT_EQ(ps.clear_color[3], 1.0f);
+}
+
 TEST(IntegerColorExport, CacheKey) {
     gpu::clear_shader_recompile_cache();
     const auto code = compressed_writer(0xbeef0001u, 0x00020003u);
@@ -322,6 +371,93 @@ TEST(IntegerColorExport, RoundTrip) {
         const auto px = render(fs, VK_FORMAT_R16_UINT);
         ASSERT_EQ(px.size(), size_t(W) * H * 2u) << "R16_UINT is a 2-byte attachment";
         EXPECT_EQ(u16_at_center(px), expected) << std::hex << "rg=0x" << rg;
+    }
+}
+
+namespace {
+// Render `rg`/`ba` through one compressed MRT0 export with col_format `code` into `format`, whose
+// output class is `cls`, and return the centre texel's native bytes.
+std::vector<uint8_t> render_compressed(uint32_t rg, uint32_t ba, uint32_t code,
+                                       FragmentOutputClass cls, VkFormat format,
+                                       size_t texel_bytes) {
+    FragmentOutputClass classes[8]{};
+    classes[0] = cls;
+    const auto code_words = compressed_writer(rg, ba);
+    const auto fs =
+        recompile_fragment(code_words.data(), code_words.size(), nullptr, nullptr, UINT32_MAX,
+                           nullptr, false, {RecompileDiagnosticStage::Fragment, 0}, {}, nullptr, {},
+                           {}, make_fragment_export_formats(code, classes));
+    if (fs.empty()) return {};
+    const auto px = render(fs, format);
+    if (px.size() != size_t(W) * H * texel_bytes) return {};
+    return {px.begin() + std::ptrdiff_t(kCenter * texel_bytes),
+            px.begin() + std::ptrdiff_t((kCenter + 1) * texel_bytes)};
+}
+
+std::array<float, 4> as_floats(const std::vector<uint8_t>& texel) {
+    std::array<float, 4> out{};
+    if (texel.size() == 16) std::memcpy(out.data(), texel.data(), 16);
+    return out;
+}
+}   // namespace
+
+// #4703 review B3: the decodes most titles reach (every 16-bit normalized target is exported as
+// UNORM16/SNORM16_ABGR) checked by VALUE, through float32 targets that keep the exact quotient.
+// Mutations, each run: unorm divisor 65536 -> Unorm16 red; drop the snorm max(-1) clamp
+// (unpack_norm) or divide by 32768 -> Snorm16 red; bfe_s for UINT16 -> Uint16HighBit red; bfe_u
+// for SINT16 -> Sint16Sign red.
+TEST(IntegerColorExport, Unorm16Values) {
+    if (!device_available()) GTEST_SKIP() << "no Vulkan device";
+    // (r, g, b, a) = (0xFFFF, 0x8000, 0x0000, 0x0001)
+    const auto texel = render_compressed(0x8000ffffu, 0x00010000u, 0x5u, FragmentOutputClass::Float,
+                                         VK_FORMAT_R32G32B32A32_SFLOAT, 16);
+    ASSERT_EQ(texel.size(), 16u);
+    const auto v = as_floats(texel);
+    // Vulkan lets FDiv err by 2.5 ULP; every mutation moves a value by >= 1.5e-5.
+    constexpr float kTol = 1e-6f;
+    EXPECT_NEAR(v[0], 1.0f, kTol) << "0xFFFF is 1.0 (x / 65535)";
+    EXPECT_NEAR(v[1], 32768.0f / 65535.0f, kTol);
+    EXPECT_EQ(v[2], 0.0f);
+    EXPECT_NEAR(v[3], 1.0f / 65535.0f, kTol);
+}
+
+TEST(IntegerColorExport, Snorm16Values) {
+    if (!device_available()) GTEST_SKIP() << "no Vulkan device";
+    // (r, g, b, a) = (0x7FFF, 0x8001, 0x8000, 0x0001)
+    const auto texel = render_compressed(0x80017fffu, 0x00018000u, 0x6u, FragmentOutputClass::Float,
+                                         VK_FORMAT_R32G32B32A32_SFLOAT, 16);
+    ASSERT_EQ(texel.size(), 16u);
+    const auto v = as_floats(texel);
+    constexpr float kTol = 1e-6f;   // as above
+    EXPECT_NEAR(v[0], 1.0f, kTol) << "0x7FFF is 1.0 (x / 32767)";
+    EXPECT_NEAR(v[1], -1.0f, kTol) << "0x8001 is -1.0";
+    EXPECT_NEAR(v[2], -1.0f, kTol) << "0x8000 clamps to -1.0, not -1.00003";
+    EXPECT_NEAR(v[3], 1.0f / 32767.0f, kTol);
+}
+
+TEST(IntegerColorExport, Uint16HighBit) {
+    if (!device_available()) GTEST_SKIP() << "no Vulkan device";
+    // UINT16 0xBEEF into a 32-bit target: a sign-extending decode would read 0xFFFFBEEF.
+    const auto texel =
+        render_compressed(0x0000beefu, 0u, 0x7u, FragmentOutputClass::Uint, VK_FORMAT_R32_UINT, 4);
+    ASSERT_EQ(texel.size(), 4u);
+    uint32_t value = 0;
+    std::memcpy(&value, texel.data(), 4);
+    EXPECT_EQ(value, 0x0000beefu);
+}
+
+TEST(IntegerColorExport, Sint16Sign) {
+    if (!device_available()) GTEST_SKIP() << "no Vulkan device";
+    // SINT16 0x8000 and 0xFFFF into a 32-bit signed target: -32768 and -1, sign-extended.
+    for (const auto& [rg, expected] :
+         {std::pair{0x00008000u, int32_t(-32768)}, std::pair{0x0000ffffu, int32_t(-1)},
+          std::pair{0x00007fffu, int32_t(32767)}}) {
+        const auto texel =
+            render_compressed(rg, 0u, 0x8u, FragmentOutputClass::Sint, VK_FORMAT_R32_SINT, 4);
+        ASSERT_EQ(texel.size(), 4u);
+        int32_t value = 0;
+        std::memcpy(&value, texel.data(), 4);
+        EXPECT_EQ(value, expected) << std::hex << "rg=0x" << rg;
     }
 }
 

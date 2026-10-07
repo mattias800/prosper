@@ -216,8 +216,17 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
                         bool has_clear, uint32_t w0, float out[4]) {
     if (!has_clear) return false;
     if (format == 0xAu) {  // COLOR_8_8_8_8
-        const float b0 = (w0 & 0xFFu) / 255.0f, b1 = ((w0 >> 8) & 0xFFu) / 255.0f,
-                    b2 = ((w0 >> 16) & 0xFFu) / 255.0f, b3 = ((w0 >> 24) & 0xFFu) / 255.0f;
+        // UINT (4) and SINT (5) store the raw integer, not a normalized value: the clear word's
+        // byte 255 is the integer 255, and a SINT byte is two's complement. The backend clears an
+        // integer attachment BY VALUE (backend_clear_color_value), so normalizing here stored 255
+        // as 1 and every byte 1..254 as 0 (#4703 review B1).
+        const auto byte = [&](uint32_t k) -> float {
+            const uint32_t b = (w0 >> (8u * k)) & 0xFFu;
+            if (number_type == 4u) return static_cast<float>(b);
+            if (number_type == 5u) return static_cast<float>(static_cast<int8_t>(b));
+            return b / 255.0f;
+        };
+        const float b0 = byte(0), b1 = byte(1), b2 = byte(2), b3 = byte(3);
         float r, g, b, a = b3;                     // alpha is byte 3 for both swaps
         if (comp_swap == 1u) { r = b2; g = b1; b = b0; }   // ALT: B8G8R8A8 (byte0=B)
         else                            { r = b0; g = b1; b = b2; }  // STD: R8G8B8A8 (byte0=R)

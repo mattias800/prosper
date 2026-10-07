@@ -604,6 +604,21 @@ TEST_P(OwnedGraphicsWaveLive, StateRefusedOwnedWavesSkipThePublication) {
     EXPECT_EQ(refusal(metadata), "draw-wave-output-metadata-extent-unavailable")
         << "the state refusal must win over the unpublished-producer refusal";
 
+    // #4703: the packet commit shader declares float outputs, so an owned fragment draw into an
+    // integer target, or one whose col_format needs a non-f16 compressed decode, is refused by
+    // state. Mutation: delete the two checks at the end of owned_wave_draw_state_refusal.
+    auto integer = state(*vs, *ps, false);
+    integer.cx[P::CB_COLOR0_INFO] = (0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT) |
+                                    (4u << P::CB_COLOR0_INFO_NUMBER_TYPE_SHIFT);   // RGBA8_UINT
+    EXPECT_STREQ(owned_wave_draw_state_refusal(integer, true),
+                 "draw-wave-integer-color-output-unimplemented");
+    EXPECT_EQ(owned_wave_draw_state_refusal(integer, false), nullptr)
+        << "a vertex-only owned draw writes through the native fragment module";
+    auto unorm16 = state(*vs, *ps, false);
+    unorm16.cx[P::SPI_SHADER_COL_FORMAT] = 0x5u;   // UNORM16_ABGR
+    EXPECT_STREQ(owned_wave_draw_state_refusal(unorm16, true),
+                 "draw-wave-compressed-export-format-unimplemented");
+
     // Only an owned FRAGMENT stage is refused by the fragment launch. An owned vertex stage with
     // a plain PS whose launch word is missing must keep its publication: it may be admitted.
     auto* owned_vs = register_program(true, vertex_code(true, GetParam()));

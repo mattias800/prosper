@@ -233,8 +233,10 @@ constexpr uint32_t live_target_vk_format_bytes(VkFormat vk_format) {
 }
 
 // Bytes per texel of a GUEST colour-target format (the raw CB format, not the renderer's canonical
-// host storage, which folds every format outside a short list into RGBA8). Zero for packed or
-// unrecognised formats: unknown is never grounds to refuse.
+// host storage). Host storage keeps the float formats on a short list and every integer format
+// (#4703), and folds the rest -- the 16-bit UNORM/SNORM, 2_10_10_10 UNORM and SNORM8 formats among
+// them -- into RGBA8 (tests/fixtures/backend_color_formats.h). Zero for packed or unrecognised
+// formats: unknown is never grounds to refuse.
 constexpr uint32_t live_target_guest_format_bytes(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT:
