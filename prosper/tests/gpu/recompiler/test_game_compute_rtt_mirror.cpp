@@ -1600,9 +1600,10 @@ static int run_destination_mirror_regression() {
     // compute stores it natively as A2B10G10R10. The exact-result mirror converts on the GPU with the
     // CPU path's integer rounding (PackedRttConversion::record_packed10_to_rgba8) instead of unpacking
     // every texel on the CPU (publish_unorm10_as_rgba8). Before it these results were declined as
-    // "format-unmapped". Every 10-bit value appears once per channel and every alpha value in a row,
-    // and each output byte is compared with the CPU table: a float conversion (a blit) rounds 48 of
-    // the 1,024 values one step low on RADV, which a single-value check cannot see.
+    // "format-unmapped". Every 10-bit value appears once per channel -- a DIFFERENT permutation in each
+    // colour channel (R = t, G = t ^ 0x155, B = 1023 - t), so a channel swap cannot pass -- and every
+    // alpha value in a row. Each output byte is compared with the CPU table: a float conversion (a
+    // blit) rounds 48 of the 1,024 values one step low on RADV, which a single-value check cannot see.
     {
         constexpr uint32_t PW = 256, PH = 4;
         std::vector<uint8_t> p10_guest(PW * PH * 4, 0x5a);
@@ -1617,9 +1618,12 @@ static int run_destination_mirror_regression() {
             0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
             0x340C0A88u,              // v6 = y << 8
             0x4A0C0906u,              // v6 = v6 + x: every value 0..1023 once
-            0x7E000D06u,              // v0 = float(v6)
+            0x3A0E0CFFu, 0x155u,      // v7 = v6 ^ 0x155
+            0x4C100CFFu, 0x3FFu,      // v8 = 1023 - v6
+            0x7E000D06u, 0x7E020D07u, 0x7E040D08u, // v0, v1, v2 = float(v6, v7, v8)
             0x100000FFu, 0x3A802008u, // v0 *= 1/1023
-            0x7E020300u, 0x7E040300u, // v1 = v2 = v0
+            0x100202FFu, 0x3A802008u, // v1 *= 1/1023
+            0x100404FFu, 0x3A802008u, // v2 *= 1/1023
             0x7E060D05u,              // v3 = float(y)
             0x100606FFu, 0x3EAAAAABu, // v3 *= 1/3: alpha 0..3 by row
             0xF0200F08u, 0x00020004u, // image_store v[0:3] (dmask RGBA) at v4,v5 through s[8:15]
@@ -1653,6 +1657,7 @@ static int run_destination_mirror_regression() {
         const auto p10_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
         CHECK(p10_after.candidates == p10_before.candidates + 1 &&
                   p10_after.borrowed == p10_before.borrowed + 1 &&
+                  p10_after.recorded == p10_before.recorded + 1 &&
                   p10_after.published == p10_before.published + 1 &&
                   p10_after.failed == p10_before.failed,
               "R10G10B10A2 result is mirrored on the GPU and publishes after writeback");
@@ -1662,8 +1667,8 @@ static int run_destination_mirror_regression() {
         std::memcpy(p10_words.data(), p10_guest.data(), p10_guest.size());
         size_t covered = 0;
         for (size_t t = 0; t < p10_words.size(); ++t)
-            covered += (p10_words[t] & 0x3ffu) == t && ((p10_words[t] >> 10) & 0x3ffu) == t &&
-                       ((p10_words[t] >> 20) & 0x3ffu) == t && (p10_words[t] >> 30) == t / PW;
+            covered += (p10_words[t] & 0x3ffu) == t && ((p10_words[t] >> 10) & 0x3ffu) == (t ^ 0x155u) &&
+                       ((p10_words[t] >> 20) & 0x3ffu) == 1023u - t && (p10_words[t] >> 30) == t / PW;
         CHECK(covered == p10_words.size(),
               "R10G10B10A2 guest writeback holds every 10-bit value and every alpha");
         LiveTargetImageRequest p10_request{};
@@ -1679,17 +1684,27 @@ static int run_destination_mirror_regression() {
         const bool read = prosper::test::readback_persistent_color_target(
             p10_address, PW, PH, VK_FORMAT_R8G8B8A8_UNORM, p10_pixels, p10_error) &&
             p10_pixels.size() == size_t{PW} * PH * 4;
-        size_t exact = 0;
+        size_t mismatches[4] = {};
         for (size_t t = 0; read && t < p10_words.size(); ++t) {
             const uint32_t w = p10_words[t];
             const uint8_t* px = p10_pixels.data() + t * 4;
-            exact += px[0] == prosper::frontend::kUnorm10To8[w & 0x3ffu] &&
-                     px[1] == prosper::frontend::kUnorm10To8[(w >> 10) & 0x3ffu] &&
-                     px[2] == prosper::frontend::kUnorm10To8[(w >> 20) & 0x3ffu] &&
-                     px[3] == prosper::frontend::kUnorm2To8[w >> 30];
+            mismatches[0] += px[0] != prosper::frontend::kUnorm10To8[w & 0x3ffu];
+            mismatches[1] += px[1] != prosper::frontend::kUnorm10To8[(w >> 10) & 0x3ffu];
+            mismatches[2] += px[2] != prosper::frontend::kUnorm10To8[(w >> 20) & 0x3ffu];
+            mismatches[3] += px[3] != prosper::frontend::kUnorm2To8[w >> 30];
         }
-        CHECK(read && exact == p10_words.size(),
+        if (mismatches[0] || mismatches[1] || mismatches[2] || mismatches[3])
+            std::fprintf(stderr, "R10G10B10A2 mismatches R=%zu G=%zu B=%zu A=%zu of %zu\n", mismatches[0],
+                         mismatches[1], mismatches[2], mismatches[3], p10_words.size());
+        CHECK(read && !mismatches[0] && !mismatches[1] && !mismatches[2] && !mismatches[3],
               "R10G10B10A2 renderer image equals the CPU path's conversion byte for byte");
+        // A packed-10 sampled binding is never a raw import of the RGBA8 renderer image, so the
+        // raw-copy seed and result mirror (seed_from_imported) can never reach this format.
+        CHECK(!prosper::frontend::direct_sampled_rtt_compatible(DataFormat::Unorm2_10_10_10, 4,
+                                                                LiveTargetPixelFormat::Rgba8Unorm, true) &&
+                  !prosper::frontend::direct_sampled_rtt_compatible(DataFormat::Unorm2_10_10_10, 4,
+                                                                    LiveTargetPixelFormat::Rgba8Unorm, false),
+              "packed R10G10B10A2 never imports the RGBA8 renderer image raw");
     }
     // R8Unorm (one 8-bit channel) is the same destination-mirror shape as RGBA8: the shader writes a
     // native R8_UNORM storage image and the renderer's R8_UNORM image seeds and receives it by an
