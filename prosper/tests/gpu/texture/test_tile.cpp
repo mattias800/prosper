@@ -2,6 +2,7 @@
 // inverses of tiling (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and
 // that tiled layouts are genuine permutations (no texel dropped/duplicated).
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -1174,6 +1175,23 @@ TEST(Tile, Contract) {
               !gfx10_dcc_fast_clear_admits(2, false, true, false, true) &&  // no RGBA8 buffer
               !gfx10_dcc_fast_clear_admits(1, false, false, false, true),
               "narrow DCC fast-clear admission: RGBA8 buffer, never HTILE, DCC or a never-depth format");
+        // The never-depth list is the depth-safety boundary: every depth/stencil sampled format must
+        // stay off it, and Float16 (Black Flag's R16F pool) must stay on it (#4699 review).
+        CHECK(gfx10_dcc_format_never_depth(DataFormat::Float16) &&
+              gfx10_dcc_format_never_depth(DataFormat::Snorm16) &&
+              gfx10_dcc_format_never_depth(DataFormat::Sint16) &&
+              gfx10_dcc_format_never_depth(DataFormat::Unorm8) &&
+              gfx10_dcc_format_never_depth(DataFormat::Snorm8) &&
+              gfx10_dcc_format_never_depth(DataFormat::Sint8),
+              "formats no depth view uses are on the never-depth list");
+        CHECK(!gfx10_dcc_format_never_depth(DataFormat::Float32) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Unorm16) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Uint16) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Uint8) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Uint32) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Sint32) &&
+              !gfx10_dcc_format_never_depth(DataFormat::Unknown),
+              "depth (D32 Float32, D16 Unorm16) and stencil/integer views stay off the list");
         CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
                                           mixed_clear.data(), mixed_clear.size(), 4, true) &&
               !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,

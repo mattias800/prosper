@@ -305,13 +305,16 @@ int main() {
     // dispatch as a failure (and poisoned its producer epoch) although nothing was wrong (#4131).
     {
         reset_output(out);
-        const uint64_t out_base = reinterpret_cast<uint64_t>(out);
+        const auto out_base = reinterpret_cast<uint64_t>(out);
         uint32_t output_writes = 0;
-        set_guest_gpu_write_observer([&](uint64_t address, uint64_t size, const char*) {
+        set_guest_gpu_write_observer([&output_writes, out_base](uint64_t address, uint64_t size,
+                                                                const char*) {
             if (address < out_base + kOutputBytes && out_base < address + size) ++output_writes;
         });
         ComputeItem zero = consumer(0, 0x36560065u);   // direct form: no indirect arguments
-        zero.launch.groups_x = zero.launch.groups_y = zero.launch.groups_z = 0;
+        zero.launch.groups_x = 0;
+        zero.launch.groups_y = 0;
+        zero.launch.groups_z = 0;
         const std::vector<bool> ran = run_submit({zero});
         set_guest_gpu_write_observer({});
         CHECK(ran.size() == 1 && ran[0],
