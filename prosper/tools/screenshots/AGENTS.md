@@ -1,5 +1,12 @@
 # `prosper/tools/screenshots/` — keeping committed imagery from swallowing the repository
 
+`shrink.py` keeps every capture a 1920-wide WebP. `check_screenshot_paths.py` REPORTS captures
+outside a *proposed* path convention,
+`assets/screenshots/<TITLE_ID>-<slug>|cross-title|app/<YYYY-MM-DD>-<what>[-i<issue>].webp`
+(spec `ASSET-1`, ADR 0026, both still proposed). It runs report-only and the convention is NOT yet
+required: keep naming captures as before until ADR 0026 is accepted, which removes `--report-only`.
+Captures predating the proposal are listed in `legacy_screenshot_paths.txt`.
+
 One tool, `shrink.py`, and one rule: **a screenshot committed to `assets/screenshots/` is a 1920-wide
 WebP, not a 4K PNG.**
 

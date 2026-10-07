@@ -1265,6 +1265,33 @@ logically sound, but it cannot make Windows exception delivery ABI-safe. Re-enab
 fault delivery itself preserves all guest red-zone bytes. Direct memory now uses a delete-on-close sparse file,
 so the kernel demand-pages mapped file data without the unsafe user-mode `SEC_RESERVE` first-touch exceptions.
 
+### Ruled out
+
+- **`GetWriteWatch` as the fault-free replacement for the retired write watch, on Black Flag
+  (2026-10-07, #4681, tracker #4131).** Two halves, both measured.
+  *The API.* Its documented contract is memory allocated with `VirtualAlloc(MEM_WRITE_WATCH)`; a probe
+  (`VirtualAlloc`, `VirtualAlloc2` placeholders, `CreateFileMapping`/`MapViewOfFile`, `MapViewOfFile3`)
+  found it works on private memory, including private memory that replaces a placeholder with
+  `MEM_WRITE_WATCH`, and returns `ERROR_INVALID_PARAMETER` (87) for every section view (pagefile-backed,
+  file-backed, placeholder-replaced); `MapViewOfFile3` refuses `MEM_WRITE_WATCH` with 87 too.
+  *The data.* The census (then `PROSPER_VALIDATION_MAPPING_CENSUS`, since #4684 an always-on `[validation-census]` exit summary) classifies each fully-compared range with
+  `VirtualQuery` (`MEM_PRIVATE` vs `MEM_MAPPED`). One ~110 s Black Flag run: **100% section views, 0%
+  private**, on both compare paths -- the renderer's validations (1,180 compares, 5.21 GB) and the compute
+  buffer cache's full compares (5,955 compares, **66.07 GB**, about 12x the renderer's volume). Earlier
+  renderer-only runs agree (999 / 3.78 GB, 880 / 3.26 GB, 1,004 / 4.43 GB). Of the renderer's compares,
+  5, 5 and 0 found a change (0.3% of the bytes at most); the compute side records no outcome.
+  *Scope.* Black Flag only, one platform (Windows/NVIDIA). Dragon Quest VII never reached validation
+  traffic in the short runs. A sound unchanged-signal from another source would remove most of this
+  compare work, and the compute buffer cache is where most of the bytes are.
+  *Sizes (always-on census, a different ~110 s Black Flag run with a wider instrument that also covers the
+  compute miss path, so its totals are not comparable with the two compute figures above: 14,860 compares /
+  61.2 GB here against the 5,955 / 66.07 GB of the gated build).* Compute: 4,855 compares of about 5.7 MB make
+  27.9 GB, and 556 compares of about 59.5 MB (about 57 MiB, the constant ring) make 33.1 GB, so the ring is
+  54% of the compared bytes. Four compute compares (33.2 MB, exactly four 1920x1080 RGBA8 images) were classified private --
+  most likely prosper's own seed vector rather than guest memory (to verify). Renderer: 537 compares of
+  about 8.8 MB make 4.75 GB. **Bound:** the same capture's sampled profile puts `memcmp` at 6.2% of Black
+  Flag's submit thread, so eliminating every compare would recover about that much, not the dominant cost.
+
 ## Separate unresolved risk
 
 Native Windows boot can still intermittently stop after exactly 75 submits while asset loading and

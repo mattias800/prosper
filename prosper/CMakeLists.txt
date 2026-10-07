@@ -143,8 +143,10 @@ prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOU
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(WIN32)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_unavailable\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/mapping_class_posix\\.cpp$")
 else()
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_win\\.cpp$")
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/platform/mapping_class_win\\.cpp$")
 endif()
 if(PROSPER_NATIVE_CLANG_TLS)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
@@ -216,6 +218,15 @@ add_test(NAME storage_write_mask_spirv COMMAND test_storage_write_mask_spirv)
 add_executable(test_compute_timing_selector tests/shared/compute/test_compute_timing_selector.cpp)
 target_include_directories(test_compute_timing_selector PRIVATE frontends)
 add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selector)
+
+# prosper_add_gtest itself (#4682): a list-valued PROPERTIES value must reach every discovered case
+# whole. Forwarded through gtest_discover_tests it was split into words, which CMake 3.31 applied
+# wrongly and silently and which segfaulted CTest 4.4 before any test ran. No prosper code linked.
+prosper_add_gtest(test_gtest_registration_properties
+  SOURCES tests/misc/test_gtest_registration_properties.cpp
+  PROPERTIES ENVIRONMENT_MODIFICATION
+    "GTEST_REGISTRATION_PROBE_A=set:alpha;GTEST_REGISTRATION_PROBE_B=set:beta;GTEST_REGISTRATION_PROBE_C=set:gamma delta"
+    TIMEOUT 30)
 
 # execute_item()'s five CPU phases on a dispatch that breaks early (#3461): no negative interval,
 # no whole-item cleanup, and the parts still sum to the item.
@@ -1921,6 +1932,28 @@ if(TARGET prosper_core)
   add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
   target_include_directories(test_texture_direct_validation PRIVATE frontends)
   target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)
+
+  # The census arithmetic behind the [validation-census] exit summary (which kind of host memory backs the
+  # fully-compared guest ranges). Header-only apart from the platform classifier it declares, which
+  # prosper_core provides.
+  prosper_add_gtest(test_validation_mapping_census
+    SOURCES frontends/shared/tests/test_validation_mapping_census.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
+  # The host mapping classifier (src/host/platform/mapping_class.hpp): one test per backend, chosen the
+  # same way the backends are.
+  if(WIN32)
+    prosper_add_gtest(test_mapping_class
+      SOURCES tests/host/platform/test_mapping_class_win.cpp
+      INCLUDES src
+      LIBRARIES prosper_core)
+  else()
+    prosper_add_gtest(test_mapping_class
+      SOURCES tests/host/platform/test_mapping_class_posix.cpp
+      INCLUDES src
+      LIBRARIES prosper_core)
+  endif()
   add_test(NAME texture_direct_validation COMMAND test_texture_direct_validation texture-direct-validation.jsonl)
   add_test(NAME texture_direct_validation_disabled COMMAND test_texture_direct_validation texture-direct-validation-disabled.jsonl)
   set_tests_properties(texture_direct_validation_disabled PROPERTIES
@@ -5047,6 +5080,14 @@ endif()
         SOURCES tests/gpu/execute/test_renderer_volume_publication.cpp
         INCLUDES src tests frontends
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
+      # #4643: a layered colour pass with two volume targets (Kena's translucency-lighting
+      # injection): every slice of both volumes, per-slot layer routing, the slot-1 control, the
+      # named refusal of a layered 2D+3D pass, and the split contract that keeps it on the GPU.
+      prosper_add_gtest(test_volume_multi_target
+        SOURCES tests/gpu/execute/test_volume_multi_target.cpp
+        INCLUDES src tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 120)
       # #3135 P4: the merged-NGG draw through the real backend draw/segment code: Kena's LUT byte
       # for byte against the P3 offline result, two wave-count groups in one draw, a draw between

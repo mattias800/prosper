@@ -1,4 +1,4 @@
-# Baseline for tools/ci/check_arch_ratchet.py -- eleven cross-title and structural costs
+# Baseline for tools/ci/check_arch_ratchet.py -- twelve cross-title and structural costs
 # that may go DOWN, never UP.
 #
 # One row per finding: `RULE|path[|token] VALUE  # optional note`. No line numbers in the key, so
@@ -30,6 +30,10 @@
 #
 # platform-stub was seeded on main e88a9e1b: two `HLE(*_stub)` handlers, the Windows arm of the APR
 # command-buffer constructor and SetBuffer in hle_kernel_mem.cpp (#2384). It is a name-based proxy.
+#
+# host-throw was seeded on 01285a38 (proposed in ADR 0022): 23 throw sites in 10 files under
+# src/{hle,gpu}, mostly capture codecs and recompiler choice parsing. A count, not a proof that any
+# escapes into guest frames.
 #
 # platform-ifdef, layer-include, fixture-include and vk-object were seeded on main 6499c4d7, again
 # with nothing fixed. The layer-include table (LAYER_ORDER in the checker) is, lowest first:
@@ -206,7 +210,7 @@ file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-tab
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
-file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
+file-size|prosper/tests/fixtures/render_runner.h 16297  # #4643: the segment helpers moved to render_pass_segments.h and the volume contract lives in render_volume_slots.h
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 74  # +1 #4625: the volume publisher reads a claimed 3D target back (readback_persistent_color_target); a compute dispatch consumes the published bytes
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
@@ -225,7 +229,7 @@ test-dep|prosper/frontends/shared/live/submit_renderer/lazy_sampled_color_target
 test-dep|prosper/frontends/shared/live/submit_renderer/mrt_slots.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.cpp 14
 test-dep|prosper/frontends/shared/live/submit_renderer/pass_diagnostics.hpp 2
-test-dep|prosper/frontends/shared/live/submit_renderer/per_target_passes.cpp 48
+test-dep|prosper/frontends/shared/live/submit_renderer/per_target_passes.cpp 47
 test-dep|prosper/frontends/shared/live/submit_renderer/resolve_pass.cpp 24
 test-dep|prosper/frontends/shared/live/submit_renderer/resolve_pass.hpp 1
 test-dep|prosper/frontends/shared/live/submit_renderer/single_framebuffer.cpp 13
@@ -282,6 +286,16 @@ platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
 platform-ifdef|prosper/src/hle/video/avplayer.cpp 23
 platform-ifdef|prosper/src/hle/video/videodec2.cpp 3
 platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constructor and SetBuffer stubs (#2384); port into a portable component, then delete
+host-throw|prosper/src/gpu/capture/fold_capture.cpp 4
+host-throw|prosper/src/gpu/capture/fragment_compile_case.cpp 2
+host-throw|prosper/src/gpu/capture/serialize/fold_capture_codec.cpp 2
+host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
+host-throw|prosper/src/gpu/execute/gpu_executor.cpp 2
+host-throw|prosper/src/gpu/execute/nested_wide_data_admission.cpp 2
+host-throw|prosper/src/gpu/pm4/command_processor.hpp 2
+host-throw|prosper/src/gpu/recompiler/compiler_choices.cpp 2
+host-throw|prosper/src/gpu/recompiler/compiler_resource_access.cpp 4
+host-throw|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
 layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
 layer-include|prosper/src/gpu/capture/gpu_capture.cpp|hle 1

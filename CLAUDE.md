@@ -307,7 +307,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
 
-- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds eleven
+- **The binding architecture rules are `prosper/docs/spec/`; the decisions behind them are
+  `prosper/docs/adr/`.** Every rule has an ID, a status and the instrument that enforces it, and
+  `tools/docs/check_arch_docs.py` keeps those references live in CI. A rule marked
+  `proposed (adr:NNNN)` is a target, not policy: **only the project owner moves an ADR to
+  `accepted`**, and the moves it describes wait for that. Read the spec page for the layer you are
+  changing before you change it, and propose a new rule as an ADR rather than as prose here.
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds
   per-file counts to "down, never up": title ids and title-named directories in shared code, raw
   `getenv` reads, blocking GPU syncs, files over 5,000 lines, `prosper::test::` in the frontends,
   host-platform `#if` directives and `HLE(*_stub)` platform-arm handlers outside `src/host`,
@@ -333,17 +339,14 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     still requires owner approval; this rule does not authorize that move. The two existing
     stubs are the Windows APR arms in
     `src/hle/memory/hle_kernel_mem.cpp` (#2384).
-  - **Steady-state invariants** — a direction and a review rule, not a description of today. After
-    warm-up: **P1** no CPU wait on, or readback from, the GPU inside a frame unless the guest
-    observes that result; **P2** no Vulkan object creation per draw or dispatch; **P3** no shader or
-    pipeline compile on the submit thread; **P4** no process-global lock on a hot path; **P5**
-    per-draw cost does not grow with guest resource size — memory that tracking can prove unchanged
-    is not compared or copied in full; **P6** bounded frames in flight, frame N+1 recording while
-    frame N executes on the GPU. A PR that moves away from one says so. **prosper violates P1 and
-    P5 today:** the main render submit waits on its fence (`submit_and_wait()`,
-    `tests/fixtures/render_runner.h:2986` → `vkWaitForFences` in `wait_and_finish()`, `:3076`;
-    staged fix #3948), and a resident-buffer hit is re-validated by a full `memcmp` (`:5462`) once
-    write-watch disables itself after two dirty queries (`:5407`, #3155).
+  - **Steady-state invariants P1-P6** — after warm-up: no unobserved in-frame GPU wait or readback
+    (P1), no Vulkan object creation per draw or dispatch (P2), no compile on the submit thread (P3), no
+    process-global lock on a hot path (P4), per-draw cost independent of resource size, so memory that tracking can prove
+    unchanged is not compared or copied in full (P5), bounded
+    frames in flight with recording overlapping execution (P6). A PR that moves away from one says
+    so. **prosper violates P1 and P5 today.** The rules, their enforcement and where each is
+    violated are `prosper/docs/spec/performance.md` (`PERF-P1`..`PERF-P6`); that page is
+    authoritative, so do not restate the violation sites here.
   - **Title ids** never appear in a condition in shared code; naming the evidence in a comment is fine,
     and tests may use them as fixture data.
     Behaviour one title needs is a general rule the evidence supports, or isolated code with its

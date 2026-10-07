@@ -30,3 +30,4 @@ rule, or it is out of place.
 | `architecture.md` | the target shape: layers and engines, the invariants that hold across them, and the proposed rules each ADR would add |
 | `layers.md` | the include order (generated from `LAYER_ORDER`) and what each layer owns |
 | `performance.md` | the steady-state frame invariants P1-P6 |
+| `repository.md` | where non-code artefacts live: the screenshot path convention |

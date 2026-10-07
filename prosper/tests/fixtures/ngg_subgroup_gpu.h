@@ -822,9 +822,10 @@ inline size_t ngg_segment_split_index(std::span<const BackendDraw> draws) {
 }
 
 // Why render_draws_rgba cannot run `draw` (an NGG draw) in a call of `draws` draws, or null.
-// `colors` is the call's attachment count: a split of an MRT call carries slots 1+ between its
+// `colors` is the call's attachment count: a split of an MRT call carries 2D slots 1+ between its
 // segments by readback whatever their identities (split_segment_contract), so only a single
-// persistent attachment splits without a CPU wait. Everything the expansion can refuse except a
+// persistent attachment, or a pass whose every slot is a retained volume (#4643), splits without a
+// CPU wait (backend_split_carries_on_gpu). Everything the expansion can refuse except a
 // scratch allocation (device memory exhaustion) is asked here, before the split, so it never lands
 // inside a segment and loses that segment's clear: the structure, and the shell pipelines (created
 // here once, then cached).
@@ -842,8 +843,8 @@ inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
                                 static_cast<uint32_t>(ngg.push_constants.size()),
                                 ngg.native_wave64))
             return "ngg-backend-pipeline";
-    const bool splits_safely = draws == 1u || (persist_depth_stencil && colors == 1u &&
-                                               color_target && color_target->persistent_id);
+    const bool splits_safely = draws == 1u || (persist_depth_stencil &&
+                                               backend_split_carries_on_gpu(color_target, colors));
     if (!persist_depth_stencil && !splits_safely) return "ngg-backend-transient-depth-split";
     if (!splits_safely) return "ngg-backend-readback-split";
     return nullptr;

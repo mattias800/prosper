@@ -111,7 +111,7 @@ A `PROSPER_*` switch is read through `src/diagnostics/env_cache.hpp`, never a ne
 Each new switch is classified in its PR as host-capability, diagnostic, or guest-behaviour
 selector; a selector has an issue whose resolution sets the default and deletes the switch.
 Status: accepted
-Enforcement: ratchet:getenv, review: (the classification is a statement of intent no scan can derive)
+Enforcement: ratchet:getenv, ci:switch-registry, review: (the registry checks that a class exists; whether it is true is a statement of intent no scan can derive)
 
 ### SIZE-1 -- no file grows past the line cap
 
@@ -244,3 +244,36 @@ alarms, unimplemented calls, recent log lines and backtraces, and never game byt
 paths.
 Status: proposed (adr:0021)
 Enforcement: adr:0021
+
+### HLE-5 -- no host exception unwinds into guest frames
+
+Code in `src/{hle,loader,self,gpu}` reports failure through return codes and the logging abort path.
+A `throw` there is allowed only when it is caught before leaving prosper code, with a comment saying
+where.
+Status: accepted
+Enforcement: ratchet:host-throw, adr:0022
+
+### LOCAL-1 -- everything derived from a title stays on the user's machine
+
+Game content is never committed or uploaded, and neither are captures and capsules, replay
+corpora, pipeline-cache files, fuzz inputs taken from dumps, or bug-report bundles carrying game
+bytes. What a PR may commit is prosper's own data about a run -- hashes, counts, timings, pipeline
+keys -- and screenshots under the charter's screenshot rules. How title-derived shader programs in
+test fixtures are treated is decided in ADR 0025 before this rule is accepted.
+Status: proposed (adr:0025)
+Enforcement: adr:0025, review: (whether a file is derived from game content is a question about its origin, which no scan of its bytes can answer; the gitignore covers dumps, not derivatives)
+
+### TITLE-3 -- isolated title code is registered with its measurement and exit
+
+Every isolated title-specific unit in shared code is listed with the mechanism it implements, the
+measurement and issue that justify it, and the condition under which it is removed; the list and the
+tree match in both directions.
+Status: proposed (adr:0024)
+Enforcement: ratchet:title-dir, adr:0024
+
+### VER-4 -- an evidence run records its switches
+
+Screenshot and snapshot runs record every `PROSPER_*` switch set, and a run counts as acceptance
+evidence only if each is a host-capability or diagnostic switch; a selector disqualifies it.
+Status: proposed (adr:0023)
+Enforcement: adr:0023

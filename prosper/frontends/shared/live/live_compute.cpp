@@ -2178,11 +2178,11 @@ struct VulkanComputeContext {
                     timing.uploaded_bytes += chunk.bytes;
                     changed = true;
                 }
-                g_write_watch_census.record_exact_compare(compared_bytes);
+                g_write_watch_census.record_exact_compare(compared_bytes, source);
                 timing.compared_bytes += compared_bytes;
                 upload_skipped = !changed;
             } else {
-                g_write_watch_census.record_exact_compare(key.bytes);
+                g_write_watch_census.record_exact_compare(key.bytes, source);
                 // Default: one pass copies each differing 64 KiB block as it is found, so compare and
                 // copy are fused and the whole cost lands in upload_compare_ms (upload_copy_ms stays
                 // 0). PROSPER_NO_COMPUTE_BLOCK_SYNC=1 restores the separate compare and full copy.
@@ -2491,7 +2491,7 @@ struct VulkanComputeContext {
         bool exact_unchanged = false;
         if (cached.content_valid && !submit_unchanged && !watch_unchanged && source &&
             cached.source_snapshot.size() == key.guest_bytes) {
-            g_write_watch_census.record_exact_compare(key.guest_bytes);
+            g_write_watch_census.record_exact_compare(key.guest_bytes, source);
             exact_unchanged =
                 std::memcmp(cached.source_snapshot.data(), source, key.guest_bytes) == 0;
         } else if (submit_unchanged) {
@@ -7655,7 +7655,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return reinterpret_cast<uint8_t*>(uintptr_t(resource->gpu_addr));
     };
 
-
     const auto notify_unchanged_buffer = [&](const BoundBuffer& buffer) {
         notify_unchanged_buffer_for(known_fill, buffer);
     };
@@ -7966,6 +7965,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                           &diff_first, &diff_last);
                     }
                     timing.compared_bytes += upload_bytes;
+                    prosper::frontend::note_compute_compare_mapping(upload_source, upload_bytes);
                     if (!equal) {
                         // Copy ONLY the bytes that differ. The comparison above established the
                         // exact inclusive extent, so writing the bytes outside it would be a no-op

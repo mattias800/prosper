@@ -580,6 +580,9 @@ capture/replay without requiring an importable system Python module.
   the generated `PROGRESS_TRACKER.md` is not link-checked (fix its links in the source issue). A
   `template: design` document must carry the design-doc sections. Runs in the `Docs` CI job; tests
   are `docs/test_check_doc_meta.py`.
+- **`docs/confidence_ledger.py`** -- lists every `CONFIDENCE: HIGH|MED|LOW` marker in the shipping
+  code (`--summary` for counts per area, `--json` for records): the ledger of what prosper currently
+  believes on thin evidence, generated so it cannot go stale. A report, never a gate.
 - **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
   reference in the repository must name a row that exists. `check_numbered_table.py` validates the
   TABLE and has no idea anything cites it, so until this existed a reference to a row that never

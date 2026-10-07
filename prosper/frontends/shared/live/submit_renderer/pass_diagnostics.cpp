@@ -132,7 +132,7 @@ void trace_pass_residency(PassResidencyTraceContext& ctx) {
         const RttSurf& surface = found->second;
         const auto* retained = prosper::test::find_persistent_color_target(
             address, surface.w, surface.h, pass_formats[slot], false,
-            slot == 0 ? surface.volume_depth : 0);
+            surface.volume_depth);   // every slot may be a volume (#4643)
         std::fprintf(stderr,
             "[rtt-residency] submit=%llu pass=%zu slot=%u addr=0x%llx "
             "extent=%ux%u format=%u live=%u writes=%llu readbacks=%llu "

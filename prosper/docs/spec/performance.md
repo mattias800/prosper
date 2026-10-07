@@ -10,8 +10,7 @@ last-verified: 2026-10-05 61557f29
 The invariants a frame satisfies after warm-up. They are a direction and a review rule as much as a
 description: prosper violates `PERF-P1` and `PERF-P5` today, and each rule says where. A PR that
 moves away from one says so in its description. The charter (`CLAUDE.md`, *Architecture and
-performance ratchets*) states the same six; this page is the form with IDs and enforcement, and
-the charter will point here once that change lands on its own (charter edits are reviewed alone).
+performance ratchets*) names the six and points here; this page is authoritative.
 
 Static rules in the ratchet are proxies: a call-site count cannot tell per-draw from one-time. The
 `runtime:` signals are the always-on perf alarms (`src/diagnostics/perf/`, read with
@@ -25,7 +24,7 @@ After warm-up, no CPU wait on the GPU and no GPU-to-CPU readback occurs inside a
 guest observes the result. A new blocking site names, beside it and in its PR, the guest-visible
 result it delivers.
 Violated today: the main render submit waits on its fence (`submit_and_wait()` in the Vulkan
-backend; staged fix #3948).
+backend, which waits in `vkWaitForFences` through `wait_and_finish()`; staged fix #3948).
 Status: accepted
 Enforcement: ratchet:blocking-sync, runtime:gpu-sync-wait, runtime:surface-readback
 
