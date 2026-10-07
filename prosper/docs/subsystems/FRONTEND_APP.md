@@ -157,9 +157,12 @@ Stage 1 adds the data behind a library view — and the app's first **persistent
 
 ```
 --games-dir  ─┐
-PROSPER_GAMES_DIR ─┼─> resolve_games_dir ─> scan_game_library ─> [GameEntry]  ─> --list-games
-config file  ─┘        (app_config.hpp)      (game_library.hpp)                  and, later, a grid
+PROSPER_GAMES_DIR ─┼─> resolve_games_dirs ─> scan_game_libraries ─> [GameEntry] ─> --list-games
+config file  ─┘        (app_config.hpp)       (game_library.hpp)                  and the list
 ```
+The file holds one `games_dir` line per folder, so the library accumulates folders: adding one
+appends a line and never disturbs the rest, and the Settings view lists each with a Remove button.
+The flag and the environment instead name the whole library (one folder) for that run only.
 
 Both headers are pure with injected filesystem IO, so the scan, the param.json metadata reading, and the
 settings precedence are unit-tested in the default core build — no window, no ImGui, no real dump. They
@@ -171,6 +174,7 @@ Design points that are deliberate rather than incidental:
 - **Precedence is `--games-dir` > `PROSPER_GAMES_DIR` > persisted setting.** The persisted value exists
   only so a GUI user is not asked for a folder every launch; it must never override a command line. This
   keeps the project's existing convention (a `PROSPER_*` override in front of a default) authoritative.
+  The flag and the environment select the whole library for the run; only the file accumulates.
 - **Persistence is only ever explicit** (`--set-games-dir`). Nothing infers a library location from a
   folder the user happened to open — that inference is wrong as often as right, and being wrong points
   the library somewhere the user never chose.
@@ -180,10 +184,12 @@ Design points that are deliberate rather than incidental:
 - **`scan_game_library` reuses `resolve_app0_root()`** from the interactive-open path above, so all three
   entry points agree on what a title is. The listing is "what a drop or the picker would accept", which
   is not identical to "will boot" — the gate accepts `sce_sys/param.json` alone. The games directory
-  itself is listed when it is a title root (a dump at a drive root); the library-browse answer still
-  boots such a folder directly instead of scanning inside it.
+  itself is listed when it is a title root (a dump at a drive root); a library picker answer is
+  likewise stored as the games directory and listed — a title picked directly shows as one row —
+  instead of booting. Only Play (or Enter/double-click on a row) boots; drops still boot on arrival.
 - **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
-  exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
+  exit 0 / 1 (empty) / 2 (unset, or every folder missing; a missing folder among several is warned
+  about on stderr and the rest are listed), and it returns before any window or Vulkan exists.
 
 `param.json` name selection is worth knowing about, because it was silently wrong before this work. The
 display name is the entry for the dump's own `defaultLanguage`, and the language object is located by

@@ -20,7 +20,9 @@
 namespace prosper::frontend {
 
 struct AppConfig {
-    std::string games_dir;   // "" = not set
+    // Every folder the library scans, in the order it was added. Empty = not set. One `games_dir`
+    // line per folder in the file, so adding a folder appends a line and never disturbs the rest.
+    std::vector<std::string> games_dirs;
 
     // Whether the library plays the focused title's music (#1630). On by default — the console-like
     // presentation is the point of the feature — and PROSPER_LAUNCHER_MUSIC still overrides this the
@@ -82,9 +84,32 @@ inline std::string config_trim(const std::string& s) {
     return s.substr(b, e - b);
 }
 
+// Record another games folder at the end of the library's list: canonicalized, deduplicated
+// against what is already there (so re-adding a folder is a no-op), and ignoring empties. Pure
+// over the struct, so the rule is unit-tested.
+inline void note_games_dir(AppConfig& cfg, const std::string& dir) {
+    const std::string canon = strip_trailing_separators(dir);
+    if (canon.empty()) return;
+    for (const std::string& have : cfg.games_dirs)
+        if (strip_trailing_separators(have) == canon) return;
+    cfg.games_dirs.push_back(canon);
+}
+
+// Drop a games folder from the library's list (canonical compare, like note). A folder that was
+// never listed changes nothing. Pure over the struct, so the rule is unit-tested.
+inline void forget_games_dir(AppConfig& cfg, const std::string& dir) {
+    const std::string canon = strip_trailing_separators(dir);
+    if (canon.empty()) return;
+    std::vector<std::string> kept;
+    for (const std::string& have : cfg.games_dirs)
+        if (strip_trailing_separators(have) != canon) kept.push_back(have);
+    cfg.games_dirs = std::move(kept);
+}
+
 // Read a `key = value` file. Blank lines and `#` comments are ignored, unknown keys are ignored (so a
-// newer build's config does not break an older one), and a later duplicate wins. Values are taken
-// literally after the first `=`, so a path may contain spaces, `=`, or `#`.
+// newer build's config does not break an older one), and a later duplicate wins — except `games_dir`
+// and `recent`, which accumulate one entry per line so the file can hold a whole library. Values are
+// taken literally after the first `=`, so a path may contain spaces, `=`, or `#`.
 inline AppConfig parse_app_config(const std::string& text) {
     AppConfig cfg;
     size_t pos = 0;
@@ -98,7 +123,7 @@ inline AppConfig parse_app_config(const std::string& text) {
         if (eq == std::string::npos) continue;
         const std::string key = config_trim(line.substr(0, eq));
         const std::string value = config_trim(line.substr(eq + 1));
-        if (key == "games_dir") cfg.games_dir = value;
+        if (key == "games_dir") note_games_dir(cfg, value);
         else if (key == "launcher_music")
             // Anything other than an explicit off is on, so a hand-edited "yes" or "1" behaves.
             cfg.launcher_music = !(value == "0" || value == "false" || value == "off" || value == "no");
@@ -129,8 +154,8 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     const auto path_safe = [](const std::string& v) {
         return v.find('\n') == std::string::npos && v.find('\r') == std::string::npos;
     };
-    if (!cfg.games_dir.empty() && path_safe(cfg.games_dir))
-        out += "games_dir = " + cfg.games_dir + "\n";
+    for (const std::string& dir : cfg.games_dirs)
+        if (!dir.empty() && path_safe(dir)) out += "games_dir = " + dir + "\n";
     // Written unconditionally, unlike games_dir: "off" is a real choice and must survive a rewrite,
     // whereas an absent games_dir simply means nothing was chosen.
     out += std::string("launcher_music = ") + (cfg.launcher_music ? "1" : "0") + "\n";
@@ -148,12 +173,14 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     return out;
 }
 
-// Apply the precedence above. Each argument is "" when that source said nothing.
-inline std::string resolve_games_dir(const std::string& flag, const std::string& env,
-                                     const AppConfig& file) {
-    if (!flag.empty()) return flag;
-    if (!env.empty()) return env;
-    return file.games_dir;
+// Apply the precedence above. Each argument is "" when that source said nothing. The flag and
+// the environment name the whole library for the run (a single folder); the file holds the
+// accumulated list.
+inline std::vector<std::string> resolve_games_dirs(const std::string& flag, const std::string& env,
+                                                   const AppConfig& file) {
+    if (!flag.empty()) return {flag};
+    if (!env.empty()) return {env};
+    return file.games_dirs;
 }
 
 // Everything a library-started boot needs from the persisted host settings, resolved in one

@@ -578,14 +578,14 @@ void LibraryUi::set_output_volume(float volume) {
         media_.set_output_gain(launcher_music_output_gain(musicLevel_, outputVolume_));
 }
 
-void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
+void LibraryUi::set_games(std::vector<GameEntry> games, const std::vector<std::string>& games_dirs) {
     if (device_) vkDeviceWaitIdle(device_);   // covers may still be referenced by an in-flight frame
     destroy_covers();
     // After destroy_covers() and the device wait, so the grow finds the old pool free of cover sets and
     // no frame in flight that could still be sampling one.
     ensure_descriptor_capacity(games.size());
     games_ = std::move(games);
-    gamesDir_ = games_dir;
+    gamesDirs_ = games_dirs;
     covers_.resize(games_.size());
     apply_filter();
 }
@@ -881,6 +881,23 @@ void LibraryUi::draw_settings_content(LibraryAction& action) {
         ImGui::TextDisabled("Using the default location.");
     else
         ImGui::TextDisabled("Now: %s", savedataApplied_.c_str());
+
+    section("Game folders");
+    if (gamesDirs_.empty()) {
+        ImGui::TextDisabled("None yet -- File > Add games folder... starts the list.");
+    }
+    // One row per folder with its own Remove: adding appends, so removing must exist or a
+    // misclick could only be undone by hand-editing the settings file.
+    for (size_t di = 0; di < gamesDirs_.size(); di++) {
+        ImGui::PushID(static_cast<int>(di));
+        if (ImGui::Button("Remove") && action.kind == LibraryAction::Kind::none) {
+            action.kind = LibraryAction::Kind::forget_games_dir;
+            action.path = gamesDirs_[di];
+        }
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", gamesDirs_[di].c_str());
+        ImGui::PopID();
+    }
 }
 
 void LibraryUi::draw_controls_content() {
@@ -1049,11 +1066,11 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         draw_controls_content();
     } else if (games_.empty()) {
         ImGui::Spacing();
-        if (gamesDir_.empty()) {
+        if (gamesDirs_.empty()) {
             ImGui::TextWrapped("No games folder is set yet. Choose the folder that holds your PS5 game "
                                "directories - the ones containing eboot.bin and sce_sys.");
         } else {
-            ImGui::TextWrapped("No PS5 games found in this folder. Each game is its own directory "
+            ImGui::TextWrapped("No PS5 games found in these folders. Each game is its own directory "
                                "containing eboot.bin and sce_sys.");
         }
         ImGui::Spacing();
