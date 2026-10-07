@@ -9,6 +9,36 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The sun lights the title-menu scene again (2026-10-07, #4703)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
+`PROSPER_NULL_PAGE=1`, an empty `PROSPER_GUEST_ARGS`, `scripts/kena/linux-reach-level-load.pad`,
+F9 frame at 222 s and a RenderDoc capture at pad flip 430. Main is `01911ba7f`; the fix is the
+#4703 branch on the same base.
+
+- **What #4703 was.** UE4's stencil-to-lighting-channel copy writes an R16_UINT target through a
+  compressed `UINT16_ABGR` export (`SPI_SHADER_COL_FORMAT=0x7`). prosper decoded every compressed
+  export as two f16 halves, declared every output float, and folded R16_UINT into RGBA8 UNORM, so
+  channel value 1 became 5.96e-8 and was stored as 0. The deferred directional light ANDs its
+  channel mask with that texture and discards every lane whose result is 0. The recompiler now
+  decodes each compressed format as `SPI_SHADER_COL_FORMAT` says and declares uvec4/ivec4 outputs
+  for integer targets, and the backend keeps every integer colour format as an integer attachment.
+- **The mechanism, measured in the RenderDoc captures:**
+
+  | | `main` | #4703 |
+  |---|---|---|
+  | lighting-channel target (writer eid 6330/6331) | RGBA8 UNORM, 100% of 71,200 view samples are 0 | R16_UINT, 99.5% are 1 and 0.5% are 3, none 0 |
+  | the light draw that reads it (eid 8406/8407), sunlit pixel (1050, 1160) | `PASS shaderOut [0, 0, 0]` | `PASS shaderOut [0.241, 0.367, 0.061]` |
+
+- **What the frame shows.** A sunlit patch of grass and leaf shadows now draw on the ground in
+  front of the shrine, which was black on `main`. Over the foreground band (the lower quarter, left
+  of the version text), the 90th-percentile luminance rises from 74.6 to 161.7 and green-dominant
+  pixels from 0.0% to 18.4%; the PS5 oracle has 94.4 and 71.1%. The whole frame got brighter, from
+  mean luminance 92.1 to 99.7, while the oracle's is 44.4. So the exposure is still far off, and the
+  ferns, flowers, light shafts and darker grade are still missing. What this changes is that the
+  sun contributes at all.
+- **Rung.** Still 2.
+
 ## Three refused pixel programs in one run: descriptor words, not opcodes, and intermittent (2026-10-07, #4700)
 
 One run on `main` `156714914` refused three pixel programs from t=16 s: `prosper-app` inside the
@@ -482,6 +512,12 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The washed-out, over-bright grade is auto-exposure brightening a scene with no sun** — false.
+  Restoring the sun (#4703) made the title-menu frame brighter, not darker: mean luminance 92.1 on
+  `main`, 99.7 with the fix, 44.4 on the PS5 oracle (2026-10-07, #4703).
+- **The ground in front of the shrine is black only because its foliage is not drawn** — false in
+  part. With the sun restored a sunlit grass patch and leaf shadows draw on that ground, so it was
+  also unlit. The ferns and flowers above it are still missing (2026-10-07, #4703).
 - **Kena's three refused pixel programs of 2026-10-07 (`0x505b7f0000`, `0x5040eb0000`,
   `0x5040890000`) contain instructions the recompiler cannot translate** — false. Their
   `first_bad_fmt=4 op=0x8/0x7` is the generic census's SOPP branches, which the fragment path lowers.
