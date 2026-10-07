@@ -181,8 +181,64 @@ static void test_concurrent_release(Checks& checks) {
                   "concurrent release obeys the free-list bounds");
 }
 
+static void test_build_fills_pooled_buffers(Checks& checks) {
+    // build() hands the caller a pooled buffer to fill. A released one comes back (same capacity, no new
+    // allocation) and the new contents replace the old tenant's entirely.
+    CpuRttSnapshotPool pool(1024, 2);
+    auto fill = [](uint8_t value) {
+        return [value](uint8_t* out) { for (size_t i = 0; i < 64; ++i) out[i] = value; };
+    };
+    const uint8_t* first_data = nullptr;
+    {
+        auto first = pool.build(64, fill(0x11));
+        checks.expect(first.pixels && all_bytes_equal(*first.pixels, 64, 0x11), "first build holds its bytes");
+        checks.expect(!first.reused, "an empty pool misses");
+        first_data = first.pixels->data();
+    }  // released here: the buffer returns to the pool
+    checks.expect(pool.retained_buffers() == 1, "the released buffer is retained");
+    auto second = pool.build(64, fill(0x22));
+    checks.expect(second.reused, "the same size is served from the pool");
+    checks.expect(second.pixels && all_bytes_equal(*second.pixels, 64, 0x22),
+                  "a recycled buffer carries only the new bytes");
+    checks.expect(second.pixels->data() == first_data, "the allocation itself is reused, not just its size");
+
+    // A retained older version is never overwritten: while `second` is held, a third build gets another buffer.
+    auto third = pool.build(64, fill(0x33));
+    checks.expect(!third.reused, "a buffer still held by a consumer is not recycled");
+    checks.expect(all_bytes_equal(*second.pixels, 64, 0x22), "the held version keeps its pixels");
+
+    // Zero bytes publish nothing, like copy().
+    checks.expect(!pool.build(0, fill(0x44)).pixels, "an empty request yields no snapshot");
+}
+
+static void test_build_has_its_own_stats_and_a_disabled_path(Checks& checks) {
+    // A pool given its own stats object reports there and not into the shared one.
+    prosper::frontend::CpuRttSnapshotPoolStats own;
+    const uint64_t shared_before = prosper::frontend::cpu_rtt_snapshot_pool_stats().misses.load();
+    CpuRttSnapshotPool pool(1024, 2, &own);
+    auto first = pool.build(32, [](uint8_t* out) { for (size_t i = 0; i < 32; ++i) out[i] = 1; });
+    checks.expect(own.misses.load() == 1, "the pool counts into the stats object it was given");
+    checks.expect(prosper::frontend::cpu_rtt_snapshot_pool_stats().misses.load() == shared_before,
+                  "and not into the shared one");
+
+    // The disabled path (PROSPER_NO_CPU_RTT_SNAPSHOT_POOL): a plain filled allocation that never enters
+    // the pool.
+    CpuRttSnapshotPool idle(1024, 2, &own);
+    {
+        auto plain = prosper::frontend::build_cpu_rtt_snapshot(
+            idle, /*pooled=*/false, 32, [](uint8_t* out) { for (size_t i = 0; i < 32; ++i) out[i] = 7; });
+        checks.expect(plain.pixels && all_bytes_equal(*plain.pixels, 32, 7), "a disabled pool still fills the bytes");
+        checks.expect(!plain.reused, "a plain allocation is not a reuse");
+    }
+    checks.expect(idle.retained_buffers() == 0, "a disabled pool retains nothing");
+    checks.expect(!prosper::frontend::build_cpu_rtt_snapshot(idle, false, 0, [](uint8_t*) {}).pixels,
+                  "a disabled pool yields nothing for a zero-byte request");
+}
+
 int main() {
     Checks checks;
+    test_build_fills_pooled_buffers(checks);
+    test_build_has_its_own_stats_and_a_disabled_path(checks);
     test_immutable_versions(checks);
     test_budget_and_resolution_change(checks);
     test_wrapper_lifetime(checks);
