@@ -11,3 +11,9 @@ TEST(MappingClassPosix, EveryAddressIsOther) {
               prosper::host::MappingClass::Other);
     EXPECT_EQ(prosper::host::classify_host_mapping(0), prosper::host::MappingClass::Other);
 }
+
+TEST(MappingClassPosix, ClassificationIsNotInformative) {
+    // Every address is `Other` here, so the census prints no class rows rather than a constant that
+    // reads like a measurement.
+    EXPECT_FALSE(prosper::host::host_mapping_classification_informative());
+}

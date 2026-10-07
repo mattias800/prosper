@@ -18,4 +18,6 @@ MappingClass classify_host_mapping(uint64_t address) {
     }
 }
 
+bool host_mapping_classification_informative() { return true; }
+
 }  // namespace prosper::host

@@ -7,4 +7,6 @@ namespace prosper::host {
 
 MappingClass classify_host_mapping(uint64_t /*address*/) { return MappingClass::Other; }
 
+bool host_mapping_classification_informative() { return false; }
+
 }  // namespace prosper::host

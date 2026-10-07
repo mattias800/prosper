@@ -12,16 +12,19 @@
 //   renderer -- `safe_equal`: sampled-source and texture validations. The outcome is known, so
 //               `changed` counts only a compare that found differing bytes (an expected-missing or
 //               short-prefix result is a validation, not a change).
-//   compute  -- the compute buffer cache's full compares (`WriteWatchCensus::record_exact_compare`).
-//               Recorded where the compare runs, before its result is known, so no `changed` figure.
+//   compute  -- the compute buffer cache's full compares: the three sites that call
+//               `WriteWatchCensus::record_exact_compare` (the cache refresh and the source-snapshot
+//               compare) and the pooled-full miss path in `execute_item`. Recorded where the compare
+//               runs, before its result is known, so no `changed` figure.
 //
 // SIZES. Each source also keeps a size histogram of its compares (below 64 KiB, 1 MiB, 16 MiB, 64 MiB,
 // and larger), so a large byte total can be attributed to a few big ranges or to many small ones.
 //
 // SOURCE POINTERS. The compute hit paths classify the pointer they compare against. For a zero-padded or
 // atomic-image binding that can be prosper's own seed vector (host heap, MEM_PRIVATE) rather than guest
-// memory, which would read as GetWriteWatch-coverable when it is not. It did not occur on Black Flag
-// (0% private); a title that shows private bytes here should be checked for that before it is believed.
+// memory, which would read as GetWriteWatch-coverable when it is not. On Black Flag the only private
+// compute compares (four, 33.2 MB, exactly four 1920x1080 RGBA8 images) are most likely that vector, not
+// guest memory; a title that shows private bytes here should be checked for that before it is believed.
 //
 // A range is classified by its FIRST byte. A range straddling a private/section boundary is attributed
 // whole, which is fine for this question: guest allocations are page-granular and the answer is a share.
@@ -42,6 +45,8 @@ class ValidationMappingCensus {
 public:
     static constexpr int kClasses = 5;      // prosper::host::MappingClass values, then kSmall
     static constexpr int kSmall = 4;        // below kMinClassifiedBytes: counted, not classified
+    static_assert(kSmall == static_cast<int>(prosper::host::MappingClass::Other) + 1,
+                  "kSmall must follow the last MappingClass value, or it would alias a real class");
     static constexpr int kSizeBuckets = 5;  // <64 KiB, <1 MiB, <16 MiB, <64 MiB, 64 MiB and larger
 
     struct Row {
@@ -100,7 +105,10 @@ public:
         for (int i = 0; i < kClasses; ++i) total_bytes += row(i).bytes;
         std::string out;
         char line[360];
-        for (int i = 0; i < kClasses; ++i) {
+        // Where the classifier is a constant (every address `Other`) the class rows and the coverable
+        // share would read like a measurement while carrying none; print only the sizes there.
+        const bool informative = prosper::host::host_mapping_classification_informative();
+        for (int i = 0; informative && i < kClasses; ++i) {
             const Row r = row(i);
             const double share = total_bytes ? 100.0 * static_cast<double>(r.bytes) /
                                                    static_cast<double>(total_bytes) : 0.0;
@@ -174,9 +182,10 @@ inline bool report_validation_mapping_census() {
     return printed;
 }
 
-// Always on, like the perf observers whose summary lines it joins: a counter pair and, for ranges of at
-// least kMinClassifiedBytes, one VirtualQuery -- compares are O(resources) and each reads at least that many
-// bytes, so the cost sits beside a memcmp it is small against. No switch, so nothing to register or retire.
+// Always on, like the perf observers whose summary lines it joins: four relaxed counters and, for ranges of
+// at least kMinClassifiedBytes, one VirtualQuery. A syscall (about a microsecond) is small against a memcmp of
+// 64 KiB or more, which takes tens of microseconds; below that it would cost as much as the compare it
+// observes, so smaller ranges are only counted. No switch, so nothing to register or retire.
 inline void ensure_validation_mapping_census_registered() {
     // Registered on first use, never during static initialisation (see exit_census.hpp).
     static const bool registered = (prosper::diagnostics::register_census(
@@ -185,8 +194,9 @@ inline void ensure_validation_mapping_census_registered() {
 }
 
 // Ranges below this are counted in the size histogram but not classified: a 16-byte constant buffer is
-// not what the question is about, and a syscall per such compare would be the dominant cost.
-inline constexpr uint64_t kMinClassifiedBytes = 4096;
+// not what the question is about, and a syscall per such compare would be the dominant cost. It equals the
+// histogram's first edge, so "small-unclassified" and the "<64KiB" bucket describe the same compares.
+inline constexpr uint64_t kMinClassifiedBytes = 64ull << 10;
 
 // The renderer's `safe_equal`. `extent` is the bytes the compare actually ran over, `changed` whether
 // it found differing bytes.

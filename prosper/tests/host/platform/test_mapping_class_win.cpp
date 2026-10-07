@@ -37,3 +37,8 @@ TEST(MappingClassWin, ReservedButUncommittedMemoryIsNotPrivateCommitted) {
     EXPECT_EQ(classify_host_mapping(reinterpret_cast<uintptr_t>(reserved)), MappingClass::Private);
     VirtualFree(reserved, 0, MEM_RELEASE);
 }
+
+TEST(MappingClassWin, ClassificationIsInformative) {
+    // The census prints its class rows only where the classes distinguish something.
+    EXPECT_TRUE(prosper::host::host_mapping_classification_informative());
+}

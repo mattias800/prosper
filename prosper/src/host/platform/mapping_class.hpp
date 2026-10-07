@@ -19,4 +19,8 @@ enum class MappingClass : int {
 
 MappingClass classify_host_mapping(uint64_t address);
 
+// Whether the classes distinguish anything on this platform. False where every address is `Other`, so a
+// report need not print rows that read like a measurement but are a constant.
+bool host_mapping_classification_informative();
+
 }  // namespace prosper::host
