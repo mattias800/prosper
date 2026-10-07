@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Enforce: new C++ tests use GoogleTest, not a hand-rolled main().
 
-Scans every .cpp under tests/, and every test_*.cpp under frontends/, for `int main(`. Files in
+Scans every .cpp under tests/ (except bench_*.cpp benchmarks, which are not ctests) and every
+test_*.cpp under frontends/, for `int main(`. Files in
 tools/ci/gtest_legacy_allowlist.txt predate the policy and are tolerated until migrated.
 A listed file that no longer has main() must be removed from the list (the list only shrinks).
 
@@ -19,7 +20,9 @@ MAIN_RE = re.compile(r'^\s*(?:extern "C"\s+)?int\s+main\s*\(', re.M)
 
 def scan(root: Path):
     """Test sources under tests/ and frontends/ that define their own main()."""
-    candidates = [*(root / "tests").rglob("*.cpp"), *(root / "frontends").rglob("test_*.cpp")]
+    # bench_*.cpp are run-by-hand benchmark executables, not ctests: their own main() is the point.
+    candidates = [p for p in (root / "tests").rglob("*.cpp") if not p.name.startswith("bench_")]
+    candidates += [*(root / "frontends").rglob("test_*.cpp")]
     found = set()
     for p in candidates:
         if MAIN_RE.search(p.read_text(encoding="utf-8", errors="replace")):
@@ -47,6 +50,16 @@ def selftest():
     assert check(set(), {"tests/a.cpp"})
     assert not check({"tests/a.cpp"}, {"tests/a.cpp"})
     assert MAIN_RE.search("int main() {") and not MAIN_RE.search("// int main(")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "tests" / "x").mkdir(parents=True)
+        (root / "frontends").mkdir()
+        (root / "tests" / "x" / "bench_y.cpp").write_text("int main() { return 0; }\n")
+        (root / "tests" / "x" / "test_y.cpp").write_text("int main() { return 0; }\n")
+        found = scan(root)
+        assert "tests/x/test_y.cpp" in found, "a test with its own main() is still caught"
+        assert "tests/x/bench_y.cpp" not in found, "a bench_*.cpp benchmark is exempt"
     print("selftest ok")
 
 
