@@ -8,7 +8,7 @@ described. Nothing here reads the real /proc or needs a running game.
 The loop runs on a virtual clock (`SampleClock`), and every change to the synthetic tree happens
 inside the collector's own pacing sleep, on the collector's thread, before a chosen sample. So no
 arm depends on wall-clock timing or on a concurrent rename being atomic to a reader. The earlier
-fixture used timer threads and `Path.replace`, and under `ctest -j4` it failed on macOS (the
+fixture used timer threads and `Path.replace`, and in CI's parallel test run it failed on macOS (the
 timer missed the window) and on Windows (the rename raced the reader) (#4142).
 """
 
