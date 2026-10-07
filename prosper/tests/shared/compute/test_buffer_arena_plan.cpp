@@ -48,7 +48,8 @@ struct Guest {
 TEST(BufferArenaPlan, AnIsolatedWindowIsPrivateAndCostsNothing) {
     BufferArenaRegistry registry;
     Guest guest{kBase, kBase + 200 * kMiB};
-    const BufferArenaDecision d = select_buffer_arena(registry, kBase + 10 * kMiB, 4 * kMiB, 256, guest);
+    const BufferArenaDecision d =
+        select_buffer_arena(registry, kBase + 10 * kMiB, 4 * kMiB, 256, guest);
     EXPECT_EQ(d.action, BufferArenaAction::Private);
     EXPECT_EQ(registry.size(), 0u);
     EXPECT_EQ(guest.probes, 0) << "no overlap evidence: nothing is probed";
@@ -65,7 +66,8 @@ TEST(BufferArenaPlan, TheSameWindowBoundEveryFrameNeverGetsAnArena) {
         for (int frame = 0; frame < 5; ++frame) {
             const BufferArenaDecision d =
                 select_buffer_arena(registry, kBase + 10 * kMiB, window, 256, guest);
-            EXPECT_EQ(d.action, BufferArenaAction::Private) << "window " << window << " frame " << frame;
+            EXPECT_EQ(d.action, BufferArenaAction::Private)
+                << "window " << window << " frame " << frame;
         }
         EXPECT_EQ(registry.size(), 0u) << window;
         EXPECT_EQ(guest.probes, 0) << "the same window again is no evidence, so nothing is probed";
@@ -74,9 +76,10 @@ TEST(BufferArenaPlan, TheSameWindowBoundEveryFrameNeverGetsAnArena) {
     // The pure planner agrees: a recent entry identical to the window is not evidence.
     const std::vector<BufferArenaExtent> recent = {{kBase + 10 * kMiB, 4 * kMiB}};
     EXPECT_FALSE(buffer_arena_has_evidence({}, recent, kBase + 10 * kMiB, 4 * kMiB));
-    EXPECT_EQ(plan_buffer_arena({}, recent, kBase + 10 * kMiB, 4 * kMiB, kBase, kBase + 200 * kMiB, 256)
-                  .action,
-              BufferArenaAction::Private);
+    EXPECT_EQ(
+        plan_buffer_arena({}, recent, kBase + 10 * kMiB, 4 * kMiB, kBase, kBase + 200 * kMiB, 256)
+            .action,
+        BufferArenaAction::Private);
 }
 
 TEST(BufferArenaPlan, ARepeatedWindowStillJoinsARingWhenADifferentWindowOverlapsIt) {
@@ -87,12 +90,15 @@ TEST(BufferArenaPlan, ARepeatedWindowStillJoinsARingWhenADifferentWindowOverlaps
     Guest guest{kBase, kBase + 200 * kMiB};
     const uint64_t window = 8 * kMiB, first = kBase + 50 * kMiB;
     for (int frame = 0; frame < 3; ++frame)
-        ASSERT_EQ(select_buffer_arena(registry, first, window, 256, guest).action, BufferArenaAction::Private);
-    const BufferArenaDecision shifted = select_buffer_arena(registry, first + 4096, window, 256, guest);
+        ASSERT_EQ(select_buffer_arena(registry, first, window, 256, guest).action,
+                  BufferArenaAction::Private);
+    const BufferArenaDecision shifted =
+        select_buffer_arena(registry, first + 4096, window, 256, guest);
     ASSERT_EQ(shifted.action, BufferArenaAction::Create);
     EXPECT_TRUE(shifted.arena.contains(first, window));
     EXPECT_TRUE(shifted.arena.contains(first + 4096, window));
-    EXPECT_EQ(select_buffer_arena(registry, first, window, 256, guest).action, BufferArenaAction::Reuse);
+    EXPECT_EQ(select_buffer_arena(registry, first, window, 256, guest).action,
+              BufferArenaAction::Reuse);
     EXPECT_EQ(registry.size(), 1u);
 }
 
@@ -100,8 +106,9 @@ TEST(BufferArenaPlan, AWindowBelowTheMinimumNeverGetsAnArena) {
     BufferArenaRegistry registry;
     Guest guest{kBase, kBase + 200 * kMiB};
     for (int i = 0; i < 4; ++i)
-        EXPECT_EQ(select_buffer_arena(registry, kBase + i * 256, 512 * 1024, 256, guest).action,
-                  BufferArenaAction::Private);
+        EXPECT_EQ(
+            select_buffer_arena(registry, kBase + uint64_t(i) * 256, kMiB / 2, 256, guest).action,
+            BufferArenaAction::Private);
     EXPECT_EQ(registry.size(), 0u);
 }
 
@@ -111,7 +118,8 @@ TEST(BufferArenaPlan, AnOverlappingSecondWindowBuildsABoundedArenaAndLaterWindow
     const uint64_t window = 43 * kMiB;
     EXPECT_EQ(select_buffer_arena(registry, kBase + 0x60b900, window, 256, guest).action,
               BufferArenaAction::Private);
-    const BufferArenaDecision d = select_buffer_arena(registry, kBase + 0x60c300, window, 256, guest);
+    const BufferArenaDecision d =
+        select_buffer_arena(registry, kBase + 0x60c300, window, 256, guest);
     ASSERT_EQ(d.action, BufferArenaAction::Create);
     EXPECT_TRUE(d.arena.contains(kBase + 0x60b900, window));
     EXPECT_TRUE(d.arena.contains(kBase + 0x60c300, window));
@@ -120,7 +128,8 @@ TEST(BufferArenaPlan, AnOverlappingSecondWindowBuildsABoundedArenaAndLaterWindow
         << "headroom is a fraction of the hull, not a constant";
     EXPECT_EQ(d.offset, kBase + 0x60c300 - d.arena.base);
     // A third window drifting a little further stays inside the arena.
-    const BufferArenaDecision third = select_buffer_arena(registry, kBase + 0x60d100, window, 256, guest);
+    const BufferArenaDecision third =
+        select_buffer_arena(registry, kBase + 0x60d100, window, 256, guest);
     EXPECT_EQ(third.action, BufferArenaAction::Reuse);
     EXPECT_EQ(registry.size(), 1u);
 }
@@ -139,7 +148,8 @@ TEST(BufferArenaPlan, AnArenaNeverLeavesProvenReadableMemoryEvenFromAnExistingOv
     registry.commit(seed);
     const BufferArenaDecision d =
         registry.plan(kBase + 98 * kMiB, 8 * kMiB, readable_lo, readable_hi, 256);
-    ASSERT_EQ(d.action, BufferArenaAction::Create) << "the window shares a ring with the overhanging arena";
+    ASSERT_EQ(d.action, BufferArenaAction::Create)
+        << "the window shares a ring with the overhanging arena";
     EXPECT_GE(d.arena.base, readable_lo);
     EXPECT_LE(d.arena.end(), readable_hi) << "clipped to readable memory, never extended past it";
     EXPECT_TRUE(d.arena.contains(kBase + 98 * kMiB, 8 * kMiB));
@@ -156,13 +166,14 @@ TEST(BufferArenaPlan, EveryPlanStaysReadableContainsItsWindowAndReplacesOnlyWhat
         const uint64_t readable_hi = readable_lo + (1 + rng() % 220) * kMiB;
         std::vector<BufferArenaExtent> arenas, recent;
         for (unsigned k = rng() % 4; k > 0; --k)
-            arenas.push_back({kBase + (rng() % 250) * kMiB, (1 + rng() % 90) * kMiB});   // may overhang
+            arenas.push_back(
+                {kBase + (rng() % 250) * kMiB, (1 + rng() % 90) * kMiB});   // may overhang
         for (unsigned k = rng() % 4; k > 0; --k)
             recent.push_back({kBase + (rng() % 250) * kMiB, (1 + rng() % 60) * kMiB});
         const uint64_t bytes = (1 + rng() % 60) * kMiB;
         const uint64_t addr = readable_lo + (rng() % 200) * 64 * 1024;
-        const BufferArenaDecision d = plan_buffer_arena(arenas, recent, addr, bytes, readable_lo,
-                                                        readable_hi, 256);
+        const BufferArenaDecision d =
+            plan_buffer_arena(arenas, recent, addr, bytes, readable_lo, readable_hi, 256);
         if (d.action != BufferArenaAction::Create) continue;
         ASSERT_GE(d.arena.base, readable_lo) << trial;
         ASSERT_LE(d.arena.end(), readable_hi) << trial;
@@ -181,13 +192,14 @@ TEST(BufferArenaPlan, TwoClustersOfWindowsOfOneRingConvergeToASingleArena) {
     BufferArenaRegistry registry;
     Guest guest{kBase, kBase + 72 * kMiB};
     const uint64_t window = 43 * kMiB;
-    const uint64_t offsets[] = {0x60b900, 0x60c300, 0x60c700, 0x60d100, 0x60d500, 0x609e00,
-                                0xb5f600, 0xb00000, 0xb73800};
+    const uint64_t offsets[] = {0x60b900, 0x60c300, 0x60c700, 0x60d100, 0x60d500,
+                                0x609e00, 0xb5f600, 0xb00000, 0xb73800};
     int creates = 0;
     for (int frame = 0; frame < 3; ++frame)
         for (uint64_t off : offsets)
             if (select_buffer_arena(registry, kBase + off, window, 256, guest).action ==
-                BufferArenaAction::Create) ++creates;
+                BufferArenaAction::Create)
+                ++creates;
     EXPECT_EQ(registry.size(), 1u) << "one arena serves every window of the ring";
     EXPECT_LE(creates, 2);
     for (uint64_t off : offsets)
@@ -203,7 +215,8 @@ TEST(BufferArenaPlan, AnArenaNeverGrowsPastTwiceTheLargestWindowItServes) {
     for (int i = 0; i < 40; ++i) {
         const BufferArenaDecision d =
             select_buffer_arena(registry, kBase + i * (window / 2), window, 256, guest);
-        if (d.action != BufferArenaAction::Private) largest_arena = std::max(largest_arena, d.arena.bytes);
+        if (d.action != BufferArenaAction::Private)
+            largest_arena = std::max(largest_arena, d.arena.bytes);
     }
     EXPECT_LE(largest_arena, 2 * window + 2 * (window * 2 / 16) + 2 * kBufferArenaChunk);
 }
@@ -211,7 +224,8 @@ TEST(BufferArenaPlan, AnArenaNeverGrowsPastTwiceTheLargestWindowItServes) {
 TEST(BufferArenaPlan, ANeighbourThatOnlyTouchesDoesNotShareARing) {
     BufferArenaRegistry registry;
     Guest guest{kBase, kBase + 200 * kMiB};
-    EXPECT_EQ(select_buffer_arena(registry, kBase, 4 * kMiB, 256, guest).action, BufferArenaAction::Private);
+    EXPECT_EQ(select_buffer_arena(registry, kBase, 4 * kMiB, 256, guest).action,
+              BufferArenaAction::Private);
     EXPECT_EQ(select_buffer_arena(registry, kBase + 4 * kMiB, 4 * kMiB, 256, guest).action,
               BufferArenaAction::Private);
     EXPECT_EQ(registry.size(), 0u);
@@ -222,12 +236,14 @@ TEST(BufferArenaPlan, AReusedArenaIsReprobedAndDroppedWhenItsMemoryDisappears) {
     Guest guest{kBase, kBase + 200 * kMiB};
     const uint64_t window = 8 * kMiB;
     select_buffer_arena(registry, kBase + 50 * kMiB, window, 256, guest);
-    const BufferArenaDecision made = select_buffer_arena(registry, kBase + 50 * kMiB + 4096, window, 256, guest);
+    const BufferArenaDecision made =
+        select_buffer_arena(registry, kBase + 50 * kMiB + 4096, window, 256, guest);
     ASSERT_EQ(made.action, BufferArenaAction::Create);
     ASSERT_EQ(registry.size(), 1u);
     // The guest releases the memory above the window (a neighbouring allocation freed).
     guest.hi = kBase + 50 * kMiB + window;
-    const BufferArenaDecision after = select_buffer_arena(registry, kBase + 50 * kMiB + 8192, window, 256, guest);
+    const BufferArenaDecision after =
+        select_buffer_arena(registry, kBase + 50 * kMiB + 8192, window, 256, guest);
     EXPECT_NE(after.action, BufferArenaAction::Reuse) << "the stale arena must not be reused";
     if (after.action == BufferArenaAction::Create) EXPECT_LE(after.arena.end(), guest.hi);
 }
@@ -237,7 +253,8 @@ TEST(BufferArenaPlan, AnUnalignedOffsetStaysPrivate) {
     Guest guest{kBase, kBase + 200 * kMiB};
     select_buffer_arena(registry, kBase + 50 * kMiB, 8 * kMiB, 256, guest);
     // An offset that is not a multiple of the device alignment must not be bound at an arena offset.
-    const BufferArenaDecision d = select_buffer_arena(registry, kBase + 50 * kMiB + 100, 8 * kMiB, 256, guest);
+    const BufferArenaDecision d =
+        select_buffer_arena(registry, kBase + 50 * kMiB + 100, 8 * kMiB, 256, guest);
     EXPECT_EQ(d.action, BufferArenaAction::Private);
 }
 
@@ -279,7 +296,7 @@ TEST(BufferAliasGroup, AReadOnlyBindingAliasingALaterWritableOneIsFlagged) {
     // arena was chosen; the pre-pass answers it up front.
     const std::vector<BufferAliasKey> bindings = {
         {0x1000, 2 * kMiB, 0, 0, false},   // read-only owner
-        {0x1000, 2 * kMiB, 0, 0, true},    // same range, writable
+        {0x1000, 2 * kMiB, 0, 0, true},   // same range, writable
         {0x9000, 2 * kMiB, 0, 0, false},   // unrelated
     };
     EXPECT_TRUE(buffer_alias_group_has_writer(bindings, 0));
@@ -290,7 +307,7 @@ TEST(BufferAliasGroup, AReadOnlyBindingAliasingALaterWritableOneIsFlagged) {
 TEST(BufferAliasGroup, DifferentSizeOrHostBackingIsNotAnAlias) {
     const std::vector<BufferAliasKey> bindings = {
         {0x1000, 2 * kMiB, 0, 0, false},
-        {0x1000, 3 * kMiB, 0, 0, true},      // same base, different size: not the same range
+        {0x1000, 3 * kMiB, 0, 0, true},   // same base, different size: not the same range
         {0x1000, 2 * kMiB, 0x77, 8, true},   // host-backed copy of the same address
     };
     EXPECT_FALSE(buffer_alias_group_has_writer(bindings, 0));
@@ -298,8 +315,15 @@ TEST(BufferAliasGroup, DifferentSizeOrHostBackingIsNotAnAlias) {
 
 // ---- cache key ------------------------------------------------------------------------------------
 
-struct FakeShape { uint64_t logical_bytes = 0, binding_bytes = 0; };
-struct FakeKey { uint64_t gpu_addr = 0; uintptr_t host_data = 0; uint32_t bytes = 0; FakeShape materialization; };
+struct FakeShape {
+    uint64_t logical_bytes = 0, binding_bytes = 0;
+};
+struct FakeKey {
+    uint64_t gpu_addr = 0;
+    uintptr_t host_data = 0;
+    uint32_t bytes = 0;
+    FakeShape materialization;
+};
 
 TEST(BufferArenaPlan, TheArenaKeyIsTheExtentWithItsShapeResized) {
     FakeKey window{kBase + 100, 0x55, 4096, {4096, 4096}};
@@ -311,4 +335,4 @@ TEST(BufferArenaPlan, TheArenaKeyIsTheExtentWithItsShapeResized) {
     EXPECT_EQ(key.materialization.binding_bytes, 10 * kMiB);
 }
 
-}  // namespace
+}   // namespace

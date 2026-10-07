@@ -47,9 +47,15 @@ public:
     BufferArenaExtent evidence_hull(uint64_t addr, uint64_t bytes) const {
         uint64_t lo = addr, hi = addr + bytes;
         for (const BufferArenaExtent& e : extents_)
-            if (buffer_windows_share_a_ring(e, addr, bytes)) { lo = std::min(lo, e.base); hi = std::max(hi, e.end()); }
+            if (buffer_windows_share_a_ring(e, addr, bytes)) {
+                lo = std::min(lo, e.base);
+                hi = std::max(hi, e.end());
+            }
         for (const BufferArenaExtent& e : recent_)
-            if (buffer_windows_share_a_ring(e, addr, bytes)) { lo = std::min(lo, e.base); hi = std::max(hi, e.end()); }
+            if (buffer_windows_share_a_ring(e, addr, bytes)) {
+                lo = std::min(lo, e.base);
+                hi = std::max(hi, e.end());
+            }
         return {lo, hi - lo};
     }
 
@@ -102,8 +108,9 @@ private:
 // it is not called for a window with no overlap evidence. The returned decision's `replaces` lists
 // the arenas a new one supersedes, so the caller can drop their cache entries.
 template <class Readable>
-BufferArenaDecision select_buffer_arena(BufferArenaRegistry& registry, uint64_t window, uint64_t span,
-                                        uint64_t offset_alignment, Readable&& readable) {
+BufferArenaDecision select_buffer_arena(BufferArenaRegistry& registry, uint64_t window,
+                                        uint64_t span, uint64_t offset_alignment,
+                                        Readable&& readable) {
     BufferArenaDecision found = registry.find(window, span, offset_alignment);
     if (found.action == BufferArenaAction::Reuse) {
         // A reused arena is re-probed: the slack around the window was proven readable when the arena
@@ -124,14 +131,15 @@ BufferArenaDecision select_buffer_arena(BufferArenaRegistry& registry, uint64_t 
     };
     // Prove the whole hull readable (not just the window's neighbourhood), then the headroom beyond it.
     const BufferArenaExtent hull = registry.evidence_hull(window, span);
-    if (hull.bytes > kBufferArenaMaxBytes || !readable(hull.base, static_cast<uint32_t>(hull.bytes))) {
+    if (hull.bytes > kBufferArenaMaxBytes ||
+        !readable(hull.base, static_cast<uint32_t>(hull.bytes))) {
         registry.remember(window, span);
         return {};
     }
     const uint64_t down = readable_slack(hull.base, true);
     const uint64_t up = readable_slack(hull.end(), false);
-    BufferArenaDecision plan = registry.plan(window, span, hull.base - down, hull.end() + up,
-                                             offset_alignment);
+    BufferArenaDecision plan =
+        registry.plan(window, span, hull.base - down, hull.end() + up, offset_alignment);
     registry.commit(plan);
     if (plan.action == BufferArenaAction::Private) registry.remember(window, span);
     return plan;
@@ -148,4 +156,4 @@ Key buffer_arena_cache_key(const Key& window_key, const BufferArenaExtent& arena
     return key;
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

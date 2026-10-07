@@ -25,7 +25,8 @@ struct BoundBuffer {
     size_t descriptor_index = SIZE_MAX; // reflected binding that owns this flattened table entry
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkDeviceSize buffer_offset = 0;     // this window inside a shared arena allocation
+    // Offset of this window inside a shared arena allocation (0 when it has its own buffer).
+    VkDeviceSize buffer_offset = 0;
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
     size_t bytes = 0;                   // Vulkan buffer bytes (may be a detiled image view)
     size_t guest_bytes = 0;             // physical guest backing (may exceed logical image bytes)

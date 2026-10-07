@@ -36,9 +36,7 @@ struct BufferArenaExtent {
     bool contains(uint64_t addr, uint64_t size) const {
         return addr >= base && size <= bytes && addr - base <= bytes - size;
     }
-    bool overlaps(uint64_t addr, uint64_t size) const {
-        return addr < end() && base < addr + size;
-    }
+    bool overlaps(uint64_t addr, uint64_t size) const { return addr < end() && base < addr + size; }
     // Bytes shared with [addr, addr+size).
     uint64_t overlap_bytes(uint64_t addr, uint64_t size) const {
         if (!overlaps(addr, size)) return 0;
@@ -56,8 +54,8 @@ inline constexpr uint64_t kBufferArenaMaxBytes = 0xffffffffull;
 
 enum class BufferArenaAction : uint8_t {
     Private,   // not shareable (or no evidence yet): use the window's own entry
-    Reuse,     // `arena` already contains the window; bind it at `offset`
-    Create,    // build `arena` (it replaces every extent in `replaces`), then bind at `offset`
+    Reuse,   // `arena` already contains the window; bind it at `offset`
+    Create,   // build `arena` (it replaces every extent in `replaces`), then bind at `offset`
 };
 
 struct BufferArenaDecision {
@@ -74,14 +72,15 @@ struct BufferArenaDecision {
 // (window + hull/16 headroom each side, ~12.5% more to validate and upload) from its second frame on.
 inline bool buffer_windows_share_a_ring(const BufferArenaExtent& a, uint64_t addr, uint64_t bytes) {
     if (a.base == addr && a.bytes == bytes) return false;
-    return a.overlap_bytes(addr, bytes) * 2 >= std::min(a.bytes, bytes) && a.overlap_bytes(addr, bytes) != 0;
+    return a.overlap_bytes(addr, bytes) * 2 >= std::min(a.bytes, bytes) &&
+           a.overlap_bytes(addr, bytes) != 0;
 }
 
 // Is there evidence that `window` belongs to a ring already seen (an arena or a recent window that
 // it overlaps by at least half)?
 inline bool buffer_arena_has_evidence(const std::vector<BufferArenaExtent>& arenas,
-                                      const std::vector<BufferArenaExtent>& recent,
-                                      uint64_t addr, uint64_t bytes) {
+                                      const std::vector<BufferArenaExtent>& recent, uint64_t addr,
+                                      uint64_t bytes) {
     for (const BufferArenaExtent& a : arenas)
         if (buffer_windows_share_a_ring(a, addr, bytes)) return true;
     for (const BufferArenaExtent& r : recent)
@@ -116,13 +115,15 @@ inline BufferArenaDecision plan_buffer_arena(const std::vector<BufferArenaExtent
     bool evidence = false;
     for (const BufferArenaExtent& e : arenas)
         if (buffer_windows_share_a_ring(e, window_addr, window_bytes)) {
-            lo = std::min(lo, e.base); hi = std::max(hi, e.end());
+            lo = std::min(lo, e.base);
+            hi = std::max(hi, e.end());
             largest = std::max(largest, e.serves());
             evidence = true;
         }
     for (const BufferArenaExtent& e : recent)
         if (buffer_windows_share_a_ring(e, window_addr, window_bytes)) {
-            lo = std::min(lo, e.base); hi = std::max(hi, e.end());
+            lo = std::min(lo, e.base);
+            hi = std::max(hi, e.end());
             largest = std::max(largest, e.serves());
             evidence = true;
         }
@@ -141,7 +142,8 @@ inline BufferArenaDecision plan_buffer_arena(const std::vector<BufferArenaExtent
     // Whole chunks, but only while that stays inside the readable range.
     const uint64_t lo_rounded = lo / kBufferArenaChunk * kBufferArenaChunk;
     if (lo_rounded >= readable_lo) lo = lo_rounded;
-    const uint64_t hi_rounded = (hi + kBufferArenaChunk - 1) / kBufferArenaChunk * kBufferArenaChunk;
+    const uint64_t hi_rounded =
+        (hi + kBufferArenaChunk - 1) / kBufferArenaChunk * kBufferArenaChunk;
     if (hi_rounded <= readable_hi) hi = hi_rounded;
     if (hi <= lo || hi - lo > kBufferArenaMaxBytes) return decision;
     // The window is inside the readable range, so it is inside [lo, hi) by construction.
@@ -176,4 +178,4 @@ inline bool buffer_alias_group_has_writer(const std::vector<BufferAliasKey>& bin
     return false;
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

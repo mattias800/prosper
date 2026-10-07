@@ -1740,7 +1740,7 @@ int main() {
             std::memcpy(arena_ring + w * 4, &v, 4);
         }
         const std::vector<uint8_t> arena_ring_before(arena_ring, arena_ring + arena_ring_bytes);
-        const size_t arena_first = 4u << 20;              // the ring's windows start 4 MiB in
+        const size_t arena_first = 4u << 20;   // the ring's windows start 4 MiB in
         std::vector<uint32_t> arena_observed(64, 0xCCCCCCCCu);
 
         auto arena_buffer = [](uint32_t binding, uint32_t sgpr, uint64_t addr, uint32_t bytes) {
@@ -1773,51 +1773,53 @@ int main() {
 
         // Read-only: observed[0] = window word 1.
         static const uint32_t arena_read_only[] = {
-            0x7e080280u,               // v4 = 0
-            0x7e0a0281u,               // v5 = 1
-            0xe0302000u, 0x80000605u,  // buffer_load_dword v6, v5, s[0:3] idxen
-            0xbf8c3f70u,               // s_waitcnt vmcnt(0)
-            0xe0702000u, 0x80030604u,  // buffer_store_dword v6, v4, s[12:15] idxen -> observed
-            0xbf810000u,               // s_endpgm
+            0x7e080280u,   // v4 = 0
+            0x7e0a0281u,   // v5 = 1
+            0xe0302000u, 0x80000605u,   // buffer_load_dword v6, v5, s[0:3] idxen
+            0xbf8c3f70u,   // s_waitcnt vmcnt(0)
+            0xe0702000u, 0x80030604u,   // buffer_store_dword v6, v4, s[12:15] idxen -> observed
+            0xbf810000u,   // s_endpgm
         };
         // Read then write the same range: observed[0] = read-binding word 1, then write-binding
         // word 0 = s4.
         static const uint32_t arena_read_then_write[] = {
-            0x7e080280u,               // v4 = 0
-            0x7e0a0281u,               // v5 = 1
-            0xe0302000u, 0x80000605u,  // buffer_load_dword v6, v5, s[0:3] idxen   (read binding)
-            0xbf8c3f70u,               // s_waitcnt vmcnt(0)
-            0xe0702000u, 0x80030604u,  // buffer_store_dword v6, v4, s[12:15] idxen -> observed
-            0x7e000204u,               // v0 = s4
-            0xe0702000u, 0x80020004u,  // buffer_store_dword v0, v4, s[8:11] idxen  (write binding)
-            0xbf810000u,               // s_endpgm
+            0x7e080280u,   // v4 = 0
+            0x7e0a0281u,   // v5 = 1
+            0xe0302000u, 0x80000605u,   // buffer_load_dword v6, v5, s[0:3] idxen   (read binding)
+            0xbf8c3f70u,   // s_waitcnt vmcnt(0)
+            0xe0702000u, 0x80030604u,   // buffer_store_dword v6, v4, s[12:15] idxen -> observed
+            0x7e000204u,   // v0 = s4
+            0xe0702000u, 0x80020004u,   // buffer_store_dword v0, v4, s[8:11] idxen  (write binding)
+            0xbf810000u,   // s_endpgm
         };
         const uint64_t observed_addr = reinterpret_cast<uint64_t>(arena_observed.data());
         const uint32_t observed_bytes = static_cast<uint32_t>(arena_observed.size() * 4);
 
         bool arena_setup_ok = true;
         for (uint32_t step = 0; step < 2 && arena_setup_ok; ++step) {
-            const uint64_t window = reinterpret_cast<uint64_t>(arena_ring + arena_first + step * 4096u);
+            const uint64_t window =
+                reinterpret_cast<uint64_t>(arena_ring + arena_first + size_t{step} * 4096u);
             ShaderResourceTable rt;
             rt.resources.push_back(arena_buffer(0, 0, window, arena_window_bytes));
             rt.resources.push_back(arena_buffer(3, 12, observed_addr, observed_bytes));
-            const std::vector<uint32_t> spirv = recompile_compute(
-                arena_read_only, std::size(arena_read_only), &rt, arena_config);
-            arena_setup_ok = !spirv.empty() &&
-                prosper::frontend::execute_live_compute_items(
-                    {arena_item(spirv, rt, arena_config, 0x4635000000ull)});
+            const std::vector<uint32_t> spirv =
+                recompile_compute(arena_read_only, std::size(arena_read_only), &rt, arena_config);
+            arena_setup_ok =
+                !spirv.empty() && prosper::frontend::execute_live_compute_items(
+                                      {arena_item(spirv, rt, arena_config, 0x4635000000ull)});
             uint32_t word1 = 0;
-            std::memcpy(&word1, arena_ring + arena_first + step * 4096u + 4, 4);
+            std::memcpy(&word1, arena_ring + arena_first + size_t{step} * 4096u + 4, 4);
             arena_setup_ok = arena_setup_ok && arena_observed[0] == word1;
         }
         CHECK(arena_setup_ok,
               "#4635 overlapping read-only windows of one ring read their own bytes");
 
-        const size_t arena_third = arena_first + 2 * 4096u;
+        const size_t arena_third = arena_first + size_t{2} * 4096u;
         const uint64_t window = reinterpret_cast<uint64_t>(arena_ring + arena_third);
         ShaderResourceTable rt;
         rt.resources.push_back(arena_buffer(0, 0, window, arena_window_bytes));   // read, first
-        rt.resources.push_back(arena_buffer(2, 8, window, arena_window_bytes));   // write, same range
+        rt.resources.push_back(
+            arena_buffer(2, 8, window, arena_window_bytes));   // write, same range
         rt.resources.push_back(arena_buffer(3, 12, observed_addr, observed_bytes));
         const std::vector<uint32_t> spirv = recompile_compute(
             arena_read_then_write, std::size(arena_read_then_write), &rt, arena_config);
@@ -1827,14 +1829,16 @@ int main() {
         const auto* writer = find_spirv_descriptor_binding(report, 0, 2);
         CHECK(!spirv.empty() && report.ok() && reader && writer && reader->readable &&
                   !reader->writable && writer->writable,
-              "#4635 read-then-write fixture reflects a read-only and a writable binding of one range");
+              "#4635 read-then-write fixture reflects a read-only and a writable binding of one "
+              "range");
         CHECK(prosper::frontend::execute_live_compute_items(
                   {arena_item(spirv, rt, arena_config, 0x4635000100ull)}),
               "#4635 read-then-write dispatch over an arena-eligible window executes");
         uint32_t expected_read = 0;
         std::memcpy(&expected_read, arena_ring_before.data() + arena_third + 4, 4);
-        CHECK(arena_observed[0] == expected_read,
-              "#4635 the read binding observes the window's own bytes, not a displaced arena offset");
+        CHECK(
+            arena_observed[0] == expected_read,
+            "#4635 the read binding observes the window's own bytes, not a displaced arena offset");
         std::vector<uint8_t> expected_ring = arena_ring_before;
         std::memcpy(expected_ring.data() + arena_third, &arena_config.user_sgprs[4], 4);
         size_t first_diff = arena_ring_bytes;
@@ -1843,8 +1847,8 @@ int main() {
         if (first_diff != arena_ring_bytes)
             std::printf("  #4635 ring differs first at +0x%llx (window at +0x%llx)\n",
                         (unsigned long long)first_diff, (unsigned long long)arena_third);
-        CHECK(first_diff == arena_ring_bytes,
-              "#4635 the writable alias stores word 0 of its window and leaves every other ring byte");
+        CHECK(first_diff == arena_ring_bytes, "#4635 the writable alias stores word 0 of its "
+                                              "window and leaves every other ring byte");
     }
 
     std::fill(result.begin(), result.end(), 0xeeeeeeee);

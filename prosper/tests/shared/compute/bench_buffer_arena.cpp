@@ -40,14 +40,17 @@ double ms_since(Clock::time_point t) {
 // The guest rewrites a few KiB scattered across the ring each frame.
 void guest_frame(std::vector<uint8_t>& ring, unsigned frame) {
     for (unsigned k = 0; k < 24; ++k) {
-        const size_t at = (static_cast<size_t>(frame) * 7919u + k * 1597331u) % (ring.size() - 4096u);
-        for (unsigned b = 0; b < 2048; ++b) ring[at + b] = static_cast<uint8_t>(frame * 31u + k + b);
+        const size_t at = (static_cast<size_t>(frame) * 7919u + static_cast<size_t>(k) * 1597331u) %
+                          (ring.size() - 4096u);
+        for (unsigned b = 0; b < 2048; ++b)
+            ring[at + b] = static_cast<uint8_t>(frame * 31u + k + b);
     }
 }
-}  // namespace
+}   // namespace
 
 int main(int argc, char** argv) {
-    const unsigned frames = argc > 1 ? static_cast<unsigned>(std::atoi(argv[1])) : 60u;
+    const unsigned frames =
+        argc > 1 ? static_cast<unsigned>(std::strtoul(argv[1], nullptr, 10)) : 60u;
     std::vector<uint8_t> ring(kRing, 0x5a);
 
     // ---- private copy per window (the old behaviour) ------------------------------------------
@@ -65,7 +68,8 @@ int main(int argc, char** argv) {
                 compute_buffers_diff_span(windows[i].bytes.data(), source, kWindow, &first, &last);
             private_compared += kWindow;
             if (!equal) {
-                copy_compute_buffer(windows[i].bytes.data() + first, source + first, last - first + 1);
+                copy_compute_buffer(windows[i].bytes.data() + first, source + first,
+                                    last - first + 1);
                 private_copied += last - first + 1;
             }
         }
@@ -105,11 +109,12 @@ int main(int argc, char** argv) {
             if (!validated_this_frame) {
                 const uint8_t* source = ring2.data() + (arena_base - kGuestBase);
                 size_t first = 0, last = 0;
-                const bool equal =
-                    compute_buffers_diff_span(arena.bytes.data(), source, arena_bytes, &first, &last);
+                const bool equal = compute_buffers_diff_span(arena.bytes.data(), source,
+                                                             arena_bytes, &first, &last);
                 arena_compared += arena_bytes;
                 if (!equal) {
-                    copy_compute_buffer(arena.bytes.data() + first, source + first, last - first + 1);
+                    copy_compute_buffer(arena.bytes.data() + first, source + first,
+                                        last - first + 1);
                     arena_copied += last - first + 1;
                 }
                 validated_this_frame = true;
@@ -125,12 +130,14 @@ int main(int argc, char** argv) {
                 private_ms / frames, mib(private_compared) / frames, mib(private_copied) / frames);
     std::printf("arena:   %8.1f ms/frame  compared %8.1f MiB/frame  copied %8.1f MiB/frame\n",
                 arena_ms / frames, mib(arena_compared) / frames, mib(arena_copied) / frames);
-    std::printf("arena planning: %.0f ns per window (%llu windows); resident arena %.1f MiB vs %.1f MiB "
-                "of private copies\n",
-                plan_ns / static_cast<double>(plans), static_cast<unsigned long long>(plans),
-                mib(arena_bytes), mib(kWindow * std::size(kWindowOffsets)));
+    std::printf(
+        "arena planning: %.0f ns per window (%llu windows); resident arena %.1f MiB vs %.1f MiB "
+        "of private copies\n",
+        plan_ns / static_cast<double>(plans), static_cast<unsigned long long>(plans),
+        mib(arena_bytes), mib(kWindow * std::size(kWindowOffsets)));
     std::printf("arena actions over %llu windows: private %llu, reuse %llu, create %llu\n",
                 static_cast<unsigned long long>(plans), static_cast<unsigned long long>(actions[0]),
-                static_cast<unsigned long long>(actions[1]), static_cast<unsigned long long>(actions[2]));
+                static_cast<unsigned long long>(actions[1]),
+                static_cast<unsigned long long>(actions[2]));
     return 0;
 }
