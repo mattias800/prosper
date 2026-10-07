@@ -73,13 +73,15 @@ otherwise face an empty window, so a dump path can also arrive interactively (#1
   `--test-pattern`, which already has something feeding the present layer.
 - **Ctrl+O** opens the host's native folder picker. Available only while no game is running — once a
   guest boots it owns the keyboard (O is its R1) — and not under `--test-pattern`, which already has
-  something feeding the present layer.
+  something feeding the present layer. With the library up the answer is listed, not booted; Play
+  (or Enter/double-click on its row) is what starts it.
 - **A launch with no arguments at all** opens that picker straight away, so a double-clicked app is not
   a dead end. `--pick` forces it for any launch; `--no-pick` disables it entirely.
 
-A PS5 title is a *directory*, so this is a folder picker, not a file picker. A folder that is not a
-title is reported and changes nothing — including the folder that merely *contains* your games, which
-a library view would scan but this does not.
+A PS5 title is a *directory*, so this is a folder picker, not a file picker. Without the library
+up, a folder that is not a title is reported and changes nothing — including the folder that merely
+*contains* your games, which a library view would scan but this does not. With the library up the
+picked folder becomes the games directory either way, and the list shows what it holds.
 
 **One boot per launch.** `run_entry` does not observe `prosper_request_stop()` yet (#352), so a booted
 guest cannot be torn down. Opening a title after this process has already tried to boot one therefore
@@ -108,8 +110,9 @@ and cover icon — instead of asking for a folder every time.
 
 `--list-games` writes one tab-separated record per line — content id, display name, app0 path — to
 **stdout**, with everything explanatory on stderr, so a script or an agent can consume it directly. It
-exits 0 when it found titles, 1 when the directory held none, and 2 when the directory is unset or is
-not a directory. It never opens a window, initializes Vulkan, or boots a guest.
+exits 0 when it found titles, 1 when the folders held none, and 2 when no folder is set or every
+folder is missing. A missing folder among several (an unplugged drive) is warned about on stderr and
+the rest are still listed. It never opens a window, initializes Vulkan, or boots a guest.
 
 Split records on tabs rather than whitespace: the first field is **empty** for a title with no
 readable `param.json`, and display names contain spaces.
@@ -165,8 +168,19 @@ With a games directory set, launching with no game shows a game list instead of 
 window: cover thumbnail, name, serial, region, version and folder, with a search box, a **Refresh
 list** button and a File menu (recent games included) in the toolbar. Up/Down move, Enter/Space
 opens the highlighted title (not while the search box has focus), and a double-click opens directly;
-**Add folder** (or File → **Add games folder...**) picks a different games directory and remembers it. Esc quits. With no directory set yet, the window explains that
-and offers the same folder picker on Enter or a click.
+**Add folder** (or File → **Add games folder...**) adds another games directory to the list and
+remembers it — adding never disturbs the folders already listed — while File → **Open game
+folder...** adds one picked title the same way. Neither boots on pick — Play, Enter, or double-click
+is what starts a game. Settings → **Open settings** lists every remembered folder with a Remove
+button each. Esc quits. With no directory set yet, the window explains that
+and offers the same folder picker on Enter or a click. A Game Log panel below the list tails this
+session's own log lines; it exists only while the library is up and never affects what the console
+or a log file receives. While it is up, stdout and stderr are pipes (so `isatty` is false), and in a
+merged `> log 2>&1` lines from the two streams may interleave in a different order. Leaving the
+library restores both streams before anything else happens, and never waits long for a program it
+started (a file manager opened by **Show in Explorer**) that still holds the inherited streams.
+
+![The library view: toolbar, search box, and game list](../../docs/screenshots/issue-4665-library-table.webp)
 
 Region is the content-id prefix (`EP`, `JP`, …) and version is `contentVersion`, both read from
 the dump's own `sce_sys/param.json`. There is no firmware/size column: no honest source for either

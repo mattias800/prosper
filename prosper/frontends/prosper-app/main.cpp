@@ -51,6 +51,8 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
+#include "log_ring.hpp"   // bounded Game Log line buffer (pure, unit-tested)
+#include "log_capture.hpp"   // stdout/stderr capture feeding it, bounded teardown
 #include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
@@ -150,6 +152,7 @@ static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = 
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>   // IFileOpenDialog: the Explorer folder picker below
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
@@ -176,6 +179,42 @@ bool clear_environment(const char* name) {
 #else
     return unsetenv(name) == 0;
 #endif
+}
+
+// ---- Game Log capture ------------------------------------------------------------------------
+// The library's Game Log panel shows the library session's own stdout/stderr tail, through
+// LogCapture (log_capture.hpp): fds 1/2 point at pipes whose readers forward every byte to the
+// real console and keep a bounded copy in a LogRing. Capture runs ONLY while the library is up
+// (installed at library init, uninstalled before any boot and before every process exit below),
+// so scripted runs, guest execution and crash reports never pass through a pipe.
+//
+// Uninstall is bounded: a child spawned during the library session (SDL's xdg-open for "Show in
+// Explorer") inherits fds 1/2 and so holds the pipes' write ends, and waiting for their EOF would
+// hang the boot until that child exits. The ring is heap-owned and never freed, because a reader
+// left forwarding such a child's output may still push into it.
+static prosper::frontend::LogCapture g_log_capture;
+static constexpr std::chrono::milliseconds kLogCaptureDrainBound{500};
+
+// Returns the ring, or null when the capture could not start (the panel then says so and the
+// streams stay exactly as they were: install is all-or-nothing).
+static prosper::frontend::LogRing* install_log_capture() {
+    static prosper::frontend::LogRing* ring = nullptr;
+    if (g_log_capture.installed()) return ring;
+    auto* fresh = new prosper::frontend::LogRing();
+    if (!g_log_capture.install(fresh, {1, 2})) {
+        delete fresh;   // no reader was started, so nothing references it
+        return nullptr;
+    }
+    ring = fresh;
+    return ring;
+}
+
+// Restore the console fds and drain the pipes within kLogCaptureDrainBound. Idempotent.
+static void uninstall_log_capture() {
+    if (!g_log_capture.installed()) return;
+    if (!g_log_capture.uninstall(kLogCaptureDrainBound))
+        fprintf(stderr, "[app] game log: a child process still holds the log pipe; "
+                        "its output keeps forwarding in the background.\n");
 }
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
@@ -1257,6 +1296,10 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
         Sleep(10000);
         std::_Exit(prosper::app::kExitGuestFault);
     }
+    // Point stderr straight back at the console before the banner, so the fault report cannot sit
+    // in a pipe when _Exit below kills the forwarding threads. No drain and no wait: a crash
+    // report must never hang on a reader, and a few already-piped lines are an acceptable loss.
+    g_log_capture.restore_now(2);
     const CONTEXT* c = ep->ContextRecord;
     const uint64_t rip = c->Rip;
     fprintf(stderr, "%s\n",
@@ -1365,6 +1408,10 @@ static void install_host_backends() {
 // so a caller that ignored a failure cannot corrupt g_prog by trying again. Callers reach the
 // second-title case through relaunch_with_dump() instead.
 static bool start_guest(const std::string& app0_root, std::string* err) {
+    // The Game Log panel dies with the library view: restore the console streams before the boot
+    // so guest output, exit summaries and crash reports flow direct and can never be caught in a
+    // pipe when _Exit kills the forwarding threads.
+    uninstall_log_capture();
     if (g_boot_attempted) {
         if (err) *err = g_guest_started ? "a game is already running"
                                         : "this process has already used its one boot attempt";
@@ -1435,6 +1482,10 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
 // close the submit gate, bound the drain, flush the exit reports, _Exit. Before a guest exists this
 // is a plain `return 1`.
 int exit_startup_failure() {
+    // Drain first: everything below ends in _Exit, which would kill the forwarding threads
+    // with bytes still in the pipes. No-op unless a library session installed the capture
+    // (a guest always uninstalls it at boot).
+    uninstall_log_capture();
     if (!g_guest_thread.joinable()) return 1;
     g_guest_thread.detach();
     prosper::gpu_submit_gate_begin_shutdown();
@@ -1460,6 +1511,90 @@ static void picked_folder_cb(void* /*userdata*/, const char* const* filelist, in
     g_picked_path = filelist[0];
 }
 
+#ifdef _WIN32
+// Set by the Explorer picker's worker when COM could not put its dialog on screen. g_picker_open
+// stays true meanwhile, so a pending library browse stays armed; the main loop consumes the flag and
+// opens SDL's dialog, which SDL3 documents as main-thread only.
+bool g_picker_sdl_fallback = false;
+
+struct ExplorerPick {
+    HRESULT hr = S_OK;   // the first failing step's result, or S_OK
+    const char* step = nullptr;   // which COM call produced hr
+    bool shown = false;   // the dialog was on screen (Show returned success)
+    std::string path;   // UTF-8, empty when nothing usable came back
+};
+
+// Native Explorer folder picker (IFileOpenDialog + FOS_PICKFOLDERS). Runs on a fresh thread so it
+// owns a single-threaded apartment. Blocks until the user answers.
+static ExplorerPick run_explorer_folder_picker(SDL_Window* win) {
+    ExplorerPick r;
+    auto failed = [&r](HRESULT hr, const char* step) {
+        r.hr = hr;
+        r.step = step;
+        return FAILED(hr);
+    };
+    if (failed(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE),
+               "CoInitializeEx"))
+        return r;
+    IFileOpenDialog* dialog = nullptr;
+    DWORD opts = 0;
+    if (!failed(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                 IID_PPV_ARGS(&dialog)),
+                "CoCreateInstance") &&
+        !failed(dialog->GetOptions(&opts), "GetOptions") &&
+        // Without FOS_PICKFOLDERS this would be a FILE picker, so a failure here is a COM failure.
+        !failed(dialog->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM), "SetOptions")) {
+        HWND parent = nullptr;
+        if (win)
+            parent = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win),
+                                                  SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        if (!failed(dialog->Show(parent), "Show")) {
+            r.shown = true;
+            IShellItem* item = nullptr;
+            if (!failed(dialog->GetResult(&item), "GetResult")) {
+                PWSTR wide = nullptr;
+                if (!failed(item->GetDisplayName(SIGDN_FILESYSPATH, &wide), "GetDisplayName") &&
+                    wide) {
+                    // Size first: a fixed buffer would silently drop a path past its length.
+                    const int n =
+                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+                    if (n > 1) {
+                        std::string utf8(static_cast<size_t>(n), '\0');
+                        if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8.data(), n, nullptr,
+                                                nullptr) == n) {
+                            utf8.resize(static_cast<size_t>(n - 1));   // drop the terminator
+                            r.path = std::move(utf8);
+                        }
+                    }
+                    if (r.path.empty()) {
+                        r.hr = HRESULT_FROM_WIN32(GetLastError());
+                        r.step = "WideCharToMultiByte";
+                    }
+                    CoTaskMemFree(wide);
+                }
+                item->Release();
+            }
+        }
+    }
+    if (dialog) dialog->Release();
+    CoUninitialize();
+    return r;
+}
+
+// Called by the main loop every iteration: opens SDL's folder dialog when the Explorer picker asked
+// for the fallback. Must run on the main thread.
+static void start_pending_sdl_folder_fallback(SDL_Window* win) {
+    {
+        std::lock_guard<std::mutex> lock(g_picked_mutex);
+        if (!g_picker_sdl_fallback) return;
+        g_picker_sdl_fallback = false;
+    }
+    SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+}
+#else
+static void start_pending_sdl_folder_fallback(SDL_Window*) {}
+#endif
+
 // Returns true when this call actually opened a dialog, so a caller can arm per-request state only
 // when its request is the one outstanding.
 static bool open_folder_picker(SDL_Window* win) {
@@ -1468,7 +1603,42 @@ static bool open_folder_picker(SDL_Window* win) {
         if (g_picker_open) return false;   // one dialog at a time
         g_picker_open = true;
     }
+#ifdef _WIN32
+    // SDL 3.2's Windows folder dialog is still the legacy SHBrowseForFolder tree, which hides
+    // drives inside a namespace modern users no longer recognize; the Explorer dialog shows
+    // This PC, the address bar and search. Same park-and-consume contract as picked_folder_cb.
+    // A COM failure before the dialog is on screen falls back to the SDL dialog, which the main
+    // loop opens (start_pending_sdl_folder_fallback); a cancel is reported as a cancel.
+    std::thread([win] {
+        const ExplorerPick r = run_explorer_folder_picker(win);
+        std::lock_guard<std::mutex> lock(g_picked_mutex);
+        if (r.hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            g_picker_open = false;
+            fprintf(stderr, "[app] folder picker cancelled.\n");
+            return;
+        }
+        if (!r.shown) {
+            // g_picker_open stays true until the SDL dialog answers through picked_folder_cb.
+            fprintf(stderr,
+                    "[app] Explorer folder picker failed (%s, HRESULT 0x%08lx); "
+                    "falling back to the SDL dialog.\n",
+                    r.step, static_cast<unsigned long>(r.hr));
+            g_picker_sdl_fallback = true;
+            return;
+        }
+        g_picker_open = false;
+        if (r.path.empty()) {
+            // The user chose something we could not read back: leave the pick unclaimed, and the
+            // main loop's "empty path, closed dialog" branch disarms any pending browse.
+            fprintf(stderr, "[app] folder picker returned no usable path (%s, HRESULT 0x%08lx).\n",
+                    r.step ? r.step : "?", static_cast<unsigned long>(r.hr));
+            return;
+        }
+        g_picked_path = r.path;
+    }).detach();
+#else
     SDL_ShowOpenFolderDialog(picked_folder_cb, nullptr, win, nullptr, /*allow_many=*/false);
+#endif
     return true;
 }
 
@@ -1701,54 +1871,64 @@ int main(int argc, char** argv) {
     pick.has_dump = !dump.empty();
     pick.test_pattern = testPattern;
 
-    // --set-games-dir: record the games directory for future launches and exit. Persisting is always
-    // an explicit act — nothing here infers a library location from a folder the user happened to open,
-    // because guessing wrong would silently point the library somewhere they never chose.
+    // --set-games-dir: record the games directory for future launches and exit. This REPLACES the
+    // stored list with the one folder (an empty value clears it); adding without disturbing the
+    // rest is the library's own Add-folder path. Persisting is always an explicit act — nothing
+    // here infers a library location from a folder the user happened to open, because guessing
+    // wrong would silently point the library somewhere they never chose.
     if (setGamesDirSeen) {
         prosper::frontend::AppConfig cfg = load_app_config();   // keeps keys this build does not know
-        cfg.games_dir = prosper::frontend::strip_trailing_separators(setGamesDir);
+        cfg.games_dirs.clear();
+        prosper::frontend::note_games_dir(cfg, setGamesDir);
         // Warn but still store: configuring a path before mounting it is plausible, and refusing
         // would be more annoying than saying so.
-        if (!cfg.games_dir.empty() && !host_path_probe().is_dir(cfg.games_dir))
-            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dir.c_str());
+        if (!cfg.games_dirs.empty() && !host_path_probe().is_dir(cfg.games_dirs[0]))
+            fprintf(stderr, "prosper-app: warning: %s is not a directory\n", cfg.games_dirs[0].c_str());
         if (!save_app_config(cfg)) return 1;
-        if (cfg.games_dir.empty())
+        if (cfg.games_dirs.empty())
             fprintf(stderr, "prosper-app: games directory cleared (%s)\n", app_config_path().c_str());
         else
-            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dir.c_str(),
+            fprintf(stderr, "prosper-app: games directory set to %s (%s)\n", cfg.games_dirs[0].c_str(),
                     app_config_path().c_str());
         return 0;
     }
 
-    // The games directory, by the documented precedence: --games-dir, then PROSPER_GAMES_DIR, then the
-    // persisted setting. Resolved before anything opens a window so --list-games stays headless.
+    // The games folders, by the documented precedence: --games-dir, then PROSPER_GAMES_DIR, then the
+    // persisted list. The flag and the environment name the whole library for the run (one folder);
+    // the file holds every folder the library accumulated. Resolved before anything opens a window
+    // so --list-games stays headless.
     const prosper::frontend::AppConfig appConfig = load_app_config();
     const char* gamesDirEnv = getenv("PROSPER_GAMES_DIR");
-    std::string gamesDir = prosper::frontend::resolve_games_dir(
+    std::vector<std::string> gamesDirs = prosper::frontend::resolve_games_dirs(
         gamesDirFlag, gamesDirEnv ? gamesDirEnv : "", appConfig);
 
     // --list-games: print the library as plain text and exit, with no window, no Vulkan and no guest.
     // One tab-separated record per line on stdout (content id, display name, app0 path) so a script or
     // an agent can consume it; everything explanatory goes to stderr.
     if (listGames) {
-        if (gamesDir.empty()) {
+        if (gamesDirs.empty()) {
             fprintf(stderr, "prosper-app: no games directory. Pass --games-dir <path>, set "
                             "PROSPER_GAMES_DIR, or record one in %s\n",
                     app_config_path().empty() ? "the settings file" : app_config_path().c_str());
             return 2;
         }
-        if (!host_path_probe().is_dir(gamesDir)) {
-            // Distinguish a wrong path from a real but empty library: both would otherwise print
-            // "0 title(s)" and exit 1, which hides a typo.
-            fprintf(stderr, "prosper-app: not a directory: %s\n", gamesDir.c_str());
-            return 2;
-        }
+        // Same rule as the library: each missing folder (a typo, an unplugged drive) is warned about
+        // and contributes nothing, and the rest are still listed. Only when EVERY folder is missing
+        // does the run exit 2 -- which keeps a wrong path distinguishable from a real but empty
+        // library, since both would otherwise print "0 title(s)" and exit 1.
+        const prosper::frontend::GamesDirsAvailability dirs =
+            prosper::frontend::split_available_games_dirs(gamesDirs, host_path_probe());
+        for (const std::string& dir : dirs.missing)
+            fprintf(stderr, "prosper-app: not a directory: %s\n", dir.c_str());
+        if (dirs.available.empty()) return prosper::frontend::list_games_exit_code(dirs, 0);
         const std::vector<prosper::frontend::GameEntry> games =
-            prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+            prosper::frontend::scan_game_libraries(dirs.available, host_path_probe(),
+                                                   host_library_io());
         for (const auto& g : games)
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
-        fprintf(stderr, "prosper-app: %zu title(s) in %s\n", games.size(), gamesDir.c_str());
-        return games.empty() ? 1 : 0;
+        fprintf(stderr, "prosper-app: %zu title(s) in %zu folder(s)\n", games.size(),
+                dirs.available.size());
+        return prosper::frontend::list_games_exit_code(dirs, games.size());
     }
 
     // Persisted host settings: savedata dir, present mode, display mode, volume. These apply ONLY
@@ -1868,11 +2048,11 @@ int main(int argc, char** argv) {
     } else if (!testPattern) {
         // The library view that will draw these is #1471 stage 2; for now report what was found so a
         // misconfigured games_dir is visible without waiting for the UI.
-        if (!gamesDir.empty()) {
+        for (const std::string& dir : gamesDirs) {
             const size_t found = prosper::frontend::scan_game_library(
-                gamesDir, host_path_probe(), host_library_io()).size();
+                dir, host_path_probe(), host_library_io()).size();
             fprintf(stderr, "[app] games directory %s holds %zu title(s); --list-games prints them.\n",
-                    gamesDir.c_str(), found);
+                    dir.c_str(), found);
         }
         fprintf(stderr, "[app] no game given; the window opens empty and can be given one "
                         "(drop a game folder on it, or press Ctrl+O).\n");
@@ -2821,13 +3001,25 @@ int main(int argc, char** argv) {
     bool libraryHasGames = false;
     auto rescan_library = [&]() {
         if (!libraryUi.ready()) return;
-        std::vector<prosper::frontend::GameEntry> found;
-        if (!gamesDir.empty())
-            found = prosper::frontend::scan_game_library(gamesDir, host_path_probe(), host_library_io());
+        size_t unavailable = 0;
+        for (const std::string& dir : gamesDirs)
+            if (!host_path_probe().is_dir(dir)) ++unavailable;
+        const std::vector<prosper::frontend::GameEntry> found =
+            prosper::frontend::scan_game_libraries(gamesDirs, host_path_probe(), host_library_io());
         libraryHasGames = !found.empty();
-        libraryUi.set_games(std::move(found), gamesDir);
+        // A folder that vanished (an unplugged drive) contributes nothing but is said aloud,
+        // or its titles would disappear without a word.
+        if (unavailable == 1)
+            libraryStatus = "One games folder is unavailable.";
+        else if (unavailable > 1)
+            libraryStatus = std::to_string(unavailable) + " games folders are unavailable.";
+        libraryUi.set_games(found, gamesDirs);
     };
     if (wantLibrary) {
+        // Game Log capture starts here and only here: a library session is the only run with a
+        // panel to feed, so scripted runs, guest execution and crash reports never pass through
+        // a pipe. A null return keeps everything working, minus the panel.
+        libraryUi.set_log_ring(install_log_capture());
         libraryUi.set_music_preference(appConfig.launcher_music);
         libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
         // Recent rows show game names, not raw paths: read each root's own param.json the
@@ -2914,6 +3106,9 @@ int main(int argc, char** argv) {
             // and let this one shut down normally.
             fprintf(stderr, "[app] this process has already booted; starting a new one for %s\n",
                     root.c_str());
+            // Uninstall first: the child inherits this process's fds, and it must get the
+            // console, not our pipes (whose readers die with us).
+            uninstall_log_capture();
             if (relaunch_with_dump(argc, argv, root)) {
                 running = false;
                 record_recent(root);
@@ -2976,7 +3171,14 @@ int main(int argc, char** argv) {
 #endif
     if (offerPicker) {
         fprintf(stderr, "[app] no game given; opening the folder picker.\n");
-        open_folder_picker(win);
+        const bool pickerClaimed = open_folder_picker(win);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+        // With the library up the answer becomes its games directory (listed, not
+        // booted); Play boots. Without it the answer below boots as before.
+        if (pickerClaimed && libraryUi.ready()) libraryBrowsePending = true;
+#else
+        (void)pickerClaimed;
+#endif
     }
 
     // The automatic capture delay starts at app-loop entry, not process start or guest boot. This
@@ -3177,7 +3379,14 @@ int main(int argc, char** argv) {
                 if (ev.type == SDL_EVENT_KEY_DOWN && key.app_window && !ev.key.repeat &&
                     ev.key.key == SDLK_O && (ev.key.mod & SDL_KMOD_CTRL) &&
                     !g_guest_started && !testPattern) {
-                    open_folder_picker(win);
+                    const bool pickerClaimed = open_folder_picker(win);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+                    // With the library up the answer becomes its games directory (listed,
+                    // not booted); Play boots. Without it the answer below boots as before.
+                    if (pickerClaimed && libraryUi.ready()) libraryBrowsePending = true;
+#else
+                    (void)pickerClaimed;
+#endif
                     continue;
                 }
                 // #1093: forward app-window keys to the guest's IME keyboard path. Titles like
@@ -3245,6 +3454,10 @@ int main(int argc, char** argv) {
         }
         if (!running) break;
 
+        // The Windows Explorer picker cannot open SDL's dialog itself (main-thread only), so a COM
+        // failure there is turned into SDL's dialog here.
+        start_pending_sdl_folder_fallback(win);
+
         // The folder picker answers asynchronously and possibly on another thread, so it parks its
         // result. Consume it here, between frames, where booting is safe.
         //
@@ -3270,29 +3483,27 @@ int main(int argc, char** argv) {
             if (libraryBrowsePending && picked.empty() && !pickerStillOpen)
                 libraryBrowsePending = false;
             // The library asked for this folder, so its answer names a games DIRECTORY to remember, not
-            // a title to boot. Without this the result went to open_game(), which resolves an app0 root
-            // and therefore always rejected a folder-of-folders with "That is not a PS5 game".
-            // One exception: the folder IS a title itself (a dump at a drive root, where F:\ holds
-            // eboot.bin directly). That falls through to open_game() below and boots like a
-            // drop or a Ctrl+O pick instead of scanning inside it for titles it cannot hold.
+            // a title to boot: it is stored and rescanned, and the list shows what it holds — a title
+            // picked directly simply lists as one row. Only Play (or Enter/double-click on a row)
+            // boots; drops still boot on arrival.
             if (!picked.empty() && libraryBrowsePending) {
                 libraryBrowsePending = false;
-                if (prosper::frontend::picked_folder_is_title(picked, host_path_probe())) {
-                    fprintf(stderr, "[app] picked folder is a game itself; opening it\n");
-                } else if (!host_path_probe().is_dir(picked)) {
+                if (!host_path_probe().is_dir(picked)) {
                     libraryStatus = "That is not a folder.";
-                    picked.clear();
                 } else {
+                    // Append, never replace: adding a folder must not disturb the folders
+                    // already listed.
                     prosper::frontend::AppConfig cfg = load_app_config();
-                    cfg.games_dir = prosper::frontend::strip_trailing_separators(picked);
-                    gamesDir = cfg.games_dir;
+                    prosper::frontend::note_games_dir(cfg, picked);
+                    gamesDirs = cfg.games_dirs;
                     libraryStatus = save_app_config(cfg) ? std::string()
                                                         : "Could not save the games folder setting.";
-                    fprintf(stderr, "[app] games directory set to %s\n", gamesDir.c_str());
+                    fprintf(stderr, "[app] added games folder %s (%zu listed)\n",
+                            prosper::frontend::strip_trailing_separators(picked).c_str(),
+                            gamesDirs.size());
                     rescan_library();
-                    picked.clear();
                 }
-                // No clear on the is-title path: `picked` survives so open_game() below boots it.
+                picked.clear();
             }
 #endif
             if (!picked.empty() && !testPattern) {
@@ -3444,10 +3655,24 @@ int main(int argc, char** argv) {
                     if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
                 case prosper::frontend::LibraryAction::Kind::pick_game:
-                    // Like Ctrl+O: the answer parks and boots via open_game() below, because no
-                    // library flag claims it.
-                    open_folder_picker(win);
+                    // Like browse: the answer joins the library as its games directory and is
+                    // listed, not booted — Play boots. Arm only the dialog this request opened,
+                    // for the same reason as browse above.
+                    if (open_folder_picker(win)) libraryBrowsePending = true;
                     break;
+                case prosper::frontend::LibraryAction::Kind::forget_games_dir: {
+                    // Adding appends, so removing must exist: drop the folder from the stored
+                    // list and rescan. Forgetting the last one simply empties the library.
+                    prosper::frontend::AppConfig forgetCfg = load_app_config();
+                    prosper::frontend::forget_games_dir(forgetCfg, act.path);
+                    gamesDirs = forgetCfg.games_dirs;
+                    libraryStatus = save_app_config(forgetCfg) ? std::string()
+                                                              : "Could not save the games folder setting.";
+                    fprintf(stderr, "[app] forgot games folder %s (%zu listed)\n", act.path.c_str(),
+                            gamesDirs.size());
+                    rescan_library();
+                    break;
+                }
                 case prosper::frontend::LibraryAction::Kind::rescan:
                     rescan_library();
                     break;
@@ -4139,6 +4364,9 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_AUDIO_SDL3
     shutdown_sdl3_audio_sink(); // join diagnostics and destroy streams while SDL is alive
 #endif
+    // Drain the Game Log capture before the normal return: buffered pipe bytes would
+    // otherwise never reach the console. No-op unless a library session installed it.
+    uninstall_log_capture();
     SDL_DestroyWindow(win); SDL_Quit();
     return exitCode;
 }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,10 +104,15 @@ struct GuestBuffer {
     GuestBuffer(const GuestBuffer&) = delete;
     GuestBuffer& operator=(const GuestBuffer&) = delete;
     uint64_t address() const { return reinterpret_cast<uint64_t>(data); }
+    // The final word of the buffer, which the shader never writes. The promotion arm changes it
+    // in guest memory to prove a cached refresh reaches a block other than the first (#4660).
+    uint32_t last_word = 0xababababu;
     bool correct() const {
-        return std::equal(std::begin(fill), std::end(fill), data) &&
-            std::all_of(data + 4, data + bytes / sizeof(uint32_t),
-                        [](uint32_t word) { return word == 0xababababu; });
+        constexpr size_t words = bytes / sizeof(uint32_t);
+        if (!std::equal(std::begin(fill), std::end(fill), data)) return false;
+        const auto untouched = [](uint32_t word) { return word == 0xababababu; };
+        if (!std::all_of(data + 4, data + words - 1, untouched)) return false;
+        return data[words - 1] == last_word;
     }
 };
 } // namespace
@@ -266,6 +272,15 @@ int main(int argc, char** argv) {
             const bool mutation = index == 3 || index == 8;
             const auto skips_before = prosper::frontend::live_compute_buffer_gpu_result_skips();
             if (mutation) first.data[0] ^= 0xffffffffu;
+            if (index == 3) {
+                // Also change a word the shader never writes, in the LAST 64 KiB block. A cached
+                // refresh must carry it into the GPU buffer: the changed writeback below copies
+                // the whole GPU buffer back over guest memory, so a refresh that left this block
+                // stale would revert the guest's own write and fail correct(). data[0] alone
+                // cannot show that -- the shader overwrites it whether or not it was uploaded.
+                first.last_word ^= 0xffffffffu;
+                first.data[bytes / sizeof(uint32_t) - 1] = first.last_word;
+            }
             auto next = dispatch(index);
             next.submit_no = submit + index;
             // Every call owns a distinct real submit journal. Reusing the item or incrementing

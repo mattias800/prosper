@@ -275,4 +275,53 @@ inline std::vector<GameEntry> scan_game_library(const std::string& games_dir,
     return games;
 }
 
+// Every PS5 title across several games folders, in display order: each folder contributes what
+// scan_game_library would report for it alone. Folders that are gone (an unplugged drive) simply
+// contribute nothing, so one missing folder cannot hide the rest. A title reachable through two
+// folders lists once, under its first spelling — the same dump mounted twice is still one game.
+inline std::vector<GameEntry> scan_game_libraries(const std::vector<std::string>& games_dirs,
+                                                  const GamePathProbe& probe,
+                                                  const GameLibraryIo& io) {
+    std::vector<GameEntry> games;
+    for (const std::string& dir : games_dirs) {
+        for (GameEntry& entry : scan_game_library(dir, probe, io)) {
+            const std::string canon = strip_trailing_separators(entry.app0_root);
+            bool seen = false;
+            for (const GameEntry& have : games)
+                if (strip_trailing_separators(have.app0_root) == canon) { seen = true; break; }
+            if (!seen) games.push_back(std::move(entry));
+        }
+    }
+    std::sort(games.begin(), games.end(), game_entry_display_less);
+    return games;
+}
+
+// --list-games over several folders, under the same rule as the library: a missing folder (an
+// unplugged drive) is reported and contributes nothing, but does not hide the rest. `available` is
+// what to scan, `missing` what to warn about, both in the order given.
+struct GamesDirsAvailability {
+    std::vector<std::string> available;
+    std::vector<std::string> missing;
+};
+
+inline GamesDirsAvailability split_available_games_dirs(const std::vector<std::string>& games_dirs,
+                                                        const GamePathProbe& probe) {
+    GamesDirsAvailability out;
+    for (const std::string& dir : games_dirs) {
+        if (probe.is_dir && probe.is_dir(dir))
+            out.available.push_back(dir);
+        else
+            out.missing.push_back(dir);
+    }
+    return out;
+}
+
+// --list-games exit status: 2 when no folder is set or EVERY folder is missing, otherwise 0 when the
+// available folders held titles and 1 when they held none. With --games-dir / PROSPER_GAMES_DIR the
+// list is one folder, so "every folder missing" is that folder missing, as before.
+inline int list_games_exit_code(const GamesDirsAvailability& dirs, size_t title_count) {
+    if (dirs.available.empty()) return 2;
+    return title_count != 0 ? 0 : 1;
+}
+
 } // namespace prosper::frontend

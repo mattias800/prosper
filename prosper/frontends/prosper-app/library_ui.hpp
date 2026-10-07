@@ -30,6 +30,14 @@
 // implementation needs it, and the app's other translation units should not pick it up.
 struct ImFont;
 
+namespace prosper {
+namespace frontend {
+// The Game Log line buffer (log_ring.hpp); owned by main.cpp, only observed here. Forward
+// declared so this header stays free of <mutex>/<deque>.
+class LogRing;
+}   // namespace frontend
+}   // namespace prosper
+
 namespace prosper::frontend {
 
 // What the user did on this frame.
@@ -37,9 +45,12 @@ struct LibraryAction {
     enum class Kind {
         none,
         open,              // launch `app0_root`
-        browse,            // asked for the folder picker (no games directory, or wants another folder)
-        pick_game,         // asked for the folder picker for ONE game to boot right away (Ctrl+O path)
-        rescan,            // re-read the games directory now
+        browse,            // asked for the folder picker; the answer is APPENDED to the games
+                           // folders, never boots, and Play starts what it lists
+        pick_game,         // asked for the folder picker for ONE game; same append rule as browse
+                           // (Ctrl+O path) — listing, not booting
+        rescan,            // re-read the games folders now
+        forget_games_dir,  // stop listing `path`; persist it and rescan
         set_games_dir,     // chose `path` as the games directory; persist it and rescan
         set_music,         // toggled launcher music to `music_on`; persist it
         toggle_fullscreen,   // the Full Screen toolbar button (same path as F11)
@@ -52,7 +63,7 @@ struct LibraryAction {
     };
     Kind kind = Kind::none;
     std::string app0_root;   // Kind::open
-    std::string path;        // Kind::set_games_dir
+    std::string path;        // Kind::set_games_dir/forget_games_dir
     std::string value;       // Kind::set_present_mode/set_display_mode/set_savedata_dir/set_volume
     bool music_on = true;    // Kind::set_music
 };
@@ -91,6 +102,10 @@ public:
     // boots only happen from here pre-guest, after which the menu is gone with the library.
     void set_recent(std::vector<RecentGame> recent) { recentGames_ = std::move(recent); }
 
+    // Point the Game Log panel at main.cpp's capture ring (null: capture unavailable, the panel
+    // says so). Seeded once before the first frame; the ring outlives the UI.
+    void set_log_ring(const LogRing* ring) { logRing_ = ring; }
+
     // Seed the settings view with the run's EFFECTIVE host settings (flag > env > file, resolved
     // by main.cpp at startup through resolve_host_policy). The view edits these live and reports
     // changes as actions; main.cpp persists them. Seeded once before the first frame.
@@ -124,7 +139,7 @@ public:
 
     // Replace the displayed titles. The visible rows and the selection are rebuilt from the search
     // box, so a rescan returns to the top rather than holding a row that may have moved.
-    void set_games(std::vector<GameEntry> games, const std::string& games_dir);
+    void set_games(std::vector<GameEntry> games, const std::vector<std::string>& games_dirs);
 
     // Build and draw one frame, and present it. `status` is shown under the list — used for the reason
     // a title failed to boot, so the message is visible in the UI rather than only on stderr.
@@ -268,6 +283,8 @@ private:
     std::vector<Cover>     covers_;
     std::vector<int>       filtered_;
     std::vector<RecentGame> recentGames_;
+    const LogRing* logRing_ = nullptr;   // observed only; owned by main.cpp
+    bool logFollow_ = true;
     // Row hovered last frame. The highlight is painted at row start, but hover is only
     // knowable after the row's items — so it trails by one frame, which is imperceptible and
     // always spans the whole row (unlike a Selectable's own cell-sized hover paint).
@@ -275,7 +292,7 @@ private:
     int                    contextFi_ = -1;      // row the menu was armed from
     bool                   contextArmed_ = false;
     LibraryTab             tab_ = LibraryTab::games;
-    std::string            gamesDir_;
+    std::vector<std::string> gamesDirs_;
     char                   filterBuf_[256] = {};
     std::string            filterApplied_;
     int                    selected_  = 0;

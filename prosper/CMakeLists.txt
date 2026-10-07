@@ -240,6 +240,11 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
 # src/diagnostics; any target including it needs `src` and that translation unit.
 find_package(Threads REQUIRED)
+# CPU microbenchmark (not a ctest): refreshing one resident compute buffer, single span vs differing blocks
+add_executable(bench_block_sync tests/shared/compute/bench_block_sync.cpp)
+target_include_directories(bench_block_sync PRIVATE frontends src tests)
+target_link_libraries(bench_block_sync PRIVATE prosper_core)
+
 prosper_add_gtest(test_compute_buffer_diff_span
   SOURCES tests/shared/compute/test_compute_buffer_diff_span.cpp
           src/diagnostics/worker_spawn_census.cpp
@@ -2044,6 +2049,20 @@ if(TARGET prosper_core)
   # boot a game. Pure predicate — no SDL, no ImGui, no window.
   prosper_add_gtest(test_frontend_list_nav
     SOURCES frontends/prosper-app/test_list_nav.cpp
+    INCLUDES frontends/prosper-app)
+
+  # The Game Log panel's bounded line buffer: capacity eviction and single-line truncation are the
+  # defects that would otherwise show up only as a runaway deque behind a per-frame snapshot.
+  # Pure std::mutex/deque — no SDL, no ImGui, no window.
+  prosper_add_gtest(test_frontend_log_ring
+    SOURCES frontends/prosper-app/test_log_ring.cpp
+    INCLUDES frontends/prosper-app)
+
+  # The Game Log capture's teardown (#4671 review): every byte still in the pipe is forwarded, the
+  # teardown stays bounded while a child process holds an inherited write end (a hang there blocks
+  # a game boot), and a failed install leaves the captured descriptors untouched.
+  prosper_add_gtest(test_frontend_log_capture
+    SOURCES frontends/prosper-app/test_log_capture.cpp
     INCLUDES frontends/prosper-app)
 
   # The optional retained-target selector bounds readback without changing the legacy broad
@@ -6591,6 +6610,12 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
                                                    frontends)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan prosper_imgui
                                               prosper_performance_capture)
+    if(WIN32)
+      # The Explorer folder picker (IFileOpenDialog) calls CoInitializeEx/CoCreateInstance/
+      # CoTaskMemFree (ole32) and references CLSID_FileOpenDialog (libuuid on MinGW). A static
+      # FetchContent SDL3 brings both transitively; a shared, packaged SDL3 does not.
+      target_link_libraries(prosper-app PRIVATE ole32 uuid)
+    endif()
     target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIBRARY_UI=1)
     # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
     if(TARGET prosper_live_renderer)
@@ -6820,6 +6845,17 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
     SOURCES tests/shared/live/test_unorm10_snapshot.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_core)
+
+  # Overlapping windows of a read-only buffer share one resident arena (interim; not ADR 0010).
+  prosper_add_gtest(test_buffer_arena_plan
+    SOURCES tests/shared/compute/test_buffer_arena_plan.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core)
+
+  # CPU microbenchmark (not a ctest): validation work of nine overlapping windows, private copies vs one arena.
+  add_executable(bench_buffer_arena tests/shared/compute/bench_buffer_arena.cpp)
+  target_include_directories(bench_buffer_arena PRIVATE frontends src tests)
+  target_link_libraries(bench_buffer_arena PRIVATE prosper_core)
 
   # The ordering contract for pipelined GPU work (ADR 0009 / PERF-P8): pure model, no Vulkan.
   prosper_add_gtest(test_pipeline_observe_hook
