@@ -17,6 +17,8 @@
 //   TokenAloneStillRejects          a KILL that drops the token unconditionally (the read would
 //                                   silently become the save's zero placeholder)
 //   DataWriteOnOnePathStillRejects  a MAY-style KILL that fires when only one path wrote data
+//   FragmentDispatcherAppliesTheSameKill  the three shapes above in a Wave64 pixel program
+//                                   (compile level; the compute arm executes the value)
 //
 // Every kernel appends kTail (kernel 17d of test_rdna2_to_spirv), an irreducible loop that forces
 // the CFG dispatcher, and puts the read at a join (below), in a later case than the save. Execution needs
@@ -63,6 +65,17 @@ const uint32_t kDataWriteOnEveryPath[] = LOOP_KERNEL(kWrite, kNop);
 const uint32_t kTokenAlone[] = LOOP_KERNEL(kNop, kNop);
 // Written only inside the loop, after the read: data on the back edge, the token on the entry edge.
 const uint32_t kDataWriteOnOnePath[] = LOOP_KERNEL(kNop, kWrite);
+// The same three shapes as a Wave64 PIXEL program, whose dispatcher runs the same KILL: the loop,
+// the irreducible tail, then v1 = float(v3) / 255 exported as green.
+#define FRAGMENT_LOOP(before, inside)                                                              \
+    {0xBE82037Cu, before,      0xBE830380u, 0x7E060202u, inside,      0x80038103u,                 \
+     0xBF0A8203u, 0xBF85FFFBu, 0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,                 \
+     0x7d840100u, 0xbf870001u, 0xbf82fffdu, 0x7e020d03u, 0x100202ffu, 0x3b808081u,                 \
+     0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u}
+const uint32_t kFragmentDataWriteOnEveryPath[] = FRAGMENT_LOOP(kWrite, kNop);
+const uint32_t kFragmentTokenAlone[] = FRAGMENT_LOOP(kNop, kNop);
+const uint32_t kFragmentDataWriteOnOnePath[] = FRAGMENT_LOOP(kNop, kWrite);
+#undef FRAGMENT_LOOP
 #undef LOOP_KERNEL
 const uint32_t kTail[] = {
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
@@ -131,4 +144,18 @@ TEST(EntryM0Wave64Kill, TokenAloneStillRejects) {
 TEST(EntryM0Wave64Kill, DataWriteOnOnePathStillRejects) {
     EXPECT_TRUE(compile(kDataWriteOnOnePath).empty())
         << "the data write is skipped on one path, so the token may still be live at the read";
+}
+
+TEST(EntryM0Wave64Kill, FragmentDispatcherAppliesTheSameKill) {
+    const std::vector<uint32_t> data =
+        recompile_fragment(kFragmentDataWriteOnEveryPath, std::size(kFragmentDataWriteOnEveryPath));
+    ASSERT_FALSE(data.empty())
+        << "a Wave64 pixel program's dispatcher kills the token the same way";
+    EXPECT_TRUE(has_opcode(data, kOpSwitch)) << "it lowered through the CFG dispatcher";
+    EXPECT_TRUE(recompile_fragment(kFragmentTokenAlone, std::size(kFragmentTokenAlone)).empty())
+        << "the token alone still rejects in a pixel program";
+    EXPECT_TRUE(
+        recompile_fragment(kFragmentDataWriteOnOnePath, std::size(kFragmentDataWriteOnOnePath))
+            .empty())
+        << "a data write on one path only still rejects in a pixel program";
 }
