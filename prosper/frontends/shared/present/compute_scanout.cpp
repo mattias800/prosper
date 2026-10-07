@@ -22,13 +22,22 @@
 namespace prosper::frontend {
 namespace {
 
-constexpr VkFormat kMirrorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+// The mirror holds the guest's bytes verbatim, so its format names their component order: a BGRA
+// display buffer is mirrored as B8G8R8A8 and present_blit's format-converting blit turns it into the
+// RGBA8 scanout (#4686). An Unknown pixel format keeps the RGBA8 mirror it always had.
+VkFormat mirror_format(uint64_t pixel_format) {
+    return videoout_component_order(pixel_format) == VideoOutComponentOrder::Bgra8
+               ? VK_FORMAT_B8G8R8A8_UNORM
+               : VK_FORMAT_R8G8B8A8_UNORM;
+}
 
 struct Mirror {
     VkDevice device = VK_NULL_HANDLE;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint64_t pixel_format = 0;   // the VideoOut format the mirrored bytes are in
     uint64_t image_registration = 0;   // lineage identity of this allocation
     uint64_t reservation = 0;          // the dispatch currently allowed to commit
     bool committed = false;
@@ -82,18 +91,21 @@ void destroy_image(Mirror& m) {
     m.image = VK_NULL_HANDLE;
     m.memory = VK_NULL_HANDLE;
     m.width = m.height = 0;
+    m.format = VK_FORMAT_UNDEFINED;
     m.image_registration = 0;
 }
 
-bool ensure_image(Mirror& m, VkDevice device, VkPhysicalDevice phys, uint32_t w, uint32_t h) {
-    if (m.image && m.device == device && m.width == w && m.height == h) return true;
+bool ensure_image(Mirror& m, VkDevice device, VkPhysicalDevice phys, uint32_t w, uint32_t h,
+                  VkFormat format) {
+    if (m.image && m.device == device && m.width == w && m.height == h && m.format == format)
+        return true;
     // Dispatches and publishes are synchronous (each waits its own fence) and run on the thread
     // that executes ordered GPU work, so no GPU work can still reference the old image here.
     destroy_image(m);
     m.device = device;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = kMirrorFormat;
+    ici.format = format;
     ici.extent = {w, h, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
@@ -121,10 +133,10 @@ bool ensure_image(Mirror& m, VkDevice device, VkPhysicalDevice phys, uint32_t w,
     }
     m.width = w;
     m.height = h;
+    m.format = format;
     m.image_registration = next_producer_identity();
     return true;
 }
-
 
 // PROSPER_COMPUTE_SCANOUT_VERIFY=1: before each GPU publish of a mirror, read it back and compare it
 // byte for byte with what the CPU fallback would have presented for the same flip (the guest buffer,
@@ -214,6 +226,9 @@ bool read_back_mirror(const Mirror& m, std::vector<uint8_t>& out) {
         if (vkMapMemory(m.device, memory, 0, bytes, 0, &mapped) != VK_SUCCESS) break;
         out.assign(static_cast<const uint8_t*>(mapped), static_cast<const uint8_t*>(mapped) + bytes);
         vkUnmapMemory(m.device, memory);
+        // A copy keeps the image's texel order; compare in the RGBA the CPU path presents.
+        if (m.format == VK_FORMAT_B8G8R8A8_UNORM)
+            videoout_guest_bytes_to_rgba(out, VideoOutComponentOrder::Bgra8);
         ok = true;
     } while (false);
     if (fence) vkDestroyFence(m.device, fence, nullptr);
@@ -302,7 +317,12 @@ ComputeScanoutTarget compute_scanout_begin(VkDevice device, uint64_t address, ui
     m.reservation = 0;
     const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
     if (!ctx.ok || ctx.dev != device) return out;
-    if (!ensure_image(m, device, ctx.phys, width, height)) return out;
+    // `address` is one of the display set's buffers (the caller checked), so the set's format is
+    // the one its bytes are in. A later re-registration in another format makes publish decline.
+    VideoOutBufferSnapshot display;
+    const uint64_t pixel_format = videoout_display_snapshot(display) ? display.pixel_format : 0;
+    if (!ensure_image(m, device, ctx.phys, width, height, mirror_format(pixel_format))) return out;
+    m.pixel_format = pixel_format;
     m.reservation = ++s.next_reservation;
     ++s.reserved;
     out.address = address;
@@ -404,6 +424,7 @@ ComputeScanoutPublishResult compute_scanout_publish(const VideoOutBufferSnapshot
     in.front_width = front.width;
     in.front_height = front.height;
     in.front_scanout_tile_mode = prosper::gpu::videoout_scanout_tile_mode(front.tiling_mode, 4);
+    in.front_pixel_format = front.pixel_format;
     auto it = s.mirrors.find(front.address);
     Mirror* m = it != s.mirrors.end() && it->second.committed && it->second.image
         ? &it->second : nullptr;
@@ -412,6 +433,7 @@ ComputeScanoutPublishResult compute_scanout_publish(const VideoOutBufferSnapshot
         in.mirror_width = m->width;
         in.mirror_height = m->height;
         in.mirror_tile_mode = m->tile_mode;
+        in.mirror_pixel_format = m->pixel_format;
         in.watch_state = static_cast<uint8_t>(m->watch.query());
     }
     result.decision = compute_scanout_present_decision(in);
@@ -419,9 +441,9 @@ ComputeScanoutPublishResult compute_scanout_publish(const VideoOutBufferSnapshot
     if (result.decision != ComputeScanoutPresent::Publish || !m) return result;
     if (verify_enabled()) verify_against_guest(*m, front);
     // Held under this module's lock so a concurrent begin() cannot recreate the image mid-copy.
-    result.published = present_blit_publish(m->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                            kMirrorFormat, m->width, m->height, front_flip,
-                                            m->producer, &front);
+    result.published =
+        present_blit_publish(m->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m->format, m->width,
+                             m->height, front_flip, m->producer, &front);
     if (result.published) ++s.published;
     return result;
 }

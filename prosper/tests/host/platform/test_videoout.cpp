@@ -691,6 +691,14 @@ TEST(Videoout, Contract) {
             reference[i + 2] = (uint8_t)(texel * 7u);
             reference[i + 3] = 0xff;
         }
+        // `fmt` is the Gen5 format, BGRA in guest memory: the image a reader presents is the
+        // guest's bytes with bytes 0 and 2 of every texel exchanged (#4686).
+        std::vector<uint8_t> presented = reference;
+        videoout_guest_bytes_to_rgba(presented, videoout_component_order(fmt));
+        CHECK(videoout_component_order(fmt) == VideoOutComponentOrder::Bgra8 &&
+                  presented != reference,
+              "the Gen5 display format is read as BGRA, so the presented image differs from the "
+              "bytes");
         const uint32_t tiled_mode = gpu::videoout_scanout_tile_mode(0 /*TILE*/, 4);
         CHECK(tiled_mode == (uint32_t)gpu::TileMode::Sw64KbRX,
               "a TILE-mode 32-bpp scanout is the SW_64KB_R_X render-target swizzle");
@@ -722,7 +730,7 @@ TEST(Videoout, Contract) {
         CHECK(got && snapshot.width == kW && snapshot.height == kH &&
                   snapshot.rgba.size() == reference.size(),
               "the guest scanout read is the registered extent, linear");
-        CHECK(got && snapshot.rgba == reference,
+        CHECK(got && snapshot.rgba == presented,
               "a TILE-mode scanout is de-swizzled into the image the guest composited");
 
         // ---- guest authorship (#2044, review finding B2) -----------------------------------------
@@ -735,7 +743,7 @@ TEST(Videoout, Contract) {
         const uint64_t scanout_before = prosper::diagnostics::transfer_bytes(Transfer::GuestScanout);
         const uint64_t scanout_calls_before =
             prosper::diagnostics::transfer_calls(Transfer::GuestScanout);
-        CHECK(videoout_read_front_linear(read) && read.pixels == reference,
+        CHECK(videoout_read_front_linear(read) && read.pixels == presented,
               "the image reader returns the same de-swizzled frame as the present snapshot");
         // #3891: the scanout read is its own host-copy site. Both of its copies -- out of guest
         // memory, then the de-swizzle -- are charged to guest-scanout and NONE to detile, so a
@@ -770,7 +778,7 @@ TEST(Videoout, Contract) {
               "re-registered the same memory, still holding the previous frame");
         CHECK(videoout_read_front_linear(read) && !read.guest_authored,
               "re-registering over reused memory does NOT inherit the previous authorship");
-        CHECK(read.pixels == reference,
+        CHECK(read.pixels == presented,
               "...and the frame is still read correctly; only the authorship claim is withheld");
 
         // The raw byte primitive stays raw: a diagnostic that dumps guest memory must keep seeing
@@ -790,7 +798,7 @@ TEST(Videoout, Contract) {
               "registered a LINEAR scanout");
         CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the LINEAR scanout");
         gpu::PresentSnapshot linear_snapshot;
-        CHECK(gpu::present_snapshot(linear_snapshot) && linear_snapshot.rgba == reference,
+        CHECK(gpu::present_snapshot(linear_snapshot) && linear_snapshot.rgba == presented,
               "a LINEAR scanout is published byte-for-byte");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the LINEAR scanout");
     }
@@ -828,6 +836,9 @@ TEST(Videoout, Contract) {
         }
         CHECK(expected_partial != reference,
               "truncating the read really does cost image content, so these arms can differ");
+        std::vector<uint8_t> presented = reference, presented_partial = expected_partial;
+        videoout_guest_bytes_to_rgba(presented, videoout_component_order(fmt));
+        videoout_guest_bytes_to_rgba(presented_partial, videoout_component_order(fmt));
 
         uint8_t padded_attr[0x50];
         setba2((uint64_t)(uintptr_t)padded_attr, fmt, 0 /*TILE*/, kW, kH, option, 0, 0);
@@ -844,7 +855,7 @@ TEST(Videoout, Contract) {
               "registered and flipped a padded-footprint scanout whose allocation is proven");
         VideoOutLinearRead proven;
         CHECK(videoout_read_front_linear(proven) && proven.padded_footprint &&
-                  proven.pixels == reference,
+                  proven.pixels == presented,
               "with both proofs the whole image de-swizzles, padded block row included");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the proven-footprint scanout");
         host::notify_guest_mapping_removed((uint64_t)(uintptr_t)pair.data(), pair.size());
@@ -867,7 +878,7 @@ TEST(Videoout, Contract) {
         VideoOutLinearRead unmapped;
         CHECK(videoout_read_front_linear(unmapped) && !unmapped.padded_footprint,
               "a stride wide enough on its own does NOT license reading past the allocation");
-        CHECK(unmapped.pixels == expected_partial,
+        CHECK(unmapped.pixels == presented_partial,
               "...and the read stops exactly at the bytes the mapping vouches for");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the far-apart scanouts");
         host::notify_guest_mapping_removed(first, linear_bytes);
@@ -888,12 +899,13 @@ TEST(Videoout, Contract) {
         VideoOutLinearRead unproven;
         CHECK(videoout_read_front_linear(unproven) && !unproven.padded_footprint,
               "a single registered buffer never licenses the padded read, mapped or not");
-        CHECK(unproven.pixels.size() == linear_bytes && unproven.pixels == expected_partial,
+        CHECK(unproven.pixels.size() == linear_bytes && unproven.pixels == presented_partial,
               "an unproven footprint de-swizzles precisely the bytes it is allowed to read");
         size_t matching = 0;
-        for (size_t i = 0; i + 3 < reference.size(); i += 4)
-            if (std::equal(reference.begin() + i, reference.begin() + i + 4,
-                           unproven.pixels.begin() + i)) ++matching;
+        for (size_t i = 0; i + 3 < presented.size(); i += 4)
+            if (std::equal(presented.begin() + i, presented.begin() + i + 4,
+                           unproven.pixels.begin() + i))
+                ++matching;
         CHECK(matching > reference.size() / 4 / 2 && matching < reference.size() / 4,
               "most of the image survives the truncation, but demonstrably not all of it");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the lone scanout");
@@ -1223,4 +1235,26 @@ TEST(VideooutPitch, StatedPitchIsPublishedAndPresented) {
     ASSERT_EQ(close(handle, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(gpu::guest_linear_texture_row_pitch(address, kW * 4), 0u)
         << "closing the last port retires the display buffers' stated pitch";
+}
+
+// A display buffer's guest bytes are in its VideoOut pixel format, and every reader presents RGBA8
+// (#4686). The Gen5 format is BGRA (The Messenger renders its display buffers in it with CB
+// COMP_SWAP=ALT); an unmapped format is passed through untouched, as before.
+TEST(VideooutComponentOrder, MapsFormatsAndConvertsGuestBytes) {
+    EXPECT_EQ(videoout_component_order(0x8000000000000000ull), VideoOutComponentOrder::Bgra8);
+    EXPECT_EQ(videoout_component_order(0x80000000ull), VideoOutComponentOrder::Bgra8);
+    EXPECT_EQ(videoout_component_order(0x80002200ull), VideoOutComponentOrder::Rgba8);
+    EXPECT_EQ(videoout_component_order(0), VideoOutComponentOrder::Unknown);
+    EXPECT_EQ(videoout_component_order(0x8000000022000000ull), VideoOutComponentOrder::Unknown);
+
+    const std::vector<uint8_t> guest = {1, 2, 3, 4, 5, 6, 7, 8, 9};   // two texels and a stray byte
+    std::vector<uint8_t> bgra = guest;
+    videoout_guest_bytes_to_rgba(bgra, VideoOutComponentOrder::Bgra8);
+    EXPECT_EQ(bgra, (std::vector<uint8_t>{3, 2, 1, 4, 7, 6, 5, 8, 9}));
+    for (VideoOutComponentOrder order :
+         {VideoOutComponentOrder::Rgba8, VideoOutComponentOrder::Unknown}) {
+        std::vector<uint8_t> same = guest;
+        videoout_guest_bytes_to_rgba(same, order);
+        EXPECT_EQ(same, guest);
+    }
 }

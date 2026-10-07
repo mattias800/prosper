@@ -807,9 +807,9 @@ bool videoout_footprint_provable_locked(const VideoOutBufferSnapshot& current, s
 }
 } // namespace
 
-// Read the flipped scanout as an IMAGE rather than as bytes: copy its guest memory and de-swizzle it
-// according to the tiling mode the guest registered with it, so `out.pixels` is always linear
-// width*height*4 RGBA.
+// Read the flipped scanout as an IMAGE rather than as bytes: copy its guest memory, de-swizzle it
+// according to the tiling mode the guest registered with it, and convert it from the registered
+// pixel format, so `out.pixels` is always linear width*height*4 RGBA (#4686).
 //
 // The three copies above are deliberately raw — they are the "hand me those bytes" primitive, and a
 // diagnostic that dumps guest memory wants exactly that. Every consumer that treats the result as
@@ -872,15 +872,21 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
     diagnostics::note_transfer(diagnostics::Transfer::GuestScanout, read_bytes);
 
     out.metadata = meta;
+    // Guest bytes are in the buffer's own pixel format; callers present RGBA8 (#4686). The readers that
+    // present these pixels decline a buffer the renderer owns, so what they show was written by the
+    // guest: by the CPU, or by a compute store routed through its T# DST_SEL.
+    const VideoOutComponentOrder order = videoout_component_order(meta.pixel_format);
     if (!tiled) {
         raw.resize(linear_bytes);
         out.pixels = std::move(raw);
+        videoout_guest_bytes_to_rgba(out.pixels, order);
         return true;
     }
     out.pixels.assign(linear_bytes, 0);
     {
         const diagnostics::TransferAttributionScope as_scanout(diagnostics::Transfer::GuestScanout);
         gpu::detile_surface(out.pixels.data(), raw.data(), meta.width, meta.height, tile_mode, 0, 4);
+        videoout_guest_bytes_to_rgba(out.pixels, order);
     }
     return true;
 }

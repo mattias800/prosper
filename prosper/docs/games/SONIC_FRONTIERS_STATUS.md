@@ -1024,3 +1024,14 @@ to remember to update it. The last one did not (review of #2820).
   it: the pooled-deleter design in #3407, which makes the destination storage stable enough to drop
   the `assign` memset and copy in parallel — i.e. it attacks the 81.6%. Take both or neither.
   #3407
+- **"The orange SEGA logo, yellow menus and yellow FMV on main (#4686) come from #4656's R8Unorm
+  mirror, #4291's BGRA handoffs, or the compute-scanout GPU present path."** All three falsified on
+  the flip-30 SEGA-logo frame of `scripts/sonic-frontiers/reach-title.pad` (visible `prosper-app`,
+  same binary, mean RGB of the saturated pixels). Control: (135, 66, 20). #4291 handling forced off:
+  (135, 66, 20). `PROSPER_NO_COMPUTE_SCANOUT_PRESENT=1` (CPU fallback): (135, 66, 20). #4656 was
+  also already excluded by date: a 2026-10-04 capture from `525cb71c0`, which predates it, has the
+  swap. Bracket: `64eb1f724` (2026-10-02) is blue, `525cb71c0` is swapped. The cause is #4290
+  (`a546107fb`): turning off only its storage-store DST_SEL routing gives (20, 66, 135), the
+  2026-08-27 capture to the byte. The routing itself is correct (see
+  `docs/gpu/RECOMPILER_REMAINING.md`); the scanout readers were not. The 2026-10-04 row above
+  that describes a "tan lower gradient" was taken with this swap present. #4686
