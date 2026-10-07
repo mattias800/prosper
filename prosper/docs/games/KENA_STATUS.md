@@ -39,6 +39,10 @@ never committed. The F9 bundle still aborts on this title (#3807: binding 32, ad
   - prosper never decoded `DEPTH_BOUNDS_ENABLE`, and bound no depth attachment for a draw that only
     bounds-tests. Each cascade therefore wrote the whole mask, and the last one drawn won.
   - With the test implemented, the three cascades partition the screen in the capture.
+  - The test is applied only against depth the guest produced: a retained plane that was valid when
+    the pass began, or one an earlier draw of the same pass wrote. A bounds-only draw with no depth
+    surface, or with a plane nothing has written, runs untested (logged once). It never marks the
+    plane valid. Comparing against prosper's cleared 1.0 would delete reverse-Z slices (#4704 review).
   - The title frame changes in 0.12% of pixels: the sun the mask feeds still adds 0 (above).
 - **Not yet localised:** the light shafts, the foliage and the grade.
   - The shafts plausibly need the sun. Auto-exposure brightening a sunless scene would also wash it

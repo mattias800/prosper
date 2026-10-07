@@ -78,6 +78,15 @@ TEST(DepthBoundsState, BoundsClampIntoTheVulkanRangeAndNanIsEmpty) {
     EXPECT_EQ(wide.depth_bounds_min, 0.0f);
     EXPECT_EQ(wide.depth_bounds_max, 1.0f);
 
+    // A bound beyond the far side of the stored range must stay empty, not be clamped into a range
+    // that admits the endpoint: min > 1 would otherwise pass a stored 1.0, max < 0 a stored 0.0.
+    const ResolvedPipelineState above = resolve(kDepthBoundsEnable, 1.5f, 2.0f);
+    EXPECT_GT(above.depth_bounds_min, above.depth_bounds_max);
+    EXPECT_GT(above.depth_bounds_min, 1.0f - 1e-6f) << "a stored 1.0 must not pass";
+    const ResolvedPipelineState below = resolve(kDepthBoundsEnable, -2.0f, -1.0f);
+    EXPECT_GT(below.depth_bounds_min, below.depth_bounds_max);
+    EXPECT_GT(below.depth_bounds_min, 0.0f) << "a stored 0.0 must not pass";
+
     // A NaN bound compares false on hardware: no stored depth passes. It must become an empty
     // range, never the full [0, 1] that a naive clamp of NaN could produce.
     const float nan = std::numeric_limits<float>::quiet_NaN();

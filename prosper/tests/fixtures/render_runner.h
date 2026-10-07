@@ -1601,6 +1601,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         // feature. Without it the bounds are not applied and the renderer says so once per run.
         r.depth_bounds_enabled = supported.depthBounds;
         if (r.depth_bounds_enabled) feats.depthBounds = VK_TRUE;
+        else
+            fprintf(stderr, "[gpu] WARNING: this Vulkan device lacks depthBounds; the guest's "
+                            "depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) will not "
+                            "be applied, so shadow cascades and light volumes cover every pixel\n");
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
         if (r.logic_op_enabled) feats.logicOp = VK_TRUE;
@@ -8759,16 +8763,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool depth_may_be_written = false;
     uint64_t depth_write_command_order = 0;
     bool stencil_may_be_written = false;
-    for (const auto& d : draws) {
+    // The first draw of this pass that can write depth. A depth-bounds test compares the STORED
+    // depth, so it is meaningful only against depth the guest produced: a plane that was already
+    // valid when the pass began, or one an earlier draw of this same pass wrote (see the
+    // depth-bounds block in the per-draw setup).
+    size_t first_depth_writer = draws.size();
+    for (size_t draw_index = 0; draw_index < draws.size(); ++draw_index) {
+        const auto& d = draws[draw_index];
         if (!d.ps) continue;
+        // A depth-bounds test is NOT here: it only reads the plane, so a bounds-only pass must not
+        // mark a never-written plane valid. That would make later passes LOAD, and the sampled-depth
+        // bridge serve, a cleared value the guest never wrote.
         depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
-            d.ps->depth_bounds_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
         const bool draw_may_write_depth = persistent_ds_pass_may_write_depth(
             d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
             d.ps->depth_compare_op);
         depth_may_be_written |= draw_may_write_depth;
+        if (draw_may_write_depth && first_depth_writer == draws.size())
+            first_depth_writer = draw_index;
         if (draw_may_write_depth)
             depth_write_command_order = std::max(depth_write_command_order, d.command_order);
         stencil_may_be_written |= stencil_clear_effective(
@@ -11370,10 +11384,34 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
         }
         if (ps && ps->depth_bounds_enable) {
-            if (render_vk_ctx().depth_bounds_enabled) {
+            // The test compares the depth already in the attachment. Apply it only when that depth
+            // is the guest's: the retained plane was valid when the pass began, or an earlier draw
+            // of this pass wrote it. Otherwise the attachment holds the value prosper cleared it to,
+            // which no bound range can stand in for (#371 approximates unknown depth by the value
+            // that always passes a compare; a range has no such value). There, as on a target with
+            // no depth surface at all, the draw runs untested -- the behaviour before the test
+            // existed -- and the run says so once.
+            const bool depth_known = (persistent_ds && depth_was_valid) || di > first_depth_writer;
+            const bool applied = depth_known && render_vk_ctx().depth_bounds_enabled;
+            static std::once_flag first_draw;
+            std::call_once(first_draw, [&] {
+                fprintf(stderr, "[gpu] first depth-bounds draw: bounds [%g, %g] %s\n",
+                        ps->depth_bounds_min, ps->depth_bounds_max,
+                        applied ? "applied"
+                        : !render_vk_ctx().depth_bounds_enabled ? "NOT applied (device lacks depthBounds)"
+                                                                 : "NOT applied (depth contents unknown)");
+            });
+            if (applied) {
                 v.depth_bounds_test = VK_TRUE;
                 v.depth_bounds_min = ps->depth_bounds_min;
                 v.depth_bounds_max = ps->depth_bounds_max;
+            } else if (!depth_known) {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] depth-bounds test skipped: the draw's depth plane holds "
+                                    "no guest-written depth (no DS surface, or never written), so "
+                                    "the draw is untested (reported once per run)\n");
+                });
             } else {
                 static std::once_flag logged;
                 std::call_once(logged, [] {
