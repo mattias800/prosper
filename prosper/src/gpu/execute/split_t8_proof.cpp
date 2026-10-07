@@ -82,9 +82,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         }
     }
     auto may_write = [&](const Rdna2Inst& in, int reg) {
-        // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base.
-        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return true;
+        // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base. The
+        // shared list names exactly those (s_movreld_*, s_movrelsd_2_b32, PC transfers, calls); an
+        // s_*_saveexec form writes only its named destination and EXEC, and falls through below.
+        if (rdna2_escapes_decoded_effects(in)) return true;
         // A plain B32 move writes only its named word. Treating it as a pair incorrectly
         // clobbers the adjacent destination while assembling a T# one lane at a time.
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&

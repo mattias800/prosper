@@ -948,6 +948,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_split_t8_sop2_width.cpp
     INCLUDES src
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_split_t8_saveexec
+    SOURCES tests/gpu/recompiler/test_split_t8_saveexec.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_image_write_extent
     SOURCES tests/gpu/recompiler/test_split_t8_image_write_extent.cpp
     INCLUDES src
