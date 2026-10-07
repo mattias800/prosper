@@ -1316,6 +1316,49 @@ int main(int argc, char** argv) {
           std::memcmp(copied_target, ordered_range.data(), sizeof copied_target) == 0,
           "ordered DMA copies current bytes produced by the preceding live-render span");
 
+    // #4686 N1: a CB_COLOR ALT (BGRA) target is kept as canonical RGBA8, but a DMA copy out of it
+    // reads guest memory, which holds B in byte 0. The byte reader must hand over the guest's order,
+    // including for a range that starts and ends mid-texel; an RGBA target is unchanged (above).
+    // These arms prove the WIRING (the reader swaps an ALT target at all). The producer samples one
+    // constant UV, so every texel is identical and texel t+1 cannot be told from t: the byte PHASE
+    // (guest address vs position in the range) is pinned by test_live_target_format's
+    // DmaRangeTakesEachByteFromItsGuestAddress over distinct bytes, not here.
+    {
+        DrawItem alt_producer = producer;
+        alt_producer.color0_base = 0x100500000ull;
+        alt_producer.ps.color0_format = VK_FORMAT_B8G8R8A8_UNORM;
+        if (alt_producer.ps.color_targets[0].format)
+            alt_producer.ps.color_targets[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+        render_submit_items({alt_producer}, W, H);
+        LiveTargetSnapshot alt_snapshot;
+        const bool alt_read =
+            read_live_render_target(alt_producer.color0_base, alt_snapshot) &&
+            alt_snapshot.pixels && alt_snapshot.component_order_bgra &&
+            alt_snapshot.pixels->size() ==
+                static_cast<size_t>(alt_producer.color0_width) * alt_producer.color0_height * 4u;
+        CHECK(alt_read, "an ALT colour target is cached as canonical RGBA8 marked BGRA-in-guest");
+        const uint64_t texel =
+            static_cast<uint64_t>(alt_producer.color0_width) + alt_producer.color0_width / 2u;
+        if (alt_read) {
+            const uint8_t* canonical = alt_snapshot.pixels->data() + texel * 4u;
+            CHECK(canonical[0] != canonical[2],
+                  "anti-triviality: the sampled texel's red and blue differ");
+            std::vector<uint8_t> whole;
+            CHECK(read_live_render_target_bytes(alt_producer.color0_base + texel * 4u, 4, whole) ==
+                          LiveTargetByteReadResult::Success &&
+                      whole.size() == 4 && whole[0] == canonical[2] && whole[1] == canonical[1] &&
+                      whole[2] == canonical[0] && whole[3] == canonical[3],
+                  "a DMA read of an ALT target returns the texel in guest BGRA order");
+            std::vector<uint8_t> straddle;
+            CHECK(read_live_render_target_bytes(alt_producer.color0_base + texel * 4u + 2u, 4,
+                                                straddle) == LiveTargetByteReadResult::Success &&
+                      straddle.size() == 4 && straddle[0] == canonical[0] &&
+                      straddle[1] == canonical[3] && straddle[2] == canonical[6] &&
+                      straddle[3] == canonical[5],
+                  "a DMA read that starts mid-texel keeps each byte's guest component");
+        }
+    }
+
     DrawItem replay_producer = producer;
     replay_producer.color0_base = 0x100400000ull;
     replay_producer.draw_index = 0;

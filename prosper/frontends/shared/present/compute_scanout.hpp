@@ -102,6 +102,7 @@ enum class ComputeScanoutPresent : uint8_t {
     Stale,              // the guest bytes may have changed since the commit (watch Dirty)
     Unwatched,          // no watch could be armed (or the platform has none): cannot prove current
     ExtentMismatch,     // the flipped buffer's geometry is not the mirror's
+    FormatMismatch,     // the flipped buffer's pixel format, so byte order, is not the mirror's
     TileMismatch,       // VideoOut de-swizzles with a different tile mode than compute retiled with
     RendererSource,     // the CPU path would present something prosper rendered instead
     RendererOwnsTarget, // the renderer holds an entry at the front address (even a pixel-less
@@ -120,6 +121,7 @@ constexpr const char* compute_scanout_present_name(ComputeScanoutPresent p) {
     case ComputeScanoutPresent::Stale: return "stale";
     case ComputeScanoutPresent::Unwatched: return "unwatched";
     case ComputeScanoutPresent::ExtentMismatch: return "extent-mismatch";
+    case ComputeScanoutPresent::FormatMismatch: return "format-mismatch";
     case ComputeScanoutPresent::TileMismatch: return "tile-mismatch";
     case ComputeScanoutPresent::RendererSource: return "renderer-source";
     case ComputeScanoutPresent::RendererOwnsTarget: return "renderer-owns-target";
@@ -159,9 +161,10 @@ constexpr ComputeScanoutPresent compute_scanout_present_decision(
         return ComputeScanoutPresent::ScaledPresent;
     if (!in.committed) return ComputeScanoutPresent::Absent;
     if (in.mirror_width != in.front_width || in.mirror_height != in.front_height ||
-        static_cast<uint64_t>(in.mirror_width) * in.mirror_height * 4u != in.display_bytes ||
-        in.mirror_pixel_format != in.front_pixel_format)   // also its byte order (#4686)
+        static_cast<uint64_t>(in.mirror_width) * in.mirror_height * 4u != in.display_bytes)
         return ComputeScanoutPresent::ExtentMismatch;
+    // A mirror's image format encodes the byte order it took (#4686).
+    if (in.mirror_pixel_format != in.front_pixel_format) return ComputeScanoutPresent::FormatMismatch;
     if (in.mirror_tile_mode != in.front_scanout_tile_mode) return ComputeScanoutPresent::TileMismatch;
     if (in.watch_state == 1) return ComputeScanoutPresent::Stale;
     if (in.watch_state != 0) return ComputeScanoutPresent::Unwatched;

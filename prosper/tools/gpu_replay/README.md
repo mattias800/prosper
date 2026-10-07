@@ -458,7 +458,7 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 
 A replay executes the captured commands with the current renderer, in a process that has no guest:
 no guest memory at guest addresses, and no guest mapping table. Most of the renderer never
-notices. Two places do, and both produce a plausible frame rather than an error.
+notices. A few places do, and each produces a plausible frame rather than an error.
 
 - **A target fast-cleared through DCC and then RENDERED to does not start from its clear colour**
   (#4627). The live renderer reads the metadata plane through its guest address; the replay
@@ -477,6 +477,13 @@ notices. Two places do, and both produce a plausible frame rather than an error.
   whether ordinary guest bytes may be read beside a renderer-only volume slice ask the mapping
   table too (`unpublished_volume_may_overlap`), and in a replay they still get Unknown. A title
   that renders to volume targets may replay differently from its live run for that reason.
+- **A DMA copy out of a seeded CB_COLOR ALT (BGRA) target is not swapped into guest order**
+  (#4686, review of #4695). The live renderer keeps an ALT target as canonical RGBA8 and hands a
+  DMA read the guest's BGRA bytes. An RTT seed records the target's host format but not the
+  guest's colour order (`guest_format` is set to the seed's own format), so in a replay the
+  same copy returns the canonical bytes with R and B exchanged relative to the live run. Only a
+  copy whose source is a seeded ALT target is affected; a target the replay renders itself keeps
+  its CB format and is swapped as live. Closing it needs the seed to carry the guest format.
 
 **Check a replayed target against its seed before trusting it.** A bundle's `rtt-seed` entries
 are the live run's own copies of those targets, one frame old; `--dump-rtt-seed` reads them

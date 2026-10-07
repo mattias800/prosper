@@ -876,18 +876,25 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
     // present these pixels decline a buffer the renderer owns, so what they show was written by the
     // guest: by the CPU, or by a compute store routed through its T# DST_SEL.
     const VideoOutComponentOrder order = videoout_component_order(meta.pixel_format);
+    // The R/B swap is one more full pass over the image; charge it to the same site on both paths,
+    // and only when it runs (#4686 N3).
+    auto to_rgba = [&] {
+        if (order != VideoOutComponentOrder::Bgra8) return;
+        videoout_guest_bytes_to_rgba(out.pixels, order);
+        diagnostics::note_transfer(diagnostics::Transfer::GuestScanout, out.pixels.size());
+    };
     if (!tiled) {
         raw.resize(linear_bytes);
         out.pixels = std::move(raw);
-        videoout_guest_bytes_to_rgba(out.pixels, order);
+        to_rgba();
         return true;
     }
     out.pixels.assign(linear_bytes, 0);
     {
         const diagnostics::TransferAttributionScope as_scanout(diagnostics::Transfer::GuestScanout);
         gpu::detile_surface(out.pixels.data(), raw.data(), meta.width, meta.height, tile_mode, 0, 4);
-        videoout_guest_bytes_to_rgba(out.pixels, order);
     }
+    to_rgba();
     return true;
 }
 
