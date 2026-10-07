@@ -1,5 +1,5 @@
 ---
-kind: design
+kind: plan
 status: current
 ---
 
