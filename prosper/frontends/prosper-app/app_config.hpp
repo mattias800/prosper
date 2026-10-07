@@ -11,6 +11,8 @@
 // Parsing and serializing are pure and unit-tested; choosing the file's location and touching the disk
 // stays in main.cpp.
 
+#include "game_path.hpp"   // strip_trailing_separators: recent roots compare canonically
+
 #include <map>
 #include <string>
 #include <vector>
@@ -37,6 +39,12 @@ struct AppConfig {
     // `guest_args_by_title` overrides per TITLE_ID (config key spelling: `guest_args.PPSA02664`).
     std::string guest_args_default;                                  // "" = none
     std::map<std::string, std::string> guest_args_by_title;
+
+    // Recently opened titles, most-recent-first, as app0 roots. Backs File > Recent games.
+    // Capped so the file cannot grow without bound; a root whose dump is gone stays listed
+    // (opening it says so) rather than being silently forgotten.
+    std::vector<std::string> recent_games;
+    static constexpr size_t kRecentGamesMax = 8;
 };
 
 // Trim ASCII spaces and tabs from both ends.
@@ -70,7 +78,9 @@ inline AppConfig parse_app_config(const std::string& text) {
         else if (key == "guest_args") cfg.guest_args_default = value;
         else if (key.rfind("guest_args.", 0) == 0)
             cfg.guest_args_by_title[key.substr(11)] = value;
-        else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
+        else if (key == "recent") {
+            if (!value.empty()) cfg.recent_games.push_back(value);
+        } else cfg.unknown_lines.push_back(line);   // preserved across a rewrite
         if (nl == text.size()) break;
     }
     return cfg;
@@ -89,6 +99,8 @@ inline std::string serialize_app_config(const AppConfig& cfg) {
     for (const auto& [title, args] : cfg.guest_args_by_title)
         out += "guest_args." + title + " = " + args + "\n";
     if (!cfg.guest_args_default.empty()) out += "guest_args = " + cfg.guest_args_default + "\n";
+    for (const std::string& recent : cfg.recent_games)
+        if (!recent.empty()) out += "recent = " + recent + "\n";
     return out;
 }
 
@@ -98,6 +110,22 @@ inline std::string resolve_games_dir(const std::string& flag, const std::string&
     if (!flag.empty()) return flag;
     if (!env.empty()) return env;
     return file.games_dir;
+}
+
+// Record a boot at `app0_root` at the head of the recent list: deduped, canonicalized,
+// capped at kRecentGamesMax. Pure over the struct, so the rule is unit-tested.
+inline void note_recent_game(AppConfig& cfg, const std::string& app0_root) {
+    const std::string root = strip_trailing_separators(app0_root);
+    if (root.empty()) return;
+    std::vector<std::string> kept;
+    kept.reserve(AppConfig::kRecentGamesMax);
+    kept.push_back(root);
+    for (const std::string& have : cfg.recent_games) {
+        if (kept.size() >= AppConfig::kRecentGamesMax) break;
+        if (have.empty() || strip_trailing_separators(have) == root) continue;
+        kept.push_back(have);
+    }
+    cfg.recent_games = std::move(kept);
 }
 
 // Per-title launch arguments for the guest: a `guest_args.<TITLE_ID>` entry wins over the global

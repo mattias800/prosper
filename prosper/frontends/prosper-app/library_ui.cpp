@@ -1,7 +1,7 @@
-// library_ui.cpp — see library_ui.hpp. Draws the library grid with Dear ImGui on the app's existing
+// library_ui.cpp — see library_ui.hpp. Draws the library list with Dear ImGui on the app's existing
 // Vulkan device, and decodes cover art with stb_image (#1471).
 #include "library_ui.hpp"
-#include "library_nav.hpp"
+#include "list_nav.hpp"   // pure keyboard gate: typing in the search box never drives the list
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 
 #include "imgui.h"
@@ -15,6 +15,7 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,16 +23,118 @@
 namespace prosper::frontend {
 namespace {
 
-// Cover art is square (icon0.png is 512x512 in every dump), so 320 still samples the source DOWN and
-// cannot show resampling artefacts. The previous 160 read as very small on a desktop monitor.
-constexpr float kCoverSize   = 320.0f;
-// Wide gutters are what let the focused title's background art actually be seen between the cards
-// (#1630) — at the old spacing the grid covered almost all of it.
-constexpr float kCellPadding = 96.0f;
-constexpr float kLabelHeight = 84.0f;    // up to three lines of wrapped title at the larger font
-constexpr float kTitleFontPx = 26.0f;    // 2x ImGui's 13px default; integer scale keeps the bitmap crisp
-constexpr float kCellWidth   = kCoverSize + kCellPadding;
-constexpr float kCellHeight  = kCoverSize + kLabelHeight + kCellPadding;
+// Table thumbnails sample the square icon0.png down, so they cannot show resampling artefacts.
+constexpr float kThumbSize = 56.0f;
+
+// Toolbar icons, drawn as vectors: no font file, no license baggage, crisp at any scale.
+// Each is centered on `c` within roughly radius `s`.
+enum class ToolbarIcon { play, folder, rescan, fullscreen, keyboard, music_on, music_off };
+void draw_toolbar_icon(ImDrawList* dl, ImVec2 c, float s, ToolbarIcon icon, ImU32 col) {
+    const float t = s / 11.0f;   // icon units: every glyph lives in an 11-unit box
+    switch (icon) {
+    case ToolbarIcon::play: {
+        // Right-pointing triangle.
+        dl->AddTriangleFilled(ImVec2(c.x - 4 * t, c.y - 6 * t), ImVec2(c.x - 4 * t, c.y + 6 * t),
+                              ImVec2(c.x + 6 * t, c.y), col);
+        break;
+    }
+    case ToolbarIcon::folder: {
+        // Outline body with a tab nub: one stroke weight throughout, no fill tricks.
+        dl->AddRect(ImVec2(c.x - 8 * t, c.y - 3 * t), ImVec2(c.x + 8 * t, c.y + 6 * t), col,
+                    1.5f * t, 0, 2 * t);
+        dl->AddLine(ImVec2(c.x - 8 * t, c.y - 3 * t), ImVec2(c.x - 8 * t, c.y - 6 * t), col,
+                    2 * t);
+        dl->AddLine(ImVec2(c.x - 8 * t, c.y - 6 * t), ImVec2(c.x - 1 * t, c.y - 6 * t), col,
+                    2 * t);
+        dl->AddLine(ImVec2(c.x - 1 * t, c.y - 6 * t), ImVec2(c.x - 1 * t, c.y - 3 * t), col,
+                    2 * t);
+        break;
+    }
+    case ToolbarIcon::rescan: {
+        // Circular arrow. The head sits at the arc's end, pointing along the tangent, so the
+        // eye reads rotation rather than a blob.
+        const float end = 5.0f;
+        dl->PathArcTo(c, 6 * t, 0.8f, end, 24);
+        dl->PathStroke(col, 0, 2.2f * t);
+        const ImVec2 dir(std::cos(end), std::sin(end));    // radial
+        const ImVec2 tan(-dir.y, dir.x);                   // direction of travel
+        const ImVec2 base(c.x + dir.x * 6 * t, c.y + dir.y * 6 * t);
+        dl->AddTriangleFilled(ImVec2(base.x + tan.x * 5.5f * t, base.y + tan.y * 5.5f * t),
+                              ImVec2(base.x - tan.x * 0.5f * t + dir.x * 3.5f * t,
+                                     base.y - tan.y * 0.5f * t + dir.y * 3.5f * t),
+                              ImVec2(base.x - tan.x * 0.5f * t - dir.x * 3.5f * t,
+                                     base.y - tan.y * 0.5f * t - dir.y * 3.5f * t),
+                              col);
+        break;
+    }
+    case ToolbarIcon::fullscreen: {
+        // Four corner brackets pushing outward.
+        const float e = 7 * t, l = 4 * t, w = 2 * t;
+        dl->AddLine(ImVec2(c.x - e, c.y - e + l), ImVec2(c.x - e, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y - e), ImVec2(c.x - e + l, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x + e - l, c.y - e), ImVec2(c.x + e, c.y - e), col, w);
+        dl->AddLine(ImVec2(c.x + e, c.y - e), ImVec2(c.x + e, c.y - e + l), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y + e - l), ImVec2(c.x - e, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x - e, c.y + e), ImVec2(c.x - e + l, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x + e - l, c.y + e), ImVec2(c.x + e, c.y + e), col, w);
+        dl->AddLine(ImVec2(c.x + e, c.y + e), ImVec2(c.x + e, c.y + e - l), col, w);
+        break;
+    }
+    case ToolbarIcon::keyboard: {
+        // Key well with three key rows.
+        dl->AddRect(ImVec2(c.x - 9 * t, c.y - 5 * t), ImVec2(c.x + 9 * t, c.y + 5 * t), col,
+                    2 * t, 0, 1.8f * t);
+        for (int row = 0; row < 3; row++)
+            for (int k = 0; k < 5; k++)
+                dl->AddRectFilled(ImVec2(c.x - 7 * t + k * 3 * t, c.y - 3 * t + row * 2.6f * t),
+                                  ImVec2(c.x - 5 * t + k * 3 * t, c.y - 1.4f * t + row * 2.6f * t),
+                                  col);
+        break;
+    }
+    case ToolbarIcon::music_on:
+    case ToolbarIcon::music_off: {
+        // One beamed note, drawn large: the stem lands through the head's middle, so the two
+        // are one mark at any size. The off state adds the universal slash.
+        dl->AddLine(ImVec2(c.x + 2 * t, c.y - 7 * t), ImVec2(c.x + 2 * t, c.y + 4 * t), col,
+                    2.6f * t);
+        dl->AddEllipseFilled(ImVec2(c.x + 1 * t, c.y + 4 * t), ImVec2(4 * t, 3.2f * t),
+                             col);
+        dl->AddTriangleFilled(ImVec2(c.x + 2 * t, c.y - 7 * t),
+                              ImVec2(c.x + 7.5f * t, c.y - 4.5f * t),
+                              ImVec2(c.x + 2 * t, c.y - 1.5f * t), col);
+        if (icon == ToolbarIcon::music_off)
+            dl->AddLine(ImVec2(c.x - 9 * t, c.y - 7 * t), ImVec2(c.x + 9 * t, c.y + 7 * t), col,
+                        2.4f * t);
+        break;
+    }
+    }
+}
+
+// An icon-over-label toolbar button. Behaves like a button (hover/active painting included);
+// `active` pins the active paint for toggle state.
+bool icon_button(const char* id, ToolbarIcon icon, const char* label, bool active = false) {
+    ImGui::BeginGroup();
+    ImGui::PushID(id);
+    const ImVec2 size(64.0f, 52.0f);
+    const bool clicked = ImGui::InvisibleButton("btn", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool pressed = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetItemRectMin();
+    if (hovered || pressed || active)
+        dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y),
+                          ImGui::GetColorU32(pressed || active ? ImGuiCol_ButtonActive
+                                                              : ImGuiCol_ButtonHovered),
+                          6.0f);
+    const ImU32 glyph =
+        ImGui::GetColorU32((hovered || pressed || active) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    draw_toolbar_icon(dl, ImVec2(p0.x + size.x * 0.5f, p0.y + 20.0f), 11.0f, icon, glyph);
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p0.x + (size.x - textSize.x) * 0.5f, p0.y + 34.0f), glyph, label);
+    ImGui::PopID();
+    ImGui::EndGroup();
+    return clicked;
+}
 
 std::string read_file_bytes(const std::string& path) {
     std::string out;
@@ -153,21 +256,105 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     imguiCtx_ = true;   // set immediately: shutdown() must destroy the context even if a backend fails
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;   // no imgui.ini beside the binary: the app has its own settings file
-    // ImGui's own keyboard/gamepad nav is deliberately NOT enabled: this screen drives selection with
-    // the unit-tested grid rules in library_nav.hpp, and letting both run means the arrow keys move a
-    // widget focus as well as the selection, and Enter activates whatever widget that focus landed on
-    // rather than launching the highlighted game.
+    // ImGui's own keyboard/gamepad nav is deliberately NOT enabled: this screen drives selection
+    // itself (Up/Down/Home/End plus Enter, gated by the pure list_nav.hpp rules), and letting both
+    // run means the arrow keys move a widget focus as well as the selection, and Enter activates
+    // whatever widget that focus landed on rather than launching the highlighted game.
     io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
     ImGui::StyleColorsDark();
+    // Console-shelf polish: roomier touch targets and one accent family. The library window sits
+    // flush against the OS window edge, so rounded content corners would frame a square window
+    // with gaps — widgets keep their rounding, windows do not.
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 0.0f;
+        style.FrameRounding = 6.0f;
+        style.GrabRounding = 6.0f;
+        style.WindowPadding = ImVec2(16, 14);
+        style.FramePadding = ImVec2(10, 6);
+        style.ItemSpacing = ImVec2(10, 8);
+        style.ItemInnerSpacing = ImVec2(8, 6);
+        ImVec4* c = style.Colors;
+        c[ImGuiCol_Button] = ImVec4(0.10f, 0.32f, 0.68f, 1.00f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.42f, 0.82f, 1.00f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.07f, 0.25f, 0.55f, 1.00f);
+        c[ImGuiCol_Header] = ImVec4(0.10f, 0.32f, 0.68f, 1.00f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.16f, 0.42f, 0.82f, 1.00f);
+        c[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.75f, 1.00f, 1.00f);
+        c[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.14f, 0.17f, 1.00f);
+        c[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.20f, 0.24f, 1.00f);
+    }
 
-    // Game titles are drawn at twice the UI font size. A SECOND atlas entry rather than
-    // SetWindowFontScale: ImGui's default font is a bitmap designed for 13 px, and scaling it at draw
-    // time blurs it, while baking it at an exact 2x integer multiple stays sharp. The first font added
-    // remains the default, so the header, footer and buttons are unchanged.
-    io.Fonts->AddFontDefault();
-    ImFontConfig titleCfg;
-    titleCfg.SizePixels = kTitleFontPx;
-    titleFont_ = io.Fonts->AddFontDefault(&titleCfg);
+    // Type comes from the host's own UI font, baked at the exact sizes it is drawn at — the same
+    // crispness rule the old 2x bitmap title font followed. A system font is data, not code:
+    // nothing guest-controlled touches it, and when none is found the bitmap default keeps every
+    // label readable, only less pretty.
+    {
+        const char* regular = nullptr;
+        const char* bold = nullptr;
+#ifdef _WIN32
+        static const char kWinRegular[] = "C:\\Windows\\Fonts\\segoeui.ttf";
+        static const char kWinBold[] = "C:\\Windows\\Fonts\\segoeuib.ttf";
+        FILE* probe = std::fopen(kWinRegular, "rb");
+        if (probe) {
+            std::fclose(probe);
+            regular = kWinRegular;
+            probe = std::fopen(kWinBold, "rb");
+            if (probe) { std::fclose(probe); bold = kWinBold; }
+        }
+#else
+        static const struct { const char* regular; const char* bold; } kLinuxFonts[] = {
+            {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"},
+            {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"},
+            {"/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"},
+            {"/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+             "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf"},
+        };
+#ifdef __APPLE__
+        static const struct { const char* regular; const char* bold; } kMacFonts[] = {
+            {"/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/Helvetica.ttc"},
+        };
+#endif
+        for (const auto& candidate : kLinuxFonts) {
+            FILE* probe = std::fopen(candidate.regular, "rb");
+            if (!probe) continue;
+            std::fclose(probe);
+            regular = candidate.regular;
+            probe = std::fopen(candidate.bold, "rb");
+            if (probe) { std::fclose(probe); bold = candidate.bold; }
+            break;
+        }
+#ifdef __APPLE__
+        if (!regular) {
+            for (const auto& candidate : kMacFonts) {
+                FILE* probe = std::fopen(candidate.regular, "rb");
+                if (!probe) continue;
+                std::fclose(probe);
+                regular = candidate.regular;
+                bold = candidate.bold;
+                break;
+            }
+        }
+#endif
+#endif
+        if (regular) {
+            // 16 px UI text and 16 px bold headers. All-or-nothing: a half-built atlas is
+            // discarded so the fallback below owns everything. A bold path identical to the
+            // regular one (macOS Helvetica.ttc, whose faces need an index this loader does not
+            // pick) is skipped rather than baking the same font twice.
+            ImFont* ui = io.Fonts->AddFontFromFileTTF(regular, 16.0f);
+            if (ui && bold && bold != regular)
+                boldFont_ = io.Fonts->AddFontFromFileTTF(bold, 16.0f);
+            if (!ui) io.Fonts->Clear();
+        }
+    }
+    if (io.Fonts->Fonts.empty()) {
+        // No system font: the bitmap default at 13 px. Scaling it at draw time would blur, so the
+        // list simply draws smaller rather than rescaling what it has.
+        io.Fonts->AddFontDefault();
+    }
 
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) { fprintf(stderr, "[library] SDL3 backend init failed\n"); shutdown(); return false; }
     sdlInit_ = true;
@@ -368,13 +555,19 @@ bool LibraryUi::ensure_descriptor_capacity(size_t title_count) {
     return true;
 }
 
-void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
-    // Hold the selection on the same title across a rescan, so adding a game elsewhere in the list
-    // does not move the cursor under the user's hands.
-    std::string keep;
-    if (selected_ >= 0 && selected_ < static_cast<int>(games_.size()))
-        keep = games_[static_cast<size_t>(selected_)].app0_root;
+void LibraryUi::apply_filter() {
+    filterApplied_ = filterBuf_;
+    filtered_.clear();
+    for (int i = 0; i < static_cast<int>(games_.size()); i++)
+        if (game_entry_matches_filter(games_[static_cast<size_t>(i)], filterApplied_))
+            filtered_.push_back(i);
+    selected_ = 0;
+    hovered_ = -1;
+    contextFi_ = -1;
+    contextArmed_ = false;
+}
 
+void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
     if (device_) vkDeviceWaitIdle(device_);   // covers may still be referenced by an in-flight frame
     destroy_covers();
     // After destroy_covers() and the device wait, so the grow finds the old pool free of cover sets and
@@ -383,12 +576,7 @@ void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games
     games_ = std::move(games);
     gamesDir_ = games_dir;
     covers_.resize(games_.size());
-
-    selected_ = 0;
-    if (!keep.empty())
-        for (size_t i = 0; i < games_.size(); i++)
-            if (games_[i].app0_root == keep) { selected_ = static_cast<int>(i); break; }
-    firstRow_ = 0;
+    apply_filter();
 }
 
 bool LibraryUi::handle_event(const SDL_Event& ev) {
@@ -616,6 +804,83 @@ void LibraryUi::draw_backdrop() {
     }
 }
 
+void LibraryUi::draw_controls_content() {
+    if (ImGui::Button("< Back to games")) tab_ = LibraryTab::games;
+    ImGui::Separator();
+    ImGui::TextWrapped("Keyboard controls. A connected controller just works as pad 0 -- "
+                       "this map is composed over it.");
+    const ImGuiTableFlags flags =
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV;
+    if (ImGui::BeginTable("controls", 2, flags)) {
+        ImGui::TableSetupColumn("Keys", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+        ImGui::TableSetupColumn("Guest control", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        // Mirrors keyboard_pad_map.hpp's documented layout; update both together.
+        static const char* kRows[][2] = {
+            {"W A S D / arrows", "D-pad"},
+            {"T F G H", "Left stick (up / left / down / right)"},
+            {"I J K L", "Right stick (up / left / down / right)"},
+            {"N M , .", "Square / Cross / Circle / Triangle"},
+            {"Space", "Cross"},
+            {"Z X C V", "L1 / L2 / R1 / R2"},
+            {"B / Slash", "L3 / R3 (stick clicks)"},
+            {"Enter", "Options"},
+            {"Pause / F10", "Pause / resume at a flip boundary"},
+            {"F11 / Alt+Enter", "Fullscreen"},
+            {"F8", "Performance capture"},
+            {"F9", "Frame capture for offline replay"},
+            {"Esc", "Exit"},
+        };
+        for (const auto (&row)[2] : kRows) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(row[0]);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(row[1]);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("One cluster per hand at a time: WASD or TFGH left, IJKL or N M , . right.");
+}
+
+// Right-click detector for one row item: arms the menu below. Called at each clickable item
+// of the row so the whole row answers; the menu itself is opened and drawn once per frame
+// after the table (draw_row_menu), where OpenPopup/BeginPopup always agree.
+void LibraryUi::note_row_right_click(int fi) {
+    if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+        selected_ = fi;
+        contextFi_ = fi;
+        contextArmed_ = true;
+    }
+}
+
+void LibraryUi::draw_row_menu(LibraryAction& action, int shown) {
+    if (contextArmed_) {
+        ImGui::OpenPopup("rowmenu");
+        contextArmed_ = false;
+    }
+    if (!ImGui::BeginPopup("rowmenu")) return;
+    // The filter may have moved under an open menu; a stale row closes it rather than acting
+    // on the wrong game.
+    if (contextFi_ < 0 || contextFi_ >= shown) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const GameEntry& game =
+        games_[static_cast<size_t>(filtered_[static_cast<size_t>(contextFi_)])];
+    if (ImGui::MenuItem("Play")) {
+        selected_ = contextFi_;
+        action.kind = LibraryAction::Kind::open;
+        action.app0_root = game.app0_root;
+    }
+    if (ImGui::MenuItem("Show in Explorer")) {
+        action.kind = LibraryAction::Kind::show_in_explorer;
+        action.app0_root = game.app0_root;
+    }
+    ImGui::EndPopup();
+}
+
 LibraryAction LibraryUi::render_frame(const std::string& status) {
     LibraryAction action;
     if (!ready_) return action;
@@ -649,30 +914,55 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         }
         lastFrameNs_ = ns;
     }
-    if (!games_.empty() && selected_ >= 0 && selected_ < static_cast<int>(games_.size()))
-        media_.set_focus(games_[static_cast<size_t>(selected_)].app0_root, nowMs);
+    if (!filtered_.empty() && selected_ >= 0 && selected_ < static_cast<int>(filtered_.size()))
+        media_.set_focus(
+            games_[static_cast<size_t>(filtered_[static_cast<size_t>(selected_)])].app0_root,
+            nowMs);
     media_.update(nowMs);
     draw_backdrop();
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
-    // NoBackground so the title's art is visible behind the grid (#1630). With no background loaded
+    // NoBackground so the title's art is visible behind the list (#1630). With no background loaded
     // this reveals the render pass's clear colour, which is the same flat dark the window used to
     // paint, so the view is unchanged for a title with no usable art.
     ImGui::Begin("prosper", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground);
+                 ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground |
+                 ImGuiWindowFlags_MenuBar);
 
-    ImGui::TextUnformatted(games_.empty() ? "prosper" : "Choose a game");
-    if (!gamesDir_.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", gamesDir_.c_str());
+    // Menu bar: File (folders, recent games, exit). No PKG install item — prosper runs
+    // user-supplied unpacked dumps, it installs nothing.
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Add games folder...")) action.kind = LibraryAction::Kind::browse;
+            if (ImGui::MenuItem("Open game folder...")) action.kind = LibraryAction::Kind::pick_game;
+            if (ImGui::BeginMenu("Recent games", !recentGames_.empty())) {
+                for (size_t ri = 0; ri < recentGames_.size(); ri++) {
+                    const RecentGame& recent = recentGames_[ri];
+                    ImGui::PushID(static_cast<int>(ri));
+                    // The name on the line, the path on hover: same screenshot rule as the table.
+                    if (ImGui::MenuItem(recent.label.c_str())) {
+                        action.kind = LibraryAction::Kind::open;
+                        action.app0_root = recent.root;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recent.root.c_str());
+                    ImGui::PopID();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit")) action.kind = LibraryAction::Kind::quit;
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
     }
-    ImGui::Separator();
 
-    if (games_.empty()) {
+    if (tab_ == LibraryTab::controls) {
+        draw_controls_content();
+    } else if (games_.empty()) {
         ImGui::Spacing();
         if (gamesDir_.empty()) {
             ImGui::TextWrapped("No games folder is set yet. Choose the folder that holds your PS5 game "
@@ -682,8 +972,8 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
                                "containing eboot.bin and sce_sys.");
         }
         ImGui::Spacing();
-        // Keyboard-reachable too: ImGui's own nav is off (it fights the grid rules), so without this
-        // the only way out of the empty state would be the mouse or a drop.
+        // Keyboard-reachable too: ImGui's own nav is off, so without this the only way out of the
+        // empty state would be the mouse or a drop. No text field exists here, so Enter is safe.
         if (ImGui::Button("Choose folder...") ||
             ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
             ImGui::IsKeyPressed(ImGuiKey_Space))
@@ -691,107 +981,189 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         ImGui::SameLine();
         ImGui::TextDisabled("or press Enter, or drop a game folder on this window");
     } else {
-        const float avail = ImGui::GetContentRegionAvail().x;
-        const int columns = library_columns_for_width(avail, kCellWidth);
-        const int count = static_cast<int>(games_.size());
-
-        // Selection. ImGui's own nav does not know about the grid, so movement is decided by the
-        // unit-tested rules in library_nav.hpp and the scroll follows the selection.
-        // Keyboard only. Controller navigation is NOT implemented: ImGui's gamepad nav is off (it
-        // fights these rules), and nothing initialises SDL's gamepad subsystem while the library is
-        // alive — the pad backend does that inside start_guest, by which point the library is gone.
-        // Tracked separately rather than shipped as code that cannot fire.
-        LibraryNavKey key = LibraryNavKey::none;
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))       key = LibraryNavKey::left;
-        else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) key = LibraryNavKey::right;
-        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    key = LibraryNavKey::up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  key = LibraryNavKey::down;
-        else if (ImGui::IsKeyPressed(ImGuiKey_Home))     key = LibraryNavKey::home;
-        else if (ImGui::IsKeyPressed(ImGuiKey_End))      key = LibraryNavKey::end;
-        else if (ImGui::IsKeyPressed(ImGuiKey_PageUp))   key = LibraryNavKey::page_up;
-        else if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) key = LibraryNavKey::page_down;
-
-        const float gridHeight = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f;
-        const int rowsPerPage = static_cast<int>(gridHeight / kCellHeight);
-        const int before = selected_;
-        selected_ = library_nav_apply(key, selected_, count, columns, rowsPerPage);
-        if (stats_ && selected_ != before)
-            fprintf(stderr, "[library] selection %d -> %d (key=%d) at frame %llu\n", before, selected_,
-                    (int)key, (unsigned long long)frameCount_);
-        firstRow_ = library_scroll_row_for(selected_, columns, rowsPerPage, firstRow_);
-
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-            ImGui::IsKeyPressed(ImGuiKey_Space)) {
-            action.kind = LibraryAction::Kind::open;
-            action.app0_root = games_[static_cast<size_t>(selected_)].app0_root;
-        }
-
-        ImGui::BeginChild("grid", ImVec2(0, gridHeight), false);
-        // Apply the computed scroll, but only when a key moved the selection: doing it every frame
-        // would fight the mouse wheel. Without this the selection can move below the visible rows —
-        // the pure test covers library_scroll_row_for, only this line makes it reach the screen.
-        if (key != LibraryNavKey::none) ImGui::SetScrollY(static_cast<float>(firstRow_) * kCellHeight);
-        for (int i = 0; i < count; i++) {
-            if (i % columns != 0) ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::PushID(i);
-            const GameEntry& game = games_[static_cast<size_t>(i)];
-            const bool isSelected = (i == selected_);
-            if (isSelected)
-                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-
-            VkDescriptorSet cover = cover_for(game);
-            bool clicked = false;
-            if (cover) {
-                clicked = ImGui::ImageButton("cover", reinterpret_cast<ImTextureID>(cover),
-                                             ImVec2(kCoverSize, kCoverSize));
-            } else {
-                // No art: a labelled button of the same size keeps the grid aligned and the entry
-                // launchable, which matters more than the picture.
-                clicked = ImGui::Button(game.title_id.empty() ? "(no art)" : game.title_id.c_str(),
-                                        ImVec2(kCoverSize, kCoverSize));
-            }
-            if (isSelected) ImGui::PopStyleColor();
-            if (clicked) {
-                selected_ = i;
-                action.kind = LibraryAction::Kind::open;
-                action.app0_root = game.app0_root;
-            }
-            // The title and its FOLDER NAME, not the absolute path. The folder name is what identifies
-            // the dump (the content id is in it), while the rest of the path is the user's home
-            // directory — which would otherwise end up in every screenshot anyone shares of their
-            // library. The games directory is already shown once in the header for orientation.
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\n%s", game.title_name.c_str(),
-                                  path_basename(game.app0_root).c_str());
-
-            // Wrapped to the cover's width so a long localized name ("Space Adventure Cobra - The
-            // Awakening") breaks onto further lines instead of running into the next column.
-            if (titleFont_) ImGui::PushFont(titleFont_);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kCoverSize);
-            ImGui::TextUnformatted(game.title_name.c_str());
-            ImGui::PopTextWrapPos();
-            if (titleFont_) ImGui::PopFont();
-
-            ImGui::PopID();
-            ImGui::EndGroup();
-        }
-        ImGui::EndChild();
-
-        ImGui::Separator();
-        ImGui::Text("%d game%s", count, count == 1 ? "" : "s");
+        // Toolbar: icon buttons left, search right.
+        const float toolbarTop = ImGui::GetCursorPosY();
+        bool playClicked = false;
+        if (icon_button("play", ToolbarIcon::play, "Play")) playClicked = true;
         ImGui::SameLine();
-        if (ImGui::Button("Change folder...")) action.kind = LibraryAction::Kind::browse;
+        if (icon_button("folder", ToolbarIcon::folder, "Add folder"))
+            action.kind = LibraryAction::Kind::browse;
+        ImGui::SameLine();
+        if (icon_button("rescan", ToolbarIcon::rescan, "Refresh list"))
+            action.kind = LibraryAction::Kind::rescan;
+        ImGui::SameLine();
+        if (icon_button("fullscreen", ToolbarIcon::fullscreen, "Full screen"))
+            action.kind = LibraryAction::Kind::toggle_fullscreen;
+        ImGui::SameLine();
+        if (icon_button("keyboard", ToolbarIcon::keyboard, "Keyboard")) tab_ = LibraryTab::controls;
         ImGui::SameLine();
         // Discoverable rather than env-only: someone who does not want a launcher making noise should
         // not have to find a variable name to stop it. Reported to the caller so it is persisted.
-        if (ImGui::Checkbox("Music", &musicToggle_)) {
+        // No active paint: the icon itself shows the state (slashed when off), and music defaults
+        // on, so an active highlight would read as permanently pressed.
+        if (icon_button("music", musicToggle_ ? ToolbarIcon::music_on : ToolbarIcon::music_off,
+                        "Music", false)) {
+            musicToggle_ = !musicToggle_;
             media_.set_music_enabled(musicToggle_, nowMs);
             action.kind = LibraryAction::Kind::set_music;
             action.music_on = musicToggle_;
         }
+        // The search box rides the row's right edge, vertically centered against the 52 px
+        // icon buttons rather than their top edge.
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 260.0f);
+        ImGui::SetCursorPosY(toolbarTop + 14.0f);
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::InputTextWithHint("##search", "Search...", filterBuf_, sizeof filterBuf_))
+            apply_filter();
+
+        // Keyboard. Controller navigation is NOT implemented: ImGui's gamepad nav is off, and
+        // nothing initialises SDL's gamepad subsystem while the library is alive — the pad backend
+        // does that inside start_guest, by which point the library is gone. Tracked separately
+        // rather than shipped as code that cannot fire.
+        // Gated on text input: with the search box focused every key belongs to it — typing a
+        // space once booted the wrong game (list_nav.hpp pins the gate).
+        const bool textActive = ImGui::GetIO().WantTextInput;
+        const int shown = static_cast<int>(filtered_.size());
+        bool moveKey = false;
+        switch (list_nav_move(ImGui::IsKeyPressed(ImGuiKey_UpArrow),
+                              ImGui::IsKeyPressed(ImGuiKey_DownArrow),
+                              ImGui::IsKeyPressed(ImGuiKey_Home),
+                              ImGui::IsKeyPressed(ImGuiKey_End), textActive)) {
+        case ListNavMove::up:
+            if (selected_ > 0) {
+                selected_--;
+                moveKey = true;
+            }
+            break;
+        case ListNavMove::down:
+            if (selected_ + 1 < shown) {
+                selected_++;
+                moveKey = true;
+            }
+            break;
+        case ListNavMove::home:
+            if (shown > 0) {
+                selected_ = 0;
+                moveKey = true;
+            }
+            break;
+        case ListNavMove::end:
+            if (shown > 0) {
+                selected_ = shown - 1;
+                moveKey = true;
+            }
+            break;
+        case ListNavMove::none:
+            break;
+        }
+        if ((playClicked ||
+             list_nav_open(ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+                               ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
+                               ImGui::IsKeyPressed(ImGuiKey_Space),
+                           textActive)) &&
+            selected_ >= 0 && selected_ < shown) {
+            action.kind = LibraryAction::Kind::open;
+            action.app0_root =
+                games_[static_cast<size_t>(filtered_[static_cast<size_t>(selected_)])].app0_root;
+        }
+
+        const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                           ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable |
+                                           ImGuiTableFlags_ScrollY;
+        float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
+        if (tableH < 0.0f) tableH = 0.0f;
+        if (ImGui::BeginTable("games", 6, tableFlags, ImVec2(0, tableH))) {
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, kThumbSize);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Serial", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Region", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            // Single-line cells center against the thumbnail row; without this every text column
+            // rides the row's top edge while the art fills it.
+            const float textPadY = (kThumbSize + 8.0f - ImGui::GetTextLineHeight()) * 0.5f;
+            int hoverThisFrame = -1;
+            for (int fi = 0; fi < shown; fi++) {
+                const GameEntry& game =
+                    games_[static_cast<size_t>(filtered_[static_cast<size_t>(fi)])];
+                ImGui::TableNextRow(0, kThumbSize + 8.0f);
+                // One highlight per row, painted up front so it always spans the whole width:
+                // solid for selected, brightest for selected+hovered, translucent wash for
+                // hovered-only. The hover trails one frame (see hovered_), which is
+                // imperceptible and avoids a cell-sized Selectable hover patch.
+                if (fi == selected_ && fi == hovered_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonHovered));
+                else if (fi == selected_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonActive));
+                else if (fi == hovered_)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImGuiCol_ButtonHovered, 0.45f));
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(fi);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.0f);
+                const VkDescriptorSet cover = cover_for(game);
+                if (cover)
+                    ImGui::Image(reinterpret_cast<ImTextureID>(cover),
+                                 ImVec2(kThumbSize, kThumbSize));
+                else
+                    ImGui::TextDisabled("--");
+                if (ImGui::IsItemClicked()) selected_ = fi;
+                note_row_right_click(fi);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
+                // SpanAllColumns makes the whole row one click target; the double-click opens.
+                // The Selectable itself paints nothing — no selected, no hover — because the row
+                // background above is the single highlight.
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+                const bool rowClicked = ImGui::Selectable(
+                    game.title_name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
+                if (ImGui::IsItemHovered()) hoverThisFrame = fi;
+                ImGui::PopStyleColor(2);
+                if (rowClicked) {
+                    selected_ = fi;
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        action.kind = LibraryAction::Kind::open;
+                        action.app0_root = game.app0_root;
+                    }
+                }
+                ImGui::TableSetColumnIndex(2);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
+                ImGui::TextUnformatted(game.title_id.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
+                ImGui::TextUnformatted(game.region.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
+                ImGui::TextUnformatted(game.version.c_str());
+                ImGui::TableSetColumnIndex(5);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + textPadY);
+                // The FOLDER NAME, not the absolute path: the folder name is what identifies the
+                // dump while the rest of the path is the user's home directory — which would
+                // otherwise end up in every screenshot anyone shares of their library. A drive
+                // root has no basename, so there the root itself is the name.
+                const std::string folder = path_basename(game.app0_root);
+                ImGui::TextUnformatted((folder.empty() ? game.app0_root : folder).c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", path_basename(game.app0_root).c_str());
+                note_row_right_click(fi);
+                ImGui::PopID();
+                // Follow a keyboard move; a mouse scroll is left alone so the two never fight.
+                if (moveKey && fi == selected_) ImGui::SetScrollHereY(0.5f);
+            }
+            hovered_ = hoverThisFrame;
+            ImGui::EndTable();
+            draw_row_menu(action, shown);
+        }
+        if (shown == 0)
+            ImGui::TextDisabled("No games match.");
+        ImGui::Separator();
+        ImGui::Text("%d game%s", shown, shown == 1 ? "" : "s");
         ImGui::SameLine();
-        ImGui::TextDisabled("Enter opens  |  arrows move  |  Esc quits");
+        ImGui::TextDisabled("Play / Enter opens  |  double-click opens  |  Esc quits");
     }
 
     if (!status.empty()) {

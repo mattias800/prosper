@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 
+using prosper::frontend::file_url_for_path;
 using prosper::frontend::GameOpenAction;
 using prosper::frontend::picked_folder_is_title;
 using prosper::frontend::GamePathProbe;
@@ -145,6 +146,17 @@ int main() {
         CHECK(!picked_folder_is_title("F:\\missing", drive), "a missing path boots nothing");
         CHECK(!picked_folder_is_title("", drive), "an empty pick boots nothing");
     }
+
+    // --- file_url_for_path ---------------------------------------------------------------------
+    CHECK(file_url_for_path("F:\\games\\T-app0") == "file:///F:/games/T-app0",
+          "a drive-letter path gets three slashes and forward slashes");
+    CHECK(file_url_for_path("/games/T-app0") == "file:///games/T-app0",
+          "a POSIX path keeps its shape");
+    CHECK(file_url_for_path("\\\\server\\share\\T-app0") == "file://server/share/T-app0",
+          "a UNC root names the host");
+    CHECK(file_url_for_path("/my games/A #1 100%") == "file:///my%20games/A%20%231%20100%25",
+          "space, # and % are encoded");
+    CHECK(file_url_for_path("") == "file:///", "an empty path still forms a URL");
 
     // --- decide_open_action --------------------------------------------------------------------
     CHECK(decide_open_action(kRoot, /*boot_attempted=*/false) == GameOpenAction::boot_in_process,
