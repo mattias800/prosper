@@ -10,7 +10,7 @@ date: 2026-10-05
 
 The shipping sources mention 992 distinct `"PROSPER_*"` names as string literals under `src/`,
 `frontends/` and `tests/fixtures/` -- names, not a census of variables actually read -- counted by
-`tools/env/check_switch_registry.py`, which is proposed in #4543 and not yet on `main`. One mechanism carries three different things: host
+`tools/env/check_switch_registry.py` (#4543). One mechanism carries three different things: host
 capabilities and user settings, diagnostics, and temporary guest-behaviour selectors. Diagnostics
 dominate, and each is its own switch with its own spelling; output goes through 1,547 direct
 `fprintf(stderr, ...)` calls in `src/`, with no levels, no channel names and no single way to turn a
@@ -34,8 +34,8 @@ Structural reference only.
    frontend's settings list.
 3. **Selectors stay switches**, each with its retiring issue (spec `CFG-1`), because they are meant
    to disappear.
-4. The switch registry proposed in #4543 is the migration inventory: a row leaves when its switch
-   does. If #4543 does not land, this ADR needs another inventory first.
+4. The switch registry (`tools/env/switch_registry.txt`, #4543) is the migration inventory: a row
+   leaves when its switch does.
 
 Adds spec rule `CFG-2`.
 

@@ -57,6 +57,7 @@ testpaths = [
     "prosper/tools/docs/test_check_doc_meta.py",
     "prosper/tools/screenshots/test_check_screenshot_paths.py",
     "prosper/tools/env/test_check_switch_registry.py",
+    "prosper/tools/docs/test_confidence_ledger.py",
     "prosper/tools/perf/test_compare_capture_pair.py",
     "prosper/tools/perf/test_perf_caller_report.py",
     "prosper/tools/perf/test_perf_f8_gap.py",

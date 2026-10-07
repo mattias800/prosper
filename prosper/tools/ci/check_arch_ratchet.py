@@ -39,6 +39,12 @@ The rules (every count is per file, over tracked files only, with comments strip
                  PROXY for a shape the preprocessor-directive count cannot see (a reduced copy of
                  another platform's logic), so a stub that is not named `_stub` is not counted;
                  the standard it serves is in ARCHITECTURE_TARGET_TREE.md, section Standards.
+  host-throw     `throw` expressions in the same roots as platform-ifdef (an exception
+                 specification `throw()` is not counted). Code there runs inside guest calls, and
+                 the host unwinder has no unwind info for guest frames, so an escaping host
+                 exception ends in std::terminate (or a stack-dependent mis-unwind on Windows) far
+                 from the call that failed, not as a logged error. A count of throw sites, not a
+                 proof that one escapes: many are caught locally.
   layer-include  an `#include` from one prosper/src top-level layer into a layer it may not depend
                  on, one row per (file, target layer), valued by the number of include lines.
                  LAYER_ORDER below is the table: a layer may include itself and any layer EARLIER
@@ -220,6 +226,7 @@ SYNC_TOKENS = (
 SYNC_RES = {token: re.compile(rf"\b{token}\b") for token in SYNC_TOKENS}
 TEST_DEP_RE = re.compile(r"\bprosper\s*::\s*test\s*::")
 PLATFORM_STUB_RE = re.compile(r"\bHLE\s*\(\s*[A-Za-z0-9_]*_stub\s*\)")
+HOST_THROW_RE = re.compile(r"\bthrow\b(?!\s*\(\s*\))")
 PLATFORM_MACROS = ("_WIN32", "_WIN64", "__linux__", "__APPLE__", "__MINGW32__", "_MSC_VER")
 PLATFORM_IF_RE = re.compile(
     r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b[^\n]*\b(?:"
@@ -241,6 +248,7 @@ RULES = (
     "test-dep",
     "platform-ifdef",
     "platform-stub",
+    "host-throw",
     "layer-include",
     "fixture-include",
     "vk-object",
@@ -296,6 +304,12 @@ FIX_HINT = {
         "(prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md, Standards 1 and 2). If this stub "
         "is genuinely temporary, raise the row in the same PR with a # note naming the issue "
         "that removes it."
+    ),
+    "host-throw": (
+        "A new throw in code that runs inside guest calls. Report the failure through the call's "
+        "return code or the logging abort path instead; a host exception that reaches guest frames "
+        "ends in std::terminate far from the failing call (ADR 0022). If the throw is caught before it "
+        "leaves prosper code, say where in a comment and raise the row in the same PR."
     ),
     "layer-include": (
         "An include against the layer order (LAYER_ORDER in check_arch_ratchet.py; "
@@ -548,6 +562,7 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
             if under(path, PLATFORM_ROOTS):
                 add(f"platform-ifdef|{path}", _hits(PLATFORM_IF_RE, bare))
                 add(f"platform-stub|{path}", _hits(PLATFORM_STUB_RE, bare))
+                add(f"host-throw|{path}", _hits(HOST_THROW_RE, bare))
             if path.startswith(SRC):
                 for target, lines in sorted(layer_violations(path, code).items()):
                     add(f"layer-include|{path}|{target}", lines)
@@ -973,6 +988,7 @@ POSITIVE_TREE = {
     "prosper/src/hle/s.cpp": "HLE(k_demo_stub) {\n    return 0;\n}\n",
     "prosper/src/host/l.cpp": '#include "hle/dispatch/dispatch.hpp"\n#include "self/module.hpp"\n',
     "prosper/src/gpu/v.cpp": "vkCreateFence(d, &i, nullptr, &f);\n",
+    "prosper/src/gpu/w.cpp": 'if (bad) throw std::runtime_error("x");\ncatch (...) { throw; }\n',
     "prosper/frontends/k.cpp": '#include "fixtures/render_runner.h"\n',
 }
 POSITIVE_KEYS = {
@@ -988,6 +1004,7 @@ POSITIVE_KEYS = {
     "platform-stub|prosper/src/hle/s.cpp": 1,
     "layer-include|prosper/src/host/l.cpp|hle": 1,
     "vk-object|prosper/src/gpu/v.cpp|vkCreateFence": 1,
+    "host-throw|prosper/src/gpu/w.cpp": 2,
     "fixture-include|prosper/frontends/k.cpp": 1,
 }
 # Every rule's pattern written where it must NOT count: comments, string and raw-string literals,
@@ -1012,6 +1029,8 @@ NEGATIVE_TREE = {
     "prosper/src/host/hs.cpp": "HLE(k_host_stub) {\n    return 0;\n}\n",
     "prosper/frontends/j.cpp": '// #include "fixtures/x.h"\n#include "shared/x.h"\n',
     "prosper/src/gpu/q.cpp": "#if PROSPER_WIN32_LIKE\n#endif\nPFN_vkCreateFence p;\n",
+    "prosper/src/gpu/r.cpp": '// throw x\nlog("throw");\nvoid f() throw ();\nint rethrow_count;\n',
+    "prosper/src/host/th.cpp": 'throw std::logic_error("host is exempt");\n',
 }
 
 
