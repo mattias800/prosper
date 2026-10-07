@@ -12,6 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <iterator>
 #include <vector>
 
@@ -19,6 +21,19 @@ using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
 namespace {
+
+// PROSPER_DROPPED_DRAW_CENSUS is read once per process (a plain getenv in a function-local static),
+// so it is armed at load time, before any test realizes a draw. It only adds stderr lines, which
+// the census-label arm below reads (#4680 review).
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): runs before main, single-threaded
+const bool kCensusArmed = [] {
+#ifdef _WIN32
+    return _putenv_s("PROSPER_DROPPED_DRAW_CENSUS", "1") == 0;
+#else
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): static initialization, before any thread exists
+    return setenv("PROSPER_DROPPED_DRAW_CENSUS", "1", 1) == 0;
+#endif
+}();
 
 constexpr uint32_t mode_word(uint32_t mode) {
     return (mode << P::CB_COLOR_CONTROL_MODE_SHIFT) | (0xCCu << P::CB_COLOR_CONTROL_ROP3_SHIFT);
@@ -293,6 +308,104 @@ TEST(EfcHelperProgram, TheOperationKeepsItsDepthStencilEffect) {
     const Realized with_depth = realize(st);
     EXPECT_TRUE(with_depth.made) << "a depth write is an effect: the draw still executes";
     EXPECT_EQ(with_depth.mask, 0u) << "...and writes no colour";
+}
+
+// #4680: the helper binds no pixel shader of its own; it runs with whatever the previous draw left
+// bound, together with that draw's stale pixel user data. Kena's live helpers inherited pixel
+// shaders whose raw buffer_load_dword reads a V# at s[24:27], and the stale words there
+// (0x92 0x00fff000 0x05000000, then an unwritten register) are not a descriptor the fold can
+// publish, so the recompiler refused the shader and the helper counted as a dropped draw -- several
+// hundred per run -- although a helper without a depth/stencil effect is "no effect" whatever its
+// shader does. The decision is now taken before any shader work. The ordinary-draw arm proves the
+// shader really is refused under those words, so the helper arms cannot pass by compiling it; the
+// depth-write arm proves a helper that still has an effect keeps going through the compiler.
+alignas(256) const uint32_t kStaleVSharpPs[] = {
+    0xE0302004u, 0x80061701u,   // buffer_load_dword v23, v1, s[24:27], 0 offen
+    0xBF8C3F70u,   // s_waitcnt vmcnt(0)
+    0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
+};
+
+GpuState with_stale_vsharp_ps(GpuState st) {
+    set_pgm(st, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kStaleVSharpPs);
+    st.sh[P::SPI_SHADER_USER_DATA_PS_0 + 24] = 0x00000092u;   // Kena's live words, PPSA01802
+    st.sh[P::SPI_SHADER_USER_DATA_PS_0 + 25] = 0x00fff000u;
+    st.sh[P::SPI_SHADER_USER_DATA_PS_0 + 26] = 0x05000000u;
+    return st;
+}
+
+TEST(EfcHelperProgram, AHelperWithoutDepthStencilEffectNeverCompilesItsInheritedPixelShader) {
+    constexpr uint32_t kRectList = 7, kTriangleList = 4;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+
+    const Realized ordinary =
+        realize(with_stale_vsharp_ps(state(kVs, kTriangleList, P::CB_COLOR_CONTROL_MODE_NORMAL)));
+    EXPECT_FALSE(ordinary.made);
+    ASSERT_EQ(ordinary.reason, RealizationFailureReason::ShaderRecompile)
+        << "positive control: the inherited shader is refused under the stale user data";
+
+    GpuState decompress =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    decompress.cx[P::DB_RENDER_CONTROL] = 0x60;
+    decompress.cx[P::DB_DEPTH_CONTROL] = 0x70;   // Kena's helper: ZFUNC=ALWAYS, Z test/write off
+    const Realized decompress_helper = realize(decompress);
+    EXPECT_FALSE(decompress_helper.made);
+    EXPECT_EQ(decompress_helper.reason, RealizationFailureReason::NoEffect)
+        << "Decompress Htile: no effect, not a refused shader";
+
+    const Realized eliminate = realize(with_stale_vsharp_ps(
+        state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR)));
+    EXPECT_FALSE(eliminate.made);
+    EXPECT_EQ(eliminate.reason, RealizationFailureReason::NoEffect)
+        << "Eliminate Fast Clear: no effect, not a refused shader";
+
+    GpuState with_depth = with_stale_vsharp_ps(
+        state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_ELIMINATE_FAST_CLEAR));
+    with_depth.cx[P::DB_DEPTH_CONTROL] = (1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT) |
+                                         (1u << P::DB_DEPTH_CONTROL_Z_WRITE_ENABLE_SHIFT);
+    const Realized depth_helper = realize(with_depth);
+    EXPECT_FALSE(depth_helper.made);
+    EXPECT_EQ(depth_helper.reason, RealizationFailureReason::ShaderRecompile)
+        << "a helper with a depth write still needs its shader, so the refusal stays visible";
+}
+
+// A stencil write is a depth/stencil effect too: the helper keeps going through the compiler, so a
+// gate narrowed to `depth_write_enable` turns this arm red (#4680 review).
+TEST(EfcHelperProgram, AStencilWritingHelperStillCompilesItsShader) {
+    constexpr uint32_t kRectList = 7;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+    GpuState st =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    st.cx[P::DB_RENDER_CONTROL] = 0x60;
+    // Kena's third observed helper state, with its stencil test switched on: ZFUNC=ALWAYS, no Z
+    // write, STENCILZPASS=REPLACE_TEST, write mask 0xff.
+    st.cx[P::DB_DEPTH_CONTROL] = 0x70u | (1u << P::DB_DEPTH_CONTROL_STENCIL_ENABLE_SHIFT);
+    st.cx[P::DB_STENCIL_CONTROL] = 3u << P::DB_STENCIL_CONTROL_STENCILZPASS_SHIFT;
+    st.cx[P::DB_STENCILREFMASK] = 0xFFu << P::DB_STENCILREFMASK_STENCILWRITEMASK_SHIFT;
+    const Realized helper = realize(st);
+    EXPECT_FALSE(helper.made);
+    EXPECT_EQ(helper.reason, RealizationFailureReason::ShaderRecompile)
+        << "a stencil-writing helper has an effect, so its shader is still compiled";
+}
+
+// The census names the early exit: a reader of [dropped-draw] lines must be able to tell helpers
+// skipped as no-effect from draws lost to a refused shader. The census prints at powers of two from
+// 256, so 512 realizations cross at least one report whatever earlier arms already counted.
+TEST(EfcHelperProgram, TheCensusNamesTheHelperExit) {
+    ASSERT_TRUE(kCensusArmed);
+    ASSERT_TRUE(dropped_draw_census_enabled());
+    constexpr uint32_t kRectList = 7;
+    std::fill(std::begin(kHelperBlock), std::end(kHelperBlock), 0u);
+    std::copy(std::begin(kKenaRect), std::end(kKenaRect), kHelperBlock);
+    GpuState st =
+        with_stale_vsharp_ps(state(kHelperBlock, kRectList, P::CB_COLOR_CONTROL_MODE_DISABLE));
+    st.cx[P::DB_RENDER_CONTROL] = 0x60;
+    st.cx[P::DB_DEPTH_CONTROL] = 0x70;
+    testing::internal::CaptureStderr();
+    for (int i = 0; i < 512; ++i) (void)realize(st);
+    const std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_NE(err.find("reason=no-effect(agc-helper)"), std::string::npos) << err;
 }
 
 }  // namespace

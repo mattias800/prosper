@@ -9,6 +9,42 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## No refused fragment programs remain (2026-10-07, #4680)
+
+Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
+`PROSPER_DBG=1`, `PROSPER_DROPPED_DRAW_CENSUS=1`, `scripts/kena/linux-reach-level-load.pad`, 260 s.
+Before is `main` `a6453028c`; after is the #4680 branch.
+
+| | before | after |
+|---|---|---|
+| `dropped-draws` reasons | `volume-multi-target:7943`, `ngg-subgroup:3666`, `shader-recompile/fragment:717` | `volume-multi-target:6045`, `ngg-subgroup:2790` |
+| `unsupported-wave64-shaders` alarm | 47 of 48 windows, `fragment/recompile:717` | did not fire |
+| refused programs (`refused_shaders_*/index.txt`) | 2 fragment | none |
+
+The `shader-recompile/fragment` count was **two unrelated causes**, not the one program
+(`0x505c3d0000`) the entry below names. Program addresses are run-local.
+
+- **AGC helper rectangles with an inherited pixel shader.** These were most of the count. Every
+  draw had the helper's vertex program (`es=0x5007020000`). The helper binds no pixel shader, so it
+  runs with whatever the previous draw left bound, and the refused program changed from run to run
+  (295 dwords in one run, 182 in the next).
+  - The stale pixel user data held `00000092 00fff000 05000000` at `s[24:27]`, which the fold
+    cannot publish as a V#.
+  - Kena's helpers have no depth/stencil effect (`DB_DEPTH_CONTROL=0x70`). Their colour is
+    suppressed (#4610), so they were "no effect" anyway; the decision just came after the pixel
+    shader compile.
+  - The executor now decides it before any shader work. The census reports these draws as
+    `no-effect(agc-helper)`.
+- **A counted loop counting in VCC_HI** (140 dwords). It appears after New Game. Its header is
+  `s_cmp_lt_i32 vcc_hi, s34`, so VCC_HI is the induction variable. The counted-loop emitter now
+  closes VCC's mask phi with a placeholder when the mask is provably unread from the header. The
+  program compiles live (5,442 words, wave64).
+- **The title-menu picture does not change.** An F9 frame at 222 s matches
+  `assets/screenshots/kena-title-menu-world.webp`, apart from the falling leaf. That is expected:
+  the helper draws had no effect to lose, and the loop program draws after the menu. The
+  foliage, light shafts and grading are still missing. The other two drop classes,
+  volume-multi-target and ngg-subgroup, went to zero with #4643 (next entry) without restoring them.
+
 ## The translucency-lighting volumes draw; the fog and the foliage are not theirs (2026-10-07, #4643)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, default launch
@@ -36,8 +72,8 @@ Linux/AMD title-menu investigations are recorded below.
 - **The picture barely changes.** F9 frames at 225 s differ in 0.7% of pixels by more than 30/765,
   around candle flames, lanterns and particles. Part of that is animation. The fog, the washed-out
   grading, the missing foliage and the missing light shafts are unchanged. So neither drop class was
-  the cause of those defects (see `## Ruled out`). What remains in the drop census is the refused
-  Wave64 fragment program (#4680).
+  the cause of those defects (see `## Ruled out`). What remained in the drop census was the refused
+  Wave64 fragment program, since removed by #4680 (entry above).
 - **Cost.** The four-volume clear (`0x5007bc0000`) now publishes four claimed volumes per frame
   instead of one. Surface readbacks rise from 2 to 5 per flip, each a fenced CPU wait. #4652 already
   tracks avoiding that wait; this makes it four times as valuable on Kena.
@@ -86,7 +122,7 @@ Linux/AMD title-menu investigations are recorded below.
   - The run's `dropped-draws` alarm fires in 42 of 43 windows. Its reasons are
     `backend/volume-multi-target:7722` (#4643), `backend/ngg-subgroup:3564` and
     `shader-recompile/fragment:595`. The fragment count is one refused Wave64 program,
-    `0x505c3d0000`.
+    `0x505c3d0000`. (Superseded by the entry above: it was two causes, and both are fixed.)
   - The volume passes are a likely cause of the fog and the missing light shafts, and the NGG
     subgroup drops of the missing foliage. Neither link has been checked per draw. **Superseded by
     the #4643 entry above: both drop classes are now zero and none of those defects moved.**
@@ -405,6 +441,12 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The `shader-recompile/fragment` drops are one refused Wave64 program that needs a recompiler
+  feature** — false. Most were AGC helper rectangles compiling the pixel shader the previous draw
+  left bound, against that draw's stale user data. The refused program changed from run to run
+  (295 dwords, then 182) and was always on `es=0x5007020000`. The helper has no depth/stencil
+  effect, so the draws had nothing to lose. The remainder was a separate counted-loop VCC_HI
+  refusal (2026-10-07, #4680).
 - **The fog, the washed-out grading, the missing light shafts or the missing foliage come from the
   dropped multi-target volume passes or the dropped merged-NGG producer** — false. With #4643 both
   `backend/volume-multi-target` (9,984 per 260 s on `main`) and `backend/ngg-subgroup` (4,608) are

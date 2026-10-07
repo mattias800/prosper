@@ -2463,6 +2463,58 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         shader_source_dwords(vs_program_addr, max_shader_dwords, producer_header);
     const size_t fragment_dwords =
         shader_source_dwords(rs.ps_addr, max_shader_dwords, pixel_header);
+    // #1588 / #4610: AGC's own rectangle under CB_COLOR_CONTROL.MODE = ELIMINATE_FAST_CLEAR, or under
+    // MODE = DISABLE with DB_RENDER_CONTROL's compress-disable bits ("Decompress Htile"), is a
+    // metadata operation that writes no colour (efc_helper_program.hpp). Its colour masks are
+    // cleared below whatever happens, so its only possible effect is depth/stencil. Decide that HERE,
+    // before any resource table or shader work: the helper binds no pixel shader of its own and
+    // runs with the one the previous draw left bound, together with that draw's stale pixel user
+    // data. A helper with no depth/stencil effect therefore used to compile an unrelated pixel
+    // shader against stale user data, and when that compile was refused the helper was counted as a
+    // dropped draw, although its result would have been "no effect" either way. Kena's live
+    // helpers (DB_DEPTH_CONTROL 0x70, no stencil write) dropped several hundred draws per run this
+    // way, through whichever pixel shader happened to be bound (#4680).
+    const auto* helper_vs =
+        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
+    const AgcHelperDrawShape helper_shape{rs.prim_type, vcount_hint, draw && draw->indexed};
+    // Decided before the source-window check below: the helper never needs the inherited pixel
+    // shader, so a missing window for that shader is not a reason to count the helper as dropped.
+    const bool helper_eliminate = vs_program_dwords != 0 && is_agc_eliminate_fast_clear_operation(
+                                                                rs.cb_color_control, helper_vs,
+                                                                vs_program_dwords, helper_shape);
+    const bool helper_decompress =
+        vs_program_dwords != 0 && !helper_eliminate &&
+        is_agc_decompress_htile_operation(rs.cb_color_control, rs.db_render_control, helper_vs,
+                                          vs_program_dwords, helper_shape);
+    if ((helper_eliminate || helper_decompress) &&
+        !is_agc_efc_rect_exact_program(helper_vs, vs_program_dwords))
+        report_agc_rect_family_match(vs_program_addr, vs_program_dwords, rs.cb_color_control,
+                                     helper_eliminate ? "eliminate-fast-clear"
+                                                      : "decompress-htile");
+    // The same two diagnostic overrides as the early no-effect gate above.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
+    const bool helper_force_colorwrite = PROSPER_ENV_ON("PROSPER_FORCE_COLORWRITE");
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
+    const bool helper_no_early_no_effect = PROSPER_ENV_ON("PROSPER_NO_EARLY_NO_EFFECT");
+    const bool helper_force_draw = helper_force_colorwrite || helper_no_early_no_effect;
+    if ((helper_eliminate || helper_decompress) &&
+        !has_depth_stencil_side_effect(resolved_pipeline) && !helper_force_draw) {
+        report_dropped_draw_target(rs.color0_base, "no-effect(agc-helper)", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
+        if (failure) {
+            failure->reason = RealizationFailureReason::NoEffect;
+            add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, {}, {});
+            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
+        }
+        if (log)
+            fprintf(stderr,
+                    "[exec] skip draw early: AGC %s helper has no depth/stencil effect "
+                    "es=0x%llx ps=0x%llx order=%llu\n",
+                    helper_eliminate ? "eliminate-fast-clear" : "decompress-htile",
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)(draw ? draw->command_order : 0));
+        return false;
+    }
     if (!vs_program_dwords || !fragment_dwords) {
         if (failure) {
             failure->reason = RealizationFailureReason::MissingProgram;
@@ -3102,18 +3154,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // AGC's "Decompress Htile" helper: a depth-metadata operation that writes no colour and has no
     // colour state of its own, so it would otherwise paint over the parent's target (#4610).
     // The family branch of the rectangle match also needs the helper's draw shape: DrawIndexAuto(3)
-    // as a RectList.
-    const auto* helper_vs = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(vs_program_addr));
-    const AgcHelperDrawShape helper_shape{rs.prim_type, vcount_hint, draw && draw->indexed};
-    const bool helper_eliminate = is_agc_eliminate_fast_clear_operation(
-        rs.cb_color_control, helper_vs, vs_program_dwords, helper_shape);
-    const bool helper_decompress = !helper_eliminate &&
-        is_agc_decompress_htile_operation(rs.cb_color_control, rs.db_render_control, helper_vs,
-                                          vs_program_dwords, helper_shape);
-    if ((helper_eliminate || helper_decompress) &&
-        !is_agc_efc_rect_exact_program(helper_vs, vs_program_dwords))
-        report_agc_rect_family_match(vs_program_addr, vs_program_dwords, rs.cb_color_control,
-                                     helper_eliminate ? "eliminate-fast-clear" : "decompress-htile");
+    // as a RectList. Both flags were decided before resource and shader work; a helper reaching this
+    // point has a depth/stencil effect of its own (#4680).
     if (helper_eliminate || helper_decompress) {
         for (auto& target : ps.color_targets) target.write_mask = 0;
         ps.color_write_mask = 0;
