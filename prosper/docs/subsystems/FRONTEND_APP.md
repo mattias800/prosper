@@ -188,7 +188,8 @@ Design points that are deliberate rather than incidental:
   likewise stored as the games directory and listed — a title picked directly shows as one row —
   instead of booting. Only Play (or Enter/double-click on a row) boots; drops still boot on arrival.
 - **`--list-games` is the headless contract:** tab-separated records on stdout, commentary on stderr,
-  exit 0 / 1 (empty) / 2 (unset or not a directory), and it returns before any window or Vulkan exists.
+  exit 0 / 1 (empty) / 2 (unset, or every folder missing; a missing folder among several is warned
+  about on stderr and the rest are listed), and it returns before any window or Vulkan exists.
 
 `param.json` name selection is worth knowing about, because it was silently wrong before this work. The
 display name is the entry for the dump's own `defaultLanguage`, and the language object is located by

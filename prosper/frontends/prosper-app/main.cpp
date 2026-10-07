@@ -1742,21 +1742,23 @@ int main(int argc, char** argv) {
                     app_config_path().empty() ? "the settings file" : app_config_path().c_str());
             return 2;
         }
-        for (const std::string& dir : gamesDirs) {
-            if (!host_path_probe().is_dir(dir)) {
-                // Distinguish a wrong path from a real but empty library: both would otherwise print
-                // "0 title(s)" and exit 1, which hides a typo (or an unplugged drive).
-                fprintf(stderr, "prosper-app: not a directory: %s\n", dir.c_str());
-                return 2;
-            }
-        }
+        // Same rule as the library: each missing folder (a typo, an unplugged drive) is warned about
+        // and contributes nothing, and the rest are still listed. Only when EVERY folder is missing
+        // does the run exit 2 -- which keeps a wrong path distinguishable from a real but empty
+        // library, since both would otherwise print "0 title(s)" and exit 1.
+        const prosper::frontend::GamesDirsAvailability dirs =
+            prosper::frontend::split_available_games_dirs(gamesDirs, host_path_probe());
+        for (const std::string& dir : dirs.missing)
+            fprintf(stderr, "prosper-app: not a directory: %s\n", dir.c_str());
+        if (dirs.available.empty()) return prosper::frontend::list_games_exit_code(dirs, 0);
         const std::vector<prosper::frontend::GameEntry> games =
-            prosper::frontend::scan_game_libraries(gamesDirs, host_path_probe(), host_library_io());
+            prosper::frontend::scan_game_libraries(dirs.available, host_path_probe(),
+                                                   host_library_io());
         for (const auto& g : games)
             printf("%s\t%s\t%s\n", g.title_id.c_str(), g.title_name.c_str(), g.app0_root.c_str());
         fprintf(stderr, "prosper-app: %zu title(s) in %zu folder(s)\n", games.size(),
-                gamesDirs.size());
-        return games.empty() ? 1 : 0;
+                dirs.available.size());
+        return prosper::frontend::list_games_exit_code(dirs, games.size());
     }
 
     // Persisted host settings: savedata dir, present mode, display mode, volume. These apply ONLY

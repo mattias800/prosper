@@ -4,6 +4,7 @@
 #include "app_config.hpp"
 #include "game_library.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -47,17 +48,28 @@ static int fails = 0;
 //   /games/PPSA00005-app0   titleName "Same Name"       -> ...its partner
 //   /games/notes            not a title                 -> skipped
 //   /games/loose.txt        a file                      -> skipped
+//   /drive2/middle-app0  titleName "Middle Title"    -> a SECOND games folder's only title; its
+//                                                          name sorts between /games' titles
 static const std::set<std::string> kDirs = {
     "/games",
-    "/games/PPSA24651-app0", "/games/PPSA24651-app0/sce_sys",
-    "/games/PPSA13579-app0", "/games/PPSA13579-app0/sce_sys",
+    "/games/PPSA24651-app0",
+    "/games/PPSA24651-app0/sce_sys",
+    "/games/PPSA13579-app0",
+    "/games/PPSA13579-app0/sce_sys",
     "/games/PPSA00001-app0",
-    "/games/PPSA00002-app0", "/games/PPSA00002-app0/sce_sys",
-    "/games/PPSA00003-app0", "/games/PPSA00003-app0/sce_sys",
-    "/games/PPSA00004-app0", "/games/PPSA00004-app0/sce_sys",
-    "/games/PPSA00005-app0", "/games/PPSA00005-app0/sce_sys",
+    "/games/PPSA00002-app0",
+    "/games/PPSA00002-app0/sce_sys",
+    "/games/PPSA00003-app0",
+    "/games/PPSA00003-app0/sce_sys",
+    "/games/PPSA00004-app0",
+    "/games/PPSA00004-app0/sce_sys",
+    "/games/PPSA00005-app0",
+    "/games/PPSA00005-app0/sce_sys",
     "/games/notes",
     "/empty",
+    "/drive2",
+    "/drive2/middle-app0",
+    "/drive2/middle-app0/sce_sys",
 };
 static const std::set<std::string> kFiles = {
     "/games/PPSA24651-app0/eboot.bin",
@@ -71,12 +83,15 @@ static const std::set<std::string> kFiles = {
     "/games/PPSA00005-app0/sce_sys/param.json",
     "/games/notes/readme.txt",
     "/games/loose.txt",
+    "/drive2/middle-app0/sce_sys/param.json",
 };
 static const std::map<std::string, std::vector<std::string>> kChildren = {
-    {"/games", {"PPSA13579-app0", "notes", "PPSA24651-app0", "loose.txt", "PPSA00001-app0",
-                "PPSA00002-app0", "PPSA00005-app0", "PPSA00003-app0", "PPSA00004-app0"}},
+    {"/games",
+     {"PPSA13579-app0", "notes", "PPSA24651-app0", "loose.txt", "PPSA00001-app0", "PPSA00002-app0",
+      "PPSA00005-app0", "PPSA00003-app0", "PPSA00004-app0"}},
     // ^ deliberately unsorted, and PPSA00005 deliberately before the two it ties with
     {"/empty", {}},
+    {"/drive2", {"middle-app0"}},
 };
 // Real shape: defaultLanguage plus several localized entries, the wanted one NOT first.
 static const std::string kMessengerJson = R"({
@@ -114,6 +129,10 @@ static const std::string kLowerJson = R"({ "titleId": "PPSA00003", "titleName": 
 // Two titles sharing a display name, to pin the content-id tie-break.
 static const std::string kTieAJson = R"({ "titleId": "PPSA00004", "titleName": "Same Name" })";
 static const std::string kTieBJson = R"({ "titleId": "PPSA00005", "titleName": "Same Name" })";
+// The second games folder's title. Its name sorts after "Blasphemous 2" and before the
+// directory-named fallbacks, so a merge that only concatenates folders (no cross-folder sort) puts
+// it in the wrong place. No titleId, so the fixture names no real title.
+static const char kDrive2Json[] = R"({ "titleName": "Middle Title" })";
 // defaultLanguage's own object carries NO titleName. This distinguishes a BOUNDED lookup from an
 // unbounded one: searching forward from the en-US key with no limit finds fr-FR's name ("After"),
 // whereas bounding the lookup to en-US's own object finds nothing there and falls back to the first
@@ -148,6 +167,7 @@ static GameLibraryIo fake_io() {
         if (p == "/games/PPSA00003-app0/sce_sys/param.json") return kLowerJson;
         if (p == "/games/PPSA00004-app0/sce_sys/param.json") return kTieAJson;
         if (p == "/games/PPSA00005-app0/sce_sys/param.json") return kTieBJson;
+        if (p == "/drive2/middle-app0/sce_sys/param.json") return kDrive2Json;
         return "";
     };
     return io;
@@ -557,6 +577,72 @@ int main() {
         CHECK(scan_game_libraries({}, probe, io).empty(), "no folders is no titles");
         CHECK(scan_game_libraries({"/missing"}, probe, io).empty(),
               "a gone folder contributes nothing instead of hiding the rest");
+
+        // Two folders holding DIFFERENT titles: both folders' titles are listed, in one display
+        // order across the folders. Fails if only the first folder is scanned (Middle Title is
+        // absent), and fails if the folders are concatenated without the cross-folder sort (Middle
+        // Title would come last instead of straight after Blasphemous 2).
+        const std::vector<GameEntry> two = scan_game_libraries({"/games", "/drive2"}, probe, io);
+        std::vector<GameEntry> expected = one;
+        expected.push_back(scan_game_library("/drive2", probe, io).at(0));
+        std::sort(expected.begin(), expected.end(), prosper::frontend::game_entry_display_less);
+        bool has_first = false, has_second = false;
+        for (const GameEntry& g : two) {
+            if (g.title_name == "The Messenger") has_first = true;
+            if (g.app0_root == "/drive2/middle-app0") has_second = true;
+        }
+        CHECK(two.size() == one.size() + 1 && has_first && has_second,
+              "two folders with different titles list the titles of BOTH folders");
+        bool ordered = two.size() == expected.size();
+        for (size_t i = 0; ordered && i < expected.size(); i++)
+            ordered = two[i].app0_root == expected[i].app0_root;
+        CHECK(ordered, "titles from two folders share one display order (game_entry_display_less)");
+        bool middle_placed = false;
+        for (size_t i = 1; i + 1 < two.size(); i++)
+            if (two[i].app0_root == "/drive2/middle-app0" &&
+                two[i - 1].title_name == "Blasphemous 2")
+                middle_placed = true;
+        CHECK(middle_placed, "the second folder's title sorts between the first folder's titles");
+        const std::vector<GameEntry> swapped =
+            scan_game_libraries({"/drive2", "/games"}, probe, io);
+        bool same_order = swapped.size() == two.size();
+        for (size_t i = 0; same_order && i < two.size(); i++)
+            same_order = swapped[i].app0_root == two[i].app0_root;
+        CHECK(same_order, "folder order does not change the listed order");
+    }
+
+    // --- --list-games over several folders: the library's rule for a missing folder ---------------
+    {
+        namespace pf = prosper::frontend;
+        const GamePathProbe probe = fake_probe();
+        const GameLibraryIo io = fake_io();
+
+        // One of two folders missing (an unplugged drive): warn about it, list the other, exit 0.
+        const pf::GamesDirsAvailability one_gone =
+            pf::split_available_games_dirs({"/games", "/missing"}, probe);
+        CHECK(one_gone.available == std::vector<std::string>{"/games"} &&
+                  one_gone.missing == std::vector<std::string>{"/missing"},
+              "one of two folders missing: the present one is scanned, the gone one warned about");
+        const size_t listed = scan_game_libraries(one_gone.available, probe, io).size();
+        CHECK(listed == scan_game_library("/games", probe, io).size() && listed != 0,
+              "one of two folders missing: the present folder's titles are still listed");
+        CHECK(pf::list_games_exit_code(one_gone, listed) == 0,
+              "one of two folders missing: exit 0, not 2 -- a gone drive does not hide the rest");
+
+        // Every folder missing: nothing to list, exit 2 (a wrong path, not an empty library).
+        const pf::GamesDirsAvailability all_gone =
+            pf::split_available_games_dirs({"/missing", "/also-missing"}, probe);
+        CHECK(all_gone.available.empty() && all_gone.missing.size() == 2,
+              "every folder missing: both are warned about, none is scanned");
+        CHECK(pf::list_games_exit_code(all_gone, 0) == 2, "every folder missing: exit 2");
+
+        // The single-folder (--games-dir / PROSPER_GAMES_DIR) contract is unchanged.
+        CHECK(pf::list_games_exit_code(pf::split_available_games_dirs({"/missing"}, probe), 0) == 2,
+              "a single missing folder still exits 2");
+        CHECK(pf::list_games_exit_code(pf::split_available_games_dirs({"/empty"}, probe), 0) == 1,
+              "a present folder holding no titles exits 1");
+        CHECK(pf::list_games_exit_code(pf::split_available_games_dirs({}, probe), 0) == 2,
+              "no folder set exits 2");
     }
 
     // --- newline safety ----------------------------------------------------------------------------

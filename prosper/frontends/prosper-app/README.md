@@ -110,8 +110,9 @@ and cover icon — instead of asking for a folder every time.
 
 `--list-games` writes one tab-separated record per line — content id, display name, app0 path — to
 **stdout**, with everything explanatory on stderr, so a script or an agent can consume it directly. It
-exits 0 when it found titles, 1 when the directory held none, and 2 when the directory is unset or is
-not a directory. It never opens a window, initializes Vulkan, or boots a guest.
+exits 0 when it found titles, 1 when the folders held none, and 2 when no folder is set or every
+folder is missing. A missing folder among several (an unplugged drive) is warned about on stderr and
+the rest are still listed. It never opens a window, initializes Vulkan, or boots a guest.
 
 Split records on tabs rather than whitespace: the first field is **empty** for a title with no
 readable `param.json`, and display names contain spaces.

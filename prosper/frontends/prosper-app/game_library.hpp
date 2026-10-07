@@ -296,4 +296,32 @@ inline std::vector<GameEntry> scan_game_libraries(const std::vector<std::string>
     return games;
 }
 
+// --list-games over several folders, under the same rule as the library: a missing folder (an
+// unplugged drive) is reported and contributes nothing, but does not hide the rest. `available` is
+// what to scan, `missing` what to warn about, both in the order given.
+struct GamesDirsAvailability {
+    std::vector<std::string> available;
+    std::vector<std::string> missing;
+};
+
+inline GamesDirsAvailability split_available_games_dirs(const std::vector<std::string>& games_dirs,
+                                                        const GamePathProbe& probe) {
+    GamesDirsAvailability out;
+    for (const std::string& dir : games_dirs) {
+        if (probe.is_dir && probe.is_dir(dir))
+            out.available.push_back(dir);
+        else
+            out.missing.push_back(dir);
+    }
+    return out;
+}
+
+// --list-games exit status: 2 when no folder is set or EVERY folder is missing, otherwise 0 when the
+// available folders held titles and 1 when they held none. With --games-dir / PROSPER_GAMES_DIR the
+// list is one folder, so "every folder missing" is that folder missing, as before.
+inline int list_games_exit_code(const GamesDirsAvailability& dirs, size_t title_count) {
+    if (dirs.available.empty()) return 2;
+    return title_count != 0 ? 0 : 1;
+}
+
 } // namespace prosper::frontend
