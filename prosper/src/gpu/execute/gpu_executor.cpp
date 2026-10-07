@@ -1130,7 +1130,8 @@ ShaderCompileKey make_shader_compile_key(
     bool capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false) {
+    RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false,
+    FragmentExportFormats fragment_export_formats = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1155,6 +1156,8 @@ ShaderCompileKey make_shader_compile_key(
         ? fragment_float_flags : FragmentFloatFlags{};
     key.fragment_launch_rsrc1 = stage == ShaderProgramStage::Fragment
         ? fragment_launch_rsrc1 : FragmentLaunchRsrc1{};
+    key.fragment_export_formats =
+        stage == ShaderProgramStage::Fragment ? fragment_export_formats : FragmentExportFormats{};
     key.float_transport = compute_config ? compute_config->float_transport : float_transport;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
@@ -1295,6 +1298,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             record->float_transport = key.float_transport;
             record->float_flags = key.fragment_float_flags;
             record->launch_rsrc1 = key.fragment_launch_rsrc1;
+            record->export_formats = key.fragment_export_formats;
             record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
             record->trip = key.trip_bound;
             try {
@@ -1310,13 +1314,14 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         // The normal compiler still consumes its existing inputs. The case's independent owned
         // replay must reproduce the whole resulting SOURCE (or refusal) before it is COMPLETE.
         CompilerChoiceTrace trace;
-        auto compile = [&] { return recompile_fragment(code, code_size, resources,
-                                  key.has_system_inputs ? &key.system_inputs : nullptr,
-                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
-                                  &interpolation, key.fragment_wave32,
-                                  {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode, arithmetic_observation, key.float_transport,
-                                  key.fragment_float_flags); };
+        auto compile = [&] {
+            return recompile_fragment(
+                code, code_size, resources, key.has_system_inputs ? &key.system_inputs : nullptr,
+                key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX, &interpolation,
+                key.fragment_wave32, {RecompileDiagnosticStage::Fragment, program_address},
+                key.fragment_float_mode, arithmetic_observation, key.float_transport,
+                key.fragment_float_flags, key.fragment_export_formats);
+        };
         std::vector<uint32_t> result;
         if (record) {
             std::vector<std::pair<std::string, std::string>> rejects;
@@ -1931,7 +1936,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
     FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
     const CheckedGraphicsSource* checked_source,
-    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation) {
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation,
+    FragmentExportFormats fragment_export_formats) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
     if (checked_compilation) *checked_compilation = {};
@@ -1939,7 +1945,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
                            checked_source->address() != reinterpret_cast<uint64_t>(code)))
         return {};
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
-        !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical()) {
+        !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical() ||
+        !fragment_export_formats.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
@@ -1949,7 +1956,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         nullptr, fragment_wave32, vertex_capture_position,
         checked_source ? checked_source->analysis() : captured_analysis, fragment_float_mode,
         float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source,
-        checked_source != nullptr);
+        checked_source != nullptr, fragment_export_formats);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -2036,12 +2043,13 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     uint32_t vertex_lds_dwords, bool vertex_capture_position,
     const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
-    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source) {
+    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
+    FragmentExportFormats fragment_export_formats) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
         fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1,
-        original_source);
+        original_source, nullptr, nullptr, fragment_export_formats);
     return words ? *words : std::vector<uint32_t>{};
 }
 

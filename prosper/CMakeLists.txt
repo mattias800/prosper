@@ -5755,6 +5755,14 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # #4703: integer colour targets written through compressed (16-bit) exports -- the export
+      # decode, the uvec4 output, the R16_UINT attachment and an R16_UINT sampled reader. Same
+      # block and include roots as the other render_runner.h tests; needs a real Vulkan device.
+      prosper_add_gtest(test_integer_color_export
+        SOURCES tests/gpu/test_integer_color_export.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       # Includes a shared fixture, which resolves from the `tests` root.

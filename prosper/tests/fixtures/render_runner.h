@@ -445,10 +445,12 @@ inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
     // components, so translate R<->B selectors into the canonical host image's component space.
     // Constants, G/A, ordinary textures, and targets whose storage order was already RGBA remain
     // unchanged. This is composition, not suppression: semantic permutations still survive.
-    if ((resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_UNORM ||
-         resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_SRGB) &&
-        backend_color_format(resource.render_target_guest_format) ==
-            VK_FORMAT_R8G8B8A8_UNORM) {
+    // The integer BGRA / A2R10G10B10 orders are canonicalized the same way (#4703).
+    const VkFormat guest = resource.render_target_guest_format;
+    if (((guest == VK_FORMAT_B8G8R8A8_UNORM || guest == VK_FORMAT_B8G8R8A8_SRGB) &&
+         backend_color_format(guest) == VK_FORMAT_R8G8B8A8_UNORM) ||
+        guest == VK_FORMAT_B8G8R8A8_UINT || guest == VK_FORMAT_B8G8R8A8_SINT ||
+        guest == VK_FORMAT_A2R10G10B10_UINT_PACK32) {
         for (uint32_t& selector : result) {
             if (selector == 4u) selector = 6u;
             else if (selector == 6u) selector = 4u;
@@ -11266,6 +11268,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cba[slot].alphaBlendOp = static_cast<VkBlendOp>(target.alpha_blend_op);
             }
         }
+        for (uint32_t slot = 0; slot < color_count; ++slot)   // integer targets never blend (#4703)
+            if (backend_color_format_is_integer(color_formats[slot]))
+                cba[slot].blendEnable = VK_FALSE;
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         if (ps && ps->logic_op_enable) {
             if (ctx.logic_op_enabled) {
@@ -12267,8 +12272,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.staging_lease = readback.lease;
                             } else if (r.has_uniform_color) {
                                 upload.uniform_clear = true;
+                                float clear_rgba[4];
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
-                                          upload.uniform_color.float32);
+                                          clear_rgba);
+                                upload.uniform_color = backend_clear_color_value(
+                                    backend_color_format(r.texture_format), clear_rgba);
                             } else if (!upload.feedback_snapshot &&
                                        !upload.assembled_target_mips && !upload.stacked_compute) {
                                 // Block-granular for a native BCn texture: the frontend hands
@@ -14015,6 +14023,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         clear[slot].color = {{value[0], value[1], value[2], value[3]}};
     }
+    for (uint32_t slot = 0; slot < color_count; ++slot)   // integer attachments clear by value
+        clear[slot].color =
+            backend_clear_color_value(color_formats[slot], clear[slot].color.float32);
     clear[ds_attachment].depthStencil = {depth_clear, stencil_clear}; // guest DB clear/default
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}};
