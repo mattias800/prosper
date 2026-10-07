@@ -8400,6 +8400,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
     fragment_draw_backend_stats() =
         {};   // recorded transaction counters never imply GPU completion
+    backend_pipeline_cache_stats_storage() = {};   // before any early refusal, like the stats above
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -10535,7 +10536,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
     BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
-    pipeline_stats = {};
     auto& pipeline_cache = persistent_pipeline_cache();
     const uint64_t pipeline_generation = ++persistent_pipeline_generation();
     const bool pipeline_cache_enabled = persistent_pipeline_cache_enabled();
@@ -16013,6 +16013,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
 }
 
 #include "fixtures/render_pass_segments.h"
+#include "fixtures/backend_call_stats_reset.h"
 
 // Logical multi-draw entry. Most calls remain one Vulkan render pass. A depth feedback transition
 // becomes multiple ordered passes without copying the (often large) BackendDraw shader/resource
@@ -16039,9 +16040,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (!backend_compact_resource_orders_valid(all)) {
         // This refusal never enters render_draw_pass_rgba, where these per-call results normally
         // reset. Do not let a preceding valid call masquerade as work done by this one.
-        backend_texture_upload_stats_storage() = {};
-        backend_resource_reuse_stats_storage() = {};
-        backend_render_timing_stats_storage() = {};
+        reset_backend_per_call_stats();   // every per-call stat, colour targets included (#4687)
         if (!all.empty())
             backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         prosper::gpu::refuse_draw_pass(all.size(), prosper::gpu::DrawDrop::ResourceOrder);

@@ -64,15 +64,18 @@ struct SlotView {
 };
 
 // One layered mesh draw of `layers` work groups (work group L writes local layer L) into a
-// two-target pass. Returns whether the backend recorded a colour write.
+// two-target pass. Returns whether the backend recorded a colour write. `malformed_order` gives the
+// draw a resource order naming a resource it does not have, which render_draws_rgba refuses before
+// any pass (DrawDrop::ResourceOrder).
 bool render_two_targets(const SlotView& slot0, const SlotView& slot1,
                         const std::vector<uint32_t>& mesh, const std::vector<uint32_t>& fragment,
-                        uint32_t layers) {
+                        uint32_t layers, bool malformed_order = false) {
     BackendDraw draw;
     draw.mesh_draw = true;
     draw.mesh_groups = {layers, 1, 1};
     draw.vs = mesh;
     draw.fs = fragment;
+    if (malformed_order) draw.resource_order = {0u};   // one token, zero resources
     BackendColorTarget target;
     target.persistent_id = slot0.id;
     target.load_existing = false;
@@ -406,4 +409,70 @@ TEST(VolumeMultiTarget, OneLayerVolumeBesideA2DSlotRendersBoth) {
             << "volume slice " << z;
     ASSERT_TRUE(readback(kFlat, 0, flat));
     EXPECT_TRUE(is_rgba(centre(flat, 0), 0, 255, 255, 255)) << "the 2D slot";
+}
+
+// #4687: a batch refused on resource order runs no pass, so it must not report the previous pass's
+// colour-target writes or retained slots as its own. The frontend reads retained_slots right after
+// the call to decide which volume versions the call produced; a stale bit claims a version for a
+// pass that never ran. Device-free: the "previous pass" is primed directly, so this arm runs on
+// any host, and every per-call stat render_draws_rgba publishes is checked, not only the two the
+// issue names.
+TEST(VolumeMultiTarget, ResourceOrderRefusalClearsThePreviousPassStats) {
+    auto& census = prosper::gpu::draw_disposition_census();
+    const uint64_t refused = census.dropped(DrawDrop::ResourceOrder);
+    BackendColorTargetStats& previous = backend_color_target_stats_storage();
+    previous.writes = previous.write_hits = previous.sampled_hits = previous.readbacks = 1;
+    previous.retained_slots = 0x3u;   // the previous pass retained both volume slots
+    backend_pipeline_cache_stats_storage().references = 5;
+    backend_pipeline_cache_stats_storage().misses = 1;
+    fragment_draw_backend_stats().planned = 2;
+    backend_texture_upload_stats_storage().references = 7;
+    BackendDraw draw;
+    draw.resource_order = {0u};   // one token, zero resources: refused before any pass
+    BackendColorTarget target;
+    target.persistent_id = 0x764d525432000061ull;
+    target.volume_depth = kDepth;
+    target.volume_slice_count = kDepth;
+    target.persistent_id1 = 0x764d525432000062ull;
+    target.volume_slots[1] = {kDepth, 0, kDepth, 0};
+    BackendMrtOutputs mrt;
+    mrt.color_count = 2;
+    EXPECT_TRUE(render_draws_rgba({draw}, kSize, kSize, nullptr, kClear0, false, &target, nullptr,
+                                  kClear1, nullptr, nullptr, true, &mrt, true)
+                    .empty());
+    ASSERT_EQ(census.dropped(DrawDrop::ResourceOrder) - refused, 1u)
+        << "the call must take the resource-order refusal, or this arm tests some other path";
+    const BackendColorTargetStats color = backend_color_target_stats();
+    EXPECT_EQ(color.writes, 0u);
+    EXPECT_EQ(color.retained_slots, 0u) << "a refused pass retained no volume slot";
+    EXPECT_EQ(color.write_hits, 0u);
+    EXPECT_EQ(color.sampled_hits, 0u);
+    EXPECT_EQ(color.readbacks, 0u);
+    const BackendPipelineCacheStats pipelines = backend_pipeline_cache_stats();
+    EXPECT_EQ(pipelines.references, 0u) << "a refused pass looked up no pipeline";
+    EXPECT_EQ(pipelines.misses, 0u);
+    EXPECT_EQ(fragment_draw_backend_stats().planned, 0u);
+    EXPECT_EQ(backend_texture_upload_stats().references, 0u);
+}
+
+// The same contract end to end: a real pass retains both volume slots, then the identical pass
+// with a malformed resource order is refused. The positive control is the first pass's own
+// report, so the zero after the refusal is the reset and not a pass that never set the bits.
+TEST(VolumeMultiTarget, ResourceOrderRefusalAfterARetainingPassRetainsNothing) {
+    if (!device_ready()) GTEST_SKIP() << "no mesh-shader device with 2D views of 3D images";
+    constexpr uint64_t kSlot0 = 0x764d525432000071ull, kSlot1 = 0x764d525432000072ull;
+    ASSERT_TRUE(render_two_targets({kSlot0, kDepth, 0, kDepth}, {kSlot1, kDepth, 0, kDepth},
+                                   words(volume_fixture::param_mesh),
+                                   words(volume_fixture::param_mrt2_fragment), kDepth));
+    ASSERT_EQ(backend_color_target_stats().retained_slots, 0x3u) << "control: both slots retained";
+    auto& census = prosper::gpu::draw_disposition_census();
+    const uint64_t refused = census.dropped(DrawDrop::ResourceOrder);
+    EXPECT_FALSE(render_two_targets({kSlot0, kDepth, 0, kDepth}, {kSlot1, kDepth, 0, kDepth},
+                                    words(volume_fixture::param_mesh),
+                                    words(volume_fixture::param_mrt2_fragment), kDepth,
+                                    /*malformed_order=*/true));
+    EXPECT_EQ(census.dropped(DrawDrop::ResourceOrder) - refused, 1u);
+    const BackendColorTargetStats color = backend_color_target_stats();
+    EXPECT_EQ(color.writes, 0u);
+    EXPECT_EQ(color.retained_slots, 0u) << "the refused pass reported the earlier pass's slots";
 }
