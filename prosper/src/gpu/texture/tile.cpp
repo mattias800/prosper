@@ -3,6 +3,7 @@
 #include "diagnostics/worker_spawn_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -90,6 +91,22 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
         return 0;
     const uint64_t bytes = blocks * meta_block_bytes;
     return bytes <= std::numeric_limits<size_t>::max() ? static_cast<size_t>(bytes) : 0;
+}
+
+bool gfx10_dcc_format_never_depth(DataFormat format) {
+    // Depth views sample D32 as Float32, D16 as Unorm16, and stencil as Uint8/Uint32; none of
+    // those is listed, so their planes are never taken for DCC without a positive correlation.
+    // CONFIDENCE: MED-HIGH for Float16 (no 16-bit float depth format exists). CONFIDENCE: MED for
+    // Snorm16/Sint16/Unorm8/Snorm8/Sint8 (no depth or stencil format samples as these).
+    switch (format) {
+        case DataFormat::Float16:
+        case DataFormat::Snorm16:
+        case DataFormat::Sint16:
+        case DataFormat::Unorm8:
+        case DataFormat::Snorm8:
+        case DataFormat::Sint8: return true;
+        default: return false;
+    }
 }
 
 bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8,

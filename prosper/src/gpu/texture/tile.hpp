@@ -15,6 +15,8 @@
 
 namespace prosper::gpu {
 
+enum class DataFormat : uint32_t;   // gpu/resources/shader_resources.hpp
+
 // AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 1 = SW_256B_S (small
 // standard-swizzled textures), 5 = SW_4KB_S (the RGBA render target). 9 = SW_64KB_S (standard 64KB,
 // DOLL's material textures), 24 = SW_64KB_Z_X
@@ -303,6 +305,9 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
 // Whether a surface may be handed to gfx10_dcc_fast_clear_rgba8 at all: three or more components,
 // or a narrow surface with an RGBA8 decode buffer whose plane is DCC, or is unclassified but cannot be
 // HTILE because its format is never a depth view. A plane known to be HTILE is always refused.
+// Whether no depth/stencil view ever uses this sampled format, so its metadata plane cannot be
+// HTILE. This list is the depth-safety boundary of the narrow fast-clear admission.
+bool gfx10_dcc_format_never_depth(DataFormat format);
 bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc,
                                  bool metadata_is_htile, bool format_cannot_be_depth);
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
