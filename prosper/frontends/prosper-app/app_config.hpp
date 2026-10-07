@@ -186,6 +186,21 @@ inline HostPolicy resolve_host_policy(const HostPolicyInputs& in) {
     return out;
 }
 
+// Whether the persisted host settings apply to this run at all. Only a boot the library starts
+// takes them: a bare launch (no game, no test pattern) or a relaunch carrying --from-library.
+// A scripted `prosper-app <dump>`, `--dump <x>` or `--test-pattern` run never does, so its guest
+// answers cannot depend on per-user state.
+inline bool host_policy_applies(bool has_dump, bool test_pattern, bool from_library) {
+    return (!has_dump && !test_pattern) || from_library;
+}
+
+// The volume a library session runs at: the resolved policy's answer when it has one, otherwise
+// whatever `current` already is (the --volume flag's value, or the built-in default). It reads
+// only the resolver's output, so the shipped volume precedence is the one the tests pin.
+inline int volume_after_policy(const HostPolicy& policy, int current) {
+    return policy.volume_percent >= 0 ? policy.volume_percent : current;
+}
+
 // Record a boot at `app0_root` at the head of the recent list: deduped, canonicalized,
 // capped at kRecentGamesMax. Pure over the struct, so the rule is unit-tested.
 inline void note_recent_game(AppConfig& cfg, const std::string& app0_root) {

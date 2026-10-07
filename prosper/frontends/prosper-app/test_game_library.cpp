@@ -445,6 +445,58 @@ int main() {
               "an empty everything resolves to leave-everything-alone");
     }
 
+    // --- display mode: the flag and the environment each suppress the file ON THEIR OWN ----------
+    // The `loud` arm above sets both, so each condition masks the other; these arms take one each.
+    {
+        HostPolicyInputs env_only;
+        env_only.file.display_mode = "host";
+        env_only.env_display_mode = "legacy";
+        CHECK(resolve_host_policy(env_only).display_mode.empty(),
+              "PROSPER_DISPLAY_MODE alone (no --display-mode) suppresses the file's display_mode");
+        HostPolicyInputs flag_only;
+        flag_only.file.display_mode = "host";
+        flag_only.flag_display_mode = true;
+        CHECK(resolve_host_policy(flag_only).display_mode.empty(),
+              "--display-mode alone (no PROSPER_DISPLAY_MODE) suppresses the file's display_mode");
+    }
+
+    // --- which runs take the persisted host settings at all ------------------------------------
+    // has_dump covers both `prosper-app <dump>` and `--dump <x>`: main.cpp passes !dump.empty().
+    {
+        namespace pf = prosper::frontend;
+        CHECK(!pf::host_policy_applies(/*has_dump=*/true, /*test_pattern=*/false,
+                                       /*from_library=*/false),
+              "a scripted dump run never takes the saved settings");
+        CHECK(!pf::host_policy_applies(/*has_dump=*/false, /*test_pattern=*/true,
+                                       /*from_library=*/false),
+              "a --test-pattern run never takes the saved settings");
+        CHECK(pf::host_policy_applies(/*has_dump=*/false, /*test_pattern=*/false,
+                                      /*from_library=*/false),
+              "a bare launch (the library) takes the saved settings");
+        CHECK(pf::host_policy_applies(/*has_dump=*/true, /*test_pattern=*/false,
+                                      /*from_library=*/true),
+              "a dump relaunched with --from-library takes the saved settings");
+    }
+
+    // --- volume: main.cpp applies the RESOLVER's answer, through volume_after_policy -------------
+    {
+        namespace pf = prosper::frontend;
+        HostPolicyInputs in;
+        in.file.volume_percent = 75;
+        CHECK(pf::volume_after_policy(resolve_host_policy(in), 100) == 75,
+              "with no --volume, the saved volume replaces the default");
+        HostPolicyInputs flagged = in;
+        flagged.flag_volume = true;
+        CHECK(pf::volume_after_policy(resolve_host_policy(flagged), 40) == 40,
+              "--volume wins: the flag's value survives a saved volume");
+        CHECK(pf::volume_after_policy(resolve_host_policy(HostPolicyInputs{}), 100) == 100,
+              "no saved volume leaves the current volume alone");
+        pf::HostPolicy muted;
+        muted.volume_percent = 0;
+        CHECK(pf::volume_after_policy(muted, 100) == 0,
+              "a saved volume of 0 (mute) is a real answer, not 'unset'");
+    }
+
     // --- newline safety ----------------------------------------------------------------------------
     {
         AppConfig evil;

@@ -1763,15 +1763,9 @@ int main(int argc, char** argv) {
     // arms. What follows only performs the resolved answer: validate, publish, remember for seed.
     std::string effDisplayMode = "legacy";
     std::string effSavedataDir;
-    const bool librarySession = (dump.empty() && !testPattern) || fromLibrary;
+    const bool librarySession =
+        prosper::frontend::host_policy_applies(!dump.empty(), testPattern, fromLibrary);
     if (librarySession) {
-        // No environment variable exists for volume, so this is flag > file: --volume wins,
-        // the persisted slider fills the silence. g_volume_percent feeds both the SDL sink gain
-        // at boot and the library seed below.
-        if (!volumeSeen && appConfig.volume_percent >= 0) {
-            g_volume_percent = appConfig.volume_percent;
-            fprintf(stderr, "[app] volume (config): %d%%\n", g_volume_percent);
-        }
         // One read per name for the whole run: env wins, the file fills the silence, and `eff*`
         // carries the answer to the library seed below.
         prosper::frontend::HostPolicyInputs policy_in;
@@ -1785,6 +1779,12 @@ int main(int argc, char** argv) {
         policy_in.file = appConfig;
         const prosper::frontend::HostPolicy policy =
             prosper::frontend::resolve_host_policy(policy_in);
+        // No environment variable exists for volume, so this is flag > file: --volume wins,
+        // the persisted slider fills the silence. g_volume_percent feeds both the SDL sink gain
+        // at boot and the library seed below.
+        g_volume_percent = prosper::frontend::volume_after_policy(policy, g_volume_percent);
+        if (policy.volume_percent >= 0)
+            fprintf(stderr, "[app] volume (config): %d%%\n", g_volume_percent);
         if (!policy_in.env_savedata_dir.empty()) {
             effSavedataDir = policy_in.env_savedata_dir;
         } else if (!policy.savedata_dir.empty()) {
