@@ -8,7 +8,8 @@
 //   * two volume slots in one pass: each slot's every slice holds what the layered draw wrote for
 //     it, checked per slice and per channel, so a swapped, dropped or aliased slot cannot pass;
 //   * per-slot layer routing: a slot's slice range is its own (different first slices per slot),
-//     and slices outside a slot's range keep their earlier contents;
+//     and slices outside a slot's range keep their earlier contents, for slot 1 and for slot 2
+//     (slots 2..7 have their own creation and attachment path);
 //   * the control: a fragment program that writes only MRT0 fails the slot-1 check, so the check
 //     is able to see a slot-1 write that never happened (the mutation this test exists for);
 //   * a 2D slot beside a volume slot: refused by name when the framebuffer is layered (Vulkan has
@@ -285,6 +286,62 @@ TEST(VolumeMultiTarget, EachSlotRoutesLayersFromItsOwnFirstSlice) {
         EXPECT_TRUE(is_rgba(centre(slot1, z), 0, 255, 255, 255)) << "slot 1 slice " << z;
     EXPECT_TRUE(slot1_slice(slot1, 2, 2)) << "outside slot 1's range: the first pass survives";
     EXPECT_TRUE(slot1_slice(slot1, 3, 3)) << "outside slot 1's range: the first pass survives";
+}
+
+// Slots 2..7 take a separate creation and attachment path from slot 1. Three volume slots, each
+// routing the same two layers from its own first slice.
+TEST(VolumeMultiTarget, ThreeVolumeSlotsIncludingAnExtraSlot) {
+    if (!device_ready()) GTEST_SKIP() << "no mesh-shader device with 2D views of 3D images";
+    constexpr uint64_t kIds[3] = {0x764d525432000051ull, 0x764d525432000052ull,
+                                  0x764d525432000053ull};
+    const auto render = [&](uint32_t first0, uint32_t first1, uint32_t first2, uint32_t count,
+                            const std::vector<uint32_t>& mesh) {
+        BackendDraw draw;
+        draw.mesh_draw = true;
+        draw.mesh_groups = {count, 1, 1};
+        draw.vs = mesh;
+        draw.fs = words(volume_fixture::param_mrt3_fragment);
+        BackendColorTarget target;
+        target.persistent_id = kIds[0];
+        target.load_existing = false;
+        target.readback = false;
+        target.format = kFormat;
+        target.volume_depth = kDepth;
+        target.volume_first_slice = first0;
+        target.volume_slice_count = count;
+        target.persistent_id1 = kIds[1];
+        target.load_existing1 = false;
+        target.readback1 = false;
+        target.format1 = kFormat;
+        target.volume_slots[1] = {kDepth, first1, count, 0};
+        target.persistent_id_slots[2] = kIds[2];
+        target.load_existing_slots[2] = false;
+        target.readback_slots[2] = false;
+        target.volume_slots[2] = {kDepth, first2, count, 0};
+        BackendMrtOutputs mrt;
+        mrt.color_count = 3;
+        (void)render_draws_rgba({draw}, kSize, kSize, nullptr, kClear0, false, &target, nullptr,
+                                kClear1, nullptr, nullptr, true, &mrt, true);
+        return backend_color_target_stats().retained_slots == 0x7u;
+    };
+    ASSERT_TRUE(render(0, 0, 0, kDepth, words(volume_fixture::param_mesh)));
+    ASSERT_TRUE(render(0, 1, 2, 2, words(volume_fixture::wrong_param_mesh)));
+    std::vector<uint8_t> slot0, slot1, slot2;
+    ASSERT_TRUE(readback(kIds[0], kDepth, slot0));
+    ASSERT_TRUE(readback(kIds[1], kDepth, slot1));
+    ASSERT_TRUE(readback(kIds[2], kDepth, slot2));
+    for (uint32_t z = 0; z < kDepth; ++z) {
+        const uint32_t v = layer_value(z);
+        EXPECT_TRUE(z < 2 ? is_rgba(centre(slot0, z), 255, 0, 255, 255)
+                          : bool(slot0_slice(slot0, z, z)))
+            << "slot 0 slice " << z;
+        EXPECT_TRUE(z >= 1 && z < 3 ? is_rgba(centre(slot1, z), 0, 255, 255, 255)
+                                    : bool(slot1_slice(slot1, z, z)))
+            << "slot 1 slice " << z;
+        EXPECT_TRUE(z >= 2 ? is_rgba(centre(slot2, z), 255, 255, 0, 255)
+                           : is_rgba(centre(slot2, z), v, 255, 0, 255))
+            << "slot 2 slice " << z;
+    }
 }
 
 // The control that proves the slot-1 check can fail: the same pass with a program that writes MRT0

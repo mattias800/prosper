@@ -1213,10 +1213,11 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 }
             }
             const auto& slot_volume = slot_volumes[slot];
-            if (slot_volume.depth && !color_target_call.writes) {
-                // The backend refused the layered pass before recording (#4643): the
-                // renderer holds no image of this version, so guest memory stays
-                // authoritative, exactly as for slot 0 above.
+            if (slot_volume.depth && !(color_target_call.retained_slots & (1u << slot))) {
+                // The backend recorded no write to this slot's retained volume (#4643):
+                // the renderer holds no image of this version, so guest memory stays
+                // authoritative, exactly as for slot 0 above. Asked per slot, because
+                // `writes` counts slot 0's retained image only.
                 note_volume_producer_denied(pass_bases[slot], g_rtt[pass_bases[slot]], gw, gh,
                                             slot_volume.depth, pass_formats[slot]);
                 continue;

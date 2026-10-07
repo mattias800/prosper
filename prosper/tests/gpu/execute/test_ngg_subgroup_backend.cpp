@@ -771,9 +771,12 @@ TEST(NggSubgroupBackend, VolumeMrtSplitKeepsTheNggDrawAndBothSlots) {
     // a slot from being copied back, so this arm sees a split that reads slot 1 back.
     (void)render_draws_rgba({a, lut}, kSize, kSize, nullptr, kClear, true, &target, nullptr, kClear,
                             nullptr, nullptr, true, &mrt, true);
+    // What catches a split that reads slot 1 back: its bytes would return as the next segment's
+    // slot-1 seed, and a seeded volume slot is refused (volume-seeded), so the NGG segment would
+    // record nothing and these two counts would fall.
     EXPECT_EQ(stats_now().draws - before.draws, 1u) << "the NGG draw ran in its own segment";
-    EXPECT_EQ(backend_color_target_stats().writes, 2u) << "two segments";
-    EXPECT_TRUE(mrt.colors[1].empty()) << "slot 1 stays on the GPU";
+    EXPECT_EQ(backend_color_target_stats().writes, 2u) << "two segments, both recorded";
+    EXPECT_EQ(backend_color_target_stats().retained_slots, 0x3u) << "both slots retained";
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(readback_persistent_color_target(target.persistent_id, kSize, kSize, target.format,

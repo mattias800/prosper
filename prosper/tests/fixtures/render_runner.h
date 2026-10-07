@@ -670,6 +670,7 @@ struct BackendColorTargetStats {
     uint64_t readbacks = 0;
     uint64_t cached_bytes = 0;
     uint64_t cached_entries = 0;
+    uint32_t retained_slots = 0;   // bit per slot whose retained image this call recorded (#4643)
 };
 
 inline BackendColorTargetStats& backend_color_target_stats_storage() {
@@ -8545,7 +8546,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // one exact allocation through the later 3D sample, or the caller sees an explicit refusal.
     if (volume_pass.any && !persistent_color_targets_enabled)
         return disposition.refuse(DD::VolumeNotPersistent, out);
-    for (const BackendDraw& draw : draws)
+    for (const BackendDraw& draw : volume_pass.any ? draws : std::span<const BackendDraw>{})
         for (const FrameResource& resource : draw.R)
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 if (volume_attempt.ids[slot] && resource.img_dim == 2u &&
@@ -13610,7 +13611,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         load.oldLayout = cached_extra[slot]->layout;
         load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         load.image = extra_images[slot];
-        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                 volume_pass.volume(slot) ? VK_REMAINING_ARRAY_LAYERS : 1u};
         load.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -13627,7 +13629,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         load.oldLayout = cached_color1->layout;
         load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         load.image = img1;
-        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                 volume_pass.volume(1) ? VK_REMAINING_ARRAY_LAYERS : 1u};
         load.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -15155,6 +15158,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                : slot == 1 ? cached_color1
                                                            : cached_extra[slot];
         if (!retained) continue;
+        color_target_stats.retained_slots |= 1u << slot;
         active_submission.add_failure_cleanup(
             [retained]() { invalidate_retained_color(retained); });
         note_retained_color_recorded(*retained, volume_pass.slots[slot],
@@ -16065,6 +16069,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     auto add_stats = [&] {
         const BackendColorTargetStats color = backend_color_target_stats();
         aggregate_color.writes += color.writes;
+        aggregate_color.retained_slots |= color.retained_slots;
         aggregate_color.write_hits += color.write_hits;
         aggregate_color.sampled_hits += color.sampled_hits;
         aggregate_color.readbacks += color.readbacks;

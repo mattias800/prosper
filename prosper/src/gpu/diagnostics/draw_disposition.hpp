@@ -93,7 +93,7 @@ enum class DrawDrop : uint8_t {
     VolumeFeedback,          // a volume pass samples the volume it writes (no snapshot yet)
     CommandPool,             // no command pool could be leased for the pass
     VolumeMultiTarget,       // RETIRED (#4643): multi-target volume passes now render
-    VolumeSeeded,            // a single-target volume pass with a CPU seed (multi-target wins)
+    VolumeSeeded,            // a volume colour slot with a CPU seed (no seeded 3D path)
     VolumeTargetLimits,      // the device cannot hold the volume target or its layer count
     VolumeDepthStencil,      // a volume pass with a depth/stencil attachment
     VolumeBudget,            // a volume target could not be retained (budget or allocation)
