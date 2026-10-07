@@ -4015,6 +4015,14 @@ endif()
   set_tests_properties(writer_provenance_ranges PROPERTIES
                        ENVIRONMENT "PROSPER_PROVENANCE_DIM=3200x1800")
 
+  # writer_provenance_enabled() is memoised per submit (it reads four environment names on a per-draw
+  # path). Two-sided: frozen inside one submit, visible at the next, live outside both.
+  prosper_add_gtest(test_writer_provenance_env
+    SOURCES tests/gpu/capture/test_writer_provenance_env.cpp
+    INCLUDES src
+    LIBRARIES prosper_core
+    PROPERTIES ENVIRONMENT_MODIFICATION "PROSPER_PROVENANCE_DIM=unset:;PROSPER_RESOURCE_HASH_DIM=unset:;PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=unset:;PROSPER_WRITER_PROVENANCE=unset:")
+
   # The init-fault report must survive a wild/null faulting RIP (#128). On Windows this also drives
   # the VEH recovery thunk and asserts its compiled-helper call obeys the Microsoft-x64 ABI (#633).
   prosper_add_gtest(test_initfault_dump
