@@ -113,6 +113,21 @@ Inspection reports each descriptor's declared size, capture-planned footprint, a
 count separately, so a thin capsule can still expose a pathological range. Capture v28+ retains the exact
 planned span and reports the resolved `row-pitch` for linear sampled images; older captures derive the
 guest pitch while retaining their historical tight byte span.
+
+**A draw buffer with nothing mapped behind it is a placeholder, not a capture gap (#3807, capture
+v74).** The live draw path asks one question of a non-image buffer with no host-owned bytes: is any
+guest mapping there? When none is, it reads nothing and binds an all-zero buffer sized from the
+shader's reflected requirement. UE4 titles bind exactly this as a whole-range V# (NUM_RECORDS
+`0xffffffff`); *Kena* binds one at `0xf00000000000`, above the 47-bit user address space, and every
+F9 grab used to abort on it with the 1 GiB per-resource ceiling. The capture now asks the renderer's
+own gate (`src/gpu/capture/capture_source_gate.hpp`) and records such a binding with no blob and an
+explicit mark; replay binds the same all-zero fallback **because the record says so**, not because the
+replay process has nothing mapped there. The summary line counts them, `--list-resources` prints
+`source unmapped live: all-zero fallback`, and `--dump-resource` on one says why there are no bytes.
+A whole-range descriptor over a source that IS mapped keeps the per-resource ceiling and still fails
+closed. Images, compute tables and owned fragment-wave tables never take this path. A capture with
+no placeholder is still written as v71/v72, byte for byte.
+
 The `vs=` and `fs=` summaries identify whether each recompiled shader is retained as `owned` or
 `shared`; their size and hash always describe the accessor-selected words the renderer consumes.
 

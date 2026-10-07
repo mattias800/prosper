@@ -170,6 +170,11 @@ struct GpuCapturedResource {
     // normalized identity remain in ShaderResource; these records bind each entry to its own exact
     // pre-submit backing without putting capture-only indices into the live resource contract.
     std::vector<BufferTableEntryBlob> table_entry_blobs;
+    // v74 (#3807): the live renderer's buffer-source gate found nothing mapped at this draw buffer's
+    // address, so it bound its all-zero fallback and read no guest bytes. The record carries no blob
+    // BY DESIGN -- there were no bytes -- and replay binds the same fallback (capture_source_gate.hpp).
+    // False on every older capture and on every resource whose bytes were captured.
+    bool source_unavailable = false;
 };
 
 struct GpuCapturedTable {
@@ -539,6 +544,12 @@ uint64_t gpu_capture_dcc_metadata_footprint(const ShaderResource& resource);
 using ReplayRttSeedWriter = std::function<bool(const GpuCaptureRttSeed& seed, std::string& error)>;
 using ReplayDsSeedWriter = std::function<bool(const GpuCaptureDsSeed& seed, std::string& error)>;
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader);
+// The live renderer's draw-buffer source gate (#3807, capture_source_gate.hpp): true when the
+// renderer binds its all-zero fallback for a draw buffer at `guest_addr` because nothing is mapped
+// there. The frontend registers it with the renderer; with no probe registered (tests, tools) no
+// resource is ever recorded as a placeholder and capture keeps its historical fail-closed shape.
+using CaptureBufferSourceProbe = std::function<bool(uint64_t guest_addr)>;
+void set_gpu_capture_buffer_source_probe(CaptureBufferSourceProbe probe);
 bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error);
 // Add one exact live renderer target to a capture unless it is already dependency-seeded. Used by
 // frame-boundary capture for a held VideoOut scanout that may predate every submit in the window.

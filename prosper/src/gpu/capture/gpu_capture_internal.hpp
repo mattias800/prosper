@@ -203,11 +203,32 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v72 (#3135 P5): the realized merged-NGG draw description (ngg_subgroup_codec.hpp). A capture is
 // written as v72 ONLY when one of its draws carries one; every other capture is still written as
 // v71, byte for byte, so the v71 tail stays the last thing in it (gpu_capture_version_for).
-constexpr uint32_t kVersion = 72;
+// v74 (#3807): one source-availability mark per draw-table resource (capture_source_gate.hpp): the
+// live renderer's buffer-source gate found nothing mapped at that draw buffer's address and bound its
+// all-zero fallback, so the record carries no blob and replay binds the same fallback. Written, after
+// the v72 tail, ONLY when a draw resource carries the mark; every other capture keeps its v71/v72
+// bytes. An older capture reads every mark as false, which is what it recorded.
+// v73 is deliberately skipped: it is claimed by the depth-bounds tail in flight (#4704). Each tail is
+// conditional and written when the file's version reaches it, so whichever merges second only has to
+// slot its read/write block in version order; no published version changes meaning.
+constexpr uint32_t kVersion = 74;
+constexpr uint32_t kVersionWithUnavailableSource = 74;
+constexpr uint32_t kVersionWithNgg = 72;
 constexpr uint32_t kVersionWithoutNgg = 71;
-inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
     for (const auto& draw : c.draws)
-        if (draw.ngg_subgroup) return kVersion;
+        for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
+            for (const auto& resource : table->resources)
+                if (resource.source_unavailable) return true;
+    for (const auto& compute : c.computes)
+        for (const auto& resource : compute.resources.resources)
+            if (resource.source_unavailable) return true;
+    return false;
+}
+inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    if (gpu_capture_has_unavailable_source(c)) return kVersionWithUnavailableSource;
+    for (const auto& draw : c.draws)
+        if (draw.ngg_subgroup) return kVersionWithNgg;
     return kVersionWithoutNgg;
 }
 constexpr uint32_t kEndian = 0x01020304u;
@@ -1459,6 +1480,7 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
 
 // ---- appended by a later promotion out of the same source ----
 inline CaptureRttSeedReader g_rtt_seed_reader;
+inline CaptureBufferSourceProbe g_buffer_source_probe;   // #3807, capture_source_gate.hpp
 
 // The readable prefix of a buffer being captured. Forwards to the shared policy (#3734); on Windows
 // this used to be a guest_readable() probe plus memcpy in 64 KiB steps, which could fault if the

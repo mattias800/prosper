@@ -67,4 +67,30 @@ inline BufferSourceGateResult classify_buffer_source(
     return result;
 }
 
+// The draw path's gate for one resource. A replayed capture placeholder (#3807,
+// src/gpu/capture/capture_source_gate.hpp) was refused by THIS gate in the live process, so it is
+// refused here by its record, before the replay process's own mapping table is consulted: what is
+// mapped in an offline tool says nothing about what was mapped in the game.
+template <typename TrackedProbe, typename ReservedStateQuery>
+inline BufferSourceGateResult classify_recorded_buffer_source(
+    bool recorded_unavailable, bool has_host_data, uint64_t gpu_addr, bool use_tracked_cache,
+    TrackedProbe probe_tracked, ReservedStateQuery query_reserved_state) {
+    if (recorded_unavailable && !has_host_data) {
+        BufferSourceGateResult result;
+        result.unavailable = true;
+        return result;
+    }
+    return classify_buffer_source(has_host_data, gpu_addr, use_tracked_cache, probe_tracked,
+                                  query_reserved_state);
+}
+
+// The same decision as the capture asks it (set_gpu_capture_buffer_source_probe): the authoritative
+// lookup, never the positive-only membership cache, for a resource with no host-owned bytes.
+template <typename TrackedProbe, typename ReservedStateQuery>
+inline bool capture_buffer_source_unavailable(uint64_t gpu_addr, TrackedProbe probe_tracked,
+                                              ReservedStateQuery query_reserved_state) {
+    return classify_buffer_source(false, gpu_addr, false, probe_tracked, query_reserved_state)
+        .unavailable;
+}
+
 } // namespace prosper::frontend

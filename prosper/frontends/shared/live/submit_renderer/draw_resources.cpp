@@ -150,8 +150,8 @@ ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx, CopyReso
     // descriptor's potentially corrupt declared size; robust buffer access makes
     // accesses beyond this minimum zero as well. Static reflection tells us how
     // much in-bounds storage the shader can definitely address.
-    const BufferSourceGateResult source_gate = classify_buffer_source(
-        r.host_data != nullptr, r.gpu_addr,
+    const BufferSourceGateResult source_gate = classify_recorded_buffer_source(
+        r.replay_source_unavailable, r.host_data != nullptr, r.gpu_addr,
         use_tracked_buffer_membership_cache,
         prosper_renderer_guest_address_tracked,
         prosper_reserved_range_state);

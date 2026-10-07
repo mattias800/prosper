@@ -1333,6 +1333,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  # #3807: a draw buffer the live source gate refuses is captured as a v74 placeholder, and the
+  # per-resource ceiling still fires for a mapped source. Pure CPU; the gate arm reads the frontend
+  # header directly.
+  prosper_add_gtest(test_capture_unavailable_source
+    SOURCES tests/gpu/capture/test_capture_unavailable_source.cpp
+    INCLUDES src frontends
+    LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.

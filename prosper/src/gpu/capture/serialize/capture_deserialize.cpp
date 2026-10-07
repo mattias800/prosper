@@ -5,6 +5,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/capture/capture_source_gate.hpp"   // #3807 v74 placeholder marks
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -1865,6 +1866,31 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 if (error.empty()) error = "invalid merged-NGG draw description";
                 return false;
             }
+    }
+    if (version >= kVersionWithUnavailableSource) {   // #3807, capture_source_gate.hpp
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid unavailable-source mark count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            for (GpuCapturedTable* table : {&draw.vrt, &draw.prt})
+                for (auto& resource : table->resources) {
+                    uint8_t mark = 0;
+                    if (!r.u8(mark) || mark > 1u) {
+                        error = "invalid unavailable-source mark";
+                        return false;
+                    }
+                    resource.source_unavailable = mark != 0u;
+                    if (resource.source_unavailable &&
+                        !valid_source_unavailable_record(resource)) {
+                        error = "invalid unavailable-source placeholder";
+                        return false;
+                    }
+                }
     }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one

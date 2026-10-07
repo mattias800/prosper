@@ -856,6 +856,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 std::move(materialized));
             return true;
         };
+        // #3807: the capture asks the draw path's own buffer-source gate, so a binding this renderer
+        // fills with its all-zero fallback is recorded as exactly that rather than as guest bytes.
+        prosper::gpu::set_gpu_capture_buffer_source_probe([](uint64_t addr) {
+            return capture_buffer_source_unavailable(
+                addr, prosper_renderer_guest_address_tracked, prosper_reserved_range_state);
+        });
         prosper::gpu::set_gpu_capture_rtt_seed_reader(
             [invalidate_ds, materialize_current_rtt](
                 uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
