@@ -34,8 +34,8 @@ namespace frontend {
 // The Game Log line buffer (log_ring.hpp); owned by main.cpp, only observed here. Forward
 // declared so this header stays free of <mutex>/<deque>.
 class LogRing;
-} // namespace frontend
-} // namespace prosper
+}   // namespace frontend
+}   // namespace prosper
 
 namespace prosper::frontend {
 
@@ -244,8 +244,8 @@ private:
     std::vector<Cover>     covers_;
     std::vector<int>       filtered_;
     std::vector<RecentGame> recentGames_;
-    const LogRing*         logRing_ = nullptr;  // observed only; owned by main.cpp
-    bool                   logFollow_ = true;
+    const LogRing* logRing_ = nullptr;   // observed only; owned by main.cpp
+    bool logFollow_ = true;
     // Row hovered last frame. The highlight is painted at row start, but hover is only
     // knowable after the row's items — so it trails by one frame, which is imperceptible and
     // always spans the whole row (unlike a Selectable's own cell-sized hover paint).

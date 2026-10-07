@@ -14,7 +14,7 @@ namespace prosper::frontend {
 
 class LogRing {
 public:
-    static constexpr size_t kMaxLines = 512;   // old lines fall off; the panel is a tail, not storage
+    static constexpr size_t kMaxLines = 512;   // old lines fall off: a tail, not storage
     static constexpr size_t kMaxLine = 2048;   // one pathological line cannot eat the whole budget
 
     void push(const std::string& line) {
@@ -45,4 +45,4 @@ private:
     std::deque<std::string> lines_;
 };
 
-} // namespace prosper::frontend
+}   // namespace prosper::frontend

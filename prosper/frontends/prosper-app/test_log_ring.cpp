@@ -26,8 +26,7 @@ TEST(LogRing, KeepsInsertionOrder) {
 
 TEST(LogRing, EvictsOldestPastCapacity) {
     LogRing ring;
-    for (size_t i = 0; i < LogRing::kMaxLines + 10; i++)
-        ring.push("line" + std::to_string(i));
+    for (size_t i = 0; i < LogRing::kMaxLines + 10; i++) ring.push("line" + std::to_string(i));
     EXPECT_EQ(ring.size(), LogRing::kMaxLines);
     const auto lines = ring.snapshot();
     EXPECT_EQ(lines.front(), "line10");

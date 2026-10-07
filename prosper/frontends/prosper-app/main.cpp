@@ -51,7 +51,8 @@
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "shared/diagnostics/renderdoc_capture.hpp" // frame-aimed RenderDoc capture (#3321)
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
-#include "log_ring.hpp"                  // bounded Game Log line buffer (pure, unit-tested)
+#include "log_ring.hpp"   // bounded Game Log line buffer (pure, unit-tested)
+#include "log_capture.hpp"   // stdout/stderr capture feeding it, bounded teardown
 #include "prosper_logo.hpp"              // baked-in mark for the window/taskbar icon
 // The --fps HUD is NOT part of the library view and is not guarded by its macro: `Vk::overlay` and
 // every use site are unconditional, so the object and its header live outside PROSPER_HAVE_LIBRARY_UI
@@ -160,27 +161,6 @@ extern char** environ;                 // the child inherits this process's envi
 #endif
 #endif
 
-// Pipe/dup shims for the Game Log capture below. MinGW and POSIX agree on everything except the
-// spelling and the open mode: _O_BINARY keeps CRLF translation out of the capture path (the
-// reader strips carriage returns itself, so console bytes stay exactly what printf emitted).
-#ifdef _WIN32
-#include <io.h>        // _pipe/_dup2/_read/_write
-#include <fcntl.h>     // _O_BINARY
-#define prosper_pipe(fds) _pipe(fds, 4096, _O_BINARY)
-#define prosper_dup(fd) _dup(fd)
-#define prosper_dup2(a, b) _dup2(a, b)
-#define prosper_read(fd, buf, n) _read(fd, buf, static_cast<unsigned>(n))
-#define prosper_write(fd, buf, n) _write(fd, buf, static_cast<unsigned>(n))
-#define prosper_close(fd) _close(fd)
-#else
-#define prosper_pipe(fds) ::pipe(fds)
-#define prosper_dup(fd) ::dup(fd)
-#define prosper_dup2(a, b) ::dup2(a, b)
-#define prosper_read(fd, buf, n) ::read(fd, buf, n)
-#define prosper_write(fd, buf, n) ::write(fd, buf, n)
-#define prosper_close(fd) ::close(fd)
-#endif
-
 using namespace prosper;
 
 namespace {
@@ -201,99 +181,39 @@ bool clear_environment(const char* name) {
 }
 
 // ---- Game Log capture ------------------------------------------------------------------------
-// The library's Game Log panel shows the library session's own stdout/stderr tail. Both streams
-// are re-pointed at pipes whose reader threads forward every byte to the real console AND keep a
-// bounded copy in a LogRing. Forwarding preserves every contract a consumer relies on; the ring
-// only observes. Capture runs ONLY while the library is up (installed at library init,
-// uninstalled before any boot and before every process exit below): scripted runs, guest
-// execution and crash reports never pass through a pipe, so no byte can be lost to a thread
-// that _Exit kills.
+// The library's Game Log panel shows the library session's own stdout/stderr tail, through
+// LogCapture (log_capture.hpp): fds 1/2 point at pipes whose readers forward every byte to the
+// real console and keep a bounded copy in a LogRing. Capture runs ONLY while the library is up
+// (installed at library init, uninstalled before any boot and before every process exit below),
+// so scripted runs, guest execution and crash reports never pass through a pipe.
 //
-// Lifetime: install/uninstall bracket the library session. The ring is heap-owned and never
-// freed; the reader threads are joined on uninstall, so no thread outlives the capture and no
-// static destructor can race one. Uninstall is idempotent and safe to call with no install.
-struct LogCapture {
-    prosper::frontend::LogRing* ring = nullptr;
-    int out_pipe[2] = {-1, -1};
-    int err_pipe[2] = {-1, -1};
-    int saved_out = -1;
-    int saved_err = -1;
-    bool installed = false;
-    std::thread out_reader;
-    std::thread err_reader;
-};
-static LogCapture g_log_capture;
+// Uninstall is bounded: a child spawned during the library session (SDL's xdg-open for "Show in
+// Explorer") inherits fds 1/2 and so holds the pipes' write ends, and waiting for their EOF would
+// hang the boot until that child exits. The ring is heap-owned and never freed, because a reader
+// left forwarding such a child's output may still push into it.
+static prosper::frontend::LogCapture g_log_capture;
+static constexpr std::chrono::milliseconds kLogCaptureDrainBound{500};
 
-static void log_capture_reader(prosper::frontend::LogRing* ring, int src_fd, int forward_fd) {
-    std::string carry;
-    char buf[4096];
-    for (;;) {
-        const long n = prosper_read(src_fd, buf, sizeof buf);
-        if (n <= 0) return;   // EOF once uninstall closes the write ends; errors end it too
-        // Forward first: the console stays the primary record, the ring the observer.
-        long done = 0;
-        while (done < n) {
-            const long w = prosper_write(forward_fd, buf + done, n - done);
-            if (w <= 0) break;
-            done += w;
-        }
-        carry.append(buf, static_cast<size_t>(n));
-        size_t pos = 0;
-        while ((pos = carry.find('\n')) != std::string::npos) {
-            std::string line = carry.substr(0, pos);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            ring->push(line);
-            carry.erase(0, pos + 1);
-        }
-        // A run that prints without newlines must not grow the carry without bound.
-        if (carry.size() > 65536) {
-            ring->push(carry);
-            carry.clear();
-        }
-    }
-}
-
-// Point fds 1/2 at pipes and start the forwarding readers. Returns the ring, or null when the
-// capture could not start (the panel then says so and the streams stay exactly as they were).
+// Returns the ring, or null when the capture could not start (the panel then says so and the
+// streams stay exactly as they were: install is all-or-nothing).
 static prosper::frontend::LogRing* install_log_capture() {
-    LogCapture& cap = g_log_capture;
-    if (cap.installed) return cap.ring;
-    if (prosper_pipe(cap.out_pipe) != 0 || prosper_pipe(cap.err_pipe) != 0) return nullptr;
-    fflush(stdout);
-    fflush(stderr);
-    cap.saved_out = prosper_dup(1);
-    cap.saved_err = prosper_dup(2);
-    if (cap.saved_out < 0 || cap.saved_err < 0) return nullptr;
-    if (prosper_dup2(cap.out_pipe[1], 1) < 0 || prosper_dup2(cap.err_pipe[1], 2) < 0)
+    static prosper::frontend::LogRing* ring = nullptr;
+    if (g_log_capture.installed()) return ring;
+    auto* fresh = new prosper::frontend::LogRing();
+    if (!g_log_capture.install(fresh, {1, 2})) {
+        delete fresh;   // no reader was started, so nothing references it
         return nullptr;
-    cap.ring = new prosper::frontend::LogRing();
-    cap.out_reader = std::thread([ring = cap.ring, src = cap.out_pipe[0], dst = cap.saved_out] {
-        log_capture_reader(ring, src, dst);
-    });
-    cap.err_reader = std::thread([ring = cap.ring, src = cap.err_pipe[0], dst = cap.saved_err] {
-        log_capture_reader(ring, src, dst);
-    });
-    cap.installed = true;
-    return cap.ring;
+    }
+    ring = fresh;
+    return ring;
 }
 
-// Restore the console fds, drain the pipes through the readers, and join them: after this
-// returns, every byte written so far has reached the console and no thread is still reading.
+// Restore the console fds and drain the pipes within kLogCaptureDrainBound. Idempotent.
 static void uninstall_log_capture() {
-    LogCapture& cap = g_log_capture;
-    if (!cap.installed) return;
-    cap.installed = false;
-    prosper_dup2(cap.saved_out, 1);
-    prosper_dup2(cap.saved_err, 2);
-    prosper_close(cap.out_pipe[1]);
-    prosper_close(cap.err_pipe[1]);
-    if (cap.out_reader.joinable()) cap.out_reader.join();
-    if (cap.err_reader.joinable()) cap.err_reader.join();
-    prosper_close(cap.out_pipe[0]);
-    prosper_close(cap.err_pipe[0]);
-    // saved_out/saved_err and the ring stay open and valid for process life (the UI may still
-    // hold the pointer, and closing a console fd it still writes to would be worse than leaking
-    // three integers).
+    if (!g_log_capture.installed()) return;
+    if (!g_log_capture.uninstall(kLogCaptureDrainBound))
+        fprintf(stderr, "[app] game log: a child process still holds the log pipe; "
+                        "its output keeps forwarding in the background.\n");
 }
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
@@ -1375,9 +1295,10 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
         Sleep(10000);
         std::_Exit(prosper::app::kExitGuestFault);
     }
-    // Best-effort drain before the banner: without it the fault report itself could sit in a
-    // pipe when _Exit below kills the forwarding threads.
-    uninstall_log_capture();
+    // Point stderr straight back at the console before the banner, so the fault report cannot sit
+    // in a pipe when _Exit below kills the forwarding threads. No drain and no wait: a crash
+    // report must never hang on a reader, and a few already-piped lines are an acceptable loss.
+    g_log_capture.restore_now(2);
     const CONTEXT* c = ep->ContextRecord;
     const uint64_t rip = c->Rip;
     fprintf(stderr, "%s\n",

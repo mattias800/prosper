@@ -2053,6 +2053,13 @@ if(TARGET prosper_core)
     SOURCES frontends/prosper-app/test_log_ring.cpp
     INCLUDES frontends/prosper-app)
 
+  # The Game Log capture's teardown (#4671 review): every byte still in the pipe is forwarded, the
+  # teardown stays bounded while a child process holds an inherited write end (a hang there blocks
+  # a game boot), and a failed install leaves the captured descriptors untouched.
+  prosper_add_gtest(test_frontend_log_capture
+    SOURCES frontends/prosper-app/test_log_capture.cpp
+    INCLUDES frontends/prosper-app)
+
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
   prosper_add_gtest(test_persistent_readback_filter

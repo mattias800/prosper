@@ -1074,8 +1074,9 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
         // The footer, the Game Log label row and the log panel below take their share first;
         // a tiny window collapses the table rather than pushing them off-screen.
         static constexpr float kLogPanelH = 140.0f;
-        float tableH = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.0f -
-                       kLogPanelH - ImGui::GetStyle().ItemSpacing.y * 3.0f;
+        float tableH = ImGui::GetContentRegionAvail().y -
+                       ImGui::GetFrameHeightWithSpacing() * 2.0f - kLogPanelH -
+                       ImGui::GetStyle().ItemSpacing.y * 3.0f;
         if (tableH < 0.0f) tableH = 0.0f;
         if (ImGui::BeginTable("games", 6, tableFlags, ImVec2(0, tableH))) {
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, kThumbSize);
