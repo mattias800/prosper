@@ -208,9 +208,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // all-zero fallback, so the record carries no blob and replay binds the same fallback. Written, after
 // the v72 tail, ONLY when a draw resource carries the mark; every other capture keeps its v71/v72
 // bytes. An older capture reads every mark as false, which is what it recorded.
-// v73 is deliberately skipped: it is claimed by the depth-bounds tail in flight (#4704). Each tail is
-// conditional and written when the file's version reaches it, so whichever merges second only has to
-// slot its read/write block in version order; no published version changes meaning.
+// v73 is claimed by the depth-bounds tail in flight (#4704), whose reader reads its tail at any version
+// >= 73. A v74 file from this change carries no v73 tail, so the two only compose if #4704 lands FIRST
+// (this block then follows its tail). If this lands first, #4704 must take a version above 74 instead,
+// and 73 stays unused; never let a published version's tail layout change meaning.
 constexpr uint32_t kVersion = 74;
 constexpr uint32_t kVersionWithUnavailableSource = 74;
 constexpr uint32_t kVersionWithNgg = 72;
