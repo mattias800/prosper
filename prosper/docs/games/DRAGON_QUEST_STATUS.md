@@ -814,6 +814,20 @@ route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1`
 by that setting. No new runtime result or rung change is claimed here.
 
 ## Ruled out — eliminated, do not re-run these
+- **"After the first Cross press the game drops to ~5 fps because the GPU (or the compute path) is the
+  bottleneck."** **Falsified 2026-10-07**, Windows, RTX 4070 SUPER, 3840x2160, `--present-mode immediate`,
+  direct frontend. In the slow state an F8 capture accounts for only ~20% of wall time in renderer plus
+  compute (~0.5 s graphics + ~0.5 s compute of ~5.5 s), and the GPU sits at 25-50% utilisation. A sampled
+  call-stack profile (ETW kernel sampling, 20 s) puts the guest's submit thread at 100% of one core with the
+  renderer running synchronously inside it. **17% of that thread was `getenv` scanning the environment block**
+  (8% from one per-resource read in `append_shader_resource_compile_keys`), ~20% was full-buffer `memcmp`
+  validation, and the rest was frontend and driver work. The `getenv` share is fixed by reading the
+  remaining hot diagnostic switches once per submit (`PROSPER_ENV_ON_PER_SUBMIT`); the `memcmp` share is
+  not removable by write tracking on Windows (red-zone corruption on exception dispatch), so it needs a
+  cheaper compare, not a skip. Separate, and **not** caused by that change: the title can sit in its
+  pre-input state (guest threads polling with short sleeps, 58 fps, picture unchanged) on every build
+  tried, with scripted and manual input, so a run that "does not pass the loading screen" is not by itself
+  a renderer regression.
 - **"The title's flat sky (no clouds) and flat sea (no waves, no glints) come from wrong shader
   values: a missing texture, a black seed, a format or a recompiler miscompile."** **Falsified
   2026-10-06.** The draws were not shading wrongly. They were rasterising into **one pixel**. In the

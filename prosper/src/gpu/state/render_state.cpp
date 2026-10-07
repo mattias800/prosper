@@ -6,6 +6,7 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/state/vk_translate.hpp"
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
+#include "diagnostics/env_submit.hpp"  // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "diagnostics/exit_reports.hpp"
 #include <algorithm>
 #include <array>
@@ -526,7 +527,8 @@ RenderState extract_render_state_uncached(const GpuState& st) {
     // title's colour"), and the run could not have produced any other number. The dedup key was
     // built from the same unassigned field, so the "distinct combinations" it counted were really
     // just distinct (base, format) pairs.
-    if (const char* clearlog = std::getenv("PROSPER_CLEARLOG")) {
+    if (const char* clearlog = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_CLEARLOG")
+                                    ? std::getenv("PROSPER_CLEARLOG") : nullptr) {
         if (clearlog[0] == '1' && clearlog[1] == '\0') {
             static std::mutex clear_mutex;
             static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> clear_seen;

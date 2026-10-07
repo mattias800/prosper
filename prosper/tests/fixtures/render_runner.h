@@ -42,6 +42,7 @@
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "diagnostics/env_submit.hpp"      // PROSPER_ENV_ON_PER_SUBMIT: per-pass switches, re-sampled each submit
 #include "diagnostics/env_numeric.hpp"     // #3267: a typo must not silently re-size a cache
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -8363,7 +8364,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   // every existing caller is bit-identical.
                                                   bool want_color_readback = true) {
     using TimingClock = std::chrono::steady_clock;
-    const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const bool timing_log_enabled = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_RENDER_TIMING");
     const prosper::frontend::PerformanceTimingMode timing_mode =
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
@@ -8502,7 +8503,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool avoid_cache_eviction = active_submission.pending() ||
                                 backend_has_unproven_submission();
     const bool persistent_color_targets_enabled =
-        getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
+        !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS");
     const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
                                           color_target->persistent_id;
     const bool volume_color = color_target && color_target->volume_depth;
@@ -8809,8 +8810,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     if (const char* v = PROSPER_ENV_VALUE("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
-    if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
-    if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
+    if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
+    if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
     if (volume_color && use_ds) return disposition.refuse(DD::VolumeDepthStencil, out);
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
@@ -8844,7 +8845,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             ds_depth_view_slice_max(d.ps->db_depth_view));
         }
     }
-    if (getenv("PROSPER_NO_STENCIL")) logical_use_stencil = false;
+    if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_STENCIL")) logical_use_stencil = false;
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
                                                identity->stencil_read_base || identity->stencil_write_base);
     const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
@@ -9683,7 +9684,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // PROSPER_NO_BACKEND_* family exist. It is a bisection lever, not a tunable: leaving it set
     // reinstates the race.
     static const bool no_renderpass_external_deps =
-        getenv("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS") != nullptr;
+        PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_RENDERPASS_EXTERNAL_DEPS");
     constexpr VkAccessFlags kAllAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     // ALL_COMMANDS on the EXTERNAL side, ALL_GRAPHICS on the SUBPASS side, and the asymmetry is
     // required rather than stylistic. VUID-VkRenderPassCreateInfo-pDependencies-00837 and -00838:
@@ -9971,7 +9972,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static uint64_t persistent_texture_batch_floor = 0;
     if (!active_submission.pending()) persistent_texture_batch_floor = texture_generation;
     const bool persistent_textures_enabled =
-        getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
+        !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES");
     refresh_persistent_texture_cache_device_budget(
         ctx, persistent_texture_bytes - persistent_texture_off_device_bytes);
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
@@ -10101,9 +10102,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         producer_tickets[slot] = begin_color_producer_write(*retained);
     }
     const bool share_backend_resources =
-        getenv("PROSPER_NO_BACKEND_RESOURCE_SHARE") == nullptr;
+        !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_RESOURCE_SHARE");
     const bool reuse_host_buffers = render_host_buffer_pool_enabled();
-    const bool buffer_verify_enabled = getenv("PROSPER_BUFVERIFY") != nullptr;
+    const bool buffer_verify_enabled = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_BUFVERIFY");
     struct SharedBufferKey {
         const uint32_t* words = nullptr;
         size_t count = 0;
@@ -10178,7 +10179,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<BufferVerifyRecord> buffer_verify_records;
     std::vector<SharedBufferArena> shared_buffer_arenas;
     static const bool use_buffer_lookup_arena =
-        getenv("PROSPER_NO_BUFFER_LOOKUP_ARENA") == nullptr;
+        !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BUFFER_LOOKUP_ARENA");
     prosper::frontend::PassBufferLookupMemory buffer_lookup_memory(
         resource_reuse_stats.buffer_lookup, use_buffer_lookup_arena);
     prosper::frontend::PassBufferLookupMap<SharedBufferKey, SharedBufferKeyHash>
@@ -10399,7 +10400,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<BufferRangeGroup> buffer_range_groups;
     double res_buffer_range_plan_ms = 0;
     bool readonly_buffer_pass = share_backend_resources && reuse_host_buffers &&
-        !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
+        !buffer_verify_enabled && !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") &&
         resident_render_buffer_limit() != 0 &&
         resident_render_buffer_configured_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
     // Content authority cannot depend on a residency/performance budget. Vote predicates read
@@ -10438,7 +10439,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     const bool readonly_buffer_watch =
-        getenv("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH") == nullptr;
+        !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_BUFFER_WRITE_WATCH");
     struct BufferRangeUpload {
         SharedBufferUpload upload;
         bool attempted = false;
@@ -10474,7 +10475,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_uploads.reserve(std::min<size_t>(draws.size() * 2, 1024));
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
     texture_upload_indices.reserve(std::min<size_t>(draws.size() * 2, 1024));
-    const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
+    const bool share_texture_uploads = !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BACKEND_TEXTURE_SHARE");
     size_t texture_references = 0;
     size_t persistent_texture_hits = 0;
     size_t persistent_texture_misses = 0;
@@ -14087,10 +14088,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Clear color: the caller's clear_rgba (game fast-clear / black on the live path), else the
     // legacy diagnostic blue. PROSPER_CLEAR_DEBUG forces blue back on even when a color is passed.
     float cc[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // diagnostic blue
-    if (clear_rgba && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
+    if (clear_rgba && !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_CLEAR_DEBUG"))
         for (int i = 0; i < 4; i++) cc[i] = clear_rgba[i];
     float cc1[4] = {0.0f, 0.0f, 1.0f, 1.0f};
-    if (clear_rgba1 && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
+    if (clear_rgba1 && !PROSPER_ENV_ON_PER_SUBMIT("PROSPER_CLEAR_DEBUG"))
         for (int i = 0; i < 4; ++i) cc1[i] = clear_rgba1[i];
     std::array<VkClearValue, prosper::gpu::kColorTargetCount + 1> clear{};
     clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
@@ -15885,7 +15886,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         accumulate(totals);
         accumulate(window);
         static const bool print_backend_timing_windows =
-            getenv("PROSPER_BACKEND_TIMING_WINDOWS") != nullptr;
+            PROSPER_ENV_ON_PER_SUBMIT("PROSPER_BACKEND_TIMING_WINDOWS");
         if (print_backend_timing_windows && totals.calls % 25 == 0) {
             const double n = static_cast<double>(totals.calls);
             const double total = totals.target + totals.draw_setup + totals.record +
@@ -16259,7 +16260,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         aggregate_pipelines.entries = pipelines.entries;
         aggregate_pipelines.evictions += pipelines.evictions;
 
-        if (getenv("PROSPER_RENDER_TIMING")) {
+        if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_RENDER_TIMING")) {
             const BackendRenderTimingStats timing = backend_render_timing_stats();
 #define PROSPER_SUM_TIMING_STAT(field) aggregate_timing.field += timing.field
             PROSPER_SUM_TIMING_STAT(calls);
@@ -16342,7 +16343,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             backend_texture_upload_stats_storage() = aggregate_textures;
             backend_resource_reuse_stats_storage() = aggregate_resources;
             backend_pipeline_cache_stats_storage() = aggregate_pipelines;
-            if (getenv("PROSPER_RENDER_TIMING"))
+            if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_RENDER_TIMING"))
                 backend_render_timing_stats_storage() = aggregate_timing;
             return rendered;
         }

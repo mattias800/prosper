@@ -86,7 +86,7 @@ getenv|prosper/src/diagnostics/perf/perf_alarms.cpp 3
 getenv|prosper/src/diagnostics/perf/perf_ledger.hpp 1
 getenv|prosper/src/diagnostics/readback_refusal.cpp 1
 getenv|prosper/src/diagnostics/transfer_pressure.cpp 1
-getenv|prosper/src/gpu/agc/agc_shader_layout.cpp 8
+getenv|prosper/src/gpu/agc/agc_shader_layout.cpp 5
 getenv|prosper/src/gpu/capture/fold_capture.cpp 5
 getenv|prosper/src/gpu/capture/fragment_compile_case.cpp 2
 getenv|prosper/src/gpu/capture/gpu_capture.cpp 22
@@ -101,7 +101,7 @@ getenv|prosper/src/gpu/diagnostics/memory_placement_log.hpp 2
 getenv|prosper/src/gpu/diagnostics/shader_dump_filter.cpp 1
 getenv|prosper/src/gpu/execute/compute_program_facts.cpp 1
 getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
-getenv|prosper/src/gpu/execute/gpu_executor.cpp 86
+getenv|prosper/src/gpu/execute/gpu_executor.cpp 85
 # note: moved verbatim with diagnose_compute_dispatches from gpu_executor.cpp
 # (86 there, down from 89); tree total conserved, no new raw environment read.
 getenv|prosper/src/gpu/execute/gpu_executor_diagnostics.cpp 3
@@ -160,7 +160,7 @@ getenv|prosper/src/host/symbols/il2cpp_symbols.cpp 1
 getenv|prosper/src/host/tls/guest_tls.cpp 6
 getenv|prosper/src/loader/linker.cpp 1
 getenv|prosper/src/self/module.cpp 5
-getenv|prosper/tests/fixtures/render_runner.h 96
+getenv|prosper/tests/fixtures/render_runner.h 78
 blocking-sync|prosper/frontends/prosper-app/fps_overlay.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkWaitForFences 1

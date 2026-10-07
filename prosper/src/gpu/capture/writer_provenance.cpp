@@ -1,5 +1,7 @@
 #include "gpu/capture/writer_provenance.hpp"
 
+#include "diagnostics/env_submit.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -100,13 +102,22 @@ const ProvenanceAddrWatch& provenance_addr_watch() {
 }
 
 bool writer_provenance_enabled() {
+    // Asked once per draw and it reads four environment names, each a full scan of the environment
+    // block when absent. Memoised for the current submit (per thread) and live outside one, so a test
+    // that arms a name between submits still sees it. See diagnostics/env_submit.hpp.
+    static thread_local uint64_t memo_window = 0;
+    static thread_local bool memo_value = false;
+    const uint64_t window = prosper::diag::submit_env_window();
+    if (window != 0 && memo_window == window) return memo_value;
     const bool explicitly_on = writer_provenance_full_enabled() || provenance_addr_watch().active;
     const char* dimension_mode = std::getenv("PROSPER_PROVENANCE_DIM");
     const char* resource_hash_mode = std::getenv("PROSPER_RESOURCE_HASH_DIM");
     const char* timeline_depth_hash_mode = std::getenv("PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM");
-    return explicitly_on || (dimension_mode && *dimension_mode) ||
-           (resource_hash_mode && *resource_hash_mode) ||
-           (timeline_depth_hash_mode && *timeline_depth_hash_mode);
+    const bool enabled = explicitly_on || (dimension_mode && *dimension_mode) ||
+                         (resource_hash_mode && *resource_hash_mode) ||
+                         (timeline_depth_hash_mode && *timeline_depth_hash_mode);
+    if (window != 0) { memo_window = window; memo_value = enabled; }
+    return enabled;
 }
 
 bool writer_provenance_full_enabled() {
