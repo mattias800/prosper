@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -13,8 +14,8 @@ namespace prosper::gpu::test {
 
 // A table of recognisable words, so a published descriptor is visibly the table's.
 inline uint32_t* split_t8_table() {
-    alignas(16) static uint32_t table[16];
-    return table;
+    alignas(16) static std::array<uint32_t, 16> table{};
+    return table.data();
 }
 
 // Runs the fold over `dwords` words of `code` with `nsgpr` entry user-data registers, all zero except

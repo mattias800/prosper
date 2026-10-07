@@ -38,7 +38,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-alignas(16) uint32_t g_table[16];
+alignas(16) std::array<uint32_t, 16> g_table{};
 
 // pc 0-1  s_load_dwordx8 s[4:11], s[2:3], 0     pc 2-3  s_load_dwordx4 s[12:15], s[2:3], 0x20
 // pc 4    s_nop                                 pc 5-6  image_store ... s[8:15]
@@ -61,7 +61,7 @@ struct Inputs {
 
 Inputs inputs() {
     Inputs in;
-    const auto base = reinterpret_cast<uint64_t>(g_table);
+    const auto base = reinterpret_cast<uint64_t>(g_table.data());
     in.user = {0u, 0u, static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u)};
     for (uint32_t lane = 0; lane < 4; ++lane) {
         in.source_addr[lane] = base + 16u + 4u * lane;   // first load, words 4..7
@@ -113,28 +113,30 @@ TEST(SplitT8Cache, ProgramPastTheMemoryGuardIsRefused) {
 namespace {
 
 // One fixed buffer, so both programs live at the same address and reach the same decoded program.
-alignas(256) uint32_t g_code[64];
+alignas(256) std::array<uint32_t, 64> g_code{};
 
-bool image_load_published(const uint32_t* tail, size_t tail_dwords) {
+bool image_load_published(const std::array<uint32_t, 4>& tail) {
     const auto& body = test::split_t8_tail_block_body();
-    std::copy(body.begin(), body.end(), g_code);
-    std::copy(tail, tail + tail_dwords, g_code + body.size());
+    const auto end = std::copy(body.begin(), body.end(), g_code.begin());
+    std::copy(tail.begin(), tail.end(), end);
     return test::split_t8_has_image_use(
-        test::split_t8_uses_for(g_code, body.size() + tail_dwords, 10, 12u), 10u);
+        test::split_t8_uses_for(g_code.data(), body.size() + tail.size(), 10, 12u), 10u);
 }
 
 }   // namespace
 
 TEST(SplitT8Cache, ChangedTailAtTheSameAddressIsReanalysed) {
     // s_mov_b32 exec_lo, 0; exp null; s_endpgm -- a closed discard block.
-    constexpr uint32_t kClosed[] = {0xBEFE0480u, 0xF8001890u, 0x00000000u, 0xBF810000u};
+    constexpr std::array<uint32_t, 4> kClosed = {0xBEFE0480u, 0xF8001890u, 0x00000000u,
+                                                 0xBF810000u};
     // s_mov_b32 exec_lo, 0; s_branch pc3; s_nop; s_endpgm -- it can re-enter the body. The same
     // length as kClosed, so a re-check that compares only lengths reuses the stale proof.
-    constexpr uint32_t kReenters[] = {0xBEFE0480u, 0xBF82FFECu, 0xBF800000u, 0xBF810000u};
-    ASSERT_TRUE(image_load_published(kClosed, 4)) << "the closed tail proves the T#";
-    EXPECT_FALSE(image_load_published(kReenters, 4))
+    constexpr std::array<uint32_t, 4> kReenters = {0xBEFE0480u, 0xBF82FFECu, 0xBF800000u,
+                                                   0xBF810000u};
+    ASSERT_TRUE(image_load_published(kClosed)) << "the closed tail proves the T#";
+    EXPECT_FALSE(image_load_published(kReenters))
         << "same address, same body, new tail: the cached proof must not be reused";
-    EXPECT_TRUE(image_load_published(kClosed, 4)) << "and the closed tail proves again";
+    EXPECT_TRUE(image_load_published(kClosed)) << "and the closed tail proves again";
 }
 
 TEST(SplitT8Cache, ProducerThroughAnOutOfRangePointerIsRefused) {
@@ -186,14 +188,14 @@ TEST(SplitT8Cache, FoldAnalysesPastTheOldCap) {
 TEST(SplitT8Cache, SameLengthEditIsReanalysed) {
     // One buffer, one cache: the second program has the same length and an EXEC save over s[8:9]
     // where the first had an s_nop, so only a content check sees that the entry no longer applies.
-    alignas(16) static uint32_t code[16];
+    alignas(16) static std::array<uint32_t, 16> code{};
     const auto original = program(8);
     ASSERT_LE(original.size(), 16u);
-    std::copy(original.begin(), original.end(), code);
+    std::copy(original.begin(), original.end(), code.begin());
     const Inputs in = inputs();
     const auto cache = make_split_t8_proof_cache();
     auto ask = [&] {
-        return mapped_split_t8_reaches_use(code, original.size(), 5u, 8, in.source_pc,
+        return mapped_split_t8_reaches_use(code.data(), original.size(), 5u, 8, in.source_pc,
                                            in.source_addr, in.user.data(), 4u, 0u, {}, cache.get());
     };
     ASSERT_TRUE(ask());

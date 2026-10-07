@@ -39,6 +39,11 @@ constexpr int kSgprs = 106;
 constexpr uint64_t kUnknown = ~0ull;
 constexpr uint64_t kEntryBit = 1ull << 63;
 
+// s_load_dwordx4/x8/x16 (opcodes 2, 3, 4) load 4, 8 or 16 dwords.
+uint32_t descriptor_load_dwords(uint32_t opcode) {
+    return 4u << (opcode - 2u);
+}
+
 uint64_t load_tag(size_t producer, uint32_t word) {
     return (static_cast<uint64_t>(producer) << 8u) | word;
 }
@@ -74,14 +79,12 @@ struct SplitT8ProofCache {
         uint32_t use_pc = 0;
         int tbase = 0;
         std::array<uint32_t, 8> source_pc{};
-        bool operator==(const Key& o) const {
-            return use_pc == o.use_pc && tbase == o.tbase && source_pc == o.source_pc;
-        }
+        bool operator==(const Key&) const = default;
     };
     struct KeyHash {
         size_t operator()(const Key& k) const {
-            uint64_t h = 0xcbf29ce484222325ull ^ k.use_pc ^ (static_cast<uint64_t>(k.tbase) << 32u);
-            for (uint32_t pc : k.source_pc) h = (h ^ pc) * 0x100000001b3ull;
+            uint64_t h = 0xCBF29CE484222325ULL ^ k.use_pc ^ (static_cast<uint64_t>(k.tbase) << 32u);
+            for (uint32_t pc : k.source_pc) h = (h ^ pc) * 0x100000001B3ULL;
             return static_cast<size_t>(h);
         }
     };
@@ -196,7 +199,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         out.producer = producer;
         out.base_reg = load.src[0].value;
         out.dst = load.dst.value;
-        out.width = load.opcode == 2u ? 4u : load.opcode == 3u ? 8u : 16u;
+        out.width = descriptor_load_dwords(load.opcode);
         out.literal = load.literal;
     }
 
@@ -205,7 +208,7 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         const Rdna2Inst& in = full[i];
         if (is_producer[i]) {
             const int base_reg = in.src[0].value;
-            const uint32_t width = in.opcode == 2u ? 4u : in.opcode == 3u ? 8u : 16u;
+            const uint32_t width = descriptor_load_dwords(in.opcode);
             const bool entry_pointer = s[static_cast<size_t>(base_reg)] ==
                                            (kEntryBit | static_cast<uint64_t>(base_reg)) &&
                                        s[static_cast<size_t>(base_reg + 1)] ==
@@ -329,7 +332,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     if (cache) {
         const SplitT8ProofCache::Key key{use_pc, tbase, source_pc};
         {
-            std::lock_guard<std::mutex> lock(cache->mutex);
+            std::scoped_lock lock(cache->mutex);
             const auto found = cache->entries.find(key);
             if (found != cache->entries.end()) structure = found->second;
         }
@@ -340,7 +343,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             structure.reset();
         if (!structure) {
             structure = analyze_split_t8(code, dwords, use_pc, tbase, source_pc);
-            std::lock_guard<std::mutex> lock(cache->mutex);
+            std::scoped_lock lock(cache->mutex);
             cache->entries.insert_or_assign(key, structure);
         }
     } else {
