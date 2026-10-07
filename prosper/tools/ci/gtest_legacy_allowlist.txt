@@ -126,7 +126,6 @@ tests/gpu/test_graphics_cache_persistence.cpp
 tests/gpu/test_rdna2_spirv_struct.cpp
 tests/gpu/test_recompile_coverage.cpp
 tests/gpu/test_texture_sample_render.cpp
-tests/gpu/texture/bench_detile.cpp
 tests/gpu/texture/test_bc_decode.cpp
 tests/gpu/texture/test_mip_tail.cpp
 tests/gpu/timeline/test_capture_tunables.cpp
