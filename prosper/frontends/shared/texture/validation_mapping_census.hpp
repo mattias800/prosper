@@ -33,6 +33,7 @@
 #include "diagnostics/exit_census.hpp"   // register_census: atexit never runs here (every frontend _exit()s)
 #include "host/platform/mapping_class.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -41,11 +42,14 @@
 
 namespace prosper::frontend {
 
+// The one place a MappingClass becomes a row index.
+inline constexpr int mapping_class_index(prosper::host::MappingClass c) { return static_cast<int>(c); }
+
 class ValidationMappingCensus {
 public:
     static constexpr int kClasses = 5;      // prosper::host::MappingClass values, then kSmall
     static constexpr int kSmall = 4;        // below kMinClassifiedBytes: counted, not classified
-    static_assert(kSmall == static_cast<int>(prosper::host::MappingClass::Other) + 1,
+    static_assert(kSmall == mapping_class_index(prosper::host::MappingClass::Other) + 1,
                   "kSmall must follow the last MappingClass value, or it would alias a real class");
     static constexpr int kSizeBuckets = 5;  // <64 KiB, <1 MiB, <16 MiB, <64 MiB, 64 MiB and larger
 
@@ -61,34 +65,34 @@ public:
     void record(int cls, uint64_t bytes, bool changed) {
         if (cls < 0 || cls >= kClasses) cls = 0;
         const int bucket = size_bucket(bytes);
-        size_validations_[bucket].fetch_add(1, std::memory_order_relaxed);
-        size_bytes_[bucket].fetch_add(bytes, std::memory_order_relaxed);
-        validations_[cls].fetch_add(1, std::memory_order_relaxed);
-        bytes_[cls].fetch_add(bytes, std::memory_order_relaxed);
+        size_validations_[bucket].fetch_add(1);
+        size_bytes_[bucket].fetch_add(bytes);
+        validations_[cls].fetch_add(1);
+        bytes_[cls].fetch_add(bytes);
         if (changed) {
-            changed_[cls].fetch_add(1, std::memory_order_relaxed);
-            changed_bytes_[cls].fetch_add(bytes, std::memory_order_relaxed);
+            changed_[cls].fetch_add(1);
+            changed_bytes_[cls].fetch_add(bytes);
         }
     }
 
     Row row(int cls) const {
         Row r;
-        r.validations = validations_[cls].load(std::memory_order_relaxed);
-        r.bytes = bytes_[cls].load(std::memory_order_relaxed);
-        r.changed = changed_[cls].load(std::memory_order_relaxed);
-        r.changed_bytes = changed_bytes_[cls].load(std::memory_order_relaxed);
+        r.validations = validations_[cls].load();
+        r.bytes = bytes_[cls].load();
+        r.changed = changed_[cls].load();
+        r.changed_bytes = changed_bytes_[cls].load();
         return r;
     }
 
     static int size_bucket(uint64_t bytes) {
-        if (bytes < (64ull << 10)) return 0;
-        if (bytes < (1ull << 20)) return 1;
-        if (bytes < (16ull << 20)) return 2;
-        if (bytes < (64ull << 20)) return 3;
+        if (bytes < (64ULL << 10)) return 0;
+        if (bytes < (1ULL << 20)) return 1;
+        if (bytes < (16ULL << 20)) return 2;
+        if (bytes < (64ULL << 20)) return 3;
         return 4;
     }
-    uint64_t size_validations(int bucket) const { return size_validations_[bucket].load(std::memory_order_relaxed); }
-    uint64_t size_bytes(int bucket) const { return size_bytes_[bucket].load(std::memory_order_relaxed); }
+    uint64_t size_validations(int bucket) const { return size_validations_[bucket].load(); }
+    uint64_t size_bytes(int bucket) const { return size_bytes_[bucket].load(); }
 
     uint64_t total_validations() const {
         uint64_t n = 0;
@@ -100,7 +104,7 @@ public:
     // fault-free `GetWriteWatch` could cover (private memory only). `outcome_known` false prints
     // `changed=n/a`.
     std::string format(const char* source, bool outcome_known) const {
-        static const char* const names[kClasses] = {"untracked", "private", "mapped-view", "other", "small-unclassified"};
+        static constexpr std::array<const char*, kClasses> names = {"untracked", "private", "mapped-view", "other", "small-unclassified"};
         uint64_t total_bytes = 0;
         for (int i = 0; i < kClasses; ++i) total_bytes += row(i).bytes;
         std::string out;
@@ -129,7 +133,7 @@ public:
             }
             out += line;
         }
-        const Row priv = row(static_cast<int>(prosper::host::MappingClass::Private));
+        const Row priv = row(mapping_class_index(prosper::host::MappingClass::Private));
         const double private_share = total_bytes ? 100.0 * static_cast<double>(priv.bytes) /
                                                        static_cast<double>(total_bytes) : 0.0;
         std::snprintf(line, sizeof(line),
@@ -137,7 +141,7 @@ public:
                       "%.1f%% of %llu compared bytes\n",
                       source, private_share, static_cast<unsigned long long>(total_bytes));
         out += line;
-        static const char* const size_names[kSizeBuckets] = {"<64KiB", "<1MiB", "<16MiB", "<64MiB", ">=64MiB"};
+        static constexpr std::array<const char*, kSizeBuckets> size_names = {"<64KiB", "<1MiB", "<16MiB", "<64MiB", ">=64MiB"};
         std::string sizes = std::string("[validation-census] source=") + source + " sizes:";
         for (int b = 0; b < kSizeBuckets; ++b) {
             std::snprintf(line, sizeof(line), " %s n=%llu %.2fGB", size_names[b],
@@ -150,12 +154,12 @@ public:
     }
 
 private:
-    std::atomic<uint64_t> size_validations_[kSizeBuckets] = {};
-    std::atomic<uint64_t> size_bytes_[kSizeBuckets] = {};
-    std::atomic<uint64_t> validations_[kClasses] = {};
-    std::atomic<uint64_t> bytes_[kClasses] = {};
-    std::atomic<uint64_t> changed_[kClasses] = {};
-    std::atomic<uint64_t> changed_bytes_[kClasses] = {};
+    std::array<std::atomic<uint64_t>, kSizeBuckets> size_validations_{};
+    std::array<std::atomic<uint64_t>, kSizeBuckets> size_bytes_{};
+    std::array<std::atomic<uint64_t>, kClasses> validations_{};
+    std::array<std::atomic<uint64_t>, kClasses> bytes_{};
+    std::array<std::atomic<uint64_t>, kClasses> changed_{};
+    std::array<std::atomic<uint64_t>, kClasses> changed_bytes_{};
 };
 
 // Never destroyed: the end-of-run report reads them after static destruction has begun elsewhere.
@@ -196,7 +200,7 @@ inline void ensure_validation_mapping_census_registered() {
 // Ranges below this are counted in the size histogram but not classified: a 16-byte constant buffer is
 // not what the question is about, and a syscall per such compare would be the dominant cost. It equals the
 // histogram's first edge, so "small-unclassified" and the "<64KiB" bucket describe the same compares.
-inline constexpr uint64_t kMinClassifiedBytes = 64ull << 10;
+inline constexpr uint64_t kMinClassifiedBytes = 64ULL << 10;
 
 // The renderer's `safe_equal`. `extent` is the bytes the compare actually ran over, `changed` whether
 // it found differing bytes.
@@ -204,7 +208,7 @@ inline void note_validation_mapping(uint64_t address, uint64_t extent, bool chan
     ensure_validation_mapping_census_registered();
     const int cls = extent < kMinClassifiedBytes
                         ? ValidationMappingCensus::kSmall
-                        : static_cast<int>(prosper::host::classify_host_mapping(address));
+                        : mapping_class_index(prosper::host::classify_host_mapping(address));
     renderer_mapping_census().record(cls, extent, changed);
 }
 
@@ -213,7 +217,7 @@ inline void note_compute_compare_mapping(const void* source, uint64_t bytes) {
     ensure_validation_mapping_census_registered();
     const int cls = bytes < kMinClassifiedBytes
                         ? ValidationMappingCensus::kSmall
-                        : static_cast<int>(prosper::host::classify_host_mapping(reinterpret_cast<uintptr_t>(source)));
+                        : mapping_class_index(prosper::host::classify_host_mapping(reinterpret_cast<uintptr_t>(source)));
     compute_mapping_census().record(cls, bytes, false);
 }
 
