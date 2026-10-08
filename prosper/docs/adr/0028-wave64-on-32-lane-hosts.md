@@ -1,6 +1,6 @@
 ---
 kind: adr
-status: proposed
+status: accepted
 date: 2026-10-07
 ---
 

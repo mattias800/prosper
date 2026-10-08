@@ -175,7 +175,19 @@ NameTable load_names(const std::string& path, bool self_check) {
     t.dir_ok = stub.dir_ok;
     const bool flat = (stub.source == prosper_tools::NameSource::FlatDb);
     for (const auto& [nid, name] : stub.by_nid) {
-        const bool verified = (nid_hash(name) == nid);
+        std::string chosen = name;
+        bool verified = (nid_hash(name) == nid);
+        if (!verified && flat) {
+            // A flat database may list several names for one NID; the first need not be the real
+            // preimage, so take whichever candidate hashes back to the NID (N1).
+            if (auto ci = stub.candidates.find(nid); ci != stub.candidates.end())
+                for (const auto& cand : ci->second)
+                    if (nid_hash(cand) == nid) {
+                        chosen = cand;
+                        verified = true;
+                        break;
+                    }
+        }
         if (!verified) {
             // A flat (secondary) name that is not a proven preimage of the NID is dropped: it would
             // otherwise present an unverifiable community string as if it were the real symbol. An
@@ -193,7 +205,7 @@ NameTable load_names(const std::string& path, bool self_check) {
                         name.c_str(), nid.c_str(), nid_hash(name).c_str());
             }
         }
-        t.by_nid.emplace(nid, name);
+        t.by_nid.emplace(nid, chosen);
         if (auto li = stub.lib_of.find(nid); li != stub.lib_of.end())
             t.lib_of.emplace(nid, li->second);
     }
@@ -378,6 +390,8 @@ int main(int argc, char** argv) {
                     "[names] secondary source: %zu verified by nid_hash, %zu dropped unverified, "
                     "%zu malformed line(s), %zu conflict(s)\n",
                     names.by_nid.size(), names.dropped, names.rejected, names.conflicts);
+            else if (names.source != prosper_tools::NameSource::FirmwareDump)
+                printf("[names] no names loaded\n");
             else if (self_check)
                 printf("[names] self-check: %zu mismatch(es) against nid_hash()\n",
                        names.mismatches);
