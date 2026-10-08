@@ -156,18 +156,30 @@ const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item
 // The entry point live_compute.cpp calls on each dispatch. Ordinary modules return immediately. The
 // device limits are read once (one device per process).
 template <class Ctx>
-const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item) {
+const char* exchange_admit(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                           const ComputeWaveLimits& limits) {
+    if (!item.exchange_facts) return nullptr;
     if (!prosper::gpu::compute_spirv_wave64_exchange(item.spirv)) return nullptr;
-    static const ComputeWaveLimits limits = query_compute_wave_limits(ctx.physical);
-    const prosper::gpu::ComputeWaveOpFacts* facts = nullptr;
-    std::shared_ptr<const prosper::gpu::ComputeProgramFacts> program;
-    if (item.code_dwords && item.code_addr) {
-        program = prosper::gpu::compute_program_facts_peek(
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(item.code_addr)),
-            item.code_dwords, item.code_addr);
-        facts = &program->wave_ops();
-    }
-    return exchange_limit(ctx, item, facts, limits);
+    const char* why = exchange_limit(ctx, item, &item.exchange_facts->wave_ops(), limits);
+    if (why) return why;
+    // Admitted: count it (lock-free, per dispatch) and name the route once per program, so the A/B
+    // in #4753 can see which dispatches took it. The announcement takes a mutex, so only the first
+    // sighting of a program reaches it.
+    prosper::diagnostics::perf::note_wave64_route(
+        prosper::diagnostics::perf::Wave64Route::WorkgroupExchange, true, 64);
+    if (!item.exchange_facts->exchange_announced.exchange(true, std::memory_order_relaxed))
+        prosper::diagnostics::perf::announce_wave64_route(
+            prosper::diagnostics::perf::Wave64Route::WorkgroupExchange, true, 64, item.code_addr);
+    return nullptr;
+}
+
+template <class Ctx>
+const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item) {
+    // FIRST and cheap: only a dispatch the executor gave an exchange width (the switch is on) carries
+    // facts. With the switch off this is a null-pointer test, never a walk of the SPIR-V module.
+    if (!item.exchange_facts) return nullptr;
+    static const ComputeWaveLimits limits = query_compute_wave_limits(ctx.physical);   // one device
+    return exchange_admit(ctx, item, limits);
 }
 
 }   // namespace prosper::frontend

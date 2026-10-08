@@ -9189,6 +9189,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
         item.code_dwords = static_cast<uint32_t>(shader_dwords);
+        if (config.wave64_exchange_width) item.exchange_facts = facts;
         item.cpu_fast_path = classify_compute_cpu_fast_path(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.recompile_config = config;

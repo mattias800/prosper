@@ -871,6 +871,11 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
 // ADR 0028: true when the module was compiled through the exact exchange dispatcher
 // (`Prosper.ComputeWave64Exchange=1`), so it needs workgroup memory beyond the guest's own LDS.
 bool compute_spirv_wave64_exchange(const std::vector<uint32_t>& spirv);
+// How many times compute_spirv_wave64_exchange walked a module (a test hook: with the switch off the
+// per-dispatch path must never reach it).
+uint64_t compute_spirv_wave64_exchange_scans_for_test();
+// True when the module contains any OpGroupNonUniform* instruction (native subgroup operation).
+bool compute_spirv_uses_group_non_uniform(const std::vector<uint32_t>& spirv);
 
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
 // write vec4(src0..3) to the matching color output. `export_formats` (#4703) selects how a

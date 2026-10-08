@@ -195,3 +195,44 @@ TEST(ComputeWaveAdmission, TheCandidateIsComputedOnlyWhenTheLineWillPrint) {
                                 32, {}, &counting_candidate, nullptr);
     EXPECT_EQ(g_candidate_calls, 1) << "five refusals of one identity run the analysis once";
 }
+
+TEST(ComputeWaveAdmission, WithTheSwitchOffTheSpirvIsNeverScanned) {
+    ComputeWaveOpFacts facts;
+    auto item = exchange_item({128, fx::Trips::Constant3}, facts);   // an exchange module...
+    item.exchange_facts.reset();   // ...the executor set no width
+    const uint64_t scans = compute_spirv_wave64_exchange_scans_for_test();
+    for (int i = 0; i < 100; ++i) EXPECT_EQ(exchange_limit(FakeContext{}, item), nullptr);
+    EXPECT_EQ(compute_spirv_wave64_exchange_scans_for_test(), scans)
+        << "the per-dispatch default path must not walk the module";
+}
+
+TEST(ComputeWaveAdmission, AnAdmittedExchangeDispatchIsCountedPerDispatchAndAnnouncedOnce) {
+    using prosper::diagnostics::perf::Counter;
+    using prosper::diagnostics::perf::ledger;
+    const fx::Case c{128, fx::Trips::Constant3};
+    ComputeWaveOpFacts unused;
+    auto item = exchange_item(c, unused);
+    const auto code = fx::program(c);
+    item.exchange_facts = compute_program_facts_peek(code.data(), code.size(), 0x5028);
+    const auto counter = [] {
+        return ledger().counters[static_cast<size_t>(Counter::Wave64RouteExchange)].load();
+    };
+    const uint64_t before = counter();
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(exchange_admit(FakeContext{}, item, {32768, 1024}), nullptr);
+    EXPECT_EQ(counter(), before + 3) << "one count per admitted dispatch";
+    EXPECT_TRUE(item.exchange_facts->exchange_announced.load())
+        << "announced on the first sighting only";
+    // A refused dispatch is not counted as admitted.
+    EXPECT_NE(exchange_admit(FakeContext{}, item, {512, 1024}), nullptr);
+    EXPECT_EQ(counter(), before + 3);
+}
+
+TEST(ComputeWaveAdmission, TheRetryRefusesANativeSubgroupOperation) {
+    // header + OpGroupNonUniformShuffle (345, five words)
+    const std::vector<uint32_t> with_shuffle = {0x07230203u,       0x00010300u, 0, 10, 0,
+                                                (5u << 16) | 345u, 1,           2, 3,  4};
+    const std::vector<uint32_t> without = {0x07230203u, 0x00010300u, 0, 10, 0, (1u << 16) | 54u};
+    EXPECT_TRUE(compute_spirv_uses_group_non_uniform(with_shuffle));
+    EXPECT_FALSE(compute_spirv_uses_group_non_uniform(without));
+}

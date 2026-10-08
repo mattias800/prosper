@@ -2057,7 +2057,14 @@ void test_wave64_routes() {
     }
     check("Wave32, unknown width and capture re-analysis are not counted",
           count(Counter::Wave64RouteNative) == native + 2);
-    for (Wave64Route reserved : {WorkgroupExchange, NLanes, FragmentPromoted, OwnedWave, Refused})
+    {
+        const uint64_t exchange_before = count(Counter::Wave64RouteExchange);
+        note_wave64_route(WorkgroupExchange, true, 64);
+        note_wave64_route(WorkgroupExchange, true, 64);
+        check("an admitted exchange dispatch is counted per use, lock-free",
+              count(Counter::Wave64RouteExchange) == exchange_before + 2);
+    }
+    for (Wave64Route reserved : {NLanes, FragmentPromoted, OwnedWave, Refused})
         note_wave64_route(reserved, false, 64);
     check("reserved routes and Refused are ignored by the admitting hook",
           count(Counter::Wave64RouteNative) == native + 2 &&
@@ -2124,11 +2131,12 @@ void test_wave64_routes() {
     source.counts[static_cast<size_t>(Counter::Wave64FragmentSubgroup)] = 2;
     source.counts[static_cast<size_t>(Counter::Wave64ComputeRecompile)] = 3;
     source.counts[static_cast<size_t>(Counter::Wave64ComputeSubgroup)] = 4;
+    source.counts[static_cast<size_t>(Counter::Wave64RouteExchange)] = 4;
     check("route totals: admitted routes by counter, refused as the four refusals' sum",
           wave64_route_uses(source, Native) == 5 &&
               wave64_route_uses(source, ProvenWidthIndependent) == 2 &&
               wave64_route_uses(source, Refused) == 10 &&
-              wave64_route_uses(source, WorkgroupExchange) == 0 &&
+              wave64_route_uses(source, WorkgroupExchange) == 4 &&
               wave64_route_uses(source, NLanes) == 0 &&
               wave64_route_uses(source, FragmentPromoted) == 0 &&
               wave64_route_uses(source, OwnedWave) == 0);

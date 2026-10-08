@@ -22,6 +22,7 @@
 //  * PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1 recomputes every dispatch on the same binary.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -53,6 +54,8 @@ struct ComputeProgramFacts {
     const ComputeWaveOpFacts& wave_ops() const;
     mutable std::once_flag wave_ops_once;
     mutable ComputeWaveOpFacts wave_ops_value;
+    // The exchange route was announced for this program (first sighting, lock-free).
+    mutable std::atomic<bool> exchange_announced{false};
     // Terminal reject reasons the probe recorded, replayed for the current address on every use.
     std::vector<std::pair<std::string, std::string>> probe_reject_reasons;
 };

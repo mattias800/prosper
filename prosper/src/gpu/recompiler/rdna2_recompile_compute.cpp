@@ -646,7 +646,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     ComputeShaderConfig retry = config;
     retry.force_exchange_dispatcher = true;
     std::vector<uint32_t> exchanged = recompile_compute_once(code, dwords, rt, retry, diagnostic);
-    if (!exchanged.empty() && compute_spirv_min_subgroup_size(exchanged) <= width) return exchanged;
+    // The retry must be a pure exchange: a native subgroup operation (which can be emitted without
+    // raising the minimum-subgroup marker) would make its exactness depend on the host's width.
+    if (!exchanged.empty() && compute_spirv_min_subgroup_size(exchanged) <= width &&
+        !compute_spirv_uses_group_non_uniform(exchanged))
+        return exchanged;
     return module;
 }
 
