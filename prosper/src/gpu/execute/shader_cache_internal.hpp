@@ -578,6 +578,9 @@ struct DecodedShader {
     }
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
+    // Where the decoded stream ends and whether the code past it is proven closed; both control
+    // plans and any invocation-local plan are built against it (fold_control_plan.hpp).
+    FoldStreamTail fold_tail;
     std::vector<uint32_t> code;
     // Canonical original-packet facts belong to this SAME immutable byte version. They are
     // derived cold from the full stream, never from compact/normalized native instructions.

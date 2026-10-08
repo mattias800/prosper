@@ -30,11 +30,31 @@ struct FoldControlPlan {
     }
 };
 
+// Where the decoded stream ends, and whether what lies past it is proven harmless. The fold walks
+// only up to the first s_endpgm; compilers put early-out blocks after it and branch there from the
+// body. `end_pc` is the PC after that s_endpgm. `closed` is true when every block reachable past it
+// is proven closed (rdna2_append_closed_tail_blocks): it can end the wave but never re-enter the
+// body, and holds no branch this plan cannot count. A branch past `end_pc` into a tail that is not
+// closed could re-enter a window the plan believes has one predecessor.
+struct FoldStreamTail {
+    uint32_t end_pc = 0;
+    bool closed = false;
+};
+
+// Branches this plan does not count as edges: the debug conditional branches (SOPP 0x17..0x1a)
+// and s_subvector_loop_begin/end (SOPK 0x1b/0x1c), which branch by SIMM16. A program holding one
+// gets no exclusive-target proof at all.
+inline bool fold_uncounted_branch(const Rdna2Inst& in) {
+    return (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a) ||
+           (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c));
+}
+
 // Cold-path diagnostic: counts actual constructions, including uncached specializations.
 // No counter is touched when a warm fold borrows its immutable plan.
 inline std::atomic<uint64_t> fold_control_plan_builds{0};
 
-inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins) {
+inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins,
+                                               const FoldStreamTail& tail) {
     fold_control_plan_builds.fetch_add(1, std::memory_order_relaxed);
     FoldControlPlan plan;
     plan.steps.resize(ins.size());
@@ -55,8 +75,12 @@ inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins
         return int64_t(in.pc) + int64_t(in.len_dwords) + int64_t(in.simm16);
     };
     for (const auto& in : ins) {
+        // An indirect transfer, an uncounted branch, or a branch into a tail not proven closed
+        // leaves edges this plan cannot see: fail closed for the whole program.
+        const bool into_open_tail = branch(in) && !tail.closed && target(in) >= tail.end_pc;
         if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20 && in.opcode <= 0x22) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16)) {
+            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16) || fold_uncounted_branch(in) ||
+            into_open_tail) {
             plan.cfg_known = false;
             for (auto& step : plan.steps) step.reset_zero_mip = true;
             return plan;
@@ -86,12 +110,14 @@ inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins
         if (k == 0) continue;
         const auto& prev = ins[k - 1];
         if (prev.fmt != Rdna2Format::SOPP || prev.opcode != 0x02) continue;
-        // `ins` is the COMPACTED stream: straight-line instructions that cannot touch fold state
-        // are dropped, but every control transfer is kept (all SOPP, SOP1, SOPK). So the code
+        // `ins` is the COMPACTED stream: straight-line instructions the fold does not model are
+        // dropped (VOP3B carry-outs that write an SGPR are among them -- #4737), but every control
+        // transfer is kept (all SOPP, SOP1, SOPK). So the code
         // between the unconditional s_branch and this retained instruction -- the gap -- falls
-        // through to it and is entered only by branches that land in it. Exactly one forward edge
-        // into [gap, pc] means one predecessor. A gap no edge reaches is dead code, not a
-        // predecessor; an edge landing inside it is counted, so a real fall-through declines.
+        // through to it and is entered only by branches that land in it. The rule: exactly one
+        // edge into [gap, pc], and it is forward. A gap no edge reaches is dead code; a single
+        // forward edge landing inside the gap still fires (the code above it is dead, the code
+        // below it is dropped); a SECOND edge, into the gap or onto pc, declines.
         // Requiring the target itself to be retained missed every block that opens with VALU --
         // UE4's depth-of-field gather lost its input descriptor that way (Kena, KENA_STATUS.md).
         const uint32_t gap = prev.pc + prev.len_dwords;
