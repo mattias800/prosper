@@ -24,7 +24,7 @@ Measured on Linux/RADV:
 | build | runs | device lost |
 |---|---|---|
 | `main` before the fix | 3 that ran 640 s or longer | 3: two `VK_ERROR_DEVICE_LOST` (hard recovery), one `GPU hang detected` under `RADV_DEBUG=hang` |
-| this branch (1 run on `6089081de`, 3 on `c87c98239`) | 4 | 0; every run reached pad time 766 s |
+| this branch (1 run on `6089081de`, 4 on `c87c98239`, the last after the review fixes) | 5 | 0; every run reached pad time 766 s |
 
 **Where the GPU stopped.**
 - The RADV hang dump's `vm_fault.log` is empty. The GPU hung; it did not fault on an address.
