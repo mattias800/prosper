@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-08
 
+### Kena: Bridge of Spirits gets past its first level load and into gameplay
+
+On Linux, Kena now gets through the first level load: the opening cutscene plays, and the world draws behind the first gameplay prompt. It is dim and blue, and Kena's hair is black ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-opening-cutscene.webp" alt="Kena: Bridge of Spirits opening cutscene, letterboxed: Kena's staff glows blue beside a green lens flare among forest roots; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 1450"></p>
+<p align="center"><img src="assets/screenshots/kena-first-gameplay-prompt-world.webp" alt="Kena: Bridge of Spirits first gameplay prompt 'Press … to Pulse' over the rendered cave, with Kena from behind, tree roots, ferns and a stone path; her hair is black and the scene is dim and blue; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 1600"></p>
+
 ### Kena: Bridge of Spirits gets its ferns, its canopy and its light shafts
 
 Kena's title-menu forest now has its ferns, grass, tree canopy and sun shafts, and the grey haze is reduced, with the fog adding about half the light it did; it is still brighter and paler than on PS5, and the white flowers are missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).

@@ -9,6 +9,53 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The level-load device loss was a loop counter the recompiler never carried (2026-10-08)
+
+The Vulkan device loss at the first level load is fixed. Past it, the opening cutscene plays (pad flip 1450) and the route reaches the first gameplay prompt, *"Press … to Pulse"*, and **the world draws behind it**: Kena, the cave, its roots, ferns and stone path. It is degraded: Kena's hair is black and the scene is dim and blue.
+
+![The first gameplay prompt over the rendered cave](../../../assets/screenshots/kena-first-gameplay-prompt-world.webp)
+
+That is a gameplay scene a person would recognise, degraded, which is the bar for rung 3. The tracker records the rung.
+
+Measured on Linux/RADV:
+- `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`, empty `PROSPER_GUEST_ARGS`;
+- `scripts/kena/linux-reach-level-load.pad`, 820 s per run.
+
+| build | runs | device lost |
+|---|---|---|
+| `main` before the fix | 3 that ran 640 s or longer | 3: two `VK_ERROR_DEVICE_LOST` (hard recovery), one `GPU hang detected` under `RADV_DEBUG=hang` |
+| this branch (1 run on `6089081de`, 3 on `c87c98239`) | 4 | 0; every run reached pad time 766 s |
+
+**Where the GPU stopped.**
+- The RADV hang dump's `vm_fault.log` is empty. The GPU hung; it did not fault on an address.
+- `PROSPER_GPU_BREADCRUMBS=1` stopped in ordinary draws of pixel program `0x5007ad0000`.
+
+**Why it hung.** That program's outer loop (pc 197..866) keeps its counter in a `v_writelane` spill slot:
+- before the loop, `v_writelane v20, s69, 40` (the counter) and `v_writelane v20, s19, 16` (the count);
+- at the header, `v_readlane s17, v20, 40`, then `s_cmp_lt_i32 s17, s16`;
+- at the latch, reload, `s_add_u32 s16, s16, 1`, then `v_writelane v20, s16, 40`.
+
+The structured loop emitters gave registers, SCC, VCC, EXEC and saved masks a header phi, but never the spill slots. So the header read the preheader counter on every trip. The recompiled exit test was `OpSLessThan 0, count`, which never exits.
+
+**The fix** (`rdna2_lane_slot_carry`) applies to every title, not just Kena:
+- loop headers get a phi per spill slot written in the loop;
+- a loop exit takes the value the exit edge carried;
+- if merges phi the slot.
+
+The same omission also let a loop exit, or an if merge, use an SSA id that does not dominate the merge, and an if/else lost the then arm's slot writes.
+
+On this branch the dumped module validates (`spirv-val`). Its exit test reads `OpPhi %uint %uint_0 <preheader> <latch>`.
+
+**Unchanged elsewhere.**
+- **Dragon Quest VII** (`reach-title-screen.pad`, one run per arm): frames at pad flips 1000, 1500 and 2000 are pixel-identical between `main` and the branch.
+- **Kena's title route:** flips 500 and 650 land on different screens in the two arms, because the time-based route ran under another lane's build. They compare nothing.
+
+**What the level shows next.** Over one 820 s run, the `dropped-draws` alarm counted 166,557 vertex draws and 480 fragment draws, almost all after the load. The run's refused-program index has 26 entries:
+- by reject mode, 11 `unresolved-operand` and 10 `unsupported-in-stage reason=mbcnt-cross-lane`;
+- three merged-NGG pairs stop at `ngg-abi-read-v4`, `ngg-abi-read-undefined-sgpr` and `ngg-layer-target-not-layered` (#3135).
+
+Which of these the dropped vertex draws belong to is not counted per program.
+
 ## The indexed producer for `f1d1baa8` is admitted; `11562c72` stops at a lane-subset proof (2026-10-08, #3135)
 
 Measured on Linux/RADV:
@@ -772,6 +819,7 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The level-load device loss is an out-of-bounds access or a bad descriptor** — false. The RADV hang dump's `vm_fault.log` is empty, so the GPU hung rather than faulted. The hang is pixel program `0x5007ad0000`'s outer loop, whose spill-slot counter the recompiled loop never advanced (2026-10-08).
 - **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).
 - **The level-load device loss is the newly admitted indexed NGG draw** — false. A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU in ordinary draws of pixel program `0x5007ad0000`, and `main`, without the draw, loses the device at the same pad time (2026-10-08, #3135).
 - **Pruning `s_cbranch_execz` under a full EXEC unblocks `11562c72`'s v4 read** — false. EXEC at main pc 582 is `s[0:1]` (tid < 240), not all-ones. The read is a lane-subset question (tid < 220 inside tid < 240) (2026-10-08, #3135).
