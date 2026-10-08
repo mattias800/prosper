@@ -192,6 +192,13 @@ TEST(NggSubgroupAbi, RestoringASavedExecBringsBackItsDefinitions) {
         analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kExecAllOnes, kRestore, kReadV7}))
             .ok())
         << "a SAVEEXEC saves the EXEC from before it narrows";
+    // #4733 review: s_and_saveexec_b32 s38, s20 changes EXEC_LO implicitly -- its only named
+    // destination is s38 -- and with s20 = 0 it leaves no lane on which the v7 write lands.
+    EXPECT_EQ(analyze(program({kExecOne, kSave, kZero20, 0xbea63c14u, kWriteV7, kExecAllOnes,
+                               kRestore, kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: an implicit B32 SAVEEXEC EXEC write ends the saved EXEC";
     // s_cbranch_execz +1 skips the save on one path (s[36:37] is written on both, so the restore
     // reads a defined pair): the join has no common saved EXEC.
     EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kClobber, 0xbf880001u, kSave, kExecAllOnes,

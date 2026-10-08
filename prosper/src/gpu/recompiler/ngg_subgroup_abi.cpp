@@ -576,7 +576,8 @@ void transfer(State& s, const Rdna2Inst& in) {
         s.sdef.set(kVcc + 1);
     }
     bool lo = false, hi = false;
-    switch (exec_effect(in, lo, hi)) {
+    const ExecEffect effect = exec_effect(in, lo, hi);
+    switch (effect) {
         case ExecEffect::None: break;
         case ExecEffect::Full:
             s.exec_full = true;
@@ -596,7 +597,9 @@ void transfer(State& s, const Rdna2Inst& in) {
             if (hi) s.sdef.set(kExecHi);
             break;
     }
-    if (lo || hi) s.exec_is_saved = false;
+    // Any EXEC change ends "EXEC is the saved copy" -- including the implicit EXEC writes no
+    // explicit destination names (the B32 SAVEEXEC/WREXEC family), which leave lo/hi false.
+    if (effect != ExecEffect::None) s.exec_is_saved = false;
     if (restore) {
         s.vcur = s.vall | s.saved_vcur;
         s.exec_is_saved = true;
