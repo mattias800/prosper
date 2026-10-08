@@ -2,6 +2,7 @@
 // context supplies the fields live_compute.cpp's real one has, so nothing here needs a Vulkan device.
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <vector>
 
 #include "gpu/execute/gpu_execute.hpp"
@@ -172,4 +173,25 @@ TEST(ComputeWaveAdmission, AnOrdinaryModuleIsNeverHeldToTheExchangeRules) {
     item.spirv = fx::compile({128, fx::Trips::Constant3}, 0);
     ASSERT_FALSE(compute_spirv_wave64_exchange(item.spirv));
     EXPECT_EQ(exchange_limit(FakeContext{}, item, nullptr, {0, 0}), nullptr);
+}
+
+namespace {
+int g_candidate_calls = 0;
+Wave64Candidate counting_candidate(const void*) {
+    ++g_candidate_calls;
+    Wave64Candidate out;
+    std::snprintf(out.route, sizeof out.route, "n-lanes");
+    std::snprintf(out.reason, sizeof out.reason, "cross-lane-in-loop");
+    return out;
+}
+}   // namespace
+
+TEST(ComputeWaveAdmission, TheCandidateIsComputedOnlyWhenTheLineWillPrint) {
+    using prosper::diagnostics::perf::note_unsupported_wave64;
+    using prosper::diagnostics::perf::Wave64Refusal;
+    g_candidate_calls = 0;
+    for (int i = 0; i < 5; ++i)
+        note_unsupported_wave64(Wave64Refusal::ComputeSubgroup, 64, 0x7a11e0a1, 0, UINT32_MAX, 32,
+                                32, {}, &counting_candidate, nullptr);
+    EXPECT_EQ(g_candidate_calls, 1) << "five refusals of one identity run the analysis once";
 }

@@ -73,6 +73,13 @@ std::shared_ptr<const ComputeProgramFacts> compute_program_facts(
 
 // False under PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1: every dispatch re-derives its facts and
 // the executor also restores the unconditional path-specialization copy (a same-binary A/B arm).
+// Side-effect-free lookup for a diagnostic: the cached facts when the exact bytes are cached, else
+// a fresh analysis that is NOT stored. It touches no statistics and replays no terminal reject
+// reasons (the full compute_program_facts overwrites `terminal_reject_reasons()[program]` with the
+// probe's record on a hit, which could clobber a later, more specific reason).
+std::shared_ptr<const ComputeProgramFacts>
+compute_program_facts_peek(const uint32_t* code, size_t dwords, uint64_t program_address);
+
 bool compute_program_facts_cache_enabled();
 
 ComputeProgramFactsStats compute_program_facts_stats();

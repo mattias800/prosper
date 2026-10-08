@@ -208,7 +208,9 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
             const bool scc_mask =
                 in.opcode == 0x08 || in.opcode == 0x0a || (in.opcode >= 0x24 && in.opcode <= 0x2b);
             const bool plain_move = in.opcode == 0x03 || in.opcode == 0x04;
-            if (!already && scc_mask && mask_operand)
+            // The saveexec family writes EXEC implicitly, so it is a mask site whatever its source.
+            const bool saveexec = in.opcode >= 0x24 && in.opcode <= 0x2b;
+            if (!already && scc_mask && (mask_operand || saveexec))
                 add(in, ComputeCrossLaneKind::MaskScc, 0);
             else if (!already && !plain_move && !scc_mask && mask_operand)
                 add(in, ComputeCrossLaneKind::MaskOther, 0);
@@ -218,14 +220,10 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
                 add(in, ComputeCrossLaneKind::WriteLane, 64);
         } else if (in.fmt == Rdna2Format::DS && !in.ds_gds) {
             if (in.opcode == 0xb2) add(in, ComputeCrossLaneKind::DsPermute, 0);
-            const bool is_read = (in.opcode >= 0x36 && in.opcode <= 0x3c) ||
-                                 (in.opcode >= 0x76 && in.opcode <= 0x78);
-            if (is_read && lds_written_since_barrier)
+            // A returning atomic is both: it reads what an earlier lane stored, then writes.
+            if (ds_opcode_is_lds_read(in.opcode) && lds_written_since_barrier)
                 add(in, ComputeCrossLaneKind::LdsWaveSync, 64);
-            else if (in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x0f ||
-                     in.opcode == 0x1e || in.opcode == 0x1f ||
-                     (in.opcode >= 0x4d && in.opcode <= 0x4f))
-                lds_written_since_barrier = true;
+            if (ds_opcode_is_lds_write(in.opcode)) lds_written_since_barrier = true;
         }
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) lds_written_since_barrier = false;
     }
