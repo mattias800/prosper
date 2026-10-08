@@ -4193,7 +4193,7 @@ endif()
     LIBRARIES prosper_core)
 
   # sceAgcDriverSubmitMultiAcbs: folds into the queue's own compute context, in 128-descriptor
-  # chunks, with the firmware's empty-batch code (read from libSceAgcDriver.sprx 0x4af0).
+  # chunks, with the empty-batch code of the project's libSceAgcDriver.sprx (worker 0x4570).
   prosper_add_gtest(test_agc_multi_acb
     SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
     LIBRARIES prosper_core)

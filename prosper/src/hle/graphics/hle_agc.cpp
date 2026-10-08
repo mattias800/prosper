@@ -167,9 +167,15 @@ constexpr uint32_t kDwReleaseMem         = 8;
 constexpr uint32_t kDwJump               = 4;
 constexpr uint32_t kDwCbBranch = 14;   // sceAgcCbBranch: header + 13 (firmware 0x38 bytes)
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
-// AgcDriver (0x8a6d....) submit-worker result for a batch of zero descriptors: libSceAgcDriver.sprx
-// 0x4af0 tests the count register (`test ecx,ecx` at 0x4b17) and returns this constant (0x4ce9).
-constexpr uint64_t kAgcDriverErrEmptyBatch = 0x8a6d0109ull;
+// AgcDriver (0x8a6d....) submit-worker result for a batch of zero descriptors. BUILD-DEPENDENT, so
+// CONFIDENCE: MED. Read from the project's copy, testdata/sprx/libSceAgcDriver.sprx (sha256
+// 7399b4ebb91e94e200e35a6b319afb54f6e5298b12f97f461c8f65136392ba9b, 136 exports): the worker at
+// 0x4570 loads the count (0x45e3), `test eax,eax; je 0x4752` (0x4603), and 0x4752 is
+// `mov r14d,0x8a6d0000`, returned after the unlock. The same constant is that worker's answer when
+// taking its lock fails (0x474b), so it is a generic driver error rather than a dedicated code.
+// Another build (sha256 1d3c11ad...2965b725, Sony build J03912178, 174 exports; worker 0x4af0)
+// returns 0x8a6d0109 here instead (#4741). The project's copy is the one anyone here can re-read.
+constexpr uint64_t kAgcDriverErrEmptyBatch = 0x8a6d0000ull;
 constexpr uint64_t kAgcErrInvalidPacket = 0x8a6c000cull;   // BranchPatch*: not a branch packet
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
@@ -3143,25 +3149,40 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
 //
 //   (uint32 queue, const uint64_t* streams, const uint32_t* dwords, uint32 count)
 //
-// Read from libSceAgcDriver.sprx (the export is at vaddr 0x4dc0, the worker it tail-jumps into at
-// 0x4af0), not inferred from the DCB sibling: the export validates the queue id (`edi`) and enters
-// the worker with the guest's rsi/rdx/ecx untouched. The worker
-//   * returns 0x8a6d0109 when the count is zero (`test ecx,ecx` 0x4b17 -> 0x4ce9);
-//   * copies streams[i] (8-byte stride) and dwords[i] (4-byte stride) into 32-byte descriptors, at
-//     most 0x80 per queue submit (`cmp r12d,0x80` / `cmovae`, 0x4bb4-0x4bc5), and repeats until the
-//     count is consumed (0x4ca2-0x4caa), so a count above 128 is several submits in guest order;
-//   * returns the first non-zero per-chunk result (0x4c86 `test eax,eax; jne` -> 0x4cb0), else 0.
-// sceAgcDriverSubmitMultiDcbs enters the same worker (wrapper at 0x4d40, graphics queue object), so
-// the empty-batch code above is the firmware's answer for that call too.
+// Read from the project's copy of the module, testdata/sprx/libSceAgcDriver.sprx (sha256
+// 7399b4ebb91e94e200e35a6b319afb54f6e5298b12f97f461c8f65136392ba9b, 136 exports, so a build later than
+// the 95-export 3.20 list), not inferred from the DCB sibling. The export is at vaddr 0x4830: it maps
+// the queue id in `edi` to a queue object (ids >= 0x58 index the table at 0x1a3e0, ids 0x20..0x57 the
+// one at 0x18460, both with a 0x90 stride; ids below 0x20 fall through to object pointer 8) and
+// tail-jumps into the worker at 0x4570 with the guest's rsi/rdx/ecx untouched. There is NO queue-id
+// range check and no error code for an out-of-table id in this build. The worker
+//   * returns 0x8a6d0000 when the count is zero (count loaded at 0x45e3, `test eax,eax; je 0x4752` at
+//     0x4603, `mov r14d,0x8a6d0000` at 0x4752). BUILD-DEPENDENT: another build (worker 0x4af0, see
+//     kAgcDriverErrEmptyBatch and #4741) returns 0x8a6d0109;
+//   * copies streams[i] (`mov rsi,[r12+rdx*8]`, 0x4656) and dwords[i] (`mov edx,[r15+rdx*4]`, 0x465f)
+//     into 32-byte descriptors in a 0x1000-byte buffer, at most 0x80 per queue submit
+//     (`cmp ebx,0x80` / `cmovae`, 0x4620-0x4633), calls the per-queue submit (`call [rcx+rax+0x60]`,
+//     0x4702), advances by 128 and repeats while descriptors remain (0x470a-0x4723), so a count above
+//     128 is several submits in guest order;
+//   * returns the first non-zero per-chunk result (`test eax,eax; jne 0x475a`, 0x4706), else 0.
+// The worker validates nothing about a descriptor: it neither checks the arrays nor the streams they
+// name. sceAgcDriverSubmitMultiDcbs (export 0x47c0, graphics queue object 0x1a8b8) enters the same
+// worker, so in this build its empty-batch answer is 0x8a6d0000 too.
 //
 // Black Flag Resynced calls this at boot. It was unregistered, so the dispatcher answered 0 and the
 // guest's async-compute work was never folded: the queue's register context and its dispatches did
-// not exist. CONFIDENCE: HIGH for the argument layout, the empty-batch code, the 128-descriptor
-// chunking and first-failure propagation (all from the disassembly above). NOT modelled: the
-// export's queue-id range check, which answers 0x8a6d0003 for ids outside the driver's queue tables
-// (queue ids here are driver handles, as for SubmitAcb). CONFIDENCE: LOW for a zero-length
-// descriptor: the worker hands it to the per-queue submit unchanged and what that returns is not
-// read; it is skipped as in SubmitMultiDcbs, where a title was seen to send them and carry on.
+// not exist. CONFIDENCE: HIGH for the argument layout, the 128-descriptor chunking and stopping at the
+// first failure (the same in both builds read). CONFIDENCE: MED for the empty-batch code, which
+// differs between builds. Queue ids here are driver handles, as for SubmitAcb. CONFIDENCE: LOW for a
+// zero-length descriptor: the worker hands it to the per-queue submit unchanged and what that returns
+// is not read; it is skipped as in SubmitMultiDcbs, where a title was seen to send them and carry on.
+//
+// prosper's own policy, NOT a firmware contract: unreadable descriptor arrays, and an unaligned,
+// oversized or unreadable stream, are refused with 0x8a6c000a (an Agc library code the firmware worker
+// never produces; it would fault instead). Each chunk is validated in full before it is folded, so a
+// refused descriptor drops the whole chunk it sits in, including the valid descriptors before it, while
+// earlier chunks have already been folded. That keeps every fold all-or-nothing per chunk, which is
+// how the firmware hands a chunk to the queue.
 HLE(agc_driver_submit_multi_acbs) {
     prosper_gpu_submit_scope_begin();
     const uint64_t queue = static_cast<uint32_t>(a0);
@@ -3202,10 +3223,12 @@ HLE(agc_driver_submit_multi_acbs) {
             buffers.push_back({(const uint32_t*)(uintptr_t)stream, words});
         }
         if (buffers.empty()) continue;
-        const uint64_t rc = submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiAcbs",
-                                               queue, /* explicit_lengths */ true,
-                                               /* require_complete_pm4 */ false);
-        if (rc) return rc;   // the firmware returns the first non-zero chunk result
+        // The firmware returns the first non-zero chunk result. prosper's per-chunk fold cannot
+        // produce one: submit_dcb_buffers returns 0 on every path and its only failure mode is
+        // abort(). So the stop-at-first-failure that is reachable here is the descriptor refusal
+        // above, which returns before any later chunk is folded.
+        (void)submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiAcbs", queue,
+                                 /* explicit_lengths */ true, /* require_complete_pm4 */ false);
     }
     return 0;
 }
