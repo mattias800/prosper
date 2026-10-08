@@ -2029,6 +2029,39 @@ inline DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuSt
     return source;
 }
 
+// #3135 P6: an indexed merged-NGG draw's indices, read where and at the size the ordinary path would
+// bind them (resolve_draw_index_source), then decoded by ngg_draw_indices. `vertex_range` (max index
+// + 1) is what sizes the linked fold and the vertex buffers, never the index count. `refusal` names
+// the rule when no indices were read: ngg-index-count, ngg-index-unavailable (no address or count, an
+// unknown element size, or unreadable bytes), or the decode's own refusal.
+struct NggDrawIndexFetch {
+    std::shared_ptr<const std::vector<uint32_t>> indices;
+    const char* refusal = nullptr;
+    uint32_t vertex_range = 0;
+};
+inline NggDrawIndexFetch fetch_ngg_draw_indices(const GpuState& ds, const GpuState::Draw& draw,
+                                                uint32_t vb_records_unclamped) {
+    NggDrawIndexFetch out;
+    if (draw.index_count > kNggMaxIndices) {
+        out.refusal = "ngg-index-count";
+        return out;
+    }
+    out.refusal = "ngg-index-unavailable";
+    if (!draw.index_addr || !draw.index_count) return out;
+    const DrawIndexSource source =
+        resolve_draw_index_source(ds, draw, draw.index_count, vb_records_unclamped);
+    if (!source.element_bytes ||
+        !guest_readable(source.addr, draw.index_count * source.element_bytes))
+        return out;
+    const NggDrawIndices fetched =
+        decode_ngg_draw_indices(reinterpret_cast<const void*>(static_cast<uintptr_t>(source.addr)),
+                                source.element_bytes, draw.index_count, read_ngg_index_restart(ds));
+    out.indices = fetched.indices;
+    out.refusal = fetched.refusal;
+    if (fetched.indices) out.vertex_range = fetched.max_index + 1u;
+    return out;
+}
+
 // #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
 // AUTHORITATIVE hardware vertex count — the GPU draws exactly that many vertices with auto indices
 // 0..draw_count-1. The bound vertex buffer's record count (vb_records = size/stride) is ONLY a fallback for
@@ -2952,21 +2985,11 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         // the size the ordinary path would bind them (resolve_draw_index_source). The vertex RANGE
         // they address, not the index count, sizes the linked fold's vertex fetches below.
         if (ngg.facts.indexed) {
-            if (draw->index_count > kNggMaxIndices) {
-                ngg.facts.index_refusal = "ngg-index-count";
-            } else if (draw->index_addr && draw->index_count) {
-                const DrawIndexSource source = resolve_draw_index_source(
-                    ds, *draw, draw->index_count, vertex_buffer_records_unclamped(vrt.get()));
-                if (source.element_bytes &&
-                    guest_readable(source.addr, draw->index_count * source.element_bytes)) {
-                    const NggDrawIndices fetched = decode_ngg_draw_indices(
-                        reinterpret_cast<const void*>(static_cast<uintptr_t>(source.addr)),
-                        source.element_bytes, draw->index_count, read_ngg_index_restart(ds));
-                    ngg.facts.indices = fetched.indices;
-                    ngg.facts.index_refusal = fetched.refusal;
-                    if (fetched.indices) ngg_vertex_range = fetched.max_index + 1u;
-                }
-            }
+            const NggDrawIndexFetch fetched =
+                fetch_ngg_draw_indices(ds, *draw, vertex_buffer_records_unclamped(vrt.get()));
+            ngg.facts.indices = fetched.indices;
+            ngg.facts.index_refusal = fetched.refusal;
+            if (fetched.indices) ngg_vertex_range = fetched.vertex_range;
         }
         ngg.facts.indirect = draw && (draw->indirect || draw->indirect_args_addr);
         ngg.facts.vertex_offset =
@@ -3021,11 +3044,17 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         // Always on, bounded: an ADMITTED indexed draw's shape, once per program. The [ngg-refused]
         // line below named these draws while they were dropped (ngg-indexed); this is the evidence
         // that one now runs, readable without PROSPER_DBG (which desyncs the routes reaching them).
-        if (ngg_subgroup && result.indexed) {
+        // Once 32 programs are logged the full flag skips the mutex: realization workers never
+        // contend on it for the rest of the run.
+        static std::atomic<bool> ngg_indexed_log_full{false};
+        if (ngg_subgroup && result.indexed &&
+            !ngg_indexed_log_full.load(std::memory_order_relaxed)) {
             static std::mutex ngg_indexed_mutex;
             static std::set<uint64_t> ngg_indexed_logged;
             const std::lock_guard lock(ngg_indexed_mutex);
-            if (ngg_indexed_logged.size() < 32 && ngg_indexed_logged.insert(rs.es_addr).second)
+            if (ngg_indexed_logged.size() >= 32)
+                ngg_indexed_log_full.store(true);
+            else if (ngg_indexed_logged.insert(rs.es_addr).second)
                 std::fprintf(
                     stderr,
                     "[ngg-indexed] es=0x%llx chain=0x%llx ps=0x%llx admitted indices=%zu "

@@ -133,15 +133,23 @@ struct DrawKey {
     std::array<uint32_t, 7> limits{};
     std::vector<uint32_t> push_constants;
     // An indexed draw's index VALUES (#3135 P6): the plan, and so every launch record, depends on
-    // them. Compared exactly; empty for a non-indexed draw. An indexed draw is never keyed equal to
-    // a non-indexed one because `indexed` is part of the key.
+    // them. Keyed by a hash computed once per draw, with the decoded vector itself held by
+    // reference (never copied into the key); two keys whose hashes match are compared exactly, so a
+    // collision is never a hit. An indexed draw never keys equal to a non-indexed one (`indexed`).
     bool indexed = false;
-    std::vector<uint32_t> indices;
+    uint64_t index_hash = 0;
+    std::shared_ptr<const std::vector<uint32_t>> indices;
     auto tie() const {
         return std::tie(stages, vertices, instances, topology, limits, push_constants, indexed,
-                        indices);
+                        index_hash);
     }
-    bool operator<(const DrawKey& other) const { return tie() < other.tie(); }
+    bool operator<(const DrawKey& other) const {
+        const auto a = tie(), b = other.tie();
+        if (a < b) return true;
+        if (b < a || indices == other.indices) return false;
+        if (!indices || !other.indices) return !indices;
+        return *indices < *other.indices;
+    }
 };
 
 struct DrawEntry {
@@ -363,7 +371,12 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                        admission.limits.esgs_item_size};
     draw_key.push_constants = input.user_data;
     draw_key.indexed = admission.shape.indices != nullptr;
-    if (admission.shape.indices) draw_key.indices = *admission.shape.indices;
+    if (admission.shape.indices) {
+        draw_key.index_hash = 1469598103934665603ull;
+        for (uint32_t index : *admission.shape.indices)
+            draw_key.index_hash = (draw_key.index_hash ^ index) * 1099511628211ull;
+        draw_key.indices = admission.shape.indices;
+    }
     {
         const std::lock_guard lock(c.mutex);
         const auto found = c.draws.find(draw_key);

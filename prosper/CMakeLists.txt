@@ -1333,6 +1333,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_ngg_draw_indices.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  # #3135 P6 (#4733 review): an indexed merged-NGG draw through realize_draw_item, and the shared
+  # index-source rule's DrawIndexOffset branch. CPU only: realization compiles, nothing renders.
+  prosper_add_gtest(test_ngg_indexed_realize
+    SOURCES tests/gpu/execute/test_ngg_indexed_realize.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   # #3135 P5: the v72 capture record of a merged-NGG draw description.
   prosper_add_gtest(test_ngg_subgroup_codec
     SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
