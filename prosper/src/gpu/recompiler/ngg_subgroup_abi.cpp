@@ -39,6 +39,14 @@ struct State {
     uint8_t vall = 0;   // tracked VGPRs written for all 64 lanes on every path
     uint8_t vcur = 0;   // tracked VGPRs written for every lane active in the current EXEC
     bool scc = false;   // SCC written on every path
+    // A saved copy of EXEC (#3135 P6): the SGPR pair `saved_exec` holds the EXEC of some earlier
+    // point on every path (s_mov_b64 sP, exec or a SAVEEXEC), and `saved_vcur` the tracked VGPRs
+    // written for every lane of that EXEC. `exec_is_saved`: EXEC has not been written since, so a
+    // VGPR written now covers the saved EXEC too. Restoring EXEC from the pair (s_mov_b64 exec, sP)
+    // brings back exactly those lanes, and with them saved_vcur -- the compiler's if/else idiom.
+    int saved_exec = -1;
+    uint8_t saved_vcur = 0;
+    bool exec_is_saved = false;
     void meet(const State& o) {
         sdef &= o.sdef;
         scc = scc && o.scc;
@@ -46,10 +54,19 @@ struct State {
         exec_full = exec_full && o.exec_full;
         vall &= o.vall;
         vcur &= o.vcur;
+        if (saved_exec != o.saved_exec) {
+            saved_exec = -1;
+            saved_vcur = 0;
+            exec_is_saved = false;
+        } else {
+            saved_vcur &= o.saved_vcur;
+            exec_is_saved = exec_is_saved && o.exec_is_saved;
+        }
     }
     bool operator==(const State& o) const {
         return sdef == o.sdef && s3_overwritten == o.s3_overwritten && exec_full == o.exec_full &&
-               vall == o.vall && vcur == o.vcur && scc == o.scc;
+               vall == o.vall && vcur == o.vcur && scc == o.scc && saved_exec == o.saved_exec &&
+               saved_vcur == o.saved_vcur && exec_is_saved == o.exec_is_saved;
     }
 };
 
@@ -501,6 +518,18 @@ Reads instruction_reads(const Rdna2Inst& in) {
     return reads;
 }
 
+bool is_exec_operand(const Operand& op) {
+    return (op.kind == OperandKind::SGPR || op.kind == OperandKind::Special) && op.value == kExecLo;
+}
+
+// The even SGPR pair below EXEC that `op` names, or -1.
+int sgpr_pair(const Operand& op) {
+    return op.kind == OperandKind::SGPR && op.value >= 0 && op.value + 1 < kVcc &&
+                   (op.value & 1) == 0
+               ? op.value
+               : -1;
+}
+
 void transfer(State& s, const Rdna2Inst& in) {
     if (writes_scc(in)) s.scc = true;
     if (const uint32_t results = definite_vgpr_results(in)) {
@@ -508,6 +537,7 @@ void transfer(State& s, const Rdna2Inst& in) {
             const uint8_t bit = tracked_bit(in.dst.value + static_cast<int>(w));
             s.vcur |= bit;
             if (s.exec_full) s.vall |= bit;
+            if (s.exec_is_saved) s.saved_vcur |= bit;
         }
     }
     for_each_scalar_write(in, [&](int base, uint32_t width) {
@@ -515,8 +545,25 @@ void transfer(State& s, const Rdna2Inst& in) {
             const int reg = base + static_cast<int>(w);
             if (reg >= 0 && reg <= kExecHi) s.sdef.set(static_cast<size_t>(reg));
             if (reg == 3) s.s3_overwritten = true;
+            if (s.saved_exec >= 0 && (reg == s.saved_exec || reg == s.saved_exec + 1)) {
+                s.saved_exec = -1;   // the copy is gone
+                s.saved_vcur = 0;
+                s.exec_is_saved = false;
+            }
         }
     });
+    // A save of EXEC: s_mov_b64 sP, exec (EXEC unchanged), or a SAVEEXEC (sP = the EXEC before
+    // the instruction changes it).
+    const bool sop1 = in.fmt == Rdna2Format::SOP1;
+    const int dst_pair = sgpr_pair(in.dst);
+    const bool copy_of_exec = sop1 && in.opcode == kSop1OpcodeMovB64 && is_exec_operand(in.src[0]);
+    if (dst_pair >= 0 && (copy_of_exec || (sop1 && sop1_opcode_is_saveexec_b64(in.opcode)))) {
+        s.saved_exec = dst_pair;
+        s.saved_vcur = s.vcur;
+        s.exec_is_saved = copy_of_exec;
+    }
+    const bool restore = sop1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == kExecLo &&
+                         s.saved_exec >= 0 && sgpr_pair(in.src[0]) == s.saved_exec;
     // The shared writer inventory names SGPR destinations; the implicit VCC results of an e32
     // compare (encoded as the VCC special operand) and of the e32 carry operations are added here.
     const bool vopc_to_vcc = in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
@@ -547,6 +594,11 @@ void transfer(State& s, const Rdna2Inst& in) {
             if (lo) s.sdef.set(kExecLo);
             if (hi) s.sdef.set(kExecHi);
             break;
+    }
+    if (lo || hi) s.exec_is_saved = false;
+    if (restore) {
+        s.vcur = s.vall | s.saved_vcur;
+        s.exec_is_saved = true;
     }
 }
 
