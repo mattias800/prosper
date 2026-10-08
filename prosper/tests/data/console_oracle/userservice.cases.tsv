@@ -1,0 +1,20 @@
+# console-oracle cases: libSceUserService argument handling and error codes.
+# Every call that returns a user id or name carries `redact`: the payload prints only the buffer's
+# length, never its contents, so no id or name is ever written to a file. Only return codes are kept.
+# No sceUserServiceTerminate: the payload may share the loader's user service session. No
+# sceUserServiceGetInitialUser either: it fails inside the payload process (which is not a game), so
+# its result would describe the harness and not the console.
+# id	lib	func	args	expect     (grammar and flags: tools/console_oracle/payload/lib_oracle.c)
+us_initialize	libSceUserService.sprx	sceUserServiceInitialize	null
+us_initialize_again	libSceUserService.sprx	sceUserServiceInitialize	null
+us_foreground_user	libSceUserService.sprx	sceUserServiceGetForegroundUser	out:4	redact
+us_foreground_user_null	libSceUserService.sprx	sceUserServiceGetForegroundUser	null
+us_login_list	libSceUserService.sprx	sceUserServiceGetLoginUserIdList	out:16	redact
+us_login_list_null	libSceUserService.sprx	sceUserServiceGetLoginUserIdList	null
+us_name_foreground_user	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:17	redact
+us_name_buffer_one	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:1	redact
+us_name_buffer_sixteen	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:16	redact
+us_name_size_zero	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:0	redact
+us_name_null_buffer	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,null,i:17
+us_name_invalid_user_minus1	libSceUserService.sprx	sceUserServiceGetUserName	i:-1,out:17,i:17	redact
+us_name_invalid_user_zero	libSceUserService.sprx	sceUserServiceGetUserName	i:0,out:17,i:17	redact

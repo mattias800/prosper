@@ -128,14 +128,15 @@ RAW_RET_PLACEHOLDER = "0x0000000000000000"
 def scrub_volatile(expect: str, measured: list[str]) -> list[str]:
     """Replace measured values the replay never compares with a fixed placeholder.
 
-    A case marked `ret` or `none` does not compare its buffers, and a `retoff:<k>` case compares an
-    offset instead of the raw return register. Those buffer bytes (a capture-time clock reading, say)
-    and that raw pointer (a heap address in the payload process) are not measurements anyone uses, so
-    they are never written to a committed file. `measured` is [status, ret, retn, buffers...].
+    A case marked `ret` or `none` does not compare its buffers, a `retoff:<k>` case compares an offset
+    instead of the raw return register, and a `none` case compares nothing at all. Those buffer bytes (a
+    capture-time clock reading, say), that raw pointer (a heap address in the payload process) and that
+    unused return value (a per-unit calibration) are not measurements anyone uses, so they are never
+    written to a committed file. `measured` is [status, ret, retn, buffers...].
     """
     flags = expect.split(",")
     status, ret, retn, *buffers = measured
-    if any(f.startswith("retoff:") for f in flags):
+    if "none" in flags or any(f.startswith("retoff:") for f in flags):
         ret = RAW_RET_PLACEHOLDER
     if "ret" in flags or "none" in flags:
         buffers = [f"{b.split('=', 1)[0]}={VOLATILE}" for b in buffers]

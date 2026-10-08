@@ -24,7 +24,12 @@ TEST(KernelSemaPoll, Contract) {
     if (!create || !poll || !signal || !destroy) FAIL() << "legacy early exit";
 
     void* sema = nullptr;
-    CHECK(create(reinterpret_cast<uintptr_t>(&sema), 0, 0, 0, 8, 0) == 0 && sema,
+    // The console refuses a NULL name with EINVAL (tests/data/console_oracle, sema_create_null_name), so
+    // a drain test that wants a live semaphore has to pass one, as every real caller does.
+    static const char kName[] = "sema_poll_test";
+    CHECK(create(reinterpret_cast<uintptr_t>(&sema), reinterpret_cast<uintptr_t>(kName), 0, 0, 8,
+                 0) == 0 &&
+              sema,
           "empty semaphore is created");
     if (!sema) FAIL() << "legacy early exit";
     const uint64_t handle = reinterpret_cast<uintptr_t>(sema);

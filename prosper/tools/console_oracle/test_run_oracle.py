@@ -102,9 +102,10 @@ def test_scrub_replaces_only_the_values_the_replay_never_compares():
         "-",
         "a0=volatile",
     ]
+    # a `none` case compares nothing: neither its buffers nor its return value (a per-unit calibration)
     assert ro.scrub_volatile("r64,none", ["ok", "0x5f259c06", "-", "a0=aa", "a1=bb"]) == [
         "ok",
-        "0x5f259c06",
+        ro.RAW_RET_PLACEHOLDER,
         "-",
         "a0=volatile",
         "a1=volatile",
