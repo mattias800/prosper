@@ -95,6 +95,23 @@ bool read_marker(std::string_view text, std::string_view prefix,
     return true;
 }
 
+// `Prosper.FragmentExecSkipVote=<result id>`: the recompiler's GUEST-level statement that the region
+// this vote's s_cbranch_execz skips has no scalar live-out, scalar memory effect, wave-level side
+// effect or foreign exit (ADR 0028). Permission-granting, so strict: anything but a plain decimal id
+// is ignored, which can only cost an admission.
+bool read_exec_skip_vote(std::string_view text, uint32_t& id) {
+    constexpr std::string_view prefix = "Prosper.FragmentExecSkipVote=";
+    if (!text.starts_with(prefix)) return false;
+    const auto number = text.substr(prefix.size());
+    uint32_t value = 0;
+    const auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
+    if (number.empty() || parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() ||
+        !value)
+        return false;
+    id = value;
+    return true;
+}
+
 bool is_fragment_builtin(uint32_t builtin) {
     switch (builtin) {
         case 7: case 9: case 10: case 15: case 16: case 17:
@@ -150,7 +167,8 @@ std::unordered_set<uint32_t> neutral_selection_votes(
     const std::unordered_set<uint32_t>& glsl_sets, bool preserve_f32,
     const std::unordered_set<uint32_t>& explicit_transport,
     const std::unordered_set<uint32_t>& frozen_leaves,
-    const std::unordered_map<uint32_t, std::vector<size_t>>& users) {
+    const std::unordered_map<uint32_t, std::vector<size_t>>& users,
+    const std::unordered_set<uint32_t>& exec_skip_votes) {
     FragmentNeutralSelection graph;
     graph.preserve_f32 = preserve_f32;
     std::unordered_map<uint32_t, std::vector<size_t>> blocks;
@@ -233,6 +251,7 @@ std::unordered_set<uint32_t> neutral_selection_votes(
     if (vote == header.end() || !users.contains(controller) ||
         users.at(controller) != std::vector<size_t>{header.back()}) return proved;
     graph.predicate = words[instructions[*vote].at + 4];
+    graph.guest_scalar_effects_absent = exec_skip_votes.contains(controller);
     if (frozen_leaves.contains(graph.predicate)) return proved; // retain the older Copy(P) certificate
     const auto& body_instructions = blocks.at(body);
     const auto& exit = instructions[body_instructions.back()];
@@ -308,6 +327,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
     std::unordered_map<uint32_t, uint32_t> pointer_elements, runtime_elements, struct_members, strides, constants;
     std::unordered_set<uint32_t> offset_zero_structs;
     std::vector<Instruction> votes;
+    std::unordered_set<uint32_t> exec_skip_votes;
     for (const auto& in : instructions) {
         const auto at = in.at;
         if (in.op == 15) {
@@ -368,6 +388,8 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         }
         if (in.op == 330) {
             const auto text = instruction_string(source, in, 1);
+            if (uint32_t marked = 0; read_exec_skip_vote(text, marked))
+                exec_skip_votes.insert(marked);
             if (text.empty() || !read_marker(text, "Prosper.FragmentSubgroupSize=", 64, size_seen) ||
                 !read_marker(text, "Prosper.FragmentSubgroupWhy=", 2, why_seen)) {
                 result.refusal = FragmentVoteRefusal::InconsistentContract;
@@ -615,8 +637,9 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         if (dead) dead_vote_ids.insert(source[vote.at + 2]);
     }
 
-    const auto neutral_vote_ids = neutral_selection_votes(source, instructions, entry_id, bool_types,
-        int32_types, float32_types, glsl_sets, preserve_f32, explicit_transport, uniform, users);
+    const auto neutral_vote_ids = neutral_selection_votes(
+        source, instructions, entry_id, bool_types, int32_types, float32_types, glsl_sets,
+        preserve_f32, explicit_transport, uniform, users, exec_skip_votes);
     // These are facts about the transaction's EFFECTIVE controller, never about source P. The
     // frozen source leaves above still own all load/address authority.
     auto effective_leaves = uniform;

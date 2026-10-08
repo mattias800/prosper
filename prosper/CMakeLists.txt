@@ -3284,6 +3284,10 @@ if(TARGET prosper_core)
   add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
   target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
+  # ADR 0028 step 1: the s_cbranch_execz any-vote certificate (guest-region classifier + SPIR-V proof).
+  prosper_add_gtest(test_fragment_exec_skip_vote
+    SOURCES tests/gpu/recompiler/test_fragment_exec_skip_vote.cpp
+    LIBRARIES prosper_core)
   add_executable(test_fragment_neutral_selection tests/gpu/recompiler/test_fragment_neutral_selection.cpp)
   target_link_libraries(test_fragment_neutral_selection PRIVATE prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)

@@ -123,6 +123,12 @@ the red frame (next section). Reasons, from `PROSPER_DBG=1` and `shader_inspect`
   counted-loop route's full-EXEC proof declines.
 - `cs 0x407ed65200`: `s_cbranch_scc1` at pc 93, control flow the structurizer cannot place.
 - a fragment draw at `0x407edfaf00` is refused by the 64-lane `unproved-vote` contract (host range 32..32).
+  **Shape of the vote**, from the run log's `[wave64-unsupported]` line (`vote-source-word=870`,
+  `vote-result-id=72`, `vote-predicate-id=71`, `predicate-def-op=169`): one `OpGroupNonUniformAny`
+  whose predicate is an `OpSelect` (a `v_cmp` result masked by EXEC) and whose only consumer is the EXEC
+  test guarding an `s_cbranch_execz` skip. That is ADR 0028 route 2's first candidate. Which of that
+  certificate's conditions the skipped region meets is **not measured**: the draw's shader words are in no
+  dump here (`refused_shaders_*` holds the four compute programs only), so see `## Ruled out`.
 
 ## Progress 2026-10-07: the corruption starts at the autosave notice, and what is ruled out
 
@@ -325,6 +331,16 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   2026-10-07 (n=1 per arm, same caveat) with the three `PROSPER_NO_COMPUTE_RTT_DEST_*`-style switches
   off: the same black/white proportions after 250 s. The corruption is already present in guest
   memory, i.e. in the guest's own compute-composite output, not added by the mirror.
+
+- **"The `s_cbranch_execz` any-vote certificate (ADR 0028 step 1) admits the `0x407edfaf00` draw."** Not
+  shown, and not claimed. The certificate needs the skipped guest region to be free of scalar live-outs,
+  scalar memory effects, wave-level effects and foreign exits (`classify_exec_skip_region`), and needs
+  every live merge value to be provably the same value under `P = false` as on the skipped edge. The
+  recompiler already linearizes an EXEC-masked VALU/VMEM region with no vote at all (`safe_execz_branches`),
+  so a region that still carries a vote holds something that linearizer refuses: a VCC write, scalar ALU,
+  an export, or a live scalar load. The classifier admits only the first of those (VCC dead at the merge),
+  so a region with scalar ALU still takes the refusal. Measure by dumping the draw's pixel shader
+  (`PROSPER_SHADER_DUMP`) and running `classify_exec_skip_region` over it before building on this.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 

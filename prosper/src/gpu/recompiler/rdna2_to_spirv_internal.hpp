@@ -676,6 +676,12 @@ struct SpirvCompute {
     // `required-ops` field scans for Vote/Arithmetic/Shuffle CAPABILITIES and the lane-id path
     // declares none of them -- so the two cases printed identically.
     uint32_t fragment_wave_reasons=0;
+    // Result ids of fragment WaveAny votes that guard a forward `s_cbranch_execz` over a region the
+    // GUEST-level classifier (`classify_exec_skip_region`) found free of scalar, memory, wave-level
+    // and exit effects. finish() publishes them as `Prosper.FragmentExecSkipVote=<id>` module
+    // metadata. It is evidence the SPIR-V cannot carry (an s_sendmsg is lowered to nothing), and it
+    // is only ever an additional NECESSARY condition for `lower_fragment_votes`, never sufficient.
+    std::vector<uint32_t> fragment_exec_skip_votes;
     // SSA provenance for fragment WaveAny results. A vote needs the exact guest-wave width when
     // that particular bool reaches a guest scalar-data consumer. Tracking result ids avoids the
     // false whole-module inference "this shader contains both a vote and S_CSELECT".
