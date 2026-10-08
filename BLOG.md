@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-08
 
+### Kena: Bridge of Spirits gets its depth of field
+
+The grass and stones nearest the camera in Kena's title-menu forest now blur, as they do on PS5; the frame is still brighter than the console's and the white flowers are still missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-dof.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, with the foreground grass and the stone cat statues on the right softly out of focus; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 420"></p>
+
+The path below the shrine: `main` (top), with the fix (middle), and the PS5 oracle (bottom).
+
+<p align="center"><img src="prosper/docs/screenshots/kena-title-dof-main-fix-oracle.webp" alt="Three crops of the foreground below Kena's shrine: on main every leaf is sharp; with the fix the nearest foliage and stones are blurred; the PS5 oracle shows the same blur with white flowers"></p>
+
 ### Kena: Bridge of Spirits gets past its first level load and into gameplay
 
 On Linux, Kena now gets through the first level load: the opening cutscene plays, and the world draws behind the first gameplay prompt. It is dim and blue, and Kena's hair is black ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
