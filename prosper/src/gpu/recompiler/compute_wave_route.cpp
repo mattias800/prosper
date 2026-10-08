@@ -123,11 +123,6 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
             any_backward_branch = true;
     }
 
-    // The region detectors below print their own PROSPER_DBG lines; tag them so they are not read
-    // as the emitter's.
-    if (PROSPER_ENV_ON("PROSPER_DBG"))
-        std::fprintf(stderr, "[wave64-route-analysis] region detector output below belongs to the "
-                             "route analysis, not to a recompile\n");
     const auto add = [&](const Rdna2Inst& in, ComputeCrossLaneKind kind, uint32_t native_lanes) {
         ComputeCrossLaneOp op;
         op.pc = in.pc;
