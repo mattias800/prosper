@@ -22,6 +22,7 @@
 // happens here; verifying a flat name against `nid_hash` is the caller's job (nid_census does it).
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -29,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace prosper_tools {
 
@@ -110,6 +112,9 @@ inline const char* name_source_str(NameSource s) {
 struct StubNames {
     std::map<std::string, std::string> by_nid;   // nid -> function name
     std::map<std::string, std::string> lib_of;   // nid -> library file stem
+    // Every distinct name a flat database gave a NID, in file order (by_nid keeps the first). A
+    // caller that can verify a name against the NID picks the one that passes (N1).
+    std::map<std::string, std::vector<std::string>> candidates;
     size_t pairs = 0;   // parsed loader lines (duplicates included)
     size_t files = 0;   // .c files read
     size_t rejected = 0;   // non-blank, non-comment lines that did not parse
@@ -191,10 +196,15 @@ inline StubNames load_nid_csv(
         t.pairs++;
         auto existing = t.by_nid.find(nid);
         if (existing != t.by_nid.end()) {
-            if (existing->second != name) t.conflicts++;   // keep the first, count the conflict
+            if (existing->second != name) {
+                t.conflicts++;   // by_nid keeps the first; the rest stay available as candidates
+                auto& c = t.candidates[nid];
+                if (std::find(c.begin(), c.end(), name) == c.end()) c.push_back(name);
+            }
             continue;
         }
         t.by_nid[nid] = name;
+        t.candidates[nid].push_back(name);
         if (!cur_lib.empty()) t.lib_of[nid] = cur_lib;
         if (on_pair) on_pair(nid, name);
     }

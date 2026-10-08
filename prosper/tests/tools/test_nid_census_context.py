@@ -243,6 +243,23 @@ def exercise_names(binary, scratch, importer):
     )
 
 
+def exercise_name_selection(binary, scratch):
+    # N1: a flat database may list a wrong name before the real preimage; the real one must win.
+    real = "PI7jIZj4pcE"   # nid_hash("sceRandomGetRandomNumber")
+    module = scratch / "names-select" / "m.prx"
+    write_module(module, imports=[(real, 1)])
+    csv = scratch / "names-select.csv"
+    csv.write_text(f"{real} notTheRealName\n{real} sceRandomGetRandomNumber\n", encoding="utf-8")
+    result = run_census(binary, module, "--names", str(csv), "--data-only", "--tsv")
+    rows = tsv_rows(result.stdout)
+    check(real in rows and rows[real][1] == "sceRandomGetRandomNumber",
+          "names selection: the candidate that hashes to the NID wins over an earlier wrong one")
+    # N3: an unreadable names path must not be labelled as an authoritative dump.
+    missing = run_census(binary, module, "--names", str(scratch / "no-such-names"), "--data-only")
+    check("[names] no names loaded" in missing.stdout and "authoritative" not in missing.stdout,
+          "names label: a missing names source is not reported as authoritative")
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_nid_census_context.py <nid_census executable>")
@@ -261,6 +278,7 @@ def main():
         exercise_tsv(binary, root, importer, provider)
         exercise_path_controls(binary, scratch)
         exercise_names(binary, scratch, importer)
+        exercise_name_selection(binary, scratch)
     print(f"== FAIL: {failures} ==" if failures else "== PASS ==")
     return int(failures != 0)
 
