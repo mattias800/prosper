@@ -2959,7 +2959,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
-            tests/gpu/state/test_render_state_memo.cpp
+            tests/gpu/state/test_render_state_memo.cpp tests/gpu/state/test_depth_bounds_state.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -3819,6 +3819,9 @@ endif()
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
   prosper_add_gtest(test_raster_launch_capture
     SOURCES tests/gpu/capture/test_raster_launch_capture.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_depth_bounds_capture
+    SOURCES tests/gpu/capture/test_depth_bounds_capture.cpp
     LIBRARIES prosper_core)
   prosper_add_gtest(test_gpu_capture_observation
     SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
@@ -5751,6 +5754,13 @@ endif()
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_shadow_compare_render
         SOURCES tests/gpu/test_shadow_compare_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # Guest depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) against a retained depth
+      # surface with the depth test off. Reaches `shared/...` through render_runner.h.
+      prosper_add_gtest(test_depth_bounds_render
+        SOURCES tests/gpu/test_depth_bounds_render.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 

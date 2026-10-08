@@ -46,9 +46,9 @@ public:
             const auto* ps = draw.ps;
             if (!ps || colors != 1 || draw.mesh_draw || !draw.gs_words().empty() ||
                 draw.instance_count != 1 || ps->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
-                ps->polygon_mode != VK_POLYGON_MODE_FILL || ps->depth_test_enable ||
-                ps->depth_write_enable || ps->stencil_enable || ps->depth_clear_enable ||
-                ps->stencil_clear_enable || raster_quad_raster_state_overridden() ||
+                ps->polygon_mode != VK_POLYGON_MODE_FILL ||
+                prosper::gpu::uses_depth_stencil_attachment(*ps) ||
+                raster_quad_raster_state_overridden() ||
                 PROSPER_ENV_ON("PROSPER_DEPTH_CLEAR_PROBE")) {
                 refuse(state, draw, "fragment-draw-attachment-raster-recipe-unimplemented");
                 continue;

@@ -9,6 +9,52 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The sun adds nothing: the lighting-channel texture is all zero (2026-10-07, #4703)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
+`scripts/kena/linux-reach-level-load.pad`, at the title menu. The builds were `main` `156714914` and the
+depth-bounds branch below. The instruments were RenderDoc captures of three guest frames
+(`PROSPER_RENDERDOC_AT_PAD_FLIP=430`, `PROSPER_GPU_LABELS=1`) and two short register probes that were
+never committed. The F9 bundle still aborts on this title (#3807: binding 32, address
+`0xf00000000000`, declared `0xffffffff`), so there is no `.prgbundle` to replay.
+
+- **The directional light contributes exactly 0.** The deferred sun pass (program `0x500aed0000`)
+  adds 0.0000 luminance to the scene colour in the regions its own shadow mask calls lit, shadowed
+  and partial (12,742 / 60,371 / 5,427 samples). RenderDoc pixel history at a sunlit path pixel
+  shows the draw passing with `shaderOut [0,0,0,0]` in all three frames. The lit scene is ambient
+  light only, which is why the world looks flat and grey next to the oracle (#3781).
+- **Why: the lighting-channel test fails at every pixel.** At pc 43–47 the light ANDs its
+  lighting-channel mask with an `image_load` of UE4's lighting-channel texture, then kills every lane
+  whose result is 0. That texture is 0 at 100% of view pixels.
+  - Its writer (program `0x5008fa0000`, the stencil-to-lighting-channels copy) renders an
+    `R16_UINT` target (`CB_COLOR0_INFO=0x00050408`) through a UINT16_ABGR compressed export
+    (`SPI_SHADER_COL_FORMAT=0x7`).
+  - prosper unpacks every compressed export as FP16 and has no `R16_UINT` colour target, so the
+    value 1 is stored as FP16 bits `0x0001` = 6e-8 in an `R8G8B8A8_UNORM` image, which rounds to 0.
+  - This is a general gap, filed as **#4703** with the evidence and a suggested fix.
+- **The shadow-cascade projections covered every pixel (fixed by #4704).** UE4 restricts each
+  CSM cascade's projection to its depth slice with the depth-bounds test
+  (`DB_DEPTH_CONTROL=0x8`, bounds [0.0005, 0.0016], [0.0015, 0.0065] and [0.0059, 1.0]). The local
+  light volumes use it too (`0x6a`), and so does a near/far pair split at depth 0.00125.
+  - prosper never decoded `DEPTH_BOUNDS_ENABLE`, and bound no depth attachment for a draw that only
+    bounds-tests. Each cascade therefore wrote the whole mask, and the last one drawn won.
+  - With the test implemented, the three cascades partition the screen in the capture.
+  - The test is applied only against depth the guest produced: a retained plane that was valid when
+    the pass began, or one an earlier draw of the same pass wrote. A bounds-only draw with no depth
+    surface, or with a plane nothing has written, runs untested (logged once). It never marks the
+    plane valid. Comparing against prosper's cleared 1.0 would delete reverse-Z slices (#4704 review).
+  - The title frame changes in 0.12% of pixels: the sun the mask feeds still adds 0 (above).
+- **Not yet localised:** the light shafts, the foliage and the grade.
+  - The shafts plausibly need the sun. Auto-exposure brightening a sunless scene would also wash it
+    out. Neither link is measured.
+  - The GBuffer has no grass or fern geometry, and the ground under it is the landscape's dark
+    albedo. The grass pass has not been found.
+- **Instrument note.** The RenderDoc run (and only it) refused three fragment programs
+  (`0x505b7f0000`, `0x5040eb0000`, `0x5040890000`: `shader-recompile/fragment:12046` dropped draws).
+  The default run on the same binary refused none in 46 windows. The RenderDoc frame's final image
+  matches the default run's F9 screenshot, so the measurements above stand. The cause of the
+  difference is unknown.
+
 ## Past New Game: two refusals fixed; the rest are image descriptors, indexed NGG and one fragment mask (2026-10-07, #4706)
 
 Measured on Linux/RADV with `prosper-app` in a visible window, default launch
@@ -540,6 +586,17 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The missing sunlight comes from the shadow projection shadowing every pixel** — false as the
+  cause. The projection did cover every pixel (the unimplemented depth-bounds test, fixed by
+  #4704). With the cascades partitioned, the sun pass still adds exactly 0,
+  because its lighting-channel test fails (#4703, 2026-10-07).
+- **The CSM PCF reads the wrong texels because the gather offsets decode wrongly** — false. The
+  recompiled SPIR-V decodes offsets 0x3e00, 0x3e3e, 0x3e02, 62, 2, 0x23e, 0x200 and 0x202 to the
+  standard (−2..2) 3×3 PCF grid. The shadow atlas holds casters (cascade 0 median depth 0.468)
+  (2026-10-07).
+- **The deferred lights skip the scene because the GBuffer shading-model bits are lost** — false.
+  GBufferB alpha is 177 (DefaultLit, id 1) on 97% of view pixels at the light draw. The early-out
+  is the lighting-channel AND, not the shading model (#4703, 2026-10-07).
 - **Kena's post-New-Game pixel programs `0x5052b20000` / `0x5008cc0000` need `v_writelane_b32` in
   fragment programs** — false. `index.txt`'s `first_bad_op=0x361` came from the compute-safe
   coverage census. The fragment translator accepts both programs' constant-lane spills. The real

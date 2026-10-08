@@ -1866,6 +1866,27 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
     }
+    if (version >= 73u) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid depth-bounds draw count";
+            return false;
+        }
+        for (auto& draw : c.draws) {
+            uint8_t enable = 0;
+            auto& ps = draw.ps;
+            // resolve_pipeline_state clamps both bounds into [0, 1]; anything else was not
+            // written by it.
+            if (!r.u8(enable) || enable > 1u || !r.f32(ps.depth_bounds_min) ||
+                !r.f32(ps.depth_bounds_max) || !(ps.depth_bounds_min >= 0.0f) ||
+                !(ps.depth_bounds_min <= 1.0f) || !(ps.depth_bounds_max >= 0.0f) ||
+                !(ps.depth_bounds_max <= 1.0f)) {
+                error = "invalid depth-bounds draw state";
+                return false;
+            }
+            ps.depth_bounds_enable = enable != 0u;
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.
