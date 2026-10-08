@@ -67,7 +67,11 @@ Reference designs, structural only (CLAUDE.md evidence hierarchy, item 4):
 when the guest itself observes that value through a CPU-visible path, and a case no route below
 covers is refused fail-visibly, never guessed.
 
-1. **Core indirect commands first.** Indirect dispatches keep the #3656 route; indirect draws gain
+1. **Core indirect commands first.** Indirect dispatches keep the #3656 route, on both rings: the
+   graphics ring's argument is an offset from the base `sceAgcDcbSetBaseIndirectArgs` sets, and the
+   async-compute ring's `sceAgcAcbDispatchIndirect` passes the whole 64-bit address because that ring
+   has no indirect base (`hle_agc.cpp:3564-3567`); the device route takes the resolved address
+   either way. Indirect draws gain
    the same shape -- pin the authoritative buffer for the record, validate on the device, and
    record `vkCmdDrawIndirect` / `vkCmdDrawIndexedIndirect`. `DRAW_INDEX_INDIRECT_MULTI` with a
    count maps to `vkCmdDraw*IndirectCount` (Vulkan 1.2 core).
@@ -78,17 +82,30 @@ covers is refused fail-visibly, never guessed.
    pre-pass also enforces every limit the CPU path enforces today, zeroing an out-of-range launch
    and counting it.
 3. **Indirect dependencies are ordering, not refusal.** A producer that has not landed for this
-   submit becomes a recorded pipeline barrier (`SHADER_WRITE` -> `INDIRECT_COMMAND_READ`) on the
-   producer's buffer. `indirect-dependencies` remains a skip reason only where the producer is
-   genuinely outside anything prosper has recorded.
+   submit becomes a recorded `SHADER_WRITE` -> `INDIRECT_COMMAND_READ` dependency on the
+   producer's buffer. This is not a second barrier mechanism: it is one more access kind
+   (`INDIRECT_COMMAND_READ` on the argument range) fed to ADR 0011's barrier inference from the
+   recorded accesses. Under ADR 0009 Stage 1, producers will routinely still be in flight when the
+   consumer is recorded, so "has landed" stops being a CPU-side question at all; the inferred
+   dependency is what orders them. `indirect-dependencies` remains a skip reason only where the
+   producer is genuinely outside anything prosper has recorded.
 4. **Predication becomes `VK_EXT_conditional_rendering`** where the guest predicate is a
    GPU-written 32-bit value over a span of draws and dispatches. Conditional *branches* over
    command streams (`COND_INDIRECT_BUFFER`) stay CPU-decided until a measured title needs more;
-   where the predicate is GPU-produced and the branch matters, that is the case for item 5.
-5. **`VK_EXT_device_generated_commands` only where the guest's command stream is itself
-   GPU-generated** (a GPU-written PM4 or AGC command buffer, or state changes inside a
-   multi-draw that core indirect cannot express). It is an optional host capability, never a
-   requirement: without it, the case is refused with a named reason.
+   where the predicate is GPU-produced and the branch matters, it is refused visibly with a named
+   reason. The conditional-rendering predicate is 32-bit, so it fits only the predicate shapes this
+   item scopes to; 64-bit occlusion-counter predication needs a small reduce pass that writes the
+   32-bit predicate first.
+5. **`VK_EXT_device_generated_commands` only for what its tokens can express**: a GPU-produced
+   multi-draw or multi-dispatch sequence whose per-sequence changes fit DGC's fixed token layout
+   (an execution-set pipeline or shader switch, push constants, index and vertex buffers, a sequence
+   index, and a draw, dispatch or count token). It is an optional host capability, never a
+   requirement; without it, such a sequence is refused with a named reason. **A GPU-written PM4 or
+   AGC command stream is refused visibly**, not routed to DGC: DGC cannot express register writes
+   for blend, depth or render targets, render-pass changes, events, label writes or DMA, and
+   executing guest PM4 on the GPU would add a second PM4 decoder outside the typed-operation list
+   that `GPU-2` (ADR 0011) makes the only input to execution. If such a stream is ever measured, it
+   needs its own ADR reconciled with 0011.
 6. **Every route is observable without a log**, as `IndirectDispatchBackendStats` is today:
    device-resolved, host-fallback and rejected counts per route, and the existing perf-alarm skip
    reasons keep their names.
@@ -106,6 +123,11 @@ a rule may follow once the draw route exists and an instrument can count its CPU
 - A GPU-resolved draw count is invisible to the CPU, so draw-count censuses and the retained-draw
   selection (`retained_draw_selected`) must not assume a known count. Diagnostics that need the
   value read it back off the frame, explicitly, under a diagnostic switch.
+- CPU-side sizing derived from a draw count needs another bound once the count is GPU-resolved.
+  Index and vertex ranges uploaded or validated per draw, and the owned-wave index window
+  (`owned_graphics_wave_draw.cpp:161-164` sizes it from `draw->index_count`), must take an upper
+  bound from the record's own limits or the bound buffer's size, or keep that draw on the CPU path
+  with a named reason.
 - Validation moves from CPU `if`s to shader code, and needs Vulkan-execution tests: a guest record
   produced by a compute pass in the same submit, an out-of-range count zeroed, `firstInstance != 0`,
   and a zero-count no-op. Each must fail with the device route removed.
@@ -135,14 +157,15 @@ By measured skip reason, largest first:
 3. Indirect draws: device route with validation pre-pass (items 1-2).
 4. `DRAW_INDEX_INDIRECT_MULTI` with a count buffer.
 5. Predication via conditional rendering (item 4).
-6. DGC, only if a title is measured issuing a GPU-generated command stream.
+6. DGC, only for a measured GPU-produced multi-draw or dispatch sequence that fits its tokens.
 
 ## Open questions
 
 - Driver support for `VK_EXT_device_generated_commands` on RADV and NVIDIA's Windows driver is
   stated from knowledge (both were reported to expose it after its 2024 release) and is
   **unverified** here; check `vulkaninfo` on both development hosts before relying on it.
-- Whether any title writes a PM4 command stream with the GPU; none is known.
+- Whether any title writes a PM4 command stream with the GPU; none is known, and such a stream is
+  refused (Decision 5) until its own ADR exists.
 - Whether the Black Flag skips are producers prosper never recorded (no fix here) or producers in
   the same submit (fixed by item 3). Step 1 decides.
 - How `firstInstance != 0` should behave: the current refusal predates any evidence either way.
