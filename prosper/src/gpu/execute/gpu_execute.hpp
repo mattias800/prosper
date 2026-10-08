@@ -3021,7 +3021,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         std::shared_ptr<ShaderResourceTable> ngg_vrt;
         if (ngg_admission.ok()) {
             ngg.user_data_complete =
-                read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
+                read_ngg_user_data(ds, ngg_admission.user_sgprs, &ngg.user_data);
             ngg.user_data_address_known = read_ngg_user_data_address(ds, ngg.user_data_address);
             ngg.linked = ngg_linked_chain(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),

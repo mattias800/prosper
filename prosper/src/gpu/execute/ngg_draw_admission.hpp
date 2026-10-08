@@ -174,7 +174,8 @@ struct NggDrawAdmission {
 //                                 "input=strip" on the [ngg-live] line) for P6 to audit.
 //   ngg-user-data-range           no AGC user-data range, a range not starting at 0, or more than
 //                                 the shell's push-constant budget
-//   ngg-user-sgpr-count           RSRC2_GS.USER_SGPR is non-zero and disagrees with the range
+//   ngg-user-sgpr-count           the user-SGPR count (RSRC2_GS.USER_SGPR, or the range when that
+//                                 field is zero) leaves no room for s0:s1 in the push budget
 //   ngg-lds-limit                 RSRC2_GS.LDS_SIZE above 64 KiB or the device's shared memory
 //   ngg-host-compute              no compute on the graphics queue
 //   ngg-layer-route-unavailable / ngg-interpolation-geometry-needs-triangles   (route selection)

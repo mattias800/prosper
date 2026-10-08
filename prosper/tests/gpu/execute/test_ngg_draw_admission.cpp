@@ -124,8 +124,18 @@ TEST(NggDrawAdmission, KenaDecodes) {
               NggInputTopology::TriangleList);
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (8u << 1);
     EXPECT_STREQ(refusal(r, kena_facts()), "admitted") << "RSRC2 USER_SGPR equal to the range";
+    EXPECT_EQ(admit_ngg_draw(r, kena_facts(), radv()).user_sgprs, 8u);
+    // #3135: RSRC2's count is what the SPI loads. Kena's 4324d9f3 has USER_SGPR 12 and a 0..24
+    // range; the other 12 words are reached through s0:s1.
+    auto wide = kena_facts();
+    wide.user_data_range_end = 24;
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (12u << 1);
+    EXPECT_STREQ(refusal(r, wide), "admitted");
+    EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 12u) << "the hardware's count";
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs;
+    EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 24u) << "zero: the AGC range";
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (1u << 27);   // USER_SGPR_MSB: 32
-    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count");
+    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count") << "no room for s0:s1";
 }
 
 TEST(NggDrawAdmission, NotMergedDoesNotApply) {
@@ -191,7 +201,7 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_start = 1; }},
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_end = 33; }},
         {"ngg-user-sgpr-count",
-         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= 4u << 1; }},
+         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= 31u << 1; }},
         {"ngg-lds-limit", [](auto&, auto&, auto& h) { h.max_compute_shared_memory = 4096; }},
         {"ngg-host-compute", [](auto&, auto&, auto& h) { h.compute = false; }},
         {"ngg-layer-route-unavailable",
