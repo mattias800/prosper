@@ -9,6 +9,11 @@
 // Mutation that turns the UNORM16 arm red: drop the `DataFormat::Unorm16` case from
 // `depth_plane_view` (shared/rtt/depth_plane_view.hpp) -- the dispatch then reads the stale
 // 0xFFFF guest bytes and observes 1.0 instead of the rendered 0.25.
+//
+// The import is admitted only when the plane's guest width matches the view: a UNORM16 view of a
+// Z32 plane must not be served depth (retained planes are never evicted and win over colour
+// targets at the same address). Mutation that turns the "Z32 plane" arm red: drop the
+// depth_plane_admits_view() check in the live renderer's importer -- that arm then reads 0.25.
 #include "fixtures/render_runner.h"
 #include <gtest/gtest.h>
 #include "gpu/execute/gpu_execute.hpp"
@@ -16,6 +21,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
+#include "shared/rtt/depth_plane_view.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -28,6 +34,13 @@ namespace {
 
 constexpr uint32_t Width = 64, Height = 8;
 constexpr float RenderedDepth = 0.25f;
+
+// The width rule on its own, including planes no pass described (taken as four bytes).
+using prosper::frontend::depth_plane_admits_view;
+static_assert(depth_plane_admits_view(2, 2) && depth_plane_admits_view(4, 4));
+static_assert(depth_plane_admits_view(0, 4) && !depth_plane_admits_view(0, 2));
+static_assert(!depth_plane_admits_view(4, 2) && !depth_plane_admits_view(2, 4));
+static_assert(!depth_plane_admits_view(2, 0) && !depth_plane_admits_view(0, 0));
 
 struct GuestMapping {
     uint64_t base = 0;
@@ -117,6 +130,7 @@ TEST(LiveComputeDepthUnorm16, ComputeSamplesRendererDepthThroughUnorm16View) {
     ASSERT_NE(guest.base, 0u);
     const uint64_t depth = guest.base;              // rendered by the producer below
     const uint64_t untouched = guest.base + 0x80000;   // never rendered: guest bytes are authority
+    const uint64_t depth32 = guest.base + 0x40000;   // a Z32 plane, rendered like `depth`
     // Every buffer the dispatch touches lives in the guest mapping, as in a real submit. A write
     // the mapping topology cannot place (a host heap address) conservatively revokes every
     // retained depth plane, which would turn each later arm into a test of that rule instead.
@@ -129,6 +143,7 @@ TEST(LiveComputeDepthUnorm16, ComputeSamplesRendererDepthThroughUnorm16View) {
     constexpr size_t PlaneBytes = size_t(Width) * Height * 4;
     std::memset(reinterpret_cast<void*>(depth), 0xff, PlaneBytes);
     std::memset(reinterpret_cast<void*>(untouched), 0xff, PlaneBytes);
+    std::memset(reinterpret_cast<void*>(depth32), 0xff, PlaneBytes);
 
     const uint32_t vs_words[]{0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u,
                               0x7E0C02F2u, 0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u,
@@ -157,22 +172,26 @@ TEST(LiveComputeDepthUnorm16, ComputeSamplesRendererDepthThroughUnorm16View) {
     producer.ps.viewport_h = float(Height);
     producer.ps.min_depth = producer.ps.max_depth = RenderedDepth;
     (void)render_submit_items({producer}, Width, Height);
+    DrawItem producer32 = producer;   // the same pass over a Z32 plane
+    producer32.ps.depth_read_base = producer32.ps.depth_write_base = depth32;
+    producer32.ps.db_z_info = 3;   // Z_32_FLOAT
+    (void)render_submit_items({producer32}, Width, Height);
 
     // Positive control on the premise: the renderer holds the depth, the guest bytes do not.
     // Without this, a renderer that wrote depth back would make every arm below pass for a
     // reason that has nothing to do with the import.
-    {
+    for (const uint64_t plane : {depth, depth32}) {
         std::vector<float> values;
         std::string error;   // the reader takes the backend resource lock itself
-        ASSERT_EQ(prosper::test::read_persistent_ds_depth_array(depth, Width, Height, 0, 1, values,
+        ASSERT_EQ(prosper::test::read_persistent_ds_depth_array(plane, Width, Height, 0, 1, values,
                                                                 error),
                   prosper::test::PersistentDsDepthArrayStatus::Ready)
             << error;
         ASSERT_EQ(values.size(), size_t(Width) * Height);
         EXPECT_EQ(values[0], RenderedDepth) << "the renderer retains the rendered depth";
-        const auto* bytes = reinterpret_cast<const uint8_t*>(depth);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(plane);
         bool stale = true;
-        for (size_t i = 0; i < size_t(Width) * Height * 2; ++i) stale = stale && bytes[i] == 0xff;
+        for (size_t i = 0; i < PlaneBytes; ++i) stale = stale && bytes[i] == 0xff;
         ASSERT_TRUE(stale) << "the guest bytes still hold the clear: only an import can see 0.25";
     }
 
@@ -187,8 +206,11 @@ TEST(LiveComputeDepthUnorm16, ComputeSamplesRendererDepthThroughUnorm16View) {
         // surface would hold round(0.25 * 65535); the D32 image holds 0.25 exactly, which is
         // within that quantization step.
         {"UNORM16 view of a rendered Z16 plane", depth, DataFormat::Unorm16, RenderedDepth},
-        // The established FLOAT32 view of the same plane, unchanged by the fix.
-        {"FLOAT32 view of a rendered plane", depth, DataFormat::Float32, RenderedDepth},
+        // The established FLOAT32 view, of a Z32 plane.
+        {"FLOAT32 view of a rendered Z32 plane", depth32, DataFormat::Float32, RenderedDepth},
+        // The guard: a UNORM16 view of a Z32 plane is not a depth reading of that plane, so it
+        // keeps the guest bytes (0xFFFF -> 1.0) rather than being served the retained depth.
+        {"UNORM16 view of a rendered Z32 plane", depth32, DataFormat::Unorm16, 1.0f},
         // A plane the renderer never drew keeps the guest bytes as its authority.
         {"UNORM16 view of an unrendered plane", untouched, DataFormat::Unorm16, 1.0f},
     };

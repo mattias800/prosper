@@ -1573,7 +1573,10 @@ constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Ref
 struct LiveTargetImageRequest {
     uint32_t width = 0, height = 0;
     uint32_t render_scale = 1;
-    bool allow_depth = false;
+    // Nonzero only for a one-component view that reads a depth plane: the guest bytes per texel
+    // of the plane it reads (2 = Z16, 4 = Z32; frontends/shared/rtt/depth_plane_view.hpp). The
+    // importer serves a retained depth plane only when the plane's own width matches.
+    uint32_t depth_texel_bytes = 0;
     // True only when reflection proves this descriptor is read exclusively through normalized
     // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
     bool normalized_sampling = false;
