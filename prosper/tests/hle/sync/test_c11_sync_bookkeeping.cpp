@@ -626,10 +626,17 @@ int main() {
             }
             return arm;
         };
+        // Several arms destroy the object on purpose before this runs, and a second destroy of an
+        // already-destroyed object is EINVAL, as on the console (#2168). The point of the cleanup is the
+        // absence of EBUSY (a live waiter, a held mutex), so success and "already destroyed" both pass.
+        const auto retired = [](uint64_t rc) { return rc == 0 || rc == 0x80020016ull; };
         const auto cleanup = [&](const std::shared_ptr<C11TimedArm>& arm) {
-            CHECK(call1(sce_cnd_destroy, &arm->cond) == 0,
+            CHECK(retired(call1(sce_cnd_destroy, &arm->cond)),
                   "C11 cleanup: completed waits leave no live waiter count");
-            CHECK(call1(sce_mtx_destroy, &arm->mutex) == 0,
+            // A wait that returns holds the mutex again, and a console refuses to destroy a held mutex
+            // (EBUSY), so release it first; unlocking a free ERRORCHECK mutex is a harmless EPERM.
+            call1(sce_unlock, &arm->mutex);
+            CHECK(retired(call1(sce_mtx_destroy, &arm->mutex)),
                   "C11 cleanup: the drained mutex can be retired");
         };
 
