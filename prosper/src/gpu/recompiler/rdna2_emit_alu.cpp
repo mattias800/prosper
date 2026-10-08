@@ -7204,10 +7204,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.cbuf_store(dword_idx, value, binding, rs.exec_narrowed, rs.exec,
                                  coherent_store);
                 };
-                // The DATA FORMAT owns the physical component COUNT of every format store, and a wider
-                // opcode writes only the components the format has: Table 31 defines identity as
-                // "X000, XY00, XYZ0, or XYZW" by the data format's component count. For MTBUF the
-                // format is the instruction's; for MUBUF it is the descriptor's (`fmt_ncomp` above).
+                // The DATA FORMAT owns the physical component COUNT of every format store: a wider
+                // opcode writes only the components the format has. For MTBUF the format is the
+                // instruction's; for MUBUF it is the descriptor's (`fmt_ncomp` above). Table 31 gives
+                // MTBUF stores identity routing ("X000, XY00, XYZ0, or XYZW" by that component count)
+                // but gives MUBUF format stores the descriptor's DST_SEL. Writing components 0..n-1
+                // in order is therefore right for MUBUF only because a routed MUBUF store was
+                // rejected above (`reject-dst-sel-store`), so what reaches here is identity.
                 // The clamp used to apply to MTBUF only, so buffer_store_format_xyzw through a
                 // one-component 32-bit V# wrote four dwords per lane at a four-byte stride: every lane
                 // overwrote its three neighbours, and only one element per wave kept its value. That
@@ -7274,8 +7277,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     //
                     // The component count comes from the FORMAT, not from the opcode: a
                     // buffer_store_format_xyzw through a 3-component 10_11_11 must not write a fourth
-                    // field, which at k=3 would land back on top of B. Same hazard the MTBUF count
-                    // clamp above addresses, one level down.
+                    // field, which at k=3 would land back on top of B. Same hazard the format
+                    // component-count clamp (`store_n`) above addresses, one level down.
                     // `packed_10_11_11` and `packed_2_10_10_10` name a BIT LAYOUT, not a channel
                     // count. GFX10 names packed formats from the HIGH field down, so 10_11_11 puts
                     // 11 bits at [10:0] and 10 at [31:22] -- while 11_11_10 and 10_10_10_2, which

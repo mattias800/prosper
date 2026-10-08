@@ -4525,6 +4525,56 @@ int main() {
               bad24mubuf_store_xy00 == 0,
           "MUBUF XYZW store through a two-component V# writes XY and leaves the record's tail");
 
+    // The packed 16-bit path takes the same count. A two-component Float16 V# packs X and Y into
+    // ONE dword (0x4000_3c00 = 2.0h:1.0h); four components would pack Z and W into the record's
+    // second dword, which must keep its 0xdeadbeef.
+    ShaderResourceTable rt24mubuf_store_h2 = rt24mubuf_store;
+    rt24mubuf_store_h2.resources[0].format = DataFormat::Float16;
+    rt24mubuf_store_h2.resources[0].num_components = 2;
+    rt24mubuf_store_h2.resources[0].stride = 8;
+    const std::vector<uint32_t> spv24mubuf_store_h2 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store_h2);
+    const size_t h2_words = static_cast<size_t>(N) * 2u;
+    std::vector<uint32_t> mubuf_h2_in(h2_words, 0xdeadbeefu), mubuf_h2_out;
+    if (!spv24mubuf_store_h2.empty())
+        prosper::test::run_compute(spv24mubuf_store_h2, in24, N, N, {}, mubuf_h2_in, &mubuf_h2_out);
+    uint32_t bad24mubuf_store_h2 = 0;
+    for (size_t i = 0; i < N && mubuf_h2_out.size() == h2_words; ++i)
+        if (mubuf_h2_out[i * 2u] != 0x40003c00u || mubuf_h2_out[i * 2u + 1u] != 0xdeadbeefu)
+            ++bad24mubuf_store_h2;
+    CHECK(!spv24mubuf_store_h2.empty() && mubuf_h2_out.size() == h2_words &&
+              bad24mubuf_store_h2 == 0,
+          "MUBUF XYZW store through a two-component Float16 V# packs XY into one dword");
+
+    // And the sub-dword integer path (atomic clear+set per byte). A one-component Uint8 V# with a
+    // one-byte stride gives lane i byte i, so every byte must hold X (1). Four components would
+    // also write Y/Z/W (2/3/4) into the next three lanes' bytes.
+    const uint32_t code24mubuf_store_u8[] = {
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0x7e060283u,   // v_mov_b32 v3, 3
+        0x7e080284u,   // v_mov_b32 v4, 4
+        0x7e0a0f00u,   // v_cvt_u32_f32 v5, v0      (the element index)
+        0xe01c2000u, 0x80020105u,   // buffer_store_format_xyzw v[1:4], v5, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt24mubuf_store_u8 = rt24mubuf_store;
+    rt24mubuf_store_u8.resources[0].format = DataFormat::Uint8;
+    rt24mubuf_store_u8.resources[0].num_components = 1;
+    rt24mubuf_store_u8.resources[0].stride = 1;
+    const std::vector<uint32_t> spv24mubuf_store_u8 = recompile_valu(
+        code24mubuf_store_u8, std::size(code24mubuf_store_u8), 1, 0, &rt24mubuf_store_u8);
+    const size_t u8_words = (static_cast<size_t>(N) + 3u) / 4u;
+    std::vector<uint32_t> mubuf_u8_in(u8_words, 0xdeadbeefu), mubuf_u8_out;
+    if (!spv24mubuf_store_u8.empty())
+        prosper::test::run_compute(spv24mubuf_store_u8, in24, N, N, {}, mubuf_u8_in, &mubuf_u8_out);
+    uint32_t bad24mubuf_store_u8 = 0;
+    for (size_t i = 0; i < u8_words && mubuf_u8_out.size() == u8_words; ++i)
+        if (mubuf_u8_out[i] != 0x01010101u) ++bad24mubuf_store_u8;
+    CHECK(!spv24mubuf_store_u8.empty() && mubuf_u8_out.size() == u8_words &&
+              bad24mubuf_store_u8 == 0,
+          "MUBUF XYZW store through a one-component Uint8 V# writes one byte per lane");
+
     // Kernel 24atomic (#590): the MUBUF 32-bit atomic RMW family. buffer_atomic_add over a binding-3
     // storage buffer — all N dispatched lanes each add 3 to element 0, so the final memory word is 3N.
     // This exercises the opcode -> SPIR-V-atomic mapping end-to-end through the proven cbuf_atomic_rtn
