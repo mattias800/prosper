@@ -5,6 +5,7 @@
 #include "gpu/execute/host_read_barrier.hpp"
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <vector>
 
 namespace prosper::frontend {
 // Owned by the compute context, which destroys it before releasing its device.
@@ -16,6 +17,11 @@ struct PackedRttConversion {
     VkPhysicalDeviceLimits limits{};
     bool attempted = false;
     VkResult setup_result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    // The pass this instance runs. One class serves both packed-10-bit directions: RGBA8 -> packed in
+    // place (the default, for a sampled seed) and packed -> RGBA8 into the second half (the
+    // exact-result mirror, record_packed10_to_rgba8).
+    std::vector<uint32_t> (*build)() = prosper::gpu::build_compute_rgba8_to_packed10;
+    const char* debug_name = "prosper packed_rtt_conversion";
 
     void destroy() {
         if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
@@ -49,14 +55,14 @@ struct PackedRttConversion {
         if (setup_result != VK_SUCCESS) {
             destroy(); return setup_result;
         }
-        const auto words = prosper::gpu::build_compute_rgba8_to_packed10();
+        const auto words = build();
         VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         sci.codeSize = words.size() * sizeof(uint32_t); sci.pCode = words.data();
         VkShaderModule shader = VK_NULL_HANDLE;
         setup_result = vkCreateShaderModule(device, &sci, nullptr, &shader);
         if (setup_result == VK_SUCCESS)   // #3578
             prosper::gpu::vk_name_object(device, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)shader,
-                                         "prosper packed_rtt_conversion");
+                                         debug_name);
         if (setup_result != VK_SUCCESS) {
             destroy(); return setup_result;
         }
@@ -69,10 +75,11 @@ struct PackedRttConversion {
         if (setup_result != VK_SUCCESS) destroy();
         return setup_result;
     }
-    bool fits(uint64_t texels) const {
+    // `words_per_texel` is 2 for the append pass, whose buffer holds the packed and the RGBA8 halves.
+    bool fits(uint64_t texels, uint64_t words_per_texel = 1) const {
         return texels && texels <= UINT32_MAX - 127u &&
-            texels * 4 <= limits.maxStorageBufferRange &&
-            (texels + 127) / 128 <= limits.maxComputeWorkGroupCount[0];
+               texels * 4 * words_per_texel <= limits.maxStorageBufferRange &&
+               (texels + 127) / 128 <= limits.maxComputeWorkGroupCount[0];
     }
     VkResult allocate_binding(VkDescriptorPool& pool, VkDescriptorSet& set) const {
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
@@ -154,6 +161,42 @@ struct PackedRttConversion {
         // owner can map and read it even though this binding never maps it.
         prosper::gpu::record_host_read_barrier(command, scratch,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    // Exact-result mirror of a packed R10G10B10A2 result into an RGBA8 renderer image. `staging` holds
+    // `width*height` packed words (just written by a transfer or retile) followed by as many words of
+    // room; `set` binds it whole. The pass converts into the second half with the CPU path's integer
+    // rounding, then the second half is copied bit for bit into `destination`, which the caller has
+    // moved to TRANSFER_DST_OPTIMAL. The first half is untouched, so guest writeback still reads it.
+    void record_packed10_to_rgba8(VkCommandBuffer command, VkBuffer staging, VkDescriptorSet set,
+                                  VkImage destination, uint32_t width, uint32_t height) const {
+        const uint32_t count = width * height;
+        VkBufferMemoryBarrier buffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        buffer.srcQueueFamilyIndex = buffer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        buffer.buffer = staging;
+        buffer.size = VK_WHOLE_SIZE;
+        buffer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        buffer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &buffer, 0, nullptr);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0,
+                                nullptr);
+        vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
+        vkCmdDispatch(command, (count + 127u) / 128u, 1, 1);
+        buffer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        buffer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &buffer, 0, nullptr);
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = VkDeviceSize{count} * 4u;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        vkCmdCopyBufferToImage(command, staging, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &copy);
+        // The staging allocation is host-visible and pooled; its next owner may map and read it.
+        prosper::gpu::record_host_read_barrier(
+            command, staging, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     }
 };
 } // namespace prosper::frontend
