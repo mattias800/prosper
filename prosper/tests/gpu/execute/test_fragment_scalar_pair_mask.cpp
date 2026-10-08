@@ -23,6 +23,8 @@
 //   ThirdReviewProbesRefuse           #4725's review: a spill slot overwritten on one arm only, a
 //                                     marked word copied through M0 or ttmp, and a loop-carried slot at
 //                                     the header and at the exit
+//   DispatcherSlotReloadRefuses       a CFG-dispatcher case reloading a spill slot that one path never
+//                                     wrote (#4725 round 4)
 //   MemoryPatternRefuses              projecting a pattern loaded from memory onto host lanes,
 //                                     directly and through a spill slot; its control overwrites the
 //                                     loaded words and must compile
@@ -175,6 +177,16 @@ constexpr uint32_t kProbeLoopExitSlot[] = {
     0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u, 0xd761000cu, 0x00010214u,
     0xbf068000u, 0xbf850004u, 0xbe9503c1u, 0xd761000cu, 0x00010215u, 0xbf82fffau,
     0xd7600004u, 0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860204u, PROBE_TAIL(0x0019e480u)};
+// #4725's round-4 review, verbatim: the slot is written on ONE arm of a scalar if, reloaded after
+// the join, and the irreducible tail (test_entry_m0_wave64_kill's kTail shape) forces the CFG
+// dispatcher, whose load_state reloads every slot's Function variable: on the skipped path, the
+// prologue's zero.
+constexpr uint32_t kProbeDispatcherSlot[] = {
+    0x7e0a0280u, 0x7e000505u, 0xd4c2000au, 0x00010080u, 0xbf800000u, 0xbf800000u,
+    0xbf068000u, 0xbf850003u, 0xbe9503c1u, 0xd761000cu, 0x00010215u, 0xd7600004u,
+    0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860a04u, 0xd5010001u, 0x0019e480u,
+    0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u, 0xbf870001u,
+    0xbf82fffdu, 0x7e000280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 // The merge-marked pair copied through M0, and through ttmp0/ttmp1, then ANDed.
 constexpr uint32_t kProbeThroughM0[] = {
     PROBE_PREFIX,           0xbefc0304u, 0xbe86037cu, 0xbefc0305u, 0xbe87037cu, 0x87880206u,
@@ -377,4 +389,18 @@ TEST(FragmentScalarPairMask, ThirdReviewProbesRefuse) {
         << "m0: a marked word copied through M0 keeps its mark";
     EXPECT_TRUE(refuses(kProbeThroughTtmp, std::size(kProbeThroughTtmp)))
         << "ttmp: a marked word copied through ttmp0/ttmp1 keeps its mark";
+}
+
+TEST(FragmentScalarPairMask, DispatcherSlotReloadRefuses) {
+    // Refused at the AND (pc15), by the dispatcher: `cfg-recompile-reject` is the tag only
+    // emit_cfg_state_machine records, so this also pins the route the probe exists to test.
+    constexpr uint64_t kAddress = 0xa4725004ull;
+    EXPECT_TRUE(recompile_fragment(kProbeDispatcherSlot, std::size(kProbeDispatcherSlot), nullptr,
+                                   nullptr, UINT32_MAX, nullptr, false,
+                                   {RecompileDiagnosticStage::Fragment, kAddress})
+                    .empty())
+        << "dispatcher slot: a reloaded slot may hold the prologue's zero and must not project";
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=15 words=87860a04"), std::string::npos) << reason;
 }

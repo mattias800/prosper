@@ -2910,8 +2910,9 @@ struct RegState {
     // from such a register (including through SCC, a destination's own old bits, or a source
     // that was never written). A write whose every input is definite clears the mark.
     // `lane_slot_merge_placeholder` carries the same mark through a v_writelane/v_readlane spill.
-    // The dispatcher needs neither: its `load_state` drops every word the Wave64 MUST analysis
-    // cannot prove. Consumers that turn scalar DATA into lane bits consult it (mask()).
+    // In the CFG dispatcher, `load_state` drops every SGPR word the Wave64 MUST analysis cannot
+    // prove, which covers SGPRs; spill slots carry no such fact, so it marks every reloaded data
+    // slot instead. Consumers that turn scalar DATA into lane bits consult the marks (mask()).
     std::set<int> sreg_merge_placeholder;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Same propagation, second fact: the SGPR's bits came from MEMORY (an SMEM load, or scalar ALU
@@ -3151,9 +3152,9 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // Merge-placeholder and memory-pattern marks (#4706): which scalar words may hold the structured
 // emitter's fabricated zero, or bits loaded from memory. See RegState::sreg_merge_placeholder.
 // Not tracked, and documented at scalar_pair_lane_bit(): a value that crosses a VGPR
-// (v_readfirstlane, a dynamic-lane v_readlane), fragment user-data words, and memory marks across a
-// CFG-dispatcher block edge (load_state starts every case from a fresh RegState; its MUST filter
-// covers the merge-placeholder half, not the memory half).
+// (v_readfirstlane, a dynamic-lane v_readlane), and memory marks on SGPRs across a CFG-dispatcher
+// block edge (load_state starts every case from a fresh RegState; its MUST filter covers the SGPR
+// merge-placeholder half, and it marks every reloaded spill slot itself).
 
 // Whether a DATA read of scalar register `r` may see a fabricated word: marked, or (for an
 // ordinary SGPR) absent from `sreg` while no mask covers it, since `operand_bits` reads absence as

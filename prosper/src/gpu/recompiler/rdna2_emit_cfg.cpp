@@ -3666,10 +3666,14 @@ bool emit_cfg_state_machine(
             return found != entry_slots->end() &&
                    (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
         };
+        // A data slot carries no definite-write fact across a case edge, and one never written on
+        // some path reloads the prologue's zero: mark every reloaded slot (#4706, #4725 review).
         for (const auto& kv : lv)
-            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true)))
+            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
+                state.lane_slot_merge_placeholder.insert(kv.first);
+            }
         for (const auto& kv : lmv)
             if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
                 state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =

@@ -426,10 +426,11 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
 //      than on PS5, because the host's pixel-to-lane assignment is not the PS5's. Such a word
 //      refuses.
 // Fragment user-data words, which `sreg_input` never holds, count as never-written, so they refuse.
-// Not tracked: a value routed through a VGPR (v_readfirstlane, a dynamic-lane v_readlane), and the
-// MEMORY mark across a
-// CFG-dispatcher block edge (each case starts from a fresh RegState; the merge-placeholder half is
-// covered there by load_state's MUST filter). The marks exist for compute too but are not
+// In a CFG-dispatcher case, SGPR words are proven by load_state's Wave64 MUST filter, and every
+// reloaded spill slot is marked (slots carry no definite-write fact across a case edge), so a
+// projection of a reloaded slot refuses there. Not tracked: a value routed through a VGPR
+// (v_readfirstlane, a dynamic-lane v_readlane), and the MEMORY mark on an SGPR across a dispatcher
+// case edge (each case starts from a fresh RegState). The marks exist for compute too but are not
 // consulted there, so compute's projection keeps its behaviour, fabricated zeros included (#4714).
 inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operand& o) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return 0;
