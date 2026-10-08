@@ -82,8 +82,8 @@ UnavailableSources capture_unavailable_draw_sources(const std::vector<DrawItem>&
     auto scan = [&](const ShaderResourceTable* table) {
         if (!table) return;
         for (const auto& r : table->resources)
-            if (capture_source_gate_candidate(r) &&
-                !capture_authority_requires_backing(table, r) && probe(r.gpu_addr))
+            if (capture_source_gate_candidate(r) && !capture_authority_requires_backing(table, r) &&
+                probe(r.gpu_addr))
                 unavailable.insert(&r);
     };
     for (const auto& draw : draws) {
@@ -164,8 +164,7 @@ bool validate_owned_raw_capture_inputs(const ShaderResourceTable& table, std::st
 // a capsule replays with a single-level image and gpu_replay declines IMAGE_LOAD_MIP. It is a
 // parameter rather than unconditional because it grows the capture, and a capture that fails is
 // worse than one that cannot study this one operation -- see the caller's fallback.
-bool collect_intervals(const std::vector<DrawItem>& draws,
-                       const std::vector<ComputeItem>& computes,
+bool collect_intervals(const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
                        const std::vector<GpuState::DmaCopy>& dma_copies,
                        uint64_t resource_limit_bytes, bool own_mip_chain_allocations,
                        std::vector<Interval>& intervals, std::string& error,
@@ -340,9 +339,8 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
 }
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
-                   bool include_resource_data, bool allow_packed_pointer,
-                   GpuCapturedTable& dst, std::string& error,
-                   const std::set<uint32_t>* used_bindings = nullptr,
+                   bool include_resource_data, bool allow_packed_pointer, GpuCapturedTable& dst,
+                   std::string& error, const std::set<uint32_t>* used_bindings = nullptr,
                    GpuCaptureFile* capture = nullptr,
                    const UnavailableSources* unavailable_sources = nullptr) {
     dst.present = src != nullptr;
@@ -711,12 +709,12 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         // would have seen before this change.
         std::string chain_error;
         if (!collect_intervals(draws, computes, dma_copies, resource_limit_bytes,
-                               /*own_mip_chain_allocations=*/true, intervals, chain_error,
-                               nullptr, &unavailable_sources)) {
+                               /*own_mip_chain_allocations=*/true, intervals, chain_error, nullptr,
+                               &unavailable_sources)) {
             intervals.clear();
             if (!collect_intervals(draws, computes, dma_copies, resource_limit_bytes,
-                                   /*own_mip_chain_allocations=*/false, intervals, error,
-                                   nullptr, &unavailable_sources))
+                                   /*own_mip_chain_allocations=*/false, intervals, error, nullptr,
+                                   &unavailable_sources))
                 return false;
         }
     }
@@ -779,8 +777,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         }
         c.owned_waves = d.owned_waves;
         c.ngg_subgroup = d.ngg_subgroup;
-        if (c.ngg_subgroup)   // v72 only when one is carried
-            out.format_version = std::max(out.format_version, kVersionWithNgg);
+        // v72 only when one is carried; v73 only when a draw enables the depth-bounds test.
+        if (c.ngg_subgroup) out.format_version = std::max(out.format_version, kVersionWithNgg);
+        if (c.ps.depth_bounds_enable)
+            out.format_version = std::max(out.format_version, kVersionWithDepthBounds);
         if (d.owned_waves && d.owned_waves->vertex_pending) {
             if (d.owned_waves->vertex.packets.empty() ||
                 !store_raw_shader_version(d.owned_waves->vertex.packets.front().guest_code, true,
@@ -828,10 +828,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.ps_entry = d.ps_entry;
         c.ps_raster_launch = d.ps_raster_launch;
         c.float_transport = d.float_transport;
-        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
-                           c.vrt, error, nullptr, &out, &unavailable_sources) ||
-            !capture_table(producing_pixel_table(d), intervals, include_resource_data, false,
-                           c.prt, error, nullptr, &out, &unavailable_sources))
+        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false, c.vrt, error,
+                           nullptr, &out, &unavailable_sources) ||
+            !capture_table(producing_pixel_table(d), intervals, include_resource_data, false, c.prt,
+                           error, nullptr, &out, &unavailable_sources))
             return false;
         out.draws.push_back(std::move(c));
     }

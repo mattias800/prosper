@@ -203,17 +203,22 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v72 (#3135 P5): the realized merged-NGG draw description (ngg_subgroup_codec.hpp). A capture is
 // written as v72 ONLY when one of its draws carries one; every other capture is still written as
 // v71, byte for byte, so the v71 tail stays the last thing in it (gpu_capture_version_for).
+// v73: each realized draw's depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE and the clamped
+// DB_DEPTH_BOUNDS_MIN/MAX). Written, after the v72 tail, ONLY when a draw enables the test; every
+// other capture keeps its v71/v72 bytes. An older capture reads the test as disabled, which is what
+// every renderer before it did.
 // v74 (#3807): one source-availability mark per draw-table resource (capture_source_gate.hpp): the
 // live renderer's buffer-source gate found nothing mapped at that draw buffer's address and bound its
-// all-zero fallback, so the record carries no blob and replay binds the same fallback. Written, after
-// the v72 tail, ONLY when a draw resource carries the mark; every other capture keeps its v71/v72
-// bytes. An older capture reads every mark as false, which is what it recorded.
-// v73 is claimed by the depth-bounds tail in flight (#4704), whose reader reads its tail at any version
-// >= 73. A v74 file from this change carries no v73 tail, so the two only compose if #4704 lands FIRST
-// (this block then follows its tail). If this lands first, #4704 must take a version above 74 instead,
-// and 73 stays unused; never let a published version's tail layout change meaning.
+// all-zero fallback, so the record carries no blob and replay binds the same fallback. Written ONLY
+// when a draw resource carries the mark; an older capture reads every mark as false, which is what
+// it recorded.
+// Tail order: each tail is present exactly when the file's version reaches it, in version order --
+// v71 raster launch, v72 merged-NGG, v73 depth bounds, v74 source marks. So a v74 file carries the
+// v72 and v73 tails too (written for every draw, absent ones as "none"/"disabled"), and a capture
+// that needs none of v72-v74 is still written as v71, byte for byte.
 constexpr uint32_t kVersion = 74;
 constexpr uint32_t kVersionWithUnavailableSource = 74;
+constexpr uint32_t kVersionWithDepthBounds = 73;
 constexpr uint32_t kVersionWithNgg = 72;
 constexpr uint32_t kVersionWithoutNgg = 71;
 inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
@@ -226,8 +231,11 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
             if (resource.source_unavailable) return true;
     return false;
 }
+// The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
     if (gpu_capture_has_unavailable_source(c)) return kVersionWithUnavailableSource;
+    for (const auto& draw : c.draws)
+        if (draw.ps.depth_bounds_enable) return kVersionWithDepthBounds;
     for (const auto& draw : c.draws)
         if (draw.ngg_subgroup) return kVersionWithNgg;
     return kVersionWithoutNgg;

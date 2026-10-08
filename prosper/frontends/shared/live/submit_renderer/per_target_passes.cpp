@@ -393,9 +393,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 return true;
             });
         const bool uses_ds = std::any_of(pass.begin(), pass.end(), [](const auto* draw) {
-            return draw->ps.depth_test_enable || draw->ps.depth_write_enable ||
-                   draw->ps.depth_clear_enable || draw->ps.stencil_enable ||
-                   draw->ps.stencil_clear_enable;
+            return prosper::gpu::uses_depth_stencil_attachment(draw->ps);
         });
         // A masked color attachment does not determine the depth allocation's size.
         // DB_DEPTH_SIZE_XY is the guest extent; both clear and caster passes must name

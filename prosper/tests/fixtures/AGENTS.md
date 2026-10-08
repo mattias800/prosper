@@ -22,7 +22,9 @@ Two kinds live here and they are worth telling apart:
   `BackendDraw::ngg_subgroup` into its pass-through run draws and records the fill, the shell
   dispatches and their barriers in the pass's own command buffer, with scratch from a retained ring.
   It also publishes the device's merged-NGG capabilities and drops, before a batch is split, the
-  NGG draws that call cannot run (P5).
+  NGG draws that call cannot run (P5). `backend_color_formats.h` holds `render_runner.h`'s
+  guest-to-host colour/texture format tables (host format, bytes per texel, numeric class); extend
+  a format there, not inline in the runner.
 - **Fixtures proper** — `at9_testvec.h`, `handmade_prx.h`, `synth_prx.h`, `spirv_*.h`, `test_data.h`,
   `gta5_*_fixture.hpp`. These are data, frozen at a known-good state so an assertion has something
   stable to compare against.

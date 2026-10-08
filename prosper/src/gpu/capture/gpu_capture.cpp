@@ -1336,9 +1336,7 @@ bool capture_referenced_gpu_ds_seeds(
     // an otherwise self-contained compute capsule from being written.
     const bool references_ds = std::any_of(
         capture.draws.begin(), capture.draws.end(), [](const GpuCapturedDraw& draw) {
-            const auto& ps = draw.ps;
-            return ps.depth_test_enable || ps.depth_write_enable || ps.depth_clear_enable ||
-                   ps.stencil_enable || ps.stencil_clear_enable;
+            return uses_depth_stencil_attachment(draw.ps);
         });
     if (!references_ds) return true;
 
@@ -1351,9 +1349,7 @@ bool capture_referenced_gpu_ds_seeds(
         const bool referenced = std::any_of(
             capture.draws.begin(), capture.draws.end(), [&](const GpuCapturedDraw& draw) {
                 const auto& ps = draw.ps;
-                const bool uses_ds = ps.depth_test_enable || ps.depth_write_enable ||
-                                     ps.depth_clear_enable || ps.stencil_enable ||
-                                     ps.stencil_clear_enable;
+                const bool uses_ds = uses_depth_stencil_attachment(ps);
                 return uses_ds && draw.color0_width == seed.width &&
                        draw.color0_height == seed.height &&
                        ps.depth_read_base == seed.depth_read_base &&

@@ -7,7 +7,10 @@
 //   OwnerMemoBoundsWarmWork     aliases growing metadata or repeats rehashing original code
 //   VersionStageAndReset        an address/first-word memo hiding rewritten or another-stage evidence
 //   ConcurrentOwnerObservedOnce competing workers all hashing/writing the same original version
+//   IndexNamesTranslatorReject  the index naming only the compute-safe coverage census, not the
+//                               stage translator's own terminal reject for the program
 #include "gpu/diagnostics/refused_shader_dump.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"   // record_terminal_reject_reason
 #include "fixtures/test_scratch.h"
 
 #include <gtest/gtest.h>
@@ -169,4 +172,25 @@ TEST(RefusedShaderDump, ConcurrentOwnerObservedOnce) {
     EXPECT_EQ(refused_shader_dump_stats().hash_evaluations, 1u);
     EXPECT_EQ(refused_shader_dump_stats().content_records, 1u);
     EXPECT_EQ(bin_files(refused_shader_dump_directory()), 1u);
+}
+
+TEST(RefusedShaderDump, IndexNamesTranslatorReject) {
+    const fs::path root = fresh_root("refused-shader-reject-reason");
+    const std::vector<uint32_t> code = {0xBE800380u, 0xBF810000u};
+    const std::vector<uint32_t> other = {0xBE800381u, 0xBF810000u};
+    record_terminal_reject_reason(0x7a5c000ull, "recompile-reject",
+                                  "mode=unsupported pc=52 op=0x361\nstage=fragment \"x\"");
+    EXPECT_TRUE(note_refused_shader("ps", 0x7a5c000, code.data(), code.size(), "draw-order=1"));
+    EXPECT_TRUE(note_refused_shader("ps", 0x7a5d000, other.data(), other.size(), "draw-order=2"));
+    std::ifstream index(fs::path(refused_shader_dump_directory()) / "index.txt");
+    const std::string text((std::istreambuf_iterator<char>(index)), {});
+    EXPECT_NE(text.find("draw-order=1 reject=\"recompile-reject mode=unsupported pc=52 op=0x361 "
+                        "stage=fragment  x\"\n"),
+              std::string::npos)
+        << "the translator's reason is kept on the program's one line, newlines and quotes "
+           "flattened so the line stays one parseable record\n"
+        << text;
+    EXPECT_NE(text.find("draw-order=2\n"), std::string::npos)
+        << "a program with no recorded reason carries no reject field\n"
+        << text;
 }

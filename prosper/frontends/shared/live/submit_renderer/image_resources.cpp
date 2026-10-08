@@ -1760,12 +1760,13 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   std::all_of(sampled_dcc_metadata.begin(), sampled_dcc_metadata.end(),
                               [](uint8_t code) { return code == 0xff; });
               uint8_t persistent_dcc_clear_pixel[4]{};
-              const bool persistent_dcc_fast_clear = r.compression_enabled &&
+              const bool dcc_admitted = dcc_fast_clear_admitted(r, decoded_texture_format);
+              const bool persistent_dcc_fast_clear =
+                  r.compression_enabled && dcc_admitted &&
                   sampled_dcc_metadata_got == sampled_dcc_metadata.size() &&
                   prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-                      persistent_dcc_clear_pixel, 1,
-                      sampled_dcc_metadata.data(), sampled_dcc_metadata.size(),
-                      r.num_components, r.alpha_is_on_msb);
+                      persistent_dcc_clear_pixel, 1, sampled_dcc_metadata.data(),
+                      sampled_dcc_metadata.size(), r.num_components, r.alpha_is_on_msb);
               // A native BC chain's pixels depend on every level, so the cache validates
               // (and watches) the whole allocation, not level 0 alone.
               const bool persistent_chain_source =
@@ -3458,20 +3459,19 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                   const size_t metadata_got = sampled_dcc_metadata_got;
                   uint8_t clear_code = 0;
                   dcc_uncompressed = persistent_dcc_uncompressed;
-                  if (!dcc_uncompressed && metadata_got == metadata.size() &&
+                  if (!dcc_uncompressed && dcc_admitted && metadata_got == metadata.size() &&
                       prosper::gpu::gfx10_dcc_fast_clear_rgba8(
-                          texture_pixels.data(), texture_pixels.size() / 4,
-                          metadata.data(), metadata.size(), r.num_components,
-                          r.alpha_is_on_msb, &clear_code)) {
+                          texture_pixels.data(), texture_pixels.size() / 4, metadata.data(),
+                          metadata.size(), r.num_components, r.alpha_is_on_msb, &clear_code)) {
                       dcc_fast_clear_done = true;
                       static std::set<std::pair<uint64_t, uint64_t>> decoded_dcc_images;
                       if (decoded_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
                           fprintf(stderr,
                                   "[render] DCC fast-clear addr=0x%llx meta=0x%llx "
-                                  "%ux%ux%u fmt=%u code=0x%02x bytes=%zu\n",
+                                  "%ux%ux%u fmt=%u comps=%u code=0x%02x bytes=%zu\n",
                                   (unsigned long long)r.gpu_addr,
-                                  (unsigned long long)r.metadata_addr,
-                                  tw, th, r.depth, (unsigned)r.format, clear_code,
+                                  (unsigned long long)r.metadata_addr, tw, th, r.depth,
+                                  (unsigned)r.format, r.num_components, clear_code,
                                   metadata.size());
                   } else if (!dcc_uncompressed) {
                       static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;

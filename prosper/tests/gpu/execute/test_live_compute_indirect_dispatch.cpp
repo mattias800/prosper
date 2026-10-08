@@ -300,6 +300,29 @@ int main() {
               "a zero-group launch publishes no write: nothing downstream is invalidated");
     }
 
+    // ---- Arm 5b: a DIRECT launch with a zero group count is the same hardware no-op ----------------
+    // It used to be reported as "exceeds the workgroup-count limit" and declined, which dropped the
+    // dispatch as a failure (and poisoned its producer epoch) although nothing was wrong (#4131).
+    {
+        reset_output(out);
+        const auto out_base = reinterpret_cast<uint64_t>(out);
+        uint32_t output_writes = 0;
+        set_guest_gpu_write_observer(
+            [&output_writes, out_base](uint64_t address, uint64_t size, const char*) {
+                if (address < out_base + kOutputBytes && out_base < address + size) ++output_writes;
+            });
+        ComputeItem zero = consumer(0, 0x36560065u);   // direct form: no indirect arguments
+        zero.launch.groups_x = 0;
+        zero.launch.groups_y = 0;
+        zero.launch.groups_z = 0;
+        const std::vector<bool> ran = run_submit({zero});
+        set_guest_gpu_write_observer({});
+        CHECK(ran.size() == 1 && ran[0],
+              "a direct zero-group launch is a neutral no-op, not a declined dispatch");
+        CHECK(output_matches(out, 0, kConsumerPattern) && output_writes == 0,
+              "a direct zero-group launch writes and publishes nothing");
+    }
+
     // ---- Arm 6: a device-produced count above the device limit is refused, not launched -----------
     if (excessive_representable) {
         const Counters before = counters();
