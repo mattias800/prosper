@@ -929,6 +929,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
     LIBRARIES prosper_core)
 
+  # prosper's HLE against what a real PS5 returned: tests/data/console_oracle/*.golden.tsv are
+  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv.
+  # No console and no game dump needed.
+  prosper_add_gtest(test_console_oracle_replay
+    SOURCES tests/hle/test_console_oracle_replay.cpp
+    INCLUDES tests/hle
+    LIBRARIES prosper_core)
+  target_compile_definitions(test_console_oracle_replay PRIVATE
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+
   # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
   # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
   # no prosper_core and no game dump.
@@ -2200,6 +2210,12 @@ if(TARGET prosper_core)
   # Storage-image alias access union is metadata-only and must run without Vulkan on every platform.
   prosper_add_gtest(test_storage_image_alias_plan
     SOURCES frontends/shared/tests/test_storage_image_alias_plan.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
+  # Native FP16 or the RGBA8 conversion for a compute-sampled texture: metadata-only.
+  prosper_add_gtest(test_sampled_float16_view
+    SOURCES frontends/shared/tests/test_sampled_float16_view.cpp
     INCLUDES frontends src
     LIBRARIES prosper_core)
 
@@ -4192,6 +4208,12 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
     LIBRARIES prosper_core)
 
+  # sceAgcDriverSubmitMultiAcbs: folds into the queue's own compute context, in 128-descriptor
+  # chunks, with the empty-batch code of the project's libSceAgcDriver.sprx (worker 0x4570).
+  prosper_add_gtest(test_agc_multi_acb
+    SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
   target_include_directories(test_agc_submit_multi PRIVATE tests)
   target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)
@@ -5496,6 +5518,13 @@ endif()
 
       # A compute UNORM16 view of a Z16 plane reads the renderer's retained depth, not the
       # guest bytes (UE4 volumetric-fog shadowing; Kena's washed-out title scene).
+      # A guest-backed one/two-channel FP16 texture keeps signed and >1 values in compute
+      # (UE4 depth-of-field tiles; Kena's foreground blur).
+      prosper_add_gtest(test_live_compute_narrow_float16
+        SOURCES tests/shared/live/test_live_compute_narrow_float16.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
       prosper_add_gtest(test_live_compute_depth_unorm16
         SOURCES tests/shared/live/test_live_compute_depth_unorm16.cpp
         INCLUDES tests frontends src

@@ -1,0 +1,4 @@
+# Cases where prosper's HLE is KNOWN to differ from the console, with the reason (an issue number or
+# a sentence). A mismatch not listed here fails test_console_oracle_replay; a listed case that now
+# matches also fails, so fixing a gap means deleting its line. This is the measured backlog.
+# id	reason

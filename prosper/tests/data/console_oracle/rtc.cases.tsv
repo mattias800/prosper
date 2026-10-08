@@ -1,0 +1,65 @@
+# console-oracle cases: libSceRtc date and tick arithmetic. Pure functions of their arguments.
+# id	lib	func	args	expect     (grammar and flags: tools/console_oracle/payload/lib_oracle.c)
+# SceRtcDateTime = u16 year,month,day,hour,minute,second + u32 microsecond (16 bytes, little endian).
+# SceRtcTick = u64 microseconds since 0001-01-01. 62135596800000000 is 1970-01-01.
+rtc_tick_resolution	libSceRtc.sprx	sceRtcGetTickResolution	-
+rtc_leap_2000	libSceRtc.sprx	sceRtcIsLeapYear	i:2000
+rtc_leap_1900	libSceRtc.sprx	sceRtcIsLeapYear	i:1900
+rtc_leap_2024	libSceRtc.sprx	sceRtcIsLeapYear	i:2024
+rtc_leap_2023	libSceRtc.sprx	sceRtcIsLeapYear	i:2023
+rtc_leap_year0	libSceRtc.sprx	sceRtcIsLeapYear	i:0
+rtc_leap_year10000	libSceRtc.sprx	sceRtcIsLeapYear	i:10000
+rtc_leap_negative	libSceRtc.sprx	sceRtcIsLeapYear	i:-4
+rtc_dim_feb_leap	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2024,i:2
+rtc_dim_feb_common	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2023,i:2
+rtc_dim_feb_1900	libSceRtc.sprx	sceRtcGetDaysInMonth	i:1900,i:2
+rtc_dim_feb_2000	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2000,i:2
+rtc_dim_dec	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2024,i:12
+rtc_dim_apr	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2024,i:4
+rtc_dim_month0	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2024,i:0
+rtc_dim_month13	libSceRtc.sprx	sceRtcGetDaysInMonth	i:2024,i:13
+rtc_dim_year0	libSceRtc.sprx	sceRtcGetDaysInMonth	i:0,i:1
+rtc_dow_leapday	libSceRtc.sprx	sceRtcGetDayOfWeek	i:2024,i:2,i:29
+rtc_dow_unix_epoch	libSceRtc.sprx	sceRtcGetDayOfWeek	i:1970,i:1,i:1
+rtc_dow_y2k	libSceRtc.sprx	sceRtcGetDayOfWeek	i:2000,i:1,i:1
+rtc_dow_year1	libSceRtc.sprx	sceRtcGetDayOfWeek	i:1,i:1,i:1
+rtc_dow_invalid_day	libSceRtc.sprx	sceRtcGetDayOfWeek	i:2024,i:2,i:30
+rtc_dow_invalid_month	libSceRtc.sprx	sceRtcGetDayOfWeek	i:2024,i:13,i:1
+rtc_valid_leapday	libSceRtc.sprx	sceRtcCheckValid	in:e80702001d000c001e000f0000000000
+rtc_valid_not_leap	libSceRtc.sprx	sceRtcCheckValid	in:e70702001d000c001e000f0000000000
+rtc_valid_month13	libSceRtc.sprx	sceRtcCheckValid	in:e8070d001d000c001e000f0000000000
+rtc_valid_hour24	libSceRtc.sprx	sceRtcCheckValid	in:e80702001d0018001e000f0000000000
+rtc_valid_us_one_million	libSceRtc.sprx	sceRtcCheckValid	in:e80702001d000c001e000f0040420f00
+rtc_valid_all_zero	libSceRtc.sprx	sceRtcCheckValid	in:00000000000000000000000000000000
+rtc_valid_null	libSceRtc.sprx	sceRtcCheckValid	null
+rtc_adddays_plus1	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:1
+rtc_adddays_minus1	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:-1
+rtc_adddays_zero	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:0
+rtc_adddays_365	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:365
+rtc_adddays_big	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:1000000
+rtc_adddays_overflow	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:9223372036854775000,i:1000000
+rtc_adddays_null_out	libSceRtc.sprx	sceRtcTickAddDays	null,p64:62135596800000000,i:1
+rtc_adddays_null_in	libSceRtc.sprx	sceRtcTickAddDays	out:8,null,i:1
+rtc_addmin_plus90	libSceRtc.sprx	sceRtcTickAddMinutes	out:8,p64:62135596800000000,i:90
+rtc_addmin_minus1	libSceRtc.sprx	sceRtcTickAddMinutes	out:8,p64:62135596800000000,i:-1
+rtc_cmp_equal	libSceRtc.sprx	sceRtcCompareTick	p64:100,p64:100
+rtc_cmp_less	libSceRtc.sprx	sceRtcCompareTick	p64:100,p64:200
+rtc_cmp_greater	libSceRtc.sprx	sceRtcCompareTick	p64:200,p64:100
+rtc_gettick_leapday	libSceRtc.sprx	sceRtcGetTick	in:e80702001d000c001e000f0000000000,out:8
+rtc_gettick_epoch	libSceRtc.sprx	sceRtcGetTick	in:b2070100010000000000000000000000,out:8
+rtc_settick_epoch	libSceRtc.sprx	sceRtcSetTick	out:16,p64:62135596800000000
+rtc_current_tick	libSceRtc.sprx	sceRtcGetCurrentTick	out:8	ret
+# Edge cases that settle documented DEVIATION comments in hle_kernel_time.cpp.
+rtc_cmp_signed	libSceRtc.sprx	sceRtcCompareTick	p64:0x8000000000000000,p64:100
+rtc_cmp_null_a	libSceRtc.sprx	sceRtcCompareTick	null,p64:100
+rtc_cmp_null_b	libSceRtc.sprx	sceRtcCompareTick	p64:100,null
+rtc_cmp_null_both	libSceRtc.sprx	sceRtcCompareTick	null,null
+rtc_adddays_2p32_plus1	libSceRtc.sprx	sceRtcTickAddDays	out:8,p64:62135596800000000,i:0x100000001
+rtc_addhours_2p32_plus1	libSceRtc.sprx	sceRtcTickAddHours	out:8,p64:62135596800000000,i:0x100000001
+rtc_addmonths_jan31	libSceRtc.sprx	sceRtcTickAddMonths	out:8,p64:63084873600000000,i:1
+rtc_rfc3339_z	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-01-01T00:00:00Z
+rtc_rfc3339_plus5	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-01-01T00:00:00+05:00
+rtc_rfc3339_minus330	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-01-01T00:00:00-03:30
+rtc_rfc3339_fraction	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-01-01T00:00:00.123456Z
+rtc_rfc3339_nozone	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-01-01T00:00:00
+rtc_rfc3339_bad_month	libSceRtc.sprx	sceRtcParseRFC3339	out:8,s:2000-13-01T00:00:00Z

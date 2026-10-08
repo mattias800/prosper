@@ -6426,12 +6426,13 @@ int main() {
               k6_ft_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
           "#2132 counter-arm: a target with a fall-through predecessor keeps the walked value");
 
-    // Kernel 7 (#2202 B1): the fold walks a COMPACTED stream (`retain_fold_instructions`) that drops
-    // EXP among other formats while preserving PCs, so "the previous element of `ins`" is not "the
-    // instruction before it". Here an `exp` sits physically between the `s_branch` at pc=3 and the
-    // target at pc=6, giving the target a real fall-through predecessor — but the previous RETAINED
-    // instruction is still that `s_branch`. Without the physical-adjacency conjunct the rule fires
-    // and *installs a known wrong value*, which is worse than the bug it fixes. It must decline.
+    // Kernel 7 (#2202 B1, revised): the fold walks a COMPACTED stream (`retain_fold_instructions`)
+    // that drops EXP among other formats while preserving PCs. Here an `exp` sits physically between
+    // the `s_branch` at pc=3 and the target at pc=6. #2202 B1 read that `exp` as a fall-through
+    // predecessor and made the rule decline. It is not one: it follows an unconditional branch, no
+    // edge lands on it, and the compacted stream keeps every control transfer, so it is dead code.
+    // The target's only predecessor is still pc=0, and the rule fires. Kernel 7b below is the case
+    // B1 was protecting against: an edge INTO that gap, which really does fall through.
     const uint32_t k7[] = {
         0xBF860005u,                // pc=0  s_cbranch_vccz 5     -> pc=6
         0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
@@ -6443,9 +6444,104 @@ int main() {
     };
     clear_shader_decode_cache();
     auto k7_fetch = resolve_dynamic_fetch(k7, sizeof(k7)/sizeof(k7[0]), seed6, 12, 8);
-    CHECK(k7_fetch.empty() ||
-              k7_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
-          "#2202 B1: a dropped instruction physically between the branch and its target blocks the rule");
+    CHECK(k7_fetch.size() == 1 &&
+              k7_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "#2202 B1 revised: an unreached instruction between the branch and its target is dead "
+          "code");
+
+    // Kernel 7b: the same gap, now entered by a backward `s_branch` at pc=10 that lands on the
+    // `exp` at pc=4 and falls through to the target. Two predecessors: the rule must decline.
+    const uint32_t k7b[] = {
+        0xBF860005u,   // pc=0  s_cbranch_vccz 5     -> pc=6
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820007u,   // pc=3  s_branch 7           -> pc=11
+        0xF80000CFu, 0x00000000u,   // pc=4  exp pos0 v0,v0,v0,v0  (dropped; entered from pc=10)
+        0xF4080108u, 0xFA000000u,   // pc=6  target: s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=8  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF82FFF9u,   // pc=10 s_branch -7          -> pc=4  (into the gap)
+        0xBF810000u,   // pc=11 s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k7b_fetch = resolve_dynamic_fetch(k7b, sizeof(k7b) / sizeof(k7b[0]), seed6, 12, 8);
+    CHECK(k7b_fetch.empty() ||
+              k7b_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a second edge, landing inside the compacted gap, declines the restore");
+
+    // Kernel 12: the target block OPENS with an instruction the compacted stream drops (a VALU),
+    // so no retained instruction sits at the branch target itself. UE4's depth-of-field gather has
+    // this shape: its skip arm loads the OUTPUT descriptor into s[0:7] and exits with s_branch, and
+    // the gather block, entered only from the earlier branch, begins with v_cvt and then samples
+    // the INPUT descriptor still in s[0:7]. Requiring a retained instruction at the target left the
+    // skip arm's load standing, and all 162 samples were bound to the gather's own output (Kena,
+    // KENA_STATUS.md). Mutation that turns this red: restore `prev.pc + prev.len_dwords != pc` in
+    // build_fold_control_plan.
+    const uint32_t k12[] = {
+        0xBF860003u,   // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820005u,   // pc=3  s_branch 5           -> pc=9
+        0x7E020300u,   // pc=4  target: v_mov_b32 v1, v0  (dropped from the fold stream)
+        0xF4080108u, 0xFA000000u,   // pc=5  s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,   // pc=9  s_endpgm
+    };
+    clear_shader_decode_cache();
+    auto k12_fetch = resolve_dynamic_fetch(k12, sizeof(k12) / sizeof(k12[0]), seed6, 12, 8);
+    CHECK(k12_fetch.size() == 1 &&
+              k12_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a branch-exclusive target that opens with a compacted VALU still restores the branch "
+          "state");
+
+    // Kernels 12t/12c: the same shape, but the skip arm branches PAST the first s_endpgm into a
+    // tail the fold never walks. In 12t the tail branches back to pc=4, a second edge into the
+    // window that the decoded stream cannot see, so the fold must decline for the program. In 12c
+    // the tail just ends, the decode cache proves it closed, and the rule fires. Mutation that turns
+    // 12t red: drop the `into_open_tail` term in build_fold_control_plan.
+    uint32_t k12t[] = {
+        0xBF860003u,   // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820006u,   // pc=3  s_branch 6           -> pc=10 (past the s_endpgm)
+        0x7E020300u,   // pc=4  target: v_mov_b32 v1, v0
+        0xF4080108u, 0xFA000000u,   // pc=5  s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,   // pc=9  s_endpgm (the decoded stream ends here)
+        0xBF82FFF9u,   // pc=10 tail: s_branch -7    -> pc=4  (re-enters the window)
+    };
+    clear_shader_decode_cache();
+    auto k12t_fetch = resolve_dynamic_fetch(k12t, sizeof(k12t) / sizeof(k12t[0]), seed6, 12, 8);
+    CHECK(k12t_fetch.empty() ||
+              k12t_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a branch into an unproven tail that re-enters the window declines the restore");
+    k12t[10] = 0xBF810000u;   // pc=10 tail: s_endpgm -- a closed tail
+    clear_shader_decode_cache();
+    auto k12c_fetch = resolve_dynamic_fetch(k12t, sizeof(k12t) / sizeof(k12t[0]), seed6, 12, 8);
+    CHECK(k12c_fetch.size() == 1 &&
+              k12c_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a branch into a proven-closed tail keeps the restore");
+
+    // Kernels 12x: tails that rdna2_append_closed_tail_blocks decodes straight through, because it
+    // follows only direct branches. An indirect transfer (s_setpc_b64) or a debug branch
+    // (s_cbranch_cdbgsys) in the tail can re-enter the window unseen, so the tail must not count
+    // as closed and the fold must decline. Mutation that turns both red: drop the
+    // fold_uncounted_transfer scan of the tail in shader_decode_cache.cpp.
+    for (const uint32_t transfer : {0xBE802000u,   // s_setpc_b64 s[0:1]
+                                    0xBF970000u}) {   // s_cbranch_cdbgsys 0
+        uint32_t k12x[] = {
+            0xBF860003u,   // pc=0  s_cbranch_vccz 3     -> pc=4
+            0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+            0xBF820006u,   // pc=3  s_branch 6           -> pc=10 (past the s_endpgm)
+            0x7E020300u,   // pc=4  target: v_mov_b32 v1, v0
+            0xF4080108u, 0xFA000000u,   // pc=5  s_load_dwordx4 s[4:7], s[16:17], 0x0
+            0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+            0xBF810000u,   // pc=9  s_endpgm (the decoded stream ends here)
+            transfer,   // pc=10 tail: an uncounted transfer
+            0xBF810000u,   // pc=11 tail: s_endpgm
+        };
+        clear_shader_decode_cache();
+        auto k12x_fetch = resolve_dynamic_fetch(k12x, sizeof(k12x) / sizeof(k12x[0]), seed6, 12, 8);
+        CHECK(k12x_fetch.empty() ||
+                  k12x_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+              "a tail holding an indirect transfer or a debug branch is not closed");
+    }
 
     // Kernel 8 (#2202 B2): a predecessor tally that counts only FORWARD branches is not a tally. Two
     // edges reach pc=4 — the forward `s_cbranch_vccz` at pc=0 and the backward `s_branch` at pc=8 —

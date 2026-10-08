@@ -12,6 +12,10 @@ using namespace prosper::gpu;
 static int failures = 0;
 #define CHECK(c, m) do { if (!(c)) { std::fprintf(stderr, "FAIL: %s\n", m); ++failures; } } while (0)
 
+// The hand-built streams below branch to PC12, where their s_endpgm would sit; the decoded
+// stream therefore ends at PC13 and nothing lies past it.
+static const FoldStreamTail kEnd{13, false};
+
 static Rdna2Inst inst(uint32_t pc, uint32_t op, int16_t displacement = 0) {
     Rdna2Inst in{};
     in.pc = pc; in.len_dwords = 1; in.fmt = Rdna2Format::SOPP;
@@ -48,7 +52,7 @@ int main(int argc, char** argv) {
     // These hand-built PCs isolate control metadata from decoder and interpreter behavior.
     std::vector<Rdna2Inst> stream{inst(0, 6, 3), inst(1, 0), inst(3, 2, 8),
         inst(4, 4, 3), inst(5, 0), inst(7, 2, 4), inst(8, 0)};
-    auto plan = build_fold_control_plan(stream);
+    auto plan = build_fold_control_plan(stream, kEnd);
     CHECK(plan.cfg_known && plan.snapshot_count == 2, "two independently qualified targets");
     CHECK(plan.steps[0].save_slot == 0 && plan.steps[3].restore_slot == 0 &&
           plan.steps[3].save_slot == 1 && plan.steps[6].restore_slot == 1,
@@ -57,21 +61,63 @@ int main(int argc, char** argv) {
           "both target blocks reset zero-mip provenance");
     auto changed = stream;
     changed[2].opcode = 0;
-    CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
+    CHECK(build_fold_control_plan(changed, kEnd).steps[3].restore_slot == UINT32_MAX,
           "fall-through prevents exclusive restoration");
+    // A gap between the s_branch (now at PC2, ending at PC3) and the next retained instruction
+    // holds only compacted straight-line code. No edge lands in it, so it is dead code rather than
+    // a predecessor: the one edge into [PC3, PC4] still makes PC4 exclusive.
     changed = stream; changed[2].pc = 2;
-    CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
-          "physical gap prevents restoration even when retained instructions are adjacent");
+    CHECK(build_fold_control_plan(changed, kEnd).steps[3].restore_slot == 0,
+          "an unreached compacted gap is dead code, not a fall-through predecessor");
+    // A SECOND edge, landing inside the gap, falls through to PC4: two predecessors.
+    changed[1] = inst(1, 4, 1);   // s_cbranch_scc0 -> PC3
+    CHECK(build_fold_control_plan(changed, kEnd).steps[3].restore_slot == UINT32_MAX,
+          "a second edge, into the compacted gap, is a real fall-through predecessor");
+    // A SINGLE forward edge landing inside the gap fires: the code above it is dead, the code
+    // below it is dropped straight-line code, and it is PC4's only way in.
+    changed = stream;
+    changed[2].pc = 2;
+    changed[0] = inst(0, 6, 2);   // s_cbranch_vccz -> PC3
+    CHECK(build_fold_control_plan(changed, kEnd).steps[3].restore_slot == 0,
+          "a single forward edge into the compacted gap still restores its branch state");
     changed = stream; changed.push_back(inst(9, 2, -6));
-    CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
+    CHECK(build_fold_control_plan(changed, kEnd).steps[3].restore_slot == UINT32_MAX,
           "backward second predecessor disqualifies the first target");
+    // A lone BACKWARD edge: a loop body after an unconditional s_branch, entered only by its own
+    // back edge at PC2. Its source has not been walked when PC1 is reached, so there is no state
+    // to restore.
+    CHECK(build_fold_control_plan(
+              {inst(0, 2, 3), inst(1, 0), inst(2, 4, -2), inst(3, 0), inst(4, 0)}, kEnd)
+                  .steps[1]
+                  .restore_slot == UINT32_MAX,
+          "a target whose only edge is backward gets no restore");
+    // Branches the plan cannot count make it decline for the whole program.
+    changed = stream;
+    changed[4] = inst(5, 0x17, 0);   // s_cbranch_cdbgsys
+    auto debug = build_fold_control_plan(changed, kEnd);
+    CHECK(!debug.cfg_known && debug.snapshot_count == 0, "a debug branch refuses the proof");
+    changed = stream;
+    changed[4].pc = 5;
+    changed[4].fmt = Rdna2Format::SOPK;
+    changed[4].opcode = 0x1b;   // s_subvector_loop_begin
+    auto subvector = build_fold_control_plan(changed, kEnd);
+    CHECK(!subvector.cfg_known && subvector.snapshot_count == 0,
+          "a subvector loop refuses the proof");
+    // A branch past the first s_endpgm (the stream ending at PC9 while branches target PC12)
+    // reaches a tail the fold never decoded; unless that tail is proven closed, decline.
+    auto open_tail = build_fold_control_plan(stream, FoldStreamTail{9, false});
+    CHECK(!open_tail.cfg_known && open_tail.snapshot_count == 0,
+          "a branch into an unproven tail refuses the proof");
+    auto closed_tail = build_fold_control_plan(stream, FoldStreamTail{9, true});
+    CHECK(closed_tail.cfg_known && closed_tail.steps[3].restore_slot == 0,
+          "a proven-closed tail keeps the proof");
     changed = stream; changed[1].fmt = Rdna2Format::SOP1; changed[1].opcode = 0x20;
-    auto indirect = build_fold_control_plan(changed);
+    auto indirect = build_fold_control_plan(changed, kEnd);
     CHECK(!indirect.cfg_known && indirect.snapshot_count == 0 &&
           indirect.steps[0].reset_zero_mip && indirect.steps.back().reset_zero_mip,
           "indirect transfer refuses finite-CFG proofs for every instruction");
     // The branch targets PC4, which was compacted out. PC5 must nevertheless start a new block.
-    auto gap = build_fold_control_plan({inst(0, 6, 3), inst(1, 0), inst(3, 0), inst(5, 0)});
+    auto gap = build_fold_control_plan({inst(0, 6, 3), inst(1, 0), inst(3, 0), inst(5, 0)}, kEnd);
     CHECK(gap.steps[3].reset_zero_mip, "compacted-out first block instruction still resets proof");
 
     static_assert(sizeof(FoldControlStep) == 16, "instruction facts fit existing plan storage");
@@ -81,21 +127,21 @@ int main(int argc, char** argv) {
     mip.mimg_unorm = mip.mimg_glc = true; mip.mimg_dmask = 1; mip.mimg_dim = 1;
     auto exec = inst(1, 0); exec.fmt = Rdna2Format::VOPC; exec.opcode = 0xd2;
     auto transfer = inst(0, 0); transfer.fmt = Rdna2Format::SOP1; transfer.opcode = 0x20;
-    auto facts = build_fold_control_plan({transfer, exec, mip});
+    auto facts = build_fold_control_plan({transfer, exec, mip}, kEnd);
     CHECK(!facts.cfg_known && facts.steps[1].changes_exec && facts.steps[2].zero_mip_vgpr == 255,
           "instruction facts after an indirect transfer survive CFG refusal");
     exec.opcode = 0xc2;
     mip.src[0].value = 254;
-    facts = build_fold_control_plan({exec, mip});
+    facts = build_fold_control_plan({exec, mip}, kEnd);
     CHECK(!facts.steps[0].changes_exec && facts.steps[1].zero_mip_vgpr == UINT16_MAX,
           "ordinary compare preserves EXEC and out-of-range mip operand has no shape");
     exec.sdst = {OperandKind::Special, 126};
     mip.opcode = 9; mip.mimg_nsa = 1; mip.len_dwords = 3; mip.words[2] = 0xff00;
-    facts = build_fold_control_plan({exec, mip});
+    facts = build_fold_control_plan({exec, mip}, kEnd);
     CHECK(facts.steps[0].changes_exec && facts.steps[1].zero_mip_vgpr == 255,
           "explicit scalar EXEC destination and NSA mip operand retain their distinct facts");
     mip.mimg_tfe = true;
-    CHECK(build_fold_control_plan({mip}).steps[0].zero_mip_vgpr == UINT16_MAX,
+    CHECK(build_fold_control_plan({mip}, kEnd).steps[0].zero_mip_vgpr == UINT16_MAX,
           "unsupported mip modifier refuses the cached shape");
 
     // Reuse the exact code address while changing instruction facts and live register values.

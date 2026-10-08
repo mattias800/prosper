@@ -20,6 +20,7 @@
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
+#include "shared/compute/sampled_float16_view.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/compute_view_swizzle.hpp"
@@ -9004,20 +9005,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // R32 image to RGBA32F every dispatch. Three-channel optimal images are not universally
             // supported, so retain the portable four-channel expansion for that uncommon case.
             const bool sampled_float32_native = sampled_float32 && sampled_components != 3;
-            // Renderer imports and compute 3D RGBA16F textures can use their exact native sampled
-            // representation. Narrowing a volume to RGBA8 discarded its HDR range and prevented a
-            // retained native storage result from seeding the next ping-pong sample on the GPU.
-            // Ordinary guest-backed 2D FP16 keeps its historical RGBA8 conversion: native RGBA16F
-            // sampling was measured 7x slower in Astro Bot's full-resolution composite on RADV.
-            const bool sampled_renderer_narrow_float16 = renderer_owned &&
-                ((live_target.format == LiveTargetPixelFormat::R16Float &&
-                  sampled_components == 1) ||
-                 (live_target.format == LiveTargetPixelFormat::Rg16Float &&
-                  sampled_components == 2));
-            const bool sampled_float16_native = !bi.storage &&
-                r->format == DataFormat::Float16 && sampled_components != 3 &&
-                ((sampled_components == 4 && (bi.imported || dim_3d)) ||
-                 sampled_renderer_narrow_float16);
+            // Native FP16 or the RGBA8 conversion: shared/compute/sampled_float16_view.hpp.
+            const bool renderer_narrow_float16 =
+                (live_target.format == LiveTargetPixelFormat::R16Float &&
+                 sampled_components == 1) ||
+                (live_target.format == LiveTargetPixelFormat::Rg16Float && sampled_components == 2);
+            const bool sampled_float16_native = !bi.storage && r->format == DataFormat::Float16 &&
+                                                prosper::frontend::sample_float16_natively(
+                                                    {sampled_components, renderer_owned,
+                                                     renderer_narrow_float16, bi.imported, dim_3d});
             const bool sampled_unorm8x2 = !bi.storage && r->format == DataFormat::Unorm8 &&
                                           sampled_components == 2;
             const bool sampled_unorm16_native = !bi.storage && r->format == DataFormat::Unorm16 &&

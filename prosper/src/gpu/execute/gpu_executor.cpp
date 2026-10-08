@@ -3145,7 +3145,7 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
     else {
         const auto plan_start = profile_fold && pcrel_dispatch_target != UINT32_MAX
             ? FoldClock::now() : FoldClock::time_point{};
-        local_control_plan = build_fold_control_plan(ins);
+        local_control_plan = build_fold_control_plan(ins, decoded->fold_tail);
         if (profile_fold && pcrel_dispatch_target != UINT32_MAX)
             pcrel_plan_ms = std::chrono::duration<double, std::milli>(
                 FoldClock::now() - plan_start).count();
@@ -3445,17 +3445,22 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
     // THE QUALIFYING SHAPE, stated as what the code actually tests (#2202 review, B1/B2):
     //
     //   * `ins` is the COMPACTED fold stream (`retain_fold_instructions`), which drops ordinary
-    //     VALU/EXP/DS/FLAT while preserving original PCs. So "the previous element" is the previous
-    //     RETAINED instruction, and a dropped VALU block between it and the target would be
-    //     invisible. The check is therefore PHYSICAL: `prev.pc + prev.len_dwords == ins[k].pc`
-    //     proves prev immediately precedes the target in the real program, whatever was compacted
-    //     away. Without it a target with a genuine fall-through predecessor can qualify, and the
-    //     restore then installs a *known* wrong value — a worse failure than the bug being fixed.
-    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the target.
-    //   * EXACTLY ONE branch in the DECODED STREAM targets it, counted over BOTH directions. A
-    //     backward edge into the target is a second predecessor and disqualifies it. "Decoded
-    //     stream" rather than "program" is deliberate: the decode stops at the first s_endpgm, so
-    //     anything past it is not scanned. B1 existed because a property of a stream was described
+    //     VALU/EXP/DS/FLAT while preserving original PCs but keeps every control transfer. So the
+    //     code between the previous retained instruction and this one -- the gap -- is straight-line
+    //     code that falls through to it and is entered only by branches landing in it.
+    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the gap.
+    //   * EXACTLY ONE branch in the DECODED STREAM targets the gap or the instruction, counted over
+    //     BOTH directions, and it is FORWARD. A backward edge disqualifies it, alone or not. A
+    //     SECOND edge -- landing inside the gap or on the instruction -- disqualifies it too: that
+    //     is the real fall-through #2202 B1 guarded against. A single forward edge landing inside
+    //     the gap still fires. A gap no edge reaches is dead code.
+    //   * Edges the plan cannot count make it decline for the whole program: the debug branches
+    //     (s_cbranch_cdbg*), s_subvector_loop_begin/end, and any branch into code past the first
+    //     s_endpgm unless that tail is proven closed (FoldStreamTail). The first version demanded a retained instruction AT
+    //     the target (`prev.pc + prev.len_dwords == ins[k].pc`), which missed every block opening
+    //     with VALU: UE4's depth-of-field gather then bound its own output as its input (Kena).
+    //     "Decoded stream" rather than "program" is deliberate: the decode stops at the first
+    //     s_endpgm, so anything past it is not scanned. B1 existed because a property of a stream was described
     //     as a property of a program, so the distinction is spelled out rather than assumed.
     //   * The program contains no indirect control transfer at all; one makes the CFG
     //     unrepresentable by any scan over SOPP displacements, so the rule declines to fire.

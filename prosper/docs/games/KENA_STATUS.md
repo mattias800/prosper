@@ -51,6 +51,69 @@ They are **not drawn yet**. A layered draw is admitted only when every bound att
 - snapshots in the PR.
 
 **The level load sometimes sits idle for minutes** before it resumes. Every guest thread is blocked; the game thread is in an untimed `sceKernelWaitEventFlag`. See #4745.
+## Depth of field works: two general fixes; exposure still open (2026-10-08)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
+`PROSPER_NULL_PAGE=1`, an empty `PROSPER_GUEST_ARGS`, `scripts/kena/linux-reach-level-load.pad`,
+snapshots at pad flip 420 and RenderDoc captures at pad flip 430. `main` is `6089081de`.
+
+| frame at pad flip 420 | mean luminance | foreground gradient | near-black pixels | mean \|L − oracle\| |
+|---|---|---|---|---|
+| `main` | 65.6 | 5.77 | 0.01% | 26.3 |
+| fix 2 alone (narrow FP16) | 64.5 | 5.60 | 1.38% | 25.9 |
+| both fixes (PR head) | 66.7 | 3.34 | 0.01% | 26.6 |
+| PS5 oracle (#3781, 1.04) | 44.4 | 2.49 | 4.61% | — |
+
+The foreground gradient is the mean horizontal luminance step in the lower quarter left of the
+version text, so lower means blurrier. The oracle's camera and version differ, so the last column is
+indicative only.
+
+- **The DOF chain ran and produced nothing.** UE4's Diaphragm DOF is all compute. Its setup pass
+  writes a valid signed circle of confusion (−13.1 to 2.6). But all four gather passes wrote exactly
+  zero, so the recombine left the scene unchanged (mean |ΔL| 0.00037).
+- **Fix 1: the descriptor fold lost a branch-exclusive restore.**
+  - The gather (`0x500a7f0000`) opens by loading its OUTPUT T# into `s[0:7]` on a skip arm that
+    stores zeros and exits with `s_branch`. Its gather block is entered only from the earlier
+    branch, opens with `v_cvt`, and samples its INPUT T#, which is still in `s[0:7]` from user data.
+  - The fold restores the branch's state at such a target (#2132). It required a retained
+    instruction AT the target, but the compacted fold stream drops the VALU. So the skip arm's load
+    stood, and all 162 samples were bound to the gather's own output.
+  - The fold now accepts a gap of compacted instructions when exactly one edge, a forward one,
+    enters [gap, target] (`fold_control_plan.hpp`). It declines for the whole program when it
+    holds branches it cannot count: debug branches, subvector loops, or a branch into code past
+    the first `s_endpgm` that is not proven closed. The gather then samples the reduce pyramid
+    (`0x509dac0000`, 1600×904).
+  - The same fix removed the 16 `[t8-dropped] ... reason=words-unknown` T#s of the TAA draw
+    `0x500a480000` (16 → 0 in a run).
+- **Fix 2: narrow FP16 was sampled as RGBA8.**
+  - Live compute converted guest-backed 2D FP16 textures to RGBA8 UNORM, which clamps to [0, 1].
+    The DOF tiles keep the foreground CoC, which is negative, in RG16F. Converted, every tile read
+    "no blur" and every gather took its skip arm.
+  - One- and two-channel FP16 now samples natively (`shared/compute/sampled_float16_view.hpp`).
+    Guest-backed RGBA16F keeps the conversion, which avoids the 7× native cost measured on
+    Astro Bot but still clamps HDR or signed RGBA16F data (#4738).
+  - Alone, this fix ran the gathers against the wrong input and left black tile holes (1.38% of
+    pixels). With fix 1 the holes are gone and the foreground and the cat statues blur as on PS5.
+- **Exposure: open, and it matters (the frame is 66.7 against the oracle's 44.4).**
+  - The eye-adaptation draw (`0x5009a20000`) does 18 `ImageFetch`es, all from one 1×1 image that
+    reads (0, 0, 0, 0). RenderDoc lists that image (capture-local id 141) as a `2D Color
+    Attachment` created at startup, also bound by draw `0x5007cd0000`, in **`R8G8B8A8_UNORM`**.
+  - The eye-adaptation targets in the same frame are different images in a different format:
+    the 1×1 the draw writes (22118) and the previous frame's (27865), which the DOF temporal
+    pass, the DOF reduce, TAA and a 1×1 copy dispatch read, are **`R32G32B32A32_FLOAT`**.
+  - So the format discriminator points at UE4's 8-bit `BlackDummy`, not at an eye-adaptation
+    target. The written value stays (2, 2, 1, 2) on every arm.
+  - Not settled, because prosper's renderer format for a colour target comes from its own
+    mapping of the guest `CB_COLOR` format. That was not cross-checked against the guest register
+    for 141; a float target folded to RGBA8 would look exactly like this.
+  - Next step: log `CB_COLOR*_INFO` for the pass that clears 141, and the T# format the exposure
+    draw fetches through (`PROSPER_TEXLOG` limited to that draw).
+- **The white flowers are not localised.**
+  - The title route has no `[ngg-refused]` lines and no `dropped-draws` alarm.
+  - A per-draw census of the first base pass found many draws that change no pixel of one MRT,
+    including the fern draws, which visibly render later. That census has no positive control and
+    proves nothing about flowers.
+- **Rung.** Still 2.
 
 ## The level-load device loss was a loop counter the recompiler never carried (2026-10-08)
 
@@ -868,6 +931,16 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).
 - **The level-load device loss is the newly admitted indexed NGG draw** — false. A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU in ordinary draws of pixel program `0x5007ad0000`, and `main`, without the draw, loses the device at the same pad time (2026-10-08, #3135).
 - **Pruning `s_cbranch_execz` under a full EXEC unblocks `11562c72`'s v4 read** — false. EXEC at main pc 582 is `s[0:1]` (tid < 240), not all-ones. The read is a lane-subset question (tid < 220 inside tid < 240) (2026-10-08, #3135).
+- **The foreground is sharp because the DOF passes do not run or the CoC is 0 everywhere** —
+  false. All DOF dispatches run, and the setup pass writes a signed CoC from −13.1 to 2.6. The
+  gathers wrote zero because their tile input was clamped to [0, 1] and their colour input was
+  their own output (2026-10-08).
+- **The DOF gather's black tile holes come from its tile data** — false. They appeared only once
+  narrow FP16 sampled natively, and came from the gather sampling its own output descriptor; with
+  the fold fix they are gone (2026-10-08).
+- **The gathers sample the reduce pyramid only after a renderer-target invalidation fix** — false.
+  The reduce pass writes `0x509dac0000`, not the setup output's range. The gather's samples were
+  attributed to the wrong descriptor by the fold, not served a stale target (2026-10-08).
 - **Indexed merged-NGG draws need the subgroup shell to take per-lane vertex indices** — false. Every lane's launch values already come from per-lane records that the CPU writes:
   - v5 = `first_vertex + es_vertex[t]`, and v8 is the instance;
   - the P1 planner already deduplicated `es_vertex` by value.
