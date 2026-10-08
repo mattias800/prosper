@@ -6132,8 +6132,8 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
 
 // A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this read point (any non-negative immediate: `addr` is the effective
-// address, immediate included); the table owns its 4 or 8 bytes from index zero.
+// GPU. The proof authenticates this read point (any aligned non-negative immediate: `addr` is the
+// effective address, immediate included); the table owns its 4 or 8 bytes from index zero.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
     const bool x2 = use.required_size == 2u * sizeof(uint32_t);
