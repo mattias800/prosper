@@ -300,7 +300,7 @@ accepted the only admitting route for the width question is proof (`ProvenVotes`
 routes do not exist yet. (`owned_graphics_wave_draw.cpp` admits wave-wide raw loads, not width
 emulation.)
 Violated today, narrowed by #4714: every Wave64 compute/fragment path that turns scalar data into an
-EXEC/VCC lane bit now consults the fabricated-zero mark, but the Wave32 mask forms
-(`allow_b32_masks`) and the merged-NGG shell's VCC reconstruction do not (#4714).
-Status: proposed (adr:0028)
+EXEC/VCC lane bit consults the fabricated-zero mark, but the Wave32 mask forms (`allow_b32_masks`)
+and the merged-NGG shell's VCC reconstruction do not (#4714).
+Status: accepted
 Enforcement: adr:0028

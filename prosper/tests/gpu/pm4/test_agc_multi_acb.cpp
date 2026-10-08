@@ -33,6 +33,10 @@
 //   OversizedCountIsRejected             the count-extent refusal is removed (the array extent wraps)
 //   DescriptorOrderIsPreserved           descriptors are folded out of order: the last write to the
 //                                        same register must win
+//   SubmitAcbIgnoresTheQueuesUpperHalf   sceAgcDriverSubmitAcb keys its compute context on all 64 bits
+//                                        of the first argument (#4743), so a guest that leaves rdi's
+//                                        upper half dirty lands in a different context from the one
+//                                        sceAgcDriverSubmitMultiAcbs names with the same low 32 bits
 #include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/command_processor.hpp"
 
@@ -238,6 +242,41 @@ TEST_F(MultiAcb, OversizedCountIsRejected) {
     const uint64_t before = submits();
     EXPECT_EQ(call(11, streams.data(), words.data(), 0x40000001u), kInvalidArg);
     EXPECT_EQ(submits(), before);
+}
+
+TEST_F(MultiAcb, SubmitAcbIgnoresTheQueuesUpperHalf) {
+    // Both libSceAgcDriver entry points compare `edi`: the queue is a 32-bit argument, so the upper
+    // half of rdi (legal garbage under the SysV ABI) is not part of its identity.
+    constexpr const char* kAcbNid = "gSRnr79F8tQ";   // sceAgcDriverSubmitAcb
+    HleFn acb = Hle::lookup(kAcbNid);
+    auto acb_hook = Hle::return_hook_of(kAcbNid);
+    ASSERT_NE(acb, nullptr);
+    ASSERT_NE(acb_hook, nullptr);
+
+    const auto one = sh_write(0x7e1, 0x0a0a0a0au);
+    // SubmitAcb reads a 16-byte record {stream address, uint32 dwords, uint32 flags}.
+    struct Record {
+        uint64_t stream;
+        uint32_t dwords;
+        uint32_t flags;
+    } record{U(one.data()), uint32_t(one.size()), 0};
+    constexpr uint64_t kQueue = 0x12;
+    constexpr uint64_t kDirty = 0xdead0000'00000000ull | kQueue;
+    EXPECT_EQ(acb(kDirty, U(&record), record.dwords, 0, 0, 0), 0u);
+    acb_hook();
+
+    // The same hardware queue through the other entry point, with a clean register.
+    const auto two = sh_write(0x7e2, 0x0b0b0b0bu);
+    const uint64_t streams[1] = {U(two.data())};
+    const uint32_t words[1] = {uint32_t(two.size())};
+    EXPECT_EQ(call(kQueue, streams, words, 1), 0u);
+
+    // One queue, one context: both writes are visible under the 32-bit queue id.
+    uint32_t v = 0;
+    ASSERT_TRUE(sh(kQueue, 0x7e1, &v)) << "SubmitAcb with a dirty rdi upper half missed queue 0x12";
+    EXPECT_EQ(v, 0x0a0a0a0au);
+    ASSERT_TRUE(sh(kQueue, 0x7e2, &v));
+    EXPECT_EQ(v, 0x0b0b0b0bu);
 }
 
 TEST_F(MultiAcb, DescriptorOrderIsPreserved) {

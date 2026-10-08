@@ -1,6 +1,6 @@
 ---
 kind: adr
-status: proposed
+status: accepted
 date: 2026-10-07
 ---
 
@@ -29,14 +29,11 @@ today, read from the code on `origin/main`:
   on that path rather than beside it.
 - **Recompile failures** for either stage are reported separately as `fragment/recompile` and
   `compute/recompile`; those are prosper defects, not host limits, and are out of scope here.
-- **One approximation on the default path, narrowed by #4714.** A scalar DATA word that may be the
-  structured emitter's fabricated zero must not become a lane-mask bit. #4711 guarded the fragment
-  pair projection; #4714 puts one predicate (`scalar_words_projectable`) in front of the pair
-  projection and of every Wave64 compute/fragment op that writes EXEC/VCC from scalar data
-  (`s_cselect_b64/b32`, `s_pack_*`, `s_lshl/lshr_b64`, `s_bfe_u64`, `s_bitreplicate`, `s_mov`,
-  `s_and_saveexec`) on both stages. **Not covered:** the Wave32 mask forms (`allow_b32_masks`) and the
-  merged-NGG shell's VCC reconstruction, which rely on a CFG definiteness proof rather than the
-  mark. That residue is still an exception to "the default never approximates".
+- **One known approximation on the default path.** The Wave64 scalar-pair projection (a 64-bit
+  scalar mask pair projected onto an invocation's own bit) is guarded against fabricated-zero halves
+  for fragment (#4711), but the compute projection does not consult that mark (#4714, open), so
+  `main` can use a synthetic zero as a lane mask today. That is a current exception to this ADR's
+  "the default never approximates"; #4714 closes it.
 
 This already satisfies `FAIL-1` for refusals: nothing refused is skipped silently. What it does not
 do is run the programs. Evidence from *Assassin's Creed Black Flag Resynced* `PPSA28183` on
@@ -84,8 +81,8 @@ shadPS4 and sharpemu do workgroup exchange for compute only, and prosper does pr
 One policy for every guest Wave64 program on a host that cannot offer a native 64-lane subgroup
 for that stage. Let W be the host subgroup width for the stage (W < 64; 32 on NVIDIA, as low as 8
 on Intel and lavapipe). Each program takes the first route that applies, chosen per shader by
-analysis, and every route is logged by name. The default never approximates (the Wave32 residue
-named under #4714 above is a defect to close, not a precedent).
+analysis, and every route is logged by name. The default never approximates (the #4714 exception
+above is a defect to close, not a precedent).
 
 1. **Native.** A host that offers a required 64-lane subgroup for the stage runs the program
    natively, always. Nothing below applies to it; AMD/RADV hosts see no change.
@@ -123,7 +120,7 @@ named under #4714 above is a defect to close, not a precedent).
 
    Each rewrite needs the same proof standard as a certificate: a positive arm and a mutation arm.
    A rewrite that projects a 64-bit scalar mask pair onto the invocation's own bit must also prove
-   neither half is a fabricated zero (the #4711 mark, consulted for Wave64 in both stages by `scalar_words_projectable` since #4714).
+   neither half is a fabricated zero (the #4711 mark, consulted in both stages once #4714 lands).
    A program it fully rewrites never reaches routes 3-5.
 3. **Compute, cross-lane operations only in uniform control flow: workgroup exchange.** One lane
    per invocation; ballot, vote, readlane, `mbcnt` and DPP/permutes that cross a W-lane boundary
