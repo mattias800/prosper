@@ -55,7 +55,7 @@ TEST(NidStubNames, ParseCsvLineRejectsMalformedNidAndExtraTokens) {
     std::string nid, name;
     // NID must be exactly 11 chars of the Sony base64 alphabet.
     EXPECT_FALSE(parse_nid_csv_line("short sceA", &nid, &name));   // too short
-    EXPECT_FALSE(parse_nid_csv_line("has_underscore0 sceA", &nid, &name));   // '_' not in alphabet
+    EXPECT_FALSE(parse_nid_csv_line("PI7jIZj4pc_ sceA", &nid, &name));   // '_' not in alphabet
     EXPECT_FALSE(parse_nid_csv_line("0x1234 sceA", &nid, &name));   // too short / not a NID
     // Swapped columns: the name-shaped token is not a valid NID.
     EXPECT_FALSE(parse_nid_csv_line("sceRandomGetRandomNumber PI7jIZj4pcE", &nid, &name));
@@ -99,6 +99,20 @@ TEST(NidStubNames, LoadCsvKeepsFirstOnDuplicateAndCountsConflict) {
     EXPECT_EQ(t.by_nid.at("aaaaaaaaaaa"), "first");
     EXPECT_EQ(t.conflicts, 1u);
     EXPECT_EQ(t.by_nid.size(), 2u);
+    fs::remove(p);
+}
+
+TEST(NidStubNames, LoadCsvKeepsEveryDistinctCandidateInFileOrder) {
+    const fs::path p = scratch("cand.csv");
+    write_file(p,
+               "aaaaaaaaaaa first\n"
+               "aaaaaaaaaaa second\n"
+               "aaaaaaaaaaa second\n"   // repeat of a candidate is not a new one
+               "aaaaaaaaaaa third\n");
+    auto t = load_nid_csv(p.string());
+    EXPECT_EQ(t.by_nid.at("aaaaaaaaaaa"), "first");
+    const std::vector<std::string> want = {"first", "second", "third"};
+    EXPECT_EQ(t.candidates.at("aaaaaaaaaaa"), want);
     fs::remove(p);
 }
 

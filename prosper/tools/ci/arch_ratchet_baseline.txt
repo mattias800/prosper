@@ -142,8 +142,9 @@ getenv|prosper/src/hle/graphics/hle_agc.cpp 49
 getenv|prosper/src/hle/graphics/hle_graphics.cpp 15
 getenv|prosper/src/hle/input/hle_pad.cpp 10
 getenv|prosper/src/hle/input/ime.cpp 3
-getenv|prosper/src/hle/kernel/hle_kernel.cpp 39
+getenv|prosper/src/hle/kernel/hle_kernel.cpp 37
 getenv|prosper/src/hle/kernel/hle_kernel_time.cpp 17
+getenv|prosper/src/hle/kernel/mutex_diagnostics.hpp 2  # moved verbatim from hle_kernel.cpp (the PROSPER_MUTEX_TRACE and _WAITLOG gates); no new reads
 getenv|prosper/src/hle/kernel/timedwait_census.hpp 1
 getenv|prosper/src/hle/memory/hle_kernel_mem.cpp 20
 getenv|prosper/src/hle/service/hle_service.cpp 4
@@ -200,7 +201,7 @@ file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7814  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559)
-file-size|prosper/src/hle/kernel/hle_kernel.cpp 5555
+file-size|prosper/src/hle/kernel/hle_kernel.cpp 5541
 # note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
 # including changed-line formatting; other memory behavior is unchanged.
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
@@ -263,8 +264,9 @@ platform-ifdef|prosper/src/hle/graphics/hle_agc.cpp 5
 platform-ifdef|prosper/src/hle/input/ime.cpp 8
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
 platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
-platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 59
+platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 55
 platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 9
+platform-ifdef|prosper/src/hle/kernel/mutex_diagnostics.hpp 4  # moved verbatim from hle_kernel.cpp with the diagnostics; hle_kernel.cpp's row dropped by the same amount
 platform-ifdef|prosper/src/hle/kernel/sce_errno.hpp 1
 platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
