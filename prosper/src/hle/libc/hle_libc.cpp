@@ -270,12 +270,38 @@ namespace prosper {
 HLE(h_memcpy)  { return (uint64_t)(uintptr_t)memcpy(P(a0), CP(a1), a2); }
 HLE(h_memmove) { return (uint64_t)(uintptr_t)memmove(P(a0), CP(a1), a2); }
 HLE(h_memset)  { return (uint64_t)(uintptr_t)memset(P(a0), (int)a1, a2); }
-HLE(h_memcmp)  { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }
+// The console's memcmp/strcmp/strncmp return the DIFFERENCE of the first differing bytes, read as
+// unsigned chars (measured: tests/data/console_oracle/libc.golden.tsv, libc_memcmp_* and libc_strcmp_*,
+// e.g. strcmp("a","z") is -25 and memcmp({0xff},{0x01}) is 254). The host routines promise only a sign --
+// the Windows C runtime returns -1/0/1 -- so the equal case is answered by the host's vectorised routine
+// and a difference is located by hand, which gives the same value on every host. Strings that differ
+// are therefore scanned twice (the host routine, then this loop up to the first difference): at most 2x
+// on a long shared prefix, and the equal case -- the common one -- stays on the vectorised path.
+// CONFIDENCE: HIGH.
+static uint64_t first_byte_difference(const void* pa, const void* pb, size_t n, bool until_nul) {
+    const unsigned char* a = (const unsigned char*)pa;
+    const unsigned char* b = (const unsigned char*)pb;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return (uint64_t)(int64_t)((int)a[i] - (int)b[i]);
+        if (until_nul && a[i] == 0) return 0;
+    }
+    return 0;
+}
+HLE(h_memcmp) {
+    if (memcmp(CP(a0), CP(a1), a2) == 0) return 0;
+    return first_byte_difference(CP(a0), CP(a1), a2, false);
+}
 HLE(h_memchr)  { return (uint64_t)(uintptr_t)memchr(CP(a0), (int)a1, a2); }
 HLE(h_strlen)  { return (uint64_t)strlen(CS(a0)); }
 HLE(h_strnlen) { return (uint64_t)strnlen(CS(a0), a1); }
-HLE(h_strcmp)  { return (uint64_t)(int64_t)strcmp(CS(a0), CS(a1)); }
-HLE(h_strncmp) { return (uint64_t)(int64_t)strncmp(CS(a0), CS(a1), a2); }
+HLE(h_strcmp) {
+    if (strcmp(CS(a0), CS(a1)) == 0) return 0;
+    return first_byte_difference(CP(a0), CP(a1), (size_t)-1, true);
+}
+HLE(h_strncmp) {
+    if (strncmp(CS(a0), CS(a1), a2) == 0) return 0;
+    return first_byte_difference(CP(a0), CP(a1), a2, true);
+}
 HLE(h_strcpy)  { return (uint64_t)(uintptr_t)strcpy((char*)P(a0), CS(a1)); }
 HLE(h_strncpy) { return (uint64_t)(uintptr_t)strncpy((char*)P(a0), CS(a1), a2); }
 HLE(h_strcat)  { return (uint64_t)(uintptr_t)strcat((char*)P(a0), CS(a1)); }
@@ -467,12 +493,44 @@ HLE(h_bsearch) {   // (key, base, nmemb, size, compar) — compar is a guest fn 
 // (routed to the return-0 stub) -> returned 0/garbage and left endptr/output args unwritten on parsing
 // paths (localization, save/config, gameplay data). Plain host thunks; guest pointers are identity-mapped
 // so endptr and buffers pass through directly. (strtod/strtof return in XMM -> native thunks, below.) ---
-HLE(h_strtol)   { return (uint64_t)(int64_t)strtol(CS(a0), (char**)P(a1), (int)a2); }
-HLE(h_strtoll)  { return (uint64_t)(int64_t)strtoll(CS(a0), (char**)P(a1), (int)a2); }
-HLE(h_strtoul)  { return (uint64_t)strtoul(CS(a0), (char**)P(a1), (int)a2); }
-HLE(h_strtoull) { return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2); }
-HLE(h_atoi)     { return (uint64_t)(int64_t)atoi(CS(a0)); }
-HLE(h_atol)     { return (uint64_t)(int64_t)atol(CS(a0)); }
+// An invalid base (neither 0 nor 2..36) is answered here and never reaches the host libc: the console
+// returns 0 and sets *endptr to the start of the string (measured, tests/data/console_oracle/
+// libc.golden.tsv: libc_strto{l,ul,ll,ull}_base1 and _base37), where glibc leaves endptr untouched and
+// the Windows C runtime treats an invalid base as an invalid-parameter error that ends the process.
+// errno = EINVAL is the POSIX contract; the console's errno on this path is not measured. CONFIDENCE: HIGH
+// for the return value and endptr (measured), MED for errno.
+static bool strto_invalid_base(uint64_t nptr, uint64_t endptr, uint64_t base) {
+    const int b = (int)base;
+    if (b == 0 || (b >= 2 && b <= 36)) return false;
+    if (endptr) *(const char**)P(endptr) = CS(nptr);
+    errno = EINVAL;
+    return true;
+}
+// A guest `long` is 64 bits (LP64) but the Windows host's is 32, so strtol/strtoul/atoi/atol go through
+// the long long routines: through the host `long` ones every value past 2^31 saturates there.
+// atoi is the int truncation of the 64 bit parse (measured: libc_atoi_overflow, "99999999999").
+HLE(h_strtol) {
+    if (strto_invalid_base(a0, a1, a2)) return 0;
+    return (uint64_t)(int64_t)strtoll(CS(a0), (char**)P(a1), (int)a2);
+}
+HLE(h_strtoll) {
+    if (strto_invalid_base(a0, a1, a2)) return 0;
+    return (uint64_t)(int64_t)strtoll(CS(a0), (char**)P(a1), (int)a2);
+}
+HLE(h_strtoul) {
+    if (strto_invalid_base(a0, a1, a2)) return 0;
+    return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2);
+}
+HLE(h_strtoull) {
+    if (strto_invalid_base(a0, a1, a2)) return 0;
+    return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2);
+}
+HLE(h_atoi) {
+    return (uint64_t)(int64_t)(int32_t)strtoll(CS(a0), nullptr, 10);
+}
+HLE(h_atol) {
+    return (uint64_t)strtoll(CS(a0), nullptr, 10);
+}
 // rand/srand/rand_r were MISSING -> the return-0 stub made rand() a constant 0 and srand() a no-op, so any
 // guest RNG routed through libc (procedural effects, shuffles, jitter, retry backoff) was degenerate.
 HLE(h_rand)     { return (uint64_t)(int64_t)rand(); }
