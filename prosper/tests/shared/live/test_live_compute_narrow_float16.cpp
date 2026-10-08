@@ -10,6 +10,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "gpu/texture/tile.hpp"
 #include "shared/live/live_compute.hpp"
 #include <bit>
 #include <cmath>
@@ -44,7 +45,7 @@ uint16_t to_half(float value) {   // exact for the small multiples of 0.25 used 
 // image_load at (gid, 0) from the sampled FP16 T# in s[0:7], image_store of all four channels to
 // an RGBA32F storage image in s[8:15].
 ComputeItem load_item(uint64_t source, uint32_t components, float* output, const uint32_t* indices,
-                      const uint32_t* dummy) {
+                      const uint32_t* dummy, uint32_t height = 1, uint32_t tile_mode = 0) {
     ShaderResourceTable resources;
     for (uint32_t binding = 0; binding < 4; ++binding) {
         ShaderResource buffer{};
@@ -60,11 +61,13 @@ ComputeItem load_item(uint64_t source, uint32_t components, float* output, const
     texture.sgpr_base = 0;
     texture.img_dim = 1;
     texture.width = Width;
-    texture.height = texture.depth = 1;
+    texture.height = height;
+    texture.depth = 1;
+    texture.tile_mode = tile_mode;
     texture.format = DataFormat::Float16;
     texture.num_components = components;
     texture.gpu_addr = source;
-    texture.size = Width * components * 2;
+    texture.size = tile_mode ? 0x10000u : Width * height * components * 2;
     // GCN's view of a narrow format: X, Y (or 0), 0, 1.
     texture.swizzle[0] = 4;
     texture.swizzle[1] = components == 2 ? 5 : 0;
@@ -143,4 +146,32 @@ TEST(LiveComputeNarrowFloat16, GuestBackedFloat16KeepsSignedAndHdrValues) {
                          << output[1] << ", " << output[2] << ", " << output[3] << "), expected ("
                          << red(0) << ", " << (components == 2 ? green(0) : 0.0f) << ", 0, 1)";
     }
+
+    // A tiled RG16F surface, in the 64 KiB render-target swizzle Kena's DOF tiles use (tile mode
+    // 27). Row 0 holds the expected values and every other row a value that matches no expectation,
+    // so a detile that lands on the wrong texels fails as surely as a clamp.
+    constexpr uint32_t TiledHeight = 64;
+    std::vector<uint16_t> linear(size_t(Width) * TiledHeight * 2);
+    for (uint32_t y = 0; y < TiledHeight; ++y)
+        for (uint32_t x = 0; x < Width; ++x) {
+            const size_t texel = (size_t(y) * Width + x) * 2;
+            linear[texel] = to_half(y ? 100.0f + float(y) : red(x));
+            linear[texel + 1] = to_half(y ? -100.0f - float(y) : green(x));
+        }
+    const uint64_t tiled = guest.base + 0x40000;
+    std::memset(reinterpret_cast<void*>(tiled), 0, 0x10000);
+    tile_surface(reinterpret_cast<uint8_t*>(tiled), reinterpret_cast<const uint8_t*>(linear.data()),
+                 Width, TiledHeight, static_cast<uint32_t>(TileMode::Sw64KbRX), 0, 4);
+    for (uint32_t i = 0; i < Width * 4; ++i) output[i] = -99.0f;
+    ComputeItem item = load_item(tiled, 2, output, indices, dummy, TiledHeight,
+                                 static_cast<uint32_t>(TileMode::Sw64KbRX));
+    ASSERT_FALSE(item.spirv.empty());
+    ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
+    bool tiled_ok = true;
+    for (uint32_t x = 0; x < Width; ++x) {
+        const float* t = output + size_t(x) * 4;
+        tiled_ok = tiled_ok && t[0] == red(x) && t[1] == green(x) && t[2] == 0.0f && t[3] == 1.0f;
+    }
+    EXPECT_TRUE(tiled_ok) << "tiled RG16F: texel 0 = (" << output[0] << ", " << output[1] << ", "
+                          << output[2] << ", " << output[3] << ")";
 }

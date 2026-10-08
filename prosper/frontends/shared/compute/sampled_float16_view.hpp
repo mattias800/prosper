@@ -15,8 +15,10 @@ struct SampledFloat16Source {
 };
 
 // The RGBA8 conversion clamps every channel to [0, 1] and keeps 8 bits of it. It stays for
-// ordinary guest-backed 2D RGBA16F, which is colour: native RGBA16F sampling was measured 7x
-// slower in Astro Bot's full-resolution composite on RADV. Renderer imports and 3D RGBA16F
+// ordinary guest-backed 2D RGBA16F only because native RGBA16F sampling was measured 7x slower in
+// Astro Bot's full-resolution composite on RADV. That is a cost decision, not a correctness one:
+// a guest-backed RGBA16F holding HDR colour (> 1) or signed data is still clamped, a known
+// correctness loss tracked as #4738. Renderer imports and 3D RGBA16F
 // sample natively, because narrowing a volume discarded its HDR range.
 //
 // One- and two-channel FP16 is data, not colour: a signed depth-of-field circle of confusion, a
