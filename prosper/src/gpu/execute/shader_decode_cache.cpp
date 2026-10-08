@@ -159,11 +159,14 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         retain_fold_instructions(decoded, result->instructions);
         if (!decoded.empty() && decoded.back().is_end) {
             result->fold_tail.end_pc = decoded.back().pc + decoded.back().len_dwords;
+            // rdna2_append_closed_tail_blocks follows only direct branches; the fold additionally
+            // refuses a tail holding any transfer its plan cannot count (fold_uncounted_transfer),
+            // the same set it refuses in the body.
             std::vector<Rdna2Inst> with_tail = decoded;
             result->fold_tail.closed =
                 rdna2_append_closed_tail_blocks(snapshot.data(), snapshot.size(), with_tail) &&
                 std::none_of(with_tail.begin() + static_cast<std::ptrdiff_t>(decoded.size()),
-                             with_tail.end(), fold_uncounted_branch);
+                             with_tail.end(), fold_uncounted_transfer);
         } else if (!decoded.empty()) {
             result->fold_tail.end_pc = decoded.back().pc + decoded.back().len_dwords;
         }
