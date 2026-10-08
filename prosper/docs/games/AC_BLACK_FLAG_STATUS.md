@@ -123,6 +123,12 @@ the red frame (next section). Reasons, from `PROSPER_DBG=1` and `shader_inspect`
   counted-loop route's full-EXEC proof declines.
 - `cs 0x407ed65200`: `s_cbranch_scc1` at pc 93, control flow the structurizer cannot place.
 - a fragment draw at `0x407edfaf00` is refused by the 64-lane `unproved-vote` contract (host range 32..32).
+  **Shape of the vote**, from the run log's `[wave64-unsupported]` line (`vote-source-word=870`,
+  `vote-result-id=72`, `vote-predicate-id=71`, `predicate-def-op=169`): one `OpGroupNonUniformAny`
+  whose predicate is an `OpSelect` (a `v_cmp` result masked by EXEC) and whose only consumer is the EXEC
+  test guarding an `s_cbranch_execz` skip. That is ADR 0028 route 2's first candidate. Which of that
+  certificate's conditions the skipped region meets is **not measured**: the draw's shader words are in no
+  dump here (`refused_shaders_*` holds the four compute programs only), so see `## Ruled out`.
 
 ## Progress 2026-10-07: the corruption starts at the autosave notice, and what is ruled out
 
@@ -325,6 +331,27 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   2026-10-07 (n=1 per arm, same caveat) with the three `PROSPER_NO_COMPUTE_RTT_DEST_*`-style switches
   off: the same black/white proportions after 250 s. The corruption is already present in guest
   memory, i.e. in the guest's own compute-composite output, not added by the mirror.
+
+- **"The `s_cbranch_execz` any-vote certificate (ADR 0028 step 1) admits the `0x407edfaf00` draw."** Measured
+  2026-10-08 on the real pixel shader (Windows, `tools/screenshot` frontend, default launch with
+  `PROSPER_RENDER=1`, `PROSPER_GUEST_ARGS=-force-gfx-direct`, `PROSPER_SHADER_DUMP_SUCCESS` with
+  `PROSPER_SHADER_DUMP_PROGRAM=0x407edfaf00`; 83 dwords, 54 instructions). **Not admitted, for two separate
+  reasons, both below the guest-level classifier's reach.** The vote is `v_cmpx_ge_f32` (EXEC) followed
+  by `s_cbranch_execz` over pc 21-27: `s_load_dwordx4 s[0:3]`, `s_buffer_load_dword vcc_lo`,
+  `v_mov_b32 v5, vcc_lo`. (1) Guest side: the region is scalar loads plus one VALU move, all with
+  destinations dead at the merge, but `sgpr_dead_at_merge` did not model a non-cmpx VOPC with an
+  explicit SGPR pair destination as redefining the pair (the merge's `v_cmp ... s[0:1]` writes), so s0-s3
+  read as live. With that kill modelled (opt-in parameter, used only by the classifier) the classifier
+  reports the region clean. (2) SPIR-V side, still open: the body holds an `OpAccessChain` + `OpLoad` on
+  the storage buffer (the `s_buffer_load`), and the neutral proof's closed domain admits no load, so the
+  vote stays `unproved-vote`. The merge Phis are otherwise as needed: the masked vreg is
+  `Select(P, load, 0)` against a skipped value `0`, and the `vcc_lo` Phi has no users. **Next step:** load
+  authority in the neutral body, restricted to a robust2 word-buffer root with a bounded index (the
+  existing `word_buffer_roots` conditions), whose result may reach only an identity-masked export or a
+  dead value. Until that lands and the draw is re-run on a 32-lane host with its output compared, the
+  draw is not admitted. The recompiler already linearizes an EXEC-masked VALU/VMEM region with no vote
+  at all (`safe_execz_branches`), so a region that still carries a vote holds something that linearizer
+  refuses; here it is the scalar loads and the VCC move.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 

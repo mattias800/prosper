@@ -133,6 +133,15 @@ bool prove_fragment_neutral_selection(const FragmentNeutralSelection& graph,
         facts.emplace(id, fact);
     }
     facts.at(graph.predicate) = {true, true, 0, 0};
+    // Value identity under P=false: ids the proof shows to be the very same Boolean/Int32 value.
+    // Only Copy and Select-with-constant-FALSE-nonpoison-condition forward their operand
+    // unchanged. Arithmetic never does, and a Float32 copy is deliberately not forwarded (an
+    // implementation may quiet a signalling NaN), matching the raw-bit stance above.
+    std::unordered_map<uint32_t, uint32_t> same_as;
+    const auto root = [&](uint32_t id) {
+        const auto found = same_as.find(id);
+        return found == same_as.end() ? id : found->second;
+    };
     for (uint32_t id : graph.body) {
         const auto found = graph.values.find(id);
         if (found == graph.values.end() || !executable(graph, found->second)) return false;
@@ -142,6 +151,10 @@ bool prove_fragment_neutral_selection(const FragmentNeutralSelection& graph,
         const bool all_nonpoison = std::all_of(value.operands.begin(), value.operands.end(),
             [&](uint32_t operand) { return facts.at(operand).nonpoison; });
         const bool exact_type = value.type == Type::Boolean || value.type == Type::Int32;
+        if (exact_type && value.opcode == 83) same_as[id] = root(value.operands[0]);
+        if (exact_type && value.opcode == 169 && facts.at(value.operands[0]).constant &&
+            facts.at(value.operands[0]).nonpoison)
+            same_as[id] = root(value.operands[facts.at(value.operands[0]).literal ? 1 : 2]);
         if (value.opcode == 169) {
             const auto condition = arg(0);
             if (condition.constant && condition.nonpoison) result = arg(condition.literal ? 1 : 2);
@@ -179,6 +192,10 @@ bool prove_fragment_neutral_selection(const FragmentNeutralSelection& graph,
         const auto type = graph.values.at(output.skipped).type;
         if ((type != Type::Boolean && type != Type::Int32) ||
             type != graph.values.at(output.executed).type) return false;
+        // Same value on both edges: nothing the merge could publish differs, whatever the value
+        // is. Requires the guest-level evidence that no scalar effect hides outside this graph.
+        if (graph.guest_scalar_effects_absent && root(output.skipped) == root(output.executed))
+            continue;
         const auto old = facts.at(output.skipped), next = facts.at(output.executed);
         // Finite-domain metadata is not part of the observable Boolean/Int32 value identity.
         if (!old.nonpoison || (!old.constant && !old.atom) || !next.nonpoison ||

@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
+#include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
@@ -7561,6 +7562,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                          !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
                            vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                     cond_reg = b.fragment_wave_any(cond_reg);
+                // ADR 0028 route 2: tell lower_fragment_votes that the GUEST region this execz skips
+                // holds no scalar, memory, wave-level or exit effect -- facts the SPIR-V cannot
+                // carry. Only the forward execz one-arm form; the vote just taken is its sole user.
+                if (b.is_fragment && F.on_exec && F.on_scc0 && !F.has_else && cond_reg != rs.exec &&
+                    classify_exec_skip_region(ins, F.branch_pc, F.target_pc).clean())
+                    b.fragment_exec_skip_votes.push_back(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&
                     active_direct_wave_loop->direct_wave_breaks && F.on_vcc &&
