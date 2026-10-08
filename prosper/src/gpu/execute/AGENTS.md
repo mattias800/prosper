@@ -46,6 +46,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `ngg_draw_admission` — which merged-NGG draws that path may run (P5): the register and
   draw-shape table every refusal is named in, and the device half (`ngg_device_refusal`) the
   producer, the backend and replay all ask. Vulkan-free; the backend publishes its capabilities.
+- `ngg_draw_indices` — an indexed merged-NGG draw's index buffer (P6). It decodes the guest indices
+  into the plan's input and refuses primitive restart wherever restart could fire. WHERE the indices
+  are, and at what size, is the ordinary path's rule (`resolve_draw_index_source`, gpu_execute.hpp).
+  Do not give this path its own rule.
 - `ngg_live_draw` — the live producer (P5), called only where a linked vertex chain just failed the
   ordinary per-vertex compile. It owns the bounded compile and description caches, so no draw
   compiles once warm.
