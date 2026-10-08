@@ -369,6 +369,9 @@ void register_audio_spatial_hle();
 // libSceAgc "Gen5" Draw Command Buffer HLE (real PM4-building Dcb functions); see hle_agc.cpp.
 // Call AFTER register_graphics_hle so these override the observe-only glog stubs.
 void register_agc_hle();
+// libSceAgc fixed-size sceAgc*GetSize answers for packets prosper has no builder for, taken from the
+// console's own library (hle_agc_getsize.cpp). Call after register_agc_hle.
+void register_agc_getsize_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
