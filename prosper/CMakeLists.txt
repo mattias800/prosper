@@ -929,6 +929,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
     LIBRARIES prosper_core)
 
+  # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
+  # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
+  # no prosper_core and no game dump.
+  prosper_add_gtest(test_nid_stub_names
+    SOURCES tests/tools/test_nid_stub_names.cpp
+    INCLUDES tests)
+
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
   prosper_add_gtest(test_storage_dst_sel
