@@ -65,7 +65,9 @@ still be HLE; the libraries that pay for themselves are the ones that compute lo
    IPMI-client, `ioctl` or licensing dependency in its transitive closure, (b) it is not graphics,
    video-out or other renderer-core code, and (c) a title in the corpus actually imports it. The
    census output that justifies each entry is reviewed in the PR that adds it. The pilot is `libSceJson2`
-   and `libSceJson`; the font, image and XML families follow by title demand.
+   and `libSceJson`; the font, image and XML families follow by title demand. A service-bound library
+   becomes eligible when the service it talks to exists in prosper at the IPMI boundary; that service is
+   its own PR, and its client libraries are allowlisted in the same review.
 3. **What stays HLE, always.** `libkernel*` and `libSceLibcInternal*` (the syscall boundary), the
    graphics path (`libSceAgc*`, `libSceGnmDriver*`, `libSceVideoOut*` -- the census calls `libSceAgc`
    "local" because it computes packets in user space, but it is prosper's renderer core), and the
@@ -112,9 +114,15 @@ still be HLE; the libraries that pay for themselves are the ones that compute lo
 
 - **Stay HLE-only (status quo).** Correct and simple, but it keeps paying the per-function cost for
   libraries whose real implementation is available and pure. Retained as the default and the fallback.
-- **Link all 353 libraries.** Rejected: 281 are clients of a service or device that does not exist
-  off-console, so linking them relocates the boundary without removing the HLE, and four are licensing
-  libraries the charter requires prosper to answer itself.
+- **Link all 353 libraries now.** Rejected as a first step, not as an end state. 281 are clients of a
+  system service or device, and 84 import the IPMI client. With no service on the other side such a
+  library blocks or errors on its first call, where today's HLE answers at once with a tailored value
+  (the sign-in wait that stalled a title for good, #3784, is that failure class), so linking them
+  regresses titles that work. Four are licensing libraries the charter requires prosper to answer
+  itself, and the graphics and video-out libraries talk to hardware that prosper's HLE is the
+  translation layer for. The end state is the Switch-emulator model, real libraries over services
+  implemented at the IPC boundary; it is reached one service at a time (Decision 2, Migration step 6),
+  because prosper has no IPMI service side and the wire formats are not documented.
 - **Vendor the open-source cores instead** (FreeType, ICU, HarfBuzz, fontconfig, libwebp, Brotli, Folly
   appear among the local libraries), under the charter's exception for permissively licensed standalone
   libraries. Viable where a library's export surface equals the upstream API, which is **not verified**
@@ -134,7 +142,10 @@ still be HLE; the libraries that pay for themselves are the ones that compute lo
    Json imports resolving, an HLE-vs-LLE differential test on the parser, and an unchanged boot for a
    user with no firmware dump.
 5. Wave 2 by title demand: the font, image and XML families, each entry justified by its census output.
-6. Settle the default (on when a firmware dump is configured, or opt-in) in an issue and delete any
+6. Wave 3, per service: take the service a title needs (user service and save data are the likely first),
+   implement it at the IPMI boundary from live traces, then allowlist the client libraries that talk to
+   it. This is where the service-bound 281 libraries are brought in, one reviewed service at a time.
+7. Settle the default (on when a firmware dump is configured, or opt-in) in an issue and delete any
    selector.
 
 ## Open questions
