@@ -9,6 +9,49 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Past the load: the dropped vertex draws are point-light shadow passes (2026-10-08, #3135 P7)
+
+Measured on Linux/RADV:
+- `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`, empty `PROSPER_GUEST_ARGS`;
+- `scripts/kena/linux-reach-pulse.pad`, about 900 s, past the Pulse prompt.
+
+**Which refusals cost the draws.** A per-program view of the dropped-draw census (`PROSPER_DROPPED_DRAW_CENSUS=1`, `[dropped-draw-program]`) counted about 155k dropped vertex draws in one run:
+
+| refusal | dropped draws |
+|---|---|
+| ten NGG VS-only culling programs, `mbcnt-cross-lane` | ~86k (55%) |
+| `11562c72` (merged), `ngg-abi-read-v4` | ~42k (27%) |
+| `52c7e8ff` (merged), `ngg-layer-target-not-layered` | ~1.1k |
+| pixel `b8e8f38e`, image descriptor | ~0.9k |
+
+**What the VS-only programs are.**
+- They are NGG primitive shaders with no GS (`VGT_SHADER_STAGES_EN` 0x2000). They read the merged launch layout: s3 counts, v0/v1 vertex offsets scaled by ITEMSIZE 4, v5 VertexID and v8 InstanceID.
+- They cull and compact primitives with a wave-wide DPP OR ladder, `v_permlanex16` and `v_mbcnt`.
+- Every one of their draws is **depth-only** (`CB_TARGET_MASK` 0) into a **6-slice depth array** (`DB_DEPTH_VIEW` slices 0..5), with the layer exported in POS1.z. These are cube shadow maps.
+
+**What changed (#3135 P7).** VS-only NGG draws now reach the subgroup shell:
+- output topology from the input (`VGT_GS_OUT_PRIM_TYPE` is 0 on them);
+- a VS-only partition;
+- the program run alone, without a fetch prolog;
+- the bounded DPP OR ladder in the shell's dispatcher.
+
+Four of them (`8642d737`, `db6b0a64`, `399ec700`, `ffbabd0c`) pass the ABI analysis and compile.
+
+They are **not drawn yet**. A layered draw is admitted only when every bound attachment is proven to be one slice, and a 6-slice depth array is not. So they are refused by name, `ngg-layer-target-not-single-slice`. An earlier revision admitted them on colour target 0's proof alone, and the raster commit then culled every primitive outside slice 0 (`layer-culled` in the `[ngg-backend]` lines). That was shadow geometry lost silently, so it was withdrawn.
+
+**What the frame shows.** Nothing changes yet: no new draw is admitted on this route. While the earlier revision admitted the draws, about half of them were also dropped at the backend (`ngg-backend-readback-split`, about 52k), because they share multi-target passes.
+
+**Next.**
+- Render NGG draws into a layered depth array, so the layer lands in its slice.
+- Let a multi-target pass split around an NGG draw on the GPU.
+- The `read-v4` lane-subset proof: #4746, about 59k draws.
+
+**The black cutscene face** seen in one run is not this work. It goes with the intermittent descriptor refusal of compute `de7035c2` (#4700), which also produced blue vertical streaks in another run. The face renders correctly at this branch's head:
+- confirmed by the owner, watching the run live;
+- snapshots in the PR.
+
+**The level load sometimes sits idle for minutes** before it resumes. Every guest thread is blocked; the game thread is in an untimed `sceKernelWaitEventFlag`. See #4745.
+
 ## The level-load device loss was a loop counter the recompiler never carried (2026-10-08)
 
 The Vulkan device loss at the first level load is fixed. Past it, the opening cutscene plays (pad flip 1450) and the route reaches the first gameplay prompt, *"Press … to Pulse"*, and **the world draws behind it**: Kena, the cave, its roots, ferns and stone path. It is degraded: Kena's hair is black and the scene is dim and blue.
@@ -819,6 +862,8 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Kena's culling NGG VS draws can be admitted into a one-slice 2D colour target and their layer culled** — false. They are depth-only (`CB_TARGET_MASK` 0) into a 6-slice depth array (`DB_DEPTH_VIEW` 0..5), so the layer is real. Admitting them on colour target 0's proof culled shadow geometry (`layer-culled` counted on every frame). They are now refused, `ngg-layer-target-not-single-slice` (2026-10-08, #3135 P7).
+- **The black cutscene face is caused by admitting NGG draws** — false. The run that showed it admitted none beyond `main`. It goes with the intermittent refusal of compute `de7035c2` (#4700), and the same build rendered the face correctly in other runs (2026-10-08).
 - **The level-load device loss is an out-of-bounds access or a bad descriptor** — false. The RADV hang dump's `vm_fault.log` is empty, so the GPU hung rather than faulted. The hang is pixel program `0x5007ad0000`'s outer loop, whose spill-slot counter the recompiled loop never advanced (2026-10-08).
 - **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).
 - **The level-load device loss is the newly admitted indexed NGG draw** — false. A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU in ordinary draws of pixel program `0x5007ad0000`, and `main`, without the draw, loses the device at the same pad time (2026-10-08, #3135).
