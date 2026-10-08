@@ -48,7 +48,7 @@ rtc_cmp_greater	libSceRtc.sprx	sceRtcCompareTick	p64:200,p64:100		ok	0x000000000
 rtc_gettick_leapday	libSceRtc.sprx	sceRtcGetTick	in:e80702001d000c001e000f0000000000,out:8		ok	0x0000000000000000	-	a0=e80702001d000c001e000f0000000000	a1=c0630a6b83d2e200
 rtc_gettick_epoch	libSceRtc.sprx	sceRtcGetTick	in:b2070100010000000000000000000000,out:8		ok	0x0000000000000000	-	a0=b2070100010000000000000000000000	a1=00c02bfffebfdc00
 rtc_settick_epoch	libSceRtc.sprx	sceRtcSetTick	out:16,p64:62135596800000000		ok	0x0000000000000000	-	a0=b2070100010000000000000000000000	a1=00c02bfffebfdc00
-rtc_current_tick	libSceRtc.sprx	sceRtcGetCurrentTick	out:8	ret	ok	0x0000000000000000	-	a0=fb7f6f2f531de300
+rtc_current_tick	libSceRtc.sprx	sceRtcGetCurrentTick	out:8	ret	ok	0x0000000000000000	-	a0=volatile
 rtc_cmp_signed	libSceRtc.sprx	sceRtcCompareTick	p64:0x8000000000000000,p64:100		ok	0x0000000000000001	-	a0=0000000000000080	a1=6400000000000000
 rtc_cmp_null_a	libSceRtc.sprx	sceRtcCompareTick	null,p64:100		ok	0x0000000080b50002	-	a1=6400000000000000
 rtc_cmp_null_b	libSceRtc.sprx	sceRtcCompareTick	p64:100,null		ok	0x0000000080b50002	-	a0=6400000000000000

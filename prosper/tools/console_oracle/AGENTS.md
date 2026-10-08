@@ -1,7 +1,14 @@
 # tools/console_oracle
 
-Measures what a **real PS5** returns for a table of system-library calls, so prosper's HLE can be
-checked against the console instead of against a guess. Read-only observation of your own console.
+An **optional cross-check, measured by a human with their own console**: it records what a real PS5
+returns for a table of system-library calls, so prosper's HLE can be compared with a measurement.
+Read-only observation of your own console.
+
+It is never a required step for adding or changing HLE. Disassembly, live guest captures and tests
+come first and stay sufficient. Nothing in CI or in the replay needs a console: the committed goldens
+are plain test inputs, and a mismatch is always resolvable without hardware (fix the HLE, or list the
+case in `known_gaps.tsv` with a reason). If your own evidence contradicts a golden, do not edit it:
+list the case in `known_gaps.tsv` with that evidence and flag it for a human to re-measure.
 
 - `payload/lib_oracle.c` + `payload/Makefile` -- the payload. Built with the ps5-payload-sdk (not by
   CMake), it `dlopen`s the named libraries, calls each function with the arguments in the cases file
@@ -21,11 +28,15 @@ fails, so the list only shrinks.
 
 ## Adding a case
 
+Adding a case needs a measurement, so it is a step for a person with a console. Without one, change the
+HLE the usual way (disassembly, captures, a normal test) and leave the case for them.
+
 1. Add a line to a `<family>.cases.tsv` (`id`, `lib`, `func`, `args`, optional `expect`).
-2. Re-measure: `python3 prosper/tools/console_oracle/run_oracle.py --cases <file> --host <console> --sdk <sdk>`.
+2. A person with a console re-measures:
+   `python3 prosper/tools/console_oracle/run_oracle.py --cases <file> --host <console> --sdk <sdk>`.
 3. Run `test_console_oracle_replay`. A mismatch is either a prosper defect (fix it, or list it in
    `known_gaps.tsv` with a reason) or a case that measures something volatile (give it `expect=ret`
-   or `none`).
+   or `none`; the driver then stores a placeholder instead of the volatile bytes).
 
 ## Traps
 
@@ -38,6 +49,11 @@ fails, so the list only shrinks.
   add `r64` for `size_t`, `long` and pointers.
 - **A fault or hang in the called function.** A fault (SIGSEGV etc.) is caught and recorded as
   `fault:<signal>`; a hang is not recovered and shows up as a missing `# done` line.
+- **String arguments are inputs only.** An `s:` buffer is never reported, so a function that writes
+  into a string (`strtok`, in-place transforms) needs an `in:` or `out:` buffer to be compared.
+- **Out of scope:** floating point and variadic functions (the `printf` family), and prosper handlers
+  registered through the guest-ABI or typed paths, which `HleFn` cannot call. The replay reports those as
+  "registered, but not callable through HleFn" instead of "not implemented".
 - **Do not `dlclose` a system library.** It fails on this console, so the payload never does.
 - **Goldens are measurements, not Sony code.** Commit call results only -- no firmware, no game data,
   nothing that came out of a module's code or data sections.

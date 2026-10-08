@@ -17,7 +17,9 @@
  *   in:<hex>           pointer to a buffer initialised with these bytes (modified calls are reported)
  *   p32:<int> p64:<int> pointer to a 4 / 8 byte little-endian buffer holding the integer
  *   out:<N>            pointer to N bytes pre-filled with 0xAB, so untouched bytes stay visible
- *   s:<text>           pointer to a NUL-terminated string; \xHH and \\ escapes (use \x2c for a comma)
+ *   s:<text>           pointer to a NUL-terminated string; \xHH and \\ escapes (use \x2c for a comma).
+ *                      An INPUT only: its contents are never reported, so a function that writes into
+ *                      a string (strtok, in-place transforms) needs an in:/out: buffer instead
  *   outptr:<k>         pointer to an 8 byte out-parameter that will hold a pointer INTO the buffer of
  *                      argument k; reported as an offset so it compares across address spaces
  *   use:<id>.<k>.<off>.<size>   integer read (size 4 or 8) from argument k of an earlier case, after it ran
@@ -27,6 +29,10 @@
  *   ret     the raw 64 bit return register
  *   retn    "-" unless expect has retoff:<k>; then ptr+<off> | null | ptr:foreign relative to argument k
  *   a<k>    final contents of buffer arguments (hex); for outptr, ptr+<off> | null | untouched | foreign
+ *
+ * Out of scope: only integer and pointer arguments (the six SysV integer registers) and an integer
+ * return are modelled, so floating point and variadic functions (printf family) cannot be measured, and
+ * prosper handlers registered through the guest-ABI or typed paths cannot be replayed through HleFn.
  *
  * A fault in the called function (SIGSEGV etc.) is caught and reported; the run continues. A hang is
  * not recovered -- the driver notices the missing "# done" line.
@@ -335,6 +341,19 @@ static void run_case(char *line) {
       return;
     }
 
+  /* retoff:<k> must name an argument that has a buffer; anything else is a bad spec, not "retoff:0". */
+  int retoff = -1;
+  const char *ro = strstr(expect, "retoff:");
+  if (ro) {
+    char *end = NULL;
+    unsigned long v = strtoul(ro + 7, &end, 10);
+    if (end == ro + 7 || (*end != '\0' && *end != ',') || v >= (unsigned long)nargs || !args[v].buf) {
+      report(id, "badspec", 0, NULL, args, nargs);
+      return;
+    }
+    retoff = (int)v;
+  }
+
   void *h = handle_for(lib);
   if (!h) {
     report(id, "nolib", 0, NULL, args, nargs);
@@ -361,19 +380,15 @@ static void run_case(char *line) {
   }
 
   char retn[48] = "-";
-  const char *ro = strstr(expect, "retoff:");
-  if (ro) {
-    int k = atoi(ro + 7);
-    if (k >= 0 && k < nargs && args[k].buf) {
-      /* reuse print_rel's rule without a second printer */
-      uint64_t v = ret;
-      if (v == 0) strcpy(retn, "null");
-      else if (v >= (uint64_t)(uintptr_t)args[k].buf &&
-               v <= (uint64_t)(uintptr_t)args[k].buf + args[k].len)
-        snprintf(retn, sizeof(retn), "ptr+%llu",
-                 (unsigned long long)(v - (uint64_t)(uintptr_t)args[k].buf));
-      else strcpy(retn, "ptr:foreign");
-    }
+  if (retoff >= 0) {
+    /* reuse print_rel's rule without a second printer */
+    uint64_t v = ret;
+    if (v == 0) strcpy(retn, "null");
+    else if (v >= (uint64_t)(uintptr_t)args[retoff].buf &&
+             v <= (uint64_t)(uintptr_t)args[retoff].buf + args[retoff].len)
+      snprintf(retn, sizeof(retn), "ptr+%llu",
+               (unsigned long long)(v - (uint64_t)(uintptr_t)args[retoff].buf));
+    else strcpy(retn, "ptr:foreign");
   }
   report(id, status, ret, retn, args, nargs);
   if (res) g_nres++;

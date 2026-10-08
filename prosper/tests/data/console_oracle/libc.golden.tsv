@@ -18,9 +18,9 @@ libc_memcmp_equal	libSceLibcInternal.sprx	memcmp	in:010203,in:010203,i:3		ok	0x0
 libc_memcmp_less	libSceLibcInternal.sprx	memcmp	in:010203,in:010204,i:3		ok	0x00000000ffffffff	-	a0=010203	a1=010204
 libc_memcmp_greater	libSceLibcInternal.sprx	memcmp	in:0102ff,in:010201,i:3		ok	0x00000000000000fe	-	a0=0102ff	a1=010201
 libc_memcmp_high_byte	libSceLibcInternal.sprx	memcmp	in:80,in:01,i:1		ok	0x000000000000007f	-	a0=80	a1=01
-libc_strchr_found	libSceLibcInternal.sprx	strchr	s:hello,i:108	r64,retoff:0	ok	0x000000088000a2e2	ptr+2
+libc_strchr_found	libSceLibcInternal.sprx	strchr	s:hello,i:108	r64,retoff:0	ok	0x0000000000000000	ptr+2
 libc_strchr_missing	libSceLibcInternal.sprx	strchr	s:hello,i:122	r64,retoff:0	ok	0x0000000000000000	null
-libc_strchr_nul	libSceLibcInternal.sprx	strchr	s:hello,i:0	r64,retoff:0	ok	0x000000088000a365	ptr+5
+libc_strchr_nul	libSceLibcInternal.sprx	strchr	s:hello,i:0	r64,retoff:0	ok	0x0000000000000000	ptr+5
 libc_atoi_plain	libSceLibcInternal.sprx	atoi	s:42		ok	0x000000000000002a	-
 libc_atoi_neg_trailing	libSceLibcInternal.sprx	atoi	s:  -7x		ok	0xfffffffffffffff9	-
 libc_atoi_empty	libSceLibcInternal.sprx	atoi	s:		ok	0x0000000000000000	-

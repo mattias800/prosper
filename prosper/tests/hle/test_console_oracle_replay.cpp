@@ -118,6 +118,23 @@ TEST(ConsoleOracleHarness, PointerReturnsCompareAsOffsets) {
     EXPECT_NE(d.find("retn console=ptr+3 prosper=ptr+2"), std::string::npos) << d;
 }
 
+TEST(ConsoleOracleHarness, FlagIntDistinguishesAbsentFromMalformed) {
+    EXPECT_EQ(co::flag_int("r64,retoff:2", "retoff:"), 2);
+    EXPECT_EQ(co::flag_int("r64", "retoff:"), co::kFlagAbsent);
+    for (const char* bad : {"retoff:x", "retoff:", "retoff:-1", "retoff:1x", "retoff: 1"})
+        EXPECT_EQ(co::flag_int(bad, "retoff:"), co::kFlagMalformed) << bad;
+}
+
+TEST(ConsoleOracleHarness, MalformedRetoffIsRejectedNotReadAsZero) {
+    register_builtin_hle();
+    co::State state;
+    co::Outcome o;
+    std::string err;
+    EXPECT_FALSE(co::replay_case(make_case("t", "strchr", "s:hello,i:108", "r64,retoff:x", 0),
+                                 state, &o, &err));
+    EXPECT_NE(err.find("malformed retoff"), std::string::npos) << err;
+}
+
 TEST(ConsoleOracleHarness, OutPointerIsReportedRelativeToItsBuffer) {
     // strtol("  -123abc") stops after 6 characters; the endptr out-parameter must read ptr+6.
     EXPECT_EQ(replay_and_compare(make_case("t", "strtol", "s:  -123abc,outptr:0,i:10", "r64",

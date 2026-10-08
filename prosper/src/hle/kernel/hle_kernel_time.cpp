@@ -2786,6 +2786,7 @@ void register_kernel_time_hle() {
     R("sceRtcGetTick", k_rtc_get_tick);   // UTC datetime -> tick
     // SceRtc calendar arithmetic: pure functions of their inputs (see the handlers above).
     R("sceRtcCheckValid", k_rtc_check_valid);
+    R("sceRtcCompareTick", k_rtc_compare_tick);
     R("sceRtcIsLeapYear", k_rtc_is_leap_year);
     R("sceRtcGetDaysInMonth", k_rtc_get_days_in_month);
     R("sceRtcGetDayOfWeek", k_rtc_get_day_of_week);
@@ -2802,7 +2803,6 @@ void register_kernel_time_hle() {
     R("sceRtcTickAddHours", k_rtc_tick_add_hours);
     R("sceRtcTickAddMicroseconds", k_rtc_tick_add_microseconds);
     R("sceRtcTickAddMinutes", k_rtc_tick_add_minutes);
-    R("sceRtcCompareTick", k_rtc_compare_tick);
     R("sceRtcTickAddMonths", k_rtc_tick_add_months);
     R("sceRtcTickAddSeconds", k_rtc_tick_add_seconds);
     R("sceRtcTickAddTicks", k_rtc_tick_add_ticks);

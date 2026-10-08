@@ -11,6 +11,7 @@
 #include "hle/dispatch/nid.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace prosper_test::console_oracle {
@@ -42,7 +44,9 @@ struct GoldenCase {
 };
 
 struct Outcome {
-    bool implemented = false;
+    bool implemented = false;   // a handler exists and is callable through HleFn
+    bool registered =
+        false;   // a handler exists, possibly one HleFn cannot call (guest-ABI, typed)
     uint64_t ret = 0;
     std::string retn = "-";
     std::vector<std::string> buffers;
@@ -204,10 +208,22 @@ inline bool has_flag(const std::string& expect, const std::string& flag) {
     return false;
 }
 
+constexpr int kFlagAbsent = -1;
+constexpr int kFlagMalformed = -2;
+
+// The integer after `prefix` in a comma separated flag list ("retoff:0" -> 0). kFlagAbsent when the flag
+// is not there; kFlagMalformed when it is there without a valid non-negative integer, so a typo such as
+// "retoff:x" is rejected instead of silently reading as 0.
 inline int flag_int(const std::string& expect, const std::string& prefix) {
-    for (const auto& f : split(expect, ','))
-        if (f.compare(0, prefix.size(), prefix) == 0) return std::atoi(f.c_str() + prefix.size());
-    return -1;
+    for (const auto& f : split(expect, ',')) {
+        if (f.compare(0, prefix.size(), prefix) != 0) continue;
+        int v = 0;
+        const char* first = f.data() + prefix.size();
+        const char* last = f.data() + f.size();
+        const auto r = std::from_chars(first, last, v);
+        return (r.ec == std::errc() && r.ptr == last && v >= 0) ? v : kFlagMalformed;
+    }
+    return kFlagAbsent;
 }
 
 // Run one case through the HLE handler. Returns false (with `err`) when the case itself is malformed;
@@ -228,14 +244,18 @@ inline bool replay_case(const GoldenCase& c, State& state, Outcome* outcome, std
             (a.ref >= static_cast<int>(args.size()) || args[a.ref].buf.empty()))
             return *err = "outptr reference has no buffer", false;
 
-    const prosper::HleFn fn = prosper::Hle::lookup(prosper::nid_hash(c.func));
+    const int k = flag_int(c.expect, "retoff:");
+    if (k == kFlagMalformed) return *err = "malformed retoff flag in '" + c.expect + "'", false;
+
+    const std::string nid = prosper::nid_hash(c.func);
+    const prosper::HleFn fn = prosper::Hle::lookup(nid);
     outcome->implemented = fn != nullptr;
+    outcome->registered = fn != nullptr || prosper::Hle::registered(nid);
     if (fn) {
         uint64_t a[kMaxArgs] = {0, 0, 0, 0, 0, 0};
         for (size_t i = 0; i < args.size(); i++) a[i] = args[i].value;
         outcome->ret = fn(a[0], a[1], a[2], a[3], a[4], a[5]);
 
-        const int k = flag_int(c.expect, "retoff:");
         if (k >= 0 && k < static_cast<int>(args.size()) && !args[k].buf.empty())
             outcome->retn = rel(outcome->ret, &args[k]);
         for (size_t i = 0; i < args.size(); i++) {
@@ -266,7 +286,11 @@ inline std::string hex64(uint64_t v) {
 // "" when prosper agrees with the console under the case's expect flags, else a one-line diff.
 inline std::string compare(const GoldenCase& c, const Outcome& o) {
     if (has_flag(c.expect, "none")) return "";
-    if (!o.implemented) return "not implemented in prosper";
+    if (!o.implemented)
+        return o.registered
+                   ? "registered, but not callable through HleFn (a guest-ABI or typed handler: "
+                     "outside what this oracle can replay)"
+                   : "not implemented in prosper";
     std::ostringstream d;
     const uint64_t mask = has_flag(c.expect, "r64") ? ~0ull : 0xFFFFFFFFull;
     // A pointer return differs between address spaces by construction, so a retoff:<k> case compares

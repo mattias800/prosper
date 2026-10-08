@@ -274,7 +274,10 @@ HLE(h_memset)  { return (uint64_t)(uintptr_t)memset(P(a0), (int)a1, a2); }
 // unsigned chars (measured: tests/data/console_oracle/libc.golden.tsv, libc_memcmp_* and libc_strcmp_*,
 // e.g. strcmp("a","z") is -25 and memcmp({0xff},{0x01}) is 254). The host routines promise only a sign --
 // the Windows C runtime returns -1/0/1 -- so the equal case is answered by the host's vectorised routine
-// and a difference is located by hand, which gives the same value on every host. CONFIDENCE: HIGH.
+// and a difference is located by hand, which gives the same value on every host. Strings that differ
+// are therefore scanned twice (the host routine, then this loop up to the first difference): at most 2x
+// on a long shared prefix, and the equal case -- the common one -- stays on the vectorised path.
+// CONFIDENCE: HIGH.
 static uint64_t first_byte_difference(const void* pa, const void* pb, size_t n, bool until_nul) {
     const unsigned char* a = (const unsigned char*)pa;
     const unsigned char* b = (const unsigned char*)pb;

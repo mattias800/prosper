@@ -341,8 +341,9 @@ capture/replay without requiring an importable system Python module.
 - **`console_oracle/`** — measure what a **real PS5** returns for a table of system-library calls
   (a payload built with the ps5-payload-sdk, driven by `run_oracle.py`) and record it as golden files
   under `tests/data/console_oracle/`. `tests/hle/test_console_oracle_replay.cpp` replays every golden
-  through prosper's HLE, so an HLE answer is checked against the console rather than a guess.
-  Read-only observation of your own console; see its `AGENTS.md` for the case grammar and traps.
+  through prosper's HLE. An **optional cross-check measured by a human**, never a required step for HLE
+  work: disassembly, live captures and tests come first, and nothing in CI needs a console. Read-only
+  observation of your own console; see its `AGENTS.md` for the case grammar and traps.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every
