@@ -4,40 +4,73 @@
 The probe's loop is driven against a synthetic /proc tree through `collect`'s `proc_root`
 parameter, so the identity-change and unreadable-process terminals are exercised rather than
 described. Nothing here reads the real /proc or needs a running game.
+
+The loop runs on a virtual clock (`SampleClock`), and every change to the synthetic tree happens
+inside the collector's own pacing sleep, on the collector's thread, before a chosen sample. So no
+arm depends on wall-clock timing or on a concurrent rename being atomic to a reader. The earlier
+fixture used timer threads and `Path.replace`, and in CI's parallel test run it failed on macOS (the
+timer missed the window) and on Windows (the rename raced the reader) (#4142).
 """
 
 import tempfile
-import threading
-import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import schedstat_probe
 from schedstat_probe import collect, read_thread, select_threads, stat_fields
 
-
-def through_sharing_violations(operation):
-    # Windows refuses to rename over, or delete, a file another handle has open (WinError 32),
-    # and the probe under test opens these files at 200 Hz. The probe holds each one only for a
-    # read, so a short bounded retry always gets in; without it the fixture thread died on the
-    # exception, the change it stood for never happened, and the arm failed with a misleading
-    # assertion (#4142). Any other error -- or one that persists for 2 s -- still raises.
-    deadline = time.monotonic() + 2.0
-    while True:
-        try:
-            return operation()
-        except PermissionError as error:
-            if getattr(error, 'winerror', None) != 32 or time.monotonic() >= deadline:
-                raise
-            time.sleep(0.001)
+HZ = 200.0
+STEP_NS = round(1e9 / HZ)  # The collector's own tick, computed the way `collect` computes it.
 
 
-def replace_atomically(path, text):
-    # A plain write_text truncates first, so a concurrent reader can observe an empty file and
-    # the probe would report "unreadable" where the test means "identity changed". Real /proc
-    # reads never see a torn file; rename gives the synthetic tree the same property.
-    temporary = path.with_name(path.name + '.new')
-    temporary.write_text(text)
-    through_sharing_violations(lambda: temporary.replace(path))
+class SampleClock:
+    """Stands in for the `time` module inside `schedstat_probe` during one `collect` call.
+
+    `monotonic_ns` advances by a fixed small read cost per call, so read brackets are ordered
+    the way real ones are. `sleep` advances virtual time and then runs every action that has
+    come due, on the caller's thread. Because the collector sleeps up to each tick before it
+    reads, an action registered with `before_sample(k)` runs after sample k-1 has been read and
+    before sample k is: samples 0..k-1 see the old tree, sample k onward sees the new one.
+
+    It exposes only `monotonic_ns` and `sleep`. Any other use of `time` by the collector fails
+    with AttributeError instead of silently reading the real clock.
+    """
+
+    READ_COST_NS = 1_000  # Far below STEP_NS, so a read never crosses into the next tick.
+    CALL_BUDGET = 1_000_000  # A loop that stops advancing fails instead of spinning forever.
+
+    def __init__(self):
+        self.now = 10**12  # Arbitrary; nothing may assume the clock starts at zero.
+        self.start = None  # The first reading, which is `collect`'s own start time.
+        self.calls = 0
+        self.pending = []
+
+    def monotonic_ns(self):
+        self.calls += 1
+        if self.calls > self.CALL_BUDGET:
+            raise RuntimeError('collector stopped advancing the virtual clock')
+        value = self.now
+        if self.start is None:
+            self.start = value
+        self.now += self.READ_COST_NS
+        return value
+
+    def sleep(self, seconds):
+        if seconds < 0:
+            raise ValueError('negative sleep')
+        self.now += round(seconds * 1e9)
+        due = [entry for entry in self.pending if self.start + entry[0] * STEP_NS <= self.now]
+        self.pending = [entry for entry in self.pending if entry not in due]
+        for _, action in sorted(due, key=lambda entry: entry[0]):
+            action()
+
+    def before_sample(self, index, action):
+        # Sample k's tick is start + k * STEP_NS, where start is `collect`'s first clock read.
+        # Sample 0 is read before any sleep, so it cannot be preceded.
+        if index < 1:
+            raise ValueError('an action can only precede sample 1 or later')
+        self.pending.append((index, action))
 
 
 def stat_text(pid, comm, state, starttime):
@@ -58,7 +91,9 @@ def make_thread(task_root, tid, comm, *, state='S', starttime=4242,
 
 class StatFieldsTests(unittest.TestCase):
     def test_parenthesized_command_with_spaces_and_parens_is_skipped(self):
-        raw = stat_text(7, 'name with (spaces)', 'R', 12345)
+        # The comm itself contains ") S " followed by more text, so a parser that split at the
+        # first ')' instead of the last would read state 'S' and a shifted starttime.
+        raw = stat_text(7, 'a) S 1 (b c', 'R', 12345)
         self.assertEqual(stat_fields(raw), ('R', 12345))
 
     def test_malformed_and_short_stat_refuse(self):
@@ -112,17 +147,23 @@ class CollectLoopTests(unittest.TestCase):
         self.root.joinpath('stat').write_text(stat_text(1234, 'prosper-app', 'S', 99))
         make_thread(self.root / 'task', 11, 'prosper-app')
         make_thread(self.root / 'task', 12, 'gpu-worker')
+        self.clock = SampleClock()
+        patcher = mock.patch.object(schedstat_probe, 'time', self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def after(self, delay, action):
-        thread = threading.Thread(target=lambda: (time.sleep(delay), action()), daemon=True)
-        thread.start()
-        self.addCleanup(thread.join)
+    def collect(self, seconds):
+        return collect(1234, 'prosper-app', seconds, HZ, proc_root=self.proc)
 
     def test_completed_run_records_read_brackets_for_the_selected_threads(self):
-        report = collect(1234, 'prosper-app', 0.1, 200.0, proc_root=self.proc)
+        report = self.collect(0.1)
         self.assertEqual(report['terminal'], 'completed')
         self.assertEqual(report['candidate_tids'], [11])
-        self.assertGreater(report['sample_count'], 0)
+        # 0.1 s at 200 Hz is 20 ticks, and the stop check runs before each sleep, so the loop
+        # also takes the sample whose tick is the stop time itself: exactly 21 on the virtual
+        # clock. A loop that stopped pacing takes tens of thousands; one that stopped early fewer.
+        self.assertEqual(report['sample_count'], 21)
+        self.assertEqual(report['overruns'], 0)
         self.assertEqual(report['matched_thread_rows'], report['sample_count'])
         self.assertEqual(report['read_failures'], 0)
         previous_after = None
@@ -134,23 +175,51 @@ class CollectLoopTests(unittest.TestCase):
             self.assertEqual([t['tid'] for t in row['threads']], [11])
 
     def test_process_identity_change_stops_the_run_instead_of_mixing_two_processes(self):
-        self.after(0.05, lambda: replace_atomically(
-            self.root / 'stat', stat_text(1234, 'prosper-app', 'S', 100)))
-        report = collect(1234, 'prosper-app', 5.0, 200.0, proc_root=self.proc)
+        # The same PID now names a process with a different starttime: a PID reuse.
+        self.clock.before_sample(5, lambda: self.root.joinpath('stat').write_text(
+            stat_text(1234, 'prosper-app', 'S', 100)))
+        report = self.collect(5.0)
         self.assertEqual(report['terminal'], 'process identity changed')
+        # Exactly the five samples taken before the swap, and none from the new process.
+        self.assertEqual(report['sample_count'], 5)
+        self.assertEqual(report['matched_thread_rows'], 5)
 
     def test_unreadable_process_stops_the_run(self):
-        self.after(0.05, lambda: through_sharing_violations(self.root.joinpath('stat').unlink))
-        report = collect(1234, 'prosper-app', 5.0, 200.0, proc_root=self.proc)
+        self.clock.before_sample(5, self.root.joinpath('stat').unlink)
+        report = self.collect(5.0)
         self.assertEqual(report['terminal'], 'process exited or became unreadable')
+        self.assertEqual(report['sample_count'], 5)
 
     def test_thread_read_failure_is_counted_not_swallowed_into_a_zero_sample(self):
         task = self.root / 'task' / '11'
-        self.after(0.02, lambda: replace_atomically(task / 'schedstat', '1000 200\n'))
-        report = collect(1234, 'prosper-app', 0.2, 200.0, proc_root=self.proc)
+        self.clock.before_sample(5, lambda: (task / 'schedstat').write_text('1000 200\n'))
+        report = self.collect(0.2)
         self.assertEqual(report['terminal'], 'completed')
-        self.assertGreater(report['read_failures'], 0)
-        self.assertLess(report['matched_thread_rows'], report['sample_count'])
+        # Samples 0-4 read the thread; every sample from index 5 on fails its one thread read,
+        # and each failure is counted and leaves that sample with no row rather than a zero one.
+        self.assertGreater(report['sample_count'], 5)
+        self.assertEqual(report['read_failures'], report['sample_count'] - 5)
+        self.assertEqual(report['matched_thread_rows'], 5)
+        self.assertEqual([len(row['threads']) for row in report['samples']],
+                         [1] * 5 + [0] * (report['sample_count'] - 5))
+
+    def test_an_overrun_resynchronises_the_tick_instead_of_bursting_to_catch_up(self):
+        # Sample 5 is read three ticks late (the host stalled). That is one overrun, and the loop
+        # restarts its schedule from the late read; a loop that kept the old schedule would take
+        # the next samples back-to-back without sleeping and count each of them as an overrun.
+        def stall():
+            self.clock.now += 3 * STEP_NS
+
+        self.clock.before_sample(5, stall)
+        report = self.collect(0.2)
+        self.assertEqual(report['terminal'], 'completed')
+        self.assertEqual(report['overruns'], 1)
+        gaps = [later['before_ns'] - earlier['after_ns']
+                for earlier, later in zip(report['samples'], report['samples'][1:])]
+        # The late sample becomes the new schedule origin: the next read follows at once (its tick
+        # is that late read), and from there the loop sleeps a full tick again instead of bursting.
+        self.assertLess(gaps[5], STEP_NS // 2)
+        self.assertGreater(gaps[6], STEP_NS // 2)
 
     def test_sampling_rate_that_rounds_the_interval_to_zero_refuses(self):
         with self.assertRaisesRegex(ValueError, 'rounded to zero'):

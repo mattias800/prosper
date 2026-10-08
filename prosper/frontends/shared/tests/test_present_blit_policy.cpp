@@ -100,6 +100,12 @@ TEST(PresentBlitPolicy, Contract) {
       CHECK(compute_scanout_present_decision(d) == ComputeScanoutPresent::ExtentMismatch); }
     { auto d = in; d.front_scanout_tile_mode = 0;
       CHECK(compute_scanout_present_decision(d) == ComputeScanoutPresent::TileMismatch); }
+    // #4686: a mirror holds the bytes of the format it was taken in, so another format declines
+    // under its own name rather than as a geometry mismatch.
+    { auto d = in; d.front_pixel_format = 0x80002200u;
+      CHECK(compute_scanout_present_decision(d) == ComputeScanoutPresent::FormatMismatch);
+      CHECK(std::strcmp(compute_scanout_present_name(ComputeScanoutPresent::FormatMismatch),
+                        "format-mismatch") == 0); }
     { auto d = in; d.watch_state = 1;
       CHECK(compute_scanout_present_decision(d) == ComputeScanoutPresent::Stale); }
     { auto d = in; d.watch_state = 2;

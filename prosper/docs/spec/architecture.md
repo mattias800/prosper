@@ -190,6 +190,19 @@ family at a time, each family gated on byte-identical SPIR-V over a recorded cor
 Status: proposed (adr:0012)
 Enforcement: adr:0012
 
+### GPU-4 -- descriptor provenance has one analysis, shared by recompiler and executor
+
+Which guest descriptor a shader resource operand names is answered by one phi-aware analysis over
+the program's CFG, computed once per program version and consumed by both the recompiler and the
+executor. What it cannot prove is refused visibly -- or, once ADR 0027's layer 2 is separately
+accepted, resolved at runtime through an emulator-maintained table. No path re-derives provenance
+on its own.
+Violated today: the executor's register fold (`resolve_dynamic_fetch`), the split-T# proof
+(`split_t8_proof.cpp`) and the x16 descriptor proof (`smem_x16_descriptor_proof.cpp`) each derive
+provenance with their own write model.
+Status: proposed (adr:0027)
+Enforcement: adr:0027
+
 ### SYNC-1 -- one wait model, no host-thread identity across a fiber switch
 
 Every blocking guest wait goes through one model that names what it waits for. No state keyed by
@@ -277,3 +290,16 @@ Screenshot and snapshot runs record every `PROSPER_*` switch set, and a run coun
 evidence only if each is a host-capability or diagnostic switch; a selector disqualifies it.
 Status: proposed (adr:0023)
 Enforcement: adr:0023
+
+### GPU-5 -- a guest Wave64 program runs natively, by proof or exact emulation, or is refused visibly
+
+On a host without a native 64-lane subgroup for the stage, a Wave64 program runs only when its
+width independence is proven or an exact emulation route admits it; otherwise it is refused with a
+`[wave64-unsupported]` line. An approximate vote is only a default-OFF selector. Until the ADR is
+accepted the only admitting route for the width question is proof (`ProvenVotes`); the emulation
+routes do not exist yet. (`owned_graphics_wave_draw.cpp` admits wave-wide raw loads, not width
+emulation.)
+Violated today: the compute Wave64 scalar-pair projection does not consult the fabricated-zero
+mark, so a synthetic zero can stand in for a lane mask on the default path (#4714).
+Status: proposed (adr:0028)
+Enforcement: adr:0028

@@ -121,12 +121,23 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
         written = (std::fclose(f) == 0) && written;
     }
     const RecompileCoverage coverage = recompile_coverage(code, dwords);
+    // The recompiler's own last terminal reject for this program, when it recorded one. The
+    // coverage census above is compute-safe and stage-agnostic, so on a graphics program it often
+    // names an instruction the stage translator accepts; this is the translator's actual answer,
+    // and without it the only way to learn it was a PROSPER_DBG run that desyncs the route.
+    std::string reject = last_terminal_reject_reason(address);
+    for (char& c : reject)
+        if (c == '\n' || c == '\r' || c == '"') c = ' ';
+    while (!reject.empty() && reject.back() == ' ') reject.pop_back();
+    if (reject.size() > 240) reject.resize(240);
     if (FILE* index = std::fopen((std::filesystem::path(dir) / "index.txt").string().c_str(), "a")) {
-        std::fprintf(index, "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
-                            "first_bad_op=0x%x unsupported=%u file=%s %s\n",
+        std::fprintf(index,
+                     "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
+                     "first_bad_op=0x%x unsupported=%u file=%s %s%s%s%s\n",
                      stage, (unsigned long long)address, dwords, (unsigned long long)hash,
                      coverage.first_bad_fmt, coverage.first_bad_op, coverage.unsupported, file,
-                     detail.c_str());
+                     detail.c_str(), reject.empty() ? "" : " reject=\"", reject.c_str(),
+                     reject.empty() ? "" : "\"");
         std::fclose(index);
     }
     // A draw a gate refused was never recompiled, so its "first unsupported" instruction is only
@@ -140,10 +151,11 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     }
     std::fprintf(stderr,
                  "[refused-shader] %s 0x%llx (%zu dwords, first unsupported fmt=%d "
-                 "op=0x%x)%s -> %s%s\n",
+                 "op=0x%x)%s -> %s%s%s%s%s\n",
                  stage, (unsigned long long)address, dwords, coverage.first_bad_fmt,
                  coverage.first_bad_op, refusal.c_str(), path.string().c_str(),
-                 written ? "" : " (WRITE FAILED)");
+                 written ? "" : " (WRITE FAILED)", reject.empty() ? "" : " reject=\"",
+                 reject.c_str(), reject.empty() ? "" : "\"");
     return written;
 }
 

@@ -748,11 +748,13 @@ TEST(Videoout, Contract) {
         // #3891: the scanout read is its own host-copy site. Both of its copies -- out of guest
         // memory, then the de-swizzle -- are charged to guest-scanout and NONE to detile, so a
         // host-copy alarm on the CPU present fallback names the present path.
+        // #4686 N3: the Gen5 format's R/B conversion is a third full pass, charged to the same site.
         CHECK(prosper::diagnostics::transfer_bytes(Transfer::GuestScanout) - scanout_before ==
-                      2 * reference.size() &&
+                      3 * reference.size() &&
                   prosper::diagnostics::transfer_calls(Transfer::GuestScanout) -
-                          scanout_calls_before == 2,
-              "a TILE-mode scanout read charges its read and its de-swizzle to guest-scanout");
+                          scanout_calls_before == 3,
+              "a TILE-mode BGRA scanout read charges its read, de-swizzle and conversion to "
+              "guest-scanout");
         CHECK(prosper::diagnostics::transfer_bytes(Transfer::Detile) == detile_before,
               "...and nothing to detile, although the de-swizzle goes through detile_surface");
         CHECK(!read.guest_authored,
@@ -798,8 +800,14 @@ TEST(Videoout, Contract) {
               "registered a LINEAR scanout");
         CHECK(flip(handle, 0, 0, 0, 0, 0) == 0, "flipped the LINEAR scanout");
         gpu::PresentSnapshot linear_snapshot;
+        const uint64_t linear_scanout_before =
+            prosper::diagnostics::transfer_bytes(Transfer::GuestScanout);
         CHECK(gpu::present_snapshot(linear_snapshot) && linear_snapshot.rgba == presented,
               "a LINEAR scanout is published byte-for-byte");
+        CHECK(prosper::diagnostics::transfer_bytes(Transfer::GuestScanout) - linear_scanout_before ==
+                  2 * reference.size(),
+              "a LINEAR BGRA scanout read charges its read and its conversion to guest-scanout "
+              "(#4686 N3)");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the LINEAR scanout");
     }
 
@@ -1036,6 +1044,10 @@ TEST(Videoout, Contract) {
         // of the tolerance. A half-period error would be 8341 us.
         CHECK(skew < 1000,
               "the exported origin IS the status grid's epoch (within ABI us quantisation)");
+        // #4696: close the oracle's handle. Stated pitches retire only when the LAST port closes
+        // (hle_graphics.cpp g_vo_close), so a leaked handle kept them alive into VideooutPitch when
+        // the whole binary runs as one process.
+        CHECK(close(ohandle, 0, 0, 0, 0, 0) == 0, "the grid-origin oracle's handle closes");
     }
 
     // ---- #3075: the grid snap hides a dropped tick from PHASE; grid_boundaries_missed must not ---

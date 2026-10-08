@@ -55,6 +55,105 @@ never committed. The F9 bundle still aborts on this title (#3807: binding 32, ad
   matches the default run's F9 screenshot, so the measurements above stand. The cause of the
   difference is unknown.
 
+## Past New Game: two refusals fixed; the rest are image descriptors, indexed NGG and one fragment mask (2026-10-07, #4706)
+
+Measured on Linux/RADV with `prosper-app` in a visible window, default launch
+(`PROSPER_NULL_PAGE=1`, `scripts/kena/linux-reach-level-load.pad`), 660 s per arm. Before is `main`
+`74e97be0` plus the `reject=` index field below; after is the #4706 branch. Both arms lose the
+Vulkan device at the first level load (compute program `0x500a380000`, the loss this route already
+records), so the counts below are the programs refused **before** that loss. Program addresses are
+run-local; hashes are stable. The "#4706" arm also carried the fragment scalar-pair projection.
+That projection has since been split out of #4706 (see below), so without it the pixel
+count is 7, not 6: `f1d1baa8` refuses again.
+
+| | `main` | #4706 |
+|---|---|---|
+| refused pixel programs | 8 | 6 |
+| refused compute programs | 7 | 6 |
+| refused vertex draws (merged NGG) | 2 | 2 |
+
+- **The `v_writelane_b32` in `index.txt` was the census, not the refusal.** `first_bad_op=0x361` is
+  the compute-safe coverage pass. The fragment translator already handles both programs'
+  constant-lane spills. `index.txt` and the `[refused-shader]` line now carry the translator's own
+  `reject="..."`, so a default run says why without `PROSPER_DBG`.
+- **Fixed in #4706, all general:**
+  - pixel `e8a1ce3b` (2009 dwords): `v_ldexp_f32 v12, v12, -2 clamp` at pc1951. CLAMP on
+    `v_ldexp_f32` is now the ordinary float saturate.
+  - compute `0x5008dc0000` (1504): s14 still carried the entry-M0 token from `s_mov_b32 s14, m0` at
+    pc85 when pc491 read it as a loop counter. The dispatcher's token now dies where the Wave64 MUST
+    analysis proves a data write on every path. The program now refuses later, at pc577, on an
+    image descriptor (next bullet).
+- **Not fixed in #4706: pixel `f1d1baa8` (1361).** It refuses at pc308,
+  `s_and_b64 s[30:31], s[30:31], s[36:37]`:
+  - s[30:31] is a compare mask written at pc226, spilled with `v_writelane` at pc252/262 and
+    reloaded with `v_readlane` at pc295/297. The `s_buffer_load_dwordx2` into s[30:31] at pc219 is
+    overwritten by those reloads.
+  - s[36:37] is a fresh compare mask.
+  - The fragment stage refuses to project a scalar data pair onto the lane bit. That stays the case
+    until the projection can prove the pair is definitely assigned (`RECOMPILER_REMAINING.md`,
+    #2790's row). #4711's review found four routes by which a fabricated zero still reached the
+    projection, so it moved to its own PR.
+  - `eb07b9cf` (1471) has the same instruction shape at pc326; its operands were not traced.
+- **What remains before the device loss:**
+  - six pixel and six compute programs refused at an image instruction whose descriptor the fold
+    cannot resolve (`pc_res=null`). The set is the same on both arms and in 3 of 3 runs. #4710.
+  - two indexed merged-NGG draws (`refusal=ngg-indexed`): 6 or 18 16-bit indices, up to 41
+    instances, into 64-slice volumes. This is #3135 P6, recorded there and not started. With the
+    fragment projection, the `b77161c6` draw reaches this refusal; without it, its pixel program
+    `f1d1baa8` is refused first.
+- **After the device loss** compute is off for the process. About ten NGG VS-only programs are
+  refused on `mbcnt-cross-lane` (#4427's class), alongside more image-descriptor refusals. Neither
+  arm's post-loss counts are comparable.
+- `[perf-alarm] summary` over each whole run, so including the post-loss part: `dropped-draws`
+  `shader-recompile/fragment` 22,952 → 872, `shader-recompile/vertex` 50,544 → 18,615.
+  `skipped-dispatches` `shader-recompile` 411 → 184. The arms reached the device loss at different
+  times, so read these as direction, not size. The after arm also carried the split-out fragment
+  projection.
+- **No picture change is claimed.** The route does not reach gameplay on either arm. Frames at host
+  frame 1100 land on different scenes (the brightness screen on #4706, the loading screen on
+  `main`), so they compare nothing.
+## Three refused pixel programs in one run: descriptor words, not opcodes, and intermittent (2026-10-07, #4700)
+
+One run on `main` `156714914` refused three pixel programs from t=16 s: `prosper-app` inside the
+`ps5ys` container, RenderDoc layer active, capture scheduled at pad flip 430,
+`scripts/kena/linux-reach-level-load.pad`. `dropped-draws` fired in 30 of 35 windows, all
+`shader-recompile/fragment` (12,046 draws). Five other runs did not reproduce it.
+
+| run (all `linux-reach-level-load.pad`) | the three refusals |
+|---|---|
+| visuals lane, container, RenderDoc layer + capture | **yes** |
+| visuals lane, container, default | no |
+| this lane, container, RenderDoc layer + capture, 240 s (×2) | no, 0 `dropped-draws` windows |
+| this lane, container, default, 473 s span (past New Game) | no |
+
+- **Not an opcode gap.** `index.txt`'s `first_bad_fmt=4 op=0x8/0x7` is the compute-safe generic
+  census: SOPP `s_cbranch_execz` / `s_cbranch_vccnz`, which the fragment structurizer lowers. Each
+  program refused at an `image_sample_b` with `[mimg-unresolved] ... pc_res=null sgpr_res=cbuf`.
+  The T# slots are AGC `ro[]` entries declared `size=0`. In that run the V# shape test claimed them
+  as buffers; on default runs it does not.
+- **The words changed, and V#-shaped words are not a T#.** The V# claim reads only the slot's
+  first four words, so its firing in that run and not on default runs shows the words themselves
+  were different. V#-shaped words decode to T# TYPE 0, which the texture checks refuse. Leading
+  hypothesis: another stage's V#s (#305's shape). #4592 recorded this program's `s[8:15]` ending in
+  `0004dfac`, the V# `dword3` constant RESOURCE_BINDING.md names. Not established: that the fold's
+  own publication failed on the words rather than on provenance or its early return.
+- **What landed:** the `[t8-dropped]` line prints the eight words and the failed gate, once per
+  (program, pc, reason), for every image-use decline in the fold's T# admission and every skip in
+  its texture publication. It does not cover the fold's whole-program early return (checked source
+  no longer current). It was silent in the runs above with the first version of this build. The next
+  reproduction keeps the evidence.
+- **Whether the RenderDoc layer matters is undecided.** 1 of 3 layer runs reproduced (the visuals
+  lane's, on `156714914`) against 0 of 2 default runs; this lane's two layer runs were on a
+  different binary. It has only ever appeared with the layer active.
+- **What these programs draw** is not established. They account for ~12–57 draws per flip from t=16 s,
+  with NGG vertex programs `0x50409e0000` / `0x5040860000`, and sample one or two textures.
+- **Title menu unchanged.** An F9 screenshot at 222 s on the default run matches
+  `assets/screenshots/kena-title-menu-world.webp` apart from the falling leaf.
+- **Separate, after New Game** (default 473 s run): `ps 0x5052b20000` and `0x5008cc0000` (first
+  unsupported VOP3 `0x361`, `v_writelane_b32`), one compute program and two NGG vertex programs
+  (`refusal=ngg-indexed`) are refused, 38 fragment draws in 3 of 61 windows. Investigated by #4706
+  (entry above).
+
 ## No refused fragment programs remain (2026-10-07, #4680)
 
 Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
@@ -498,6 +597,24 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **The deferred lights skip the scene because the GBuffer shading-model bits are lost** — false.
   GBufferB alpha is 177 (DefaultLit, id 1) on 97% of view pixels at the light draw. The early-out
   is the lighting-channel AND, not the shading model (#4703, 2026-10-07).
+- **Kena's post-New-Game pixel programs `0x5052b20000` / `0x5008cc0000` need `v_writelane_b32` in
+  fragment programs** — false. `index.txt`'s `first_bad_op=0x361` came from the compute-safe
+  coverage census. The fragment translator accepts both programs' constant-lane spills. The real
+  rejects were `v_ldexp_f32 ... clamp` (pc1951, fixed by #4706) and `s_and_b64` of a reloaded
+  mask spill with a VOPC mask (pc308, still refused: the fragment scalar-pair projection needs a
+  definite-assignment proof first) (2026-10-07, #4706).
+- **The image-descriptor refusals at the first level load are caused by the F9 bundle capture** —
+  false. A run with `PROSPER_GRAB_BUNDLE_AFTER_MS` refused them all inside the capture window, but
+  a run with no capture and a `main` run refused the same set (2026-10-07, #4710).
+- **Kena's three refused pixel programs of 2026-10-07 (`0x505b7f0000`, `0x5040eb0000`,
+  `0x5040890000`) contain instructions the recompiler cannot translate** — false. Their
+  `first_bad_fmt=4 op=0x8/0x7` is the generic census's SOPP branches, which the fragment path lowers.
+  The refusal was an unresolved `image_sample_b` descriptor (#4700).
+- **Keeping a V#-claimed `size=0` T# slot a texture when the code reads it only as an image fixes
+  them** — false for V#-shaped words, which is what the claim firing shows they were: they decode to
+  T# TYPE 0 and the texture loop rejects them. Implemented, proven on the three dumps, and withdrawn.
+  Not established for a valid T# whose fold publication failed on provenance or the early return
+  (`docs/gpu/RESOURCE_BINDING.md` § Ruled out, #4700).
 - **The `shader-recompile/fragment` drops are one refused Wave64 program that needs a recompiler
   feature** — false. Most were AGC helper rectangles compiling the pixel shader the previous draw
   left bound, against that draw's stale user data. The refused program changed from run to run

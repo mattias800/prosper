@@ -878,6 +878,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_scalar_reads
     SOURCES tests/gpu/recompiler/test_fragment_scalar_reads.cpp
     INCLUDES tests LIBRARIES prosper_core)
+  # [t8-dropped]: the bounded witness that keeps the words of an image descriptor the fold
+  # declined (#4700).
+  prosper_add_gtest(test_dropped_image_descriptor
+    SOURCES tests/gpu/diagnostics/test_dropped_image_descriptor.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
@@ -1963,6 +1968,14 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_texture_validation_census.cpp
     INCLUDES frontends)
 
+  # The census of compute publications that are byte-identical to the previous one for the same target (the
+  # F8-window hook is header-only; this covers the pure class and its hash and the hook gate).
+  prosper_add_gtest(test_unchanged_publication_census
+    SOURCES frontends/shared/tests/test_unchanged_publication_census.cpp
+            src/diagnostics/exit_census.cpp src/diagnostics/exit_reports.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_performance_capture)
+
   add_executable(test_performance_capture frontends/shared/tests/test_performance_capture.cpp)
   target_link_libraries(test_performance_capture PRIVATE prosper_performance_capture)
   add_test(NAME performance_capture COMMAND test_performance_capture)
@@ -1976,10 +1989,6 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
     add_test(NAME schedstat_probe_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
-    # RUN_SERIAL: its fixture changes are wall-clock timers that must land inside a fixed sampling
-    # window, and under the CI's `ctest -j4` (#4116) they missed it on macOS and Windows in two
-    # different subtests while passing every serial run. A stopgap, NOT a fix -- #4142.
-    set_tests_properties(schedstat_probe_logic PROPERTIES RUN_SERIAL TRUE)
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
@@ -5252,6 +5261,13 @@ endif()
       # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
       prosper_add_gtest(test_cfg_spilled_mask_halves
         SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
+      # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
+      prosper_add_gtest(test_entry_m0_wave64_kill
+        SOURCES tests/gpu/recompiler/test_entry_m0_wave64_kill.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 

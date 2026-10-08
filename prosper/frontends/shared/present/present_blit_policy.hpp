@@ -54,6 +54,7 @@ enum class GpuPresentOutcome : uint8_t {
     ComputeScanoutStale,          // the guest bytes changed after the compute result was mirrored
     ComputeScanoutUnwatched,      // no guest write watch could be armed over the buffer
     ComputeScanoutExtentMismatch, // the flipped buffer's geometry is not the mirror's
+    ComputeScanoutFormatMismatch, // the flipped buffer's pixel format is not the mirror's (#4686)
     ComputeScanoutTileMismatch,   // VideoOut de-swizzles with another tile mode than compute wrote
     ComputeScanoutRendererSource, // the CPU path would present prosper's rendered pixels instead
     ComputeScanoutScaled,         // PROSPER_RENDER_SCALE: present extent is not the display extent
@@ -77,6 +78,7 @@ constexpr const char* gpu_present_outcome_name(GpuPresentOutcome o) {
     case GpuPresentOutcome::ComputeScanoutStale: return "compute-scanout-stale";
     case GpuPresentOutcome::ComputeScanoutUnwatched: return "compute-scanout-unwatched";
     case GpuPresentOutcome::ComputeScanoutExtentMismatch: return "compute-scanout-extent-mismatch";
+    case GpuPresentOutcome::ComputeScanoutFormatMismatch: return "compute-scanout-format-mismatch";
     case GpuPresentOutcome::ComputeScanoutTileMismatch: return "compute-scanout-tile-mismatch";
     case GpuPresentOutcome::ComputeScanoutRendererSource: return "compute-scanout-renderer-source";
     case GpuPresentOutcome::ComputeScanoutScaled: return "compute-scanout-scaled";
