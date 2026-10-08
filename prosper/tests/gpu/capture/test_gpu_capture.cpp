@@ -4206,10 +4206,10 @@ int main(int argc, char** argv) {
     uint32_t future_version = 0;
     if (legacy_bytes.size() >= 12)
         for (unsigned i = 0; i < 4; ++i) future_version |= uint32_t(legacy_bytes[8 + i]) << (8u * i);
-    // Derive the unknown version from this actual writer's header. A capture with no merged-NGG
-    // description and no unavailable-source placeholder is written as v71 (v72 exists only for an
-    // NGG description, #3135 P5; v74 only for a placeholder, #3807; v73 is reserved for the
-    // depth-bounds tail, #4704), so the first version no reader knows is four above it.
+    // Derive the unknown version from this actual writer's header. This capture needs none of the
+    // conditional tails, so it is written as v71; v72 (merged-NGG, #3135 P5), v73 (depth bounds,
+    // #4704) and v74 (unavailable-source marks, #3807) are all known, so the first version no
+    // reader knows is four above it.
     future_version += 4;
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {

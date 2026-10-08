@@ -45,12 +45,11 @@ namespace prosper::gpu {
 // about, with nothing else obliging the capture to own its bytes".
 inline bool capture_source_gate_candidate(const ShaderResource& r) {
     return r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage &&
-        !r.host_data && !r.host_data_size && !r.host_data_prefix_bytes &&
-        !r.table_index_count && r.table_entries.empty() &&
-        !r.raw_register_snapshot && !r.owned_raw_snapshot_bytes &&
-        !r.owned_nested_snapshot_bytes && !r.nested_raw_snapshot_admitted &&
-        !r.indirect_buffer_contract_tag && !r.indirect_pointer_relocation.binding_bytes &&
-        !r.compression_enabled && !r.metadata_addr;
+           !r.host_data && !r.host_data_size && !r.host_data_prefix_bytes && !r.table_index_count &&
+           r.table_entries.empty() && !r.raw_register_snapshot && !r.owned_raw_snapshot_bytes &&
+           !r.owned_nested_snapshot_bytes && !r.nested_raw_snapshot_admitted &&
+           !r.indirect_buffer_contract_tag && !r.indirect_pointer_relocation.binding_bytes &&
+           !r.compression_enabled && !r.metadata_addr;
 }
 
 // The record a placeholder must be to be read or written: no backing of any kind, and a resource
@@ -58,9 +57,9 @@ inline bool capture_source_gate_candidate(const ShaderResource& r) {
 // corrupt or hand-edited file cannot turn a real resource into zeros by setting one byte.
 inline bool valid_source_unavailable_record(const GpuCapturedResource& c) {
     return c.source_unavailable && c.blob_index == 0xFFFFFFFFu && c.blob_offset == 0 &&
-        c.metadata_blob_index == 0xFFFFFFFFu && c.metadata_size == 0 &&
-        c.internal_bytes.empty() && c.table_entry_blobs.empty() &&
-        capture_source_gate_candidate(c.resource);
+           c.metadata_blob_index == 0xFFFFFFFFu && c.metadata_size == 0 &&
+           c.internal_bytes.empty() && c.table_entry_blobs.empty() &&
+           capture_source_gate_candidate(c.resource);
 }
 
-}  // namespace prosper::gpu
+}   // namespace prosper::gpu

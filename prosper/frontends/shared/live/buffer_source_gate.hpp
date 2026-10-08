@@ -72,9 +72,10 @@ inline BufferSourceGateResult classify_buffer_source(
 // refused here by its record, before the replay process's own mapping table is consulted: what is
 // mapped in an offline tool says nothing about what was mapped in the game.
 template <typename TrackedProbe, typename ReservedStateQuery>
-inline BufferSourceGateResult classify_recorded_buffer_source(
-    bool recorded_unavailable, bool has_host_data, uint64_t gpu_addr, bool use_tracked_cache,
-    TrackedProbe probe_tracked, ReservedStateQuery query_reserved_state) {
+inline BufferSourceGateResult
+classify_recorded_buffer_source(bool recorded_unavailable, bool has_host_data, uint64_t gpu_addr,
+                                bool use_tracked_cache, TrackedProbe probe_tracked,
+                                ReservedStateQuery query_reserved_state) {
     if (recorded_unavailable && !has_host_data) {
         BufferSourceGateResult result;
         result.unavailable = true;

@@ -3792,7 +3792,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(r.size),
                         static_cast<unsigned long long>(r.host_data ? r.host_data_size : 0),
                         r.host_data ? ""
-                            : r.replay_source_unavailable
+                        : r.replay_source_unavailable
                             ? "  <- source unmapped live: all-zero fallback, no bytes by design"
                             : "  <- no captured bytes");
         }

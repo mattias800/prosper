@@ -1338,7 +1338,7 @@ if(TARGET prosper_core)
   # header directly.
   prosper_add_gtest(test_capture_unavailable_source
     SOURCES tests/gpu/capture/test_capture_unavailable_source.cpp
-    INCLUDES src frontends
+    INCLUDES src frontends tests
     LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
