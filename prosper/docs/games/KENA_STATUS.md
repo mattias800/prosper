@@ -19,9 +19,9 @@ Linux/AMD title-menu investigations are recorded below.
 
 | frame | mean luminance | PS5 oracle |
 |---|---|---|
-| title menu, `main` | 67.5 | 43.5 (`kena-oracle.png`) |
-| title menu, this PR | 66.6 (mean abs diff 3.7, from animated leaves) | 43.5 |
-| cave after the Pulse, `main` | 32.4 | 3.5 (after-Pulse oracle) |
+| title menu, `main` | 67.5 | 44.4 (title screenshot, [#3781](https://github.com/mattias800/prosper/issues/3781#issuecomment-5785053219)) |
+| title menu, this PR | 66.6 (mean abs diff 3.7, from animated leaves) | 44.4 |
+| cave after the Pulse, `main` | 32.4 | 3.5 (the owner's after-L1 screenshot, [#3781](https://github.com/mattias800/prosper/issues/3781#issuecomment-6059040004)) |
 | cave after the Pulse, this PR | 32.1 (mean abs diff 1.3) | 3.5 |
 | cave, `main`, both ambient passes skipped (diagnostic) | 5.5 | 3.5 |
 
@@ -35,7 +35,7 @@ The `main` and PR runs are not on the same base: `7a4636d7d` against `39d2e600f`
     previous exposure at (0, 1).
   - Every one of those loads hits the 1×1 dummy, so the result is a function of constants. It is
     2.0 on the title menu and 1.189 (2^0.25) in the cave. The cave is the darker exposure, and it
-    is still 9× too bright.
+    is still about 9× too bright.
   - Reading the dummy as UE4's histogram eye adaptation with the histogram turned off (fixed exposure)
     is `CONFIDENCE: MED`. The T# formats are measured.
 - **The cave's excess is ambient light.** Mean scene luminance of a RenderDoc capture, per stage,
@@ -953,12 +953,12 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **The exposure pass reads an 8-bit texture because prosper's view format differs from the guest's**
   — false. `PROSPER_TEXLOG` shows the guest T# itself is a 1×1 `IMG_FMT 56` (8_8_8_8_UNORM) at
   `0x500f0c0000`, and the 1×1 targets it writes are `IMG_FMT 77` (32_32_32_32_FLOAT), as prosper
-  renders them (2026-10-08).
-- **The cave is 7–9× too bright because its exposure does not adapt** — false. The exposure is a
+  renders them (2026-10-08, #4773).
+- **The cave is about 9× too bright because its exposure does not adapt** — false. The exposure is a
   constant-driven 1.189 in the cave against 2.0 on the title menu. The light comes from two ambient
   passes; skipping them gives 5.5 against the oracle's 3.5 (2026-10-08, #4766).
 - **prosper's BC6H decoder brightens Kena's ambient cubemap** — false. On 256 random blocks it matches
-  Pillow's independent BC6H decode to within 1 of 255 (2026-10-08).
+  Pillow's independent BC6H decode to within 1 of 255 (2026-10-08, #4773).
 - **Fixing the typed-buffer clear restores the distance-field AO** — false. With every element of the
   cone buffer now written, the cone trace still leaves it almost unchanged, and the bent normals stay
   at length 0.003 (2026-10-08, #4766).

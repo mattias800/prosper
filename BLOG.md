@@ -23,7 +23,7 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Kena's dark cave is too bright, but not because of exposure
 
-Kena's exposure turns out to be fixed by the game itself. Prosper's cave is nine times too bright because sky and ambient light reach the walls unoccluded; on PS5, distance-field occlusion blocks them ([#4766](https://github.com/mattias800/prosper/issues/4766)).
+Kena's exposure is a constant the game computes, and prosper reproduces it correctly. prosper's cave is nine times too bright because sky and ambient light reach the walls unoccluded; on PS5, distance-field occlusion blocks them ([#4766](https://github.com/mattias800/prosper/issues/4766)).
 
 ### Kena: Bridge of Spirits gets its depth of field
 
