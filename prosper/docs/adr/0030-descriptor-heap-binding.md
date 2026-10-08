@@ -108,12 +108,15 @@ not as code to follow (charter: external implementations are verification-only).
    - **descriptor-set backend**: today's pool / allocate / update / bind path, unchanged in
      behaviour, used when the extension is absent or disabled.
    `VK_EXT_descriptor_buffer` is **not** a third backend: it is the model Khronos is replacing, and
-   every target driver that has it either already has the heap extension (NVIDIA 610+, RADV 26.2+)
-   or falls back to sets. A third backend would be a third path to test for no device that needs it.
+   every target driver checked either already has the heap extension (NVIDIA 610+, RADV 26.2+) or
+   falls back to sets. AMD's Windows driver was not checked; until it is, it is assumed to take the
+   sets fallback. A third backend would be a third path to test for no device that needs it.
    The backend is chosen once per device, never per draw, so pipelines are created with or without
    `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT` uniformly. That also satisfies proposed ADR 0029
-   (#4722): every library linked into a GPL pipeline must agree on the descriptor model, and a
-   per-device choice guarantees it.
+   (on main): every library linked into a GPL pipeline must agree on the descriptor model, and a
+   per-device choice guarantees it. On heap-capable devices it also largely removes 0029's largest
+   unknown: a heap pipeline has no pipeline layout, so the `INDEPENDENT_SETS` layout question does
+   not arise there.
 2. **The descriptor heap is the substrate for ADR 0027's mirroring.** If ADR 0027's dynamic layer
    is accepted, a mirrored guest table is a region of the resource heap written index for index; on
    the set backend it stays an update-after-bind descriptor-indexing array. This ADR does not decide

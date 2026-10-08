@@ -71,7 +71,7 @@ lower-bound caveat.
   (`live_compute.cpp:11092-11109`): aliased, imported, partial write, inexact bytes, mip tail or
   offset, no resource, no staging, unsupported shape, packed extension off or unsupported, layout
   mismatch, prepare failed. That is twelve reasons plus `Disabled` (`PROSPER_NO_GPU_RETILE`), with
-`Admitted` besides. A declined image takes the CPU `tile_surface` path.
+  `Admitted` besides. A declined image takes the CPU `tile_surface` path.
 
 So the GPU kernels exist, are bit-checked against the host, and cover one format family for reads
 and most shapes for writes. The default for everything else is the host. The case against that
@@ -139,7 +139,7 @@ Spec rule `PERF-P12` (`docs/spec/performance.md`), `Status: proposed (adr:0031)`
   it to overlap. It remains worthwhile for the
   reference path and the fallback, but not as the default.
 - **Cache detiled copies with better dirty tracking, and keep the host transform.** This is
-  necessary, and it is ADR 0010 and the parallel ADR 0032. It is not sufficient: a surface the guest
+  necessary, and it is ADR 0010 and ADR 0032. It is not sufficient: a surface the guest
   really does rewrite every frame (video planes, streamed atlases, compute outputs that a later
   dispatch reads) still pays a full host transform for every change. Page tracking decides *whether*
   to transform, and this ADR decides *where*. The two compose, and neither replaces the other.
