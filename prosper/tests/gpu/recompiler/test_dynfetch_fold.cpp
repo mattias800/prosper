@@ -6465,7 +6465,7 @@ int main() {
     auto k7b_fetch = resolve_dynamic_fetch(k7b, sizeof(k7b) / sizeof(k7b[0]), seed6, 12, 8);
     CHECK(k7b_fetch.empty() ||
               k7b_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
-          "an edge landing inside the compacted gap is a real fall-through predecessor");
+          "a second edge, landing inside the compacted gap, declines the restore");
 
     // Kernel 12: the target block OPENS with an instruction the compacted stream drops (a VALU),
     // so no retained instruction sits at the branch target itself. UE4's depth-of-field gather has
@@ -6490,6 +6490,33 @@ int main() {
               k12_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
           "a branch-exclusive target that opens with a compacted VALU still restores the branch "
           "state");
+
+    // Kernels 12t/12c: the same shape, but the skip arm branches PAST the first s_endpgm into a
+    // tail the fold never walks. In 12t the tail branches back to pc=4, a second edge into the
+    // window that the decoded stream cannot see, so the fold must decline for the program. In 12c
+    // the tail just ends, the decode cache proves it closed, and the rule fires. Mutation that turns
+    // 12t red: drop the `into_open_tail` term in build_fold_control_plan.
+    uint32_t k12t[] = {
+        0xBF860003u,   // pc=0  s_cbranch_vccz 3     -> pc=4
+        0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+        0xBF820006u,   // pc=3  s_branch 6           -> pc=10 (past the s_endpgm)
+        0x7E020300u,   // pc=4  target: v_mov_b32 v1, v0
+        0xF4080108u, 0xFA000000u,   // pc=5  s_load_dwordx4 s[4:7], s[16:17], 0x0
+        0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+        0xBF810000u,   // pc=9  s_endpgm (the decoded stream ends here)
+        0xBF82FFF9u,   // pc=10 tail: s_branch -7    -> pc=4  (re-enters the window)
+    };
+    clear_shader_decode_cache();
+    auto k12t_fetch = resolve_dynamic_fetch(k12t, sizeof(k12t) / sizeof(k12t[0]), seed6, 12, 8);
+    CHECK(k12t_fetch.empty() ||
+              k12t_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a branch into an unproven tail that re-enters the window declines the restore");
+    k12t[10] = 0xBF810000u;   // pc=10 tail: s_endpgm -- a closed tail
+    clear_shader_decode_cache();
+    auto k12c_fetch = resolve_dynamic_fetch(k12t, sizeof(k12t) / sizeof(k12t[0]), seed6, 12, 8);
+    CHECK(k12c_fetch.size() == 1 &&
+              k12c_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+          "a branch into a proven-closed tail keeps the restore");
 
     // Kernel 8 (#2202 B2): a predecessor tally that counts only FORWARD branches is not a tally. Two
     // edges reach pc=4 — the forward `s_cbranch_vccz` at pc=0 and the backward `s_branch` at pc=8 —

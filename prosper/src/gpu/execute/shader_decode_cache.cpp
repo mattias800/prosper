@@ -1,6 +1,8 @@
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/execute/shader_source_window.hpp"
 
+#include <algorithm>
+
 namespace prosper::gpu {
 namespace {
 struct ShaderDecodeCache {
@@ -155,16 +157,26 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                 raw_snapshot_write_plan(decoded, result->owned_raw_x2_chains);
         result->raw_nested_numeric_load_pcs = rdna2_raw_nested_numeric_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
+        if (!decoded.empty() && decoded.back().is_end) {
+            result->fold_tail.end_pc = decoded.back().pc + decoded.back().len_dwords;
+            std::vector<Rdna2Inst> with_tail = decoded;
+            result->fold_tail.closed =
+                rdna2_append_closed_tail_blocks(snapshot.data(), snapshot.size(), with_tail) &&
+                std::none_of(with_tail.begin() + static_cast<std::ptrdiff_t>(decoded.size()),
+                             with_tail.end(), fold_uncounted_branch);
+        } else if (!decoded.empty()) {
+            result->fold_tail.end_pc = decoded.back().pc + decoded.back().len_dwords;
+        }
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
         result->shader_constant_specialized =
             rdna2_specialize_shader_constant_branches(shader_constant_decoded) != 0;
         if (result->shader_constant_specialized)
             retain_fold_instructions(shader_constant_decoded, result->shader_constant_instructions);
         if (fold_control_cache_enabled()) {
-            result->control_plan = build_fold_control_plan(result->instructions);
+            result->control_plan = build_fold_control_plan(result->instructions, result->fold_tail);
             if (result->shader_constant_specialized)
-                result->shader_constant_control_plan =
-                    build_fold_control_plan(result->shader_constant_instructions);
+                result->shader_constant_control_plan = build_fold_control_plan(
+                    result->shader_constant_instructions, result->fold_tail);
         }
         result->bytes =
             static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
