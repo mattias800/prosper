@@ -7214,7 +7214,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return decline("subgroup-too-narrow");
     }
     prosper::diagnostics::perf::note_wave64_compute_native(   // ADR 0028 route= field
-        effective_subgroup, guest_wave, item.code_addr);
+        item.required_subgroup_size, guest_wave);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:
     // runtime predicates, coordinates and loop bounds may change with identical code and launch.
     // Preserve current input contents instead. Exact cached images can omit the upload only after

@@ -90,11 +90,11 @@ TEST(Wave64RefusalLine, ASubgroupRefusalStillNamesTheHostRange) {
     EXPECT_FALSE(has(missing, "not-consulted")) << missing;
 }
 
-// ADR 0028's route= field. The vocabulary is fixed before the routes exist, so the names are pinned
+// ADR 0028's route= field. The vocabulary is named before the routes exist, so the names are pinned
 // here: a census tool keys on them.
 TEST(Wave64RouteField, TheVocabularyIsFixedAndReservedNamesExist) {
     const char* const expected[] = {"native",  "proven-width-independent", "workgroup-exchange",
-                                    "n-lanes", "fragment-promoted",        "refused"};
+                                    "n-lanes", "fragment-promoted",        "owned-wave", "refused"};
     ASSERT_EQ(kWave64RouteCount, std::size(expected));
     for (size_t i = 0; i < kWave64RouteCount; ++i)
         EXPECT_STREQ(wave64_route_name(static_cast<Wave64Route>(i)), expected[i]);
@@ -126,7 +126,8 @@ TEST(Wave64RouteField, AnAdmittedProgramIsNotTaggedUnsupported) {
 
 TEST(Wave64RouteField, ARouteThatDoesNotExistYetPrintsNothing) {
     for (Wave64Route reserved : {Wave64Route::WorkgroupExchange, Wave64Route::NLanes,
-                                 Wave64Route::FragmentPromoted, Wave64Route::Refused})
+                                 Wave64Route::FragmentPromoted, Wave64Route::OwnedWave,
+                                 Wave64Route::Refused})
         EXPECT_TRUE(wave64_route_line(reserved, false, 1, 2).empty())
             << wave64_route_name(reserved);
 }

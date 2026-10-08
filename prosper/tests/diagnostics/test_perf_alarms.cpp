@@ -2035,55 +2035,87 @@ struct RouteSource {
 
 void test_wave64_routes() {
     std::puts("Wave64 routes (ADR 0028)");
+    using enum Wave64Route;
     auto& l = ledger();
     const auto count = [&](Counter c) { return l.counters[static_cast<size_t>(c)].load(); };
     const uint64_t native = count(Counter::Wave64RouteNative);
     const uint64_t proven = count(Counter::Wave64RouteProven);
-    note_wave64_route(Wave64Route::Native, false, 64, 0x39930001);
-    note_wave64_route(Wave64Route::Native, true, 64, 0x39930002);
-    check("native uses are counted per use", count(Counter::Wave64RouteNative) == native + 2 &&
-                                                 count(Counter::Wave64RouteProven) == proven);
-    note_wave64_route(Wave64Route::Native, false, 32, 0x39930001);
-    note_wave64_route(Wave64Route::Native, false, 0, 0x39930001);
+    note_wave64_route(Native, false, 64);
+    note_wave64_route(Native, true, 64);
+    check("native uses are counted per use", count(Counter::Wave64RouteNative) == native + 2);
+    check("a native use does not touch the proof counter",
+          count(Counter::Wave64RouteProven) == proven);
+    note_wave64_route(Native, false, 32);
+    note_wave64_route(Native, false, 0);
     {
         const SuppressDrawDropCounting capture;
-        note_wave64_route(Wave64Route::Native, false, 64, 0x39930001);
+        note_wave64_route(Native, false, 64);
     }
     {
         const SuppressDispatchSkipCounting capture;
-        note_wave64_route(Wave64Route::Native, true, 64, 0x39930002);
+        note_wave64_route(Native, true, 64);
     }
     check("Wave32, unknown width and capture re-analysis are not counted",
           count(Counter::Wave64RouteNative) == native + 2);
-    for (Wave64Route reserved : {Wave64Route::WorkgroupExchange, Wave64Route::NLanes,
-                                 Wave64Route::FragmentPromoted, Wave64Route::Refused})
-        note_wave64_route(reserved, false, 64, 0x39930003);
+    for (Wave64Route reserved : {WorkgroupExchange, NLanes, FragmentPromoted, OwnedWave, Refused})
+        note_wave64_route(reserved, false, 64);
     check("reserved routes and Refused are ignored by the admitting hook",
           count(Counter::Wave64RouteNative) == native + 2 &&
               count(Counter::Wave64RouteProven) == proven);
+
+    // Compute route 1 is a REQUIRED 64-lane subgroup, so it means the same on every host: a program
+    // with no required size is counted on none.
     const uint64_t before_compute_native = count(Counter::Wave64RouteNative);
-    note_wave64_compute_native(32, 64, 0x39930010);
-    note_wave64_compute_native(8, 64, 0x39930010);
-    note_wave64_compute_native(64, 32, 0x39930010);
-    check("a compute program on a host narrower than 64 lanes is not counted native",
+    note_wave64_compute_native(0, 64);
+    note_wave64_compute_native(32, 64);
+    note_wave64_compute_native(64, 32);
+    check("a compute program without a required 64-lane subgroup is not counted native",
           count(Counter::Wave64RouteNative) == before_compute_native);
-    note_wave64_compute_native(64, 64, 0x39930010);
-    check("a compute program on a 64-lane host is counted native",
+    note_wave64_compute_native(64, 64);
+    check("a compute program that requires 64 lanes is counted native",
           count(Counter::Wave64RouteNative) == before_compute_native + 1);
+
+    // The per-use hook is only a counter: it never logs and takes no lock.
     testing::internal::CaptureStderr();
-    note_wave64_route(Wave64Route::ProvenWidthIndependent, false, 64, 0x39930004, 0x39930005);
-    note_wave64_route(Wave64Route::ProvenWidthIndependent, false, 64, 0x39930004, 0x39930005);
-    note_wave64_route(Wave64Route::Native, false, 64, 0x39930006, 0x39930007);
+    note_wave64_route(ProvenWidthIndependent, false, 64);
+    note_wave64_route(ProvenWidthIndependent, false, 64);
+    const std::string quiet = testing::internal::GetCapturedStderr();
+    check("a proven use counts and announces nothing by itself",
+          count(Counter::Wave64RouteProven) == proven + 2 && quiet.empty());
+
+    // The fragment helpers: announce only on the first sighting, count every admitted use.
+    const uint64_t proven_before_helpers = count(Counter::Wave64RouteProven);
+    testing::internal::CaptureStderr();
+    note_proven_fragment_wave64(true, true, 0x39930004, 0x39930005);
+    note_proven_fragment_wave64(true, false, 0x39930004, 0x39930005);
+    note_proven_fragment_wave64(false, true, 0x39930008, 0x39930009);
+    note_native_fragment_wave64(true, false, 64);
+    note_native_fragment_wave64(true, true, 64);
+    note_native_fragment_wave64(true, false, 0);
+    note_native_fragment_wave64(false, false, 64);
     const std::string log = testing::internal::GetCapturedStderr();
-    check("proven uses are all counted", count(Counter::Wave64RouteProven) == proven + 2);
+    check("proven uses are all counted, and a refused draw is not",
+          count(Counter::Wave64RouteProven) == proven_before_helpers + 2);
+    check("only a native fragment use with a required 64-lane size and no lowering counts",
+          count(Counter::Wave64RouteNative) == before_compute_native + 2);
     const std::string wanted = "[wave64-route] stage=fragment program=0x39930004 "
                                "identity=0x39930005 route=proven-width-independent";
     const size_t first = log.find(wanted);
-    check("the proof route announces its identity once",
+    check("the proof route announces its identity on the first sighting only",
           first != std::string::npos && log.find(wanted, first + 1) == std::string::npos);
-    check("the native route is counted but never logged, so native hosts log nothing new",
-          log.find("0x39930006") == std::string::npos &&
+    check("a refused draw and the native route are never logged",
+          log.find("0x39930009") == std::string::npos &&
               log.find("route=native") == std::string::npos);
+
+    // A full announce inventory is said once, and the counter stays complete.
+    testing::internal::CaptureStderr();
+    for (uint64_t id = 1; id <= 700; ++id)
+        announce_wave64_route(ProvenWidthIndependent, true, 64, 0x3993100000ull + id);
+    const std::string overflow = testing::internal::GetCapturedStderr();
+    const std::string notice = "announce inventory full (512)";
+    const size_t at = overflow.find(notice);
+    check("a full inventory is announced once as a lower bound",
+          at != std::string::npos && overflow.find(notice, at + 1) == std::string::npos);
 
     RouteSource source;
     source.counts[static_cast<size_t>(Counter::Wave64RouteNative)] = 5;
@@ -2093,12 +2125,13 @@ void test_wave64_routes() {
     source.counts[static_cast<size_t>(Counter::Wave64ComputeRecompile)] = 3;
     source.counts[static_cast<size_t>(Counter::Wave64ComputeSubgroup)] = 4;
     check("route totals: admitted routes by counter, refused as the four refusals' sum",
-          wave64_route_uses(source, Wave64Route::Native) == 5 &&
-              wave64_route_uses(source, Wave64Route::ProvenWidthIndependent) == 2 &&
-              wave64_route_uses(source, Wave64Route::Refused) == 10 &&
-              wave64_route_uses(source, Wave64Route::WorkgroupExchange) == 0 &&
-              wave64_route_uses(source, Wave64Route::NLanes) == 0 &&
-              wave64_route_uses(source, Wave64Route::FragmentPromoted) == 0);
+          wave64_route_uses(source, Native) == 5 &&
+              wave64_route_uses(source, ProvenWidthIndependent) == 2 &&
+              wave64_route_uses(source, Refused) == 10 &&
+              wave64_route_uses(source, WorkgroupExchange) == 0 &&
+              wave64_route_uses(source, NLanes) == 0 &&
+              wave64_route_uses(source, FragmentPromoted) == 0 &&
+              wave64_route_uses(source, OwnedWave) == 0);
 }
 
 void test_wave64_engine_json() {
