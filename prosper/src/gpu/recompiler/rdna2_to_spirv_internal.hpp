@@ -1094,6 +1094,11 @@ struct SpirvCompute {
     uint32_t unpack_norm(uint32_t dword, uint32_t bit_off, uint32_t bits, bool is_signed, float norm);
     // unpack_half: extract one of the two f16 halves packed in `dword` (which=0 low, 1 high) -> float bits.
     uint32_t unpack_half(uint32_t dword, uint32_t which);
+    // One channel of a compressed (COMPR) colour export: half `which` of `dword`, decoded as
+    // SPI_SHADER_COL_FORMAT says it was packed, and delivered as the bits the MRT's output class
+    // expects (#4703). Defined in spirv/fragment_color_export.cpp.
+    uint32_t compressed_export_channel(uint32_t dword, uint32_t which, ColorExportFormat format,
+                                       FragmentOutputClass output_class);
     // GFX10's packed 10/11-bit vertex-float fields use binary16's five-bit exponent and a shortened
     // mantissa, without a sign bit. Widening the complete field left by 4 (11-bit) or 5 (10-bit)
     // produces the exact low-half binary16 encoding, including subnormals, infinity, and NaN.
@@ -2266,6 +2271,17 @@ struct SpirvCompute {
     // the only thing holding it to two.
     uint32_t t_v4f = 0;
     std::array<uint32_t, kFragmentColorOutputs> v_color{};
+    // #4703: the numeric class of each colour output, set before begin_fragment(). An integer
+    // attachment needs a uvec4/ivec4 output; Float is the historical vec4 declaration.
+    std::array<FragmentOutputClass, kFragmentColorOutputs> color_output_class{};
+    uint32_t t_v4i_cache = 0;
+    uint32_t t_v4i() {
+        if (!t_v4i_cache) {
+            t_v4i_cache = id();
+            put(types, Op_TypeVector, {t_v4i_cache, t_i32, 4});
+        }
+        return t_v4i_cache;
+    }
     void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u) {
         bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
@@ -2294,14 +2310,16 @@ struct SpirvCompute {
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypePointer, {t_ptr_out, SC_Output, t_v4f});
-        for (uint32_t output : v_color)
-            if (output) put(types, Op_Variable, {t_ptr_out, output, SC_Output});
+        declare_color_outputs(t_ptr_out);
         if (with_cbufs) declare_cbufs(rt);   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
         function_var_insert = code.size();
     }
-    // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output.
+    // Declare each enabled colour output variable with its class's pointer type (#4703).
+    void declare_color_outputs(uint32_t t_ptr_out_float);
+    // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output. An integer
+    // output (color_output_class) receives the operand bits unchanged, as uvec4 or ivec4.
     void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a);
     // Fragment depth export (EXP target 8 = MRTZ) — a lazily declared BuiltIn FragDepth output.
     // Writing FragDepth requires ExecutionMode DepthReplacing (fixed-function Z is replaced by the

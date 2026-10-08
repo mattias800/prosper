@@ -203,6 +203,7 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
     require(c.float_transport.canonical(), "compile-case noncanonical float transport");
     require(c.float_flags.canonical(), "compile-case noncanonical float flags");
     require(c.launch_rsrc1.canonical(), "compile-case noncanonical RSRC1_PS evidence");
+    require(c.export_formats.canonical(), "compile-case noncanonical export formats");
     require(c.resources.resources.size() <= kCompileCaseMaxResources &&
             c.blobs.size() <= kCompileCaseMaxBlobs && c.choices.reads.size() <= 65536,
             "compile-case collection budget");
@@ -274,10 +275,11 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
     TripBoundOperation trip(c.trip);
     CompilerChoiceScope choices(c.choices);
     TerminalRejectCapture rejection;
-    auto result = recompile_fragment(c.code.data(), c.code.size(), c.has_resources ? &owned.resources : nullptr,
-        c.has_system_inputs ? &c.system_inputs : nullptr, c.pcrel_target,
-        &c.interpolation, c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address},
-        c.float_mode, nullptr, c.float_transport, c.float_flags);
+    auto result = recompile_fragment(
+        c.code.data(), c.code.size(), c.has_resources ? &owned.resources : nullptr,
+        c.has_system_inputs ? &c.system_inputs : nullptr, c.pcrel_target, &c.interpolation,
+        c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address}, c.float_mode, nullptr,
+        c.float_transport, c.float_flags, c.export_formats);
     choices.finish_replay();
     if (baseline) require(result == c.source, "baseline SOURCE differs (full word comparison)");
     const auto reject_records = rejection.take();

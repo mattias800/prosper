@@ -398,18 +398,15 @@ bool rdna2_fragment_compiles_wave64(const uint32_t* code, size_t program_dwords)
 }
 
 static std::vector<uint32_t> recompile_fragment_impl(
-        const uint32_t* code, size_t dwords,
-        const ShaderResourceTable* rt,
-        const PixelSystemInputMapping* system_inputs,
-        uint32_t pcrel_dispatch_target,
-        const FragmentInterpolationLayout* interpolation,
-        uint32_t wave_size,
-        RecompileDiagnosticContext diagnostic,
-        FragmentFloatMode float_mode,
-        FragmentArithmeticObservation* arithmetic_observation, FloatTransportConfig float_transport,
-        FragmentFloatFlags float_flags) {
+    const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
+    const PixelSystemInputMapping* system_inputs, uint32_t pcrel_dispatch_target,
+    const FragmentInterpolationLayout* interpolation, uint32_t wave_size,
+    RecompileDiagnosticContext diagnostic, FragmentFloatMode float_mode,
+    FragmentArithmeticObservation* arithmetic_observation, FloatTransportConfig float_transport,
+    FragmentFloatFlags float_flags, FragmentExportFormats export_formats) {
     if ((wave_size != 32 && wave_size != 64) || !float_mode.canonical() ||
-        !float_transport.canonical() || !float_flags.canonical()) return {};
+        !float_transport.canonical() || !float_flags.canonical() || !export_formats.canonical())
+        return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream
@@ -504,6 +501,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
     arithmetic_observation->source_fingerprint = b.fragment_program_hash;
     arithmetic_observation->float_mode = float_mode;
     b.wave_size = effective_wave_size;
+    for (uint32_t mrt = 0; mrt < kFragmentColorOutputs; ++mrt)
+        b.color_output_class[mrt] = export_formats.output_class(mrt);
     b.begin_fragment(rt, color_mask);
     // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
     // operations below represent the complete wave. Keep the older byte-exact captured exception
@@ -633,17 +632,24 @@ static std::vector<uint32_t> recompile_fragment_impl(
             if (in.exp_en == 0) return true;
             bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
-                // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
-                // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
+                // COMPR: the 4 channels are two 16-bit pairs — src[0] holds (r,g), src[1] holds
+                // (b,a). SPI_SHADER_COL_FORMAT says what a half IS: f16 for the pkrtz'd
+                // tonemap/sRGB output, but unorm16/snorm16/u16/s16 for the other compressed
+                // formats. Decoding every one as f16 is what zeroed Kena's lighting channels (#4703).
+                const ColorExportFormat format = export_formats.compressed_format(in.exp_target);
+                const FragmentOutputClass output_class = export_formats.output_class(in.exp_target);
                 const uint32_t p0 = (in.exp_en & 0x3u)
                     ? operand_bits(b, state, in, in.src[0], &eok) : b.uconst(0);
                 const uint32_t p1 = (in.exp_en & 0xCu)
                     ? operand_bits(b, state, in, in.src[1], &eok) : b.uconst(0);
-                b.export_color(in.exp_target,
-                               (in.exp_en & 0x1u) ? b.unpack_half(p0, 0) : b.uconst(0),
-                               (in.exp_en & 0x2u) ? b.unpack_half(p0, 1) : b.uconst(0),
-                               (in.exp_en & 0x4u) ? b.unpack_half(p1, 0) : b.uconst(0),
-                               (in.exp_en & 0x8u) ? b.unpack_half(p1, 1) : b.uconst(0));
+                const auto channel = [&](uint32_t enable, uint32_t packed, uint32_t which) {
+                    return (in.exp_en & enable)
+                               ? b.compressed_export_channel(packed, which, format, output_class)
+                               : b.uconst(0);
+                };
+                const uint32_t red = channel(0x1u, p0, 0), green = channel(0x2u, p0, 1);
+                const uint32_t blue = channel(0x4u, p1, 0), alpha = channel(0x8u, p1, 1);
+                b.export_color(in.exp_target, red, green, blue, alpha);
             } else {
                 b.export_color(in.exp_target,
                                (in.exp_en & 0x1u) ? operand_bits(b, state, in, in.src[0], &eok) : b.uconst(0),
@@ -687,22 +693,18 @@ static std::vector<uint32_t> recompile_fragment_impl(
     return b.finish();
 }
 
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* rt,
-                                         const PixelSystemInputMapping* system_inputs,
-                                         uint32_t pcrel_dispatch_target,
-                                         const FragmentInterpolationLayout* interpolation,
-                                         bool wave32,
-                                         RecompileDiagnosticContext diagnostic,
-                                         FragmentFloatMode float_mode,
-                                         FragmentArithmeticObservation* arithmetic_observation,
-                                         FloatTransportConfig float_transport,
-                                         FragmentFloatFlags float_flags) {
+std::vector<uint32_t>
+recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
+                   const PixelSystemInputMapping* system_inputs, uint32_t pcrel_dispatch_target,
+                   const FragmentInterpolationLayout* interpolation, bool wave32,
+                   RecompileDiagnosticContext diagnostic, FragmentFloatMode float_mode,
+                   FragmentArithmeticObservation* arithmetic_observation,
+                   FloatTransportConfig float_transport, FragmentFloatFlags float_flags,
+                   FragmentExportFormats export_formats) {
     FragmentArithmeticObservation observation;
-    auto result = recompile_fragment_impl(code, dwords, rt, system_inputs,
-                                         pcrel_dispatch_target, interpolation,
-                                         wave32 ? 32u : 64u, diagnostic, float_mode, &observation,
-                                         float_transport, float_flags);
+    auto result = recompile_fragment_impl(
+        code, dwords, rt, system_inputs, pcrel_dispatch_target, interpolation, wave32 ? 32u : 64u,
+        diagnostic, float_mode, &observation, float_transport, float_flags, export_formats);
     if (arithmetic_observation) *arithmetic_observation = observation;
     else observe_fragment_arithmetic(observation, diagnostic.program_address, !result.empty());
     return result;

@@ -1298,6 +1298,43 @@ int main(int argc, char** argv) {
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4), "recompile_fragment"); }
+    // Fragment: compressed and uncompressed colour exports under every SPI_SHADER_COL_FORMAT
+    // decode and output class (#4703): u16/s16 halves into uvec4/ivec4 outputs (Kena's R16_UINT
+    // lighting channels), unorm16/snorm16 into a float output, the mismatched value conversions,
+    // and raw 32-bit bits into integer outputs. Two MRTs so mixed output classes share a module.
+    {
+        const uint32_t compr[] = {0x7e0002ffu, 0xbeef0001u, 0x7e0202ffu, 0x00020003u, 0xf800140fu,
+                                  0x00000100u, 0xf8001c1fu, 0x00000100u, 0xbf810000u};
+        const uint32_t raw[] = {0x7e0002ffu, 0xbeef0001u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+                                0xf800100fu, 0x03020100u, 0xf800181fu, 0x03020100u, 0xbf810000u};
+        struct Variant {
+            const char* name;
+            uint32_t col_format;
+            FragmentOutputClass mrt0, mrt1;
+            bool compressed;
+        };
+        constexpr auto F = FragmentOutputClass::Float, U = FragmentOutputClass::Uint,
+                       S = FragmentOutputClass::Sint;
+        const Variant variants[] = {
+            {"fragment_export_uint16_uint", 0x77u, U, U, true},
+            {"fragment_export_sint16_sint", 0x88u, S, S, true},
+            {"fragment_export_norm16_float", 0x65u, F, F, true},
+            {"fragment_export_fp16_into_uint", 0x44u, U, S, true},
+            {"fragment_export_int16_into_float", 0x87u, F, F, true},
+            {"fragment_export_raw32_uint_sint", 0x91u, U, S, false},
+        };
+        for (const auto& v : variants) {
+            FragmentOutputClass classes[8]{};
+            classes[0] = v.mrt0;
+            classes[1] = v.mrt1;
+            const auto& code = v.compressed ? compr : raw;
+            const size_t words = v.compressed ? std::size(compr) : std::size(raw);
+            dump(dir, v.name,
+                 recompile_fragment(code, words, nullptr, nullptr, UINT32_MAX, nullptr, false,
+                                    {RecompileDiagnosticStage::Fragment, 0}, {}, nullptr, {}, {},
+                                    make_fragment_export_formats(v.col_format, classes)));
+        }
+    }
     // Fragment: Astro's exact wave64 MBCNT + device-global append allocation shape.
     { const uint32_t c[] = {
           0xD7660007u,0x0001007Fu,0xBEFC0380u,0xD8FA0014u,0x06000000u,

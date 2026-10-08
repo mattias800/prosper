@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-07
 
+### Kena: Bridge of Spirits gets its sun back
+
+Sunlight and leaf shadows fall on the path in front of Kena's title-menu shrine; the grade is still far too bright and the ferns and flowers are still missing ([#4703](https://github.com/mattias800/prosper/issues/4703), [tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-sunlit.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, with a sunlit patch of grass and leaf shadows on the path in the foreground; Linux prosper-app, route linux-reach-level-load.pad, F9 frame at 222 s"></p>
+
+Left to right: `main`, this fix, and the PS5 oracle, cropped to the path below the shrine.
+
+<p align="center"><img src="prosper/docs/screenshots/issue-4703-kena-sun-main-fix-oracle.webp" alt="Three crops of the path below Kena's shrine: on main the ground is black; with the fix a sunlit grass patch and shadows appear; the PS5 oracle shows dense ferns, flowers and a darker grade"></p>
+
 ### Kena: Bridge of Spirits draws its title-menu world
 
 The shrine and forest now draw behind Kena's title menu on Linux. The foreground grass and the light shafts are still missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787), [#3835](https://github.com/mattias800/prosper/issues/3835)).

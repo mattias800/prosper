@@ -77,6 +77,17 @@ const char* owned_wave_draw_state_refusal(const GpuState& state, bool fragment) 
     if (render.depth_read_base || render.depth_write_base || render.stencil_read_base ||
         render.stencil_write_base || render.htile_data_base)
         return "draw-wave-depth-physical-extent-unavailable";
+    // #4703: the packet commit shader declares vec4 colour outputs and decodes no compressed
+    // export but f16 (it refuses `compr` outright). An integer attachment needs a uvec4/ivec4
+    // output, and UNORM16..SINT16 col_formats a non-f16 decode -- refuse both visibly rather than
+    // write a float-typed output into an integer target, which Vulkan leaves undefined.
+    if (fragment) {
+        const FragmentExportFormats exports =
+            fragment_export_formats(resolve_pipeline_state(render));
+        if (exports.uint_outputs || exports.sint_outputs)
+            return "draw-wave-integer-color-output-unimplemented";
+        if (exports.compressed_formats) return "draw-wave-compressed-export-format-unimplemented";
+    }
     return nullptr;
 }
 

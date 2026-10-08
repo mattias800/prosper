@@ -20,6 +20,7 @@
 #include <span>
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/recompiler/fragment_export_formats.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
@@ -858,23 +859,23 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instr
 uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
 
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
-// write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
+// write vec4(src0..3) to the matching color output. `export_formats` (#4703) selects how a
+// compressed export is unpacked and which outputs are uvec4/ivec4; {} is the historical
+// f16-unpack, all-float-output module. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF/MTBUF) with resolved bindings.
 // A nonnull arithmetic_observation transfers reporting to the owning cache request; it must replay
 // the retained observation on every return. Default direct callers announce once per request.
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* rt = nullptr,
-                                         const PixelSystemInputMapping* system_inputs = nullptr,
-                                         uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                         const FragmentInterpolationLayout* interpolation = nullptr,
-                                         bool wave32 = false,
-                                         RecompileDiagnosticContext diagnostic = {
-                                             RecompileDiagnosticStage::Fragment, 0},
-                                         FragmentFloatMode float_mode = {},
-                                         FragmentArithmeticObservation* arithmetic_observation = nullptr,
-                                         FloatTransportConfig float_transport = {},
-                                         FragmentFloatFlags float_flags = {});
+std::vector<uint32_t>
+recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt = nullptr,
+                   const PixelSystemInputMapping* system_inputs = nullptr,
+                   uint32_t pcrel_dispatch_target = UINT32_MAX,
+                   const FragmentInterpolationLayout* interpolation = nullptr, bool wave32 = false,
+                   RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Fragment, 0},
+                   FragmentFloatMode float_mode = {},
+                   FragmentArithmeticObservation* arithmetic_observation = nullptr,
+                   FloatTransportConfig float_transport = {}, FragmentFloatFlags float_flags = {},
+                   FragmentExportFormats export_formats = {});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

@@ -200,6 +200,9 @@ struct ShaderCompileKey {
     FloatTransportConfig float_transport{};
     FragmentFloatFlags fragment_float_flags{};
     FragmentLaunchRsrc1 fragment_launch_rsrc1{};
+    // #4703: compressed-export unpack and integer outputs. Normalized, so a draw whose exports
+    // compile as they always did keeps the historical key.
+    FragmentExportFormats fragment_export_formats{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
     // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
@@ -260,15 +263,14 @@ struct ShaderCompileKey {
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
                capture_position == other.capture_position &&
-               has_pixel_inputs == other.has_pixel_inputs &&
-               pixel_inputs == other.pixel_inputs &&
+               has_pixel_inputs == other.has_pixel_inputs && pixel_inputs == other.pixel_inputs &&
                has_system_inputs == other.has_system_inputs &&
-               system_inputs == other.system_inputs &&
-               fragment_wave32 == other.fragment_wave32 &&
+               system_inputs == other.system_inputs && fragment_wave32 == other.fragment_wave32 &&
                fragment_float_mode == other.fragment_float_mode &&
                float_transport == other.float_transport &&
                fragment_float_flags == other.fragment_float_flags &&
                fragment_launch_rsrc1 == other.fragment_launch_rsrc1 &&
+               fragment_export_formats == other.fragment_export_formats &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
@@ -291,8 +293,7 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
-               compute_storage_buffer_int64_atomics ==
-                   other.compute_storage_buffer_int64_atomics &&
+               compute_storage_buffer_int64_atomics == other.compute_storage_buffer_int64_atomics &&
                compute_packed_r11_storage == other.compute_packed_r11_storage &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
@@ -362,6 +363,9 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.fragment_float_flags.dx10_clamp);
         hash = hash_mix(hash, key.fragment_launch_rsrc1.available);
         hash = hash_mix(hash, key.fragment_launch_rsrc1.value);
+        hash = hash_mix(hash, key.fragment_export_formats.compressed_formats);
+        hash = hash_mix(hash, key.fragment_export_formats.uint_outputs);
+        hash = hash_mix(hash, key.fragment_export_formats.sint_outputs);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.has_compute_config);

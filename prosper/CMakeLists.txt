@@ -5786,6 +5786,14 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # #4703: integer colour targets written through compressed (16-bit) exports -- the export
+      # decode, the uvec4 output, the R16_UINT attachment and an R16_UINT sampled reader. Same
+      # block and include roots as the other render_runner.h tests; needs a real Vulkan device.
+      prosper_add_gtest(test_integer_color_export
+        SOURCES tests/gpu/test_integer_color_export.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       # Includes a shared fixture, which resolves from the `tests` root.
@@ -7054,6 +7062,14 @@ if(TARGET gpu_replay)
     PROPERTIES TIMEOUT 60)
   target_compile_definitions(test_gpu_capture_observation_cli PRIVATE PROSPER_OBSERVATION_CLI_TESTS=1)
   add_dependencies(test_gpu_capture_observation_cli gpu_replay)
+  # #4703 review B2: both gpu_replay fragment-regeneration routes use the captured export formats.
+  prosper_add_gtest(test_replay_export_formats
+    SOURCES tests/gpu/capture/test_replay_export_formats.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    PROPERTIES TIMEOUT 60)
+  add_dependencies(test_replay_export_formats gpu_replay)
 endif()
 
 # CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links

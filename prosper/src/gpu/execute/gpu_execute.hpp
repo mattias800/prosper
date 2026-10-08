@@ -21,6 +21,7 @@
 #include "gpu/state/fragment_entry_observation.hpp"
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
+#include "gpu/state/fragment_export_state.hpp"   // #4703: per-draw fragment export compile input
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include "gpu/pm4/vgt_shader_stages.hpp"   // NGG shape in the refused-shader index
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
@@ -765,7 +766,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr);
+    RefusedShaderSource* original_source = nullptr,
+    FragmentExportFormats fragment_export_formats = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
@@ -776,7 +778,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
     RefusedShaderSource* original_source = nullptr,
     const CheckedGraphicsSource* checked_source = nullptr,
-    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr);
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr,
+    FragmentExportFormats fragment_export_formats = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -2739,6 +2742,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     }
     uint64_t vs_identity = 0, fs_identity = 0;
     RefusedShaderSource vs_original, fs_original;
+    // #4703: compressed-export unpack and integer outputs follow the bound targets.
+    const FragmentExportFormats fragment_exports = fragment_export_formats(resolved_pipeline);
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words || checked_vertex) {
@@ -2763,7 +2768,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
                 rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original, checked_fragment.get(),
-                &out.native_ps_source);
+                &out.native_ps_source, fragment_exports);
     } else {
         if (owned_vertex) {
         }   // execution and native export commit happen at the actual device owner
@@ -2787,7 +2792,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
+                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original, fragment_exports);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
