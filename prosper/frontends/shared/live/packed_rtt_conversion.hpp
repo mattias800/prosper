@@ -78,8 +78,8 @@ struct PackedRttConversion {
     // `words_per_texel` is 2 for the append pass, whose buffer holds the packed and the RGBA8 halves.
     bool fits(uint64_t texels, uint64_t words_per_texel = 1) const {
         return texels && texels <= UINT32_MAX - 127u &&
-            texels * 4 * words_per_texel <= limits.maxStorageBufferRange &&
-            (texels + 127) / 128 <= limits.maxComputeWorkGroupCount[0];
+               texels * 4 * words_per_texel <= limits.maxStorageBufferRange &&
+               (texels + 127) / 128 <= limits.maxComputeWorkGroupCount[0];
     }
     VkResult allocate_binding(VkDescriptorPool& pool, VkDescriptorSet& set) const {
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
@@ -172,30 +172,31 @@ struct PackedRttConversion {
         const uint32_t count = width * height;
         VkBufferMemoryBarrier buffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         buffer.srcQueueFamilyIndex = buffer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        buffer.buffer = staging; buffer.size = VK_WHOLE_SIZE;
+        buffer.buffer = staging;
+        buffer.size = VK_WHOLE_SIZE;
         buffer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         buffer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(command,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        vkCmdPipelineBarrier(
+            command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &buffer, 0, nullptr);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout,
-                                0, 1, &set, 0, nullptr);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0,
+                                nullptr);
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
         vkCmdDispatch(command, (count + 127u) / 128u, 1, 1);
         buffer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         buffer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &buffer, 0, nullptr);
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &buffer, 0, nullptr);
         VkBufferImageCopy copy{};
         copy.bufferOffset = VkDeviceSize{count} * 4u;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {width, height, 1};
-        vkCmdCopyBufferToImage(command, staging, destination,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(command, staging, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &copy);
         // The staging allocation is host-visible and pooled; its next owner may map and read it.
-        prosper::gpu::record_host_read_barrier(command, staging,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        prosper::gpu::record_host_read_barrier(
+            command, staging, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     }
 };
 } // namespace prosper::frontend

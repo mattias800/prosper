@@ -29,8 +29,8 @@ inline bool is_unorm10_rgba_storage(const prosper::gpu::ShaderResource& r) {
 template <class Bound>
 bool unorm10_mirror_wants_scratch(const Bound& bi, const prosper::gpu::ShaderResource& r,
                                   VkDeviceSize staging_bytes) {
-    return bi.storage_writeback && bi.native_float_storage && is_unorm10_rgba_storage(r) && r.depth == 1 &&
-           staging_bytes == VkDeviceSize{r.width} * r.height * 4u;
+    return bi.storage_writeback && bi.native_float_storage && is_unorm10_rgba_storage(r) &&
+           r.depth == 1 && staging_bytes == VkDeviceSize{r.width} * r.height * 4u;
 }
 
 // The result can take the mirror only with its scratch half reserved and the integer conversion pass
@@ -45,11 +45,11 @@ bool unorm10_mirror_ready(Context& ctx, Bound& bi, VkBuffer staging, VkDeviceSiz
     if (!soft_ok(conversion.initialize(ctx.physical, ctx.device, ctx.pipeline_cache),
                  "unorm10-mirror-pipeline") ||
         !conversion.fits(result_bytes / 4u, 2u) ||
-        (!bi.unorm10_set &&
-         !soft_ok(conversion.allocate_binding(bi.unorm10_pool, bi.unorm10_set), "unorm10-mirror-descriptors")))
+        (!bi.unorm10_set && !soft_ok(conversion.allocate_binding(bi.unorm10_pool, bi.unorm10_set),
+                                     "unorm10-mirror-descriptors")))
         return false;
     conversion.bind_buffer(bi.unorm10_set, staging, result_bytes * 2u);
     return true;
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

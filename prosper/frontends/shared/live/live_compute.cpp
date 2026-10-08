@@ -1345,7 +1345,8 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
-    PackedRttConversion unorm10_mirror_conversion{.build = prosper::gpu::build_compute_packed10_to_rgba8_append,
+    PackedRttConversion unorm10_mirror_conversion{
+        .build = prosper::gpu::build_compute_packed10_to_rgba8_append,
         .debug_name = "prosper unorm10_mirror_conversion"};
     BgraSeedScratch bgra_seed_scratch;
     // #3656: device-side bounding of a device-resolved indirect dispatch's argument record.
@@ -9636,7 +9637,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      (bi.standalone_seed.valid() && bi.packed_r11_storage) ||
                      (!bi.has_renderer_seed() && !bi.compute_transfer_seed_borrowed &&
                       !(bi.persistent && bi.upload_skipped)))) {
-                    bi.unorm10_mirror_scratch = prosper::frontend::unorm10_mirror_wants_scratch(bi, *r, sbytes);
+                    bi.unorm10_mirror_scratch =
+                        prosper::frontend::unorm10_mirror_wants_scratch(bi, *r, sbytes);
                     VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                     sci.size = bi.unorm10_mirror_scratch ? sbytes * 2u : sbytes;
                     sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -11830,11 +11832,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto decline = [](ExactResultDecline why) {
                 prosper::diagnostics::perf::note_exact_result(why);
             };
-            // Packed R10G10B10A2 mirrors into the renderer's RGBA8 image by blit (unorm10_mirror.hpp).
+            // Packed R10G10B10A2 converts exactly into the renderer's RGBA8 image (unorm10_mirror.hpp).
             const bool unorm10_convert = prosper::frontend::is_unorm10_rgba_storage(*r);
-            const auto format = unorm10_convert
-                ? std::optional<LiveTargetPixelFormat>(LiveTargetPixelFormat::Rgba8Unorm)
-                : storage_target_format(*r);
+            const auto format =
+                unorm10_convert
+                    ? std::optional<LiveTargetPixelFormat>(LiveTargetPixelFormat::Rgba8Unorm)
+                    : storage_target_format(*r);
             if (!format) { decline(ExactResultDecline::FormatUnmapped); continue; }
             // A GPU-authoritative result must remain readable by the next partial writer.
             // Only these exact formats currently have a renderer-image storage seed path.
@@ -11848,7 +11851,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if ((*format == LiveTargetPixelFormat::Rgba16Float &&
                  (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
                 (*format == LiveTargetPixelFormat::R8Unorm && !bi.native_float_storage) ||
-                (unorm10_convert && !prosper::frontend::unorm10_mirror_ready(ctx, bi, staging[i], staging_bytes[i], vk_soft_ok)) ||
+                (unorm10_convert && !prosper::frontend::unorm10_mirror_ready(
+                                        ctx, bi, staging[i], staging_bytes[i], vk_soft_ok)) ||
                 (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
                 decline(ExactResultDecline::FormatNotNative);
                 continue;
@@ -11920,7 +11924,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // sampled imports, including duplicate descriptors folded onto an earlier sampled
             // import, can share the destination when they name this same allocation. Their
             // reads end with the dispatch before the result copy below; each import owns a pin.
-            const bool own_seed_destination = !unorm10_convert &&
+            const bool own_seed_destination =
+                !unorm10_convert &&
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
                  (*format == LiveTargetPixelFormat::R8Unorm && bi.native_float_storage) ||
@@ -12678,8 +12683,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             if (bi.mirror_result_to_imported)
-                prosper::frontend::record_result_to_imported_copy(command, bi.image,
-                    images[bi.seed_from_imported].image, r->width, r->height, r->depth);
+                prosper::frontend::record_result_to_imported_copy(
+                    command, bi.image, images[bi.seed_from_imported].image, r->width, r->height,
+                    r->depth);
             if (bi.mirror_destination.valid()) {
                 // staging[i] holds canonical row-major guest texels (staging_mirror_copy.hpp).
                 prosper::frontend::record_staging_ready_for_transfer(command, staging[i],
@@ -12704,12 +12710,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_dst);
                 if (bi.mirror_unorm10_convert) {
-                    ctx.unorm10_mirror_conversion.record_packed10_to_rgba8(command, staging[i],
-                        bi.unorm10_set, static_cast<VkImage>(bi.mirror_destination.image),
-                        r->width, r->height);
-                } else {
-                    prosper::frontend::record_staging_to_image_copy(command, staging[i],
+                    ctx.unorm10_mirror_conversion.record_packed10_to_rgba8(
+                        command, staging[i], bi.unorm10_set,
                         static_cast<VkImage>(bi.mirror_destination.image), r->width, r->height);
+                } else {
+                    prosper::frontend::record_staging_to_image_copy(
+                        command, staging[i], static_cast<VkImage>(bi.mirror_destination.image),
+                        r->width, r->height);
                 }
                 VkImageMemoryBarrier restore = to_dst;
                 restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

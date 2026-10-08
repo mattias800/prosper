@@ -187,7 +187,7 @@ blocking-sync|prosper/tests/fixtures/render_runner.h|vkQueueWaitIdle 2
 blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
 # note #4635: +76 for the shared read-only buffer arena binding. The header extraction that paid for
 # it on its own base landed first through #4660, so on main the PR nets this growth.
-file-size|prosper/frontends/shared/live/live_compute.cpp 14587  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
+file-size|prosper/frontends/shared/live/live_compute.cpp 14594  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
 file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5501  # lowered: lazy sampled colour-target materializer moved to lazy_sampled_color_target.hpp
 # note: retain eleven upstream DST_SEL/refused-CS observation lines (#4290) alongside the finality reduction.
 # note #4328: 59 lines above that lowered cap connect real public-entry activity, borrowed private

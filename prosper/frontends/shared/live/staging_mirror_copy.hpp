@@ -23,7 +23,8 @@ inline void record_staging_ready_for_transfer(VkCommandBuffer command, VkBuffer 
     ready.srcQueueFamilyIndex = ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     ready.buffer = staging;
     ready.size = bytes;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(command,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &ready, 0, nullptr);
 }
 
@@ -34,14 +35,16 @@ inline void record_staging_to_image_copy(VkCommandBuffer command, VkBuffer stagi
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(command, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(command, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &region);
 }
 
 // Copies a dispatch's result (`result`, already in TRANSFER_SRC_OPTIMAL) into the imported image it was
 // seeded from (`imported`, GENERAL and only read by the dispatch), returning `imported` to GENERAL for the
 // next compute reader. Same texel format on both sides, so a bit copy.
-inline void record_result_to_imported_copy(VkCommandBuffer command, VkImage result, VkImage imported,
-                                           uint32_t width, uint32_t height, uint32_t depth) {
+inline void record_result_to_imported_copy(VkCommandBuffer command, VkImage result,
+                                           VkImage imported, uint32_t width, uint32_t height,
+                                           uint32_t depth) {
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -50,8 +53,8 @@ inline void record_result_to_imported_copy(VkCommandBuffer command, VkImage resu
     to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_dst.image = imported;
     to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &to_dst);
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
     VkImageCopy copy{};
     copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -63,8 +66,9 @@ inline void record_result_to_imported_copy(VkCommandBuffer command, VkImage resu
     to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &to_general);
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &to_general);
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

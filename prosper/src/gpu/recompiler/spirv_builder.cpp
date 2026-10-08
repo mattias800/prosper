@@ -828,7 +828,8 @@ class UniqueUintConstants {
 public:
     UniqueUintConstants(Emitter& e, uint32_t uint_t) : e_(e), uint_t_(uint_t) {}
     uint32_t operator()(uint32_t value) {
-        for (auto [v, id] : ids_) if (v == value) return id;
+        for (auto [v, id] : ids_)
+            if (v == value) return id;
         const auto id = e_.id();
         ids_.emplace_back(value, id);
         Emitter::put(e_.types, Op_Constant, {uint_t_, id, value});
@@ -868,8 +869,8 @@ private:
 // Opens `main` with the bounds guard the count-driven word passes share: loads the invocation index and
 // the pushed texel count, and enters `body` only when index < count. `zero` is the pass's uint 0
 // constant. Returns {index, count}; emit_in_place_word_compute_end closes the function.
-std::pair<uint32_t, uint32_t> emit_in_place_word_compute_begin(Emitter& e, const InPlaceWordComputeIds& ids,
-                                                               uint32_t zero) {
+std::pair<uint32_t, uint32_t>
+emit_in_place_word_compute_begin(Emitter& e, const InPlaceWordComputeIds& ids, uint32_t zero) {
     const auto xyz = e.id(), index = e.id(), count_ptr = e.id(), count = e.id(), valid = e.id();
     Emitter::put(e.code, Op_Function, {ids.void_t, ids.main, FC_None, ids.fn_t});
     Emitter::put(e.code, Op_Label, {ids.entry});
@@ -896,9 +897,8 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     WordPassBuilder w;
     Emitter& e = w.e;
     const InPlaceWordComputeIds& ids = w.ids;
-    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
-                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
-                 push_word, push, main, entry, body, done] = ids;
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid, array_t, block_t, block_ptr,
+                 word_ptr, words, push_t, push_ptr, push_word, push, main, entry, body, done] = ids;
     auto& constant = w.constant;
     const auto [index, count] = emit_in_place_word_compute_begin(e, ids, constant(0));
     const auto texel_ptr = e.id(), bits = e.id();
@@ -914,64 +914,70 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     const auto exponent = w.binary(Op_ShiftRightLogical, bits, constant(23));
     const auto low_exp = w.predicate(Op_ULessThan, exponent, constant(118));
     const auto high_exp = w.predicate(Op_UGreaterThan, exponent, constant(127));
-    const auto bounded_exp = w.select(low_exp, constant(118),
-                                    w.select(high_exp, constant(127), exponent));
-    const auto mantissa = w.binary(Op_BitwiseOr,
-        w.binary(Op_BitwiseAnd, bits, constant(0x7fffffu)), constant(0x800000u));
+    const auto bounded_exp =
+        w.select(low_exp, constant(118), w.select(high_exp, constant(127), exponent));
+    const auto mantissa = w.binary(Op_BitwiseOr, w.binary(Op_BitwiseAnd, bits, constant(0x7fffffu)),
+                                   constant(0x800000u));
     const auto product = w.binary(Op_IMul, mantissa, constant(255));
     const auto wide = w.predicate(Op_UGreaterThanEqual, product, constant(0x80000000u));
     const auto shift = w.select(wide, constant(8), constant(7));
     const auto product_m = w.binary(Op_ShiftRightLogical, product, shift);
-    const auto remainder = w.binary(Op_BitwiseAnd, product,
-        w.binary(Op_ISub, w.binary(Op_ShiftLeftLogical, constant(1), shift), constant(1)));
-    const auto half = w.binary(Op_ShiftLeftLogical, constant(1),
-        w.binary(Op_ISub, shift, constant(1)));
-    const auto round_product = w.predicate(Op_LogicalOr,
-        w.predicate(Op_UGreaterThan, remainder, half),
+    const auto remainder =
+        w.binary(Op_BitwiseAnd, product,
+                 w.binary(Op_ISub, w.binary(Op_ShiftLeftLogical, constant(1), shift), constant(1)));
+    const auto half =
+        w.binary(Op_ShiftLeftLogical, constant(1), w.binary(Op_ISub, shift, constant(1)));
+    const auto round_product = w.predicate(
+        Op_LogicalOr, w.predicate(Op_UGreaterThan, remainder, half),
         w.predicate(Op_LogicalAnd, w.predicate(Op_IEqual, remainder, half),
-            w.predicate(Op_INotEqual,
-                w.binary(Op_BitwiseAnd, product_m, constant(1)), constant(0))));
-    const auto product_rounded = w.binary(Op_IAdd, product_m,
-                                        w.select(round_product, constant(1), constant(0)));
+                    w.predicate(Op_INotEqual, w.binary(Op_BitwiseAnd, product_m, constant(1)),
+                                constant(0))));
+    const auto product_rounded =
+        w.binary(Op_IAdd, product_m, w.select(round_product, constant(1), constant(0)));
     const auto product_carry = w.predicate(Op_IEqual, product_rounded, constant(1u << 24));
-    const auto product_normal = w.select(product_carry,
-        w.binary(Op_ShiftRightLogical, product_rounded, constant(1)), product_rounded);
+    const auto product_normal =
+        w.select(product_carry, w.binary(Op_ShiftRightLogical, product_rounded, constant(1)),
+                 product_rounded);
     // Use exponent+2 to keep the small negative exponents unsigned. The clamped input makes every
     // dynamic shift below fall in [14,25], even when the final out-of-range select discards it.
-    const auto exp_plus_two = w.binary(Op_IAdd,
-        w.binary(Op_ISub, w.binary(Op_IAdd, bounded_exp, shift), constant(125)),
-        w.select(product_carry, constant(1), constant(0)));
-    const auto added = w.binary(Op_IAdd, product_normal,
-        w.binary(Op_ShiftLeftLogical, constant(1),
-            w.binary(Op_ISub, constant(24), exp_plus_two)));
+    const auto exp_plus_two =
+        w.binary(Op_IAdd, w.binary(Op_ISub, w.binary(Op_IAdd, bounded_exp, shift), constant(125)),
+                 w.select(product_carry, constant(1), constant(0)));
+    const auto added = w.binary(
+        Op_IAdd, product_normal,
+        w.binary(Op_ShiftLeftLogical, constant(1), w.binary(Op_ISub, constant(24), exp_plus_two)));
     const auto add_carry = w.predicate(Op_UGreaterThanEqual, added, constant(1u << 24));
     const auto added_half = w.binary(Op_ShiftRightLogical, added, constant(1));
-    const auto round_add = w.predicate(Op_LogicalAnd,
+    const auto round_add = w.predicate(
+        Op_LogicalAnd,
         w.predicate(Op_INotEqual, w.binary(Op_BitwiseAnd, added, constant(1)), constant(0)),
         w.predicate(Op_INotEqual, w.binary(Op_BitwiseAnd, added_half, constant(1)), constant(0)));
-    const auto added_m = w.select(add_carry,
-        w.binary(Op_IAdd, added_half, w.select(round_add, constant(1), constant(0))), added);
-    const auto added_exp = w.binary(Op_IAdd, exp_plus_two,
-        w.select(add_carry, constant(1), constant(0)));
+    const auto added_m = w.select(
+        add_carry, w.binary(Op_IAdd, added_half, w.select(round_add, constant(1), constant(0))),
+        added);
+    const auto added_exp =
+        w.binary(Op_IAdd, exp_plus_two, w.select(add_carry, constant(1), constant(0)));
     const auto second_carry = w.predicate(Op_IEqual, added_m, constant(1u << 24));
-    const auto final_m = w.select(second_carry,
-        w.binary(Op_ShiftRightLogical, added_m, constant(1)), added_m);
-    const auto final_exp = w.binary(Op_IAdd, added_exp,
-        w.select(second_carry, constant(1), constant(0)));
-    const auto finite_q = w.binary(Op_ShiftRightLogical, final_m,
-        w.binary(Op_ISub, constant(25), final_exp));
+    const auto final_m =
+        w.select(second_carry, w.binary(Op_ShiftRightLogical, added_m, constant(1)), added_m);
+    const auto final_exp =
+        w.binary(Op_IAdd, added_exp, w.select(second_carry, constant(1), constant(0)));
+    const auto finite_q =
+        w.binary(Op_ShiftRightLogical, final_m, w.binary(Op_ISub, constant(25), final_exp));
     const auto at_least_one = w.predicate(Op_UGreaterThanEqual, bits, constant(0x3f800000u));
-    const auto nan = w.predicate(Op_LogicalAnd,
-        w.predicate(Op_IEqual, w.binary(Op_BitwiseAnd, bits, constant(0x7f800000u)),
-                  constant(0x7f800000u)),
-        w.predicate(Op_INotEqual, w.binary(Op_BitwiseAnd, bits, constant(0x007fffffu)),
-                  constant(0)));
-    const auto negative = w.predicate(Op_INotEqual,
-        w.binary(Op_BitwiseAnd, bits, constant(0x80000000u)), constant(0));
-    const auto q = w.select(w.predicate(Op_LogicalOr, negative, nan), constant(0),
-        w.select(at_least_one, constant(255), w.select(low_exp, constant(0), finite_q)));
-    const auto packed = w.binary(Op_BitwiseOr, w.binary(Op_IMul, q, constant(0x010101u)),
-                               constant(0xff000000u));
+    const auto nan =
+        w.predicate(Op_LogicalAnd,
+                    w.predicate(Op_IEqual, w.binary(Op_BitwiseAnd, bits, constant(0x7f800000u)),
+                                constant(0x7f800000u)),
+                    w.predicate(Op_INotEqual, w.binary(Op_BitwiseAnd, bits, constant(0x007fffffu)),
+                                constant(0)));
+    const auto negative = w.predicate(
+        Op_INotEqual, w.binary(Op_BitwiseAnd, bits, constant(0x80000000u)), constant(0));
+    const auto q =
+        w.select(w.predicate(Op_LogicalOr, negative, nan), constant(0),
+                 w.select(at_least_one, constant(255), w.select(low_exp, constant(0), finite_q)));
+    const auto packed =
+        w.binary(Op_BitwiseOr, w.binary(Op_IMul, q, constant(0x010101u)), constant(0xff000000u));
     Emitter::put(e.code, Op_Store, {texel_ptr, packed});
     Emitter::put(e.code, Op_Branch, {done});
     Emitter::put(e.code, Op_Label, {done});
@@ -1019,9 +1025,8 @@ std::vector<uint32_t> build_compute_packed10_to_rgba8_append() {
     WordPassBuilder w;
     Emitter& e = w.e;
     const InPlaceWordComputeIds& ids = w.ids;
-    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
-                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
-                 push_word, push, main, entry, body, done] = ids;
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid, array_t, block_t, block_ptr,
+                 word_ptr, words, push_t, push_ptr, push_word, push, main, entry, body, done] = ids;
     auto& constant = w.constant;
     const uint32_t zero = constant(0), ten_mask = constant(0x3ffu), scale = constant(255),
                    half = constant(511), denominator = constant(1023), alpha_shift = constant(30),
@@ -1037,11 +1042,14 @@ std::vector<uint32_t> build_compute_packed10_to_rgba8_append() {
     Emitter::put(e.code, Op_Load, {uint_t, packed, source_ptr});
     auto rgba = zero;
     for (uint32_t c = 0; c < 3; ++c) {
-        const auto v = w.binary(Op_BitwiseAnd, w.binary(Op_ShiftRightLogical, packed, shift[c]), ten_mask);
-        const auto q = w.binary(Op_UDiv, w.binary(Op_IAdd, w.binary(Op_IMul, v, scale), half), denominator);
+        const auto v =
+            w.binary(Op_BitwiseAnd, w.binary(Op_ShiftRightLogical, packed, shift[c]), ten_mask);
+        const auto q =
+            w.binary(Op_UDiv, w.binary(Op_IAdd, w.binary(Op_IMul, v, scale), half), denominator);
         rgba = w.binary(Op_BitwiseOr, rgba, w.binary(Op_ShiftLeftLogical, q, byte_shift[c]));
     }
-    const auto a = w.binary(Op_IMul, w.binary(Op_ShiftRightLogical, packed, alpha_shift), alpha_scale);
+    const auto a =
+        w.binary(Op_IMul, w.binary(Op_ShiftRightLogical, packed, alpha_shift), alpha_scale);
     rgba = w.binary(Op_BitwiseOr, rgba, w.binary(Op_ShiftLeftLogical, a, byte_shift[3]));
     Emitter::put(e.code, Op_AccessChain,
                  {word_ptr, target_ptr, words, zero, w.binary(Op_IAdd, index, count)});
@@ -1092,10 +1100,11 @@ std::vector<uint32_t> build_compute_indirect_dispatch_validate() {
     // counts). A count that is not cannot be clamped (a clamped kernel would silently compute part
     // of its domain), so the whole launch becomes the hardware no-op of zero groups and word 3
     // records why. The per-axis limits are host-written once into words 4..6 of the record.
-    const auto bad = w.predicate(Op_LogicalOr,
-        w.predicate(Op_LogicalOr, w.predicate(Op_UGreaterThan, value[0], limit[0]),
-                  w.predicate(Op_UGreaterThan, value[1], limit[1])),
-        w.predicate(Op_UGreaterThan, value[2], limit[2]));
+    const auto bad =
+        w.predicate(Op_LogicalOr,
+                    w.predicate(Op_LogicalOr, w.predicate(Op_UGreaterThan, value[0], limit[0]),
+                                w.predicate(Op_UGreaterThan, value[1], limit[1])),
+                    w.predicate(Op_UGreaterThan, value[2], limit[2]));
     for (uint32_t i = 0; i < 3; ++i)
         Emitter::put(e.code, Op_Store, {pointer[i], w.select(bad, zero, value[i])});
     Emitter::put(e.code, Op_Store, {pointer[3], w.select(bad, one, zero)});

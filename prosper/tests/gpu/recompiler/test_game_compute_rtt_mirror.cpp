@@ -1610,44 +1610,63 @@ static int run_destination_mirror_regression() {
         const uint64_t p10_address = reinterpret_cast<uint64_t>(p10_guest.data());
         DrawItem p10_producer = producer;
         p10_producer.color0_base = p10_address;
-        p10_producer.color0_width = PW; p10_producer.color0_height = PH;
+        p10_producer.color0_width = PW;
+        p10_producer.color0_height = PH;
         p10_producer.ps.color0_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         CHECK(!render_submit_items({p10_producer}, PW, PH).empty(),
               "R10G10B10A2 producer materializes a renderer target");
         static const uint32_t store_p10[] = {
-            0x7E080300u, 0x7E0A0301u, // v4=x, v5=y
-            0x340C0A88u,              // v6 = y << 8
-            0x4A0C0906u,              // v6 = v6 + x: every value 0..1023 once
-            0x3A0E0CFFu, 0x155u,      // v7 = v6 ^ 0x155
-            0x4C100CFFu, 0x3FFu,      // v8 = 1023 - v6
-            0x7E000D06u, 0x7E020D07u, 0x7E040D08u, // v0, v1, v2 = float(v6, v7, v8)
-            0x100000FFu, 0x3A802008u, // v0 *= 1/1023
-            0x100202FFu, 0x3A802008u, // v1 *= 1/1023
-            0x100404FFu, 0x3A802008u, // v2 *= 1/1023
-            0x7E060D05u,              // v3 = float(y)
-            0x100606FFu, 0x3EAAAAABu, // v3 *= 1/3: alpha 0..3 by row
-            0xF0200F08u, 0x00020004u, // image_store v[0:3] (dmask RGBA) at v4,v5 through s[8:15]
+            0x7E080300u, 0x7E0A0301u,   // v4=x, v5=y
+            0x340C0A88u,   // v6 = y << 8
+            0x4A0C0906u,   // v6 = v6 + x: every value 0..1023 once
+            0x3A0E0CFFu, 0x155u,   // v7 = v6 ^ 0x155
+            0x4C100CFFu, 0x3FFu,   // v8 = 1023 - v6
+            0x7E000D06u, 0x7E020D07u, 0x7E040D08u,   // v0, v1, v2 = float(v6, v7, v8)
+            0x100000FFu, 0x3A802008u,   // v0 *= 1/1023
+            0x100202FFu, 0x3A802008u,   // v1 *= 1/1023
+            0x100404FFu, 0x3A802008u,   // v2 *= 1/1023
+            0x7E060D05u,   // v3 = float(y)
+            0x100606FFu, 0x3EAAAAABu,   // v3 *= 1/3: alpha 0..3 by row
+            0xF0200F08u, 0x00020004u,   // image_store v[0:3] (dmask RGBA) at v4,v5 through s[8:15]
             0xBF810000u,
         };
         ShaderResource p10_output{};
-        p10_output.cls = ResourceClass::StorageImage; p10_output.format = DataFormat::Unorm2_10_10_10;
-        p10_output.num_components = 4; p10_output.binding = 5; p10_output.sgpr_base = 8;
-        p10_output.img_dim = 1; p10_output.width = PW; p10_output.height = PH; p10_output.depth = 1;
-        p10_output.gpu_addr = p10_address; p10_output.size = static_cast<uint32_t>(p10_guest.size());
-        ShaderResourceTable p10_table; p10_table.resources.push_back(p10_output);
+        p10_output.cls = ResourceClass::StorageImage;
+        p10_output.format = DataFormat::Unorm2_10_10_10;
+        p10_output.num_components = 4;
+        p10_output.binding = 5;
+        p10_output.sgpr_base = 8;
+        p10_output.img_dim = 1;
+        p10_output.width = PW;
+        p10_output.height = PH;
+        p10_output.depth = 1;
+        p10_output.gpu_addr = p10_address;
+        p10_output.size = static_cast<uint32_t>(p10_guest.size());
+        ShaderResourceTable p10_table;
+        p10_table.resources.push_back(p10_output);
         ComputeShaderConfig p10_config;
-        p10_config.user_sgprs.resize(16); p10_config.local_x = PW; p10_config.local_y = PH; p10_config.local_z = 1;
-        p10_config.threads_x = PW; p10_config.threads_y = PH; p10_config.threads_z = 1;
+        p10_config.user_sgprs.resize(16);
+        p10_config.local_x = PW;
+        p10_config.local_y = PH;
+        p10_config.local_z = 1;
+        p10_config.threads_x = PW;
+        p10_config.threads_y = PH;
+        p10_config.threads_z = 1;
         p10_config.tidig_comp_cnt = 1;
         p10_config.native_storage_format_support =
             native_storage_format_support_bit(DataFormat::Unorm2_10_10_10, 4);
-        const auto p10_spirv = recompile_compute(store_p10, std::size(store_p10), &p10_table, p10_config);
+        const auto p10_spirv =
+            recompile_compute(store_p10, std::size(store_p10), &p10_table, p10_config);
         CHECK(!p10_spirv.empty(), "R10G10B10A2 storage writer recompiles");
         ComputeItem p10_full;
         p10_full.spirv = p10_spirv;
         p10_full.resources = std::make_shared<ShaderResourceTable>(p10_table);
-        p10_full.launch.threads_x = PW; p10_full.launch.threads_y = PH; p10_full.launch.threads_z = 1;
-        p10_full.launch.local_x = PW; p10_full.launch.local_y = PH; p10_full.launch.local_z = 1;
+        p10_full.launch.threads_x = PW;
+        p10_full.launch.threads_y = PH;
+        p10_full.launch.threads_z = 1;
+        p10_full.launch.local_x = PW;
+        p10_full.launch.local_y = PH;
+        p10_full.launch.local_z = 1;
         p10_full.launch.groups_x = p10_full.launch.groups_y = p10_full.launch.groups_z = 1;
         p10_full.code_addr = 0x37310031u;
 
@@ -1667,12 +1686,14 @@ static int run_destination_mirror_regression() {
         std::memcpy(p10_words.data(), p10_guest.data(), p10_guest.size());
         size_t covered = 0;
         for (size_t t = 0; t < p10_words.size(); ++t)
-            covered += (p10_words[t] & 0x3ffu) == t && ((p10_words[t] >> 10) & 0x3ffu) == (t ^ 0x155u) &&
-                       ((p10_words[t] >> 20) & 0x3ffu) == 1023u - t && (p10_words[t] >> 30) == t / PW;
+            covered +=
+                (p10_words[t] & 0x3ffu) == t && ((p10_words[t] >> 10) & 0x3ffu) == (t ^ 0x155u) &&
+                ((p10_words[t] >> 20) & 0x3ffu) == 1023u - t && (p10_words[t] >> 30) == t / PW;
         CHECK(covered == p10_words.size(),
               "R10G10B10A2 guest writeback holds every 10-bit value and every alpha");
         LiveTargetImageRequest p10_request{};
-        p10_request.width = PW; p10_request.height = PH;
+        p10_request.width = PW;
+        p10_request.height = PH;
         LiveTargetImageImport p10_import;
         CHECK(import_live_render_target_image(p10_address, p10_request, p10_import) &&
                   p10_import.valid() && p10_import.format == LiveTargetPixelFormat::Rgba8Unorm &&
@@ -1681,9 +1702,10 @@ static int run_destination_mirror_regression() {
         release_live_render_target_image(p10_address);
         std::vector<uint8_t> p10_pixels;
         std::string p10_error;
-        const bool read = prosper::test::readback_persistent_color_target(
-            p10_address, PW, PH, VK_FORMAT_R8G8B8A8_UNORM, p10_pixels, p10_error) &&
-            p10_pixels.size() == size_t{PW} * PH * 4;
+        const bool read = prosper::test::readback_persistent_color_target(p10_address, PW, PH,
+                                                                          VK_FORMAT_R8G8B8A8_UNORM,
+                                                                          p10_pixels, p10_error) &&
+                          p10_pixels.size() == size_t{PW} * PH * 4;
         size_t mismatches[4] = {};
         for (size_t t = 0; read && t < p10_words.size(); ++t) {
             const uint32_t w = p10_words[t];
@@ -1694,16 +1716,17 @@ static int run_destination_mirror_regression() {
             mismatches[3] += px[3] != prosper::frontend::kUnorm2To8[w >> 30];
         }
         if (mismatches[0] || mismatches[1] || mismatches[2] || mismatches[3])
-            std::fprintf(stderr, "R10G10B10A2 mismatches R=%zu G=%zu B=%zu A=%zu of %zu\n", mismatches[0],
-                         mismatches[1], mismatches[2], mismatches[3], p10_words.size());
+            std::fprintf(stderr, "R10G10B10A2 mismatches R=%zu G=%zu B=%zu A=%zu of %zu\n",
+                         mismatches[0], mismatches[1], mismatches[2], mismatches[3],
+                         p10_words.size());
         CHECK(read && !mismatches[0] && !mismatches[1] && !mismatches[2] && !mismatches[3],
               "R10G10B10A2 renderer image equals the CPU path's conversion byte for byte");
         // A packed-10 sampled binding is never a raw import of the RGBA8 renderer image, so the
         // raw-copy seed and result mirror (seed_from_imported) can never reach this format.
-        CHECK(!prosper::frontend::direct_sampled_rtt_compatible(DataFormat::Unorm2_10_10_10, 4,
-                                                                LiveTargetPixelFormat::Rgba8Unorm, true) &&
-                  !prosper::frontend::direct_sampled_rtt_compatible(DataFormat::Unorm2_10_10_10, 4,
-                                                                    LiveTargetPixelFormat::Rgba8Unorm, false),
+        CHECK(!prosper::frontend::direct_sampled_rtt_compatible(
+                  DataFormat::Unorm2_10_10_10, 4, LiveTargetPixelFormat::Rgba8Unorm, true) &&
+                  !prosper::frontend::direct_sampled_rtt_compatible(
+                      DataFormat::Unorm2_10_10_10, 4, LiveTargetPixelFormat::Rgba8Unorm, false),
               "packed R10G10B10A2 never imports the RGBA8 renderer image raw");
     }
     // R8Unorm (one 8-bit channel) is the same destination-mirror shape as RGBA8: the shader writes a
