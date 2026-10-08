@@ -2427,6 +2427,20 @@ struct SpirvCompute {
     uint32_t v_fragcoord = 0;
     uint32_t fragcoord_var();
     uint32_t fragcoord_component(uint32_t component);
+    // The guest's POS_{X,Y,Z,W}_FLOAT pixel inputs (component 0..3). X, Y and Z are FragCoord's.
+    // GFX10 loads clip-space w into POS_W_FLOAT -- SV_Position.w, the view depth -- while SPIR-V's
+    // FragCoord.w is 1/w. The guest reads the VGPR as a depth with no reciprocal of its own: UE4's
+    // dithered near-camera fade computes saturate((w - 100) / 50) from it, and given 1/w it faded
+    // Kena's foliage out (KENA_STATUS.md). Mesa's AMD drivers agree (main @ 1375dc60642a; the
+    // installed 26.1.4 predates the mechanism): radv_shader.c:72 and radeonsi's
+    // gfx/si_gfx_screen.c:344 set nir_frag_coord_use_w_rcp; nir_builder.c:809 then builds
+    // FragCoord.w as frcp(load_frag_coord_w_rcp); and ac_nir_lower_intrinsics_to_args.c:205 reads
+    // that intrinsic from frag_pos[3], the POS_W VGPR -- so the register holds clip-space w.
+    // CONFIDENCE: HIGH (guest disassembly and constants, and Mesa's lowering).
+    uint32_t guest_pixel_position_component(uint32_t component) {
+        const uint32_t value = fragcoord_component(component);
+        return component == 3 ? fbin(Op_FDiv, uconst(0x3f800000u), value) : value;
+    }
     // SPI_PS_INPUT_ENA.ANCILLARY_ENA places the rasterized primitive's render-target
     // array index in bits 26:16 of its one VGPR. Other ancillary fields remain zero.
     uint32_t fragment_ancillary_layer_bits();

@@ -34,6 +34,7 @@
 #include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/depth_plane_view.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
@@ -8471,16 +8472,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // may also consume canonical RGBA8 because byte*257/65535 == byte/255. The independent
             // extent check below still rejects a scaled image for texel fetch/query access. Other
             // aliases and numeric conversions keep the snapshot path below.
-            const bool depth_float_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Float32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_bits_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Uint32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_import_eligible =
-                depth_float_import_eligible || depth_bits_import_eligible;
+            using prosper::frontend::DepthPlaneRead;   // shared/rtt/depth_plane_view.hpp
+            const bool plain_2d_sample = !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
+                                         r->depth == 1 && r->img_dim == 1;
+            const prosper::frontend::DepthPlaneView depth_view =
+                plain_2d_sample ? prosper::frontend::depth_plane_view(r->format, r->num_components)
+                                : prosper::frontend::DepthPlaneView{};
+            const bool depth_float_import_eligible = depth_view.read == DepthPlaneRead::Float;
+            const bool depth_bits_import_eligible = depth_view.read == DepthPlaneRead::Bits;
+            const bool depth_import_eligible = depth_view.read != DepthPlaneRead::None;
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
@@ -8495,9 +8495,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     image_descriptors[i].normalized_sampling &&
                     !image_descriptors[i].texel_access;
                 const bool format_float_sampling = image_descriptors[i].sampled_float;
-                const LiveTargetImageRequest import_request{
-                    r->width, r->height, render_scale, depth_import_eligible,
-                    scalable_normalized_sampling};
+                const LiveTargetImageRequest import_request{r->width, r->height, render_scale,
+                                                            depth_view.texel_bytes,
+                                                            scalable_normalized_sampling};
                 const auto import_start = ComputeClock::now();
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
@@ -8715,8 +8715,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         LiveTargetImageImport source;
                         // Integer texel coordinates require exact actual extents. A configured render
                         // scale does not matter when the imported Vulkan image itself matches.
-                        const LiveTargetImageRequest request{
-                            r->width, r->height, render_scale, false, false};
+                        const LiveTargetImageRequest request{r->width, r->height, render_scale, 0u,
+                                                             false};
                         const bool time_seed = image_timing && perf_capture_timing;
                         const auto seed_start = time_seed
                             ? ComputeClock::now() : ComputeClock::time_point{};

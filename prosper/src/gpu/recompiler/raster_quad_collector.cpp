@@ -102,8 +102,10 @@ std::vector<uint32_t> build_raster_quad_collector(const RasterQuadInputs& inputs
     b.put(b.code, Op_Load, {b.t_i32, mask_value, mask_address});
     std::vector<uint32_t> values{helper_word, b.sel(helper, b.uconst(0), b.uconst(1)),
         b.i2u(mask_value), b.sel(facing, b.uconst(1), b.uconst(0)), primitive};
+    // The guest's POS_*_FLOAT values: these words seed guest VGPRs on the packet path
+    // (nested_wide_data_admission.cpp), so W is clip-space w, not FragCoord.w.
     for (uint32_t component = 0; component < 4; ++component)
-        values.push_back(b.fragcoord_component(component));
+        values.push_back(b.guest_pixel_position_component(component));
     for (const auto& field : out.fields)
         for (uint32_t component = 0; component < field.words; ++component) {
             uint32_t value = field.kind == RasterQuadFieldKind::Interpolant

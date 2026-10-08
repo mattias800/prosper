@@ -350,6 +350,47 @@ TEST(RecompiledFragment, Contract) {
         }
     }
 
+    // POS_W_FLOAT is clip-space w (SV_Position.w, the view depth), not SPIR-V's FragCoord.w = 1/w.
+    // UE4's dithered near-camera fade reads it as a depth; given 1/w it faded Kena's foliage out.
+    // The fullscreen triangle is emitted at w = 2 (x, y doubled: same NDC), because at w = 1 the
+    // two conventions agree and the check could not tell them apart. The PS exports w * 0.25:
+    // 0.5 (~128) for the guest's w, 0.125 (~32) for 1/w. Mutation that turns this red: return
+    // `value` for component 3 in SpirvCompute::guest_pixel_position_component.
+    {
+        const uint32_t vs_w2[] = {
+            0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u,   // v1 = u, v2 = v (vertex id bits)
+            0x7E0A02F6u, 0x7E0C02F2u,   // v5 = 4.0, v6 = 1.0
+            0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u,   // v1 = 4u - 1, v2 = 4v - 1
+            0x7E0A02F4u,   // v5 = 2.0
+            0x10020B01u, 0x10040B02u,   // v1 *= 2, v2 *= 2
+            0x7E060280u, 0x7E0802F4u,   // v3 = 0 (z), v4 = 2.0 (w)
+            0xF80008CFu, 0x04030201u, 0xBF810000u,   // exp pos0 v1..v4 done; s_endpgm
+        };
+        // ENA = ADDR = PERSP_CENTER | POS_W_FLOAT: v0:v1 perspective centre, v2 POS_W.
+        const uint32_t pos_w_ps[] = {
+            0x100404F0u, 0x100404F0u,   // v2 *= 0.5 twice
+            0x7E060280u, 0x7E080280u, 0x7E0A02F2u,   // v3 = 0, v4 = 0, v5 = 1
+            0xF800180Fu, 0x05040302u, 0xBF810000u,   // exp mrt0 v2..v5 done vm
+        };
+        PixelSystemInputMapping pos_w_inputs{0x00000802u, 0x00000802u};
+        const std::vector<uint32_t> vert_w2 = recompile_vertex(vs_w2, std::size(vs_w2));
+        const std::vector<uint32_t> pos_w_frag =
+            recompile_fragment(pos_w_ps, std::size(pos_w_ps), nullptr, &pos_w_inputs);
+        CHECK(!vert_w2.empty() && !pos_w_frag.empty(),
+              "recompiled a w=2 fullscreen VS and a PS reading POS_W_FLOAT");
+        if (!vert_w2.empty() && !pos_w_frag.empty()) {
+            const std::vector<uint8_t> px =
+                prosper::test::render_triangle_rgba(vert_w2, pos_w_frag, W, H);
+            CHECK(px.size() == (size_t)W * H * 4, "rendered the POS_W_FLOAT consumer");
+            if (px.size() == (size_t)W * H * 4) {
+                const uint8_t* pc = &px[((size_t)(H / 2) * W + W / 2) * 4];
+                printf("  POS_W center=(%u,%u,%u,%u)\n", pc[0], pc[1], pc[2], pc[3]);
+                CHECK(pc[0] >= 124 && pc[0] <= 132 && pc[1] < 4 && pc[2] < 4,
+                      "POS_W_FLOAT holds clip-space w (2.0 -> red 0.5), not FragCoord.w (0.5)");
+            }
+        }
+    }
+
     // VCC kill-mask early-out (#273 — DOLL's alpha-cull PS): `v_cmp; s_andn2_b64 vcc, exec, vcc;
     // s_cbranch_scc0 <null-export>; s_mov_b64 exec, vcc; export`. The kill mask lives in VCC itself
     // (not a saved SGPR pair); mask_test_branches must recognize it so the branch linearizes and the

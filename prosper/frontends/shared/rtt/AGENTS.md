@@ -15,3 +15,7 @@ Renderer-claimed VOLUMES follow one rule per colour slot: `volume_producer_shape
 guest footprint a volume slot's producer pass claims from its proven native layout, for every slot
 of a layered pass (#4643), and `volume_publication_source.hpp` is what a claimed volume hands to
 its guest publication (#4625).
+
+`depth_plane_view.hpp` names the one-component sampled views (FLOAT32, UNORM16, UINT32) that read
+a retained depth plane's value. The renderer never writes depth back to guest memory, so for those
+views a consumer must be served the retained image; the guest bytes hold only the clear.

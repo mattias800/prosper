@@ -5480,6 +5480,13 @@ endif()
         INCLUDES tests frontends src
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
+      # A compute UNORM16 view of a Z16 plane reads the renderer's retained depth, not the
+      # guest bytes (UE4 volumetric-fog shadowing; Kena's washed-out title scene).
+      prosper_add_gtest(test_live_compute_depth_unorm16
+        SOURCES tests/shared/live/test_live_compute_depth_unorm16.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
       add_executable(test_storage_metadata_borrow tests/gpu/execute/test_storage_metadata_borrow.cpp)
       target_include_directories(test_storage_metadata_borrow PRIVATE tests frontends)
       target_link_libraries(test_storage_metadata_borrow PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)

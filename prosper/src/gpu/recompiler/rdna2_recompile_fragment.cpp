@@ -559,7 +559,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
     if (system_inputs) {
         // RDNA2 PS system values are packed in field order. ADDR reserves each field's documented
         // width even when ENA is clear, allowing a driver to keep later VGPR numbers stable. Vulkan
-        // exposes the four floating-point position terms directly as FragCoord.xyzw.
+        // exposes the four floating-point position terms as FragCoord.xyzw, except that the
+        // guest's W is FragCoord.w's reciprocal (guest_pixel_position_component).
         static constexpr uint8_t widths[16] = {2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1};
         uint32_t vgpr = 0;
         for (uint32_t field = 0; field < 16; ++field) {
@@ -579,7 +580,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
                         rs.vreg[(int)(vgpr + component)] = value;
                     }
                 } else if (field >= 8 && field <= 11) {
-                    rs.vreg[(int)vgpr] = b.fragcoord_component(field - 8);
+                    rs.vreg[(int)vgpr] = b.guest_pixel_position_component(field - 8);
                 } else if (field == 13) {
                     rs.vreg[(int)vgpr] = b.fragment_ancillary_layer_bits();
                 }

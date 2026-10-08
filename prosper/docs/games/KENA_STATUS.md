@@ -57,6 +57,76 @@ Merged-NGG programs refused before the loss: 2 on `main`, 1 after.
 - `4324d9f3` (USER_SGPR 12, user-data range 0..24, 23-27 instances) is no longer refused `ngg-user-sgpr-count`. RSRC2's count is now what admission uses, and the program stops at `ngg-abi-read-undefined-sgpr`.
 - `52c7e8ff` stays `ngg-layer-target-not-layered`: it exports a layer (`PA_CL_VS_OUT_CNTL` 0x01240000) into a 2D colour target. What the hardware does with a layer on a non-array target is not established, so it is recorded on #3135, not modelled.
 
+## The fog gets its shadows and the foliage draws: two general fixes (2026-10-08)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
+`PROSPER_NULL_PAGE=1`, an empty `PROSPER_GUEST_ARGS`, `scripts/kena/linux-reach-level-load.pad`,
+snapshots at pad flip 420 (`PROSPER_SNAP_AT_FLIPS`) and RenderDoc captures at pad flip 430. `main`
+is `debe081ed`.
+
+| frame at pad flip 420 | mean luminance | foreground p90 | foreground green-dominant | mean \|L − oracle\| |
+|---|---|---|---|---|
+| `main` | 102.2 | 160.0 | 42.7% | 61.6 |
+| fix 1 (shadow depth reaches compute) | 76.1 | 153.7 | 43.5% | 38.1 |
+| fixes 1 + 2 (and `POS_W_FLOAT`) | 67.3 | 128.7 | 58.6% | 27.8 |
+| PS5 oracle (#3781, 1.04) | 44.4 | 86.5 | 81.0% | — |
+
+The foreground band is the lower quarter, left of the version text. The oracle is version 1.04 at
+a slightly different camera, so the per-pixel column is indicative only.
+
+- **Fix 1: the haze was the volumetric fog, lit without shadows.**
+  - The one draw that doubles the frame's brightness is UE4's height fog applying the volumetric-fog
+    volume (program `0x5006ab0000`). It takes mean scene luminance from 0.116 to 0.237 on `main`,
+    and the 5th percentile from 0.014 to 0.056. The translucent draws after it add nothing measurable.
+  - That volume is integrated from a light-scattering volume (compute `0x5008e80000`, 140×79×64).
+    On `main` the scattering had no shadow structure at all: a smooth phase-function gradient and
+    one local light.
+  - The scattering dispatch reads the CSM shadow atlas through a 6144×2048 **one-component
+    UNORM16** T#, which is how GFX10 samples a Z16 depth plane. Live compute imported a
+    renderer-owned depth image only for a Float32 or Uint32 view. So it read the guest bytes,
+    which hold the clear: 1.0 at every texel. The renderer's D32 atlas holds the casters (cascade
+    means 0.55, 0.76 and 0.9995). Every froxel therefore saw the sun.
+  - Compute now imports the depth plane for a UNORM16 view as well. The rule for which
+    one-component views read a retained depth plane is `frontends/shared/rtt/depth_plane_view.hpp`,
+    which live compute calls. The renderer's importer serves a plane only when its guest width
+    (from `DB_Z_INFO.FORMAT`) matches the view, so a UNORM16 view of a Z32 plane, or an R16
+    texture at a recycled depth address, is never handed depth. In the fix capture the dispatch binds the D32
+    atlas directly, and the scattering volume shows canopy shadows and lit gaps. The fog draw now
+    adds 0.062 instead of 0.121. Light shafts appear.
+- **Fix 2: the foliage drew, then discarded itself.**
+  - The fern draws (program `0x5053500000`, 2–12 instances each) are submitted, rasterized and
+    never refused. At pixel (1000, 778) each delivers 19–39 fragments, and RenderDoc reports every
+    one `shaderDiscarded`. Across the whole frame, one draw changed 1 GBuffer pixel and another 35.
+  - The pixel shader's test is `opacity × (fade + dither − 0.5) < 0.333`, with
+    `fade = saturate((POS_W − 100) / 50)`. The constants at binding 39 are 100, 50 and 1. This is
+    UE4's dithered near-camera fade, in centimetres of view depth.
+  - GFX10 loads clip-space w into `POS_W_FLOAT`, and the guest uses the VGPR with no reciprocal.
+    The recompiler handed it SPIR-V's `FragCoord.w`, which is 1/w (about 0.002 here), so the fade
+    was 0 and almost every fragment failed.
+  - `SpirvCompute::guest_pixel_position_component` now returns 1/`FragCoord.w` for W. Both the
+    fragment shell and the raster-quad collector use it, since the collector's words seed guest
+    VGPRs on the packet path. Ferns, grass, undergrowth and the tree canopy now draw.
+- **Still wrong:**
+  - The frame is still brighter than the oracle (67 against 44), and stones and the shrine are
+    paler and less saturated.
+  - The white foreground flowers are absent.
+  - The 1×1 exposure target reads (2.0, 2.0, 1.0, 2.0) on every arm. Its draw (`0x5009a20000`)
+    binds only the 1×1 placeholder texture in every slot, so this looks like a fixed exposure from
+    constants rather than a failed luminance measurement. Not established.
+- **Instruments.**
+  - **XWayland window mapping hung** on this desktop: even `prosper-app --test-pattern` blocks in
+    `X11_ShowWindow` under `SDL_VIDEODRIVER=x11`, so the frontend never reached its capture setup
+    while the guest ran on.
+  - **Under native Wayland the RenderDoc layer refuses the present instance**, with
+    `VK_ERROR_EXTENSION_NOT_PRESENT`: this RenderDoc build has no Wayland WSI. A local,
+    uncommitted patch cleared `ENABLE_VULKAN_RENDERDOC_CAPTURE` around the present instance's
+    `vkCreateInstance` only. The guest renderer's device, which is the one captured, keeps the
+    layer. That made the captures in this entry work in a visible Wayland window.
+  - Capture analysis ran through RenderDoc 1.45's Python module in the container with
+    `/usr/bin/python3.12`. Pixel debugging declined these fragments, so the discard condition was
+    read from the disassembled SPIR-V.
+- **Rung.** Still 2: the title menu, not gameplay.
+
 ## Indexed merged-NGG draws are admitted; ABI and fold refusals come next (2026-10-08, #3135 P6)
 
 Measured on Linux/RADV:
@@ -711,6 +781,23 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
   An indexed draw is a planner input. The shell, the backend and the capture record are unchanged (2026-10-08, #3135 P6).
 - **`b77161c6` reads the undefined ES user VGPR v7 at pc 121** — false. It writes v7 at pc 8 under the ES EXEC, saves and restores that EXEC through `s[36:37]`, and stores v7 only on those lanes. The ABI analysis lost the definition at the restore (2026-10-08, #3135 P6).
+- **The volumetric-fog haze comes from the RGBA8 materialization of the integrated scattering
+  volume** — false. The fog draw samples a 140×79×64 RGBA8 copy where UE4 writes RGBA16F, but its
+  values match the RGBA16F volume slice by slice. The haze came from the light-scattering input,
+  whose shadow atlas read the guest clear (2026-10-08).
+- **The haze is added by the translucent draws that follow the fog** — false. Measured per draw,
+  the 16 translucent draws after the height fog add 0.0003 mean scene luminance in total; the
+  height-fog draw alone adds 0.121 (2026-10-08).
+- **The foliage is missing because its draws are refused or never submitted** — false. The fern
+  draws are submitted, instanced (2–12 instances) and rasterized, with no `[ngg-refused]` and no
+  `dropped-draws` on the title route. Every fragment was discarded by the shader's distance fade,
+  which read 1/w as `POS_W_FLOAT` (2026-10-08).
+- **The foliage's opacity-mask texture is empty** — false. The fern's BC3 alpha has 31% fully
+  opaque and 61% fully transparent blocks, a normal frond mask (2026-10-08).
+- **A compute dispatch that samples a retained depth plane revokes it for the next dispatch** —
+  false in production; an artifact of a test fixture. A guest write the mapping topology cannot
+  place (a host heap address) conservatively revokes every retained plane. Real compute
+  writebacks land in guest mappings, and the fix capture binds the D32 atlas directly (2026-10-08).
 - **The washed-out, over-bright grade is auto-exposure brightening a scene with no sun** — false.
   Restoring the sun (#4703) made the title-menu frame brighter, not darker: mean luminance 92.1 on
   `main`, 99.7 with the fix, 44.4 on the PS5 oracle (2026-10-07, #4703).

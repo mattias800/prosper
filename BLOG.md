@@ -19,6 +19,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-08
+
+### Kena: Bridge of Spirits gets its ferns, its canopy and its light shafts
+
+Kena's title-menu forest now has its ferns, grass, tree canopy and sun shafts, and the grey haze is reduced, with the fog adding about half the light it did; it is still brighter and paler than on PS5, and the white flowers are missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-foliage.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, now with ferns and grass in the foreground, a leafy canopy overhead and sun shafts through the trees; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 420"></p>
+
+`main` (top left), with shadows reaching the fog (top right), with the foliage fix as well (bottom left), and the PS5 oracle (bottom right).
+
+<p align="center"><img src="prosper/docs/screenshots/kena-title-grade-main-fixes-oracle.webp" alt="Four Kena title-menu frames: main is washed out by uniform grey haze; with the shadow fix the haze is reduced; with the foliage fix ferns, grass and canopy appear; the PS5 oracle is darker and more saturated with white flowers"></p>
+
 ## 2026-10-07
 
 ### Kena: Bridge of Spirits gets its sun back
