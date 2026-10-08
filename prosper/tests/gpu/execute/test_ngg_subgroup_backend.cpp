@@ -1284,12 +1284,11 @@ const uint32_t kVsOnlyDepthLayers[] = {
     0xF800020Fu, 0x100F1211u, 0xBF810000u,
 };
 
-// The per-slice replays of one depth-only draw, as ngg_live_draw builds them: one draw compiled to
-// select its layer at draw time, then per slice a copy selecting that layer.
-std::vector<std::shared_ptr<const NggSubgroupDraw>> depth_slice_draws(const RenderVkCtx& ctx,
-                                                                      std::vector<uint32_t> indices,
-                                                                      uint32_t slices,
-                                                                      std::string* why) {
+// One depth-only draw compiled to select its layer at draw time, as ngg_live_draw builds it. Its
+// per-slice replays are this same description with BackendDraw::ngg_layer_select = k.
+std::shared_ptr<const NggSubgroupDraw> depth_slice_draw(const RenderVkCtx& ctx,
+                                                        std::vector<uint32_t> indices,
+                                                        uint32_t slices, std::string* why) {
     static const ShaderResourceTable none;
     NggSubgroupDrawRequest request;
     request.linked_code = kVsOnlyDepthLayers;
@@ -1306,16 +1305,7 @@ std::vector<std::shared_ptr<const NggSubgroupDraw>> depth_slice_draws(const Rend
     request.raster.layer_select = true;
     request.raster.count_violations = ngg_backend_counts_violations(ctx);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e930000ull};
-    std::vector<std::shared_ptr<const NggSubgroupDraw>> out;
-    auto base = build_ngg_subgroup_draw(request, why);
-    if (!base) return out;
-    out.push_back(base);
-    for (uint32_t layer = 1; layer < slices; ++layer) {
-        auto replay = std::make_shared<NggSubgroupDraw>(*base);
-        replay->layer_select = layer;
-        out.push_back(std::move(replay));
-    }
-    return out;
+    return build_ngg_subgroup_draw(request, why);
 }
 
 // Depth-only state for one slice of the array at `base`: Z test LESS with writes (a fresh image
@@ -1356,10 +1346,10 @@ TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
     }
     upper.insert(upper.end(), {17u, 19u, 18u});   // layer 4
     std::string why;
-    const auto a = depth_slice_draws(*ctx, upper, kSlices, &why);
-    ASSERT_EQ(a.size(), kSlices) << why;
-    const auto b = depth_slice_draws(*ctx, lower, kSlices, &why);
-    ASSERT_EQ(b.size(), kSlices) << why;
+    const auto a = depth_slice_draw(*ctx, upper, kSlices, &why);
+    ASSERT_TRUE(a) << why;
+    const auto b = depth_slice_draw(*ctx, lower, kSlices, &why);
+    ASSERT_TRUE(b) << why;
 
     std::array<ResolvedPipelineState, kSlices> states;
     const StatsSnapshot before = stats_now();
@@ -1367,7 +1357,8 @@ TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
         states[k] = depth_slice_state(kDepth, kFirst + k);
         std::vector<BackendDraw> pass(2);
         for (uint32_t i = 0; i < 2; ++i) {
-            pass[i].ngg_subgroup = i ? b[k] : a[k];
+            pass[i].ngg_subgroup = i ? b : a;
+            pass[i].ngg_layer_select = k;
             pass[i].fs = ngg_param_fragment(0, false);
             pass[i].ps = &states[k];
         }
@@ -1407,7 +1398,7 @@ TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
     const float kColour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
     std::vector<BackendDraw> split_pass(2);
     for (uint32_t i = 0; i < 2; ++i) {
-        split_pass[i].ngg_subgroup = i ? b[0] : a[0];
+        split_pass[i].ngg_subgroup = i ? b : a;
         split_pass[i].fs = ngg_param_fragment(0, false);
         split_pass[i].ps = &states[0];
     }
@@ -1423,8 +1414,8 @@ TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
     ResolvedPipelineState coloured = states[0];
     coloured.color_write_mask = 0xfu;
     BackendDraw pair_a, pair_b;
-    pair_a.ngg_subgroup = a[0];
-    pair_b.ngg_subgroup = b[0];
+    pair_a.ngg_subgroup = a;
+    pair_b.ngg_subgroup = b;
     pair_a.ps = pair_b.ps = &coloured;
     pair_a.fs = pair_b.fs = ngg_param_fragment(0, false);
     const auto host = ngg_host_capabilities(*ctx);

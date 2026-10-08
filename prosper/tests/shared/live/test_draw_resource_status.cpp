@@ -378,6 +378,16 @@ static void ngg_arms(FixtureState& state) {
           "build_backend_draws hands the description to the backend draw");
     check(bds.size() == 1 && bds[0].B.size() == 1 && bds[0].B[0].set == 0, arm,
           "and the set-0 buffer the shell reads travels with it");
+
+    // A layered depth replay's item carries its layer; the backend draw must too, or every slice
+    // would draw layer 0's primitives (#3135, #4778 review).
+    arm = "ngg-frontend-layer";
+    DrawItem replay = draw;
+    replay.ngg_layer_select = 4;
+    const std::vector<const DrawItem*> replay_items = {&replay};
+    const auto replayed = build_backend_draws(backend_context, replay_items, nullptr);
+    check(replayed.size() == 1 && replayed[0].ngg_layer_select == 4, arm,
+          "build_backend_draws hands the replay's layer to the backend draw");
 }
 
 int main(int argc, char** argv) {

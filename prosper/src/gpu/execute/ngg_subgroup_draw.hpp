@@ -86,10 +86,6 @@ struct NggSubgroupDraw {
     std::vector<NggSubgroupRun> runs;   // plan order: the draw order
     std::vector<uint32_t> guest_bindings;   // set-0 storage-buffer bindings the shells read
     std::vector<uint32_t> push_constants;   // s8.. (then s0:s1 when the address is known)
-    // A per-slice replay of a layered depth draw (#3135): the layer whose primitives this replay
-    // draws, delivered to the raster vertex stage as each run's firstInstance (its stages were
-    // compiled with NggRasterCommitConfig::layer_select). Zero for every other draw.
-    uint32_t layer_select = 0;
 };
 
 struct NggSubgroupDrawRequest {

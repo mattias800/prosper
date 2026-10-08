@@ -9841,6 +9841,9 @@ OrderedSubmitResult execute_ordered_items_impl(
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
         g_live_phase.source_submit = source_submit;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11359,6 +11362,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
         // plus the batch's trailing barrier. Every other operation retires first.
         g_live_phase.defer_batch_completion = defer_graphics_wait && before_dispatch &&
                                               !final_span && !authoritative_readback;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -13040,6 +13046,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bo
         operations.push_back({SubmitOperationKind::Draw,
                               static_cast<size_t>(item.draw_index), item.command_order});
     auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
+    expand_ngg_depth_slices_in_place(items);   // see the ordered spans above
     RenderedFrame rendered = g_live(items, width, height);
     if (pending) {
         std::string error;

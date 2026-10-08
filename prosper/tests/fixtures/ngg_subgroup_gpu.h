@@ -722,7 +722,8 @@ private:
             expanded.vcount = run.blocks * per_block;
             expanded.vertex_offset = static_cast<int32_t>(run.first_block * per_block);
             expanded.instance_count = 1;
-            expanded.first_instance = ngg.layer_select;   // the replay's layer, as InstanceIndex
+            expanded.first_instance =
+                draw.ngg_layer_select;   // the replay's layer, as InstanceIndex
             const NggScratchSlice& exports = prelude.exports[run.group];
             add_view(expanded, kNggRasterExportBinding,
                      FragmentDrawGpuBuffer::view(ctx_.dev, exports.buffer(), exports.offset,

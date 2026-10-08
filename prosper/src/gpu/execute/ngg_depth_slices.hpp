@@ -30,10 +30,16 @@ struct DrawItem;
 // every other field (read-only flags, MIPID) unchanged.
 uint32_t depth_view_for_slice(uint32_t db_depth_view, uint32_t slice);
 
-// When any item carries ngg_depth_slices, writes the expanded list to `out` and returns true: each
-// such item becomes one item per slice (item k's ngg_subgroup is slice k's replay and its
-// DB_DEPTH_VIEW names slice first + k; none still carries ngg_depth_slices), runs ordered as above.
-// Returns false and leaves `out` untouched when there is nothing to expand.
+// When any item has ngg_depth_slice_count > 1, writes the expanded list to `out` and returns true:
+// each such item becomes one item per slice -- item k shares the draw's ngg_subgroup, selects layer
+// k (ngg_layer_select) and its DB_DEPTH_VIEW names slice first + k; no expanded item has a count --
+// with runs ordered as above. Returns false and leaves `out` untouched when there is nothing to
+// expand.
 bool expand_ngg_depth_slices(const std::vector<DrawItem>& items, std::vector<DrawItem>& out);
+
+// The same over a vector the caller owns: items are moved, so only the extra slices of a replayed
+// draw are copies. The executor uses it on the spans it builds; the const form above is the
+// renderer-registration safety net for every other path, and finds nothing left to expand there.
+bool expand_ngg_depth_slices_in_place(std::vector<DrawItem>& items);
 
 }   // namespace prosper::gpu

@@ -53,6 +53,8 @@ struct BackendDraw {
     uint32_t vcount = 3;
     uint32_t instance_count = 1;
     uint32_t first_instance = 0;   // vkCmdDraw firstInstance (an NGG replay's selected layer)
+    // A layered depth replay (#3135): the layer this item's ngg_subgroup draws (DrawItem's).
+    uint32_t ngg_layer_select = 0;
     int32_t vertex_offset = 0;
     // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). The live frontend
     // lends the DrawItem's already-owned words for this synchronous backend call; replay and direct

@@ -113,7 +113,7 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
             if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
             // A layered colour pass binds its depth/stencil as one single-layer image, so a layer
             // above 0 would test and write depth nowhere the guest's surface has it.
-            if (facts.depth_bound) return refuse("ngg-layer-attachments-mixed");
+            if (facts.depth_attached) return refuse("ngg-layer-attachments-mixed");
             admission.layer_slices = facts.target_slices;
         } else if (facts.target_single_slice) {
             if (facts.depth_bound && facts.depth_view_known && facts.depth_slice_count > 1u)

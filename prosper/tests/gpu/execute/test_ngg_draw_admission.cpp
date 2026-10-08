@@ -800,6 +800,10 @@ TEST(NggDrawAdmission, ADepthOnlyLayeredDrawIsReplayedPerSlice) {
     volume.depth_bound = true;
     volume.depth_view_known = true;
     volume.depth_slice_count = 1;
+    // Depth writes on but no test: the backend attaches nothing, so the volume still renders.
+    const NggDrawAdmission write_only = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(write_only.ok()) << write_only.refusal << ": no attached depth, no mixed shape";
+    volume.depth_attached = true;
     const NggDrawAdmission with_depth = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
     ASSERT_TRUE(with_depth.refusal);
     EXPECT_STREQ(with_depth.refusal, "ngg-layer-attachments-mixed");

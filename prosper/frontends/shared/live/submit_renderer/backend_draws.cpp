@@ -228,6 +228,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         }
         bd.owned_waves = it.owned_waves;
         bd.ngg_subgroup = it.ngg_subgroup;
+        bd.ngg_layer_select = it.ngg_layer_select;   // a layered depth replay's slice (#3135)
         // Five clock reads bounding four spans, only when timing is armed -- ~0.9% of
         // this bucket at 2,100 draws a submit. It inflates what it measures while
         // armed, as every timer here does; read the shares, not the totals.

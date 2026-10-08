@@ -133,6 +133,9 @@ struct NggDrawFacts {
     // Depth/stencil is bound, and DB_DEPTH_VIEW is present: its slices are
     // [depth_first_slice, depth_first_slice + depth_slice_count).
     bool depth_bound = false;
+    // Depth/stencil the backend actually attaches (its own depth_stencil_tests_enabled()): the
+    // narrower test, used where the outcome is a refusal rather than a proof.
+    bool depth_attached = false;
     bool depth_view_known = false;
     uint32_t depth_first_slice = 0;
     uint32_t depth_slice_count = 0;
