@@ -2,6 +2,7 @@
 #include "gpu/execute/ngg_draw_admission.hpp"
 
 #include "gpu/pm4/vgt_shader_stages.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -95,6 +96,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
             if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
             admission.layer_slices = facts.target_slices;
         } else if (facts.target_single_slice) {
+            // Every bound attachment must be one slice, not colour target 0 alone: otherwise the
+            // layer may address a real slice the raster commit would cull (#3135 P7 review).
+            if (!facts.other_attachments_single_slice)
+                return refuse("ngg-layer-target-not-single-slice");
             // A one-slice view: layer 0 is its only slice. A primitive naming another layer is
             // culled and counted by the raster commit, the rule a volume's out-of-range layers
             // already follow (CONFIDENCE: LOW on cull versus clamp, ngg_raster_commit.hpp) -- here

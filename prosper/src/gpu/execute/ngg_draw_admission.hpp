@@ -122,6 +122,11 @@ struct NggDrawFacts {
     // Colour target 0 is not a volume and its CB view programs exactly slice 0 (SLICE_START and
     // SLICE_MAX both present and 0): a one-slice target a layer can address only at 0.
     bool target_single_slice = false;
+    // EVERY other attachment the draw binds is proven one slice the same way: each colour slot the
+    // draw writes (CB view 0..0, not a volume) and the depth/stencil attachment when one is bound
+    // (DB_DEPTH_VIEW present with SLICE_START and SLICE_MAX 0). A layered depth array behind a 2D
+    // colour target is how a shadow-cascade pass looks, and its layer is real.
+    bool other_attachments_single_slice = false;
     // The user-data range the program's AGC header declares (user_data_range_start/end).
     bool user_data_range_known = false;
     uint32_t user_data_range_start = 0;
@@ -171,6 +176,10 @@ struct NggDrawAdmission {
 //   ngg-vs-out-undecoded          PA_CL_VS_OUT_CNTL bits [31:25], until each is decoded
 //   ngg-layer-target-not-layered  the layer is read and colour target 0 is neither a layered volume
 //                                 nor a proven one-slice view (a 2D array, or a view not programmed)
+//   ngg-layer-target-not-single-slice  the layer is read, colour target 0 is one slice, and another
+//                                 bound attachment (a colour slot, or depth/stencil) is not proven
+//                                 one slice. The layer may then address a real slice of it, which
+//                                 the shell cannot route: refused rather than culled (#3135 P7)
 //   ngg-layer-slice-start         the layer is read and the view's SLICE_START is not 0
 //   ngg-strip-order-visible       a strip with culling, a FRONT_FACE input, a flat input or a raw
 //                                 per-vertex input (odd-triangle order is open question 3).

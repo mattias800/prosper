@@ -1135,6 +1135,7 @@ inline void report_dropped_draw_program(const char* stage, uint64_t program, con
     const uint64_t n = ++total;
     if ((n & (n - 1)) != 0 || n < 256) return;
     std::vector<std::pair<uint64_t, const decltype(key)*>> ranked;
+    ranked.reserve(dropped.size());
     for (const auto& e : dropped) ranked.push_back({e.second, &e.first});
     std::sort(ranked.begin(), ranked.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -3036,9 +3037,32 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg.facts.target_slices = volume.slice_count;
         ngg.facts.target_first_slice = volume.first_slice;
         const ColorTargetState& target0 = rs.color_targets[0];
-        ngg.facts.target_single_slice = target0.has_view && target0.has_attrib3 &&
-                                        target0.resource_type != 2u && target0.slice_start == 0u &&
-                                        target0.slice_max == 0u;
+        const auto one_slice = [](const ColorTargetState& target) {
+            return target.has_view && target.has_attrib3 && target.resource_type != 2u &&
+                   target.slice_start == 0u && target.slice_max == 0u;
+        };
+        ngg.facts.target_single_slice = one_slice(target0);
+        // #3135 P7 review: every OTHER bound attachment must be one slice too. A colour slot is
+        // bound when the draw writes it; depth/stencil when it has a surface and a test or clear
+        // that touches it (the backend then attaches it).
+        bool others = true;
+        for (uint32_t slot = 1; slot < rs.color_targets.size(); ++slot)
+            if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base)
+                others = others && one_slice(rs.color_targets[slot]);
+        const bool depth_bound = (rs.depth_read_base || rs.depth_write_base ||
+                                  rs.stencil_read_base || rs.stencil_write_base) &&
+                                 (rs.z_enable || rs.z_write_enable || rs.stencil_enable ||
+                                  rs.depth_clear_enable || rs.stencil_clear_enable);
+        if (depth_bound) {
+            const bool view_present = ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) != 0;
+            const uint32_t v = rs.db_depth_view;
+            const uint32_t first = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START) |
+                                   (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START_HI) << 11);
+            const uint32_t last = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX) |
+                                  (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX_HI) << 11);
+            others = others && view_present && first == 0u && last == 0u;
+        }
+        ngg.facts.other_attachments_single_slice = others;
         if (vertex_header && vertex_header->specials &&
             guest_readable(reinterpret_cast<uintptr_t>(vertex_header->specials),
                            sizeof(AgcShaderSpecials))) {
@@ -3158,7 +3182,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u "
                     "rsrc2-user-sgprs=%u user-data-range=%u..%u%s vs-out-cntl=%08x "
                     "onchip=%08x ge-cntl=%08x max-out=%08x max-vert-out=%08x itemsize=%08x "
-                    "missing=%s\n",
+                    "missing=%s cb-target-mask=%08x db-depth-view=%08x%s depth-bound=%d "
+                    "z=%d/%d stencil=%d\n",
                     static_cast<unsigned long long>(rs.es_addr),
                     static_cast<unsigned long long>(chain_addr),
                     static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
@@ -3174,7 +3199,14 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     ngg.registers.pa_cl_vs_out_cntl, ngg.registers.vgt_gs_onchip_cntl,
                     ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
                     ngg.registers.vgt_gs_max_vert_out, ngg.registers.vgt_esgs_ring_itemsize,
-                    ngg.registers.missing ? ngg.registers.missing : "none");
+                    ngg.registers.missing ? ngg.registers.missing : "none", rs.cb_target_mask,
+                    rs.db_depth_view,
+                    ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) ? "" : "(absent)",
+                    (rs.depth_read_base || rs.depth_write_base || rs.stencil_read_base ||
+                     rs.stencil_write_base)
+                        ? 1
+                        : 0,
+                    rs.z_enable ? 1 : 0, rs.z_write_enable ? 1 : 0, rs.stencil_enable ? 1 : 0);
         }
         // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit

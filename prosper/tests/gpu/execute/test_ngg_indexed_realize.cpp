@@ -21,6 +21,7 @@
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -412,6 +413,26 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     ASSERT_TRUE(realize(layered, kIndices, 3, 1, one_slice));
     ASSERT_TRUE(one_slice.ngg_subgroup) << "a one-slice 2D target is admitted for a layered draw";
     EXPECT_NE(one_slice.ngg_subgroup->route, NggLayerRoute::None) << "the layer is routed";
+    // A layered DEPTH array beside the one-slice colour target: the layer may name a real depth
+    // slice the shell cannot route, so the draw is refused by name -- never admitted and culled.
+    // A depth view of slice 0 alone is admitted.
+    GpuState depth = layered;
+    depth.cx[P::DB_DEPTH_CONTROL] = 1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT;
+    depth.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    depth.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    depth.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+    DrawItem depth_array;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_array));
+    EXPECT_FALSE(depth_array.ngg_subgroup) << "a two-slice depth array is not one slice";
+    depth.cx.erase(P::DB_DEPTH_VIEW);
+    DrawItem depth_unknown;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_unknown));
+    EXPECT_FALSE(depth_unknown.ngg_subgroup) << "an unprogrammed depth view proves nothing";
+    depth.cx[P::DB_DEPTH_VIEW] = 0u;
+    DrawItem depth_one;
+    ASSERT_TRUE(realize(depth, kIndices, 3, 1, depth_one));
+    EXPECT_TRUE(depth_one.ngg_subgroup) << "a one-slice depth view is admitted";
+
     layered.cx[P::CB_COLOR0_VIEW] = 1u << 13;   // SLICE_MAX 1: a two-slice view of a 2D array
     DrawItem array;
     EXPECT_FALSE(realize(layered, kIndices, 3, 1, array));

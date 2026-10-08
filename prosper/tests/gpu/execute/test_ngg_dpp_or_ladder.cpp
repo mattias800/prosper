@@ -17,7 +17,9 @@
 #include <gtest/gtest.h>
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <ios>
 #include <vector>
 
 namespace {
@@ -26,18 +28,18 @@ constexpr uint32_t kLanes = 64;
 
 std::vector<uint32_t> or_ladder() {
     return {
-        0x7E000F00u,               // v_cvt_u32_f32 v0, v0 (input: lane * 4)
-        0x2C000082u,               // v_lshrrev_b32 v0, 2, v0: the lane
-        0x3602008Fu,               // v_and_b32 v1, 15, v0: its row lane
-        0x7E040281u,               // v_mov_b32 v2, 1
-        0x34140501u,               // v_lshlrev_b32 v10, v1, v2
-        0xBF8A0000u,               // s_barrier: the phased dispatcher, as in Kena's programs
-        0x381414FAu, 0xFF09110Au,  // v_or_b32_dpp v10, v10, v10 row_shr:1 bound_ctrl:1
-        0x381414FAu, 0xFF09120Au,  // ... row_shr:2
-        0x381414FAu, 0xFF09140Au,  // ... row_shr:4
-        0x381414FAu, 0xFF09180Au,  // ... row_shr:8
-        0xF8000941u, 0x0000000Au,  // exp prim v10 done
-        0xBF810000u,               // s_endpgm
+        0x7E000F00u,   // v_cvt_u32_f32 v0, v0 (input: lane * 4)
+        0x2C000082u,   // v_lshrrev_b32 v0, 2, v0: the lane
+        0x3602008Fu,   // v_and_b32 v1, 15, v0: its row lane
+        0x7E040281u,   // v_mov_b32 v2, 1
+        0x34140501u,   // v_lshlrev_b32 v10, v1, v2
+        0xBF8A0000u,   // s_barrier: the phased dispatcher, as in Kena's programs
+        0x381414FAu, 0xFF09110Au,   // v_or_b32_dpp v10, v10, v10 row_shr:1 bound_ctrl:1
+        0x381414FAu, 0xFF09120Au,   // ... row_shr:2
+        0x381414FAu, 0xFF09140Au,   // ... row_shr:4
+        0x381414FAu, 0xFF09180Au,   // ... row_shr:8
+        0xF8000941u, 0x0000000Au,   // exp prim v10 done
+        0xBF810000u,   // s_endpgm
     };
 }
 
@@ -48,23 +50,24 @@ std::vector<float> lane_inputs() {
 }
 
 uint32_t exported(const std::vector<float>& out, uint32_t lane) {
-    return std::bit_cast<uint32_t>(out[static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords]);
+    return std::bit_cast<uint32_t>(
+        out[static_cast<size_t>(lane) * prosper::gpu::kNggExportProbeWords]);
 }
 
 ::testing::AssertionResult inclusive_row_or(const std::vector<float>& out) {
-    if (out.size() != kLanes * prosper::gpu::kNggExportProbeWords)
+    if (out.size() != size_t{kLanes} * prosper::gpu::kNggExportProbeWords)
         return ::testing::AssertionFailure() << "dispatch returned " << out.size() << " floats";
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
         const uint32_t expected = (2u << (lane & 15u)) - 1u;
         if (exported(out, lane) != expected)
-            return ::testing::AssertionFailure() << "lane " << lane << " = 0x" << std::hex
-                                                 << exported(out, lane) << ", expected 0x"
-                                                 << expected;
+            return ::testing::AssertionFailure()
+                   << "lane " << lane << " = 0x" << std::hex << exported(out, lane)
+                   << ", expected 0x" << expected;
     }
     return ::testing::AssertionSuccess();
 }
 
-}  // namespace
+}   // namespace
 
 TEST(NggDppOrLadder, PortableShellComputesTheInclusiveRowOr) {
     const std::vector<uint32_t> code = or_ladder();
@@ -93,7 +96,8 @@ TEST(NggDppOrLadder, NativeWave64ShellComputesTheInclusiveRowOr) {
     const auto out = prosper::test::run_compute(
         module, input, kThreads, kThreads * prosper::gpu::kNggExportProbeWords, {}, {}, nullptr,
         kThreads, nullptr, nullptr, nullptr, 64u);
-    ASSERT_EQ(out.size(), kThreads * prosper::gpu::kNggExportProbeWords) << "native dispatch failed";
+    ASSERT_EQ(out.size(), kThreads * prosper::gpu::kNggExportProbeWords)
+        << "native dispatch failed";
     for (uint32_t t = 0; t < kThreads; ++t)
         EXPECT_EQ(exported(out, t), (2u << (t & 15u)) - 1u) << "thread " << t;
 }

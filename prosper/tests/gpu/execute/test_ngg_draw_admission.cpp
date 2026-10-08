@@ -685,6 +685,7 @@ NggDrawFacts kena_vs_only_facts() {
     f.vertex_count = 6;
     f.instance_count = 1;
     f.target_single_slice = true;   // a 2D scene target, CB view slices 0..0
+    f.other_attachments_single_slice = true;   // and every other attachment one slice too
     f.user_data_range_known = true;
     f.user_data_range_end = 25;
     return f;
@@ -719,6 +720,12 @@ TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
     ASSERT_TRUE(unknown.refusal);
     EXPECT_STREQ(unknown.refusal, "ngg-layer-target-not-layered")
         << "a target not proven to be one slice keeps the refusal";
+    NggDrawFacts layered_depth = kena_vs_only_facts();
+    layered_depth.other_attachments_single_slice = false;   // e.g. a cascade depth array
+    const NggDrawAdmission depth = admit_ngg_draw(kena_vs_only_registers(), layered_depth, radv());
+    ASSERT_TRUE(depth.refusal);
+    EXPECT_STREQ(depth.refusal, "ngg-layer-target-not-single-slice")
+        << "a layered attachment beside a one-slice colour target is refused, not culled";
 
     NggDrawRegisters legacy = kena_vs_only_registers();
     legacy.vgt_shader_stages_en = 0u;
