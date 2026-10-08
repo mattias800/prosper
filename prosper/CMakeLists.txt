@@ -1328,6 +1328,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  # #3135 P6: an indexed merged-NGG draw's index decode and primitive restart. Pure CPU.
+  prosper_add_gtest(test_ngg_draw_indices
+    SOURCES tests/gpu/execute/test_ngg_draw_indices.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   # #3135 P5: the v72 capture record of a merged-NGG draw description.
   prosper_add_gtest(test_ngg_subgroup_codec
     SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
