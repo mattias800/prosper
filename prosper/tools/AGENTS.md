@@ -338,6 +338,11 @@ capture/replay without requiring an importable system Python module.
   colours erases thin UI** (a 4K frame at 160x90 reported *Stray*'s legible main menu as flat black),
   and a share-of-non-black test scores a flat **white** clear as a perfect frame. Run `--selftest`
   after touching a threshold.
+- **`console_oracle/`** — measure what a **real PS5** returns for a table of system-library calls
+  (a payload built with the ps5-payload-sdk, driven by `run_oracle.py`) and record it as golden files
+  under `tests/data/console_oracle/`. `tests/hle/test_console_oracle_replay.cpp` replays every golden
+  through prosper's HLE, so an HLE answer is checked against the console rather than a guess.
+  Read-only observation of your own console; see its `AGENTS.md` for the case grammar and traps.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every

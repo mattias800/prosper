@@ -1,0 +1,48 @@
+# console-oracle cases: the console's libSceLibcInternal string and number routines.
+# id	lib	func	args	expect     (grammar and flags: tools/console_oracle/payload/lib_oracle.c)
+# r64 compares the full 64 bit return (size_t, long, pointers); the default compares the low 32 bits.
+libc_strlen_hello	libSceLibcInternal.sprx	strlen	s:hello	r64
+libc_strlen_empty	libSceLibcInternal.sprx	strlen	s:	r64
+libc_strlen_escape	libSceLibcInternal.sprx	strlen	s:a\x2cb\x2cc	r64
+libc_strcmp_equal	libSceLibcInternal.sprx	strcmp	s:abc,s:abc
+libc_strcmp_less	libSceLibcInternal.sprx	strcmp	s:abc,s:abd
+libc_strcmp_greater	libSceLibcInternal.sprx	strcmp	s:abd,s:abc
+libc_strcmp_far_less	libSceLibcInternal.sprx	strcmp	s:a,s:z
+libc_strcmp_prefix	libSceLibcInternal.sprx	strcmp	s:abc,s:abcd
+libc_strcmp_high_byte	libSceLibcInternal.sprx	strcmp	s:\x80,s:a
+libc_strncmp_within	libSceLibcInternal.sprx	strncmp	s:abcdef,s:abcxyz,i:3
+libc_strncmp_past	libSceLibcInternal.sprx	strncmp	s:abcdef,s:abcxyz,i:4
+libc_strncmp_zero	libSceLibcInternal.sprx	strncmp	s:abc,s:xyz,i:0
+libc_memcmp_equal	libSceLibcInternal.sprx	memcmp	in:010203,in:010203,i:3
+libc_memcmp_less	libSceLibcInternal.sprx	memcmp	in:010203,in:010204,i:3
+libc_memcmp_greater	libSceLibcInternal.sprx	memcmp	in:0102ff,in:010201,i:3
+libc_memcmp_high_byte	libSceLibcInternal.sprx	memcmp	in:80,in:01,i:1
+libc_strchr_found	libSceLibcInternal.sprx	strchr	s:hello,i:108	r64,retoff:0
+libc_strchr_missing	libSceLibcInternal.sprx	strchr	s:hello,i:122	r64,retoff:0
+libc_strchr_nul	libSceLibcInternal.sprx	strchr	s:hello,i:0	r64,retoff:0
+libc_atoi_plain	libSceLibcInternal.sprx	atoi	s:42
+libc_atoi_neg_trailing	libSceLibcInternal.sprx	atoi	s:  -7x
+libc_atoi_empty	libSceLibcInternal.sprx	atoi	s:
+libc_atoi_overflow	libSceLibcInternal.sprx	atoi	s:99999999999
+libc_strtol_dec	libSceLibcInternal.sprx	strtol	s:  -123abc,outptr:0,i:10	r64
+libc_strtol_hex	libSceLibcInternal.sprx	strtol	s:0x1F,outptr:0,i:16	r64
+libc_strtol_auto_hex	libSceLibcInternal.sprx	strtol	s:0x1F,outptr:0,i:0	r64
+libc_strtol_auto_oct	libSceLibcInternal.sprx	strtol	s:017,outptr:0,i:0	r64
+libc_strtol_nodigits	libSceLibcInternal.sprx	strtol	s:xyz,outptr:0,i:10	r64
+libc_strtol_overflow	libSceLibcInternal.sprx	strtol	s:99999999999999999999,outptr:0,i:10	r64
+libc_strtol_underflow	libSceLibcInternal.sprx	strtol	s:-99999999999999999999,outptr:0,i:10	r64
+libc_strtol_base1	libSceLibcInternal.sprx	strtol	s:10,outptr:0,i:1	r64
+libc_strtol_null_endptr	libSceLibcInternal.sprx	strtol	s:77,null,i:10	r64
+libc_strtoul_neg	libSceLibcInternal.sprx	strtoul	s:-1,outptr:0,i:10	r64
+libc_strtoul_dec	libSceLibcInternal.sprx	strtoul	s:4000000000,outptr:0,i:10	r64
+libc_strtoul_overflow	libSceLibcInternal.sprx	strtoul	s:99999999999999999999,outptr:0,i:10	r64
+# The whole strto* family, invalid bases and the largest valid one.
+libc_strtol_base37	libSceLibcInternal.sprx	strtol	s:10,outptr:0,i:37	r64
+libc_strtol_base36	libSceLibcInternal.sprx	strtol	s:zz,outptr:0,i:36	r64
+libc_strtoul_base1	libSceLibcInternal.sprx	strtoul	s:10,outptr:0,i:1	r64
+libc_strtoul_base37	libSceLibcInternal.sprx	strtoul	s:10,outptr:0,i:37	r64
+libc_strtoul_plus	libSceLibcInternal.sprx	strtoul	s:+5,outptr:0,i:10	r64
+libc_strtoll_base1	libSceLibcInternal.sprx	strtoll	s:10,outptr:0,i:1	r64
+libc_strtoll_dec	libSceLibcInternal.sprx	strtoll	s:-9223372036854775808,outptr:0,i:10	r64
+libc_strtoull_base1	libSceLibcInternal.sprx	strtoull	s:10,outptr:0,i:1	r64
+libc_strtoull_big	libSceLibcInternal.sprx	strtoull	s:18446744073709551615,outptr:0,i:10	r64

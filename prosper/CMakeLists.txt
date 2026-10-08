@@ -929,6 +929,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
     LIBRARIES prosper_core)
 
+  # prosper's HLE against what a real PS5 returned: tests/data/console_oracle/*.golden.tsv are
+  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv.
+  # No console and no game dump needed.
+  prosper_add_gtest(test_console_oracle_replay
+    SOURCES tests/hle/test_console_oracle_replay.cpp
+    INCLUDES tests/hle
+    LIBRARIES prosper_core)
+  target_compile_definitions(test_console_oracle_replay PRIVATE
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+
   # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
   # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
   # no prosper_core and no game dump.

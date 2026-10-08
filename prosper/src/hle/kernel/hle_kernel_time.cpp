@@ -771,6 +771,15 @@ HLE(k_rtc_tick_add_microseconds) {   // (out, in, int64_t us)
     *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)(int64_t)a2;
     return 0;
 }
+// (const SceRtcTick* a, const SceRtcTick* b) -> -1 / 0 / 1. Measured on a console
+// (tests/data/console_oracle/rtc.golden.tsv, rtc_cmp_*): an UNSIGNED compare (0x8000000000000000 is
+// greater than 100), the result zero-extended from 32 bits, and a null on either side returns
+// SCE_RTC_ERROR_INVALID_POINTER. CONFIDENCE: HIGH.
+HLE(k_rtc_compare_tick) {
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    const uint64_t x = *(const uint64_t*)P(a0), y = *(const uint64_t*)P(a1);
+    return x < y ? (uint64_t)(uint32_t)-1 : (x > y ? 1 : 0);
+}
 HLE(k_rtc_tick_add_minutes) {   // (out, in, int64_t min)
     if (!a0 || !a1) return kRtcErrInvalidPointer;
     *(uint64_t*)P(a0) = *(const uint64_t*)P(a1) + (uint64_t)((int64_t)a2 * 60000000ll);
@@ -2793,6 +2802,7 @@ void register_kernel_time_hle() {
     R("sceRtcTickAddHours", k_rtc_tick_add_hours);
     R("sceRtcTickAddMicroseconds", k_rtc_tick_add_microseconds);
     R("sceRtcTickAddMinutes", k_rtc_tick_add_minutes);
+    R("sceRtcCompareTick", k_rtc_compare_tick);
     R("sceRtcTickAddMonths", k_rtc_tick_add_months);
     R("sceRtcTickAddSeconds", k_rtc_tick_add_seconds);
     R("sceRtcTickAddTicks", k_rtc_tick_add_ticks);

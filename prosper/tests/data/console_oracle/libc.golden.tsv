@@ -1,0 +1,48 @@
+# console-oracle golden v1
+# source: libc.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+libc_strlen_hello	libSceLibcInternal.sprx	strlen	s:hello	r64	ok	0x0000000000000005	-
+libc_strlen_empty	libSceLibcInternal.sprx	strlen	s:	r64	ok	0x0000000000000000	-
+libc_strlen_escape	libSceLibcInternal.sprx	strlen	s:a\x2cb\x2cc	r64	ok	0x0000000000000005	-
+libc_strcmp_equal	libSceLibcInternal.sprx	strcmp	s:abc,s:abc		ok	0x0000000000000000	-
+libc_strcmp_less	libSceLibcInternal.sprx	strcmp	s:abc,s:abd		ok	0xffffffffffffffff	-
+libc_strcmp_greater	libSceLibcInternal.sprx	strcmp	s:abd,s:abc		ok	0x0000000000000001	-
+libc_strcmp_far_less	libSceLibcInternal.sprx	strcmp	s:a,s:z		ok	0xffffffffffffffe7	-
+libc_strcmp_prefix	libSceLibcInternal.sprx	strcmp	s:abc,s:abcd		ok	0xffffffffffffff9c	-
+libc_strcmp_high_byte	libSceLibcInternal.sprx	strcmp	s:\x80,s:a		ok	0x000000000000001f	-
+libc_strncmp_within	libSceLibcInternal.sprx	strncmp	s:abcdef,s:abcxyz,i:3		ok	0x0000000000000000	-
+libc_strncmp_past	libSceLibcInternal.sprx	strncmp	s:abcdef,s:abcxyz,i:4		ok	0x00000000ffffffec	-
+libc_strncmp_zero	libSceLibcInternal.sprx	strncmp	s:abc,s:xyz,i:0		ok	0x0000000000000000	-
+libc_memcmp_equal	libSceLibcInternal.sprx	memcmp	in:010203,in:010203,i:3		ok	0x0000000000000000	-	a0=010203	a1=010203
+libc_memcmp_less	libSceLibcInternal.sprx	memcmp	in:010203,in:010204,i:3		ok	0x00000000ffffffff	-	a0=010203	a1=010204
+libc_memcmp_greater	libSceLibcInternal.sprx	memcmp	in:0102ff,in:010201,i:3		ok	0x00000000000000fe	-	a0=0102ff	a1=010201
+libc_memcmp_high_byte	libSceLibcInternal.sprx	memcmp	in:80,in:01,i:1		ok	0x000000000000007f	-	a0=80	a1=01
+libc_strchr_found	libSceLibcInternal.sprx	strchr	s:hello,i:108	r64,retoff:0	ok	0x000000088000a2e2	ptr+2
+libc_strchr_missing	libSceLibcInternal.sprx	strchr	s:hello,i:122	r64,retoff:0	ok	0x0000000000000000	null
+libc_strchr_nul	libSceLibcInternal.sprx	strchr	s:hello,i:0	r64,retoff:0	ok	0x000000088000a365	ptr+5
+libc_atoi_plain	libSceLibcInternal.sprx	atoi	s:42		ok	0x000000000000002a	-
+libc_atoi_neg_trailing	libSceLibcInternal.sprx	atoi	s:  -7x		ok	0xfffffffffffffff9	-
+libc_atoi_empty	libSceLibcInternal.sprx	atoi	s:		ok	0x0000000000000000	-
+libc_atoi_overflow	libSceLibcInternal.sprx	atoi	s:99999999999		ok	0x000000174876e7ff	-
+libc_strtol_dec	libSceLibcInternal.sprx	strtol	s:  -123abc,outptr:0,i:10	r64	ok	0xffffffffffffff85	-	a1=ptr+6
+libc_strtol_hex	libSceLibcInternal.sprx	strtol	s:0x1F,outptr:0,i:16	r64	ok	0x000000000000001f	-	a1=ptr+4
+libc_strtol_auto_hex	libSceLibcInternal.sprx	strtol	s:0x1F,outptr:0,i:0	r64	ok	0x000000000000001f	-	a1=ptr+4
+libc_strtol_auto_oct	libSceLibcInternal.sprx	strtol	s:017,outptr:0,i:0	r64	ok	0x000000000000000f	-	a1=ptr+3
+libc_strtol_nodigits	libSceLibcInternal.sprx	strtol	s:xyz,outptr:0,i:10	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtol_overflow	libSceLibcInternal.sprx	strtol	s:99999999999999999999,outptr:0,i:10	r64	ok	0x7fffffffffffffff	-	a1=ptr+20
+libc_strtol_underflow	libSceLibcInternal.sprx	strtol	s:-99999999999999999999,outptr:0,i:10	r64	ok	0x8000000000000000	-	a1=ptr+21
+libc_strtol_base1	libSceLibcInternal.sprx	strtol	s:10,outptr:0,i:1	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtol_null_endptr	libSceLibcInternal.sprx	strtol	s:77,null,i:10	r64	ok	0x000000000000004d	-
+libc_strtoul_neg	libSceLibcInternal.sprx	strtoul	s:-1,outptr:0,i:10	r64	ok	0xffffffffffffffff	-	a1=ptr+2
+libc_strtoul_dec	libSceLibcInternal.sprx	strtoul	s:4000000000,outptr:0,i:10	r64	ok	0x00000000ee6b2800	-	a1=ptr+10
+libc_strtoul_overflow	libSceLibcInternal.sprx	strtoul	s:99999999999999999999,outptr:0,i:10	r64	ok	0xffffffffffffffff	-	a1=ptr+20
+libc_strtol_base37	libSceLibcInternal.sprx	strtol	s:10,outptr:0,i:37	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtol_base36	libSceLibcInternal.sprx	strtol	s:zz,outptr:0,i:36	r64	ok	0x000000000000050f	-	a1=ptr+2
+libc_strtoul_base1	libSceLibcInternal.sprx	strtoul	s:10,outptr:0,i:1	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtoul_base37	libSceLibcInternal.sprx	strtoul	s:10,outptr:0,i:37	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtoul_plus	libSceLibcInternal.sprx	strtoul	s:+5,outptr:0,i:10	r64	ok	0x0000000000000005	-	a1=ptr+2
+libc_strtoll_base1	libSceLibcInternal.sprx	strtoll	s:10,outptr:0,i:1	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtoll_dec	libSceLibcInternal.sprx	strtoll	s:-9223372036854775808,outptr:0,i:10	r64	ok	0x8000000000000000	-	a1=ptr+20
+libc_strtoull_base1	libSceLibcInternal.sprx	strtoull	s:10,outptr:0,i:1	r64	ok	0x0000000000000000	-	a1=ptr+0
+libc_strtoull_big	libSceLibcInternal.sprx	strtoull	s:18446744073709551615,outptr:0,i:10	r64	ok	0xffffffffffffffff	-	a1=ptr+20
