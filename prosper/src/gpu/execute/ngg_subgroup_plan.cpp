@@ -48,6 +48,7 @@ std::array<uint32_t, 3> prim_vertices(const NggDrawShape& draw, uint32_t p) {
 }
 
 uint32_t threads_of(const NggSubgroup& s, const NggSubgroupLimits& limits) {
+    if (limits.vs_only) return std::max(s.es_threads(), s.gs_threads());
     return std::max({s.es_threads(), s.gs_threads(), s.gs_threads() * limits.gs_max_vert_out});
 }
 
@@ -56,12 +57,17 @@ uint32_t threads_of(const NggSubgroup& s, const NggSubgroupLimits& limits) {
 NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLimits& limits,
                                    const NggSubgroupBudget& budget) {
     NggSubgroupPlan plan;
-    const uint32_t prim_limit = std::min(
-        {limits.gs_prims_per_subgroup, limits.prim_group_size,
-         limits.gs_max_vert_out ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out : 0u});
-    const uint32_t es_limit = limits.vert_group_size == 256u
-                                  ? limits.es_verts_per_subgroup
-                                  : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    const uint32_t prim_limit =
+        limits.vs_only ? std::min(limits.gs_prims_per_subgroup, limits.prim_group_size)
+                       : std::min({limits.gs_prims_per_subgroup, limits.prim_group_size,
+                                   limits.gs_max_vert_out
+                                       ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out
+                                       : 0u});
+    uint32_t es_limit = limits.vert_group_size == 256u
+                            ? limits.es_verts_per_subgroup
+                            : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    // Without a GS the exported vertices are the ES vertices themselves.
+    if (limits.vs_only) es_limit = std::min(es_limit, limits.max_out_verts_per_subgroup);
     const uint32_t max_waves = std::min(budget.max_waves_per_subgroup, 15u);
     // A primitive must fit, and a vertex offset (lane x ITEMSIZE) must fit its 16-bit field.
     if (prim_limit == 0 || es_limit < 3u || limits.esgs_item_size == 0 ||

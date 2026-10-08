@@ -142,8 +142,9 @@ TEST(NggDrawAdmission, KenaDecodes) {
     EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count") << "past the push budget";
 }
 
+// Without PRIMGEN_EN there is no NGG draw. (PRIMGEN_EN without GS_EN is the VS-only draw, P7.)
 TEST(NggDrawAdmission, NotMergedDoesNotApply) {
-    for (uint32_t stages : {0x00002010u /* no GS_EN */, 0x00000030u /* no PRIMGEN_EN */, 0u}) {
+    for (uint32_t stages : {0x00000030u /* no PRIMGEN_EN */, 0x00000010u, 0u}) {
         auto r = kena_registers();
         r.vgt_shader_stages_en = stages;
         const NggDrawAdmission a = admit_ngg_draw(r, kena_facts(), radv());
@@ -660,6 +661,95 @@ TEST_F(NggLiveDraw, DeviceRefusals) {
         "ngg-backend-workgroup-limit", [](auto& h) { h.max_compute_workgroup_subgroups = 0; },
         none);
     expect("ngg-backend-buffer-range", [](auto& h) { h.max_storage_buffer_range = 4096; }, none);
+}
+
+// ---- #3135 P7: NGG without a GS ---------------------------------------------------------------------
+//
+// Kena's culling VS programs, as their draws arrive past the first level load: VGT_SHADER_STAGES_EN
+// 0x2000 (PRIMGEN_EN, no GS), VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0, GE_MAX_OUTPUT_PER_SUBGROUP
+// 64, an indexed triangle list into a 2D target, 25 user SGPRs.
+NggDrawRegisters kena_vs_only_registers() {
+    NggDrawRegisters r = kena_registers();
+    r.vgt_shader_stages_en = 0x00002000u;
+    r.vgt_gs_out_prim_type = 0u;
+    r.vgt_gs_max_vert_out = 0u;
+    r.ge_max_output_per_subgroup = 0x40u;
+    r.spi_shader_pgm_rsrc2_gs = 25u << 1;
+    r.pa_su_sc_mode_cntl = 0x240u;
+    r.primitive_type = 4u;   // triangle list
+    return r;
+}
+
+NggDrawFacts kena_vs_only_facts() {
+    NggDrawFacts f;
+    f.vertex_count = 6;
+    f.instance_count = 1;
+    f.target_single_slice = true;   // a 2D scene target, CB view slices 0..0
+    f.other_attachments_single_slice = true;   // and every other attachment one slice too
+    f.user_data_range_known = true;
+    f.user_data_range_end = 25;
+    return f;
+}
+
+// The draw is admitted as a VS-only NGG draw whose output is triangles, although the GS output
+// primitive type register says points: there is no GS to apply it. The same registers with GS_EN
+// set are a merged draw, where the register does apply, and stay refused by its name.
+TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
+    const NggDrawAdmission vs =
+        admit_ngg_draw(kena_vs_only_registers(), kena_vs_only_facts(), radv());
+    ASSERT_TRUE(vs.applies);
+    ASSERT_TRUE(vs.ok()) << vs.refusal;
+    EXPECT_TRUE(vs.vs_only);
+    EXPECT_TRUE(vs.limits.vs_only) << "the planner must partition it as VS-only";
+    EXPECT_EQ(vs.topology, NggOutputTopology::TriangleList);
+    EXPECT_EQ(vs.user_sgprs, 25u);
+
+    NggDrawRegisters merged = kena_vs_only_registers();
+    merged.vgt_shader_stages_en = 0x00002030u;
+    const NggDrawAdmission gs = admit_ngg_draw(merged, kena_vs_only_facts(), radv());
+    EXPECT_FALSE(gs.vs_only);
+    ASSERT_TRUE(gs.refusal);
+    EXPECT_STREQ(gs.refusal, "ngg-output-topology") << "a GS's point output is still refused";
+
+    // The layer (USE_VTX_RENDER_TARGET_INDX) addresses the one-slice target's only slice.
+    EXPECT_TRUE(vs.layer_from_pos1);
+    EXPECT_EQ(vs.layer_slices, 1u);
+    EXPECT_EQ(vs.route, NggLayerRoute::None) << "one slice needs no layer route";
+    NggDrawFacts array = kena_vs_only_facts();
+    array.target_single_slice = false;   // a 2D array, or an unprogrammed view
+    const NggDrawAdmission unknown = admit_ngg_draw(kena_vs_only_registers(), array, radv());
+    ASSERT_TRUE(unknown.refusal);
+    EXPECT_STREQ(unknown.refusal, "ngg-layer-target-not-layered")
+        << "a target not proven to be one slice keeps the refusal";
+    NggDrawFacts layered_depth = kena_vs_only_facts();
+    layered_depth.other_attachments_single_slice = false;   // e.g. a cascade depth array
+    const NggDrawAdmission depth = admit_ngg_draw(kena_vs_only_registers(), layered_depth, radv());
+    ASSERT_TRUE(depth.refusal);
+    EXPECT_STREQ(depth.refusal, "ngg-layer-target-not-single-slice")
+        << "a layered attachment beside a one-slice colour target is refused, not culled";
+
+    NggDrawRegisters legacy = kena_vs_only_registers();
+    legacy.vgt_shader_stages_en = 0u;
+    EXPECT_FALSE(admit_ngg_draw(legacy, kena_vs_only_facts(), radv()).applies)
+        << "without PRIMGEN_EN the path does not apply";
+}
+
+// A VS-only draw whose input the shell cannot represent is refused by name, not admitted as
+// triangles.
+TEST(NggDrawAdmission, AVsOnlyDrawRefusesInputsItCannotRepresent) {
+    for (uint32_t prim : {1u /* points */, 2u /* lines */, 5u /* fan */, 17u /* rect list */}) {
+        NggDrawRegisters r = kena_vs_only_registers();
+        r.primitive_type = prim;
+        const NggDrawAdmission a = admit_ngg_draw(r, kena_vs_only_facts(), radv());
+        ASSERT_TRUE(a.refusal) << "prim type " << prim;
+        EXPECT_STREQ(a.refusal, "ngg-input-topology") << "prim type " << prim;
+    }
+    NggDrawRegisters strip = kena_vs_only_registers();
+    strip.primitive_type = 6u;
+    strip.pa_su_sc_mode_cntl = 0u;   // no culling, so strip order is not visible
+    const NggDrawAdmission a = admit_ngg_draw(strip, kena_vs_only_facts(), radv());
+    EXPECT_TRUE(a.ok()) << a.refusal << ": control, a strip without culling";
+    EXPECT_EQ(a.topology, NggOutputTopology::TriangleList);
 }
 
 }   // namespace
