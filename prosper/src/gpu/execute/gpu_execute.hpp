@@ -654,6 +654,8 @@ ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t d
 uint64_t compute_dispatch_code_addr(const GpuState& submit,
                                     const GpuState::Dispatch& dispatch);
 
+struct ComputeProgramFacts;   // gpu/execute/compute_program_facts.hpp
+
 struct ComputeItem {
     std::vector<uint32_t> spirv;
     std::vector<uint32_t> user_sgprs;
@@ -678,6 +680,9 @@ struct ComputeItem {
     // the memoized program facts (and from them the cross-lane inventory) lazily. 0 = unknown
     // (capture replay, hand-built records): reported as unanalyzed, never as "no cross-lane op".
     uint32_t code_dwords = 0;
+    // Only when PROSPER_WAVE64_EXCHANGE set a width for this dispatch: the memoized program facts, so
+    // the admission check needs no cache lookup per dispatch. Null (no refcount traffic) otherwise.
+    std::shared_ptr<const ComputeProgramFacts> exchange_facts;
     ComputeCpuFastPath cpu_fast_path = ComputeCpuFastPath::None;
     // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
     // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the

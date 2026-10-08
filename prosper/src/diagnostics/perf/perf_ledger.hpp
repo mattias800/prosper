@@ -141,6 +141,7 @@ enum class Counter : uint8_t {
     // can still be dropped for another reason, so native + proven + refused is not an executed count.
     Wave64RouteNative,         // a host that offers the required 64-lane subgroup (required size 64)
     Wave64RouteProven,         // proven width-independent (FragmentWavePolicy::ProvenVotes)
+    Wave64RouteExchange,       // a compute dispatch admitted through PROSPER_WAVE64_EXCHANGE (#4753)
     // Actual direct/cached fragment compiler requests, NOT draws, execution or wrong pixels.
     // Families describe emitted guest ADD/MUL sites only; other arithmetic is not inventoried.
     FragmentArithmeticRequests,

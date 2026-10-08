@@ -139,6 +139,12 @@ struct ComputeWaveHost {
     // size). Vulkan requires every invocation of a workgroup to reach an OpControlBarrier, so an
     // entry guard that retires the padded invocations makes an exchange barrier divergent.
     bool partial_workgroup = false;
+    // The exchange is the exact guest-wave dispatcher: every invocation of the workgroup runs the same
+    // persistent loop and each cross-lane service is a common synchronized phase, so a loop or a
+    // region whose branch is not workgroup-uniform does not make an exchange barrier divergent
+    // (tests: per-wave trip counts and a barrier inside the loop execute exactly). Control flow the
+    // detectors cannot model stays refused. Set only by the admission of a module compiled that way.
+    bool exchange_dispatcher = false;
     uint32_t max_workgroup_invocations = 0;   // 0 = unknown, not checked
 };
 

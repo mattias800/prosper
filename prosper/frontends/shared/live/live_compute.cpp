@@ -7209,6 +7209,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup);
         return decline("subgroup-too-narrow");
     }
+    if (const char* why = prosper::frontend::exchange_limit(ctx, item)) return decline(why);
     prosper::diagnostics::perf::note_wave64_compute_native(   // ADR 0028 route= field
         item.required_subgroup_size, guest_wave);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:

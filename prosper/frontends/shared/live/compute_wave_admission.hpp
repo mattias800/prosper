@@ -14,11 +14,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/compute_wave_route.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 namespace prosper::frontend {
 
@@ -117,6 +119,67 @@ void note_compute_wave_refusal(const Ctx& ctx, const prosper::gpu::ComputeItem& 
         prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup, guest_wave, item.code_addr, 0,
         UINT32_MAX, ctx.min_native_subgroup_size, ctx.max_native_subgroup_size, {},
         &compute_wave_candidate_thunk<Ctx>, &arg);
+}
+
+// ---- ADR 0028 route 3 admission (PROSPER_WAVE64_EXCHANGE, #4753) ----
+
+// A module compiled through the exchange dispatcher keeps its scratch in workgroup memory beside the
+// guest's own LDS, and its barriers need whole guest waves per workgroup. The route analysis decides
+// whether the program's cross-lane operations may be exchanged at all (here with the dispatcher's
+// own semantics, see ComputeWaveHost::exchange_dispatcher); the launch limits are the device's.
+// Returns the REASON the dispatch must be declined (a literal naming the condition that fired), or
+// nullptr. `facts` null means unanalyzed, which is itself a refusal.
+template <class Ctx>
+const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                           const prosper::gpu::ComputeWaveOpFacts* facts,
+                           const ComputeWaveLimits& limits) {
+    if (!prosper::gpu::compute_spirv_wave64_exchange(item.spirv)) return nullptr;
+    auto host = compute_wave_host(ctx, item, limits);
+    host.exchange_dispatcher = true;
+    const char* why = nullptr;
+    if (!facts) {
+        why = "unanalyzed";
+    } else {
+        const auto decision = prosper::gpu::select_compute_wave_route(*facts, host);
+        if (decision.route == prosper::gpu::ComputeWaveRoute::Refused ||
+            decision.route == prosper::gpu::ComputeWaveRoute::NeedsNLanes)
+            why = decision.reason;
+    }
+    if (!why) return nullptr;
+    std::fprintf(
+        stderr,
+        "[compute] program 0x%llx compiled for the Wave64 exchange but %s -> dispatch skipped\n",
+        static_cast<unsigned long long>(item.code_addr), why);
+    return why;
+}
+
+// The entry point live_compute.cpp calls on each dispatch. Ordinary modules return immediately. The
+// device limits are read once (one device per process).
+template <class Ctx>
+const char* exchange_admit(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                           const ComputeWaveLimits& limits) {
+    if (!item.exchange_facts) return nullptr;
+    if (!prosper::gpu::compute_spirv_wave64_exchange(item.spirv)) return nullptr;
+    const char* why = exchange_limit(ctx, item, &item.exchange_facts->wave_ops(), limits);
+    if (why) return why;
+    // Admitted: count it (lock-free, per dispatch) and name the route once per program, so the A/B
+    // in #4753 can see which dispatches took it. The announcement takes a mutex, so only the first
+    // sighting of a program reaches it.
+    prosper::diagnostics::perf::note_wave64_route(
+        prosper::diagnostics::perf::Wave64Route::WorkgroupExchange, true, 64);
+    if (!item.exchange_facts->exchange_announced.exchange(true, std::memory_order_relaxed))
+        prosper::diagnostics::perf::announce_wave64_route(
+            prosper::diagnostics::perf::Wave64Route::WorkgroupExchange, true, 64, item.code_addr);
+    return nullptr;
+}
+
+template <class Ctx>
+const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item) {
+    // FIRST and cheap: only a dispatch the executor gave an exchange width (the switch is on) carries
+    // facts. With the switch off this is a null-pointer test, never a walk of the SPIR-V module.
+    if (!item.exchange_facts) return nullptr;
+    static const ComputeWaveLimits limits = query_compute_wave_limits(ctx.physical);   // one device
+    return exchange_admit(ctx, item, limits);
 }
 
 }   // namespace prosper::frontend

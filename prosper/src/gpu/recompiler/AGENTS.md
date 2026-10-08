@@ -262,6 +262,16 @@ Three things about it are load-bearing and each has cost someone a run:
   that dispatcher. The route's job today is the `route=` field of `[wave64-unsupported]`, so a refusal
   says which of those it is.
 
+- **`PROSPER_WAVE64_EXCHANGE` (default OFF, a guest-behaviour selector, #4753) gives a module that
+  needs a wider subgroup than the host has a second chance** through the exact dispatcher.
+  `recompile_compute` compiles normally; when `ComputeShaderConfig::wave64_exchange_width` is set and
+  the module's `Prosper.ComputeSubgroupMin` exceeds it, it recompiles with
+  `force_exchange_dispatcher` and keeps that result only if it compiles AND no longer needs the wider
+  subgroup, so a refusal is never swapped for an approximation. The retry module carries
+  `Prosper.ComputeWave64Exchange=1`; the live frontend then applies the device limits only it knows
+  (`frontends/shared/live/compute_wave_admission.hpp`). The width is part of the shader-cache key and
+  is not serialized into captures, so a replay recompiles with the route off.
+
 Every SPIR-V emitter path is `spirv-val`-gated in CI (`tools/spv_validate`) with one representative
 module per path, not one per game shader.
 

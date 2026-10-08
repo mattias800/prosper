@@ -220,6 +220,7 @@ struct ShaderCompileKey {
     bool compute_tg_size_en = false;
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
+    uint32_t compute_wave64_exchange_width = 0;   // ADR 0028: a different module, same bytes
     uint32_t compute_native_storage_format_support = 0;
     bool compute_storage_buffer_int64_atomics = false;
     bool compute_packed_r11_storage = true;
@@ -291,6 +292,7 @@ struct ShaderCompileKey {
                compute_tg_size_en == other.compute_tg_size_en &&
                compute_lds_bytes == other.compute_lds_bytes &&
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
+               compute_wave64_exchange_width == other.compute_wave64_exchange_width &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
                compute_storage_buffer_int64_atomics == other.compute_storage_buffer_int64_atomics &&
@@ -387,6 +389,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_tg_size_en);
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
+            hash = hash_mix(hash, key.compute_wave64_exchange_width);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
             hash = hash_mix(hash, key.compute_storage_buffer_int64_atomics);
             hash = hash_mix(hash, key.compute_packed_r11_storage);

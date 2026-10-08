@@ -615,10 +615,50 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     return b.finish();
 }
 
+namespace {
+// A launch whose exact thread extent ends in a partial workgroup: the entry guard that retires the
+// padded invocations would leave them out of every exchange barrier.
+bool compute_extent_is_partial(const ComputeShaderConfig& config) {
+    return config.exact_thread_extent && ((config.local_x && config.threads_x % config.local_x) ||
+                                          (config.local_y && config.threads_y % config.local_y) ||
+                                          (config.local_z && config.threads_z % config.local_z));
+}
+std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
+                                             const ShaderResourceTable* rt,
+                                             const ComputeShaderConfig& config,
+                                             RecompileDiagnosticContext diagnostic);
+}   // namespace
+
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    std::vector<uint32_t> module = recompile_compute_once(code, dwords, rt, config, diagnostic);
+    // ADR 0028 route 3, default OFF: a module that needs a subgroup wider than the host's gets one
+    // second chance through the exact exchange dispatcher. It replaces the original only when it
+    // compiles and no longer needs the wider subgroup, so a refusal is never turned into a
+    // different (silently approximate) program.
+    const uint32_t width = config.wave64_exchange_width;
+    if (!width || module.empty() || config.force_exchange_dispatcher ||
+        config.native_subgroup_size || config.wave_size != 64 ||
+        compute_extent_is_partial(config) || compute_spirv_min_subgroup_size(module) <= width)
+        return module;
+    ComputeShaderConfig retry = config;
+    retry.force_exchange_dispatcher = true;
+    std::vector<uint32_t> exchanged = recompile_compute_once(code, dwords, rt, retry, diagnostic);
+    // The retry must be a pure exchange: a native subgroup operation (which can be emitted without
+    // raising the minimum-subgroup marker) would make its exactness depend on the host's width.
+    if (!exchanged.empty() && compute_spirv_min_subgroup_size(exchanged) <= width &&
+        !compute_spirv_uses_group_non_uniform(exchanged))
+        return exchanged;
+    return module;
+}
+
+namespace {
+std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
+                                             const ShaderResourceTable* rt,
+                                             const ComputeShaderConfig& config,
+                                             RecompileDiagnosticContext diagnostic) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -948,9 +988,25 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
-                   /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; },
-                   code, dwords, nullptr, true, initial_dispatch_active, false,
+    if (config.force_exchange_dispatcher) {
+        // ADR 0028 route 3 retry: every invocation of the workgroup runs the same persistent
+        // dispatcher, so each cross-lane service (readlane, readfirstlane, mask reductions,
+        // bpermute, DPP rows) is a common synchronized phase that all of them reach together,
+        // whatever the guest's own control flow. The dispatcher hoists a guest barrier into its
+        // common phase (a counted loop with an s_barrier inside executes exactly, tested), and refuses
+        // what it cannot hold by returning false here, in which case the caller keeps the original
+        // module. A partial thread extent is refused by the caller BEFORE this runs.
+        if (!b.has_workgroup_execution() || wave_size != 64) return {};
+        b.wave64_exchange_dispatcher = true;
+        if (!emit_cfg_state_machine(
+                b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true, /*allow_smem*/ true,
+                [](RegState&, const Rdna2Inst&) { return false; }, code, dwords,
+                initial_dispatch_active, lds_fminmax_synchronization.needs_dispatcher))
+            return {};
+    } else if (!emit_body(
+                   b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true,
+                   /*allow_smem*/ true, [](RegState&, const Rdna2Inst&) { return false; }, code,
+                   dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
     // Exact resource contracts and portable wave gathers execute partial workgroups through ACTIVE. Padded
@@ -972,6 +1028,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     }
     return b.finish();
 }
+}   // namespace
 
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
                                      std::vector<RecompileUnsupportedSite>* sites) {

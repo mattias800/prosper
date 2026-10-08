@@ -324,11 +324,12 @@ ComputeWaveRouteDecision select_compute_wave_route(const ComputeWaveOpFacts& fac
             return done(ComputeWaveRoute::Refused, "exchange-lowering-unavailable");
         }
         needs_exchange = true;
-        if (op.context == ComputeWaveContext::Loop && !in_loop) {
+        if (op.context == ComputeWaveContext::Loop && !in_loop && !host.exchange_dispatcher) {
             in_loop = true;
             loop_pc = op.pc;
             loop_kind = op.kind;
-        } else if (op.context == ComputeWaveContext::UnprovenRegion && !single_wave && !in_region) {
+        } else if (op.context == ComputeWaveContext::UnprovenRegion && !single_wave && !in_region &&
+                   !host.exchange_dispatcher) {
             in_region = true;
             region_pc = op.pc;
             region_kind = op.kind;

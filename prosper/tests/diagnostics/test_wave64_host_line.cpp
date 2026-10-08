@@ -141,10 +141,15 @@ TEST(Wave64RouteField, AnAdmittedProgramIsNotTaggedUnsupported) {
     EXPECT_TRUE(has(native, "route=native ")) << native;
 }
 
+TEST(Wave64RouteField, TheExchangeRoutePrintsItsOwnLine) {
+    const std::string line = wave64_route_line(Wave64Route::WorkgroupExchange, true, 0x5028, 0);
+    EXPECT_TRUE(has(line, "[wave64-route] stage=compute program=0x5028 ")) << line;
+    EXPECT_TRUE(has(line, "route=workgroup-exchange ")) << line;
+}
+
 TEST(Wave64RouteField, ARouteThatDoesNotExistYetPrintsNothing) {
-    for (Wave64Route reserved : {Wave64Route::WorkgroupExchange, Wave64Route::NLanes,
-                                 Wave64Route::FragmentPromoted, Wave64Route::OwnedWave,
-                                 Wave64Route::Refused})
+    for (Wave64Route reserved : {Wave64Route::NLanes, Wave64Route::FragmentPromoted,
+                                 Wave64Route::OwnedWave, Wave64Route::Refused})
         EXPECT_TRUE(wave64_route_line(reserved, false, 1, 2).empty())
             << wave64_route_name(reserved);
 }

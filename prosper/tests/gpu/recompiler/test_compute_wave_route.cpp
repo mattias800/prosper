@@ -10,9 +10,13 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
+#include <utility>
 #include <vector>
 
+#include "fixtures/wave64_exchange_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 using namespace prosper::gpu;
 
@@ -435,6 +439,138 @@ TEST(ComputeWaveRoute, ABallotInTheElseArmOfADivergentBranchIsUnproven) {
     ASSERT_NE(ballot, nullptr);
     EXPECT_EQ(ballot->context, ComputeWaveContext::UnprovenRegion)
         << "the else arm is inside the region";
+}
+
+// ---- the exchange retry (ADR 0028 route 3): compile-level arms; execution is in
+// ---- test_wave64_exchange.cpp ----
+
+namespace {
+namespace fx = prosper::test::wave64_exchange;
+
+// Bytes of Workgroup storage the module declares, summed over u32 arrays behind Workgroup variables.
+uint32_t workgroup_array_bytes(const std::vector<uint32_t>& module) {
+    std::map<uint32_t, uint32_t> constants, array_length, pointee;
+    std::map<uint32_t, bool> workgroup_pointer;
+    uint32_t total = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> variables;   // (pointer type, storage class)
+    for (size_t i = 5; i < module.size();) {
+        const uint32_t words = module[i] >> 16, op = module[i] & 0xffffu;
+        if (!words || words > module.size() - i) return 0;
+        if (op == 43 && words == 4) constants[module[i + 2]] = module[i + 3];   // OpConstant
+        if (op == 28 && words == 4) array_length[module[i + 1]] = module[i + 3];   // OpTypeArray
+        if (op == 32 && words == 4) {   // OpTypePointer
+            workgroup_pointer[module[i + 1]] = module[i + 2] == 4u;
+            pointee[module[i + 1]] = module[i + 3];
+        }
+        if (op == 59 && words >= 4)
+            variables.push_back({module[i + 1], module[i + 3]});   // OpVariable
+        i += words;
+    }
+    for (const auto& [pointer_type, storage_class] : variables) {
+        if (storage_class != 4u || !workgroup_pointer[pointer_type]) continue;
+        const auto length_id = array_length.find(pointee[pointer_type]);
+        if (length_id == array_length.end()) continue;
+        total += constants[length_id->second] * 4u;
+    }
+    return total;
+}
+}   // namespace
+
+TEST(ComputeWaveExchange, ControlArmReadLaneInALoopNeedsASixtyFourLaneSubgroup) {
+    // Route OFF: the structured loop path lowers v_readlane to a native shuffle, so the module
+    // declares it needs a 64-lane subgroup -- the contract a 32-lane host cannot meet, and what
+    // live_compute.cpp declines as `subgroup-too-narrow`. This arm is what the next one changes.
+    const fx::Case c{128, fx::Trips::Constant3};
+    const auto module = fx::compile(c, /*exchange_width=*/0);
+    ASSERT_FALSE(module.empty());
+    EXPECT_EQ(compute_spirv_min_subgroup_size(module), 64u);
+    EXPECT_FALSE(compute_spirv_wave64_exchange(module));
+}
+
+TEST(ComputeWaveExchange, ReadLaneInALoopCompilesThroughTheDispatcherOnA32LaneHost) {
+    for (auto trips : {fx::Trips::Constant3, fx::Trips::PerWave}) {
+        const fx::Case c{128, trips};
+        const auto module = fx::compile(c, /*exchange_width=*/32);
+        ASSERT_FALSE(module.empty());
+        EXPECT_LE(compute_spirv_min_subgroup_size(module), 32u) << "no longer needs 64 lanes";
+        EXPECT_TRUE(compute_spirv_wave64_exchange(module));
+        const uint32_t bytes = workgroup_array_bytes(module);
+        EXPECT_GT(bytes, 0u) << "the exchange keeps its scratch in workgroup memory";
+        EXPECT_LE(bytes, compute_exchange_scratch_bytes(128, 64))
+            << "the route's budget is an upper bound of what the module actually declares";
+    }
+}
+
+TEST(ComputeWaveExchange, TheSwitchIsInertWhereTheHostCoversTheGuestWave) {
+    const fx::Case c{128, fx::Trips::Constant3};
+    // A 64-lane host (width 64) needs nothing: the original module is returned untouched.
+    const auto module = fx::compile(c, /*exchange_width=*/64);
+    ASSERT_FALSE(module.empty());
+    EXPECT_EQ(compute_spirv_min_subgroup_size(module), 64u);
+    EXPECT_FALSE(compute_spirv_wave64_exchange(module));
+}
+
+TEST(ComputeWaveExchange, APartialWorkgroupKeepsTheRefusalVisibleAndAWholeExtentDoesNot) {
+    // The condition that fires is the partial thread extent: the SAME exact-extent launch with a
+    // whole number of workgroups retries, a partial one keeps the original module. The refusal lives
+    // in the wrapper, so it cannot be bypassed by a compile that would otherwise accept a partial
+    // extent under a validated dispatch.
+    fx::Case whole{128, fx::Trips::Constant3};
+    whole.threads = 128;   // exact_thread_extent set, extent == local size
+    const auto exchanged = fx::compile(whole, 32);
+    ASSERT_FALSE(exchanged.empty());
+    EXPECT_TRUE(compute_spirv_wave64_exchange(exchanged)) << "a whole extent is retried";
+    for (uint32_t threads : {100u, 1u}) {
+        fx::Case partial{128, fx::Trips::Constant3};
+        partial.threads = threads;
+        const auto off = fx::compile(partial, 0);
+        const auto on = fx::compile(partial, 32);
+        ASSERT_FALSE(off.empty());
+        EXPECT_EQ(on, off) << "threads=" << threads;
+        EXPECT_FALSE(compute_spirv_wave64_exchange(on));
+    }
+}
+
+TEST(ComputeWaveExchange, ANativeContractIsNeverRetriedByTheWrapper) {
+    // native_subgroup_size != 0: one native subgroup IS one guest wave. The wrapper's own guard is
+    // the only thing between this config and a retry (the forced compile no longer repeats it).
+    fx::Case c{64, fx::Trips::Constant3};
+    const auto p = fx::program(c);
+    const auto rt = fx::resources(c);
+    ComputeShaderConfig cfg;
+    cfg.local_x = 64;
+    cfg.wave_size = 64;
+    cfg.threads_x = 64;
+    cfg.native_subgroup_size = 64;
+    cfg.wave64_exchange_width = 32;
+    const auto module = recompile_compute(p.data(), p.size(), &rt, cfg,
+                                          {RecompileDiagnosticStage::Compute, 0x5029u});
+    ASSERT_FALSE(module.empty());
+    EXPECT_FALSE(compute_spirv_wave64_exchange(module));
+}
+
+TEST(ComputeWaveExchange, ABallotOrMbcntInTheLoopIsNotChangedByTheSwitch) {
+    // Beside the loop's readlane these shapes are refused by the ordinary recompile today (empty
+    // module, no module to retry) or compile without a 64-lane requirement. Either way the switch
+    // must leave the result byte-identical: the retry only replaces a module that needs a wider
+    // subgroup, and there is none here.
+    for (auto extra : {fx::Extra::Ballot, fx::Extra::Mbcnt}) {
+        fx::Case c{128, fx::Trips::Constant3};
+        c.extra = extra;
+        const auto off = fx::compile(c, 0);
+        EXPECT_EQ(fx::compile(c, 32), off) << static_cast<int>(extra);
+        if (!off.empty()) EXPECT_LE(compute_spirv_min_subgroup_size(off), 32u);
+    }
+}
+
+TEST(ComputeWaveExchange, ASourceLaneAboveThirtyOneAndAnSgprSelectorStillRetry) {
+    for (bool sgpr : {false, true}) {
+        fx::Case c{128, fx::Trips::Constant3};
+        c.lane = 40;
+        c.sgpr_lane = sgpr;
+        EXPECT_EQ(compute_spirv_min_subgroup_size(fx::compile(c, 0)), 64u) << sgpr;
+        EXPECT_TRUE(compute_spirv_wave64_exchange(fx::compile(c, 32))) << sgpr;
+    }
 }
 
 TEST(ComputeWaveRoute, EveryLdsFamilyTheEmitterDecodesCountsAsWaveSynchronousLds) {

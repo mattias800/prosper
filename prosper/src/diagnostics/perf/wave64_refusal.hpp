@@ -49,7 +49,8 @@ inline const char* wave64_route_name(Wave64Route route) {
 }
 // True for the routes that exist today and admit a program.
 inline constexpr bool wave64_route_admits_today(Wave64Route route) {
-    return route == Wave64Route::Native || route == Wave64Route::ProvenWidthIndependent;
+    return route == Wave64Route::Native || route == Wave64Route::ProvenWidthIndependent ||
+           route == Wave64Route::WorkgroupExchange;
 }
 // Uses by route over any counter source with a count(Counter) member (a ledger window). A reserved
 // route reports 0. Refused is the sum of the four refusal counters.
@@ -58,6 +59,7 @@ uint64_t wave64_route_uses(const Source& source, Wave64Route route) {
     switch (route) {
         case Wave64Route::Native: return source.count(Counter::Wave64RouteNative);
         case Wave64Route::ProvenWidthIndependent: return source.count(Counter::Wave64RouteProven);
+        case Wave64Route::WorkgroupExchange: return source.count(Counter::Wave64RouteExchange);
         case Wave64Route::Refused: {
             uint64_t total = 0;
             for (Counter counter : kWave64RefusalCounters) total += source.count(counter);
@@ -242,7 +244,9 @@ inline void observe_wave64_shader(uint32_t guest_wave, bool compute) {
 inline void note_wave64_route(Wave64Route route, bool compute, uint32_t guest_wave) {
     if (!enabled() || guest_wave != 64 || !wave64_route_admits_today(route)) return;
     if (compute ? thread_dispatch_skip_suppression() : thread_draw_drop_suppression()) return;
-    add(route == Wave64Route::Native ? Counter::Wave64RouteNative : Counter::Wave64RouteProven);
+    add(route == Wave64Route::Native              ? Counter::Wave64RouteNative
+        : route == Wave64Route::WorkgroupExchange ? Counter::Wave64RouteExchange
+                                                  : Counter::Wave64RouteProven);
 }
 
 // Names one proof-route program once, the way a refusal does. Takes a mutex and scans the
