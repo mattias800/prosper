@@ -412,7 +412,8 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     DrawItem one_slice;
     ASSERT_TRUE(realize(layered, kIndices, 3, 1, one_slice));
     ASSERT_TRUE(one_slice.ngg_subgroup) << "a one-slice 2D target is admitted for a layered draw";
-    EXPECT_NE(one_slice.ngg_subgroup->route, NggLayerRoute::None) << "the layer is routed";
+    EXPECT_EQ(one_slice.ngg_subgroup->route, NggLayerRoute::None)
+        << "one slice: the layer is read to cull, never written to gl_Layer";
     // A layered DEPTH array beside the one-slice colour target: the layer may name a real depth
     // slice the shell cannot route, so the draw is refused by name -- never admitted and culled.
     // A depth view of slice 0 alone is admitted.

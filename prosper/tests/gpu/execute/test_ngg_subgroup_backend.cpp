@@ -1147,7 +1147,7 @@ vs_only_draw(std::vector<uint32_t> indices, std::string* why,
     if (layered) {   // the layer addresses a one-slice 2D target (#3135 P7 admission)
         request.raster.layer_from_pos1 = true;
         request.raster.layer_slices = 1;
-        request.raster.route = backend_route(*layered);
+        request.raster.route = NggLayerRoute::None;   // one slice: cull only, no gl_Layer
         request.raster.count_violations = ngg_backend_counts_violations(*layered);
     }
     request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e920000ull};
@@ -1236,7 +1236,6 @@ TEST(NggSubgroupBackend, VsOnlyPrimitiveShaderDrawsItsTriangleIntoA2DTarget) {
 TEST(NggSubgroupBackend, VsOnlyLayerAddressesAOneSliceTarget) {
     const RenderVkCtx* ctx = backend();
     if (!ctx) GTEST_SKIP() << "no backend device";
-    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
     const ResolvedPipelineState state = flipped_state();
     for (const bool second_layer : {false, true}) {
         std::string why;

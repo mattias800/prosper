@@ -152,7 +152,8 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
 
     NggLayerRouteQuery query;
     query.topology = admission.topology;
-    query.layer_from_pos1 = admission.layer_from_pos1;
+    // A one-slice target is addressed without a layer route (ngg_raster_commit: cull only).
+    query.layer_from_pos1 = admission.layer_from_pos1 && admission.layer_slices > 1u;
     query.interpolation_geometry_required = facts.interpolation_geometry_required;
     query.shader_output_layer = host.shader_output_layer;
     query.geometry_shader = host.geometry_shader;

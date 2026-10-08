@@ -714,6 +714,7 @@ TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
     // The layer (USE_VTX_RENDER_TARGET_INDX) addresses the one-slice target's only slice.
     EXPECT_TRUE(vs.layer_from_pos1);
     EXPECT_EQ(vs.layer_slices, 1u);
+    EXPECT_EQ(vs.route, NggLayerRoute::None) << "one slice needs no layer route";
     NggDrawFacts array = kena_vs_only_facts();
     array.target_single_slice = false;   // a 2D array, or an unprogrammed view
     const NggDrawAdmission unknown = admit_ngg_draw(kena_vs_only_registers(), array, radv());
