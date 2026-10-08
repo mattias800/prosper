@@ -28,7 +28,7 @@ namespace {
 
 using Words = std::vector<uint32_t>;
 
-constexpr uint64_t kAddress = 0xa4714001ull;
+constexpr uint64_t kAddress = 0xa4714001ULL;
 constexpr const char* kReason = "scalar-fabricated-lane-mask";
 
 // v_mov v5,0 | v_readfirstlane s0,v5 (no fold knows s0) | v_cmp_eq_u32 s[2:3],0,0
@@ -92,7 +92,7 @@ const char* name(Stage stage) {
     return stage == Stage::Fragment ? "fragment" : "compute";
 }
 
-// prefix | <path> | s_cmp_eq_u32 s0,0 | <probe ops>
+// The program: prefix, then the path, then s_cmp_eq_u32 s0,0, then the probe ops.
 Words program(const Words& path, const Words& probe) {
     return cat({&kPrefix, &path, &kScc, &probe});
 }

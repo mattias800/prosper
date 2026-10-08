@@ -419,32 +419,45 @@ inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, 
     return true;
 }
 
+// s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source. It is the only
+// saveexec form with an emitter: s_or/xor/andn2/orn2/nand/nor/xnor_saveexec_b64 refuse as
+// unresolved-operand today (ScalarPairMask tests), and each needs the guard if it gains one.
+inline bool is_and_saveexec(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64;
+}
+
+// Does this instruction write EXEC or VCC (or EXEC through saveexec)?
+inline bool writes_lane_mask_register(const Rdna2Inst& in) {
+    const bool register_dst =
+        in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR;
+    const int dst = in.dst.value;
+    return is_and_saveexec(in) ||
+           (register_dst && (dst == 106 || dst == 107 || dst == 126 || dst == 127));
+}
+
+// Is source `k` of `in` a scalar DATA operand that may become lane bits? A mask (a Bool in
+// sreg_bool, or VCC's live predicate) is not data and is not checked; an inline or literal is real.
+inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
+                                      const Rdna2Inst& in, uint32_t k) {
+    const Operand& o = in.src[k];
+    const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
+    if (o.kind != OperandKind::SGPR && !special_data) return true;
+    if ((o.value == 106 || o.value == 107) && rs.vcc) return true;   // the live predicate wins
+    if (rs.sreg_bool.contains(o.value)) return true;
+    // A NEVER-WRITTEN source counts: operand_bits reads its absence as uconst(0).
+    return scalar_words_projectable(b, rs, o.value, scalar_alu_source_words(in, k) == 1u ? 1 : 2);
+}
+
 // The shared guard for every scalar op that turns scalar DATA words into this lane's EXEC/VCC bit
 // through the lane id (s_cselect_b64/b32 into VCC, s_pack into VCC, s_lshl/lshr/bfe_b64 into
-// EXEC/VCC, s_bitreplicate, s_mov/logical forms into EXEC/VCC). Such an op is refused when a DATA
-// source word, or the VCC sibling word the result is combined with, is not projectable. A source
-// that is a mask (a Bool in sreg_bool, or VCC's live predicate) is not data and is not checked.
+// EXEC/VCC, s_bitreplicate, s_mov/logical forms into EXEC/VCC, s_and_saveexec). False when a DATA
+// source word is not projectable.
 inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, const RegState& rs,
                                                       const Rdna2Inst& in) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
-    const int dst = in.dst.value;
-    // s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source. It is the only
-    // saveexec form with an emitter: s_or/xor/andn2/orn2/nand/nor/xnor_saveexec_b64 refuse as
-    // unresolved-operand today (ScalarPairMask tests), and each needs this guard if it gains one.
-    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64;
-    if (!saveexec && (!(in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR) ||
-                      !(dst == 106 || dst == 107 || dst == 126 || dst == 127)))
-        return true;
-    for (uint32_t k = 0; k < 4; ++k) {
-        const Operand& o = in.src[k];
-        const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
-        if (o.kind != OperandKind::SGPR && !special_data) continue;
-        if ((o.value == 106 || o.value == 107) && rs.vcc) continue;   // the live predicate wins
-        if (rs.sreg_bool.contains(o.value)) continue;
-        // A NEVER-WRITTEN source counts: operand_bits reads its absence as uconst(0).
-        const uint32_t width = scalar_alu_source_words(in, k);
-        if (!scalar_words_projectable(b, rs, o.value, width == 1u ? 1 : 2)) return false;
-    }
+    if (!writes_lane_mask_register(in)) return true;
+    for (uint32_t k = 0; k < 4; ++k)
+        if (!scalar_source_projectable(b, rs, in, k)) return false;
     return true;
 }
 
@@ -465,8 +478,7 @@ inline void drop_vcc_mask_view(RegState& rs) {
 // True when the lane-mask write targets only VCC (so dropping its mask view is possible). EXEC
 // cannot be left without a view, and s_and_saveexec writes EXEC, so those are refused instead.
 inline bool scalar_mask_write_is_vcc_only(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64) return false;
-    return in.dst.value == 106 || in.dst.value == 107;
+    return !is_and_saveexec(in) && (in.dst.value == 106 || in.dst.value == 107);
 }
 
 // Applies drop_vcc_mask_view when the instruction finishes, if `on`.
@@ -480,6 +492,29 @@ struct VccMaskViewDrop {
         if (on) drop_vcc_mask_view(rs);
     }
 };
+
+// The emitters' one-line entry: false means REFUSE (an EXEC write from a non-projectable source,
+// named in the terminal reject line, #3135); a VCC write from one proceeds as data and `drop` takes
+// its mask view away when the instruction finishes.
+inline bool admit_scalar_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
+                                    VccMaskViewDrop& drop) {
+    if (scalar_data_sources_projectable_into_mask(b, rs, in)) return true;
+    if (scalar_mask_write_is_vcc_only(in)) {
+        drop.on = true;   // VCC as scalar scratch: data kept, no lane view
+        return true;
+    }
+    b.stage_reject_pc = in.pc;
+    b.stage_reject_reason = "scalar-fabricated-lane-mask";
+    return false;
+}
+
+// The VCC sibling word of a B32 write is combined into the lane bit: when it is not projectable the
+// view is dropped (data only) and the emitter returns. True means "handled, return now".
+inline bool vcc_sibling_dropped(const SpirvCompute& b, RegState& rs, int sibling) {
+    if (scalar_words_projectable(b, rs, sibling, 1)) return false;
+    drop_vcc_mask_view(rs);
+    return true;
+}
 
 // A B64 wave-mask logical (s_and_b64 and family) whose operand is an ordinary scalar DATA pair:
 // project the pair onto this invocation's lane bit -- this lane's 32-bit half, then its bit -- so
