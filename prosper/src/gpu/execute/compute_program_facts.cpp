@@ -52,7 +52,8 @@ FactsCache& facts_cache() {
 
 uint64_t facts_bytes(const ComputeProgramFacts& facts) {
     uint64_t bytes = sizeof(ComputeProgramFacts) + facts.code.size() * sizeof(uint32_t) +
-                     facts.decoded.size() * sizeof(Rdna2Inst);
+                     facts.decoded.size() * sizeof(Rdna2Inst) +
+                     facts.decoded.size() * sizeof(ComputeCrossLaneOp);   // wave_ops, worst case
     for (const auto& [tag, payload] : facts.probe_reject_reasons)
         bytes += tag.size() + payload.size() + 2 * sizeof(std::string);
     return bytes;
@@ -80,6 +81,13 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
 }
 
 } // namespace
+
+const ComputeWaveOpFacts& ComputeProgramFacts::wave_ops() const {
+    std::call_once(wave_ops_once, [this] {
+        wave_ops_value = analyze_compute_wave_ops(decoded, code.data(), code.size());
+    });
+    return wave_ops_value;
+}
 
 bool compute_program_facts_cache_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE") == nullptr;
@@ -136,6 +144,24 @@ std::shared_ptr<const ComputeProgramFacts> compute_program_facts(
         cache.entries.emplace(key, facts);
         cache.bytes += bytes;
     }
+    return facts;
+}
+
+std::shared_ptr<const ComputeProgramFacts>
+compute_program_facts_peek(const uint32_t* code, size_t dwords, uint64_t program_address) {
+    {
+        FactsCache& cache = facts_cache();
+        std::lock_guard lock(cache.mutex);
+        const auto found = cache.entries.find(FactsKey{program_address, dwords});
+        if (found != cache.entries.end() && found->second->code.size() == dwords &&
+            (dwords == 0 ||
+             std::memcmp(found->second->code.data(), code, dwords * sizeof(uint32_t)) == 0))
+            return found->second;
+    }
+    auto facts = std::make_shared<ComputeProgramFacts>();
+    facts->address = program_address;
+    facts->code.assign(code, code + dwords);
+    rdna2_walk(code, dwords, facts->decoded);
     return facts;
 }
 

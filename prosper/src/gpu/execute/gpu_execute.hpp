@@ -674,6 +674,10 @@ struct ComputeItem {
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
     uint32_t required_subgroup_size = 0;
+    // ADR 0028: dword count of the program at code_addr, so a decline that prints its line can fetch
+    // the memoized program facts (and from them the cross-lane inventory) lazily. 0 = unknown
+    // (capture replay, hand-built records): reported as unanalyzed, never as "no cross-lane op".
+    uint32_t code_dwords = 0;
     ComputeCpuFastPath cpu_fast_path = ComputeCpuFastPath::None;
     // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
     // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the

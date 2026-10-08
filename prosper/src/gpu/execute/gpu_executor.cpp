@@ -9176,6 +9176,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             recompile_diagnostic, program_uses_guest_gds_for_item ? nullptr : &compiled_trip_witness);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
+        item.code_dwords = static_cast<uint32_t>(shader_dwords);
         item.cpu_fast_path = classify_compute_cpu_fast_path(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.recompile_config = config;

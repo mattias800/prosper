@@ -3039,6 +3039,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
+  # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
+  prosper_add_gtest(test_compute_wave_route
+    SOURCES tests/gpu/recompiler/test_compute_wave_route.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
     LIBRARIES prosper_core)
@@ -3271,6 +3276,10 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_wave_admission
+      SOURCES tests/gpu/execute/test_compute_wave_admission.cpp
+      INCLUDES frontends
+      LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.

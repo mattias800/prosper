@@ -75,6 +75,23 @@ TEST(Wave64RefusalLine, ARecompileRefusalSaysTheHostWasNotConsulted) {
     EXPECT_TRUE(has(fragment, "refusal=fragment/recompile")) << fragment;
 }
 
+TEST(Wave64RefusalLine, ACandidateIsPrintedAsSeparateFieldsAndOnlyWhenKnown) {
+    const std::string without =
+        wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {});
+    EXPECT_FALSE(has(without, "candidate-"))
+        << "a caller without a candidate is unchanged: " << without;
+    const std::string with =
+        wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {},
+                            "n-lanes", "cross-lane-in-loop");
+    EXPECT_TRUE(has(with, " candidate-route=n-lanes candidate-reason=cross-lane-in-loop")) << with;
+    EXPECT_TRUE(has(with, " route=refused ")) << "the single route= is #4754's: " << with;
+    EXPECT_EQ(with.find(" route=", with.find(" route=") + 1), std::string::npos)
+        << "never a second `route=`; that field belongs to #4754: " << with;
+    EXPECT_TRUE(has(with, "[wave64-unsupported] stage=compute program=0x4072 "))
+        << "the prefix the census tools key on is unchanged: " << with;
+    EXPECT_EQ(with.back(), '\n');
+}
+
 TEST(Wave64RefusalLine, ASubgroupRefusalStillNamesTheHostRange) {
     const std::string known =
         wave64_refusal_line(Wave64Refusal::FragmentSubgroup, 0x4071, 0x40710001, 2, 32, 32, {});
