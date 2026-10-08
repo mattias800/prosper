@@ -5,9 +5,11 @@
 #include "gpu/pm4/pm4_registers.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace prosper::gpu {
@@ -46,10 +48,10 @@ NggDrawIndices decode_ngg_draw_indices(const void* bytes, uint32_t element_bytes
         uint32_t value = 0;
         if (element_bytes == 2u) {
             uint16_t narrow = 0;
-            std::memcpy(&narrow, src + 2u * i, 2u);
+            std::memcpy(&narrow, src + size_t{2} * i, 2u);
             value = narrow;
         } else {
-            std::memcpy(&value, src + 4u * i, 4u);
+            std::memcpy(&value, src + size_t{4} * i, 4u);
         }
         if (restart.enabled && value == restart_value) {
             out.refusal = "ngg-index-restart";

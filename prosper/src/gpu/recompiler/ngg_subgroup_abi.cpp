@@ -1,6 +1,7 @@
 // ngg_subgroup_abi.cpp -- see ngg_subgroup_abi.hpp.
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
