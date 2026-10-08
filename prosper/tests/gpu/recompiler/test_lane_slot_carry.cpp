@@ -72,6 +72,29 @@ const uint32_t kBodyEndsAnUnreloadedSpill[] = {
     0xBF0A8300u, 0xBF840006u, 0x4A020282u, 0xD7610014u, 0x00015000u, 0x7E280285u,
     0x80008100u, 0xBF82FFF8u, 0x4A020300u, 0x7E060D01u, 0xBF810000u,
 };
+// #4740 second review: the slot holds 7; a loop whose count is 0 would spill s0 into it and then
+// end its lifetime (v_mov_b32 v20, 5), never reloading it inside; the slot is reloaded AFTER the
+// exit. Hardware takes zero trips and reads 7 (7 + lane); the exit has no value that names both
+// paths, so the reload must refuse rather than read the VGPR's placeholder vector value.
+const uint32_t kReloadAfterExitOfAnEndedSlot[] = {
+    0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00015004u, 0xBE800380u, 0xBE810380u,
+    0xBF0A0100u, 0xBF840005u, 0xD7610014u, 0x00015000u, 0x7E280285u, 0x80008100u,
+    0xBF82FFF9u, 0xD7600008u, 0x00015114u, 0x4A020008u, 0x7E060D01u, 0xBF810000u,
+};
+// As above, but the body spills EXEC_LO into the data slot instead (a type change): the same
+// silent path, so the reload after the exit must refuse too.
+const uint32_t kReloadAfterExitOfATypeChangedSlot[] = {
+    0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00015004u, 0xBE800380u, 0xBE810380u,
+    0xBF0A0100u, 0xBF840005u, 0xD7610014u, 0x0001507Eu, 0xBF800000u, 0x80008100u,
+    0xBF82FFF9u, 0xD7600008u, 0x00015114u, 0x4A020008u, 0x7E060D01u, 0xBF810000u,
+};
+// Control: count 3 and no overwrite, so the slot is live at the exit (it holds the last s0, 2) and
+// the reload after it is well defined. Expected 2 + lane.
+const uint32_t kReloadAfterExitOfALiveSlot[] = {
+    0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00015004u, 0xBE800380u, 0xBE810383u,
+    0xBF0A0100u, 0xBF840005u, 0xD7610014u, 0x00015000u, 0xBF800000u, 0x80008100u,
+    0xBF82FFF9u, 0xD7600008u, 0x00015114u, 0x4A020008u, 0x7E060D01u, 0xBF810000u,
+};
 // slot v20[3] = 7; if (s9 == 1) v_mov_b32 v20, v0 (ends the array on the taken arm); then an
 // ORDINARY read v1 = v20 + v0. On the skipped edge V_WRITELANE erased v20's vector value, so the
 // merge has nothing honest to give that read.
@@ -212,6 +235,19 @@ TEST(LaneSlotCarry, LoopBodyLifetimeEndAndDomainFlip) {
         EXPECT_FALSE(compile(kBodyEndsAnUnreloadedSpill).empty());
     EXPECT_TRUE(compile(kBodyFlipsTheSlotToAMask).empty())
         << "a slot entering as data and leaving the body as a mask must refuse";
+}
+
+// A slot the loop does not carry to its exit (ended or type-changed in the body, never reloaded
+// inside) must not be read after the exit through the VGPR's vector value.
+TEST(LaneSlotCarry, ReloadAfterTheExitOfAnUncarriedSlotRefuses) {
+    if (have_device())
+        expect_lanes(kReloadAfterExitOfALiveSlot, 2, "control: slot live at the exit");
+    else
+        ASSERT_FALSE(compile(kReloadAfterExitOfALiveSlot).empty());
+    EXPECT_TRUE(compile(kReloadAfterExitOfAnEndedSlot).empty())
+        << "a zero-trip exit reads 7 on hardware; the reload must refuse, not read 0";
+    EXPECT_TRUE(compile(kReloadAfterExitOfATypeChangedSlot).empty())
+        << "a slot the body re-spilled as a mask must not be reloaded as data after the exit";
 }
 
 // After an if merge where one edge ended the spill array, an ORDINARY read of the VGPR refuses

@@ -27,7 +27,8 @@
 //   * a loop refuses a slot it reloads when the body leaves no value for it in the phi's domain:
 //     the body ended its lifetime (an ordinary VGPR write) or left it in the other data/mask
 //     domain. A slot the loop never reloads closes with its loop-invariant seed, which nothing
-//     inside the loop reads.
+//     inside the loop reads, and leaves the loop as a missing lane of a kept (possibly EMPTY) spill
+//     array, so a reload after the exit refuses too.
 //
 // CONFIDENCE: HIGH for loops (the header phi is the standard loop-carried form, and the merge value
 // is the one that reaches the exit). HIGH for if merges with the placeholder caveat above.

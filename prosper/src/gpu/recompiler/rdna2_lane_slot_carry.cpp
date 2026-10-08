@@ -251,11 +251,16 @@ bool LaneSlotLoopCarry::finish_exit(SpirvCompute& b, RegState& rs, bool body_edg
     for (const Exit& exit : exits)
         set_slot(rs, exit.slot->vgpr, exit.slot->lane, exit.slot->mask, exit.value);
     // A slot the condition region left unnamed, or the body left uncarried, has no value on the
-    // exit edge that dominates the merge. Drop it so a reload after the loop refuses visibly.
+    // exit edge that dominates the merge: on a zero-trip exit it still holds its pre-loop value,
+    // after a trip it holds whatever the body left. Drop the lane but keep the spill array, EMPTY
+    // if nothing else is left (the if-merge convention): erasing the array would let a later
+    // V_READLANE shuffle the VGPR's tracked vector value, which is a placeholder on the zero-trip
+    // path. operand_bits refuses an ordinary read of the array and V_READLANE the missing lane.
     for (const Slot& slot : slots_) {
         if (!slot.uncarried && slot.at_check) continue;
         erase_slot(rs.vgpr_lane_slots, slot.vgpr, slot.lane);
         erase_slot(rs.vgpr_lane_mask_slots, slot.vgpr, slot.lane);
+        rs.vgpr_lane_slots.try_emplace(slot.vgpr);
     }
     return true;
 }
