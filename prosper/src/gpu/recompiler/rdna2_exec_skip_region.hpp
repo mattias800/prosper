@@ -19,11 +19,13 @@ struct ExecSkipRegionEffects {
     // SALU/VALU wrote an SGPR, VCC half, SCC, M0 or EXEC-derived scalar that is not proven dead at
     // the merge. SCC and EXEC have no liveness proof here, so any write to them counts.
     bool scalar_live_out = false;
-    // An s_store/s_buffer_store/s_atomic/cache-control operation, or a scalar load whose result
-    // is not proven dead at the merge.
+    // Any SMEM operation other than a plain s_load/s_buffer_load (RDNA2 has no scalar stores or
+    // atomics; this is the cache-control, timer and ATC-probe forms), or a scalar load whose
+    // result is not proven dead at the merge.
     bool scalar_memory_effect = false;
-    // s_sendmsg, s_barrier, s_setreg, s_sleep, s_trap, s_ttracedata, cross-lane DPP, or any other
-    // SOPP/SOPK this classifier does not know to be a pure hint.
+    // s_sendmsg, s_barrier, s_setreg, s_sleep, s_trap, s_ttracedata, any other SOPP/SOPK this
+    // classifier does not know to be a pure hint, or a cross-lane/EXEC-unpredicated VALU access:
+    // DPP/SDWA forms it does not model, v_readfirstlane_b32, v_readlane_b32, v_writelane_b32.
     bool wave_side_effect = false;
     // A branch or jump in the region, an s_endpgm, or an indirect transfer. The only permitted
     // way out of the region is falling through to the merge.

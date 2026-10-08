@@ -60,13 +60,6 @@ TEST(FragmentExecSkipVote, SgprLiveOutReadAfterMergeIsRefused) {
     EXPECT_EQ(lowered.neutral_votes, 0u);
 }
 
-TEST(FragmentExecSkipVote, ScalarMemoryStoreInTheRegionIsRefused) {
-    // ADR mutation arm, by name. The state is correctly masked, but the region also stores.
-    const auto lowered = lower_fragment_votes(marked(f::Shape::ScalarStore));
-    EXPECT_EQ(lowered.refusal, FragmentVoteRefusal::UnprovedVote);
-    EXPECT_TRUE(lowered.words.empty());
-}
-
 TEST(FragmentExecSkipVote, MaskNotTiedToTheVotePredicateIsRefused) {
     // Masking by some OTHER condition does not make the region neutral under P=false.
     const auto lowered = lower_fragment_votes(marked(f::Shape::UnrelatedMask));
@@ -81,6 +74,7 @@ TEST(FragmentExecSkipVote, EvidenceMustNameThisVoteAndBeWellFormed) {
         "Prosper.FragmentExecSkipVote=",   // empty
         "Prosper.FragmentExecSkipVote=60x",   // trailing garbage
         "Prosper.FragmentExecSkipVote=-60",   // sign
+        "Prosper.FragmentExecSkipVote=060",   // leading zero: not the canonical spelling
         "Prosper.FragmentExecSkipVote= 60",   // space
         "Prosper.FragmentExecSkipVote=99999999999",   // overflow
         "Prosper.FragmentExecSkipVoteX=60",   // a different key
@@ -145,6 +139,16 @@ Rdna2Inst decode(uint32_t word, uint32_t pc, Rdna2Format expected_fmt, uint32_t 
 Operand sgpr(int n) {
     return {OperandKind::SGPR, n};
 }
+Rdna2Inst decode2(uint32_t word0, uint32_t word1, uint32_t pc, Rdna2Format expected_fmt,
+                  uint32_t expected_opcode) {
+    const uint32_t words[2] = {word0, word1};
+    Rdna2Inst in = rdna2_decode_one(words, 2);
+    EXPECT_EQ(in.fmt, expected_fmt) << std::hex << word0;
+    EXPECT_EQ(in.opcode, expected_opcode) << std::hex << word0;
+    EXPECT_EQ(in.len_dwords, 2u) << std::hex << word0;
+    in.pc = pc;
+    return in;
+}
 
 constexpr uint32_t kBranch = 0xBF880000u;   // s_cbranch_execz
 constexpr uint32_t kEnd = 0xBF810000u;   // s_endpgm
@@ -161,6 +165,18 @@ constexpr uint32_t kSendMsg = 0xBF900000u;
 constexpr uint32_t kBarrier = 0xBF8A0000u;
 constexpr uint32_t kSleep = 0xBF8E0001u;
 constexpr uint32_t kSBranch = 0xBF820001u;
+// Encodings below are llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64 round-trips, except the VOP3
+// spelling of v_readfirstlane_b32 (0x182), which llvm-mc refuses to assemble and is built by hand
+// from the VOP3 field layout (cf. v_mov_b32_e64 v5, v1 = 0xD5810005 0x00000101).
+// v_cmp_lt_f32_e64 s[6:7], v1, v2
+constexpr uint32_t kVCmpE64S6 = 0xD4010006u;
+constexpr uint32_t kVCmpE64S6Hi = 0x00020501u;
+constexpr uint32_t kSMovS8S6 = 0xBE880306u;   // s_mov_b32 s8, s6
+constexpr uint32_t kSMovS6Zero = 0xBE860380u;   // s_mov_b32 s6, 0
+constexpr uint32_t kSMovS7Zero = 0xBE870380u;   // s_mov_b32 s7, 0
+constexpr uint32_t kVCndmaskE32 = 0x02020702u;   // v_cndmask_b32_e32 v1, v2, v3, vcc (reads VCC)
+constexpr uint32_t kVAddS5 = 0x06040405u;   // v_add_f32_e32 v2, s5, v2
+constexpr uint32_t kVCmpGtU32Region = 0x7d880284u;   // v_cmp_gt_u32 vcc, 4, v1
 
 // pc 0: s_cbranch_execz -> merge; the region follows; the merge is `tail` then s_endpgm.
 struct Program {
@@ -199,6 +215,13 @@ Rdna2Inst vmov() {
 Rdna2Inst smov(uint32_t word) {
     return decode(word, 0, Rdna2Format::SOP1, 0x03);
 }
+// s_mov_b32 s6, 0 ; s_mov_b32 s7, 0 ; s_mov_b32 s8, s6: s[6:7] dead at the merge, then read.
+std::vector<Rdna2Inst> redefine_s6_s7_then_read() {
+    return {smov(kSMovS6Zero), smov(kSMovS7Zero), smov(kSMovS8S6)};
+}
+Rdna2Inst cndmask_reads_vcc() {
+    return decode(kVCndmaskE32, 0, Rdna2Format::VOP2, 0x01);
+}
 Rdna2Inst smem(uint32_t opcode, int dst) {
     Rdna2Inst in;
     in.fmt = Rdna2Format::SMEM;
@@ -221,13 +244,16 @@ TEST(FragmentExecSkipRegion, ValuOnlyRegionIsClean) {
 }
 
 TEST(FragmentExecSkipRegion, SgprLiveOutIsRefusedAndDeadOneIsNot) {
-    // ADR mutation arm, by name: a scalar written in the region and read after the merge.
-    const auto write = decode(kReadFirstLaneS5, 0, Rdna2Format::VOP1, 0x02);
-    auto fx = classify(program({vadd(), write}, {smov(kSMovS6S5)}));
+    // ADR mutation arm, by name: a scalar written in the region and read after the merge. The
+    // writer is an e64 compare into s[6:7], which the decoder reclassifies as VOPC.
+    const auto write = decode2(kVCmpE64S6, kVCmpE64S6Hi, 1, Rdna2Format::VOPC, 0x01);
+    ASSERT_EQ(write.dst.kind, OperandKind::SGPR);
+    ASSERT_EQ(write.dst.value, 6);
+    auto fx = classify(program({vadd(), write}, {smov(kSMovS8S6)}));
     EXPECT_TRUE(fx.scalar_live_out);
     EXPECT_FALSE(fx.clean());
     // Control: the same write, redefined before any read, is not observable.
-    EXPECT_TRUE(classify(program({vadd(), write}, {smov(kSMovS5Zero), smov(kSMovS6S5)})).clean());
+    EXPECT_TRUE(classify(program({vadd(), write}, redefine_s6_s7_then_read())).clean());
 }
 
 TEST(FragmentExecSkipRegion, ScalarAluAndExecWritesAreLiveOuts) {
@@ -248,14 +274,29 @@ TEST(FragmentExecSkipRegion, ScalarAluAndExecWritesAreLiveOuts) {
     EXPECT_TRUE(classify(program({cmp}, {cndmask})).scalar_live_out);
 }
 
-TEST(FragmentExecSkipRegion, ScalarMemoryEffectIsRefused) {
-    // ADR mutation arm, by name: a scalar memory store in the region.
-    EXPECT_TRUE(classify(program({vadd(), smem(0x18, 4)})).scalar_memory_effect);
+TEST(FragmentExecSkipRegion, ScalarLoadReadAfterTheMergeIsRefused) {
     // A scalar load whose result is read after the merge.
     EXPECT_TRUE(classify(program({smem(0x8, 4)}, {smov(0xBE860304u)})).scalar_memory_effect)
         << "s_mov_b32 s6, s4 reads the loaded value";
     // Control: the loaded register is redefined before it is read.
     EXPECT_TRUE(classify(program({smem(0x8, 5)}, {smov(kSMovS5Zero), smov(kSMovS6S5)})).clean());
+}
+
+TEST(FragmentExecSkipRegion, OnlyPlainScalarLoadsAreCleanAcrossEverySmemOpcode) {
+    // RDNA2 has no scalar store or atomic, so the scalar-memory condition is a whitelist of the
+    // loads: s_load_dword{,x2,x4,x8,x16} 0x00-0x04 and s_buffer_load_* 0x08-0x0C. Everything else
+    // in the 6-bit opcode space -- s_gl1_inv 0x1F, s_dcache_inv 0x20, s_memtime 0x24,
+    // s_memrealtime 0x25, s_atc_probe{,_buffer} 0x26/0x27 and every undefined slot -- is refused,
+    // with its destination dead (nothing follows the merge), so only the opcode decides.
+    for (uint32_t op = 0; op <= 0x3F; ++op) {
+        // word0: SDATA = s4, SBASE = s[0:1]; word1: SOFFSET = null, offset 0.
+        const auto in =
+            decode2(0xF4000000u | (op << 18) | (4u << 6), 0xFA000000u, 1, Rdna2Format::SMEM, op);
+        const bool plain_load = op <= 0x04 || (op >= 0x08 && op <= 0x0C);
+        const auto fx = classify(program({in}));
+        EXPECT_EQ(fx.clean(), plain_load) << "SMEM opcode 0x" << std::hex << op;
+        EXPECT_EQ(fx.scalar_memory_effect, !plain_load) << "SMEM opcode 0x" << std::hex << op;
+    }
 }
 
 TEST(FragmentExecSkipRegion, WaveLevelSideEffectsAreRefused) {
@@ -291,6 +332,143 @@ TEST(FragmentExecSkipRegion, UnknownFormatsAndBackwardRegionsFailClosed) {
     auto p = program({vadd()});
     EXPECT_TRUE(classify_exec_skip_region(p.ins, p.target, 0).foreign_exit);
     EXPECT_TRUE(classify_exec_skip_region(p.ins, 0, 0).foreign_exit);
+}
+
+// ---- one arm per classifier condition, each with the control that isolates it --------------
+
+TEST(FragmentExecSkipRegion, Vop2CarryOutToVccIsALiveOutOnlyWhenRead) {
+    // v_add/sub/subrev_co_ci_u32_e32 (0x28-0x2A) write their carry-out to VCC implicitly; the
+    // decoded operands name no scalar destination. Read after the merge by v_cndmask_b32_e32.
+    for (const uint32_t word : {0x50020702u, 0x52020702u, 0x54020702u}) {
+        const auto carry = decode(word, 0, Rdna2Format::VOP2, (word >> 25) & 0x3Fu);
+        EXPECT_TRUE(classify(program({carry}, {cndmask_reads_vcc()})).scalar_live_out)
+            << std::hex << word;
+        // Control: a v_cmp kills the VCC pair before the same reader.
+        EXPECT_TRUE(classify(program({carry}, {decode(kVCmp, 0, Rdna2Format::VOPC, 0x01),
+                                               cndmask_reads_vcc()}))
+                        .clean())
+            << std::hex << word;
+    }
+}
+
+TEST(FragmentExecSkipRegion, Vop3bScalarDestinationIsALiveOutOnlyWhenRead) {
+    // VOP3B carry/flag SDST in s[6:7]: v_add_co_u32, v_mad_u64_u32, v_div_scale_f32.
+    const struct {
+        uint32_t lo, hi, opcode;
+    } forms[] = {
+        {0xD70F0601u, 0x00020702u, 0x30F},   // v_add_co_u32 v1, s[6:7], v2, v3
+        {0xD5760601u, 0x04120702u, 0x176},   // v_mad_u64_u32 v[1:2], s[6:7], v2, v3, v[4:5]
+        {0xD56D0601u, 0x04120702u, 0x16D},   // v_div_scale_f32 v1, s[6:7], v2, v3, v4
+    };
+    for (const auto& form : forms) {
+        const auto in = decode2(form.lo, form.hi, 1, Rdna2Format::VOP3, form.opcode);
+        ASSERT_EQ(in.sdst.kind, OperandKind::SGPR) << std::hex << form.opcode;
+        ASSERT_EQ(in.sdst.value, 6) << std::hex << form.opcode;
+        EXPECT_TRUE(classify(program({in}, {smov(kSMovS8S6)})).scalar_live_out)
+            << std::hex << form.opcode;
+        EXPECT_TRUE(classify(program({in}, redefine_s6_s7_then_read())).clean())
+            << std::hex << form.opcode;
+    }
+}
+
+TEST(FragmentExecSkipRegion, ReadFirstLaneIntoADeadSgprIsStillRefused) {
+    // The failing scenario this certificate must not admit: VCC dead, s5 never read after the
+    // merge, but s5 feeds an EXEC-masked v_add. Guest wave64 adds the FIRST active lane's v1 to
+    // every lane; the fragment emitter adds each lane's own v1. Liveness of s5 is irrelevant.
+    const auto readfirstlane = decode(kReadFirstLaneS5, 0, Rdna2Format::VOP1, 0x02);
+    const auto fx = classify(program({decode(kVCmpGtU32Region, 0, Rdna2Format::VOPC, 0xC4),
+                                      readfirstlane, decode(kVAddS5, 0, Rdna2Format::VOP2, 0x03)}));
+    EXPECT_TRUE(fx.wave_side_effect);
+    EXPECT_FALSE(fx.scalar_live_out) << "nothing after the merge reads s5 or VCC";
+    EXPECT_FALSE(fx.clean());
+    // Control: the same region with an ordinary move in place of the cross-lane read is clean.
+    EXPECT_TRUE(
+        classify(program({decode(kVCmpGtU32Region, 0, Rdna2Format::VOPC, 0xC4), vmov(), vadd()}))
+            .clean());
+}
+
+TEST(FragmentExecSkipRegion, Vop3LaneAccessIsRefusedWhateverItsDestination) {
+    // VOP3 0x182 v_readfirstlane_b32 and 0x360 v_readlane_b32 read another lane; 0x361
+    // v_writelane_b32 writes one lane with EXEC ignored. Every destination is dead here.
+    const struct {
+        uint32_t lo, hi, opcode;
+    } forms[] = {
+        {0xD5820005u, 0x00000101u, 0x182},   // v_readfirstlane_b32 s5, v1 (VOP3, hand-encoded)
+        {0xD7600005u, 0x00010701u, 0x360},   // v_readlane_b32 s5, v1, 3
+        {0xD7610001u, 0x00010605u, 0x361},   // v_writelane_b32 v1, s5, 3
+    };
+    for (const auto& form : forms) {
+        const auto in = decode2(form.lo, form.hi, 1, Rdna2Format::VOP3, form.opcode);
+        const auto fx = classify(program({in}));
+        EXPECT_TRUE(fx.wave_side_effect) << std::hex << form.opcode;
+        EXPECT_FALSE(fx.clean()) << std::hex << form.opcode;
+    }
+    // Control: the neighbouring VOP3 opcode 0x181, v_mov_b32_e64 v5, v1, is clean.
+    EXPECT_TRUE(classify(program({decode2(0xD5810005u, 0x00000101u, 1, Rdna2Format::VOP3, 0x181)}))
+                    .clean());
+}
+
+TEST(FragmentExecSkipRegion, UnmodelledVopModifiersAreWaveSideEffects) {
+    // VOP2 DPP16 (row/quad permutations read other lanes).
+    const auto dpp = decode2(0x060206FAu, 0xFF00E402u, 1, Rdna2Format::VOP2, 0x03);
+    ASSERT_TRUE(dpp.has_dpp || dpp.has_modifier);
+    EXPECT_TRUE(classify(program({dpp})).wave_side_effect) << "v_add_f32_dpp quad_perm";
+    EXPECT_TRUE(classify(program({vadd()})).clean()) << "control: v_add_f32_e32";
+    // VOPC SDWA with a float WORD_1 select: a form the decoder leaves has_modifier on.
+    const auto sdwa = decode2(0x7C0204F9u, 0x06050001u, 1, Rdna2Format::VOPC, 0x01);
+    ASSERT_TRUE(sdwa.has_modifier);
+    EXPECT_TRUE(classify(program({sdwa})).wave_side_effect) << "v_cmp_lt_f32_sdwa WORD_1";
+    EXPECT_TRUE(classify(program({decode(kVCmp, 0, Rdna2Format::VOPC, 0x01)})).clean())
+        << "control: v_cmp_lt_f32_e32";
+    // VOP3: gfx10 VOP3 has no DPP/SDWA spelling, so the decoder sets neither flag today. Pin the
+    // fail-closed rule anyway, on a real v_fma_f32 with the flag set, against a future decoder.
+    auto fma = decode2(0xD54B0001u, 0x04120702u, 1, Rdna2Format::VOP3, 0x14B);
+    EXPECT_TRUE(classify(program({fma})).clean()) << "control: v_fma_f32 v1, v2, v3, v4";
+    fma.has_modifier = true;
+    EXPECT_TRUE(classify(program({fma})).wave_side_effect);
+    fma.has_modifier = false;
+    fma.has_dpp = true;
+    EXPECT_TRUE(classify(program({fma})).wave_side_effect);
+}
+
+TEST(FragmentExecSkipRegion, InstructionsThatLeaveTheDecodedCfgAreForeignExits) {
+    // rdna2_escapes_decoded_effects: without that check each of these would read only as scalar
+    // ALU (SOP1) or a scalar write (SOPK), so the arm asserts the foreign exit specifically.
+    EXPECT_TRUE(classify(program({decode(0xBE802004u, 0, Rdna2Format::SOP1, 0x20)})).foreign_exit)
+        << "s_setpc_b64 s[4:5]";
+    EXPECT_TRUE(classify(program({decode(0xBE853006u, 0, Rdna2Format::SOP1, 0x30)})).foreign_exit)
+        << "s_movreld_b32 s5, s6";
+    EXPECT_TRUE(classify(program({decode(0xBD840001u, 0, Rdna2Format::SOPK, 0x1B)})).foreign_exit)
+        << "s_subvector_loop_begin s4, 1";
+    // Control: an ordinary SOP1 move is a scalar live-out, not an exit.
+    const auto fx = classify(program({smov(kSMovS6Zero)}));
+    EXPECT_FALSE(fx.foreign_exit);
+    EXPECT_TRUE(fx.scalar_live_out);
+}
+
+TEST(FragmentExecSkipRegion, WaitcntVscntIsAWaveSideEffectAndCounterWaitsAreNot) {
+    Rdna2Inst vscnt = decode(0xBBFD0000u, 0, Rdna2Format::SOPK, 0x17);   // s_waitcnt_vscnt null, 0
+    const auto fx = classify(program({vscnt}));
+    EXPECT_TRUE(fx.wave_side_effect);
+    EXPECT_FALSE(fx.scalar_live_out) << "refused as a barrier, not as a scalar write";
+    // Control: s_waitcnt_lgkmcnt null, 0 is a counter the synchronous model never waits on.
+    EXPECT_TRUE(classify(program({decode(0xBD7D0000u, 0, Rdna2Format::SOPK, 0x1A)})).clean());
+}
+
+TEST(FragmentExecSkipRegion, Sop1AndSopcAreScalarLiveOutsEvenWithADeadDestination) {
+    // SCC has no liveness proof, so a dead SGPR destination does not clear a scalar ALU op.
+    const auto smov_dead = classify(program({smov(kSMovS6Zero)}));   // s6 never read
+    EXPECT_TRUE(smov_dead.scalar_live_out);
+    EXPECT_FALSE(smov_dead.unclassified);
+    const auto scmp = classify(program({decode(0xBF060201u, 0, Rdna2Format::SOPC, 0x06)}));
+    EXPECT_TRUE(scmp.scalar_live_out) << "s_cmp_eq_u32 s1, s2 writes SCC";
+    EXPECT_FALSE(scmp.unclassified);
+}
+
+TEST(FragmentExecSkipRegion, LdsIsUnclassified) {
+    // ds_read_b32 v1, v2
+    const auto ds = decode2(0xD8D80000u, 0x01000002u, 1, Rdna2Format::DS, 0x36);
+    EXPECT_TRUE(classify(program({ds})).unclassified);
 }
 
 // ---- emitter half: the recompiler's own evidence ---------------------------------------------
@@ -369,5 +547,37 @@ TEST(FragmentExecSkipEmitter, RegionWithScalarWorkCarriesNone) {
     const auto e = compile_evidence({kVCmpGtU32, 0xbe850387u /* s_mov_b32 s5, 7 */, kVMovOne});
     ASSERT_EQ(e.votes.size(), 1u);
     EXPECT_TRUE(e.marked.empty());
+}
+
+TEST(FragmentExecSkipEmitter, RegionWithReadFirstLaneCarriesNone) {
+    // The classifier's readfirstlane refusal, end to end: VCC is dead and s5 is never read after
+    // the merge, but s5 feeds an EXEC-masked v_add whose value is per-lane on the host.
+    const auto e = compile_evidence({kVCmpGtU32, kReadFirstLaneS5, kVAddS5});
+    ASSERT_EQ(e.votes.size(), 1u);
+    EXPECT_TRUE(e.marked.empty());
+}
+
+// Cross-lane work the classifier does not itself refuse rests on lower_fragment_votes' exact
+// `Prosper.FragmentSubgroupWhy=2` contract: the evidence names the vote, and the module is still
+// refused because the emitter recorded a lane-id reason beside the vote.
+TEST(FragmentExecSkipEmitter, LaneIdInTheRegionIsRefusedDespiteTheEvidence) {
+    const auto lower = [](const std::vector<uint32_t>& region) {
+        const auto code = execz_shader(region);
+        return lower_fragment_votes(recompile_fragment(code.data(), code.size()));
+    };
+    // v_mbcnt_lo_u32_b32 v1, -1, 0: a lane id the 32-lane host numbers differently.
+    const std::vector<uint32_t> mbcnt = {kVCmpGtU32, 0xD7650001u, 0x000100C1u, kVMovOne};
+    const auto e = compile_evidence(mbcnt);
+    ASSERT_EQ(e.votes.size(), 1u);
+    EXPECT_EQ(e.marked, e.votes) << "the guest classifier does not see lane ids";
+    const auto lowered = lower(mbcnt);
+    EXPECT_EQ(lowered.refusal, FragmentVoteRefusal::InconsistentContract);
+    EXPECT_TRUE(lowered.words.empty());
+    // v_readlane_b32 s5, v1, 40: a lane the 32-lane host does not have. Refused twice over.
+    const std::vector<uint32_t> readlane = {kVCmpGtU32, 0xD7600005u, 0x00015101u, kVMovOne};
+    EXPECT_TRUE(compile_evidence(readlane).marked.empty());
+    EXPECT_NE(lower(readlane).refusal, FragmentVoteRefusal::None);
+    // Control: the clean region, carrying the same evidence, lowers.
+    EXPECT_EQ(lower({kVCmpGtU32, kVMovOne}).refusal, FragmentVoteRefusal::None);
 }
 }   // namespace

@@ -57,9 +57,11 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
         switch (in.fmt) {
             case Rdna2Format::VOP1:
                 if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // v_readfirstlane_b32: the decoder keeps the SGPR index in a VGPR-kinded `dst`.
-                if (in.opcode == 0x02 && !dead({OperandKind::SGPR, in.dst.value}, 1))
-                    fx.scalar_live_out = true;
+                // v_readfirstlane_b32 reads ANOTHER lane, whatever happens to its SGPR destination:
+                // the fragment emitter lowers it to this invocation's own value (speculative, no
+                // wave-reason bit), so a value it feeds into an EXEC-masked write would differ
+                // per lane on a narrower host. Refused outright, never as a liveness question.
+                if (in.opcode == 0x02) fx.wave_side_effect = true;
                 break;
             case Rdna2Format::VOP2:
                 if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
@@ -74,10 +76,12 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
                 break;
             case Rdna2Format::VOP3:
                 if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // 0x182 is v_readfirstlane_b32 and 0x360 v_readlane_b32 in their VOP3 spelling.
-                if ((in.opcode == 0x182 || in.opcode == 0x360) &&
-                    !dead({OperandKind::SGPR, in.dst.value}, 1))
-                    fx.scalar_live_out = true;
+                // Cross-lane and EXEC-unpredicated lane access, refused outright like VOP1 0x02:
+                // 0x182 v_readfirstlane_b32 and 0x360 v_readlane_b32 (VOP3 spelling) read another
+                // lane; 0x361 v_writelane_b32 writes one lane whatever EXEC holds.
+                if (in.opcode == 0x182 || in.opcode == 0x360 || in.opcode == 0x361)
+                    fx.wave_side_effect = true;
+                // VOP3B carry/flag destination (v_add_co_u32, v_div_scale, v_mad_u64_u32, ...).
                 if (in.sdst.kind != OperandKind::None && !dead(in.sdst, 2))
                     fx.scalar_live_out = true;
                 break;
@@ -120,9 +124,12 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
                 fx.scalar_live_out = true;
                 break;
             case Rdna2Format::SMEM: {
+                // A whitelist of the plain loads: RDNA2 has no scalar stores or atomics, so the
+                // only SMEM work besides a load is s_gl1_inv, s_dcache_inv, s_memtime,
+                // s_memrealtime and the s_atc_probe forms, and every one of those (with every
+                // undefined slot) has no load width here and is refused.
                 const int n = smem_load_dwords(in.opcode);
-                if (rdna2_instruction_may_write_memory(in) || n == 0 || !dead(in.dst, n))
-                    fx.scalar_memory_effect = true;
+                if (n == 0 || !dead(in.dst, n)) fx.scalar_memory_effect = true;
                 break;
             }
             default:   // DS, MUBUF, MTBUF, MIMG, FLAT, EXP, Unknown
