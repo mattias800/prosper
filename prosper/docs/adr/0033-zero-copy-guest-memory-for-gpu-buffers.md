@@ -67,9 +67,14 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
   section-view pointer is not established; `vkGetMemoryHostPointerPropertiesEXT` answers it per
   pointer and must be asked, not assumed.
 - *Linux/AMD cannot import guest direct memory as host memory -- this is known, not open.* RADV
-  implements `VK_EXT_external_memory_host` through amdgpu userptr, and libdrm's
-  `amdgpu_create_bo_from_user_mem` (`amdgpu/amdgpu_bo.c`, primary evidence) always passes
-  `AMDGPU_GEM_USERPTR_ANONONLY`; the kernel then refuses (`-EPERM`) any VMA backed by a file.
+  implements `VK_EXT_external_memory_host` through amdgpu userptr. The chain, read at source on
+  2026-10-07: RADV's `radv_amdgpu_winsys_bo_from_ptr` calls `ac_drm_create_bo_from_user_mem`
+  (Mesa `be847f9`, `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c:815`), which on a non-virtio
+  device calls libdrm's `amdgpu_create_bo_from_user_mem` (`src/amd/common/ac_linux_drm.c:950-960`);
+  libdrm (`b97cbde`, `amdgpu/amdgpu_bo.c:591-592`) always sets `AMDGPU_GEM_USERPTR_ANONONLY`, and
+  the kernel's `amdgpu_ttm_tt_get_user_pages` (`drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c`, Linux
+  master) returns `-EPERM` when that flag is set and the VMA has a `vm_file`. This is read, not
+  measured: Migration step 1 confirms it with a host-pointer probe on a memfd mapping.
   prosper's Linux guest direct memory is a memfd (`hle_kernel_mem.cpp:1552`,
   `prosper_memfd_create("prosper-dmem")`) mapped `MAP_SHARED` (`:1617`, `:1681-1707`), so every
   guest mapping has a `vm_file` and a host-pointer import would be refused for essentially every
@@ -149,6 +154,14 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
   compare without tracking (gaps doc § 3), and memory grows with the guest's working set.
 - **Persistently mapped staging with diff-copies.** Cheaper than a fresh copy, but still a copy
   plus a compare; it is the fallback this ADR keeps where import is refused, not the target.
+- **Invert ownership: back guest direct memory with exported Vulkan memory.** Allocate
+  host-visible device memory, export it (`VK_KHR_external_memory_fd` / `_win32`), and map that
+  handle into the guest address space, so the GPU already owns every guest page and nothing is
+  imported. It sidesteps the userptr refusal on Linux/AMD and the section-view question on Windows
+  with one design, at the cost of rebuilding the guest memory backend (aliasing, ADR 0032 page
+  tracking and host-visible heap size limits all move onto driver allocations). Not chosen yet:
+  Migration step 1 measures both this and the udmabuf route before Stage A picks one, and adopting
+  it would be its own ADR on the guest memory backend.
 - **BDA first, as KytyPS5 and shadPS4 do.** Both still copy into device memory; adopting BDA alone
   changes addressing and leaves the measured copy in place, so it is Stage B, not Stage A.
 
@@ -156,7 +169,7 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
 
 1. Probe and count: report `VK_EXT_external_memory_host`, `minImportedHostPointerAlignment` and
    per-pointer `vkGetMemoryHostPointerPropertiesEXT` acceptance for the bytes `DrawBufferStage` and
-   `res_buffer_copy_ms` cover, on Linux/AMD (udmabuf route) and Windows/NVIDIA. No behaviour change.
+   `res_buffer_copy_ms` cover, on Linux/AMD (udmabuf route) and Windows/NVIDIA, plus an exported-Vulkan-memory mapping probe for the alternative above. No behaviour change.
 2. Page tracking that validates without a compare (ADR 0010, ADR 0032) where it is missing.
 3. Stage A behind its switch for read-only graphics buffers; A/B; then compute read-only buffers.
 4. Device-local promotion by measured reads-per-change (item 3).
