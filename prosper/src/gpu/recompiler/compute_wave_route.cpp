@@ -1,7 +1,12 @@
 // Compute Wave64 route selection -- see compute_wave_route.hpp and ADR 0028.
 #include "gpu/recompiler/compute_wave_route.hpp"
 
+#include "diagnostics/env_cache.hpp"
+#include "diagnostics/perf/wave64_refusal.hpp"
+
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -22,20 +27,30 @@ const char* compute_cross_lane_kind_name(ComputeCrossLaneKind kind) {
         case ComputeCrossLaneKind::DsSwizzle: return "ds-swizzle";
         case ComputeCrossLaneKind::DsBpermute: return "ds-bpermute";
         case ComputeCrossLaneKind::DsAppend: return "ds-append";
+        case ComputeCrossLaneKind::MaskScc: return "mask-scc";
+        case ComputeCrossLaneKind::MaskOther: return "mask-other";
+        case ComputeCrossLaneKind::WriteLane: return "writelane";
+        case ComputeCrossLaneKind::LdsWaveSync: return "lds-wave-sync";
+        case ComputeCrossLaneKind::DsPermute: return "ds-permute";
         case ComputeCrossLaneKind::Count: break;
     }
     return "none";
 }
 
 const char* compute_wave_route_name(ComputeWaveRoute route) {
+    // The single route vocabulary is owned by #4754 (wave64_refusal.hpp); use its table directly.
+    using prosper::diagnostics::perf::wave64_route_name;
+    using prosper::diagnostics::perf::Wave64Route;
     switch (route) {
-        case ComputeWaveRoute::Native: return "native";
-        case ComputeWaveRoute::WidthIndependent: return "width-independent";
-        case ComputeWaveRoute::WorkgroupExchange: return "workgroup-exchange";
-        case ComputeWaveRoute::NeedsNLanes: return "needs-n-lanes";
-        case ComputeWaveRoute::Refused: return "refused";
+        case ComputeWaveRoute::Native: return wave64_route_name(Wave64Route::Native);
+        case ComputeWaveRoute::WidthIndependent:
+            return wave64_route_name(Wave64Route::ProvenWidthIndependent);
+        case ComputeWaveRoute::WorkgroupExchange:
+            return wave64_route_name(Wave64Route::WorkgroupExchange);
+        case ComputeWaveRoute::NeedsNLanes: return wave64_route_name(Wave64Route::NLanes);
+        case ComputeWaveRoute::Refused: return wave64_route_name(Wave64Route::Refused);
     }
-    return "refused";
+    return wave64_route_name(Wave64Route::Refused);
 }
 
 uint32_t compute_exchange_scratch_bytes(uint32_t local_invocations, uint32_t guest_wave) {
@@ -58,6 +73,8 @@ bool compute_exchange_carries(ComputeCrossLaneKind kind) {
         case ComputeCrossLaneKind::WaveVote:
         case ComputeCrossLaneKind::Ballot:
         case ComputeCrossLaneKind::MaskConsumer:
+        case ComputeCrossLaneKind::MaskScc:
+        case ComputeCrossLaneKind::MaskOther:
         case ComputeCrossLaneKind::DsBpermute: return true;
         // Native shuffles only, and the wave-collective counter: no exchange form exists, so a
         // program using them is refused unless the host subgroup holds the whole shuffle domain.
@@ -65,6 +82,9 @@ bool compute_exchange_carries(ComputeCrossLaneKind kind) {
         case ComputeCrossLaneKind::PermLane:
         case ComputeCrossLaneKind::DsSwizzle:
         case ComputeCrossLaneKind::DsAppend:
+        case ComputeCrossLaneKind::WriteLane:
+        case ComputeCrossLaneKind::LdsWaveSync:
+        case ComputeCrossLaneKind::DsPermute:
         case ComputeCrossLaneKind::Count: return false;
     }
     return false;
@@ -99,10 +119,15 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
         if (first_exec_write == UINT32_MAX && rdna2_instruction_may_change_exec(in))
             first_exec_write = in.pc;
         if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
-            in.opcode != 0x03 && in.simm16 < 0)
+            in.opcode != 0x03 && in.simm16 < 0 && !waterfalls.contains(in.pc))
             any_backward_branch = true;
     }
 
+    // The region detectors below print their own PROSPER_DBG lines; tag them so they are not read
+    // as the emitter's.
+    if (PROSPER_ENV_ON("PROSPER_DBG"))
+        std::fprintf(stderr, "[wave64-route-analysis] region detector output below belongs to the "
+                             "route analysis, not to a recompile\n");
     const auto add = [&](const Rdna2Inst& in, ComputeCrossLaneKind kind, uint32_t native_lanes) {
         ComputeCrossLaneOp op;
         op.pc = in.pc;
@@ -157,6 +182,55 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
         }
         if (in.has_dpp) add(in, ComputeCrossLaneKind::Dpp, dpp_native_lanes(in.dpp_ctrl));
     }
+    // Scalar lane-mask sites. A "mask" operand is EXEC/VCC (specials 126/127/106/107).
+    const auto is_mask_special = [](const Operand& o) {
+        return o.kind == OperandKind::Special &&
+               (o.value == 126 || o.value == 127 || o.value == 106 || o.value == 107);
+    };
+    bool lds_written_since_barrier = false;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        bool mask_operand = is_mask_special(in.dst);
+        for (uint32_t k = 0; k < in.n_src && k < 3; ++k) mask_operand |= is_mask_special(in.src[k]);
+        if (in.fmt == Rdna2Format::SOPC) {
+            // s_cmp_eq/lg_u64 (0x12/0x13) read a whole 64-bit mask; the b32 forms on a mask half too.
+            if (in.opcode == 0x12 || in.opcode == 0x13 || mask_operand)
+                add(in, ComputeCrossLaneKind::MaskScc, 0);
+        } else if (in.fmt == Rdna2Format::SOP2) {
+            const bool b64_logic = in.opcode >= 0x0f && in.opcode <= 0x1d && (in.opcode & 1);
+            if (b64_logic && (mask_operand || in.dst.kind == OperandKind::SGPR))
+                add(in, ComputeCrossLaneKind::MaskScc, 0);
+            else if (mask_operand)
+                add(in, ComputeCrossLaneKind::MaskOther, 0);
+        } else if (in.fmt == Rdna2Format::SOP1) {
+            const bool already =
+                in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64;
+            const bool scc_mask =
+                in.opcode == 0x08 || in.opcode == 0x0a || (in.opcode >= 0x24 && in.opcode <= 0x2b);
+            const bool plain_move = in.opcode == 0x03 || in.opcode == 0x04;
+            if (!already && scc_mask && mask_operand)
+                add(in, ComputeCrossLaneKind::MaskScc, 0);
+            else if (!already && !plain_move && !scc_mask && mask_operand)
+                add(in, ComputeCrossLaneKind::MaskOther, 0);
+        } else if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
+            // v_writelane_b32: an inline selector is the lane-slot spill form and crosses no lane.
+            if (in.src[1].kind != OperandKind::InlineInt)
+                add(in, ComputeCrossLaneKind::WriteLane, 64);
+        } else if (in.fmt == Rdna2Format::DS && !in.ds_gds) {
+            if (in.opcode == 0xb2) add(in, ComputeCrossLaneKind::DsPermute, 0);
+            const bool is_read = (in.opcode >= 0x36 && in.opcode <= 0x3c) ||
+                                 (in.opcode >= 0x76 && in.opcode <= 0x78);
+            if (is_read && lds_written_since_barrier)
+                add(in, ComputeCrossLaneKind::LdsWaveSync, 64);
+            else if (in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x0f ||
+                     in.opcode == 0x1e || in.opcode == 0x1f ||
+                     (in.opcode >= 0x4d && in.opcode <= 0x4f))
+                lds_written_since_barrier = true;
+        }
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) lds_written_since_barrier = false;
+    }
+    std::sort(facts.ops.begin(), facts.ops.end(),
+              [](const ComputeCrossLaneOp& a, const ComputeCrossLaneOp& b) { return a.pc < b.pc; });
     for (const auto& op : facts.ops) ++facts.count[static_cast<size_t>(op.kind)];
     if (facts.ops.empty()) return facts;
 
@@ -176,6 +250,10 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
         bool in_loop = false;
         for (const auto& loop : loops)
             if (op.pc >= loop.header_pc && op.pc <= loop.backedge_pc) in_loop = true;
+        // A waterfall is a loop with a per-wave trip count (one iteration per distinct lane value).
+        for (const auto& br : ins)
+            if (waterfalls.contains(br.pc) && branch_target(br) <= op.pc && op.pc <= br.pc)
+                in_loop = true;
         if (in_loop) {
             op.context = ComputeWaveContext::Loop;
             continue;
@@ -248,11 +326,12 @@ ComputeWaveRouteDecision select_compute_wave_route(const ComputeWaveOpFacts& fac
             return done(ComputeWaveRoute::Refused, "exchange-lowering-unavailable");
         }
         needs_exchange = true;
-        if (op.context == ComputeWaveContext::Loop && !in_loop) {
+        if (op.context == ComputeWaveContext::Loop && !in_loop && !host.exchange_dispatcher) {
             in_loop = true;
             loop_pc = op.pc;
             loop_kind = op.kind;
-        } else if (op.context == ComputeWaveContext::UnprovenRegion && !single_wave && !in_region) {
+        } else if (op.context == ComputeWaveContext::UnprovenRegion && !single_wave && !in_region &&
+                   !host.exchange_dispatcher) {
             in_region = true;
             region_pc = op.pc;
             region_kind = op.kind;

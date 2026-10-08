@@ -654,8 +654,6 @@ ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t d
 uint64_t compute_dispatch_code_addr(const GpuState& submit,
                                     const GpuState::Dispatch& dispatch);
 
-struct ComputeWaveOpFacts;   // gpu/recompiler/compute_wave_route.hpp (ADR 0028)
-
 struct ComputeItem {
     std::vector<uint32_t> spirv;
     std::vector<uint32_t> user_sgprs;
@@ -676,10 +674,10 @@ struct ComputeItem {
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
     uint32_t required_subgroup_size = 0;
-    // ADR 0028: the program's cross-lane operations (aliases the memoized program facts). Null for
-    // items built without them (capture replay, hand-built records); a null is "unanalyzed", never
-    // "no cross-lane operation".
-    std::shared_ptr<const ComputeWaveOpFacts> wave_ops;
+    // ADR 0028: dword count of the program at code_addr, so a decline that prints its line can fetch
+    // the memoized program facts (and from them the cross-lane inventory) lazily. 0 = unknown
+    // (capture replay, hand-built records): reported as unanalyzed, never as "no cross-lane op".
+    uint32_t code_dwords = 0;
     ComputeCpuFastPath cpu_fast_path = ComputeCpuFastPath::None;
     // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
     // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the

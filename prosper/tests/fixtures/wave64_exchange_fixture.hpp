@@ -24,9 +24,15 @@ enum class Trips : uint8_t {
     PerWave,   // wave w iterates w + 1 times (s0 = readlane(v0, 0) >> 6, + 1)
 };
 
+enum class Extra : uint8_t { None, Ballot, Mbcnt };   // a second cross-lane op in the loop
+
 struct Case {
     uint32_t local = 64;
     Trips trips = Trips::Constant3;
+    Extra extra = Extra::None;
+    uint32_t lane = 5;   // the lane every wave reads (0..63)
+    bool sgpr_lane =
+        false;   // the selector is an SGPR (s_mov s7, lane) rather than an inline constant
     uint32_t threads = 0;   // 0 = a whole number of workgroups (threads == local)
     bool barrier_in_loop =
         false;   // an s_barrier inside the loop body: no dispatcher case can hold it
@@ -52,7 +58,12 @@ inline std::vector<uint32_t> expected(const Case& c) {
     for (uint32_t lane = 0; lane < c.local; ++lane) {
         const uint32_t base = lane / 64u * 64u;
         uint32_t sum = 0;
-        for (uint32_t i = 0; i < trip_count(c, lane); ++i) sum += data(base + 5u) + i;
+        for (uint32_t i = 0; i < trip_count(c, lane); ++i) {
+            sum += data(base + c.lane) + i;
+            if (c.extra == Extra::Ballot) sum += 64u;   // every lane of the wave votes
+            if (c.extra == Extra::Mbcnt)
+                sum += (lane % 64u) < 32u ? lane % 64u : 32u;   // low-half lanes below
+        }
         v[c.local * 3 + lane] = sum;
     }
     return v;
@@ -70,13 +81,23 @@ inline std::vector<uint32_t> program(const Case& c) {
         p.push_back(0xbe800383u);   // s_mov_b32 s0, 3
     }
     p.push_back(0x7e080280u);   // v_mov_b32 v4, 0
+    if (c.sgpr_lane) p.push_back(0xbe870380u | ((128u + c.lane) & 0xffu));   // s_mov_b32 s7, lane
     const uint32_t loop_pc = static_cast<uint32_t>(p.size());
     if (c.barrier_in_loop) p.push_back(0xbf8a0000u);   // s_barrier
-    p.insert(p.end(), {0xd7600006u, 0x00010b01u,   // v_readlane_b32 s6, v1, 5
-                       0x4a080806u,   // v_add_nc_u32 v4, s6, v4
-                       0x4a020281u,   // v_add_nc_u32 v1, 1, v1
-                       0x80808100u,   // s_sub_u32 s0, s0, 1
-                       0xbf078000u});   // s_cmp_lg_u32 s0, 0
+    p.insert(p.end(),
+             {0xd7600006u,
+              c.sgpr_lane ? 0x00000f01u
+                          : (0x101u | ((128u + c.lane) << 9)),   // v_readlane_b32 s6, v1, lane
+              0x4a080806u,   // v_add_nc_u32 v4, s6, v4
+              0x4a020281u,   // v_add_nc_u32 v1, 1, v1
+              0x80808100u,   // s_sub_u32 s0, s0, 1
+              0xbf078000u});   // s_cmp_lg_u32 s0, 0
+    if (c.extra == Extra::Ballot)
+        p.insert(p.end(), {0x7d840100u, 0xbe88106au,
+                           0x4a080808u});   // v_cmp vcc ; s_bcnt1 s8, vcc ; v4 += s8
+    if (c.extra == Extra::Mbcnt)
+        p.insert(p.end(),
+                 {0xd7650007u, 0x0001007eu, 0x4a080907u});   // v_mbcnt_lo v7, exec_lo, 0 ; v4 += v7
     const int32_t displacement = static_cast<int32_t>(loop_pc) - static_cast<int32_t>(p.size() + 1);
     p.push_back(0xbf850000u | (static_cast<uint32_t>(displacement) & 0xffffu));   // s_cbranch_scc1
     // v5 = v0 + 3 * local ; cbuf[v5] = v4

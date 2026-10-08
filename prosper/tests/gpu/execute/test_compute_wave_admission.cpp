@@ -1,21 +1,17 @@
-// ADR 0028: the frontend glue that names a Wave64 route on a refusal line and checks an exchange
-// module against the device limits. A stand-in context supplies the fields live_compute.cpp's real
-// one has, so nothing here needs a Vulkan device.
+// ADR 0028: the frontend glue that names a Wave64 route CANDIDATE on a refusal line. A stand-in
+// context supplies the fields live_compute.cpp's real one has, so nothing here needs a Vulkan device.
 #include <gtest/gtest.h>
 
-#include <cstring>
-#include <memory>
 #include <vector>
 
+#include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/compute_wave_route.hpp"
-#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "fixtures/wave64_exchange_fixture.hpp"
 #include "shared/live/compute_wave_admission.hpp"
 
-#include "fixtures/wave64_exchange_fixture.hpp"
-
-namespace fx = prosper::test::wave64_exchange;
 using namespace prosper::frontend;
 using namespace prosper::gpu;
+using prosper::diagnostics::perf::Wave64Candidate;
 
 namespace {
 
@@ -25,88 +21,155 @@ struct FakeContext {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
 };
 
-ComputeItem item_for(const fx::Case& c, uint32_t exchange_width) {
+ComputeItem plain_item() {
     ComputeItem item;
-    item.spirv = fx::compile(c, exchange_width);
     item.recompile_config_available = true;
-    item.recompile_config.local_x = c.local;
+    item.recompile_config.local_x = 64;
     item.recompile_config.wave_size = 64;
+    item.recompile_config.threads_x = 64;
+    return item;
+}
+
+ComputeWaveOpFacts one(ComputeCrossLaneKind kind, ComputeWaveContext context) {
+    ComputeWaveOpFacts facts;
+    facts.analyzed = true;
+    facts.ops.push_back({3, kind, context, true, 0});
+    return facts;
+}
+
+}   // namespace
+
+TEST(ComputeWaveAdmission, TheCandidateNamesTheVocabularyRouteAndTheReason) {
+    const auto item = plain_item();
+    const auto loop = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop),
+        {32768, 1024});
+    EXPECT_STREQ(loop.route, "n-lanes");
+    EXPECT_STREQ(loop.reason, "cross-lane-in-loop");
+    const auto top = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {32768, 1024});
+    EXPECT_STREQ(top.route, "workgroup-exchange");
+    // Unknown device limits are refused, not assumed.
+    const auto unknown = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {0, 0});
+    EXPECT_STREQ(unknown.route, "refused");
+    EXPECT_STREQ(unknown.reason, "shared-memory-limit-unknown");
+}
+
+TEST(ComputeWaveAdmission, ANativeCandidateIsNeverPrintedOnADeclinedDispatch) {
+    FakeContext ctx;
+    ctx.min_native_subgroup_size = ctx.max_native_subgroup_size = 64;
+    auto item = plain_item();
+    item.required_subgroup_size = 64;
+    const auto out = compute_wave_candidate(
+        ctx, item, one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop), {32768, 1024});
+    EXPECT_STREQ(out.route, "") << "`native` beside `dispatch skipped` would contradict itself";
+    EXPECT_STREQ(out.reason, "");
+}
+
+TEST(ComputeWaveAdmission, APartialWorkgroupIsRefused) {
+    auto item = plain_item();
+    item.recompile_config.exact_thread_extent = true;
+    item.recompile_config.threads_x = 40;
+    item.recompile_config.threads_y = item.recompile_config.threads_z = 1;
+    const auto out = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {32768, 1024});
+    EXPECT_STREQ(out.reason, "partial-workgroup-barrier");
+}
+
+TEST(ComputeWaveAdmission, TheThunkAnalysesTheProgramFromItsGuestAddress) {
+    // The callback note_unsupported_wave64 runs after its dedupe: a ballot popcount at the top level.
+    // The physical device is null, so the device limits are unknown and the candidate says so.
+    static const std::vector<uint32_t> code{0x7d840100u, 0xbe84106au, 0xbf810000u};
+    auto item = plain_item();
+    item.code_addr = reinterpret_cast<uintptr_t>(code.data());
+    item.code_dwords = static_cast<uint32_t>(code.size());
+    const FakeContext ctx;
+    const ComputeWaveCandidateArg<FakeContext> arg{&ctx, &item};
+    const auto out = compute_wave_candidate_thunk<FakeContext>(&arg);
+    EXPECT_STREQ(out.route, "refused");
+    EXPECT_STREQ(out.reason, "shared-memory-limit-unknown");
+}
+
+TEST(ComputeWaveAdmission, AnItemWithoutAProgramLengthIsUnanalyzedNotWidthIndependent) {
+    const auto item = plain_item();
+    const FakeContext ctx;
+    const ComputeWaveCandidateArg<FakeContext> arg{&ctx, &item};
+    const auto out = compute_wave_candidate_thunk<FakeContext>(&arg);
+    EXPECT_STREQ(out.route, "refused");
+    EXPECT_STREQ(out.reason, "unanalyzed");
+}
+
+// ---- the exchange admission: each refusal names the condition that fired ----
+
+namespace {
+namespace fx = prosper::test::wave64_exchange;
+
+ComputeItem exchange_item(const fx::Case& c, ComputeWaveOpFacts& facts) {
+    ComputeItem item = plain_item();
+    item.spirv = fx::compile(c, 32);
+    item.recompile_config.local_x = c.local;
     item.recompile_config.threads_x = c.local;
     item.code_addr = 0x5028;
     const auto code = fx::program(c);
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
-    auto facts = std::make_shared<ComputeWaveOpFacts>(
-        analyze_compute_wave_ops(ins, code.data(), code.size()));
-    item.wave_ops = facts;
+    facts = analyze_compute_wave_ops(ins, code.data(), code.size());
     return item;
 }
+}   // namespace
 
-}  // namespace
-
-TEST(ComputeWaveAdmission, AnItemWithoutFactsSaysUnanalyzedNotNoCrossLaneOp) {
-    ComputeItem item;
-    EXPECT_STREQ(compute_wave_route_text(FakeContext{}, item, {32768, 1024}).text, "unanalyzed");
-}
-
-TEST(ComputeWaveAdmission, TheRouteTextNamesTheRouteAndTheReason) {
-    const fx::Case c{128, fx::Trips::Constant3};
-    const auto item = item_for(c, 0);
-    // The loop's readlane is a cross-lane operation in a loop: route 4 territory for the analysis.
-    EXPECT_STREQ(compute_wave_route_text(FakeContext{}, item, {32768, 1024}).text,
-                 "needs-n-lanes:cross-lane-in-loop");
-    // Unknown device limits are refused, not assumed: this one is about the budget, so use a
-    // top-level program for it.
-    ComputeItem plain = item;
-    ComputeWaveOpFacts top;
-    top.analyzed = true;
-    top.ops.push_back({3, ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel, true, 0});
-    plain.wave_ops = std::make_shared<ComputeWaveOpFacts>(top);
-    EXPECT_STREQ(compute_wave_route_text(FakeContext{}, plain, {0, 0}).text,
-                 "refused:shared-memory-limit-unknown");
-    EXPECT_STREQ(compute_wave_route_text(FakeContext{}, plain, {32768, 1024}).text,
-                 "workgroup-exchange:cross-lane-in-uniform-flow");
-}
-
-TEST(ComputeWaveAdmission, ANativeContractRoutesNative) {
-    FakeContext ctx;
-    ctx.min_native_subgroup_size = 64;
-    ctx.max_native_subgroup_size = 64;
-    ComputeItem item = item_for({64, fx::Trips::Constant3}, 0);
-    item.required_subgroup_size = 64;
-    EXPECT_STREQ(compute_wave_route_text(ctx, item, {32768, 1024}).text,
-                 "native:host-subgroup-covers-guest-wave");
-}
-
-TEST(ComputeWaveAdmission, AnExchangeModuleIsCheckedAgainstTheDeviceLimits) {
-    const fx::Case c{128, fx::Trips::Constant3};
-    const auto item = item_for(c, 32);
+TEST(ComputeWaveAdmission, AnExchangeModuleIsAdmittedWhenTheAnalysisAndTheLimitsAgree) {
+    ComputeWaveOpFacts facts;
+    const auto item = exchange_item({128, fx::Trips::Constant3}, facts);
     ASSERT_TRUE(compute_spirv_wave64_exchange(item.spirv));
-    EXPECT_EQ(exchange_limit(FakeContext{}, item, {32768, 1024}), nullptr);
-    // Not enough workgroup memory for the exchange's scratch: refused, visibly.
-    const char* why = exchange_limit(FakeContext{}, item, {512, 1024});
-    ASSERT_NE(why, nullptr);
-    EXPECT_STREQ(why, "wave64-exchange-limit");
-    // A workgroup larger than the device allows.
-    EXPECT_NE(exchange_limit(FakeContext{}, item, {32768, 64}), nullptr);
-    // Unknown limits are not assumed to be large.
-    EXPECT_NE(exchange_limit(FakeContext{}, item, {0, 0}), nullptr);
+    // For the dispatcher a loop is admissible (per-wave trip counts execute exactly); the refusal
+    // line's candidate still names the analysis's own, stricter route, labelled as a candidate.
+    EXPECT_EQ(exchange_limit(FakeContext{}, item, &facts, {32768, 1024}), nullptr);
+    EXPECT_STREQ(compute_wave_candidate(FakeContext{}, item, facts, {32768, 1024}).route,
+                 "n-lanes");
 }
 
-TEST(ComputeWaveAdmission, AnOrdinaryModuleIsNeverHeldToTheExchangeLimits) {
-    const fx::Case c{128, fx::Trips::Constant3};
-    const auto item = item_for(c, 0);
+TEST(ComputeWaveAdmission, EachExchangeRefusalNamesItsOwnCondition) {
+    ComputeWaveOpFacts facts;
+    auto item = exchange_item({128, fx::Trips::Constant3}, facts);
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, &facts, {512, 1024}), "shared-memory-budget");
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, &facts, {0, 1024}),
+                 "shared-memory-limit-unknown");
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, &facts, {32768, 64}),
+                 "workgroup-exceeds-device-limit");
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, nullptr, {32768, 1024}), "unanalyzed");
+    auto partial = item;
+    partial.recompile_config.exact_thread_extent = true;
+    partial.recompile_config.threads_x = 100;
+    partial.recompile_config.threads_y = partial.recompile_config.threads_z = 1;
+    EXPECT_STREQ(exchange_limit(FakeContext{}, partial, &facts, {32768, 1024}),
+                 "partial-workgroup-barrier");
+    auto ragged = item;
+    ragged.recompile_config.local_x = 96;
+    EXPECT_STREQ(exchange_limit(FakeContext{}, ragged, &facts, {32768, 1024}),
+                 "workgroup-not-guest-wave-multiple");
+}
+
+TEST(ComputeWaveAdmission, TheAnalysisGatesAdmissionNotJustTheLimits) {
+    ComputeWaveOpFacts facts;
+    auto item = exchange_item({128, fx::Trips::Constant3}, facts);
+    facts.control_flow_unmodelled = true;
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, &facts, {32768, 1024}),
+                 "control-flow-unmodelled");
+    const ComputeWaveOpFacts writelane =
+        one(ComputeCrossLaneKind::WriteLane, ComputeWaveContext::TopLevel);
+    EXPECT_STREQ(exchange_limit(FakeContext{}, item, &writelane, {32768, 1024}),
+                 "exchange-lowering-unavailable");
+}
+
+TEST(ComputeWaveAdmission, AnOrdinaryModuleIsNeverHeldToTheExchangeRules) {
+    ComputeWaveOpFacts facts;
+    auto item = exchange_item({128, fx::Trips::Constant3}, facts);
+    item.spirv = fx::compile({128, fx::Trips::Constant3}, 0);
     ASSERT_FALSE(compute_spirv_wave64_exchange(item.spirv));
-    EXPECT_EQ(exchange_limit(FakeContext{}, item, {0, 0}), nullptr)
-        << "the limits belong to the exchange module only";
-}
-
-TEST(ComputeWaveAdmission, APartialWorkgroupIsRefusedEvenWhenTheModuleIsAnExchange) {
-    fx::Case c{128, fx::Trips::Constant3};
-    ComputeItem item = item_for(c, 32);
-    ASSERT_TRUE(compute_spirv_wave64_exchange(item.spirv));
-    item.recompile_config.exact_thread_extent = true;
-    item.recompile_config.threads_x = 100;
-    item.recompile_config.threads_y = item.recompile_config.threads_z = 1;
-    EXPECT_NE(exchange_limit(FakeContext{}, item, {32768, 1024}), nullptr);
+    EXPECT_EQ(exchange_limit(FakeContext{}, item, nullptr, {0, 0}), nullptr);
 }

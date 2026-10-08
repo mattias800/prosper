@@ -615,8 +615,9 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         if (dead) dead_vote_ids.insert(source[vote.at + 2]);
     }
 
-    const auto neutral_vote_ids = neutral_selection_votes(source, instructions, entry_id, bool_types,
-        int32_types, float32_types, glsl_sets, preserve_f32, explicit_transport, uniform, users);
+    const auto neutral_vote_ids = neutral_selection_votes(
+        source, instructions, entry_id, bool_types, int32_types, float32_types, glsl_sets,
+        preserve_f32, explicit_transport, uniform, users);
     // These are facts about the transaction's EFFECTIVE controller, never about source P. The
     // frozen source leaves above still own all load/address authority.
     auto effective_leaves = uniform;

@@ -78,6 +78,18 @@ TEST(Wave64ExchangeExecution, AGuestBarrierInsideTheLoopStillComputesExactly) {
     expect_exact(c, run(c, module));
 }
 
+TEST(Wave64ExchangeExecution, ASourceLaneAboveThirtyOneAndAnSgprSelectorAreExact) {
+    // Lane 40 of each guest wave lives in the second 32-lane host subgroup of that wave.
+    fx::Case c{128, fx::Trips::Constant3};
+    c.lane = 40;
+    for (bool sgpr : {false, true}) {
+        c.sgpr_lane = sgpr;
+        const auto module = fx::compile(c, 32);
+        ASSERT_TRUE(compute_spirv_wave64_exchange(module)) << "sgpr selector=" << sgpr;
+        expect_exact(c, run(c, module));
+    }
+}
+
 TEST(Wave64ExchangeExecution, TheOracleRejectsAWrongLane) {
     // Positive control for the oracle itself, built by hand: reading lane 6 instead of lane 5 of
     // the same wave must NOT equal the expectation, so a lowering that picked the wrong source

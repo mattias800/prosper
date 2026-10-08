@@ -52,7 +52,8 @@ FactsCache& facts_cache() {
 
 uint64_t facts_bytes(const ComputeProgramFacts& facts) {
     uint64_t bytes = sizeof(ComputeProgramFacts) + facts.code.size() * sizeof(uint32_t) +
-                     facts.decoded.size() * sizeof(Rdna2Inst);
+                     facts.decoded.size() * sizeof(Rdna2Inst) +
+                     facts.decoded.size() * sizeof(ComputeCrossLaneOp);   // wave_ops, worst case
     for (const auto& [tag, payload] : facts.probe_reject_reasons)
         bytes += tag.size() + payload.size() + 2 * sizeof(std::string);
     return bytes;
@@ -70,7 +71,6 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
             compute_shader_prefers_native_multiwave(facts->decoded, code, dwords, diagnostic);
         facts->probe_reject_reasons = capture.take();
     }
-    facts->wave_ops = analyze_compute_wave_ops(facts->decoded, code, dwords);
     facts->uses_gds =
         std::any_of(facts->decoded.begin(), facts->decoded.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && in.ds_gds &&
@@ -81,6 +81,13 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
 }
 
 } // namespace
+
+const ComputeWaveOpFacts& ComputeProgramFacts::wave_ops() const {
+    std::call_once(wave_ops_once, [this] {
+        wave_ops_value = analyze_compute_wave_ops(decoded, code.data(), code.size());
+    });
+    return wave_ops_value;
+}
 
 bool compute_program_facts_cache_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE") == nullptr;

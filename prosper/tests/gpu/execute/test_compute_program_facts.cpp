@@ -72,15 +72,15 @@ TEST(ComputeProgramFacts, CarriesTheCrossLaneInventory) {
     const std::vector<uint32_t> program{0x7d840100u, 0xbe84106au, 0xd7600006u, 0x00010b1fu,
                                         0xbf810000u};
     const auto facts = compute_program_facts(program.data(), program.size(), at(0x8000));
-    check(facts->wave_ops.analyzed && facts->wave_ops.total() == 2,
+    check(facts->wave_ops().analyzed && facts->wave_ops().total() == 2,
           "the facts name the ballot and the readlane");
-    check(facts->wave_ops.count[static_cast<size_t>(ComputeCrossLaneKind::Ballot)] == 1 &&
-              facts->wave_ops.count[static_cast<size_t>(ComputeCrossLaneKind::ReadLane)] == 1,
+    check(facts->wave_ops().count[static_cast<size_t>(ComputeCrossLaneKind::Ballot)] == 1 &&
+              facts->wave_ops().count[static_cast<size_t>(ComputeCrossLaneKind::ReadLane)] == 1,
           "by kind");
     const auto again = compute_program_facts(program.data(), program.size(), at(0x8000));
-    check(again == facts && again->wave_ops.ops.size() == 2, "a hit serves the same inventory");
+    check(again == facts && again->wave_ops().ops.size() == 2, "a hit serves the same inventory");
     const std::vector<uint32_t> plain{0x7e020287u, 0xbf810000u};
-    check(compute_program_facts(plain.data(), plain.size(), at(0x8100))->wave_ops.ops.empty(),
+    check(compute_program_facts(plain.data(), plain.size(), at(0x8100))->wave_ops().ops.empty(),
           "a program without cross-lane operations has an empty inventory, and is analyzed");
 }
 

@@ -110,8 +110,9 @@ TEST(ComputeWaveRoute, ExecWrittenBeforeAnOperationIsRecorded) {
     // s_and_saveexec_b64 s[8:9], vcc narrows EXEC; the popcount after it no longer has a full EXEC.
     const auto facts =
         analyze({kCmpEqVcc, 0xbe88246au /* s_and_saveexec_b64 s[8:9], vcc */, kBcnt1Exec, kEnd});
-    ASSERT_EQ(facts.ops.size(), 1u);
-    EXPECT_FALSE(facts.ops[0].exec_full);
+    ASSERT_EQ(facts.ops.size(), 2u) << "the saveexec is itself a mask-SCC site";
+    EXPECT_EQ(facts.ops[1].kind, ComputeCrossLaneKind::Ballot);
+    EXPECT_FALSE(facts.ops[1].exec_full);
 }
 
 TEST(ComputeWaveRoute, BallotUnderAProvenUniformBranchStaysAdmissibleInAMultiWaveWorkgroup) {
@@ -151,14 +152,15 @@ TEST(ComputeWaveRoute, SingleWaveWorkgroupMakesEveryScalarBranchWorkgroupUniform
 }
 
 TEST(ComputeWaveRoute, BackwardBranchNoLoopModelCoversIsRefusedNotAdmitted) {
-    // s_mov s20,0 ; loop: popcount ; s_cbranch_scc0 loop. A shape the region detectors do not
-    // model proves nothing, whatever the workgroup size.
-    const std::vector<uint32_t> code = {
-        kMovS20Zero, kCmpEqVcc, kBcnt1Vcc, kCmpEq0S20, 0xbf84fffcu /* s_cbranch_scc0 -4 */, kEnd};
+    // An unconditional backward s_branch around a ballot: no loop shape covers it, so nothing can be
+    // proved about where the operation sits, whatever the workgroup size.
+    const std::vector<uint32_t> code = {kCmpEqVcc, kBcnt1Vcc, 0xbf82fffdu /* s_branch -3 */, kEnd};
     const auto facts = analyze(code);
     ASSERT_FALSE(facts.ops.empty());
+    EXPECT_TRUE(facts.control_flow_unmodelled);
     const auto decision = select_compute_wave_route(facts, nvidia(64));
-    EXPECT_NE(decision.route, ComputeWaveRoute::WorkgroupExchange) << decision.reason;
+    EXPECT_EQ(decision.route, ComputeWaveRoute::Refused);
+    EXPECT_STREQ(decision.reason, "control-flow-unmodelled");
 }
 
 // ---- hand-built facts: contexts and constraints constructed outside the analysis ----
@@ -312,6 +314,133 @@ TEST(ComputeWaveRoute, LaunchRefusalIsTheSameFunctionTheBackendApplies) {
     EXPECT_STREQ(compute_exchange_launch_refusal(host), "shared-memory-budget");
 }
 
+// ---- decoded arms for every inventory path (each is red if its detection is deleted) ----
+
+namespace {
+bool has_kind(const ComputeWaveOpFacts& f, ComputeCrossLaneKind k) {
+    return f.count[static_cast<size_t>(k)] != 0;
+}
+}   // namespace
+
+TEST(ComputeWaveRoute, AWholeWaveSccVoteIsNotWidthIndependent) {
+    // v_cmp vcc ; s_cmp_lg_u64 vcc, 0 ; s_cbranch_scc1 +1: SCC reads the whole wave's mask.
+    const auto facts = analyze({kCmpEqVcc, 0xbf13806au, 0xbf850001u, 0x7e020287u, kEnd});
+    EXPECT_TRUE(has_kind(facts, ComputeCrossLaneKind::MaskScc));
+    EXPECT_NE(select_compute_wave_route(facts, nvidia()).route, ComputeWaveRoute::WidthIndependent);
+}
+
+TEST(ComputeWaveRoute, ASaveExecSccVoteIsNotWidthIndependent) {
+    const auto facts = analyze({kCmpEqVcc, 0xbe88246au /* s_and_saveexec_b64 s[8:9], vcc */,
+                                0xbf840001u, 0x7e020287u, 0xbefe0408u, kEnd});
+    EXPECT_TRUE(has_kind(facts, ComputeCrossLaneKind::MaskScc));
+}
+
+TEST(ComputeWaveRoute, ASixtyFourBitMaskAndIsAMaskScc) {
+    // s_and_b64 s[4:5], vcc, exec -> SCC = (result != 0)
+    const auto facts = analyze({kCmpEqVcc, 0x87847e6au, kEnd});
+    EXPECT_TRUE(has_kind(facts, ComputeCrossLaneKind::MaskScc));
+}
+
+TEST(ComputeWaveRoute, WriteLaneWithADynamicSelectorIsInventoriedAndRefused) {
+    const auto dynamic = analyze({0xd7610001u, 0x00000602u /* v_writelane v1, s2, s3 */, kEnd});
+    ASSERT_TRUE(has_kind(dynamic, ComputeCrossLaneKind::WriteLane));
+    const auto decision = select_compute_wave_route(dynamic, nvidia());
+    EXPECT_EQ(decision.route, ComputeWaveRoute::Refused);
+    EXPECT_STREQ(decision.reason, "exchange-lowering-unavailable");
+    // The inline-selector form is the lane-slot spill and crosses no lane.
+    EXPECT_FALSE(has_kind(analyze({0xd7610001u, 0x00010a02u /* v_writelane v1, s2, 5 */, kEnd}),
+                          ComputeCrossLaneKind::WriteLane));
+}
+
+TEST(ComputeWaveRoute, WaveSynchronousLdsIsNamedNotWidthIndependent) {
+    // ds_write_b32 v0, v1 ; ds_read_b32 v2, v0 with no s_barrier between.
+    const std::vector<uint32_t> synchronous = {0xd8340000u, 0x00000100u, 0xd8d80000u, 0x02000000u,
+                                               kEnd};
+    const auto facts = analyze(synchronous);
+    ASSERT_TRUE(has_kind(facts, ComputeCrossLaneKind::LdsWaveSync));
+    const auto decision = select_compute_wave_route(facts, nvidia());
+    EXPECT_EQ(decision.route, ComputeWaveRoute::Refused);
+    EXPECT_EQ(decision.blocker_kind, ComputeCrossLaneKind::LdsWaveSync);
+    // A barrier between the store and the load makes it ordinary workgroup LDS.
+    const std::vector<uint32_t> barriered = {0xd8340000u, 0x00000100u, 0xbf8a0000u,
+                                             0xd8d80000u, 0x02000000u, kEnd};
+    EXPECT_FALSE(has_kind(analyze(barriered), ComputeCrossLaneKind::LdsWaveSync));
+}
+
+TEST(ComputeWaveRoute, EveryDecodedKindIsInventoried) {
+    EXPECT_TRUE(
+        has_kind(analyze({kCmpEqVcc, 0xbf860001u /* s_cbranch_vccz +1 */, 0x7e020287u, kEnd}),
+                 ComputeCrossLaneKind::WaveVote));
+    EXPECT_TRUE(has_kind(analyze({0xbe841006u /* s_bcnt1_i32_b64 s4, s[6:7] */, kEnd}),
+                         ComputeCrossLaneKind::MaskConsumer));
+    EXPECT_TRUE(has_kind(analyze({0xdacc0000u, 0x02000100u /* ds_bpermute_b32 */, kEnd}),
+                         ComputeCrossLaneKind::DsBpermute));
+    EXPECT_TRUE(has_kind(analyze({0xd8f40000u, 0x01000000u /* ds_append */, kEnd}),
+                         ComputeCrossLaneKind::DsAppend));
+    EXPECT_TRUE(has_kind(analyze({0xdac80000u, 0x02000100u /* ds_permute_b32 */, kEnd}),
+                         ComputeCrossLaneKind::DsPermute));
+    const auto quad = analyze({0xd8d48000u, 0x02000000u /* ds_swizzle quad form */, kEnd});
+    ASSERT_TRUE(has_kind(quad, ComputeCrossLaneKind::DsSwizzle));
+    EXPECT_EQ(quad.ops[0].native_lanes, 4u);
+    const auto group = analyze({0xd8d4001fu, 0x02000000u /* ds_swizzle group32 form */, kEnd});
+    ASSERT_TRUE(has_kind(group, ComputeCrossLaneKind::DsSwizzle));
+    EXPECT_EQ(group.ops[0].native_lanes, 32u);
+}
+
+TEST(ComputeWaveRoute, DppOperationsReportTheirShuffleDomain) {
+    const auto quad = analyze({0x7e0202fau, 0xff00e400u /* v_mov_b32 v1, v0 quad_perm */, kEnd});
+    ASSERT_TRUE(has_kind(quad, ComputeCrossLaneKind::Dpp));
+    EXPECT_EQ(quad.ops[0].native_lanes, 4u);
+    const auto row = analyze({0x7e0202fau, 0xff011100u /* v_mov_b32 v1, v0 row_shr:1 */, kEnd});
+    ASSERT_TRUE(has_kind(row, ComputeCrossLaneKind::Dpp));
+    EXPECT_EQ(row.ops[0].native_lanes, 16u);
+}
+
+TEST(ComputeWaveRoute, ADecodedCountedLoopPutsItsOperationInTheLoopContext) {
+    // s_mov s0,4 ; loop: v_readlane s6,v1,5 ; s_sub s0,s0,1 ; s_cmp_lg s0,0 ; s_cbranch_scc1 loop
+    const auto facts = analyze(
+        {0xbe800384u, 0xd7600006u, 0x00010b01u, 0x80808100u, 0xbf078000u, 0xbf85fffbu, kEnd});
+    ASSERT_EQ(facts.ops.size(), 1u);
+    EXPECT_EQ(facts.ops[0].context, ComputeWaveContext::Loop);
+    EXPECT_EQ(select_compute_wave_route(facts, nvidia()).route, ComputeWaveRoute::NeedsNLanes);
+}
+
+TEST(ComputeWaveRoute, AWaterfallLoopIsALoopEvenBesideARecognisedLoop) {
+    // A counted loop, then a waterfall (readfirstlane ; s_andn2_b64 s[6:7],s[6:7],exec ; scc1 back).
+    // Its trip count is per wave, so a barrier inside it diverges in a multi-wave workgroup.
+    const std::vector<uint32_t> program = {0xbe800383u, 0x80808100u, 0xbf078000u,
+                                           0xbf85fffdu,   // counted loop, 3 trips
+                                           0x7e080500u, 0x8a867e06u, 0xbf85fffdu,   // waterfall
+                                           kEnd};
+    const auto facts = analyze(program);
+    const ComputeCrossLaneOp* waterfall_op = nullptr;
+    for (const auto& op : facts.ops)
+        if (op.kind == ComputeCrossLaneKind::ReadFirstLane) waterfall_op = &op;
+    ASSERT_NE(waterfall_op, nullptr);
+    EXPECT_EQ(waterfall_op->context, ComputeWaveContext::Loop);
+    EXPECT_NE(select_compute_wave_route(facts, nvidia(128)).route,
+              ComputeWaveRoute::WorkgroupExchange);
+}
+
+TEST(ComputeWaveRoute, ABallotInTheElseArmOfADivergentBranchIsUnproven) {
+    // cond = per-wave value ; scc0 -> else. then: v_mov ; s_branch merge. else: ballot. merge: end.
+    const std::vector<uint32_t> program = {kReadFirstLaneS20,
+                                           kCmpEq0S20,
+                                           0xbf840002u /* s_cbranch_scc0 else (+2) */,
+                                           0x7e020287u /* then: v_mov v1, 7 */,
+                                           0xbf820002u /* s_branch merge (+2) */,
+                                           kCmpEqVcc,
+                                           kBcnt1Vcc,
+                                           /* else */ kEnd};
+    const auto facts = analyze(program);
+    const ComputeCrossLaneOp* ballot = nullptr;
+    for (const auto& op : facts.ops)
+        if (op.kind == ComputeCrossLaneKind::Ballot) ballot = &op;
+    ASSERT_NE(ballot, nullptr);
+    EXPECT_EQ(ballot->context, ComputeWaveContext::UnprovenRegion)
+        << "the else arm is inside the region";
+}
+
 // ---- the exchange retry (ADR 0028 route 3): compile-level arms; execution is in
 // ---- test_wave64_exchange.cpp ----
 
@@ -381,26 +510,30 @@ TEST(ComputeWaveExchange, TheSwitchIsInertWhereTheHostCoversTheGuestWave) {
     EXPECT_FALSE(compute_spirv_wave64_exchange(module));
 }
 
-TEST(ComputeWaveExchange, APartialWorkgroupKeepsTheRefusalVisible) {
-    // An entry guard that retires the padded invocations of a partial workgroup would leave them
-    // out of every exchange barrier. The dispatcher refuses that combination; the retry must then
-    // leave the ORIGINAL module in place, whose 64-lane requirement is what the backend declines
-    // -- never a different, approximate program.
+TEST(ComputeWaveExchange, APartialWorkgroupKeepsTheRefusalVisibleAndAWholeExtentDoesNot) {
+    // The condition that fires is the partial thread extent: the SAME exact-extent launch with a
+    // whole number of workgroups retries, a partial one keeps the original module. The refusal lives
+    // in the wrapper, so it cannot be bypassed by a compile that would otherwise accept a partial
+    // extent under a validated dispatch.
+    fx::Case whole{128, fx::Trips::Constant3};
+    whole.threads = 128;   // exact_thread_extent set, extent == local size
+    const auto exchanged = fx::compile(whole, 32);
+    ASSERT_FALSE(exchanged.empty());
+    EXPECT_TRUE(compute_spirv_wave64_exchange(exchanged)) << "a whole extent is retried";
     for (uint32_t threads : {100u, 1u}) {
-        fx::Case c{128, fx::Trips::Constant3};
-        c.threads = threads;
-        const auto off = fx::compile(c, 0);
-        const auto on = fx::compile(c, 32);
+        fx::Case partial{128, fx::Trips::Constant3};
+        partial.threads = threads;
+        const auto off = fx::compile(partial, 0);
+        const auto on = fx::compile(partial, 32);
         ASSERT_FALSE(off.empty());
         EXPECT_EQ(on, off) << "threads=" << threads;
-        EXPECT_EQ(compute_spirv_min_subgroup_size(on), 64u);
         EXPECT_FALSE(compute_spirv_wave64_exchange(on));
     }
 }
 
-TEST(ComputeWaveExchange, ANativeContractIsNeverRetried) {
-    // native_subgroup_size != 0 means one native subgroup IS one guest wave; the exchange has
-    // nothing to add and must not replace that module even if the switch's width is set.
+TEST(ComputeWaveExchange, ANativeContractIsNeverRetriedByTheWrapper) {
+    // native_subgroup_size != 0: one native subgroup IS one guest wave. The wrapper's own guard is
+    // the only thing between this config and a retry (the forced compile no longer repeats it).
     fx::Case c{64, fx::Trips::Constant3};
     const auto p = fx::program(c);
     const auto rt = fx::resources(c);
@@ -414,4 +547,28 @@ TEST(ComputeWaveExchange, ANativeContractIsNeverRetried) {
                                           {RecompileDiagnosticStage::Compute, 0x5029u});
     ASSERT_FALSE(module.empty());
     EXPECT_FALSE(compute_spirv_wave64_exchange(module));
+}
+
+TEST(ComputeWaveExchange, ABallotOrMbcntInTheLoopIsNotChangedByTheSwitch) {
+    // Beside the loop's readlane these shapes are refused by the ordinary recompile today (empty
+    // module, no module to retry) or compile without a 64-lane requirement. Either way the switch
+    // must leave the result byte-identical: the retry only replaces a module that needs a wider
+    // subgroup, and there is none here.
+    for (auto extra : {fx::Extra::Ballot, fx::Extra::Mbcnt}) {
+        fx::Case c{128, fx::Trips::Constant3};
+        c.extra = extra;
+        const auto off = fx::compile(c, 0);
+        EXPECT_EQ(fx::compile(c, 32), off) << static_cast<int>(extra);
+        if (!off.empty()) EXPECT_LE(compute_spirv_min_subgroup_size(off), 32u);
+    }
+}
+
+TEST(ComputeWaveExchange, ASourceLaneAboveThirtyOneAndAnSgprSelectorStillRetry) {
+    for (bool sgpr : {false, true}) {
+        fx::Case c{128, fx::Trips::Constant3};
+        c.lane = 40;
+        c.sgpr_lane = sgpr;
+        EXPECT_EQ(compute_spirv_min_subgroup_size(fx::compile(c, 0)), 64u) << sgpr;
+        EXPECT_TRUE(compute_spirv_wave64_exchange(fx::compile(c, 32))) << sgpr;
+    }
 }
