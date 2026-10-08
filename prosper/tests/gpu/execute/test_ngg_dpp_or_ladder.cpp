@@ -69,6 +69,22 @@ uint32_t exported(const std::vector<float>& out, uint32_t lane) {
 
 }   // namespace
 
+// Every lane holds the SAME bit (1). OR keeps 1 in every lane; an integer ADD of the same ladder
+// would give each lane the count of row lanes at or below it, (L & 15) + 1. The disjoint-bit
+// kernel above cannot tell the two apart, since OR and ADD agree on disjoint bits (#4750 review).
+TEST(NggDppOrLadder, PortableShellOrsRatherThanAdds) {
+    std::vector<uint32_t> code = or_ladder();
+    code[4] = 0x7E140302u;   // v_mov_b32 v10, v2 (= 1) instead of the per-lane shift
+    const auto module = prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1);
+    ASSERT_FALSE(module.empty());
+    const auto out = prosper::test::run_compute(module, lane_inputs(), kLanes,
+                                                kLanes * prosper::gpu::kNggExportProbeWords);
+    if (out.empty()) GTEST_SKIP() << "no Vulkan compute device";
+    ASSERT_EQ(out.size(), size_t{kLanes} * prosper::gpu::kNggExportProbeWords);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(exported(out, lane), 1u) << "lane " << lane;
+}
+
 TEST(NggDppOrLadder, PortableShellComputesTheInclusiveRowOr) {
     const std::vector<uint32_t> code = or_ladder();
     const auto module = prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1);
@@ -100,6 +116,18 @@ TEST(NggDppOrLadder, NativeWave64ShellComputesTheInclusiveRowOr) {
         << "native dispatch failed";
     for (uint32_t t = 0; t < kThreads; ++t)
         EXPECT_EQ(exported(out, t), (2u << (t & 15u)) - 1u) << "thread " << t;
+
+    // The same bit in every lane: OR keeps 1, an ADD would count the row lanes (#4750 review).
+    std::vector<uint32_t> same = or_ladder();
+    same[4] = 0x7E140302u;   // v_mov_b32 v10, v2 (= 1)
+    const auto same_module = prosper::gpu::recompile_ngg_exports_for_test(
+        same.data(), same.size(), 10, 0, nullptr, 4, 0, {}, true, true, true);
+    ASSERT_FALSE(same_module.empty());
+    const auto ones = prosper::test::run_compute(
+        same_module, input, kThreads, kThreads * prosper::gpu::kNggExportProbeWords, {}, {},
+        nullptr, kThreads, nullptr, nullptr, nullptr, 64u);
+    ASSERT_EQ(ones.size(), kThreads * prosper::gpu::kNggExportProbeWords);
+    for (uint32_t t = 0; t < kThreads; ++t) EXPECT_EQ(exported(ones, t), 1u) << "thread " << t;
 }
 
 // The admitted family is exactly the bounded form: the same ladder with BOUND_CTRL=0 (whose

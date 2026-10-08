@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <ios>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -438,6 +439,44 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     DrawItem array;
     EXPECT_FALSE(realize(layered, kIndices, 3, 1, array));
     EXPECT_FALSE(array.ngg_subgroup) << "a 2D array view is not one slice";
+    layered.cx[P::CB_COLOR0_VIEW] = 0u;
+
+    // #4750 review: every reason the backend binds depth/stencil counts, not only the depth test.
+    // Depth bounds alone (Z off) is UE4's shadow-cascade shape; stencil alone binds it too. Each
+    // arm is refused into a two-slice depth view and admitted into a one-slice one.
+    for (const uint32_t control : {1u << P::DB_DEPTH_CONTROL_DEPTH_BOUNDS_ENABLE_SHIFT,
+                                   1u << P::DB_DEPTH_CONTROL_STENCIL_ENABLE_SHIFT}) {
+        GpuState tested = layered;
+        tested.cx[P::DB_DEPTH_CONTROL] = control;
+        tested.cx[P::DB_Z_READ_BASE] = 0x1000u;
+        tested.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+        tested.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+        DrawItem two;
+        EXPECT_FALSE(realize(tested, kIndices, 3, 1, two));
+        EXPECT_FALSE(two.ngg_subgroup)
+            << "DB_DEPTH_CONTROL 0x" << std::hex << control << ": a two-slice depth array is bound";
+        tested.cx[P::DB_DEPTH_VIEW] = 0u;
+        DrawItem one;
+        ASSERT_TRUE(realize(tested, kIndices, 3, 1, one)) << "control 0x" << std::hex << control;
+        EXPECT_TRUE(one.ngg_subgroup) << "control: a one-slice depth view is admitted";
+    }
+
+    // A second colour slot the draw writes counts too: slot 1 as a two-slice view is refused,
+    // as one slice admitted.
+    constexpr uint32_t kSlot1 = 0xf;   // CB_COLORn main-block register stride
+    GpuState mrt = layered;
+    mrt.cx[P::CB_TARGET_MASK] = 0xffu;
+    mrt.cx[P::CB_COLOR0_BASE + kSlot1] = 0x2000u;
+    mrt.cx[P::CB_COLOR0_INFO + kSlot1] = mrt.cx[P::CB_COLOR0_INFO];
+    mrt.cx[P::CB_COLOR0_ATTRIB3 + 1u] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 1u << 13;   // slices 0..1
+    DrawItem mrt_array;
+    EXPECT_FALSE(realize(mrt, kIndices, 3, 1, mrt_array));
+    EXPECT_FALSE(mrt_array.ngg_subgroup) << "a written two-slice colour slot 1";
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 0u;
+    DrawItem mrt_one;
+    ASSERT_TRUE(realize(mrt, kIndices, 3, 1, mrt_one));
+    EXPECT_TRUE(mrt_one.ngg_subgroup) << "control: a one-slice colour slot 1 is admitted";
 
     GpuState merged = vs_only_state();
     merged.cx[P::VGT_SHADER_STAGES_EN] = 0x2030u;

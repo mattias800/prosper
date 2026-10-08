@@ -3049,10 +3049,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         for (uint32_t slot = 1; slot < rs.color_targets.size(); ++slot)
             if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base)
                 others = others && one_slice(rs.color_targets[slot]);
+        // The backend attaches depth/stencil for depth_stencil_tests_enabled() or a clear; the
+        // proof takes the superset, uses_depth_stencil_attachment(), so depth bounds alone (Z off)
+        // counts as bound (#4750 review).
         const bool depth_bound = (rs.depth_read_base || rs.depth_write_base ||
                                   rs.stencil_read_base || rs.stencil_write_base) &&
-                                 (rs.z_enable || rs.z_write_enable || rs.stencil_enable ||
-                                  rs.depth_clear_enable || rs.stencil_clear_enable);
+                                 uses_depth_stencil_attachment(resolved_pipeline);
         if (depth_bound) {
             const bool view_present = ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) != 0;
             const uint32_t v = rs.db_depth_view;

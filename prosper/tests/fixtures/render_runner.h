@@ -8576,6 +8576,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
+        // The depth aspect: the shared test list (depth_stencil_tests_enabled) less stencil.
         if (d.ps->depth_test_enable || d.ps->depth_bounds_enable || effective_depth_clear(d.ps))
             use_depth = true;
         if (d.ps->stencil_enable ||
@@ -8736,11 +8737,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                              d.ps->stencil_write_mask[0],
                                              d.ps->stencil_write_mask[1])))
             logical_use_stencil = true;
-        if (d.ps && (d.ps->depth_test_enable || d.ps->depth_bounds_enable ||
-                     d.ps->stencil_enable || effective_depth_clear(d.ps) ||
-                     stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
-                                             d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1]))) {
+        if (d.ps &&
+            (prosper::gpu::depth_stencil_tests_enabled(*d.ps) || effective_depth_clear(d.ps) ||
+             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))) {
             if (!identity) identity = d.ps;
             pass_depth_slice_max = std::max(pass_depth_slice_max,
                                             ds_depth_view_slice_max(d.ps->db_depth_view));

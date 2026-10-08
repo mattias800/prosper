@@ -511,12 +511,21 @@ ColorStateTraceSnapshot snapshot_color_state_trace(const RenderState& rs,
 bool color_state_trace_matches_dimension(const ColorStateTraceSnapshot& snapshot,
                                          uint32_t width, uint32_t height);
 
+// The TESTS that make a draw bind its depth/stencil attachment: depth, depth bounds, stencil. The
+// backend's attach decision is this or an effective clear (render_runner.h), and NGG layer
+// admission's single-slice proof is uses_depth_stencil_attachment below, which contains it -- one
+// list, so a reason the backend attaches for cannot be missed by the proof (#4750 review: depth
+// bounds with Z off is UE4's shadow-cascade shape).
+inline bool depth_stencil_tests_enabled(const ResolvedPipelineState& ps) {
+    return ps.depth_test_enable || ps.depth_bounds_enable || ps.stencil_enable;
+}
+
 // The draw reads or writes the depth/stencil attachment, so the pass must bind one. The depth-bounds
 // test belongs here although it writes nothing: it reads the stored depth, and a draw drawn without
 // its attachment silently loses the test and covers every pixel.
 inline bool uses_depth_stencil_attachment(const ResolvedPipelineState& ps) {
-    return ps.depth_test_enable || ps.depth_bounds_enable || ps.depth_write_enable ||
-           ps.depth_clear_enable || ps.stencil_enable || ps.stencil_clear_enable;
+    return depth_stencil_tests_enabled(ps) || ps.depth_write_enable || ps.depth_clear_enable ||
+           ps.stencil_clear_enable;
 }
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed

@@ -201,7 +201,8 @@ struct NggDrawAdmission {
 //   ngg-layer-route-unavailable / ngg-interpolation-geometry-needs-triangles   (route selection)
 // A draw without PRIMGEN_EN returns applies=false and no refusal: the path does not apply to it.
 // Without GS_EN the same table applies to the VS alone (vs_only): GS_MAX_VERT_OUT then plays no
-// part in the partition, and VGT_GS_OUT_PRIM_TYPE still names the exported primitive (#3135 P7).
+// part in the partition, and VGT_GS_OUT_PRIM_TYPE does NOT name the exported primitive: the
+// draw exports its input triangles (#3135 P7).
 NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDrawFacts& facts,
                                 const NggHostCapabilities& host);
 

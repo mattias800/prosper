@@ -46,7 +46,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     // #3135 P7: NGG without a GS runs the VS as the primitive shader. Its launch is the merged
     // one (s3 counts, v0/v1 vertex offsets scaled by ESGS_RING_ITEMSIZE, v5 VertexID, v8
     // InstanceID): Kena's culling VS programs read exactly those, and the ABI analysis admits them
-    // unchanged. Only the partition differs (NggSubgroupLimits::vs_only).
+    // unchanged. Only the partition differs (NggSubgroupLimits::vs_only). CONFIDENCE: MED -- the
+    // layout rests on the merged path's evidence (Kena's merged LUT producer, checked against its
+    // guest code) and on what these programs read; no VS-only draw has rendered on hardware-
+    // checked output yet.
     admission.vs_only = !stages.gs_enabled();
     admission.applies = true;
     const auto refuse = [&](const char* reason) {
