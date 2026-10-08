@@ -2213,6 +2213,12 @@ if(TARGET prosper_core)
     INCLUDES frontends src
     LIBRARIES prosper_core)
 
+  # Native FP16 or the RGBA8 conversion for a compute-sampled texture: metadata-only.
+  prosper_add_gtest(test_sampled_float16_view
+    SOURCES frontends/shared/tests/test_sampled_float16_view.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_texture_decode_diagnostic
     SOURCES frontends/shared/tests/test_texture_decode_diagnostic.cpp
     INCLUDES frontends src
@@ -5505,6 +5511,13 @@ endif()
 
       # A compute UNORM16 view of a Z16 plane reads the renderer's retained depth, not the
       # guest bytes (UE4 volumetric-fog shadowing; Kena's washed-out title scene).
+      # A guest-backed one/two-channel FP16 texture keeps signed and >1 values in compute
+      # (UE4 depth-of-field tiles; Kena's foreground blur).
+      prosper_add_gtest(test_live_compute_narrow_float16
+        SOURCES tests/shared/live/test_live_compute_narrow_float16.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
       prosper_add_gtest(test_live_compute_depth_unorm16
         SOURCES tests/shared/live/test_live_compute_depth_unorm16.cpp
         INCLUDES tests frontends src
