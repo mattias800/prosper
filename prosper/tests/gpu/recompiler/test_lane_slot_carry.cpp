@@ -16,6 +16,7 @@
 #include "fixtures/compute_runner.h"
 
 #include <cstddef>
+#include <iterator>
 #include <cstdint>
 #include <vector>
 
@@ -56,12 +57,49 @@ const uint32_t kExitTakesTheCheckValue[] = {
     0x00015314u, 0x4A020008u, 0x7E060D01u, 0xBF810000u,
 };
 // slot v20[40] = 0; for (i = 0; i < 3; ++i) { v1 += reload(slot); re-spill slot + 1; then
-// v_mov_b32 v20, 0 }. The ordinary write ends the spill lifetime inside the body, so the next
-// header sees vector data (0 in every lane), not the re-spilled scalar. Expected 0 + lane.
+// v_mov_b32 v20, 5 }. The ordinary write ends the spill lifetime inside the body, so on hardware
+// trips 2 and 3 reload VECTOR data, 5 (10 + lane). The overwrite is deliberately not the seed (0):
+// with 0 a phi closed by its seed would give the hardware answer by coincidence.
 const uint32_t kBodyEndsTheSpillLifetime[] = {
     0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE800380u, 0x7E020280u, 0xBF0A8300u,
     0xBF840009u, 0xD7600006u, 0x00015114u, 0x4A020206u, 0x80068106u, 0xD7610014u, 0x00015006u,
-    0x7E280280u, 0x80008100u, 0xBF82FFF5u, 0x4A020300u, 0x7E060D01u, 0xBF810000u,
+    0x7E280285u, 0x80008100u, 0xBF82FFF5u, 0x4A020300u, 0x7E060D01u, 0xBF810000u,
+};
+// The same lifetime end, but the loop never reloads the slot: v1 += 2 per trip, the slot is
+// spilled and then overwritten (v_mov_b32 v20, 5), and nothing reads it. Expected 6 + lane.
+const uint32_t kBodyEndsAnUnreloadedSpill[] = {
+    0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE800380u, 0x7E020280u,
+    0xBF0A8300u, 0xBF840006u, 0x4A020282u, 0xD7610014u, 0x00015000u, 0x7E280285u,
+    0x80008100u, 0xBF82FFF8u, 0x4A020300u, 0x7E060D01u, 0xBF810000u,
+};
+// slot v20[3] = 7; if (s9 == 1) v_mov_b32 v20, v0 (ends the array on the taken arm); then an
+// ORDINARY read v1 = v20 + v0. On the skipped edge V_WRITELANE erased v20's vector value, so the
+// merge has nothing honest to give that read.
+const uint32_t kOrdinaryReadAfterEndedArray[] = {
+    0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00010604u, 0xBE890381u, 0xBF068109u,
+    0xBF840001u, 0x7E280300u, 0x4A020114u, 0x7E060D01u, 0xBF810000u,
+};
+// As above, without the read (v1 = v0): a dead conflict must still compile.
+const uint32_t kEndedArrayNotRead[] = {
+    0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00010604u, 0xBE890381u, 0xBF068109u,
+    0xBF840001u, 0x7E280300u, 0x7E020300u, 0x7E060D01u, 0xBF810000u,
+};
+// #4740 review probe, a Wave64 FRAGMENT program on the structured path: v12[1] is spilled on the
+// taken arm only, reloaded into s[4:5] after the merge, and projected onto lane bits by
+// s_and_b64 with a compare mask. On the skipped edge the slot is the merge's placeholder 0, which
+// a projection must not consume (#4725). The control spills v12[1] before the branch as well
+// (replacing the two s_nops), so both edges hold a real word.
+const uint32_t kFragmentOneEdgeSlotProjected[] = {
+    0x7e0a0280u, 0x7e000505u, 0xd4c2000au, 0x00010080u, 0xbf800000u, 0xbf800000u,
+    0xbf068000u, 0xbf850003u, 0xbe9503c1u, 0xd761000cu, 0x00010215u, 0xd7600004u,
+    0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860a04u, 0xd5010001u, 0x0019e480u,
+    0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+const uint32_t kFragmentBothEdgesSlotProjected[] = {
+    0x7e0a0280u, 0x7e000505u, 0xd4c2000au, 0x00010080u, 0xd761000cu, 0x00010200u,
+    0xbf068000u, 0xbf850003u, 0xbe9503c1u, 0xd761000cu, 0x00010215u, 0xd7600004u,
+    0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860a04u, 0xd5010001u, 0x0019e480u,
+    0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
 };
 // slot v20[40] = 0 (data) before the loop; the body re-spills EXEC_LO into the same lane.
 const uint32_t kBodyFlipsTheSlotToAMask[] = {
@@ -165,12 +203,37 @@ TEST(LaneSlotCarry, LoopExitTakesTheConditionRegionValue) {
 // lane holds vector data on the next trip); a body that re-spills a mask into a data slot has no
 // phi type and refuses.
 TEST(LaneSlotCarry, LoopBodyLifetimeEndAndDomainFlip) {
+    EXPECT_TRUE(compile(kBodyEndsTheSpillLifetime).empty())
+        << "a slot the loop reloads must not be closed with its seed once the body ends its "
+           "lifetime: hardware reloads the lane's vector data (10 + lane), the seed gives 0 + lane";
     if (have_device())
-        expect_lanes(kBodyEndsTheSpillLifetime, 0, "lifetime ended in the body");
+        expect_lanes(kBodyEndsAnUnreloadedSpill, 6, "control: lifetime ended, slot never reloaded");
     else
-        ASSERT_FALSE(compile(kBodyEndsTheSpillLifetime).empty());
+        EXPECT_FALSE(compile(kBodyEndsAnUnreloadedSpill).empty());
     EXPECT_TRUE(compile(kBodyFlipsTheSlotToAMask).empty())
         << "a slot entering as data and leaving the body as a mask must refuse";
+}
+
+// After an if merge where one edge ended the spill array, an ORDINARY read of the VGPR refuses
+// instead of reading the slot edge's placeholder in every lane.
+TEST(LaneSlotCarry, OrdinaryReadOfAnArrayEndedOnOneEdgeRefuses) {
+    EXPECT_FALSE(compile(kEndedArrayNotRead).empty()) << "control: the merge itself compiles";
+    EXPECT_TRUE(compile(kOrdinaryReadAfterEndedArray).empty())
+        << "an ordinary read of a VGPR whose vector value one edge erased must refuse";
+}
+
+// A slot written on one if-edge only is a fabricated word on the other edge (#4725's mark), so
+// the fragment projection of its reload must refuse.
+TEST(LaneSlotCarry, FragmentProjectionOfAOneEdgeSlotRefuses) {
+    ASSERT_FALSE(prosper::gpu::recompile_fragment(kFragmentBothEdgesSlotProjected,
+                                                  std::size(kFragmentBothEdgesSlotProjected))
+                     .empty())
+        << "control: with the slot written on both edges the projection compiles, or the next "
+           "check is void";
+    EXPECT_TRUE(prosper::gpu::recompile_fragment(kFragmentOneEdgeSlotProjected,
+                                                 std::size(kFragmentOneEdgeSlotProjected))
+                    .empty())
+        << "projecting the merge's placeholder onto lane bits must refuse";
 }
 
 // A one-arm if: the skipped edge keeps the entry slot, the taken edge the arm's. Without a merge
@@ -224,8 +287,9 @@ TEST(LaneSlotCarry, JoinPhisDiffersPlaceholdsAbsenceAndDropsConflicts) {
     second.mask[21][0] = b.btrue();
     first.data[22][0] = seven;   // the other edge ended this array's lifetime
     second.invalidated.insert(22);
+    first.data[23][0] = seven;   // an earlier merge left the other edge's array EMPTY (ended)
+    second.data[23];
     RegState rs;
-    rs.vreg[21] = b.uconst(0);   // the merge's placeholder for a V_WRITELANE'd register
     join_lane_slots(b, rs, first, second, /*branch_pc*/ 6);
 
     ASSERT_TRUE(rs.vgpr_lane_slots.contains(20));
@@ -235,12 +299,16 @@ TEST(LaneSlotCarry, JoinPhisDiffersPlaceholdsAbsenceAndDropsConflicts) {
     EXPECT_NE(v20.at(3), hundred) << "differing values must be joined by a new phi";
     EXPECT_EQ(v20.at(4), seven) << "equal values need no phi";
     EXPECT_NE(v20.at(5), seven) << "a slot absent on one edge is a phi against the placeholder";
-    EXPECT_FALSE(rs.vgpr_lane_slots.contains(21)) << "a data/mask conflict must not keep data";
-    EXPECT_FALSE(rs.vgpr_lane_mask_slots.contains(21)) << "nor keep the mask";
-    EXPECT_TRUE(rs.invalidated_vgpr_lane_slots.contains(21))
-        << "a dropped spill array is tombstoned so a reload cannot read it as ordinary data";
-    EXPECT_FALSE(rs.vreg.contains(21)) << "and its merge placeholder is not a vector value";
-    EXPECT_FALSE(rs.vgpr_lane_slots.contains(22))
-        << "a lifetime ended on one edge leaves no slot to reload";
-    EXPECT_TRUE(rs.invalidated_vgpr_lane_slots.contains(22));
+    EXPECT_TRUE(rs.lane_slot_merge_placeholder.contains({20, 5}))
+        << "and that placeholder is marked fabricated, like an SGPR absent on one edge";
+    EXPECT_FALSE(rs.lane_slot_merge_placeholder.contains({20, 3}))
+        << "a slot both edges wrote is not fabricated";
+    EXPECT_FALSE(rs.lane_slot_merge_placeholder.contains({20, 4}));
+    // An ended or dropped array stays as an EMPTY data entry: operand_bits refuses an ordinary
+    // read of a spill array, and V_READLANE refuses a lane the array does not hold.
+    for (int vgpr : {21, 22, 23}) {
+        ASSERT_TRUE(rs.vgpr_lane_slots.contains(vgpr)) << "v" << vgpr << " must stay an array";
+        EXPECT_TRUE(rs.vgpr_lane_slots.at(vgpr).empty()) << "v" << vgpr << " keeps no slot";
+        EXPECT_FALSE(rs.vgpr_lane_mask_slots.contains(vgpr)) << "v" << vgpr << " keeps no mask";
+    }
 }

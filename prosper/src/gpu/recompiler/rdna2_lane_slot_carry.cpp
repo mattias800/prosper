@@ -16,6 +16,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr uint32_t kOpWritelane = 0x361;
+constexpr uint32_t kOpReadlane = 0x360;
 
 bool constant_lane_writelane(const Rdna2Inst& in) {
     return !in.is_end && in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane &&
@@ -46,6 +47,14 @@ void erase_slot(std::unordered_map<int, std::unordered_map<int, uint32_t>>& slot
     if (v == slots.end()) return;
     v->second.erase(lane);
     if (v->second.empty()) slots.erase(v);
+}
+
+// The edge ended this spill array: an ordinary write tombstoned it, or an earlier merge left it as
+// an EMPTY array (see join_lane_slots). Its lanes hold values no slot names on that edge.
+bool array_ended(const LaneSlotEdge& edge, int vgpr) {
+    if (edge.invalidated.contains(vgpr)) return true;
+    const auto data = edge.data.find(vgpr);
+    return data != edge.data.end() && data->second.empty() && !edge.mask.contains(vgpr);
 }
 
 void set_slot(RegState& rs, int vgpr, int lane, bool mask, uint32_t value) {
@@ -80,16 +89,26 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
     for (const LaneSlotEdge* edge : {&first, &second})
         for (const auto* slots : {&edge->data, &edge->mask})
             for (const auto& [vgpr, by_lane] : *slots)
-                for (const auto& kv : by_lane) lanes[vgpr].insert(kv.first);
+                if (by_lane.empty())
+                    lanes[vgpr];
+                else
+                    for (const auto& kv : by_lane) lanes[vgpr].insert(kv.first);
     rs.vgpr_lane_slots.clear();
     rs.vgpr_lane_mask_slots.clear();
     rs.invalidated_vgpr_lane_slots = first.invalidated;
     rs.invalidated_vgpr_lane_slots.insert(second.invalidated.begin(), second.invalidated.end());
-    std::set<int> dropped;
     for (const auto& [vgpr, lane_set] : lanes) {
-        // One edge ended this spill array with an ordinary write. The lanes on that path now hold
-        // vector data, which no slot can stand for; keep the tombstone so a later reload refuses.
-        if (rs.invalidated_vgpr_lane_slots.contains(vgpr)) continue;
+        // An EMPTY spill array is how a merge says "a spill array whose lanes no slot names": the
+        // VGPR's vector value is gone on the slot edge (V_WRITELANE erased it), and the slot values
+        // are gone on the other. operand_bits refuses an ordinary read of a spill array and
+        // V_READLANE refuses a missing lane, so every later read of it refuses.
+        auto& data_lanes = rs.vgpr_lane_slots[vgpr];
+        // One edge ended this spill array (an ordinary write, or an earlier such merge). Its lanes
+        // hold vector data there, which no slot can stand for.
+        if (array_ended(first, vgpr) || array_ended(second, vgpr)) {
+            rs.invalidated_vgpr_lane_slots.erase(vgpr);
+            continue;
+        }
         for (int lane : lane_set) {
             const uint32_t* d1 = find_slot(first.data, vgpr, lane);
             const uint32_t* m1 = find_slot(first.mask, vgpr, lane);
@@ -103,7 +122,6 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
                                          "lane slot v%d[%d] is data on one edge and a mask on the "
                                          "other at the merge of branch pc=%u: dropped",
                                          vgpr, lane, branch_pc);
-                dropped.insert(vgpr);
                 continue;
             }
             const bool mask = m1 || m2;
@@ -116,17 +134,18 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
             const uint32_t joined = a == c ? a
                                            : b.emit_phi_2way(mask ? b.t_bool : b.t_u32, a,
                                                              first.block, c, second.block);
-            (mask ? rs.vgpr_lane_mask_slots : rs.vgpr_lane_slots)[vgpr][lane] = joined;
+            if (mask)
+                rs.vgpr_lane_mask_slots[vgpr][lane] = joined;
+            else
+                data_lanes[lane] = joined;
+            // The placeholder is a FABRICATED word on its edge, exactly like an SGPR absent on one
+            // edge (merge_edge_word_fabricated): a consumer that projects scalar data onto lanes
+            // must refuse it (#4725). The edges' own marks were already joined.
+            if (!v1 || !v2) rs.lane_slot_merge_placeholder.insert({vgpr, lane});
         }
+        // `data_lanes` stays even when empty: a reload of a dropped lane must find the array and
+        // refuse ("slot never written"), not fall through to a shuffle of the VGPR's placeholder.
     }
-    // A spill array left with no slot at all would otherwise read as an ordinary VGPR: V_WRITELANE
-    // erased its vector value on both edges, so whatever the merge holds for it is a placeholder.
-    // Erase that too, so a reload refuses instead of shuffling the placeholder.
-    for (int vgpr : dropped)
-        if (!rs.vgpr_lane_slots.contains(vgpr) && !rs.vgpr_lane_mask_slots.contains(vgpr)) {
-            rs.invalidated_vgpr_lane_slots.insert(vgpr);
-            rs.vreg.erase(vgpr);
-        }
 }
 
 void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
@@ -134,8 +153,12 @@ void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rd
     header_pc_ = header_pc;
     slots_.clear();
     std::map<std::pair<int, int>, bool> statically_mask;
+    read_in_loop_.clear();
     for (const auto& in : ins) {
         if (in.is_end) break;
+        if (in.pc >= header_pc && in.pc < backedge_pc && in.fmt == Rdna2Format::VOP3 &&
+            in.opcode == kOpReadlane && in.src[1].kind == OperandKind::InlineInt)
+            read_in_loop_.insert({in.src[0].value, in.src[1].value});
         if (in.pc < header_pc || in.pc >= backedge_pc || !constant_lane_writelane(in)) continue;
         const std::pair<int, int> key{in.dst.value, in.src[1].value};
         const bool mask = static_mask_source(b, in);
@@ -174,21 +197,24 @@ bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint
             b.patch_phi(slot.patch, *same, cont);
             continue;
         }
-        const uint32_t* other = find_slot(slot.mask ? rs.vgpr_lane_slots : rs.vgpr_lane_mask_slots,
-                                          slot.vgpr, slot.lane);
-        if (other && slot.seeded) {
-            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
-                                     "loop-carried lane slot v%d[%d] enters as %s and leaves the "
-                                     "body as %s (header pc=%u)",
-                                     slot.vgpr, slot.lane, slot.mask ? "a mask" : "data",
-                                     slot.mask ? "data" : "a mask", header_pc_);
+        const bool other = find_slot(slot.mask ? rs.vgpr_lane_slots : rs.vgpr_lane_mask_slots,
+                                     slot.vgpr, slot.lane) != nullptr;
+        // Either the body ended the spill lifetime with an ordinary VGPR write, or it left the slot
+        // in the other data/mask domain (a seeded slot that changed, or an unseeded one whose domain
+        // the static scan could not predict). On the hardware the lane then holds a value no slot
+        // names -- a V_READLANE of an ordinary VGPR lane is legitimate code -- so a later
+        // iteration's reload must not see the seed. Refuse when the loop reloads this lane at all;
+        // otherwise the phi is unobserved inside the loop, and the seed (which the preheader makes
+        // dominate this block) closes it.
+        if (read_in_loop_.contains({slot.vgpr, slot.lane})) {
+            log_recompile_diagnostic(
+                b.diagnostic, "recompile-reject", "terminal",
+                "lane slot v%d[%d] is reloaded in the loop but the body %s "
+                "(header pc=%u)",
+                slot.vgpr, slot.lane,
+                other ? "leaves it in the other domain" : "ends its spill lifetime", header_pc_);
             return false;
         }
-        // Either the body ended the spill lifetime with an ordinary VGPR write, or a slot that was
-        // unwritten before the loop took the domain the static scan could not predict. On the
-        // hardware the lane then holds a value no slot names, so a later iteration can observe
-        // nothing a correct guest relies on: close the phi with its loop-invariant seed (which the
-        // preheader makes dominate this block), and leave the slot's exit state to the body.
         b.patch_phi(slot.patch, slot.seed, cont);
         slot.uncarried = true;
     }

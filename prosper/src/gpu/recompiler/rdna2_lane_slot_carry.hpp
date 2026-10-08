@@ -20,11 +20,14 @@
 // the merge takes the value the exit edge carried. An if merge phis a slot whose value differs; a
 // slot unwritten on one edge takes a placeholder there, because an unwritten lane is undefined on
 // that path (the same convention as the absent-SGPR zero and as SpillSlotDomains). What cannot be
-// represented never reaches a reload silently: an if merge drops a slot whose data/mask domain
-// differs between its edges, and a loop refuses one that enters in one domain and leaves its body
-// in the other. A loop body that ends a carried slot's spill lifetime (an ordinary VGPR write)
-// closes the phi with the loop-invariant seed -- the lane then holds vector data on the hardware,
-// which no correct guest reloads as the spilled scalar.
+// represented never reaches a reload silently:
+//   * an if merge marks a slot written on only one edge as fabricated (#4725's mark, so a lane
+//     projection refuses it), and leaves an EMPTY spill array -- which every later read refuses --
+//     where one edge ended the array or the edges disagree on a slot's data/mask domain;
+//   * a loop refuses a slot it reloads when the body leaves no value for it in the phi's domain:
+//     the body ended its lifetime (an ordinary VGPR write) or left it in the other data/mask
+//     domain. A slot the loop never reloads closes with its loop-invariant seed, which nothing
+//     inside the loop reads.
 //
 // CONFIDENCE: HIGH for loops (the header phi is the standard loop-carried form, and the merge value
 // is the one that reaches the exit). HIGH for if merges with the placeholder caveat above.
@@ -57,8 +60,10 @@ struct LaneSlotEdge {
 
 // Join two predecessors at an if merge whose label is the current block. `rs` receives the joined
 // slots; every other field of `rs` is left alone. Emits only OpPhi, so it may run among the merge's
-// other phis. A slot that is data on one edge and a mask on the other is dropped (logged), so only
-// a reload of it after the merge refuses.
+// other phis. A slot written on one edge only is marked fabricated. A spill array that one edge
+// ended, or whose slot is data on one edge and a mask on the other, is left with that slot (or every
+// slot) missing, so a reload refuses; an array left with no slot stays as an EMPTY entry, so an
+// ordinary read of the VGPR refuses too.
 void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
                      const LaneSlotEdge& second, uint32_t branch_pc);
 
@@ -72,7 +77,7 @@ public:
     // At the end of the check block: the values the exit edge carries.
     void record_check(const RegState& rs);
     // In the continue block: close each phi with the body's value. False (logged) when the body
-    // left a carried slot in the other domain or ended its spill lifetime.
+    // left a slot the loop reloads without a value in the phi's domain.
     bool patch_backedge(SpirvCompute& b, const RegState& rs, uint32_t cont);
     // At the merge label. Without a body edge the merge's only predecessor is the check block;
     // with one (a direct break from the body) each slot is phi'd between `check_end` and `body_end`.
@@ -94,6 +99,7 @@ private:
         bool uncarried;   // the back-edge closed with `seed`, not with a body value
     };
     std::vector<Slot> slots_;
+    std::set<std::pair<int, int>> read_in_loop_;   // constant-lane V_READLANEs in the loop
     uint32_t header_pc_ = 0;
 };
 
