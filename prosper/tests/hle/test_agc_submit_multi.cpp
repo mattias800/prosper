@@ -1,7 +1,9 @@
 // Multi-DCB imports must fold every array entry in order as one submission. Calling the single
 // submit HLE repeatedly loses earlier draws, resets cross-buffer barriers, and leaks import scopes.
-// Sony error/empty-batch semantics are unproved: unsupported shapes must diagnose and abort rather
-// than claim success. All command words and mappings below are synthetic; no renderer is created.
+// Sony error semantics for malformed batches are unproved: unsupported shapes must diagnose and abort
+// rather than claim success. The one proved shape is count == 0 (#4741): the shared submit worker
+// tests the count first and returns an empty-batch code, so that case returns it and folds nothing.
+// All command words and mappings below are synthetic; no renderer is created.
 #include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "support/death_test.hpp"
@@ -77,8 +79,8 @@ static int child(const char* mode, HleFn submit) {
     uint64_t pointers[] = {U(stream), U(stream)};
     uint32_t lengths[] = {1, 1};
     uint64_t p = U(pointers), n = U(lengths), count = 1;
-    if (!std::strcmp(mode, "empty")) count = 0;
-    else if (!std::strcmp(mode, "null-pointers")) p = 0;
+    if (!std::strcmp(mode, "null-pointers"))
+        p = 0;
     else if (!std::strcmp(mode, "null-lengths")) n = 0;
     else if (!std::strcmp(mode, "array-size")) count = 0xffffffffu;
     else if (!std::strcmp(mode, "null-stream")) pointers[0] = 0;
@@ -161,6 +163,18 @@ int main(int argc, char** argv) {
     hook();
     CHECK(!::prosper_gpu_submit_scope_active(), "multi-buffer submission opens only one scope");
 
+    // count == 0 returns the library's empty-batch code and folds nothing. The constant is
+    // build-dependent (hle_agc.cpp, kAgcDriverErrEmptyBatch): this pins the project module's value,
+    // written as a literal so a mutated handler constant cannot agree with itself.
+    before = after;
+    CHECK(submit(U(pointers), U(lengths), 0, 0, 0, 0) == 0x8a6d0000ull,
+          "count == 0 returns the empty-batch code instead of aborting");
+    prosper_agc_submit_stats(&after, &draws);
+    CHECK(after == before, "an empty batch folds nothing");
+    hook();
+    CHECK(!::prosper_gpu_submit_scope_active(),
+          "the empty batch's scope is retired by the return hook");
+
     // Distinct target addresses matter: per-address gating would conceal a fold reset if both
     // buffers wrote the same label. A blocked WAIT must gate even the fresh second-buffer address.
     uint64_t condition = 0, upstream = 0, downstream = 0;
@@ -186,9 +200,9 @@ int main(int argc, char** argv) {
     CHECK(run_child(argv[0], "probe") == 0, "death-test child launches successfully");
     CHECK(aborted(run_child(argv[0], "abort-control")), "hand-built abort control is recognized");
     CHECK(!aborted(run_child(argv[0], "wrong-failure-control")), "ordinary nonzero exit is not an abort");
-    const char* modes[] = {"empty", "null-pointers", "null-lengths", "array-size", "null-stream", "unaligned-stream",
-                           "zero-length", "stream-size", "short-packet", "unknown-packet",
-                           "pointer-guard", "length-guard", "stream-guard"};
+    const char* modes[] = {"null-pointers",    "null-lengths",  "array-size",   "null-stream",
+                           "unaligned-stream", "zero-length",   "stream-size",  "short-packet",
+                           "unknown-packet",   "pointer-guard", "length-guard", "stream-guard"};
     for (const char* mode : modes) CHECK(aborted(run_child(argv[0], mode)), mode);
     std::printf("%d failures\n", fails);
     return fails ? 1 : 0;
