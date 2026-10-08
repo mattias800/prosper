@@ -101,27 +101,53 @@ Words program(const Words& path, const Words& probe) {
 struct Probe {
     const char* what;
     Words ops;
+    bool vcc_only;   // writes VCC only: the data is kept and the refusal is at the first mask read
 };
 
 std::vector<Probe> site_probes() {
     return {
-        {"s_cselect_b64 vcc, s[4:5], -1", {0x85eac104u}},
-        {"s_cselect_b32 vcc_lo, s4, -1", {0x856ac104u}},
-        {"s_pack_ll_b32_b16 vcc_lo, s4, s5", {0x996a0504u}},
-        {"s_lshl_b64 vcc, s[4:5], 1", {0x8fea8104u}},
-        {"s_lshl_b64 exec, s[4:5], 1", {0x8ffe8104u}},
-        {"s_bitreplicate_b64_b32 vcc, s4", {0xbeea3b04u}},
-        {"s_mov_b64 vcc, s[4:5]", {0xbeea0404u}},
-        {"s_mov_b64 exec, s[4:5]", {0xbefe0404u}},
-        {"s_and_saveexec_b64 s[10:11], s[4:5]", {0xbe8a2404u}},
+        {"s_cselect_b64 vcc, s[4:5], -1", {0x85eac104u}, true},
+        {"s_cselect_b32 vcc_lo, s4, -1", {0x856ac104u}, true},
+        {"s_pack_ll_b32_b16 vcc_lo, s4, s5", {0x996a0504u}, true},
+        {"s_lshl_b64 vcc, s[4:5], 1", {0x8fea8104u}, true},
+        {"s_lshl_b64 exec, s[4:5], 1", {0x8ffe8104u}, false},
+        {"s_bitreplicate_b64_b32 vcc, s4", {0xbeea3b04u}, true},
+        {"s_mov_b64 vcc, s[4:5]", {0xbeea0404u}, true},
+        {"s_mov_b64 exec, s[4:5]", {0xbefe0404u}, false},
+        {"s_and_saveexec_b64 s[10:11], s[4:5]", {0xbe8a2404u}, false},
     };
 }
 
-void expect_refused_for_the_mark(Stage stage, const Words& code, const std::string& what) {
-    EXPECT_TRUE(compile(stage, code).empty()) << name(stage) << ": " << what;
+// A probe that writes EXEC is refused AT the write, naming the guard. One that writes only VCC keeps
+// the data words and publishes no lane view, so it is refused at the first instruction that reads
+// VCC as a mask (the v_cndmask appended by compile()), as an unresolved operand.
+void expect_refused_for_the_mark(Stage stage, const Words& code, const Probe& probe) {
+    EXPECT_TRUE(compile(stage, code).empty()) << name(stage) << ": " << probe.what;
     const std::string reason = last_terminal_reject_reason(kAddress);
-    EXPECT_NE(reason.find(kReason), std::string::npos)
-        << name(stage) << ": " << what << ": refused for another reason: " << reason;
+    if (probe.vcc_only) {
+        // At the mask read, or (for the B32 cselect, which wave64 compute also gates on a whole-CFG
+        // low-only proof of its own) at the probe itself; never earlier.
+        const std::string consumer = "pc=" + std::to_string(code.size()) + " ";
+        const std::string at_probe = "pc=" + std::to_string(code.size() - 1) + " ";
+        EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos)
+            << name(stage) << ": " << probe.what << ": " << reason;
+        EXPECT_TRUE(reason.find(consumer) != std::string::npos ||
+                    reason.find(at_probe) != std::string::npos)
+            << name(stage) << ": " << probe.what << ": not refused at the mask read: " << reason;
+    } else {
+        EXPECT_NE(reason.find(kReason), std::string::npos)
+            << name(stage) << ": " << probe.what << ": refused for another reason: " << reason;
+    }
+}
+
+// The same VCC-writing probes with VCC consumed only as scalar DATA (v_mov v3, vcc_lo / v1 for the
+// fragment): no mask read, so the marked source is irrelevant and the program must compile.
+Words compile_vcc_as_data(Stage stage, const Words& body) {
+    const Words tail = stage == Stage::Fragment
+                           ? Words{0x7e02026au, 0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+                                   0xf800180fu, 0x03020100u, 0xbf810000u}
+                           : Words{0x7e06026au, 0xe0702000u, 0x80020300u, 0xbf810000u};
+    return compile_whole(stage, cat({&body, &tail}));
 }
 
 }   // namespace
@@ -143,7 +169,17 @@ TEST(ScalarPairMask, PairWrittenOnBothArmsIsAdmitted) {
 TEST(ScalarPairMask, EverySiteFamilyRefusesAOnePathPair) {
     for (Stage stage : {Stage::Compute, Stage::Fragment})
         for (const Probe& probe : site_probes())
-            expect_refused_for_the_mark(stage, program(kOnePath, probe.ops), probe.what);
+            expect_refused_for_the_mark(stage, program(kOnePath, probe.ops), probe);
+}
+
+TEST(ScalarPairMask, VccUsedAsScalarScratchIsAdmitted) {
+    // Over-refusal control (Black Flag: a loop counter / SMEM word shifted into VCC and read back as
+    // an address): the pair is fabricated but never read as a mask.
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        for (const Probe& probe : site_probes())
+            if (probe.vcc_only)
+                EXPECT_FALSE(compile_vcc_as_data(stage, program(kOnePath, probe.ops)).empty())
+                    << name(stage) << ": " << probe.what;
 }
 
 TEST(ScalarPairMask, ReviewersExecutedProbeRefuses) {
@@ -159,7 +195,9 @@ TEST(ScalarPairMask, ReviewersExecutedProbeRefuses) {
     EXPECT_TRUE(recompile_compute(probe.data(), probe.size(), &table, config,
                                   {RecompileDiagnosticStage::Compute, kAddress})
                     .empty());
-    EXPECT_NE(last_terminal_reject_reason(kAddress).find(kReason), std::string::npos);
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=10 "), std::string::npos) << "refused at the v_cndmask: " << reason;
 }
 
 TEST(ScalarPairMask, AndPairProjectionRefusesAOnePathPair) {
@@ -175,5 +213,61 @@ TEST(ScalarPairMask, AndPairProjectionRefusesAOnePathPair) {
                         0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
         code.insert(code.end(), select.begin(), select.end());
         EXPECT_TRUE(compile_whole(stage, code).empty()) << name(stage);
+    }
+}
+
+TEST(ScalarPairMask, ANeverWrittenSourceIsFabricatedToo) {
+    // No branch: s[4:5] is defined, s20/s21 are NEVER written, and operand_bits reads their
+    // absence as uconst(0). Each probe turns one into lane bits. VCC writers keep the data and are
+    // refused at the first mask read; the program is otherwise unchanged.
+    const std::vector<Probe> rows = {
+        {"s_mov_b64 vcc, s[20:21]", {0xbeea0414u}, true},
+        {"s_mov_b32 vcc_hi, s20", {0xbeeb0314u}, true},
+        {"s_lshl_b64 vcc, s[4:5], s20", {0x8fea1404u}, true},
+        {"s_mov_b64 exec, s[20:21]", {0xbefe0414u}, false},
+    };
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        for (const Probe& row : rows)
+            expect_refused_for_the_mark(stage, program(kDefined, row.ops), row);
+}
+
+TEST(ScalarPairMask, ADirectDescriptorWordStillProjects) {
+    // s[8:9] is the output V# the compute harness binds directly: real driver user data kept in
+    // sreg_input, not a fabricated word, so projecting it must not be over-refused.
+    const Words body = program(kDefined, {0xbeea0408u});
+    const Words code = cat({&body, &kComputeTail});
+    ComputeShaderConfig config;
+    config.local_x = 64;
+    config.wave_size = 64;
+    config.native_subgroup_size = 64;
+    config.user_sgprs.assign(12, 0u);   // s0..s11 are launch user data; s[8:11] is the V#
+    ShaderResourceTable table = output_table();
+    table.resources[0].srt_offset = 0xFFFFFFFFu;   // a direct (inline) descriptor
+    EXPECT_FALSE(recompile_compute(code.data(), code.size(), &table, config,
+                                   {RecompileDiagnosticStage::Compute, kAddress})
+                     .empty());
+}
+
+TEST(ScalarPairMask, AFabricatedVccHiSiblingIsNotAMask) {
+    // vcc_hi is copied from the never-written s20 (so marked, with no branch in the program);
+    // s_cselect_b32 vcc_lo then combines it with vcc_lo to form the lane bit. The marked sibling
+    // must not become that bit (compute: this is the sibling check's own refusal).
+    const Words fabricated_hi = {0xbe840380u, 0xbe8503c1u,
+                                 0xbeeb0314u};   // s4=0, s5=-1, vcc_hi=s20
+    const Words code = program(fabricated_hi, {0x856ac1c1u});
+    EXPECT_TRUE(compile(Stage::Compute, code).empty());
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=" + std::to_string(code.size() + 0u) + " "), std::string::npos)
+        << reason;
+}
+
+TEST(ScalarPairMask, OtherSaveexecFormsHaveNoEmitterYet) {
+    // Only s_and_saveexec_b64 has an emitter (and the guard). s_or_saveexec_b64 refuses as an
+    // unresolved operand even for a fully defined pair, so a new emitter must bring the guard.
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_TRUE(compile(stage, program(kDefined, {0xbe8a2504u})).empty()) << name(stage);
+        EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+                  std::string::npos);
     }
 }

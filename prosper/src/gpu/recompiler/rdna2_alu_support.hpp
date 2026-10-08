@@ -399,6 +399,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
     }
 }
 
+uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);   // rdna2_cfg_support.hpp
+
 // May `words` consecutive scalar words starting at `reg` become per-lane mask bits? Not when any is
 // the structured emitter's fabricated zero (sreg_merge_placeholder: a one-path write, a loop phi, a
 // never-written source), on either stage (#4714, GPU-5/FAIL-1). Not when it is a memory-loaded
@@ -409,7 +411,9 @@ inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, 
                                      int words) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
     for (int r = reg; r < reg + words; ++r) {
-        if (rs.sreg_merge_placeholder.contains(r)) return false;
+        // Direct-descriptor user-data words live in sreg_input: real driver data, kept out of
+        // sreg on purpose, so absence from sreg is not fabrication for them.
+        if (sreg_word_may_be_fabricated(rs, r) && !rs.sreg_input.contains(r)) return false;
         if (b.is_fragment && rs.sreg_memory_pattern.contains(r)) return false;
     }
     return true;
@@ -424,34 +428,58 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
                                                       const Rdna2Inst& in) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
     const int dst = in.dst.value;
-    // s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source.
+    // s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source. It is the only
+    // saveexec form with an emitter: s_or/xor/andn2/orn2/nand/nor/xnor_saveexec_b64 refuse as
+    // unresolved-operand today (ScalarPairMask tests), and each needs this guard if it gains one.
     const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64;
     if (!saveexec && (!(in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR) ||
                       !(dst == 106 || dst == 107 || dst == 126 || dst == 127)))
         return true;
-    const auto has_data = [&](int reg) {
-        return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
-    };
-    for (const Operand& o : in.src) {
+    for (uint32_t k = 0; k < 4; ++k) {
+        const Operand& o = in.src[k];
         const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
         if (o.kind != OperandKind::SGPR && !special_data) continue;
         if ((o.value == 106 || o.value == 107) && rs.vcc) continue;   // the live predicate wins
         if (rs.sreg_bool.contains(o.value)) continue;
-        if (!has_data(o.value) && !has_data(o.value + 1)) continue;
-        if (!scalar_words_projectable(b, rs, o.value, 2)) return false;
+        // A NEVER-WRITTEN source counts: operand_bits reads its absence as uconst(0).
+        const uint32_t width = scalar_alu_source_words(in, k);
+        if (!scalar_words_projectable(b, rs, o.value, width == 1u ? 1 : 2)) return false;
     }
     return true;
 }
 
-// The VCC sibling word a B32 write into one VCC half is combined with to form the lane bit. Checked
-// at the three emitters that read it (s_cselect_b32, s_pack_*, the generic B32 VCC-half write), not
-// in the shared guard: a B64 write replaces both words, so its old sibling is not read.
-inline bool vcc_sibling_projectable(SpirvCompute& b, const RegState& rs, int sibling, uint32_t pc) {
-    if (scalar_words_projectable(b, rs, sibling, 1)) return true;
-    b.stage_reject_pc = pc;
-    b.stage_reject_reason = "scalar-fabricated-lane-mask";
-    return false;
+// A write of scalar DATA into VCC whose source may be fabricated or memory-patterned keeps the data
+// words but must not publish a per-lane view of them: VCC is then plain scalar scratch (an address,
+// a counter), which the guest reads as data, and a later READ of VCC as a mask finds no view and is
+// refused there (its pair projection consults the same marks). Refusing at the write instead
+// over-refuses every VCC-as-scratch use of a loop-carried or SMEM-loaded word (Black Flag, #4714).
+inline void drop_vcc_mask_view(RegState& rs) {
+    rs.vcc = 0;
+    for (int half : {106, 107}) {
+        rs.sreg_bool.erase(half);
+        rs.sreg_bool_narrowed.erase(half);
+        rs.sreg_bool_b32.erase(half);
+    }
 }
+
+// True when the lane-mask write targets only VCC (so dropping its mask view is possible). EXEC
+// cannot be left without a view, and s_and_saveexec writes EXEC, so those are refused instead.
+inline bool scalar_mask_write_is_vcc_only(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64) return false;
+    return in.dst.value == 106 || in.dst.value == 107;
+}
+
+// Applies drop_vcc_mask_view when the instruction finishes, if `on`.
+struct VccMaskViewDrop {
+    RegState& rs;
+    bool on = false;
+    explicit VccMaskViewDrop(RegState& state) : rs(state) {}
+    VccMaskViewDrop(const VccMaskViewDrop&) = delete;
+    VccMaskViewDrop& operator=(const VccMaskViewDrop&) = delete;
+    ~VccMaskViewDrop() {
+        if (on) drop_vcc_mask_view(rs);
+    }
+};
 
 // A B64 wave-mask logical (s_and_b64 and family) whose operand is an ordinary scalar DATA pair:
 // project the pair onto this invocation's lane bit -- this lane's 32-bit half, then its bit -- so

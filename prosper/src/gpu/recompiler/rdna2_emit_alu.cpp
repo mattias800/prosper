@@ -258,13 +258,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            VccMaskViewDrop vcc_view_drop(rs);
             if (!scalar_data_sources_projectable_into_mask(b, rs, in)) {
-                // Named in the ONE terminal reject line (#3135): a scalar source of a lane-mask
-                // write may be the emitter's fabricated zero (#4714).
-                b.stage_reject_pc = in.pc;
-                b.stage_reject_reason = "scalar-fabricated-lane-mask";
-                ok = false;
-                return true;
+                if (scalar_mask_write_is_vcc_only(in)) {
+                    vcc_view_drop.on = true;   // VCC as scalar scratch: data kept, no lane view
+                } else {
+                    // Named in the ONE terminal reject line (#3135): a scalar source of an EXEC
+                    // write may be the emitter's fabricated zero (#4714).
+                    b.stage_reject_pc = in.pc;
+                    b.stage_reject_reason = "scalar-fabricated-lane-mask";
+                    ok = false;
+                    return true;
+                }
             }
             if (in.opcode == 0x0a &&
                 ((in.dst.value & 1) ||
@@ -1516,13 +1521,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOP2: {
+            VccMaskViewDrop vcc_view_drop(rs);
             if (!scalar_data_sources_projectable_into_mask(b, rs, in)) {
-                // Named in the ONE terminal reject line (#3135): a scalar source of a lane-mask
-                // write may be the emitter's fabricated zero (#4714).
-                b.stage_reject_pc = in.pc;
-                b.stage_reject_reason = "scalar-fabricated-lane-mask";
-                ok = false;
-                return true;
+                if (scalar_mask_write_is_vcc_only(in)) {
+                    vcc_view_drop.on = true;   // VCC as scalar scratch: data kept, no lane view
+                } else {
+                    // Named in the ONE terminal reject line (#3135): a scalar source of an EXEC
+                    // write may be the emitter's fabricated zero (#4714).
+                    b.stage_reject_pc = in.pc;
+                    b.stage_reject_reason = "scalar-fabricated-lane-mask";
+                    ok = false;
+                    return true;
+                }
             }
             const bool gtav_wave32_vcchi_scalar_packet =
                 allows_compute_scalar_vcc_bridge(b) && b.native_subgroup_size == 32 &&
@@ -1552,8 +1562,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_b32.erase(106);
                 if (complete_scalar_pair) {
                     auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end() || !vcc_sibling_projectable(b, rs, 107, in.pc)) {
+                    if (high == rs.sreg.end()) {
                         ok = false;
+                        return true;
+                    }
+                    if (!scalar_words_projectable(b, rs, 107, 1)) {
+                        drop_vcc_mask_view(rs);   // the sibling word is not a mask: keep data only
                         return true;
                     }
                     const uint32_t lane = b.ibin(
@@ -1860,8 +1874,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
                     const auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end() || !vcc_sibling_projectable(b, rs, 107, in.pc)) {
+                    if (high == rs.sreg.end()) {
                         ok = false;
+                        return true;
+                    }
+                    if (!scalar_words_projectable(b, rs, 107, 1)) {
+                        drop_vcc_mask_view(rs);   // the sibling word is not a mask: keep data only
                         return true;
                     }
                     const uint32_t lane = b.ibin(
@@ -2423,9 +2441,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) {
                         const int sibling = writes_hi ? 106 : 107;
                         auto other = rs.sreg.find(sibling);
-                        if (other == rs.sreg.end() ||
-                            !vcc_sibling_projectable(b, rs, sibling, in.pc)) {
+                        if (other == rs.sreg.end()) {
                             ok = false;
+                            return true;
+                        }
+                        if (!scalar_words_projectable(b, rs, sibling, 1)) {
+                            drop_vcc_mask_view(
+                                rs);   // the sibling word is not a mask: keep data only
                             return true;
                         }
                         const uint32_t other_bit = b.ucmp(
