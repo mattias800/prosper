@@ -3141,9 +3141,10 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     uint32_t header = 0; memcpy(&header, (const void*)(uintptr_t)stream, sizeof header);
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
         return reject("stream-header", stream, count64, header);
-    // The queue is a 32-bit argument: the library compares `edi` (`cmp edi,0x57` at the start of both
-    // sceAgcDriverSubmitAcb and sceAgcDriverSubmitMultiAcbs), so the upper half of rdi is not part of
-    // the queue's identity. Narrowing here keeps both entry points on one compute context for the
+    // The queue is a 32-bit argument: the library compares only `edi` (`cmp edi,0x58` at 0x2820
+    // and 0x4830, the entries of SubmitAcb and SubmitMultiAcbs in the project's
+    // libSceAgcDriver.sprx, sha256 7399b4eb...; build J03912178 has `cmp edi,0x57`), so the
+    // upper half of rdi is not part of the queue's identity. Narrowing here keeps both entry points on one compute context for the
     // same hardware queue (#4743); keying on all 64 bits split it when a guest left rdi's upper half
     // dirty.
     return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb",
@@ -3247,8 +3248,9 @@ HLE(agc_driver_submit_multi_acbs) {
 // Sony completion or return-code contract. Invalid and partial acceptance semantics are unproved,
 // so unsupported input is fatal and explicit rather than a guessed SCE error or fake success.
 // The one exception is count == 0 (#4741): this call enters the same submit worker as
-// sceAgcDriverSubmitMultiAcbs, whose first test returns the empty-batch code before it reads either
-// array, so that answer is read from the library and not guessed. See the MultiAcbs comment above
+// sceAgcDriverSubmitMultiAcbs. That worker takes its lock first (0x45a4), then tests the count
+// (0x4603) and returns the empty-batch code before it reads either array; a failed lock returns the
+// same 0x8a6d0000 (0x474b). So that answer is read from the library and not guessed. See the MultiAcbs comment above
 // for the two builds and their different constants. CONFIDENCE: MED (build-dependent constant).
 HLE(agc_driver_submit_multi_dcbs) {
     prosper_gpu_submit_scope_begin();
