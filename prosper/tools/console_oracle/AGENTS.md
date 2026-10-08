@@ -7,8 +7,9 @@ Read-only observation of your own console.
 It is never a required step for adding or changing HLE. Disassembly, live guest captures and tests
 come first and stay sufficient. Nothing in CI or in the replay needs a console: the committed goldens
 are plain test inputs, and a mismatch is always resolvable without hardware (fix the HLE, or list the
-case in `known_gaps.tsv` with a reason). If your own evidence contradicts a golden, do not edit it:
-list the case in `known_gaps.tsv` with that evidence and flag it for a human to re-measure.
+case in `known_gaps.tsv` with an action and a reason). If your own evidence contradicts a golden, do not
+edit it: list the case in `known_gaps.tsv` as `triage` with that evidence and flag it for a human to
+re-measure.
 
 - `payload/lib_oracle.c` + `payload/Makefile` -- the payload. Built with the ps5-payload-sdk (not by
   CMake), it `dlopen`s the named libraries, calls each function with the arguments in the cases file
@@ -36,8 +37,56 @@ HLE the usual way (disassembly, captures, a normal test) and leave the case for 
    `python3 prosper/tools/console_oracle/run_oracle.py --family <name> --host <console> --sdk <sdk>`.
    The family is a bare name: the tool only ever reads and writes `tests/data/console_oracle/`.
 3. Run `test_console_oracle_replay`. A mismatch is either a prosper defect (fix it, or list it in
-   `known_gaps.tsv` with a reason) or a case that measures something volatile (give it `expect=ret`
+   `known_gaps.tsv` with an action and a reason) or a case that measures something volatile (give it `expect=ret`
    or `none`; the driver then stores a placeholder instead of the volatile bytes).
+
+## What a known gap says
+
+`known_gaps.tsv` is `id`, `action`, `reason`, so the list also answers "does this need fixing?":
+
+- `fix` -- prosper is wrong here and should change. `fix:#4757` says where it is tracked.
+- `keep` -- prosper differs on purpose and stays as it is; the reason says why (a safe direction, a
+  deliberate floor). `keep:#4757` links the discussion.
+- `triage` -- nobody has decided yet. This is also what to use when your own evidence contradicts a golden.
+
+The replay rejects a row with no action, or an action outside that set. A gap that starts matching still
+fails the replay, so fixing one means deleting its row.
+
+## Command-buffer builders (`dcb:<N>`)
+
+An Agc builder (`sceAgcDcbDrawIndexAuto`, `sceAgcAcbCopyData`, ...) takes a pointer to a command-buffer
+descriptor, not to raw dwords, so a plain `out:` buffer cannot stand in for it. `dcb:<N>` builds the
+descriptor over a fresh N-dword buffer pre-filled with 0xAB; the payload and the replay build it
+identically. The reported value is `<dwords written>:<those dwords in hex>`, and `retoff:<k>` is relative
+to the command dwords, so a builder's returned packet pointer compares as an offset. A builder that does
+not fit leaves the cursor where it was and reports `0:`.
+
+`gen_builder_cases.py` generates the `agcbuild` family: every exported Dcb/Cb/Acb builder, called with
+three argument patterns whose values are easy to recognise in the emitted words, which recovers each
+builder's argument mapping by observation (the signatures are not published). It only ever calls
+builders, which encode their arguments into the descriptor's own buffer; it excludes the `*Patch*`
+functions, which store through a pointer into a packet built earlier.
+
+## Probe families and the resumable runner
+
+A family named `probe_*`, or one with a row in `tests/data/console_oracle/probe_baseline.tsv`, is a
+measured inventory rather than a list of individually reviewed gaps. Its differences are not listed one
+by one in `known_gaps.tsv`; the replay counts them and fails if the count differs from the baseline, so
+it can only go down (and the baseline is lowered with it). A mismatch printed as `[probe-gap]` is a lead.
+
+`expect=default0` compares an UNREGISTERED function against the dispatcher's return-0 default instead of
+reporting "not implemented": what is left is exactly the false-success class (#2081), a function the
+console answers with an error where prosper answers 0.
+
+`run_oracle.py --resume N --prune-unmeasured` is for a bulk run. If the payload dies or hangs, the case it
+stopped on is recorded as `hang` and the rest run again in a fresh payload (up to N times); only cases the
+console ran to completion stay in the cases and golden files, and the others are listed in
+`<family>.unmeasured.tsv`. A hang that never returns relies on `--timeout`.
+
+What is never called, however it is generated: anything that changes console state (save data, settings,
+reboot, install), anything that returns a device or account identifier, anything that talks to a network
+endpoint, and `sceKernelDebugRaiseException`. Blind probing of every export is not the goal: a call with
+garbage arguments mostly measures argument validation, not what a title relies on.
 
 ## Traps
 

@@ -930,11 +930,12 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # prosper's HLE against what a real PS5 returned: tests/data/console_oracle/*.golden.tsv are
-  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv.
+  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv, and a
+  # generated probe_* family is gated by a count in probe_baseline.tsv that may only go down.
   # No console and no game dump needed.
   prosper_add_gtest(test_console_oracle_replay
     SOURCES tests/hle/test_console_oracle_replay.cpp
-    INCLUDES tests/hle
+    INCLUDES tests/hle tests
     LIBRARIES prosper_core)
   target_compile_definitions(test_console_oracle_replay PRIVATE
       PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")

@@ -26,6 +26,7 @@ import datetime
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -257,13 +258,20 @@ def run_on_console(cases_text: str, sdk: str, host: str, port: int, timeout: int
             shutil.copy(PAYLOAD_DIR / name, build / name)
         (build / "cases_data.h").write_text(render_cases_header(cases_text))
         env = dict(os.environ, PS5_PAYLOAD_SDK=sdk, PS5_HOST=host, PS5_PORT=str(port))
-        proc = subprocess.run(
-            ["make", "-C", str(build), "test"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                ["make", "-C", str(build), "test"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as expired:
+            # A hung payload never prints its "# done" line. What it printed up to the hang is the whole
+            # point of resuming, so return it instead of losing the run (the exception carries bytes even
+            # when text=True was requested).
+            partial = expired.stdout or ""
+            return partial.decode(errors="replace") if isinstance(partial, bytes) else partial
         if proc.returncode != 0 and "R\t" not in proc.stdout:
             hint = (
                 "\nIs --sdk an installed ps5-payload-sdk (it needs toolchain/prospero.mk)?"
@@ -274,6 +282,101 @@ def run_on_console(cases_text: str, sdk: str, host: str, port: int, timeout: int
                 f"build or deploy failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}{hint}"
             )
         return proc.stdout
+
+
+HANG = "hang"
+
+
+def console_reachable(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Whether the console's ELF loader accepts a connection (it is not pinged: the console drops ping)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def cases_to_text(cases: list[Case]) -> str:
+    """The inverse of parse_cases for the five spec columns (comments are not carried)."""
+    return "".join("\t".join([c.id, c.lib, c.func, c.args, c.expect]) + "\n" for c in cases)
+
+
+def run_resumable(cases: list[Case], run, max_restarts: int) -> Output:
+    """Run `cases` through `run(cases_text) -> printed output`, surviving a payload that dies or hangs.
+
+    The payload prints one result line per case, in order, flushing each, so when it stops before its
+    "# done" line the first case without a result is the one that was running. That case is recorded as
+    `hang`, and the remaining cases are run again in a fresh payload. After `max_restarts` such stops the
+    rest stay without a result (reported as missing), so a console that keeps dying cannot loop forever.
+    """
+    results: dict[str, list[str]] = {}
+    pending = list(cases)
+    restarts = 0
+    done = True
+    while pending:
+        try:
+            printed = run(cases_to_text(pending))
+        except SystemExit:
+            if not results:
+                raise  # the very first launch failed: a real error, nothing to keep
+            # The console went away part way through (a failed build or deploy after earlier launches
+            # succeeded). What was measured so far is kept; the rest stay missing.
+            done = False
+            break
+        out = parse_output(printed)
+        results.update(out.results)
+        missing = [c for c in pending if c.id not in out.results]
+        if not missing:
+            pending = []
+            break
+        if out.done:
+            # The payload finished yet skipped cases (a malformed line it ignored): nothing to resume.
+            done = False
+            break
+        culprit, pending = missing[0], missing[1:]
+        results[culprit.id] = [HANG, RAW_RET_PLACEHOLDER, "-"]
+        restarts += 1
+        if restarts > max_restarts:
+            done = False
+            break
+    return Output(results=results, done=done and not pending, ran=len(results))
+
+
+def split_measured(cases: list[Case], output: Output) -> tuple[list[Case], list[tuple[Case, str]]]:
+    """Cases the console ran to completion (status ok) and, separately, the rest with their status
+    (hang, fault:<signal>, nofunc, nolib, badspec, or missing)."""
+    ok: list[Case] = []
+    rest: list[tuple[Case, str]] = []
+    for c in cases:
+        res = output.results.get(c.id)
+        status = res[0] if res else "missing"
+        if status == "ok":
+            ok.append(c)
+        else:
+            rest.append((c, status))
+    return ok, rest
+
+
+def prune_cases_text(text: str, keep_ids: set[str]) -> str:
+    """The cases file with every case line whose id is not in keep_ids removed; comments and blank lines
+    stay, so the file keeps explaining itself."""
+    out = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip() or line.startswith("#") or line.split("\t", 1)[0] in keep_ids:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def unmeasured_text(source_name: str, rest: list[tuple[Case, str]], date: str) -> str:
+    lines = [
+        "# console-oracle: cases the console could not measure (not in the golden)",
+        f"# source: {source_name}",
+        f"# captured: {date}",
+        "# columns: id\tfunc\tstatus",
+    ]
+    lines += [f"{c.id}\t{c.func}\t{status}" for c, status in rest]
+    return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -289,6 +392,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=int(os.environ.get("PS5_PORT", "9021")))
     ap.add_argument("--sdk", default=os.environ.get("PS5_PAYLOAD_SDK"), help="installed SDK root")
     ap.add_argument("--timeout", type=int, default=180, help="seconds for build + run")
+    ap.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        metavar="N",
+        help="survive up to N payload deaths or hangs: the case it stopped on is recorded as `hang` and "
+        "the rest run again (for a bulk probe family; default 0 = one run, stop at the first death)",
+    )
+    ap.add_argument(
+        "--prune-unmeasured",
+        action="store_true",
+        help="keep only the cases the console measured (status ok) in the cases and golden files, and "
+        "list the rest in <family>.unmeasured.tsv; for a generated probe family",
+    )
     ap.add_argument(
         "--check",
         action="store_true",
@@ -323,10 +440,38 @@ def main(argv: list[str] | None = None) -> int:
     if not args.host or not args.sdk:
         ap.error("--host and --sdk are required (or set PS5_HOST / PS5_PAYLOAD_SDK)")
 
-    printed = run_on_console(cases_text, args.sdk, args.host, args.port, args.timeout)
-    output = parse_output(printed)
-    missing = [c.id for c in cases if c.id not in output.results]
+    launches = 0
+
+    def run(text: str) -> str:
+        nonlocal launches
+        # A restart must not pile another payload onto a console that has stopped answering: a failed
+        # connection here ends the run and keeps what was measured.
+        if launches and not console_reachable(args.host, args.port):
+            raise SystemExit(f"console {args.host}:{args.port} is not answering; stopping the run")
+        launches += 1
+        n = sum(1 for line in text.splitlines() if line.strip())
+        print(f"[oracle] launch {launches}: {n} cases", file=sys.stderr, flush=True)
+        return run_on_console(text, args.sdk, args.host, args.port, args.timeout)
+
+    if args.resume > 0:
+        output = run_resumable(cases, run, args.resume)
+    else:
+        output = parse_output(run(cases_text))
     date = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+
+    if args.prune_unmeasured:
+        ok, rest = split_measured(cases, output)
+        cases_path.write_text(prune_cases_text(cases_text, {c.id for c in ok}))
+        out_path.write_text(build_golden(cases_path.name, ok, output, date))
+        unmeasured_path = out_path.with_name(f"{args.family}.unmeasured.tsv")
+        unmeasured_path.write_text(unmeasured_text(cases_path.name, rest, date))
+        print(
+            f"{len(ok)}/{len(cases)} cases measured -> {out_path}; "
+            f"{len(rest)} unmeasured -> {unmeasured_path}"
+        )
+        return 0 if output.done else 2
+
+    missing = [c.id for c in cases if c.id not in output.results]
     out_path.write_text(build_golden(cases_path.name, cases, output, date))
 
     print(f"{len(cases) - len(missing)}/{len(cases)} cases measured -> {out_path}")
