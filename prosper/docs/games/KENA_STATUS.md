@@ -9,7 +9,7 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
-## The fog lifts and the foliage draws: two general fixes (2026-10-08)
+## The fog gets its shadows and the foliage draws: two general fixes (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
 `PROSPER_NULL_PAGE=1`, an empty `PROSPER_GUEST_ARGS`, `scripts/kena/linux-reach-level-load.pad`,
@@ -40,7 +40,9 @@ a slightly different camera, so the per-pixel column is indicative only.
     means 0.55, 0.76 and 0.9995). Every froxel therefore saw the sun.
   - Compute now imports the depth plane for a UNORM16 view as well. The rule for which
     one-component views read a retained depth plane is `frontends/shared/rtt/depth_plane_view.hpp`,
-    which live compute calls. In the fix capture the dispatch binds the D32
+    which live compute calls. The renderer's importer serves a plane only when its guest width
+    (from `DB_Z_INFO.FORMAT`) matches the view, so a UNORM16 view of a Z32 plane, or an R16
+    texture at a recycled depth address, is never handed depth. In the fix capture the dispatch binds the D32
     atlas directly, and the scattering volume shows canopy shadows and lit gaps. The fog draw now
     adds 0.062 instead of 0.121. Light shafts appear.
 - **Fix 2: the foliage drew, then discarded itself.**
