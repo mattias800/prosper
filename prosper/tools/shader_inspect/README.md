@@ -168,6 +168,12 @@ only for whatever a route happened to reach, once per distinct shader, at whatev
 the run stopped: two runtime counts taken that way, 43 and 86, differed by run length alone and
 read as a regression until they were matched by frame.
 
+`route_candidates.py census.csv` reads that census's `--csv` output and sorts the wide-wave shaders'
+reason sets by which of ADR 0028's route-2 rewrites (uniform readlane, compaction ballot, uniform
+vote) they could apply to; `scalar-reduce` (a WaveAny result reaching a scalar consumer) is covered
+when a `wave-any` is present. It is an upper bound that admits nothing: a reason bit says the
+operation is present, not that its operand is uniform, so each rewrite still needs its own proof.
+
 ### Measured limit: over a raw dump this mode is mostly blind, and says so
 
 Run against a 3,453-shader dump of GTA V's pixel-shader database (2026-09-08):

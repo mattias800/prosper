@@ -36,23 +36,23 @@ ComputeWaveOpFacts one(ComputeCrossLaneKind kind, ComputeWaveContext context) {
     return facts;
 }
 
-}  // namespace
+}   // namespace
 
 TEST(ComputeWaveAdmission, TheCandidateNamesTheVocabularyRouteAndTheReason) {
     const auto item = plain_item();
-    const auto loop = compute_wave_candidate(FakeContext{}, item,
-                                             one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop),
-                                             {32768, 1024});
+    const auto loop = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop),
+        {32768, 1024});
     EXPECT_STREQ(loop.route, "n-lanes");
     EXPECT_STREQ(loop.reason, "cross-lane-in-loop");
-    const auto top = compute_wave_candidate(FakeContext{}, item,
-                                            one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
-                                            {32768, 1024});
+    const auto top = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {32768, 1024});
     EXPECT_STREQ(top.route, "workgroup-exchange");
     // Unknown device limits are refused, not assumed.
-    const auto unknown = compute_wave_candidate(FakeContext{}, item,
-                                                one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
-                                                {0, 0});
+    const auto unknown = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {0, 0});
     EXPECT_STREQ(unknown.route, "refused");
     EXPECT_STREQ(unknown.reason, "shared-memory-limit-unknown");
 }
@@ -62,9 +62,8 @@ TEST(ComputeWaveAdmission, ANativeCandidateIsNeverPrintedOnADeclinedDispatch) {
     ctx.min_native_subgroup_size = ctx.max_native_subgroup_size = 64;
     auto item = plain_item();
     item.required_subgroup_size = 64;
-    const auto out = compute_wave_candidate(ctx, item,
-                                            one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop),
-                                            {32768, 1024});
+    const auto out = compute_wave_candidate(
+        ctx, item, one(ComputeCrossLaneKind::ReadLane, ComputeWaveContext::Loop), {32768, 1024});
     EXPECT_STREQ(out.route, "") << "`native` beside `dispatch skipped` would contradict itself";
     EXPECT_STREQ(out.reason, "");
 }
@@ -74,9 +73,9 @@ TEST(ComputeWaveAdmission, APartialWorkgroupIsRefused) {
     item.recompile_config.exact_thread_extent = true;
     item.recompile_config.threads_x = 40;
     item.recompile_config.threads_y = item.recompile_config.threads_z = 1;
-    const auto out = compute_wave_candidate(FakeContext{}, item,
-                                            one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
-                                            {32768, 1024});
+    const auto out = compute_wave_candidate(
+        FakeContext{}, item, one(ComputeCrossLaneKind::Ballot, ComputeWaveContext::TopLevel),
+        {32768, 1024});
     EXPECT_STREQ(out.reason, "partial-workgroup-barrier");
 }
 

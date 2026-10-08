@@ -1,6 +1,9 @@
 // Compute Wave64 route selection -- see compute_wave_route.hpp and ADR 0028.
 #include "gpu/recompiler/compute_wave_route.hpp"
 
+#include "diagnostics/env_cache.hpp"
+#include "diagnostics/perf/wave64_refusal.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -35,14 +38,19 @@ const char* compute_cross_lane_kind_name(ComputeCrossLaneKind kind) {
 }
 
 const char* compute_wave_route_name(ComputeWaveRoute route) {
+    // The single route vocabulary is owned by #4754 (wave64_refusal.hpp); use its table directly.
+    using prosper::diagnostics::perf::wave64_route_name;
+    using prosper::diagnostics::perf::Wave64Route;
     switch (route) {
-        case ComputeWaveRoute::Native: return "native";
-        case ComputeWaveRoute::WidthIndependent: return "proven-width-independent";
-        case ComputeWaveRoute::WorkgroupExchange: return "workgroup-exchange";
-        case ComputeWaveRoute::NeedsNLanes: return "n-lanes";
-        case ComputeWaveRoute::Refused: return "refused";
+        case ComputeWaveRoute::Native: return wave64_route_name(Wave64Route::Native);
+        case ComputeWaveRoute::WidthIndependent:
+            return wave64_route_name(Wave64Route::ProvenWidthIndependent);
+        case ComputeWaveRoute::WorkgroupExchange:
+            return wave64_route_name(Wave64Route::WorkgroupExchange);
+        case ComputeWaveRoute::NeedsNLanes: return wave64_route_name(Wave64Route::NLanes);
+        case ComputeWaveRoute::Refused: return wave64_route_name(Wave64Route::Refused);
     }
-    return "refused";
+    return wave64_route_name(Wave64Route::Refused);
 }
 
 uint32_t compute_exchange_scratch_bytes(uint32_t local_invocations, uint32_t guest_wave) {
@@ -117,7 +125,7 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
 
     // The region detectors below print their own PROSPER_DBG lines; tag them so they are not read
     // as the emitter's.
-    if (std::getenv("PROSPER_DBG"))
+    if (PROSPER_ENV_ON("PROSPER_DBG"))
         std::fprintf(stderr, "[wave64-route-analysis] region detector output below belongs to the "
                              "route analysis, not to a recompile\n");
     const auto add = [&](const Rdna2Inst& in, ComputeCrossLaneKind kind, uint32_t native_lanes) {
@@ -195,11 +203,13 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
             else if (mask_operand)
                 add(in, ComputeCrossLaneKind::MaskOther, 0);
         } else if (in.fmt == Rdna2Format::SOP1) {
-            const bool already = in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64;
-            const bool scc_mask = in.opcode == 0x08 || in.opcode == 0x0a ||
-                                  (in.opcode >= 0x24 && in.opcode <= 0x2b);
+            const bool already =
+                in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64;
+            const bool scc_mask =
+                in.opcode == 0x08 || in.opcode == 0x0a || (in.opcode >= 0x24 && in.opcode <= 0x2b);
             const bool plain_move = in.opcode == 0x03 || in.opcode == 0x04;
-            if (!already && scc_mask && mask_operand) add(in, ComputeCrossLaneKind::MaskScc, 0);
+            if (!already && scc_mask && mask_operand)
+                add(in, ComputeCrossLaneKind::MaskScc, 0);
             else if (!already && !plain_move && !scc_mask && mask_operand)
                 add(in, ComputeCrossLaneKind::MaskOther, 0);
         } else if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
@@ -212,8 +222,9 @@ ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, c
                                  (in.opcode >= 0x76 && in.opcode <= 0x78);
             if (is_read && lds_written_since_barrier)
                 add(in, ComputeCrossLaneKind::LdsWaveSync, 64);
-            else if (in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x0f || in.opcode == 0x1e ||
-                     in.opcode == 0x1f || (in.opcode >= 0x4d && in.opcode <= 0x4f))
+            else if (in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x0f ||
+                     in.opcode == 0x1e || in.opcode == 0x1f ||
+                     (in.opcode >= 0x4d && in.opcode <= 0x4f))
                 lds_written_since_barrier = true;
         }
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) lds_written_since_barrier = false;

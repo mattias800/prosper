@@ -40,11 +40,11 @@ enum class ComputeCrossLaneKind : uint8_t {
     DsSwizzle,   // ds_swizzle_b32
     DsBpermute,   // ds_bpermute_b32
     DsAppend,   // ds_append / ds_consume: a wave-collective counter update
-    MaskScc,         // SCC produced from a whole-wave mask (s_cmp_*_u64 / s_and,or,xor,andn2_b64 / saveexec / wqm / not)
-    MaskOther,       // any other scalar op that reads or writes EXEC/VCC as a lane mask
-    WriteLane,       // v_writelane_b32 with a non-inline lane selector
-    LdsWaveSync,     // an LDS read after an LDS write with no s_barrier between: wave-synchronous LDS
-    DsPermute,       // ds_permute_b32
+    MaskScc,   // SCC produced from a whole-wave mask (s_cmp_*_u64 / s_and,or,xor,andn2_b64 / saveexec / wqm / not)
+    MaskOther,   // any other scalar op that reads or writes EXEC/VCC as a lane mask
+    WriteLane,   // v_writelane_b32 with a non-inline lane selector
+    LdsWaveSync,   // an LDS read after an LDS write with no s_barrier between: wave-synchronous LDS
+    DsPermute,   // ds_permute_b32
     Count
 };
 inline constexpr size_t kComputeCrossLaneKindCount =

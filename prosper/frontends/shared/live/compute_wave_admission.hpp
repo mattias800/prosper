@@ -31,11 +31,13 @@ struct ComputeWaveLimits {
 inline ComputeWaveLimits query_compute_wave_limits(VkPhysicalDevice physical) {
     VkPhysicalDeviceProperties properties{};
     if (physical) vkGetPhysicalDeviceProperties(physical, &properties);
-    return {properties.limits.maxComputeSharedMemorySize, properties.limits.maxComputeWorkGroupInvocations};
+    return {properties.limits.maxComputeSharedMemorySize,
+            properties.limits.maxComputeWorkGroupInvocations};
 }
 
 template <class Ctx>
-prosper::gpu::ComputeWaveHost compute_wave_host(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+prosper::gpu::ComputeWaveHost compute_wave_host(const Ctx& ctx,
+                                                const prosper::gpu::ComputeItem& item,
                                                 const ComputeWaveLimits& limits) {
     prosper::gpu::ComputeWaveHost host;
     host.guest_wave = item.recompile_config_available ? item.recompile_config.wave_size : 64u;
@@ -50,8 +52,8 @@ prosper::gpu::ComputeWaveHost compute_wave_host(const Ctx& ctx, const prosper::g
         host.local_z = c.local_z;
         host.guest_lds_bytes = c.lds_bytes;
         if (c.exact_thread_extent)
-            host.partial_workgroup = (c.threads_x % c.local_x) || (c.threads_y % c.local_y) ||
-                                     (c.threads_z % c.local_z);
+            host.partial_workgroup =
+                (c.threads_x % c.local_x) || (c.threads_y % c.local_y) || (c.threads_z % c.local_z);
     }
     host.max_shared_bytes = limits.shared_bytes;
     host.max_workgroup_invocations = limits.invocations;
@@ -65,13 +67,16 @@ prosper::gpu::ComputeWaveHost compute_wave_host(const Ctx& ctx, const prosper::g
 // means "runs as is", which contradicts the refusal beside it (instrument trap 291 in reverse), so
 // the candidate is left empty and the reason is the whole story.
 template <class Ctx>
-prosper::diagnostics::perf::Wave64Candidate compute_wave_candidate(
-    const Ctx& ctx, const prosper::gpu::ComputeItem& item, const prosper::gpu::ComputeWaveOpFacts& facts,
-    const ComputeWaveLimits& limits) {
+prosper::diagnostics::perf::Wave64Candidate
+compute_wave_candidate(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                       const prosper::gpu::ComputeWaveOpFacts& facts,
+                       const ComputeWaveLimits& limits) {
     prosper::diagnostics::perf::Wave64Candidate out;
-    const auto decision = prosper::gpu::select_compute_wave_route(facts, compute_wave_host(ctx, item, limits));
+    const auto decision =
+        prosper::gpu::select_compute_wave_route(facts, compute_wave_host(ctx, item, limits));
     if (decision.route == prosper::gpu::ComputeWaveRoute::Native) return out;
-    std::snprintf(out.route, sizeof out.route, "%s", prosper::gpu::compute_wave_route_name(decision.route));
+    std::snprintf(out.route, sizeof out.route, "%s",
+                  prosper::gpu::compute_wave_route_name(decision.route));
     std::snprintf(out.reason, sizeof out.reason, "%s", decision.reason);
     return out;
 }
@@ -104,7 +109,8 @@ prosper::diagnostics::perf::Wave64Candidate compute_wave_candidate_thunk(const v
 
 // Both compute decline sites of live_compute.cpp.
 template <class Ctx>
-void note_compute_wave_refusal(const Ctx& ctx, const prosper::gpu::ComputeItem& item, uint32_t guest_wave) {
+void note_compute_wave_refusal(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                               uint32_t guest_wave) {
     const ComputeWaveCandidateArg<Ctx> arg{&ctx, &item};
     prosper::diagnostics::perf::note_unsupported_wave64(
         prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup, guest_wave, item.code_addr, 0,
@@ -112,4 +118,4 @@ void note_compute_wave_refusal(const Ctx& ctx, const prosper::gpu::ComputeItem& 
         &compute_wave_candidate_thunk<Ctx>, &arg);
 }
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

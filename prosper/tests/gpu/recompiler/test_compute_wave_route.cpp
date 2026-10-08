@@ -316,7 +316,7 @@ namespace {
 bool has_kind(const ComputeWaveOpFacts& f, ComputeCrossLaneKind k) {
     return f.count[static_cast<size_t>(k)] != 0;
 }
-}  // namespace
+}   // namespace
 
 TEST(ComputeWaveRoute, AWholeWaveSccVoteIsNotWidthIndependent) {
     // v_cmp vcc ; s_cmp_lg_u64 vcc, 0 ; s_cbranch_scc1 +1: SCC reads the whole wave's mask.
@@ -326,8 +326,8 @@ TEST(ComputeWaveRoute, AWholeWaveSccVoteIsNotWidthIndependent) {
 }
 
 TEST(ComputeWaveRoute, ASaveExecSccVoteIsNotWidthIndependent) {
-    const auto facts = analyze({kCmpEqVcc, 0xbe88246au /* s_and_saveexec_b64 s[8:9], vcc */, 0xbf840001u,
-                                0x7e020287u, 0xbefe0408u, kEnd});
+    const auto facts = analyze({kCmpEqVcc, 0xbe88246au /* s_and_saveexec_b64 s[8:9], vcc */,
+                                0xbf840001u, 0x7e020287u, 0xbefe0408u, kEnd});
     EXPECT_TRUE(has_kind(facts, ComputeCrossLaneKind::MaskScc));
 }
 
@@ -350,21 +350,23 @@ TEST(ComputeWaveRoute, WriteLaneWithADynamicSelectorIsInventoriedAndRefused) {
 
 TEST(ComputeWaveRoute, WaveSynchronousLdsIsNamedNotWidthIndependent) {
     // ds_write_b32 v0, v1 ; ds_read_b32 v2, v0 with no s_barrier between.
-    const std::vector<uint32_t> synchronous = {0xd8340000u, 0x00000100u, 0xd8d80000u, 0x02000000u, kEnd};
+    const std::vector<uint32_t> synchronous = {0xd8340000u, 0x00000100u, 0xd8d80000u, 0x02000000u,
+                                               kEnd};
     const auto facts = analyze(synchronous);
     ASSERT_TRUE(has_kind(facts, ComputeCrossLaneKind::LdsWaveSync));
     const auto decision = select_compute_wave_route(facts, nvidia());
     EXPECT_EQ(decision.route, ComputeWaveRoute::Refused);
     EXPECT_EQ(decision.blocker_kind, ComputeCrossLaneKind::LdsWaveSync);
     // A barrier between the store and the load makes it ordinary workgroup LDS.
-    const std::vector<uint32_t> barriered = {0xd8340000u, 0x00000100u, 0xbf8a0000u, 0xd8d80000u,
-                                             0x02000000u, kEnd};
+    const std::vector<uint32_t> barriered = {0xd8340000u, 0x00000100u, 0xbf8a0000u,
+                                             0xd8d80000u, 0x02000000u, kEnd};
     EXPECT_FALSE(has_kind(analyze(barriered), ComputeCrossLaneKind::LdsWaveSync));
 }
 
 TEST(ComputeWaveRoute, EveryDecodedKindIsInventoried) {
-    EXPECT_TRUE(has_kind(analyze({kCmpEqVcc, 0xbf860001u /* s_cbranch_vccz +1 */, 0x7e020287u, kEnd}),
-                         ComputeCrossLaneKind::WaveVote));
+    EXPECT_TRUE(
+        has_kind(analyze({kCmpEqVcc, 0xbf860001u /* s_cbranch_vccz +1 */, 0x7e020287u, kEnd}),
+                 ComputeCrossLaneKind::WaveVote));
     EXPECT_TRUE(has_kind(analyze({0xbe841006u /* s_bcnt1_i32_b64 s4, s[6:7] */, kEnd}),
                          ComputeCrossLaneKind::MaskConsumer));
     EXPECT_TRUE(has_kind(analyze({0xdacc0000u, 0x02000100u /* ds_bpermute_b32 */, kEnd}),
@@ -392,8 +394,8 @@ TEST(ComputeWaveRoute, DppOperationsReportTheirShuffleDomain) {
 
 TEST(ComputeWaveRoute, ADecodedCountedLoopPutsItsOperationInTheLoopContext) {
     // s_mov s0,4 ; loop: v_readlane s6,v1,5 ; s_sub s0,s0,1 ; s_cmp_lg s0,0 ; s_cbranch_scc1 loop
-    const auto facts = analyze({0xbe800384u, 0xd7600006u, 0x00010b01u, 0x80808100u, 0xbf078000u,
-                                0xbf85fffbu, kEnd});
+    const auto facts = analyze(
+        {0xbe800384u, 0xd7600006u, 0x00010b01u, 0x80808100u, 0xbf078000u, 0xbf85fffbu, kEnd});
     ASSERT_EQ(facts.ops.size(), 1u);
     EXPECT_EQ(facts.ops[0].context, ComputeWaveContext::Loop);
     EXPECT_EQ(select_compute_wave_route(facts, nvidia()).route, ComputeWaveRoute::NeedsNLanes);
@@ -402,29 +404,35 @@ TEST(ComputeWaveRoute, ADecodedCountedLoopPutsItsOperationInTheLoopContext) {
 TEST(ComputeWaveRoute, AWaterfallLoopIsALoopEvenBesideARecognisedLoop) {
     // A counted loop, then a waterfall (readfirstlane ; s_andn2_b64 s[6:7],s[6:7],exec ; scc1 back).
     // Its trip count is per wave, so a barrier inside it diverges in a multi-wave workgroup.
-    const std::vector<uint32_t> program = {
-        0xbe800383u, 0x80808100u, 0xbf078000u, 0xbf85fffdu,   // counted loop, 3 trips
-        0x7e080500u, 0x8a867e06u, 0xbf85fffdu,                // waterfall
-        kEnd};
+    const std::vector<uint32_t> program = {0xbe800383u, 0x80808100u, 0xbf078000u,
+                                           0xbf85fffdu,   // counted loop, 3 trips
+                                           0x7e080500u, 0x8a867e06u, 0xbf85fffdu,   // waterfall
+                                           kEnd};
     const auto facts = analyze(program);
     const ComputeCrossLaneOp* waterfall_op = nullptr;
     for (const auto& op : facts.ops)
         if (op.kind == ComputeCrossLaneKind::ReadFirstLane) waterfall_op = &op;
     ASSERT_NE(waterfall_op, nullptr);
     EXPECT_EQ(waterfall_op->context, ComputeWaveContext::Loop);
-    EXPECT_NE(select_compute_wave_route(facts, nvidia(128)).route, ComputeWaveRoute::WorkgroupExchange);
+    EXPECT_NE(select_compute_wave_route(facts, nvidia(128)).route,
+              ComputeWaveRoute::WorkgroupExchange);
 }
 
 TEST(ComputeWaveRoute, ABallotInTheElseArmOfADivergentBranchIsUnproven) {
     // cond = per-wave value ; scc0 -> else. then: v_mov ; s_branch merge. else: ballot. merge: end.
-    const std::vector<uint32_t> program = {
-        kReadFirstLaneS20, kCmpEq0S20, 0xbf840002u /* s_cbranch_scc0 else (+2) */,
-        0x7e020287u /* then: v_mov v1, 7 */, 0xbf820002u /* s_branch merge (+2) */,
-        kCmpEqVcc, kBcnt1Vcc, /* else */ kEnd};
+    const std::vector<uint32_t> program = {kReadFirstLaneS20,
+                                           kCmpEq0S20,
+                                           0xbf840002u /* s_cbranch_scc0 else (+2) */,
+                                           0x7e020287u /* then: v_mov v1, 7 */,
+                                           0xbf820002u /* s_branch merge (+2) */,
+                                           kCmpEqVcc,
+                                           kBcnt1Vcc,
+                                           /* else */ kEnd};
     const auto facts = analyze(program);
     const ComputeCrossLaneOp* ballot = nullptr;
     for (const auto& op : facts.ops)
         if (op.kind == ComputeCrossLaneKind::Ballot) ballot = &op;
     ASSERT_NE(ballot, nullptr);
-    EXPECT_EQ(ballot->context, ComputeWaveContext::UnprovenRegion) << "the else arm is inside the region";
+    EXPECT_EQ(ballot->context, ComputeWaveContext::UnprovenRegion)
+        << "the else arm is inside the region";
 }
