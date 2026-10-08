@@ -22,8 +22,8 @@
 // A refused compile is cached too, so a refused program is not recompiled per draw. Compilation
 // happens at first use inside realization, which runs on the draw realization workers like every
 // other shader compile in prosper; once warm, no draw compiles. The planner and the launch records
-// are rebuilt per distinct draw shape, and an assembled description is reused while the shape and
-// the push-constant words repeat. Both caches are bounded (least recently used is evicted).
+// are rebuilt per distinct draw shape, and an assembled description is reused while the shape, the
+// push-constant words and (for an indexed draw) the index values repeat. Both caches are bounded (least recently used is evicted).
 #pragma once
 
 #include "gpu/execute/ngg_draw_admission.hpp"
@@ -66,6 +66,7 @@ struct NggLiveDrawResult {
     // An admitted triangle STRIP: its odd triangles reach the guest GS in natural order, which
     // open question 3 (#3135) leaves unsettled. Counted so P6 can find the titles relying on it.
     bool strip = false;
+    bool indexed = false;   // an admitted indexed draw (#3135 P6)
 };
 
 // The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded
@@ -88,6 +89,7 @@ struct NggLiveDrawCacheStats {
     uint64_t stage_hits = 0, stage_compiles = 0, stage_evictions = 0;
     uint64_t draw_hits = 0, draw_assemblies = 0;
     uint64_t strip_draws = 0;   // admitted strip draws (see NggLiveDrawResult::strip)
+    uint64_t indexed_draws = 0;   // admitted indexed draws
 };
 NggLiveDrawCacheStats ngg_live_draw_cache_stats();
 void reset_ngg_live_draw_cache_for_test();
