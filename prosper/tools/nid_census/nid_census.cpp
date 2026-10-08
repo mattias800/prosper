@@ -492,7 +492,9 @@ int main(int argc, char** argv) {
             printf("# names: source=%s path=%s named=%zu dropped=%zu malformed=%zu conflicts=%zu\n",
                    prosper_tools::name_source_str(names.source), names_dir.c_str(),
                    names.by_nid.size(), names.dropped, names.rejected, names.conflicts);
-        printf("nid\tname\tname_src\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\n");
+        // name_src is appended as the LAST column so the legacy 0-7 column positions a consumer
+        // depends on stay put; a flat-sourced name is still distinguishable per row.
+        printf("nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\tname_src\n");
         for (const Row* r : selected) {
             std::string libs, tl;
             for (const auto& l : r->libs) {
@@ -503,10 +505,10 @@ int main(int argc, char** argv) {
                 if (!tl.empty()) tl += ",";
                 tl += t;
             }
-            printf("%s\t%s\t%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
-                   r->name.empty() ? "?" : r->name.c_str(), r->name.empty() ? "-" : name_src_tag,
-                   sym_types_of(*r).c_str(), Hle::registered(r->nid) ? 1 : 0, r->titles.size(),
-                   r->modules, libs.c_str(), tl.c_str());
+            printf("%s\t%s\t%s\t%d\t%zu\t%zu\t%s\t%s\t%s\n", r->nid.c_str(),
+                   r->name.empty() ? "?" : r->name.c_str(), sym_types_of(*r).c_str(),
+                   Hle::registered(r->nid) ? 1 : 0, r->titles.size(), r->modules, libs.c_str(),
+                   tl.c_str(), r->name.empty() ? "-" : name_src_tag);
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
                     shown_unregistered, satisfied_cross_module, input_scopes,
