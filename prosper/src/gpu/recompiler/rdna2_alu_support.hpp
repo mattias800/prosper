@@ -440,10 +440,18 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
         if (!has_data(o.value) && !has_data(o.value + 1)) continue;
         if (!scalar_words_projectable(b, rs, o.value, 2)) return false;
     }
-    if (dst == 106 || dst == 107)
-        for (int r : {106, 107})
-            if (has_data(r) && !scalar_words_projectable(b, rs, r, 1)) return false;
     return true;
+}
+
+// The VCC sibling word a B32 write into one VCC half is combined with to form the lane bit. Checked
+// at the three emitters that read it (s_cselect_b32, s_pack_*, the generic B32 VCC-half write), not
+// in the shared guard: a B64 write replaces both words, so its old sibling is not read.
+inline bool vcc_sibling_projectable(SpirvCompute& b, const RegState& rs, int sibling,
+                                    uint32_t pc) {
+    if (scalar_words_projectable(b, rs, sibling, 1)) return true;
+    b.stage_reject_pc = pc;
+    b.stage_reject_reason = "scalar-fabricated-lane-mask";
+    return false;
 }
 
 // A B64 wave-mask logical (s_and_b64 and family) whose operand is an ordinary scalar DATA pair:
