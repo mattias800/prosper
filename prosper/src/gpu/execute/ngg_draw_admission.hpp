@@ -22,6 +22,8 @@
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace prosper::gpu {
 
@@ -104,6 +106,10 @@ struct NggDrawFacts {
     uint32_t vertex_count = 0;
     uint32_t instance_count = 1;
     bool indexed = false;
+    // An indexed draw's indices, read by the caller (ngg_draw_indices.hpp), or the rule that
+    // refused reading them. Neither: the caller could not reach the buffer (ngg-index-unavailable).
+    std::shared_ptr<const std::vector<uint32_t>> indices;
+    const char* index_refusal = nullptr;
     bool indirect = false;
     bool vertex_offset = false;   // GE_INDX_OFFSET or an indirect vertex offset is non-zero
     // Colour target 0's renderable volume view (color_target_volume_view); zero slices = not layered.
@@ -146,7 +152,11 @@ struct NggDrawAdmission {
 //   ngg-input-topology            anything but a triangle list or strip (adjacency, rect, quad,
 //                                 fan, points, lines, patches)
 //   ngg-output-topology           VGT_GS_OUT_PRIM_TYPE points or rect list
-//   ngg-indexed / ngg-indirect / ngg-vertex-offset   (P6)
+//   ngg-index-unavailable         an indexed draw whose index buffer was not read: no address or
+//                                 count, an unknown element size, or unreadable bytes
+//   ngg-index-element-size / ngg-index-count / ngg-index-restart-unknown / ngg-index-restart
+//                                 the index decode refused (ngg_draw_indices.hpp)
+//   ngg-indirect / ngg-vertex-offset   (P6)
 //   ngg-viewport-index / ngg-point-size / ngg-clip-cull-distance / ngg-user-clip-plane /
 //   ngg-vertex-kill-flag          per-vertex state the pass-through stage does not model
 //   ngg-vs-out-undecoded          PA_CL_VS_OUT_CNTL bits [31:25], until each is decoded

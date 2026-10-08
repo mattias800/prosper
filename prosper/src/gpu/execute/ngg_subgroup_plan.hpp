@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -55,12 +56,18 @@ NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32
 // Input topologies the planner models. Anything else is refused.
 enum class NggInputTopology : uint8_t { TriangleList, TriangleStrip };
 
-// A non-indexed draw (indexed draws are a later phase).
+// The draw. Input vertex k of an instance (k < vertex_count) is vertex k for a non-indexed draw and
+// vertex indices[k] for an indexed one (#3135 P6). Either way VertexID (v5) = first_vertex + that
+// vertex, and ES vertices are deduplicated by it within a subgroup -- so an indexed draw that
+// repeats an index runs it on one ES lane, as the hardware's vertex grouper does.
 struct NggDrawShape {
     NggInputTopology topology = NggInputTopology::TriangleList;
-    uint32_t vertex_count = 0;
+    uint32_t vertex_count = 0;   // an indexed draw: indices->size()
     uint32_t instance_count = 1;
     uint32_t first_vertex = 0;   // added to every VertexID (v5)
+    // The guest's indices, widened to 32 bits, in API order (ngg_draw_indices.hpp). Null for a
+    // non-indexed draw.
+    std::shared_ptr<const std::vector<uint32_t>> indices;
 };
 
 struct NggSubgroupBudget {
@@ -75,8 +82,8 @@ struct NggSubgroup {
     uint32_t instance = 0;
     uint32_t first_vertex = 0;   // the draw's, carried so the launch has one source for VertexID
     uint32_t first_prim = 0;   // the instance-local index of the first primitive
-    // Unique vertex indices (VertexID before first_vertex), in first-use order: ES lane e runs
-    // es_vertex[e].
+    // Unique input vertices (VertexID before first_vertex: the index VALUE for an indexed draw), in
+    // first-use order: ES lane e runs es_vertex[e].
     std::vector<uint32_t> es_vertex;
     // Per primitive, the ES lanes of its three vertices in input order.
     std::vector<uint32_t> prim_slot;   // 3 per primitive
@@ -91,6 +98,10 @@ struct NggSubgroupPlan {
     bool ok() const { return refusal.empty(); }
 };
 
+// Every instance is partitioned identically (instances are never packed), so the plan is one
+// instance's partition repeated with each InstanceID. Refusals: ngg-limits-unusable,
+// ngg-subgroup-too-wide, ngg-subgroup-plan-budget, ngg-index-count-mismatch (an indexed shape whose
+// vertex_count is not its index count).
 NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLimits& limits,
                                    const NggSubgroupBudget& budget = {});
 

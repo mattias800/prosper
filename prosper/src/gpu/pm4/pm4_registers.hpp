@@ -502,6 +502,9 @@ constexpr uint32_t VGT_PRIMITIVEID_RESET  = 0x2A3;
 constexpr uint32_t VGT_DRAW_PAYLOAD_CNTL  = 0x2A6;
 constexpr uint32_t VGT_ESGS_RING_ITEMSIZE = 0x2AB;
 constexpr uint32_t VGT_REUSE_OFF          = 0x2AD;
+// Context register 0x2840C (Mesa R_02840C_VGT_MULTI_PRIM_IB_RESET_INDX): the primitive restart value
+// that GE_MULTI_PRIM_IB_RESET_EN (UCONFIG) enables. Read by the merged-NGG index fetch (#3135 P6).
+constexpr uint32_t VGT_MULTI_PRIM_IB_RESET_INDX = 0x103;
 constexpr uint32_t DB_HTILE_SURFACE                               = 0x2AF;
 constexpr uint32_t DB_HTILE_SURFACE_LINEAR_SHIFT                  = 0;
 constexpr uint32_t DB_HTILE_SURFACE_LINEAR_MASK                   = 0x1;

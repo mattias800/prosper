@@ -61,7 +61,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         return refuse("ngg-input-topology");
     admission.topology = ngg_output_topology(registers.vgt_gs_out_prim_type);
     if (admission.topology == NggOutputTopology::Unsupported) return refuse("ngg-output-topology");
-    if (facts.indexed) return refuse("ngg-indexed");
+    if (facts.indexed) {
+        if (facts.index_refusal) return refuse(facts.index_refusal);
+        if (!facts.indices) return refuse("ngg-index-unavailable");
+    }
     if (facts.indirect) return refuse("ngg-indirect");
     if (facts.vertex_offset) return refuse("ngg-vertex-offset");
 
@@ -106,6 +109,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         registers.vgt_gs_onchip_cntl, registers.ge_cntl, registers.ge_max_output_per_subgroup,
         registers.vgt_gs_max_vert_out, registers.vgt_esgs_ring_itemsize);
     admission.shape.vertex_count = facts.vertex_count;
+    if (facts.indexed) {
+        admission.shape.indices = facts.indices;
+        admission.shape.vertex_count = static_cast<uint32_t>(facts.indices->size());
+    }
     admission.shape.instance_count = facts.instance_count;
     admission.shape.first_vertex = 0;
 

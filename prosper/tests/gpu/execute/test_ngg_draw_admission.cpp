@@ -14,13 +14,16 @@
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_subgroup_shell.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -155,7 +158,12 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 2u; }},   // lines
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 0u; }},
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 3u; }},
-        {"ngg-indexed", [](auto&, auto& f, auto&) { f.indexed = true; }},
+        {"ngg-index-unavailable", [](auto&, auto& f, auto&) { f.indexed = true; }},
+        {"ngg-index-restart",
+         [](auto&, auto& f, auto&) {
+             f.indexed = true;
+             f.index_refusal = "ngg-index-restart";
+         }},
         {"ngg-indirect", [](auto&, auto& f, auto&) { f.indirect = true; }},
         {"ngg-vertex-offset", [](auto&, auto& f, auto&) { f.vertex_offset = true; }},
         {"ngg-viewport-index",
@@ -241,6 +249,32 @@ TEST(NggDrawAdmission, AdmittedTwins) {
     h.vertex_pipeline_stores = false;
     EXPECT_FALSE(admit_ngg_draw(kena_registers(), kena_facts(), h).count_violations)
         << "no vertex stores: admitted without counting";
+}
+
+// #3135 P6: an indexed draw is admitted with its indices, and the INDEX count -- not the packet's
+// vertex count the caller passed, which a stale or non-indexed reading would leave -- sizes the
+// shape. Kena's past-New-Game shape: an 18-index list, 41 instances, into a 64-slice volume.
+TEST(NggDrawAdmission, IndexedListIsAdmittedWithItsIndices) {
+    auto r = kena_registers();
+    r.primitive_type = 4u;   // triangle list
+    auto f = kena_facts(41);
+    f.target_slices = 64;
+    f.indexed = true;
+    std::vector<uint32_t> values;
+    for (uint32_t quad = 0; quad < 3u; ++quad)
+        values.insert(values.end(), {4 * quad, 4 * quad + 1, 4 * quad + 2, 4 * quad + 2,
+                                     4 * quad + 1, 4 * quad + 3});
+    f.indices = std::make_shared<const std::vector<uint32_t>>(values);
+    f.vertex_count = 4;   // what a non-indexed reading of the packet would say
+    const NggDrawAdmission a = admit_ngg_draw(r, f, radv());
+    ASSERT_TRUE(a.ok()) << a.refusal;
+    EXPECT_EQ(a.shape.indices, f.indices);
+    EXPECT_EQ(a.shape.vertex_count, 18u);
+    EXPECT_EQ(a.shape.instance_count, 41u);
+    EXPECT_EQ(a.shape.topology, NggInputTopology::TriangleList);
+    EXPECT_EQ(a.layer_slices, 64u);
+    f.indexed = false;   // the same facts read as non-indexed carry no indices into the shape
+    EXPECT_EQ(admit_ngg_draw(r, f, radv()).shape.indices, nullptr);
 }
 
 TEST(NggDrawAdmission, RegistersAndUserDataAreReadFromTheDrawState) {
@@ -450,6 +484,47 @@ TEST_F(NggLiveDraw, AWarmEntryIsNotReusedAcrossAResourceAdmissionChange) {
     EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, compiles + 1);
 }
 
+// #3135 P6: the draw cache keys an indexed draw on its index VALUES. Two indexed draws with the
+// same count, instances and push words but different indices must get different descriptions (the
+// launch records carry different VertexIDs), the same indices must hit, and the compiled stages are
+// shared by all of them.
+TEST_F(NggLiveDraw, IndexedDrawsAreCachedByTheirIndexValues) {
+    const auto with = [](std::vector<uint32_t> values) {
+        auto in = kena_input(3);
+        in.registers.primitive_type = 4u;   // triangle list
+        in.facts.indexed = true;
+        in.facts.indices = std::make_shared<const std::vector<uint32_t>>(std::move(values));
+        return in;
+    };
+    const auto first = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 3}), radv());
+    ASSERT_TRUE(first.draw) << (first.refusal ? first.refusal : "") << " " << first.detail;
+    EXPECT_TRUE(first.indexed);
+    const auto launch_v5 = [](const NggSubgroupDraw& draw, uint32_t lane) {
+        return draw.groups[0].launch_words[lane * kNggLaunchWordsPerLane + 5u];
+    };
+    EXPECT_EQ(launch_v5(*first.draw, 3), 3u);
+
+    const auto same = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 3}), radv());
+    EXPECT_EQ(same.draw, first.draw) << "the same index values reuse the description";
+
+    const auto other = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 7}), radv());
+    ASSERT_TRUE(other.draw);
+    EXPECT_NE(other.draw, first.draw) << "different index values are a different plan";
+    EXPECT_EQ(launch_v5(*other.draw, 3), 7u) << "lane 3 runs index 7";
+    EXPECT_EQ(other.draw->groups[0].stages, first.draw->groups[0].stages)
+        << "indices never reach the compiled stages";
+
+    // The same draw read as non-indexed (vertices 0..5) is not the indexed one.
+    auto plain = kena_input(3);
+    plain.registers.primitive_type = 4u;
+    plain.facts.vertex_count = 6;
+    const auto unindexed = realize_ngg_live_draw(plain, radv());
+    ASSERT_TRUE(unindexed.draw);
+    EXPECT_NE(unindexed.draw, first.draw);
+    EXPECT_FALSE(unindexed.indexed);
+    EXPECT_EQ(ngg_live_draw_cache_stats().indexed_draws, 3u) << "first, same and other";
+}
+
 TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {
     auto in = kena_input();
     in.user_data_complete = false;
@@ -459,7 +534,7 @@ TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {
 
     in = kena_input();
     in.facts.indexed = true;
-    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-indexed");
+    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-index-unavailable");
 
     // Four user SGPRs where the chain reads eight: the shell refuses, by the ABI rule's name.
     in = kena_input();

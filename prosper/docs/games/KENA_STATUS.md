@@ -9,6 +9,44 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Indexed merged-NGG draws are admitted; ABI and fold refusals come next (2026-10-08, #3135 P6)
+
+Measured on Linux/RADV:
+- `prosper-app` in a visible window, default launch with `PROSPER_NULL_PAGE=1` and an empty `PROSPER_GUEST_ARGS`;
+- `PROSPER_DROPPED_DRAW_CENSUS=1`;
+- the route `scripts/kena/linux-reach-level-load.pad`, 660 s per run.
+
+Before is `main` `debe081ed`. After is the P6 branch at two commits:
+- indexed admission alone;
+- indexed admission plus the EXEC save/restore rule.
+
+Counts stop at the Vulkan device loss at the first level load. That loss predates this work, and all three runs reached it at about 300 s of pad time.
+
+| program pair (refused-index hashes) | shape | `main` | indexed admission | + EXEC restore |
+|---|---|---|---|---|
+| `11562c72` + `2fc43332` | 6 indices, 1 instance, 64 slices (three addresses) | `ngg-indexed` | `ngg-abi-read-s0-s1` pc 154 | `ngg-abi-read-s0-s1` pc 154 |
+| `b77161c6` + `0ff40cdf` (pixel `f1d1baa8`) | 18 indices, 41 instances, 64 slices | `ngg-indexed` | `ngg-abi-read-v6-v7` pc 121 | `ngg-compile-rejected`, prolog pc 55 |
+
+- **No `ngg-indexed` refusal remains.** Before: 2 programs (4 draw shapes). After: 0. Both programs now pass index fetch, planning and admission, and are refused further on:
+  - **`11562c72` reads s0** at linked pc 154. s0 is the user-data address (`SPI_SHADER_USER_DATA_ADDR_LO_GS`). The shell supplies it only when the caller knows it, and live admission never does.
+  - **`b77161c6`'s v7 read at pc 121 was a false positive** of the ABI analysis, fixed in the same PR:
+    - v7 is written at pc 8 under the ES EXEC;
+    - EXEC is saved with `s_mov_b64 s[36:37], exec` at pc 20 and restored with `s_mov_b64 exec, s[36:37]` at pc 104;
+    - the `ds_write_b32` at pc 121 reads v7 only on the lanes that wrote it.
+
+    The program then reaches its compile and is refused at prolog pc 55, `s_load_dwordx4 s[8:11], s[16:17], vcc_lo`. That is a descriptor load at a register offset read from a constant-buffer word at pc 5, and the linked fold leaves it unresolved (`unresolved-operand`). **So `f1d1baa8`'s draw still does not render.**
+- **After the device loss** (not counted, and not comparable between arms), two more indexed programs show up:
+  - `52c7e8ff` is refused `ngg-layer-target-not-layered`: it reads the layer but draws into a 2D target;
+  - `4324d9f3` (26–27 instances) is refused `ngg-user-sgpr-count`.
+- **`dropped-draws` before the loss:** 4 windows on `main`, all `shader-recompile/fragment` (197). They come from `ps 0x504b9b0000`, which is #4700's intermittent refusal. The two branch runs had 1 window and 0.
+- **The title route is unchanged.**
+  - No merged-NGG refusal occurs before New Game on any arm.
+  - Title-menu frames at pad flip 500 differ by mean |diff| 5.6 and 3.9 between `main` and the two branch runs, and by 5.5 between the two branch runs themselves (animated foliage and light).
+- **Cross-title check: Dragon Quest VII**, `scripts/dragon-quest-vii/reach-title-screen.pad`, 150 s, two arms of each binary.
+  - The adventure-log frames at pad flips 1000, 1500, 2000 and 2500 are byte-identical between `main` and the branch.
+  - The title frame at flip 600 differs by mean |diff| 3.8 between `main` and the branch, and by 3.9 between two branch runs (the animated sea).
+  - A first, cold `main` run reached the title later and is excluded from the comparison. Its frames are a different screen, not a different picture.
+
 ## The sun lights the title-menu scene again (2026-10-07, #4703)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
@@ -616,6 +654,12 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Indexed merged-NGG draws need the subgroup shell to take per-lane vertex indices** — false. Every lane's launch values already come from per-lane records that the CPU writes:
+  - v5 = `first_vertex + es_vertex[t]`, and v8 is the instance;
+  - the P1 planner already deduplicated `es_vertex` by value.
+
+  An indexed draw is a planner input. The shell, the backend and the capture record are unchanged (2026-10-08, #3135 P6).
+- **`b77161c6` reads the undefined ES user VGPR v7 at pc 121** — false. It writes v7 at pc 8 under the ES EXEC, saves and restores that EXEC through `s[36:37]`, and stores v7 only on those lanes. The ABI analysis lost the definition at the restore (2026-10-08, #3135 P6).
 - **The washed-out, over-bright grade is auto-exposure brightening a scene with no sun** — false.
   Restoring the sun (#4703) made the title-menu frame brighter, not darker: mean luminance 92.1 on
   `main`, 99.7 with the fix, 44.4 on the PS5 oracle (2026-10-07, #4703).
