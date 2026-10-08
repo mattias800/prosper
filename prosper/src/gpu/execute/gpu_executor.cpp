@@ -4519,7 +4519,8 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
                 const bool latched_offset_source =
-                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u &&
+                    static_cast<int32_t>(in.literal) >= 0 && (in.literal & 3u) == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -6131,7 +6132,8 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
 
 // A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
+// GPU. The proof authenticates this read point (any non-negative immediate: `addr` is the effective
+// address, immediate included); the table owns its 4 or 8 bytes from index zero.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
     const bool x2 = use.required_size == 2u * sizeof(uint32_t);

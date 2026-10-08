@@ -255,7 +255,10 @@ TEST(MemoryFedRawWide, Contract) {
     CHECK(proof(unaligned_read).empty(), "unaligned source immediate stays unproven");
     auto nonzero_read = code;
     nonzero_read[1] = 0xfa000004u;
-    CHECK(proof(nonzero_read).empty(), "even aligned nonzero source immediates stay outside this unit");
+    // #3135 widened the unit to aligned non-negative immediates (Kena's indexed NGG prolog reads its
+    // selector at +4); test_raw_offset_immediate_source pins the snapshot and the emitted read.
+    CHECK(proof(nonzero_read) == std::vector<uint32_t>{7u},
+          "an aligned nonzero source immediate is a latched source too");
     auto negative_read = code;
     negative_read[1] = 0xfa1ffffcu;
     CHECK(proof(negative_read).empty(), "negative source immediate stays outside this subset");

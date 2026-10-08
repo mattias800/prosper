@@ -981,13 +981,20 @@ rdna2_proven_raw_register_wide_data_loads(const std::vector<Rdna2Inst>& ins,
             // after the read while preserving the loaded scalar that supplies SOFFSET. UE4's
             // vertex-factory fetch loads its index pair with s_load_dwordx2 (Kena, #4578); the
             // owned snapshot then carries both words, since the emitted load writes both.
+            // The immediate need not be zero (#3135): Kena's indexed NGG prolog b77161c6 reads
+            // its selector with `s_load_dword s38, s[18:19], 0x4`. The fold observes the words
+            // at the EFFECTIVE address and the snapshot holds exactly those, so the emitted load
+            // reads them from index zero whatever the immediate was. A negative immediate stays
+            // out (the emitter refuses an immediate-only scalar load whose offset would wrap), and
+            // so does an unaligned one (the fold rounds the address down to a dword).
             const bool immediate_scalar_read =
                 writer.fmt == Rdna2Format::SMEM && (writer.opcode == 0u || writer.opcode == 1u) &&
                 writer.dst.kind == OperandKind::SGPR && writer.dst.value >= 0 &&
                 writer.dst.value + static_cast<int>(writer.opcode) <= 105 &&
                 writer.src[0].kind == OperandKind::SGPR && writer.src[0].value >= 0 &&
                 writer.src[0].value < 105 && writer.src[1].kind == OperandKind::Special &&
-                writer.src[1].value == 125 && writer.literal == 0u;
+                writer.src[1].value == 125 && static_cast<int32_t>(writer.literal) >= 0 &&
+                (writer.literal & 3u) == 0u;
             if (immediate_scalar_read) {
                 bool entry_at_read = true;
                 for (size_t prefix = 0; prefix < j && entry_at_read; ++prefix) {
