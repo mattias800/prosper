@@ -72,6 +72,10 @@ struct NggLiveDrawResult {
     // open question 3 (#3135) leaves unsettled. Counted so P6 can find the titles relying on it.
     bool strip = false;
     bool indexed = false;   // an admitted indexed draw (#3135 P6)
+    // A depth-only draw whose layer addresses a depth array: one draw per slice, slice
+    // depth_first_slice + k drawing layer k's primitives (index 0 is `draw`). Empty otherwise.
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> depth_slices;
+    uint32_t depth_first_slice = 0;
 };
 
 // The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded

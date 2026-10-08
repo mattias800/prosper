@@ -127,6 +127,15 @@ struct NggDrawFacts {
     // (DB_DEPTH_VIEW present with SLICE_START and SLICE_MAX 0). A layered depth array behind a 2D
     // colour target is how a shadow-cascade pass looks, and its layer is real.
     bool other_attachments_single_slice = false;
+    // The draw writes no colour slot (CB_TARGET_MASK selects none with a bound base): its only
+    // attachment is depth/stencil, and a layer addresses a slice of that.
+    bool depth_only = false;
+    // Depth/stencil is bound, and DB_DEPTH_VIEW is present: its slices are
+    // [depth_first_slice, depth_first_slice + depth_slice_count).
+    bool depth_bound = false;
+    bool depth_view_known = false;
+    uint32_t depth_first_slice = 0;
+    uint32_t depth_slice_count = 0;
     // The user-data range the program's AGC header declares (user_data_range_start/end).
     bool user_data_range_known = false;
     uint32_t user_data_range_start = 0;
@@ -154,6 +163,11 @@ struct NggDrawAdmission {
     NggLayerRoute route = NggLayerRoute::None;
     bool count_violations = false;
     bool native_wave64 = false;
+    // A depth-only draw whose layer addresses a depth array of this many slices (0: none). It is
+    // replayed once per slice: slice depth_first_slice + k draws the primitives of layer k, into
+    // the backend's single-layer image of that guest slice (NggRasterCommitConfig::layer_select).
+    uint32_t depth_slice_fanout = 0;
+    uint32_t depth_first_slice = 0;
     bool ok() const { return applies && !refusal; }
 };
 
@@ -176,6 +190,11 @@ struct NggDrawAdmission {
 //   ngg-vs-out-undecoded          PA_CL_VS_OUT_CNTL bits [31:25], until each is decoded
 //   ngg-layer-target-not-layered  the layer is read and colour target 0 is neither a layered volume
 //                                 nor a proven one-slice view (a 2D array, or a view not programmed)
+//   ngg-layer-attachments-mixed   the layer is read and the bound attachments disagree on shape:
+//                                 a one-slice colour target beside a layered depth array, or a
+//                                 layered colour volume beside any bound depth/stencil (which the
+//                                 backend binds as one layer). One layer cannot address both
+//                                 (#3135 layered NGG depth)
 //   ngg-layer-target-not-single-slice  the layer is read, colour target 0 is one slice, and another
 //                                 bound attachment (a colour slot, or depth/stencil) is not proven
 //                                 one slice. The layer may then address a real slice of it, which

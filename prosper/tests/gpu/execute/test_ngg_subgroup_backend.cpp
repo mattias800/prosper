@@ -17,6 +17,9 @@
 //   * #3135 P6, indexed draws: an instanced triangle list of scattered 16- and 32-bit indices
 //     covers every instance's layer, the index VALUES (not their positions) decide which half of
 //     the screen one triangle covers, and each instance's primitives land on their own slice.
+//   * Layered NGG depth: a depth-only VS-only draw whose layer addresses a depth array, replayed
+//     per slice, leaves layer k's exact depth in slice k, and two such draws split one pass with no
+//     colour carried.
 #include "fixtures/render_runner.h"
 
 #include "fixtures/ngg_merged_lut_fixture.hpp"
@@ -24,6 +27,7 @@
 #include "fixtures/ngg_subgroup_runner.h"
 #include "fixtures/test_data.h"
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
 #include "gpu/execute/ngg_draw_indices.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/ngg_subgroup_plan.hpp"
@@ -1262,6 +1266,233 @@ TEST(NggSubgroupBackend, VsOnlyLayerAddressesAOneSliceTarget) {
             EXPECT_EQ(after.culled - before.culled, second_layer ? 1u : 0u)
                 << "the out-of-range layer is counted";
     }
+}
+
+// ---- Layered depth: a depth-only draw replayed per slice -----------------------------------------
+//
+// The VS-only program above with its layer and depth taken from the vertex: VertexID (v5) bits 0
+// and 1 place the corner as before, layer = VertexID >> 2 is exported in POS1.z, and POS0.z =
+// (layer + 1) / 8. Assembled with llvm-mc -mcpu=gfx1030.
+const uint32_t kVsOnlyDepthLayers[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x2C280A82u, 0x4A1E2881u, 0x7E1E0D0Fu, 0x101E1EFFu, 0x3E000000u, 0x7E2002F2u,
+    0xF80000CFu, 0x100F0E0Du, 0xF80008D4u, 0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u,
+    0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// The per-slice replays of one depth-only draw, as ngg_live_draw builds them: one draw compiled to
+// select its layer at draw time, then per slice a copy selecting that layer.
+std::vector<std::shared_ptr<const NggSubgroupDraw>> depth_slice_draws(const RenderVkCtx& ctx,
+                                                                      std::vector<uint32_t> indices,
+                                                                      uint32_t slices,
+                                                                      std::string* why) {
+    static const ShaderResourceTable none;
+    NggSubgroupDrawRequest request;
+    request.linked_code = kVsOnlyDepthLayers;
+    request.dwords = std::size(kVsOnlyDepthLayers);
+    request.resources = &none;
+    request.limits = vs_only_limits();
+    request.shape.topology = NggInputTopology::TriangleList;
+    request.shape.vertex_count = static_cast<uint32_t>(indices.size());
+    request.shape.indices = std::make_shared<const std::vector<uint32_t>>(std::move(indices));
+    request.raster.topology = NggOutputTopology::TriangleList;
+    request.raster.layer_from_pos1 = true;
+    request.raster.layer_slices = slices;
+    request.raster.route = NggLayerRoute::None;
+    request.raster.layer_select = true;
+    request.raster.count_violations = ngg_backend_counts_violations(ctx);
+    request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e930000ull};
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> out;
+    auto base = build_ngg_subgroup_draw(request, why);
+    if (!base) return out;
+    out.push_back(base);
+    for (uint32_t layer = 1; layer < slices; ++layer) {
+        auto replay = std::make_shared<NggSubgroupDraw>(*base);
+        replay->layer_select = layer;
+        out.push_back(std::move(replay));
+    }
+    return out;
+}
+
+// Depth-only state for one slice of the array at `base`: Z test LESS with writes (a fresh image
+// starts at the far value 1.0), CB_TARGET_MASK 0, DB_DEPTH_VIEW naming exactly `slice`.
+ResolvedPipelineState depth_slice_state(uint64_t base, uint32_t slice) {
+    ResolvedPipelineState state = flipped_state();
+    state.depth_test_enable = true;
+    state.depth_write_enable = true;
+    state.depth_compare_op = VK_COMPARE_OP_LESS;
+    state.depth_read_base = base;
+    state.depth_write_base = base;
+    // The guest's whole-array view, slices 1..4, narrowed as expand_ngg_depth_slices narrows it.
+    const uint32_t array_view = 1u | (4u << prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT);
+    state.db_depth_view = depth_view_for_slice(array_view, slice);
+    state.color_write_mask = 0;
+    state.color1_write_mask = 0;
+    return state;
+}
+
+// Two depth-only draws into a four-slice depth array (guest slices 1..4), each replayed per slice
+// in one pass per slice, as the renderer groups them. Draw A covers the upper-right half on layers
+// 0..3 plus one primitive on layer 4, which the view does not have; draw B the lower-left half on
+// layers 0..3. Every slice k then holds exactly (k + 1) / 8 in both halves:
+//   * the layer chose the slice: an unselected replay puts layer 0's 0.125 in every slice;
+//   * the pass split between A and B carried depth: a lost segment leaves A's half at 1.0;
+//   * the pass wrote no colour, so its split needs no colour target and reads nothing back.
+// The layer-4 primitive is culled and counted once, in the slice-0 replay.
+TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    constexpr uint32_t kSlices = 4, kFirst = 1;
+    constexpr uint64_t kDepth = 0x4e474734d000ull;
+    std::vector<uint32_t> upper, lower;
+    for (uint32_t layer = 0; layer < kSlices; ++layer) {
+        const uint32_t v = 4u * layer;
+        upper.insert(upper.end(), {v + 1u, v + 3u, v + 2u});
+        lower.insert(lower.end(), {v + 0u, v + 1u, v + 2u});
+    }
+    upper.insert(upper.end(), {17u, 19u, 18u});   // layer 4
+    std::string why;
+    const auto a = depth_slice_draws(*ctx, upper, kSlices, &why);
+    ASSERT_EQ(a.size(), kSlices) << why;
+    const auto b = depth_slice_draws(*ctx, lower, kSlices, &why);
+    ASSERT_EQ(b.size(), kSlices) << why;
+
+    std::array<ResolvedPipelineState, kSlices> states;
+    const StatsSnapshot before = stats_now();
+    for (uint32_t k = 0; k < kSlices; ++k) {
+        states[k] = depth_slice_state(kDepth, kFirst + k);
+        std::vector<BackendDraw> pass(2);
+        for (uint32_t i = 0; i < 2; ++i) {
+            pass[i].ngg_subgroup = i ? b[k] : a[k];
+            pass[i].fs = ngg_param_fragment(0, false);
+            pass[i].ps = &states[k];
+        }
+        ASSERT_TRUE(backend_draws_leave_colour(pass));
+        (void)render_draws_rgba(pass, kSize, kSize, nullptr, nullptr, true, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, true, nullptr, false);
+    }
+    const StatsSnapshot after = stats_now();
+    EXPECT_EQ(after.draws - before.draws, 2u * kSlices) << "no replay was dropped";
+    EXPECT_EQ(after.invalid - before.invalid, 0u);
+    if (ngg_backend_counts_violations(*ctx))
+        EXPECT_EQ(after.culled - before.culled, 1u) << "layer 4 is culled, counted once";
+
+    std::vector<float> depth;
+    std::string error;
+    ASSERT_EQ(read_persistent_ds_depth_array(kDepth, kSize, kSize, kFirst, kSlices, depth, error),
+              PersistentDsDepthArrayStatus::Ready)
+        << error;
+    ASSERT_EQ(depth.size(), static_cast<size_t>(kSlices) * kSize * kSize);
+    for (uint32_t k = 0; k < kSlices; ++k) {
+        const float expected = static_cast<float>(k + 1u) / 8.0f;
+        uint32_t upper_px = 0, lower_px = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+            for (uint32_t x = 0; x < kSize; ++x) {
+                if (x < y + 2u && y < x + 2u) continue;   // the diagonal margin
+                const float z = depth[(static_cast<size_t>(k) * kSize + y) * kSize + x];
+                ASSERT_EQ(z, expected) << "slice " << kFirst + k << " (" << x << "," << y << ")";
+                (x >= y + 2u ? upper_px : lower_px)++;
+            }
+        EXPECT_EQ(upper_px, 105u);
+        EXPECT_EQ(lower_px, 105u);
+    }
+
+    // The colour attachment of a colourless split restarts from the caller's clear in every
+    // segment, so the final readback is that clear -- exactly what one unsplit draw returns, and
+    // not the default clear a segment without the caller's arguments would show.
+    const float kColour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    std::vector<BackendDraw> split_pass(2);
+    for (uint32_t i = 0; i < 2; ++i) {
+        split_pass[i].ngg_subgroup = i ? b[0] : a[0];
+        split_pass[i].fs = ngg_param_fragment(0, false);
+        split_pass[i].ps = &states[0];
+    }
+    const auto split = render_draws_rgba(split_pass, kSize, kSize, nullptr, kColour, true);
+    const auto whole = render_draws_rgba({split_pass[0]}, kSize, kSize, nullptr, kColour, true);
+    const auto unset = render_draws_rgba({split_pass[0]}, kSize, kSize, nullptr, nullptr, true);
+    ASSERT_FALSE(split.empty());
+    EXPECT_EQ(split, whole) << "every segment starts from the caller's clear";
+    EXPECT_NE(split, unset) << "control: the clear is visible in the readback";
+
+    // Control: the same pair writing colour has no colour target to carry it across the split,
+    // and is dropped by name rather than drawn with a readback per segment.
+    ResolvedPipelineState coloured = states[0];
+    coloured.color_write_mask = 0xfu;
+    BackendDraw pair_a, pair_b;
+    pair_a.ngg_subgroup = a[0];
+    pair_b.ngg_subgroup = b[0];
+    pair_a.ps = pair_b.ps = &coloured;
+    pair_a.fs = pair_b.fs = ngg_param_fragment(0, false);
+    const auto host = ngg_host_capabilities(*ctx);
+    EXPECT_STREQ(ngg_backend_draw_refusal(
+                     pair_a, host, 2, true, nullptr, 1,
+                     backend_draws_leave_colour(std::vector<BackendDraw>{pair_a, pair_b})),
+                 "ngg-backend-readback-split");
+    EXPECT_EQ(ngg_backend_draw_refusal(pair_a, host, 2, true, nullptr, 1, true), nullptr)
+        << "control: the colourless call splits safely";
+    EXPECT_STREQ(ngg_backend_draw_refusal(pair_a, host, 2, false, nullptr, 1, true),
+                 "ngg-backend-transient-depth-split")
+        << "transient depth is never carried, colour or not";
+}
+
+// The rule the split uses: a draw leaves colour only when no slot's write mask is set and it has
+// no other colour route; and the contract each segment of such a call renders under.
+TEST(NggSubgroupBackend, OnlyAMaskedCallSplitsWithoutCarryingColour) {
+    ResolvedPipelineState state;
+    state.color_write_mask = 0;
+    BackendDraw draw;
+    draw.ps = &state;
+    EXPECT_TRUE(backend_draw_leaves_colour(draw));
+    ResolvedPipelineState slot0 = state;
+    slot0.color_write_mask = 0x1u;
+    ResolvedPipelineState slot1 = state;
+    slot1.color1_write_mask = 0x8u;
+    ResolvedPipelineState slot5 = state;
+    slot5.color_targets[5].write_mask = 0x2u;
+    for (const ResolvedPipelineState* writes : {&slot0, &slot1, &slot5}) {
+        BackendDraw w = draw;
+        w.ps = writes;
+        EXPECT_FALSE(backend_draw_leaves_colour(w));
+        EXPECT_FALSE(backend_draws_leave_colour(std::vector<BackendDraw>{draw, w}))
+            << "one writer makes the call coloured";
+    }
+    // A decoded fast-clear value is register state, not a write: the backend never acts on it per
+    // draw (Kena's shadow passes carry one with CB_TARGET_MASK 0).
+    ResolvedPipelineState cleared = state;
+    cleared.has_clear_color = true;
+    cleared.has_clear_color1 = true;
+    cleared.color_targets[3].has_clear = true;
+    BackendDraw clear_value = draw;
+    clear_value.ps = &cleared;
+    EXPECT_TRUE(backend_draw_leaves_colour(clear_value));
+    BackendDraw stateless;
+    EXPECT_FALSE(backend_draw_leaves_colour(stateless)) << "no state: a draw writes RGBA";
+    EXPECT_FALSE(backend_draws_leave_colour(std::span<const BackendDraw>{}))
+        << "an empty call proves nothing";
+
+    // The segment contract of a colourless call: a later segment starts as the first does (it
+    // loads only what the caller asked the whole call to load) and no non-final segment copies
+    // anything out; the final one reads back what the caller asked for.
+    BackendColorTarget target;
+    target.persistent_id = 0x4e47473400d0ull;
+    target.load_existing = false;
+    target.readback = true;
+    BackendMrtOutputs mrt;
+    mrt.color_count = 3;
+    const auto later = split_segment_contract(&target, &mrt, false, false, {}, true);
+    EXPECT_FALSE(later.target.load_existing) << "a later segment restarts, it does not load";
+    EXPECT_FALSE(later.target.readback || later.target.readback1 || later.target.readback_slots[2])
+        << "a non-final colourless segment carries nothing through the CPU";
+    const auto last = split_segment_contract(&target, &mrt, false, true, {}, true);
+    EXPECT_TRUE(last.target.readback) << "the final segment answers the caller";
+    EXPECT_FALSE(last.target.load_existing);
+    const auto coloured = split_segment_contract(&target, &mrt, false, false, {}, false);
+    EXPECT_TRUE(coloured.target.load_existing && coloured.target.readback1)
+        << "control: a coloured split loads and carries";
 }
 
 }   // namespace

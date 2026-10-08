@@ -119,6 +119,13 @@ struct DrawItem {
     // A merged ES+GS NGG draw the backend runs through its subgroup shell (#3135 P4). No producer
     // sets it yet: live admission is P5.
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
+    // A depth-only NGG draw into a depth array (#3135 layered depth): slice ngg_depth_first_slice + k
+    // receives ngg_depth_slices[k] (layer k's primitives; [0] is ngg_subgroup itself). The executor
+    // expands such an item into one item per slice (expand_ngg_depth_slices) before the submit
+    // renderer sees it; empty for every other draw. Not serialized: a capture keeps the slice-0
+    // replay only.
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> ngg_depth_slices;
+    uint32_t ngg_depth_first_slice = 0;
     // Ordered source authority only. Never serialized or interpreted as ready resource backing.
     std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
@@ -2255,6 +2262,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     out.native_ps_source.reset();
     out.original_graphics_effects.reset();
     out.ngg_subgroup.reset();
+    out.ngg_depth_slices.clear();
+    out.ngg_depth_first_slice = 0;
     const uint64_t scalar_order = draw ? draw->command_order : 0;
     const auto checked_vertex =
         scalar_read_point ? checked_graphics_source(scalar_read_point, ds, rs.es_addr, scalar_order,
@@ -3013,6 +3022,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // subgroup shell instead (ngg_live_draw.hpp). Strictly additive: only a draw dropped below can
     // change, and a refusal keeps it dropped, now with the rule named.
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> ngg_depth_slices;
+    uint32_t ngg_depth_first_slice = 0;
     const char* ngg_refusal = nullptr;
     uint32_t ngg_vertex_range = vcount_hint;   // an indexed NGG draw: max index + 1 (#3135 P6)
     // #3135 P7: an NGG VS without a GS (the VS is the primitive shader) runs through the same shell,
@@ -3055,9 +3066,13 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         // bound when the draw writes it; depth/stencil when it has a surface and a test or clear
         // that touches it (the backend then attaches it).
         bool others = true;
+        bool colour_written = (rs.cb_target_mask & 0xfu) && rs.color_targets[0].base;
         for (uint32_t slot = 1; slot < rs.color_targets.size(); ++slot)
-            if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base)
+            if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base) {
                 others = others && one_slice(rs.color_targets[slot]);
+                colour_written = true;
+            }
+        ngg.facts.depth_only = !colour_written;
         // The backend attaches depth/stencil for depth_stencil_tests_enabled() or a clear; the
         // proof takes the superset, uses_depth_stencil_attachment(), so depth bounds alone (Z off)
         // counts as bound (#4750 review).
@@ -3072,7 +3087,11 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             const uint32_t last = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX) |
                                   (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX_HI) << 11);
             others = others && view_present && first == 0u && last == 0u;
+            ngg.facts.depth_view_known = view_present && last >= first;
+            ngg.facts.depth_first_slice = first;
+            ngg.facts.depth_slice_count = ngg.facts.depth_view_known ? last - first + 1u : 0u;
         }
+        ngg.facts.depth_bound = depth_bound;
         ngg.facts.other_attachments_single_slice = others;
         if (vertex_header && vertex_header->specials &&
             guest_readable(reinterpret_cast<uintptr_t>(vertex_header->specials),
@@ -3123,6 +3142,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             result = realize_ngg_live_draw(ngg, ngg_host);
         }
         ngg_subgroup = result.draw;
+        if (ngg_subgroup) {
+            ngg_depth_slices = std::move(result.depth_slices);
+            ngg_depth_first_slice = result.depth_first_slice;
+        }
         if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
         // Always on, bounded: an ADMITTED indexed draw's shape, once per program. The [ngg-refused]
         // line below named these draws while they were dropped (ngg-indexed); this is the evidence
@@ -3164,13 +3187,14 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     stderr,
                     "[ngg-vs] es=0x%llx ps=0x%llx admitted prim=%u vertices=%u "
                     "instances=%u indexed=%d subgroups=%zu onchip=%08x ge-cntl=%08x "
-                    "max-out=%08x itemsize=%08x gs-out-prim=%08x\n",
+                    "max-out=%08x itemsize=%08x gs-out-prim=%08x depth-slices=%zu@%u\n",
                     static_cast<unsigned long long>(rs.es_addr),
                     static_cast<unsigned long long>(rs.ps_addr), rs.prim_type,
                     ngg.facts.vertex_count, ngg.facts.instance_count, ngg.facts.indexed ? 1 : 0,
                     ngg_subgroup->plan.subgroups.size(), ngg.registers.vgt_gs_onchip_cntl,
                     ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
-                    ngg.registers.vgt_esgs_ring_itemsize, ngg.registers.vgt_gs_out_prim_type);
+                    ngg.registers.vgt_esgs_ring_itemsize, ngg.registers.vgt_gs_out_prim_type,
+                    ngg_depth_slices.size(), ngg_depth_first_slice);
         }
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused")
@@ -3877,6 +3901,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             out.fragment_draw_inputs ? out.fragment_draw_inputs->original_fragment_producer
                                      : nullptr);
     out.ngg_subgroup = std::move(ngg_subgroup);
+    out.ngg_depth_slices = std::move(ngg_depth_slices);
+    out.ngg_depth_first_slice = ngg_depth_first_slice;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
@@ -4130,6 +4156,8 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           uint32_t width, uint32_t height);
 
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
+// Every submit it receives has its layered depth-only NGG draws expanded per slice
+// (ngg_depth_slices.hpp).
 void set_submit_renderer(LiveRenderFn fn);
 bool have_submit_renderer();
 

@@ -113,6 +113,15 @@ struct NggRasterCommitConfig {
     const PixelInputMapping* pixel_inputs = nullptr;
     FloatTransportConfig float_transport = {};
     bool count_violations = true;
+    // Per-slice replay of a layered DEPTH target (#3135, layered NGG depth). The backend keeps one
+    // single-layer depth image per guest slice, so a draw whose layer addresses a depth array is
+    // drawn once per slice: each pass draws only the primitives whose layer equals the selected
+    // one, with route None (nothing writes gl_Layer). The selection is a draw-time value, not a
+    // compile-time one, so every slice runs the same module and pipeline: the stage reads it as
+    // gl_InstanceIndex, which the backend sets through the run's firstInstance
+    // (NggSubgroupDraw::layer_select; a run draws one instance). A layer at or above
+    // `layer_slices` is culled in every pass and counted by the layer-0 pass alone, so once.
+    bool layer_select = false;
     // TEST ONLY: draw every slot below prims_alloc whatever its connectivity. Exists so a test can
     // prove the checks are what keeps a corrupted record from drawing.
     bool skip_connectivity_for_test = false;

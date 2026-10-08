@@ -92,7 +92,7 @@ struct StageKey {
     std::vector<uint32_t> program;   // the linked chain, compared exactly
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
-    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
+    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0, depth_slice_fanout = 0;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
     bool count_violations = false, interpolation = false, user_data_address = false;
@@ -108,7 +108,7 @@ struct StageKeyHash {
             hash = mix(hash, (uint64_t{r.binding} << 32) ^ r.fetch_pc ^ (uint64_t{r.cls} << 48));
         for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
-        hash = mix(hash, key.lds_granules);
+        hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -157,6 +157,7 @@ struct DrawKey {
 struct DrawEntry {
     std::shared_ptr<StageEntry> stage_owner;
     std::shared_ptr<const NggSubgroupDraw> draw;
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> slices;   // per-slice replay, or empty
     uint64_t last_use = 0;
 };
 
@@ -348,6 +349,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.user_sgprs = admission.user_sgprs;
     key.lds_granules = admission.lds_granules;
     key.layer_slices = admission.layer_slices;
+    key.depth_slice_fanout = admission.depth_slice_fanout;
     key.topology = static_cast<uint8_t>(admission.topology);
     key.route = static_cast<uint8_t>(admission.route);
     key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
@@ -375,6 +377,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     request.raster.pixel_inputs = input.pixel_inputs;
     request.raster.float_transport = input.float_transport;
     request.raster.count_violations = admission.count_violations;
+    // A depth array is replayed per slice; the base draw is the slice-0 replay, so a consumer that
+    // knows nothing of the replay draws slice 0's primitives only, never the others into it.
+    if (admission.depth_slice_fanout) request.raster.layer_select = true;
     if (admission.route == NggLayerRoute::InterpolationGeometry)
         request.raster.reserved_locations = input.interpolation.attribute_mask;
     if (interpolation) {
@@ -434,6 +439,8 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
             c.stats.strip_draws += result.strip ? 1u : 0u;
             c.stats.indexed_draws += result.indexed ? 1u : 0u;
             result.draw = found->second.draw;
+            result.depth_slices = found->second.slices;
+            result.depth_first_slice = admission.depth_first_slice;
             return result;
         }
     }
@@ -462,12 +469,25 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     auto draw = assemble_ngg_subgroup_draw(request, stages_for, &why);
     if (!draw) return refuse(intern_reason(why), why);
     if (const char* device = ngg_device_refusal(*draw, host)) return refuse(device);
+    // The per-slice replay: one draw per depth slice, each the base draw (its plan, launch
+    // records, runs and compiled stages all shared) selecting another layer at draw time.
+    std::vector<std::shared_ptr<const NggSubgroupDraw>> slices;
+    if (admission.depth_slice_fanout) {
+        slices.reserve(admission.depth_slice_fanout);
+        slices.push_back(draw);
+        for (uint32_t layer = 1; layer < admission.depth_slice_fanout; ++layer) {
+            auto replay = std::make_shared<NggSubgroupDraw>(*draw);
+            replay->layer_select = layer;
+            slices.push_back(std::move(replay));
+        }
+    }
     {
         const std::lock_guard lock(c.mutex);
         ++c.stats.draw_assemblies;
         DrawEntry stored;
         stored.stage_owner = entry;
         stored.draw = draw;
+        stored.slices = slices;
         stored.last_use = ++c.clock;
         c.draws[std::move(draw_key)] = std::move(stored);
         evict(c.draws, kDrawEntries, nullptr);
@@ -478,6 +498,8 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         c.stats.indexed_draws += result.indexed ? 1u : 0u;
     }
     result.draw = std::move(draw);
+    result.depth_slices = std::move(slices);
+    result.depth_first_slice = admission.depth_first_slice;
     return result;
 }
 

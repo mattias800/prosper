@@ -159,7 +159,11 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
     // A one-slice target needs no route: the layer is read only to cull (and count) a primitive
     // that names another slice, and nothing writes gl_Layer, which a one-layer framebuffer leaves
     // undefined (Undefined-Value-Layer-Written). More slices need a route (#3135 P7).
-    if (read_layer && config.route == NggLayerRoute::None && config.layer_slices != 1u)
+    const bool selects_layer = config.layer_select;
+    if (selects_layer && (!read_layer || config.route != NggLayerRoute::None))
+        return fail(refusal, "ngg-raster-config", "cause=layer-select");
+    if (read_layer && config.route == NggLayerRoute::None && config.layer_slices != 1u &&
+        !selects_layer)
         return fail(refusal, "ngg-layer-route-unavailable", "cause=route-none");
     if (config.route == NggLayerRoute::InterpolationGeometry && corners != 3)
         return fail(refusal, "ngg-interpolation-geometry-needs-triangles");
@@ -273,6 +277,11 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
     const uint32_t source = record(select_of(b, guest_corner, index, corners));
 
     uint32_t layer = b.uconst(0), draw = valid, layer_ok = b.btrue();
+    // A per-slice replay's layer arrives as the instance index (the run's firstInstance); only the
+    // layer-0 replay counts protocol violations, so a culled primitive is counted once.
+    const uint32_t selected = selects_layer ? b.load_instance_index() : 0u;
+    const uint32_t counting_replay =
+        selects_layer ? b.ucmp(Op_IEqual, selected, b.uconst(0)) : b.btrue();
     if (read_layer) {
         const uint32_t provoking =
             config.provoking_vertex_last && !config.layer_from_first_corner_for_test ? corners - 1
@@ -280,10 +289,13 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
         layer = word_at(record(index[provoking]), layout.pos1_word + 2u);
         layer_ok = b.ucmp(Op_ULessThan, layer, b.uconst(config.layer_slices));
         draw = b.land(valid, layer_ok);
+        if (selects_layer)   // this pass draws one slice's primitives only
+            draw = b.land(draw, b.ucmp(Op_IEqual, layer, selected));
     }
 
     if (config.count_violations) {
-        const uint32_t first_corner = b.ucmp(Op_IEqual, corner, b.uconst(0));
+        const uint32_t first_corner =
+            b.land(counting_replay, b.ucmp(Op_IEqual, corner, b.uconst(0)));
         const auto count = [&](uint32_t word, uint32_t condition) {
             b.cbuf_atomic_rtn(Op_AtomicIAdd, b.uconst(word), b.uconst(1), kCounterKey, true,
                               b.land(first_corner, condition), b.uconst(0));

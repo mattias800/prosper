@@ -16,6 +16,7 @@
 
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/execute/ngg_draw_admission.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
 #include "gpu/execute/ngg_draw_indices.hpp"
 #include "gpu/execute/ngg_live_draw.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
@@ -405,6 +406,7 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     // target is not proven to be one slice and the draw stays dropped.
     GpuState layered = vs_only_state();
     layered.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    layered.cx[P::CB_COLOR0_BASE] = 0x30u;   // a bound colour target: the draw writes colour
     layered.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
     DrawItem unproven;
     EXPECT_FALSE(realize(layered, kIndices, 3, 1, unproven));
@@ -415,9 +417,9 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     ASSERT_TRUE(one_slice.ngg_subgroup) << "a one-slice 2D target is admitted for a layered draw";
     EXPECT_EQ(one_slice.ngg_subgroup->route, NggLayerRoute::None)
         << "one slice: the layer is read to cull, never written to gl_Layer";
-    // A layered DEPTH array beside the one-slice colour target: the layer may name a real depth
-    // slice the shell cannot route, so the draw is refused by name -- never admitted and culled.
-    // A depth view of slice 0 alone is admitted.
+    // A layered DEPTH array beside the one-slice colour target: one layer cannot address a 2D
+    // colour target and a depth array, so the draw is refused by name (ngg-layer-attachments-mixed)
+    // -- never admitted and culled. A depth view of slice 0 alone is admitted.
     GpuState depth = layered;
     depth.cx[P::DB_DEPTH_CONTROL] = 1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT;
     depth.cx[P::DB_Z_READ_BASE] = 0x1000u;
@@ -483,6 +485,155 @@ TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
     DrawItem dropped;
     EXPECT_FALSE(realize(merged, kIndices, 3, 1, dropped));
     EXPECT_FALSE(dropped.ngg_subgroup) << "control: a merged draw without its chain is not linked";
+}
+
+// #3135 layered NGG depth: Kena's point-light shadow shape. A VS-only draw with CB_TARGET_MASK 0
+// whose layer addresses a six-slice depth array (DB_DEPTH_VIEW 0x0000a000, slices 0..5) is
+// admitted as six per-slice replays: replay k is the same plan, launch records and compiled stages
+// selecting layer k at draw time, and expand_ngg_depth_slices turns the item into six items whose
+// DB_DEPTH_VIEW names exactly slice k.
+GpuState depth_only_layered_state() {
+    GpuState st = vs_only_state();
+    st.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    st.cx[P::CB_TARGET_MASK] = 0u;
+    st.cx[P::DB_DEPTH_CONTROL] = (1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT) |
+                                 (1u << P::DB_DEPTH_CONTROL_Z_WRITE_ENABLE_SHIFT);
+    st.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    st.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    st.cx[P::DB_DEPTH_VIEW] = 0x0000a000u;
+    return st;
+}
+
+TEST_F(NggIndexedRealize, ALayeredDepthOnlyDrawIsReplayedOncePerSlice) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    DrawItem item;
+    ASSERT_TRUE(realize(depth_only_layered_state(), kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the layered depth-only draw was not admitted";
+    ASSERT_EQ(item.ngg_depth_slices.size(), 6u);
+    EXPECT_EQ(item.ngg_depth_first_slice, 0u);
+    EXPECT_EQ(item.ngg_depth_slices[0], item.ngg_subgroup) << "slice 0 is the draw itself";
+    const NggSubgroupDraw& base = *item.ngg_subgroup;
+    EXPECT_EQ(base.route, NggLayerRoute::None) << "a replay routes nothing: one layer per pass";
+    for (uint32_t k = 0; k < 6u; ++k) {
+        const NggSubgroupDraw& slice = *item.ngg_depth_slices[k];
+        EXPECT_EQ(slice.layer_select, k) << "replay " << k << " selects its own layer";
+        ASSERT_EQ(slice.groups.size(), base.groups.size());
+        EXPECT_EQ(slice.runs.size(), base.runs.size());
+        for (size_t g = 0; g < base.groups.size(); ++g) {
+            EXPECT_EQ(slice.groups[g].stages, base.groups[g].stages)
+                << "one module and pipeline for every slice";
+            EXPECT_EQ(slice.groups[g].launch_words, base.groups[g].launch_words);
+        }
+    }
+
+    std::vector<DrawItem> expanded;
+    ASSERT_TRUE(expand_ngg_depth_slices({item}, expanded));
+    ASSERT_EQ(expanded.size(), 6u);
+    for (uint32_t k = 0; k < 6u; ++k) {
+        EXPECT_EQ(expanded[k].ngg_subgroup, item.ngg_depth_slices[k]);
+        EXPECT_TRUE(expanded[k].ngg_depth_slices.empty()) << "an expanded item is final";
+        EXPECT_EQ(expanded[k].ps.db_depth_view, (k << 13) | k) << "slice " << k << " alone";
+    }
+
+    // Slices 2..3 of a larger array: two replays, the first naming slice 2.
+    GpuState offset = depth_only_layered_state();
+    offset.cx[P::DB_DEPTH_VIEW] = 2u | (3u << 13);
+    DrawItem pair;
+    ASSERT_TRUE(realize(offset, kIndices, 3, 1, pair));
+    ASSERT_EQ(pair.ngg_depth_slices.size(), 2u);
+    EXPECT_EQ(pair.ngg_depth_first_slice, 2u);
+
+    // One slice: the layer only culls, nothing is replayed.
+    GpuState one = depth_only_layered_state();
+    one.cx[P::DB_DEPTH_VIEW] = 0u;
+    DrawItem single;
+    ASSERT_TRUE(realize(one, kIndices, 3, 1, single));
+    EXPECT_TRUE(single.ngg_subgroup);
+    EXPECT_TRUE(single.ngg_depth_slices.empty());
+
+    // Refused by name: no depth attachment at all (the layer addresses nothing proven), and a
+    // depth view that was never programmed.
+    GpuState unbound = depth_only_layered_state();
+    unbound.cx[P::DB_Z_READ_BASE] = 0u;
+    unbound.cx[P::DB_Z_WRITE_BASE] = 0u;
+    DrawItem none;
+    EXPECT_FALSE(realize(unbound, kIndices, 3, 1, none));
+    EXPECT_FALSE(none.ngg_subgroup);
+    GpuState unknown = depth_only_layered_state();
+    unknown.cx.erase(P::DB_DEPTH_VIEW);
+    DrawItem unseen;
+    EXPECT_FALSE(realize(unknown, kIndices, 3, 1, unseen));
+    EXPECT_FALSE(unseen.ngg_subgroup);
+}
+
+// DB_DEPTH_VIEW narrowed to one slice keeps every other field and carries the high bits.
+TEST(NggDepthSlices, AViewNarrowsToOneSliceKeepingItsOtherFields) {
+    const uint32_t flags =
+        (1u << P::DB_DEPTH_VIEW_Z_READ_ONLY_SHIFT) | (5u << P::DB_DEPTH_VIEW_MIPID_SHIFT);
+    const uint32_t whole = flags | 0x7ffu | (3u << 11) | (0x7ffu << 13) | (3u << 30);
+    EXPECT_EQ(depth_view_for_slice(whole, 4u), flags | 4u | (4u << 13));
+    // Slice 0x900: low bits 0x100, high bits 1, in both START and MAX.
+    EXPECT_EQ(depth_view_for_slice(flags, 0x900u),
+              flags | 0x100u | (1u << 11) | (0x100u << 13) | (1u << 30));
+}
+
+// Consecutive replayed items into one depth surface and view are emitted slice-major, so each
+// slice's draws stay in guest order and form one pass; a different view starts a new run, and
+// every other item keeps its place.
+TEST(NggDepthSlices, ARunOfReplayedDrawsIsEmittedSliceMajor) {
+    const auto draw = [] { return std::make_shared<const NggSubgroupDraw>(); };
+    const auto replayed = [&](uint64_t order, uint32_t view, uint32_t slices) {
+        DrawItem item;
+        item.command_order = order;
+        item.ps.depth_read_base = item.ps.depth_write_base = 0x1000u;
+        item.ps.db_depth_view = view;
+        item.ngg_depth_first_slice = view & 0x7ffu;   // as admission records SLICE_START
+        for (uint32_t k = 0; k < slices; ++k) item.ngg_depth_slices.push_back(draw());
+        item.ngg_subgroup = item.ngg_depth_slices[0];
+        return item;
+    };
+    DrawItem plain_before, plain_after;
+    plain_before.command_order = 1;
+    plain_after.command_order = 9;
+    const uint32_t three = 2u << 13;   // slices 0..2
+    const std::vector<DrawItem> items = {plain_before, replayed(2, three, 3), replayed(3, three, 3),
+                                         replayed(4, 1u | (2u << 13), 2), plain_after};
+    std::vector<DrawItem> out;
+    ASSERT_TRUE(expand_ngg_depth_slices(items, out));
+    const std::vector<std::pair<uint64_t, uint32_t>> expect = {
+        {1, 0}, {2, 0}, {3, 0}, {2, 1}, {3, 1}, {2, 2}, {3, 2}, {4, 1}, {4, 2}, {9, 0}};
+    ASSERT_EQ(out.size(), expect.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_EQ(out[i].command_order, expect[i].first) << "item " << i;
+        if (out[i].ngg_subgroup)
+            EXPECT_EQ(out[i].ps.db_depth_view & 0x7ffu, expect[i].second) << "item " << i;
+    }
+    // The slice-k item carries the slice-k replay.
+    EXPECT_EQ(out[3].ngg_subgroup, items[1].ngg_depth_slices[1]);
+    EXPECT_EQ(out[6].ngg_subgroup, items[2].ngg_depth_slices[2]);
+
+    std::vector<DrawItem> untouched;
+    EXPECT_FALSE(expand_ngg_depth_slices({plain_before, plain_after}, untouched));
+    EXPECT_TRUE(untouched.empty()) << "nothing to expand leaves the output alone";
+}
+
+// The executor expands before the renderer sees the submit: every renderer is handed one item per
+// slice, so no frontend has to know about the replay.
+TEST(NggDepthSlices, TheRendererIsHandedOneItemPerSlice) {
+    DrawItem item;
+    item.ps.depth_read_base = item.ps.depth_write_base = 0x1000u;
+    item.ps.db_depth_view = 2u << 13;   // slices 0..2
+    for (int k = 0; k < 3; ++k)
+        item.ngg_depth_slices.push_back(std::make_shared<const NggSubgroupDraw>());
+    item.ngg_subgroup = item.ngg_depth_slices[0];
+    std::vector<uint32_t> views;
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const DrawItem& seen : items) views.push_back(seen.ps.db_depth_view);
+        return RenderedFrame{};
+    });
+    (void)render_submit_items({item}, 4, 4);
+    set_submit_renderer({});
+    EXPECT_EQ(views, (std::vector<uint32_t>{0u, 1u | (1u << 13), 2u | (2u << 13)}));
 }
 
 }   // namespace

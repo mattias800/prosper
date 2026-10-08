@@ -95,10 +95,29 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     if (vs_out & kVsOutUndecodedMask) return refuse("ngg-vs-out-undecoded");
     admission.layer_from_pos1 = (vs_out & kVsOutUseVtxRenderTargetIndx) != 0;
     if (admission.layer_from_pos1) {
-        if (facts.target_slices) {
+        if (facts.depth_only) {
+            // No colour slot is written: the layer addresses the depth attachment. A depth array
+            // is replayed once per slice (the backend keeps one single-layer image per guest
+            // slice, keyed by SLICE_START). The layer is taken relative to SLICE_START, as an
+            // array view's index is. CONFIDENCE: MED (Kena's cube shadow passes program
+            // SLICE_START 0, so the two readings agree on every observed draw).
+            if (!facts.depth_bound) return refuse("ngg-layer-target-not-layered");
+            if (!facts.depth_view_known || !facts.depth_slice_count)
+                return refuse("ngg-layer-target-not-single-slice");
+            admission.layer_slices = facts.depth_slice_count;
+            if (facts.depth_slice_count > 1u) {
+                admission.depth_slice_fanout = facts.depth_slice_count;
+                admission.depth_first_slice = facts.depth_first_slice;
+            }
+        } else if (facts.target_slices) {
             if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
+            // A layered colour pass binds its depth/stencil as one single-layer image, so a layer
+            // above 0 would test and write depth nowhere the guest's surface has it.
+            if (facts.depth_bound) return refuse("ngg-layer-attachments-mixed");
             admission.layer_slices = facts.target_slices;
         } else if (facts.target_single_slice) {
+            if (facts.depth_bound && facts.depth_view_known && facts.depth_slice_count > 1u)
+                return refuse("ngg-layer-attachments-mixed");
             // Every bound attachment must be one slice, not colour target 0 alone: otherwise the
             // layer may address a real slice the raster commit would cull (#3135 P7 review).
             if (!facts.other_attachments_single_slice)
@@ -155,8 +174,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
 
     NggLayerRouteQuery query;
     query.topology = admission.topology;
-    // A one-slice target is addressed without a layer route (ngg_raster_commit: cull only).
-    query.layer_from_pos1 = admission.layer_from_pos1 && admission.layer_slices > 1u;
+    // A one-slice target is addressed without a layer route (ngg_raster_commit: cull only), and a
+    // depth array by per-slice replay, also without one.
+    query.layer_from_pos1 =
+        admission.layer_from_pos1 && admission.layer_slices > 1u && !admission.depth_slice_fanout;
     query.interpolation_geometry_required = facts.interpolation_geometry_required;
     query.shader_output_layer = host.shader_output_layer;
     query.geometry_shader = host.geometry_shader;
