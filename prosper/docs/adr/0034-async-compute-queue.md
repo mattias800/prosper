@@ -18,8 +18,10 @@ What is true today (`origin/main` at `d4d43d8ed`):
   (`src/hle/graphics/hle_agc.cpp:3068`) routes async-compute streams through "the same serialized
   queue model" as DCB submits; its comment (`:3064-3067`) keeps the named wrapper only so "independent
   hardware queue state" can be added later. The library exports 35 `sceAgcAcb*` entry points
-  (`hle_agc.cpp:3567`), and ACB variants such as `sceAgcAcbDmaData` (`:957`) and
-  `sceAgcAcbDispatchIndirect` (`:3564`) build the same packets as their DCB siblings.
+  (`hle_agc.cpp:3567`). ACB variants perform the same operations as their DCB siblings, but not
+  always with the same packet or ABI. `sceAgcAcbDispatchIndirect` takes a whole 64-bit argument
+  address because the ACB ring has no indirect base (`:3564-3567`), and `sceAgcAcbDmaData` has a
+  shifted ABI (`:957`).
 - **The compute backend borrows the renderer's queue.** `live_compute.cpp:3266-3281` adopts the
   shared Vulkan context, including `shared.queue` and `shared.queue_family`, whenever that family
   supports compute. Only a headless compute-only process creates a private device (`:3414-3426`). So
@@ -30,15 +32,20 @@ What is true today (`origin/main` at `d4d43d8ed`):
   GPU executes compute and graphics back to back.
 - **The guest already says which work depends on which.** Cross-queue ordering on PS5 comes from the
   guest's own packets: end-of-pipe `ReleaseMem` label writes, `WaitRegMem`/`WAIT_MEM_64` polls on
-  those labels, and ordered DMA. The command processor already decodes and orders these
-  (`hle_agc.cpp:3064-3066`), so the dependency graph is available without a heuristic.
+  those labels, and ordered DMA. The command processor already decodes and orders these: the fold
+  in `src/gpu/pm4/command_processor.cpp` handles `ReleaseMem` at `:4762-4774` (deferred behind an
+  unsatisfied wait in ring order, ordered behind retained DMA, or queued until the submit drains) and
+  `WaitRegMem` at `:4857` onward (checked against retained DMA and ordered memory effects), so the dependency graph is available without a heuristic.
 
-**Measurement.** A 2026-10-07 *Assassin's Creed IV: Black Flag* run on Windows with an RTX 4070
+**Measurement.** A 2026-10-07 *Assassin's Creed Black Flag Resynced* run on Windows with an RTX 4070
 SUPER, using `prosper-app` in `--present-mode immediate`, reported:
 
 ```text
 [perf-alarm] rule=gpu-sync-wait value=121.14 %budget ... wait=1171ms (compute 1124ms/377, graphics 47ms/145) ... gpu-busy=21%
 ```
+
+The build commit of that run was not recorded, so this line has no commit to compare against;
+Migration order step 1 re-measures it on a named commit before any A/B.
 
 So 96% of the sync wait (1,124 of 1,171 ms) is spent on compute, over 377 waits, while the GPU is
 busy only 21% of the time. The executor serialises compute behind a GPU that is mostly idle. This is
@@ -80,7 +87,8 @@ design space only.
    another queue that polls that label becomes a timeline wait on the matching value, where prosper
    can resolve the label to a pending signal. Otherwise it stays a CPU-side wait at the point ADR 0009
    already defines. Ordered DMA and guest-memory writebacks keep their current ordering.
-5. **`PERF-P8` is unchanged and binds both queues.** A completion label, EOP event, flip, writeback or
+5. **`PERF-P8`, read per guest stream, binds both queues.** This is a reading of a still-proposed
+   rule; the owner confirms it when accepting ADR 0009. A completion label, EOP event, flip, writeback or
    write-watch invalidation becomes guest-visible only after all work that precedes it *in its own
    guest stream* has retired. Work on different guest queues may complete in any order the guest's
    own sync allows, which is the PS5 contract. It may never be visible in an order the guest's sync
