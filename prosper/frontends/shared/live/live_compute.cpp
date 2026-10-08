@@ -8472,15 +8472,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // may also consume canonical RGBA8 because byte*257/65535 == byte/255. The independent
             // extent check below still rejects a scaled image for texel fetch/query access. Other
             // aliases and numeric conversions keep the snapshot path below.
-            using prosper::frontend::DepthPlaneView;   // shared/rtt/depth_plane_view.hpp
+            using prosper::frontend::DepthPlaneRead;   // shared/rtt/depth_plane_view.hpp
             const bool plain_2d_sample = !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
                                          r->depth == 1 && r->img_dim == 1;
-            const DepthPlaneView depth_view =
+            const prosper::frontend::DepthPlaneView depth_view =
                 plain_2d_sample ? prosper::frontend::depth_plane_view(r->format, r->num_components)
-                                : DepthPlaneView::None;
-            const bool depth_float_import_eligible = depth_view == DepthPlaneView::Float;
-            const bool depth_bits_import_eligible = depth_view == DepthPlaneView::Bits;
-            const bool depth_import_eligible = depth_view != DepthPlaneView::None;
+                                : prosper::frontend::DepthPlaneView{};
+            const bool depth_float_import_eligible = depth_view.read == DepthPlaneRead::Float;
+            const bool depth_bits_import_eligible = depth_view.read == DepthPlaneRead::Bits;
+            const bool depth_import_eligible = depth_view.read != DepthPlaneRead::None;
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
@@ -8495,9 +8495,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     image_descriptors[i].normalized_sampling &&
                     !image_descriptors[i].texel_access;
                 const bool format_float_sampling = image_descriptors[i].sampled_float;
-                const LiveTargetImageRequest import_request{
-                    r->width, r->height, render_scale, depth_import_eligible,
-                    scalable_normalized_sampling};
+                const LiveTargetImageRequest import_request{r->width, r->height, render_scale,
+                                                            depth_view.texel_bytes,
+                                                            scalable_normalized_sampling};
                 const auto import_start = ComputeClock::now();
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
@@ -8715,8 +8715,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         LiveTargetImageImport source;
                         // Integer texel coordinates require exact actual extents. A configured render
                         // scale does not matter when the imported Vulkan image itself matches.
-                        const LiveTargetImageRequest request{
-                            r->width, r->height, render_scale, false, false};
+                        const LiveTargetImageRequest request{r->width, r->height, render_scale, 0u,
+                                                             false};
                         const bool time_seed = image_timing && perf_capture_timing;
                         const auto seed_start = time_seed
                             ? ComputeClock::now() : ComputeClock::time_point{};

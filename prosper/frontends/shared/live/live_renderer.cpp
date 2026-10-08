@@ -10,6 +10,7 @@
 #include "gpu/diagnostics/pass_break_census.hpp"         // why a pass stopped accepting draws
 #include "gpu/diagnostics/link_list_census.hpp"          // PROSPER_DRAW_LINKSCAN
 #include "gpu/capture/writer_provenance.hpp"              // who last wrote a censused range
+#include "shared/rtt/depth_plane_view.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/rtt/rtt_injection.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -1112,20 +1113,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                      prosper::gpu::LiveTargetImageImport& import) {
             if (!direct_bind) { import.refusal = prosper::gpu::LiveTargetImageImport::Refusal::DirectBindDisabled; return false; }
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
-            // `allow_depth` is set only for a proven one-component Float32 sample or Uint32 raw-bit
-            // view of an ordinary 2D descriptor. Prefer the matching DS plane before consulting the
-            // address-only color registry: guest allocations are reused, and a stale RttSurf at the
-            // same base must not hide the newer persistent depth image. Persistent DS entries are
+            // `depth_texel_bytes` is set only for a one-component view of an ordinary 2D descriptor
+            // that reads a depth plane -- FLOAT32 or UINT32 over Z32, UNORM16 over Z16 -- and a
+            // plane is served only when its guest width matches (depth_plane_admits_view); a
+            // mismatch falls through to the colour registry. Prefer the matching DS plane before
+            // consulting the address-only color registry: guest allocations are reused, and a stale
+            // RttSurf at the same base must not hide the newer persistent depth image. Persistent DS entries are
             // not evicted, and compute runs in ordered submit execution, so unlike the bounded color
             // cache this path needs no pin.
-            if (request.allow_depth && request.width && request.height) {
+            if (request.depth_texel_bytes && request.width && request.height) {
                 const prosper::test::PersistentDsSampled sampled =
                     prosper::test::find_persistent_ds_sampled(
                         addr, request.width, request.height,
                         request.render_scale ? request.render_scale : 1u,
                         request.normalized_sampling);
                 const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
-                if (sampled.image && ctx.ok) {
+                if (sampled.image && ctx.ok &&
+                    prosper::frontend::depth_plane_admits_view(
+                        sampled.image->guest_depth_texel_bytes, request.depth_texel_bytes)) {
                     import.width = sampled.width;
                     import.height = sampled.height;
                     import.kind = prosper::gpu::LiveTargetImageImport::Kind::Depth;
