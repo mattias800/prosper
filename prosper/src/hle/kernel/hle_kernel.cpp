@@ -70,9 +70,6 @@ extern "C" int arch_prctl(int, unsigned long);
 #include <condition_variable>
 #include <chrono>
 #include <new>
-// After the platform headers above: it uses windows.h's GetCurrentThreadId and arch_prctl, which this
-// file already pulls in, and adds no host-platform #if of its own.
-#include "hle/kernel/mutex_diagnostics.hpp"
 #ifdef _WIN32
 #include <windows.h>   // GetCurrentThreadStackLimits/GetCurrentThreadId for the guest-thread trampoline
 #endif
@@ -86,6 +83,9 @@ extern "C" int arch_prctl(int, unsigned long);
 #include <ucontext.h>
 #endif
 #endif
+// After the platform headers above: it uses windows.h's GetCurrentThreadId and arch_prctl, which this
+// file already pulls in, and adds no host-platform #if of its own.
+#include "hle/kernel/mutex_diagnostics.hpp"
 
 namespace prosper {
 
@@ -827,12 +827,15 @@ uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     if (kind == SyncObjectKind::Mutex) {
         if (auto* probe = (pthread_mutex_t*)pt_peek_slot(slot_addr)) {
             const int rc = pthread_mutex_trylock(probe);
-            if (rc == EBUSY) return prosper::hle::kSceKernelErrorEBUSY;
+            // Bare FreeBSD errno: each spelling encodes it at its own entry point, like k_cond_destroy
+            // (the POSIX `pthread_mutex_destroy` must see 16, `scePthreadMutexDestroy` 0x80020010).
+            if (rc == EBUSY) return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EBusy);
             if (rc == 0) pthread_mutex_unlock(probe);
         }
     }
     auto* m = (pthread_mutex_t*)pt_claim_slot(slot_addr);   // #2176: claim, then retire
     // PROSPER_SYNCLOG: the destroy half of the lifecycle probe — see ensure_mutex.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): diagnostic switch read at destroy time
     if (m && getenv("PROSPER_SYNCLOG") && slot_addr >= BOOT_AKSOUNDENGINE &&
         slot_addr < BOOT_LIBC) {   // AkSoundEngine.prx module owns the contended lock
         static std::atomic<int> n{0};
@@ -854,6 +857,7 @@ namespace {
 
 inline uint64_t mtx_report(const char* op, uint64_t slot, pthread_mutex_t* m, int host) {
     mtx_trace(op, slot, m, host);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
     static const bool on = getenv("PROSPER_MUTEX_FAILLOG") != nullptr;
     if (on && host != 0)
         fprintf(stderr, "[mtx-fail] %s slot=0x%llx host_m=%p rc=%d(%s)\n", op,
@@ -1004,6 +1008,8 @@ SCE_PTHREAD_ALIAS(k_sce_mutex_trylock, k_mutex_trylock)
 // travel with them for the same reason: each has a failure path, so each needs the split.
 SCE_PTHREAD_ALIAS(k_sce_mutex_unlock,      k_mutex_unlock)
 SCE_PTHREAD_ALIAS(k_sce_mutex_init,        k_mutex_init)
+// #2168: destroying a held mutex is refused, so the Sony spelling needs the encoding split too.
+SCE_PTHREAD_ALIAS(k_sce_mutex_destroy,     k_mutex_destroy)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_init,    k_mutexattr_init)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_settype, k_mutexattr_settype)
 
@@ -5354,7 +5360,7 @@ void register_kernel_hle() {
     R("scePthreadMutexattrSetpshared", k_mutexattr_setpshared);     // always 0
     R("scePthreadMutexattrDestroy", k_mutexattr_destroy);           // always 0
     R("scePthreadMutexInit", k_sce_mutex_init);
-    R("scePthreadMutexDestroy", k_mutex_destroy);                   // always 0
+    R("scePthreadMutexDestroy", k_sce_mutex_destroy);               // EBUSY for a held mutex (#2168)
     R("scePthreadMutexLock", k_sce_mutex_lock);
     R("scePthreadMutexTrylock", k_sce_mutex_trylock);
     R("scePthreadMutexTimedlock", k_mutex_timedlock);   // was MISSING -> faked "locked" without locking

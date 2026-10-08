@@ -21,9 +21,15 @@
 #include <mutex>
 #include <unordered_map>
 
-// Not self-contained by design: it relies on windows.h (GetCurrentThreadId) and on `arch_prctl` /
-// ARCH_GET_FS being declared by the includes hle_kernel.cpp already has, so that moving the code here
-// adds no host-platform #if of its own (the architecture ratchet counts those).
+// Self-contained without a host-platform #if (the architecture ratchet counts those): the headers are
+// pulled in by what they provide, with __has_include, which is not a platform test.
+#if __has_include(<windows.h>)
+#include <windows.h>   // GetCurrentThreadId
+#endif
+#if __has_include(<asm/prctl.h>)
+#include <asm/prctl.h>   // ARCH_GET_FS
+extern "C" int arch_prctl(int, unsigned long);
+#endif
 
 namespace {
 // PROSPER_MUTEX_TRACE -- name every lock/trylock/unlock on ONE guest mutex slot, with the host
@@ -45,6 +51,7 @@ namespace {
 // restored the wrong host TCB" from "the stub did not swap back at all" -- two different bugs
 // that present identically in every other field.
 inline bool mtx_trace_enabled(uint64_t slot) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
     static const char* const env = getenv("PROSPER_MUTEX_TRACE");
     if (!env) return false;
     static const bool all = std::strcmp(env, "all") == 0;
@@ -104,6 +111,7 @@ struct MtxOwner {
 std::mutex g_mtx_waitlog_mx;
 std::unordered_map<pthread_mutex_t*, MtxOwner> g_mtx_waitlog_owner;
 inline bool mtx_waitlog() {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one-shot cached diagnostic switch
     static const bool on = getenv("PROSPER_MUTEX_WAITLOG") != nullptr;
     return on;
 }

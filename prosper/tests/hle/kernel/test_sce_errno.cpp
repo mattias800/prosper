@@ -221,18 +221,20 @@ int main() {
     // Each arm below is destroy-then-USE. A test that only checked destroy's own return value could
     // not see this at all: destroy returned 0 before and returns 0 now.
     {
-        struct { const char* init; const char* destroy; const char* use; const char* what; } objs[] = {
-            { "scePthreadMutexInit",  "scePthreadMutexDestroy",  "scePthreadMutexLock",   "mutex"  },
-            { "scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock","rwlock" },
+        struct { const char* init; const char* destroy; const char* use; const char* release; const char* what; } objs[] = {
+            { "scePthreadMutexInit",  "scePthreadMutexDestroy",  "scePthreadMutexLock",   "scePthreadMutexUnlock",  "mutex"  },
+            { "scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock","scePthreadRwlockUnlock", "rwlock" },
         };
         for (const auto& o : objs) {
             auto init = Hle::lookup(nid_hash(o.init));
             auto destroy = Hle::lookup(nid_hash(o.destroy));
             auto use = Hle::lookup(nid_hash(o.use));
+            auto release = Hle::lookup(nid_hash(o.release));
             char msg[220];
-            snprintf(msg, sizeof msg, "%s / %s / %s are registered", o.init, o.destroy, o.use);
-            CHECK(init && destroy && use, msg);
-            if (!init || !destroy || !use) continue;
+            snprintf(msg, sizeof msg, "%s / %s / %s / %s are registered", o.init, o.destroy, o.use,
+                     o.release);
+            CHECK(init && destroy && use && release, msg);
+            if (!init || !destroy || !use || !release) continue;
 
             alignas(16) uint8_t slot[32]{};
             const uint64_t h = (uint64_t)(uintptr_t)slot;
@@ -245,6 +247,10 @@ int main() {
             snprintf(msg, sizeof msg, "the %s is usable before destroy", o.what);
             CHECK(use(h, 0, 0, 0, 0, 0) == 0, msg);
 
+            // Release first: a console refuses to destroy a HELD mutex with EBUSY (#2168), so the
+            // destroy-succeeds sequence is lock, unlock, destroy.
+            snprintf(msg, sizeof msg, "the %s is released before destroy", o.what);
+            CHECK(release(h, 0, 0, 0, 0, 0) == 0, msg);
             CHECK(destroy(h, 0, 0, 0, 0, 0) == 0, "destroy succeeds");
             // THE BUG: this used to return 0, having silently built a fresh unheld object.
             snprintf(msg, sizeof msg,
@@ -258,6 +264,7 @@ int main() {
             CHECK(init(h, 0, 0, 0, 0, 0) == 0, msg);
             snprintf(msg, sizeof msg, "the re-initialised %s works again", o.what);
             CHECK(use(h, 0, 0, 0, 0, 0) == 0, msg);
+            release(h, 0, 0, 0, 0, 0);
             destroy(h, 0, 0, 0, 0, 0);
         }
     }

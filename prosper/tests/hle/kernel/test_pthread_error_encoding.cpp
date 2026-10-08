@@ -223,7 +223,7 @@ bool wait_for(const std::atomic<int>& counter, int target) {
 // established that its absence is the right answer rather than an oversight.
 const char* const kInfallible[] = {
     "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
-    "scePthreadMutexDestroy", "scePthreadCondattrDestroy",
+    "scePthreadCondattrDestroy",
     "scePthreadCondSignal", "scePthreadCondBroadcast",
     "scePthreadRwlockDestroy", "scePthreadSemDestroy",
     "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
@@ -261,11 +261,15 @@ const char* const kInfallible[] = {
 // inventing a failure. That is all this arm can see: `sce_pthread_rc(0)` is 0, so it reads the same
 // through the condvar's existing alias as it would through the barrier's direct registration, and
 // it would not notice an alias being added to or removed from either.
-// #2168's remaining third, `scePthreadMutexDestroy`, is still genuinely infallible above: it needs
-// owner tracking that deliberately does not exist on POSIX hosts (#719/#793).
+// #2168's third, `scePthreadMutexDestroy`, is fallible the same way as the condvar: `k_mutex_destroy`
+// returns the BARE errno (`pthread_mutex_destroy` is registered onto the same body) and
+// `k_sce_mutex_destroy` encodes it through `SCE_PTHREAD_ALIAS`. A held mutex is found with a trylock
+// probe, so no owner tracking is needed (#719/#793 stay removed); `test_mutex_destroy_busy.cpp`
+// asserts the bare 16 and the encoded 0x80020010 for a held mutex.
 const char* const kFallibleButNullSucceeds[] = {
     "scePthreadCondDestroy",      // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
     "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked -- encoded in the body itself
+    "scePthreadMutexDestroy",     // #2168: EBUSY while held -- bare from the body, encoded by the alias
 };
 
 }  // namespace
