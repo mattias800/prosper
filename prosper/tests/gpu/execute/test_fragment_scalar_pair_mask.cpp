@@ -25,6 +25,10 @@
 //                                     the header and at the exit
 //   DispatcherSlotReloadRefuses       a CFG-dispatcher case reloading a spill slot that one path never
 //                                     wrote (#4725 round 4)
+//   BallotOfMemoryCompareProjects     Kena's live shape: a spilled compare mask whose compared scalar
+//                                     came from SMEM must still project (main refused it live)
+//   UnreachedDispatcherCaseRefuses    a dispatcher case the MUST walk never reaches, whose reloaded
+//                                     words are therefore unfiltered (#4725's approval, non-blocking)
 //   MemoryPatternRefuses              projecting a pattern loaded from memory onto host lanes,
 //                                     directly and through a spill slot; its control overwrites the
 //                                     loaded words and must compile
@@ -187,6 +191,38 @@ constexpr uint32_t kProbeDispatcherSlot[] = {
     0x0001030cu, 0xd7600005u, 0x0001030cu, 0x87860a04u, 0xd5010001u, 0x0019e480u,
     0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u, 0xbf870001u,
     0xbf82fffdu, 0x7e000280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+// Kena's live f1d1baa8 shape: the spilled compare mask was computed FROM a memory-loaded scalar
+// (`v_cmp_* s[36:37], s101, ...` with s101 from SMEM). The compare's result is a ballot of this
+// wave, not a memory pattern, so it must not inherit the memory mark; on main after #4725 it did,
+// and the program was refused live at pc308. s_buffer_load_dword s20 | lane id | s[2:3] = s20 >
+// lane | spill s2/s3 to v12[1]/v12[2] | reload into s[14:15] | s[8:9] = s[14:15] & every lane.
+constexpr uint32_t kBallotOfMemoryCompare[] = {
+    0xf4200502u, 0xfa000000u, 0xbf8cc07fu, 0xd7650005u, 0x000100c1u, 0xd7660005u, 0x00020ac1u,
+    0xd4c40002u, 0x00020a14u, 0xd761000cu, 0x00010202u, 0xd761000cu, 0x00010403u, 0xd760000eu,
+    0x0001030cu, 0xd760000fu, 0x0001050cu, 0xd4c2000au, 0x00010080u, 0x87880a0eu, 0xd5010001u,
+    0x0021e480u, 0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+// Kena's exact instruction: `v_cmp_gt_f32_sdwa s[36:37], s101, -2.0` (7c09eaf9 8686a465), both
+// operands scalar, s101 from SMEM, spilled from s36/s37 and reloaded for the AND. As in Kena (an
+// s_load_dwordx16 into s[36:51] at pc96), s[36:37] held memory words before the compare. The emitter may
+// keep a uniform data view of such a compare; it is still a predicate, not a memory pattern.
+constexpr uint32_t kBallotOfScalarMemoryCompare[] = {
+    0xf4240902u, 0xfa000008u, 0xf4201942u, 0xfa000000u, 0xbf8cc07fu, 0x7c09eaf9u, 0x8686a465u,
+    0xd761000cu, 0x00010224u, 0xd761000cu, 0x00010425u, 0xd760000eu, 0x0001030cu, 0xd760000fu,
+    0x0001050cu, 0xd4c2000au, 0x00010080u, 0x87880a0eu, 0xd5010001u, 0x0021e480u, 0x7e000280u,
+    0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+// A dispatcher case whose entry block the Wave64 MUST walk never reaches: the projection sits in a
+// block only reachable past an unconditional s_branch, and the irreducible tail forces the
+// dispatcher. Such a case gets no definite-assignment filtering (the walk's facts do not exist for
+// it), so its reloaded words must be marked. The AND's other operand is an inline -1, so the data
+// pair s[4:5] is the only thing that can refuse. The control replaces that block with s_nop.
+#define UNREACHED_CASE(w0, w1, w2)                                                                 \
+    {0xd4c2000au, 0x00010080u, 0xbe8403c1u, 0xbe8503c1u, 0x7e020280u, 0xbf820003u, w0,             \
+     w1,          w2,          0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,    \
+     0xbf870001u, 0xbf82fffdu, 0x7e000280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u}
+constexpr uint32_t kProbeUnreachedCase[] = UNREACHED_CASE(0x8786c104u, 0xd5010001u, 0x0019e480u);
+constexpr uint32_t kProbeUnreachedCaseControl[] =
+    UNREACHED_CASE(0xbf800000u, 0xbf800000u, 0xbf800000u);
+#undef UNREACHED_CASE
 // The merge-marked pair copied through M0, and through ttmp0/ttmp1, then ANDed.
 constexpr uint32_t kProbeThroughM0[] = {
     PROBE_PREFIX,           0xbefc0304u, 0xbe86037cu, 0xbefc0305u, 0xbe87037cu, 0x87880206u,
@@ -403,4 +439,37 @@ TEST(FragmentScalarPairMask, DispatcherSlotReloadRefuses) {
     const std::string reason = last_terminal_reject_reason(kAddress);
     EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
     EXPECT_NE(reason.find("pc=15 words=87860a04"), std::string::npos) << reason;
+}
+
+TEST(FragmentScalarPairMask, UnreachedDispatcherCaseRefuses) {
+    const std::vector<uint32_t> control =
+        recompile_fragment(kProbeUnreachedCaseControl, std::size(kProbeUnreachedCaseControl));
+    ASSERT_FALSE(control.empty()) << "control: the same program without the unreached projection";
+    bool has_switch = false;   // OpSwitch (251): only the CFG dispatcher emits one here
+    for (size_t i = 5; i < control.size() && control[i] >> 16u;) {
+        has_switch = has_switch || (control[i] & 0xffffu) == 251u;
+        i += control[i] >> 16u;
+    }
+    EXPECT_TRUE(has_switch) << "control: the program lowers through the CFG dispatcher";
+    constexpr uint64_t kAddress = 0xa4725005ull;
+    EXPECT_TRUE(recompile_fragment(kProbeUnreachedCase, std::size(kProbeUnreachedCase), nullptr,
+                                   nullptr, UINT32_MAX, nullptr, false,
+                                   {RecompileDiagnosticStage::Fragment, kAddress})
+                    .empty())
+        << "unreached case: words the MUST walk never filtered must not project";
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=6 words=8786c104"), std::string::npos) << reason;
+}
+
+TEST(FragmentScalarPairMask, BallotOfMemoryCompareProjects) {
+    const ShaderResourceTable table = memory_table();
+    EXPECT_FALSE(
+        recompile_fragment(kBallotOfMemoryCompare, std::size(kBallotOfMemoryCompare), &table)
+            .empty())
+        << "a compare mask is a ballot even when a compared scalar came from memory (Kena pc308)";
+    EXPECT_FALSE(recompile_fragment(kBallotOfScalarMemoryCompare,
+                                    std::size(kBallotOfScalarMemoryCompare), &table)
+                     .empty())
+        << "a compare ballot of two scalars is a predicate even with a data view (Kena pc226)";
 }
