@@ -13,7 +13,7 @@ buffer a draw or dispatch reads is first copied by the CPU into Vulkan-owned mem
 copy is re-validated by reading the guest bytes again. Vulkan has two standard ways to avoid that
 copy, and prosper uses neither: a grep of `src/`, `frontends/` and `tests/` for
 `external_memory_host`, `HostPointer`, `minImportedHostPointerAlignment` and
-`BufferDeviceAddress` finds nothing (`origin/main` at `e7599be8c`).
+`BufferDeviceAddress` finds nothing (`origin/main` at `5fee2f98d`).
 
 **How a buffer reaches the GPU today.**
 - The live frontend "borrows" guest memory where it can: `draw_resources.cpp:221-224`
@@ -64,8 +64,26 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
 - *Which memory imports.* Windows guest direct memory is a sparse-file section mapped as views
   (`src/hle/memory/hle_kernel_mem.cpp:4966-4985`, `:5244`, `:5522`; ADR 0032), and #4681 found
   100% of compared bytes in section views. Whether NVIDIA and AMD Windows drivers import a
-  section-view pointer, and whether RADV imports the Linux guest mappings, is not established;
-  `vkGetMemoryHostPointerPropertiesEXT` answers it per pointer and must be asked, not assumed.
+  section-view pointer is not established; `vkGetMemoryHostPointerPropertiesEXT` answers it per
+  pointer and must be asked, not assumed.
+- *Linux/AMD cannot import guest direct memory as host memory -- this is known, not open.* RADV
+  implements `VK_EXT_external_memory_host` through amdgpu userptr, and libdrm's
+  `amdgpu_create_bo_from_user_mem` (`amdgpu/amdgpu_bo.c`, primary evidence) always passes
+  `AMDGPU_GEM_USERPTR_ANONONLY`; the kernel then refuses (`-EPERM`) any VMA backed by a file.
+  prosper's Linux guest direct memory is a memfd (`hle_kernel_mem.cpp:1552`,
+  `prosper_memfd_create("prosper-dmem")`) mapped `MAP_SHARED` (`:1617`, `:1681-1707`), so every
+  guest mapping has a `vm_file` and a host-pointer import would be refused for essentially every
+  guest buffer. Two independent secondary implementations hit the same wall and moved to udmabuf
+  (evidence class 3/4 only): AnyPS5 PR #943 (<https://github.com/boykopovar/AnyPS5/pull/943>) and a
+  shadPS4 fork issue (<https://github.com/kaaburgh/shadPS4/issues/9>).
+  The Linux/AMD route is therefore different: create a `udmabuf` over the existing memfd and import
+  it as a dma-buf (`VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf`). Its own
+  constraints are **unverified** and must be checked before relying on it: udmabuf requires the
+  memfd to be sealed with `F_SEAL_SHRINK`, ranges are page-granular, and the process needs access
+  to `/dev/udmabuf`. **Absent that route, Linux/AMD gets only Stage B plus the page-tracking half
+  of this ADR**, not the copy removal.
+- *macOS/MoltenVK.* `minImportedHostPointerAlignment` follows the host page size, 16 KiB on Apple
+  silicon. macOS is out of scope for this ADR; Stage A stays off there.
 - *Aliasing.* One physical guest page can appear at several VAs (section views, ADR 0032). An import
   is per VA; a write through one alias must invalidate every alias's consumer.
 - *Coherence.* Imported memory is host-coherent only if the chosen type says so; a GPU read of
@@ -87,8 +105,10 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
 2. **Stage A -- host-pointer import for buffers the GPU reads.** Where the device exposes
    `VK_EXT_external_memory_host` and `vkGetMemoryHostPointerPropertiesEXT` accepts the pointer, a
    read-only guest buffer range is imported (page-rounded, cached per host page run) and bound at
-   its offset instead of copied. Anything the query rejects keeps today's copy, counted.
-3. **Device-local copies only where measured cheaper.** The default stays "read in place" for
+   its offset instead of copied. Anything the query rejects keeps today's copy, counted. On
+   Linux/AMD the import is the udmabuf/dma-buf route in Context, not a host pointer; until that
+   route's constraints are verified, Stage A is off there.
+3. **Device-local copies only where measured cheaper.** Once Stage A is promoted, the default is read in place for
    buffers read about once per upload; a buffer whose reads per change exceed a measured threshold
    is copied once to device-local memory and kept there until page tracking says a page changed.
    The threshold is a measurement per vendor, not a constant chosen in review.
@@ -101,7 +121,10 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
    waits for, or defers behind, that retirement and never frees memory a queued command reads.
 6. **Stage B -- buffer device address where provenance is proven.** The recompiler may address a
    buffer by `VK_KHR_buffer_device_address` only when the descriptor's guest VA is proven to lie in
-   one imported or resident range for the whole draw; otherwise it keeps a descriptor binding.
+   one imported or resident range for the whole draw -- the descriptor-provenance proof of ADR 0027
+   (`GPU-4`); otherwise it keeps a descriptor binding. This does not compete with ADR 0030: the
+   descriptor heap remains where descriptors live, and BDA is used only for raw buffer accesses
+   whose range is proven in bounds; every other access goes through the heap.
    BDA is an addressing change that removes descriptor churn; it does not by itself remove a copy.
 7. **Spec rule.** This ADR adds `PERF-P14` (`docs/spec/performance.md`), proposed.
 
@@ -133,18 +156,20 @@ around `:560-590`) already name `draw-buffer-stage` as a cause.
 
 1. Probe and count: report `VK_EXT_external_memory_host`, `minImportedHostPointerAlignment` and
    per-pointer `vkGetMemoryHostPointerPropertiesEXT` acceptance for the bytes `DrawBufferStage` and
-   `res_buffer_copy_ms` cover, on Linux/AMD and Windows/NVIDIA. No behaviour change.
+   `res_buffer_copy_ms` cover, on Linux/AMD (udmabuf route) and Windows/NVIDIA. No behaviour change.
 2. Page tracking that validates without a compare (ADR 0010, ADR 0032) where it is missing.
 3. Stage A behind its switch for read-only graphics buffers; A/B; then compute read-only buffers.
 4. Device-local promotion by measured reads-per-change (item 3).
-5. Stage B in the recompiler, after the descriptor-provenance proof exists.
+5. Stage B in the recompiler, after the descriptor-provenance proof of ADR 0027 (`GPU-4`) exists.
 6. Delete each switch once its default is settled, with the verdict recorded.
 
 ## Open questions
 
 - Do NVIDIA and AMD Windows drivers accept pointers into `MapViewOfFile` section views? If not,
   Stage A on Windows needs guest direct memory backed differently, which is its own ADR.
-- Does RADV accept the Linux guest mappings (shared vs anonymous), and at what alignment?
+- Does write-protect page tracking (`mprotect` on Linux) interact badly with pinned or imported
+  pages -- e.g. a driver MMU-notifier registration invalidating and revalidating the import on
+  every arm? Low confidence that it costs anything; step 3's A/B measures it.
 - How are GPU *writes* into imported guest memory ordered against guest CPU reads (writeback
   today goes through `guest_write_watch_notify_gpu_write`, `src/gpu/execute/gpu_executor.cpp:12567`)?
   This ADR covers reads only.
