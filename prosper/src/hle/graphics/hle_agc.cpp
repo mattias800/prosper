@@ -3141,7 +3141,13 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     uint32_t header = 0; memcpy(&header, (const void*)(uintptr_t)stream, sizeof header);
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
         return reject("stream-header", stream, count64, header);
-    return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb", a0);
+    // The queue is a 32-bit argument: the library compares `edi` (`cmp edi,0x57` at the start of both
+    // sceAgcDriverSubmitAcb and sceAgcDriverSubmitMultiAcbs), so the upper half of rdi is not part of
+    // the queue's identity. Narrowing here keeps both entry points on one compute context for the
+    // same hardware queue (#4743); keying on all 64 bits split it when a guest left rdi's upper half
+    // dirty.
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb",
+                             static_cast<uint32_t>(a0));
 }
 
 // sceAgcDriverSubmitMultiAcbs, libSceAgcDriver (NID HF3YllT3mXU; nid_hash of the name reproduces it).
@@ -3238,15 +3244,19 @@ HLE(agc_driver_submit_multi_acbs) {
 // actual import witness (count 1, 1484 DWORDs). Full arity/additional argument semantics are unproved.
 // CONFIDENCE: MED for a generic ordered batch on the existing graphics queue. We retain prosper's
 // established execute/visibility/completion policy once for the batch; this is not evidence of a
-// Sony completion or return-code contract. Empty/invalid/partial acceptance semantics are unproved,
+// Sony completion or return-code contract. Invalid and partial acceptance semantics are unproved,
 // so unsupported input is fatal and explicit rather than a guessed SCE error or fake success.
+// The one exception is count == 0 (#4741): this call enters the same submit worker as
+// sceAgcDriverSubmitMultiAcbs, whose first test returns the empty-batch code before it reads either
+// array, so that answer is read from the library and not guessed. See the MultiAcbs comment above
+// for the two builds and their different constants. CONFIDENCE: MED (build-dependent constant).
 HLE(agc_driver_submit_multi_dcbs) {
     prosper_gpu_submit_scope_begin();
     const uint32_t count = static_cast<uint32_t>(a2);
+    if (!count) return kAgcDriverErrEmptyBatch;
     // guest_readable has a uint32 byte extent. Refuse unrepresentable ranges before narrowing;
     // these are host implementation bounds, not asserted Sony array/stream limits.
-    if (!count || count > UINT32_MAX / sizeof(uint64_t))
-        unsupported_multi_dcb("array extent", count);
+    if (count > UINT32_MAX / sizeof(uint64_t)) unsupported_multi_dcb("array extent", count);
     if (!gpu::guest_readable(a0, count * static_cast<uint32_t>(sizeof(uint64_t))) ||
         !gpu::guest_readable(a1, count * static_cast<uint32_t>(sizeof(uint32_t))))
         unsupported_multi_dcb("unreadable descriptor arrays", count);
