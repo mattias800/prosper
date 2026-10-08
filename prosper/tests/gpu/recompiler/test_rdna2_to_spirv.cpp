@@ -4475,6 +4475,56 @@ int main() {
               bad24mt_store_xy00 == 0,
           "MTBUF XYZW store honors XY00 format width and leaves the adjacent dword untouched");
 
+    // The MUBUF half of the same rule. buffer_store_format_xyzw takes its format from the V#, and a
+    // one-component 32-bit V# (UE4's typed RWBuffer<float>, Kena's distance-field AO cone buffer)
+    // has identity X000: each lane writes ONE dword at index*4. Writing all four overlapped the next
+    // three lanes' elements, so the surviving values depended on lane order and only one element per
+    // wave kept X. Values are distinct per component so any overlap is visible: X=1, Y=2, Z=4, W=-1.
+    const uint32_t code24mubuf_store_x000[] = {
+        0x7e0202f2u,   // v_mov_b32 v1, 1.0
+        0x7e0402f4u,   // v_mov_b32 v2, 2.0
+        0x7e0602f6u,   // v_mov_b32 v3, 4.0
+        0x7e0802f3u,   // v_mov_b32 v4, -1.0
+        0x7e0a0f00u,   // v_cvt_u32_f32 v5, v0      (the element index)
+        0xe01c2000u, 0x80020105u,   // buffer_store_format_xyzw v[1:4], v5, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt24mubuf_store = rt24mt_store;   // Float32 x1, stride 4, binding 3
+    rt24mubuf_store.resources[0].fetch_pc = 5;
+    const std::vector<uint32_t> spv24mubuf_store_x000 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store);
+    std::vector<uint32_t> x000_store_in(N, 0xdeadbeefu), x000_store_out;
+    if (!spv24mubuf_store_x000.empty())
+        prosper::test::run_compute(spv24mubuf_store_x000, in24, N, N, {}, x000_store_in,
+                                   &x000_store_out);
+    uint32_t bad24mubuf_store_x000 = 0;
+    for (uint32_t i = 0; i < N && x000_store_out.size() == N; ++i)
+        if (x000_store_out[i] != 0x3f800000u) ++bad24mubuf_store_x000;
+    CHECK(!spv24mubuf_store_x000.empty() && x000_store_out.size() == N &&
+              bad24mubuf_store_x000 == 0,
+          "MUBUF XYZW store through a one-component V# writes X only, one dword per lane");
+
+    // Two components in a three-dword record: identity XY00 writes X and Y, and the record's third
+    // dword (where Z would have landed) and the next record's X (where W would) stay untouched.
+    ShaderResourceTable rt24mubuf_store_xy00 = rt24mubuf_store;
+    rt24mubuf_store_xy00.resources[0].num_components = 2;
+    rt24mubuf_store_xy00.resources[0].stride = 12;
+    const std::vector<uint32_t> spv24mubuf_store_xy00 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store_xy00);
+    const size_t xy00_words = static_cast<size_t>(N) * 3u;
+    std::vector<uint32_t> mubuf_xy00_in(xy00_words, 0xdeadbeefu), mubuf_xy00_out;
+    if (!spv24mubuf_store_xy00.empty())
+        prosper::test::run_compute(spv24mubuf_store_xy00, in24, N, N, {}, mubuf_xy00_in,
+                                   &mubuf_xy00_out);
+    uint32_t bad24mubuf_store_xy00 = 0;
+    for (size_t i = 0; i < N && mubuf_xy00_out.size() == xy00_words; ++i)
+        if (mubuf_xy00_out[i * 3u] != 0x3f800000u || mubuf_xy00_out[i * 3u + 1u] != 0x40000000u ||
+            mubuf_xy00_out[i * 3u + 2u] != 0xdeadbeefu)
+            ++bad24mubuf_store_xy00;
+    CHECK(!spv24mubuf_store_xy00.empty() && mubuf_xy00_out.size() == xy00_words &&
+              bad24mubuf_store_xy00 == 0,
+          "MUBUF XYZW store through a two-component V# writes XY and leaves the record's tail");
+
     // Kernel 24atomic (#590): the MUBUF 32-bit atomic RMW family. buffer_atomic_add over a binding-3
     // storage buffer — all N dispatched lanes each add 3 to element 0, so the final memory word is 3N.
     // This exercises the opcode -> SPIR-V-atomic mapping end-to-end through the proven cbuf_atomic_rtn

@@ -7204,6 +7204,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.cbuf_store(dword_idx, value, binding, rs.exec_narrowed, rs.exec,
                                  coherent_store);
                 };
+                // The DATA FORMAT owns the physical component COUNT of every format store, and a wider
+                // opcode writes only the components the format has: Table 31 defines identity as
+                // "X000, XY00, XYZ0, or XYZW" by the data format's component count. For MTBUF the
+                // format is the instruction's; for MUBUF it is the descriptor's (`fmt_ncomp` above).
+                // The clamp used to apply to MTBUF only, so buffer_store_format_xyzw through a
+                // one-component 32-bit V# wrote four dwords per lane at a four-byte stride: every lane
+                // overwrote its three neighbours, and only one element per wave kept its value. That
+                // is UE4's typed-buffer clear and Kena's distance-field AO cone buffer. Raw stores
+                // leave `fmt_ncomp` at 0 and keep the opcode's width.
+                const uint32_t store_n = is_format && fmt_ncomp && fmt_ncomp < n ? fmt_ncomp : n;
                 if (dyn_int_store) {
                     // Integer sub-dword store: clear then set THIS lane's disjoint field of the containing
                     // dword with two atomics. Disjoint fields commute (And clears only this field's bits,
@@ -7215,7 +7225,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shader never has. A straddling field (excluded by the alignment guard above) is the
                     // one shape this can't express and stays deferred.
                     const uint32_t field_mask = comp_bytes == 2 ? 0xffffu : 0xffu;
-                    for (uint32_t k = 0; k < n; k++) {
+                    for (uint32_t k = 0; k < store_n; k++) {
                         const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
                         const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                         const uint32_t bitpos = b.ibin(Op_ShiftLeftLogical,
@@ -7238,15 +7248,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (packed && !packed_word && (is_uint || is_sint)) {
                     buf_op.how = "reject-subword-int-store"; ok = false; return true;
                 }
-                // MTBUF's instruction format owns the physical component COUNT, and a wider opcode
-                // still writes only those components (for example XY00), so Z/W must not spill into
-                // adjacent memory. This line is about the COUNT, but the identity claim it makes is
-                // now settled rather than assumed: RDNA2 ISA Table 31 gives TBUFFER_STORE_FORMAT_* a
-                // DST SEL of "identity", so an MTBUF store really does ignore the descriptor's
-                // routing, while BUFFER_STORE_FORMAT_* does not and reaches `reject-dst-sel-store`
-                // above when routed (#2869). Everything below is therefore identity routing.
-                const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
-                                           ? fmt_ncomp : n;
+                // The identity claim the code below makes is settled rather than assumed: RDNA2 ISA
+                // Table 31 gives TBUFFER_STORE_FORMAT_* a DST SEL of "identity", so an MTBUF store
+                // really does ignore the descriptor's routing, while BUFFER_STORE_FORMAT_* does not
+                // and reaches `reject-dst-sel-store` above when routed (#2869). Everything below is
+                // therefore identity routing, written `store_n` components wide (see above).
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < store_n; k++) {
