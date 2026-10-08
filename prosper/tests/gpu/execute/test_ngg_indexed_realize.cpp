@@ -279,6 +279,14 @@ TEST_F(NggIndexedRealize, AMainReadingTheUserDataAddressIsSuppliedIt) {
     }
     EXPECT_TRUE(reloaded) << "the fold followed s0:s1 to the reloaded V#";
     EXPECT_FALSE(original) << "the stale user-data V# is not what the main reads";
+
+    // A reader of s0:s1 needs two push words beyond its user SGPRs: with RSRC2's count at 31
+    // there is no room, and the draw is refused by name rather than pushing past the budget.
+    for (uint32_t k = 4; k < 31; ++k) st.sh[P::SPI_SHADER_USER_DATA_GS_0 + k] = 0;
+    st.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 31u << 1;
+    DrawItem full;
+    EXPECT_FALSE(realize(st, kIndices, 3, 1, full));
+    EXPECT_FALSE(full.ngg_subgroup) << "31 user SGPRs + s0:s1 exceed the 32-word push budget";
 }
 
 // The same draw with a garbage index is refused by name rather than sized to 2^28 vertices (#461).

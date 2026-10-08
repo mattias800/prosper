@@ -87,8 +87,13 @@ NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primiti
 // The user-data words s8.. for `count` user SGPRs; false when one is absent.
 bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint32_t>* words);
 // The GS user-data address s0:s1 (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS); false when either register
-// is absent or the address is zero.
+// is absent or the address is zero. The ONE rule for "the address is known": the live producer and
+// the resource fold (fused GS backs and linked chains) both ask it.
 bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]);
+// Whether the linked program reads s0:s1 as launch values, i.e. needs the user-data address: its
+// ABI admission without the address refuses ngg-abi-read-s0-s1. Cached per program and count.
+bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                         uint32_t user_sgprs);
 
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host);

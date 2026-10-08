@@ -56,6 +56,10 @@ inline uint32_t ngg_rsrc2_gs_user_sgprs(uint32_t rsrc2) {
     return ((rsrc2 >> 1) & 0x1fu) | (((rsrc2 >> 27) & 1u) << 5);
 }
 
+// The subgroup shell's push-constant budget in words (128 bytes): the user SGPRs, then s0:s1 when
+// the program reads the user-data address.
+inline constexpr uint32_t kNggShellMaxPushWords = 32;
+
 // ---- Host capabilities ----------------------------------------------------------------------------
 // What the Vulkan device the backend runs on can do for this path. The backend publishes it once
 // its device exists (ngg_subgroup_gpu.h); realization reads the published copy. Until published,
@@ -175,7 +179,8 @@ struct NggDrawAdmission {
 //   ngg-user-data-range           no AGC user-data range, a range not starting at 0, or more than
 //                                 the shell's push-constant budget
 //   ngg-user-sgpr-count           the user-SGPR count (RSRC2_GS.USER_SGPR, or the range when that
-//                                 field is zero) leaves no room for s0:s1 in the push budget
+//                                 field is zero) exceeds the push budget. The live producer refuses
+//                                 by the same name a program that reads s0:s1 and has no room for it
 //   ngg-lds-limit                 RSRC2_GS.LDS_SIZE above 64 KiB or the device's shared memory
 //   ngg-host-compute              no compute on the graphics queue
 //   ngg-layer-route-unavailable / ngg-interpolation-geometry-needs-triangles   (route selection)

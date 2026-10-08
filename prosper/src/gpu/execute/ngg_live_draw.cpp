@@ -5,6 +5,7 @@
 
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -286,6 +288,29 @@ bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]) {
     return true;
 }
 
+bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                         uint32_t user_sgprs) {
+    if (!linked || linked->empty()) return false;
+    // Keyed by the shared program (ngg_linked_chain hands out one copy per content), which the
+    // entry also owns, so an address is never reused for other words while it is cached.
+    static std::mutex mutex;
+    static std::map<std::pair<std::shared_ptr<const std::vector<uint32_t>>, uint32_t>, bool> cache;
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto found = cache.find({linked, user_sgprs}); found != cache.end())
+            return found->second;
+    }
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(linked->data(), linked->size(), ins);
+    NggSubgroupAbiLaunch launch;
+    launch.user_sgprs = user_sgprs;
+    const bool reads = analyze_ngg_subgroup_abi(ins, launch).reason == "ngg-abi-read-s0-s1";
+    const std::lock_guard lock(mutex);
+    if (cache.size() >= 64u) cache.clear();
+    cache[{linked, user_sgprs}] = reads;
+    return reads;
+}
+
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host) {
     NggLiveDrawResult result;
@@ -304,6 +329,13 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     if (!input.user_data_complete || input.user_data.size() != admission.user_sgprs)
         return refuse("ngg-user-data-unavailable");
     if (!input.linked || input.linked->empty()) return refuse("ngg-program-unavailable");
+    // s0:s1 costs two push words, so it is supplied only to a program that reads it (#4735
+    // review): a program with 31-32 user SGPRs that never touches s0:s1 keeps its admission.
+    const bool supply_address =
+        input.user_data_address_known &&
+        ngg_program_reads_user_data_address(input.linked, admission.user_sgprs);
+    if (supply_address && admission.user_sgprs + 2u > kNggShellMaxPushWords)
+        return refuse("ngg-user-sgpr-count");
     const bool interpolation = input.interpolation.requires_geometry;
     if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
 
@@ -323,14 +355,14 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.count_violations = admission.count_violations;
     key.interpolation = interpolation;
     key.interpolation_layout = interpolation ? interpolation_hash(input.interpolation) : 0u;
-    key.user_data_address = input.user_data_address_known;
+    key.user_data_address = supply_address;
 
     NggSubgroupDrawRequest request;
     request.resources = input.resources;
     request.shell.rsrc2_gs_lds_size = admission.lds_granules;
     request.shell.user_sgprs = admission.user_sgprs;
     request.shell.native_wave64 = admission.native_wave64;
-    request.shell.user_data_address_known = input.user_data_address_known;
+    request.shell.user_data_address_known = supply_address;
     request.limits = admission.limits;
     request.shape = admission.shape;
     request.raster.topology = admission.topology;
@@ -352,7 +384,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         };
     }
     request.push_constants = input.user_data;
-    if (input.user_data_address_known)
+    if (supply_address)
         request.push_constants.insert(request.push_constants.end(), input.user_data_address,
                                       input.user_data_address + 2);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, input.program_address};

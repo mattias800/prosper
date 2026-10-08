@@ -134,8 +134,12 @@ TEST(NggDrawAdmission, KenaDecodes) {
     EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 12u) << "the hardware's count";
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs;
     EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 24u) << "zero: the AGC range";
+    // The whole 32-word push budget is usable: s0:s1's two words are reserved only for a program
+    // that reads them, and the live producer checks that (#4735 review).
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (1u << 27);   // USER_SGPR_MSB: 32
-    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count") << "no room for s0:s1";
+    EXPECT_STREQ(refusal(r, kena_facts()), "admitted");
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (1u << 27) | (1u << 1);   // 33
+    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count") << "past the push budget";
 }
 
 TEST(NggDrawAdmission, NotMergedDoesNotApply) {
@@ -201,7 +205,7 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_start = 1; }},
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_end = 33; }},
         {"ngg-user-sgpr-count",
-         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= 31u << 1; }},
+         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= (1u << 27) | (1u << 1); }},
         {"ngg-lds-limit", [](auto&, auto&, auto& h) { h.max_compute_shared_memory = 4096; }},
         {"ngg-host-compute", [](auto&, auto&, auto& h) { h.compute = false; }},
         {"ngg-layer-route-unavailable",
@@ -547,6 +551,46 @@ TEST_F(NggLiveDraw, IndexedDrawsAreCachedByTheirIndexValues) {
     EXPECT_NE(unindexed.draw, first.draw);
     EXPECT_FALSE(unindexed.indexed);
     EXPECT_EQ(ngg_live_draw_cache_stats().indexed_draws, 3u) << "first, same and other";
+}
+
+// #4735 review: a program that never reads s0:s1 is not charged its two push words. Kena's LUT
+// chain with 31 user SGPRs and a known user-data address is admitted, and the address is not
+// pushed: the push constants are exactly the 31 user words.
+TEST_F(NggLiveDraw, TheUserDataAddressIsSuppliedOnlyToAProgramThatReadsIt) {
+    const KenaProgram& p = kena_program();
+    EXPECT_FALSE(ngg_program_reads_user_data_address(
+        ngg_linked_chain(p.prolog.data(), p.prefix, p.main.data(), p.main.size()), 31))
+        << "the LUT chain never reads s0:s1";
+    auto in = kena_input();
+    in.facts.user_data_range_end = 31;
+    in.user_data.assign(31, 0u);
+    in.user_data_address_known = true;
+    in.user_data_address[0] = 0x12340000u;
+    in.user_data_address[1] = 0x5u;
+    const auto result = realize_ngg_live_draw(in, radv());
+    ASSERT_TRUE(result.draw) << (result.refusal ? result.refusal : "") << " " << result.detail;
+    EXPECT_EQ(result.draw->push_constants.size(), 31u) << "no s0:s1 words for a non-reader";
+
+    // A program that DOES read s0:s1 (it reloads its user SGPRs from the address, as Kena's
+    // 11562c72 does) needs those two words: with 31 user SGPRs there is no room, refused by name
+    // before anything compiles; with 30 the same program is not refused by that rule.
+    auto reader = std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{
+        0xbefe04c1u,   // s_mov_b64 exec, -1
+        0xf4100200u, 0xfa000000u,   // s_load_dwordx8 s[8:15], s[0:1], 0
+        0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+        0xb07c3005u, 0xbf900009u,   // s_movk_i32 m0, 0x3005; s_sendmsg GS_ALLOC_REQ
+        0xf8000941u, 0x00000009u,   // exp prim v9
+        0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
+        0xbf810000u});
+    EXPECT_TRUE(ngg_program_reads_user_data_address(reader, 31));
+    in.linked = reader;
+    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-user-sgpr-count")
+        << "31 user SGPRs + s0:s1 exceed the 32-word push budget";
+    in.facts.user_data_range_end = 30;
+    in.user_data.assign(30, 0u);
+    const auto roomy = realize_ngg_live_draw(in, radv());
+    EXPECT_FALSE(roomy.refusal && std::string(roomy.refusal) == "ngg-user-sgpr-count")
+        << "30 + 2 fits";
 }
 
 TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {
