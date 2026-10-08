@@ -3037,6 +3037,7 @@ if(TARGET prosper_core)
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
   prosper_add_gtest(test_compute_wave_route
     SOURCES tests/gpu/recompiler/test_compute_wave_route.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
 
   prosper_add_gtest(test_direct_descriptor_copy
@@ -3271,9 +3272,14 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_wave64_exchange_execution
+      SOURCES tests/gpu/execute/test_wave64_exchange.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 120)
     prosper_add_gtest(test_compute_wave_admission
       SOURCES tests/gpu/execute/test_compute_wave_admission.cpp
-      INCLUDES frontends
+      INCLUDES tests frontends
       LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 

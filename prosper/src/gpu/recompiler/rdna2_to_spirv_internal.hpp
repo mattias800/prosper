@@ -669,6 +669,10 @@ struct SpirvCompute {
     bool packed_r11_storage=true;
     uint32_t compute_pgm_rsrc1=kDefaultComputePgmRsrc1;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
+    // ADR 0028: this module was compiled through the exact exchange dispatcher (a second chance
+    // taken when the ordinary lowering needed a wider subgroup than the host has). Recorded as
+    // `Prosper.ComputeWave64Exchange=1` so the backend can apply the exchange's own launch limits.
+    bool wave64_exchange_dispatcher = false;
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
     // WHY that width was required, as a bitmask (#2147). The size alone is not actionable: a
     // shader needing 64 for lane IDENTITY can never run at 32, while one needing it only for a

@@ -615,10 +615,39 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     return b.finish();
 }
 
+namespace {
+std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
+                                             const ShaderResourceTable* rt,
+                                             const ComputeShaderConfig& config,
+                                             RecompileDiagnosticContext diagnostic);
+}   // namespace
+
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    std::vector<uint32_t> module = recompile_compute_once(code, dwords, rt, config, diagnostic);
+    // ADR 0028 route 3, default OFF: a module that needs a subgroup wider than the host's gets one
+    // second chance through the exact exchange dispatcher. It replaces the original only when it
+    // compiles and no longer needs the wider subgroup, so a refusal is never turned into a
+    // different (silently approximate) program.
+    const uint32_t width = config.wave64_exchange_width;
+    if (!width || module.empty() || config.force_exchange_dispatcher ||
+        config.native_subgroup_size || config.wave_size != 64 ||
+        compute_spirv_min_subgroup_size(module) <= width)
+        return module;
+    ComputeShaderConfig retry = config;
+    retry.force_exchange_dispatcher = true;
+    std::vector<uint32_t> exchanged = recompile_compute_once(code, dwords, rt, retry, diagnostic);
+    if (!exchanged.empty() && compute_spirv_min_subgroup_size(exchanged) <= width) return exchanged;
+    return module;
+}
+
+namespace {
+std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
+                                             const ShaderResourceTable* rt,
+                                             const ComputeShaderConfig& config,
+                                             RecompileDiagnosticContext diagnostic) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -948,9 +977,23 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
-                   /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; },
-                   code, dwords, nullptr, true, initial_dispatch_active, false,
+    if (config.force_exchange_dispatcher) {
+        // ADR 0028 route 3 retry: every invocation of the workgroup runs the same persistent
+        // dispatcher, so each cross-lane service (readlane, readfirstlane, mask reductions,
+        // bpermute, DPP rows) is a common synchronized phase that all of them reach together,
+        // whatever the guest's own control flow. A guest barrier, which cannot sit in one
+        // dispatcher case, makes this reject and the caller keeps the original module.
+        if (!b.has_workgroup_execution() || b.native_subgroup_size || wave_size != 64) return {};
+        b.wave64_exchange_dispatcher = true;
+        if (!emit_cfg_state_machine(
+                b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true, /*allow_smem*/ true,
+                [](RegState&, const Rdna2Inst&) { return false; }, code, dwords,
+                initial_dispatch_active, lds_fminmax_synchronization.needs_dispatcher))
+            return {};
+    } else if (!emit_body(
+                   b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true,
+                   /*allow_smem*/ true, [](RegState&, const Rdna2Inst&) { return false; }, code,
+                   dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
     // Exact resource contracts and portable wave gathers execute partial workgroups through ACTIVE. Padded
@@ -972,6 +1015,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     }
     return b.finish();
 }
+}   // namespace
 
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
                                      std::vector<RecompileUnsupportedSite>* sites) {

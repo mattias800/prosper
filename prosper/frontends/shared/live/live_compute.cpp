@@ -7216,6 +7216,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             prosper::frontend::compute_wave_route_text(ctx, item).text);
         return decline("subgroup-too-narrow");
     }
+    if (const char* why = prosper::frontend::exchange_limit(ctx, item)) return decline(why);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:
     // runtime predicates, coordinates and loop bounds may change with identical code and launch.
     // Preserve current input contents instead. Exact cached images can omit the upload only after

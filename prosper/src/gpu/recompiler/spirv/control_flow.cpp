@@ -107,6 +107,11 @@ std::vector<uint32_t> SpirvCompute::finish() {
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
         }
+        if (is_compute && wave64_exchange_dispatcher) {
+            std::vector<uint32_t> words;
+            pstr(words, "Prosper.ComputeWave64Exchange=1");
+            putv(debug, Op_ModuleProcessed, words);
+        }
         if (is_fragment && fragment_required_subgroup_size) {
             char marker[64];
             std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",

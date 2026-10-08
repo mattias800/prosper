@@ -12,8 +12,10 @@
 #include <map>
 #include <mutex>
 
+#include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/compute_wave_route.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 namespace prosper::frontend {
 
@@ -93,11 +95,40 @@ ComputeWaveRouteText compute_wave_route_text(const Ctx& ctx, const prosper::gpu:
     return out;
 }
 
+// A module compiled through the exchange dispatcher keeps its scratch in workgroup memory beside
+// the guest's own LDS, and its barriers need whole guest waves in every workgroup. Those are
+// limits this frontend knows and the recompiler does not: returns the decline reason, after
+// printing the refusal, or nullptr when the dispatch may proceed.
+template <class Ctx>
+const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item,
+                           const ComputeWaveLimits& limits) {
+    if (!prosper::gpu::compute_spirv_wave64_exchange(item.spirv)) return nullptr;
+    const char* why =
+        prosper::gpu::compute_exchange_launch_refusal(compute_wave_host(ctx, item, limits));
+    if (!why) return nullptr;
+    std::fprintf(
+        stderr,
+        "[compute] program 0x%llx compiled for the Wave64 exchange but %s -> dispatch skipped\n",
+        static_cast<unsigned long long>(item.code_addr), why);
+    char route[96];
+    std::snprintf(route, sizeof route, "refused:%s", why);
+    prosper::diagnostics::perf::note_unsupported_wave64(
+        prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
+        item.recompile_config_available ? item.recompile_config.wave_size : 64u, item.code_addr, 0,
+        UINT32_MAX, ctx.min_native_subgroup_size, ctx.max_native_subgroup_size, {}, route);
+    return "wave64-exchange-limit";
+}
+
 // The two entry points live_compute.cpp calls: the limits come from the context's own device.
 template <class Ctx>
 ComputeWaveRouteText compute_wave_route_text(const Ctx& ctx,
                                              const prosper::gpu::ComputeItem& item) {
     return compute_wave_route_text(ctx, item, compute_wave_device_limits(ctx.physical));
+}
+
+template <class Ctx>
+const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item) {
+    return exchange_limit(ctx, item, compute_wave_device_limits(ctx.physical));
 }
 
 }  // namespace prosper::frontend

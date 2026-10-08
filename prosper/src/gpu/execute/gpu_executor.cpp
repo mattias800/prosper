@@ -1178,6 +1178,7 @@ ShaderCompileKey make_shader_compile_key(
         key.compute_tg_size_en = compute_config->tg_size_en;
         key.compute_lds_bytes = compute_config->lds_bytes;
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
+        key.compute_wave64_exchange_width = compute_config->wave64_exchange_width;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
         key.compute_storage_buffer_int64_atomics =
@@ -8999,6 +9000,17 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr;
         config.native_subgroup_size = select_native_compute_subgroup_size(
             shared_vulkan, config, native_multiwave_requested, native_subgroup_disabled);
+        // PROSPER_WAVE64_EXCHANGE (ADR 0028 route 3; a guest-behaviour SELECTOR, default OFF,
+        // tracker in tools/env/switch_registry.txt): on a host whose compute subgroups are narrower
+        // than the guest wave, let a module that would need a wider subgroup be recompiled through
+        // the exact exchange dispatcher. Inert unless the device's compute subgroup range is known
+        // and narrower than 64, so a native or unknown host keeps the ordinary lowering.
+        if (PROSPER_ENV_ON("PROSPER_WAVE64_EXCHANGE") && config.wave_size == 64 &&
+            !config.native_subgroup_size && shared_vulkan.max_compute_subgroup_size &&
+            shared_vulkan.max_compute_subgroup_size < 64)
+            config.wave64_exchange_width = shared_vulkan.min_compute_subgroup_size
+                                               ? shared_vulkan.min_compute_subgroup_size
+                                               : shared_vulkan.max_compute_subgroup_size;
         // PROSPER_SUBGROUP_LOG (#2429): the resolved native-subgroup contract is a GUARD CONDITION in
         // several recompiler paths and was printable NOWHERE -- so any claim that turned on it could
         // only be inferred from the device's reported subgroup size, which is a different value with a

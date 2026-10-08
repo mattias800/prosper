@@ -630,6 +630,29 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv) {
     return required;
 }
 
+bool compute_spirv_wave64_exchange(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return false;
+    constexpr char kMarker[] = "Prosper.ComputeWave64Exchange=1";
+    for (size_t offset = 5; offset < spirv.size();) {
+        const uint32_t instruction = spirv[offset];
+        const uint32_t words = instruction >> 16;
+        const uint32_t opcode = instruction & 0xffffu;
+        if (!words || words > spirv.size() - offset) return false;
+        if (opcode == Op_ModuleProcessed && words > 1) {
+            const char* text = reinterpret_cast<const char*>(&spirv[offset + 1]);
+            const size_t bytes = static_cast<size_t>(words - 1) * sizeof(uint32_t);
+            const void* terminator = std::memchr(text, ' ', bytes);
+            if (terminator &&
+                static_cast<size_t>(static_cast<const char*>(terminator) - text) ==
+                    sizeof(kMarker) - 1 &&
+                std::memcmp(text, kMarker, sizeof(kMarker) - 1) == 0)
+                return true;
+        }
+        offset += words;
+    }
+    return false;
+}
+
 namespace {
 
 
