@@ -163,6 +163,17 @@ inline bool parse_arg(const std::string& tok, const State& prior, Arg* a, std::s
         stabilise(a, 8, 16);
         std::memset(a->buf.data(), kSentinel, 8);
         a->ref = static_cast<int>(v);
+    } else if (key == "ref") {
+        // The ADDRESS of an earlier case's argument buffer, so this call operates on the same object.
+        const size_t dot = val.find('.');
+        uint64_t k = 0;
+        if (dot == std::string::npos || !parse_int(val.substr(dot + 1), &k))
+            return *err = "bad ref spec '" + val + "'", false;
+        const auto it = prior.find(val.substr(0, dot));
+        if (it == prior.end() || k >= it->second.size() || it->second[k].buf.empty())
+            return *err = "ref:" + val + " does not name an earlier buffer", false;
+        a->kind = Arg::Kind::Int;
+        a->value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(it->second[k].buf.data()));
     } else if (key == "use") {
         const std::vector<std::string> p = split(val, '.');
         uint64_t k = 0, off = 0, size = 0;
@@ -300,7 +311,8 @@ inline std::string compare(const GoldenCase& c, const Outcome& o) {
         d << "ret console=" << hex64(c.ret & mask) << " prosper=" << hex64(o.ret & mask) << "; ";
     if (pointer_return && o.retn != c.retn)
         d << "retn console=" << c.retn << " prosper=" << o.retn << "; ";
-    if (!has_flag(c.expect, "ret") && o.buffers != c.buffers) {
+    // "redact" means the golden holds no buffer contents (personal data), so there is nothing to compare.
+    if (!has_flag(c.expect, "ret") && !has_flag(c.expect, "redact") && o.buffers != c.buffers) {
         for (size_t i = 0; i < std::max(o.buffers.size(), c.buffers.size()); i++) {
             const std::string want = i < c.buffers.size() ? c.buffers[i] : "<none>";
             const std::string got = i < o.buffers.size() ? o.buffers[i] : "<none>";

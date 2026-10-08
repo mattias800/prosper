@@ -301,5 +301,5 @@ routes do not exist yet. (`owned_graphics_wave_draw.cpp` admits wave-wide raw lo
 emulation.)
 Violated today: the compute Wave64 scalar-pair projection does not consult the fabricated-zero
 mark, so a synthetic zero can stand in for a lane mask on the default path (#4714).
-Status: proposed (adr:0028)
+Status: accepted
 Enforcement: adr:0028

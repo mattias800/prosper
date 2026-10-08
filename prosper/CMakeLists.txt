@@ -1539,6 +1539,11 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_cond_destroy_busy.cpp
     LIBRARIES prosper_core)
 
+  # #2168: a mutex destroy must refuse while the mutex is held (bare 16 POSIX, 0x80020010 Sony).
+  prosper_add_gtest(test_mutex_destroy_busy
+    SOURCES tests/hle/test_mutex_destroy_busy.cpp
+    LIBRARIES prosper_core)
+
   # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
   prosper_add_gtest(test_sce_pthread_encoding
     SOURCES tests/hle/test_sce_pthread_encoding.cpp
