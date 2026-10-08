@@ -299,8 +299,8 @@ width independence is proven or an exact emulation route admits it; otherwise it
 accepted the only admitting route for the width question is proof (`ProvenVotes`); the emulation
 routes do not exist yet. (`owned_graphics_wave_draw.cpp` admits wave-wide raw loads, not width
 emulation.)
-The scalar-pair projection (a 64-bit scalar mask pair projected onto an invocation's own bit)
-consults the fabricated-zero mark in both stages, so a synthetic zero never stands in for a lane
-mask (#4711 fragment, #4714 compute).
+Violated today, narrowed by #4714: every Wave64 compute/fragment path that turns scalar data into an
+EXEC/VCC lane bit now consults the fabricated-zero mark, but the Wave32 mask forms
+(`allow_b32_masks`) and the merged-NGG shell's VCC reconstruction do not (#4714).
 Status: proposed (adr:0028)
 Enforcement: adr:0028

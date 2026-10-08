@@ -399,6 +399,53 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
     }
 }
 
+// May `words` consecutive scalar words starting at `reg` become per-lane mask bits? Not when any is
+// the structured emitter's fabricated zero (sreg_merge_placeholder: a one-path write, a loop phi, a
+// never-written source), on either stage (#4714, GPU-5/FAIL-1). Not when it is a memory-loaded
+// pattern in a fragment shader either: the host's pixel-to-lane assignment is not the PS5's, while
+// compute's lane identity is the guest's own, so GTA's scratch pairs keep projecting. Wave64
+// compute/fragment only; Wave32 mask forms are not covered (see the PR for the uncovered sites).
+inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, int reg, int words) {
+    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    for (int r = reg; r < reg + words; ++r) {
+        if (rs.sreg_merge_placeholder.contains(r)) return false;
+        if (b.is_fragment && rs.sreg_memory_pattern.contains(r)) return false;
+    }
+    return true;
+}
+
+// The shared guard for every scalar op that turns scalar DATA words into this lane's EXEC/VCC bit
+// through the lane id (s_cselect_b64/b32 into VCC, s_pack into VCC, s_lshl/lshr/bfe_b64 into
+// EXEC/VCC, s_bitreplicate, s_mov/logical forms into EXEC/VCC). Such an op is refused when a DATA
+// source word, or the VCC sibling word the result is combined with, is not projectable. A source
+// that is a mask (a Bool in sreg_bool, or VCC's live predicate) is not data and is not checked.
+inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, const RegState& rs,
+                                                      const Rdna2Inst& in) {
+    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    const int dst = in.dst.value;
+    // s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source.
+    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64;
+    if (!saveexec &&
+        (!(in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR) ||
+         !(dst == 106 || dst == 107 || dst == 126 || dst == 127)))
+        return true;
+    const auto has_data = [&](int reg) {
+        return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+    };
+    for (const Operand& o : in.src) {
+        const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
+        if (o.kind != OperandKind::SGPR && !special_data) continue;
+        if ((o.value == 106 || o.value == 107) && rs.vcc) continue;   // the live predicate wins
+        if (rs.sreg_bool.contains(o.value)) continue;
+        if (!has_data(o.value) && !has_data(o.value + 1)) continue;
+        if (!scalar_words_projectable(b, rs, o.value, 2)) return false;
+    }
+    if (dst == 106 || dst == 107)
+        for (int r : {106, 107})
+            if (has_data(r) && !scalar_words_projectable(b, rs, r, 1)) return false;
+    return true;
+}
+
 // A B64 wave-mask logical (s_and_b64 and family) whose operand is an ordinary scalar DATA pair:
 // project the pair onto this invocation's lane bit -- this lane's 32-bit half, then its bit -- so
 // it joins the per-invocation Bool representation. Returns 0 when the projection is not admitted,
@@ -438,14 +485,7 @@ inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operan
     if (o.kind != OperandKind::SGPR &&
         !(o.kind == OperandKind::Special && (o.value == 106 || o.value == 107)))
         return 0;
-    // A fabricated zero is no lane mask on either stage (#4714, GPU-5/FAIL-1): refuse it.
-    for (int r = o.value; r <= o.value + 1; ++r)
-        if (rs.sreg_merge_placeholder.contains(r)) return 0;
-    // A memory-loaded pattern is refused for fragments only: the host's pixel-to-lane assignment is
-    // not the PS5's. Compute's lane identity is the guest's own, so GTA's scratch pairs project.
-    if (b.is_fragment)
-        for (int r = o.value; r <= o.value + 1; ++r)
-            if (rs.sreg_memory_pattern.contains(r)) return 0;
+    if (!scalar_words_projectable(b, rs, o.value, 2)) return 0;
     auto scalar_word = [&](int reg, uint32_t& value) {
         if (auto current = rs.sreg.find(reg); current != rs.sreg.end()) {
             value = current->second;

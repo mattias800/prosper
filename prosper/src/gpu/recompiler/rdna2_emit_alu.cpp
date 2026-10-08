@@ -258,6 +258,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            if (!scalar_data_sources_projectable_into_mask(b, rs, in)) {
+                // Named in the ONE terminal reject line (#3135): a scalar source of a lane-mask
+                // write may be the emitter's fabricated zero (#4714).
+                b.stage_reject_pc = in.pc;
+                b.stage_reject_reason = "scalar-fabricated-lane-mask";
+                ok = false;
+                return true;
+            }
             if (in.opcode == 0x0a &&
                 ((in.dst.value & 1) ||
                  ((in.src[0].kind == OperandKind::SGPR ||
@@ -1508,6 +1516,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOP2: {
+            if (!scalar_data_sources_projectable_into_mask(b, rs, in)) {
+                // Named in the ONE terminal reject line (#3135): a scalar source of a lane-mask
+                // write may be the emitter's fabricated zero (#4714).
+                b.stage_reject_pc = in.pc;
+                b.stage_reject_reason = "scalar-fabricated-lane-mask";
+                ok = false;
+                return true;
+            }
             const bool gtav_wave32_vcchi_scalar_packet =
                 allows_compute_scalar_vcc_bridge(b) && b.native_subgroup_size == 32 &&
                 is_gtav_wave32_vcchi_scalar_packet(in);
