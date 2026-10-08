@@ -136,6 +136,11 @@ enum class Counter : uint8_t {
     Wave64UnidentifiedRefusals, // uses with neither a compile identity nor a program address
     Wave64InventoryOverflow,   // uses whose identity could not enter the full inventory
     Wave64ShaderChecks,        // known-Wave64 observations at realization/backend boundaries
+    // Admitted guest Wave64 uses by route (ADR 0028). Refused uses are the four counters above.
+    // "Admitted" means the use passed the subgroup gate, NOT that it executed: the draw or dispatch
+    // can still be dropped for another reason, so native + proven + refused is not an executed count.
+    Wave64RouteNative,         // a host that offers the required 64-lane subgroup (required size 64)
+    Wave64RouteProven,         // proven width-independent (FragmentWavePolicy::ProvenVotes)
     // Actual direct/cached fragment compiler requests, NOT draws, execution or wrong pixels.
     // Families describe emitted guest ADD/MUL sites only; other arithmetic is not inventoried.
     FragmentArithmeticRequests,

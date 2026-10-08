@@ -4,6 +4,8 @@
 // start-up, with this device's real facts, is test_wave64_host_announcement's job.
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <gtest/gtest.h>
+#include <cstddef>
+#include <iterator>
 #include <string>
 
 using namespace prosper::diagnostics::perf;
@@ -86,4 +88,46 @@ TEST(Wave64RefusalLine, ASubgroupRefusalStillNamesTheHostRange) {
         wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 0, 0, {});
     EXPECT_TRUE(has(missing, "host-subgroups=unavailable")) << missing;
     EXPECT_FALSE(has(missing, "not-consulted")) << missing;
+}
+
+// ADR 0028's route= field. The vocabulary is named before the routes exist, so the names are pinned
+// here: a census tool keys on them.
+TEST(Wave64RouteField, TheVocabularyIsFixedAndReservedNamesExist) {
+    const char* const expected[] = {"native",  "proven-width-independent", "workgroup-exchange",
+                                    "n-lanes", "fragment-promoted",        "owned-wave", "refused"};
+    ASSERT_EQ(kWave64RouteCount, std::size(expected));
+    for (size_t i = 0; i < kWave64RouteCount; ++i)
+        EXPECT_STREQ(wave64_route_name(static_cast<Wave64Route>(i)), expected[i]);
+    EXPECT_STREQ(wave64_route_name(Wave64Route::Count), "unknown");
+}
+
+TEST(Wave64RouteField, EveryRefusalLineSaysRouteRefused) {
+    for (size_t i = 0; i < kWave64RefusalCount; ++i) {
+        const Wave64Refusal site = static_cast<Wave64Refusal>(i);
+        const std::string line = wave64_refusal_line(site, 0x4071, 0x40710001, 2, 32, 32, {});
+        EXPECT_TRUE(has(line, "route=refused guest-wave=64 ")) << line;
+        const std::string refusal =
+            std::string("refusal=") + kWave64RefusalNames[i] + " route=refused ";
+        EXPECT_TRUE(has(line, refusal.c_str())) << "route= follows refusal=: " << line;
+    }
+}
+
+TEST(Wave64RouteField, AnAdmittedProgramIsNotTaggedUnsupported) {
+    const std::string proven =
+        wave64_route_line(Wave64Route::ProvenWidthIndependent, false, 0x4071, 0x40710001);
+    EXPECT_TRUE(has(proven, "[wave64-route] stage=fragment program=0x4071 identity=0x40710001 "
+                            "route=proven-width-independent guest-wave=64\n"))
+        << proven;
+    EXPECT_FALSE(has(proven, "unsupported")) << proven;
+    const std::string native = wave64_route_line(Wave64Route::Native, true, 0x4072, 0);
+    EXPECT_TRUE(has(native, "stage=compute ")) << native;
+    EXPECT_TRUE(has(native, "route=native ")) << native;
+}
+
+TEST(Wave64RouteField, ARouteThatDoesNotExistYetPrintsNothing) {
+    for (Wave64Route reserved : {Wave64Route::WorkgroupExchange, Wave64Route::NLanes,
+                                 Wave64Route::FragmentPromoted, Wave64Route::OwnedWave,
+                                 Wave64Route::Refused})
+        EXPECT_TRUE(wave64_route_line(reserved, false, 1, 2).empty())
+            << wave64_route_name(reserved);
 }
