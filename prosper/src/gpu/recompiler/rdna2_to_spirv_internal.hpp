@@ -2953,6 +2953,14 @@ struct RegState {
     // slot instead. Consumers that turn scalar DATA into lane bits consult the marks (mask()).
     std::set<int> sreg_merge_placeholder;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
+    // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
+    // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in
+    // every emitting shell: compute seeds its whole launch state, so absence is "never written";
+    // fragment models no user data, so its absent words read as 0 and count as never-written
+    // (#4725). recompile_coverage() clears it: its census seeds no launch state at all and discards
+    // its code, so a stage's launch word there (Messenger's VS `s_and_b32 vcc_hi, s3, ...`) is not
+    // a fabricated word (#4714 review). Merge edges ignore it: `sget()` always supplies uconst(0).
+    bool absent_sgpr_reads_fabricated_zero = true;
     // Same propagation, second fact: the SGPR's bits came from MEMORY (an SMEM load, or scalar ALU
     // over one). Such a word is not a ballot of this wave, so projecting it onto host lanes would
     // select different pixels than the PS5 does whenever the pattern is not uniform.
@@ -3200,19 +3208,31 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // read needs them. An untracked VCC half (106/107) is the VCC Bool, materialized exactly or
 // refused, so it counts only when marked; so do ttmp0-15 (108-123) and M0 (124), whose untracked
 // data reads `operand_bits` refuses (#4725 review: both laundered the mark while unscanned).
+//
+// The explicit mark is tested first, so it always wins. Absence then counts only when nothing real
+// stands behind it: a direct-descriptor word in `sreg_input` is the driver's own data, which
+// `operand_bits` reads, and every scalar write, merge, loop and dispatcher case erases
+// `sreg_input`, so a word still there was never written on any path. scalar_source_marks() asks
+// this same question, so a COPY of such a word stays clean too (#4714 review). And a shell that
+// seeds no launch state (recompile_coverage) cannot tell never-written from launch data at all.
+inline bool sreg_word_absent_unmasked(const RegState& rs, int r) {
+    return r >= 0 && r <= 105 && !rs.sreg.contains(r) && !rs.sreg_bool.contains(r) &&
+           !(r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
+}
 inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
     if (r < 0 || r > 124) return false;
     if (rs.sreg_merge_placeholder.contains(r)) return true;
-    if (r > 105 || rs.sreg.contains(r)) return false;
-    return !rs.sreg_bool.contains(r) &&
-           !(r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
+    return rs.absent_sgpr_reads_fabricated_zero && !rs.sreg_input.contains(r) &&
+           sreg_word_absent_unmasked(rs, r);
 }
 // Whether a merge EDGE's word for `r` is fabricated. A merge reads an absent register through
 // `sget()`, which supplies `uconst(0)` for any absent word, so absence there counts for the special
-// data registers 106-124 (VCC, ttmp, M0) too.
+// data registers 106-124 (VCC, ttmp, M0) too, and for an ordinary SGPR whatever `sreg_input` holds:
+// the skipped edge of an if whose arm overwrote a direct-descriptor word merges a zero, not the
+// driver's word.
 inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
     if (r >= 106 && r <= 124 && !rs.sreg.contains(r)) return true;
-    return sreg_word_may_be_fabricated(rs, r);
+    return sreg_word_absent_unmasked(rs, r) || sreg_word_may_be_fabricated(rs, r);
 }
 
 // The scalar instructions that read SCC as a value.

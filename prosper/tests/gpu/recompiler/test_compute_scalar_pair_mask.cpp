@@ -271,3 +271,95 @@ TEST(ScalarPairMask, OtherSaveexecFormsHaveNoEmitterYet) {
                   std::string::npos);
     }
 }
+
+namespace {
+
+// The compute harness with real launch data: s0..s15 are user SGPRs, s[8:11] is the output V#
+// (binding 3) and s[12:15] a second, unused direct V# (binding 4). Both are direct (inline)
+// descriptors, so their words live in sreg_input rather than sreg.
+Words compile_with_direct_descriptors(const Words& code) {
+    ComputeShaderConfig config;
+    config.local_x = 64;
+    config.wave_size = 64;
+    config.native_subgroup_size = 64;
+    config.user_sgprs.assign(16, 0u);
+    ShaderResourceTable table = output_table();
+    table.resources[0].srt_offset = 0xFFFFFFFFu;
+    ShaderResource second = table.resources[0];
+    second.binding = 4;
+    second.sgpr_base = 12;
+    table.resources.push_back(second);
+    return recompile_compute(code.data(), code.size(), &table, config,
+                             {RecompileDiagnosticStage::Compute, kAddress});
+}
+
+// s_mov_b32 s6, s8 | s_mov_b32 s7, s9 | s_mov_b64 vcc, s[6:7]: a register copy of a descriptor pair.
+const Words kCopiedDescriptorPair = {0xbe860308u, 0xbe870309u, 0xbeea0406u};
+
+}   // namespace
+
+TEST(ScalarPairMask, ACopiedDirectDescriptorWordStillProjects) {
+    // The review's executed row: the same driver words that project when read directly must not be
+    // refused after a register copy. The copy's source marks are decided by the same
+    // sreg_word_may_be_fabricated() call as a direct read, which is where sreg_input is exempted.
+    const Words body = program(kDefined, kCopiedDescriptorPair);
+    EXPECT_FALSE(compile_with_direct_descriptors(cat({&body, &kComputeTail})).empty())
+        << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ADescriptorWordOverwrittenOnOnePathIsFabricated) {
+    // The exemption must not survive a merge. s12 (a word of the unused direct V#) is overwritten on
+    // ONE arm of the if; the skipped edge's phi input is sget()'s uconst(0), not the driver's word,
+    // so after the join s12 is the fabricated zero even though the edge still held it in sreg_input.
+    // s_cbranch_scc1 +1 | s_mov_b32 s12, -1 | s_mov_b64 vcc, s[12:13]
+    const Words one_path = {0xbf068000u, 0xbf850001u, 0xbe8c03c1u};
+    const Words probe = {0xbeea040cu};
+    const Words code = cat({&kPrefix, &one_path, &probe, &kComputeTail});
+    EXPECT_TRUE(compile_with_direct_descriptors(code).empty());
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=" + std::to_string(kPrefix.size() + one_path.size() + 1u) + " "),
+              std::string::npos)
+        << "refused at the v_cndmask: " << reason;
+    // Control: the same if writing s12 on the arm and leaving s13 alone, with the pair read only
+    // after s12 is redefined on every path, is admitted.
+    const Words redefined = {0xbe8c03c1u};
+    EXPECT_FALSE(compile_with_direct_descriptors(
+                     cat({&kPrefix, &one_path, &redefined, &probe, &kComputeTail}))
+                     .empty())
+        << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, AFragmentUserDataWordReadsAsTheFabricatedZero) {
+    // A fragment shell seeds no user data: operand_bits reads s13 / s[8:9] as uconst(0), so turning
+    // one into lane bits, directly or through a copy, refuses at the mask read (#4725's contract,
+    // unchanged by #4714). (s13, not Messenger's s3: this harness's prefix writes s[2:3] as a mask.)
+    const Words vcc_hi_from_s13 = {0x876bff0du, 0x0000ffffu};   // s_and_b32 vcc_hi, s13, 0xffff
+    const std::vector<Probe> rows = {
+        {"s_and_b32 vcc_hi, s13, 0xffff", vcc_hi_from_s13, true},
+        {"s_mov_b64 vcc, s[8:9]", {0xbeea0408u}, true},
+        {"s_mov_b32 s6, s8 ; s_mov_b32 s7, s9 ; s_mov_b64 vcc, s[6:7]", kCopiedDescriptorPair,
+         true},
+    };
+    for (const Probe& row : rows)
+        expect_refused_for_the_mark(Stage::Fragment, program(kDefined, row.ops), row);
+    // The same user-data word used as VCC scratch DATA (Messenger's NGG-preamble shape) compiles:
+    // v_mov_b32 v1, vcc_hi | v0=0, v2=0, v3=1.0 | exp mrt0 v0..v3 | s_endpgm
+    const Words data_tail = {0x7e02026bu, 0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+                             0xf800180fu, 0x03020100u, 0xbf810000u};
+    const Words body = program(kDefined, vcc_hi_from_s13);
+    EXPECT_FALSE(compile_whole(Stage::Fragment, cat({&body, &data_tail})).empty())
+        << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, CoverageDoesNotCallLaunchDataFabricated) {
+    // recompile_coverage() seeds no launch state for any stage, so a VS's launch word is not a
+    // fabricated zero there. The Messenger VS fixture's first two VCC writes, then a mask read:
+    // s_and_b32 vcc_hi, s3, 0xffff | s_and_b32 vcc_lo, s11, 0x1 | v_cndmask_b32 v3, 0, 1.0, vcc
+    const Words code = {0x876bff03u, 0x0000ffffu, 0x876aff0bu, 0x00000001u,
+                        0xd5010003u, 0x01a9e480u, 0xbf810000u};
+    const RecompileCoverage coverage = recompile_coverage(code.data(), code.size());
+    EXPECT_EQ(coverage.unsupported, 0u)
+        << "first_bad fmt=" << coverage.first_bad_fmt << " op=0x" << std::hex
+        << coverage.first_bad_op << " pc=" << std::dec << coverage.first_bad_pc;
+}
