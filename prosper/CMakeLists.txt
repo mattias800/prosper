@@ -1539,6 +1539,11 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_cond_destroy_busy.cpp
     LIBRARIES prosper_core)
 
+  # #2168: a mutex destroy must refuse while the mutex is held (bare 16 POSIX, 0x80020010 Sony).
+  prosper_add_gtest(test_mutex_destroy_busy
+    SOURCES tests/hle/test_mutex_destroy_busy.cpp
+    LIBRARIES prosper_core)
+
   # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
   prosper_add_gtest(test_sce_pthread_encoding
     SOURCES tests/hle/test_sce_pthread_encoding.cpp
@@ -3288,6 +3293,10 @@ if(TARGET prosper_core)
   add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
   target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
+  # ADR 0028 step 1: the s_cbranch_execz any-vote certificate (guest-region classifier + SPIR-V proof).
+  prosper_add_gtest(test_fragment_exec_skip_vote
+    SOURCES tests/gpu/recompiler/test_fragment_exec_skip_vote.cpp
+    LIBRARIES prosper_core)
   add_executable(test_fragment_neutral_selection tests/gpu/recompiler/test_fragment_neutral_selection.cpp)
   target_link_libraries(test_fragment_neutral_selection PRIVATE prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)

@@ -23,6 +23,12 @@
  *   outptr:<k>         pointer to an 8 byte out-parameter that will hold a pointer INTO the buffer of
  *                      argument k; reported as an offset so it compares across address spaces
  *   use:<id>.<k>.<off>.<size>   integer read (size 4 or 8) from argument k of an earlier case, after it ran
+ *   ref:<id>.<k>       the ADDRESS of argument k's buffer in an earlier case: a later call operates on
+ *                      the same object (a mutex, an attribute) the earlier call created
+ *
+ * expect flags handled here: retoff:<k> (normalise a pointer return) and redact (never print buffer
+ * contents -- for calls that return personal data such as user ids and names). The rest (r64, ret,
+ * none) are read by the replay.
  *
  * Result line (TAB separated):  R  id  status  ret  retn  a<k>=<value>...
  *   status  ok | nolib | nofunc | badspec | fault:<signal>
@@ -224,6 +230,22 @@ static int parse_arg(char *tok, struct arg *a) {
     a->value = (uint64_t)(uintptr_t)a->buf;
     return 0;
   }
+  if (strcmp(key, "ref") == 0) {
+    /* ref:<id>.<k> -- the ADDRESS of argument k's buffer in an earlier case, so a later call can
+     * operate on the same object (a mutex, an attribute) the earlier call created. */
+    char spec[160], *dot;
+    if (strlen(val) >= sizeof(spec)) return -1;
+    strcpy(spec, val);
+    dot = strchr(spec, '.');
+    if (!dot) return -1;
+    *dot = 0;
+    const struct result *r = find_result(spec);
+    uint64_t k;
+    if (!r || parse_int(dot + 1, &k) || k >= MAX_ARGS || !r->args[k].buf) return -1;
+    a->kind = K_INT;
+    a->value = (uint64_t)(uintptr_t)r->args[k].buf;
+    return 0;
+  }
   if (strcmp(key, "use") == 0) {
     char spec[160];
     if (strlen(val) >= sizeof(spec)) return -1;
@@ -260,6 +282,8 @@ static void print_hex(const uint8_t *b, size_t n) {
   for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
 }
 
+static int g_redact; /* set per case from expect "redact": buffer contents are never printed */
+
 static void report(const char *id, const char *status, uint64_t ret, const char *retn,
                    const struct arg *args, int nargs) {
   printf("R\t%s\t%s\t0x%016llx\t", id, status, (unsigned long long)ret);
@@ -267,7 +291,9 @@ static void report(const char *id, const char *status, uint64_t ret, const char 
   else printf("-");
   for (int i = 0; i < nargs; i++) {
     const struct arg *a = &args[i];
-    if (a->kind == K_IN || a->kind == K_OUT) {
+    if (g_redact && (a->kind == K_IN || a->kind == K_OUT || a->kind == K_OUTPTR)) {
+      printf("\ta%d=redacted(%zu)", i, a->kind == K_OUTPTR ? (size_t)8 : a->len);
+    } else if (a->kind == K_IN || a->kind == K_OUT) {
       printf("\ta%d=", i);
       print_hex(a->buf, a->len);
     } else if (a->kind == K_OUTPTR) {
@@ -321,6 +347,7 @@ static void run_case(char *line) {
   if (nf < 4) return;
   const char *id = f[0], *lib = f[1], *func = f[2];
   const char *expect = nf > 4 ? f[4] : "";
+  g_redact = strstr(expect, "redact") != NULL;
 
   struct result *res = g_nres < MAX_CASES ? &g_results[g_nres] : NULL;
   struct arg local[MAX_ARGS];

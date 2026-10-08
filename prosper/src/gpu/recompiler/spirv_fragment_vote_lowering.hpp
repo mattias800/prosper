@@ -30,7 +30,11 @@ struct FragmentVoteLowering {
 // is an implementation of that target, not unrestricted source-SPIR-V optimization authority.
 // A common-entry one-arm selection additionally permits TRUE control only after proving every
 // extra operation UB-free and every live merge export stable and unchanged under P=false. P stays
-// varying; an output-dead branch/loop alone is NOT that certificate. Strict replay never calls
+// varying; an output-dead branch/loop alone is NOT that certificate. For an s_cbranch_execz skip
+// (ADR 0028) the recompiler's `Prosper.FragmentExecSkipVote=<vote id>` metadata states that the
+// GUEST region has no scalar/memory/wave-level/exit effect; with it, an export is also certified
+// when its executed value is the same value as its skipped one under P=false. The metadata never
+// admits a vote by itself. Strict replay never calls
 // this transformation. A caller may certify buffer inputs immutable only after proving that all
 // shaders in the pass leave them read-only. Buffer-derived predicates additionally require an
 // enabled deterministic robust2 storage-read contract (32-bit aligned range, no rounded padding).
