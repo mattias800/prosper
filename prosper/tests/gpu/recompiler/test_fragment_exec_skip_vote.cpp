@@ -60,16 +60,6 @@ TEST(FragmentExecSkipVote, SgprLiveOutReadAfterMergeIsRefused) {
     EXPECT_EQ(lowered.neutral_votes, 0u);
 }
 
-TEST(FragmentExecSkipVote, ScalarMemoryStoreInTheRegionIsRefused) {
-    // ADR mutation arm, by name, at the SPIR-V level: the state is correctly masked, but the
-    // region also stores. It is refused by the existing body-purity rule (the stored composite is
-    // itself outside the executable domain); the guest-level scalar-memory condition is tested
-    // by EveryScalarMemoryOpcodeIsALoadOrRefused.
-    const auto lowered = lower_fragment_votes(marked(f::Shape::ScalarStore));
-    EXPECT_EQ(lowered.refusal, FragmentVoteRefusal::UnprovedVote);
-    EXPECT_TRUE(lowered.words.empty());
-}
-
 TEST(FragmentExecSkipVote, MaskNotTiedToTheVotePredicateIsRefused) {
     // Masking by some OTHER condition does not make the region neutral under P=false.
     const auto lowered = lower_fragment_votes(marked(f::Shape::UnrelatedMask));
@@ -472,4 +462,32 @@ TEST(FragmentExecSkipEmitter, RegionWithScalarWorkCarriesNone) {
     ASSERT_EQ(e.votes.size(), 1u);
     EXPECT_TRUE(e.marked.empty());
 }
+TEST(FragmentExecSkipEmitter, RegionWithReadFirstLaneCarriesNone) {
+    // The classifier's readfirstlane refusal, end to end: VCC is dead and s5 is never read after
+    // the merge, but s5 feeds an EXEC-masked v_add whose value is per-lane on a narrower host.
+    const auto e = compile_evidence({kVCmpGtU32, 0x7e0a0501u /* v_readfirstlane_b32 s5, v1 */,
+                                     0x06040405u /* v_add_f32 v2, s5, v2 */});
+    ASSERT_EQ(e.votes.size(), 1u);
+    EXPECT_TRUE(e.marked.empty());
+}
+
+TEST(FragmentExecSkipEmitter, LaneIdInTheRegionCarriesNoEvidenceAndIsRefused) {
+    const auto lower = [](const std::vector<uint32_t>& region) {
+        const auto code = execz_shader(region);
+        return lower_fragment_votes(recompile_fragment(code.data(), code.size()));
+    };
+    // v_mbcnt_lo_u32_b32 v1, -1, 0: a lane id the 32-lane host numbers differently. The guest
+    // classifier refuses it, and independently the emitter records a lane-id wave reason, so the
+    // module's `FragmentSubgroupWhy=2` contract is inconsistent.
+    const std::vector<uint32_t> mbcnt = {kVCmpGtU32, 0xD7650001u, 0x000100C1u, kVMovOne};
+    EXPECT_TRUE(compile_evidence(mbcnt).marked.empty());
+    const auto lowered = lower(mbcnt);
+    EXPECT_EQ(lowered.refusal, FragmentVoteRefusal::InconsistentContract);
+    EXPECT_TRUE(lowered.words.empty());
+    // v_readlane_b32 s5, v1, 40: a lane the 32-lane host does not have.
+    const std::vector<uint32_t> readlane = {kVCmpGtU32, 0xD7600005u, 0x00015101u, kVMovOne};
+    EXPECT_TRUE(compile_evidence(readlane).marked.empty());
+    EXPECT_NE(lower(readlane).refusal, FragmentVoteRefusal::None);
+}
+
 }   // namespace

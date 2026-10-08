@@ -97,12 +97,14 @@ bool read_marker(std::string_view text, std::string_view prefix,
 
 // `Prosper.FragmentExecSkipVote=<result id>`: the recompiler's GUEST-level statement that the region
 // this vote's s_cbranch_execz skips has no scalar live-out, scalar memory effect, wave-level side
-// effect or foreign exit (ADR 0028). Permission-granting, so strict: anything but a plain decimal id
-// is ignored, which can only cost an admission.
+// effect or foreign exit (ADR 0028). Permission-granting, so strict: anything but the canonical
+// decimal spelling of a non-zero id (no sign, space, leading zero or trailing text) is ignored,
+// which can only cost an admission.
 bool read_exec_skip_vote(std::string_view text, uint32_t& id) {
     constexpr std::string_view prefix = "Prosper.FragmentExecSkipVote=";
     if (!text.starts_with(prefix)) return false;
     const auto number = text.substr(prefix.size());
+    if (number.starts_with('0')) return false;   // "0" names no result; "060" is not canonical
     uint32_t value = 0;
     const auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
     if (number.empty() || number.front() == '0' || parsed.ec != std::errc{} ||

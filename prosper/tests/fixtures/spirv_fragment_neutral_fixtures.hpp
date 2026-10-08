@@ -2,47 +2,22 @@
 #include "spirv_fragment_vote_fixtures.hpp"
 
 namespace prosper::test::fragment_neutral {
+// clang-format off
 enum class Shape {
-    Masked,
-    Termination,
-    ScalarExport,
-    TerminationExport,
-    DeadUnequalPhi,
-    LiveUnequalPhi,
-    SecondConsumer,
-    PoisonConjunction,
-    UndefinedConjunction,
-    MaskedFloat,
-    UnmaskedFloat,
-    DeadLoad,
-    DeadDivide,
-    DeadDerivative,
-    BodyStore,
-    BodyEscape,
-    SecondUnsafeVote,
-    BitcastPoisonConjunction,
-    MaskedBitcastPoison,
-    UndefinedReconsume,
-    NonEntry,
-    Nested,
-    Reentered,
-    BuiltinReconsume,
-    LocationReconsume,
-    BufferPredicate,
-    BitcastPoisonSelection,
-    FloatPoisonConjunction,
-    FloatPoisonSelection,
+    Masked, Termination, ScalarExport, TerminationExport, DeadUnequalPhi, LiveUnequalPhi,
+    SecondConsumer, PoisonConjunction, UndefinedConjunction, MaskedFloat, UnmaskedFloat,
+    DeadLoad, DeadDivide, DeadDerivative, BodyStore, BodyEscape, SecondUnsafeVote,
+    BitcastPoisonConjunction, MaskedBitcastPoison,
+    UndefinedReconsume, NonEntry, Nested, Reentered, BuiltinReconsume, LocationReconsume,
+    BufferPredicate, BitcastPoisonSelection, FloatPoisonConjunction, FloatPoisonSelection,
     // ADR 0028 execz certificate. The skipped state is a VARYING value (FragCoord.x bits), not a
     // constant or frozen leaf, so only value identity under P=false can certify the export.
     // VaryingMasked: EXEC-masked VALU work only (positive). SgprLiveOut: the region's value
     // reaches a merge Phi unmasked, i.e. a scalar written in the region and read after the merge.
-    // ScalarStore: masked, but the region also stores. UnrelatedMask: Select on a condition that
-    // is not the vote's predicate.
-    VaryingMasked,
-    SgprLiveOut,
-    ScalarStore,
-    UnrelatedMask,
+    // UnrelatedMask: Select on a condition that is not the vote's predicate.
+    VaryingMasked, SgprLiveOut, UnrelatedMask,
 };
+// clang-format on
 enum class Predicate { Helpers, Visible, AllFalse, AllTrue };
 
 // Independent project-owned SSA, not title bytes or the recompiler's own emission. All-false
@@ -119,7 +94,7 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     op(61, {6, 50, 22}); op(81, {4, 51, 50, 0}); op(81, {4, 52, 50, 1});
     op(61, {2, 53, 24});
     const bool varying_state = shape == Shape::VaryingMasked || shape == Shape::SgprLiveOut ||
-                               shape == Shape::ScalarStore || shape == Shape::UnrelatedMask;
+                               shape == Shape::UnrelatedMask;
     if (varying_state) {
         op(124, {3, 140, 51});
         op(61, {2, 142, 24});
@@ -194,10 +169,7 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     if (shape == Shape::DeadLoad) op(61, {2, 86, 25});
     if (shape == Shape::DeadDivide) op(134, {3, 86, 9, 8});
     if (shape == Shape::DeadDerivative) op(207, {4, 86, 51});
-    if (shape == Shape::BodyStore || shape == Shape::ScalarStore) {
-        op(80, {6, 87, 12, 12, 12, 13});
-        op(62, {23, 87});
-    }
+    if (shape == Shape::BodyStore) { op(80, {6, 87, 12, 12, 12, 13}); op(62, {23, 87}); }
     op(249, {70}); op(248, {70});
     const uint32_t header = shape == Shape::Reentered ? 46 : 45;
     op(245, {3, 100, varying_state ? 140u : 8u, header, 80, 65});
