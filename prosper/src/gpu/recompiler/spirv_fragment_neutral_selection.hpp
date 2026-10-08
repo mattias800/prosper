@@ -37,6 +37,15 @@ struct FragmentNeutralExport {
 struct FragmentNeutralSelection {
     uint32_t predicate = 0;
     bool preserve_f32 = false;
+    // The guest-level classifier (`classify_exec_skip_region`, ADR 0028) found the skipped region
+    // free of scalar live-outs, scalar memory effects, wave-level side effects and foreign exits.
+    // That evidence is NOT derivable from SPIR-V (an s_sendmsg lowers to nothing), so it arrives as
+    // module metadata and is only ever a necessary condition. With it, an export is also certified
+    // when its executed value is provably the SAME value as its skipped value under P=false
+    // (copies and Selects whose condition is constant FALSE), which admits EXEC-masked writes of
+    // varying values that the constant/atom comparison alone cannot. Without it the proof is the
+    // older constant/atom one.
+    bool guest_scalar_effects_absent = false;
     std::unordered_map<uint32_t, FragmentNeutralValue> values;
     std::vector<uint32_t> body;
     std::vector<FragmentNeutralExport> exports;

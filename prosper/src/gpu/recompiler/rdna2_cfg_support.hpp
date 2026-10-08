@@ -83,7 +83,11 @@ struct ScalarMergeBlocker {
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                                ScalarMergeProof proof = ScalarMergeProof::AnyRead,
-                               ScalarMergeBlocker* blocker = nullptr) {
+                               ScalarMergeBlocker* blocker = nullptr,
+                               // A non-cmpx VOPC with an explicit SGPR destination (the e64 form)
+                               // overwrites the whole 64-bit pair, so it redefines both words. Off
+                               // by default: other callers keep the older, more conservative walk.
+                               bool vopc_sgpr_pair_kills = false) {
     const auto block = [&](const Rdna2Inst& at, const char* kind) {
         if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
         return false;
@@ -125,6 +129,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 return block(in, "vop2-implicit-vcc");
             if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
                 return block(in, "vccz-branch");
+            // NOTE: v_div_fmas_f32/f64 (VOP3 0x16f/0x170) also read VCC implicitly and are NOT
+            // listed above. Neither is emitted by the recompiler today (an unsupported opcode
+            // fails the whole recompile), so no liveness question reaches them; add the reader
+            // here before one is lowered.
         }
         switch (in.fmt) {
             // Most SOPK instructions remain fail-closed: s_addk/s_mulk/s_cmovk/s_cmpk read or
@@ -229,6 +237,11 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 // block whose vcc scratch-write hardware would have skipped.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
+                    continue;
+                if (vopc_sgpr_pair_kills && in.fmt == Rdna2Format::VOPC &&
+                    !vopc_is_cmpx(in.opcode) && in.dst.kind == OperandKind::SGPR &&
+                    in.dst.value >= 0 && in.dst.value <= 104 &&
+                    (R == in.dst.value || R == in.dst.value + 1))
                     continue;
                 // A scalar redefinition kills every word covered by its opcode's write width. Keep
                 // this after the explicit/implicit read checks above: B64 read-modify-write forms
