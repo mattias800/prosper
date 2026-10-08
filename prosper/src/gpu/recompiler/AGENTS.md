@@ -21,6 +21,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
+- `rdna2_exec_skip_region` — the GUEST-level verdict on the region a forward `s_cbranch_execz` skips:
+  scalar live-out, scalar memory effect, wave-level side effect, foreign exit (ADR 0028 route 2). The
+  structured fragment emitter publishes a clean verdict as `Prosper.FragmentExecSkipVote=<id>` module
+  metadata on the vote; `lower_fragment_votes` treats it only as an additional necessary condition,
+  because effects such as `s_sendmsg` lower to nothing and the SPIR-V cannot show them.
 - `rdna2_counted_loop_guard` — the counted-loop lowering's proof that a wave-empty
   `s_cbranch_execz` guard around or inside the loop may be linearized (the `s_and_saveexec` form
   and UE4's `s_mov sN, exec … v_cmpx` form). A shape it does not prove is left to `emit_alu`,

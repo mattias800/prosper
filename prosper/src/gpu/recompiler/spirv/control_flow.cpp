@@ -128,6 +128,12 @@ std::vector<uint32_t> SpirvCompute::finish() {
             words.clear();
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
+            for (const uint32_t vote : fragment_exec_skip_votes) {
+                std::snprintf(marker, sizeof marker, "Prosper.FragmentExecSkipVote=%u", vote);
+                words.clear();
+                pstr(words, marker);
+                putv(debug, Op_ModuleProcessed, words);
+            }
         }
         for (const auto& [binding, semantic] : cbuf_zero_pad_candidates) {
             if (cbuf_ordinary_accesses.count(binding)) continue;
