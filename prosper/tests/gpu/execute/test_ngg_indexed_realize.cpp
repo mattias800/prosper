@@ -22,6 +22,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <gtest/gtest.h>
