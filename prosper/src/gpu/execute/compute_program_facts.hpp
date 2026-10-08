@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,7 +48,11 @@ struct ComputeProgramFacts {
     // ADR 0028: every cross-lane operation and the control-flow context it sits in. Host
     // independent, so it is memoized with the program; the route is chosen per host at the decline
     // site (select_compute_wave_route).
-    ComputeWaveOpFacts wave_ops;
+    // Computed on first use (a decline that is about to print its line), so a host that never refuses
+    // a Wave64 compute program never pays for it.
+    const ComputeWaveOpFacts& wave_ops() const;
+    mutable std::once_flag wave_ops_once;
+    mutable ComputeWaveOpFacts wave_ops_value;
     // Terminal reject reasons the probe recorded, replayed for the current address on every use.
     std::vector<std::pair<std::string, std::string>> probe_reject_reasons;
 };

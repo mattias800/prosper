@@ -40,12 +40,19 @@ enum class ComputeCrossLaneKind : uint8_t {
     DsSwizzle,   // ds_swizzle_b32
     DsBpermute,   // ds_bpermute_b32
     DsAppend,   // ds_append / ds_consume: a wave-collective counter update
+    MaskScc,         // SCC produced from a whole-wave mask (s_cmp_*_u64 / s_and,or,xor,andn2_b64 / saveexec / wqm / not)
+    MaskOther,       // any other scalar op that reads or writes EXEC/VCC as a lane mask
+    WriteLane,       // v_writelane_b32 with a non-inline lane selector
+    LdsWaveSync,     // an LDS read after an LDS write with no s_barrier between: wave-synchronous LDS
+    DsPermute,       // ds_permute_b32
     Count
 };
 inline constexpr size_t kComputeCrossLaneKindCount =
     static_cast<size_t>(ComputeCrossLaneKind::Count);
 const char* compute_cross_lane_kind_name(ComputeCrossLaneKind kind);
 
+// Names follow the single route vocabulary of #4754 (kWave64RouteNames): native,
+// proven-width-independent, workgroup-exchange, n-lanes, refused.
 enum class ComputeWaveRoute : uint8_t {
     Native,
     WidthIndependent,

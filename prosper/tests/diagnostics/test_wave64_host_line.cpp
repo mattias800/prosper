@@ -73,14 +73,15 @@ TEST(Wave64RefusalLine, ARecompileRefusalSaysTheHostWasNotConsulted) {
     EXPECT_TRUE(has(fragment, "refusal=fragment/recompile")) << fragment;
 }
 
-TEST(Wave64RefusalLine, ARouteIsPrintedWhenKnownAndOnlyThen) {
+TEST(Wave64RefusalLine, ACandidateIsPrintedAsSeparateFieldsAndOnlyWhenKnown) {
     const std::string without =
         wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {});
-    EXPECT_FALSE(has(without, "route=")) << "a pre-ADR caller's line is unchanged: " << without;
+    EXPECT_FALSE(has(without, "candidate-")) << "a caller without a candidate is unchanged: " << without;
     const std::string with =
         wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {},
-                            "needs-n-lanes:cross-lane-in-loop");
-    EXPECT_TRUE(has(with, " route=needs-n-lanes:cross-lane-in-loop")) << with;
+                            "n-lanes", "cross-lane-in-loop");
+    EXPECT_TRUE(has(with, " candidate-route=n-lanes candidate-reason=cross-lane-in-loop")) << with;
+    EXPECT_FALSE(has(with, " route=")) << "never a second `route=`; that field belongs to #4754: " << with;
     EXPECT_TRUE(has(with, "[wave64-unsupported] stage=compute program=0x4072 "))
         << "the prefix the census tools key on is unchanged: " << with;
     EXPECT_EQ(with.back(), '\n');
