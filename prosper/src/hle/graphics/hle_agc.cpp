@@ -167,6 +167,9 @@ constexpr uint32_t kDwReleaseMem         = 8;
 constexpr uint32_t kDwJump               = 4;
 constexpr uint32_t kDwCbBranch = 14;   // sceAgcCbBranch: header + 13 (firmware 0x38 bytes)
 constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
+// AgcDriver (0x8a6d....) submit-worker result for a batch of zero descriptors: libSceAgcDriver.sprx
+// 0x4af0 tests the count register (`test ecx,ecx` at 0x4b17) and returns this constant (0x4ce9).
+constexpr uint64_t kAgcDriverErrEmptyBatch = 0x8a6d0109ull;
 constexpr uint64_t kAgcErrInvalidPacket = 0x8a6c000cull;   // BranchPatch*: not a branch packet
 constexpr uint64_t kAgcErrInvalidShaderHalves = 0x8a6c0008ull;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
@@ -2737,6 +2740,14 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
 // sceAgcCbBranch targets executed when the branch was recorded, and a branch now runs inside the
 // buffer that carries it, under that buffer's register state, so there is no separate stream left
 // to split.
+// The async-compute submit entry points. Both fold into the per-queue compute register context and
+// not into the graphics one: the two hardware queues use the same numeric SH-register offsets
+// concurrently, and folding an Acb's writes into graphics state overwrote live vertex user-data
+// bindings before the next Dcb draw (#1226, Plucky's first gameplay scene).
+static bool is_async_compute_submit(const char* who) {
+    return strcmp(who, "SubmitAcb") == 0 || strcmp(who, "SubmitMultiAcbs") == 0;
+}
+
 [[noreturn]] static void unsupported_multi_dcb(const char* reason, size_t count, size_t index = 0) {
     fprintf(stderr, "[agc] sceAgcDriverSubmitMultiDcbs unsupported: %s (count=%zu index=%zu)\n",
             reason, count, index);
@@ -2767,7 +2778,7 @@ static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buf
                     unsupported_multi_dcb("unknown PM4 packet", buffer_count, i);
         }
     }
-    const bool async_compute = strcmp(who, "SubmitAcb") == 0;
+    const bool async_compute = is_async_compute_submit(who);
     gpu::GpuState& state = async_compute ? agc_compute_state(queue_id) : agc_graphics_state();
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
     // graphics Dcb stream from the async-compute Acb stream. The queues share ordered memory
@@ -3125,6 +3136,78 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
         return reject("stream-header", stream, count64, header);
     return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb", a0);
+}
+
+// sceAgcDriverSubmitMultiAcbs, libSceAgcDriver (NID HF3YllT3mXU; nid_hash of the name reproduces it).
+// Several async-compute streams for ONE queue in a single call:
+//
+//   (uint32 queue, const uint64_t* streams, const uint32_t* dwords, uint32 count)
+//
+// Read from libSceAgcDriver.sprx (the export is at vaddr 0x4dc0, the worker it tail-jumps into at
+// 0x4af0), not inferred from the DCB sibling: the export validates the queue id (`edi`) and enters
+// the worker with the guest's rsi/rdx/ecx untouched. The worker
+//   * returns 0x8a6d0109 when the count is zero (`test ecx,ecx` 0x4b17 -> 0x4ce9);
+//   * copies streams[i] (8-byte stride) and dwords[i] (4-byte stride) into 32-byte descriptors, at
+//     most 0x80 per queue submit (`cmp r12d,0x80` / `cmovae`, 0x4bb4-0x4bc5), and repeats until the
+//     count is consumed (0x4ca2-0x4caa), so a count above 128 is several submits in guest order;
+//   * returns the first non-zero per-chunk result (0x4c86 `test eax,eax; jne` -> 0x4cb0), else 0.
+// sceAgcDriverSubmitMultiDcbs enters the same worker (wrapper at 0x4d40, graphics queue object), so
+// the empty-batch code above is the firmware's answer for that call too.
+//
+// Black Flag Resynced calls this at boot. It was unregistered, so the dispatcher answered 0 and the
+// guest's async-compute work was never folded: the queue's register context and its dispatches did
+// not exist. CONFIDENCE: HIGH for the argument layout, the empty-batch code, the 128-descriptor
+// chunking and first-failure propagation (all from the disassembly above). NOT modelled: the
+// export's queue-id range check, which answers 0x8a6d0003 for ids outside the driver's queue tables
+// (queue ids here are driver handles, as for SubmitAcb). CONFIDENCE: LOW for a zero-length
+// descriptor: the worker hands it to the per-queue submit unchanged and what that returns is not
+// read; it is skipped as in SubmitMultiDcbs, where a title was seen to send them and carry on.
+HLE(agc_driver_submit_multi_acbs) {
+    prosper_gpu_submit_scope_begin();
+    const uint64_t queue = static_cast<uint32_t>(a0);
+    const uint32_t count = static_cast<uint32_t>(a3);
+    auto reject = [&](const char* reason, uint32_t index = 0) -> uint64_t {
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1) < 16)
+            fprintf(stderr, "[agc] SubmitMultiAcbs reject=%s queue=%llu count=%u index=%u\n",
+                    reason, (unsigned long long)queue, count, index);
+        return kAgcErrInvalidArg;
+    };
+    if (!count) return kAgcDriverErrEmptyBatch;
+    // guest_readable has a uint32 byte extent: refuse unrepresentable arrays before narrowing.
+    if (count > UINT32_MAX / sizeof(uint64_t)) return reject("count-extent");
+    if (!gpu::guest_readable(a1, count * static_cast<uint32_t>(sizeof(uint64_t))) ||
+        !gpu::guest_readable(a2, count * static_cast<uint32_t>(sizeof(uint32_t))))
+        return reject("descriptor-arrays-unreadable");
+    constexpr uint32_t kChunk = 0x80;   // firmware: at most 128 descriptors per queue submit
+    for (uint32_t base = 0; base < count; base += kChunk) {
+        const uint32_t n = std::min(kChunk, count - base);
+        std::vector<gpu::CommandBuffer> buffers;
+        buffers.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t idx = base + i;
+            uint64_t stream = 0;
+            uint32_t words = 0;
+            // Snapshot the descriptor before executing it, as the firmware does; memcpy accepts
+            // unaligned arrays.
+            memcpy(&stream, (const void*)(uintptr_t)(a1 + uint64_t(idx) * sizeof(stream)),
+                   sizeof(stream));
+            memcpy(&words, (const void*)(uintptr_t)(a2 + uint64_t(idx) * sizeof(words)),
+                   sizeof(words));
+            if (!words) continue;   // nothing to execute (CONFIDENCE: LOW, see above)
+            if (words > UINT32_MAX / sizeof(uint32_t)) return reject("stream-extent", idx);
+            if (stream % alignof(uint32_t)) return reject("stream-unaligned", idx);
+            if (!gpu::guest_readable(stream, words * static_cast<uint32_t>(sizeof(uint32_t))))
+                return reject("stream-unreadable", idx);
+            buffers.push_back({(const uint32_t*)(uintptr_t)stream, words});
+        }
+        if (buffers.empty()) continue;
+        const uint64_t rc = submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiAcbs",
+                                               queue, /* explicit_lengths */ true,
+                                               /* require_complete_pm4 */ false);
+        if (rc) return rc;   // the firmware returns the first non-zero chunk result
+    }
+    return 0;
 }
 
 // sceAgcDriverSubmitMultiDcbs, libSceAgcDriver (primary firmware name/NID metadata).
@@ -3979,6 +4062,7 @@ void register_agc_hle() {
     RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
     RN_SUBMIT_NAMED("6UzEidRZwkg", agc_driver_submit_multi_dcbs, "sceAgcDriverSubmitMultiDcbs");
+    RN_SUBMIT_NAMED("HF3YllT3mXU", agc_driver_submit_multi_acbs, "sceAgcDriverSubmitMultiAcbs");
     // sceAgcCbBranch and its family (#2173, #4540). The branch is a builder, not a submit, so it
     // carries no submit-scope return hook. It takes twelve arguments, so its handler is guest-ABI:
     // see agc_cb_branch for why neither the (HleFn) cast nor a declared signature reaches all twelve

@@ -1,0 +1,165 @@
+// test_agc_multi_acb -- sceAgcDriverSubmitMultiAcbs (NID HF3YllT3mXU) folds a batch of async-compute
+// streams into its queue's own register context, in order, in firmware-sized chunks.
+//
+// THE DEFECT. The call was unregistered: the dispatcher answered 0 ("unimplemented, returning 0"),
+// so a title's async-compute work was never folded at all. Assassin's Creed Black Flag Resynced calls
+// it during boot. The contract is read from libSceAgcDriver.sprx (export 0x4dc0, worker 0x4af0):
+//   (uint32 queue, const uint64_t* streams, const uint32_t* dwords, uint32 count);
+//   count == 0 -> 0x8a6d0109; at most 0x80 descriptors per queue submit, repeated until the count is
+//   consumed; the first non-zero chunk result is returned.
+//
+// WHAT EACH ASSERTION KILLS:
+//   RegisteredAndFoldsIntoItsQueueOnly   unregistered again (stub returning 0) -> no submission and
+//                                        no register; folded into the GRAPHICS context instead of the
+//                                        queue's -> the queue-0 probe sees the write, or the queue's
+//                                        probe does not
+//   EmptyBatchReturnsTheFirmwareCode     count == 0 returns 0 or submits anyway
+//   ChunksAtOneHundredTwentyEight        a batch above 128 descriptors is truncated at 128 (the tail
+//                                        writes are missing) or is folded as one submission (the
+//                                        submit counter moves by 1, not 2)
+//   ZeroLengthSegmentIsSkipped           a zero-length descriptor aborts or drops its neighbour
+//   UnreadableArraysAreRejected          unreadable descriptor arrays are dereferenced (crash) or
+//                                        answered with success
+//   DescriptorOrderIsPreserved           descriptors are folded out of order: the last write to the
+//                                        same register must win
+#include "hle/dispatch/dispatch.hpp"
+#include "gpu/pm4/command_processor.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <vector>
+
+using namespace prosper;
+extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws);
+extern "C" bool prosper_agc_submit_sh_reg(uint64_t queue, uint32_t offset, uint32_t* value);
+
+namespace {
+constexpr const char* kNid = "HF3YllT3mXU";   // sceAgcDriverSubmitMultiAcbs
+// Written as literals so a mutated constant in the handler cannot make the arms agree with itself.
+constexpr uint64_t kEmptyBatch = 0x8a6d0109ull;
+constexpr uint64_t kInvalidArg = 0x8a6c000aull;
+
+uint64_t U(const void* p) {
+    return reinterpret_cast<uintptr_t>(p);
+}
+uint32_t header(uint32_t words, uint32_t op, uint32_t sub = 0) {
+    return 0xc0000000u | ((words - 2) << 16) | (op << 8) | (sub << 2);
+}
+
+// One SET_SH_REG stream writing `value` to SH register `offset`.
+std::vector<uint32_t> sh_write(uint32_t offset, uint32_t value) {
+    return {header(3, gpu::IT_SET_SH_REG), offset, value};
+}
+
+// Calls the handler and its paired return hook, as the generated import trampoline does.
+uint64_t call(uint64_t queue, const uint64_t* streams, const uint32_t* words, uint32_t count) {
+    HleFn fn = Hle::lookup(kNid);
+    auto hook = Hle::return_hook_of(kNid);
+    if (!fn || !hook) {
+        // An unregistered NID is a failure to report, not a null call to make.
+        ADD_FAILURE() << "sceAgcDriverSubmitMultiAcbs (" << kNid << ") is not registered";
+        return ~0ull;
+    }
+    const uint64_t rc = fn(queue, U(streams), U(words), count, 0, 0);
+    hook();
+    return rc;
+}
+
+uint64_t submits() {
+    uint64_t s = 0, d = 0;
+    prosper_agc_submit_stats(&s, &d);
+    return s;
+}
+bool sh(uint64_t queue, uint32_t offset, uint32_t* value) {
+    return prosper_agc_submit_sh_reg(queue, offset, value);
+}
+
+class MultiAcb : public ::testing::Test {
+protected:
+    void SetUp() override { register_builtin_hle(); }
+};
+}   // namespace
+
+TEST_F(MultiAcb, RegisteredAndFoldsIntoItsQueueOnly) {
+    ASSERT_NE(Hle::lookup(kNid), nullptr) << "sceAgcDriverSubmitMultiAcbs must be registered";
+    const auto a = sh_write(0x7a1, 0x11111111u);
+    const auto b = sh_write(0x7a2, 0x22222222u);
+    const uint64_t streams[2] = {U(a.data()), U(b.data())};
+    const uint32_t words[2] = {uint32_t(a.size()), uint32_t(b.size())};
+    const uint64_t before = submits();
+    EXPECT_EQ(call(/* queue */ 5, streams, words, 2), 0u);
+    EXPECT_EQ(submits(), before + 1) << "a batch inside one chunk is one submission";
+    uint32_t v = 0;
+    ASSERT_TRUE(sh(5, 0x7a1, &v));
+    EXPECT_EQ(v, 0x11111111u);
+    ASSERT_TRUE(sh(5, 0x7a2, &v));
+    EXPECT_EQ(v, 0x22222222u);
+    // The async-compute context is the queue's own: the same numeric offsets in the graphics context
+    // (queue 0) are untouched.
+    EXPECT_FALSE(sh(0, 0x7a1, &v)) << "an Acb batch must not write the graphics SH context";
+    EXPECT_FALSE(sh(0, 0x7a2, &v));
+    // And a different compute queue keeps its own context too.
+    EXPECT_FALSE(sh(6, 0x7a1, &v)) << "queue 6 never received this batch";
+}
+
+TEST_F(MultiAcb, EmptyBatchReturnsTheFirmwareCode) {
+    const uint64_t before = submits();
+    EXPECT_EQ(call(5, nullptr, nullptr, 0), kEmptyBatch);
+    EXPECT_EQ(submits(), before) << "an empty batch folds nothing";
+}
+
+TEST_F(MultiAcb, ChunksAtOneHundredTwentyEight) {
+    // 130 descriptors: the firmware submits 128, then the remaining 2.
+    constexpr uint32_t kCount = 130;
+    std::vector<std::vector<uint32_t>> bodies;
+    std::vector<uint64_t> streams;
+    std::vector<uint32_t> words;
+    for (uint32_t i = 0; i < kCount; ++i) {
+        bodies.push_back(sh_write(0x800 + i, 0x1000 + i));
+        streams.push_back(U(bodies.back().data()));
+        words.push_back(uint32_t(bodies.back().size()));
+    }
+    const uint64_t before = submits();
+    EXPECT_EQ(call(7, streams.data(), words.data(), kCount), 0u);
+    EXPECT_EQ(submits(), before + 2) << "130 descriptors are two queue submits (128 + 2)";
+    for (uint32_t i = 0; i < kCount; ++i) {
+        uint32_t v = 0;
+        ASSERT_TRUE(sh(7, 0x800 + i, &v)) << "descriptor " << i << " was dropped";
+        EXPECT_EQ(v, 0x1000 + i) << "descriptor " << i;
+    }
+}
+
+TEST_F(MultiAcb, ZeroLengthSegmentIsSkipped) {
+    alignas(16) static uint32_t empty[4] = {};
+    const auto real = sh_write(0x7b1, 0xdeadbeefu);
+    const uint64_t streams[2] = {U(empty), U(real.data())};
+    const uint32_t words[2] = {0, uint32_t(real.size())};
+    const uint64_t before = submits();
+    EXPECT_EQ(call(8, streams, words, 2), 0u);
+    EXPECT_EQ(submits(), before + 1);
+    uint32_t v = 0;
+    ASSERT_TRUE(sh(8, 0x7b1, &v));
+    EXPECT_EQ(v, 0xdeadbeefu) << "the real segment still lands beside the empty one";
+}
+
+TEST_F(MultiAcb, UnreadableArraysAreRejected) {
+    const uint64_t before = submits();
+    // Page 0 is never mapped: neither descriptor array is readable.
+    EXPECT_EQ(call(5, reinterpret_cast<const uint64_t*>(0x10),
+                   reinterpret_cast<const uint32_t*>(0x10), 4),
+              kInvalidArg);
+    EXPECT_EQ(submits(), before) << "a rejected batch folds nothing";
+}
+
+TEST_F(MultiAcb, DescriptorOrderIsPreserved) {
+    // Two writes to the SAME register: the later descriptor must win.
+    const auto first = sh_write(0x7c1, 0xaaaaaaaau);
+    const auto second = sh_write(0x7c1, 0xbbbbbbbbu);
+    const uint64_t streams[2] = {U(first.data()), U(second.data())};
+    const uint32_t words[2] = {uint32_t(first.size()), uint32_t(second.size())};
+    EXPECT_EQ(call(9, streams, words, 2), 0u);
+    uint32_t v = 0;
+    ASSERT_TRUE(sh(9, 0x7c1, &v));
+    EXPECT_EQ(v, 0xbbbbbbbbu);
+}
