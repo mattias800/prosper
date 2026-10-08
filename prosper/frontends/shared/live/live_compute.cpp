@@ -34,6 +34,7 @@
 #include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/depth_plane_view.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
@@ -8471,16 +8472,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // may also consume canonical RGBA8 because byte*257/65535 == byte/255. The independent
             // extent check below still rejects a scaled image for texel fetch/query access. Other
             // aliases and numeric conversions keep the snapshot path below.
-            const bool depth_float_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Float32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_bits_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Uint32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_import_eligible =
-                depth_float_import_eligible || depth_bits_import_eligible;
+            using prosper::frontend::DepthPlaneView;   // shared/rtt/depth_plane_view.hpp
+            const bool plain_2d_sample = !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
+                                         r->depth == 1 && r->img_dim == 1;
+            const DepthPlaneView depth_view =
+                plain_2d_sample ? prosper::frontend::depth_plane_view(r->format, r->num_components)
+                                : DepthPlaneView::None;
+            const bool depth_float_import_eligible = depth_view == DepthPlaneView::Float;
+            const bool depth_bits_import_eligible = depth_view == DepthPlaneView::Bits;
+            const bool depth_import_eligible = depth_view != DepthPlaneView::None;
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
