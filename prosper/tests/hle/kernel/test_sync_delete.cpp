@@ -321,7 +321,8 @@ TEST(SyncDelete, Contract) {
     {
         void* ef = nullptr; ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0, 0, 0);
         ef_delete((uint64_t)(uintptr_t)ef, 0, 0, 0, 0, 0);
-        void* se = nullptr; se_create((uint64_t)(uintptr_t)&se, (uint64_t)(uintptr_t)"free-sema", 0, 0, 8, 0);
+        void* se = nullptr;
+        se_create((uint64_t)(uintptr_t)&se, (uint64_t)(uintptr_t)"free-sema", 0, 0, 8, 0);
         se_delete((uint64_t)(uintptr_t)se, 0, 0, 0, 0, 0);
         CHECK(true, "delete with no waiters frees cleanly");
     }

@@ -221,9 +221,17 @@ int main() {
     // Each arm below is destroy-then-USE. A test that only checked destroy's own return value could
     // not see this at all: destroy returned 0 before and returns 0 now.
     {
-        struct { const char* init; const char* destroy; const char* use; const char* release; const char* what; } objs[] = {
-            { "scePthreadMutexInit",  "scePthreadMutexDestroy",  "scePthreadMutexLock",   "scePthreadMutexUnlock",  "mutex"  },
-            { "scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock","scePthreadRwlockUnlock", "rwlock" },
+        struct {
+            const char* init;
+            const char* destroy;
+            const char* use;
+            const char* release;
+            const char* what;
+        } objs[] = {
+            {"scePthreadMutexInit", "scePthreadMutexDestroy", "scePthreadMutexLock",
+             "scePthreadMutexUnlock", "mutex"},
+            {"scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock",
+             "scePthreadRwlockUnlock", "rwlock"},
         };
         for (const auto& o : objs) {
             auto init = Hle::lookup(nid_hash(o.init));

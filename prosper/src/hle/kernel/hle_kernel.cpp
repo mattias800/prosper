@@ -861,6 +861,7 @@ inline uint64_t mtx_report(const char* op, uint64_t slot, pthread_mutex_t* m, in
     static const bool on = getenv("PROSPER_MUTEX_FAILLOG") != nullptr;
     if (on && host != 0)
         fprintf(stderr, "[mtx-fail] %s slot=0x%llx host_m=%p rc=%d(%s)\n", op,
+                // NOLINTNEXTLINE(concurrency-mt-unsafe): failure-only diagnostic message
                 (unsigned long long)slot, (void*)m, host, strerror(host));
     return fbsd_errno(host);
 }
@@ -1009,7 +1010,7 @@ SCE_PTHREAD_ALIAS(k_sce_mutex_trylock, k_mutex_trylock)
 SCE_PTHREAD_ALIAS(k_sce_mutex_unlock,      k_mutex_unlock)
 SCE_PTHREAD_ALIAS(k_sce_mutex_init,        k_mutex_init)
 // #2168: destroying a held mutex is refused, so the Sony spelling needs the encoding split too.
-SCE_PTHREAD_ALIAS(k_sce_mutex_destroy,     k_mutex_destroy)
+SCE_PTHREAD_ALIAS(k_sce_mutex_destroy, k_mutex_destroy)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_init,    k_mutexattr_init)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_settype, k_mutexattr_settype)
 
@@ -5360,7 +5361,7 @@ void register_kernel_hle() {
     R("scePthreadMutexattrSetpshared", k_mutexattr_setpshared);     // always 0
     R("scePthreadMutexattrDestroy", k_mutexattr_destroy);           // always 0
     R("scePthreadMutexInit", k_sce_mutex_init);
-    R("scePthreadMutexDestroy", k_sce_mutex_destroy);               // EBUSY for a held mutex (#2168)
+    R("scePthreadMutexDestroy", k_sce_mutex_destroy);   // EBUSY for a held mutex (#2168)
     R("scePthreadMutexLock", k_sce_mutex_lock);
     R("scePthreadMutexTrylock", k_sce_mutex_trylock);
     R("scePthreadMutexTimedlock", k_mutex_timedlock);   // was MISSING -> faked "locked" without locking

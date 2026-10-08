@@ -222,11 +222,17 @@ bool wait_for(const std::atomic<int>& counter, int target) {
 // Entry points whose body returns 0 on every path. They correctly have NO alias, and #2158
 // established that its absence is the right answer rather than an oversight.
 const char* const kInfallible[] = {
-    "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
+    "scePthreadMutexattrSetprotocol",
+    "scePthreadMutexattrSetpshared",
+    "scePthreadMutexattrDestroy",
     "scePthreadCondattrDestroy",
-    "scePthreadCondSignal", "scePthreadCondBroadcast",
-    "scePthreadRwlockDestroy", "scePthreadSemDestroy",
-    "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
+    "scePthreadCondSignal",
+    "scePthreadCondBroadcast",
+    "scePthreadRwlockDestroy",
+    "scePthreadSemDestroy",
+    "scePthreadBarrierattrInit",
+    "scePthreadBarrierattrDestroy",
+    "scePthreadBarrierattrSetpshared",
 };
 
 // Bodies that CAN fail, but answer 0 for a NULL slot — so the sweep's null probe cannot reach their
@@ -267,9 +273,9 @@ const char* const kInfallible[] = {
 // probe, so no owner tracking is needed (#719/#793 stay removed); `test_mutex_destroy_busy.cpp`
 // asserts the bare 16 and the encoded 0x80020010 for a held mutex.
 const char* const kFallibleButNullSucceeds[] = {
-    "scePthreadCondDestroy",      // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
+    "scePthreadCondDestroy",   // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
     "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked -- encoded in the body itself
-    "scePthreadMutexDestroy",     // #2168: EBUSY while held -- bare from the body, encoded by the alias
+    "scePthreadMutexDestroy",   // #2168: EBUSY while held -- bare from the body, encoded by the alias
 };
 
 }  // namespace

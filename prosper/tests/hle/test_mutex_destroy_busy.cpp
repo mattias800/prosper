@@ -19,9 +19,13 @@ using prosper::HleFn;
 
 namespace {
 
-uint64_t call(HleFn fn, uint64_t a0 = 0) { return fn(a0, 0, 0, 0, 0, 0); }
+uint64_t call(HleFn fn, uint64_t a0 = 0) {
+    return fn(a0, 0, 0, 0, 0, 0);
+}
 
-HleFn by_name(const char* name) { return Hle::lookup(prosper::nid_hash(name)); }
+HleFn by_name(const char* name) {
+    return Hle::lookup(prosper::nid_hash(name));
+}
 
 }   // namespace
 
