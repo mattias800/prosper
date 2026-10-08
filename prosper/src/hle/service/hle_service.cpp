@@ -116,11 +116,48 @@ const char* gameintent_activity_id(size_t* length = nullptr) {
 }
 
 // --- user service ---
-HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
-HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
+// Return codes measured on a console (tests/data/console_oracle/userservice.golden.tsv, replayed by
+// test_console_oracle_replay). CONFIDENCE: HIGH for each fault taken alone; MED for the order checks run
+// in when several apply at once (null argument, then unknown user, then short buffer), which was not
+// measured in combination.
+constexpr uint64_t kUserServiceAlreadyInitialized = 0x80960003ull;
+constexpr uint64_t kUserServiceInvalidArgument = 0x80960005ull;
+constexpr uint64_t kUserServiceBufferTooShort = 0x8096000aull;
+constexpr uint64_t kUserServiceNoSuchUser = 0x80960105ull;
+constexpr int32_t kLocalUserId = 1;   // the single local user this model exposes
+constexpr uint64_t kUserNameBufferSize = 17;   // SCE_USER_SERVICE_MAX_USER_NAME_LENGTH (16) + NUL
+std::atomic<bool> g_user_service_initialized{false};
+
+// The first Initialize succeeds and a second reports ALREADY_INITIALIZED until Terminate.
+HLE(s_user_initialize) {
+    return g_user_service_initialized.exchange(true) ? kUserServiceAlreadyInitialized : 0;
+}
+HLE(s_user_terminate) {
+    g_user_service_initialized = false;
+    return 0;
+}
+HLE(s_user_initial) {   // GetInitialUser / GetForegroundUser -> userId 1; a null out-pointer is an argument error
+    if (!a0) return kUserServiceInvalidArgument;
+    *(int32_t*)PW(a0) = kLocalUserId;
+    return 0;
+}
+HLE(s_user_idlist) {
+    if (!a0) return kUserServiceInvalidArgument;
+    int32_t* p = (int32_t*)PW(a0);
+    p[0] = kLocalUserId;
+    for (int i = 1; i < 4; i++) p[i] = -1;
+    return 0;
+}
 // Bounded, non-padding write (strncpy would zero-pad the whole a2-byte buffer -> a
-// stack-smash if a2 is large/garbage). snprintf writes only the string + NUL.
-HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
+// stack-smash if a2 is large/garbage). snprintf writes only the string + NUL. The console refuses a
+// buffer under 17 bytes (including 0) with BUFFER_TOO_SHORT rather than truncating.
+HLE(s_user_name) {
+    if (!a1) return kUserServiceInvalidArgument;
+    if ((int32_t)a0 != kLocalUserId) return kUserServiceNoSuchUser;
+    if (a2 < kUserNameBufferSize) return kUserServiceBufferTooShort;
+    snprintf((char*)PW(a1), (size_t)a2, "%s", "Player");
+    return 0;
+}
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
 HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
 // sceUserServiceGetUserNumber(userId, number): each local user has a stable controller/user number.
@@ -1642,9 +1679,9 @@ void register_service_hle() {
     // UpdateStatus, GetResult and the other exports remain unregistered (#4463).
     R("sceWebBrowserDialogInitialize", s_ok);
     R("sceWebBrowserDialogTerminate", s_ok);
-    R("sceUserServiceInitialize", s_ok);
+    R("sceUserServiceInitialize", s_user_initialize);
     R("sceUserServiceInitialize2", s_ok);
-    R("sceUserServiceTerminate", s_ok);
+    R("sceUserServiceTerminate", s_user_terminate);
     // PlatformPrivacyWs1 (userId, int* out): a deterministic default with a NULL check, like the
     // module (s_user_privacy_ws1). Not in the 3.20 list: it lives in the newer
     // libSceUserServicePlatformPrivacyWs1 sub-library that the shipped libSceUserService.sprx
