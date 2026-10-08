@@ -430,13 +430,11 @@ namespace {
         return pt_static_sentinel(cur) ? nullptr : cur;
     }
 
-    // True when the slot holds the destroyed sentinel; a NULL (never initialised) slot is not destroyed.
-    inline bool pt_slot_destroyed(uint64_t slot_addr) {
-        if (!slot_addr) return false;
-        return pt_destroyed_sentinel(
-            __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE));
+    // True when the slot holds the destroyed sentinel (a NULL, never initialised, slot is not destroyed).
+    inline bool pt_slot_destroyed(uint64_t slot) {
+        return slot &&
+               pt_destroyed_sentinel(__atomic_load_n((void**)(uintptr_t)slot, __ATOMIC_ACQUIRE));
     }
-
     inline void pt_report_destroyed(const char* what) {
         static std::atomic<unsigned> seen{0};
         if (seen.fetch_add(1) < 16)
@@ -1204,7 +1202,6 @@ uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     // Checked BEFORE pt_claim_slot, because claiming retires the slot -- answering EBUSY after
     // clearing it would be the worst of both: the guest keeps a handle it is told is still live,
     // pointing at storage prosper has already quarantined.
-    // A second destroy of the same condvar is EINVAL on a console (measured, cond_destroy_again).
     if (kind == SyncObjectKind::Cond && pt_slot_destroyed(slot_addr))
         return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EInval);
     if (auto* existing = (pthread_cond_t*)pt_peek_slot(slot_addr)) {
@@ -3625,7 +3622,6 @@ HLE(k_barrier_destroy) {
     // peek and the claim to be one atomic step -- possible, since both are lock-free atomics rather
     // than lock-holders, but not cheap. What the check buys is the case the guest actually hits:
     // threads ALREADY parked when the destroy arrives. Raised in review of this PR by Marlow.
-    // A second destroy of the same barrier is EINVAL on a console (measured, barrier_destroy_again).
     if (pt_slot_destroyed(a0)) return prosper::hle::kSceKernelErrorEINVAL;
     if (auto* existing = (pthread_barrier_t*)pt_peek_slot(a0))
         if (guest_barrier_has_waiters(existing)) return prosper::hle::kSceKernelErrorEBUSY;
