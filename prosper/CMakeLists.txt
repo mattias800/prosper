@@ -4192,6 +4192,12 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
     LIBRARIES prosper_core)
 
+  # sceAgcDriverSubmitMultiAcbs: folds into the queue's own compute context, in 128-descriptor
+  # chunks, with the empty-batch code of the project's libSceAgcDriver.sprx (worker 0x4570).
+  prosper_add_gtest(test_agc_multi_acb
+    SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
   target_include_directories(test_agc_submit_multi PRIVATE tests)
   target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)
