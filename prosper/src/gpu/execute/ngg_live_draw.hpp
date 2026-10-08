@@ -76,7 +76,8 @@ struct NggLiveDrawResult {
 
 // The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded
 // content-keyed cache, so a repeated chain has one stable address (the stage-table fold's decode
-// cache is keyed by address). Null when the main has no code span.
+// cache is keyed by address). Null when the main has no code span. A null prolog with a zero
+// prefix is the main alone: an NGG VS that is its own primitive shader (#3135 P7).
 std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* prolog,
                                                               size_t prefix_dwords,
                                                               const uint32_t* main,

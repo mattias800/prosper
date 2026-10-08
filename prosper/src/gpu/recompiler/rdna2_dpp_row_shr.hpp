@@ -21,8 +21,9 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& builder, const RegState& reg
                                       uint32_t& result);
 // Function-variable IDs shared by the synchronized dispatcher. maximum=0 preserves the
 // established ADD-only emission; otherwise each pending static site supplies ADD=false/MAX=true.
+// bitwise_or=0 likewise preserves every stream without the bounded OR ladder (#3135 P7).
 struct ComputeDppRowShrPhaseVariables {
-    uint32_t pending, active, source, amount, destination, event, maximum;
+    uint32_t pending, active, source, amount, destination, event, maximum, bitwise_or;
 };
 
 bool emit_portable_compute_dpp_row_shr_phase(

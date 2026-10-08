@@ -1127,6 +1127,36 @@ inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
     }
 }
 
+// PROSPER_DROPPED_DRAW_CENSUS=1, second view: shader-recompile drops by the PROGRAM that refused.
+// The target view above says where draws were lost; this one says whose refusal lost them, so a
+// census ranks refusals by dropped draws rather than by refused programs (one refused vertex
+// program can own most of a level's draws). The refusal reason itself is in the run's
+// refused-shader index and on the program's terminal reject line; join on the address, which is
+// run-local. Bounded like the target view: 256 keys, reported at powers of two.
+inline void report_dropped_draw_program(const char* stage, uint64_t program, const char* reason) {
+    if (!dropped_draw_census_enabled()) return;
+    static std::mutex mutex;
+    static std::map<std::tuple<std::string, uint64_t, std::string>, uint64_t> dropped;
+    static uint64_t total = 0;
+    std::lock_guard lock(mutex);
+    const auto key = std::make_tuple(std::string(stage), program, std::string(reason));
+    if (dropped.size() < 256 || dropped.count(key)) ++dropped[key];
+    const uint64_t n = ++total;
+    if ((n & (n - 1)) != 0 || n < 256) return;
+    std::vector<std::pair<uint64_t, const decltype(key)*>> ranked;
+    ranked.reserve(dropped.size());
+    for (const auto& e : dropped) ranked.push_back({e.second, &e.first});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[dropped-draw-program] %llu shader-recompile draws dropped\n",
+                 (unsigned long long)n);
+    for (size_t i = 0; i < ranked.size() && i < 16; ++i)
+        std::fprintf(stderr, "[dropped-draw-program]   %s=0x%llx reason=%s x%llu\n",
+                     std::get<0>(*ranked[i].second).c_str(),
+                     (unsigned long long)std::get<1>(*ranked[i].second),
+                     std::get<2>(*ranked[i].second).c_str(), (unsigned long long)ranked[i].first);
+}
+
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -2985,9 +3015,14 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
     const char* ngg_refusal = nullptr;
     uint32_t ngg_vertex_range = vcount_hint;   // an indexed NGG draw: max index + 1 (#3135 P6)
-    if (vs_words.empty() && !owned_vertex && vertex_chain && !owned_fragment && !scalar_bank &&
-        !fs_words.empty() && !rect_list_synthesis && !dcc_decompress &&
-        std::strcmp(refused_ngg_class, "merged-gs") == 0) {
+    // #3135 P7: an NGG VS without a GS (the VS is the primitive shader) runs through the same shell,
+    // as its own program (no fetch prolog) or linked like a merged chain. A fused back half is
+    // neither and stays on the per-vertex path.
+    const bool ngg_vs_alone = std::strcmp(refused_ngg_class, "ngg-vs") == 0 &&
+                              (vertex_chain || vs_program_addr == rs.es_addr);
+    if (vs_words.empty() && !owned_vertex && !owned_fragment && !scalar_bank && !fs_words.empty() &&
+        !rect_list_synthesis && !dcc_decompress &&
+        ((vertex_chain && std::strcmp(refused_ngg_class, "merged-gs") == 0) || ngg_vs_alone)) {
         NggLiveDrawInput ngg;
         ngg.registers = read_ngg_draw_registers(ds, rs.prim_type);
         ngg.facts.vertex_count = vcount_hint;
@@ -3010,6 +3045,35 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         const auto volume = color_target_volume_view(rs.color_targets[0]);
         ngg.facts.target_slices = volume.slice_count;
         ngg.facts.target_first_slice = volume.first_slice;
+        const ColorTargetState& target0 = rs.color_targets[0];
+        const auto one_slice = [](const ColorTargetState& target) {
+            return target.has_view && target.has_attrib3 && target.resource_type != 2u &&
+                   target.slice_start == 0u && target.slice_max == 0u;
+        };
+        ngg.facts.target_single_slice = one_slice(target0);
+        // #3135 P7 review: every OTHER bound attachment must be one slice too. A colour slot is
+        // bound when the draw writes it; depth/stencil when it has a surface and a test or clear
+        // that touches it (the backend then attaches it).
+        bool others = true;
+        for (uint32_t slot = 1; slot < rs.color_targets.size(); ++slot)
+            if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base)
+                others = others && one_slice(rs.color_targets[slot]);
+        // The backend attaches depth/stencil for depth_stencil_tests_enabled() or a clear; the
+        // proof takes the superset, uses_depth_stencil_attachment(), so depth bounds alone (Z off)
+        // counts as bound (#4750 review).
+        const bool depth_bound = (rs.depth_read_base || rs.depth_write_base ||
+                                  rs.stencil_read_base || rs.stencil_write_base) &&
+                                 uses_depth_stencil_attachment(resolved_pipeline);
+        if (depth_bound) {
+            const bool view_present = ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) != 0;
+            const uint32_t v = rs.db_depth_view;
+            const uint32_t first = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START) |
+                                   (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START_HI) << 11);
+            const uint32_t last = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX) |
+                                  (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX_HI) << 11);
+            others = others && view_present && first == 0u && last == 0u;
+        }
+        ngg.facts.other_attachments_single_slice = others;
         if (vertex_header && vertex_header->specials &&
             guest_readable(reinterpret_cast<uintptr_t>(vertex_header->specials),
                            sizeof(AgcShaderSpecials))) {
@@ -3035,11 +3099,17 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             ngg.user_data_complete =
                 read_ngg_user_data(ds, ngg_admission.user_sgprs, &ngg.user_data);
             ngg.user_data_address_known = read_ngg_user_data_address(ds, ngg.user_data_address);
-            ngg.linked = ngg_linked_chain(
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
-                vertex_prolog.prefix_dwords,
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)),
-                chain_dwords);
+            ngg.linked =
+                vertex_chain
+                    ? ngg_linked_chain(
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                          vertex_prolog.prefix_dwords,
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)),
+                          chain_dwords)
+                    : ngg_linked_chain(
+                          nullptr, 0,
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                          vs_program_dwords);
             // The shell runs the LINKED program, so its table is folded over the linked words.
             if (ngg.linked)
                 ngg_vrt = build_stage_table(ds, rs.es_addr, false, ngg_vertex_range,
@@ -3080,6 +3150,28 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     ngg.facts.instance_count, ngg_subgroup->plan.subgroups.size(),
                     static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices);
         }
+        // Always on, bounded like [ngg-indexed]: an admitted VS-only NGG program, once, with the
+        // partition registers its plan was built from (#3135 P7).
+        static std::atomic<bool> ngg_vs_log_full{false};
+        if (ngg_subgroup && ngg_vs_alone && !ngg_vs_log_full.load(std::memory_order_relaxed)) {
+            static std::mutex ngg_vs_mutex;
+            static std::set<uint64_t> ngg_vs_logged;
+            const std::lock_guard lock(ngg_vs_mutex);
+            if (ngg_vs_logged.size() >= 32)
+                ngg_vs_log_full.store(true);
+            else if (ngg_vs_logged.insert(rs.es_addr).second)
+                std::fprintf(
+                    stderr,
+                    "[ngg-vs] es=0x%llx ps=0x%llx admitted prim=%u vertices=%u "
+                    "instances=%u indexed=%d subgroups=%zu onchip=%08x ge-cntl=%08x "
+                    "max-out=%08x itemsize=%08x gs-out-prim=%08x\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(rs.ps_addr), rs.prim_type,
+                    ngg.facts.vertex_count, ngg.facts.instance_count, ngg.facts.indexed ? 1 : 0,
+                    ngg_subgroup->plan.subgroups.size(), ngg.registers.vgt_gs_onchip_cntl,
+                    ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
+                    ngg.registers.vgt_esgs_ring_itemsize, ngg.registers.vgt_gs_out_prim_type);
+        }
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused")
                           : nullptr;
@@ -3099,7 +3191,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     "order=%llu prim=%u vertices=%u instances=%u indexed=%d "
                     "index-count=%u index-type=%u indirect=%d vertex-offset=%d "
                     "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u "
-                    "rsrc2-user-sgprs=%u user-data-range=%u..%u%s vs-out-cntl=%08x\n",
+                    "rsrc2-user-sgprs=%u user-data-range=%u..%u%s vs-out-cntl=%08x "
+                    "onchip=%08x ge-cntl=%08x max-out=%08x max-vert-out=%08x itemsize=%08x "
+                    "missing=%s cb-target-mask=%08x db-depth-view=%08x%s depth-bound=%d "
+                    "z=%d/%d stencil=%d\n",
                     static_cast<unsigned long long>(rs.es_addr),
                     static_cast<unsigned long long>(chain_addr),
                     static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
@@ -3112,7 +3207,17 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     ngg_rsrc2_gs_user_sgprs(ngg.registers.spi_shader_pgm_rsrc2_gs),
                     ngg.facts.user_data_range_start, ngg.facts.user_data_range_end,
                     ngg.facts.user_data_range_known ? "" : "(unknown)",
-                    ngg.registers.pa_cl_vs_out_cntl);
+                    ngg.registers.pa_cl_vs_out_cntl, ngg.registers.vgt_gs_onchip_cntl,
+                    ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
+                    ngg.registers.vgt_gs_max_vert_out, ngg.registers.vgt_esgs_ring_itemsize,
+                    ngg.registers.missing ? ngg.registers.missing : "none", rs.cb_target_mask,
+                    rs.db_depth_view,
+                    ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) ? "" : "(absent)",
+                    (rs.depth_read_base || rs.depth_write_base || rs.stencil_read_base ||
+                     rs.stencil_write_base)
+                        ? 1
+                        : 0,
+                    rs.z_enable ? 1 : 0, rs.z_write_enable ? 1 : 0, rs.stencil_enable ? 1 : 0);
         }
         // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit
@@ -3167,6 +3272,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             ngg_refusal ? (std::string("shader-recompile/ngg:") + ngg_refusal).c_str()
                         : "shader-recompile",
             rs.cb_target_mask, rs.cb_shader_mask);
+        if (vs_words.empty())
+            report_dropped_draw_program("es", rs.es_addr, ngg_refusal ? ngg_refusal : "recompile");
+        else if (fs_words.empty())
+            report_dropped_draw_program("ps", rs.ps_addr, "recompile");
+        else
+            report_dropped_draw_program("gs", rs.es_addr, "geometry");
         // #3951: a draw lost here never reaches the renderer's pass loop, so neither the frontend
         // drop sites nor [draw-disposition] could see it and `dropped-draws` stayed at 0 while a
         // recompiler refusal removed ~99.7% of GTA V's gameplay draws. Name the failing stage.

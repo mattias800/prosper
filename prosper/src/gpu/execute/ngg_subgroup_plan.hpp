@@ -46,6 +46,12 @@ struct NggSubgroupLimits {
     uint32_t max_out_verts_per_subgroup = 0;   // GE_MAX_OUTPUT_PER_SUBGROUP [9:0]
     uint32_t gs_max_vert_out = 0;   // VGT_GS_MAX_VERT_OUT [10:0]
     uint32_t esgs_item_size = 0;   // VGT_ESGS_RING_ITEMSIZE [14:0], in dwords
+    // NGG without a GS (VGT_SHADER_STAGES_EN: PRIMGEN_EN, no GS_EN): the VS is the primitive
+    // shader. Each lane is at once ES vertex t and primitive t, and the vertices a subgroup exports
+    // are its ES vertices, so GS_MAX_VERT_OUT plays no part: a subgroup has max(es, prims) threads,
+    // GE_MAX_OUTPUT_PER_SUBGROUP bounds its ES vertices, and primitives are bounded by
+    // GS_PRIMS_PER_SUBGRP and GE_CNTL.PRIM_GRP_SIZE alone (#3135 P7).
+    bool vs_only = false;
 };
 
 NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32_t ge_cntl,

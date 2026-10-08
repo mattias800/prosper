@@ -599,8 +599,8 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         }
         return true;
     };
-    const bool force_phases_for_dpp = (native_wave64 && has_barrier) || std::any_of(
-        ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
+    const bool force_phases_for_dpp = (native_wave64 && has_barrier) ||
+                                      std::any_of(ins.begin(), ins.end(), is_dpp_row_shr_bounded);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
                    nullptr, true, 0, force_phases_for_dpp) || !saw_export)

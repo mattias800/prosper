@@ -21,6 +21,7 @@
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -29,6 +30,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <ios>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -79,6 +81,22 @@ alignas(256) const uint32_t kMainReload[] = {
     0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
     0xf800020fu, 0x030a0805u,   // exp param0 v5, v8, v10, v3
     0xbf810000u,   // s_endpgm
+};
+
+// #3135 P7: an NGG VS that is its own primitive shader (no GS, no fetch prolog), the launch Kena's
+// culling VS programs read: GS_ALLOC_REQ from s3's counts on wave 0; PRIM = the three ES slots from
+// v0/v1 (offsets scaled by ITEMSIZE 4) packed 9/10 bits apart; POS0 from VertexID (v5) bit 0 -> x,
+// bit 1 -> y, each -1 or +1; POS1.z = 0 (the layer, when read); PARAM0 = (0.25, 0.5, 0, 1). The general SGPR-mask v_mbcnt (unused) makes
+// the per-vertex compile refuse, as Kena's culling programs' compaction does. Assembled with llvm-mc
+// -mcpu=gfx1030.
+alignas(256) const uint32_t kVsOnly[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
 };
 
 // Solid-green pixel stage (llvm-mc gfx1030; the same words test_gpu_execute uses).
@@ -140,9 +158,11 @@ bool register_blob(ShaderBlob& blob, const uint32_t* code, size_t bytes, uint32_
 bool register_chain_headers() {
     static const bool registered = [] {
         prosper::register_agc_hle();
-        static ShaderBlob prolog, main, reload;
+        static ShaderBlob prolog, main, reload, vs_only;
         return register_blob(prolog, kProlog, sizeof(kProlog), P::SPI_SHADER_PGM_LO_ES,
                              P::SPI_SHADER_PGM_HI_ES, 4) &&
+               register_blob(vs_only, kVsOnly, sizeof(kVsOnly), P::SPI_SHADER_PGM_LO_ES,
+                             P::SPI_SHADER_PGM_HI_ES, 0) &&
                register_blob(main, kMain, sizeof(kMain), P::SPI_SHADER_PGM_LO_GS,
                              P::SPI_SHADER_PGM_HI_GS, 4) &&
                register_blob(reload, kMainReload, sizeof(kMainReload), P::SPI_SHADER_PGM_LO_GS,
@@ -346,6 +366,123 @@ TEST(DrawIndexSource, AnOffsetDrawRecomputesTheAddressAtTheDetectedSize) {
     EXPECT_EQ(announced.detected, nullptr);
     EXPECT_EQ(announced.element_bytes, 2u);
     EXPECT_EQ(announced.addr, draw.index_addr);
+}
+
+// #3135 P7: Kena's culling-VS draw state. VGT_SHADER_STAGES_EN 0x2000 (PRIMGEN_EN, no GS), the
+// program in the ES registers with no chain, VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0,
+// GE_MAX_OUTPUT_PER_SUBGROUP 64, an indexed triangle list.
+GpuState vs_only_state() {
+    GpuState st = merged_state();
+    set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVsOnly);
+    st.sh.erase(P::SPI_SHADER_PGM_LO_GS);
+    st.sh.erase(P::SPI_SHADER_PGM_HI_GS);
+    st.cx[P::VGT_SHADER_STAGES_EN] = 0x2000u;
+    st.cx[P::VGT_GS_OUT_PRIM_TYPE] = 0u;
+    st.cx[P::VGT_GS_MAX_VERT_OUT] = 0u;
+    st.cx[P::GE_MAX_OUTPUT_PER_SUBGROUP] = 0x40u;
+    return st;
+}
+
+// The per-vertex compile refuses the program (its general-mask MBCNT), and the draw is realized
+// through the subgroup shell as the program alone: one subgroup, ES lanes = the distinct indices.
+// The same state with GS_EN set is a merged draw with no chain, which stays dropped.
+TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    DrawItem item;
+    ASSERT_TRUE(realize(vs_only_state(), kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the VS-only draw was not realized through the subgroup path";
+    const NggSubgroupDraw& ngg = *item.ngg_subgroup;
+    ASSERT_EQ(ngg.plan.subgroups.size(), 1u);
+    EXPECT_EQ(ngg.plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}));
+    ASSERT_EQ(ngg.groups.size(), 1u);
+    const std::vector<uint32_t>& launch = ngg.groups[0].launch_words;
+    EXPECT_EQ(launch[0], 0u | (4u << 16)) << "lane 0's v0: slots 0 and 1 scaled by ITEMSIZE";
+    EXPECT_EQ(launch[1], 8u) << "lane 0's v1: slot 2 x 4";
+
+    // Kena's culling VS programs also read the layer (USE_VTX_RENDER_TARGET_INDX + MISC_VEC_ENA).
+    // Into colour target 0 programmed as one 2D slice (CB view slices 0..0, ATTRIB3 type 2D) the
+    // layer has one slice to address and the draw is admitted; without the view programmed the
+    // target is not proven to be one slice and the draw stays dropped.
+    GpuState layered = vs_only_state();
+    layered.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    layered.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    DrawItem unproven;
+    EXPECT_FALSE(realize(layered, kIndices, 3, 1, unproven));
+    EXPECT_FALSE(unproven.ngg_subgroup) << "no CB view: the target is not proven to be one slice";
+    layered.cx[P::CB_COLOR0_VIEW] = 0u;
+    DrawItem one_slice;
+    ASSERT_TRUE(realize(layered, kIndices, 3, 1, one_slice));
+    ASSERT_TRUE(one_slice.ngg_subgroup) << "a one-slice 2D target is admitted for a layered draw";
+    EXPECT_EQ(one_slice.ngg_subgroup->route, NggLayerRoute::None)
+        << "one slice: the layer is read to cull, never written to gl_Layer";
+    // A layered DEPTH array beside the one-slice colour target: the layer may name a real depth
+    // slice the shell cannot route, so the draw is refused by name -- never admitted and culled.
+    // A depth view of slice 0 alone is admitted.
+    GpuState depth = layered;
+    depth.cx[P::DB_DEPTH_CONTROL] = 1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT;
+    depth.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    depth.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    depth.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+    DrawItem depth_array;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_array));
+    EXPECT_FALSE(depth_array.ngg_subgroup) << "a two-slice depth array is not one slice";
+    depth.cx.erase(P::DB_DEPTH_VIEW);
+    DrawItem depth_unknown;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_unknown));
+    EXPECT_FALSE(depth_unknown.ngg_subgroup) << "an unprogrammed depth view proves nothing";
+    depth.cx[P::DB_DEPTH_VIEW] = 0u;
+    DrawItem depth_one;
+    ASSERT_TRUE(realize(depth, kIndices, 3, 1, depth_one));
+    EXPECT_TRUE(depth_one.ngg_subgroup) << "a one-slice depth view is admitted";
+
+    layered.cx[P::CB_COLOR0_VIEW] = 1u << 13;   // SLICE_MAX 1: a two-slice view of a 2D array
+    DrawItem array;
+    EXPECT_FALSE(realize(layered, kIndices, 3, 1, array));
+    EXPECT_FALSE(array.ngg_subgroup) << "a 2D array view is not one slice";
+    layered.cx[P::CB_COLOR0_VIEW] = 0u;
+
+    // #4750 review: every reason the backend binds depth/stencil counts, not only the depth test.
+    // Depth bounds alone (Z off) is UE4's shadow-cascade shape; stencil alone binds it too. Each
+    // arm is refused into a two-slice depth view and admitted into a one-slice one.
+    for (const uint32_t control : {1u << P::DB_DEPTH_CONTROL_DEPTH_BOUNDS_ENABLE_SHIFT,
+                                   1u << P::DB_DEPTH_CONTROL_STENCIL_ENABLE_SHIFT}) {
+        GpuState tested = layered;
+        tested.cx[P::DB_DEPTH_CONTROL] = control;
+        tested.cx[P::DB_Z_READ_BASE] = 0x1000u;
+        tested.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+        tested.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+        DrawItem two;
+        EXPECT_FALSE(realize(tested, kIndices, 3, 1, two));
+        EXPECT_FALSE(two.ngg_subgroup)
+            << "DB_DEPTH_CONTROL 0x" << std::hex << control << ": a two-slice depth array is bound";
+        tested.cx[P::DB_DEPTH_VIEW] = 0u;
+        DrawItem one;
+        ASSERT_TRUE(realize(tested, kIndices, 3, 1, one)) << "control 0x" << std::hex << control;
+        EXPECT_TRUE(one.ngg_subgroup) << "control: a one-slice depth view is admitted";
+    }
+
+    // A second colour slot the draw writes counts too: slot 1 as a two-slice view is refused,
+    // as one slice admitted.
+    constexpr uint32_t kSlot1 = 0xf;   // CB_COLORn main-block register stride
+    GpuState mrt = layered;
+    mrt.cx[P::CB_TARGET_MASK] = 0xffu;
+    mrt.cx[P::CB_COLOR0_BASE + kSlot1] = 0x2000u;
+    mrt.cx[P::CB_COLOR0_INFO + kSlot1] = mrt.cx[P::CB_COLOR0_INFO];
+    mrt.cx[P::CB_COLOR0_ATTRIB3 + 1u] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 1u << 13;   // slices 0..1
+    DrawItem mrt_array;
+    EXPECT_FALSE(realize(mrt, kIndices, 3, 1, mrt_array));
+    EXPECT_FALSE(mrt_array.ngg_subgroup) << "a written two-slice colour slot 1";
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 0u;
+    DrawItem mrt_one;
+    ASSERT_TRUE(realize(mrt, kIndices, 3, 1, mrt_one));
+    EXPECT_TRUE(mrt_one.ngg_subgroup) << "control: a one-slice colour slot 1 is admitted";
+
+    GpuState merged = vs_only_state();
+    merged.cx[P::VGT_SHADER_STAGES_EN] = 0x2030u;
+    DrawItem dropped;
+    EXPECT_FALSE(realize(merged, kIndices, 3, 1, dropped));
+    EXPECT_FALSE(dropped.ngg_subgroup) << "control: a merged draw without its chain is not linked";
 }
 
 }   // namespace

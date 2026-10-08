@@ -5316,6 +5316,13 @@ endif()
 
       # Constant-lane V_WRITELANE spill slots across structured loop headers, loop exits and if
       # merges (Kena 0x5007ad0000's spilled loop counter hung the GPU), executed per lane.
+      # The bounded DPP OR ladder of Kena's culling NGG VS programs in the NGG shell (#3135 P7),
+      # portable and native Wave64, executed.
+      prosper_add_gtest(test_ngg_dpp_or_ladder
+        SOURCES tests/gpu/execute/test_ngg_dpp_or_ladder.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       prosper_add_gtest(test_lane_slot_carry
         SOURCES tests/gpu/recompiler/test_lane_slot_carry.cpp
         INCLUDES tests

@@ -246,10 +246,12 @@ std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* pr
                                                               size_t prefix_dwords,
                                                               const uint32_t* main,
                                                               size_t main_dwords) {
-    if (!prolog || !prefix_dwords || !main || !main_dwords) return nullptr;
+    // No prolog: an NGG VS that is its own primitive shader runs as one program (#3135 P7).
+    if (!prolog != !prefix_dwords || !main || !main_dwords) return nullptr;
     const size_t main_span = rdna2_recompile_code_span(main, main_dwords);
     if (!main_span) return nullptr;
-    std::vector<uint32_t> words(prolog, prolog + prefix_dwords);
+    std::vector<uint32_t> words;
+    if (prolog) words.assign(prolog, prolog + prefix_dwords);
     words.insert(words.end(), main, main + main_span);
     static std::mutex mutex;
     static std::map<std::vector<uint32_t>,

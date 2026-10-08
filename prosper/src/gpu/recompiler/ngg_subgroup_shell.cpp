@@ -308,9 +308,8 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t pc : waterfall_branches(ins)) safe_branches.insert(pc);
-    const bool force_phases_for_dpp =
-        (config.native_wave64 && has_barrier) ||
-        std::any_of(ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
+    const bool force_phases_for_dpp = (config.native_wave64 && has_barrier) ||
+                                      std::any_of(ins.begin(), ins.end(), is_dpp_row_shr_bounded);
     const bool emitted =
         emit_body(b, rs, ins, safe_branches, resources,
                   /*allow_exec_update*/ true, /*allow_smem*/ resources != nullptr, export_record,
