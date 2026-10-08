@@ -6518,6 +6518,31 @@ int main() {
               k12c_fetch[0].desc.base == ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
           "a branch into a proven-closed tail keeps the restore");
 
+    // Kernels 12x: tails that rdna2_append_closed_tail_blocks decodes straight through, because it
+    // follows only direct branches. An indirect transfer (s_setpc_b64) or a debug branch
+    // (s_cbranch_cdbgsys) in the tail can re-enter the window unseen, so the tail must not count
+    // as closed and the fold must decline. Mutation that turns both red: drop the
+    // fold_uncounted_transfer scan of the tail in shader_decode_cache.cpp.
+    for (const uint32_t transfer : {0xBE802000u,   // s_setpc_b64 s[0:1]
+                                    0xBF970000u}) {   // s_cbranch_cdbgsys 0
+        uint32_t k12x[] = {
+            0xBF860003u,   // pc=0  s_cbranch_vccz 3     -> pc=4
+            0xF4300404u, 0xFA000060u,   // pc=1  s_buffer_load_dwordx16 s[16:31], s[8:11], 0x60
+            0xBF820006u,   // pc=3  s_branch 6           -> pc=10 (past the s_endpgm)
+            0x7E020300u,   // pc=4  target: v_mov_b32 v1, v0
+            0xF4080108u, 0xFA000000u,   // pc=5  s_load_dwordx4 s[4:7], s[16:17], 0x0
+            0xE0002000u, 0x80010100u,   // pc=7  buffer_load_format_x v1, v0, s[4:7], 0 idxen
+            0xBF810000u,   // pc=9  s_endpgm (the decoded stream ends here)
+            transfer,   // pc=10 tail: an uncounted transfer
+            0xBF810000u,   // pc=11 tail: s_endpgm
+        };
+        clear_shader_decode_cache();
+        auto k12x_fetch = resolve_dynamic_fetch(k12x, sizeof(k12x) / sizeof(k12x[0]), seed6, 12, 8);
+        CHECK(k12x_fetch.empty() ||
+                  k12x_fetch[0].desc.base != ((uint64_t)(uintptr_t)k6_vbuf & 0xFFFFFFFFFFFFull),
+              "a tail holding an indirect transfer or a debug branch is not closed");
+    }
+
     // Kernel 8 (#2202 B2): a predecessor tally that counts only FORWARD branches is not a tally. Two
     // edges reach pc=4 — the forward `s_cbranch_vccz` at pc=0 and the backward `s_branch` at pc=8 —
     // so the target has two predecessors and the rule must decline. The forward branch and the

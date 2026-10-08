@@ -41,12 +41,18 @@ struct FoldStreamTail {
     bool closed = false;
 };
 
-// Branches this plan does not count as edges: the debug conditional branches (SOPP 0x17..0x1a)
-// and s_subvector_loop_begin/end (SOPK 0x1b/0x1c), which branch by SIMM16. A program holding one
-// gets no exclusive-target proof at all.
-inline bool fold_uncounted_branch(const Rdna2Inst& in) {
-    return (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a) ||
-           (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c));
+// Control transfers this plan does not count as edges. A program holding one -- in its body or in
+// a tail it can branch to -- gets no exclusive-target proof at all. One predicate serves both, so
+// the body and the tail can never disagree about what is uncountable:
+//   * indirect transfers: s_setpc_b64 / s_swappc_b64 / s_rfe_b64 (SOP1 0x20..0x22) and
+//     s_call_b64 (SOPK 0x16), whose successors are not statically enumerable;
+//   * the debug conditional branches s_cbranch_cdbg* (SOPP 0x17..0x1a);
+//   * s_subvector_loop_begin/end (SOPK 0x1b/0x1c), which branch by SIMM16.
+inline bool fold_uncounted_transfer(const Rdna2Inst& in) {
+    return (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20 && in.opcode <= 0x22) ||
+           (in.fmt == Rdna2Format::SOPK &&
+            (in.opcode == 0x16 || in.opcode == 0x1b || in.opcode == 0x1c)) ||
+           (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a);
 }
 
 // Cold-path diagnostic: counts actual constructions, including uncached specializations.
@@ -75,12 +81,10 @@ inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins
         return int64_t(in.pc) + int64_t(in.len_dwords) + int64_t(in.simm16);
     };
     for (const auto& in : ins) {
-        // An indirect transfer, an uncounted branch, or a branch into a tail not proven closed
-        // leaves edges this plan cannot see: fail closed for the whole program.
+        // An uncounted transfer, or a branch into a tail not proven closed, leaves edges this plan
+        // cannot see: fail closed for the whole program.
         const bool into_open_tail = branch(in) && !tail.closed && target(in) >= tail.end_pc;
-        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20 && in.opcode <= 0x22) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16) || fold_uncounted_branch(in) ||
-            into_open_tail) {
+        if (fold_uncounted_transfer(in) || into_open_tail) {
             plan.cfg_known = false;
             for (auto& step : plan.steps) step.reset_zero_mip = true;
             return plan;
