@@ -147,6 +147,24 @@ std::shared_ptr<const ComputeProgramFacts> compute_program_facts(
     return facts;
 }
 
+std::shared_ptr<const ComputeProgramFacts>
+compute_program_facts_peek(const uint32_t* code, size_t dwords, uint64_t program_address) {
+    {
+        FactsCache& cache = facts_cache();
+        std::lock_guard lock(cache.mutex);
+        const auto found = cache.entries.find(FactsKey{program_address, dwords});
+        if (found != cache.entries.end() && found->second->code.size() == dwords &&
+            (dwords == 0 ||
+             std::memcmp(found->second->code.data(), code, dwords * sizeof(uint32_t)) == 0))
+            return found->second;
+    }
+    auto facts = std::make_shared<ComputeProgramFacts>();
+    facts->address = program_address;
+    facts->code.assign(code, code + dwords);
+    rdna2_walk(code, dwords, facts->decoded);
+    return facts;
+}
+
 ComputeProgramFactsStats compute_program_facts_stats() {
     FactsCache& cache = facts_cache();
     std::lock_guard lock(cache.mutex);

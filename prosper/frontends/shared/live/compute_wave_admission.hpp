@@ -100,9 +100,10 @@ prosper::diagnostics::perf::Wave64Candidate compute_wave_candidate_thunk(const v
         std::snprintf(out.reason, sizeof out.reason, "unanalyzed");
         return out;
     }
-    const auto facts = prosper::gpu::compute_program_facts(
+    // Runs under note_unsupported_wave64's mutex, once per printed line. The peek is side-effect free.
+    const auto facts = prosper::gpu::compute_program_facts_peek(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(item.code_addr)), item.code_dwords,
-        {prosper::gpu::RecompileDiagnosticStage::Compute, item.code_addr});
+        item.code_addr);
     return compute_wave_candidate(*arg.ctx, item, facts->wave_ops(),
                                   query_compute_wave_limits(arg.ctx->physical));
 }

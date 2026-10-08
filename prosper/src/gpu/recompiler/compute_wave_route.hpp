@@ -99,6 +99,25 @@ struct ComputeWaveOpFacts {
     }
 };
 
+// The DS (LDS) opcode families the route analysis treats as LDS writes and reads. One table, used by
+// the wave-synchronous-LDS detector, covering every opcode the compute emitter and
+// rdna2_recompile_compute.cpp's `ordinary_lds_store` decode: the b32/b64/b96/b128 stores (0x0d, 0x0e,
+// 0x0f, 0x1e, 0x1f, 0x4d-0x4f, 0xde, 0xdf), the D16 stores (0xa0, 0xa1), ds_write_addtid (0xb0), the
+// non-returning atomics (0x00-0x1f, which share the range), the b32/b64/b96/b128 reads (0x36-0x3c,
+// 0x76-0x78, 0xfe, 0xff), the D16 reads (0xa4-0xa9), ds_read_addtid (0xb1), and the RETURNING atomics
+// (0x20-0x33 and the 64-bit forms 0x60-0x73), which are both a read and a write.
+inline bool ds_opcode_is_lds_returning_atomic(uint32_t op) {
+    return (op >= 0x20 && op <= 0x33) || (op >= 0x60 && op <= 0x73);
+}
+inline bool ds_opcode_is_lds_write(uint32_t op) {
+    return op <= 0x1f || (op >= 0x4d && op <= 0x4f) || op == 0xa0 || op == 0xa1 || op == 0xb0 ||
+           op == 0xde || op == 0xdf || ds_opcode_is_lds_returning_atomic(op);
+}
+inline bool ds_opcode_is_lds_read(uint32_t op) {
+    return (op >= 0x36 && op <= 0x3c) || (op >= 0x76 && op <= 0x78) || op == 0xfe || op == 0xff ||
+           (op >= 0xa4 && op <= 0xa9) || op == 0xb1 || ds_opcode_is_lds_returning_atomic(op);
+}
+
 // Decode-level analysis. `code`/`dwords` are the exact bytes `ins` was walked from (the region
 // detectors re-read branch targets from them).
 ComputeWaveOpFacts analyze_compute_wave_ops(const std::vector<Rdna2Inst>& ins, const uint32_t* code,

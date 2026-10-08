@@ -436,3 +436,45 @@ TEST(ComputeWaveRoute, ABallotInTheElseArmOfADivergentBranchIsUnproven) {
     EXPECT_EQ(ballot->context, ComputeWaveContext::UnprovenRegion)
         << "the else arm is inside the region";
 }
+
+TEST(ComputeWaveRoute, EveryLdsFamilyTheEmitterDecodesCountsAsWaveSynchronousLds) {
+    // (store, load) pairs with NO s_barrier between: the load reads what another lane of the same
+    // guest wave stored. Wide forms, D16, addtid and returning atomics are all in the table.
+    struct Pair {
+        const char* name;
+        std::vector<uint32_t> store, load;
+    };
+    const std::vector<Pair> pairs = {
+        {"b128", {0xdb7c0000u, 0x00000100u}, {0xdbfc0000u, 0x05000000u}},
+        {"b96", {0xdb780000u, 0x00000100u}, {0xdbf80000u, 0x05000000u}},
+        {"d16", {0xda800000u, 0x00000100u}, {0xda900000u, 0x02000000u}},
+        {"addtid", {0xdac00000u, 0x00000100u}, {0xdac40000u, 0x02000000u}},
+        {"b32-then-returning-atomic", {0xd8340000u, 0x00000100u}, {0xd8b40000u, 0x02000100u}},
+        {"returning-atomic-pair", {0xd8800000u, 0x02000100u}, {0xd8b40000u, 0x02000100u}},
+    };
+    for (const auto& p : pairs) {
+        std::vector<uint32_t> program = p.store;
+        program.insert(program.end(), p.load.begin(), p.load.end());
+        program.push_back(kEnd);
+        EXPECT_TRUE(has_kind(analyze(program), ComputeCrossLaneKind::LdsWaveSync)) << p.name;
+        // The same program with a barrier between the two is ordinary workgroup LDS.
+        std::vector<uint32_t> barriered = p.store;
+        barriered.push_back(0xbf8a0000u);
+        barriered.insert(barriered.end(), p.load.begin(), p.load.end());
+        barriered.push_back(kEnd);
+        EXPECT_FALSE(has_kind(analyze(barriered), ComputeCrossLaneKind::LdsWaveSync)) << p.name;
+    }
+}
+
+TEST(ComputeWaveRoute, AWideLdsStoreAndLoadWithoutABarrierIsNotWidthIndependent) {
+    // ds_write_b128 v0, v[1:4] ; ds_read_b128 v[5:8], v0
+    const auto facts = analyze({0xdb7c0000u, 0x00000100u, 0xdbfc0000u, 0x05000000u, kEnd});
+    const auto decision = select_compute_wave_route(facts, nvidia());
+    EXPECT_NE(decision.route, ComputeWaveRoute::WidthIndependent);
+    EXPECT_EQ(decision.blocker_kind, ComputeCrossLaneKind::LdsWaveSync);
+}
+
+TEST(ComputeWaveRoute, ASaveExecWithAnSgprSourceIsAMaskSite) {
+    // s_and_saveexec_b64 s[8:9], s[10:11] writes EXEC implicitly.
+    EXPECT_TRUE(has_kind(analyze({0xbe88240au, kEnd}), ComputeCrossLaneKind::MaskScc));
+}
