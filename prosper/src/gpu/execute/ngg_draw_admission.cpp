@@ -65,7 +65,7 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         admission.shape.topology = NggInputTopology::TriangleList;
     else if (registers.primitive_type == kPrimTriangleStrip)
         admission.shape.topology = NggInputTopology::TriangleStrip;
-    else
+    else   // an adjacency topology would also need NggSubgroupShellConfig::adjacency_input (#4746)
         return refuse("ngg-input-topology");
     // Without a GS there is no GS output primitive type to read: the primitive shader exports the
     // INPUT primitives it keeps (culling drops some, never changes their kind), so a triangle list

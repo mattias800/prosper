@@ -15,7 +15,8 @@
 //   ngg-abi-read-undefined-vcc / -m0 / -scc / ngg-abi-read-ttmp
 //   ngg-abi-unclassified-vector-width  a vector source whose register count is not classified
 //   ngg-abi-exec-read-before-write     EXEC (explicitly, or implicitly by a vector instruction)
-//   ngg-abi-read-v4                    adjacency offsets 4/5 read before written on the lane
+//   ngg-abi-read-v4                    adjacency offsets 4/5 read before written on the lane, for
+//                                      an ADJACENCY input topology only (see adjacency_input)
 //   ngg-abi-read-v6-v7                 ES user VGPRs read before written on the lane
 //   ngg-side-effect                    memory stores/atomics, GDS/GWS/ordered count, scratch
 //   ngg-sendmsg-missing                no GS_ALLOC_REQ at all
@@ -54,6 +55,16 @@ namespace prosper::gpu {
 struct NggSubgroupAbiLaunch {
     uint32_t user_sgprs = 0;   // s8 .. s8+user_sgprs-1 hold user data
     bool user_data_address_known = false;   // s0:s1 hold SPI_SHADER_USER_DATA_ADDR_LO/HI_GS
+    // The draw's input primitives carry adjacency, so launch v4 holds the offsets of vertices 4/5
+    // (#3135 launch research: v0 = offsets 0/1, v1 = 2/3, v2 = PrimitiveID, v3 = GS invocation,
+    // v4 = 4/5; radeonsi, radv and LLPC agree). Without adjacency there are no vertices 4/5: v4
+    // carries no input, the hardware leaves whatever an earlier wave held there, and a correct
+    // program cannot depend on it -- so the shell's 0 is one of the values the hardware may present
+    // and a read of it is admitted. Kena's compiler treats v4 accordingly: in every refused program
+    // its first reference is a write, as a temporary (#4746). ngg_draw_admission admits triangle
+    // lists and strips only, so no live draw sets this. CONFIDENCE: MED (the hardware's v4 for a
+    // non-adjacency input is inferred from the layout, not observed).
+    bool adjacency_input = false;
 };
 
 struct NggSubgroupAbiFacts {

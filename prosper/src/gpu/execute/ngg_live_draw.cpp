@@ -366,6 +366,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     request.shell.user_sgprs = admission.user_sgprs;
     request.shell.native_wave64 = admission.native_wave64;
     request.shell.user_data_address_known = supply_address;
+    // Admission takes triangle lists and strips only, never an adjacency topology, so launch v4
+    // carries no input (NggSubgroupAbiLaunch::adjacency_input, #4746).
+    request.shell.adjacency_input = false;
     request.limits = admission.limits;
     request.shape = admission.shape;
     request.raster.topology = admission.topology;

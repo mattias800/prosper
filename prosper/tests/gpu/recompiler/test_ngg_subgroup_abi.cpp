@@ -38,13 +38,16 @@ std::vector<uint32_t> program(std::initializer_list<uint32_t> body, bool exec_fi
     return code;
 }
 
+// Adjacency input by default: launch v4 then holds vertex offsets 4/5 the shell does not supply, so
+// the read-inventory tests below can use it as a tracked register. Live draws have no adjacency.
 NggSubgroupAbiFacts analyze(const std::vector<uint32_t>& code, uint32_t user_sgprs = 0,
-                            bool address = false) {
+                            bool address = false, bool adjacency = true) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
     NggSubgroupAbiLaunch launch;
     launch.user_sgprs = user_sgprs;
     launch.user_data_address_known = address;
+    launch.adjacency_input = adjacency;
     return analyze_ngg_subgroup_abi(ins, launch);
 }
 
@@ -144,6 +147,24 @@ TEST(NggSubgroupAbi, UnsuppliedLaunchVgprsMustBeWrittenOnTheLaneFirst) {
     EXPECT_TRUE(analyze(program({0x7e080280u, 0x7e120304u})).ok())   // v_mov v4, 0 first
         << "a full-EXEC write defines the register on every lane";
     EXPECT_TRUE(analyze(program({0x7e120305u, 0x7e120308u})).ok()) << "v5 and v8 are supplied";
+}
+
+// #4746: without adjacency there are no vertices 4/5, so launch v4 carries no input and a read of
+// it before the program writes it is admitted (any value is one the hardware may present). The
+// same reads stay refused for an adjacency input, and v6/v7 (ES user VGPRs) stay refused either way.
+TEST(NggSubgroupAbi, LaunchV4IsNoInputWithoutAdjacency) {
+    EXPECT_TRUE(analyze(program({0x7e120304u}), 0, false, false).ok());   // v_mov v9, v4
+    EXPECT_EQ(analyze(program({0x7e120304u}), 0, false, true).reason, "ngg-abi-read-v4");
+    EXPECT_EQ(analyze(program({0x7e120306u}), 0, false, false).reason, "ngg-abi-read-v6-v7");
+    // Kena d38fa780's shape: v4 written under a narrow EXEC, EXEC widened to all lanes, then read.
+    // s_mov_b64 exec, 1; v_mov v4, 0; s_mov_b64 exec, -1; v_mov v9, v4.
+    const std::initializer_list<uint32_t> narrowed = {0xbefe0381u, 0x7e080280u, 0xbefe04c1u,
+                                                      0x7e120304u};
+    EXPECT_TRUE(analyze(program(narrowed), 0, false, false).ok());
+    EXPECT_EQ(analyze(program(narrowed), 0, false, true).reason, "ngg-abi-read-v4")
+        << "control: with adjacency the widened lanes never had v4 written";
+    // A 64-bit source reaching into v4 (v_cmp_eq_u64 vcc, 0, v[3:4]) is admitted too.
+    EXPECT_TRUE(analyze(program({0x7dc40680u}), 0, false, false).ok());
 }
 
 TEST(NggSubgroupAbi, AVgprWrittenUnderNarrowEXECIsDefinedOnlyWhileEXECStaysNarrow) {

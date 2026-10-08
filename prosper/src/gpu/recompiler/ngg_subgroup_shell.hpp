@@ -64,6 +64,9 @@ struct NggSubgroupShellConfig {
     uint32_t rsrc2_gs_lds_size = 0;
     uint32_t user_sgprs = 0;   // s8.. count (AGC user_data_range_end); one push-constant word each
     bool user_data_address_known = false;   // two more push-constant words supply s0:s1
+    // The input primitives carry adjacency (NggSubgroupAbiLaunch::adjacency_input): only then is a
+    // read of launch v4 before the program writes it refused.
+    bool adjacency_input = false;
     // Require one exact 64-lane Vulkan subgroup per guest wave. The pipeline must then be created
     // with requiredSubgroupSize = 64 and full subgroups; without it the portable shell emulates
     // cross-lane operations through workgroup memory.

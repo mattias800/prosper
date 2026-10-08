@@ -757,6 +757,12 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
     // MUST dataflow to a fixpoint (greatest fixpoint: unreached states start at TOP).
     State entry;
     entry.sdef.set(3);
+    // Without adjacency, v4 is no input (NggSubgroupAbiLaunch::adjacency_input): every lane holds a
+    // value the hardware may present, so it is defined on every lane from the start.
+    if (!launch.adjacency_input) {
+        entry.vall |= tracked_bit(4);
+        entry.vcur |= tracked_bit(4);
+    }
     for (uint32_t k = 0; k < launch.user_sgprs && 8u + k <= 105u; ++k) entry.sdef.set(8u + k);
     if (launch.user_data_address_known) {
         entry.sdef.set(0);

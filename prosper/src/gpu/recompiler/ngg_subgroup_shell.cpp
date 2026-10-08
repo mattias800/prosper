@@ -83,6 +83,7 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     NggSubgroupAbiLaunch launch;
     launch.user_sgprs = config.user_sgprs;
     launch.user_data_address_known = config.user_data_address_known;
+    launch.adjacency_input = config.adjacency_input;
     const NggSubgroupAbiFacts facts = analyze_ngg_subgroup_abi(ins, launch);
     if (!facts.ok()) {
         if (refusal) *refusal = facts.refusal;
