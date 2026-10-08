@@ -33,6 +33,7 @@
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
 #include "gpu/execute/ngg_live_draw.hpp"   // its live producer (#3135 P5)
+#include "gpu/execute/ngg_draw_indices.hpp"   // an indexed draw's index fetch (#3135 P6)
 #include <span>
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
@@ -1979,6 +1980,55 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
     return (have_even && even_const && even0 != 0) || (have_odd && odd_const && odd0 != 0);
 }
 
+// The bound vertex buffers' UNCLAMPED record count (size/stride, the largest) -- the bound the #304
+// part-two detector needs. 0 when the table has none.
+inline uint32_t vertex_buffer_records_unclamped(const ShaderResourceTable* table) {
+    uint32_t records = 0;
+    if (table)
+        for (const auto& r : table->resources)
+            if (r.cls == ResourceClass::VertexBuffer && r.stride)
+                records = std::max(records, r.size / r.stride);
+    return records;
+}
+
+// Where an indexed draw's `n` indices live and at what element size: the announced size, or -- for a
+// title that announced none (#3009) -- the size the #304 detectors recover from the bytes, with a
+// DrawIndexOffset's address recomputed at that stride. ONE rule for every consumer: the ordinary
+// path binds what this names for vkCmdDrawIndexed, and the merged-NGG path (#3135 P6) reads the
+// same bytes into its subgroup plan, so the two can never read one buffer two ways.
+// `element_bytes` is 0 for an unknown announced size. `detected` names the detector that fired.
+struct DrawIndexSource {
+    uint64_t addr = 0;
+    uint64_t addr32 = 0;   // the same buffer at a 4-byte stride (differs only for an offset draw)
+    uint32_t element_bytes = 0;
+    const char* detected = nullptr;
+};
+inline DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Draw& draw,
+                                                 uint32_t n, uint32_t vb_records_unclamped) {
+    DrawIndexSource source;
+    source.element_bytes = index_elem_bytes(ds.index_type);
+    source.addr = draw.index_addr;
+    source.addr32 =
+        draw.from_offset ? (draw.index_base + (uint64_t)draw.index_offset * 4u) : draw.index_addr;
+    if (!index_size_detection_permitted(ds.index_type, ds.index_type_announced) || n < 2)
+        return source;
+    if (!guest_readable(draw.index_addr, n * 2u) || !guest_readable(source.addr32, n * 4u))
+        return source;
+    const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw.index_addr;
+    const uint32_t* p32 = (const uint32_t*)(uintptr_t)source.addr32;
+    // Zero high halves first, so every buffer that detector already classifies keeps its existing
+    // verdict; the constant-non-zero form (#304 part two) only ever sees what it rejected.
+    if (index_buffer_is_unannounced_32bit(p16, p32, n))
+        source.detected = "zero-high-half";
+    else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
+        source.detected = "constant-high-half";
+    if (source.detected) {
+        source.element_bytes = 4;
+        source.addr = source.addr32;
+    }
+    return source;
+}
+
 // #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
 // AUTHORITATIVE hardware vertex count — the GPU draws exactly that many vertices with auto indices
 // 0..draw_count-1. The bound vertex buffer's record count (vb_records = size/stride) is ONLY a fallback for
@@ -2889,6 +2939,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // change, and a refusal keeps it dropped, now with the rule named.
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
     const char* ngg_refusal = nullptr;
+    uint32_t ngg_vertex_range = vcount_hint;   // an indexed NGG draw: max index + 1 (#3135 P6)
     if (vs_words.empty() && !owned_vertex && vertex_chain && !owned_fragment && !scalar_bank &&
         !fs_words.empty() && !rect_list_synthesis && !dcc_decompress &&
         std::strcmp(refused_ngg_class, "merged-gs") == 0) {
@@ -2897,6 +2948,26 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         ngg.facts.vertex_count = vcount_hint;
         ngg.facts.instance_count = draw ? draw->instance_count : ds.num_instances;
         ngg.facts.indexed = draw && draw->indexed;
+        // #3135 P6: an indexed draw's indices feed the subgroup plan, read from the place and at
+        // the size the ordinary path would bind them (resolve_draw_index_source). The vertex RANGE
+        // they address, not the index count, sizes the linked fold's vertex fetches below.
+        if (ngg.facts.indexed) {
+            if (draw->index_count > kNggMaxIndices) {
+                ngg.facts.index_refusal = "ngg-index-count";
+            } else if (draw->index_addr && draw->index_count) {
+                const DrawIndexSource source = resolve_draw_index_source(
+                    ds, *draw, draw->index_count, vertex_buffer_records_unclamped(vrt.get()));
+                if (source.element_bytes &&
+                    guest_readable(source.addr, draw->index_count * source.element_bytes)) {
+                    const NggDrawIndices fetched = decode_ngg_draw_indices(
+                        reinterpret_cast<const void*>(static_cast<uintptr_t>(source.addr)),
+                        source.element_bytes, draw->index_count, read_ngg_index_restart(ds));
+                    ngg.facts.indices = fetched.indices;
+                    ngg.facts.index_refusal = fetched.refusal;
+                    if (fetched.indices) ngg_vertex_range = fetched.max_index + 1u;
+                }
+            }
+        }
         ngg.facts.indirect = draw && (draw->indirect || draw->indirect_args_addr);
         ngg.facts.vertex_offset =
             rs.ge_indx_offset != 0 ||
@@ -2935,7 +3006,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 chain_dwords);
             // The shell runs the LINKED program, so its table is folded over the linked words.
             if (ngg.linked)
-                ngg_vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint,
+                ngg_vrt = build_stage_table(ds, rs.es_addr, false, ngg_vertex_range,
                                             draw ? draw->command_order : 0, raw_context, nullptr,
                                             nullptr, *ngg.linked);
             ngg.resources = ngg_vrt.get();
@@ -2947,6 +3018,26 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         }
         ngg_subgroup = result.draw;
         if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
+        // Always on, bounded: an ADMITTED indexed draw's shape, once per program. The [ngg-refused]
+        // line below named these draws while they were dropped (ngg-indexed); this is the evidence
+        // that one now runs, readable without PROSPER_DBG (which desyncs the routes reaching them).
+        if (ngg_subgroup && result.indexed) {
+            static std::mutex ngg_indexed_mutex;
+            static std::set<uint64_t> ngg_indexed_logged;
+            const std::lock_guard lock(ngg_indexed_mutex);
+            if (ngg_indexed_logged.size() < 32 && ngg_indexed_logged.insert(rs.es_addr).second)
+                std::fprintf(
+                    stderr,
+                    "[ngg-indexed] es=0x%llx chain=0x%llx ps=0x%llx admitted indices=%zu "
+                    "vertex-range=%u instances=%u subgroups=%zu target=0x%llx "
+                    "slices=%u\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(chain_addr),
+                    static_cast<unsigned long long>(rs.ps_addr),
+                    ngg.facts.indices ? ngg.facts.indices->size() : size_t{0}, ngg_vertex_range,
+                    ngg.facts.instance_count, ngg_subgroup->plan.subgroups.size(),
+                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices);
+        }
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused")
                           : nullptr;
@@ -3235,10 +3326,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // value for these NGG draws (4 of ~20 verts -> a degenerate sliver), while the VB's record count is
     // the whole mesh. A shader fetching past a real vertex reads 0 under robustBufferAccess -> a
     // degenerate, clipped vertex, so a slightly-generous count is harmless.
-    uint32_t vb_entries = 0;
-    if (vrt) for (const auto& r : vrt->resources)
-        if (r.cls == ResourceClass::VertexBuffer && r.stride)
-            vb_entries = std::max(vb_entries, r.size / r.stride);
+    uint32_t vb_entries = vertex_buffer_records_unclamped(vrt.get());
     // The unclamped count, kept only as an INDEX-RANGE BOUND for the #304 part-two detector below.
     // vb_entries itself is clamped next, and that clamp would defeat the bound: Tomb Raider's level
     // pool holds 775,111 records and its real 32-bit indices reach 774,898, so a 65,536 ceiling would
@@ -3254,17 +3342,18 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // non-indexed draw of the hint count instead of reading garbage.
     static constexpr uint32_t kMaxIndices = 1u << 20;   // sanity cap (largest seen live: 0x61e)
     if (owned_vertex) out.indices = std::move(owned_indices);
-    if (!owned_vertex && draw && draw->indexed && draw->index_addr && draw->index_count) {
-        uint32_t esz = index_elem_bytes(ds.index_type);
+    // A merged-NGG draw's indices were read into its subgroup plan; the backend refuses an index
+    // buffer on it (ngg_backend_draw_structure_refusal).
+    if (!owned_vertex && !ngg_subgroup && draw && draw->indexed && draw->index_addr &&
+        draw->index_count) {
         uint32_t n = std::min(draw->index_count, kMaxIndices);
-        uint64_t index_addr = draw->index_addr;
-        // The address the same buffer would be read from at a 4-byte stride. For a DrawIndexOffset
-        // the two differ (index_base + offset*2 against index_base + offset*4); otherwise they are
-        // the same bytes. Computed for every indexed draw so the instrument below can print both
-        // readings whatever the announced size says -- it is arithmetic, nothing is dereferenced.
-        const uint64_t addr32 = draw->from_offset
-                                    ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
-                                    : draw->index_addr;
+        // Where the indices live and at what size (#304/#3009): one rule, shared with the merged-NGG
+        // path. For a DrawIndexOffset the 2- and 4-byte strides name different addresses; the
+        // instrument below prints both readings whatever the announced size says.
+        const DrawIndexSource index_source =
+            resolve_draw_index_source(ds, *draw, n, vb_records_unclamped);
+        const uint64_t addr32 = index_source.addr32;
+        uint32_t esz = index_elem_bytes(ds.index_type);   // the announced size, for the instrument
         {
             // PROSPER_INDEXTYPE_LOG=1 -- what the guest ANNOUNCED against what its bytes actually
             // hold. Without it, "the title never set an index size" and "it set one and we dropped
@@ -3328,27 +3417,15 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         //
         // #3009 gates the whole thing on the guest NOT having announced a size. `esz == 2` used to
         // stand in for that and could not: it is true both for an announced 16-bit buffer and for a
-        // title that never announced anything.
-        if (index_size_detection_permitted(ds.index_type, ds.index_type_announced) && n >= 2) {
-            if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u)) {
-                const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw->index_addr;
-                const uint32_t* p32 = (const uint32_t*)(uintptr_t)addr32;
-                // Zero high halves first, so every buffer that detector already classifies keeps
-                // its existing verdict; the constant-non-zero form (#304 part two) only ever sees
-                // what it rejected.
-                const char* how = nullptr;
-                if (index_buffer_is_unannounced_32bit(p16, p32, n))            how = "zero-high-half";
-                else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
-                    how = "constant-high-half";
-                if (how) {
-                    esz = 4; index_addr = addr32;
-                    if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "
-                                     "(unannounced, %s) at 0x%llx (was 16-bit 0x%llx)\n",
-                                     how, (unsigned long long)addr32,
-                                     (unsigned long long)draw->index_addr);
-                }
-            }
-        }
+        // title that never announced anything. resolve_draw_index_source above applies both.
+        esz = index_source.element_bytes;
+        uint64_t index_addr = index_source.addr;
+        if (index_source.detected && log)
+            fprintf(stderr,
+                    "[exec] indexed draw: auto-detected 32-bit index buffer "
+                    "(unannounced, %s) at 0x%llx (was 16-bit 0x%llx)\n",
+                    index_source.detected, (unsigned long long)addr32,
+                    (unsigned long long)draw->index_addr);
         if (esz == 0) {
             if (log) fprintf(stderr, "[exec] indexed draw: UNKNOWN index_type=%u — falling back to non-indexed\n",
                              ds.index_type);
@@ -3400,6 +3477,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         return false;
     }
     if (out.indices.empty()) vertex_count = resolve_nonindexed_vertex_count(vcount_hint, vb_entries);
+    // An indexed merged-NGG draw carries no index buffer (its indices are in the launch records),
+    // but its vertex buffers must still span the vertices those indices address (#3135 P6).
+    if (ngg_subgroup && draw && draw->indexed) vertex_count = ngg_vertex_range;
     // PS5 RectList (primitive 7; standard AMD RectList is 17) consumes three procedural vertices but
     // covers the rectangle's synthesized fourth corner. Vulkan has no rectangle-list topology. The
     // Blasphemous 2 clear shader explicitly computes all four clip-space corners from VertexIndex, has
