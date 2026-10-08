@@ -9,7 +9,7 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
-## Depth of field works: two general fixes; exposure is fixed by design (2026-10-08)
+## Depth of field works: two general fixes; exposure still open (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
 `PROSPER_NULL_PAGE=1`, an empty `PROSPER_GUEST_ARGS`, `scripts/kena/linux-reach-level-load.pad`,
@@ -36,8 +36,10 @@ indicative only.
   - The fold restores the branch's state at such a target (#2132). It required a retained
     instruction AT the target, but the compacted fold stream drops the VALU. So the skip arm's load
     stood, and all 162 samples were bound to the gather's own output.
-  - The fold now accepts a gap of compacted instructions when exactly one edge enters
-    [gap, target] (`fold_control_plan.hpp`). The gather then samples the reduce pyramid
+  - The fold now accepts a gap of compacted instructions when exactly one edge, a forward one,
+    enters [gap, target] (`fold_control_plan.hpp`). It declines for the whole program when it
+    holds branches it cannot count: debug branches, subvector loops, or a branch into code past
+    the first `s_endpgm` that is not proven closed. The gather then samples the reduce pyramid
     (`0x509dac0000`, 1600×904).
   - The same fix removed the 16 `[t8-dropped] ... reason=words-unknown` T#s of the TAA draw
     `0x500a480000` (16 → 0 in a run).
@@ -47,16 +49,23 @@ indicative only.
     "no blur" and every gather took its skip arm.
   - One- and two-channel FP16 now samples natively (`shared/compute/sampled_float16_view.hpp`).
     Guest-backed RGBA16F keeps the conversion, which avoids the 7× native cost measured on
-    Astro Bot.
+    Astro Bot but still clamps HDR or signed RGBA16F data (#4738).
   - Alone, this fix ran the gathers against the wrong input and left black tile holes (1.38% of
     pixels). With fix 1 the holes are gone and the foreground and the cat statues blur as on PS5.
-- **Exposure is not a defect, as far as measured.**
-  - The eye-adaptation draw (`0x5009a20000`) does 18 `ImageFetch`es from one 1×1 image, which reads
-    (0, 0, 0, 0). RenderDoc lists that image as a `2D Color Attachment` created at startup and
-    cleared, and another draw also binds it. That matches UE4's `BlackDummy` system texture.
-  - So the shader reads a deliberately black histogram, and the exposure target's (2, 2, 1, 2) is a
-    fixed exposure from constants. CONFIDENCE: MED. The remaining brightness gap (65–67 against 44)
-    is not localised.
+- **Exposure: open, and it matters (the frame is 66.7 against the oracle's 44.4).**
+  - The eye-adaptation draw (`0x5009a20000`) does 18 `ImageFetch`es, all from one 1×1 image that
+    reads (0, 0, 0, 0). RenderDoc lists that image (capture-local id 141) as a `2D Color
+    Attachment` created at startup, also bound by draw `0x5007cd0000`, in **`R8G8B8A8_UNORM`**.
+  - The eye-adaptation targets in the same frame are different images in a different format:
+    the 1×1 the draw writes (22118) and the previous frame's (27865), which the DOF temporal
+    pass, the DOF reduce, TAA and a 1×1 copy dispatch read, are **`R32G32B32A32_FLOAT`**.
+  - So the format discriminator points at UE4's 8-bit `BlackDummy`, not at an eye-adaptation
+    target. The written value stays (2, 2, 1, 2) on every arm.
+  - Not settled, because prosper's renderer format for a colour target comes from its own
+    mapping of the guest `CB_COLOR` format. That was not cross-checked against the guest register
+    for 141; a float target folded to RGBA8 would look exactly like this.
+  - Next step: log `CB_COLOR*_INFO` for the pass that clears 141, and the T# format the exposure
+    draw fetches through (`PROSPER_TEXLOG` limited to that draw).
 - **The white flowers are not localised.**
   - The title route has no `[ngg-refused]` lines and no `dropped-draws` alarm.
   - A per-draw census of the first base pass found many draws that change no pixel of one MRT,
@@ -885,9 +894,6 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **The DOF gather's black tile holes come from its tile data** — false. They appeared only once
   narrow FP16 sampled natively, and came from the gather sampling its own output descriptor; with
   the fold fix they are gone (2026-10-08).
-- **The over-bright frame is an eye-adaptation chain that fails to see the scene** — not supported.
-  The exposure draw samples a 1×1 cleared colour attachment that matches UE4's `BlackDummy`, so the
-  exposure is fixed by the title, not lost by prosper. CONFIDENCE: MED (2026-10-08).
 - **The gathers sample the reduce pyramid only after a renderer-target invalidation fix** — false.
   The reduce pass writes `0x509dac0000`, not the setup output's range. The gather's samples were
   attributed to the wrong descriptor by the fold, not served a stale target (2026-10-08).
