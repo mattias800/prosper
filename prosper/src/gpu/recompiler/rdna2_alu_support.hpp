@@ -404,8 +404,9 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
 // it joins the per-invocation Bool representation. Returns 0 when the projection is not admitted,
 // and the caller refuses. Both words must exist.
 //
-// Compute (Wave64) projects any present pair: GTA copies EXEC_LO/HI ballots into scalar scratch and
-// intersects that pair with VCC at pc1467; Sonic Frontiers Cyber Space intersects s[0:1]={1,1}.
+// Compute (Wave64) projects any present pair that carries no fabricated-zero mark (#4714): GTA
+// copies EXEC_LO/HI ballots into scalar scratch and intersects that pair with VCC at pc1467; Sonic
+// Frontiers Cyber Space intersects s[0:1]={1,1}.
 //
 // Wave64 fragment (#4706) is admitted only when three things hold, because RECOMPILER_REMAINING.md's
 // #2790 row records why presence alone proves nothing there:
@@ -430,17 +431,21 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
 // reloaded spill slot is marked (slots carry no definite-write fact across a case edge), so a
 // projection of a reloaded slot refuses there. Not tracked: a value routed through a VGPR
 // (v_readfirstlane, a dynamic-lane v_readlane), and the MEMORY mark on an SGPR across a dispatcher
-// case edge (each case starts from a fresh RegState). The marks exist for compute too but are not
-// consulted there, so compute's projection keeps its behaviour, fabricated zeros included (#4714).
+// case edge (each case starts from a fresh RegState). Compute consults the fabricated-zero mark too
+// (#4714); the MEMORY mark stays fragment-only, since compute's lane identity is the guest's own.
 inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operand& o) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return 0;
     if (o.kind != OperandKind::SGPR &&
         !(o.kind == OperandKind::Special && (o.value == 106 || o.value == 107)))
         return 0;
+    // A fabricated zero is no lane mask on either stage (#4714, GPU-5/FAIL-1): refuse it.
+    for (int r = o.value; r <= o.value + 1; ++r)
+        if (rs.sreg_merge_placeholder.contains(r)) return 0;
+    // A memory-loaded pattern is refused for fragments only: the host's pixel-to-lane assignment is
+    // not the PS5's. Compute's lane identity is the guest's own, so GTA's scratch pairs project.
     if (b.is_fragment)
         for (int r = o.value; r <= o.value + 1; ++r)
-            if (rs.sreg_merge_placeholder.contains(r) || rs.sreg_memory_pattern.contains(r))
-                return 0;
+            if (rs.sreg_memory_pattern.contains(r)) return 0;
     auto scalar_word = [&](int reg, uint32_t& value) {
         if (auto current = rs.sreg.find(reg); current != rs.sreg.end()) {
             value = current->second;

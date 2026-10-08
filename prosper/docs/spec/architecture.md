@@ -299,7 +299,8 @@ width independence is proven or an exact emulation route admits it; otherwise it
 accepted the only admitting route for the width question is proof (`ProvenVotes`); the emulation
 routes do not exist yet. (`owned_graphics_wave_draw.cpp` admits wave-wide raw loads, not width
 emulation.)
-Violated today: the compute Wave64 scalar-pair projection does not consult the fabricated-zero
-mark, so a synthetic zero can stand in for a lane mask on the default path (#4714).
+The scalar-pair projection (a 64-bit scalar mask pair projected onto an invocation's own bit)
+consults the fabricated-zero mark in both stages, so a synthetic zero never stands in for a lane
+mask (#4711 fragment, #4714 compute).
 Status: proposed (adr:0028)
 Enforcement: adr:0028

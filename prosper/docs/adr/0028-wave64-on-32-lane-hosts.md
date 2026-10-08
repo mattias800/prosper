@@ -29,11 +29,10 @@ today, read from the code on `origin/main`:
   on that path rather than beside it.
 - **Recompile failures** for either stage are reported separately as `fragment/recompile` and
   `compute/recompile`; those are prosper defects, not host limits, and are out of scope here.
-- **One known approximation on the default path.** The Wave64 scalar-pair projection (a 64-bit
+- **One approximation on the default path, now closed.** The Wave64 scalar-pair projection (a 64-bit
   scalar mask pair projected onto an invocation's own bit) is guarded against fabricated-zero halves
-  for fragment (#4711), but the compute projection does not consult that mark (#4714, open), so
-  `main` can use a synthetic zero as a lane mask today. That is a current exception to this ADR's
-  "the default never approximates"; #4714 closes it.
+  for fragment (#4711) and, since #4714, for compute, so no synthetic zero stands in for a lane mask
+  and "the default never approximates" holds for it.
 
 This already satisfies `FAIL-1` for refusals: nothing refused is skipped silently. What it does not
 do is run the programs. Evidence from *Assassin's Creed Black Flag Resynced* `PPSA28183` on
