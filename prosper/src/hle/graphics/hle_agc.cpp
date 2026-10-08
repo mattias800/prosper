@@ -3733,9 +3733,9 @@ HLE(agc_cb_eop_action_get_size)   { (void)a0; return kDwReleaseMem * 4u; }
 // which cannot be told anything) is what PROSPER_DCBFULL exists to detect.
 //
 // Deliberately NOT here: the size-carrying builders whose GetSize argument position is unknown
-// (WriteData, SetShRegisterRangeDirect, SetShRegistersDirect — see the issue), and the 33 GetSize
-// functions whose builder prosper does not implement either, where a size would be a guess and the
-// builder call would fail anyway.
+// (WriteData, SetShRegisterRangeDirect, SetShRegistersDirect; the argument is the count, measured on a
+// console, see #4757). The GetSize functions whose builder prosper does not implement are answered in
+// hle_agc_getsize.cpp, with the size the console's own library returns for each.
 // CONFIDENCE: HIGH on the contract (GetSize == builder emission) and on each NID (3.20 firmware
 // export table); the dword counts are prosper's own and are asserted against the builders by
 // test_agc_getsize.
