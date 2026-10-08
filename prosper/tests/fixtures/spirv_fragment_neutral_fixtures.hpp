@@ -2,6 +2,7 @@
 #include "spirv_fragment_vote_fixtures.hpp"
 
 namespace prosper::test::fragment_neutral {
+// clang-format off
 enum class Shape {
     Masked, Termination, ScalarExport, TerminationExport, DeadUnequalPhi, LiveUnequalPhi,
     SecondConsumer, PoisonConjunction, UndefinedConjunction, MaskedFloat, UnmaskedFloat,
@@ -9,7 +10,14 @@ enum class Shape {
     BitcastPoisonConjunction, MaskedBitcastPoison,
     UndefinedReconsume, NonEntry, Nested, Reentered, BuiltinReconsume, LocationReconsume,
     BufferPredicate, BitcastPoisonSelection, FloatPoisonConjunction, FloatPoisonSelection,
+    // ADR 0028 execz certificate. The skipped state is a VARYING value (FragCoord.x bits), not a
+    // constant or frozen leaf, so only value identity under P=false can certify the export.
+    // VaryingMasked: EXEC-masked VALU work only (positive). SgprLiveOut: the region's value
+    // reaches a merge Phi unmasked, i.e. a scalar written in the region and read after the merge.
+    // UnrelatedMask: Select on a condition that is not the vote's predicate.
+    VaryingMasked, SgprLiveOut, UnrelatedMask,
 };
+// clang-format on
 enum class Predicate { Helpers, Visible, AllFalse, AllTrue };
 
 // Independent project-owned SSA, not title bytes or the recompiler's own emission. All-false
@@ -85,6 +93,12 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     if (shape == Shape::PoisonConjunction || shape == Shape::DeadLoad) op(59, {26, 25, 7});
     op(61, {6, 50, 22}); op(81, {4, 51, 50, 0}); op(81, {4, 52, 50, 1});
     op(61, {2, 53, 24});
+    const bool varying_state = shape == Shape::VaryingMasked || shape == Shape::SgprLiveOut ||
+                               shape == Shape::UnrelatedMask;
+    if (varying_state) {
+        op(124, {3, 140, 51});
+        op(61, {2, 142, 24});
+    }
     if (shape == Shape::PoisonConjunction) op(61, {2, 54, 25});
     uint32_t p = 53;
     if (shape == Shape::BufferPredicate) {
@@ -124,7 +138,13 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
         op(124, {4, 120, 117}); op(180, {2, 121, 120, 12});
         op(167, {2, 81, p, 121});
     }
-    if (shape == Shape::ScalarExport)
+    if (varying_state) {
+        op(128, {3, 141, 140, 9});
+        if (shape == Shape::SgprLiveOut)
+            op(83, {3, 80, 141});
+        else
+            op(169, {3, 80, shape == Shape::UnrelatedMask ? 142u : p, 141, 140});
+    } else if (shape == Shape::ScalarExport)
         op(83, {3, 80, 9});
     else op(169, {3, 80, p, new_state, 8});
     if (shape == Shape::Termination) op(168, {2, 82, p});
@@ -152,7 +172,7 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     if (shape == Shape::BodyStore) { op(80, {6, 87, 12, 12, 12, 13}); op(62, {23, 87}); }
     op(249, {70}); op(248, {70});
     const uint32_t header = shape == Shape::Reentered ? 46 : 45;
-    op(245, {3, 100, 8, header, 80, 65});
+    op(245, {3, 100, varying_state ? 140u : 8u, header, 80, 65});
     op(245, {2, 101, 14, header, 82, 65});
     if (shape == Shape::DeadUnequalPhi || shape == Shape::LiveUnequalPhi)
         op(245, {3, 102, 8, 45, 9, 65});
