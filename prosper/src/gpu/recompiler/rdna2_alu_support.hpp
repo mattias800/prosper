@@ -405,7 +405,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
 // pattern in a fragment shader either: the host's pixel-to-lane assignment is not the PS5's, while
 // compute's lane identity is the guest's own, so GTA's scratch pairs keep projecting. Wave64
 // compute/fragment only; Wave32 mask forms are not covered (see the PR for the uncovered sites).
-inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, int reg, int words) {
+inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, int reg,
+                                     int words) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
     for (int r = reg; r < reg + words; ++r) {
         if (rs.sreg_merge_placeholder.contains(r)) return false;
@@ -425,9 +426,8 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
     const int dst = in.dst.value;
     // s_and_saveexec_b64 saves into an SGPR pair but also writes EXEC from its source.
     const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64;
-    if (!saveexec &&
-        (!(in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR) ||
-         !(dst == 106 || dst == 107 || dst == 126 || dst == 127)))
+    if (!saveexec && (!(in.dst.kind == OperandKind::Special || in.dst.kind == OperandKind::SGPR) ||
+                      !(dst == 106 || dst == 107 || dst == 126 || dst == 127)))
         return true;
     const auto has_data = [&](int reg) {
         return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
@@ -446,8 +446,7 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
 // The VCC sibling word a B32 write into one VCC half is combined with to form the lane bit. Checked
 // at the three emitters that read it (s_cselect_b32, s_pack_*, the generic B32 VCC-half write), not
 // in the shared guard: a B64 write replaces both words, so its old sibling is not read.
-inline bool vcc_sibling_projectable(SpirvCompute& b, const RegState& rs, int sibling,
-                                    uint32_t pc) {
+inline bool vcc_sibling_projectable(SpirvCompute& b, const RegState& rs, int sibling, uint32_t pc) {
     if (scalar_words_projectable(b, rs, sibling, 1)) return true;
     b.stage_reject_pc = pc;
     b.stage_reject_reason = "scalar-fabricated-lane-mask";

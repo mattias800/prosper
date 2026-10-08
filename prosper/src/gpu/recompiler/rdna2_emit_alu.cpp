@@ -1553,7 +1553,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (complete_scalar_pair) {
                     auto high = rs.sreg.find(107);
                     if (high == rs.sreg.end() || !vcc_sibling_projectable(b, rs, 107, in.pc)) {
-                        ok = false; return true;
+                        ok = false;
+                        return true;
                     }
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
@@ -1860,7 +1861,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
                     const auto high = rs.sreg.find(107);
                     if (high == rs.sreg.end() || !vcc_sibling_projectable(b, rs, 107, in.pc)) {
-                        ok = false; return true;
+                        ok = false;
+                        return true;
                     }
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
@@ -2421,8 +2423,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) {
                         const int sibling = writes_hi ? 106 : 107;
                         auto other = rs.sreg.find(sibling);
-                        if (other == rs.sreg.end() || !vcc_sibling_projectable(b, rs, sibling, in.pc)) {
-                            ok = false; return true;
+                        if (other == rs.sreg.end() ||
+                            !vcc_sibling_projectable(b, rs, sibling, in.pc)) {
+                            ok = false;
+                            return true;
                         }
                         const uint32_t other_bit = b.ucmp(
                             Op_INotEqual,
