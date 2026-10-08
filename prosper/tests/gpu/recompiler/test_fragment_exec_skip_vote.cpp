@@ -61,7 +61,10 @@ TEST(FragmentExecSkipVote, SgprLiveOutReadAfterMergeIsRefused) {
 }
 
 TEST(FragmentExecSkipVote, ScalarMemoryStoreInTheRegionIsRefused) {
-    // ADR mutation arm, by name. The state is correctly masked, but the region also stores.
+    // ADR mutation arm, by name, at the SPIR-V level: the state is correctly masked, but the
+    // region also stores. It is refused by the existing body-purity rule (the stored composite is
+    // itself outside the executable domain); the guest-level scalar-memory condition is tested
+    // by EveryScalarMemoryOpcodeIsALoadOrRefused.
     const auto lowered = lower_fragment_votes(marked(f::Shape::ScalarStore));
     EXPECT_EQ(lowered.refusal, FragmentVoteRefusal::UnprovedVote);
     EXPECT_TRUE(lowered.words.empty());
@@ -79,6 +82,7 @@ TEST(FragmentExecSkipVote, EvidenceMustNameThisVoteAndBeWellFormed) {
         "Prosper.FragmentExecSkipVote=61",   // a different id
         "Prosper.FragmentExecSkipVote=0",   // no such result
         "Prosper.FragmentExecSkipVote=",   // empty
+        "Prosper.FragmentExecSkipVote=060",     // leading zero
         "Prosper.FragmentExecSkipVote=60x",   // trailing garbage
         "Prosper.FragmentExecSkipVote=-60",   // sign
         "Prosper.FragmentExecSkipVote= 60",   // space
@@ -135,32 +139,29 @@ TEST(FragmentExecSkipVote, GraphProofRequiresTheFlagForVaryingIdentity) {
 
 // ---- guest half ----------------------------------------------------------------------------
 
-Rdna2Inst decode(uint32_t word, uint32_t pc, Rdna2Format expected_fmt, uint32_t expected_opcode) {
-    Rdna2Inst in = rdna2_decode_one(&word, 1);
-    EXPECT_EQ(in.fmt, expected_fmt) << std::hex << word;
-    EXPECT_EQ(in.opcode, expected_opcode) << std::hex << word;
-    in.pc = pc;
+// Decode hand-assembled gfx10 words and check the decoder produced the instruction meant.
+Rdna2Inst decode(std::vector<uint32_t> words, Rdna2Format expected_fmt, uint32_t expected_opcode) {
+    Rdna2Inst in = rdna2_decode_one(words.data(), words.size());
+    EXPECT_EQ(in.fmt, expected_fmt) << std::hex << words[0];
+    EXPECT_EQ(in.opcode, expected_opcode) << std::hex << words[0];
     return in;
 }
-Operand sgpr(int n) {
-    return {OperandKind::SGPR, n};
+Rdna2Inst decode(uint32_t word, Rdna2Format fmt, uint32_t opcode) {
+    return decode(std::vector<uint32_t>{word}, fmt, opcode);
 }
+Operand sgpr(int n) { return {OperandKind::SGPR, n}; }
 
-constexpr uint32_t kBranch = 0xBF880000u;   // s_cbranch_execz
-constexpr uint32_t kEnd = 0xBF810000u;   // s_endpgm
-constexpr uint32_t kNop = 0xBF800000u;
+constexpr uint32_t kBranch = 0xBF880000u; // s_cbranch_execz
+constexpr uint32_t kEnd = 0xBF810000u;    // s_endpgm
 constexpr uint32_t kVAdd = 0x06020702u;   // v_add_f32 v1, v2, v3
 constexpr uint32_t kVMov = 0x7E020302u;   // v_mov_b32 v1, v2
 constexpr uint32_t kVCmp = 0x7C020501u;   // v_cmp_lt_f32 vcc, v1, v2
-constexpr uint32_t kVCmpx = 0x7C220501u;   // v_cmpx_lt_f32 vcc, v1, v2
-constexpr uint32_t kReadFirstLaneS5 = 0x7E0A0501u;   // v_readfirstlane_b32 s5, v1
-constexpr uint32_t kSMovS6S5 = 0xBE860305u;   // s_mov_b32 s6, s5
-constexpr uint32_t kSMovS5Zero = 0xBE850380u;   // s_mov_b32 s5, 0
-constexpr uint32_t kSAddU32 = 0x80050201u;   // s_add_u32 s5, s1, s2
-constexpr uint32_t kSendMsg = 0xBF900000u;
-constexpr uint32_t kBarrier = 0xBF8A0000u;
-constexpr uint32_t kSleep = 0xBF8E0001u;
-constexpr uint32_t kSBranch = 0xBF820001u;
+constexpr uint32_t kVCmpx = 0x7C220501u;  // v_cmpx_lt_f32 vcc, v1, v2
+constexpr uint32_t kSMovS6S5 = 0xBE860305u;    // s_mov_b32 s6, s5
+constexpr uint32_t kSMovS5Zero = 0xBE850380u;  // s_mov_b32 s5, 0
+constexpr uint32_t kSMovS5Seven = 0xBE850387u; // s_mov_b32 s5, 7
+constexpr uint32_t kSAddU32 = 0x80050201u;     // s_add_u32 s5, s1, s2
+constexpr uint32_t kSCmpEq = 0xBF060201u;      // s_cmp_eq_u32 s1, s2
 
 // pc 0: s_cbranch_execz -> merge; the region follows; the merge is `tail` then s_endpgm.
 struct Program {
@@ -169,35 +170,36 @@ struct Program {
 };
 Program program(const std::vector<Rdna2Inst>& region, const std::vector<Rdna2Inst>& tail = {}) {
     Program p;
-    p.ins.push_back(
-        decode(kBranch | static_cast<uint32_t>(region.size()), 0, Rdna2Format::SOPP, 0x08));
+    auto branch = decode(kBranch | static_cast<uint32_t>(region.size()), Rdna2Format::SOPP, 0x08);
+    branch.pc = 0;
+    p.ins.push_back(branch);
     uint32_t pc = 1;
-    for (auto in : region) {
-        in.pc = pc;
-        pc += in.len_dwords;
-        p.ins.push_back(in);
-    }
+    for (auto in : region) { in.pc = pc; pc += in.len_dwords; p.ins.push_back(in); }
     p.target = pc;
-    for (auto in : tail) {
-        in.pc = pc;
-        pc += in.len_dwords;
-        p.ins.push_back(in);
-    }
-    auto end = decode(kEnd, pc, Rdna2Format::SOPP, 0x01);
+    for (auto in : tail) { in.pc = pc; pc += in.len_dwords; p.ins.push_back(in); }
+    auto end = decode(kEnd, Rdna2Format::SOPP, 0x01);
+    end.pc = pc;
     p.ins.push_back(end);
     return p;
 }
-ExecSkipRegionEffects classify(const Program& p) {
+ExecSkipRegionEffects classify(const std::vector<Rdna2Inst>& region,
+                               const std::vector<Rdna2Inst>& tail = {}) {
+    const auto p = program(region, tail);
     return classify_exec_skip_region(p.ins, 0, p.target);
 }
-Rdna2Inst vadd() {
-    return decode(kVAdd, 0, Rdna2Format::VOP2, 0x03);
-}
-Rdna2Inst vmov() {
-    return decode(kVMov, 0, Rdna2Format::VOP1, 0x01);
-}
-Rdna2Inst smov(uint32_t word) {
-    return decode(word, 0, Rdna2Format::SOP1, 0x03);
+Rdna2Inst vadd() { return decode(kVAdd, Rdna2Format::VOP2, 0x03); }
+Rdna2Inst vmov() { return decode(kVMov, Rdna2Format::VOP1, 0x01); }
+Rdna2Inst smov(uint32_t word) { return decode(word, Rdna2Format::SOP1, 0x03); }
+// A merge-side reader of VCC (v_cndmask_b32 reads it implicitly): makes a region's VCC write live.
+Rdna2Inst vcc_reader() {
+    Rdna2Inst in;
+    in.fmt = Rdna2Format::VOP2;
+    in.opcode = 0x01;
+    in.dst = {OperandKind::VGPR, 1};
+    in.src[0] = {OperandKind::VGPR, 2};
+    in.src[1] = {OperandKind::VGPR, 3};
+    in.n_src = 2;
+    return in;
 }
 Rdna2Inst smem(uint32_t opcode, int dst) {
     Rdna2Inst in;
@@ -207,88 +209,170 @@ Rdna2Inst smem(uint32_t opcode, int dst) {
     in.src[0] = sgpr(0);
     in.src[1] = {OperandKind::InlineInt, 0};
     in.n_src = 2;
-    in.len_dwords = 1;
     return in;
 }
 
 TEST(FragmentExecSkipRegion, ValuOnlyRegionIsClean) {
-    // Positive arm: VALU work only, including a v_cmp whose VCC result is dead at the merge.
-    const auto cmp = decode(kVCmp, 0, Rdna2Format::VOPC, 0x01);
-    EXPECT_TRUE(classify(program({vadd(), vmov()})).clean());
-    EXPECT_TRUE(classify(program({decode(kNop, 0, Rdna2Format::SOPP, 0x00), vadd()})).clean());
-    EXPECT_TRUE(classify(program({vadd(), cmp, vmov()})).clean())
-        << "VCC is overwritten or unread after the merge";
+    // Positive arm: VALU work only, including a v_cmp whose VCC result is dead at the merge, the
+    // pure SOPP hints, and the wait-counter SOPKs.
+    const auto cmp = decode(kVCmp, Rdna2Format::VOPC, 0x01);
+    EXPECT_TRUE(classify({vadd(), vmov()}).clean());
+    EXPECT_TRUE(classify({vadd(), cmp, vmov()}).clean()) << "VCC is unread after the merge";
+    EXPECT_TRUE(classify({decode(0xBF800000u, Rdna2Format::SOPP, 0x00),  // s_nop
+                          decode(0xBF8C0000u, Rdna2Format::SOPP, 0x0c),  // s_waitcnt
+                          decode(0xBFA00000u, Rdna2Format::SOPP, 0x20),  // s_inst_prefetch
+                          decode(0xBFA10000u, Rdna2Format::SOPP, 0x21),  // s_clause
+                          decode(0xBD7D0000u, Rdna2Format::SOPK, 0x1a),  // s_waitcnt lgkmcnt
+                          vadd()})
+                    .clean());
+    Rdna2Inst interp;
+    interp.fmt = Rdna2Format::VINTRP;
+    EXPECT_TRUE(classify({interp}).clean());
 }
 
 TEST(FragmentExecSkipRegion, SgprLiveOutIsRefusedAndDeadOneIsNot) {
-    // ADR mutation arm, by name: a scalar written in the region and read after the merge.
-    const auto write = decode(kReadFirstLaneS5, 0, Rdna2Format::VOP1, 0x02);
-    auto fx = classify(program({vadd(), write}, {smov(kSMovS6S5)}));
-    EXPECT_TRUE(fx.scalar_live_out);
-    EXPECT_FALSE(fx.clean());
-    // Control: the same write, redefined before any read, is not observable.
-    EXPECT_TRUE(classify(program({vadd(), write}, {smov(kSMovS5Zero), smov(kSMovS6S5)})).clean());
+    // ADR mutation arm, by name: a scalar written in the region and read after the merge. The only
+    // scalar writers a VALU-only region may hold are the VOPC/carry/VOP3B VCC and SGPR-pair writes,
+    // so this arm uses a v_cmp whose pair is read after the merge, with its dead control.
+    const auto cmp = decode(kVCmp, Rdna2Format::VOPC, 0x01);
+    EXPECT_TRUE(classify({vadd(), cmp}, {vcc_reader()}).scalar_live_out);
+    EXPECT_FALSE(classify({vadd(), cmp}, {}).scalar_live_out);
+    // The e64 form with an explicit SGPR pair: live while read, dead once the pair is redefined by
+    // another compare before any read (the real Black Flag region needs this kill).
+    const auto cmp_s2 = decode({0xD4C40002u, 0x00020501u}, Rdna2Format::VOPC, 0xC4);
+    EXPECT_EQ(cmp_s2.dst.kind, OperandKind::SGPR);
+    EXPECT_EQ(cmp_s2.dst.value, 2);
+    const Rdna2Inst read_s2 = smov(0xBE860302u);  // s_mov_b32 s6, s2
+    EXPECT_TRUE(classify({cmp_s2}, {read_s2}).scalar_live_out);
+    EXPECT_FALSE(classify({cmp_s2}, {cmp_s2, read_s2}).scalar_live_out)
+        << "a non-cmpx VOPC redefines both words of its SGPR pair";
+}
+
+TEST(FragmentExecSkipRegion, EveryCrossLaneOperationIsRefusedEvenWithADeadDestination) {
+    // v_readfirstlane returns the invocation's own lane in a fragment shader, which is wrong on a
+    // narrower host whatever its destination; likewise the lane-addressed and permuting forms.
+    struct Case {
+        const char* name;
+        std::vector<uint32_t> words;
+        Rdna2Format fmt;
+        uint32_t opcode;
+    };
+    const Case cases[] = {
+        {"v_readfirstlane_b32 s5, v1", {0x7E0A0501u}, Rdna2Format::VOP1, 0x02},
+        {"v_readfirstlane_b32 s5, v1 (VOP3 form)", {0xD5820005u, 0x00000101u}, Rdna2Format::VOP3, 0x182},
+        {"v_readlane_b32 s5, v1, 0", {0xD7600005u, 0x00010101u}, Rdna2Format::VOP3, 0x360},
+        {"v_writelane_b32 v1, s5, 0", {0xD7610001u, 0x00010005u}, Rdna2Format::VOP3, 0x361},
+        {"v_mbcnt_lo_u32_b32 v4, s0, 0", {0xD7650004u, 0x00010000u}, Rdna2Format::VOP3, 0x365},
+        {"v_mbcnt_hi_u32_b32 v4, s1, v4", {0xD7660004u, 0x00020801u}, Rdna2Format::VOP3, 0x366},
+        {"v_permlane16_b32 v1, v2, s0, s1", {0xD7770001u, 0x00000102u}, Rdna2Format::VOP3, 0x377},
+        {"v_permlanex16_b32 v1, v2, s0, s1", {0xD7780001u, 0x00000102u}, Rdna2Format::VOP3, 0x378},
+    };
+    for (const auto& c : cases) {
+        const auto fx = classify({decode(c.words, c.fmt, c.opcode)});
+        EXPECT_TRUE(fx.wave_side_effect) << c.name;
+        EXPECT_FALSE(fx.clean()) << c.name;
+    }
+    // The scenario that motivated the rule: dead destination, consumed inside the region.
+    const auto write = decode(0x7E0A0501u, Rdna2Format::VOP1, 0x02);
+    EXPECT_TRUE(classify({vadd(), write, vadd()}, {smov(kSMovS5Zero)}).wave_side_effect);
+}
+
+TEST(FragmentExecSkipRegion, CarryOutsAndFlagWritesAreLiveOutsOnlyWhenRead) {
+    // VOP2 v_addc_co_u32 e32 writes its carry-out to VCC.
+    const auto carry = decode(0x50020702u, Rdna2Format::VOP2, 0x28);
+    EXPECT_TRUE(classify({carry}, {vcc_reader()}).scalar_live_out);
+    EXPECT_FALSE(classify({carry}).scalar_live_out);
+    // VOP3B v_add_co_u32 vcc, v1, v2, v3 carries its flag in SDST.
+    const auto vop3b = decode({0xD70F6A01u, 0x00020702u}, Rdna2Format::VOP3, 0x30F);
+    EXPECT_EQ(vop3b.sdst.kind, OperandKind::SGPR);
+    EXPECT_TRUE(classify({vop3b}, {vcc_reader()}).scalar_live_out);
+    EXPECT_FALSE(classify({vop3b}).scalar_live_out);
 }
 
 TEST(FragmentExecSkipRegion, ScalarAluAndExecWritesAreLiveOuts) {
-    EXPECT_TRUE(classify(program({decode(kSAddU32, 0, Rdna2Format::SOP2, 0x00)})).scalar_live_out)
-        << "SCC has no liveness proof, so any scalar ALU op is refused";
-    EXPECT_TRUE(classify(program({decode(kVCmpx, 0, Rdna2Format::VOPC, 0x11)})).scalar_live_out)
+    EXPECT_TRUE(classify({decode(kSAddU32, Rdna2Format::SOP2, 0x00)}).scalar_live_out);
+    EXPECT_TRUE(classify({decode(kSMovS5Seven, Rdna2Format::SOP1, 0x03)}).scalar_live_out);
+    EXPECT_TRUE(classify({decode(kSCmpEq, Rdna2Format::SOPC, 0x06)}).scalar_live_out) << "SCC";
+    EXPECT_TRUE(classify({decode(0xB0050007u, Rdna2Format::SOPK, 0x00)}).scalar_live_out)
+        << "s_movk_i32";
+    EXPECT_TRUE(classify({decode(kVCmpx, Rdna2Format::VOPC, 0x11)}).scalar_live_out)
         << "v_cmpx writes EXEC";
-    // VCC read after the merge by a v_cndmask-style consumer: a v_cmp whose mask survives.
-    const auto cmp = decode(kVCmp, 0, Rdna2Format::VOPC, 0x01);
-    Rdna2Inst cndmask;
-    cndmask.fmt = Rdna2Format::VOP2;
-    cndmask.opcode = 0x01;
-    cndmask.dst = {OperandKind::VGPR, 1};
-    cndmask.src[0] = {OperandKind::VGPR, 2};
-    cndmask.src[1] = {OperandKind::VGPR, 3};
-    cndmask.n_src = 2;
-    cndmask.len_dwords = 1;
-    EXPECT_TRUE(classify(program({cmp}, {cndmask})).scalar_live_out);
 }
 
-TEST(FragmentExecSkipRegion, ScalarMemoryEffectIsRefused) {
-    // ADR mutation arm, by name: a scalar memory store in the region.
-    EXPECT_TRUE(classify(program({vadd(), smem(0x18, 4)})).scalar_memory_effect);
-    // A scalar load whose result is read after the merge.
-    EXPECT_TRUE(classify(program({smem(0x8, 4)}, {smov(0xBE860304u)})).scalar_memory_effect)
+TEST(FragmentExecSkipRegion, ModifiersAndDppAreWaveLevelOnEveryVectorFormat) {
+    // DPP crosses lanes and SDWA/modifier forms are not modelled: refused on each VALU format.
+    const Rdna2Inst forms[] = {vmov(), vadd(), decode(kVCmp, Rdna2Format::VOPC, 0x01),
+                               decode({0xD5010003u, 0x00110103u}, Rdna2Format::VOP3, 0x101)};
+    for (const auto& base : forms) {
+        auto dpp = base;
+        dpp.has_dpp = true;
+        EXPECT_TRUE(classify({dpp}).wave_side_effect) << "dpp, fmt " << static_cast<int>(base.fmt);
+        auto modified = base;
+        modified.has_modifier = true;
+        EXPECT_TRUE(classify({modified}).wave_side_effect)
+            << "modifier, fmt " << static_cast<int>(base.fmt);
+        EXPECT_FALSE(classify({base}, {vcc_reader()}).wave_side_effect);
+    }
+}
+
+TEST(FragmentExecSkipRegion, EveryScalarMemoryOpcodeIsALoadOrRefused) {
+    // gfx10.3 has no scalar stores. The SMEM opcode space holds the dword loads (0x0-0x4 s_load,
+    // 0x8-0xC s_buffer_load) and, beyond them, only cache control, s_memtime/s_memrealtime and
+    // s_atc_probe, none of which is a load the region rules can reason about. Every opcode in the
+    // 6-bit field is classified: loads with a dead destination are clean, the rest are refused.
+    for (uint32_t opcode = 0; opcode < 64; ++opcode) {
+        const bool load = opcode <= 0x4 || (opcode >= 0x8 && opcode <= 0xC);
+        const auto fx = classify({smem(opcode, 20)});  // s20..: never read after the merge
+        EXPECT_EQ(fx.scalar_memory_effect, !load) << "opcode 0x" << std::hex << opcode;
+        EXPECT_EQ(fx.clean(), load) << "opcode 0x" << std::hex << opcode;
+    }
+}
+
+TEST(FragmentExecSkipRegion, ScalarLoadReadAfterTheMergeIsRefused) {
+    // The ADR's scalar-memory condition: a load whose result is read after the merge.
+    EXPECT_TRUE(classify({smem(0x8, 4)}, {smov(0xBE860304u)}).scalar_memory_effect)
         << "s_mov_b32 s6, s4 reads the loaded value";
-    // Control: the loaded register is redefined before it is read.
-    EXPECT_TRUE(classify(program({smem(0x8, 5)}, {smov(kSMovS5Zero), smov(kSMovS6S5)})).clean());
+    EXPECT_FALSE(
+        classify({smem(0x8, 5)}, {smov(kSMovS5Zero), smov(kSMovS6S5)}).scalar_memory_effect)
+        << "the loaded register is redefined before it is read";
 }
 
 TEST(FragmentExecSkipRegion, WaveLevelSideEffectsAreRefused) {
-    EXPECT_TRUE(
-        classify(program({vadd(), decode(kSendMsg, 0, Rdna2Format::SOPP, 0x10)})).wave_side_effect);
-    EXPECT_TRUE(classify(program({decode(kBarrier, 0, Rdna2Format::SOPP, 0x0a)})).wave_side_effect);
-    EXPECT_TRUE(classify(program({decode(kSleep, 0, Rdna2Format::SOPP, 0x0e)})).wave_side_effect);
+    for (const uint32_t word : {0xBF900000u /* s_sendmsg */, 0xBF8A0000u /* s_barrier */,
+                                0xBF8E0001u /* s_sleep */, 0xBF920000u /* s_trap */,
+                                0xBF960000u /* s_ttracedata */}) {
+        const Rdna2Inst in = rdna2_decode_one(&word, 1);
+        ASSERT_EQ(in.fmt, Rdna2Format::SOPP) << std::hex << word;
+        EXPECT_TRUE(classify({vadd(), in}).wave_side_effect) << std::hex << word;
+    }
+    EXPECT_TRUE(classify({decode(0xBBFD0000u, Rdna2Format::SOPK, 0x17)}).wave_side_effect)
+        << "s_waitcnt_vscnt publishes stores";
     Rdna2Inst setreg;
     setreg.fmt = Rdna2Format::SOPK;
     setreg.opcode = 0x13;
-    setreg.len_dwords = 1;
-    EXPECT_TRUE(classify(program({setreg})).wave_side_effect);
-    Rdna2Inst dpp = vmov();
-    dpp.has_dpp = true;
-    EXPECT_TRUE(classify(program({dpp})).wave_side_effect) << "cross-lane read";
+    EXPECT_TRUE(classify({setreg}).wave_side_effect);
 }
 
 TEST(FragmentExecSkipRegion, ExitsOtherThanTheMergeAreRefused) {
-    EXPECT_TRUE(classify(program({decode(kSBranch, 0, Rdna2Format::SOPP, 0x02)})).foreign_exit);
-    EXPECT_TRUE(classify(program({decode(kEnd, 0, Rdna2Format::SOPP, 0x01)})).foreign_exit);
-    EXPECT_TRUE(classify(program({decode(kBranch | 1u, 0, Rdna2Format::SOPP, 0x08)})).foreign_exit)
-        << "a nested skip is not a fall-through to the merge";
+    for (const uint32_t opcode : {0x02u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u, 0x09u})
+        EXPECT_TRUE(
+            classify({decode(0xBF800000u | (opcode << 16) | 1u, Rdna2Format::SOPP, opcode)})
+                .foreign_exit)
+            << opcode;
+    EXPECT_TRUE(classify({decode(kEnd, Rdna2Format::SOPP, 0x01)}).foreign_exit);
+    // s_setpc_b64 s[0:1]: control goes where the decoded CFG does not.
+    EXPECT_TRUE(classify({decode(0xBE802000u, Rdna2Format::SOP1, 0x20)}).foreign_exit);
 }
 
 TEST(FragmentExecSkipRegion, UnknownFormatsAndBackwardRegionsFailClosed) {
-    Rdna2Inst buffer;
-    buffer.fmt = Rdna2Format::MUBUF;
-    buffer.len_dwords = 2;
-    EXPECT_TRUE(classify(program({buffer})).unclassified);
-    Rdna2Inst unknown;
-    unknown.fmt = Rdna2Format::Unknown;
-    EXPECT_TRUE(classify(program({unknown})).unclassified);
-    auto p = program({vadd()});
+    for (const auto fmt : {Rdna2Format::DS, Rdna2Format::MUBUF, Rdna2Format::MTBUF,
+                           Rdna2Format::MIMG, Rdna2Format::FLAT, Rdna2Format::EXP,
+                           Rdna2Format::Unknown}) {
+        Rdna2Inst in;
+        in.fmt = fmt;
+        EXPECT_TRUE(classify({in}).unclassified) << static_cast<int>(fmt);
+    }
+    const auto p = program({vadd()});
     EXPECT_TRUE(classify_exec_skip_region(p.ins, p.target, 0).foreign_exit);
     EXPECT_TRUE(classify_exec_skip_region(p.ins, 0, 0).foreign_exit);
 }

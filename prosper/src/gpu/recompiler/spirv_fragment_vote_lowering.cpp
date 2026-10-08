@@ -105,8 +105,8 @@ bool read_exec_skip_vote(std::string_view text, uint32_t& id) {
     const auto number = text.substr(prefix.size());
     uint32_t value = 0;
     const auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
-    if (number.empty() || parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() ||
-        !value)
+    if (number.empty() || number.front() == '0' || parsed.ec != std::errc{} ||
+        parsed.ptr != number.data() + number.size() || !value)
         return false;
     id = value;
     return true;

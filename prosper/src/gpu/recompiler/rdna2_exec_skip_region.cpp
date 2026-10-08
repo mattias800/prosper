@@ -15,9 +15,27 @@ bool scalar_destination_dead(const std::vector<Rdna2Inst>& ins, uint32_t target_
     for (int k = 0; k < dwords; ++k) {
         const int reg = destination.value + k;
         if (reg > 107) return false;             // M0, EXEC, and anything unnamed
-        if (!sgpr_dead_at_merge(ins, target_pc, reg)) return false;
+        if (!sgpr_dead_at_merge(ins, target_pc, reg, ScalarMergeProof::AnyRead, nullptr,
+                                /*vopc_sgpr_pair_kills=*/true))
+            return false;
     }
     return true;
+}
+
+// Cross-lane and lane-addressed VALU: its result depends on which lanes of the 64-lane guest wave
+// are active, and the fragment emitter lowers it per invocation (v_readfirstlane returns the
+// invocation's own lane), so it is wrong on a narrower host even when its destination is dead.
+bool is_cross_lane_valu(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::VOP1) return in.opcode == 0x02;          // v_readfirstlane_b32
+    if (in.fmt != Rdna2Format::VOP3) return false;
+    switch (in.opcode) {
+        case 0x182:                                                     // readfirstlane (VOP3 form)
+        case 0x360: case 0x361:                                         // v_readlane / v_writelane
+        case 0x365: case 0x366:                                         // v_mbcnt_lo / v_mbcnt_hi
+        case 0x377: case 0x378:                                         // v_permlane16 / x16
+            return true;
+        default: return false;
+    }
 }
 
 int smem_load_dwords(uint32_t opcode) {
@@ -56,49 +74,34 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
         }
         switch (in.fmt) {
             case Rdna2Format::VOP1:
-                if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // v_readfirstlane_b32: the decoder keeps the SGPR index in a VGPR-kinded `dst`.
-                if (in.opcode == 0x02 && !dead({OperandKind::SGPR, in.dst.value}, 1))
-                    fx.scalar_live_out = true;
-                break;
             case Rdna2Format::VOP2:
-                if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // v_add/sub/subrev_co_ci_u32 write the carry-out to VCC implicitly.
-                if (in.opcode >= 0x28 && in.opcode <= 0x2A && !dead({OperandKind::Special, 106}, 2))
-                    fx.scalar_live_out = true;
-                break;
             case Rdna2Format::VOPC:
-                if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // v_cmpx writes EXEC only; the others write the VCC/SGPR pair in `dst`.
-                if (vopc_is_cmpx(in.opcode) || !dead(in.dst, 2)) fx.scalar_live_out = true;
-                break;
             case Rdna2Format::VOP3:
-                if (in.has_dpp || in.has_modifier) fx.wave_side_effect = true;
-                // 0x182 is v_readfirstlane_b32 and 0x360 v_readlane_b32 in their VOP3 spelling.
-                if ((in.opcode == 0x182 || in.opcode == 0x360) &&
-                    !dead({OperandKind::SGPR, in.dst.value}, 1))
-                    fx.scalar_live_out = true;
-                if (in.sdst.kind != OperandKind::None && !dead(in.sdst, 2))
-                    fx.scalar_live_out = true;
+                // DPP crosses lanes, and an SDWA/modifier form is not one the emitter models.
+                if (in.has_dpp || in.has_modifier || is_cross_lane_valu(in))
+                    fx.wave_side_effect = true;
+                if (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A &&
+                    !dead({OperandKind::Special, 106}, 2))
+                    fx.scalar_live_out = true;   // v_*_co_ci_u32 carry-out to VCC
+                if (in.fmt == Rdna2Format::VOPC &&
+                    (vopc_is_cmpx(in.opcode) || !dead(in.dst, 2)))
+                    fx.scalar_live_out = true;   // v_cmpx writes EXEC; others write VCC/SGPR pair
+                if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind != OperandKind::None &&
+                    !dead(in.sdst, 2))
+                    fx.scalar_live_out = true;   // VOP3B carry/flag out
                 break;
             case Rdna2Format::VOP3P:
-            case Rdna2Format::VINTRP: break;   // VGPR destinations only
+            case Rdna2Format::VINTRP:
+                break;   // VGPR destinations only
             case Rdna2Format::SOPP:
                 // Only pure hints. Every branch (the way out of the region, or a nested region
                 // the emitter would have to structure separately) and every message, barrier,
                 // sleep, trap or trace operation is refused.
                 switch (in.opcode) {
-                    case 0x00:
-                    case 0x0c:
-                    case 0x20:
-                    case 0x21: break;
-                    case 0x02:
-                    case 0x04:
-                    case 0x05:
-                    case 0x06:
-                    case 0x07:
-                    case 0x08:
-                    case 0x09: fx.foreign_exit = true; break;
+                    case 0x00: case 0x0c: case 0x20: case 0x21: break;
+                    case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09:
+                        fx.foreign_exit = true;
+                        break;
                     default: fx.wave_side_effect = true; break;
                 }
                 break;
@@ -120,9 +123,11 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
                 fx.scalar_live_out = true;
                 break;
             case Rdna2Format::SMEM: {
+                // gfx10.3 has no scalar stores or atomics; every non-load opcode (cache control,
+                // s_memtime, s_atc_probe, and any encoding left over from older ISAs) has width 0
+                // and is refused here, which is also what keeps this fail-closed for new opcodes.
                 const int n = smem_load_dwords(in.opcode);
-                if (rdna2_instruction_may_write_memory(in) || n == 0 || !dead(in.dst, n))
-                    fx.scalar_memory_effect = true;
+                if (n == 0 || !dead(in.dst, n)) fx.scalar_memory_effect = true;
                 break;
             }
             default:   // DS, MUBUF, MTBUF, MIMG, FLAT, EXP, Unknown
@@ -133,4 +138,4 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
     return fx;
 }
 
-}   // namespace prosper::gpu
+} // namespace prosper::gpu
