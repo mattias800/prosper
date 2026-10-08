@@ -21,6 +21,10 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-08
 
+### Kena's dark cave is too bright, but not because of exposure
+
+Kena's exposure turns out to be fixed by the game itself. Prosper's cave is nine times too bright because sky and ambient light reach the walls unoccluded; on PS5, distance-field occlusion blocks them ([#4766](https://github.com/mattias800/prosper/issues/4766)).
+
 ### Kena: Bridge of Spirits gets its depth of field
 
 The grass and stones nearest the camera in Kena's title-menu forest now blur, as they do on PS5; the frame is still brighter than the console's and the white flowers are still missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).

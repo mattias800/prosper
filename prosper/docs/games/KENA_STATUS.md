@@ -9,6 +9,72 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Exposure is the guest's own; the cave's excess light is ambient (2026-10-08)
+
+**Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window and
+`PROSPER_NULL_PAGE=1`, using two routes:
+- the title route, `scripts/kena/linux-reach-level-load.pad`, snap at pad flip 420;
+- the cave route, `scripts/kena/linux-reach-pulse.pad`, snaps from flip 1700, after the Pulse.
+  That route is not on `main` yet; it is commit `cc3c6552a` on `gpu/kena-post-load-refusals`.
+
+| frame | mean luminance | PS5 oracle |
+|---|---|---|
+| title menu, `main` | 67.5 | 43.5 (`kena-oracle.png`) |
+| title menu, this PR | 66.6 (mean abs diff 3.7, from animated leaves) | 43.5 |
+| cave after the Pulse, `main` | 32.4 | 3.5 (after-Pulse oracle) |
+| cave after the Pulse, this PR | 32.1 (mean abs diff 1.3) | 3.5 |
+| cave, `main`, both ambient passes skipped (diagnostic) | 5.5 | 3.5 |
+
+The `main` and PR runs are not on the same base: `7a4636d7d` against `39d2e600f`.
+
+- **Exposure is settled, and it is not the defect.** `PROSPER_TEXLOG` on the title route gives the
+  eye-adaptation draw (`0x5009a20000`) one T#: a guest 1×1 `IMG_FMT 56` (8_8_8_8_UNORM) at
+  `0x500f0c0000`, raw dword1 `0x03800000`. The 1×1 targets it ping-pongs (`0x509afe0000`,
+  `0x505cb70000`) are `IMG_FMT 77` (32_32_32_32_FLOAT). prosper's two formats are the guest's own.
+  - The program loops over 64 histogram buckets, using `image_load` at `x = i/4`, and reads the
+    previous exposure at (0, 1).
+  - Every one of those loads hits the 1×1 dummy, so the result is a function of constants. It is
+    2.0 on the title menu and 1.189 (2^0.25) in the cave. The cave is the darker exposure, and it
+    is still 9× too bright.
+  - Reading the dummy as UE4's histogram eye adaptation with the histogram turned off (fixed exposure)
+    is `CONFIDENCE: MED`. The T# formats are measured.
+- **The cave's excess is ambient light.** Mean scene luminance of a RenderDoc capture, per stage,
+  inside the 2240×1260 view:
+
+  | stage | mean luminance |
+  |---|---|
+  | base pass (no static lighting: GBufferC.a = 237 is material AO) | 0.0001 |
+  | ambient-cubemap pass `0x5009a60000` | +0.0089 |
+  | deferred lights | +0.006 |
+  | reflection and sky pass `0x5008750000` | +0.022 |
+
+  On the walls, essentially all the light is the two ambient passes. Skipping both programs
+  (`PROSPER_SKIP_DRAW_PROGRAM`, a diagnostic) takes the frame to 5.5 against the oracle's 3.5: dark
+  walls and blue markers, as on PS5. But Kena becomes a silhouette, so PS5's ambient there is small
+  rather than zero.
+- **Sky occlusion is missing.** In a fully dynamic UE4 scene, distance-field AO occludes the sky. Its
+  bent normals are length 0.003 at every pixel (#4766).
+- **Fix: a MUBUF format store writes only its V# format's components.** The clamp applied to MTBUF
+  only. So `buffer_store_format_xyzw` through a one-component 32-bit V# wrote four dwords per lane, and
+  each lane overwrote its three neighbours.
+  - UE4's typed-buffer clear is such a store. On `main`, Kena's AO cone buffer kept the clear value
+    in 1% of its elements, all at multiples of 64. With the fix it is written everywhere.
+  - The cone trace that follows still changes almost nothing, so the picture did not move (#4766).
+- **Found on the way, filed, not fixed.**
+  - A cube **array** samples face 5 of its first cube (#4767). Kena's reflection captures are a
+    four-cube BC7 array.
+  - The sky light's GPU-written RGBA16F cube is decoded from guest memory and reads as noise (#4768).
+- **Kena's hair is unlit, not mis-shaded so far.** Hair pixels are shading model 7 (GBufferB.a
+  `0xA7`). The head's median HDR is 0.0007. Both ambient passes give hair about 20× less than lit
+  rock. At a sampled head pixel, every light draw covering it fails its depth or depth-bounds test,
+  because those lights are elsewhere. So the hair branch of the deferred light was not reached at
+  that pixel. The next probe is a light whose bounds contain Kena's depth (0.032).
+- **Route timing.** The cave route is seconds-anchored, and its flip rate varies by run. One fix run
+  sat at the Pulse prompt at flip 1700. Check the frame before quoting a cave number. A RenderDoc
+  capture run with the fix was perturbed by owner input at 19:05Z, so it is used only for the
+  buffer-level DFAO measurements above.
+- **Rung.** Unchanged; the picture did not move.
+
 ## Depth of field works: two general fixes; exposure still open (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
@@ -66,6 +132,7 @@ indicative only.
     for 141; a float target folded to RGBA8 would look exactly like this.
   - Next step: log `CB_COLOR*_INFO` for the pass that clears 141, and the T# format the exposure
     draw fetches through (`PROSPER_TEXLOG` limited to that draw).
+  - Settled later the same day; see the section above. The guest T# is itself a 1×1 8_8_8_8_UNORM.
 - **The white flowers are not localised.**
   - The title route has no `[ngg-refused]` lines and no `dropped-draws` alarm.
   - A per-draw census of the first base pass found many draws that change no pixel of one MRT,
@@ -883,6 +950,18 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The exposure pass reads an 8-bit texture because prosper's view format differs from the guest's**
+  — false. `PROSPER_TEXLOG` shows the guest T# itself is a 1×1 `IMG_FMT 56` (8_8_8_8_UNORM) at
+  `0x500f0c0000`, and the 1×1 targets it writes are `IMG_FMT 77` (32_32_32_32_FLOAT), as prosper
+  renders them (2026-10-08).
+- **The cave is 7–9× too bright because its exposure does not adapt** — false. The exposure is a
+  constant-driven 1.189 in the cave against 2.0 on the title menu. The light comes from two ambient
+  passes; skipping them gives 5.5 against the oracle's 3.5 (2026-10-08, #4766).
+- **prosper's BC6H decoder brightens Kena's ambient cubemap** — false. On 256 random blocks it matches
+  Pillow's independent BC6H decode to within 1 of 255 (2026-10-08).
+- **Fixing the typed-buffer clear restores the distance-field AO** — false. With every element of the
+  cone buffer now written, the cone trace still leaves it almost unchanged, and the bent normals stay
+  at length 0.003 (2026-10-08, #4766).
 - **The level-load device loss is an out-of-bounds access or a bad descriptor** — false. The RADV hang dump's `vm_fault.log` is empty, so the GPU hung rather than faulted. The hang is pixel program `0x5007ad0000`'s outer loop, whose spill-slot counter the recompiled loop never advanced (2026-10-08).
 - **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).
 - **The level-load device loss is the newly admitted indexed NGG draw** — false. A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU in ordinary draws of pixel program `0x5007ad0000`, and `main`, without the draw, loses the device at the same pad time (2026-10-08, #3135).
