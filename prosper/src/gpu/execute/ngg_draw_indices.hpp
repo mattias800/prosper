@@ -28,8 +28,9 @@ namespace prosper::gpu {
 
 struct GpuState;
 
-// The most indices one merged-NGG draw may carry; more is refused (ngg-index-count). Every live
-// shape recorded so far has 6 or 18 (#3135); the ordinary path's sanity cap is the same 2^20.
+// The most indices one merged-NGG draw may carry, and the bound on an index VALUE; more is refused
+// (ngg-index-count, ngg-index-range). Every live shape recorded so far has 6 or 18 (#3135); the
+// ordinary path's sanity cap is the same 2^20 (#461).
 inline constexpr uint32_t kNggMaxIndices = 1u << 20;
 
 struct NggIndexRestart {
@@ -49,7 +50,8 @@ struct NggDrawIndices {
 
 // Decodes `count` little-endian indices of `element_bytes` (2 or 4) from `bytes`. Refusals:
 // ngg-index-element-size, ngg-index-count (zero, or above kNggMaxIndices), ngg-index-restart-unknown,
-// ngg-index-restart.
+// ngg-index-restart, ngg-index-range (an index value at or above kNggMaxIndices: the vertex range
+// max_index + 1 sizes the fold and every vertex buffer, #461).
 NggDrawIndices decode_ngg_draw_indices(const void* bytes, uint32_t element_bytes, uint32_t count,
                                        const NggIndexRestart& restart);
 

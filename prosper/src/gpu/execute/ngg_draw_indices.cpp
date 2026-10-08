@@ -60,6 +60,15 @@ NggDrawIndices decode_ngg_draw_indices(const void* bytes, uint32_t element_bytes
         (*indices)[i] = value;
         out.max_index = std::max(out.max_index, value);
     }
+    // #461's guard, as a refusal: the vertex RANGE max_index + 1 sizes the fold and every vertex
+    // buffer, so one garbage or torn index would grow them to the 256 MiB ceiling on every draw (and
+    // 0xffffffff would wrap the range to 0). The ordinary path clamps; a clamp here would leave ES
+    // lanes fetching past the grown buffers, so the draw is refused by name instead.
+    if (out.max_index >= kNggMaxIndices) {
+        out.refusal = "ngg-index-range";
+        out.max_index = 0;
+        return out;
+    }
     out.indices = std::move(indices);
     return out;
 }

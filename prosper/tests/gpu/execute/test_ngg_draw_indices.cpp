@@ -57,6 +57,26 @@ TEST(NggDrawIndices, ShapeRefusals) {
     EXPECT_TRUE(at_cap.indices) << "the cap itself is admitted";
 }
 
+// #461's arm for the NGG path: one garbage 32-bit index would size the fold and every vertex
+// buffer by max_index + 1. Refused by name, at the same 2^20 bound the ordinary path clamps to;
+// 0xffffffff (which would wrap the range to 0) too. The largest admitted index is 2^20 - 1.
+TEST(NggDrawIndices, AGarbageIndexValueIsRefusedNotClamped) {
+    const std::vector<uint32_t> garbage = {0, 1, 0x0F000000u};
+    const auto a = decode_ngg_draw_indices(bytes_of(garbage).data(), 4, 3, {});
+    EXPECT_STREQ(a.refusal, "ngg-index-range");
+    EXPECT_FALSE(a.indices);
+    const std::vector<uint32_t> wraps = {0, 1, 0xffffffffu};
+    EXPECT_STREQ(decode_ngg_draw_indices(bytes_of(wraps).data(), 4, 3, {}).refusal,
+                 "ngg-index-range");
+    const std::vector<uint32_t> at_bound = {0, 1, kNggMaxIndices};
+    EXPECT_STREQ(decode_ngg_draw_indices(bytes_of(at_bound).data(), 4, 3, {}).refusal,
+                 "ngg-index-range");
+    const std::vector<uint32_t> below = {0, 1, kNggMaxIndices - 1u};
+    const auto b = decode_ngg_draw_indices(bytes_of(below).data(), 4, 3, {});
+    ASSERT_TRUE(b.indices) << b.refusal;
+    EXPECT_EQ(b.max_index, kNggMaxIndices - 1u);
+}
+
 // Restart is refused whenever it could change the draw -- an index equal to the restart value, or a
 // restart value the draw state does not hold -- and admitted when it provably cannot.
 TEST(NggDrawIndices, PrimitiveRestartIsRefusedWhereItCouldFire) {
