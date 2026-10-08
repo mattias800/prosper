@@ -14,6 +14,9 @@
 //     is an atomic add, so a stale count would invalidate every block.
 //   * The violation counters are read lazily: nothing is read until the batch completes for its own
 //     reasons, and an out-of-range layer is then counted.
+//   * #3135 P6, indexed draws: an instanced triangle list of scattered 16- and 32-bit indices
+//     covers every instance's layer, the index VALUES (not their positions) decide which half of
+//     the screen one triangle covers, and each instance's primitives land on their own slice.
 #include "fixtures/render_runner.h"
 
 #include "fixtures/ngg_merged_lut_fixture.hpp"
@@ -21,6 +24,7 @@
 #include "fixtures/ngg_subgroup_runner.h"
 #include "fixtures/test_data.h"
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "gpu/execute/ngg_draw_indices.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/ngg_subgroup_plan.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
@@ -40,6 +44,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -81,21 +86,18 @@ const KenaInputs& kena_inputs() {
     return inputs;
 }
 
-std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_t vertices,
-                                                 uint32_t instances, uint32_t slices,
-                                                 std::string* why,
-                                                 std::optional<NggLayerRoute> route = {}) {
+std::shared_ptr<const NggSubgroupDraw>
+kena_shape_draw(const RenderVkCtx& ctx, const NggDrawShape& shape, const ShaderResourceTable& table,
+                uint32_t slices, std::string* why, std::optional<NggLayerRoute> route = {}) {
     const KenaInputs& in = kena_inputs();
     NggSubgroupDrawRequest request;
     request.linked_code = in.linked.data();
     request.dwords = in.linked.size();
-    request.resources = &in.table;
+    request.resources = &table;
     request.shell.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(ngg::kKenaRsrc2Gs);
     request.shell.user_sgprs = ngg::kKenaUserSgprs;
     request.limits = ngg::kena_limits();
-    request.shape.topology = NggInputTopology::TriangleStrip;
-    request.shape.vertex_count = vertices;
-    request.shape.instance_count = instances;
+    request.shape = shape;
     request.raster.topology = NggOutputTopology::TriangleList;
     request.raster.layer_from_pos1 = true;
     request.raster.layer_slices = slices;
@@ -104,6 +106,17 @@ std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_
     request.push_constants.assign(ngg::kKenaUserSgprs, 0u);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x5009440000ull};
     return build_ngg_subgroup_draw(request, why);
+}
+
+std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_t vertices,
+                                                 uint32_t instances, uint32_t slices,
+                                                 std::string* why,
+                                                 std::optional<NggLayerRoute> route = {}) {
+    NggDrawShape shape;
+    shape.topology = NggInputTopology::TriangleStrip;
+    shape.vertex_count = vertices;
+    shape.instance_count = instances;
+    return kena_shape_draw(ctx, shape, kena_inputs().table, slices, why, route);
 }
 
 // The guest's convention: a negative viewport height puts clip y = +1 on the top row.
@@ -912,6 +925,162 @@ TEST(NggSubgroupBackend, ShellPipelineCacheIsKeyedOnceAndBounded) {
     EXPECT_LE(stats.entries, kNggShellPipelineCacheEntries);
     EXPECT_GT(stats.evictions, evictions);
     EXPECT_TRUE(first->pipeline) << "an evicted entry a holder still owns stays valid";
+}
+
+// ---- P6: indexed draws ------------------------------------------------------------------------------
+//
+// Kena's LUT producer driven by an INDEX BUFFER instead of its strip: the shapes Kena submits past
+// New Game (#3135 P6) are small instanced triangle lists into a 64-slice volume. Eight vertex
+// records; the quad's corners sit at the scattered indices 6 (1,-1), 1 (1,1), 4 (-1,-1) and 3 (-1,1).
+// The other records are decoys placed so that reading index POSITIONS instead of index VALUES draws
+// the complementary half: records 0, 1, 2 are the upper-left triangle, and 3, 4, 5 a degenerate one.
+// Each record's PARAM is its own normalized screen position, so a covered pixel must read its own
+// position whichever records drew it -- coverage is what each arm discriminates.
+
+const std::vector<std::array<float, 2>>& scattered_records() {
+    static const std::vector<std::array<float, 2>> positions = {
+        {-1, 1}, {1, 1}, {-1, -1}, {-1, 1}, {-1, -1}, {-1, 1}, {1, -1}, {-1, -1}};
+    return positions;
+}
+
+const ShaderResourceTable& scattered_table() {
+    static const ShaderResourceTable table = ngg::kena_resources(8);
+    return table;
+}
+
+std::shared_ptr<const std::vector<uint32_t>> decoded(const std::vector<uint32_t>& values,
+                                                     uint32_t element_bytes) {
+    std::vector<unsigned char> bytes(values.size() * element_bytes);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (element_bytes == 2u) {
+            const uint16_t narrow = static_cast<uint16_t>(values[i]);
+            std::memcpy(bytes.data() + 2u * i, &narrow, 2u);
+        } else {
+            std::memcpy(bytes.data() + 4u * i, &values[i], 4u);
+        }
+    }
+    return decode_ngg_draw_indices(bytes.data(), element_bytes,
+                                   static_cast<uint32_t>(values.size()), {})
+        .indices;
+}
+
+std::shared_ptr<const NggSubgroupDraw>
+kena_indexed_draw(const RenderVkCtx& ctx, std::shared_ptr<const std::vector<uint32_t>> indices,
+                  uint32_t instances, uint32_t slices, std::string* why) {
+    NggDrawShape shape;
+    shape.topology = NggInputTopology::TriangleList;
+    shape.indices = std::move(indices);
+    shape.vertex_count = shape.indices ? static_cast<uint32_t>(shape.indices->size()) : 0u;
+    shape.instance_count = instances;
+    return kena_shape_draw(ctx, shape, scattered_table(), slices, why);
+}
+
+// The quad as two triangles of scattered 16-bit and 32-bit indices, 5 instances into an 8-slice
+// volume: layers 0..4 complete, 5..7 clear, and the two encodings give identical bytes. Without the
+// index mapping the planner would run records 0..5 and only the upper-left half would draw.
+TEST(NggSubgroupBackend, IndexedListDrawsItsIndexedVerticesOnEveryInstanceLayer) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    const std::vector<uint32_t> quad = {6, 1, 4, 4, 1, 3};
+    const ResolvedPipelineState state = flipped_state();
+    const auto records = ngg::vertex_records(scattered_records());
+    std::vector<uint8_t> by_width[2];
+    for (uint32_t w = 0; w < 2u; ++w) {
+        std::string why;
+        const auto ngg = kena_indexed_draw(*ctx, decoded(quad, w ? 4u : 2u), 5, 8, &why);
+        ASSERT_TRUE(ngg) << why;
+        ASSERT_EQ(ngg->plan.subgroups.size(), 5u);
+        EXPECT_EQ(ngg->plan.subgroups[0].es_threads(), 4u) << "6 references, 4 ES lanes";
+        const BackendColorTarget target = volume_target(0x4e4747340010ull + w, 8);
+        const StatsSnapshot before = stats_now();
+        by_width[w] = render_draws_rgba({ngg_backend_draw(ngg, records, &state)}, kSize, kSize,
+                                        nullptr, kClear, true, &target);
+        const StatsSnapshot after = stats_now();
+        EXPECT_TRUE(lut_layers(by_width[w], 8, 5)) << (w ? "32-bit" : "16-bit") << " indices";
+        EXPECT_EQ(after.invalid - before.invalid, 0u);
+        EXPECT_EQ(after.connectivity - before.connectivity, 0u);
+        EXPECT_EQ(after.culled - before.culled, 0u);
+    }
+    EXPECT_EQ(by_width[0], by_width[1]) << "16- and 32-bit encodings of one list";
+}
+
+// Which records a primitive reads is what decides coverage. One triangle, indices (6, 1, 4), is
+// the lower-right half of the screen (clip y < x); the records at positions 0, 1, 2 are the
+// upper-left half. Pixels on either side of the diagonal (one-pixel margin) are checked.
+TEST(NggSubgroupBackend, IndexValuesDecideWhichHalfIsCovered) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    // Two slices, not one: the vertex stage writes gl_Layer, which a one-layer framebuffer leaves
+    // undefined (the validation layer's Undefined-Value-Layer-Written). Slice 1 stays clear.
+    const auto ngg = kena_indexed_draw(*ctx, decoded({6, 1, 4}, 2), 1, 2, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    const BackendColorTarget target = volume_target(0x4e4747340012ull, 2);
+    const auto bytes =
+        render_draws_rgba({ngg_backend_draw(ngg, ngg::vertex_records(scattered_records()), &state)},
+                          kSize, kSize, nullptr, kClear, true, &target);
+    ASSERT_EQ(bytes.size(), 2u * kSize * kSize * 16u);
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x)
+            ASSERT_EQ(texel(bytes, 1, x, y)[0], -1.0f) << "slice 1 (" << x << "," << y << ")";
+    uint32_t covered = 0, clear = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float sx = (static_cast<float>(x) + 0.5f) / kSize;
+            const float sy = (static_cast<float>(y) + 0.5f) / kSize;
+            const float cx = 2.0f * sx - 1.0f, cy = 1.0f - 2.0f * sy;   // clip y = +1 on top
+            const float* p = texel(bytes, 0, x, y);
+            if (cy < cx - 0.13f) {
+                EXPECT_NEAR(p[0], sx, 1e-4f) << "lower-right (" << x << "," << y << ")";
+                EXPECT_NEAR(p[1], sy, 1e-4f) << "lower-right (" << x << "," << y << ")";
+                ++covered;
+            } else if (cy > cx + 0.13f) {
+                EXPECT_EQ(p[0], -1.0f) << "upper-left must stay clear (" << x << "," << y << ")";
+                ++clear;
+            }
+        }
+    EXPECT_EQ(covered, 105u) << "x + y >= 17";
+    EXPECT_EQ(clear, 105u) << "x + y <= 13";
+}
+
+// Slice routing per primitive: each primitive's layer is its instance plus the layer base the
+// prolog reads from the constant buffer at binding 5 (word 0, pc 12). Base 2, 5 instances, into an
+// 8-slice volume: layers 2..6 complete, 0, 1 and 7 clear.
+TEST(NggSubgroupBackend, IndexedInstancesRouteToTheirOwnSlices) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_indexed_draw(*ctx, decoded({6, 1, 4, 4, 1, 3}, 2), 5, 8, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw draw = ngg_backend_draw(ngg, ngg::vertex_records(scattered_records()), &state);
+    bool based = false;
+    for (FrameBufferResource& buffer : draw.B)
+        if (buffer.set == 0 && buffer.binding == 5) {
+            buffer.dwords[0] = 2;
+            based = true;
+        }
+    ASSERT_TRUE(based);
+    const BackendColorTarget target = volume_target(0x4e4747340013ull, 8);
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    ASSERT_EQ(bytes.size(), 8u * kSize * kSize * 16u);
+    for (uint32_t layer = 0; layer < 8u; ++layer) {
+        const bool drawn = layer >= 2u && layer < 7u;
+        for (uint32_t y = 0; y < kSize; ++y)
+            for (uint32_t x = 0; x < kSize; ++x) {
+                const float* p = texel(bytes, layer, x, y);
+                if (drawn) {
+                    ASSERT_NEAR(p[0], (static_cast<float>(x) + 0.5f) / kSize, 1e-4f) << layer;
+                    ASSERT_NEAR(p[1], (static_cast<float>(y) + 0.5f) / kSize, 1e-4f) << layer;
+                } else {
+                    ASSERT_EQ(p[0], -1.0f) << "layer " << layer << " must stay clear";
+                }
+            }
+    }
 }
 
 }   // namespace
