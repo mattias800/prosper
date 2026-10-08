@@ -73,47 +73,47 @@ enum class Cost : uint8_t {
 
 // Plain event counters.
 enum class Counter : uint8_t {
-    TextureReferences = 0,   // sampled texture references the frontend resolved
-    TextureCacheMisses,   // persistent resident-texture lookups that missed
-    TextureCacheRefusals,   // misses refused admission for lack of room (not for size)
-    TextureCacheRefusedBytes,   // image bytes of those refusals: re-uploaded, then freed
-    TextureCacheEvictions,   // resident images evicted to make room
-    DroppedDrawsBackend,   // draws the backend wanted to issue and could not (draw_disposition)
-    DroppedDrawsFrontend,   // draws the frontend rejected: a resource did not resolve
-    DroppedDrawsContract,   // draws the frontend rejected: descriptor contract validation failed
-    DeviceAllocations,   // successful vkAllocateMemory calls
-    SkippedDispatches,   // compute dispatches prosper wanted to run and did not (DispatchSkip)
+    TextureReferences = 0,     // sampled texture references the frontend resolved
+    TextureCacheMisses,        // persistent resident-texture lookups that missed
+    TextureCacheRefusals,      // misses refused admission for lack of room (not for size)
+    TextureCacheRefusedBytes,  // image bytes of those refusals: re-uploaded, then freed
+    TextureCacheEvictions,     // resident images evicted to make room
+    DroppedDrawsBackend,       // draws the backend wanted to issue and could not (draw_disposition)
+    DroppedDrawsFrontend,      // draws the frontend rejected: a resource did not resolve
+    DroppedDrawsContract,      // draws the frontend rejected: descriptor contract validation failed
+    DeviceAllocations,         // successful vkAllocateMemory calls
+    SkippedDispatches,         // compute dispatches prosper wanted to run and did not (DispatchSkip)
     // GPU-only renderer allocations (gpu/diagnostics/memory_placement_log.hpp, #3897):
-    GpuMemoryFallbacks,   // succeeded only after the preferred type ran out of device memory
-    GpuMemoryOffDevice,   // landed on a non-device-local type although the device has one
+    GpuMemoryFallbacks,        // succeeded only after the preferred type ran out of device memory
+    GpuMemoryOffDevice,        // landed on a non-device-local type although the device has one
     GpuMemoryOffDeviceBytes,   // bytes of those placements
     // #3891 queue (2026-09-28). Each is bumped on an EVENT path, never per accepted draw/reference:
-    DrawsUnaccounted,   // |seen - recorded - dropped| of a pass (draw_disposition blind spot)
-    HleUnimplementedCalls,   // calls into an unregistered NID (the dispatcher answers 0)
-    HleUnimplementedFirst,   // ...of which the FIRST call of a distinct import
-    PresentCpuFallbacks,   // GPU-present iterations that showed a CPU-read-back frame instead
-    PresentGpuDeclines,   // final render spans that declined to publish the front to GPU
-    // present, by reason in Ledger::present_declines (#3915)
+    DrawsUnaccounted,          // |seen - recorded - dropped| of a pass (draw_disposition blind spot)
+    HleUnimplementedCalls,     // calls into an unregistered NID (the dispatcher answers 0)
+    HleUnimplementedFirst,     // ...of which the FIRST call of a distinct import
+    PresentCpuFallbacks,       // GPU-present iterations that showed a CPU-read-back frame instead
+    PresentGpuDeclines,        // final render spans that declined to publish the front to GPU
+                               // present, by reason in Ledger::present_declines (#3915)
     // Host present attempts that could not reach the window at all: a minimized / zero-extent
     // window waiting for its swapchain, an occluded acquire that timed out, or an out-of-date
     // swapchain being recreated. gpu-present-stalled stays silent in a window that has any.
     PresentWindowUnavailable,
-    PipelineEvictions,   // graphics pipelines evicted from the full pipeline cache
+    PipelineEvictions,         // graphics pipelines evicted from the full pipeline cache
     PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
-    DescriptorSetLayoutEvictions,   // descriptor-set layouts evicted from their full cache
-    TextureValidationFailures,   // persistent decode-cache entries whose exact validation failed
-    TextureValidationFailedBytes,   // failed validations' route-specific prefix count: direct/depth
-    // comparisons count matching chunks, excluding the differing
-    // chunk; scratch validation counts copied readable bytes.
-    // Neither total compare traffic nor source mutation is proved.
+    DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache
+    TextureValidationFailures,     // persistent decode-cache entries whose exact validation failed
+    TextureValidationFailedBytes,  // failed validations' route-specific prefix count: direct/depth
+                                   // comparisons count matching chunks, excluding the differing
+                                   // chunk; scratch validation counts copied readable bytes.
+                                   // Neither total compare traffic nor source mutation is proved.
     // #3891 queue (2026-09-29), all on event paths:
-    RttDestinationRefusals,   // compute results whose renderer-image destination borrow was
-    // refused, so the result went back through a CPU snapshot
-    RttDestinationRefusedBytes,   // staging bytes of those results
-    PersistentTargetEvictions,   // persistent colour targets evicted (census twin, #3872)
+    RttDestinationRefusals,        // compute results whose renderer-image destination borrow was
+                                   // refused, so the result went back through a CPU snapshot
+    RttDestinationRefusedBytes,    // staging bytes of those results
+    PersistentTargetEvictions,     // persistent colour targets evicted (census twin, #3872)
     PersistentTargetEvictedBytes,
-    ExactResultCandidates,   // compute storage-writeback results tested for the exact
-    // full-overwrite shape (live_compute's exact_full_result)
+    ExactResultCandidates,         // compute storage-writeback results tested for the exact
+                                   // full-overwrite shape (live_compute's exact_full_result)
     // #3948 stage 0: GPU device time (timestamp pair) of the work inside the waits above, and how
     // many waits carried a readable pair. A wait without one counts in Cost::GpuWait* only.
     GpuDeviceNsCompute,
@@ -125,23 +125,23 @@ enum class Counter : uint8_t {
     // (and so blocked, in Cost::GpuWaitGraphics).
     GpuGraphicsDeferred,
     GpuGraphicsDeferredBlocked,
-    CpuRttPublicationChecks,   // evaluated slot-0 CPU pass-readback publication candidates
-    CpuRttColorlessPublications,   // actual publications with no slot-0 colour writer (#3907)
+    CpuRttPublicationChecks,     // evaluated slot-0 CPU pass-readback publication candidates
+    CpuRttColorlessPublications, // actual publications with no slot-0 colour writer (#3907)
     // Proven guest Wave64 refusals, counted per shader USE, not per distinct shader (#3992).
     Wave64FragmentRecompile,
     Wave64ComputeRecompile,
     Wave64FragmentSubgroup,
     Wave64ComputeSubgroup,
-    Wave64NewRefusalIdentities,   // newly observed (site, compile identity), bounded inventory
-    Wave64UnidentifiedRefusals,   // uses with neither a compile identity nor a program address
+    Wave64NewRefusalIdentities, // newly observed (site, compile identity), bounded inventory
+    Wave64UnidentifiedRefusals, // uses with neither a compile identity nor a program address
     Wave64InventoryOverflow,   // uses whose identity could not enter the full inventory
-    Wave64ShaderChecks,   // known-Wave64 observations at realization/backend boundaries
+    Wave64ShaderChecks,        // known-Wave64 observations at realization/backend boundaries
     // Admitted guest Wave64 uses by route (ADR 0028). Refused uses are the four counters above.
     // "Admitted" means the use passed the subgroup gate, NOT that it executed: the draw or dispatch
     // can still be dropped for another reason, so native + proven + refused is not an executed count.
-    Wave64RouteNative,   // a host that offers the required 64-lane subgroup (required size 64)
-    Wave64RouteProven,   // proven width-independent (FragmentWavePolicy::ProvenVotes)
-    Wave64RouteExchange,   // a compute dispatch admitted through PROSPER_WAVE64_EXCHANGE (#4753)
+    Wave64RouteNative,         // a host that offers the required 64-lane subgroup (required size 64)
+    Wave64RouteProven,         // proven width-independent (FragmentWavePolicy::ProvenVotes)
+    Wave64RouteExchange,       // a compute dispatch admitted through PROSPER_WAVE64_EXCHANGE (#4753)
     // Actual direct/cached fragment compiler requests, NOT draws, execution or wrong pixels.
     // Families describe emitted guest ADD/MUL sites only; other arithmetic is not inventoried.
     FragmentArithmeticRequests,
@@ -149,7 +149,7 @@ enum class Counter : uint8_t {
     FragmentArithmeticUnknownMode,
     FragmentArithmeticAddRequests,
     FragmentArithmeticMulRequests,
-    FragmentArithmeticRefusedRequests,   // qualifying requests whose final module was empty
+    FragmentArithmeticRefusedRequests, // qualifying requests whose final module was empty
     FragmentArithmeticTruncatedRequests,
     FragmentArithmeticInventoryOverflowRequests,
     // Fresh direct-fold WAIT_REG_MEM predicate evaluations only. Ordered-effect acceptance,
