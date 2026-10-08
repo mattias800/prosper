@@ -128,9 +128,34 @@ constexpr int32_t kLocalUserId = 1;   // the single local user this model expose
 constexpr uint64_t kUserNameBufferSize = 17;   // SCE_USER_SERVICE_MAX_USER_NAME_LENGTH (16) + NUL
 std::atomic<bool> g_user_service_initialized{false};
 
-// The first Initialize succeeds and a second reports ALREADY_INITIALIZED until Terminate.
-HLE(s_user_initialize) {
+// Both Initialize spellings validate a priority, then share one initialized flag: the first success sets
+// it and a second reports ALREADY_INITIALIZED until Terminate. Read from the library's own code
+// (system libSceUserService, the two 31/42-byte export wrappers and the common body they jump to):
+//   * sceUserServiceInitialize(const Params*) reads the priority from the first int of the struct and
+//     uses 700 (0x2bc) for a NULL pointer;
+//   * sceUserServiceInitialize2(int priority) takes the priority itself;
+//   * a priority outside [0x100, 0x2ff] is INVALID_ARGUMENT, checked BEFORE the initialized flag, so an
+//     out-of-range call fails the same way whether or not the service is already up.
+// CONFIDENCE: HIGH for the range and the order (both read from the code); the console cases in
+// userservice.cases.tsv measure them.
+constexpr int32_t kUserServiceDefaultPriority = 0x2bc;
+constexpr uint32_t kUserServiceMinPriority = 0x100;
+constexpr uint32_t kUserServiceMaxPriority = 0x2ff;
+uint64_t user_service_init(int32_t priority) {
+    if (static_cast<uint32_t>(priority) < kUserServiceMinPriority ||
+        static_cast<uint32_t>(priority) > kUserServiceMaxPriority)
+        return kUserServiceInvalidArgument;
     return g_user_service_initialized.exchange(true) ? kUserServiceAlreadyInitialized : 0;
+}
+HLE(s_user_initialize) {
+    int32_t priority = kUserServiceDefaultPriority;
+    if (a0)
+        std::memcpy(&priority, reinterpret_cast<const void*>(static_cast<uintptr_t>(a0)),
+                    sizeof priority);
+    return user_service_init(priority);
+}
+HLE(s_user_initialize2) {
+    return user_service_init(static_cast<int32_t>(a0));
 }
 HLE(s_user_terminate) {
     g_user_service_initialized = false;
@@ -1680,7 +1705,7 @@ void register_service_hle() {
     R("sceWebBrowserDialogInitialize", s_ok);
     R("sceWebBrowserDialogTerminate", s_ok);
     R("sceUserServiceInitialize", s_user_initialize);
-    R("sceUserServiceInitialize2", s_ok);
+    R("sceUserServiceInitialize2", s_user_initialize2);
     R("sceUserServiceTerminate", s_user_terminate);
     // PlatformPrivacyWs1 (userId, int* out): a deterministic default with a NULL check, like the
     // module (s_user_privacy_ws1). Not in the 3.20 list: it lives in the newer

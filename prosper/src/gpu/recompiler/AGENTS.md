@@ -21,6 +21,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
   file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
   destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
+- `rdna2_exec_skip_region` — the GUEST-level verdict on the region a forward `s_cbranch_execz` skips:
+  scalar live-out, scalar memory effect, wave-level side effect, foreign exit (ADR 0028 route 2). The
+  structured fragment emitter publishes a clean verdict as `Prosper.FragmentExecSkipVote=<id>` module
+  metadata on the vote; `lower_fragment_votes` treats it only as an additional necessary condition,
+  because effects such as `s_sendmsg` lower to nothing and the SPIR-V cannot show them.
 - `rdna2_counted_loop_guard` — the counted-loop lowering's proof that a wave-empty
   `s_cbranch_execz` guard around or inside the loop may be linearized (the `s_and_saveexec` form
   and UE4's `s_mov sN, exec … v_cmpx` form). A shape it does not prove is left to `emit_alu`,
@@ -242,6 +247,30 @@ Three things about it are load-bearing and each has cost someone a run:
   exists — to decide whether to bind the GDS witness buffer. It is outside any operation, reads
   live, and is the ~283k-call residual #3714 left behind. So "the settings are pinned" is a
   statement about the key and the emitter, not about every reader in the tree.
+
+- **Wave64 compute on a narrower host: `compute_wave_route.{hpp,cpp}` is the analysis, not an
+  emitter** (ADR 0028, #4753). It inventories every cross-lane operation of a decoded compute program
+  (readlane, readfirstlane, mbcnt, whole-wave vote branches, `s_bcnt1/s_ff1` over a mask, DPP,
+  permlane, `ds_swizzle`, `ds_bpermute`, `ds_append`) with the control-flow context it sits in, and
+  `select_compute_wave_route` turns that plus the host/launch facts into one of `native`,
+  `width-independent`, `workgroup-exchange`, `needs-n-lanes` or `refused:<reason>`. The context comes
+  from this directory's own region detectors (`detect_forward_ifs`, `detect_divergent_loops`), so
+  "uniform" means what the compute emitter's `top_level_pc` means. **It describes a proof over the
+  guest program, not what the emitter did**: most programs it calls `workgroup-exchange` already
+  compile by default through the scratch votes and the exact guest-wave dispatcher
+  (`emit_cfg_state_machine`), and a program it calls `needs-n-lanes` can still be compiled exactly by
+  that dispatcher. The route's job today is the `route=` field of `[wave64-unsupported]`, so a refusal
+  says which of those it is.
+
+- **`PROSPER_WAVE64_EXCHANGE` (default OFF, a guest-behaviour selector, #4753) gives a module that
+  needs a wider subgroup than the host has a second chance** through the exact dispatcher.
+  `recompile_compute` compiles normally; when `ComputeShaderConfig::wave64_exchange_width` is set and
+  the module's `Prosper.ComputeSubgroupMin` exceeds it, it recompiles with
+  `force_exchange_dispatcher` and keeps that result only if it compiles AND no longer needs the wider
+  subgroup, so a refusal is never swapped for an approximation. The retry module carries
+  `Prosper.ComputeWave64Exchange=1`; the live frontend then applies the device limits only it knows
+  (`frontends/shared/live/compute_wave_admission.hpp`). The width is part of the shader-cache key and
+  is not serialized into captures, so a replay recompiles with the route off.
 
 Every SPIR-V emitter path is `spirv-val`-gated in CI (`tools/spv_validate`) with one representative
 module per path, not one per game shader.

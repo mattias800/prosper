@@ -3039,6 +3039,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
+  # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
+  prosper_add_gtest(test_compute_wave_route
+    SOURCES tests/gpu/recompiler/test_compute_wave_route.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
     LIBRARIES prosper_core)
@@ -3271,6 +3277,15 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_wave64_exchange_execution
+      SOURCES tests/gpu/execute/test_wave64_exchange.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 120)
+    prosper_add_gtest(test_compute_wave_admission
+      SOURCES tests/gpu/execute/test_compute_wave_admission.cpp
+      INCLUDES tests frontends
+      LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
@@ -3289,6 +3304,10 @@ if(TARGET prosper_core)
   add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
   target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
+  # ADR 0028 step 1: the s_cbranch_execz any-vote certificate (guest-region classifier + SPIR-V proof).
+  prosper_add_gtest(test_fragment_exec_skip_vote
+    SOURCES tests/gpu/recompiler/test_fragment_exec_skip_vote.cpp
+    LIBRARIES prosper_core)
   add_executable(test_fragment_neutral_selection tests/gpu/recompiler/test_fragment_neutral_selection.cpp)
   target_link_libraries(test_fragment_neutral_selection PRIVATE prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)
@@ -5297,6 +5316,13 @@ endif()
 
       # Constant-lane V_WRITELANE spill slots across structured loop headers, loop exits and if
       # merges (Kena 0x5007ad0000's spilled loop counter hung the GPU), executed per lane.
+      # The bounded DPP OR ladder of Kena's culling NGG VS programs in the NGG shell (#3135 P7),
+      # portable and native Wave64, executed.
+      prosper_add_gtest(test_ngg_dpp_or_ladder
+        SOURCES tests/gpu/execute/test_ngg_dpp_or_ladder.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       prosper_add_gtest(test_lane_slot_carry
         SOURCES tests/gpu/recompiler/test_lane_slot_carry.cpp
         INCLUDES tests

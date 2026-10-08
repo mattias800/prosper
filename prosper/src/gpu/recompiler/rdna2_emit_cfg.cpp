@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
+#include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
@@ -969,7 +970,7 @@ bool emit_cfg_state_machine(
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
         return b.is_compute &&
                (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
-                (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
+                (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -1153,6 +1154,7 @@ bool emit_cfg_state_machine(
     std::unordered_map<uint32_t, uint32_t> compute_dpp_row_shr_event_for_pc;
     std::set<int> compute_dpp_row_shr_dsts;
     bool has_compute_dpp_row_maximum = false;
+    bool has_compute_dpp_row_or = false;
     std::unordered_set<uint32_t> compute_dpp_row_ror8_pcs;
     std::unordered_map<uint32_t, uint32_t> compute_dpp_ror8_event_for_pc;
     std::set<int> compute_dpp_row_ror8_dsts;
@@ -1228,6 +1230,7 @@ bool emit_cfg_state_machine(
         }
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
+            has_compute_dpp_row_or |= is_vor_b32_dpp_row_shr_bounded(in);
             compute_dpp_row_shr_pcs.insert(in.pc);
             compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
@@ -3283,6 +3286,9 @@ bool emit_cfg_state_machine(
         has_portable_compute_dpp_row_shr && has_compute_dpp_row_maximum
             ? b.function_var(b.t_bool, ptr_bool)
             : 0;
+    const uint32_t dpp_shr_or_var = has_portable_compute_dpp_row_shr && has_compute_dpp_row_or
+                                        ? b.function_var(b.t_bool, ptr_bool)
+                                        : 0;
     const uint32_t dpp_ror8_pending_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_bool, ptr_bool) : 0;
     const uint32_t dpp_ror8_active_var = has_portable_compute_dpp_ror8
@@ -3467,6 +3473,7 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_shr_dst_var, zero);
         b.store_function(dpp_shr_event_var, zero);
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
+        if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_src0_var, zero);
@@ -3846,6 +3853,7 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_shr_active_var, no);
         b.store_function(dpp_shr_event_var, zero);
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
+        if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_pending_var, no);
@@ -4682,7 +4690,8 @@ bool emit_cfg_state_machine(
                 return reject_cfg(dpp_row_shr->pc, "dpp-add-row-shr-event");
             const int dst = dpp_row_shr->dst.value;
             const bool maximum = is_inplace_vmax_u32_dpp_row_shr(*dpp_row_shr);
-            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr);
+            const bool bitwise_or = is_vor_b32_dpp_row_shr_bounded(*dpp_row_shr);
+            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr) || bitwise_or;
             const auto source = state.vreg.find(bounded ? dpp_row_shr->src[0].value : dst);
             uint32_t source_value = source == state.vreg.end() ? zero : source->second;
             if (maximum) {
@@ -4714,7 +4723,7 @@ bool emit_cfg_state_machine(
                 // the ordinary unbounded path retains its existing validity rule.
                 const uint32_t result =
                     maximum ? b.uext2(Glsl_UMax, source_value, shifted)
-                            : b.ibin(Op_IAdd, source_value,
+                            : b.ibin(bitwise_or ? Op_BitwiseOr : Op_IAdd, source_value,
                                      bounded ? b.sel(valid_source, shifted, zero) : shifted);
                 state.vreg[dst] = b.sel(
                     bounded ? state.exec : b.land(state.exec, valid_source),
@@ -4731,6 +4740,7 @@ bool emit_cfg_state_machine(
                 b.store_function(dpp_shr_dst_var, b.uconst(static_cast<uint32_t>(dst)));
                 b.store_function(dpp_shr_event_var, b.uconst(event->second));
                 if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, maximum ? yes : no);
+                if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, bitwise_or ? yes : no);
             }
         }
         if (dpp_row_ror8) {
@@ -5546,7 +5556,7 @@ bool emit_cfg_state_machine(
         !emit_portable_compute_dpp_row_shr_phase(
             b,
             {dpp_shr_pending_var, dpp_shr_active_var, dpp_shr_source_var, dpp_shr_amount_var,
-             dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var},
+             dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var, dpp_shr_or_var},
             dpp_value_base, dpp_metadata_base, compute_dpp_row_shr_dsts, vv, lv, lmv))
         return reject_cfg(0, "missing-dpp-row-shr-dst");
 
@@ -6172,7 +6182,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
+                               (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
@@ -7561,6 +7571,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                          !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
                            vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                     cond_reg = b.fragment_wave_any(cond_reg);
+                // ADR 0028 route 2: tell lower_fragment_votes that the GUEST region this execz skips
+                // holds no scalar, memory, wave-level or exit effect -- facts the SPIR-V cannot
+                // carry. Only the forward execz one-arm form; the vote just taken is its sole user.
+                if (b.is_fragment && F.on_exec && F.on_scc0 && !F.has_else && cond_reg != rs.exec &&
+                    classify_exec_skip_region(ins, F.branch_pc, F.target_pc).clean())
+                    b.fragment_exec_skip_votes.push_back(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&
                     active_direct_wave_loop->direct_wave_breaks && F.on_vcc &&

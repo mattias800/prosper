@@ -8576,6 +8576,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
+        // The depth aspect: the shared test list (depth_stencil_tests_enabled) less stencil.
         if (d.ps->depth_test_enable || d.ps->depth_bounds_enable || effective_depth_clear(d.ps))
             use_depth = true;
         if (d.ps->stencil_enable ||
@@ -8736,11 +8737,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                              d.ps->stencil_write_mask[0],
                                              d.ps->stencil_write_mask[1])))
             logical_use_stencil = true;
-        if (d.ps && (d.ps->depth_test_enable || d.ps->depth_bounds_enable ||
-                     d.ps->stencil_enable || effective_depth_clear(d.ps) ||
-                     stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
-                                             d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1]))) {
+        if (d.ps &&
+            (prosper::gpu::depth_stencil_tests_enabled(*d.ps) || effective_depth_clear(d.ps) ||
+             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))) {
             if (!identity) identity = d.ps;
             pass_depth_slice_max = std::max(pass_depth_slice_max,
                                             ds_depth_view_slice_max(d.ps->db_depth_view));
@@ -10852,7 +10852,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     required_fragment_subgroup_features, available_fragment_subgroup_features);
                 const uint64_t shader_key = bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::unordered_set<uint64_t> proven_logged;
-                if (proven_logged.insert(shader_key).second) {
+                const bool first_sighting = proven_logged.insert(shader_key).second;
+                // ADR 0028 route= field: admitted by proof, unless the lowered module still needs
+                // a subgroup feature this device lacks (then the refusal below names it).
+                prosper::diagnostics::perf::note_proven_fragment_wave64(
+                    !fragment_subgroup_skip, first_sighting, bd.fs_guest_addr, bd.fs_identity);
+                if (first_sighting) {
                     std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
                         "(uniform=%u dead=%u neutral=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
                         lowered->neutral_votes,
@@ -10932,6 +10937,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fragment_subgroup_skip = false;
             }
         }
+        // ADR 0028 route= field: the device itself offers the required 64-lane subgroup.
+        prosper::diagnostics::perf::note_native_fragment_wave64(
+            !fragment_subgroup_skip, fragment_votes_lowered, required_fragment_subgroup_size);
         if (fragment_subgroup_skip) {
             prosper::diagnostics::perf::note_unsupported_wave64(
                 prosper::diagnostics::perf::Wave64Refusal::FragmentSubgroup,

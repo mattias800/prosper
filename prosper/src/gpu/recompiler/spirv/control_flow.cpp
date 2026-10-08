@@ -107,6 +107,11 @@ std::vector<uint32_t> SpirvCompute::finish() {
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
         }
+        if (is_compute && wave64_exchange_dispatcher) {
+            std::vector<uint32_t> words;
+            pstr(words, "Prosper.ComputeWave64Exchange=1");
+            putv(debug, Op_ModuleProcessed, words);
+        }
         if (is_fragment && fragment_required_subgroup_size) {
             char marker[64];
             std::snprintf(marker, sizeof marker, "Prosper.FragmentSubgroupSize=%u",
@@ -123,6 +128,12 @@ std::vector<uint32_t> SpirvCompute::finish() {
             words.clear();
             pstr(words, marker);
             putv(debug, Op_ModuleProcessed, words);
+            for (const uint32_t vote : fragment_exec_skip_votes) {
+                std::snprintf(marker, sizeof marker, "Prosper.FragmentExecSkipVote=%u", vote);
+                words.clear();
+                pstr(words, marker);
+                putv(debug, Op_ModuleProcessed, words);
+            }
         }
         for (const auto& [binding, semantic] : cbuf_zero_pad_candidates) {
             if (cbuf_ordinary_accesses.count(binding)) continue;

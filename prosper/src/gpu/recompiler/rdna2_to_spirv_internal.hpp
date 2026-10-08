@@ -669,6 +669,10 @@ struct SpirvCompute {
     bool packed_r11_storage=true;
     uint32_t compute_pgm_rsrc1=kDefaultComputePgmRsrc1;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
+    // ADR 0028: this module was compiled through the exact exchange dispatcher (a second chance
+    // taken when the ordinary lowering needed a wider subgroup than the host has). Recorded as
+    // `Prosper.ComputeWave64Exchange=1` so the backend can apply the exchange's own launch limits.
+    bool wave64_exchange_dispatcher = false;
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
     // WHY that width was required, as a bitmask (#2147). The size alone is not actionable: a
     // shader needing 64 for lane IDENTITY can never run at 32, while one needing it only for a
@@ -676,6 +680,12 @@ struct SpirvCompute {
     // `required-ops` field scans for Vote/Arithmetic/Shuffle CAPABILITIES and the lane-id path
     // declares none of them -- so the two cases printed identically.
     uint32_t fragment_wave_reasons=0;
+    // Result ids of fragment WaveAny votes that guard a forward `s_cbranch_execz` over a region the
+    // GUEST-level classifier (`classify_exec_skip_region`) found free of scalar, memory, wave-level
+    // and exit effects. finish() publishes them as `Prosper.FragmentExecSkipVote=<id>` module
+    // metadata. It is evidence the SPIR-V cannot carry (an s_sendmsg is lowered to nothing), and it
+    // is only ever an additional NECESSARY condition for `lower_fragment_votes`, never sufficient.
+    std::vector<uint32_t> fragment_exec_skip_votes;
     // SSA provenance for fragment WaveAny results. A vote needs the exact guest-wave width when
     // that particular bool reaches a guest scalar-data consumer. Tracking result ids avoids the
     // false whole-module inference "this shader contains both a vote and S_CSELECT".

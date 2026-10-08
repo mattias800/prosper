@@ -432,6 +432,11 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                          n(Counter::Wave64NewRefusalIdentities),
                          n(Counter::Wave64UnidentifiedRefusals), n(Counter::Wave64InventoryOverflow),
                          n(Counter::Wave64ShaderChecks));
+            uint64_t routes[kWave64RouteCount];
+            for (size_t i = 0; i < kWave64RouteCount; ++i)
+                routes[i] = wave64_route_uses(w, static_cast<Wave64Route>(i));
+            std::fputs(",\"wave64_routes\":", jsonl_);
+            json_counts(jsonl_, ranked(routes, kWave64RouteNames, kWave64RouteCount));
         }
         std::fprintf(jsonl_, ",\"fragment_arithmetic_requests\":%llu,"
             "\"fragment_arithmetic_known_mode_requests\":%llu,"

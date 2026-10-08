@@ -115,6 +115,7 @@
 // The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
 extern "C" int prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+#include "shared/live/compute_wave_admission.hpp"
 #include "shared/live/live_compute_storage_codec.hpp"
 
 namespace prosper::frontend {
@@ -7158,9 +7159,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
     }
-    prosper::diagnostics::perf::observe_wave64_shader(
-        item.recompile_config_available ? item.recompile_config.wave_size : item.required_subgroup_size,
-        true);
+    const uint32_t guest_wave = item.recompile_config_available ? item.recompile_config.wave_size
+                                                                : item.required_subgroup_size;
+    prosper::diagnostics::perf::observe_wave64_shader(guest_wave, true);
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -7169,10 +7170,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "[compute] program 0x%llx requires subgroup=%u on a context without "
                      "that enabled contract -> dispatch skipped\n",
                      (unsigned long long)item.code_addr, item.required_subgroup_size);
-        prosper::diagnostics::perf::note_unsupported_wave64(
-            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
-            item.required_subgroup_size, item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+        prosper::frontend::note_compute_wave_refusal(ctx, item, item.required_subgroup_size);
         return decline("subgroup-contract-absent");
     }
     const uint32_t dispatch_groups[3] = {item.launch.groups_x, item.launch.groups_y,
@@ -7206,13 +7204,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "of at least %u lanes (host=%u stages=0x%x operations=0x%x)\n",
                      static_cast<unsigned long long>(item.code_addr), min_subgroup,
                      effective_subgroup, ctx.subgroup_stages, ctx.subgroup_operations);
-        prosper::diagnostics::perf::note_unsupported_wave64(
-            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
-            item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup,
-            item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+        prosper::frontend::note_compute_wave_refusal(
+            ctx, item,
+            item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup);
         return decline("subgroup-too-narrow");
     }
+    if (const char* why = prosper::frontend::exchange_limit(ctx, item)) return decline(why);
+    prosper::diagnostics::perf::note_wave64_compute_native(   // ADR 0028 route= field
+        item.required_subgroup_size, guest_wave);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:
     // runtime predicates, coordinates and loop bounds may change with identical code and launch.
     // Preserve current input contents instead. Exact cached images can omit the upload only after
