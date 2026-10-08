@@ -3732,6 +3732,14 @@ bool emit_cfg_state_machine(
                 for (int word : *entry_wave64_scalar_words)
                     if (state.sreg.contains(word))
                         state.terminal_wave64_scalar_words.insert(word);
+        } else if (filters_wave64_b64) {
+            // An entry block the MUST walk never reached (only edges it does not model lead there:
+            // s_trap, proven_exit_target) gets no filtering above, so no reloaded word is proven.
+            // Mark them all, and SCC, so the fragment projection refuses in such a case (#4725).
+            for (const auto* words : {&state.sreg, &state.sreg_input})
+                for (const auto& kv : *words)
+                    if (kv.first <= 124) state.sreg_merge_placeholder.insert(kv.first);
+            state.scc_merge_placeholder = true;
         }
         if (entry_b32) {
             for (int reg : *entry_b32) {

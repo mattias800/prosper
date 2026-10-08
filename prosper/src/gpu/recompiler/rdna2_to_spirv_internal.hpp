@@ -3606,13 +3606,33 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
             rs.lane_slot_memory_pattern.erase(slot);
         return;
     }
+    // A word this instruction left in the MASK domain (a compare's or a mask logical's Bool, with
+    // no data view) is a ballot of this wave: whatever its inputs were, it is consumed per lane
+    // like every other mask, and a later data read of it materializes the exact ballot word. So
+    // it carries neither mark. Kena's f1d1baa8 compares SMEM-loaded s101 into s[36:37], spills the
+    // mask and reloads it for its pc308 projection; a memory mark copied onto that ballot refused
+    // the program live on main after #4725.
+    // A compare (VOPC, or a VOP3-encoded compare or carry-out) writes a per-lane predicate even
+    // when the emitter also keeps a uniform data view of it: Kena's pc226 is
+    // `v_cmp_gt_f32_sdwa s[36:37], s101, -2.0`, two scalar operands, s101 from SMEM.
+    const bool compare_writer =
+        in.fmt == Rdna2Format::VOPC ||
+        (in.fmt == Rdna2Format::VOP3 && (in.opcode < 0x100 || vop3_writes_mask_sdst(in)));
+    const auto mask_word = [&](int r) {
+        if (compare_writer) return true;
+        if (rs.sreg.contains(r)) return false;
+        if ((r == 106 || r == 107) && rs.vcc) return true;
+        return rs.sreg_bool.contains(r) ||
+               (r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
+    };
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (int r = base; r < base + static_cast<int>(width); ++r) {
-            if (marks.placeholder)
+            const bool ballot = mask_word(r);
+            if (marks.placeholder && !ballot)
                 rs.sreg_merge_placeholder.insert(r);
             else
                 rs.sreg_merge_placeholder.erase(r);
-            if (marks.memory)
+            if (marks.memory && !ballot)
                 rs.sreg_memory_pattern.insert(r);
             else
                 rs.sreg_memory_pattern.erase(r);
