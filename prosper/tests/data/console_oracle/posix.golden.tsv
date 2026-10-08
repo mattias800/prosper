@@ -1,0 +1,61 @@
+# console-oracle golden v1
+# source: posix.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+px_pton_v4	libkernel.sprx	inet_pton	i:2,s:1.2.3.4,out:4		ok	0x0000000000000001	-	a2=01020304
+px_pton_v4_zero	libkernel.sprx	inet_pton	i:2,s:0.0.0.0,out:4		ok	0x0000000000000001	-	a2=00000000
+px_pton_v4_max	libkernel.sprx	inet_pton	i:2,s:255.255.255.255,out:4		ok	0x0000000000000001	-	a2=ffffffff
+px_pton_v4_octet_over	libkernel.sprx	inet_pton	i:2,s:256.1.1.1,out:4		ok	0x0000000000000000	-	a2=abababab
+px_pton_v4_short	libkernel.sprx	inet_pton	i:2,s:1.2.3,out:4		ok	0x0000000000000000	-	a2=abababab
+px_pton_v4_empty	libkernel.sprx	inet_pton	i:2,s:,out:4		ok	0x0000000000000000	-	a2=abababab
+px_pton_v4_trailing	libkernel.sprx	inet_pton	i:2,s:1.2.3.4x,out:4		ok	0x0000000000000000	-	a2=abababab
+px_pton_v4_leading_zero	libkernel.sprx	inet_pton	i:2,s:01.2.3.4,out:4		ok	0x0000000000000000	-	a2=abababab
+px_pton_v6_loopback	libkernel.sprx	inet_pton	i:28,s:::1,out:16		ok	0x0000000000000001	-	a2=00000000000000000000000000000001
+px_pton_v6_full	libkernel.sprx	inet_pton	i:28,s:2001:db8:0:0:0:0:2:1,out:16		ok	0x0000000000000001	-	a2=20010db8000000000000000000020001
+px_pton_v6_compressed	libkernel.sprx	inet_pton	i:28,s:fe80::1:2,out:16		ok	0x0000000000000001	-	a2=fe800000000000000000000000010002
+px_pton_v6_v4mapped	libkernel.sprx	inet_pton	i:28,s:::ffff:1.2.3.4,out:16		ok	0x0000000000000001	-	a2=00000000000000000000ffff01020304
+px_pton_v6_bad	libkernel.sprx	inet_pton	i:28,s:1:2:3,out:16		ok	0x0000000000000000	-	a2=abababababababababababababababab
+px_pton_bad_family	libkernel.sprx	inet_pton	i:99,s:1.2.3.4,out:4		ok	0x00000000ffffffff	-	a2=abababab
+px_ntop_v4	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:32	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=01020304	a2=312e322e332e3400abababababababababababababababababababababababab
+px_ntop_v4_exact_size	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:8	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=01020304	a2=312e322e332e3400abababababababababababababababababababababababab
+px_ntop_v4_too_small	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:7	r64,retoff:2	ok	0x0000000000000000	null	a1=01020304	a2=abababababababababababababababababababababababababababababababab
+px_ntop_v6_loopback	libkernel.sprx	inet_ntop	i:28,in:00000000000000000000000000000001,out:64,i:64	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=00000000000000000000000000000001	a2=3a3a3100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+px_ntop_v6_full	libkernel.sprx	inet_ntop	i:28,in:20010db8000000000000000000020001,out:64,i:64	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=20010db8000000000000000000020001	a2=323030313a6462383a3a323a31000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+px_ntop_bad_family	libkernel.sprx	inet_ntop	i:99,in:01020304,out:32,i:32	r64,retoff:2	ok	0x0000000000000000	null	a1=01020304	a2=abababababababababababababababababababababababababababababababab
+px_getpagesize	libkernel.sprx	getpagesize	-		ok	0x0000000000004000	-
+px_sched_max_0	libkernel.sprx	sched_get_priority_max	i:0		ok	0xffffffffffffffff	-
+px_sched_min_0	libkernel.sprx	sched_get_priority_min	i:0		ok	0xffffffffffffffff	-
+px_sched_max_1	libkernel.sprx	sched_get_priority_max	i:1		ok	0x00000000000002ff	-
+px_sched_min_1	libkernel.sprx	sched_get_priority_min	i:1		ok	0x0000000000000100	-
+px_sched_max_2	libkernel.sprx	sched_get_priority_max	i:2		ok	0xffffffffffffffff	-
+px_sched_min_2	libkernel.sprx	sched_get_priority_min	i:2		ok	0xffffffffffffffff	-
+px_sched_max_3	libkernel.sprx	sched_get_priority_max	i:3		ok	0x00000000000002ff	-
+px_sched_min_3	libkernel.sprx	sched_get_priority_min	i:3		ok	0x0000000000000100	-
+px_sched_max_4	libkernel.sprx	sched_get_priority_max	i:4		ok	0xffffffffffffffff	-
+px_sched_min_4	libkernel.sprx	sched_get_priority_min	i:4		ok	0xffffffffffffffff	-
+px_sched_max_99	libkernel.sprx	sched_get_priority_max	i:99		ok	0xffffffffffffffff	-
+px_sched_min_99	libkernel.sprx	sched_get_priority_min	i:99		ok	0xffffffffffffffff	-
+px_usleep_zero	libkernel.sprx	usleep	i:0		ok	0x0000000000000000	-
+px_usleep_1ms	libkernel.sprx	usleep	i:1000		ok	0x0000000000000000	-
+px_bind_bad_fd	libkernel.sprx	bind	i:-1,in:02000050010203040000000000000000,i:16		ok	0xffffffffffffffff	-	a1=02000050010203040000000000000000
+px_listen_bad_fd	libkernel.sprx	listen	i:-1,i:1		ok	0xffffffffffffffff	-
+px_accept_bad_fd	libkernel.sprx	accept	i:-1,out:16,out:4		ok	0x00000000ffffffff	-	a1=abababababababababababababababab	a2=abababab
+px_connect_bad_fd	libkernel.sprx	connect	i:-1,in:02000050010203040000000000000000,i:16		ok	0x00000000ffffffff	-	a1=02000050010203040000000000000000
+px_send_bad_fd	libkernel.sprx	send	i:-1,in:41424344,i:4,i:0		ok	0xffffffffffffffff	-	a1=41424344
+px_recv_bad_fd	libkernel.sprx	recv	i:-1,out:16,i:16,i:0		ok	0xffffffffffffffff	-	a1=abababababababababababababababab
+px_sendto_bad_fd	libkernel.sprx	sendto	i:-1,in:41424344,i:4,i:0,in:02000050010203040000000000000000,i:16		ok	0xffffffffffffffff	-	a1=41424344	a4=02000050010203040000000000000000
+px_recvfrom_bad_fd	libkernel.sprx	recvfrom	i:-1,out:16,i:16,i:0,out:16,out:4		ok	0xffffffffffffffff	-	a1=abababababababababababababababab	a4=abababababababababababababababab	a5=abababab
+px_shutdown_bad_fd	libkernel.sprx	shutdown	i:-1,i:2		ok	0xffffffffffffffff	-
+px_getsockname_bad_fd	libkernel.sprx	getsockname	i:-1,out:16,out:4		ok	0xffffffffffffffff	-	a1=abababababababababababababababab	a2=abababab
+px_getpeername_bad_fd	libkernel.sprx	getpeername	i:-1,out:16,out:4		ok	0xffffffffffffffff	-	a1=abababababababababababababababab	a2=abababab
+px_getsockopt_bad_fd	libkernel.sprx	getsockopt	i:-1,i:0xffff,i:4,out:4,out:4		ok	0xffffffffffffffff	-	a3=abababab	a4=abababab
+px_setsockopt_bad_fd	libkernel.sprx	setsockopt	i:-1,i:0xffff,i:4,in:01000000,i:4		ok	0xffffffffffffffff	-	a3=01000000
+px_socket_bad_domain	libkernel.sprx	socket	i:99,i:1,i:0		ok	0xffffffffffffffff	-
+px_socket_bad_type	libkernel.sprx	socket	i:2,i:99,i:0		ok	0xffffffffffffffff	-
+px_close_bad_fd	libkernel.sprx	close	i:-1		ok	0x00000000ffffffff	-
+px_read_bad_fd	libkernel.sprx	read	i:-1,out:8,i:8		ok	0xffffffffffffffff	-	a1=abababababababab
+px_write_bad_fd	libkernel.sprx	write	i:-1,in:41,i:1		ok	0xffffffffffffffff	-	a1=41
+px_fstat_bad_fd	libkernel.sprx	fstat	i:-1,out:128	ret	ok	0xffffffffffffffff	-	a1=volatile
+px_fcntl_bad_fd	libkernel.sprx	fcntl	i:-1,i:1,i:0		ok	0xffffffffffffffff	-
+px_open_missing	libkernel.sprx	open	s:/oracle_nonexistent/file,i:0,i:0	ret	ok	0x00000000ffffffff	-
+px_stat_missing	libkernel.sprx	stat	s:/oracle_nonexistent/file,out:128	ret	ok	0xffffffffffffffff	-	a1=volatile

@@ -1,0 +1,4 @@
+# console-oracle: cases the console could not measure (not in the golden)
+# source: kernelx.cases.tsv
+# captured: 2026-10-08
+# columns: id	func	status

@@ -1,0 +1,7 @@
+# family<TAB>number of probes whose answer differs from the console. A count that may only go DOWN: a fix lowers
+# the row (the replay fails if it is lower than the file says, so the file cannot go stale), never raises it.
+# These are measured inventories, not curated assertions; each difference is a lead to triage, not a verdict.
+agcbuild	203
+kernelx	31
+nethttp	17
+posix	48

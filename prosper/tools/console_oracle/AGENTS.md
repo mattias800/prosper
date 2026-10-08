@@ -74,6 +74,10 @@ measured inventory rather than a list of individually reviewed gaps. Its differe
 by one in `known_gaps.tsv`; the replay counts them and fails if the count differs from the baseline, so
 it can only go down (and the baseline is lowered with it). A mismatch printed as `[probe-gap]` is a lead.
 
+Baselined today: `agcbuild`, `kernelx`, `nethttp`, `posix`. Five `kernelx` cases are deliberately absent:
+using an event flag or equeue after deleting it aborts the replay process in prosper (#4779). Put them back
+with the fix.
+
 `expect=default0` compares an UNREGISTERED function against the dispatcher's return-0 default instead of
 reporting "not implemented": what is left is exactly the false-success class (#2081), a function the
 console answers with an error where prosper answers 0.
