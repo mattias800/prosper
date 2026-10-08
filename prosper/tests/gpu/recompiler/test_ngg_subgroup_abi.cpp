@@ -243,6 +243,31 @@ TEST(NggSubgroupAbi, NestedSavedExecPairsSurviveALoop) {
         << "control: the back edge leaves with EXEC widened past the loop EXEC";
 }
 
+// Five nested saves overflow the four slots: the oldest record is dropped, which only forgets
+// definitions. A restore from the newest still brings back v7; one from the dropped oldest pair is
+// no longer recognised and the read is refused (#4735 review).
+TEST(NggSubgroupAbi, AFifthNestedSaveDropsOnlyTheOldest) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    const std::vector<uint32_t> saves = {0xbea4047eu, 0xbea6047eu, 0xbea8047eu, 0xbeaa047eu,
+                                         0xbeac047eu};   // s_mov_b64 s[36..45 by pairs], exec
+    const auto with = [&](uint32_t restore) {
+        std::vector<uint32_t> body = {kExecOne, kWriteV7};
+        body.insert(body.end(), saves.begin(), saves.end());
+        body.insert(body.end(), {kExecAllOnes, restore, kReadV7});
+        std::vector<uint32_t> code = {kExecAllOnes, 0x7e120280u};
+        code.insert(code.end(), body.begin(), body.end());
+        code.insert(code.end(), {0xb07c3005u, 0xbf900009u});
+        code.insert(code.end(), kExports.begin(), kExports.end());
+        code.push_back(kEnd);
+        return analyze(code);
+    };
+    EXPECT_TRUE(with(0xbefe042cu).ok()) << "s_mov_b64 exec, s[44:45]: the newest save is kept";
+    EXPECT_EQ(with(0xbefe0424u).reason, "ngg-abi-read-v6-v7")
+        << "s_mov_b64 exec, s[36:37]: the oldest was dropped, so the restore is not recognised";
+}
+
 TEST(NggSubgroupAbi, MemoryEffectsAreRefused) {
     // buffer_store_dword v9, off, s[8:11], 0 versus buffer_load_dword v10 with the same operands.
     EXPECT_EQ(analyze(program({0xe0700000u, 0x80020900u}), 4).reason, "ngg-side-effect");
