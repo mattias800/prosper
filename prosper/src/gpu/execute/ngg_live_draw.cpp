@@ -93,7 +93,7 @@ struct StageKey {
     uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
-    bool count_violations = false, interpolation = false;
+    bool count_violations = false, interpolation = false, user_data_address = false;
     uint64_t interpolation_layout = 0;
     bool operator==(const StageKey&) const = default;
 };
@@ -108,12 +108,12 @@ struct StageKeyHash {
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
         hash = mix(hash, key.lds_granules);
         hash = mix(hash, key.interpolation_layout);
-        hash = mix(hash, key.topology | (key.route << 8) | (key.float_transport << 16) |
-                             (uint64_t{key.native_wave64} << 24) |
-                             (uint64_t{key.provoking_vertex_last} << 25) |
-                             (uint64_t{key.layer_from_pos1} << 26) |
-                             (uint64_t{key.count_violations} << 27) |
-                             (uint64_t{key.interpolation} << 28));
+        hash = mix(
+            hash,
+            key.topology | (key.route << 8) | (key.float_transport << 16) |
+                (uint64_t{key.native_wave64} << 24) | (uint64_t{key.provoking_vertex_last} << 25) |
+                (uint64_t{key.layer_from_pos1} << 26) | (uint64_t{key.count_violations} << 27) |
+                (uint64_t{key.interpolation} << 28) | (uint64_t{key.user_data_address} << 29));
         return static_cast<size_t>(hash);
     }
 };
@@ -277,6 +277,15 @@ bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint3
     return true;
 }
 
+bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]) {
+    const auto lo = state.sh.find(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
+    const auto hi = state.sh.find(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
+    if (lo == state.sh.end() || hi == state.sh.end() || (!lo->second && !hi->second)) return false;
+    words[0] = lo->second;
+    words[1] = hi->second;
+    return true;
+}
+
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host) {
     NggLiveDrawResult result;
@@ -314,12 +323,14 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.count_violations = admission.count_violations;
     key.interpolation = interpolation;
     key.interpolation_layout = interpolation ? interpolation_hash(input.interpolation) : 0u;
+    key.user_data_address = input.user_data_address_known;
 
     NggSubgroupDrawRequest request;
     request.resources = input.resources;
     request.shell.rsrc2_gs_lds_size = admission.lds_granules;
     request.shell.user_sgprs = admission.user_sgprs;
     request.shell.native_wave64 = admission.native_wave64;
+    request.shell.user_data_address_known = input.user_data_address_known;
     request.limits = admission.limits;
     request.shape = admission.shape;
     request.raster.topology = admission.topology;
@@ -341,6 +352,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         };
     }
     request.push_constants = input.user_data;
+    if (input.user_data_address_known)
+        request.push_constants.insert(request.push_constants.end(), input.user_data_address,
+                                      input.user_data_address + 2);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, input.program_address};
 
     request.linked_code = key.program.data();
@@ -369,7 +383,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                        admission.limits.max_out_verts_per_subgroup,
                        admission.limits.gs_max_vert_out,
                        admission.limits.esgs_item_size};
-    draw_key.push_constants = input.user_data;
+    draw_key.push_constants = request.push_constants;
     draw_key.indexed = admission.shape.indices != nullptr;
     if (admission.shape.indices) {
         draw_key.index_hash = 1469598103934665603ull;

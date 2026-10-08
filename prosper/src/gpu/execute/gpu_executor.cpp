@@ -7644,7 +7644,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
         uint32_t system_sgprs[2] = {};
         uint32_t system_count = 0;
-        if (hdr->type == 6) { // fused GS back: s[0:1] points at the driver stage-data table
+        // A fused GS back, and a LINKED merged ES+GS chain (#3135), enter with s[0:1] = the GS
+        // user-data address (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS: the launch research on #3135,
+        // where the ISA and two independent compilers agree). Kena's indexed producer 11562c72
+        // reloads its user SGPRs with `s_load_dwordx8 s[8:15], s[0:1], 0`.
+        if (hdr->type == 6 || !linked.empty()) {
             const auto sh_value = [&](uint32_t reg) {
                 const auto found = st.sh.find(reg);
                 return found == st.sh.end() ? 0u : found->second;

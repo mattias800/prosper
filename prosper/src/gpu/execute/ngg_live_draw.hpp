@@ -47,6 +47,11 @@ struct NggLiveDrawInput {
     // when any of those registers is absent.
     std::vector<uint32_t> user_data;
     bool user_data_complete = false;
+    // SPI_SHADER_USER_DATA_ADDR_LO/HI_GS, which the hardware places in s0:s1 at merged ES+GS entry
+    // (#3135). Supplied to the shell (two more push-constant words) only when known and non-zero;
+    // otherwise a program reading s0:s1 stays refused (ngg-abi-read-s0-s1).
+    bool user_data_address_known = false;
+    uint32_t user_data_address[2] = {};
     // The chain as the hardware runs it (ngg_linked_chain), and the resource table folded over
     // exactly those words: the prolog alone cannot prove the raw register-offset loads that
     // feed its vertex fetches, because its own analysis stops at the link (#3135 P5).
@@ -81,6 +86,9 @@ std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* pr
 NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primitive_type);
 // The user-data words s8.. for `count` user SGPRs; false when one is absent.
 bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint32_t>* words);
+// The GS user-data address s0:s1 (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS); false when either register
+// is absent or the address is zero.
+bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]);
 
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host);

@@ -3022,6 +3022,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         if (ngg_admission.ok()) {
             ngg.user_data_complete =
                 read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
+            ngg.user_data_address_known = read_ngg_user_data_address(ds, ngg.user_data_address);
             ngg.linked = ngg_linked_chain(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
                 vertex_prolog.prefix_dwords,
@@ -3085,7 +3086,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     "[ngg-refused] es=0x%llx chain=0x%llx ps=0x%llx reason=%s "
                     "order=%llu prim=%u vertices=%u instances=%u indexed=%d "
                     "index-count=%u index-type=%u indirect=%d vertex-offset=%d "
-                    "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u\n",
+                    "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u "
+                    "rsrc2-user-sgprs=%u user-data-range=%u..%u%s vs-out-cntl=%08x\n",
                     static_cast<unsigned long long>(rs.es_addr),
                     static_cast<unsigned long long>(chain_addr),
                     static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
@@ -3094,7 +3096,11 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                     draw ? draw->index_count : 0u, ds.index_type, ngg.facts.indirect ? 1 : 0,
                     ngg.facts.vertex_offset ? 1 : 0, ngg.registers.vgt_gs_out_prim_type,
                     ngg.registers.vgt_shader_stages_en,
-                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices);
+                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices,
+                    ngg_rsrc2_gs_user_sgprs(ngg.registers.spi_shader_pgm_rsrc2_gs),
+                    ngg.facts.user_data_range_start, ngg.facts.user_data_range_end,
+                    ngg.facts.user_data_range_known ? "" : "(unknown)",
+                    ngg.registers.pa_cl_vs_out_cntl);
         }
         // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit

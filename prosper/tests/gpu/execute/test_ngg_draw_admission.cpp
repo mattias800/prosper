@@ -303,6 +303,20 @@ TEST(NggDrawAdmission, RegistersAndUserDataAreReadFromTheDrawState) {
     state.cx.erase(P::VGT_GS_INSTANCE_CNT);
     EXPECT_EQ(read_ngg_draw_registers(state, 6u).missing, nullptr) << "reset value 0";
 
+    // #3135: the GS user-data address s0:s1, known only when both registers are present and the
+    // address is not zero.
+    uint32_t address[2] = {};
+    EXPECT_FALSE(read_ngg_user_data_address(state, address));
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = 0x12340000u;
+    EXPECT_FALSE(read_ngg_user_data_address(state, address)) << "HI absent";
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = 0x5u;
+    ASSERT_TRUE(read_ngg_user_data_address(state, address));
+    EXPECT_EQ(address[0], 0x12340000u);
+    EXPECT_EQ(address[1], 0x5u);
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = 0;
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = 0;
+    EXPECT_FALSE(read_ngg_user_data_address(state, address)) << "a zero address is no address";
+
     std::vector<uint32_t> words;
     for (uint32_t k2 = 0; k2 < 8; ++k2) state.sh[P::SPI_SHADER_USER_DATA_GS_0 + k2] = 0x100 + k2;
     ASSERT_TRUE(read_ngg_user_data(state, 8, &words));
