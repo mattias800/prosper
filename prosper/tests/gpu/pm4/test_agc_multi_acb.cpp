@@ -217,19 +217,26 @@ TEST_F(MultiAcb, UnalignedStreamIsRejected) {
 }
 
 TEST_F(MultiAcb, OversizedStreamIsRejected) {
-    // 0x40000000 dwords is 4 GiB: the byte extent does not fit the readability check's uint32.
+    // 0x40000003 dwords is just over 4 GiB. Its byte extent wraps a uint32 to exactly 12 bytes, which
+    // this 3-dword stream really has, so only the extent refusal (not the readability check) can
+    // reject it; 0x40000000 would wrap to 0 and be refused as unreadable even without the guard.
     const auto a = sh_write(0x7d3, 0x55555555u);
     const uint64_t streams[1] = {U(a.data())};
-    const uint32_t words[1] = {0x40000000u};
+    const uint32_t words[1] = {0x40000003u};
     const uint64_t before = submits();
     EXPECT_EQ(call(11, streams, words, 1), kInvalidArg);
     EXPECT_EQ(submits(), before);
 }
 
 TEST_F(MultiAcb, OversizedCountIsRejected) {
-    // 0x20000000 descriptors is a 4 GiB streams array: refused before either array is read.
+    // 0x40000001 descriptors: the streams extent (x8) and dwords extent (x4) wrap a uint32 to 8 and 4
+    // bytes, which these real 128-entry arrays cover, so only the count-extent refusal rejects it.
+    // Null arrays would be refused as unreadable even without that guard.
+    const auto a = sh_write(0x7d4, 0x66666666u);
+    std::vector<uint64_t> streams(128, U(a.data()));
+    std::vector<uint32_t> words(128, uint32_t(a.size()));
     const uint64_t before = submits();
-    EXPECT_EQ(call(11, nullptr, nullptr, 0x20000000u), kInvalidArg);
+    EXPECT_EQ(call(11, streams.data(), words.data(), 0x40000001u), kInvalidArg);
     EXPECT_EQ(submits(), before);
 }
 
