@@ -134,7 +134,7 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `CbDispatch` | 6 | `DISPATCH_DIRECT` | 5 | LOW | no title evidence |
 | `DcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
 | `AcbDispatchIndirect` | **5** | `DISPATCH_INDIRECT` (MEC, address form) | 4 | MED | **one dword LARGER than the Dcb form, deliberately** (#3218). The ACB carries a whole 64-bit argument address, not an offset: libSceAgc 3.20 has 36 `sceAgcAcb*` exports and no SetBase among them, so nothing on that ring defines a base. Astro Bot's async-compute stream is the live half — its packets carried exactly the low 32 bits of the argument allocations its Dcb announces at full width in the same run. prosper answers `sceAgcAcbDispatchIndirectGetSize` too, so the guest reserves 5 |
-| `Dcb/AcbEventWrite` | 4 | `EVENT_WRITE` (address form) | 4 | MED | address-carrying form (#132) |
+| `Dcb/AcbEventWrite` | 4 | `EVENT_WRITE` (address form) | 4 | MED | address-carrying form (#132). **The console's own `GetSize` says 2 dwords** (console-oracle measurement, below), so the 4 is two over what a guest may have reserved (#4757) |
 | `DcbWriteData` | 5 + n | `WRITE_DATA` | 4 + n | LOW | one dword over; no title evidence |
 | `DcbSetIndexBuffer` | 3 | `INDEX_BASE` | 3 | MED | — |
 | `DcbSetIndexCount` | 2 | `INDEX_BUFFER_SIZE` | 2 | MED | — |
@@ -266,6 +266,26 @@ Three size-carrying builders are **deliberately excluded**: `DcbWriteData`,
 whose position is not established (`CbNopGetSize` puts it in `a0`, but that is one data point), and
 `CbSetShRegistersDirect`'s emission is data-dependent — it coalesces adjacent register offsets, so
 its size is not a function of the count at all.
+
+## What the console itself reserves (measured)
+
+Every `sceAgc*GetSize` the library exports was called on a PS5 through the console oracle
+(`tests/data/console_oracle/agc.golden.tsv`, replayed by `test_console_oracle_replay`). Each answer is
+the reservation the real libSceAgc makes, so it is the size a guest can have compiled in, which makes
+it a stronger reference than the "published dw" column above. What it showed:
+
+* **Builders over the console's size** (the fatal direction): `DcbDrawIndexAuto` 7 vs 3,
+  `DcbDrawIndex` 7 vs 6, `CbDispatch` 6 vs 5, `DcbDispatchIndirect` 4 vs 3, `AcbDispatchIndirect`
+  5 vs 4, `Dcb/AcbEventWrite` 4 vs 2, `DcbWriteData` 5+n vs 4+n, `CbSetShRegisterRangeDirect` n+4 vs
+  2+n. Tracked in #4757 and listed in `known_gaps.tsv`; none is changed here.
+* **Prosper reserves less** (the safe direction): `DcbDrawIndexOffset`, `DcbDrawIndexIndirect`,
+  `DcbDrawIndirect`, the three `*RegistersIndirect` forms and `DcbSetIndexSize`.
+* **Unanswered queries**: 30 fixed-size queries had no answer (the generic stub returns 0, the failure
+  #1137 records) and now answer the console's size (`src/hle/graphics/hle_agc_getsize.cpp`); they all
+  stand for packets prosper has no builder for. Five count-dependent queries are still unanswered
+  because their builders are larger than the console's formula: `CbSetShRegisterRangeDirect` and
+  `CbSetUcRegisterRangeDirect` (8 + 4n bytes), `CbSetShRegistersDirect` and `CbSetUcRegistersDirect`
+  (12n bytes), `DcbWriteData` (16 + 4n bytes). Argument 0 is the count.
 
 ## Import is not call
 
