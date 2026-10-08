@@ -5296,6 +5296,13 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # #3135: a memory-fed register offset whose x1 source has a non-zero immediate (Kena's
+      # indexed NGG prolog). Proof and owned snapshot on the CPU; the emitted load executed.
+      prosper_add_gtest(test_raw_offset_immediate_source
+        SOURCES tests/gpu/recompiler/test_raw_offset_immediate_source.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
       # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
       prosper_add_gtest(test_entry_m0_wave64_kill

@@ -22,7 +22,6 @@ NggHostCapabilities& host_slot() {
 
 constexpr uint32_t kPrimTriangleList = 4;
 constexpr uint32_t kPrimTriangleStrip = 6;
-constexpr uint32_t kMaxPushWords = 32;   // the shell's push-constant budget (128 bytes)
 constexpr uint32_t kWaveLanes = 64;
 
 }   // namespace
@@ -92,12 +91,18 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     }
 
     if (!facts.user_data_range_known || facts.user_data_range_start != 0 ||
-        facts.user_data_range_end > kMaxPushWords)
+        facts.user_data_range_end > kNggShellMaxPushWords)
         return refuse("ngg-user-data-range");
+    // The SPI loads RSRC2_GS.USER_SGPR user SGPRs (s8..) from SPI_SHADER_USER_DATA_GS_*: that is
+    // the hardware's count. AGC leaves the field zero on some programs (Kena's LUT producer reads
+    // exactly its 8-dword range), and then the range is the count. A count below a longer range is
+    // ordinary: the rest of the user data is reached through the user-data address in s0:s1, as
+    // Kena's 4324d9f3 does (USER_SGPR 12, range 0..24). CONFIDENCE: HIGH on the field's meaning,
+    // MED on reading zero as "the range" (#3135). Whether two more push words are needed for s0:s1
+    // depends on the program, so the live producer checks that room (ngg_live_draw.cpp).
     const uint32_t rsrc2_sgprs = ngg_rsrc2_gs_user_sgprs(registers.spi_shader_pgm_rsrc2_gs);
-    if (rsrc2_sgprs && rsrc2_sgprs != facts.user_data_range_end)
-        return refuse("ngg-user-sgpr-count");
-    admission.user_sgprs = facts.user_data_range_end;
+    admission.user_sgprs = rsrc2_sgprs ? rsrc2_sgprs : facts.user_data_range_end;
+    if (admission.user_sgprs > kNggShellMaxPushWords) return refuse("ngg-user-sgpr-count");
 
     admission.lds_granules = ngg_rsrc2_gs_lds_size(registers.spi_shader_pgm_rsrc2_gs);
     const uint64_t lds_bytes = uint64_t{admission.lds_granules} * kNggLdsGranuleDwords * 4u;

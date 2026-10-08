@@ -22,6 +22,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <gtest/gtest.h>
@@ -57,12 +58,39 @@ alignas(256) const uint32_t kMain[] = {
     0xbf810000u,   // s_endpgm
 };
 
+// #3135: the same main, but it first reloads its user SGPRs from the GS user-data address, as
+// Kena's indexed producer 11562c72's main does: `s_load_dwordx8 s[8:15], s[0:1], 0` at entry.
+alignas(256) const uint32_t kMainReload[] = {
+    0xbefe04c1u,   // s_mov_b64 exec, -1
+    0xf4100200u, 0xfa000000u,   // s_load_dwordx8 s[8:15], s[0:1], 0
+    0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+    0x9394ff03u, 0x00040018u,   // s_bfe_u32 s20, s3, [27:24]: wave index
+    0xbf068014u,   // s_cmp_eq_u32 s20, 0
+    0xbf840002u,   // s_cbranch_scc0 +2
+    0xb07c2004u,   // s_movk_i32 m0, 0x2004
+    0xbf900009u,   // s_sendmsg GS_ALLOC_REQ
+    0xf4200544u, 0xfa000000u,   // s_buffer_load_dword s21, s[8:11], 0
+    0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+    0x7e140215u,   // v_mov_b32 v10, s21
+    0x7e120302u,   // v_mov_b32 v9, v2
+    0xbe9603c1u,   // s_mov_b32 s22, -1
+    0xd765000bu, 0x00010016u,   // v_mbcnt_lo_u32_b32 v11, s22, 0 (a general SGPR mask)
+    0xf8000941u, 0x00000009u,   // exp prim v9
+    0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
+    0xf800020fu, 0x030a0805u,   // exp param0 v5, v8, v10, v3
+    0xbf810000u,   // s_endpgm
+};
+
 // Solid-green pixel stage (llvm-mc gfx1030; the same words test_gpu_execute uses).
 alignas(256) const uint32_t kPs[] = {
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
 
 alignas(16) const uint32_t kConstants[4] = {0x1234u, 0, 0, 0};
+// The constant buffer the reloaded user data names, and that user-data table (8 words: a V# for
+// s[8:11], then s12..s15). Filled at run time: it holds a host address.
+alignas(16) const uint32_t kReloadedConstants[4] = {0x5678u, 0, 0, 0};
+alignas(16) uint32_t g_user_table[8] = {};
 
 void set_pgm(GpuState& st, uint32_t lo, uint32_t hi, const void* code) {
     const uint64_t a = reinterpret_cast<uint64_t>(code);
@@ -112,10 +140,12 @@ bool register_blob(ShaderBlob& blob, const uint32_t* code, size_t bytes, uint32_
 bool register_chain_headers() {
     static const bool registered = [] {
         prosper::register_agc_hle();
-        static ShaderBlob prolog, main;
+        static ShaderBlob prolog, main, reload;
         return register_blob(prolog, kProlog, sizeof(kProlog), P::SPI_SHADER_PGM_LO_ES,
                              P::SPI_SHADER_PGM_HI_ES, 4) &&
                register_blob(main, kMain, sizeof(kMain), P::SPI_SHADER_PGM_LO_GS,
+                             P::SPI_SHADER_PGM_HI_GS, 4) &&
+               register_blob(reload, kMainReload, sizeof(kMainReload), P::SPI_SHADER_PGM_LO_GS,
                              P::SPI_SHADER_PGM_HI_GS, 4);
     }();
     return registered;
@@ -209,6 +239,54 @@ TEST_F(NggIndexedRealize, AnIndexedMergedDrawIsRealizedThroughTheSubgroupPath) {
             EXPECT_EQ(launch[at + 8], block) << "InstanceID";
         }
     EXPECT_EQ(ngg_live_draw_cache_stats().indexed_draws, 1u);
+}
+
+// #3135: a main that reads s0:s1 is admitted when the GS user-data address is in the draw state.
+// The linked fold follows s0:s1 into the table, so the constant buffer it resolves is the one the
+// RELOADED V# names (not the one in SPI_SHADER_USER_DATA_GS_0..3), and the shell receives the
+// address as the two push-constant words after the user SGPRs. Without the address registers the
+// same draw is refused by the ABI rule's name.
+TEST_F(NggIndexedRealize, AMainReadingTheUserDataAddressIsSuppliedIt) {
+    const uint64_t cbuf = reinterpret_cast<uint64_t>(kReloadedConstants);
+    g_user_table[0] = static_cast<uint32_t>(cbuf);
+    g_user_table[1] = static_cast<uint32_t>((cbuf >> 32) & 0xffffu);
+    g_user_table[2] = sizeof(kReloadedConstants);
+    g_user_table[3] = (22u << 12) | 0xfacu;
+    GpuState st = merged_state();
+    set_pgm(st, P::SPI_SHADER_PGM_LO_GS, P::SPI_SHADER_PGM_HI_GS, kMainReload);
+    alignas(4) static const uint16_t kIndices[3] = {0, 1, 2};
+    DrawItem refused;
+    EXPECT_FALSE(realize(st, kIndices, 3, 1, refused));
+    EXPECT_FALSE(refused.ngg_subgroup) << "control: no address registers, s0 is undefined";
+
+    const uint64_t table = reinterpret_cast<uint64_t>(g_user_table);
+    st.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = static_cast<uint32_t>(table);
+    st.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = static_cast<uint32_t>(table >> 32);
+    DrawItem item;
+    ASSERT_TRUE(realize(st, kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the draw was not realized through the subgroup path";
+    EXPECT_EQ(item.ngg_subgroup->push_constants,
+              (std::vector<uint32_t>{
+                  st.sh[P::SPI_SHADER_USER_DATA_GS_0], st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 1],
+                  st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 2], st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 3],
+                  static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32)}))
+        << "s8..s11, then s0:s1";
+    ASSERT_TRUE(item.vrt);
+    bool reloaded = false, original = false;
+    for (const ShaderResource& r : item.vrt->resources) {
+        reloaded |= r.gpu_addr == cbuf;
+        original |= r.gpu_addr == reinterpret_cast<uint64_t>(kConstants);
+    }
+    EXPECT_TRUE(reloaded) << "the fold followed s0:s1 to the reloaded V#";
+    EXPECT_FALSE(original) << "the stale user-data V# is not what the main reads";
+
+    // A reader of s0:s1 needs two push words beyond its user SGPRs: with RSRC2's count at 31
+    // there is no room, and the draw is refused by name rather than pushing past the budget.
+    for (uint32_t k = 4; k < 31; ++k) st.sh[P::SPI_SHADER_USER_DATA_GS_0 + k] = 0;
+    st.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 31u << 1;
+    DrawItem full;
+    EXPECT_FALSE(realize(st, kIndices, 3, 1, full));
+    EXPECT_FALSE(full.ngg_subgroup) << "31 user SGPRs + s0:s1 exceed the 32-word push budget";
 }
 
 // The same draw with a garbage index is refused by name rather than sized to 2^28 vertices (#461).

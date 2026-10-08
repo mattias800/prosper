@@ -4519,7 +4519,8 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
                 const bool latched_offset_source =
-                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u &&
+                    static_cast<int32_t>(in.literal) >= 0 && (in.literal & 3u) == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -6131,7 +6132,8 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
 
 // A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
+// GPU. The proof authenticates this read point (any aligned non-negative immediate: `addr` is the
+// effective address, immediate included); the table owns its 4 or 8 bytes from index zero.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
     const bool x2 = use.required_size == 2u * sizeof(uint32_t);
@@ -7642,15 +7644,14 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
         uint32_t system_sgprs[2] = {};
         uint32_t system_count = 0;
-        if (hdr->type == 6) { // fused GS back: s[0:1] points at the driver stage-data table
-            const auto sh_value = [&](uint32_t reg) {
-                const auto found = st.sh.find(reg);
-                return found == st.sh.end() ? 0u : found->second;
-            };
-            system_sgprs[0] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
-            system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
-            system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
-        }
+        // A fused GS back, and a LINKED merged ES+GS chain (#3135), enter with s[0:1] = the GS
+        // user-data address (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS: the launch research on #3135,
+        // where the ISA and two independent compilers agree). Kena's indexed producer 11562c72
+        // reloads its user SGPRs with `s_load_dwordx8 s[8:15], s[0:1], 0`.
+        // One rule with the live NGG path (read_ngg_user_data_address): both registers present
+        // and the address non-zero.
+        if ((hdr->type == 6 || !linked.empty()) && read_ngg_user_data_address(st, system_sgprs))
+            system_count = 2u;
         dyn_vb = resolve_dynamic_fetch(code, shader_dwords, primary_sgprs, kUserSgprs, 8, &srt_uses,
                                        UINT32_MAX, nullptr, system_sgprs, system_count,
                                        nested_reader.get(), checked_source);

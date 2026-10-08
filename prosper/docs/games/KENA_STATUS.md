@@ -9,6 +9,54 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The indexed producer for `f1d1baa8` is admitted; `11562c72` stops at a lane-subset proof (2026-10-08, #3135)
+
+Measured on Linux/RADV:
+- `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`, empty `PROSPER_GUEST_ARGS`;
+- `scripts/kena/linux-reach-level-load.pad`, 660 s per run.
+
+Before is `main` `0fe02a520`, which includes P6; after is the `gpu/ngg-downstream` branch. All runs reached the level-load device loss at about 301 s of pad time, and counts stop there.
+
+| program pair | `main` | after |
+|---|---|---|
+| `b77161c6` + `0ff40cdf` (18 idx × 41, pixel `f1d1baa8`) | `ngg-compile-rejected`, prolog pc 55 | **admitted**: `[ngg-indexed] ... instances=41 subgroups=41`, recorded by the backend |
+| `11562c72` + `2fc43332` (6 idx, 64 slices) | `ngg-abi-read-s0-s1` pc 154 | `ngg-abi-read-v4` pc 810 |
+
+Merged-NGG programs refused before the loss: 2 on `main`, 1 after.
+
+**What each fix was.**
+- **pc 55** is `s_load_dwordx4 s[8:11], s[16:17], vcc_lo`. VCC_LO is `(s38 << 4) & 0x1f0`, and s38 comes from `s_load_dword s38, s[18:19], 0x4`.
+  - The memory-fed register-offset machinery (#3979, #4578) already covers this shape. But it admitted only an immediate-ZERO source, in three places: the proof, the fold and the emitter.
+  - The fold already observes the bytes at the effective address. The emitter now reads the source snapshot from index zero.
+  - Aligned non-negative immediates are now admitted.
+- **s0:s1** at merged ES+GS entry is the GS user-data address (`SPI_SHADER_USER_DATA_ADDR_LO/HI_GS`).
+  - `2fc43332` reloads its user SGPRs with `s_load_dwordx8 s[8:15], s[0:1], 0`.
+  - The linked fold now seeds s0:s1 the way the fused-GS fold does.
+  - Live admission pushes the address after the user SGPRs.
+- **Nested EXEC saves.** After s0:s1, `11562c72` refused `ngg-abi-read-v6-v7` at pc 548.
+  - Its main saves the loop EXEC in s[4:5] and the inner EXEC in s[6:7].
+  - The ABI analysis tracked a single saved pair, so the inner save evicted the outer one.
+  - It now keeps four.
+
+**What `11562c72` needs next (not done).** At pc 810 it stores v4, which a `ds_read_b128 v[4:7]` at main pc 588 wrote under the EXEC `s[0:1] = (tid < 240)`. The store runs under an EXEC narrowed by `v_cmpx` to `tid < 220`.
+- Proving the read lanes are a subset of the written lanes needs a lane-predicate model: thresholds on the same thread-id VGPR, v51. The MUST analysis does not have one.
+- Pruning `s_cbranch_execz` under a full EXEC was tried and does not reach it, because EXEC is not full there. The commit was dropped.
+
+**Is `f1d1baa8`'s draw visible?** Not yet observable:
+- The admitted draw is recorded about 1 s before the device loss.
+- A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU inside ordinary draws of pixel program `0x5007ad0000` (submit 26138, draws 114-117), not in an NGG segment.
+- The loss happens at the same pad time on `main`.
+
+**`dropped-draws` before the loss:** `main` fired 1 window (fragment 3, #4700's intermittent refusal); the final branch run fired 0.
+
+**Unchanged elsewhere.**
+- **Title route:** title-menu frames at pad flips 500 and 650 differ main vs branch by mean |diff| 3.8 and 3.5, against 3.2 and 3.1 between two branch runs (animated foliage).
+- **Dragon Quest VII:** see the PR.
+
+**After the loss (not counted).**
+- `4324d9f3` (USER_SGPR 12, user-data range 0..24, 23-27 instances) is no longer refused `ngg-user-sgpr-count`. RSRC2's count is now what admission uses, and the program stops at `ngg-abi-read-undefined-sgpr`.
+- `52c7e8ff` stays `ngg-layer-target-not-layered`: it exports a layer (`PA_CL_VS_OUT_CNTL` 0x01240000) into a 2D colour target. What the hardware does with a layer on a non-array target is not established, so it is recorded on #3135, not modelled.
+
 ## The fog gets its shadows and the foliage draws: two general fixes (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window,
@@ -724,6 +772,9 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).
+- **The level-load device loss is the newly admitted indexed NGG draw** — false. A `PROSPER_GPU_BREADCRUMBS=1` run stopped the GPU in ordinary draws of pixel program `0x5007ad0000`, and `main`, without the draw, loses the device at the same pad time (2026-10-08, #3135).
+- **Pruning `s_cbranch_execz` under a full EXEC unblocks `11562c72`'s v4 read** — false. EXEC at main pc 582 is `s[0:1]` (tid < 240), not all-ones. The read is a lane-subset question (tid < 220 inside tid < 240) (2026-10-08, #3135).
 - **Indexed merged-NGG draws need the subgroup shell to take per-lane vertex indices** — false. Every lane's launch values already come from per-lane records that the CPU writes:
   - v5 = `first_vertex + es_vertex[t]`, and v8 is the instance;
   - the P1 planner already deduplicated `es_vertex` by value.

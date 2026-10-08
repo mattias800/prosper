@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cstdint>
 #include <cstdio>
@@ -40,14 +41,25 @@ struct State {
     uint8_t vall = 0;   // tracked VGPRs written for all 64 lanes on every path
     uint8_t vcur = 0;   // tracked VGPRs written for every lane active in the current EXEC
     bool scc = false;   // SCC written on every path
-    // A saved copy of EXEC (#3135 P6): the SGPR pair `saved_exec` holds the EXEC of some earlier
-    // point on every path (s_mov_b64 sP, exec or a SAVEEXEC), and `saved_vcur` the tracked VGPRs
-    // written for every lane of that EXEC. `exec_is_saved`: EXEC has not been written since, so a
-    // VGPR written now covers the saved EXEC too. Restoring EXEC from the pair (s_mov_b64 exec, sP)
-    // brings back exactly those lanes, and with them saved_vcur -- the compiler's if/else idiom.
-    int saved_exec = -1;
-    uint8_t saved_vcur = 0;
-    bool exec_is_saved = false;
+    // Saved copies of EXEC (#3135): each slot's SGPR pair holds the EXEC of some earlier point on
+    // every path (s_mov_b64 sP, exec or a SAVEEXEC), with `vcur` the tracked VGPRs written for
+    // every lane of that EXEC. `exec_equal`: EXEC has not been written since, so a VGPR written now
+    // covers that saved EXEC too. Restoring EXEC from a pair (s_mov_b64 exec, sP) brings back
+    // exactly those lanes, and with them the slot's vcur -- the compiler's if/else idiom. Several
+    // slots, because the idiom nests: Kena's 11562c72 saves the loop EXEC into s[4:5] and the inner
+    // EXEC into s[6:7], restores s[6:7] inside the loop and s[4:5] before the back edge.
+    struct SavedExec {
+        int pair = -1;
+        uint8_t vcur = 0;
+        bool exec_equal = false;
+        bool operator==(const SavedExec&) const = default;
+    };
+    std::array<SavedExec, 4> saved{};
+    SavedExec* saved_slot(int pair) {
+        for (SavedExec& slot : saved)
+            if (slot.pair == pair) return &slot;
+        return nullptr;
+    }
     void meet(const State& o) {
         sdef &= o.sdef;
         scc = scc && o.scc;
@@ -55,19 +67,23 @@ struct State {
         exec_full = exec_full && o.exec_full;
         vall &= o.vall;
         vcur &= o.vcur;
-        if (saved_exec != o.saved_exec) {
-            saved_exec = -1;
-            saved_vcur = 0;
-            exec_is_saved = false;
-        } else {
-            saved_vcur &= o.saved_vcur;
-            exec_is_saved = exec_is_saved && o.exec_is_saved;
+        // A pair saved on both paths keeps the definitions both paths had; any other is dropped.
+        for (SavedExec& slot : saved) {
+            if (slot.pair < 0) continue;
+            const auto other =
+                std::find_if(o.saved.begin(), o.saved.end(),
+                             [&](const SavedExec& x) { return x.pair == slot.pair; });
+            if (other == o.saved.end()) {
+                slot = SavedExec{};
+                continue;
+            }
+            slot.vcur &= other->vcur;
+            slot.exec_equal = slot.exec_equal && other->exec_equal;
         }
     }
     bool operator==(const State& o) const {
         return sdef == o.sdef && s3_overwritten == o.s3_overwritten && exec_full == o.exec_full &&
-               vall == o.vall && vcur == o.vcur && scc == o.scc && saved_exec == o.saved_exec &&
-               saved_vcur == o.saved_vcur && exec_is_saved == o.exec_is_saved;
+               vall == o.vall && vcur == o.vcur && scc == o.scc && saved == o.saved;
     }
 };
 
@@ -538,7 +554,8 @@ void transfer(State& s, const Rdna2Inst& in) {
             const uint8_t bit = tracked_bit(in.dst.value + static_cast<int>(w));
             s.vcur |= bit;
             if (s.exec_full) s.vall |= bit;
-            if (s.exec_is_saved) s.saved_vcur |= bit;
+            for (State::SavedExec& slot : s.saved)
+                if (slot.pair >= 0 && slot.exec_equal) slot.vcur |= bit;
         }
     }
     for_each_scalar_write(in, [&](int base, uint32_t width) {
@@ -546,11 +563,9 @@ void transfer(State& s, const Rdna2Inst& in) {
             const int reg = base + static_cast<int>(w);
             if (reg >= 0 && reg <= kExecHi) s.sdef.set(static_cast<size_t>(reg));
             if (reg == 3) s.s3_overwritten = true;
-            if (s.saved_exec >= 0 && (reg == s.saved_exec || reg == s.saved_exec + 1)) {
-                s.saved_exec = -1;   // the copy is gone
-                s.saved_vcur = 0;
-                s.exec_is_saved = false;
-            }
+            for (State::SavedExec& slot : s.saved)
+                if (slot.pair >= 0 && (reg == slot.pair || reg == slot.pair + 1))
+                    slot = State::SavedExec{};   // the copy is gone
         }
     });
     // A save of EXEC: s_mov_b64 sP, exec (EXEC unchanged), or a SAVEEXEC (sP = the EXEC before
@@ -559,12 +574,19 @@ void transfer(State& s, const Rdna2Inst& in) {
     const int dst_pair = sgpr_pair(in.dst);
     const bool copy_of_exec = sop1 && in.opcode == kSop1OpcodeMovB64 && is_exec_operand(in.src[0]);
     if (dst_pair >= 0 && (copy_of_exec || (sop1 && sop1_opcode_is_saveexec_b64(in.opcode)))) {
-        s.saved_exec = dst_pair;
-        s.saved_vcur = s.vcur;
-        s.exec_is_saved = copy_of_exec;
+        // The write above already cleared a slot this pair had; take a free one. With every slot
+        // in use the oldest record is dropped, which only forgets definitions (conservative).
+        State::SavedExec* slot = s.saved_slot(-1);
+        if (!slot) {
+            std::rotate(s.saved.begin(), s.saved.begin() + 1, s.saved.end());
+            slot = &s.saved.back();
+        }
+        *slot = {dst_pair, s.vcur, copy_of_exec};
     }
-    const bool restore = sop1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == kExecLo &&
-                         s.saved_exec >= 0 && sgpr_pair(in.src[0]) == s.saved_exec;
+    const int restored_pair = sop1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == kExecLo
+                                  ? sgpr_pair(in.src[0])
+                                  : -1;
+    State::SavedExec* const restore = restored_pair >= 0 ? s.saved_slot(restored_pair) : nullptr;
     // The shared writer inventory names SGPR destinations; the implicit VCC results of an e32
     // compare (encoded as the VCC special operand) and of the e32 carry operations are added here.
     const bool vopc_to_vcc = in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
@@ -599,10 +621,11 @@ void transfer(State& s, const Rdna2Inst& in) {
     }
     // Any EXEC change ends "EXEC is the saved copy" -- including the implicit EXEC writes no
     // explicit destination names (the B32 SAVEEXEC/WREXEC family), which leave lo/hi false.
-    if (effect != ExecEffect::None) s.exec_is_saved = false;
+    if (effect != ExecEffect::None)
+        for (State::SavedExec& slot : s.saved) slot.exec_equal = false;
     if (restore) {
-        s.vcur = s.vall | s.saved_vcur;
-        s.exec_is_saved = true;
+        s.vcur = s.vall | restore->vcur;
+        restore->exec_equal = true;
     }
 }
 

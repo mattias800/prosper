@@ -206,6 +206,66 @@ TEST(NggSubgroupAbi, RestoringASavedExecBringsBackItsDefinitions) {
                   .reason,
               "ngg-abi-read-v6-v7")
         << "control: saved on one path only";
+    // The same join reached first by the path that KEEPS the save: s_cbranch_execz +1 skips the
+    // clobber, so the branch target's first state still holds the pair, and only the meet with the
+    // fall-through (which overwrote s[36:37]) can drop it.
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kSave, 0xbf880001u, kClobber, kExecAllOnes,
+                               kRestore, kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: the pair is overwritten on one path into the join";
+}
+
+// #3135: nested saves inside a loop, the shape of Kena's indexed producer 11562c72 (its main saves
+// the loop EXEC into s[4:5] and the inner EXEC into s[6:7], restores s[6:7] in the body and s[4:5]
+// before the back edge, and reads a VGPR written before the loop at the top of the body). The read
+// is defined only if the analysis keeps BOTH saved pairs: with one slot, the inner save evicts the
+// outer one, the back edge arrives with EXEC widened, and the loop-head join loses v7.
+TEST(NggSubgroupAbi, NestedSavedExecPairsSurviveALoop) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    constexpr uint32_t kZero20 = 0xbe940480u;   // s_mov_b64 s[20:21], 0
+    constexpr uint32_t kAndSave = 0xbea42414u;   // s_and_saveexec_b64 s[36:37], s[20:21]
+    constexpr uint32_t kSaveInner = 0xbea6047eu;   // s_mov_b64 s[38:39], exec
+    constexpr uint32_t kRestoreInner = 0xbefe0426u;   // s_mov_b64 exec, s[38:39]
+    constexpr uint32_t kRestoreOuter = 0xbefe0424u;   // s_mov_b64 exec, s[36:37]
+    constexpr uint32_t kCmp = 0xbf068014u;   // s_cmp_eq_u32 s20, 0
+    constexpr uint32_t kBack = 0xbf84fff8u;   // s_cbranch_scc0 -> the s_and_saveexec
+    EXPECT_TRUE(analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kReadV7, kSaveInner,
+                                 kExecAllOnes, kRestoreInner, kRestoreOuter, kCmp, kBack}))
+                    .ok())
+        << "both pairs are tracked: the back edge restores the loop EXEC";
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kReadV7, kSaveInner,
+                               kRestoreInner, kExecAllOnes, kCmp, kBack, kRestoreOuter}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: the back edge leaves with EXEC widened past the loop EXEC";
+}
+
+// Five nested saves overflow the four slots: the oldest record is dropped, which only forgets
+// definitions. A restore from the newest still brings back v7; one from the dropped oldest pair is
+// no longer recognised and the read is refused (#4735 review).
+TEST(NggSubgroupAbi, AFifthNestedSaveDropsOnlyTheOldest) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    const std::vector<uint32_t> saves = {0xbea4047eu, 0xbea6047eu, 0xbea8047eu, 0xbeaa047eu,
+                                         0xbeac047eu};   // s_mov_b64 s[36..45 by pairs], exec
+    const auto with = [&](uint32_t restore) {
+        std::vector<uint32_t> body = {kExecOne, kWriteV7};
+        body.insert(body.end(), saves.begin(), saves.end());
+        body.insert(body.end(), {kExecAllOnes, restore, kReadV7});
+        std::vector<uint32_t> code = {kExecAllOnes, 0x7e120280u};
+        code.insert(code.end(), body.begin(), body.end());
+        code.insert(code.end(), {0xb07c3005u, 0xbf900009u});
+        code.insert(code.end(), kExports.begin(), kExports.end());
+        code.push_back(kEnd);
+        return analyze(code);
+    };
+    EXPECT_TRUE(with(0xbefe042cu).ok()) << "s_mov_b64 exec, s[44:45]: the newest save is kept";
+    EXPECT_EQ(with(0xbefe0424u).reason, "ngg-abi-read-v6-v7")
+        << "s_mov_b64 exec, s[36:37]: the oldest was dropped, so the restore is not recognised";
 }
 
 TEST(NggSubgroupAbi, MemoryEffectsAreRefused) {

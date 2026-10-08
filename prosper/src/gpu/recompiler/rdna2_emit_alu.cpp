@@ -5828,8 +5828,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source || owned_nested_source)
-                ? 0 : in.literal >> 2;
+            // A raw-offset scalar source's snapshot holds the words at the EFFECTIVE address
+            // (immediate included), so it is read from index zero like the owned sources (#3135).
+            const bool raw_offset_scalar_source =
+                rs.smem_raw_offset_scalar_source_pcs.contains(in.pc);
+            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source ||
+                                 owned_nested_source || raw_offset_scalar_source)
+                                    ? 0
+                                    : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
