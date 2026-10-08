@@ -124,8 +124,7 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
         op(124, {4, 120, 117}); op(180, {2, 121, 120, 12});
         op(167, {2, 81, p, 121});
     }
-    if (shape == Shape::ScalarExport)
-        op(83, {3, 80, 9});
+    if (shape == Shape::ScalarExport) op(83, {3, 80, 9});
     else op(169, {3, 80, p, new_state, 8});
     if (shape == Shape::Termination) op(168, {2, 82, p});
     else if (shape == Shape::TerminationExport) op(83, {2, 82, 15});
@@ -152,8 +151,7 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     if (shape == Shape::BodyStore) { op(80, {6, 87, 12, 12, 12, 13}); op(62, {23, 87}); }
     op(249, {70}); op(248, {70});
     const uint32_t header = shape == Shape::Reentered ? 46 : 45;
-    op(245, {3, 100, 8, header, 80, 65});
-    op(245, {2, 101, 14, header, 82, 65});
+    op(245, {3, 100, 8, header, 80, 65}); op(245, {2, 101, 14, header, 82, 65});
     if (shape == Shape::DeadUnequalPhi || shape == Shape::LiveUnequalPhi)
         op(245, {3, 102, 8, 45, 9, 65});
     uint32_t keep = 101;
