@@ -83,8 +83,7 @@ extern "C" int arch_prctl(int, unsigned long);
 #include <ucontext.h>
 #endif
 #endif
-// After the platform headers above: it uses windows.h's GetCurrentThreadId and arch_prctl, which this
-// file already pulls in, and adds no host-platform #if of its own.
+// After the platform headers above (it uses windows.h's GetCurrentThreadId).
 #include "hle/kernel/mutex_diagnostics.hpp"
 
 namespace prosper {
@@ -431,9 +430,7 @@ namespace {
         return pt_static_sentinel(cur) ? nullptr : cur;
     }
 
-    // True when the slot holds the destroyed sentinel, i.e. the object was destroyed through prosper
-    // and not re-initialised. A NULL slot is deliberately NOT destroyed: a never-initialised object
-    // is a different state and keeps answering success.
+    // True when the slot holds the destroyed sentinel; a NULL (never initialised) slot is not destroyed.
     inline bool pt_slot_destroyed(uint64_t slot_addr) {
         if (!slot_addr) return false;
         return pt_destroyed_sentinel(
@@ -825,24 +822,17 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // once, which is why it is the shared primitive rather than three separate guards.
 HLE(k_mutex_destroy) { return guest_mutex_destroy_slot(a0, SyncObjectKind::Mutex); }
 uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
-    // #2168, mutexes only: destroying a LOCKED mutex is refused with EBUSY and leaves the mutex alive and
-    // the slot untouched. Measured on a console (tests/data/console_oracle/kernel.golden.tsv,
-    // mutex_destroy_while_held: EBUSY, and the mutex still unlocks afterwards), which also settles the
-    // "did Sony's libkernel rewrite this" question above for this one call. The probe is a trylock so the
-    // lock and unlock hot paths stay untouched (a per-mutex owner map on POSIX is what #719/#793 removed).
-    // Known limit: a recursive mutex the CALLING thread holds cannot be told from a free one this way
-    // (the trylock succeeds), so that case is still destroyed. CONFIDENCE: HIGH for the held normal
-    // mutex (measured); the recursive case is unmeasured.
-    // Destroying a mutex that was already destroyed is EINVAL on a console (measured: pm_destroy_again
-    // 22 bare, errcheck-style double destroy 0x80020016). Mutex kind only: the C11 spelling is a void
-    // wrapper whose result the guest never sees. Bare errno here, encoded by the Sony alias.
+    // #2168, mutexes only: a LOCKED mutex is refused with EBUSY and left alive (measured, kernel.golden.tsv
+    // mutex_destroy_while_held). The probe is a trylock, so the lock/unlock hot paths stay untouched
+    // (#719/#793). Limit: a recursive mutex the CALLING thread holds probes as free and is still destroyed
+    // (unmeasured).
+    // A second destroy is EINVAL on a console (measured, pm_destroy_again); bare here, encoded by the alias.
     if (kind == SyncObjectKind::Mutex && pt_slot_destroyed(slot_addr))
         return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EInval);
     if (kind == SyncObjectKind::Mutex) {
         if (auto* probe = (pthread_mutex_t*)pt_peek_slot(slot_addr)) {
             const int rc = pthread_mutex_trylock(probe);
-            // Bare FreeBSD errno: each spelling encodes it at its own entry point, like k_cond_destroy
-            // (the POSIX `pthread_mutex_destroy` must see 16, `scePthreadMutexDestroy` 0x80020010).
+            // Bare errno, like k_cond_destroy: the alias encodes it for the Sony spelling.
             if (rc == EBUSY) return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EBusy);
             if (rc == 0) pthread_mutex_unlock(probe);
         }
@@ -1023,7 +1013,6 @@ SCE_PTHREAD_ALIAS(k_sce_mutex_trylock, k_mutex_trylock)
 // travel with them for the same reason: each has a failure path, so each needs the split.
 SCE_PTHREAD_ALIAS(k_sce_mutex_unlock,      k_mutex_unlock)
 SCE_PTHREAD_ALIAS(k_sce_mutex_init,        k_mutex_init)
-// #2168: destroying a held mutex is refused, so the Sony spelling needs the encoding split too.
 SCE_PTHREAD_ALIAS(k_sce_mutex_destroy, k_mutex_destroy)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_init,    k_mutexattr_init)
 SCE_PTHREAD_ALIAS(k_sce_mutexattr_settype, k_mutexattr_settype)
@@ -3750,31 +3739,26 @@ struct Sema {
         interruptible_cond_forget(&s->c);
         free(s);
     }
-    // The handles the guest may still use. A handle that is not in here was never created or has been
-    // deleted: the console answers ESRCH for it, and without this check a call after sceKernelDeleteSema
-    // dereferenced freed memory (measured: SignalSema after DeleteSema deadlocked on the freed mutex).
-    // A handle's address can be reused by a later create; the console's handles do not alias like that,
-    // which is acceptable for a guest that uses a handle after deleting it.
+    // The handles the guest may still use: a deleted or never-created handle is ESRCH on the console, and
+    // without this check a call after sceKernelDeleteSema used freed memory (measured: SignalSema deadlocked).
     std::mutex g_sema_registry_mutex;
     std::unordered_set<const Sema*> g_sema_registry;
     Sema* sema_find(uint64_t handle) {
         std::lock_guard<std::mutex> lock(g_sema_registry_mutex);
-        const auto* key = (const Sema*)(uintptr_t)handle;
-        return g_sema_registry.count(key) ? (Sema*)(uintptr_t)handle : nullptr;
+        return g_sema_registry.count((const Sema*)(uintptr_t)handle) ? (Sema*)(uintptr_t)handle
+                                                                     : nullptr;
     }
     // Remove-and-return in one step so two concurrent deletes of one handle cannot both succeed.
     Sema* sema_take(uint64_t handle) {
         std::lock_guard<std::mutex> lock(g_sema_registry_mutex);
-        const auto* key = (const Sema*)(uintptr_t)handle;
-        return g_sema_registry.erase(key) ? (Sema*)(uintptr_t)handle : nullptr;
+        return g_sema_registry.erase((const Sema*)(uintptr_t)handle) ? (Sema*)(uintptr_t)handle
+                                                                     : nullptr;
     }
     }   // namespace
-    // Argument checks and codes measured on a console (tests/data/console_oracle/kernel.golden.tsv, the
-    // sema_* cases): initial count below 0, a maximum below 1, an initial count above the maximum and a
-    // null name are EINVAL; a count of 0 or one above the maximum is EINVAL for Poll and Signal; a signal that
-    // would pass the maximum is EINVAL; a deleted or unknown handle is ESRCH; an unavailable count is EBUSY.
-    // CONFIDENCE: HIGH for each case taken alone. Wait is only given the ESRCH check: its need argument was
-    // not measured.
+    // Checks and codes measured on a console (kernel.golden.tsv, sema_* cases): a bad initial count,
+    // maximum or null name is EINVAL, as is a Poll/Signal count of 0 or one past the maximum or a signal
+    // whose sum passes it (count + n > max); a deleted handle is ESRCH; an unavailable count is EBUSY.
+    // Wait gets only the ESRCH check (its need argument was not measured).
     HLE(k_sema_create) {   // (sema*, name, attr, initCount, maxCount, opt)
         const int64_t init = (int32_t)a3, max = (int32_t)a4;
         if (!a0 || !a1 || init < 0 || max < 1 || init > max)
