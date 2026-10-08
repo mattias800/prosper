@@ -45,8 +45,10 @@
 // Each input's selection and parse counts are reported beside the aggregate census. Passing several
 // dump roots ranks each NID by how many of them import it, which is the signal #2081 asks for.
 //
-// `--names` points at the PS5 3.20 stub dump, whose loader lines carry `<NID> <-> <funcName>`
-// pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
+// `--names` points at the PS5 stub dump (a directory of `sprx_dlsym(...)` libraries), OR at a flat
+// `NID name` database file (aerolib.csv / ps5rs), whichever names more of this firmware's exports.
+// Both carry `<NID> <-> <funcName>` pairs directly. `--self-check` re-derives each pair with
+// prosper's own `nid_hash` and reports
 // any disagreement: the name table is the instrument this tool reads the census through, so it
 // gets a control of its own rather than being trusted.
 #include "host/image/boot_program.hpp"
@@ -148,7 +150,10 @@ struct NameTable {
 
 NameTable load_names(const std::string& dir, bool self_check) {
     NameTable t;
-    auto stub = prosper_tools::load_stub_names(
+    // A DIRECTORY is the per-library sprx_dlsym firmware dump; a FILE is a flat `NID name`
+    // community database (aerolib.csv / ps5rs). load_nid_names dispatches on that, so --names
+    // transparently accepts either source and --self-check controls both the same way.
+    auto stub = prosper_tools::load_nid_names(
         dir, [&](const std::string& nid, const std::string& name) {
             // The dump states the NID; prosper computes it. They must agree, and a disagreement
             // means one of the two is wrong for that name — report it rather than silently
@@ -275,9 +280,10 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
 
 void usage(const char* argv0) {
     fprintf(stderr,
-            "usage: %s <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]\n"
+            "usage: %s <app0-dir|module> [more...] [--names <dump-dir|nid-csv>]\n"
             "         [--registered] [--tsv] [--lib <substr>] [--self-check]\n\n"
-            "  --names DIR    resolve NIDs through the PS5 3.20 stub dump\n"
+            "  --names PATH   resolve NIDs through the PS5 stub dump (a directory) or a flat\n"
+            "                 `NID name` database file (aerolib.csv / ps5rs)\n"
             "  --registered   also list imports that DO have a handler (default: only unregistered)\n"
             "  --tsv          machine-readable output\n"
             "  --lib SUBSTR   only report NIDs whose import library contains SUBSTR\n"

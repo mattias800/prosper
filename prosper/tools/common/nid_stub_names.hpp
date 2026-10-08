@@ -45,6 +45,31 @@ inline bool parse_stub_line(const std::string& line, std::string* nid, std::stri
     return !nid->empty() && !name->empty();
 }
 
+// Parse one flat `NID name` line from a community NID database (aerolib.csv / ps5rs stubs.txt):
+//
+//     PI7jIZj4pcE sceRandomGetRandomNumber
+//
+// The NID and the name are separated by whitespace; everything after the first run of whitespace is
+// the name, trimmed. Blank lines and `#` comment lines return false. This is the format the
+// ps5-payload SDK's genstub flow and the zecoxao/ps5rs databases use, so a caller can name NIDs from
+// the aggregated community map without the per-library `sprx_dlsym(...)` firmware dump.
+inline bool parse_nid_csv_line(const std::string& line, std::string* nid, std::string* name) {
+    size_t b = 0;
+    while (b < line.size() && std::isspace((unsigned char)line[b])) ++b;
+    if (b >= line.size() || line[b] == '#') return false;   // blank or comment
+    size_t e = b;
+    while (e < line.size() && !std::isspace((unsigned char)line[e])) ++e;  // end of NID
+    const std::string n = line.substr(b, e - b);
+    size_t s = e;
+    while (s < line.size() && std::isspace((unsigned char)line[s])) ++s;   // skip gap
+    size_t t = line.size();
+    while (t > s && std::isspace((unsigned char)line[t - 1])) --t;         // rtrim name
+    if (n.empty() || s >= t) return false;
+    *nid = n;
+    *name = line.substr(s, t - s);
+    return true;
+}
+
 struct StubNames {
     std::map<std::string, std::string> by_nid;   // nid -> function name
     std::map<std::string, std::string> lib_of;   // nid -> library file stem
@@ -82,6 +107,62 @@ inline StubNames load_stub_names(
         }
     }
     return t;
+}
+
+// Read one flat `NID name` database file (aerolib.csv / ps5rs stubs.txt). A `# libName` comment
+// line sets the library attributed to the pairs that follow it (the ps5rs stubs.txt convention);
+// aerolib.csv has no such comments, so `lib_of` is simply left empty there. `on_pair` fires per
+// parsed pair in file order, exactly as `load_stub_names` does, so --self-check works identically
+// whichever source named the NID. A missing/unreadable file yields `dir_ok == false`.
+inline StubNames load_nid_csv(
+    const std::string& path,
+    const std::function<void(const std::string& nid, const std::string& name)>& on_pair = {}) {
+    StubNames t;
+    std::ifstream in(path);
+    if (!in) return t;
+    t.dir_ok = true;
+    t.files = 1;
+    std::string line, nid, name, cur_lib;
+    while (std::getline(in, line)) {
+        // Track a leading `# libName` so a grouped dump attributes names to libraries.
+        size_t b = 0;
+        while (b < line.size() && std::isspace((unsigned char)line[b])) ++b;
+        if (b < line.size() && line[b] == '#') {
+            // Only a `# libName` comment (a single whitespace-free token beginning "lib") sets the
+            // current library, as ps5rs stubs.txt writes it. A prose comment is just skipped, so it
+            // does not mis-attribute the pairs that follow it to a bogus library.
+            size_t s = b + 1;
+            while (s < line.size() && std::isspace((unsigned char)line[s])) ++s;
+            size_t e = line.size();
+            while (e > s && std::isspace((unsigned char)line[e - 1])) --e;
+            const std::string tok = (s < e) ? line.substr(s, e - s) : std::string();
+            if (tok.rfind("lib", 0) == 0 &&
+                tok.find_first_of(" \t") == std::string::npos) {
+                cur_lib = tok;
+            }
+            continue;
+        }
+        if (!parse_nid_csv_line(line, &nid, &name)) continue;
+        t.pairs++;
+        t.by_nid[nid] = name;
+        if (!cur_lib.empty()) t.lib_of[nid] = cur_lib;
+        if (on_pair) on_pair(nid, name);
+    }
+    return t;
+}
+
+// Name NIDs from either source: a DIRECTORY is the per-library `sprx_dlsym(...)` firmware dump
+// (load_stub_names); a regular FILE is a flat `NID name` database (load_nid_csv). Anything else
+// yields an empty table with `dir_ok == false`, which the caller reports rather than presenting as
+// "nothing is nameable".
+inline StubNames load_nid_names(
+    const std::string& path,
+    const std::function<void(const std::string& nid, const std::string& name)>& on_pair = {}) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::is_directory(path, ec)) return load_stub_names(path, on_pair);
+    if (fs::is_regular_file(path, ec)) return load_nid_csv(path, on_pair);
+    return {};
 }
 
 }  // namespace prosper_tools
