@@ -27,8 +27,8 @@ What is now known:
   `0x407edfaf00` is a full-screen pass is not known.
 - **The fragment frontier is a proof-domain question.** The Black Flag `unproved-vote` draw is clean
   at the guest-side classifier and is refused only at the SPIR-V neutral proof, because its body
-  holds a storage-buffer load and the proof admits no loads. The owner has been asked on #4755
-  whether to widen it (option B) or keep loads out (option A).
+  holds a storage-buffer load and the proof admits no loads. The question of widening it (option B) or keeping loads out (option A) was posted as a comment on #4755,
+  which merged without an answer.
 - **Route 2's rewrites have only an estimator.** The `s_cbranch_execz` certificate exists; the
   uniform `readlane`, compaction-ballot and uniform-vote rewrites do not, and the yield estimate has
   never run on a real title.
@@ -43,10 +43,15 @@ What is now known:
    from current `main` and a warm pipeline cache shows refused programs they would admit, with the
    count per class. Until then the next work is the route-2 rewrites and the four `compute/recompile`
    defects, each as its own issue with a red-without-fix test.
-4. **The loads decision is the owner's** (#4755). Whatever is chosen is recorded here as an
-   amendment line, not by editing the neutral proof's contract silently. Option B, if chosen, is
-   narrow: robust2 word-buffer contract, bounded index, result reaching only an identity-masked
-   export or a dead value, each condition with a mutation arm.
+4. **Loads stay out of the neutral proof (option A) as the working default.** The merged step-1 certificate
+   admits no loads, and this ADR does not change that. A draw refused only because its skipped region
+   holds a load stays visibly refused and is served later by the exact routes (the owned wave of #4384,
+   or step 5 promotion). Rationale: no surveyed emulator proves loads neutral in an EXEC-skipped region,
+   a wrong verdict corrupts pixels silently, and the exact routes need no such proof. **Option B may be
+   adopted later** by a follow-up amendment, if a census of the refused fragment set shows the
+   load-bearing shapes are few and structurally alike. It would be narrow: robust2 word-buffer contract,
+   bounded index, result reaching only an identity-masked export or a dead value, each condition with a
+   mutation arm, and the cross-title A/B before any default.
 5. **Programs outside the ADR's coverage are named, not implied.** The ADR gives no route to vertex,
    geometry or NGG programs (the Kena refusals, #4427), and says nothing about the reverse direction
    (a guest Wave32 program on a wider host). Both stay visibly refused under the ADR's route 6 until
@@ -84,5 +89,4 @@ What is now known:
 ## Approval
 
 Requires the project owner's acceptance. It unblocks the census-gated ordering above and the
-self-check mode; it does not accept option A or B for #4755, which stays the owner's separate
-answer.
+self-check mode; it makes option A the recorded default and leaves option B open for a later amendment.
