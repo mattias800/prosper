@@ -1800,6 +1800,37 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_vcc_scratch_loop_voted",
              recompile_fragment(voted, sizeof(voted) / 4, nullptr));
     }
+    // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
+    // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
+    // the structured loop route, and the one-arm if phis a slot written on the taken arm only.
+    // test_lane_slot_carry executes all three; these lock spirv-val on the new phi shapes.
+    {
+        const uint32_t counted[] = {0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE850385u,
+                                    0xD7610014u, 0x00012005u, 0x7E020280u, 0xBE8B0380u, 0xD7600006u,
+                                    0x00012114u, 0xD7600007u, 0x00015114u, 0xBF040607u, 0x850A8081u,
+                                    0xBF0AC00Bu, 0x850C8081u, 0x870A0C0Au, 0xBF07800Au, 0xBF840008u,
+                                    0x4A020282u, 0x800B810Bu, 0xD7600006u, 0x00015114u, 0x80068106u,
+                                    0xD7610014u, 0x00015006u, 0xBF82FFEDu, 0xD7600008u, 0x00015114u,
+                                    0x4A020208u, 0x4A020300u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_counted_loop",
+             recompile_valu(counted, sizeof(counted) / 4, 1, 3));
+        const uint32_t nested[] = {0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE850383u,
+                                   0xD7610014u, 0x00012005u, 0x7E020280u, 0xBE8B0380u, 0xD7600006u,
+                                   0x00012114u, 0xD7600007u, 0x00015114u, 0xBF040607u, 0x850A8081u,
+                                   0xBF0AC00Bu, 0x850C8081u, 0x870A0C0Au, 0xBF07800Au, 0xBF84000Du,
+                                   0x800B810Bu, 0xBE8D0380u, 0xBF0A820Du, 0xBF840003u, 0x4A020281u,
+                                   0x800D810Du, 0xBF82FFFBu, 0xD7600006u, 0x00015114u, 0x80068106u,
+                                   0xD7610014u, 0x00015006u, 0xBF82FFE8u, 0xD7600008u, 0x00015114u,
+                                   0x4A020208u, 0x4A020300u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_nested_loop",
+             recompile_valu(nested, sizeof(nested) / 4, 1, 3));
+        const uint32_t one_arm_if[] = {0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00010604u,
+                                       0xBE890381u, 0xBF068109u, 0xBF840003u, 0xB0040064u,
+                                       0xD7610014u, 0x00010604u, 0xD7600008u, 0x00010714u,
+                                       0x4A020008u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_one_arm_if",
+             recompile_valu(one_arm_if, sizeof(one_arm_if) / 4, 1, 3));
+    }
     // Fragment: a COUNTED loop whose induction variable is VCC_HI (#4680, Kena's light-list loop):
     // the counted emitter's VCC mask phi closes with a placeholder while the scalar halves ride
     // their own phis. test_fragment_loop_vcc_scratch executes it; this locks spirv-val.

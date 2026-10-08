@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
+#include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
@@ -643,11 +644,6 @@ int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint3
     return -1;
 }
 
-namespace {
-
-
-} // namespace
-
 // True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
 // buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
 // a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
@@ -733,39 +729,6 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
     }
     return bound;
 }
-
-namespace {
-
-// #3231 — is the CFG region's ENTRY-BLOCK VCC value dead?
-//
-// The dispatcher stores one value into `vcc_var` before its loop, then dispatches block 0 first,
-// exactly once, with every invocation active (`selector = active ? pc : UINT32_MAX`, and
-// `active_var` is seeded true when the caller has no partial-workgroup extent). So that stored
-// value is observable only until block 0 overwrites it: if block 0 DEFINES the complete VCC pair
-// before any instruction in it can read VCC, nothing anywhere in the region can see the entry
-// value, and persisting `false` for it invents nothing. Block 0's own `save_state` publishes the
-// real definition before the iteration's common phases run, so the two direct `vcc_var` readers
-// (portable readlane into 106, and the vote-to-VCC merge) see it too.
-//
-// This is deliberately narrow, because the failure the caller's gate prevents is silent-wrong
-// rather than a crash. What it does NOT admit:
-//   * anything but a `v_cmp_*` (VOPC, never `v_cmpx_*`) whose destination is the VCC pair. That is
-//     the one encoding that defines both words for every lane in a single instruction, and it is
-//     the form the live evidence uses. A VOP3B carry-out into VCC, a 64-bit scalar write of the
-//     pair, and `v_cmpx_*`'s EXEC write are all left rejected.
-//   * a b32 write of vcc_lo or vcc_hi alone — half the pair would still carry the entry value, so
-//     the scan stops there rather than continuing to a later full define.
-//   * an entry block that reads VCC first, in ANY form. "Reads" is over-approximated: the implicit
-//     consumers this file already enumerates for the mask-domain analyses, plus any operand that
-//     can name a word of the pair — including a wide scalar read rooted low enough to reach s106.
-//     An operand the decoder left stale is read too (all four source slots, not `n_src`), because
-//     over-reading only ever moves the answer to "not dead".
-//
-// `lo`/`hi` are the entry block's half-open pc range as the dispatcher itself partitions it
-// (`starts[0]` and `starts[1]`), so a block split by a branch target, or by one of the synchronized
-// cross-lane events that each get their own block, shortens the window rather than widening it.
-
-}  // namespace
 
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
@@ -6616,6 +6579,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 ++idx; // consume the then arm's jump to the merge
             }
             const uint32_t then_block = b.cur_block;
+            const LaneSlotEdge then_slots = LaneSlotEdge::of(rs, then_block);
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
             for (int reg : written_s) then_s[reg] = sget(reg);
@@ -6667,6 +6631,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.t_bool, then_vcc, then_block, rs.vcc, else_block);
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
+            join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, else_block), F.branch_pc);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
             for (int reg : then_written) rs.sreg_input.erase(reg);
@@ -6756,6 +6721,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             rs.exec = ph;
             phis.push_back({0, 4, ph, p});
         }
+        // V_WRITELANE spill slots are loop-carried state too (Kena 0x5007ad0000 keeps its loop
+        // counter in v20 lane 40; without these phis the exit test read the preheader value).
+        LaneSlotLoopCarry lane_slots;
+        lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
         // The header executes again after the back-edge. A direct/SRT descriptor overwritten
         // anywhere in the loop is therefore not an invariant entry descriptor at header compile
         // time. An exact descriptor load in the header may establish fresh provenance afterward.
@@ -6773,6 +6742,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : condv) condv_val[r] = vget(r);
         for (int r : conds) conds_val[r] = sget(r);
         const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
+        lane_slots.record_check(rs);
         const uint32_t cond_exec = rs.exec;
         const bool cond_exec_narrowed = rs.exec_narrowed;
         // VCC as the exit sees it (#4680). The merge's ONLY predecessor is this check block, so its
@@ -6813,6 +6783,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);
         }
+        if (!lane_slots.patch_backedge(b, rs, cont)) return false;
         b.emit_branch(hdr);
         // 6. Merge (loop exit): a condition-region reg keeps its exit-iteration (%check) value; a body-only
         //    reg (and scc) takes the header phi (its value when the loop exited). VCC takes the check
@@ -6835,6 +6806,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 rs.vcc = cond_vcc;
             else                  rs.exec = cond_exec;
         }
+        // The merge's only predecessor is the check block: each slot keeps the value it had there.
+        if (!lane_slots.finish_exit(b, rs, /*body_edge*/ false, 0, 0)) return false;
         // A VCC half the check block overwrote with a mask holds that mask's dword on exit, not the
         // body scratch its header phi carries; leave it untracked so a data read takes the exact
         // ballot or refuses loudly (#4680, the counted-loop form of #4526).
@@ -7392,6 +7365,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
+            LaneSlotLoopCarry lane_slots;   // V_WRITELANE spill slots, as in the counted loop
+            lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             // See the sibling loop above: the zero-trip path carries these aliases, not the body's.
             const auto loop_entry_ud_alias = rs.sreg_ud_alias;
@@ -7422,6 +7397,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
+            lane_slots.record_check(rs);
             LoopVccCarry vcc_carry(rs);   // #4508: a body may recycle VCC as scalar scratch
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec
                                : L.condition == DivLoop::Condition::Vcc ? rs.vcc : rs.scc;
@@ -7479,6 +7455,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
             }
+            if (!lane_slots.patch_backedge(b, rs, cont)) return false;
             b.emit_branch(hdr);
             b.emit_label(merge);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
@@ -7513,6 +7490,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
+            if (!lane_slots.finish_exit(b, rs, L.direct_exec_breaks || L.direct_wave_breaks,
+                                        chk_end, body_end))
+                return false;
             vcc_carry.finish_exit(rs);
             mark_loop_exit_slots(rs, check_marks);   // #4706
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
@@ -7591,6 +7571,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         b.land(*active_direct_wave_continue, exec_cond);
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {
+                    const LaneSlotEdge pre_slots = LaneSlotEdge::of(rs, preblock);   // skipped edge
                     std::set<int> ifv, ifs;
                     loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
                     omit_promoted_scalar_phis(ifs);
@@ -7669,6 +7650,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
                         }
                     }
+                    join_lane_slots(b, rs, pre_slots, LaneSlotEdge::of(rs, thenEnd), F.branch_pc);
                     // A differing physical-word domain needs no validity phi when that word is
                     // provably overwritten before every post-merge read. Drop its stale typed view
                     // on both synthesized paths; the later defining instruction recreates the
@@ -7721,6 +7703,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const auto then_bool_b32 = rs.sreg_bool_b32;
                     const auto then_written = rs.sreg_written;
                     const auto then_ud_alias = rs.sreg_ud_alias;   // the then edge's alias claims
+                    const LaneSlotEdge then_slots = LaneSlotEdge::of(rs, thenEnd);
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
                     b.emit_label(elseL);
@@ -7767,6 +7750,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : b.emit_phi_2way(b.t_bool, tv, thenEnd, ev, elseEnd);
                         if (tv != ev) rs.sreg_bool_narrowed[key] = true;
                     }
+                    join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, elseEnd), F.branch_pc);
                     lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)
                 }
             }

@@ -42,6 +42,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_loop_vcc_carry` — what the divergent-loop emitter does with VCC when a loop body recycles
   it as scalar scratch: the back-edge placeholder (only when VCC is provably dead at the header),
   the merge check, and the exit-state cleanup. Every refusal here logs a terminal reason.
+- `rdna2_lane_slot_carry` — the STRUCTURED emitter's counterpart of the dispatcher's slot
+  variables: `v_writelane` spill slots get loop-header phis, the exit edge's value at a loop merge,
+  and phis at if merges. Without it a slot read in a loop saw its preheader value forever (Kena's
+  spilled loop counter hung the GPU).
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
   votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,
