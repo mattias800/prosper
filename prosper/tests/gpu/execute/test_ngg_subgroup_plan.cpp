@@ -1,11 +1,14 @@
 // The merged-NGG subgroup planner (ngg_subgroup_plan.hpp, #3135 phase P1): partition, launch SGPR
 // s3 and launch VGPRs v0..v8. The Kena arm uses that title's recorded registers
 // (KENA_STATUS.md: VGT_GS_ONCHIP_CNTL 0x10020040, GE_CNTL 0x8040, 192 / 3 / ITEMSIZE 4) and the
-// LUT producer's draw (a 4-vertex strip, 32 instances).
+// LUT producer's draw (a 4-vertex strip, 32 instances). The indexed arms (#3135 P6) are the shapes
+// Kena submits past New Game: triangle lists of 6 or 18 indices, instanced.
 #include "gpu/execute/ngg_subgroup_plan.hpp"
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -201,6 +204,122 @@ TEST(NggSubgroupPlan, NothingToDrawIsAnEmptyPlan) {
     none.vertex_count = 3;
     none.instance_count = 0;
     EXPECT_TRUE(plan_ngg_subgroups(none, kena_limits()).subgroups.empty());
+}
+
+// ---- Indexed draws (#3135 P6) ---------------------------------------------------------------------
+
+std::shared_ptr<const std::vector<uint32_t>> indices(std::vector<uint32_t> values) {
+    return std::make_shared<const std::vector<uint32_t>>(std::move(values));
+}
+
+// One quad as two triangles whose corners are SCATTERED vertex indices, 3 instances. Each index
+// value runs on exactly one ES lane (6 references, 4 lanes), in first-use order, and VertexID is
+// the index value: a planner reading positions instead of values would run vertices 0..5.
+TEST(NggSubgroupPlan, IndexedListRunsEachIndexValueOnceWithItsValueAsVertexId) {
+    NggDrawShape draw;
+    draw.indices = indices({6, 1, 4, 4, 1, 3});
+    draw.vertex_count = 6;
+    draw.instance_count = 3;
+    draw.first_vertex = 1000;
+    const NggSubgroupPlan plan = plan_ngg_subgroups(draw, kena_limits());
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    ASSERT_EQ(plan.subgroups.size(), 3u) << "one subgroup per instance, never packed";
+    for (uint32_t i = 0; i < 3u; ++i) {
+        const NggSubgroup& s = plan.subgroups[i];
+        EXPECT_EQ(s.instance, i);
+        EXPECT_EQ(s.es_vertex, (std::vector<uint32_t>{6, 1, 4, 3})) << "deduplicated by value";
+        EXPECT_EQ(s.prim_slot, (std::vector<uint32_t>{0, 1, 2, 2, 1, 3}));
+        EXPECT_EQ(ngg_merged_wave_info(s, 0), (1u << 28) | (2u << 8) | 4u)
+            << "4 ES threads, 2 GS threads";
+    }
+    const NggSubgroup& s = plan.subgroups[2];
+    const uint32_t expect_vertex[4] = {1006, 1001, 1004, 1003};
+    for (uint32_t lane = 0; lane < 4u; ++lane) {
+        const NggLaneLaunch l = ngg_lane_launch(s, kena_limits(), 0, lane);
+        EXPECT_EQ(l.v[5], expect_vertex[lane]) << "lane " << lane << ": first_vertex + index";
+        EXPECT_EQ(l.v[8], 2u) << "InstanceID";
+    }
+    const NggLaneLaunch prim1 = ngg_lane_launch(s, kena_limits(), 0, 1);
+    EXPECT_EQ(prim1.v[0], (2u * 4u) | ((1u * 4u) << 16)) << "triangle 1 is lanes 2,1,3";
+    EXPECT_EQ(prim1.v[1], 3u * 4u);
+    EXPECT_EQ(ngg_lane_launch(s, kena_limits(), 0, 4).v[5], 0u) << "no fifth ES lane";
+}
+
+// Deduplication is not cosmetic: it decides the partition. A 64-triangle strip expanded into a
+// LIST of 192 indices references only 66 vertices. By value, 62 triangles share 64 ES lanes (one
+// subgroup) and the last 2 take a second; counting every reference would fit 21 per subgroup.
+TEST(NggSubgroupPlan, IndexedDeduplicationDecidesThePartition) {
+    std::vector<uint32_t> values;
+    for (uint32_t p = 0; p < 64u; ++p) values.insert(values.end(), {p, p + 1u, p + 2u});
+    NggDrawShape draw;
+    draw.indices = indices(values);
+    draw.vertex_count = static_cast<uint32_t>(values.size());
+    const NggSubgroupPlan plan = plan_ngg_subgroups(draw, kena_limits());
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    ASSERT_EQ(plan.subgroups.size(), 2u);
+    EXPECT_EQ(plan.subgroups[0].gs_threads(), 62u);
+    EXPECT_EQ(plan.subgroups[0].es_threads(), 64u);
+    EXPECT_EQ(plan.subgroups[0].waves, 3u) << "62 x 3 output vertices";
+    EXPECT_EQ(plan.subgroups[1].first_prim, 62u);
+    EXPECT_EQ(plan.subgroups[1].es_vertex, (std::vector<uint32_t>{62, 63, 64, 65}));
+    uint32_t next_prim = 0;
+    for (const NggSubgroup& s : plan.subgroups) {
+        for (uint32_t p = 0; p < s.gs_threads(); ++p)
+            for (uint32_t k = 0; k < 3u; ++k)
+                EXPECT_EQ(s.es_vertex[s.prim_slot[3u * p + k]], values[3u * (next_prim + p) + k])
+                    << "slot -> vertex is the input primitive's own index";
+        next_prim += s.gs_threads();
+    }
+    EXPECT_EQ(next_prim, 64u);
+}
+
+// A degenerate primitive (a repeated index) runs its vertex once; an indexed STRIP maps strip
+// positions through the index buffer; a partial trailing list primitive is dropped as on hardware.
+TEST(NggSubgroupPlan, IndexedDegenerateStripAndPartialPrimitives) {
+    NggDrawShape degenerate;
+    degenerate.indices = indices({2, 2, 5});
+    degenerate.vertex_count = 3;
+    const auto a = plan_ngg_subgroups(degenerate, kena_limits());
+    ASSERT_TRUE(a.ok());
+    ASSERT_EQ(a.subgroups.size(), 1u);
+    EXPECT_EQ(a.subgroups[0].es_vertex, (std::vector<uint32_t>{2, 5}));
+    EXPECT_EQ(a.subgroups[0].prim_slot, (std::vector<uint32_t>{0, 0, 1}));
+
+    NggDrawShape strip;
+    strip.topology = NggInputTopology::TriangleStrip;
+    strip.indices = indices({10, 11, 12, 13});
+    strip.vertex_count = 4;
+    const auto b = plan_ngg_subgroups(strip, kena_limits());
+    ASSERT_TRUE(b.ok());
+    ASSERT_EQ(b.subgroups.size(), 1u);
+    EXPECT_EQ(b.subgroups[0].es_vertex, (std::vector<uint32_t>{10, 11, 12, 13}));
+    EXPECT_EQ(b.subgroups[0].prim_slot, (std::vector<uint32_t>{0, 1, 2, 1, 2, 3}));
+
+    NggDrawShape partial;
+    partial.indices = indices({7, 8, 9, 7, 8});
+    partial.vertex_count = 5;
+    const auto c = plan_ngg_subgroups(partial, kena_limits());
+    ASSERT_TRUE(c.ok());
+    ASSERT_EQ(c.subgroups.size(), 1u);
+    EXPECT_EQ(c.subgroups[0].gs_threads(), 1u) << "5 indices are one triangle";
+}
+
+TEST(NggSubgroupPlan, IndexedShapeRefusals) {
+    NggDrawShape draw;
+    draw.indices = indices({0, 1, 2, 2, 1, 3});
+    draw.vertex_count = 4;   // the stale non-indexed count, not the index count
+    EXPECT_EQ(plan_ngg_subgroups(draw, kena_limits()).refusal, "ngg-index-count-mismatch");
+    draw.vertex_count = 6;
+    EXPECT_TRUE(plan_ngg_subgroups(draw, kena_limits()).ok());
+    // The budget counts every instance's subgroups, and a refused plan carries none.
+    draw.instance_count = 41;
+    NggSubgroupBudget budget;
+    budget.max_subgroups = 41;
+    EXPECT_EQ(plan_ngg_subgroups(draw, kena_limits(), budget).subgroups.size(), 41u);
+    budget.max_subgroups = 40;
+    const auto refused = plan_ngg_subgroups(draw, kena_limits(), budget);
+    EXPECT_EQ(refused.refusal, "ngg-subgroup-plan-budget");
+    EXPECT_TRUE(refused.subgroups.empty());
 }
 
 }   // namespace
