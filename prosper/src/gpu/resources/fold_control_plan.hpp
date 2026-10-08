@@ -85,12 +85,20 @@ inline FoldControlPlan build_fold_control_plan(const std::vector<Rdna2Inst>& ins
         previous_block = block;
         if (k == 0) continue;
         const auto& prev = ins[k - 1];
-        // Compaction may have removed a fall-through block: retained adjacency is insufficient.
-        if (prev.fmt != Rdna2Format::SOPP || prev.opcode != 0x02 ||
-            prev.pc + prev.len_dwords != pc) continue;
-        const auto lo = std::lower_bound(edges.begin(), edges.end(), std::pair{pc, uint32_t{0}});
+        if (prev.fmt != Rdna2Format::SOPP || prev.opcode != 0x02) continue;
+        // `ins` is the COMPACTED stream: straight-line instructions that cannot touch fold state
+        // are dropped, but every control transfer is kept (all SOPP, SOP1, SOPK). So the code
+        // between the unconditional s_branch and this retained instruction -- the gap -- falls
+        // through to it and is entered only by branches that land in it. Exactly one forward edge
+        // into [gap, pc] means one predecessor. A gap no edge reaches is dead code, not a
+        // predecessor; an edge landing inside it is counted, so a real fall-through declines.
+        // Requiring the target itself to be retained missed every block that opens with VALU --
+        // UE4's depth-of-field gather lost its input descriptor that way (Kena, KENA_STATUS.md).
+        const uint32_t gap = prev.pc + prev.len_dwords;
+        if (gap > pc) continue;
+        const auto lo = std::lower_bound(edges.begin(), edges.end(), std::pair{gap, uint32_t{0}});
         const auto hi = std::upper_bound(edges.begin(), edges.end(), std::pair{pc, UINT32_MAX});
-        if (std::distance(lo, hi) != 1 || lo->second >= pc) continue;
+        if (std::distance(lo, hi) != 1 || lo->second >= gap) continue;
         const auto source = std::lower_bound(ins.begin(), ins.end(), lo->second,
             [](const Rdna2Inst& in, uint32_t source_pc) { return in.pc < source_pc; });
         if (source == ins.end() || source->pc != lo->second) continue;
