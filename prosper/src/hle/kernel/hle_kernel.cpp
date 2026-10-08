@@ -3735,8 +3735,8 @@ struct Sema {
         interruptible_cond_forget(&s->c);
         free(s);
     }
-    // The handles the guest may still use: a deleted or never-created handle is ESRCH on the console, and
-    // without this check a call after sceKernelDeleteSema used freed memory (measured: SignalSema deadlocked).
+    // Handles the guest may still use: a deleted one is ESRCH on the console; without this a call after
+    // sceKernelDeleteSema used freed memory (measured: deadlock). A later create can reuse the address.
     std::mutex g_sema_registry_mutex;
     std::unordered_set<const Sema*> g_sema_registry;
     Sema* sema_find(uint64_t handle) {
@@ -3754,7 +3754,7 @@ struct Sema {
     // Checks and codes measured on a console (kernel.golden.tsv, sema_* cases): a bad initial count,
     // maximum or null name is EINVAL, as is a Poll/Signal count of 0 or one past the maximum or a signal
     // whose sum passes it (count + n > max); a deleted handle is ESRCH; an unavailable count is EBUSY.
-    // Wait gets only the ESRCH check (its need argument was not measured).
+    // CONFIDENCE: HIGH per case; Wait gets only ESRCH (its need argument was not measured).
     HLE(k_sema_create) {   // (sema*, name, attr, initCount, maxCount, opt)
         const int64_t init = (int32_t)a3, max = (int32_t)a4;
         if (!a0 || !a1 || init < 0 || max < 1 || init > max)
