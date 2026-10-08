@@ -41,7 +41,12 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
                                 const NggHostCapabilities& host) {
     NggDrawAdmission admission;
     const VgtShaderStages stages{registers.vgt_shader_stages_en};
-    if (!stages.gs_enabled() || !stages.primgen_enabled()) return admission;
+    if (!stages.primgen_enabled()) return admission;
+    // #3135 P7: NGG without a GS runs the VS as the primitive shader. Its launch is the merged
+    // one (s3 counts, v0/v1 vertex offsets scaled by ESGS_RING_ITEMSIZE, v5 VertexID, v8
+    // InstanceID): Kena's culling VS programs read exactly those, and the ABI analysis admits them
+    // unchanged. Only the partition differs (NggSubgroupLimits::vs_only).
+    admission.vs_only = !stages.gs_enabled();
     admission.applies = true;
     const auto refuse = [&](const char* reason) {
         admission.refusal = reason;
@@ -58,7 +63,15 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         admission.shape.topology = NggInputTopology::TriangleStrip;
     else
         return refuse("ngg-input-topology");
-    admission.topology = ngg_output_topology(registers.vgt_gs_out_prim_type);
+    // Without a GS there is no GS output primitive type to read: the primitive shader exports the
+    // INPUT primitives it keeps (culling drops some, never changes their kind), so a triangle list
+    // or strip comes out as triangles. VGT_GS_OUT_PRIM_TYPE is not consulted for it. Kena's culling
+    // VS programs run with that register at 0 -- POINTLIST if it applied -- while the title draws
+    // their geometry as triangles on PS5. CONFIDENCE: MED (Kena's register values and its PS5
+    // picture; no published register reference states the VS-only rule). Inputs other than a
+    // triangle list or strip were refused above (ngg-input-topology), by name.
+    admission.topology = admission.vs_only ? NggOutputTopology::TriangleList
+                                           : ngg_output_topology(registers.vgt_gs_out_prim_type);
     if (admission.topology == NggOutputTopology::Unsupported) return refuse("ngg-output-topology");
     if (facts.indexed) {
         if (facts.index_refusal) return refuse(facts.index_refusal);
@@ -78,9 +91,19 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     if (vs_out & kVsOutUndecodedMask) return refuse("ngg-vs-out-undecoded");
     admission.layer_from_pos1 = (vs_out & kVsOutUseVtxRenderTargetIndx) != 0;
     if (admission.layer_from_pos1) {
-        if (!facts.target_slices) return refuse("ngg-layer-target-not-layered");
-        if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
-        admission.layer_slices = facts.target_slices;
+        if (facts.target_slices) {
+            if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
+            admission.layer_slices = facts.target_slices;
+        } else if (facts.target_single_slice) {
+            // A one-slice view: layer 0 is its only slice. A primitive naming another layer is
+            // culled and counted by the raster commit, the rule a volume's out-of-range layers
+            // already follow (CONFIDENCE: LOW on cull versus clamp, ngg_raster_commit.hpp) -- here
+            // it is visible as a counted cull rather than a draw silently placed at slice 0.
+            // Kena's culling VS programs export POS1.z into 2D scene targets (#3135 P7).
+            admission.layer_slices = 1;
+        } else {
+            return refuse("ngg-layer-target-not-layered");
+        }
     }
     admission.provoking_vertex_last = (registers.pa_su_sc_mode_cntl >> 19) & 1u;
     if (admission.shape.topology == NggInputTopology::TriangleStrip) {
@@ -113,6 +136,7 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     admission.limits = decode_ngg_subgroup_limits(
         registers.vgt_gs_onchip_cntl, registers.ge_cntl, registers.ge_max_output_per_subgroup,
         registers.vgt_gs_max_vert_out, registers.vgt_esgs_ring_itemsize);
+    admission.limits.vs_only = admission.vs_only;
     admission.shape.vertex_count = facts.vertex_count;
     if (facts.indexed) {
         admission.shape.indices = facts.indices;

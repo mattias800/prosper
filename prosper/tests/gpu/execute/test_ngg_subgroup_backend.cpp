@@ -1083,4 +1083,186 @@ TEST(NggSubgroupBackend, IndexedInstancesRouteToTheirOwnSlices) {
     }
 }
 
+// ---- P7: NGG without a GS -----------------------------------------------------------------------------
+//
+// A primitive shader with no GS (VGT_SHADER_STAGES_EN 0x2000), the launch Kena's culling VS programs
+// read: GS_ALLOC_REQ from s3's counts, PRIM = the three ES slots from v0/v1 (scaled by ITEMSIZE 4),
+// POS0 from VertexID (v5) bit 0 -> x and bit 1 -> y (each -1 or +1), PARAM0 = (0.25, 0.5, 0, 1).
+// Assembled with llvm-mc -mcpu=gfx1030; the same words as test_ngg_indexed_realize's kVsOnly.
+const uint32_t kVsOnlyPrimitiveShader[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80008CFu, 0x100F0E0Du, 0x7E2202FFu, 0x3E800000u,
+    0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// The same program also exporting POS1.z = 0 (layer 0) or 1 (layer 1), as Kena's culling VS programs
+// export POS1.z under USE_VTX_RENDER_TARGET_INDX into 2D scene targets.
+const uint32_t kVsOnlyLayer0[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+const uint32_t kVsOnlyLayer1[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280281u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// Kena's culling-VS partition registers: onchip 0x10020040, GE_CNTL 0x8040, GE_MAX_OUTPUT 64,
+// GS_MAX_VERT_OUT 0, ITEMSIZE 4, read as VS-only.
+NggSubgroupLimits vs_only_limits() {
+    NggSubgroupLimits l = decode_ngg_subgroup_limits(0x10020040u, 0x8040u, 0x40u, 0u, 4u);
+    l.vs_only = true;
+    return l;
+}
+
+std::shared_ptr<const NggSubgroupDraw>
+vs_only_draw(std::vector<uint32_t> indices, std::string* why,
+             std::span<const uint32_t> program = kVsOnlyPrimitiveShader,
+             const RenderVkCtx* layered = nullptr) {
+    static const ShaderResourceTable none;
+    NggSubgroupDrawRequest request;
+    request.linked_code = program.data();
+    request.dwords = program.size();
+    request.resources = &none;
+    request.limits = vs_only_limits();
+    request.shape.topology = NggInputTopology::TriangleList;
+    request.shape.vertex_count = static_cast<uint32_t>(indices.size());
+    request.shape.indices = std::make_shared<const std::vector<uint32_t>>(std::move(indices));
+    request.raster.topology = NggOutputTopology::TriangleList;
+    request.raster.route = NggLayerRoute::None;
+    request.raster.count_violations = false;
+    if (layered) {   // the layer addresses a one-slice 2D target (#3135 P7 admission)
+        request.raster.layer_from_pos1 = true;
+        request.raster.layer_slices = 1;
+        request.raster.route = backend_route(*layered);
+        request.raster.count_violations = ngg_backend_counts_violations(*layered);
+    }
+    request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e920000ull};
+    return build_ngg_subgroup_draw(request, why);
+}
+
+// One triangle, indices (1, 3, 2) = (+1,-1), (+1,+1), (-1,+1): the half of the screen with
+// clip x + y > 0, i.e. pixel x > y. The pixels a one-pixel margin either side of the diagonal are
+// exact: PARAM0 (0.25, 0.5, 0, 1) above, the clear below. The VS-only partition is what lets the
+// draw exist at all: read as merged, GS_MAX_VERT_OUT 0 leaves no primitive limit and the plan is
+// refused.
+TEST(NggSubgroupBackend, VsOnlyPrimitiveShaderDrawsItsTriangleIntoA2DTarget) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    std::string why;
+    const auto ngg = vs_only_draw({1, 3, 2}, &why);
+    ASSERT_TRUE(ngg) << why;
+    ASSERT_EQ(ngg->plan.subgroups.size(), 1u);
+    EXPECT_EQ(ngg->plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}));
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw draw;
+    draw.ngg_subgroup = ngg;
+    draw.fs = ngg_param_fragment(0, false);
+    draw.ps = &state;
+    BackendColorTarget target;
+    target.persistent_id = 0x4e4747340070ull;
+    target.load_existing = false;
+    target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    const StatsSnapshot before = stats_now();
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    const StatsSnapshot after = stats_now();
+    ASSERT_EQ(bytes.size(), static_cast<size_t>(kSize) * kSize * 16u);
+    EXPECT_EQ(after.draws - before.draws, 1u);
+    EXPECT_EQ(after.invalid - before.invalid, 0u) << "the GS_ALLOC_REQ counts were accepted";
+    EXPECT_EQ(after.connectivity - before.connectivity, 0u);
+    uint32_t covered = 0, clear = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float* p = texel(bytes, 0, x, y);
+            if (x >= y + 2u) {
+                EXPECT_EQ(p[0], 0.25f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[1], 0.5f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[2], 0.0f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[3], 1.0f) << "covered (" << x << "," << y << ")";
+                ++covered;
+            } else if (y >= x + 2u) {
+                EXPECT_EQ(p[0], -1.0f) << "clear (" << x << "," << y << ")";
+                ++clear;
+            }
+        }
+    EXPECT_EQ(covered, 105u);
+    EXPECT_EQ(clear, 105u);
+
+    NggSubgroupLimits merged = vs_only_limits();
+    merged.vs_only = false;
+    NggDrawShape triangle;
+    triangle.topology = NggInputTopology::TriangleList;
+    triangle.vertex_count = 3;
+    EXPECT_EQ(plan_ngg_subgroups(triangle, merged).refusal, "ngg-limits-unusable")
+        << "control: the same registers read as merged cannot be planned";
+}
+
+// The upper-right half (x >= y + 2) holds PARAM0 and the lower-left half (y >= x + 2) the clear.
+::testing::AssertionResult upper_right_triangle(const std::vector<uint8_t>& bytes, bool drawn) {
+    if (bytes.size() != static_cast<size_t>(kSize) * kSize * 16u)
+        return ::testing::AssertionFailure() << "readback of " << bytes.size() << " bytes";
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float* p = texel(bytes, 0, x, y);
+            const bool inside = x >= y + 2u;
+            if (!inside && y < x + 2u) continue;   // the diagonal margin
+            const bool ok = inside && drawn
+                                ? p[0] == 0.25f && p[1] == 0.5f && p[2] == 0.0f && p[3] == 1.0f
+                                : p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f && p[3] == -1.0f;
+            if (!ok)
+                return ::testing::AssertionFailure()
+                       << "(" << x << "," << y << ") = (" << p[0] << "," << p[1] << "," << p[2]
+                       << "," << p[3] << ")";
+        }
+    return ::testing::AssertionSuccess();
+}
+
+// Kena's culling VS programs export POS1.z into 2D targets. Admitted as a one-slice target: layer 0
+// draws exactly the unlayered picture, and layer 1 -- a slice the view does not have -- is culled
+// and counted, not drawn at slice 0.
+TEST(NggSubgroupBackend, VsOnlyLayerAddressesAOneSliceTarget) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    const ResolvedPipelineState state = flipped_state();
+    for (const bool second_layer : {false, true}) {
+        std::string why;
+        const auto ngg = vs_only_draw({1, 3, 2}, &why,
+                                      second_layer ? std::span<const uint32_t>(kVsOnlyLayer1)
+                                                   : std::span<const uint32_t>(kVsOnlyLayer0),
+                                      ctx);
+        ASSERT_TRUE(ngg) << why;
+        BackendDraw draw;
+        draw.ngg_subgroup = ngg;
+        draw.fs = ngg_param_fragment(0, false);
+        draw.ps = &state;
+        BackendColorTarget target;
+        target.persistent_id = 0x4e4747340071ull + (second_layer ? 1u : 0u);
+        target.load_existing = false;
+        target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        const StatsSnapshot before = stats_now();
+        const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+        const StatsSnapshot after = stats_now();
+        EXPECT_TRUE(upper_right_triangle(bytes, !second_layer))
+            << (second_layer ? "layer 1" : "layer 0");
+        EXPECT_EQ(after.invalid - before.invalid, 0u);
+        if (ngg_backend_counts_violations(*ctx))
+            EXPECT_EQ(after.culled - before.culled, second_layer ? 1u : 0u)
+                << "the out-of-range layer is counted";
+    }
+}
+
 }   // namespace
