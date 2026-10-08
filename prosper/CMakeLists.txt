@@ -5268,6 +5268,13 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # Constant-lane V_WRITELANE spill slots across structured loop headers, loop exits and if
+      # merges (Kena 0x5007ad0000's spilled loop counter hung the GPU), executed per lane.
+      prosper_add_gtest(test_lane_slot_carry
+        SOURCES tests/gpu/recompiler/test_lane_slot_carry.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
       # counted-loop route declines and the general route lowers both loops, executed per lane.
       prosper_add_gtest(test_counted_loop_prelude_exec_loop
