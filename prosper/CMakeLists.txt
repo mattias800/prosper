@@ -933,7 +933,8 @@ if(TARGET prosper_core)
   # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
   # no prosper_core and no game dump.
   prosper_add_gtest(test_nid_stub_names
-    SOURCES tests/tools/test_nid_stub_names.cpp)
+    SOURCES tests/tools/test_nid_stub_names.cpp
+    INCLUDES tests)
 
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
