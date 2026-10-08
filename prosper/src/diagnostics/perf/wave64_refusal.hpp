@@ -51,9 +51,13 @@ template<size_t Capacity> struct Wave64RefusalInventory {
 // read as "this GPU cannot run Wave64": Space Adventure Cobra's missing 3D (#4508) was taken that
 // way on a device that offers 64-lane subgroups. Those sites now say `not-consulted`, and name
 // the recompiler as the cause.
+//
+// `route` (ADR 0028): the route the program's analysis selected, as `name` or `name:reason` text
+// (e.g. `needs-n-lanes:cross-lane-in-loop`). Null prints no field, which is every pre-ADR caller.
 inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uint64_t identity,
                                        uint32_t wave_reasons, uint32_t host_min, uint32_t host_max,
-                                       const gpu::FragmentVoteLoweringDiagnostic& lowering) {
+                                       const gpu::FragmentVoteLoweringDiagnostic& lowering,
+                                       const char* route = nullptr) {
     const size_t i = static_cast<size_t>(site);
     if (i >= kWave64RefusalCount) return {};
     const bool compute =
@@ -85,12 +89,14 @@ inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uin
                           gpu::fragment_vote_refusal_name(lowering.refusal));
         }
     }
-    char line[1024];
+    char route_field[128] = "";
+    if (route && *route) std::snprintf(route_field, sizeof route_field, " route=%s", route);
+    char line[1280];
     std::snprintf(
         line, sizeof line,
         "[wave64-unsupported] stage=%s program=0x%llx identity=0x%llx "
         "refusal=%s guest-wave=64 host-subgroups=%s wave-reasons=%s consequence=%s "
-        "next=%s%s\n",
+        "next=%s%s%s\n",
         compute ? "compute" : "fragment", (unsigned long long)program, (unsigned long long)identity,
         kWave64RefusalNames[i], host, reasons,
         compute ? "dispatch-skipped/output-unwritten" : "draw-dropped/content-missing",
@@ -98,7 +104,7 @@ inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uin
             ? "prosper recompiler/resource-binding, NOT a host limit; "
               "PROSPER_DBG_PROGRAM=<program> for rejection pc"
             : "subgroup-contract/lowering; see the adjacent backend skip and wave reason bits",
-        detail);
+        detail, route_field);
     return line;
 }
 
@@ -156,11 +162,11 @@ inline void observe_wave64_shader(uint32_t guest_wave, bool compute) {
     add(Counter::Wave64ShaderChecks);
 }
 
-inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
-                                    uint64_t program, uint64_t identity = 0,
-                                    uint32_t wave_reasons = UINT32_MAX,
+inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave, uint64_t program,
+                                    uint64_t identity = 0, uint32_t wave_reasons = UINT32_MAX,
                                     uint32_t host_min = 0, uint32_t host_max = 0,
-                                    const gpu::FragmentVoteLoweringDiagnostic& lowering = {}) {
+                                    const gpu::FragmentVoteLoweringDiagnostic& lowering = {},
+                                    const char* route = nullptr) {
     const size_t i = static_cast<size_t>(site);
     if (!enabled() || guest_wave != 64 || i >= kWave64RefusalCount) return;
     const bool compute = site == Wave64Refusal::ComputeRecompile ||
@@ -195,8 +201,8 @@ inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
     } else {
         add(Counter::Wave64NewRefusalIdentities);
     }
-    const std::string line =
-        wave64_refusal_line(site, program, identity, wave_reasons, host_min, host_max, lowering);
+    const std::string line = wave64_refusal_line(site, program, identity, wave_reasons, host_min,
+                                                 host_max, lowering, route);
     std::fputs(line.c_str(), stderr);
 }
 

@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "gpu/recompiler/compute_wave_route.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/diagnostics/refused_shader_dump.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -43,6 +44,10 @@ struct ComputeProgramFacts {
     std::vector<Rdna2Inst> decoded;   // rdna2_walk(code, dwords)
     bool prefers_native_multiwave = false;  // compute_shader_prefers_native_multiwave(decoded, ...)
     bool uses_gds = false;                  // a DS GDS access the dispatch must bind a buffer for
+    // ADR 0028: every cross-lane operation and the control-flow context it sits in. Host
+    // independent, so it is memoized with the program; the route is chosen per host at the decline
+    // site (select_compute_wave_route).
+    ComputeWaveOpFacts wave_ops;
     // Terminal reject reasons the probe recorded, replayed for the current address on every use.
     std::vector<std::pair<std::string, std::string>> probe_reject_reasons;
 };

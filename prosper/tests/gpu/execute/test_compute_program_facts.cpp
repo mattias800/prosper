@@ -14,6 +14,7 @@
 //     specializers act on.
 #include "gpu/execute/compute_program_facts.hpp"
 #include <gtest/gtest.h>
+#include "gpu/recompiler/compute_wave_route.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <cstdio>
@@ -63,6 +64,25 @@ RecompileDiagnosticContext at(uint64_t address) {
     return {RecompileDiagnosticStage::Compute, address};
 }
 } // namespace
+
+TEST(ComputeProgramFacts, CarriesTheCrossLaneInventory) {
+    // ADR 0028: the memoized facts hold the program's cross-lane operations, so the decline site
+    // can choose a route per host without re-decoding. A ballot popcount and a v_readlane.
+    reset_compute_program_facts_for_test();
+    const std::vector<uint32_t> program{0x7d840100u, 0xbe84106au, 0xd7600006u, 0x00010b1fu,
+                                        0xbf810000u};
+    const auto facts = compute_program_facts(program.data(), program.size(), at(0x8000));
+    check(facts->wave_ops.analyzed && facts->wave_ops.total() == 2,
+          "the facts name the ballot and the readlane");
+    check(facts->wave_ops.count[static_cast<size_t>(ComputeCrossLaneKind::Ballot)] == 1 &&
+              facts->wave_ops.count[static_cast<size_t>(ComputeCrossLaneKind::ReadLane)] == 1,
+          "by kind");
+    const auto again = compute_program_facts(program.data(), program.size(), at(0x8000));
+    check(again == facts && again->wave_ops.ops.size() == 2, "a hit serves the same inventory");
+    const std::vector<uint32_t> plain{0x7e020287u, 0xbf810000u};
+    check(compute_program_facts(plain.data(), plain.size(), at(0x8100))->wave_ops.ops.empty(),
+          "a program without cross-lane operations has an empty inventory, and is analyzed");
+}
 
 TEST(ComputeProgramFacts, Contract) {
     // 1 + 2: hit counting and equality with a direct evaluation.

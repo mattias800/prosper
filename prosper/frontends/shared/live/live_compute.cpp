@@ -115,6 +115,7 @@
 // The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
 extern "C" int prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+#include "shared/live/compute_wave_admission.hpp"
 #include "shared/live/live_compute_storage_codec.hpp"
 
 namespace prosper::frontend {
@@ -7170,9 +7171,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "that enabled contract -> dispatch skipped\n",
                      (unsigned long long)item.code_addr, item.required_subgroup_size);
         prosper::diagnostics::perf::note_unsupported_wave64(
-            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
-            item.required_subgroup_size, item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup, item.required_subgroup_size,
+            item.code_addr, 0, UINT32_MAX, ctx.min_native_subgroup_size,
+            ctx.max_native_subgroup_size, {},
+            prosper::frontend::compute_wave_route_text(ctx, item).text);
         return decline("subgroup-contract-absent");
     }
     const uint32_t dispatch_groups[3] = {item.launch.groups_x, item.launch.groups_y,
@@ -7209,8 +7211,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         prosper::diagnostics::perf::note_unsupported_wave64(
             prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
             item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup,
-            item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+            item.code_addr, 0, UINT32_MAX, ctx.min_native_subgroup_size,
+            ctx.max_native_subgroup_size, {},
+            prosper::frontend::compute_wave_route_text(ctx, item).text);
         return decline("subgroup-too-narrow");
     }
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:

@@ -70,6 +70,7 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
             compute_shader_prefers_native_multiwave(facts->decoded, code, dwords, diagnostic);
         facts->probe_reject_reasons = capture.take();
     }
+    facts->wave_ops = analyze_compute_wave_ops(facts->decoded, code, dwords);
     facts->uses_gds =
         std::any_of(facts->decoded.begin(), facts->decoded.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && in.ds_gds &&
