@@ -629,6 +629,9 @@ int main() {
         const auto cleanup = [&](const std::shared_ptr<C11TimedArm>& arm) {
             CHECK(call1(sce_cnd_destroy, &arm->cond) == 0,
                   "C11 cleanup: completed waits leave no live waiter count");
+            // A wait that returns holds the mutex again, and a console refuses to destroy a held mutex
+            // (EBUSY, #2168), so release it first; an unlock of a free ERRORCHECK mutex is a harmless EPERM.
+            call1(sce_unlock, &arm->mutex);
             CHECK(call1(sce_mtx_destroy, &arm->mutex) == 0,
                   "C11 cleanup: the drained mutex can be retired");
         };
