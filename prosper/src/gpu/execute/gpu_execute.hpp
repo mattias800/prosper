@@ -1118,6 +1118,35 @@ inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
     }
 }
 
+// PROSPER_DROPPED_DRAW_CENSUS=1, second view: shader-recompile drops by the PROGRAM that refused.
+// The target view above says where draws were lost; this one says whose refusal lost them, so a
+// census ranks refusals by dropped draws rather than by refused programs (one refused vertex
+// program can own most of a level's draws). The refusal reason itself is in the run's
+// refused-shader index and on the program's terminal reject line; join on the address, which is
+// run-local. Bounded like the target view: 256 keys, reported at powers of two.
+inline void report_dropped_draw_program(const char* stage, uint64_t program, const char* reason) {
+    if (!dropped_draw_census_enabled()) return;
+    static std::mutex mutex;
+    static std::map<std::tuple<std::string, uint64_t, std::string>, uint64_t> dropped;
+    static uint64_t total = 0;
+    std::lock_guard lock(mutex);
+    const auto key = std::make_tuple(std::string(stage), program, std::string(reason));
+    if (dropped.size() < 256 || dropped.count(key)) ++dropped[key];
+    const uint64_t n = ++total;
+    if ((n & (n - 1)) != 0 || n < 256) return;
+    std::vector<std::pair<uint64_t, const decltype(key)*>> ranked;
+    for (const auto& e : dropped) ranked.push_back({e.second, &e.first});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[dropped-draw-program] %llu shader-recompile draws dropped\n",
+                 (unsigned long long)n);
+    for (size_t i = 0; i < ranked.size() && i < 16; ++i)
+        std::fprintf(stderr, "[dropped-draw-program]   %s=0x%llx reason=%s x%llu\n",
+                     std::get<0>(*ranked[i].second).c_str(),
+                     (unsigned long long)std::get<1>(*ranked[i].second),
+                     std::get<2>(*ranked[i].second).c_str(), (unsigned long long)ranked[i].first);
+}
+
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -3158,6 +3187,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             ngg_refusal ? (std::string("shader-recompile/ngg:") + ngg_refusal).c_str()
                         : "shader-recompile",
             rs.cb_target_mask, rs.cb_shader_mask);
+        if (vs_words.empty())
+            report_dropped_draw_program("es", rs.es_addr, ngg_refusal ? ngg_refusal : "recompile");
+        else if (fs_words.empty())
+            report_dropped_draw_program("ps", rs.ps_addr, "recompile");
+        else
+            report_dropped_draw_program("gs", rs.es_addr, "geometry");
         // #3951: a draw lost here never reaches the renderer's pass loop, so neither the frontend
         // drop sites nor [draw-disposition] could see it and `dropped-draws` stayed at 0 while a
         // recompiler refusal removed ~99.7% of GTA V's gameplay draws. Name the failing stage.
