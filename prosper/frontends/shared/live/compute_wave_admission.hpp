@@ -163,8 +163,8 @@ const char* exchange_limit(const Ctx& ctx, const prosper::gpu::ComputeItem& item
     std::shared_ptr<const prosper::gpu::ComputeProgramFacts> program;
     if (item.code_dwords && item.code_addr) {
         program = prosper::gpu::compute_program_facts_peek(
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(item.code_addr)), item.code_dwords,
-            item.code_addr);
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(item.code_addr)),
+            item.code_dwords, item.code_addr);
         facts = &program->wave_ops();
     }
     return exchange_limit(ctx, item, facts, limits);
