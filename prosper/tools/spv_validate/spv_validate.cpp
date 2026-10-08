@@ -1616,6 +1616,16 @@ int main(int argc, char** argv) {
       vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
       vb.num_components=4; rt.resources.push_back(vb);
       dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // #4706: a Wave64 pixel program reloads a spilled compare-mask ballot with v_readlane and ANDs
+    // it with a fresh compare mask, so the data pair is projected onto the lane bit.
+    {
+        const uint32_t c[] = {0xD7650005u, 0x000100C1u, 0xD7660005u, 0x00020AC1u, 0xD4C40002u,
+                              0x00020AA0u, 0xD761000Cu, 0x00010202u, 0xD761000Cu, 0x00010403u,
+                              0xD7600004u, 0x0001030Cu, 0xD7600005u, 0x0001050Cu, 0xD4C20006u,
+                              0x00010080u, 0x87880604u, 0xD5010001u, 0x0021E480u, 0x7E000280u,
+                              0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_scalar_pair_mask_projection", recompile_fragment(c, std::size(c)));
+    }
     // #4706: v_ldexp_f32 with CLAMP (the float saturate routed through fresult).
     {
         const uint32_t c[] = {0xD7628000u, 0x0002030Du, 0xBF810000u};
