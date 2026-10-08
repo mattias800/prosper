@@ -7648,15 +7648,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // user-data address (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS: the launch research on #3135,
         // where the ISA and two independent compilers agree). Kena's indexed producer 11562c72
         // reloads its user SGPRs with `s_load_dwordx8 s[8:15], s[0:1], 0`.
-        if (hdr->type == 6 || !linked.empty()) {
-            const auto sh_value = [&](uint32_t reg) {
-                const auto found = st.sh.find(reg);
-                return found == st.sh.end() ? 0u : found->second;
-            };
-            system_sgprs[0] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
-            system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
-            system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
-        }
+        // One rule with the live NGG path (read_ngg_user_data_address): both registers present
+        // and the address non-zero.
+        if ((hdr->type == 6 || !linked.empty()) && read_ngg_user_data_address(st, system_sgprs))
+            system_count = 2u;
         dyn_vb = resolve_dynamic_fetch(code, shader_dwords, primary_sgprs, kUserSgprs, 8, &srt_uses,
                                        UINT32_MAX, nullptr, system_sgprs, system_count,
                                        nested_reader.get(), checked_source);
