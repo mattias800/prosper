@@ -8,9 +8,11 @@ loader, and records what the real libraries returned as <family>.golden.tsv. pro
 
 Run it from Linux or WSL (it needs make, the SDK and a network path to the console):
 
-    python3 prosper/tools/console_oracle/run_oracle.py \\
-        --cases prosper/tests/data/console_oracle/rtc.cases.tsv \\
+    python3 prosper/tools/console_oracle/run_oracle.py --family rtc \\
         --host <console-ip> --sdk <ps5-payload-sdk-root>
+
+A family is a bare name (rtc, libc, ...): the tool reads <family>.cases.tsv and writes
+<family>.golden.tsv in tests/data/console_oracle and nowhere else.
 
 The cases grammar and result line format are documented at the top of payload/lib_oracle.c. This
 file keeps its parsing and formatting as pure functions so they are unit tested without a console
@@ -31,7 +33,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PAYLOAD_DIR = Path(__file__).resolve().parent / "payload"
-ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+DATA_DIR = Path(__file__).resolve().parents[2] / "tests" / "data" / "console_oracle"
+ID_RE = re.compile(r"\w+", re.ASCII)
+# --host and --sdk are placed in a make recipe that a shell runs, so only plain characters are accepted.
+HOST_RE = re.compile(r"[A-Za-z0-9.:-]+")
+SDK_RE = re.compile(r"[A-Za-z0-9_./@+-]+")
 GOLDEN_MAGIC = "# console-oracle golden v1"
 SPEC_COLUMNS = ("id", "lib", "func", "args", "expect")
 
@@ -68,7 +74,7 @@ def parse_cases(text: str) -> list[Case]:
             raise ValueError(f"line {lineno}: expected id, lib, func, args[, expect]: {line!r}")
         cid, lib, func, args = parts[:4]
         expect = parts[4] if len(parts) > 4 else ""
-        if not ID_RE.match(cid):
+        if not ID_RE.fullmatch(cid):
             raise ValueError(f"line {lineno}: bad case id {cid!r} (use A-Z a-z 0-9 _)")
         if cid in seen:
             raise ValueError(f"line {lineno}: duplicate case id {cid!r}")
@@ -213,12 +219,37 @@ def golden_spec_problems(golden_text: str, cases_text: str) -> list[str]:
     return problems
 
 
+def family_paths(family: str) -> tuple[Path, Path]:
+    """The cases and golden files of a family.
+
+    A family is a bare name, so the tool can only ever read and write inside DATA_DIR: there is no way to
+    point it at another path. The resolved paths are checked against DATA_DIR as well, which also covers
+    a symlink planted in that directory.
+    """
+    if not ID_RE.fullmatch(family):
+        raise ValueError(f"bad family name {family!r} (use A-Z a-z 0-9 _)")
+    base = DATA_DIR.resolve()
+    cases = (base / f"{family}.cases.tsv").resolve()
+    golden = (base / f"{family}.golden.tsv").resolve()
+    for path in (cases, golden):
+        if not path.is_relative_to(base):
+            raise ValueError(f"{path} is outside {base}")
+    return cases, golden
+
+
+def check_connection_args(host: str, sdk: str) -> None:
+    """Reject a --host or --sdk that is not plain text before it reaches a make recipe."""
+    if not HOST_RE.fullmatch(host):
+        raise SystemExit(f"--host {host!r}: only letters, digits, '.', ':' and '-' are allowed")
+    if not SDK_RE.fullmatch(sdk):
+        raise SystemExit(
+            f"--sdk {sdk!r}: only letters, digits and '_ . / @ + -' are allowed (no spaces)"
+        )
+
+
 def run_on_console(cases_text: str, sdk: str, host: str, port: int, timeout: int) -> str:
     """Build the payload with embedded cases and deploy it; return everything it printed."""
-    if not Path(sdk, "toolchain", "prospero.mk").exists():
-        raise SystemExit(
-            f"--sdk {sdk!r} is not an installed ps5-payload-sdk (no toolchain/prospero.mk)"
-        )
+    check_connection_args(host, sdk)
     with tempfile.TemporaryDirectory(prefix="console_oracle_") as tmp:
         build = Path(tmp)
         for name in ("lib_oracle.c", "Makefile"):
@@ -233,17 +264,23 @@ def run_on_console(cases_text: str, sdk: str, host: str, port: int, timeout: int
             timeout=timeout,
         )
         if proc.returncode != 0 and "R\t" not in proc.stdout:
+            hint = (
+                "\nIs --sdk an installed ps5-payload-sdk (it needs toolchain/prospero.mk)?"
+                if "prospero.mk" in proc.stderr + proc.stdout
+                else ""
+            )
             raise SystemExit(
-                f"build or deploy failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+                f"build or deploy failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}{hint}"
             )
         return proc.stdout
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--cases", required=True, help="<family>.cases.tsv")
     ap.add_argument(
-        "--out", help="golden file to write (default: <family>.golden.tsv beside --cases)"
+        "--family",
+        required=True,
+        help="family name, e.g. rtc: reads <family>.cases.tsv, writes <family>.golden.tsv",
     )
     ap.add_argument(
         "--host", default=os.environ.get("PS5_HOST"), help="console address (or $PS5_HOST)"
@@ -264,14 +301,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    cases_path = Path(args.cases)
+    try:
+        cases_path, out_path = family_paths(args.family)
+    except ValueError as err:
+        ap.error(str(err))
     cases_text = cases_path.read_text()
     cases = parse_cases(cases_text)
-    out_path = (
-        Path(args.out)
-        if args.out
-        else cases_path.with_name(cases_path.name.replace(".cases.tsv", ".golden.tsv"))
-    )
 
     if args.scrub:
         out_path.write_text(scrub_golden_text(out_path.read_text()))

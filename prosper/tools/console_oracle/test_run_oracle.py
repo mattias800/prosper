@@ -2,17 +2,17 @@
 
 Covers the cases-file parser, the C header generator (round-tripped through Python's own string
 literal rules, which match C's for the escapes used), the payload-output parser, the golden file
-format, and the committed data under tests/data/console_oracle: every cases file must have a golden
-whose spec columns still match, and every measured case must have run on the console.
+format, the path and argument validation, and the committed data under tests/data/console_oracle:
+every cases file must have a golden whose spec columns still match, and every measured case must have
+run on the console.
 """
 
 import ast
-from pathlib import Path
 
 import pytest
 import run_oracle as ro
 
-DATA = Path(__file__).resolve().parents[2] / "tests" / "data" / "console_oracle"
+DATA = ro.DATA_DIR
 
 
 def test_parse_cases_skips_comments_and_blank_lines():
@@ -20,7 +20,8 @@ def test_parse_cases_skips_comments_and_blank_lines():
         "# c\n\nrtc_a\tlibSceRtc.sprx\tsceRtcIsLeapYear\ti:2000\nrtc_b\t-\tstrlen\ts:x\tr64\n"
     )
     assert [c.id for c in cases] == ["rtc_a", "rtc_b"]
-    assert cases[0].expect == "" and cases[1].expect == "r64"
+    assert cases[0].expect == ""
+    assert cases[1].expect == "r64"
 
 
 @pytest.mark.parametrize(
@@ -55,14 +56,16 @@ def test_parse_output_picks_result_lines_out_of_deploy_noise():
         "R\tc2\tfault:11\t0x0000000000000000\t-\n"
         "garbage line\n# done ran=2\n"
     )
-    assert out.done and out.ran == 2
+    assert out.done
+    assert out.ran == 2
     assert out.results["c1"] == ["ok", "0x0000000000000001", "-", "a0=aa"]
     assert out.results["c2"][0] == "fault:11"
 
 
 def test_parse_output_without_done_line_marks_the_run_incomplete():
     out = ro.parse_output("R\tc1\tok\t0x0\t-\n")
-    assert not out.done and out.ran is None
+    assert not out.done
+    assert out.ran is None
 
 
 def test_golden_round_trip_and_missing_case_marker():
@@ -71,11 +74,11 @@ def test_golden_round_trip_and_missing_case_marker():
     text = ro.build_golden("x.cases.tsv", cases, output, "2026-10-08")
     assert text.startswith(ro.GOLDEN_MAGIC)
     rows = {r["id"]: r for r in ro.parse_golden(text)}
-    assert rows["a"]["status"] == "ok" and rows["a"]["ret"] == "0x0000000000000005"
+    assert rows["a"]["status"] == "ok"
+    assert rows["a"]["ret"] == "0x0000000000000005"
     assert rows["a"]["buffers"] == ["a0=00"]
-    assert (
-        rows["b"]["status"] == "missing"
-    )  # a case the payload never reached is visible, not dropped
+    # a case the payload never reached is visible, not dropped
+    assert rows["b"]["status"] == "missing"
     assert rows["b"]["expect"] == "ret"
 
 
@@ -126,7 +129,8 @@ def test_scrub_is_idempotent_and_keeps_headers():
     )
     once = ro.scrub_golden_text(text)
     assert once.splitlines()[0] == "# header"
-    assert "a0=volatile" in once and "0x7ffd1234" not in once
+    assert "a0=volatile" in once
+    assert "0x7ffd1234" not in once
     assert ro.scrub_golden_text(once) == once
 
 
@@ -135,12 +139,56 @@ def test_short_golden_line_is_an_error():
         ro.parse_golden("a\tb\tc\n")
 
 
-def test_run_on_console_rejects_a_directory_that_is_not_an_sdk(tmp_path):
-    with pytest.raises(SystemExit, match="not an installed ps5-payload-sdk"):
-        ro.run_on_console("", str(tmp_path), "host", 9021, 5)
+# --- argument and path validation ---------------------------------------------------------------
 
 
-# The committed data. These are the checks that stop a cases file and its measurement drifting apart.
+@pytest.mark.parametrize(
+    "host, sdk",
+    [
+        ("console; ls x", "/opt/ps5-payload-sdk"),
+        ("console name", "/opt/ps5-payload-sdk"),
+        ("192.168.0.2", "/opt/ps5 payload sdk"),
+        ("192.168.0.2", "$(whoami)"),
+        ("192.168.0.2", "/opt/sdk;ls"),
+    ],
+)
+def test_unsafe_host_or_sdk_is_rejected_before_anything_runs(host, sdk):
+    with pytest.raises(SystemExit, match="only"):
+        ro.run_on_console("", sdk, host, 9021, 5)
+
+
+def test_plain_host_and_sdk_are_accepted():
+    ro.check_connection_args("192.168.0.2", "/opt/ps5-payload-sdk")
+    ro.check_connection_args("my-console.local", "/mnt/c/dev/ps5/ps5-payload-sdk")
+    ro.check_connection_args("fe80::1", "relative/sdk")
+
+
+def test_a_failed_build_is_reported_with_an_sdk_hint(monkeypatch):
+    class Failed:
+        returncode = 2
+        stdout = ""
+        stderr = "Makefile:9: toolchain/prospero.mk: No such file or directory"
+
+    monkeypatch.setattr(ro.subprocess, "run", lambda *args, **kwargs: Failed())
+    with pytest.raises(SystemExit, match="installed ps5-payload-sdk"):
+        ro.run_on_console("", "/opt/not-an-sdk", "192.168.0.2", 9021, 5)
+
+
+def test_family_paths_stay_inside_the_data_directory():
+    cases, golden = ro.family_paths("rtc")
+    base = ro.DATA_DIR.resolve()
+    assert cases == base / "rtc.cases.tsv"
+    assert golden == base / "rtc.golden.tsv"
+
+
+@pytest.mark.parametrize("family", ["../x", "a/b", "a\\b", "a.b", "", "rtc\n", "..", "x y"])
+def test_a_family_that_is_not_a_bare_name_is_rejected(family):
+    with pytest.raises(ValueError, match="bad family name"):
+        ro.family_paths(family)
+
+
+# --- the committed data -------------------------------------------------------------------------
+# These are the checks that stop a cases file and its measurement drifting apart.
 CASES_FILES = sorted(DATA.glob("*.cases.tsv"))
 
 

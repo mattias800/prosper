@@ -289,6 +289,22 @@ static void report(const char *id, const char *status, uint64_t ret, const char 
 
 static int g_ran;
 
+/* Free the buffers a case allocated. */
+static void release_args(struct arg *args) {
+  for (int i = 0; i < MAX_ARGS; i++) {
+    free(args[i].buf);
+    args[i].buf = NULL;
+    args[i].len = 0;
+  }
+}
+
+/* A finished case with a result slot keeps its buffers (a later use:/ref: reads them; main frees them at
+ * the end). Without a slot (the table is full) nothing can refer to them, so free them now. */
+static void finish_case(struct result *res, struct arg *args) {
+  if (res) g_nres++;
+  else release_args(args);
+}
+
 static void run_case(char *line) {
   char *f[5] = {0, 0, 0, 0, 0};
   int nf = 0;
@@ -322,12 +338,14 @@ static void run_case(char *line) {
     while (p && *p) {
       if (nargs >= MAX_ARGS) {
         report(id, "badspec", 0, NULL, args, 0);
+        release_args(args);
         return;
       }
       char *comma = strchr(p, ',');
       if (comma) *comma = 0;
       if (parse_arg(p, &args[nargs])) {
         report(id, "badspec", 0, NULL, args, nargs);
+        release_args(args);
         return;
       }
       nargs++;
@@ -338,6 +356,7 @@ static void run_case(char *line) {
   for (int i = 0; i < nargs; i++)
     if (args[i].kind == K_OUTPTR && (args[i].ref >= nargs || !args[args[i].ref].buf)) {
       report(id, "badspec", 0, NULL, args, nargs);
+      release_args(args);
       return;
     }
 
@@ -349,6 +368,7 @@ static void run_case(char *line) {
     unsigned long v = strtoul(ro + 7, &end, 10);
     if (end == ro + 7 || (*end != '\0' && *end != ',') || v >= (unsigned long)nargs || !args[v].buf) {
       report(id, "badspec", 0, NULL, args, nargs);
+      release_args(args);
       return;
     }
     retoff = (int)v;
@@ -357,13 +377,13 @@ static void run_case(char *line) {
   void *h = handle_for(lib);
   if (!h) {
     report(id, "nolib", 0, NULL, args, nargs);
-    if (res) g_nres++;
+    finish_case(res, args);
     return;
   }
   void *sym = dlsym(h, func);
   if (!sym) {
     report(id, "nofunc", 0, NULL, args, nargs);
-    if (res) g_nres++;
+    finish_case(res, args);
     return;
   }
 
@@ -391,7 +411,7 @@ static void run_case(char *line) {
     else strcpy(retn, "ptr:foreign");
   }
   report(id, status, ret, retn, args, nargs);
-  if (res) g_nres++;
+  finish_case(res, args);
   g_ran++;
 }
 
@@ -421,6 +441,7 @@ int main(void) {
     if (line[0] == 0 || line[0] == '#') continue;
     run_case(line);
   }
+  for (int i = 0; i < g_nres; i++) release_args(g_results[i].args);
   printf("# done ran=%d\n", g_ran);
   fflush(stdout);
   return 0;

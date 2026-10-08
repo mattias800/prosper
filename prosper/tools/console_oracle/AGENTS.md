@@ -33,7 +33,8 @@ HLE the usual way (disassembly, captures, a normal test) and leave the case for 
 
 1. Add a line to a `<family>.cases.tsv` (`id`, `lib`, `func`, `args`, optional `expect`).
 2. A person with a console re-measures:
-   `python3 prosper/tools/console_oracle/run_oracle.py --cases <file> --host <console> --sdk <sdk>`.
+   `python3 prosper/tools/console_oracle/run_oracle.py --family <name> --host <console> --sdk <sdk>`.
+   The family is a bare name: the tool only ever reads and writes `tests/data/console_oracle/`.
 3. Run `test_console_oracle_replay`. A mismatch is either a prosper defect (fix it, or list it in
    `known_gaps.tsv` with a reason) or a case that measures something volatile (give it `expect=ret`
    or `none`; the driver then stores a placeholder instead of the volatile bytes).
