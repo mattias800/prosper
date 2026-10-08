@@ -25,6 +25,7 @@
 #include "gpu/present/videoout_present.hpp"
 
 #include "gpu/capture/capture_compute_policy.hpp"
+#include "gpu/capture/capture_source_gate.hpp"   // #3807 replay placeholders
 
 #include <algorithm>
 #include <atomic>
@@ -376,6 +377,18 @@ public:
                             "buffer descriptor-table entry blob offset exceeds its logical address"))
                         return false;
                 }
+                dst->resources.push_back(std::move(r));
+                continue;
+            }
+            if (x.source_unavailable) {
+                // The live renderer bound its all-zero fallback and read no guest bytes (#3807).
+                // Publish exactly that: no backing, and a mark the draw path's source gate honours
+                // whatever this process has mapped at the address.
+                if (!valid_source_unavailable_record(x)) {
+                    error = "invalid unavailable-source placeholder in replay";
+                    return false;
+                }
+                r.replay_source_unavailable = true;
                 dst->resources.push_back(std::move(r));
                 continue;
             }
@@ -1207,6 +1220,9 @@ bool materialize_gpu_capture_observation(const GpuCaptureFile& c,
 }
 
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader) { g_rtt_seed_reader = std::move(reader); }
+void set_gpu_capture_buffer_source_probe(CaptureBufferSourceProbe probe) {
+    g_buffer_source_probe = std::move(probe);
+}
 bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error) {
     error.clear();
     if (!g_rtt_seed_reader) { error = "live renderer has no RTT seed reader"; return false; }

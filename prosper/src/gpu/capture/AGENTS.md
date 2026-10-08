@@ -23,6 +23,10 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
   and blob-size helpers, and the validators. Internal to this folder; not a public header.
 - `gpu_capture_bundle` — bundle format and manifest.
 - `capture_compute_policy` — the policy governing compute capture.
+- `capture_source_gate` — which draw buffers are recorded as placeholders (#3807): the live
+  renderer's source gate found nothing mapped, bound zeros, and the capture says exactly that
+  instead of owning the declared range. The probe is the renderer's own gate, registered by the
+  frontend; with none registered nothing is ever a placeholder.
 - `writer_provenance` — which pass wrote a given range, so a replay can attribute a pixel.
 
 This is the highest-leverage debugging path in the project: press **F9** in `prosper-app` (or use the
