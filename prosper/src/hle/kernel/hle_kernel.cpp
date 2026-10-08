@@ -431,6 +431,14 @@ namespace {
         return pt_static_sentinel(cur) ? nullptr : cur;
     }
 
+    // True when the slot holds the destroyed sentinel, i.e. the object was destroyed through prosper
+    // and not re-initialised. A NULL slot is deliberately NOT destroyed: a never-initialised object
+    // is a different state and keeps answering success.
+    inline bool pt_slot_destroyed(uint64_t slot_addr) {
+        if (!slot_addr) return false;
+        return pt_destroyed_sentinel(__atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE));
+    }
+
     inline void pt_report_destroyed(const char* what) {
         static std::atomic<unsigned> seen{0};
         if (seen.fetch_add(1) < 16)
@@ -824,6 +832,11 @@ uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     // Known limit: a recursive mutex the CALLING thread holds cannot be told from a free one this way
     // (the trylock succeeds), so that case is still destroyed. CONFIDENCE: HIGH for the held normal
     // mutex (measured); the recursive case is unmeasured.
+    // Destroying a mutex that was already destroyed is EINVAL on a console (measured: pm_destroy_again
+    // 22 bare, errcheck-style double destroy 0x80020016). Mutex kind only: the C11 spelling is a void
+    // wrapper whose result the guest never sees. Bare errno here, encoded by the Sony alias.
+    if (kind == SyncObjectKind::Mutex && pt_slot_destroyed(slot_addr))
+        return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EInval);
     if (kind == SyncObjectKind::Mutex) {
         if (auto* probe = (pthread_mutex_t*)pt_peek_slot(slot_addr)) {
             const int rc = pthread_mutex_trylock(probe);
@@ -1201,6 +1214,9 @@ uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     // Checked BEFORE pt_claim_slot, because claiming retires the slot -- answering EBUSY after
     // clearing it would be the worst of both: the guest keeps a handle it is told is still live,
     // pointing at storage prosper has already quarantined.
+    // A second destroy of the same condvar is EINVAL on a console (measured, cond_destroy_again).
+    if (kind == SyncObjectKind::Cond && pt_slot_destroyed(slot_addr))
+        return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EInval);
     if (auto* existing = (pthread_cond_t*)pt_peek_slot(slot_addr)) {
         if (guest_cond_has_waiters(existing))
             // Bare errno here; each spelling encodes it its own way at its own entry point.
@@ -3619,6 +3635,8 @@ HLE(k_barrier_destroy) {
     // peek and the claim to be one atomic step -- possible, since both are lock-free atomics rather
     // than lock-holders, but not cheap. What the check buys is the case the guest actually hits:
     // threads ALREADY parked when the destroy arrives. Raised in review of this PR by Marlow.
+    // A second destroy of the same barrier is EINVAL on a console (measured, barrier_destroy_again).
+    if (pt_slot_destroyed(a0)) return prosper::hle::kSceKernelErrorEINVAL;
     if (auto* existing = (pthread_barrier_t*)pt_peek_slot(a0))
         if (guest_barrier_has_waiters(existing)) return prosper::hle::kSceKernelErrorEBUSY;
     if (void* b = pt_claim_slot(a0)) retire_sync_object(b, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); });   // #2176

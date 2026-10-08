@@ -60,3 +60,24 @@ errcheck_unlock	libkernel.sprx	scePthreadMutexUnlock	ref:errcheck_init.0
 errcheck_unlock_again	libkernel.sprx	scePthreadMutexUnlock	ref:errcheck_init.0
 errcheck_destroy	libkernel.sprx	scePthreadMutexDestroy	ref:errcheck_init.0
 errcheck_attr_destroy	libkernel.sprx	scePthreadMutexattrDestroy	ref:errcheck_attr_init.0
+# Second semaphore (initial 2, maximum 3): tells the sum rule (count + n > max) from n > max alone.
+sema2_create	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema2,i:0,i:2,i:3,null	ret
+sema2_signal_two_over_by_sum	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:2
+sema2_signal_one_reaches_max	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:1
+sema2_signal_one_past_max	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:1
+sema2_delete	libkernel.sprx	sceKernelDeleteSema	use:sema2_create.0.0.8
+# POSIX spelling of mutex destroy on a held mutex: the encoding split (bare errno vs Sony-encoded).
+pm_init	libkernel.sprx	pthread_mutex_init	out:8,null	ret
+pm_lock	libkernel.sprx	pthread_mutex_lock	ref:pm_init.0
+pm_destroy_while_held	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0
+pm_unlock	libkernel.sprx	pthread_mutex_unlock	ref:pm_init.0
+pm_destroy	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0
+pm_destroy_again	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0
+# Condition variable and barrier lifecycle without a waiter (a waiter needs a second thread).
+cond_init	libkernel.sprx	scePthreadCondInit	out:8,null,s:oracle_cond	ret
+cond_destroy	libkernel.sprx	scePthreadCondDestroy	ref:cond_init.0
+cond_destroy_again	libkernel.sprx	scePthreadCondDestroy	ref:cond_init.0
+barrier_init	libkernel.sprx	scePthreadBarrierInit	out:8,null,i:1,s:oracle_barrier	ret
+barrier_destroy	libkernel.sprx	scePthreadBarrierDestroy	ref:barrier_init.0
+barrier_destroy_again	libkernel.sprx	scePthreadBarrierDestroy	ref:barrier_init.0
+barrier_init_count_zero	libkernel.sprx	scePthreadBarrierInit	out:8,null,i:0,s:oracle_barrier_bad
