@@ -5,6 +5,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/capture/capture_source_gate.hpp"   // #3807 v74 placeholder marks
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -1316,8 +1317,9 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(launch.db_shader_control_available ? 1u : 0u);
         w.u32(launch.db_shader_control);
     }
-    // v72: the merged-NGG description each realized draw carries, or none. Written only into a
-    // capture that has one (gpu_capture_version_for), which is then a v72 file.
+    // v72: the merged-NGG description each realized draw carries, or none. Written whenever the
+    // file's version reaches v72 (gpu_capture_version_for): a draw carries one, or a later tail is
+    // needed. Tails follow in version order: v72, v73, v74.
     if (gpu_capture_version_for(c) >= 72u) {
         w.u32(static_cast<uint32_t>(c.draws.size()));
         for (const auto& draw : c.draws)
@@ -1326,6 +1328,44 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 return false;
             }
     }
+    // v73: each draw's depth-bounds test. Written whenever the file's version reaches v73: a draw
+    // enables the test, or the v74 tail below is needed.
+    if (gpu_capture_version_for(c) >= kVersionWithDepthBounds) {
+        w.u32(static_cast<uint32_t>(c.draws.size()));
+        for (const auto& draw : c.draws) {
+            w.u8(draw.ps.depth_bounds_enable ? 1u : 0u);
+            w.f32(draw.ps.depth_bounds_min);
+            w.f32(draw.ps.depth_bounds_max);
+        }
+    }
+    // v74 (#3807): one source-availability mark per draw-table resource, vrt then prt per draw.
+    // Written only into a capture that carries a placeholder, after the v73 tail. A compute
+    // resource is never one: the live compute backend does not consult the draw-buffer gate.
+    if (gpu_capture_version_for(c) >= kVersionWithUnavailableSource) {
+        size_t marks = 0;
+        for (const auto& draw : c.draws)
+            marks += draw.vrt.resources.size() + draw.prt.resources.size();
+        if (marks > std::numeric_limits<uint32_t>::max()) {
+            error = "too many unavailable-source marks";
+            return false;
+        }
+        w.u32(static_cast<uint32_t>(marks));
+        for (const auto& draw : c.draws)
+            for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
+                for (const auto& resource : table->resources) {
+                    if (resource.source_unavailable && !valid_source_unavailable_record(resource)) {
+                        error = "invalid unavailable-source placeholder";
+                        return false;
+                    }
+                    w.u8(resource.source_unavailable ? 1u : 0u);
+                }
+    }
+    for (const auto& compute : c.computes)
+        for (const auto& resource : compute.resources.resources)
+            if (resource.source_unavailable) {
+                error = "compute resource cannot be an unavailable-source placeholder";
+                return false;
+            }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

@@ -2922,6 +2922,26 @@ struct RegState {
     // statically observed SGPR and may load a zero placeholder where no scalar lifetime reaches the
     // block. Keep that distinction explicit so a narrow prefix proof cannot weaken either route.
     bool scalar_presence_has_no_placeholders = true;
+    // The per-register form of that fact (#4706). An SGPR is here when its current value may be
+    // the structured emitter's fabricated zero on some path: an if-merge or loop-header phi took
+    // `sget()`'s `uconst(0)` from an edge where the register had no value, or the value was computed
+    // from such a register (including through SCC, a destination's own old bits, or a source
+    // that was never written). A write whose every input is definite clears the mark.
+    // `lane_slot_merge_placeholder` carries the same mark through a v_writelane/v_readlane spill.
+    // In the CFG dispatcher, `load_state` drops every SGPR word the Wave64 MUST analysis cannot
+    // prove, which covers SGPRs; spill slots carry no such fact, so it marks every reloaded data
+    // slot instead. Consumers that turn scalar DATA into lane bits consult the marks (mask()).
+    std::set<int> sreg_merge_placeholder;
+    std::set<std::pair<int, int>> lane_slot_merge_placeholder;
+    // Same propagation, second fact: the SGPR's bits came from MEMORY (an SMEM load, or scalar ALU
+    // over one). Such a word is not a ballot of this wave, so projecting it onto host lanes would
+    // select different pixels than the PS5 does whenever the pattern is not uniform.
+    std::set<int> sreg_memory_pattern;
+    std::set<std::pair<int, int>> lane_slot_memory_pattern;
+    // SCC computed from a marked word (or poisoned, or a loop/merge phi of either): a later
+    // s_cselect/s_cmov/s_addc/s_subb carries the mark into its destination even with clean
+    // explicit sources.
+    bool scc_merge_placeholder = false;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
@@ -3146,9 +3166,151 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // that overwrites VCC_LO while leaving no scalar SSA value behind, since operand_bits consults
 // `rs.sreg` first. Tracked in #2804. Wave32 B32 aliases are likewise left to
 // record_scalar_write's own (narrower) rules.
+// ---------------------------------------------------------------------------------------------
+// Merge-placeholder and memory-pattern marks (#4706): which scalar words may hold the structured
+// emitter's fabricated zero, or bits loaded from memory. See RegState::sreg_merge_placeholder.
+// Not tracked, and documented at scalar_pair_lane_bit(): a value that crosses a VGPR
+// (v_readfirstlane, a dynamic-lane v_readlane), and memory marks on SGPRs across a CFG-dispatcher
+// block edge (load_state starts every case from a fresh RegState; its MUST filter covers the SGPR
+// merge-placeholder half, and it marks every reloaded spill slot itself).
+
+// Whether a DATA read of scalar register `r` may see a fabricated word: marked, or (for an
+// ordinary SGPR) absent from `sreg` while no mask covers it, since `operand_bits` reads absence as
+// `uconst(0)`. A Bool-domain mask is a real value; its ballot words are materialized where a data
+// read needs them. An untracked VCC half (106/107) is the VCC Bool, materialized exactly or
+// refused, so it counts only when marked; so do ttmp0-15 (108-123) and M0 (124), whose untracked
+// data reads `operand_bits` refuses (#4725 review: both laundered the mark while unscanned).
+inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
+    if (r < 0 || r > 124) return false;
+    if (rs.sreg_merge_placeholder.contains(r)) return true;
+    if (r > 105 || rs.sreg.contains(r)) return false;
+    return !rs.sreg_bool.contains(r) &&
+           !(r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
+}
+// Whether a merge EDGE's word for `r` is fabricated. A merge reads an absent register through
+// `sget()`, which supplies `uconst(0)` for any absent word, so absence there counts for the special
+// data registers 106-124 (VCC, ttmp, M0) too.
+inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
+    if (r >= 106 && r <= 124 && !rs.sreg.contains(r)) return true;
+    return sreg_word_may_be_fabricated(rs, r);
+}
+
+// The scalar instructions that read SCC as a value.
+inline bool scalar_reads_scc(const Rdna2Inst& in) {
+    return (in.fmt == Rdna2Format::SOP2 &&
+            (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)) ||
+           (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||
+           (in.fmt == Rdna2Format::SOPK && in.opcode == 0x02);
+}
+
+// What one instruction's inputs carry, computed BEFORE emission (emission changes `sreg`, so a
+// read-modify-write would otherwise see its own result).
+struct ScalarSourceMarks {
+    bool placeholder = false;   // some input word may be the fabricated zero (or derived from it)
+    bool memory = false;   // some input word came from memory
+};
+
+// scalar_source_marks() lives in rdna2_cfg_support.hpp, beside the width inventories it reads.
+
+// Set a merged register's marks from its two incoming edges. `rs` is one edge; the caller supplies
+// what the other edge held. The memory mark is a union.
+inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabricated,
+                                   bool other_edge_memory) {
+    if (either_edge_fabricated)
+        rs.sreg_merge_placeholder.insert(r);
+    else
+        rs.sreg_merge_placeholder.erase(r);
+    if (other_edge_memory) rs.sreg_memory_pattern.insert(r);
+}
+
+// One structured-merge edge's marks, captured before the other edge is emitted.
+struct MergeEdgeMarks {
+    std::set<int> fabricated;   // registers this edge may hold as a fabricated zero
+    std::set<int> memory;   // this edge's memory-pattern marks
+    bool scc = false;   // this edge's SCC is marked or poisoned (merges as bfalse)
+    // This edge's v_writelane spill-slot marks. A merge keeps only one edge's slot map, so a slot
+    // the OTHER edge left marked would otherwise come out clean (#4725 review).
+    std::set<std::pair<int, int>> slot_fabricated, slot_memory;
+};
+template <class Registers>
+MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) {
+    MergeEdgeMarks marks;
+    for (int r : registers)
+        if (merge_edge_word_fabricated(rs, r)) marks.fabricated.insert(r);
+    marks.memory = rs.sreg_memory_pattern;
+    marks.scc = rs.scc_merge_placeholder || !rs.scc;
+    marks.slot_fabricated = rs.lane_slot_merge_placeholder;
+    marks.slot_memory = rs.lane_slot_memory_pattern;
+    return marks;
+}
+// Join register `r` at a two-edge merge: `rs` is one edge, `other` the captured other edge.
+inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
+    join_merge_placeholder(rs, r, other.fabricated.contains(r) || merge_edge_word_fabricated(rs, r),
+                           other.memory.contains(r));
+}
+// Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
+// fabricated too; a slot marked on either edge is marked after it).
+inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
+    rs.scc_merge_placeholder = rs.scc_merge_placeholder || !rs.scc || other.scc;
+    rs.lane_slot_merge_placeholder.insert(other.slot_fabricated.begin(),
+                                          other.slot_fabricated.end());
+    rs.lane_slot_memory_pattern.insert(other.slot_memory.begin(), other.slot_memory.end());
+}
+// Every loop-carried SGPR, and SCC, is marked at its loop header: the phi takes the preheader value
+// (the fabricated zero when absent) and the back edge, whose marks are unknown until the body has
+// been emitted. A write from definite inputs clears the mark.
+// A spill slot the loop writes (a constant-lane v_writelane in [lo, hi)) is loop-carried the same
+// way and is marked at the header too.
+template <class Registers>
+void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
+                       uint32_t lo, uint32_t hi) {
+    for (int r : carried) join_merge_placeholder(rs, r, true, false);
+    rs.scc_merge_placeholder = true;
+    for (const Rdna2Inst& in : ins)
+        if (in.pc >= lo && in.pc < hi && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
+            in.src[1].kind == OperandKind::InlineInt)
+            rs.lane_slot_merge_placeholder.insert({in.dst.value, in.src[1].value});
+}
+// The loop's marks at the END OF ITS CHECK BLOCK, where the exit leaves: a condition-region
+// register exits with the value it had there, so it must exit with the mark it had there too, not
+// with whatever the body's later writes left (#4711 review, finding 1).
+struct LoopCheckMarks {
+    std::set<int> fabricated, memory;
+    std::set<std::pair<int, int>> slot_fabricated, slot_memory;
+};
+inline LoopCheckMarks loop_check_marks(const RegState& rs) {
+    return {rs.sreg_merge_placeholder, rs.sreg_memory_pattern, rs.lane_slot_merge_placeholder,
+            rs.lane_slot_memory_pattern};
+}
+// The spill slots at a loop exit: `rs` holds the body end's slot map, so union in the check
+// block's marks (a slot marked on either is marked after the loop).
+inline void mark_loop_exit_slots(RegState& rs, const LoopCheckMarks& check) {
+    rs.lane_slot_merge_placeholder.insert(check.slot_fabricated.begin(),
+                                          check.slot_fabricated.end());
+    rs.lane_slot_memory_pattern.insert(check.slot_memory.begin(), check.slot_memory.end());
+}
+// At the loop exit: a body-only register leaves as the (marked) header phi; a condition-region
+// register leaves with its check-block marks. `body_edge` is set when the exit value also merges a
+// direct break from the body, whose marks are `rs`'s current ones. SCC leaves as the header phi.
+inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
+                           const LoopCheckMarks& check, bool body_edge) {
+    const bool fabricated = !written_in_condition || check.fabricated.contains(r) ||
+                            (body_edge && rs.sreg_merge_placeholder.contains(r));
+    const bool memory =
+        check.memory.contains(r) || (body_edge && rs.sreg_memory_pattern.contains(r));
+    join_merge_placeholder(rs, r, fabricated, false);
+    if (memory)
+        rs.sreg_memory_pattern.insert(r);
+    else
+        rs.sreg_memory_pattern.erase(r);
+    rs.scc_merge_placeholder = true;
+}
+
 struct SavedB64MaskSnapshot {
     // (root, Bool id). At most a few entries: only the roots this one instruction can overwrite.
     std::vector<std::pair<int, uint32_t>> entries;
+    // The instruction's input marks, taken before emission with the masks (#4706).
+    ScalarSourceMarks source_marks;
 };
 
 inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& before, int reg,
@@ -3270,22 +3432,7 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
                               vop3b_fresh_carry_output(in)) ? 1u : 2u);
 }
 
-inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Inst& in) {
-    SavedB64MaskSnapshot snapshot;
-    // The widest write form is deliberate: this set only FILTERS what record_scalar_write may
-    // expire, and that function applies its own exact `effective_width`, so an extra candidate root
-    // here can never widen the erase set.
-    for_each_scalar_write(in, [&](int base, uint32_t width) {
-        for (uint32_t word = 0; word < width; ++word) {
-            const int root = base + static_cast<int>(word);
-            if (root > 105 || rs.sreg_bool_b32.contains(root)) continue;
-            const auto mask = rs.sreg_bool.find(root);
-            if (mask != rs.sreg_bool.end())
-                snapshot.entries.emplace_back(root, mask->second);
-        }
-    }, /*wave32_one_word_masks*/false);
-    return snapshot;
-}
+// snapshot_saved_b64_masks() lives in rdna2_cfg_support.hpp (it reads scalar_source_marks()).
 
 inline bool wqm_has_numeric_destination(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x09 || in.opcode == 0x0a) &&
@@ -3442,9 +3589,49 @@ inline bool join_entry_m0(RegState& rs, int r, bool other_edge_token) {
     return true;
 }
 
+// Apply one emitted instruction's input marks to what it wrote (#4706): every destination word, a
+// v_writelane spill slot, and SCC when a scalar instruction may have written it.
+inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
+                                        const ScalarSourceMarks& marks) {
+    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
+        if (in.dst.kind != OperandKind::VGPR || in.src[1].kind != OperandKind::InlineInt) return;
+        const std::pair<int, int> slot{in.dst.value, in.src[1].value};
+        if (marks.placeholder)
+            rs.lane_slot_merge_placeholder.insert(slot);
+        else
+            rs.lane_slot_merge_placeholder.erase(slot);
+        if (marks.memory)
+            rs.lane_slot_memory_pattern.insert(slot);
+        else
+            rs.lane_slot_memory_pattern.erase(slot);
+        return;
+    }
+    for_each_scalar_write(in, [&](int base, uint32_t width) {
+        for (int r = base; r < base + static_cast<int>(width); ++r) {
+            if (marks.placeholder)
+                rs.sreg_merge_placeholder.insert(r);
+            else
+                rs.sreg_merge_placeholder.erase(r);
+            if (marks.memory)
+                rs.sreg_memory_pattern.insert(r);
+            else
+                rs.sreg_memory_pattern.erase(r);
+        }
+    });
+    // SCC: a marked input marks it. Only a compare is certain to rewrite it, so only a compare from
+    // definite inputs clears it (other scalar writers may leave it, which keeps the mark: safe).
+    const bool scalar_alu = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                            in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC;
+    if (scalar_alu && marks.placeholder)
+        rs.scc_merge_placeholder = true;
+    else if (in.fmt == Rdna2Format::SOPC)
+        rs.scc_merge_placeholder = false;
+}
+
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          bool allow_compute_scalar_vcc_bridge,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
+    propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks);
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
     // keeping either would let a later descriptor use observe the pre-overwrite value.

@@ -1629,7 +1629,14 @@ bool emit_cfg_state_machine(
     // -- "over-rejects rather than fabricates ... left as the safe direction" -- and without a KILL
     // this dispatcher path now agrees with the emitter instead of being more permissive than it.
     // A precise KILL wants a value-publishing predicate shared with `emit_alu`, so that the two
-    // cannot drift; that is follow-up work, not a thing to approximate here.
+    // cannot drift. For Wave64 that predicate is the MUST set `wave64_scalar_word_in`, applied in
+    // `load_state` (#4706); Wave32 and the terminal call keep this MAY set unchanged. Where a token
+    // STARTS agrees too: the analysis's `m0_token_save` needs `!scalar_words.contains(124)`,
+    // emit_alu's needs `!rs.sreg.contains(124)`, and at each block entry `load_state` makes
+    // `state.sreg` (words <= 124) equal to the MUST set. Counting a word as data where the emitter
+    // has none would reload a fabricated zero for ANY register, an invariant the dispatcher already
+    // rests on; the converse starts a token only in the analysis, so the KILL does not fire and the
+    // read rejects (the safe side).
     //
     // BOTH BOUNDS ARE SCOPED TO ONE DISPATCHER REGION, and `emit_body` runs several: a
     // barrier-phased compute kernel calls this function once per phase with the SAME `RegState&`
@@ -3579,7 +3586,17 @@ bool emit_cfg_state_machine(
             entry_block != UINT32_MAX && entry_m0_reachable[entry_block];
         const std::set<int>& entry_m0_here =
             narrow ? entry_m0_in[entry_block] : entry_m0_may_hold;
+        // The Wave64 MUST scalar-word set is this MAY set's KILL (#4706): a word in it had a value-
+        // publishing write after the last save on every path here (a save of a value-less M0 drops
+        // the word from it), the same tag the filter below trusts for every reloaded scalar. Kena's
+        // compute `0x5008dc0000` saves M0 into s14 at pc85, reuses s14 as a loop counter, and was
+        // refused at pc491 without it.
+        const std::set<int>* m0_kill_words = nullptr;
+        if (narrow && (b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+            wave64_b64_reachable[entry_block])
+            m0_kill_words = &wave64_scalar_word_in[entry_block];
         for (int reg : entry_m0_here) {
+            if (m0_kill_words && m0_kill_words->contains(reg)) continue;
             state.sreg.erase(reg);
             state.sreg_entry_m0.insert(reg);
         }
@@ -3649,10 +3666,14 @@ bool emit_cfg_state_machine(
             return found != entry_slots->end() &&
                    (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
         };
+        // A data slot carries no definite-write fact across a case edge, and one never written on
+        // some path reloads the prologue's zero: mark every reloaded slot (#4706, #4725 review).
         for (const auto& kv : lv)
-            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true)))
+            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
+                state.lane_slot_merge_placeholder.insert(kv.first);
+            }
         for (const auto& kv : lmv)
             if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
                 state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
@@ -6596,6 +6617,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::set<int> then_entry_m0;
             for (int reg : written_s)
                 if (entry_m0_live(rs, reg)) then_entry_m0.insert(reg);
+            const MergeEdgeMarks then_marks = merge_edge_marks(rs, written_s);   // #4706
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
@@ -6618,12 +6640,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
             for (int reg : written_s) {
                 const uint32_t else_value = sget(reg);
+                join_merge_edge(rs, reg, then_marks);
                 // `rs` is the else edge here; skip the phi entirely when the token decides (#3133).
                 if (!join_entry_m0(rs, reg, then_entry_m0.count(reg) != 0)) continue;
                 if (then_s[reg] != else_value)
                     rs.sreg[reg] = b.emit_phi_2way(
                         b.t_u32, then_s[reg], then_block, else_value, else_block);
             }
+            join_merge_scc_and_slots(rs, then_marks);   // #4706, before SCC becomes the phi
             if (then_scc != rs.scc)
                 // A poisoned (0) input degrades to bfalse across the merge — no invalid SPIR-V and
                 // no stricter rejection than the pre-poison behavior; straight-line consumers of a
@@ -6713,6 +6737,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+        mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -6739,6 +6764,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
         for (int r : conds) conds_val[r] = sget(r);
+        const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
         const uint32_t cond_exec = rs.exec;
         const bool cond_exec_narrowed = rs.exec_narrowed;
         // VCC as the exit sees it (#4680). The merge's ONLY predecessor is this check block, so its
@@ -6788,11 +6814,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (auto& pr : phis) {
             if (pr.dom == 0)
                 rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
-            else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+            else if (pr.dom == 1) {
+                mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks, false);
+                rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+            }
             // SCC takes the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
             // not a real codegen pattern (flags are transient, consumed by their branch), so the A-class
             // exit-iteration refinement is intentionally omitted for it.
-            else if (pr.dom == 2) rs.scc = pr.phi;
+            else if (pr.dom == 2)
+                rs.scc = pr.phi;
             else if (pr.dom == 3)
                 rs.vcc = cond_vcc;
             else                  rs.exec = cond_exec;
@@ -6801,6 +6831,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // body scratch its header phi carries; leave it untracked so a data read takes the exact
         // ballot or refuses loudly (#4680, the counted-loop form of #4526).
         cond_vcc_halves.finish_exit(rs);
+        mark_loop_exit_slots(rs, check_marks);   // #4706
         if (carry_vertex_exec) rs.exec_narrowed = cond_exec_narrowed;
         // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
@@ -7343,6 +7374,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+            mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -7379,6 +7411,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::unordered_map<int, uint32_t> condv_val, conds_val;
             for (int r : condv) condv_val[r] = vget(r);
             for (int r : conds) conds_val[r] = sget(r);
+            const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
             LoopVccCarry vcc_carry(rs);   // #4508: a body may recycle VCC as scalar scratch
@@ -7462,13 +7495,18 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                       chk_value, chk_end, body_value, body_end)
                     : chk_value;
                 if (pr.dom == 0)      rs.vreg[pr.reg] = merged;
-                else if (pr.dom == 1) rs.sreg[pr.reg] = merged;
-                else if (pr.dom == 2) rs.scc = merged;
+                else if (pr.dom == 1) {
+                    mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks,
+                                   L.direct_exec_breaks || L.direct_wave_breaks);   // #4706
+                    rs.sreg[pr.reg] = merged;
+                } else if (pr.dom == 2)
+                    rs.scc = merged;
                 else if (pr.dom == 3) rs.vcc = merged;
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
             vcc_carry.finish_exit(rs);
+            mark_loop_exit_slots(rs, check_marks);   // #4706
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
@@ -7556,6 +7594,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> pre_entry_m0;
                     for (int r : ifs)
                         if (entry_m0_live(rs, r)) pre_entry_m0.insert(r);
+                    const MergeEdgeMarks pre_marks = merge_edge_marks(rs, ifs);   // #4706
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
@@ -7597,9 +7636,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
                     for (int r : ifs) {   // `rs` is the taken arm; the skipped edge is `pre_*`
+                        join_merge_edge(rs, r, pre_marks);
                         if (!join_entry_m0(rs, r, pre_entry_m0.count(r) != 0)) continue;   // #3133
                         rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
                     }
+                    join_merge_scc_and_slots(rs, pre_marks);   // #4706
                     if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
@@ -7665,6 +7706,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> then_entry_m0;                 // #3133, the then edge's tokens
                     for (int r : ws)
                         if (entry_m0_live(rs, r)) then_entry_m0.insert(r);
+                    const MergeEdgeMarks then_marks = merge_edge_marks(rs, ws);   // #4706
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
@@ -7680,9 +7722,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     for (int r : wv) { uint32_t ev = vget(r);
                         if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
                     for (int r : ws) { uint32_t es = sget(r);
+                        join_merge_edge(rs, r, then_marks);
                         // `rs` is the else edge here (the then arm's state was rolled back).
                         if (!join_entry_m0(rs, r, then_entry_m0.count(r) != 0)) continue;   // #3133
                         if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
+                    join_merge_scc_and_slots(rs, then_marks);   // #4706
                     if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
                                                  rs.scc ? rs.scc : b.bfalse(), elseEnd);

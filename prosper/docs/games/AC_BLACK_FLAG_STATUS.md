@@ -124,6 +124,52 @@ the red frame (next section). Reasons, from `PROSPER_DBG=1` and `shader_inspect`
 - `cs 0x407ed65200`: `s_cbranch_scc1` at pc 93, control flow the structurizer cannot place.
 - a fragment draw at `0x407edfaf00` is refused by the 64-lane `unproved-vote` contract (host range 32..32).
 
+## Progress 2026-10-07: the corruption starts at the autosave notice, and what is ruled out
+
+Windows, RTX 4070 SUPER, `prosper-app --present-mode immediate`, direct frontend, J presses every 2 s from the
+title (the title needs a Cross press after the logo). The window shows, in order: the Ubisoft logos, the
+intro cinematic (correct, about 7 fps), the logo and the "historical fiction" disclaimer, the **autosave
+notice** ("This game saves data automatically at certain points. Do not switch off the power when this icon
+is displayed."), and from about 180 s a frame that is mostly black with solid white rectangles and a few
+blue/red marks. Frame rate then falls to about 1 flip per second and the picture stops changing.
+
+Measured with a one-off dump of the renderer's front-buffer image on every Nth GPU-published flip (the
+image that is blitted to the window, read back from the persistent target at the flipped VA):
+
+- Every flip from the first to the last is `outcome=published` from a renderer-owned persistent colour target
+  (`1920x1080`, `gpu_valid=1`). The garbage is therefore **in the renderer's own target**, not a present-blit
+  or CPU-fallback artefact. The target is written by a compute dispatch every few submits
+  (`PROSPER_PROVENANCE_ADDR` on the middle scanout buffer: 321 `compute-buffer` writes of 8,847,360 bytes,
+  one `color` write at submit 8).
+- The white rectangles are solid, 104 px tall in a 1280-wide window, with scalloped lower edges; later flips
+  show the same layout fading to a few red dotted lines and one white bar. It reads as a UI skeleton drawn
+  without its textures, not as a mis-tiled frame.
+- At the same stage the log shows 472 `[fragment-draw] refused reason=fragment-draw-producing-owner-unavailable`
+  lines (distinct fragment identities refused by the original-fragment-packet route), 7 fragment programs
+  refused by the 64-lane subgroup contract, 9 refused by the recompiler, 20 compute refusals
+  (`partial-workgroup-barrier`, unresolved MIMG operands, cfg rejects) and `[draw-disposition] dropped=232`
+  of 9,925 draws over a 255 s run.
+- A fast-cleared one-component **R16F** pool surface (`1920x1080`, tile 27, six distinct addresses sampled by
+  program `0x407f7d5500`) was reported `compressed sampled image kind=DCC ... is unsupported` and then sampled
+  as its stale base bytes. `gfx10_dcc_fast_clear_rgba8` accepted only three- and four-component surfaces.
+  It now also materializes one- and two-component clears (the clear colour fills the components that exist,
+  the absent ones read (0,0,0,1)); the `is unsupported` lines are gone and six `[render] DCC fast-clear`
+  lines appear instead. **This did not remove the garbage**: it is a correct fix for a real stale read, and
+  not the cause of the white rectangles.
+
+Ruled out by a switched A/B on the same route (`PROSPER_NO_COMPUTE_RTT_DEST_MIRROR`,
+`PROSPER_NO_COMPUTE_RTT_DEST_CREATE`, `PROSPER_NO_COMPUTE_RTT_MIRROR` all set, 250 s): the garbage appears
+at the same time and in the same proportion (black 74-75%, white 4-5% of the window), so publishing compute
+results into renderer images is not what produces it.
+
+Instrument notes: F9 cannot capture this frame under GPU present (`F9 target was host-presented without known
+producer lineage`: the scanout target's producer is a compute write that carries no lineage), and with
+`PROSPER_APP_GPU_PRESENT=0` the window stays black ("no frames published yet") while F9 writes a correct
+frame at the disclaimer stage, so the CPU path is not a stand-in for what the window shows. Several runs
+ended with process exit code -1 and no final log line, at 41 to 180 s (no fault banner, no `shutting down`
+line); the cause was not established and they are not evidence either way. Stop only your own PID when
+scripting runs, since other sessions may be running `prosper-app` on the same machine.
+
 ## Current frontier
 
 1. **Fixed by #4129 (open): the guest dereferenced a Windows thread handle.** At `eboot+0x161ed91`
@@ -270,6 +316,15 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   but by erasing a real clear, which only moves the error.
 - **"Gating the last-pass present fallback until the first guest flip removes it"** Falsified earlier: the
   first guest flips already carry the red.
+- **"The white 128x128 rectangles are the stale R16F DCC read."** Falsified 2026-10-07 (n=1 per arm, on a
+  box where runs exited with code -1 at 41-180 s for a reason not established): with the one- and
+  two-component fast-clear fix (#4699) the `is unsupported` warnings for those surfaces are replaced
+  by `DCC fast-clear ... comps=1` lines (observed at head #4699 after the gate fix: 2 admissions on the 1920x1080 R16F surfaces, 0 `is unsupported`; the `75abf97ed` run showed six fast-clear lines before the correlation gate, and the gate as first written, at `48c379168`, left them `UNCORRELATED` and unsupported) and the black/white proportions of the corrupted frame are
+  unchanged. The fix is still correct (the surfaces were sampled as stale bytes); it is not the cause.
+- **"Publishing compute results into the renderer's images produces the garbage."** Falsified
+  2026-10-07 (n=1 per arm, same caveat) with the three `PROSPER_NO_COMPUTE_RTT_DEST_*`-style switches
+  off: the same black/white proportions after 250 s. The corruption is already present in guest
+  memory, i.e. in the guest's own compute-composite output, not added by the mirror.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 

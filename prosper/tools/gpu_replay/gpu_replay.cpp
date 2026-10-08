@@ -719,6 +719,19 @@ void print_frame_summary(const prosper::gpu::GpuReplayFrame& replay, size_t shad
         shader_count, replay.failure_diagnostics.size(), replay.raw_shader_versions.size(),
         replay.blobs.size(), replay.rtt_seeds.size(), replay.ds_seeds.size(),
         replay.expected_output_valid ? "yes" : "no", metadata_only ? "omitted" : "present");
+    // #3807: placeholders are part of the frame, not gaps; say how many so a reader does not go
+    // looking for bytes that never existed.
+    size_t unmapped_sources = 0;
+    for (const auto& item : replay.items)
+        for (const auto* table : {item.vrt.get(), item.prt.get()})
+            if (table)
+                for (const auto& resource : table->resources)
+                    unmapped_sources += resource.replay_source_unavailable ? 1u : 0u;
+    if (unmapped_sources)
+        std::fprintf(stderr,
+                     "[gpureplay] %zu draw binding(s) had no mapped source live; replay binds the "
+                     "same all-zero fallback (capture v74 placeholders, #3807)\n",
+                     unmapped_sources);
     const auto history_lower_bound =
         std::find_if(m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
             return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT";
@@ -1398,8 +1411,7 @@ BundleDsIdentity ds_identity(const prosper::gpu::ResolvedPipelineState& ps) {
 }
 
 bool uses_depth_stencil(const prosper::gpu::ResolvedPipelineState& ps) {
-    return ps.depth_test_enable || ps.depth_write_enable || ps.stencil_enable ||
-           ps.depth_clear_enable || ps.stencil_clear_enable;
+    return prosper::gpu::uses_depth_stencil_attachment(ps);
 }
 
 struct BundleDsProgramming {
@@ -3780,7 +3792,10 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(r.gpu_addr),
                         static_cast<unsigned long long>(r.size),
                         static_cast<unsigned long long>(r.host_data ? r.host_data_size : 0),
-                        r.host_data ? "" : "  <- no captured bytes");
+                        r.host_data ? ""
+                        : r.replay_source_unavailable
+                            ? "  <- source unmapped live: all-zero fallback, no bytes by design"
+                            : "  <- no captured bytes");
         }
         if (positional.size() == 1 && !inspect && dump_spec.empty()) return 0;
     }
@@ -3822,6 +3837,15 @@ int main(int argc, char** argv) {
                          "gpu_replay: draw %llu stage %s has no binding %d. Present: %s\n",
                          draw_index, stage.c_str(), binding,
                          present.empty() ? "(none)" : present.c_str());
+            return 2;
+        }
+        if (!found->host_data && found->replay_source_unavailable) {
+            // #3807: not a gap. The live renderer found nothing mapped there and bound zeros.
+            std::fprintf(stderr,
+                         "gpu_replay: draw %llu stage %s binding %d had no mapped source live; the "
+                         "renderer bound its all-zero fallback and the capture recorded that, so "
+                         "there are no bytes to dump\n",
+                         draw_index, stage.c_str(), binding);
             return 2;
         }
         if (!found->host_data) {

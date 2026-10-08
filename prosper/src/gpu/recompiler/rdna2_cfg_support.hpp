@@ -1545,6 +1545,71 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
     }
 }
 
+// The input marks of one instruction (#4706; RegState::sreg_merge_placeholder). Defined here, not
+// in rdna2_to_spirv_internal.hpp, because it reads the two width inventories above; every caller
+// of snapshot_saved_b64_masks() includes this header.
+inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
+    ScalarSourceMarks marks;
+    const auto word = [&](int r) {
+        marks.placeholder = marks.placeholder || sreg_word_may_be_fabricated(rs, r);
+        marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
+    };
+    if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
+        marks.memory = true;
+        return marks;
+    }
+    if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
+        if (in.opcode == 0x360) {   // v_readlane: a constant-lane read of a spill slot
+            if (in.src[1].kind == OperandKind::InlineInt) {
+                const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
+                marks.placeholder = rs.lane_slot_merge_placeholder.contains(slot);
+                marks.memory = rs.lane_slot_memory_pattern.contains(slot);
+            }
+        } else if (in.src[0].kind == OperandKind::SGPR ||
+                   (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124)) {
+            word(in.src[0].value);   // v_writelane's data word
+        }
+        return marks;
+    }
+    for (uint32_t k = 0; k < in.n_src && k < 3; ++k) {
+        const Operand& o = in.src[k];
+        // Every register whose marks propagation can set: SGPRs, and the special data words VCC,
+        // ttmp0-15 and M0 (106-124).
+        const bool scalar = o.kind == OperandKind::SGPR ||
+                            (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
+        if (!scalar) continue;
+        uint32_t width = scalar_alu_source_words(in, k);
+        if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
+        if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range
+        for (uint32_t w = 0; w < width; ++w) word(o.value + static_cast<int>(w));
+    }
+    // A read-modify-write keeps the destination's old bits (s_bitset*, s_cmov*, s_addk, ...).
+    const uint32_t implicit = scalar_implicit_destination_read_width(in);
+    for (uint32_t w = 0; w < implicit; ++w) word(in.dst.value + static_cast<int>(w));
+    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = true;
+    return marks;
+}
+
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Inst& in) {
+    SavedB64MaskSnapshot snapshot;
+    snapshot.source_marks = scalar_source_marks(rs, in);
+    // The widest write form is deliberate: this set only FILTERS what record_scalar_write may
+    // expire, and that function applies its own exact `effective_width`, so an extra candidate root
+    // here can never widen the erase set.
+    for_each_scalar_write(
+        in,
+        [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word) {
+                const int root = base + static_cast<int>(word);
+                if (root > 105 || rs.sreg_bool_b32.contains(root)) continue;
+                const auto mask = rs.sreg_bool.find(root);
+                if (mask != rs.sreg_bool.end()) snapshot.entries.emplace_back(root, mask->second);
+            }
+        },
+        /*wave32_one_word_masks*/ false);
+    return snapshot;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Workgroup-uniform wave branch (#1554).
 //

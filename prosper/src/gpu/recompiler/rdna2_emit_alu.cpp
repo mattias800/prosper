@@ -2031,44 +2031,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (it != rs.sreg_bool.end()) return it->second; }
                     if (o.kind == OperandKind::InlineInt)
                         return inline_int_mask_bit(b, o.value);
-                    // Project an ordinary scalar pair into the same per-invocation Bool representation
-                    // used for wave masks: select this guest lane's 32-bit half, then extract its bit.
-                    // GTA copies EXEC_LO/HI ballots into scalar scratch and intersects that pair with
-                    // VCC at pc1467; Sonic Frontiers Cyber Space uses s[0:1]={1,1} intersected with VCC.
-                    // Both halves must exist.
-                    if (b.is_compute && b.wave_size == 64 &&
-                        (o.kind == OperandKind::SGPR ||
-                         (o.kind == OperandKind::Special &&
-                          (o.value == 106 || o.value == 107)))) {
-                        auto scalar_word = [&](int reg, uint32_t& value) {
-                            auto current = rs.sreg.find(reg);
-                            if (current != rs.sreg.end()) {
-                                value = current->second;
-                                return true;
-                            }
-                            auto input = rs.sreg_input.find(reg);
-                            if (input != rs.sreg_input.end()) {
-                                value = input->second;
-                                return true;
-                            }
-                            return false;
-                        };
-                        uint32_t lo = 0, hi = 0;
-                        if (scalar_word(o.value, lo) && scalar_word(o.value + 1, hi)) {
-                            // Invert the ballot with the subgroup-local index if native 64, or guest_lane_id.
-                            const uint32_t lane = b.native_subgroup_size == 64
-                                ? b.ibin(Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63))
-                                : b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
-                            const uint32_t word = b.sel(
-                                b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
-                            const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
-                            return b.ucmp(
-                                Op_INotEqual,
-                                b.ibin(Op_BitwiseAnd,
-                                       b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
-                                b.uconst(0));
-                        }
-                    }
+                    // An ordinary scalar pair projected onto this lane's bit (rdna2_alu_support.hpp).
+                    if (const uint32_t bit = scalar_pair_lane_bit(b, rs, o)) return bit;
                     // Name WHICH representation is missing. A wave-mask op that cannot resolve
                     // an operand rejects the whole shader, and the reject line downstream says
                     // only `mode=unresolved-operand` -- which cannot distinguish these states,
@@ -2119,10 +2083,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                : b.is_fragment ? "fragment"
                                                                : "vertex";
                         if (first)
-                            std::fprintf(stderr,
+                            std::fprintf(
+                                stderr,
                                 "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%u "
                                 "sreg_bool=%d sreg=%d/%d sreg_input=%d/%d "
-                                "no_placeholders=%d stage=%s wave=%u native_sg=%u\n",
+                                "no_placeholders=%d merge_placeholder=%d/%d stage=%s wave=%u "
+                                "native_sg=%u\n",
                                 static_cast<unsigned long long>(b.diagnostic.program_address),
                                 in.pc, o.value,
                                 static_cast<unsigned>(
@@ -2133,6 +2099,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 static_cast<int>(rs.sreg_input.contains(o.value)),
                                 static_cast<int>(rs.sreg_input.contains(o.value + 1)),
                                 static_cast<int>(rs.scalar_presence_has_no_placeholders),
+                                static_cast<int>(rs.sreg_merge_placeholder.contains(o.value)),
+                                static_cast<int>(rs.sreg_merge_placeholder.contains(o.value + 1)),
                                 stage_name, b.wave_size, b.native_subgroup_size);
                     }
                     return 0;
@@ -4950,14 +4918,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
                 // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
-                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP and
-                // OMOD keep rejecting too -- their denormal behaviour needs its own contract.
-                if (in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[1] || in.src_neg[2] ||
-                    in.clamp || in.omod) {
+                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP is
+                // the ordinary float saturate of the exact result via fresult() (Kena #4706,
+                // `d762800c,0001850c`; CONFIDENCE: HIGH). OMOD keeps rejecting: hardware ignores it
+                // on f32 with denormals enabled, so it needs the MODE contract.
+                if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = b.ldexp_f32_bits(fv(0), val(in.src[1]));
+                    vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
                 }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):

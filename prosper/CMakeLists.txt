@@ -1333,6 +1333,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  # #3807: a draw buffer the live source gate refuses is captured as a v74 placeholder, and the
+  # per-resource ceiling still fires for a mapped source. Pure CPU; the gate arm reads the frontend
+  # header directly.
+  prosper_add_gtest(test_capture_unavailable_source
+    SOURCES tests/gpu/capture/test_capture_unavailable_source.cpp
+    INCLUDES src frontends tests
+    LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
@@ -2959,7 +2966,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
-            tests/gpu/state/test_render_state_memo.cpp
+            tests/gpu/state/test_render_state_memo.cpp tests/gpu/state/test_depth_bounds_state.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -3819,6 +3826,9 @@ endif()
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
   prosper_add_gtest(test_raster_launch_capture
     SOURCES tests/gpu/capture/test_raster_launch_capture.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_depth_bounds_capture
+    SOURCES tests/gpu/capture/test_depth_bounds_capture.cpp
     LIBRARIES prosper_core)
   prosper_add_gtest(test_gpu_capture_observation
     SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
@@ -5261,6 +5271,20 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # A Wave64 pixel shader's B64 mask logical over a scalar DATA pair projects the pair onto
+      # the pixel's own lane bit (Kena 0x5008cc0000, #4706); rendered where 64 lanes can be required.
+      prosper_add_gtest(test_fragment_scalar_pair_mask
+        SOURCES tests/gpu/execute/test_fragment_scalar_pair_mask.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
+      # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
+      prosper_add_gtest(test_entry_m0_wave64_kill
+        SOURCES tests/gpu/recompiler/test_entry_m0_wave64_kill.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Several bottom-tested SCC do-while loops in one fragment program (#4518): detector
       # positives/negatives, plus the program rendered with both back-edge polarities.
       prosper_add_gtest(test_scc_do_while_loops
@@ -5744,6 +5768,13 @@ endif()
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_shadow_compare_render
         SOURCES tests/gpu/test_shadow_compare_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # Guest depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) against a retained depth
+      # surface with the depth test off. Reaches `shared/...` through render_runner.h.
+      prosper_add_gtest(test_depth_bounds_render
+        SOURCES tests/gpu/test_depth_bounds_render.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 

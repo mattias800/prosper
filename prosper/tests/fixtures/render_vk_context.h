@@ -57,6 +57,8 @@ struct RenderVkCtx {
     float max_aniso_limit = 1.0f;
     bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
     bool logic_op_enabled = false;
+    // VkPhysicalDeviceFeatures::depthBounds: the guest's DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE test.
+    bool depth_bounds_enabled = false;
     bool ok = false;
     bool geometry_shader_enabled = false;
     // VK_EXT_shader_viewport_index_layer enabled: a vertex stage may write gl_Layer (#3135 P3's

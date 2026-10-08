@@ -25,6 +25,7 @@
 #include "gpu/present/videoout_present.hpp"
 
 #include "gpu/capture/capture_compute_policy.hpp"
+#include "gpu/capture/capture_source_gate.hpp"   // #3807 replay placeholders
 
 #include <algorithm>
 #include <atomic>
@@ -376,6 +377,18 @@ public:
                             "buffer descriptor-table entry blob offset exceeds its logical address"))
                         return false;
                 }
+                dst->resources.push_back(std::move(r));
+                continue;
+            }
+            if (x.source_unavailable) {
+                // The live renderer bound its all-zero fallback and read no guest bytes (#3807).
+                // Publish exactly that: no backing, and a mark the draw path's source gate honours
+                // whatever this process has mapped at the address.
+                if (!valid_source_unavailable_record(x)) {
+                    error = "invalid unavailable-source placeholder in replay";
+                    return false;
+                }
+                r.replay_source_unavailable = true;
                 dst->resources.push_back(std::move(r));
                 continue;
             }
@@ -1207,6 +1220,9 @@ bool materialize_gpu_capture_observation(const GpuCaptureFile& c,
 }
 
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader) { g_rtt_seed_reader = std::move(reader); }
+void set_gpu_capture_buffer_source_probe(CaptureBufferSourceProbe probe) {
+    g_buffer_source_probe = std::move(probe);
+}
 bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error) {
     error.clear();
     if (!g_rtt_seed_reader) { error = "live renderer has no RTT seed reader"; return false; }
@@ -1320,9 +1336,7 @@ bool capture_referenced_gpu_ds_seeds(
     // an otherwise self-contained compute capsule from being written.
     const bool references_ds = std::any_of(
         capture.draws.begin(), capture.draws.end(), [](const GpuCapturedDraw& draw) {
-            const auto& ps = draw.ps;
-            return ps.depth_test_enable || ps.depth_write_enable || ps.depth_clear_enable ||
-                   ps.stencil_enable || ps.stencil_clear_enable;
+            return uses_depth_stencil_attachment(draw.ps);
         });
     if (!references_ds) return true;
 
@@ -1335,9 +1349,7 @@ bool capture_referenced_gpu_ds_seeds(
         const bool referenced = std::any_of(
             capture.draws.begin(), capture.draws.end(), [&](const GpuCapturedDraw& draw) {
                 const auto& ps = draw.ps;
-                const bool uses_ds = ps.depth_test_enable || ps.depth_write_enable ||
-                                     ps.depth_clear_enable || ps.stencil_enable ||
-                                     ps.stencil_clear_enable;
+                const bool uses_ds = uses_depth_stencil_attachment(ps);
                 return uses_ds && draw.color0_width == seed.width &&
                        draw.color0_height == seed.height &&
                        ps.depth_read_base == seed.depth_read_base &&

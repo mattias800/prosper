@@ -1599,6 +1599,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.depth_bias_clamp_enabled = supported.depthBiasClamp;
         if (r.depth_bias_clamp_enabled) feats.depthBiasClamp = VK_TRUE;
         r.logic_op_enabled = supported.logicOp;
+        // The guest's depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) maps 1:1 onto this
+        // feature. Without it the bounds are not applied and the renderer says so once per run.
+        r.depth_bounds_enabled = supported.depthBounds;
+        if (r.depth_bounds_enabled) feats.depthBounds = VK_TRUE;
+        else
+            fprintf(stderr, "[gpu] WARNING: this Vulkan device lacks depthBounds; the guest's "
+                            "depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) will not "
+                            "be applied, so shadow cascades and light volumes cover every pixel\n");
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
         if (r.logic_op_enabled) feats.logicOp = VK_TRUE;
@@ -8527,8 +8535,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // span. Segment-local use/write/layout decisions and explicit clears remain local below.
     const std::span<const BackendDraw> logical_draws = logical_ds_draws.empty()
         ? draws : logical_ds_draws;
-    // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
-    // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
+    // Depth attachment is created if ANY draw enables the depth test or the depth-bounds test (the
+    // shared render pass has one fixed attachment set; the bounds test reads the stored depth even
+    // with the depth test off); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false, use_stencil = false;
     // Initial values for a newly-created depth/stencil attachment (#371). Existing guest-identified
@@ -8567,7 +8576,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
+        if (d.ps->depth_test_enable || d.ps->depth_bounds_enable || effective_depth_clear(d.ps))
+            use_depth = true;
         if (d.ps->stencil_enable ||
             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))
@@ -8726,8 +8736,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                              d.ps->stencil_write_mask[0],
                                              d.ps->stencil_write_mask[1])))
             logical_use_stencil = true;
-        if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
-                     effective_depth_clear(d.ps) ||
+        if (d.ps && (d.ps->depth_test_enable || d.ps->depth_bounds_enable ||
+                     d.ps->stencil_enable || effective_depth_clear(d.ps) ||
                      stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                              d.ps->stencil_write_mask[0],
                                              d.ps->stencil_write_mask[1]))) {
@@ -8755,8 +8765,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool depth_may_be_written = false;
     uint64_t depth_write_command_order = 0;
     bool stencil_may_be_written = false;
-    for (const auto& d : draws) {
+    // The first draw of this pass that can write depth. A depth-bounds test compares the STORED
+    // depth, so it is meaningful only against depth the guest produced: a plane that was already
+    // valid when the pass began, or one an earlier draw of this same pass wrote (see the
+    // depth-bounds block in the per-draw setup).
+    size_t first_depth_writer = draws.size();
+    for (size_t draw_index = 0; draw_index < draws.size(); ++draw_index) {
+        const auto& d = draws[draw_index];
         if (!d.ps) continue;
+        // A depth-bounds test is NOT here: it only reads the plane, so a bounds-only pass must not
+        // mark a never-written plane valid. That would make later passes LOAD, and the sampled-depth
+        // bridge serve, a cleared value the guest never wrote.
         depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
@@ -8764,6 +8783,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
             d.ps->depth_compare_op);
         depth_may_be_written |= draw_may_write_depth;
+        if (draw_may_write_depth && first_depth_writer == draws.size())
+            first_depth_writer = draw_index;
         if (draw_may_write_depth)
             depth_write_command_order = std::max(depth_write_command_order, d.command_order);
         stencil_may_be_written |= stencil_clear_effective(
@@ -9697,6 +9718,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
         VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
+        VkBool32 depth_bounds_test = VK_FALSE;
+        float depth_bounds_min = 0.0f, depth_bounds_max = 1.0f;
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
         bool mesh_draw = false;
         std::array<uint32_t, 3> mesh_groups{1, 1, 1};
@@ -11182,6 +11205,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
             VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
             VK_DYNAMIC_STATE_STENCIL_OP,
+            // Depth bounds vary per light and per shadow cascade: UE4 draws dozens of distinct
+            // ranges a frame, so baking them into the pipeline would create pipelines per draw.
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS,
             VK_DYNAMIC_STATE_CULL_MODE,
             VK_DYNAMIC_STATE_FRONT_FACE,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -11360,6 +11387,44 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ps->stencil_compare_op[1], ps->stencil_ref[1],
                         ps->stencil_fail_op[1], ps->stencil_pass_op[1], ps->stencil_depth_fail_op[1],
                         dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
+        }
+        if (ps && ps->depth_bounds_enable) {
+            // The test compares the depth already in the attachment. Apply it only when that depth
+            // is the guest's: the retained plane was valid when the pass began, or an earlier draw
+            // of this pass wrote it. Otherwise the attachment holds the value prosper cleared it to,
+            // which no bound range can stand in for (#371 approximates unknown depth by the value
+            // that always passes a compare; a range has no such value). There, as on a target with
+            // no depth surface at all, the draw runs untested -- the behaviour before the test
+            // existed -- and the run says so once.
+            const bool depth_known = (persistent_ds && depth_was_valid) || di > first_depth_writer;
+            const bool applied = depth_known && render_vk_ctx().depth_bounds_enabled;
+            static std::once_flag first_draw;
+            std::call_once(first_draw, [&] {
+                fprintf(stderr, "[gpu] first depth-bounds draw: bounds [%g, %g] %s\n",
+                        ps->depth_bounds_min, ps->depth_bounds_max,
+                        applied ? "applied"
+                        : !render_vk_ctx().depth_bounds_enabled ? "NOT applied (device lacks depthBounds)"
+                                                                 : "NOT applied (depth contents unknown)");
+            });
+            if (applied) {
+                v.depth_bounds_test = VK_TRUE;
+                v.depth_bounds_min = ps->depth_bounds_min;
+                v.depth_bounds_max = ps->depth_bounds_max;
+            } else if (!depth_known) {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] depth-bounds test skipped: the draw's depth plane holds "
+                                    "no guest-written depth (no DS surface, or never written), so "
+                                    "the draw is untested (reported once per run)\n");
+                });
+            } else {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] Vulkan device lacks depthBounds: the guest's "
+                                    "depth-bounds test is NOT applied, so those draws cover "
+                                    "every pixel\n");
+                });
+            }
         }
         v.stencil_front = dss.front;
         v.stencil_back = dss.back;
@@ -14220,6 +14285,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdSetDepthWriteEnable(command, v.depth_write);
         vkCmdSetDepthCompareOp(command, v.depth_compare);
         vkCmdSetStencilTestEnable(command, v.stencil_test);
+        vkCmdSetDepthBoundsTestEnable(command, v.depth_bounds_test);
+        vkCmdSetDepthBounds(command, v.depth_bounds_min, v.depth_bounds_max);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
         if (!v.mesh_draw) {
