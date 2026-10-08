@@ -84,11 +84,13 @@ Words compile_whole(Stage stage, const Words& code) {
 }
 
 Words compile(Stage stage, const Words& body) {
-    return compile_whole(stage, cat({&body, stage == Stage::Fragment ? &kFragmentTail
-                                                                      : &kComputeTail}));
+    return compile_whole(stage,
+                         cat({&body, stage == Stage::Fragment ? &kFragmentTail : &kComputeTail}));
 }
 
-const char* name(Stage stage) { return stage == Stage::Fragment ? "fragment" : "compute"; }
+const char* name(Stage stage) {
+    return stage == Stage::Fragment ? "fragment" : "compute";
+}
 
 // prefix | <path> | s_cmp_eq_u32 s0,0 | <probe ops>
 Words program(const Words& path, const Words& probe) {
@@ -166,10 +168,11 @@ TEST(ScalarPairMask, AndPairProjectionRefusesAOnePathPair) {
     const Words and_pair = {0x87860204u};
     for (Stage stage : {Stage::Compute, Stage::Fragment}) {
         Words code = cat({&kPrefix, &kOnePath, &and_pair});
-        const Words select = stage == Stage::Compute
-            ? Words{0xd5010003u, 0x0019e480u, 0xe0702000u, 0x80020300u, 0xbf810000u}
-            : Words{0xd5010001u, 0x0019e480u, 0x7e000280u, 0x7e040280u,
-                    0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+        const Words select =
+            stage == Stage::Compute
+                ? Words{0xd5010003u, 0x0019e480u, 0xe0702000u, 0x80020300u, 0xbf810000u}
+                : Words{0xd5010001u, 0x0019e480u, 0x7e000280u, 0x7e040280u,
+                        0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
         code.insert(code.end(), select.begin(), select.end());
         EXPECT_TRUE(compile_whole(stage, code).empty()) << name(stage);
     }
