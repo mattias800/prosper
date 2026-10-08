@@ -10,63 +10,81 @@
 // Only queries with NO builder in prosper are answered here. A query whose builder exists keeps the
 // size of prosper's own emission in hle_agc.cpp: answering the console's smaller number there would
 // under-reserve for a builder that writes more. Those differences are listed in known_gaps.tsv.
+// Each registration is a literal call so the inventory tools (tools/re/hle_handler_map.py,
+// tools/progress) see every NID.
 #include "hle/dispatch/dispatch.hpp"
-#include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
 
 namespace prosper {
 
-namespace {
+#define HLE(name)                                                                                  \
+    static PROSPER_SYSV_ABI uint64_t name(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,        \
+                                          uint64_t)
 
-template <uint32_t Bytes>
-PROSPER_SYSV_ABI uint64_t fixed_size(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
-    return Bytes;
+// One handler per distinct size, in bytes.
+HLE(size_8) {
+    return 8;
 }
-
-struct FixedSize {
-    const char* nid;
-    HleFn fn;
-    const char* name;
-};
-
-const FixedSize kFixedSizes[] = {
-    {"hcIxS8pmXF4", &fixed_size<44>, "sceAgcAcbAtomicGdsGetSize"},
-    {"da1Sm8-QDoU", &fixed_size<36>, "sceAgcAcbAtomicMemGetSize"},
-    {"ozKzBP4aki4", &fixed_size<20>, "sceAgcAcbCondExecGetSize"},
-    {"CbQh3DKMSno", &fixed_size<24>, "sceAgcAcbCopyDataGetSize"},
-    {"b-oySn+G2tE", &fixed_size<16>, "sceAgcAcbJumpGetSize"},
-    {"eCjKaqeeQ5s", &fixed_size<20>, "sceAgcAcbPrimeUtcl2GetSize"},
-    {"F8NLhWvFemI", &fixed_size<32>, "sceAgcAcbQueueEndOfShaderActionGetSize"},
-    {"0ZOG0jc9nRg", &fixed_size<8>, "sceAgcAcbRewindGetSize"},
-    {"idlaArvdXEs", &fixed_size<56>, "sceAgcAcbWaitOnAddressGetSize"},
-    {"FuVbkyKlf+s", &fixed_size<36>, "sceAgcCbCondWriteGetSize"},
-    {"1tB0xkLNjcw", &fixed_size<44>, "sceAgcDcbAtomicGdsGetSize"},
-    {"oz6zQq1JwCE", &fixed_size<36>, "sceAgcDcbAtomicMemGetSize"},
-    {"ms1xVoZ-Vwc", &fixed_size<16>, "sceAgcDcbBeginOcclusionQueryGetSize"},
-    {"ou16V5hh5sg", &fixed_size<20>, "sceAgcDcbCondExecGetSize"},
-    {"H6vHS5cidSA", &fixed_size<20>, "sceAgcDcbContextStateOpGetSize"},
-    {"b5u0Jzm8TF8", &fixed_size<24>, "sceAgcDcbCopyDataGetSize"},
-    {"r98I08t+LOg", &fixed_size<64>, "sceAgcDcbDrawIndexIndirectMultiGetSize"},
-    {"mR9j7+SfM34", &fixed_size<60>, "sceAgcDcbDrawIndexMultiInstancedGetSize"},
-    {"pYoKs3lPy88", &fixed_size<64>, "sceAgcDcbDrawIndirectMultiGetSize"},
-    {"P1CugZ99Uzc", &fixed_size<16>, "sceAgcDcbEndOcclusionQueryGetSize"},
-    {"rUuVjyR+Rd4", &fixed_size<20>, "sceAgcDcbGetLodStatsGetSize"},
-    {"KjPeVduz6jU", &fixed_size<20>, "sceAgcDcbPrimeUtcl2GetSize"},
-    {"zg6u-N6Otxs", &fixed_size<32>, "sceAgcDcbQueueEndOfShaderActionGetSize"},
-    {"9S4noWrUI0s", &fixed_size<16>, "sceAgcDcbSetBaseDispatchIndirectArgsGetSize"},
-    {"MMlmJAL7N5w", &fixed_size<16>, "sceAgcDcbSetBaseDrawIndirectArgsGetSize"},
-    {"yheJGN-ay+A", &fixed_size<16>, "sceAgcDcbSetBoolPredicationEnableGetSize"},
-    {"AFIh8SQkYlQ", &fixed_size<16>, "sceAgcDcbSetIndexIndirectArgsGetSize"},
-    {"vLrBL8DQiz8", &fixed_size<16>, "sceAgcDcbSetPredicationDisableGetSize"},
-    {"XN+Iuu7XsM8", &fixed_size<16>, "sceAgcDcbSetZPassPredicationEnableGetSize"},
-    {"43WJ08sSugE", &fixed_size<56>, "sceAgcDcbWaitOnAddressGetSize"},
-};
-
-}  // namespace
+HLE(size_16) {
+    return 16;
+}
+HLE(size_20) {
+    return 20;
+}
+HLE(size_24) {
+    return 24;
+}
+HLE(size_32) {
+    return 32;
+}
+HLE(size_36) {
+    return 36;
+}
+HLE(size_44) {
+    return 44;
+}
+HLE(size_56) {
+    return 56;
+}
+HLE(size_60) {
+    return 60;
+}
+HLE(size_64) {
+    return 64;
+}
 
 void register_agc_getsize_hle() {
-    for (const FixedSize& s : kFixedSizes) Hle::register_fn(s.nid, s.fn, s.name);
+    Hle::register_fn("hcIxS8pmXF4", (HleFn)size_44, "sceAgcAcbAtomicGdsGetSize");
+    Hle::register_fn("da1Sm8-QDoU", (HleFn)size_36, "sceAgcAcbAtomicMemGetSize");
+    Hle::register_fn("ozKzBP4aki4", (HleFn)size_20, "sceAgcAcbCondExecGetSize");
+    Hle::register_fn("CbQh3DKMSno", (HleFn)size_24, "sceAgcAcbCopyDataGetSize");
+    Hle::register_fn("b-oySn+G2tE", (HleFn)size_16, "sceAgcAcbJumpGetSize");
+    Hle::register_fn("eCjKaqeeQ5s", (HleFn)size_20, "sceAgcAcbPrimeUtcl2GetSize");
+    Hle::register_fn("F8NLhWvFemI", (HleFn)size_32, "sceAgcAcbQueueEndOfShaderActionGetSize");
+    Hle::register_fn("0ZOG0jc9nRg", (HleFn)size_8, "sceAgcAcbRewindGetSize");
+    Hle::register_fn("idlaArvdXEs", (HleFn)size_56, "sceAgcAcbWaitOnAddressGetSize");
+    Hle::register_fn("FuVbkyKlf+s", (HleFn)size_36, "sceAgcCbCondWriteGetSize");
+    Hle::register_fn("1tB0xkLNjcw", (HleFn)size_44, "sceAgcDcbAtomicGdsGetSize");
+    Hle::register_fn("oz6zQq1JwCE", (HleFn)size_36, "sceAgcDcbAtomicMemGetSize");
+    Hle::register_fn("ms1xVoZ-Vwc", (HleFn)size_16, "sceAgcDcbBeginOcclusionQueryGetSize");
+    Hle::register_fn("ou16V5hh5sg", (HleFn)size_20, "sceAgcDcbCondExecGetSize");
+    Hle::register_fn("H6vHS5cidSA", (HleFn)size_20, "sceAgcDcbContextStateOpGetSize");
+    Hle::register_fn("b5u0Jzm8TF8", (HleFn)size_24, "sceAgcDcbCopyDataGetSize");
+    Hle::register_fn("r98I08t+LOg", (HleFn)size_64, "sceAgcDcbDrawIndexIndirectMultiGetSize");
+    Hle::register_fn("mR9j7+SfM34", (HleFn)size_60, "sceAgcDcbDrawIndexMultiInstancedGetSize");
+    Hle::register_fn("pYoKs3lPy88", (HleFn)size_64, "sceAgcDcbDrawIndirectMultiGetSize");
+    Hle::register_fn("P1CugZ99Uzc", (HleFn)size_16, "sceAgcDcbEndOcclusionQueryGetSize");
+    Hle::register_fn("rUuVjyR+Rd4", (HleFn)size_20, "sceAgcDcbGetLodStatsGetSize");
+    Hle::register_fn("KjPeVduz6jU", (HleFn)size_20, "sceAgcDcbPrimeUtcl2GetSize");
+    Hle::register_fn("zg6u-N6Otxs", (HleFn)size_32, "sceAgcDcbQueueEndOfShaderActionGetSize");
+    Hle::register_fn("9S4noWrUI0s", (HleFn)size_16, "sceAgcDcbSetBaseDispatchIndirectArgsGetSize");
+    Hle::register_fn("MMlmJAL7N5w", (HleFn)size_16, "sceAgcDcbSetBaseDrawIndirectArgsGetSize");
+    Hle::register_fn("yheJGN-ay+A", (HleFn)size_16, "sceAgcDcbSetBoolPredicationEnableGetSize");
+    Hle::register_fn("AFIh8SQkYlQ", (HleFn)size_16, "sceAgcDcbSetIndexIndirectArgsGetSize");
+    Hle::register_fn("vLrBL8DQiz8", (HleFn)size_16, "sceAgcDcbSetPredicationDisableGetSize");
+    Hle::register_fn("XN+Iuu7XsM8", (HleFn)size_16, "sceAgcDcbSetZPassPredicationEnableGetSize");
+    Hle::register_fn("43WJ08sSugE", (HleFn)size_56, "sceAgcDcbWaitOnAddressGetSize");
 }
 
-}  // namespace prosper
+}   // namespace prosper

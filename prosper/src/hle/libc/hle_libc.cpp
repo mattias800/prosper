@@ -1123,7 +1123,7 @@ void register_builtin_hle() {
     register_audio_spatial_hle(); // libSceAudio3d (one port) / libSceAcm (contexts; no batch engine)
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
-    register_agc_getsize_hle(); // fixed-size sceAgc*GetSize answers measured on a console
+    register_agc_getsize_hle();   // fixed-size sceAgc*GetSize answers measured on a console
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
 }
 
