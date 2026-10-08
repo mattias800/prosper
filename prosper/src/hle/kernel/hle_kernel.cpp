@@ -436,7 +436,8 @@ namespace {
     // is a different state and keeps answering success.
     inline bool pt_slot_destroyed(uint64_t slot_addr) {
         if (!slot_addr) return false;
-        return pt_destroyed_sentinel(__atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE));
+        return pt_destroyed_sentinel(
+            __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE));
     }
 
     inline void pt_report_destroyed(const char* what) {
