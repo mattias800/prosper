@@ -24,6 +24,47 @@ inline constexpr Counter kWave64RefusalCounters[] = {
     Counter::Wave64FragmentSubgroup, Counter::Wave64ComputeSubgroup
 };
 
+// The route a guest Wave64 program took (ADR 0028, Decision). Only Native, ProvenWidthIndependent and
+// Refused exist today; the other names are reserved so the field's vocabulary is fixed before the
+// routes land, and nothing emits or counts them. The names are what a log reader and the census
+// tools key on, so they do not change.
+enum class Wave64Route : uint8_t {
+    Native,
+    ProvenWidthIndependent,
+    WorkgroupExchange,
+    NLanes,
+    FragmentPromoted,
+    Refused,
+    Count
+};
+inline constexpr size_t kWave64RouteCount = static_cast<size_t>(Wave64Route::Count);
+inline constexpr const char* kWave64RouteNames[] = {
+    "native",  "proven-width-independent", "workgroup-exchange",
+    "n-lanes", "fragment-promoted",        "refused"};
+inline const char* wave64_route_name(Wave64Route route) {
+    const size_t i = static_cast<size_t>(route);
+    return i < kWave64RouteCount ? kWave64RouteNames[i] : "unknown";
+}
+// True for the routes that exist today and admit a program.
+inline constexpr bool wave64_route_admits_today(Wave64Route route) {
+    return route == Wave64Route::Native || route == Wave64Route::ProvenWidthIndependent;
+}
+// Uses by route over any counter source with a count(Counter) member (a ledger window). A reserved
+// route reports 0. Refused is the sum of the four refusal counters.
+template <class Source>
+uint64_t wave64_route_uses(const Source& source, Wave64Route route) {
+    switch (route) {
+        case Wave64Route::Native: return source.count(Counter::Wave64RouteNative);
+        case Wave64Route::ProvenWidthIndependent: return source.count(Counter::Wave64RouteProven);
+        case Wave64Route::Refused: {
+            uint64_t total = 0;
+            for (Counter counter : kWave64RefusalCounters) total += source.count(counter);
+            return total;
+        }
+        default: return 0;
+    }
+}
+
 // Identities are compile variants when available, otherwise run-local program addresses.
 // The site is part of the key: these are distinct REFUSAL identities, not unique shader contents.
 // Saturation stays explicit; it never stops counting refused uses or claims an exact shader total.
@@ -33,7 +74,10 @@ template<size_t Capacity> struct Wave64RefusalInventory {
     std::array<Key, Capacity> keys{};
     size_t size = 0;
     Observation observe(Wave64Refusal site, uint64_t program, uint64_t identity) {
-        const Key key{identity ? identity : program, static_cast<uint8_t>(site), identity != 0};
+        return observe_site(static_cast<uint8_t>(site), program, identity);
+    }
+    Observation observe_site(uint8_t site, uint64_t program, uint64_t identity) {
+        const Key key{identity ? identity : program, site, identity != 0};
         if (!key.id) return Observation::Unidentified;
         for (size_t i = 0; i < size; ++i)
             if (keys[i].id == key.id && keys[i].site == key.site && keys[i].compile == key.compile)
@@ -89,16 +133,31 @@ inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uin
     std::snprintf(
         line, sizeof line,
         "[wave64-unsupported] stage=%s program=0x%llx identity=0x%llx "
-        "refusal=%s guest-wave=64 host-subgroups=%s wave-reasons=%s consequence=%s "
+        "refusal=%s route=%s guest-wave=64 host-subgroups=%s wave-reasons=%s consequence=%s "
         "next=%s%s\n",
         compute ? "compute" : "fragment", (unsigned long long)program, (unsigned long long)identity,
-        kWave64RefusalNames[i], host, reasons,
+        kWave64RefusalNames[i], wave64_route_name(Wave64Route::Refused), host, reasons,
         compute ? "dispatch-skipped/output-unwritten" : "draw-dropped/content-missing",
         recompile
             ? "prosper recompiler/resource-binding, NOT a host limit; "
               "PROSPER_DBG_PROGRAM=<program> for rejection pc"
             : "subgroup-contract/lowering; see the adjacent backend skip and wave reason bits",
         detail);
+    return line;
+}
+
+// One ADMITTED program's route as text, in the same field layout as the refusal line so one parser
+// reads both. It carries its own prefix, `[wave64-route]`, rather than `[wave64-unsupported]`: a
+// program that runs is not unsupported, and that tag is what the census tools and the alarm's hint
+// key on for a refusal (instrument trap 291 is a refusal tag read as a host limit).
+inline std::string wave64_route_line(Wave64Route route, bool compute, uint64_t program,
+                                     uint64_t identity) {
+    if (!wave64_route_admits_today(route)) return {};
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "[wave64-route] stage=%s program=0x%llx identity=0x%llx route=%s guest-wave=64\n",
+                  compute ? "compute" : "fragment", (unsigned long long)program,
+                  (unsigned long long)identity, wave64_route_name(route));
     return line;
 }
 
@@ -154,6 +213,39 @@ inline void observe_wave64_shader(uint32_t guest_wave, bool compute) {
     if (!enabled() || guest_wave != 64) return;
     if (compute ? thread_dispatch_skip_suppression() : thread_draw_drop_suppression()) return;
     add(Counter::Wave64ShaderChecks);
+}
+
+// An ADMITTED Wave64 program and the route that admitted it. Native is counted only: on a host that
+// runs Wave64 natively every program takes it, so a line per program would change what AMD hosts
+// log (ADR 0028: nothing changes there). The proof route announces each identity once, the way a
+// refusal does. Reserved routes are ignored until they exist.
+inline void note_wave64_route(Wave64Route route, bool compute, uint32_t guest_wave,
+                              uint64_t program, uint64_t identity = 0) {
+    if (!enabled() || guest_wave != 64 || !wave64_route_admits_today(route)) return;
+    if (compute ? thread_dispatch_skip_suppression() : thread_draw_drop_suppression()) return;
+    add(route == Wave64Route::Native ? Counter::Wave64RouteNative : Counter::Wave64RouteProven);
+    if (route == Wave64Route::Native) return;
+    struct State {
+        std::mutex mutex;
+        Wave64RefusalInventory<512> inventory;
+    };
+    static State* const state = new State();   // exit-safe; allocated only on the first proven use
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const uint8_t site =
+        static_cast<uint8_t>(static_cast<uint8_t>(route) * 2u + (compute ? 1u : 0u));
+    using Observation = Wave64RefusalInventory<512>::Observation;
+    // Full and Unidentified stay silent: the counter above is complete either way.
+    if (state->inventory.observe_site(site, program, identity) != Observation::New) return;
+    const std::string line = wave64_route_line(route, compute, program, identity);
+    std::fputs(line.c_str(), stderr);
+}
+
+// The compute site's form of the native route: a guest Wave64 program that passed both subgroup
+// checks on a host whose compute subgroup is 64 lanes wide runs natively. A narrower host runs it
+// through the portable lowering, which has no named route yet, so it is not counted.
+inline void note_wave64_compute_native(uint32_t host_subgroup, uint32_t guest_wave,
+                                       uint64_t program) {
+    if (host_subgroup >= 64) note_wave64_route(Wave64Route::Native, true, guest_wave, program);
 }
 
 inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,

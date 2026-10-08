@@ -173,7 +173,13 @@ Adds spec rule `GPU-5` (`GPU-4` is proposed by ADR 0027, #4716).
   green CI run does not cover the 32-lane case. A hand-built divergent ballot is the positive
   control for route 4, built outside the analysis that selects it.
 - **Diagnostics.** The `[wave64-unsupported]` line gains a `route=` field for admitted programs, so
-  a run shows which route each Wave64 program took and what is still refused.
+  a run shows which route each Wave64 program took and what is still refused. Implemented (step 2)
+  with one deviation: the refusal line carries `route=refused`, and an admitted program is announced
+  once on its own `[wave64-route]` line (same fields), because a program that runs should not be
+  tagged `unsupported` (instrument trap 291). The native route is counted but never logged, so AMD
+  hosts log nothing new. Per-route counters are in `perf_alarms`' JSONL (`wave64_routes`); the names
+  of routes 3-5 are reserved and nothing emits them. `tools/shader_inspect/route_candidates.py`
+  sorts a census's reason sets by route-2 rewrite candidacy, as an upper bound that admits nothing.
 - **AMD hosts:** nothing changes; route 1 short-circuits before any analysis.
 - **Enforcement:** the refusal counters (`runtime:dropped-draws`, `runtime:skipped-dispatches`)
   and review; no tool can check that an approximation is not on by default except review against

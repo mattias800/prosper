@@ -10851,6 +10851,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fragment_subgroup_skip = !prosper::gpu::fragment_subgroup_features_supported(
                     required_fragment_subgroup_features, available_fragment_subgroup_features);
                 const uint64_t shader_key = bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
+                // ADR 0028 route= field: admitted by proof, unless the lowered module still needs
+                // a subgroup feature this device lacks (then the refusal below names it).
+                if (!fragment_subgroup_skip)
+                    prosper::diagnostics::perf::note_wave64_route(
+                        prosper::diagnostics::perf::Wave64Route::ProvenWidthIndependent, false, 64u,
+                        bd.fs_guest_addr, bd.fs_identity);
                 static std::unordered_set<uint64_t> proven_logged;
                 if (proven_logged.insert(shader_key).second) {
                     std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
@@ -10932,6 +10938,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fragment_subgroup_skip = false;
             }
         }
+        // ADR 0028 route= field: the device itself offers the required 64-lane subgroup.
+        if (!fragment_subgroup_skip && !fragment_votes_lowered &&
+            required_fragment_subgroup_size == 64)
+            prosper::diagnostics::perf::note_wave64_route(
+                prosper::diagnostics::perf::Wave64Route::Native, false, 64u, bd.fs_guest_addr,
+                bd.fs_identity);
         if (fragment_subgroup_skip) {
             prosper::diagnostics::perf::note_unsupported_wave64(
                 prosper::diagnostics::perf::Wave64Refusal::FragmentSubgroup,

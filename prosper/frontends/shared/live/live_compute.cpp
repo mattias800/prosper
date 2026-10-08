@@ -7158,9 +7158,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
     }
-    prosper::diagnostics::perf::observe_wave64_shader(
-        item.recompile_config_available ? item.recompile_config.wave_size : item.required_subgroup_size,
-        true);
+    const uint32_t guest_wave = item.recompile_config_available ? item.recompile_config.wave_size
+                                                                : item.required_subgroup_size;
+    prosper::diagnostics::perf::observe_wave64_shader(guest_wave, true);
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -7213,6 +7213,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
         return decline("subgroup-too-narrow");
     }
+    prosper::diagnostics::perf::note_wave64_compute_native(   // ADR 0028 route= field
+        effective_subgroup, guest_wave, item.code_addr);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:
     // runtime predicates, coordinates and loop bounds may change with identical code and launch.
     // Preserve current input contents instead. Exact cached images can omit the upload only after
