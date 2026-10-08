@@ -59,9 +59,16 @@ int main(int argc, char** argv) {
     changed[2].opcode = 0;
     CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
           "fall-through prevents exclusive restoration");
+    // A gap between the s_branch (now at PC2, ending at PC3) and the next retained instruction
+    // holds only compacted straight-line code. No edge lands in it, so it is dead code rather than
+    // a predecessor: the one edge into [PC3, PC4] still makes PC4 exclusive.
     changed = stream; changed[2].pc = 2;
+    CHECK(build_fold_control_plan(changed).steps[3].restore_slot == 0,
+          "an unreached compacted gap is dead code, not a fall-through predecessor");
+    // An edge landing INSIDE the gap does fall through to PC4: two predecessors.
+    changed[1] = inst(1, 4, 1);   // s_cbranch_scc0 -> PC3
     CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
-          "physical gap prevents restoration even when retained instructions are adjacent");
+          "an edge into the compacted gap is a real fall-through predecessor");
     changed = stream; changed.push_back(inst(9, 2, -6));
     CHECK(build_fold_control_plan(changed).steps[3].restore_slot == UINT32_MAX,
           "backward second predecessor disqualifies the first target");
