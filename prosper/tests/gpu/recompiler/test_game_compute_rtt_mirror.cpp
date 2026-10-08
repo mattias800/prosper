@@ -1606,7 +1606,7 @@ static int run_destination_mirror_regression() {
     // blit) rounds 48 of the 1,024 values one step low on RADV, which a single-value check cannot see.
     {
         constexpr uint32_t PW = 256, PH = 4;
-        std::vector<uint8_t> p10_guest(PW * PH * 4, 0x5a);
+        std::vector<uint8_t> p10_guest(size_t{PW} * PH * 4, 0x5a);
         const uint64_t p10_address = reinterpret_cast<uint64_t>(p10_guest.data());
         DrawItem p10_producer = producer;
         p10_producer.color0_base = p10_address;
