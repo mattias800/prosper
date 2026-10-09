@@ -65,6 +65,27 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.kind = K::SetBaseIndirectArgs;
             if (npl >= 1) c.indirect_shader_type = pl[0] & 1u;
             if (npl >= 3) c.indirect_base = lo_hi(&pl[1]);
+        } else if (c.op == IT_CLEAR_STATE) {
+            // Hardware PM4 Type-3 CLEAR_STATE packet (GFX10 / RDNA2):
+            // Reset graphics draw state.
+            c.kind = K::DrawReset;
+        } else if (c.op == IT_INDEX_BUFFER_SIZE) {
+            // Hardware PM4 Type-3 INDEX_BUFFER_SIZE packet (GFX10 / RDNA2):
+            // payload: [0]=index count / buffer size.
+            c.kind = K::SetIndexCount;
+            if (npl >= 1) c.index_count = pl[0];
+        } else if (c.op == IT_ATOMIC_MEM) {
+            // Hardware PM4 Type-3 ATOMIC_MEM packet (GFX10 / RDNA2):
+            // Memory atomic barrier / operation.
+            c.kind = K::AcquireMem;
+        } else if (c.op == IT_CONTEXT_CONTROL) {
+            // Hardware PM4 Type-3 CONTEXT_CONTROL packet (GFX10 / RDNA2):
+            // Context register shadow state enable / load.
+            c.kind = K::DrawReset;
+        } else if (c.op == IT_PFP_SYNC_ME) {
+            // Hardware PM4 Type-3 PFP_SYNC_ME packet (GFX10 / RDNA2):
+            // Parser stall until CP/ME catches up with PFP.
+            c.kind = K::StallCommandBufferParser;
         } else if (c.op == IT_DRAW_INDEX_AUTO) {
             // Hardware PM4 Type-3 DRAW_INDEX_AUTO packet (GFX10 / RDNA2):
             // payload: [0]=index_count, [1]=initiator / flags.

@@ -405,5 +405,31 @@ TEST(Pm4Decode, Contract) {
         CHECK(wait_ops[0].wm_ref == 1u, "op0 ref == 1");
         CHECK(wait_ops[0].wm_mask == 0xffffffffu && wait_ops[0].wm_valid, "op0 mask == 0xffffffff and valid");
     }
+
+    // Hardware control and barrier packets (Black Flag submit0.bin):
+    {
+        uint32_t ctl_stream[] = {
+            // IT_CLEAR_STATE: 2 dwords, op 0x12
+            PM4(2, IT_CLEAR_STATE, 0), 0u,
+            // IT_INDEX_BUFFER_SIZE: 2 dwords, op 0x13, count=0x38a
+            PM4(2, IT_INDEX_BUFFER_SIZE, 0), 0x38au,
+            // IT_ATOMIC_MEM: 2 dwords, op 0x1E
+            PM4(2, IT_ATOMIC_MEM, 0), 0u,
+            // IT_CONTEXT_CONTROL: 2 dwords, op 0x28
+            PM4(2, IT_CONTEXT_CONTROL, 0), 0u,
+            // IT_PFP_SYNC_ME: 2 dwords, op 0x42
+            PM4(2, IT_PFP_SYNC_ME, 0), 0u,
+        };
+        std::vector<Pm4Command> ctl_ops;
+        const size_t c = decode_pm4(ctl_stream, std::size(ctl_stream), ctl_ops);
+        CHECK(c == 10, "consumed 10 dwords of control/barrier packets");
+        CHECK(ctl_ops.size() == 5, "decoded 5 control/barrier packets");
+
+        CHECK(ctl_ops[0].kind == K::DrawReset, "op0 is DrawReset");
+        CHECK(ctl_ops[1].kind == K::SetIndexCount && ctl_ops[1].index_count == 0x38au, "op1 is SetIndexCount");
+        CHECK(ctl_ops[2].kind == K::AcquireMem, "op2 is AcquireMem");
+        CHECK(ctl_ops[3].kind == K::DrawReset, "op3 is DrawReset");
+        CHECK(ctl_ops[4].kind == K::StallCommandBufferParser, "op4 is StallCommandBufferParser");
+    }
 }
 
