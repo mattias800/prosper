@@ -223,9 +223,8 @@ bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint
     return true;
 }
 
-void LaneSlotLoopCarry::note_preheader_marks(const RegState& rs) {
-    preheader_marks_ = rs.lane_slot_merge_placeholder;
-}
+LaneSlotLoopCarry::LaneSlotLoopCarry(const RegState& rs)
+    : preheader_marks_(rs.lane_slot_merge_placeholder) {}
 
 void LaneSlotLoopCarry::refine_exit_marks(RegState& rs) const {
     for (const Slot& slot : slots_) {

@@ -71,8 +71,9 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
 // The loop-carried slots of one structured loop.
 class LaneSlotLoopCarry {
 public:
-    // Before mark_loop_carried(): which slots were fabricated-marked on the preheader edge.
-    void note_preheader_marks(const RegState& rs);
+    // Constructed BEFORE mark_loop_carried(): records which slots were fabricated-marked on the
+    // preheader edge.
+    explicit LaneSlotLoopCarry(const RegState& rs);
     // At the header label, after the other header phis: one phi per slot written in
     // [header_pc, backedge_pc), seeded from the preheader (a placeholder when it is unwritten there).
     void open(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t header_pc,

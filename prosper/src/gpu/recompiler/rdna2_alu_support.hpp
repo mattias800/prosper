@@ -493,24 +493,30 @@ struct VccMaskViewDrop {
     }
 };
 
-// The emitters' one-line entry: false means REFUSE (an EXEC write from a non-projectable source,
+// The emitters' one-line entry: true means REFUSE (`ok` is cleared) (an EXEC write from a non-projectable source,
 // named in the terminal reject line, #3135); a VCC write from one proceeds as data and `drop` takes
 // its mask view away when the instruction finishes.
-inline bool admit_scalar_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
-                                    VccMaskViewDrop& drop) {
-    if (scalar_data_sources_projectable_into_mask(b, rs, in)) return true;
+inline bool refuse_scalar_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
+                                     VccMaskViewDrop& drop, bool& ok) {
+    if (scalar_data_sources_projectable_into_mask(b, rs, in)) return false;
     if (scalar_mask_write_is_vcc_only(in)) {
         drop.on = true;   // VCC as scalar scratch: data kept, no lane view
-        return true;
+        return false;
     }
     b.stage_reject_pc = in.pc;
     b.stage_reject_reason = "scalar-fabricated-lane-mask";
-    return false;
+    ok = false;
+    return true;
 }
 
 // The VCC sibling word of a B32 write is combined into the lane bit: when it is not projectable the
 // view is dropped (data only) and the emitter returns. True means "handled, return now".
-inline bool vcc_sibling_dropped(const SpirvCompute& b, RegState& rs, int sibling) {
+inline bool vcc_sibling_unavailable(const SpirvCompute& b, RegState& rs, int sibling, bool absent,
+                                    bool& ok) {
+    if (absent) {
+        ok = false;
+        return true;
+    }
     if (scalar_words_projectable(b, rs, sibling, 1)) return false;
     drop_vcc_mask_view(rs);
     return true;

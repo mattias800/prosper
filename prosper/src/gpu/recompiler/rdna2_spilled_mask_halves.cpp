@@ -50,6 +50,37 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     keep_agreeing(into.pair_def_pc, incoming.pair_def_pc);
     keep_agreeing(into.slots, incoming.slots);
     keep_agreeing(into.sregs, incoming.sregs);
+    std::erase_if(into.defined_slots,
+                  [&](const auto& slot) { return !incoming.defined_slots.contains(slot); });
+}
+
+void advance_defined_spill_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
+                                 const std::set<int>& masks, const std::set<int>& scalar_words,
+                                 const std::vector<int>& vector_writes) {
+    auto& defined = state.defined_slots;
+    const auto drop_vgpr = [&](int vgpr) {
+        std::erase_if(defined, [&](const auto& slot) { return slot.first == vgpr; });
+    };
+    if (in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane) {
+        if (!constant_lane(in)) return drop_vgpr(in.dst.value);
+        const Operand& source = in.src[0];
+        const int reg = source.value;
+        const bool constant = source.kind == OperandKind::InlineInt ||
+                              source.kind == OperandKind::InlineFloat ||
+                              source.kind == OperandKind::Literal;
+        const bool is_sgpr = source.kind == OperandKind::SGPR;
+        const bool is_exec = source.kind == OperandKind::Special && (reg == 126 || reg == 127);
+        const bool pair_mask = is_sgpr && (masks.contains(reg) || masks.contains(reg - 1));
+        const bool defined_word =
+            (is_sgpr || source.kind == OperandKind::Special) && scalar_words.contains(reg);
+        const std::pair<int, int> slot{in.dst.value, in.src[1].value};
+        if (constant || is_exec || pair_mask || defined_word)
+            defined.insert(slot);
+        else
+            defined.erase(slot);
+    } else if (!(in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane)) {
+        for (int vgpr : vector_writes) drop_vgpr(vgpr);
+    }
 }
 
 bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2Inst& in) {

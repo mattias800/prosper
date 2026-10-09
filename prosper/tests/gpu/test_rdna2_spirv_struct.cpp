@@ -3235,6 +3235,9 @@ int main() {
     ComputeShaderConfig gta_structured_vcc_config = portable_wave64_compute_config;
     gta_structured_vcc_config.local_x = 64;
     gta_structured_vcc_config.native_subgroup_size = 64;
+    // The kernel reads s0, s2 and s7 as launch data. A config with no user SGPRs seeds none of them,
+    // and an unseeded register reads as the fabricated zero (#4714), so supply the launch shape.
+    gta_structured_vcc_config.user_sgprs.assign(16, 0u);
     const auto gta_structured_vcc_scalar_pair_spv = recompile_compute(
         gta_structured_vcc_scalar_pair.data(), gta_structured_vcc_scalar_pair.size(), nullptr,
         gta_structured_vcc_config);

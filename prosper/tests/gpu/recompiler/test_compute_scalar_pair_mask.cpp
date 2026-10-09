@@ -31,6 +31,8 @@ using Words = std::vector<uint32_t>;
 constexpr uint64_t kAddress = 0xa4714001ULL;
 constexpr const char* kReason = "scalar-fabricated-lane-mask";
 
+// NOLINTBEGIN(bugprone-throwing-static-initialization): constant instruction words of a test
+// fixture; an allocation failure here ends the test binary either way.
 // v_mov v5,0 | v_readfirstlane s0,v5 (no fold knows s0) | v_cmp_eq_u32 s[2:3],0,0
 const Words kPrefix = {0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u};
 // s_cmp_eq_u32 s0,0 | s_cbranch_scc1 +2 | s_mov_b32 s4,-1 | s_mov_b32 s5,-1   <- the one path
@@ -54,6 +56,8 @@ const Words kComputeTail = {0xd5010003u, 0x01a9e480u, 0xe0702000u, 0x80020300u, 
 // v_cndmask_b32_e64 v1,0,1.0,vcc | v0=0, v2=0, v3=1.0 | exp mrt0 v0..v3 | s_endpgm
 const Words kFragmentTail = {0xd5010001u, 0x01a9e480u, 0x7e000280u, 0x7e040280u,
                              0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+
+// NOLINTEND(bugprone-throwing-static-initialization)
 
 ShaderResourceTable output_table() {
     ShaderResourceTable table;
@@ -294,6 +298,7 @@ Words compile_with_direct_descriptors(const Words& code) {
 }
 
 // s_mov_b32 s6, s8 | s_mov_b32 s7, s9 | s_mov_b64 vcc, s[6:7]: a register copy of a descriptor pair.
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): fixture instruction words, as above.
 const Words kCopiedDescriptorPair = {0xbe860308u, 0xbe870309u, 0xbeea0406u};
 
 }   // namespace
@@ -440,4 +445,38 @@ TEST(ScalarPairMask, ASlotWrittenOnOnePathRefusesAtTheRestore) {
     for (Stage stage : {Stage::Compute, Stage::Fragment})
         EXPECT_FALSE(compile(stage, cat({&kPrefix, &both})).empty())
             << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+// The CFG dispatcher reloads every spill slot at a block entry. A slot written on EVERY path from a
+// defined word (here the saved EXEC halves) reads back as defined, so Kena's and GTA V's
+// `s_mov_b64 exec, s[6:7]` restore compiles; a slot spilled from a fabricated word still refuses.
+// NOLINTBEGIN(bugprone-throwing-static-initialization): fixture instruction words, as above.
+namespace {
+const Words kDispatcherBody = {
+    0x7e040280u, 0x7e060280u, 0x7e080280u, 0x7e0a0280u,   // v2..v5 = 0
+    0x7c020300u, 0xbf860003u,   // v_cmp_lt_f32 vcc,v0,v1 ; vccz -> +3
+    0x7c020300u, 0xbf860002u,   // v_cmp ; vccz -> +2 (crosses the first)
+    0x7e040281u, 0x7e060281u,   // v2 = 1 ; v3 = 1
+    0x7c020300u, 0xbf860002u,   // v_cmp ; vccz -> +2
+    0x7e080281u, 0xbf820001u, 0x7e0a0281u};   // v4 = 1 ; s_branch +1 ; v5 = 1
+const Words kWriteLanes = {0xd7610014u, 0x0001022du, 0xd7610014u, 0x0001002cu};
+const Words kReadLanesAndRestore = {0xd7600006u, 0x00010114u, 0xd7600007u, 0x00010314u,
+                                    0xbefe0406u};
+const Words kExecTail = {0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+                         0xf800000fu, 0x03020100u, 0xbf810000u};
+}   // namespace
+// NOLINTEND(bugprone-throwing-static-initialization)
+
+TEST(ScalarPairMask, ADispatcherReloadedDefinedExecPairCompiles) {
+    const Words saved_exec = {0xbeac047eu};   // s_mov_b64 s[44:45], exec
+    const Words code =
+        cat({&saved_exec, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
+    EXPECT_FALSE(compile_whole(Stage::Fragment, code).empty());
+}
+
+TEST(ScalarPairMask, ADispatcherReloadedFabricatedExecPairStillRefuses) {
+    const Words one_path = {0xbf068000u, 0xbf850002u, 0xbeac03c1u, 0xbead03c1u};
+    const Words code = cat(
+        {&kPrefix, &one_path, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
+    EXPECT_TRUE(compile_whole(Stage::Fragment, code).empty());
 }

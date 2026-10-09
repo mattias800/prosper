@@ -2727,6 +2727,7 @@ bool emit_cfg_state_machine(
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
+            advance_defined_spill_slots(halves, in, masks, scalar_words, vector_writes);
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
@@ -3636,13 +3637,16 @@ bool emit_cfg_state_machine(
             return found != entry_slots->end() &&
                    (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
         };
-        // A data slot carries no definite-write fact across a case edge, and one never written on
-        // some path reloads the prologue's zero: mark every reloaded slot (#4706, #4725 review).
+        // A slot never written on some path reloads the prologue's zero: mark every reloaded slot
+        // (#4706) except one written on EVERY path from a defined word (defined_slots, #4714).
+        const auto& defined_slots =
+            wave64_spilled_halves_in[entry_block % starts.size()].defined_slots;
         for (const auto& kv : lv)
             if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
-                state.lane_slot_merge_placeholder.insert(kv.first);
+                if (!(entry_wave64_b64 && defined_slots.contains(kv.first)))
+                    state.lane_slot_merge_placeholder.insert(kv.first);
             }
         for (const auto& kv : lmv)
             if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
@@ -6721,8 +6725,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        LaneSlotLoopCarry lane_slots;
-        lane_slots.note_preheader_marks(rs);   // #4749: before the header marks them
+        LaneSlotLoopCarry lane_slots(rs);   // notes the preheader marks, before the header's
         mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
@@ -7368,8 +7371,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            LaneSlotLoopCarry lane_slots;   // V_WRITELANE spill slots, as in the counted loop
-            lane_slots.note_preheader_marks(rs);   // #4749: before the header marks them
+            LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
@@ -7379,12 +7381,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
-            for (int k : mask_keys) {
-                size_t p;
-                uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p);
-                rs.sreg_bool[k] = ph;
-                phis.push_back({k, 5, ph, p});
-            }
+            for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
             lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             // See the sibling loop above: the zero-trip path carries these aliases, not the body's.

@@ -27,11 +27,21 @@ struct SpilledMaskHalves {
     std::map<int, uint32_t> pair_def_pc;   // live MUST-mask pair -> defining pc
     std::map<std::pair<int, int>, SpilledMaskHalf> slots;   // (vgpr, lane) -> spilled half
     std::map<int, SpilledMaskHalf> sregs;   // SGPR -> reloaded half
+    // (vgpr, lane) slots written on EVERY path from a word the MUST analysis proves defined (scalar
+    // data, an inline constant, EXEC, a MUST mask). The dispatcher marks every reloaded slot as
+    // possibly fabricated except these, so a spill/restore of defined words reads back as defined
+    // while one spilled from a fabricated word still refuses (#4714). Any stage.
+    std::set<std::pair<int, int>> defined_slots;
     bool operator==(const SpilledMaskHalves&) const = default;
 };
 
 // CFG join: keep only the facts every incoming path agrees on.
 void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& incoming);
+
+// The transfer of `defined_slots` for one instruction (`masks` and `scalar_words` are the MUST sets).
+void advance_defined_spill_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
+                                 const std::set<int>& masks, const std::set<int>& scalar_words,
+                                 const std::vector<int>& vector_writes);
 
 // True when `in` is `s_mov_b64 dst, s[N:N+1]` and sN / sN+1 hold the low / high half of the same
 // saved-mask instance. Evaluated BEFORE `in`'s own transfer.
