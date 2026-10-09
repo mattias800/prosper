@@ -2728,6 +2728,7 @@ bool emit_cfg_state_machine(
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
+            advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes);
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
@@ -3637,13 +3638,16 @@ bool emit_cfg_state_machine(
             return found != entry_slots->end() &&
                    (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
         };
-        // A data slot carries no definite-write fact across a case edge, and one never written on
-        // some path reloads the prologue's zero: mark every reloaded slot (#4706, #4725 review).
+        // A slot never written on some path reloads the prologue's zero: mark every reloaded slot
+        // (#4706) except one written on EVERY path from a defined word (defined_slots, #4714).
+        const SpilledMaskHalves& halves_in = wave64_spilled_halves_in[entry_block % starts.size()];
+        if (entry_wave64_b64) mark_relayed_words(halves_in, state);   // and relayed SGPRs, #4749
         for (const auto& kv : lv)
             if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
-                state.lane_slot_merge_placeholder.insert(kv.first);
+                if (!(entry_wave64_b64 && halves_in.defined_slots.contains(kv.first)))
+                    state.lane_slot_merge_placeholder.insert(kv.first);
             }
         for (const auto& kv : lmv)
             if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
@@ -6338,6 +6342,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
             const uint32_t trace_entry_exec = rs.exec_narrowed ? rs.exec : 0;
+            keep_surviving_mask_high_half(b, rs, ins, in);   // #4749: s101 outlives s100's reload
             const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
@@ -6524,14 +6529,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
     }
     if (counted_route) {
-        auto vget = [&](int r) {
-            auto it = rs.vreg.find(r);
-            return it == rs.vreg.end() ? b.uconst(0) : it->second;
-        };
-        auto sget = [&](int r) {
-            auto it = rs.sreg.find(r);
-            return it == rs.sreg.end() ? b.uconst(0) : it->second;
-        };
+        auto vget = [&](int r) { return vreg_seed(b, rs, r); };
+        auto sget = [&](int r) { return sreg_seed(b, rs, r); };
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
         } else if (preloop_ifs.size() > 1) {
@@ -6721,8 +6720,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
+        const LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
+        LaneSlotLoopCarry lane_slots(rs);   // notes the preheader marks, before the header's
+        mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -6735,7 +6736,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // V_WRITELANE spill slots are loop-carried state too (Kena 0x5007ad0000 keeps its loop
         // counter in v20 lane 40; without these phis the exit test read the preheader value).
-        LaneSlotLoopCarry lane_slots;
         lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
         // The header executes again after the back-edge. A direct/SRT descriptor overwritten
         // anywhere in the loop is therefore not an invariant entry descriptor at header compile
@@ -6753,7 +6753,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
         for (int r : conds) conds_val[r] = sget(r);
-        const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
+        LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
         lane_slots.record_check(rs);
         const uint32_t cond_exec = rs.exec;
         const bool cond_exec_narrowed = rs.exec_narrowed;
@@ -6779,6 +6779,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             return false;
         }
         if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;        // skip the back-edge branch
+        if (!blanket_check.holds(b, rs, check_marks)) return false;   // #4749 review
         // 5. Continue block branches back to the header; patch each phi's back-edge (value = current, cont).
         b.emit_branch(cont); b.emit_label(cont);
         for (auto& pr : phis) {
@@ -6825,6 +6826,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // ballot or refuses loudly (#4680, the counted-loop form of #4526).
         cond_vcc_halves.finish_exit(rs);
         mark_loop_exit_slots(rs, check_marks);   // #4706
+        lane_slots.refine_exit_marks(rs);   // #4749
         if (carry_vertex_exec) rs.exec_narrowed = cond_exec_narrowed;
         // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
@@ -7281,7 +7283,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // CONFIDENCE: MED-HIGH — guarded by the test suite + exec-diff; DOLL's two-vccz color-grade
         // PS and nested-vccz lighting PS are the motivating real shaders (#273).
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+        auto sget = [&](int r) { return sreg_seed(b, rs, r); };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
         const DivLoop* active_direct_wave_loop = nullptr;
@@ -7366,8 +7368,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
+            const LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
+            LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
+            mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -7377,7 +7381,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
-            LaneSlotLoopCarry lane_slots;   // V_WRITELANE spill slots, as in the counted loop
             lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             // See the sibling loop above: the zero-trip path carries these aliases, not the body's.
@@ -7406,7 +7409,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::unordered_map<int, uint32_t> condv_val, conds_val;
             for (int r : condv) condv_val[r] = vget(r);
             for (int r : conds) conds_val[r] = sget(r);
-            const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
+            LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
             lane_slots.record_check(rs);
@@ -7439,7 +7442,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc);
             active_direct_wave_loop = prior_direct_wave_loop;
             active_direct_wave_continue = prior_direct_wave_continue;
-            if (!body_ok) return false;
+            if (!body_ok || !blanket_check.holds(b, rs, check_marks)) return false;
             const bool body_exec_narrowed = rs.exec_narrowed;
             if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;      // consume the back-edge
             const uint32_t body_end = b.cur_block;
@@ -7507,6 +7510,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             vcc_carry.finish_exit(rs);
             mark_loop_exit_slots(rs, check_marks);   // #4706
+            if (!(L.direct_exec_breaks || L.direct_wave_breaks)) lane_slots.refine_exit_marks(rs);
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {

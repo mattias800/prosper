@@ -255,7 +255,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
-    if (in.has_modifier) { ok = false; return true; }
+    VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
+    if (refuse_mask_write(b, rs, in, drop, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
             if (in.opcode == 0x0a &&
@@ -1541,7 +1542,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_b32.erase(106);
                 if (complete_scalar_pair) {
                     auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end()) { ok = false; return true; }
+                    if (vcc_sibling_unavailable(b, rs, 107, high, ok)) return true;
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
                     const uint32_t word = b.sel(
@@ -1846,7 +1847,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
                     const auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end()) { ok = false; return true; }
+                    if (vcc_sibling_unavailable(b, rs, 107, high, ok)) return true;
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
                     const uint32_t word = b.sel(
@@ -2406,7 +2407,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) {
                         const int sibling = writes_hi ? 106 : 107;
                         auto other = rs.sreg.find(sibling);
-                        if (other == rs.sreg.end()) { ok = false; return true; }
+                        if (vcc_sibling_unavailable(b, rs, sibling, other, ok)) return true;
                         const uint32_t other_bit = b.ucmp(
                             Op_INotEqual,
                             b.ibin(Op_BitwiseAnd,
@@ -8419,7 +8420,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // wrapped, atlas, and uniform coordinates do not share the screen quad's implicit derivative.
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
-            const bool is_sample_d = (in.opcode == 0x22);
+            //
+            // image_sample_cd = 0x68 takes the same operands in the same order (llvm-mc gfx1030:
+            // 0xf1a00f08 "image_sample_cd v[6:9], v[0:5], ..." beside 0xf0880f08 "image_sample_d"),
+            // contiguous and NSA, so it takes the same Grad lowering. Only this opcode: the siblings
+            // 0x69-0x6f (_cd_cl, _c_cd, _c_cd_cl, _cd_o, _cd_cl_o, _c_cd_o, _c_cd_cl_o) add a clamp,
+            // a dref or a packed offset to the address, so the exact-opcode test below keeps them
+            // refused. The Pathless (PPSA01826, six fragment programs), Little Nightmares II
+            // (PPSA02154) and Sonic Origins (PPSA05325, NSA) issue it as a plain 2D sample; with no
+            // lowering every one of those draws was dropped (#4808).
+            // The lowering is stage-agnostic, like _d's: explicit Grad needs no quad, so compute and
+            // vertex programs issuing 0x68 are admitted too. Only fragment use is seen or tested.
+            // CONFIDENCE: MED -- the "C" (coarse) form selects one LOD per 2x2 quad from the supplied
+            // derivatives; Grad evaluates it per invocation. They agree when the derivatives are
+            // quad-uniform (what ddx_coarse supplies; not checked against any title here), and a
+            // quad whose lanes differ may get a neighbouring mip per pixel. How the hardware reduces
+            // a quad to one LOD (lane 0, an average) is not established. Only quad-uniform is tested.
+            const bool is_sample_d = (in.opcode == 0x22) || (in.opcode == 0x68);
             // These array lowerings preserve the guest's layer operand. The older generic
             // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.

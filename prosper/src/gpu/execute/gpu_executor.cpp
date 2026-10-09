@@ -5308,9 +5308,10 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                             same_code &&
                             mapped_split_t8_reaches_use(
                                 code,
-                                std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u),
+                                std::min<size_t>(rdna2_recompile_code_span(code, dwords),
+                                                 kSplitT8MaxDwords),
                                 in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
-                                user_sgpr_base, image_writes);
+                                user_sgpr_base, image_writes, decoded->split_t8_cache.get());
                     }
                     // The admission predicate lives in fold_t8_decline_reason so every decline
                     // names its gate in the [t8-dropped] witness (#4700).
@@ -9928,8 +9929,16 @@ OrderedSubmitResult execute_ordered_items_impl(
             read_points.advance();
             if (compute) {
                 const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
+                set_compute_decline_reason(nullptr);
                 const bool executed = compute({computes[operation.item]});
                 outcome.finish(executed);
+                if (!executed) {
+                    const ComputeItem& declined = computes[operation.item];
+                    note_backend_declined_compute(
+                        declined.code_addr, declined.code_dwords, declined.launch.groups_x,
+                        declined.launch.groups_y, declined.launch.groups_z,
+                        take_compute_decline_reason());
+                }
                 result.compute_executed |= executed;
                 read_points.dependencies_ok &= executed;
             } else
@@ -12166,9 +12175,17 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                         observe_compute_tree_watch_pre(item, submit_no, operation.index,
                                                        operation.command_order, tree_watch_touch);
                     const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
+                    // `item` may be moved into the backend below; keep what a decline dumps.
+                    const uint32_t declined_dwords = item.code_dwords;
+                    set_compute_decline_reason(nullptr);
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
                     epoch_broken_deliberately |= outcome.finish(executed);
+                    if (!executed)
+                        note_backend_declined_compute(
+                            tree_watch_program, declined_dwords, tree_watch_launch.groups_x,
+                            tree_watch_launch.groups_y, tree_watch_launch.groups_z,
+                            take_compute_decline_reason());
                     log_compute_dispatch(tree_watch_program, submit_no, operation.index,
                                          operation.command_order,
                                          executed ? "executed" : "backend-declined",

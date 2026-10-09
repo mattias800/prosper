@@ -71,6 +71,24 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.reg_offset = pl[0]; c.reg_value = pl[1];
                 c.reg_count = npl - 1; c.reg_data = &pl[1];
             }
+        } else if ((c.op == IT_LOAD_SH_REG || c.op == IT_LOAD_CONTEXT_REG ||
+                    c.op == IT_LOAD_CONTEXT_REG_INDEX || c.op == IT_LOAD_UCONFIG_REG) &&
+                   npl == 4 && (pl[0] & 3u) == 0 && (pl[2] & 0x80000000u) != 0) {
+            // Hardware PM4 indirect register loads, as the PS5's own libSceAgc emits them (#4822):
+            //   [0..1] = 64-bit guest address of a ShaderReg {offset, value} array (lo/hi),
+            //   [2]    = bit 31 set: the array holds offset/value pairs,
+            //   [3]    = number of pairs.
+            // Seen in a Black Flag (PPSA28183) submit captured on PS5 hardware: 330 0x63 packets
+            // loading user-data SGPRs, plus 0x64 and 0x9F context loads. Only that observed shape
+            // decodes: an index/offset address mode (low address bits), the contiguous-range data
+            // format (bit 31 clear) or another length stays Unknown rather than being read as
+            // pairs. CONFIDENCE: MED (one title's capture; 0x64's role is inferred from it).
+            c.kind = K::SetRegsIndirect;
+            c.reg_class = (c.op == IT_LOAD_SH_REG)        ? RegClass::Sh
+                          : (c.op == IT_LOAD_UCONFIG_REG) ? RegClass::Uc
+                                                          : RegClass::Cx;
+            c.regs_vaddr = lo_hi(pl);
+            c.num_regs = pl[3];
         } else if (c.op == IT_INDIRECT_BUFFER && npl == 13) {
             // sceAgcCbBranch's packet (#4540). Other lengths of this opcode are not emitted by any
             // prosper builder and stay Unknown.

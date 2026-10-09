@@ -352,6 +352,13 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   draw is not admitted. The recompiler already linearizes an EXEC-masked VALU/VMEM region with no vote
   at all (`safe_execz_branches`), so a region that still carries a vote holds something that linearizer
   refuses; here it is the scalar loads and the VCC move.
+- **"Black Flag's main graphics queue submits through the single-buffer `sceAgcDriverSubmitDcb`
+  (`UglJIZjGssM`)."** Falsified 2026-10-09 on PS5 hardware, which is optional human evidence and not
+  reproducible by an agent (`PPSA28183` in the foreground, FW 13.40, ps5debug-NG through
+  `tools/console_capture`, #4817): a software breakpoint at `sceAgcDriverSubmitDcb` never hit, while
+  one at `sceAgcDriverSubmitMultiDcbs` (`6UzEidRZwkg`) hit on every active frame. The captured submit
+  held 115 segments (23,766 dwords), and all 212 of its compute dispatches request Wave64
+  (`CS_W32_EN=0`). The capture itself is not in the repository.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 

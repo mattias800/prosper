@@ -51,6 +51,8 @@ indent-style = "space"
 testpaths = [
     "prosper/tools/revision/test_compiler_wrapper.py",
     "prosper/tests/tools/test_dump_hygiene.py",
+    "prosper/tests/tools/test_eboot_shader_elfs.py",
+    "prosper/tests/tools/test_console_capture.py",
     "prosper/tools/ci",
     "prosper/tools/doctor/test_doctor.py",
     "prosper/tools/docs/test_check_arch_docs.py",
@@ -78,6 +80,7 @@ testpaths = [
     "prosper/tools/progress/test_progress.py",
     "prosper/tools/console_oracle/test_run_oracle.py",
     "prosper/tools/console_oracle/test_gen_builder_cases.py",
+    "prosper/tools/console_oracle/test_coverage_report.py",
 ]
 # --import-mode=importlib does not put a test's folder on sys.path, and these tests import their
 # sibling tool by bare name.
