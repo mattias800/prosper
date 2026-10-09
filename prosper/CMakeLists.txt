@@ -5912,6 +5912,13 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # #4808: the NSA fragment MIMG forms image_sample_c, image_sample_o and image_get_lod, executed
+      # (one-level textures) with their refusal controls. Reaches `shared/...` through render_runner.h.
+      prosper_add_gtest(test_mimg_nsa_forms_render
+        SOURCES tests/gpu/test_mimg_nsa_forms_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Guest depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) against a retained depth
       # surface with the depth test off. Reaches `shared/...` through render_runner.h.
       prosper_add_gtest(test_depth_bounds_render

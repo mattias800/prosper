@@ -1432,6 +1432,11 @@ struct SpirvCompute {
     bool declared_image_query = false;
     void image_sample_lz_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                    uint32_t off_bits, uint32_t out[4]);
+    // image_sample_o 2D on a ONE-level texture: the same level-0 fold, then an implicit-LOD sample
+    // in a fragment stage (explicit LOD 0 elsewhere, as image_sample_2d). Only exact while the
+    // texture has a single level -- the caller guarantees it (#4808).
+    void image_sample_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                uint32_t off_bits, uint32_t out[4]);
     // image_get_resinfo: query a sampled image's dimensions at the integer LOD carried in VADDR.
     // RDNA returns {width,height,depth-or-layers,mip-levels}; absent spatial axes are 1. The result is
     // integer data in ordinary VGPRs, so the signed SPIR-V query result is bitcast back to raw u32.

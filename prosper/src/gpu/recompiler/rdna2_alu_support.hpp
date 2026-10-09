@@ -231,8 +231,15 @@ inline bool is_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
 // IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
 // Table 100 control families separate so each can be mutation-tested, while production and the
 // table-less coverage classifier consume one shared predicate and cannot drift apart.
+// NSA is modelled in exactly one shape: [u, v] as VADDR plus byte 0 of one extra dword, every
+// other byte zero (House of the Dead 2, #4808). Any further NSA address is an operand this form
+// does not have.
+inline bool mimg_get_lod_nsa_two_addresses(const Rdna2Inst& in) {
+    return in.mimg_nsa != 0u && in.len_dwords == 3u && (in.words[2] & 0xffffff00u) == 0u;
+}
 inline bool mimg_get_lod_has_address_controls(const Rdna2Inst& in) {
-    return in.mimg_nsa != 0u || in.mimg_unorm || in.mimg_a16;
+    return (in.mimg_nsa != 0u && !mimg_get_lod_nsa_two_addresses(in)) || in.mimg_unorm ||
+           in.mimg_a16;
 }
 inline bool mimg_get_lod_has_cache_controls(const Rdna2Inst& in) {
     return in.mimg_dlc || in.mimg_glc || in.mimg_slc;
@@ -245,6 +252,28 @@ inline bool mimg_get_lod_has_unmodeled_controls(const Rdna2Inst& in) {
            mimg_get_lod_has_cache_controls(in) ||
            mimg_get_lod_has_result_controls(in) ||
            in.mimg_reserved;
+}
+
+// IMAGE_GET_LOD (0x60), fragment 2D only; false refuses (rdna2_emit_image_lod.cpp).
+bool emit_image_get_lod(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
+                        const ShaderResource& res, bool uint_texture);
+
+// image_sample_c = 0x28 (implicit-LOD depth compare, vaddr [dref, u, v]) and
+// image_sample_o = 0x30 (implicit-LOD sample with the packed texel offset first,
+// [offset, u, v]); llvm-mc gfx1030 on live NSA bytes: Yakuza Kiwami
+// `image_sample_c v0, [v14, v7, v12], s[16:23], s[0:3] dmask:0x1 dim:2D` and Bendy and
+// the Ink Machine `image_sample_o v[19:21], [v5, v25, v26], ... dmask:0x7 dim:2D` (#4808).
+// Both are lowered only where the implicit LOD cannot change the answer: a T# with ONE
+// mip level, so no level is selected and an offset folded at level 0's size is exact.
+// For _c the existing manual comparison (the _c_lz lowering) also needs equal min and
+// mag filters (the LOD sign picks between them) and no anisotropy (it takes no
+// derivatives). Every other resource stays refused. CONFIDENCE: HIGH on the operand
+// order (ISA 8.2.5 "{offset}{bias}{z-compare}{derivative}{body}", as _c_lz and _lz_o
+// already read it); HIGH on the single-level equivalence.
+inline bool mimg_single_level_implicit_form(const Rdna2Inst& in, const ShaderResource& res) {
+    if (in.mimg_dim != 1u || res.declared_mip_levels != 1u) return false;
+    if (in.opcode == 0x30) return true;
+    return in.opcode == 0x28 && res.min_filter == res.mag_filter && !res.max_aniso_ratio;
 }
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
