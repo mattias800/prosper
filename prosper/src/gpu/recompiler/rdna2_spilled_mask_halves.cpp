@@ -56,6 +56,8 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     std::erase_if(into.defined_slots,
                   [&](const auto& slot) { return !incoming.defined_slots.contains(slot); });
     into.relayed_words.insert(incoming.relayed_words.begin(), incoming.relayed_words.end());
+    into.lane_written_vgprs.insert(incoming.lane_written_vgprs.begin(),
+                                   incoming.lane_written_vgprs.end());
 }
 
 namespace {
@@ -97,7 +99,8 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
     const bool relays =
-        readlane ? !(constant_lane(in) && defined.contains({in.src[0].value, in.src[1].value}))
+        readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
+                       !(constant_lane(in) && defined.contains({in.src[0].value, in.src[1].value}))
                  : reads_relayed_word(relayed, in);
     for (const auto& [base, width] : scalar_writes)
         for (uint32_t word = 0; word < width; ++word) {
@@ -116,6 +119,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         std::erase_if(defined, [&](const auto& slot) { return slot.first == vgpr; });
     };
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane) {
+        state.lane_written_vgprs.insert(in.dst.value);
         if (!constant_lane(in)) return drop_vgpr(in.dst.value);
         const Operand& source = in.src[0];
         const int reg = source.value;

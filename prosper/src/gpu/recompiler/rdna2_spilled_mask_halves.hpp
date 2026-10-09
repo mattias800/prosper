@@ -40,6 +40,11 @@ struct SpilledMaskHalves {
     // so without it a fabricated word relayed through one slot re-spills into another as defined,
     // or crosses a dispatcher edge as a defined SGPR (#4749 review).
     std::set<int> relayed_words;
+    // The VGPRs a V_WRITELANE has written on some path here (a MAY fact, union at joins): the only
+    // VGPRs whose V_READLANE can read a SPILL SLOT. A readlane of any other VGPR is an ordinary
+    // vector-to-scalar read (GTA V's `v_readlane_b32 vcc_lo, v0, 0`), not a relay of a possibly
+    // fabricated slot word.
+    std::set<int> lane_written_vgprs;
     bool operator==(const SpilledMaskHalves&) const = default;
 };
 inline constexpr int kRelayedScc = 253;

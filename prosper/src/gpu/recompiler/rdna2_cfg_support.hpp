@@ -1564,7 +1564,9 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
 inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
     ScalarSourceMarks marks;
     const auto word = [&](int r) {
-        marks.placeholder = marks.placeholder || sreg_word_may_be_fabricated(rs, r);
+        const bool fabricated = sreg_word_may_be_fabricated(rs, r);
+        marks.placeholder = marks.placeholder || fabricated;
+        marks.hard = marks.hard || (fabricated && !rs.sreg_loop_blanket.contains(r));
         marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
     };
     if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
@@ -1576,6 +1578,7 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
             if (in.src[1].kind == OperandKind::InlineInt) {
                 const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
                 marks.placeholder = rs.lane_slot_merge_placeholder.contains(slot);
+                marks.hard = marks.placeholder;
                 marks.memory = rs.lane_slot_memory_pattern.contains(slot);
             }
         } else if (in.src[0].kind == OperandKind::SGPR ||
@@ -1599,7 +1602,7 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     // A read-modify-write keeps the destination's old bits (s_bitset*, s_cmov*, s_addk, ...).
     const uint32_t implicit = scalar_implicit_destination_read_width(in);
     for (uint32_t w = 0; w < implicit; ++w) word(in.dst.value + static_cast<int>(w));
-    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = true;
+    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = marks.hard = true;
     return marks;
 }
 

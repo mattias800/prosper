@@ -2956,6 +2956,13 @@ struct RegState {
     // prove, which covers SGPRs; spill slots carry no such fact, so it marks every reloaded data
     // slot instead. Consumers that turn scalar DATA into lane bits consult the marks (mask()).
     std::set<int> sreg_merge_placeholder;
+    // Which marks are ONLY the loop header's blanket mark (mark_loop_carried marks every loop-carried
+    // SGPR before the body exists) on a word that was DEFINED on the preheader edge, or derived only
+    // from such words. Any other cause erases the entry. The lane-bit guard accepts these: refusing
+    // them made a VCC-as-scratch write from a loop counter drop VCC's lane view, and a loop exit
+    // that could not name VCC (Kena's per-cone loop). A word written from fabricated data on the
+    // back-edge only is the residue this accepts (#4714).
+    std::set<int> sreg_loop_blanket;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
     // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in
@@ -3252,6 +3259,7 @@ inline bool scalar_reads_scc(const Rdna2Inst& in) {
 struct ScalarSourceMarks {
     bool placeholder = false;   // some input word may be the fabricated zero (or derived from it)
     bool memory = false;   // some input word came from memory
+    bool hard = false;   // some marked input is not merely a loop-header blanket mark
 };
 
 // scalar_source_marks() lives in rdna2_cfg_support.hpp, beside the width inventories it reads.
@@ -3264,6 +3272,7 @@ inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabrica
         rs.sreg_merge_placeholder.insert(r);
     else
         rs.sreg_merge_placeholder.erase(r);
+    rs.sreg_loop_blanket.erase(r);
     if (other_edge_memory) rs.sreg_memory_pattern.insert(r);
 }
 
@@ -3308,7 +3317,11 @@ inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) 
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi) {
-    for (int r : carried) join_merge_placeholder(rs, r, true, false);
+    for (int r : carried) {
+        const bool defined_at_preheader = !merge_edge_word_fabricated(rs, r);
+        join_merge_placeholder(rs, r, true, false);
+        if (defined_at_preheader) rs.sreg_loop_blanket.insert(r);
+    }
     rs.scc_merge_placeholder = true;
     for (const Rdna2Inst& in : ins)
         if (in.pc >= lo && in.pc < hi && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
@@ -3321,10 +3334,11 @@ void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector
 struct LoopCheckMarks {
     std::set<int> fabricated, memory;
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
+    std::set<int> blanket;   // the check block's sreg_loop_blanket
 };
 inline LoopCheckMarks loop_check_marks(const RegState& rs) {
     return {rs.sreg_merge_placeholder, rs.sreg_memory_pattern, rs.lane_slot_merge_placeholder,
-            rs.lane_slot_memory_pattern};
+            rs.lane_slot_memory_pattern, rs.sreg_loop_blanket};
 }
 // The spill slots at a loop exit: `rs` holds the body end's slot map, so union in the check
 // block's marks (a slot marked on either is marked after the loop).
@@ -3343,6 +3357,9 @@ inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
     const bool memory =
         check.memory.contains(r) || (body_edge && rs.sreg_memory_pattern.contains(r));
     join_merge_placeholder(rs, r, fabricated, false);
+    // A register that leaves as the header phi (or as the check block's own value) and was only
+    // blanket-marked there stays blanket-marked; a direct break from the body makes it hard.
+    if (fabricated && !body_edge && check.blanket.contains(r)) rs.sreg_loop_blanket.insert(r);
     if (memory)
         rs.sreg_memory_pattern.insert(r);
     else
@@ -3676,6 +3693,10 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                 rs.sreg_merge_placeholder.insert(r);
             else
                 rs.sreg_merge_placeholder.erase(r);
+            if (marks.placeholder && !marks.hard && !ballot)
+                rs.sreg_loop_blanket.insert(r);
+            else
+                rs.sreg_loop_blanket.erase(r);
             if (marks.memory && !ballot)
                 rs.sreg_memory_pattern.insert(r);
             else

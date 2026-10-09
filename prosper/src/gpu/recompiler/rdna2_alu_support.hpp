@@ -413,7 +413,7 @@ inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, 
     for (int r = reg; r < reg + words; ++r) {
         // A direct-descriptor word in sreg_input, or a copy of one, is real driver data: the
         // exemption lives where absence is decided (sreg_word_may_be_fabricated).
-        if (sreg_word_may_be_fabricated(rs, r)) return false;
+        if (sreg_word_may_be_fabricated(rs, r) && !rs.sreg_loop_blanket.contains(r)) return false;
         if (b.is_fragment && rs.sreg_memory_pattern.contains(r)) return false;
     }
     return true;

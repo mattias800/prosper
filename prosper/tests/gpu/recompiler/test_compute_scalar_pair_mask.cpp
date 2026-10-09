@@ -555,3 +555,36 @@ TEST(ScalarPairMask, AReadlanedFabricatedWordCrossingTheDispatcherRefuses) {
     expect_restore_refused(never, 0xbefe0406u);
     expect_restore_refused(one_path, 0xbefe0406u);
 }
+
+// Kena's per-cone loop (cs 0x50071e0000): an outer s_cmp/s_cbranch_scc1 loop around an inner step loop
+// that leaves through s_cbranch_execz after v_cmp writes VCC. Its tail recycles VCC as scalar scratch
+// from the loop counter (only blanket-marked at the header). The check block's VCC must stay a mask:
+// dropping VCC's lane view for that write left the loop exit unable to name VCC ("check-mask=0
+// body-mask=0") and refused a program main compiles.
+// NOLINTBEGIN(bugprone-throwing-static-initialization): fixture instruction words, as above.
+namespace {
+const Words kNestedLoopsWithVccScratchTail = {
+    0x7d820082u,   // v_cmp_lt_u32 vcc, 2, v0: VCC holds a lane mask on loop entry
+    0xbe9a0380u,   // s_mov_b32 s26, 0
+    0xbe9b0380u,   // OUTER: s_mov_b32 s27, 0
+    0x7d82001bu,   // INNER: v_cmp_lt_u32 vcc, s27, v0
+    0xbe9c246au,   // s_and_saveexec_b64 s[28:29], vcc
+    0xbf880004u,   // s_cbranch_execz -> exit of the inner loop
+    0x801b811bu,   // s_add_u32 s27, s27, 1
+    0x88fe1c7eu,   // s_or_b64 exec, exec, s[28:29]
+    0xbf0a841bu,   // s_cmp_lt_u32 s27, 4
+    0xbf85fff9u,   // s_cbranch_scc1 INNER
+    0x88fe1c7eu,   // s_or_b64 exec, exec, s[28:29]
+    0x8f6a821au,   // s_lshl_b32 vcc_lo, s26, 2   (VCC scratch from the counter, after the inner loop)
+    0x801a811au,   // s_add_u32 s26, s26, 1
+    0xbf0a891au,   // s_cmp_lt_u32 s26, 9
+    0xbf85fff4u};   // s_cbranch_scc1 OUTER
+}   // namespace
+// NOLINTEND(bugprone-throwing-static-initialization)
+
+TEST(ScalarPairMask, ANestedLoopWhoseTailRecyclesVccFromItsCounterCompiles) {
+    const Words tail = {0x7e0602f2u, 0xe0702000u, 0x80020300u, 0xbf810000u};   // v3 = 1.0; store
+    const Words code = cat({&kNestedLoopsWithVccScratchTail, &tail});
+    EXPECT_FALSE(compile_whole(Stage::Compute, code).empty())
+        << last_terminal_reject_reason(kAddress);
+}
