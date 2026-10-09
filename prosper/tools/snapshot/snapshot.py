@@ -28,6 +28,7 @@ Env overrides:
   PROSPER_SCREENSHOT  path to the screenshot binary    (default: <prosper>/build-linux/screenshot)
   PROSPER_SNAPSHOT_LOCK path for the cross-worktree capture lock
   PROSPER_SNAPSHOT_NO_LOCK=1 to allow an intentional concurrent capture
+  PROSPER_SAVE_FIXTURES dir holding save fixtures for entries with `save_fixture` (default: ~/prosper-saves)
 
 Exact mode targets a frame with RENDER_EVERY=1 plus `frame`=F, so frame_<F>.bmp
 is the F-th draw submit's render. Pick F in a stable-content window and use
@@ -437,6 +438,38 @@ def resolve_dump(entry):
     return dump if os.path.isabs(dump) else os.path.join(GAME_ROOT, dump)
 
 
+def _save_fixture_module():
+    """Load tools/saves/save_fixture.py by path (it is a sibling tool, not an installed package)."""
+    import importlib.util
+    path = os.path.join(HERE, "..", "saves", "save_fixture.py")
+    spec = importlib.util.spec_from_file_location("prosper_save_fixture", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def save_fixture_skip_reason(entry):
+    """Why this snap cannot run on this machine because its save fixture is absent, or None.
+
+    Fixtures are derived from game content and never committed, so a clean clone legitimately lacks
+    them. The snap is then SKIPPED with this message. It must never fall back to a fresh save: its
+    route assumes the post-setup state, so a fresh run would diverge at the first-boot screens and
+    read as a regression.
+    """
+    state = entry.get("save_fixture")
+    if not state:
+        return None
+    fixtures = _save_fixture_module()
+    try:
+        title = entry.get("title_id") or fixtures.title_from_dump(entry["dump"])
+        if fixtures.fixture_exists(title, state):
+            return None
+    except fixtures.FixtureError as exc:
+        return f"save fixture {state!r} is unusable: {exc}"
+    return (f"save fixture {title}/{state} not found under {fixtures.fixtures_root()}; "
+            f"create it with tools/saves/save_fixture.py capture {title} {state} ...")
+
+
 def apply_entry_env(env, entry, tmp):
     """Apply route/save policy after generic renderer defaults.
 
@@ -453,7 +486,25 @@ def apply_entry_env(env, entry, tmp):
         env["PROSPER_PAD_SCRIPT"] = "@" + route
         env.setdefault("PROSPER_PAD_SCRIPT_LOG", "1")
     save_policy = entry.get("savedata_policy")
-    if save_policy == "fresh":
+    fixture_state = entry.get("save_fixture")
+    if fixture_state:
+        # Seed BOTH roots from a local fixture into fresh per-run directories. A missing fixture is
+        # an error here (the check/verify loops skip such snaps before getting this far), never a
+        # silent fresh run, and the policy cannot be "preserve": that would mix a fixture with the
+        # developer's real saves.
+        if save_policy == "preserve":
+            raise RuntimeError("save_fixture conflicts with savedata_policy=preserve")
+        reason = save_fixture_skip_reason(entry)
+        if reason:
+            raise RuntimeError(reason)
+        fixtures = _save_fixture_module()
+        title = entry.get("title_id") or fixtures.title_from_dump(entry["dump"])
+        try:
+            seeded = fixtures.seed(title, fixture_state, tmp)
+        except fixtures.FixtureError as exc:
+            raise RuntimeError(f"save fixture {title}/{fixture_state}: {exc}") from exc
+        env.update(seeded)
+    elif save_policy == "fresh":
         # prosper has TWO independent save roots and a fresh console state needs BOTH redirected:
         #   PROSPER_SAVEDATA_DIR -> SaveDataMemory slots (the entire save path for Unity titles)
         #   PROSPER_SAVE0        -> the /savedata0 file mount (Blasphemous 2 writes slot0/slot1 here)
@@ -1238,6 +1289,10 @@ def cmd_update(m, names, options=None):
 def cmd_verify(m, names, options=None):
     rc = 0
     for s in select(m, names):
+        skip = save_fixture_skip_reason(s)
+        if skip:
+            print(f"[verify] {s['name']}: SKIPPED — {skip}")
+            continue
         temps = []
         try:
             if s.get("min_colors"):
@@ -1330,6 +1385,12 @@ def cmd_check(m, names, options=None):
         if base and (not s.get("review") or str(s["review"]).lower() == "pending"):
             print(f"[check] {s['name']}: baseline lacks a completed visual-review note", file=sys.stderr)
             rc = 1
+            continue
+        skip = save_fixture_skip_reason(s)
+        if skip:
+            # Not a failure: fixtures are local-only, so a clean clone cannot have them. It is not
+            # a pass either, and it must never run with a fresh save (the route assumes the fixture).
+            print(f"[check] {s['name']}: SKIPPED — {skip}")
             continue
         log = os.path.join(FAIL_DIR, f"{s['name']}.log")
         try:

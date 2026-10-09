@@ -73,6 +73,7 @@ testpaths = [
     "prosper/tools/re/test_hle_handler_map.py",
     "prosper/tools/shader_inspect/test_route_candidates.py",
     "prosper/tools/snapshot/test_snapshot.py",
+    "prosper/tools/saves/test_save_fixture.py",
     "prosper/tools/test_worktree_reclaim.py",
     "prosper/tools/progress/test_progress.py",
     "prosper/tools/console_oracle/test_run_oracle.py",
