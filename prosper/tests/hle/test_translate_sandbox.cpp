@@ -3,6 +3,8 @@
 //  - #1205: a guest path must not climb OUT of its virtual root (/app0, /temp0, /savedata0). A
 //    sub-path containing ".." is lexically normalized; an ABSOLUTE path that escapes above the root
 //    is denied. Normal paths and benign in-sandbox ".." are byte-for-byte unaffected.
+//  - #4782: a path no served mount owns has NO host spelling. resolve_guest_path returns an empty
+//    string for it, never the raw guest path, which on the host would name the host's own files.
 //  - #1226: sceAvPlayer sources arrive as file:// URLs (UE4:
 //    "file://../../../<project>/Content/Movies/x.mp4"). The scheme is stripped; a RELATIVE path's
 //    leading ".." clamps at the /app0 root (prosper models no UE4 BaseDir/CWD) instead of being
@@ -27,7 +29,9 @@ using namespace prosper;
 
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-static bool denied(const std::string& r) { return r.rfind("/prosper-denied", 0) == 0; }
+// Unmapped (#4782): no host path at all. Before #4782 an escape was redirected to a
+// "/prosper-denied" host path and any other unmounted path was returned verbatim.
+static bool denied(const std::string& r) { return r.empty(); }
 
 TEST(TranslateSandbox, Contract) {
     std::printf("== test_translate_sandbox ==\n");
@@ -54,15 +58,15 @@ TEST(TranslateSandbox, Contract) {
 
     // A mount name must end at a component boundary. Raw prefix matching aliases unrelated guest
     // namespaces into a mount (for example, /app0evil/file -> <app0-root>/evil/file).
-    CHECK(resolve_guest_path("/app0evil/file") == "/app0evil/file",
-          "sibling prefix '/app0evil' is not mapped into /app0");
-    CHECK(resolve_guest_path("/temp00/file") == "/temp00/file",
-          "sibling prefix '/temp00' is not mapped into /temp0");
+    CHECK(denied(resolve_guest_path("/app0evil/file")),
+          "sibling prefix '/app0evil' is not mapped into /app0 (nor passed to the host)");
+    CHECK(denied(resolve_guest_path("/temp00/file")),
+          "sibling prefix '/temp00' is not mapped into /temp0 (nor passed to the host)");
     // /download0 is a mount like the others (#3496), so it needs the same component-boundary guard.
     // Its name is also exactly as long as "/savedata0", and both slice with vlen = 10 -- so the
     // if/else arm order in resolve_guest_path is load-bearing, not cosmetic.
-    CHECK(resolve_guest_path("/download00/file") == "/download00/file",
-          "sibling prefix '/download00' is not mapped into /download0");
+    CHECK(denied(resolve_guest_path("/download00/file")),
+          "sibling prefix '/download00' is not mapped into /download0 (nor passed to the host)");
     {
         const std::string download0 = resolve_guest_path("/download0/patch.pkg");
         CHECK(download0 != "/download0/patch.pkg",
@@ -73,7 +77,7 @@ TEST(TranslateSandbox, Contract) {
         CHECK(download0.size() > std::string("/patch.pkg").size() &&
                   download0.compare(download0.size() - 10, 10, "/patch.pkg") == 0,
               "the subpath under /download0 survives translation");
-        CHECK(resolve_guest_path("/download0/../etc/passwd").rfind("/prosper-denied", 0) == 0,
+        CHECK(denied(resolve_guest_path("/download0/../etc/passwd")),
               "/download0 traversal out of its mount is denied like every other mount");
         // A traversal that RE-ENTERS a mount is allowed and mapped, unlike one that leaves the
         // sandbox. This is what the `reenters_mount` clause is for, and the deny case above cannot
@@ -86,9 +90,20 @@ TEST(TranslateSandbox, Contract) {
     fs::create_directories(root / "saves");
     CHECK(savedata0_mount("slot", SaveDataMountPolicy::OpenOrCreate) == SaveDataMountOutcome::Created,
           "test save directory mounts");
-    CHECK(resolve_guest_path("/savedata00/file") == "/savedata00/file",
-          "sibling prefix '/savedata00' is not mapped into /savedata0");
+    CHECK(denied(resolve_guest_path("/savedata00/file")),
+          "sibling prefix '/savedata00' is not mapped into /savedata0 (nor passed to the host)");
+    CHECK(!denied(resolve_guest_path("/savedata0/file")), "a mounted /savedata0 is mapped");
     CHECK(savedata0_umount(), "test save directory unmounts");
+    // #4782: with no save mounted, /savedata0 is not served. It used to fall through to the host's
+    // literal "/savedata0/file".
+    CHECK(denied(resolve_guest_path("/savedata0/file")),
+          "an unmounted /savedata0 has no host spelling");
+    // #4782: absolute paths outside every mount -- the console-oracle spellings among them -- have
+    // no host spelling. Before the fix both came back verbatim, i.e. as paths on the host's root.
+    CHECK(denied(resolve_guest_path("/oracle_nonexistent_dir")),
+          "a root-level name outside the mounts has no host spelling");
+    CHECK(denied(resolve_guest_path("/oracle_nonexistent/file")),
+          "a deeper path outside the mounts has no host spelling");
 
     // Every separator-only spelling names the jailed title's virtual root. In particular, bare
     // "/" must not pass through to the real host root while "/app0/.." maps to the vroot (#1323).

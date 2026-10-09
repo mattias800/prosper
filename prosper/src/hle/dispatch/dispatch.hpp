@@ -241,7 +241,9 @@ void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
 // Resolve a guest filesystem path through the same mount table used by libkernel file I/O.
-// Host frontends such as native media decoders must never receive raw /app0 paths.
+// Host frontends such as native media decoders must never receive raw /app0 paths. Returns an
+// EMPTY string for a path no served mount owns: such a path has no host file, and the raw guest
+// spelling must never be handed to the host in its place (#4782).
 std::string resolve_guest_path(const char* guest_path);
 // Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName.
 // The policy/result distinction preserves SaveData's exclusive CREATE versus CREATE2

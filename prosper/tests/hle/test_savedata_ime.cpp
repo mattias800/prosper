@@ -208,7 +208,9 @@ TEST(SavedataIme, Contract) {
 
             CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
                   "legacy Umount releases an active mount synchronously");
-            CHECK(resolve_guest_path("/savedata0/probe.bin") == "/savedata0/probe.bin",
+            // #4782: an unmounted /savedata0 has no host spelling at all (it used to come back
+            // verbatim, i.e. as a path on the host's root).
+            CHECK(resolve_guest_path("/savedata0/probe.bin").empty(),
                   "legacy Umount removes /savedata0 path translation");
             // #3666: this used to expect NOT_FOUND (0x809F0008), which sceSaveDataUmount alone
             // answered for BOTH "your mount point is wrong" and "nothing is mounted". It now
@@ -224,7 +226,7 @@ TEST(SavedataIme, Contract) {
                          0,0,0,0) == 0x809F0007ull,
                   "Mount2 CREATE of an existing save -> EXISTS");
             CHECK(all_bytes_are(&guarded, sizeof guarded, 0xAB) &&
-                  resolve_guest_path("/savedata0/probe.bin") == "/savedata0/probe.bin",
+                  resolve_guest_path("/savedata0/probe.bin").empty(),
                   "failed exclusive CREATE leaves its result untouched and does not mount");
 
             memset(&guarded, 0xAB, sizeof guarded);

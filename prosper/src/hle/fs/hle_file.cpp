@@ -635,7 +635,7 @@ namespace {
     // redirected to a guaranteed-missing host path, so open/stat fail with ENOENT.
     // Diagnostic knob (off by default) — used to A/B whether the title's boot flow gates on a
     // file class we can't service yet (e.g. .usm movies through the stubbed CRI/AJM decoders).
-    // Matching is CASE-INSENSITIVE (#1237): translate() resolves guest paths case-insensitively
+    // Matching is CASE-INSENSITIVE (#1237): resolve_guest() resolves guest paths case-insensitively
     // against the dump (the PS5 namespace is effectively case-insensitive, #1233), so a guest
     // spelling `Intro.USM` must not slip past a `.usm` deny — a casing variant defeating the knob
     // makes the A/B experiment lie.
@@ -713,8 +713,72 @@ namespace {
         return path.compare(0, len, mount) == 0 &&
                (path.size() == len || path[len] == '/' || path[len] == '\\');
     }
-    std::string translate(const char* guest) {
-        if (!guest) return {};
+    // ---- The guest filesystem namespace (#4782) ------------------------------------------------
+    // Every path-taking entry point resolves its guest path through resolve_guest() below, and only
+    // a Mapped result carries a host path. A guest path that no served mount owns never reaches a
+    // host filesystem call: before #4782 it was handed to the host verbatim, so a guest
+    // rmdir("/oracle_nonexistent_dir") ran a real rmdir on the host's root, and the answer depended
+    // on whether that root happened to be writable (#1323 had closed this for a bare "/" only).
+    //
+    // Outside the mounts, the PS5 namespace is read-only system space. prosper serves nothing
+    // there, so it is modelled as holding no entries at all, and the answer is the one FreeBSD's
+    // namei gives on a read-only filesystem:
+    //   - a name DIRECTLY under the root (SystemEntry): a lookup finds nothing -> ENOENT; an
+    //     operation that would create, remove or rename the name -> EROFS;
+    //   - a deeper name (Absent): its parent directory does not exist, so every operation fails
+    //     ENOENT before the read-only check is reached.
+    // Evidence: console-oracle measurements on PS5 hardware (#4780) --
+    // sceKernelRmdir("/oracle_nonexistent_dir") = 0x8002001e (EROFS),
+    // sceKernelUnlink("/oracle_nonexistent/file") = 0x80020002 (ENOENT), and sceKernelOpen /
+    // sceKernelStat / open / stat of "/oracle_nonexistent/file" = ENOENT.
+    // CONFIDENCE: HIGH for those measured shapes. MED for the unmeasured siblings that share their
+    // namei operation: mkdir, unlink, open(O_CREAT) and rename of a root-level name answering EROFS.
+    // MED that the real system space holds nothing a title reads: real hardware has entries there
+    // (/dev, /system, ...), which prosper does not serve and never served -- the host files that
+    // used to answer were the host's, not the console's.
+    enum class GuestPathKind : uint8_t {
+        Mapped,        // inside a served mount, or the virtual root: `host` names the host path
+        SystemEntry,   // a single name directly under the guest root that no served mount owns
+        Absent,        // the parent does not exist in the guest namespace (or PROSPER_DENY_SUBSTR)
+    };
+    // The namei operation the caller performs: a plain LOOKUP, or a CREATE/DELETE/RENAME.
+    enum class GuestPathOp : uint8_t { Lookup, Modify };
+    struct GuestPath {
+        GuestPathKind kind = GuestPathKind::Absent;
+        std::string host;   // empty unless kind == Mapped
+        bool mapped() const { return kind == GuestPathKind::Mapped; }
+    };
+    // The guest namespace's errno for an unmapped path. FreeBSD and Linux agree on both values
+    // (ENOENT 2, EROFS 30), so the POSIX names publish it as is and the sceKernel* names encode it
+    // through file_sce_error() like any other failure.
+    int unmapped_errno(const GuestPath& g, GuestPathOp op) {
+        return op == GuestPathOp::Modify && g.kind == GuestPathKind::SystemEntry ? EROFS : ENOENT;
+    }
+    // The POSIX-name refusal: -1 with the guest namespace's errno. The k_* wrappers re-encode it.
+    uint64_t refuse_unmapped(const GuestPath& g, GuestPathOp op) {
+        errno = unmapped_errno(g, op);
+        return (uint64_t)(int64_t)-1;
+    }
+    GuestPath unmapped_guest_path(const std::string& rooted, const char* guest) {
+        GuestPath g;
+        const std::string name = clamp_normalize_relative(rooted);
+        g.kind = !name.empty() && name.find('/') == std::string::npos ? GuestPathKind::SystemEntry
+                                                                      : GuestPathKind::Absent;
+        if (filelog())
+            fprintf(stderr, "[file] '%s' is outside every mount -> %s (no host access)\n", guest,
+                    g.kind == GuestPathKind::SystemEntry ? "read-only system entry" : "absent");
+        return g;
+    }
+    GuestPath mapped_guest_path(std::string host) {
+        GuestPath g;
+        g.kind = GuestPathKind::Mapped;
+        g.host = std::move(host);
+        return g;
+    }
+    GuestPath resolve_guest(const char* guest) {
+        // An empty path names nothing: FreeBSD answers ENOENT for every operation, and the console
+        // agrees for sceKernelOpen("") (#4780, kx_file_open_empty_path).
+        if (!guest || !*guest) return {};
         std::string p = guest;
         // The documented env spelling of the /app0 root. Route it through set_app0_root() rather
         // than assigning g_app0 here: that is what runs the single sce_sys/param.json parse, and
@@ -725,84 +789,66 @@ namespace {
         if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) set_app0_root(e); }
         if (deny_path(p)) {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
-            return "/prosper-denied" + p;
+            return {};   // Absent: ENOENT for every operation, the knob's documented answer
         }
+        // A relative path resolves against the guest's working directory. prosper implements no
+        // chdir, so that is the root a FreeBSD process starts in; it was the HOST's working
+        // directory before #4782. CONFIDENCE: LOW on the PS5 process's initial working directory
+        // (no measurement); HIGH that the host's must never be the answer.
+        if (p[0] != '/' && p[0] != '\\') p.insert(p.begin(), '/');
         // #1323: separator-only spellings name the jailed title's root, not the host root.
         // Keep this consistent with the traversal spelling "/app0/.." handled below. Accept
-        // both guest separators (and repeated separators) so no equivalent root spelling can
-        // fall through to the host-passthrough return.
-        if (!p.empty() && p.find_first_not_of("/\\") == std::string::npos) {
+        // both guest separators (and repeated separators).
+        if (p.find_first_not_of("/\\") == std::string::npos) {
             const std::string vroot = virtual_root_dir();
             if (filelog())
-                fprintf(stderr, "[file] open '%s' -> virtual root '%s'\n", guest,
-                        vroot.c_str());
-            return vroot;
+                fprintf(stderr, "[file] open '%s' -> virtual root '%s'\n", guest, vroot.c_str());
+            return mapped_guest_path(vroot);
         }
-        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir, /savedata0[/...] -> the mounted
-        // save dir; other paths as-is. Guest paths are the game's own and normally contain no ".." —
-        // but a path that climbs above its virtual root (e.g. "/savedata0/../x") would otherwise compose
-        // a host path OUTSIDE the sandbox. Only when a ".." is present do we lexically normalize the
-        // sub-path and reject an escape (#1205); normal paths are byte-identical to before, and a benign
-        // in-sandbox ".." resolves to the same host file it would have anyway.
+        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir, /savedata0[/...] -> the
+        // mounted save dir, /download0[/...] -> the download-data dir. Guest paths are the game's
+        // own and normally contain no ".." — but a path that climbs above its virtual root (e.g.
+        // "/savedata0/../x") would otherwise compose a host path OUTSIDE the sandbox. Only when a
+        // ".." is present is the whole path lexically normalized first (#1205); normal paths are
+        // byte-identical to before, and a benign in-sandbox ".." resolves to the same host file it
+        // would have anyway.
         //
         // #1234: a climb that lands ON the virtual root is not an escape — the title is jailed and
         // "/app0/.." IS its (readable) root directory on real hardware (ArcRunner opens it during
-        // boot). Normalize the whole absolute path first: the bare root resolves to a prepared
-        // virtual-root host directory (whose entries are the mounts), and a path that re-enters a
-        // mount ("/app0/../app0/x", "/app0/../savedata0/y") proceeds through normal mount mapping.
-        // A traversal to an unmounted sibling ("/app0/../etc") KEEPS the #1205 deny — it must never
-        // fall through to the host-passthrough return below.
-        if (p.find("..") != std::string::npos && (p[0] == '/' || p[0] == '\\')) {
-            const std::string normalized = "/" + clamp_normalize_relative(p);
-            const bool reenters_mount = mount_path_matches(normalized, "/app0") ||
-                                        mount_path_matches(normalized, "/temp0") ||
-                                        mount_path_matches(normalized, "/savedata0") ||
-                                        mount_path_matches(normalized, "/download0");
-            if (normalized == "/") {
+        // boot). The bare root resolves to a prepared virtual-root host directory (whose entries are
+        // the mounts), and a path that re-enters a mount ("/app0/../app0/x", "/app0/../savedata0/y")
+        // proceeds through normal mount mapping. A traversal to an unmounted sibling ("/app0/../etc")
+        // is answered like any other path outside the mounts.
+        if (p.find("..") != std::string::npos) {
+            p = "/" + clamp_normalize_relative(p);
+            if (p == "/") {
                 const std::string vroot = virtual_root_dir();
                 if (filelog())
                     fprintf(stderr, "[file] open '%s' -> virtual root '%s'\n", guest,
                             vroot.c_str());
-                return vroot;
-            }
-            if (reenters_mount) {
-                // A savedata0 re-entry with NO save mounted must not proceed: the mount-mapping
-                // below would find no root and fall to the host-passthrough return — the exact
-                // fall-through this block promises never happens (review of #1234). Deny it like
-                // any other unmounted destination; the direct spelling keeps its historical
-                // behavior.
-                if (mount_path_matches(normalized, "/savedata0")) {
-                    std::lock_guard<std::mutex> lk(g_save0_mx);
-                    if (g_save0.empty()) {
-                        if (filelog())
-                            fprintf(stderr, "[file] DENIED (sandbox traversal, save unmounted) '%s'\n",
-                                    guest);
-                        return "/prosper-denied" + p;
-                    }
-                }
-                p = normalized;
-            } else {
-                if (filelog()) fprintf(stderr, "[file] DENIED (sandbox traversal) '%s'\n", guest);
-                return "/prosper-denied" + p;
+                return mapped_guest_path(vroot);
             }
         }
-        std::string save0;
-        if (mount_path_matches(p, "/savedata0")) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
+        // A mount with no host root behind it is not served: /app0 before set_app0_root() and
+        // /savedata0 while no save is mounted. Both fall through to the unmapped answer rather than
+        // composing "<empty root>/sub", which is a path on the host's root.
         std::string root; size_t vlen = 0;
-        if      (mount_path_matches(p, "/app0"))  { root = g_app0;       vlen = 5;  }
-        else if (mount_path_matches(p, "/temp0")) { root = temp0_root(); vlen = 6;  }
+        if (mount_path_matches(p, "/app0")) { root = g_app0; vlen = 5; }
+        else if (mount_path_matches(p, "/temp0")) { root = temp0_root(); vlen = 6; }
         else if (mount_path_matches(p, "/download0")) { root = download0_root(); vlen = 10; }
-        else if (!save0.empty())            { root = save0;        vlen = 10; }
-        else {
-            if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, p.c_str());
-            return p;
+        else if (mount_path_matches(p, "/savedata0")) {
+            std::lock_guard<std::mutex> lk(g_save0_mx);
+            root = g_save0;
+            vlen = 10;
         }
+        if (root.empty()) return unmapped_guest_path(p, guest);
         std::string sub = p.substr(vlen);
         if (sub.find("..") != std::string::npos) {
+            // Unreachable after the whole-path normalization above; kept as the sandbox backstop.
             std::optional<std::string> norm = sandbox_normalize_subpath(sub);
             if (!norm) {
                 if (filelog()) fprintf(stderr, "[file] DENIED (sandbox traversal) '%s'\n", guest);
-                return "/prosper-denied" + p;
+                return {};
             }
             sub = *norm;
         }
@@ -817,7 +863,7 @@ namespace {
         // ancestor needed correcting; when the leaf is absent but a parent directory WAS case-
         // corrected it returns that corrected parent with the original leaf (#1236), so an O_CREAT
         // lands in the real directory. A read of a genuinely absent leaf still fails ENOENT as before.
-        if (!root.empty() && !sub.empty()) {
+        if (!sub.empty()) {
             std::string fixed = resolve_host_path_case(h);
             if (fixed != h) {
                 if (filelog()) fprintf(stderr, "[file] case-corrected '%s' -> '%s'\n",
@@ -826,7 +872,7 @@ namespace {
             }
         }
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
-        return h;
+        return mapped_guest_path(std::move(h));
     }
 
     struct HostStat {
@@ -922,10 +968,10 @@ std::string resolve_guest_path(const char* guest_path) {
     // is the absolute spelling, "file://<relative>" the BaseDir-relative one).
     if (p.rfind("file://", 0) == 0) p = p.substr(7);
     if (p.empty()) return {};
-    // A separator-only spelling names the guest root. Send it directly to translate() so a bare
+    // A separator-only spelling names the guest root. Send it directly to resolve_guest() so a bare
     // backslash reaches the virtual-root case without making every leading-backslash path host-
     // absolute on Windows ("\\foo" and UNC-like spellings must remain rooted under /app0).
-    if (p.find_first_not_of("/\\") == std::string::npos) return translate(p.c_str());
+    if (p.find_first_not_of("/\\") == std::string::npos) return resolve_guest(p.c_str()).host;
     // Sony media APIs accept content paths relative to the title's application root. Unlike the
     // guest libc, a native host backend has no guest current-working-directory state, so root the
     // relative spelling explicitly before applying the shared mount translation.
@@ -934,15 +980,15 @@ std::string resolve_guest_path(const char* guest_path) {
         // ("../../../<project>/Content/..." climbs from Engine/Binaries/<Platform>/ up to the
         // package root), but prosper models no BaseDir/CWD and ArcRunner's dump has no such
         // directories — the only mount a rootless relative path can name is /app0 itself. Clamp
-        // ".." at that root (POSIX "/.." == "/") instead of letting translate() deny the composed
-        // path as an absolute sandbox escape (#1205 stays intact for absolute guest paths).
+        // ".." at that root (POSIX "/.." == "/") instead of letting resolve_guest() refuse the
+        // composed path as an absolute sandbox escape (#1205 stays intact for absolute guest paths).
         // CONFIDENCE: MED — correct for the observed UE4 shape, where the ".." count equals the
         // real base-dir depth; the resolved host path is visible under PROSPER_FILELOG/[avp] logs.
         if (p.find("..") != std::string::npos) p = clamp_normalize_relative(p);
         const std::string app_path = std::string("/app0/") + p;
-        return translate(app_path.c_str());
+        return resolve_guest(app_path.c_str()).host;
     }
-    return translate(p.c_str());
+    return resolve_guest(p.c_str()).host;
 }
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
@@ -1116,7 +1162,12 @@ HLE(f_fopen) {
         errno = EINVAL;
         return 0;
     }
-    std::string h = translate(CS(a0));
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) {
+        errno = unmapped_errno(g, m.create ? GuestPathOp::Modify : GuestPathOp::Lookup);
+        return 0;
+    }
+    const std::string& h = g.host;
     FILE* f = fopen(h.c_str(), m.host);
     guest_sync_note_stream(f, m.writable);
     if (filelog())
@@ -1298,7 +1349,11 @@ static uint32_t file_sce_error(int error) {
     return (uint32_t)prosper::hle::sce_error_from_host_errno(error, prosper::hle::FreeBsdErrno::EIo);
 }
 
-HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
+HLE(f_open)  { const GuestPath g = resolve_guest(CS(a0));
+               // FreeBSD O_CREAT (0x0200) makes the open a namei CREATE; anything else is a lookup.
+               if (!g.mapped())
+                   return refuse_unmapped(g, (a1 & 0x0200) ? GuestPathOp::Modify : GuestPathOp::Lookup);
+               const std::string& h = g.host; int host_flags = host_open_flags(a1);
 #ifdef _WIN32
                int fd;
                if (windows_host_path_is_directory(h)) {
@@ -1877,13 +1932,17 @@ HLE(k_pwritev){ uint64_t r = f_pwritev(a0, a1, a2, a3, a4, a5); int e = errno; r
 HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
 // sceKernelTruncate(path, length): the path-based sibling of ftruncate. Same fake-success -> stale-tail
 // corruption class (NID WlyEA-sLDf0, reached via libc.prx). Translate the path through the mount layer.
-HLE(f_truncate)  { std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
+HLE(f_truncate)  { const GuestPath g = resolve_guest(CS(a0));
+                   if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+                   guest_sync_note_path(g.host); return (uint64_t)(int64_t)::truncate(g.host.c_str(), (off_t)a1); }
 #else
 HLE(f_ftruncate) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                     int error = ::_chsize_s((int)a0, (__int64)a1);
                     if (error) { errno = error; return (uint64_t)(int64_t)-1; }
                     return 0; }
-HLE(f_truncate)  { std::string h = translate(CS(a0));
+HLE(f_truncate)  { const GuestPath g = resolve_guest(CS(a0));
+                    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+                    const std::string& h = g.host;
                     ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                     int fd = ::_open(h.c_str(), _O_RDWR | _O_BINARY);
                     if (fd < 0) return (uint64_t)(int64_t)-1;
@@ -1976,7 +2035,8 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 }
 
 #ifndef _WIN32
-HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_stat)  { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               const std::string& h = g.host; struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
                filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
@@ -1985,10 +2045,13 @@ HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? 
 // lstat: was MISSING -> the return-0 stub reported success while leaving the caller's stat buffer as
 // uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
-HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_lstat) { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               const std::string& h = g.host; struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
-               std::string h = translate(CS(a0)); guest_sync_note_path(h);
-               return (uint64_t)(int64_t)::chmod(h.c_str(), (mode_t)a1); }
+               const GuestPath g = resolve_guest(CS(a0));
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               guest_sync_note_path(g.host);
+               return (uint64_t)(int64_t)::chmod(g.host.c_str(), (mode_t)a1); }
 HLE(f_fchmod){ return (uint64_t)(int64_t)::fchmod((int)a0, (mode_t)a1); }
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 HLE(f_fdatasync) {
@@ -2007,7 +2070,8 @@ HLE(k_sync) {
     return 0;
 }
 #else
-HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_stat)  { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               const std::string& h = g.host; struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                int r = windows_directory_path((int)a0, &directory_path)
@@ -2020,8 +2084,9 @@ HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
 HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
-               std::string h = translate(CS(a0));
-               return (uint64_t)(int64_t)windows_chmod_path(h, a1); }
+               const GuestPath g = resolve_guest(CS(a0));
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               return (uint64_t)(int64_t)windows_chmod_path(g.host, a1); }
 HLE(f_fchmod){ return (uint64_t)(int64_t)windows_fchmod((int)a0, a1); }
 HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                return (uint64_t)(int64_t)::_commit((int)a0); }
@@ -2061,8 +2126,9 @@ HLE(k_check_reachability) {
     size_t length = 0;
     while (length <= 255 && guest[length]) ++length;
     if (length > 255) return file_sce_error(ENAMETOOLONG);
-    const std::string host = translate(guest);
-    if (::access(host.c_str(), 0) == 0) return 0;
+    const GuestPath g = resolve_guest(guest);
+    if (!g.mapped()) return file_sce_error(unmapped_errno(g, GuestPathOp::Lookup));
+    if (::access(g.host.c_str(), 0) == 0) return 0;
     return file_sce_error(errno);
 }
 HLE(k_utimes) {
@@ -2071,7 +2137,9 @@ HLE(k_utimes) {
     if (guest_times && (guest_times[0].usec < 0 || guest_times[0].usec >= 1000000 ||
                         guest_times[1].usec < 0 || guest_times[1].usec >= 1000000))
         return file_sce_error(EINVAL);
-    const std::string host = translate(CS(a0));
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return file_sce_error(unmapped_errno(g, GuestPathOp::Lookup));
+    const std::string& host = g.host;
 #ifndef _WIN32
     struct timeval host_times[2];
     if (guest_times) {
@@ -2124,15 +2192,21 @@ HLE(k_utimes) {
     return updated ? 0 : file_sce_error(windows_directory_errno(error));
 #endif
 }
-HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
-HLE(f_mkdir) { std::string h = translate(CS(a0)); guest_sync_note_path(h);   // sceKernelMkdir(path, mode)
+HLE(f_access){ const GuestPath g = resolve_guest(CS(a0));
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+               return (uint64_t)(int64_t)::access(g.host.c_str(), (int)a1); }
+HLE(f_mkdir) { const GuestPath g = resolve_guest(CS(a0));   // sceKernelMkdir(path, mode)
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+               const std::string& h = g.host; guest_sync_note_path(h);
 #ifdef _WIN32
     return (uint64_t)(int64_t)::_mkdir(h.c_str());
 #else
     return (uint64_t)(int64_t)::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
 #endif
 }
-HLE(f_rmdir) { std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+HLE(f_rmdir) { const GuestPath g = resolve_guest(CS(a0));
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+               guest_sync_note_path(g.host); return (uint64_t)(int64_t)::rmdir(g.host.c_str()); }
 HLE(k_mkdir) { uint64_t r = f_mkdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rmdir) { uint64_t r = f_rmdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
@@ -2307,7 +2381,9 @@ HLE(f_getdents) {
 HLE(f_getdirentries) {
     return directory_result_to_posix(k_getdirentries(a0, a1, a2, a3, a4, a5));
 }
-HLE(f_unlink){ std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::
+HLE(f_unlink){ const GuestPath g = resolve_guest(CS(a0));
+               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+               const std::string& h = g.host; guest_sync_note_path(h); return (uint64_t)(int64_t)::
 #ifdef _WIN32
     _unlink
 #else
@@ -2319,9 +2395,19 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); guest_sync_note_path(h); retur
 // "save.dat"): the real save file was never produced/updated while the guest believed it saved. BOTH
 // paths go through the mount-path translation (a rename inside /savedata0 must not hit raw guest paths).
 // NID 52NcYU9+lEo, reached via libc.prx. ::rename is standard C (Windows + Linux).
-HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
-               guest_sync_note_path(from); guest_sync_note_path(to);
-               return (uint64_t)(int64_t)::rename(from.c_str(), to.c_str()); }
+// Outside the mounts the order is FreeBSD's kern_renameat: the source is looked up first (a DELETE),
+// then the target (a RENAME), so an unmapped source answers before the target is examined, and an
+// unmapped target answers only once the source is known to exist (#4782).
+HLE(f_rename){ const GuestPath from = resolve_guest(CS(a0));
+               if (!from.mapped()) return refuse_unmapped(from, GuestPathOp::Modify);
+               const GuestPath to = resolve_guest(CS(a1));
+               if (!to.mapped()) {
+                   struct stat st;
+                   if (::stat(from.host.c_str(), &st) != 0) return (uint64_t)(int64_t)-1;   // its errno
+                   return refuse_unmapped(to, GuestPathOp::Modify);
+               }
+               guest_sync_note_path(from.host); guest_sync_note_path(to.host);
+               return (uint64_t)(int64_t)::rename(from.host.c_str(), to.host.c_str()); }
 HLE(k_unlink){ uint64_t r = f_unlink(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rename){ uint64_t r = f_rename(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
@@ -2854,7 +2940,8 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         const char* gp = paths[i];
         std::string guest = gp ? std::string(gp) : std::string();
         if (prefix && prefix[0] && !guest.empty()) guest = std::string(prefix) + guest;
-        std::string host = guest.empty() ? std::string() : translate(guest.c_str());
+        // Only a mapped path has a host file; anything else is a miss (#4782).
+        std::string host = resolve_guest(guest.c_str()).host;
         uint64_t size = 0; uint32_t id = 0;
 #ifndef _WIN32
         ProsperStat st;
@@ -2876,7 +2963,7 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         // miss. Existing paths and already-raw paths keep exact PS5 namespace semantics.
         if (!found && guest.rfind("/app0/", 0) == 0 && guest.rfind("/app0/raw/", 0) != 0) {
             const std::string raw_guest = "/app0/raw/" + guest.substr(6);
-            std::string raw_host = translate(raw_guest.c_str());
+            std::string raw_host = resolve_guest(raw_guest.c_str()).host;
 #ifndef _WIN32
             found = !raw_host.empty() && PROSPER_STAT(raw_host.c_str(), &st) == 0;
 #else
