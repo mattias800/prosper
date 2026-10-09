@@ -1,6 +1,8 @@
 // dropped_image_descriptor.cpp -- see the header.
 #include "gpu/diagnostics/dropped_image_descriptor.hpp"
 
+#include "diagnostics/exit_census.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -102,10 +104,44 @@ std::string format_unbound_image_descriptor(uint64_t program, uint32_t pc,
     return line + " -> null image (skippable instruction)";
 }
 
+namespace {
+
+// Every null binding is counted, not only the first per site, and the total is printed at exit next
+// to the other RUN TOTAL lines: a draw this rule rescues leaves the dropped-draw census, so without
+// a count of its own the conversion would be invisible in the summary people read first (#4801).
+std::atomic<uint64_t> g_unbound_uses{0};
+std::atomic<uint64_t> g_unbound_sites{0};
+
+bool print_unbound_total() {
+    const uint64_t uses = g_unbound_uses.load(std::memory_order_relaxed);
+    if (!uses) return false;
+    std::fprintf(stderr,
+                 "[t8-unbound] RUN TOTAL null-bound uses=%llu sites=%llu (T# words that are not a "
+                 "descriptor, read only by a scalar-skippable instruction; #4796)\n",
+                 static_cast<unsigned long long>(uses),
+                 static_cast<unsigned long long>(g_unbound_sites.load(std::memory_order_relaxed)));
+    return true;
+}
+
+}   // namespace
+
+uint64_t unbound_image_descriptor_uses() {
+    return g_unbound_uses.load(std::memory_order_relaxed);
+}
+
 bool note_unbound_image_descriptor(uint64_t program, uint32_t pc,
                                    const std::array<uint32_t, 8>& words, const char* reason) {
+    // Not std::atexit: prosper leaves through _exit(), so only the exit-census hook runs
+    // (exit_census.hpp). Registered on first use, never during static initialisation.
+    static const bool registered = [] {
+        prosper::diagnostics::register_census(nullptr, print_unbound_total);
+        return true;
+    }();
+    (void)registered;
+    g_unbound_uses.fetch_add(1, std::memory_order_relaxed);
     static BoundedSiteReport report;
     if (!report.admit(program, pc, reason)) return false;
+    g_unbound_sites.fetch_add(1, std::memory_order_relaxed);
     const std::string line = format_unbound_image_descriptor(program, pc, words, reason);
     std::fprintf(stderr, "%s\n", line.c_str());
     return true;

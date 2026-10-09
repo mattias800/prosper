@@ -91,3 +91,11 @@ TEST(DroppedImageDescriptor, UnboundLineNamesItsVerdict) {
     EXPECT_NE(line.find("-> null image (skippable instruction)"), std::string::npos) << line;
     EXPECT_EQ(line.find("[t8-dropped]"), std::string::npos) << line;
 }
+
+TEST(DroppedImageDescriptor, EveryUnboundUseIsCountedPastTheSiteDedupe) {
+    const uint64_t before = unbound_image_descriptor_uses();
+    for (int i = 0; i < 3; ++i)
+        note_unbound_image_descriptor(0x77000000ull, 9, kKenaNullShaped, "bad-image-type");
+    EXPECT_EQ(unbound_image_descriptor_uses(), before + 3)
+        << "a draw rescued every frame must count every frame, not once";
+}

@@ -70,5 +70,8 @@ std::string format_unbound_image_descriptor(uint64_t program, uint32_t pc,
                                             const char* reason);
 bool note_unbound_image_descriptor(uint64_t program, uint32_t pc,
                                    const std::array<uint32_t, 8>& words, const char* reason);
+// Every call, not only reported sites: the process total, also printed once at exit as
+// `[t8-unbound] RUN TOTAL null-bound uses=N sites=M`.
+uint64_t unbound_image_descriptor_uses();
 
 }   // namespace prosper::gpu

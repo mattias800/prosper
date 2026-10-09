@@ -217,6 +217,14 @@ inline bool image_type_has_modeled_layer_stride(uint8_t type) { return type == 1
 // governs them all.
 const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d);
 
+// True for the reject reasons that mean "these eight words are not a T# at all" -- an encoding no
+// real descriptor carries (no image type, an inverted layer range, a reserved selector, a base no
+// texture can have) -- as opposed to a well-formed descriptor prosper does not model yet, such as
+// `base-array-on-unmodelled-type`, which must keep refusing visibly (the fatal-gap rule). This is
+// what lets a stale, never-written slot be bound null without hiding a modelling gap (#4796).
+// Unknown reasons answer false, so a new reject reason is fail-visible until someone classifies it.
+bool image_reject_reason_is_not_a_descriptor(const char* reason);
+
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed
 // formats block dims are 1x1 and it equals bytes-per-texel; for BCn blocks are 4x4.

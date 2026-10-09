@@ -77,6 +77,23 @@ control-flow shape may remain listed there even when the vertex/fragment structu
 `--stage vertex|fragment|compute` additionally runs the complete stage translator, which exposes contextual
 resource and structured-control-flow failures that per-instruction coverage cannot decide.
 
+## `--skippable-mimg`: which image instructions scalar branches can skip
+
+```bash
+./build-linux/shader_inspect ps_5007ae0000_b8e8f38ec3a5fc7f.bin --skippable-mimg
+skippable-site pc=27 op=0x20 scalar-skippable=0
+skippable-site pc=73 op=0x20 scalar-skippable=1
+...
+skippable-mimg-end instructions=256 sites=8 skippable=5
+```
+
+For each image instruction, the production answer of `program_may_skip_by_scalar_branch`
+(`src/gpu/execute/skippable_instruction.hpp`), with out-of-line tail blocks appended as the live
+table build does. That predicate gates binding a null image for a T# whose words are not a
+descriptor (#4796), so this answers offline, from a refused-shader dump, whether a `[t8-dropped]`
+site could ever take that route. It is how the #4801 review's question was measured: which of a
+run's stale descriptor sites sit behind scalar branches and which behind mask branches.
+
 ## `--mimg-sites`: the MIMG census, for tools that must not carry their own decoder
 
 ```bash

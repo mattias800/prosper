@@ -38,7 +38,7 @@
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
-#include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4775)
+#include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4796)
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
 #include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -7161,7 +7161,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                                                    : registered_shader_dwords(*hdr, code_addr);
     const auto full_source = checked_source ? checked_source->source().decoded
                                             : decode_shader_cached(code, shader_dwords);
-    SkippableInstructionQuery skippable(full_source->code, code, shader_dwords);   // #4775, lazy
+    SkippableInstructionQuery skippable(full_source, full_source->code, code,
+                                        shader_dwords);   // #4796
     if (original_source) {
         *original_source =
             checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
@@ -7949,20 +7950,37 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     const bool exact_null_t8 = reject && std::string_view(reject) == "base-zero" &&
                                                !u.is_storage_image &&
                                                t8_is_null_for_op(u.t8, texel_read);
-                    // #4775: an UNUSABLE T# (a screen reject, or a base that maps no memory) read
-                    // only by an instruction the program can skip is an unbound slot: it binds the
-                    // same null. Switch and feature arms leave the slots of arms a draw never takes
-                    // holding stale ring bytes, and whether those passed the screen decided
-                    // admission run to run on identical bytes. A usable T# still materializes; an
-                    // unusable one on every path and any store stay refused. CONFIDENCE: MED --
-                    // see skippable_instruction.hpp for the evidence and the limit.
+                    // #4796: a T# whose words are NOT A DESCRIPTOR AT ALL (no image type, an
+                    // inverted range, a reserved selector, an impossible base), read only by an
+                    // instruction that scalar branches can skip, is a slot the guest left unwritten:
+                    // it binds the same null. Kena's switch arms leave such slots holding stale ring
+                    // bytes, and whether those passed the screen decided admission run to run. A
+                    // well-formed T# prosper does not model, a bad T# that every scalar path reaches
+                    // (alpha kill and divergent ifs included), and any store all stay refused.
+                    // CONFIDENCE: MED, and only while prosper's bytes are the GPU's: a table the
+                    // guest recycled under prosper (SDK<13, #2220) looks exactly like a stale slot.
+                    // On Kena that race never reached a scalar-skippable use (#4801); the
+                    // `[t8-unbound]` line names every slot this binds. skippable_instruction.hpp.
+                    // Pure reads only, by the decoder's fail-closed writer test rather than the
+                    // storage classifier, which does not list every gfx10 write op (#4801 review).
+                    const bool pure_read_use = u.use_pc < shader_dwords && [&] {
+                        const Rdna2Inst op =
+                            rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);
+                        return op.fmt == Rdna2Format::MIMG &&
+                               !rdna2_instruction_may_write_memory(op);
+                    }();
+                    // The second test catches stale bytes that happen to decode as a well-formed
+                    // shape prosper does not support: a T# whose base lies in no mapping the guest
+                    // ever made cannot be a texture, while one at GPU-only or lazily committed
+                    // guest memory (host-unreadable) still is, and keeps its ordinary route.
                     const char* unbound_reason = nullptr;
-                    if (!exact_null_t8 && !u.is_storage_image) {
-                        unbound_reason = reject                       ? reject
-                                         : !guest_readable(d.base, 1) ? "base-unmapped"
-                                                                      : nullptr;
-                        if (unbound_reason && !skippable.may_skip(u.use_pc))
-                            unbound_reason = nullptr;
+                    if (!exact_null_t8 && !u.is_storage_image && pure_read_use &&
+                        skippable.may_skip(u.use_pc)) {
+                        if (image_reject_reason_is_not_a_descriptor(reject))
+                            unbound_reason = reject;
+                        else if (!guest_readable(d.base, 1) &&
+                                 !prosper::guest_virtual_address_tracked(d.base))
+                            unbound_reason = "base-names-no-guest-mapping";
                     }
                     if (unbound_reason)
                         note_unbound_image_descriptor(code_addr, u.use_pc, u.t8, unbound_reason);

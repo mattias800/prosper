@@ -1,10 +1,12 @@
 // test_agc_shader -- shader registration and real stage-table provenance guards. A loaded buffer
 // descriptor must retain its consumer PC even when metadata already describes the same memory.
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "host/memory/guest_memory_topology.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -12,6 +14,7 @@
 #include <cstdio>
 #include <functional>
 #include <iterator>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -1002,10 +1005,19 @@ TEST(AgcShader, Contract) {
         0xBF068000u, 0xBF850002u, 0xF0200F08u, 0x00030004u,   // pc6: image_store ..., s[12:19]
         0xBF810000u,
     };
-    static Shader skippable_sample{}, skippable_store{};
+    // image_atomic_cmpswap (0x10) writes memory but is not in the storage-image classifier's list
+    // (#4801 review N4), so only the decoder's writer test keeps it out of the null rule.
+    static const uint32_t skippable_cmpswap_shader[] = {
+        0xF40C0304u, 0xFA000020u, 0xF4080504u, 0xFA000040u, 0xBF068000u,
+        0xBF850002u, 0xF0400F08u, 0x00030004u,   // pc6: image_atomic_cmpswap ..., s[12:19]
+        0xBF810000u,
+    };
+    static Shader skippable_sample{}, skippable_store{}, skippable_cmpswap{};
     for (auto [shader, words, bytes] :
          {std::tuple{&skippable_sample, skippable_sample_shader, sizeof(skippable_sample_shader)},
-          std::tuple{&skippable_store, skippable_store_shader, sizeof(skippable_store_shader)}}) {
+          std::tuple{&skippable_store, skippable_store_shader, sizeof(skippable_store_shader)},
+          std::tuple{&skippable_cmpswap, skippable_cmpswap_shader,
+                     sizeof(skippable_cmpswap_shader)}}) {
         shader->file_header = 0x34333231u;
         shader->version = 0x18u;
         shader->shader_size = static_cast<uint32_t>(bytes);
@@ -1042,6 +1054,10 @@ TEST(AgcShader, Contract) {
     auto store_stale = stage(skippable_store_shader);
     CHECK(!store_stale || !store_stale->by_fetch_pc(6),
           "#4775: a skippable image_store through a stale T# stays fail-visible");
+    auto cmpswap_stale = stage(skippable_cmpswap_shader);
+    CHECK(!cmpswap_stale || !cmpswap_stale->by_fetch_pc(6) ||
+              cmpswap_stale->by_fetch_pc(6)->gpu_addr != 0,
+          "#4796: a skippable image atomic outside the storage classifier is never given a null");
     // A usable descriptor in the skippable arm is the texture it names, not a null.
     alignas(256) static uint8_t skippable_texels[256]{};
     make_test_tsharp(skippable_table + 8, reinterpret_cast<uint64_t>(skippable_texels), 4, 4, 60);
@@ -1050,14 +1066,57 @@ TEST(AgcShader, Contract) {
         skippable_valid ? skippable_valid->by_fetch_pc(6) : nullptr;
     CHECK(bound && bound->gpu_addr == reinterpret_cast<uint64_t>(skippable_texels),
           "#4775: a usable T# in a skippable arm still materializes its texture");
-    // Well-formed words whose base maps no memory (above the 47-bit user address space) cannot be
-    // the texture a skippable arm reads either.
+    // #4801 review B2: a WELL-FORMED T# prosper does not model (a layered 3D UAV view: BASE_ARRAY on
+    // a type whose slice origin is unmodelled) is a gap, not stale bytes. It stays refused in the
+    // skippable arm too, so the gap stays visible.
+    make_test_tsharp(skippable_table + 8, reinterpret_cast<uint64_t>(skippable_texels), 4, 4, 60);
+    skippable_table[8 + 3] = (skippable_table[8 + 3] & 0x0fffffffu) | (10u << 28);   // 3D
+    skippable_table[8 + 4] = (1u << 16) | 3u;   // BASE_ARRAY 1, last slice 3
+    skippable_table[8 + 5] |= 1u;   // a UAV view: the range applies
+    const prosper::gpu::DecodedImageDescriptor layered =
+        prosper::gpu::decode_image_descriptor(skippable_table + 8);
+    const char* layered_reason = prosper::gpu::image_descriptor_reject_reason(layered);
+    CHECK(layered_reason && std::string_view(layered_reason) == "base-array-on-unmodelled-type",
+          "PREMISE: the layered 3D T# is the unmodelled-gap reject");
+    auto skippable_gap = stage(skippable_sample_shader);
+    CHECK(!skippable_gap || !skippable_gap->by_fetch_pc(6),
+          "#4796: an unmodelled but well-formed T# in a skippable arm stays fail-visible");
+    // B1: a well-formed T# at GPU-only guest memory (mapped with GPU protection only, so the host
+    // cannot read it) is still the texture it names. The host readability probe says "unmapped"
+    // here; the guest's own mapping table says otherwise, and only the latter may decide.
+    {
+        const auto allocate = Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+        const auto map = Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+        const auto unmap = Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+        const auto release = Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+        uint64_t physical = 0, gpu_only = 0;
+        constexpr uint64_t kBytes = 0x10000;
+        const bool mapped = allocate && map && unmap && release &&
+                            allocate(0, 0x200000000ull, kBytes, 0x10000, 0,
+                                     reinterpret_cast<uint64_t>(&physical)) == 0 &&
+                            map(reinterpret_cast<uint64_t>(&gpu_only), kBytes,
+                                0x30 /* GPU read+write only */, 0, physical, 0x10000) == 0 &&
+                            gpu_only;
+        CHECK(mapped && !prosper::gpu::guest_readable(gpu_only, 1) &&
+                  prosper::guest_virtual_address_tracked(gpu_only),
+              "PREMISE: a GPU-only direct mapping is guest-tracked and host-unreadable");
+        make_test_tsharp(skippable_table + 8, gpu_only, 4, 4, 60);
+        auto skippable_gpu_only = stage(skippable_sample_shader);
+        const prosper::gpu::ShaderResource* bound_gpu_only =
+            skippable_gpu_only ? skippable_gpu_only->by_fetch_pc(6) : nullptr;
+        CHECK(bound_gpu_only && bound_gpu_only->gpu_addr == gpu_only,
+              "#4796: a T# at GPU-only guest memory still materializes in a skippable arm");
+        if (gpu_only) unmap(gpu_only, kBytes, 0, 0, 0, 0);
+        if (physical) release(physical, kBytes, 0, 0, 0, 0);
+    }
+    // A well-formed T# whose base lies in no guest mapping at all (here non-canonical) names no
+    // texture: in a skippable arm it is stale bytes and binds the null.
     make_test_tsharp(skippable_table + 8, 0xF00000000000ull, 4, 4, 60);
-    auto skippable_unmapped = stage(skippable_sample_shader);
-    const prosper::gpu::ShaderResource* unmapped =
-        skippable_unmapped ? skippable_unmapped->by_fetch_pc(6) : nullptr;
-    CHECK(unmapped && unmapped->gpu_addr == 0 && unmapped->size == 0,
-          "#4775: a skippable sample whose T# base maps no memory binds the null image");
+    auto skippable_far = stage(skippable_sample_shader);
+    const prosper::gpu::ShaderResource* far =
+        skippable_far ? skippable_far->by_fetch_pc(6) : nullptr;
+    CHECK(far && far->gpu_addr == 0 && far->size == 0,
+          "#4796: a skippable T# naming no guest mapping binds the null image");
 
     // The same null-image semantics apply when MIMG consumes an unchanged direct user-SGPR T#.
     // Exercise the complete production path added for GTA V: fold admission and exact-PC

@@ -57,11 +57,12 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   compute binding can read guest bytes (#4625). The plan names every refusal before any readback.
   The live renderer registers the publisher, and compute asks through
   `compute_renderer_volume_refusal`. Only a claim that is actually released admits the binding.
-- `skippable_instruction` — whether a program can finish without executing one instruction, over
-  its direct branches (fail-closed on indirect control flow or an incomplete stream). The stage table
-  asks it before refusing an image use whose T# is unusable: a slot read only by a skippable
-  instruction is one the guest may leave unwritten, and its stale bytes must not decide admission
-  (#4796). It answers "skippable as encoded", never "skipped by this draw".
+- `skippable_instruction` — whether scalar (wave-uniform) branch decisions alone can finish a
+  program without executing one instruction: a reachability game where `s_cbranch_scc*` may take
+  either edge and mask branches (`execz`, `vccz`, an alpha kill) must avoid it on both. Fail-closed on
+  indirect control flow or an incomplete stream. The stage table asks it before refusing a T# whose
+  words are not a descriptor (#4796); it answers "skippable as encoded", never "skipped by this draw",
+  and it cannot tell a never-written slot from a table recycled under prosper (#2220).
 - `srt_publication_dedupe.hpp` — which of those uses the graphics stage table publishes: once per
   key while the key resolves by `srt_offset`, once per consuming pc once it clashes. Getting this
   wrong leaves a consumer with no resource and refuses the whole program.
