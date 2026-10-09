@@ -71,6 +71,8 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
 // The loop-carried slots of one structured loop.
 class LaneSlotLoopCarry {
 public:
+    // Before mark_loop_carried(): which slots were fabricated-marked on the preheader edge.
+    void note_preheader_marks(const RegState& rs);
     // At the header label, after the other header phis: one phi per slot written in
     // [header_pc, backedge_pc), seeded from the preheader (a placeholder when it is unwritten there).
     void open(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t header_pc,
@@ -85,6 +87,12 @@ public:
     // False (logged) when the body edge holds a slot in the other domain or not at all.
     bool finish_exit(SpirvCompute& b, RegState& rs, bool body_edge, uint32_t check_end,
                      uint32_t body_end) const;
+    // After mark_loop_exit_slots(), for an exit without a body edge: a carried slot the check block
+    // left as its header phi is fabricated exactly when its preheader value or its back-edge value
+    // was. mark_loop_carried() marked the phi before the body existed; the back-edge mark, computed
+    // under that pessimistic assumption, is an upper bound, so this only ever lifts a mark that no
+    // input carried (#4749 review: Kena's EXEC_HI re-spill at pc 853).
+    void refine_exit_marks(RegState& rs) const;
     size_t carried() const { return slots_.size(); }
 
 private:
@@ -98,8 +106,11 @@ private:
         uint32_t seed;   // the preheader value, or the placeholder for an unwritten lane
         bool seeded;   // the preheader held this slot
         bool uncarried;   // the back-edge closed with `seed`, not with a body value
+        bool seed_marked;   // the preheader value is fabricated (or the lane was unwritten there)
+        bool backedge_marked;   // the body's value on the back edge is fabricated
     };
     std::vector<Slot> slots_;
+    std::set<std::pair<int, int>> preheader_marks_;
     std::set<std::pair<int, int>> read_in_loop_;   // constant-lane V_READLANEs in the loop
     uint32_t header_pc_ = 0;
 };

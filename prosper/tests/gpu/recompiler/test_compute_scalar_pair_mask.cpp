@@ -363,3 +363,81 @@ TEST(ScalarPairMask, CoverageDoesNotCallLaunchDataFabricated) {
         << "first_bad fmt=" << coverage.first_bad_fmt << " op=0x" << std::hex
         << coverage.first_bad_op << " pc=" << std::dec << coverage.first_bad_pc;
 }
+
+namespace {
+
+// Kena's level-load pixel program 0x5007ad0000, reduced (#4749 review). EXEC is saved into s[20:21]
+// and both halves are spilled to v20 lanes 0/1; s20 is then reused for data (Kena reloads s100 from
+// memory), and the loop re-spills the high half on every trip (Kena's pc 853), so that slot is
+// loop-carried. After the loop both halves are reloaded and EXEC is restored from them. (Not
+// s[8:11]: that is the compute harness's output V#.)
+//   s_mov_b64 s[20:21], exec | v_writelane v20, <pre>, 1 | v_writelane v20, s20, 0
+//   s_mov_b32 s20, 5 | s_mov_b32 s22, 0 | s_mov_b32 s23, 3
+//   L: s_cmp_lt_u32 s22, s23 | s_cbranch_scc0 X | v_writelane v20, <back>, 1
+//      s_add_u32 s22, s22, 1 | s_branch L
+//   X: v_readlane s20, v20, 0 | v_readlane s21, v20, 1 | s_mov_b64 exec, s[20:21]
+Words spill_restore_through_loop(uint32_t preheader_hi, uint32_t backedge_hi) {
+    return {0xbe94047eu, 0xd7610014u, 0x00010200u | preheader_hi,
+            0xd7610014u, 0x00010014u, 0xbe940385u,
+            0xbe960380u, 0xbe970383u, 0xbf0a1716u,
+            0xbf840004u, 0xd7610014u, 0x00010200u | backedge_hi,
+            0x80168116u, 0xbf82fffau, 0xd7600014u,
+            0x00010114u, 0xd7600015u, 0x00010314u,
+            0xbefe0414u};
+}
+constexpr uint32_t kS21 = 21;   // the saved EXEC_HI
+constexpr uint32_t kS24 = 24;   // never written: operand_bits reads it as the fabricated zero
+
+const Probe kRestore = {"s_mov_b64 exec, s[20:21] after the reload", {}, false};
+
+}   // namespace
+
+TEST(ScalarPairMask, AnExecSpillRestoreThroughALoopCompiles) {
+    // (a) Every word is real: the high half survives s20's reuse (it is materialized from the mask
+    // before s20 is overwritten), and the loop-carried slot's exit value is defined because both
+    // its preheader and its back-edge values are.
+    const Words body = spill_restore_through_loop(kS21, kS21);
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(compile(stage, cat({&kPrefix, &body})).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, AFabricatedWordSpilledThroughALoopRefusesAtTheRestore) {
+    // (b) The same shape with one fabricated input: the back edge re-spills the never-written s24,
+    // or the preheader spills it and the back edge spills the real s21. Either way the loop's exit
+    // value may be the zero, so the EXEC restore refuses at the write.
+    const Words backedge = spill_restore_through_loop(kS21, kS24);
+    const Words seed = spill_restore_through_loop(kS24, kS21);
+    expect_refused_for_the_mark(Stage::Fragment, cat({&kPrefix, &backedge}), kRestore);
+    expect_refused_for_the_mark(Stage::Fragment, cat({&kPrefix, &seed}), kRestore);
+}
+
+TEST(ScalarPairMask, AOnePathWordSpilledRefusesAtTheRestore) {
+    // (b) s25 is written on ONE arm of an if, then spilled as EXEC_HI and restored.
+    //   s_mov_b64 s[20:21], exec | v_writelane v20, s20, 0 | s_cmp_eq_u32 s0, 0
+    //   s_cbranch_scc1 +1 | s_mov_b32 s25, -1 | v_writelane v20, s25, 1
+    //   v_readlane s20, v20, 0 | v_readlane s21, v20, 1 | s_mov_b64 exec, s[20:21]
+    const Words body = {0xbe94047eu, 0xd7610014u, 0x00010014u, 0xbf068000u, 0xbf850001u,
+                        0xbe9903c1u, 0xd7610014u, 0x00010219u, 0xd7600014u, 0x00010114u,
+                        0xd7600015u, 0x00010314u, 0xbefe0414u};
+    expect_refused_for_the_mark(Stage::Fragment, cat({&kPrefix, &body}), kRestore);
+}
+
+TEST(ScalarPairMask, ASlotWrittenOnOnePathRefusesAtTheRestore) {
+    // (c) EXEC_HI is spilled on ONE arm only, so on the skipped edge the slot holds the merge's
+    // placeholder, not a word of EXEC (#4740: a one-edge slot is fabricated after the merge).
+    //   s_mov_b64 s[20:21], exec | v_writelane v20, s20, 0 | s_cmp_eq_u32 s0, 0
+    //   s_cbranch_scc1 +2 | v_writelane v20, s21, 1
+    //   v_readlane s20, v20, 0 | v_readlane s21, v20, 1 | s_mov_b64 exec, s[20:21]
+    const Words body = {0xbe94047eu, 0xd7610014u, 0x00010014u, 0xbf068000u,
+                        0xbf850002u, 0xd7610014u, 0x00010215u, 0xd7600014u,
+                        0x00010114u, 0xd7600015u, 0x00010314u, 0xbefe0414u};
+    expect_refused_for_the_mark(Stage::Fragment, cat({&kPrefix, &body}), kRestore);
+    // Control: the same if, with EXEC_HI spilled before the branch as well, compiles.
+    const Words both = {0xbe94047eu, 0xd7610014u, 0x00010014u, 0xd7610014u, 0x00010215u,
+                        0xbf068000u, 0xbf850002u, 0xd7610014u, 0x00010215u, 0xd7600014u,
+                        0x00010114u, 0xd7600015u, 0x00010314u, 0xbefe0414u};
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(compile(stage, cat({&kPrefix, &both})).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}

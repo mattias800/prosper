@@ -1623,6 +1623,43 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
     return snapshot;
 }
 
+// A scalar write that replaces only the ROOT word of a saved Wave64 B64 mask ends the mask
+// (expire_saved_b64_mask), yet on the hardware the HIGH word still holds its half of that mask.
+// Kena's level-load pixel program 0x5007ad0000 saves EXEC into s[100:101], spills both halves,
+// reloads s100 from memory at pc 146, and re-spills s101 inside its loop at pc 853. With the mask
+// gone and no data view, s101 read as operand_bits' absent-SGPR zero there: EXEC_HI went to the
+// spill slot as a fabricated 0, which the restore at pc 882 then put back into EXEC (#4749
+// review). So, before such a write, give the high word the data view a data read of it would
+// have materialized from the still-live mask, when anything may still read it.
+inline void keep_surviving_mask_high_half(SpirvCompute& b, RegState& rs,
+                                          const std::vector<Rdna2Inst>& ins, const Rdna2Inst& in) {
+    if (b.wave_size != 64 || !(b.is_fragment || (b.is_compute && b.native_subgroup_size == 64)))
+        return;
+    // A V_READLANE into the root is a spill reload; it manages the halves itself.
+    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) return;
+    std::vector<std::pair<int, uint32_t>> writes;
+    for_each_scalar_write(in, [&](int base, uint32_t width) { writes.emplace_back(base, width); });
+    const auto written = [&](int r) {
+        for (const auto& [base, width] : writes)
+            if (r >= base && r < base + static_cast<int>(width)) return true;
+        return false;
+    };
+    for (const auto& [base, width] : writes)
+        for (int root = base; root < base + static_cast<int>(width) && root < 105; ++root) {
+            const int high = root + 1;
+            const auto mask = rs.sreg_bool.find(root);
+            if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root) || written(high) ||
+                rs.sreg.contains(high) || sgpr_dead_at_merge(ins, in.pc + in.len_dwords, high))
+                continue;
+            const uint32_t half = b.is_fragment ? b.fragment_wave_ballot_half(mask->second, 1)
+                                                : b.native_wave_ballot_half(mask->second, 1);
+            if (!half) continue;
+            rs.sreg[high] = half;   // a ballot of this wave: it carries neither mark
+            rs.sreg_merge_placeholder.erase(high);
+            rs.sreg_memory_pattern.erase(high);
+        }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Workgroup-uniform wave branch (#1554).
 //
