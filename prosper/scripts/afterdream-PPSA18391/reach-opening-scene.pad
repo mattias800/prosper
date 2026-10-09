@@ -1,0 +1,44 @@
+# Afterdream (PPSA18391) -- from a fresh boot with EMPTY save directories, past the first-boot
+# language menu (English, the default item) and the warning card into the in-engine opening scene.
+#
+# A generic probe, not a hand-tuned route: a one-second Cross every 8 s from 20 s, in SECONDS from the
+# guest's first pad poll. Measured on 2026-10-09 (prosper-app, Linux/RADV, main a56a085e1, 59.9
+# guest flips/s): the language menu holds until the first press, the warning card is up at about pad
+# flip 2000, and the dialogue scene in the sitting room is drawn from pad flip 3000 to the end of a
+# 300 s run, advancing one line per press.
+#
+# Use it as PROSPER_PAD_SCRIPT=@<path> -- without the @ the script loads 0 entries.
+20-21:cross
+28-29:cross
+36-37:cross
+44-45:cross
+52-53:cross
+60-61:cross
+68-69:cross
+76-77:cross
+84-85:cross
+92-93:cross
+100-101:cross
+108-109:cross
+116-117:cross
+124-125:cross
+132-133:cross
+140-141:cross
+148-149:cross
+156-157:cross
+164-165:cross
+172-173:cross
+180-181:cross
+188-189:cross
+196-197:cross
+204-205:cross
+212-213:cross
+220-221:cross
+228-229:cross
+236-237:cross
+244-245:cross
+252-253:cross
+260-261:cross
+268-269:cross
+276-277:cross
+284-285:cross

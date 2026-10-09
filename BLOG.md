@@ -19,6 +19,42 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-09
+
+### The Blood of Dawnwalker reaches its title screen on its first run
+
+On its first run in prosper, *The Blood of Dawnwalker* plays its intro and stops on a lit 3D title menu, which the owner checked by eye and found correct ([tracker #4792](https://github.com/mattias800/prosper/issues/4792)).
+
+<p align="center"><img src="assets/screenshots/blood-of-dawnwalker-title-screen.webp" alt="The Blood of Dawnwalker title menu: the hero on a spire above a night-time town and castle, with New Game, Settings, Extras and Credits on the left; Linux prosper-app, owner-played route, F9 frame grab"></p>
+<p align="center"><img src="assets/screenshots/blood-of-dawnwalker-intro-cinematic.webp" alt="The Blood of Dawnwalker intro cinematic: a hooded rider on horseback at dusk; Linux prosper-app, route reach-title-screen.pad, snapshot at pad flip 1200"></p>
+<p align="center"><img src="assets/screenshots/blood-of-dawnwalker-title-card.webp" alt="The Blood of Dawnwalker title card on red, Press X to continue; Linux prosper-app, route reach-title-screen.pad, snapshot at pad flip 2000"></p>
+
+### PGA TOUR 2K25 reaches its title screen
+
+*PGA TOUR 2K25* used to die before its first frame. A plain launch now reaches its 4K title screen at about 60 fps; the studio logo before it draws upside down ([tracker #2895](https://github.com/mattias800/prosper/issues/2895)).
+
+<p align="center"><img src="assets/screenshots/pga-tour-2k25-title-screen.webp" alt="PGA TOUR 2K25 title screen: key art of three golfers under the 2K25 logo, with a CONTINUE prompt; Linux prosper-app, default launch, snapshot at pad flip 12000"></p>
+<p align="center"><img src="assets/screenshots/pga-tour-2k25-studio-logo-flipped.webp" alt="The HB Studios logo drawn upside down on black; Linux prosper-app, default launch, snapshot at pad flip 1200"></p>
+
+### Beast of Reincarnation reaches its title screen
+
+*Beast of Reincarnation* now gets past its boot dialogs to the New Game / Settings title screen without a diagnostic switch, at about 4 fps ([tracker #2916](https://github.com/mattias800/prosper/issues/2916)).
+
+<p align="center"><img src="assets/screenshots/beast-of-reincarnation-title-screen.webp" alt="Beast of Reincarnation title screen: the logo with New Game and Settings beneath it on black; Linux prosper-app, route advance-boot-dialogs.pad, snapshot at pad flip 600"></p>
+
+### ArcRunner plays its intro on a plain launch
+
+*ArcRunner* used to crash within seconds of a plain launch. Now it plays its 4K intro cinematic, then holds on a black screen before the title ([tracker #1817](https://github.com/mattias800/prosper/issues/1817)).
+
+<p align="center"><img src="assets/screenshots/arcrunner-intro-cinematic-default-launch.webp" alt="ArcRunner intro cinematic: two armoured figures in a neon-lit rainy street at night; Linux prosper-app, default launch, snapshot at pad flip 300"></p>
+
+### Afterdream gets past its language menu into its opening scene
+
+*Afterdream* runs at a steady 60 fps on its first run: the first-boot language menu, then a pixel-art dialogue scene in a sitting room. No title screen has shown up yet ([tracker #4793](https://github.com/mattias800/prosper/issues/4793)).
+
+<p align="center"><img src="assets/screenshots/afterdream-opening-scene.webp" alt="Afterdream opening scene: two characters seated in a dim sitting room with red curtains and a grandfather clock, subtitle Would it help if you closed your eyes?; Linux prosper-app, route reach-opening-scene.pad, snapshot at pad flip 12000"></p>
+<p align="center"><img src="assets/screenshots/afterdream-language-menu.webp" alt="Afterdream first-boot language menu listing English, Chinese, German, Korean and Japanese on a dark curved screen; Linux prosper-app, default launch, snapshot at pad flip 600"></p>
+
 ## 2026-10-08
 
 ### Kena's dark cave is too bright, but not because of exposure
