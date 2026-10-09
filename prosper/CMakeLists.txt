@@ -3062,6 +3062,13 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # A wave-empty EXEC guard around a counted loop in Black Flag's direct-EXEC-write
+  # form (#4816): s_mov_b64/s_or_b64 into EXEC with a constant-full restore.
+  prosper_add_gtest(test_counted_loop_movexec_guard
+    SOURCES tests/gpu/recompiler/test_counted_loop_movexec_guard.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan)
+
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
     LIBRARIES prosper_core)
