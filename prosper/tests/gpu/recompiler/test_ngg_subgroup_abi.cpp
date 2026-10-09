@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "fixtures/test_data.h"
 
 #include <gtest/gtest.h>
@@ -477,4 +478,23 @@ TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
     EXPECT_EQ(analyze(program({0xd501000au, 0x00020300u})).reason, "ngg-abi-read-s0-s1");
     // A real read of s0 is still counted: v_add_nc_u32_e64 v10, s0, v1 reads it through SRC0.
     EXPECT_EQ(analyze(program({0xd525000au, 0x00020200u})).reason, "ngg-abi-read-s0-s1");
+}
+
+// rdna2_local_vcc_data: a scalar write into VCC keeps data only when its sources were written
+// earlier in the same basic block. A branch INTO the block between the writes and the VCC write
+// joins a path on which they never ran, the debugger-conditional branches included (#4819 review).
+TEST(NggSubgroupAbi, ALocalVccWriteNeedsItsSourcesWrittenInItsOwnBlock) {
+    // pc0 <first> | s_mov_b32 s8, 1 | s_mov_b32 s9, 1 | s_mov_b32 vcc_hi, 3
+    // pc4 s_bfe_u64 vcc, s[8:9], vcc_hi | s_endpgm
+    const auto proven = [](uint32_t first) {
+        const std::vector<uint32_t> code = {first,       0xBE880381u, 0xBE890381u,
+                                            0xBEEB0383u, 0x94EA6B08u, 0xBF810000u};
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        return proven_local_vcc_scalar_write_pcs(ins).contains(4u);
+    };
+    EXPECT_TRUE(proven(0xBF800000u)) << "control: s_nop, every source written in the block";
+    // s_cbranch_scc0 +2 and s_cbranch_cdbgsys +2 both land on pc 3, past the s[8:9] writes.
+    EXPECT_FALSE(proven(0xBF840002u)) << "a conditional branch joins at pc 3";
+    EXPECT_FALSE(proven(0xBF970002u)) << "a debugger-conditional branch joins at pc 3";
 }
