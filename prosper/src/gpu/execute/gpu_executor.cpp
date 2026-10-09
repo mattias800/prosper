@@ -8870,9 +8870,16 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             if (raw_x2_reader)
                 (void)raw_x2_reader->publish_compute_x2(*table, raw_source->owned_raw_x2_write_plan,
                                                         compute_srt_uses);
-            (void)admit_compute_nested_wide_data(
-                mapping_lease ? mapping_lease->get() : nullptr,
-                facts->decoded, compute_srt_uses, *table);
+            // The inventory is a pure function of the program's bytes, so it is taken from the
+            // memoized facts; the decision itself still reads this dispatch's table and memory.
+            if (compute_nested_wide_facts_memo_enabled())
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, facts->nested_wide_data(), compute_srt_uses, *table);
+            else
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, compute_srt_uses, *table);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then

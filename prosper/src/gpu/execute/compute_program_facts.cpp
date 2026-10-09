@@ -7,6 +7,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "diagnostics/env_cache.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"            // raw wide-data analyses
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"   // recompile_diagnostic_verbose
 
 namespace prosper::gpu {
@@ -53,7 +55,8 @@ FactsCache& facts_cache() {
 uint64_t facts_bytes(const ComputeProgramFacts& facts) {
     uint64_t bytes = sizeof(ComputeProgramFacts) + facts.code.size() * sizeof(uint32_t) +
                      facts.decoded.size() * sizeof(Rdna2Inst) +
-                     facts.decoded.size() * sizeof(ComputeCrossLaneOp);   // wave_ops, worst case
+                     facts.decoded.size() * sizeof(ComputeCrossLaneOp) +  // wave_ops, worst case
+                     facts.decoded.size() * 2 * sizeof(uint32_t);         // nested_wide_data, worst case
     for (const auto& [tag, payload] : facts.probe_reject_reasons)
         bytes += tag.size() + payload.size() + 2 * sizeof(std::string);
     return bytes;
@@ -87,6 +90,22 @@ const ComputeWaveOpFacts& ComputeProgramFacts::wave_ops() const {
         wave_ops_value = analyze_compute_wave_ops(decoded, code.data(), code.size());
     });
     return wave_ops_value;
+}
+
+const NestedWideDataFacts& ComputeProgramFacts::nested_wide_data() const {
+    std::call_once(nested_wide_once, [this] {
+        nested_wide_value.nested = rdna2_proven_raw_nested_wide_data_loads(decoded);
+        if (!nested_wide_value.nested.empty())
+            nested_wide_value.parents = rdna2_proven_raw_immediate_wide_data_loads(decoded);
+        FactsCache& cache = facts_cache();
+        std::lock_guard lock(cache.mutex);
+        ++cache.stats.nested_wide_evaluations;
+    });
+    return nested_wide_value;
+}
+
+bool compute_nested_wide_facts_memo_enabled() {
+    return !PROSPER_ENV_ON("PROSPER_NO_NESTED_WIDE_FACTS_MEMO");
 }
 
 bool compute_program_facts_cache_enabled() {

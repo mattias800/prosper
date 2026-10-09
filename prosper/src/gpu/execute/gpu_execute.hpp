@@ -510,6 +510,15 @@ bool admit_compute_nested_wide_data(const prosper::GuestMappingLease* mapping_le
                                     const std::vector<Rdna2Inst>& decoded,
                                     const std::vector<SrtUse>& uses,
                                     ShaderResourceTable& table);
+// The same admission from an inventory already derived for these exact `decoded` instructions
+// (ComputeProgramFacts::nested_wide_data()), so a repeated dispatch does not re-run the analysis.
+// The inventory must be the one the overload above would compute; the decision is then identical.
+struct NestedWideDataFacts;   // gpu/execute/compute_program_facts.hpp
+bool admit_compute_nested_wide_data(const prosper::GuestMappingLease* mapping_lease,
+                                    const std::vector<Rdna2Inst>& decoded,
+                                    const NestedWideDataFacts& inventory,
+                                    const std::vector<SrtUse>& uses,
+                                    ShaderResourceTable& table);
 
 // Apply the exact dispatch-scoped resource-path specialization used by the live compute executor.
 // The report makes the production decision observable to tests and diagnostics: callers can verify
