@@ -38,6 +38,7 @@
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
+#include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4796)
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
 #include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -7160,6 +7161,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                                                    : registered_shader_dwords(*hdr, code_addr);
     const auto full_source = checked_source ? checked_source->source().decoded
                                             : decode_shader_cached(code, shader_dwords);
+    SkippableInstructionQuery skippable(full_source, full_source->code, code,
+                                        shader_dwords);   // #4796
     if (original_source) {
         *original_source =
             checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
@@ -7947,7 +7950,42 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     const bool exact_null_t8 = reject && std::string_view(reject) == "base-zero" &&
                                                !u.is_storage_image &&
                                                t8_is_null_for_op(u.t8, texel_read);
-                    if (exact_null_t8) {
+                    // #4796: a T# whose words are NOT A DESCRIPTOR AT ALL (no image type, an
+                    // inverted range, a reserved selector, an impossible base), read only by an
+                    // instruction that scalar branches can skip, is a slot the guest left unwritten:
+                    // it binds the same null. Kena's switch arms leave such slots holding stale ring
+                    // bytes, and whether those passed the screen decided admission run to run. A
+                    // well-formed T# prosper does not model, a bad T# that every scalar path reaches
+                    // (alpha kill and divergent ifs included), and any store all stay refused.
+                    // CONFIDENCE: MED, and only while prosper's bytes are the GPU's: a table the
+                    // guest recycled under prosper (SDK<13, #2220) looks exactly like a stale slot.
+                    // On Kena the race reached one scalar-skippable use, in a program it already
+                    // refuses on an always-run sample (#4801). `[t8-unbound]` names every slot this
+                    // binds, and its RUN TOTAL counts them. See skippable_instruction.hpp.
+                    // Pure reads only, by the decoder's fail-closed writer test rather than the
+                    // storage classifier, which does not list every gfx10 write op (#4801 review).
+                    const bool pure_read_use = u.use_pc < shader_dwords && [&] {
+                        const Rdna2Inst op =
+                            rdna2_decode_one(use_code + u.use_pc, shader_dwords - u.use_pc);
+                        return op.fmt == Rdna2Format::MIMG &&
+                               !rdna2_instruction_may_write_memory(op);
+                    }();
+                    // The second test catches stale bytes that happen to decode as a well-formed
+                    // shape prosper does not support: a T# whose base lies in no mapping the guest
+                    // ever made cannot be a texture, while one at GPU-only or lazily committed
+                    // guest memory (host-unreadable) still is, and keeps its ordinary route.
+                    const char* unbound_reason = nullptr;
+                    if (!exact_null_t8 && !u.is_storage_image && pure_read_use &&
+                        skippable.may_skip(u.use_pc)) {
+                        if (image_reject_reason_is_not_a_descriptor(reject))
+                            unbound_reason = reject;
+                        else if (!guest_readable(d.base, 1) &&
+                                 !prosper::guest_virtual_address_tracked(d.base))
+                            unbound_reason = "base-names-no-guest-mapping";
+                    }
+                    if (unbound_reason)
+                        note_unbound_image_descriptor(code_addr, u.use_pc, u.t8, unbound_reason);
+                    if (exact_null_t8 || unbound_reason) {
                         ShaderResource rn;
                         rn.cls      = ResourceClass::Texture;
                         rn.gpu_addr = 0;            // the three fields validate_shader_resources reads
@@ -7992,7 +8030,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // cached read would never see it (cached_env_arming_logic, #4602).
                         // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only diagnostic switch
                         const bool dbg = std::getenv("PROSPER_DBG") != nullptr;
-                        const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
+                        const uint64_t null_ordinal =
+                            dbg && exact_null_t8 ? null_images.fetch_add(1) + 1 : 0;
                         if (null_ordinal &&
                             (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))
                             fprintf(stderr,
@@ -8000,9 +8039,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                                     "constant-zero selectors)\n",
                                     is_ps ? "PS" : "VS",
                                     static_cast<unsigned long long>(null_ordinal), u.use_pc, u.key);
-                        record_null_image_source_probe(
-                            code_addr, u.use_pc, u.descriptor_source_addr,
-                            draw_command_order, u.t8);
+                        if (exact_null_t8)
+                            record_null_image_source_probe(code_addr, u.use_pc,
+                                                           u.descriptor_source_addr,
+                                                           draw_command_order, u.t8);
                         t.resources.push_back(rn);
                         continue;
                     }
@@ -8672,14 +8712,26 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.type, d.base_array, d.format, d.tile_mode,
                                 reject ? reject : "materialize");
-                    if (reject) continue;                            // garbage/degenerate T#
+                    // The compute decline sites name their words too (#4796): a refused dispatch
+                    // whose `[mimg-unresolved]` has no `[t8-dropped]` line was unreadable before.
+                    if (reject) {   // garbage/degenerate T#
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, reject);
+                        continue;
+                    }
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
                     // recompile (format-free SPIR-V), but remain explicitly Unknown so the live backend
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
-                    if (!mapped_fmt && !u.is_storage_image) continue;
-                    if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    if (!mapped_fmt && !u.is_storage_image) {
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                      "unmapped-img-fmt");
+                        continue;
+                    }
+                    if (mapped_fmt && fi.block_width > 1 && fi.snorm) {   // signed BCn: not wired
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, "signed-bcn");
+                        continue;
+                    }
                     // The unmapped-format fallback builds a view by hand and therefore never applies
                     // a slice offset. It must fail closed on a non-zero BASE_ARRAY for the same
                     // reason image_base_level_view's early returns do: an unshifted base under a
@@ -8690,6 +8742,8 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                         : unmapped_format_image_view(d);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                      "unsupported-image-view");
                         continue;
                     }
                     const ResourceClass wanted = u.is_storage_image ? ResourceClass::StorageImage

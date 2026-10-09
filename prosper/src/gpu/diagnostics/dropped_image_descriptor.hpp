@@ -14,10 +14,12 @@
 // resolve the same instruction by its SRSRC register.
 //
 // Coverage, so an absence can be read: every image-use decline in resolve_dynamic_fetch_fold's T#
-// admission (fold_t8_decline_reason below) and every `continue` in build_stage_table's texture
-// publication. NOT covered: the fold's whole-program early return when a checked source is no
-// longer current, which declines before any instruction is examined. A `[mimg-unresolved]
-// pc_res=null` with no `[t8-dropped]` line for that program and pc points there, or at the cap.
+// admission (fold_t8_decline_reason below), every `continue` in build_stage_table's texture
+// publication, and the compute table's screen, format, signed-BCn and view declines (#4796). NOT
+// covered: the fold's whole-program early return when a checked source is no longer current, which
+// declines before any instruction is examined, and the backing-size overflow skips. A
+// `[mimg-unresolved] pc_res=null` with no `[t8-dropped]` line for that program and pc points there,
+// or at the cap.
 #pragma once
 
 #include <array>
@@ -56,5 +58,20 @@ std::string format_dropped_image_descriptor(uint64_t program, uint32_t pc, int s
 // it is kept by pointer as part of the dedupe key. Returns whether this call printed. Thread-safe.
 bool note_dropped_image_descriptor(uint64_t program, uint32_t pc, int srsrc,
                                    const std::array<uint32_t, 8>& words, const char* reason);
+
+// #4775: the counterpart for a use that was NOT dropped. When an unusable T# is read only by an
+// instruction the program can skip, build_stage_table binds a null image instead of refusing the
+// program, and prints one `[t8-unbound]` line per (program, pc, reason) with the same fields as
+// `[t8-dropped]`. Same bound and dedupe discipline, separate cap, so neither line can starve the
+// other. It is how a reader tells "this arm's slot was stale and bound null" apart from a resolved
+// texture: a run whose picture is missing a sampled term should look here first.
+std::string format_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                            const std::array<uint32_t, 8>& words,
+                                            const char* reason);
+bool note_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                   const std::array<uint32_t, 8>& words, const char* reason);
+// Every call, not only reported sites: the process total, also printed once at exit as
+// `[t8-unbound] RUN TOTAL null-bound uses=N sites=M`.
+uint64_t unbound_image_descriptor_uses();
 
 }   // namespace prosper::gpu

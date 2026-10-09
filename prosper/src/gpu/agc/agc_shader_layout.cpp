@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <string_view>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -433,6 +434,20 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
 // MSAA, 1D-array), and let image_base_level_view() decide the rest; it still fails closed when the
 // chain stride cannot be computed. CONFIDENCE: HIGH (the stride path has its own coverage, and the
 // descriptor decode of BASE_ARRAY/LAST_ARRAY is pinned by test_build_shader_resources).
+bool image_reject_reason_is_not_a_descriptor(const char* reason) {
+    if (!reason) return false;
+    static constexpr std::string_view kNotADescriptor[] = {
+        "base-zero",        "base-below-low-pointer-guard",
+        "zero-extent",      "inverted-array-range",
+        "bad-image-type",   "extent-too-large",
+        "dst-sel-reserved",
+    };
+    const std::string_view r(reason);
+    for (const std::string_view k : kNotADescriptor)
+        if (r == k) return true;
+    return false;
+}
+
 const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     if (d.base == 0) return "base-zero";
     // A base BELOW the PS5 guest-VA floor is as unusable as zero, and used to pass this screen (#2446).

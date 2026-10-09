@@ -8583,6 +8583,13 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
                                      second_address, second_size);
 }
 
+bool guest_virtual_address_tracked(uint64_t address) {
+    std::lock_guard<std::mutex> lock(g_mx);
+    return std::any_of(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {
+        return mapping.base <= address && address - mapping.base < mapping.size;
+    });
+}
+
 bool guest_memory_direct_range_fault_safe(const GuestMappingLease&,
                                           uint64_t address, uint64_t size) {
 #if defined(__linux__)

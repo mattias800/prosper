@@ -1,4 +1,5 @@
 // shader_inspect - print the decoded RDNA2 stream and resolved control-flow targets from a raw dump.
+#include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
@@ -152,6 +153,7 @@ int main(int argc, char** argv) {
     std::string stage;
     std::string input_path;
     bool mimg_sites = false;
+    bool skippable_mimg = false;
     bool wave_reasons = false;
     bool raw_wide_proof = false;
     bool wave64 = false;
@@ -163,6 +165,8 @@ int main(int argc, char** argv) {
             else stage = argv[++i];
         } else if (arg == "--mimg-sites") {
             mimg_sites = true;
+        } else if (arg == "--skippable-mimg") {
+            skippable_mimg = true;
         } else if (arg == "--wave-reasons") {
             wave_reasons = true;
         } else if (arg == "--raw-wide-proof") {
@@ -181,44 +185,57 @@ int main(int argc, char** argv) {
         (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
         (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
         (wave64 && !raw_wide_proof) ||
+        (skippable_mimg && (!stage.empty() || mimg_sites || wave_reasons || raw_wide_proof)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
-    std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
-    std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof [--wave64]\n", argv[0]);
-    std::fprintf(
-        stderr,
-        "\n"
-        "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
-        "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the same\n"
-        "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
-        "census from a run that died before printing one.\n"
-        "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
-        "wave width the source module requires, why, and its legacy reason-set classification.\n"
-        "This is NOT the live ProvenVotes rewrite certificate: policy, enabled device contracts\n"
-        "and pass input authority are not evaluated here. No title allowlist controls admission.\n"
-        "Every row states these limits. Same sentinel discipline as\n"
-        "--mimg-sites.\n"
-        "--raw-wide-proof prints ONLY the code-side proofs that gate numeric use of an x4/x8\n"
-        "scalar load: needs-backing, entry-proven and register-proven per load, then a\n"
-        "`raw-wide-proof-end` sentinel. These proofs read code only, so a raw dump answers them.\n"
-        "With --wave64, needs-backing and its blockers are the answer for a program known to run\n"
-        "64 lanes wide (a compare into a register pair writes both words); the default is the\n"
-        "answer for an unknown or 32-lane width. The dump does not say which the title uses.\n"
-        "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
-        "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
-        "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
-        "was compiled with the real resource table.\n"
-        "\n"
-        "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
-        "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
-        "When such an instruction is present, a failed stage recompile is reported as\n"
-        "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
-        "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
-        "  gpu_replay <capture>.prgcap --inspect-only\n"
-        "\n"
-        "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource table).\n");
-    return 2;
+        std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
+        std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
+        std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof [--wave64]\n", argv[0]);
+        std::fprintf(
+            stderr,
+            "\n"
+            "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
+            "--mimg-sites prints ONLY a machine-readable MIMG census (pc, opcode, dim) from the "
+            "same\n"
+            "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real "
+            "empty\n"
+            "census from a run that died before printing one.\n"
+            "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
+            "wave width the source module requires, why, and its legacy reason-set "
+            "classification.\n"
+            "This is NOT the live ProvenVotes rewrite certificate: policy, enabled device "
+            "contracts\n"
+            "and pass input authority are not evaluated here. No title allowlist controls "
+            "admission.\n"
+            "Every row states these limits. Same sentinel discipline as\n"
+            "--mimg-sites.\n"
+            "--raw-wide-proof prints ONLY the code-side proofs that gate numeric use of an x4/x8\n"
+            "scalar load: needs-backing, entry-proven and register-proven per load, then a\n"
+            "`raw-wide-proof-end` sentinel. These proofs read code only, so a raw dump answers "
+            "them.\n"
+            "With --wave64, needs-backing and its blockers are the answer for a program known to "
+            "run\n"
+            "64 lanes wide (a compare into a register pair writes both words); the default is the\n"
+            "answer for an unknown or 32-lane width. The dump does not say which the title uses.\n"
+            "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
+            "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
+            "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, "
+            "which\n"
+            "was compiled with the real resource table.\n"
+            "\n"
+            "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), "
+            "so\n"
+            "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment "
+            "stages.\n"
+            "When such an instruction is present, a failed stage recompile is reported as\n"
+            "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
+            "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
+            "  gpu_replay <capture>.prgcap --inspect-only\n"
+            "\n"
+            "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource "
+            "table).\n");
+        return 2;
     }
 
     std::ifstream input(input_path.c_str(), std::ios::binary);
@@ -277,6 +294,27 @@ int main(int argc, char** argv) {
         }
         std::printf("mimg-sites-end dwords=%zu consumed=%zu instructions=%zu sites=%zu endpgm=%d\n",
                     words.size(), consumed, instructions.size(), sites, walk_ended ? 1 : 0);
+        return 0;
+    }
+
+    // --skippable-mimg: for every image instruction, whether scalar branch decisions alone can
+    // finish the program without executing it (program_may_skip_by_scalar_branch, the gate on
+    // binding a null for an unwritten descriptor slot, #4796). Out-of-line tail blocks are appended
+    // as the live table build does. Same sentinel discipline as --mimg-sites.
+    if (skippable_mimg) {
+        std::vector<Rdna2Inst> complete = instructions;
+        (void)rdna2_append_closed_tail_blocks(words.data(), words.size(), complete);
+        size_t sites = 0, skippable = 0;
+        for (const Rdna2Inst& in : complete) {
+            if (in.fmt != Rdna2Format::MIMG) continue;
+            const bool skip = prosper::gpu::program_may_skip_by_scalar_branch(complete, in.pc);
+            ++sites;
+            skippable += skip ? 1 : 0;
+            std::printf("skippable-site pc=%u op=0x%x scalar-skippable=%d\n", in.pc, in.opcode,
+                        skip ? 1 : 0);
+        }
+        std::printf("skippable-mimg-end instructions=%zu sites=%zu skippable=%zu\n",
+                    complete.size(), sites, skippable);
         return 0;
     }
 

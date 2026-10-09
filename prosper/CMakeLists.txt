@@ -3525,6 +3525,12 @@ endif()
     SOURCES tests/gpu/execute/test_null_image_shape.cpp
     LIBRARIES prosper_core)
 
+  # #4775: whether a program can finish without executing an instruction -- the gate on binding a
+  # null image for an unusable T# read only by a skippable instruction.
+  prosper_add_gtest(test_skippable_instruction
+    SOURCES tests/gpu/execute/test_skippable_instruction.cpp
+    LIBRARIES prosper_core)
+
   # #3579: a refused buffer instruction must not print the same census word as an emitted one.
   prosper_add_gtest(test_buf_op_census_disposition
     SOURCES tests/gpu/recompiler/test_buf_op_census_disposition.cpp

@@ -36,6 +36,14 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(uint64_t first_addres
                                                            uint64_t second_address,
                                                            uint64_t second_size);
 
+// True when the kernel-memory HLE tracks a guest mapping that contains `address`, whatever its CPU
+// protection and whether or not it is committed yet. This is the guest's own view, so GPU-only
+// direct memory (no CPU bits, host PROT_NONE) and lazily committed ranges both answer true, where a
+// host readability probe would answer false. It is what separates a descriptor naming no guest
+// memory at all (stale bytes) from one at memory the CPU simply cannot read (#4796). Takes the
+// mapping-table lock: keep it off per-draw paths that are not already declining something.
+bool guest_virtual_address_tracked(uint64_t address);
+
 // Linux's guest fault handler may replace a whole 64 KiB reservation granule on first touch.
 // Admission under a GuestMappingLease must require each granule intersecting a source or writable
 // destination to be fully backed by committed direct mappings, or a fault in an adjacent reserved
