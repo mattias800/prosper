@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -39,10 +40,23 @@ bool admit_compute_nested_wide_data(const GuestMappingLease* lease,
                                     const std::vector<Rdna2Inst>& decoded,
                                     const std::vector<SrtUse>& uses,
                                     ShaderResourceTable& table) {
-    const auto nested = rdna2_proven_raw_nested_wide_data_loads(decoded);
+    NestedWideDataFacts inventory;
+    inventory.nested = rdna2_proven_raw_nested_wide_data_loads(decoded);
+    if (inventory.nested.empty()) return true;
+    if (!lease) return false;
+    inventory.parents = rdna2_proven_raw_immediate_wide_data_loads(decoded);
+    return admit_compute_nested_wide_data(lease, decoded, inventory, uses, table);
+}
+
+bool admit_compute_nested_wide_data(const GuestMappingLease* lease,
+                                    const std::vector<Rdna2Inst>& decoded,
+                                    const NestedWideDataFacts& inventory,
+                                    const std::vector<SrtUse>& uses,
+                                    ShaderResourceTable& table) {
+    const std::vector<uint32_t>& nested = inventory.nested;
     if (nested.empty()) return true;
     if (!lease) return false;
-    const auto parents = rdna2_proven_raw_immediate_wide_data_loads(decoded);
+    const std::vector<uint32_t>& parents = inventory.parents;
     std::vector<std::pair<size_t, size_t>> chains;
     std::set<uint32_t> source_pcs;
     for (uint32_t child_pc : nested) {

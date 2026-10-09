@@ -12,8 +12,17 @@
 //     the map entry was overwritten, exactly as a fresh probe would (positive control included).
 //  5. may_specialize: the scratch-copy gate is true exactly for the resource shapes the two
 //     specializers act on.
+//  6. nested wide data: the admission inventory equals a direct evaluation, is analyzed once per
+//     exact program, and is re-analyzed for rewritten bytes.
+//  7. executor: repeated live dispatches of one program take that inventory from the memo, so the
+//     analysis runs once (fails if the executor re-derives it per dispatch, as it did before).
 #include "gpu/execute/compute_program_facts.hpp"
 #include <gtest/gtest.h>
+#include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "gpu/recompiler/compute_wave_route.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
@@ -202,4 +211,117 @@ TEST(ComputeProgramFacts, Contract) {
     if (failures) std::fprintf(stderr, "%d FAILED\n", failures);
     else std::fprintf(stderr, "all compute_program_facts checks passed\n");
     EXPECT_EQ(failures, 0);
+}
+
+// Production bytes with one proven nested child (pc2) under an immediate parent (pc0); the same
+// fixture test_nested_wide_data_admission admits end to end.
+const uint32_t kNestedChild[] = {
+    0xf4080a00u, 0xfa000000u,   // pc0: parent x4 s[40:43] from entry s[0:1]
+    0xf4080b14u, 0xfa000010u,   // pc2: child x4 s[44:47] from s[40:41]
+    0x7e00022eu,                // pc4: numeric reader of s46
+    0xf0200f08u, 0x00060004u,   // pc5: 2D image_store
+    0xbf810000u,
+};
+
+TEST(ComputeProgramFacts, NestedWideDataIsMemoizedAndExact) {
+    reset_compute_program_facts_for_test();
+    std::vector<uint32_t> program(std::begin(kNestedChild), std::end(kNestedChild));
+    std::vector<Rdna2Inst> direct;
+    rdna2_walk(program.data(), program.size(), direct);
+    const auto expected_nested = rdna2_proven_raw_nested_wide_data_loads(direct);
+    const auto expected_parents = rdna2_proven_raw_immediate_wide_data_loads(direct);
+    // Positive control: the fixture really has a nested child, so equality below is not 0 == 0.
+    ASSERT_EQ(expected_nested, std::vector<uint32_t>{2u});
+    ASSERT_FALSE(expected_parents.empty());
+
+    const auto first = compute_program_facts(program.data(), program.size(), at(0x9000));
+    EXPECT_EQ(compute_program_facts_stats().nested_wide_evaluations, 0u)
+        << "the inventory is computed on first use, not at analysis time";
+    EXPECT_EQ(first->nested_wide_data().nested, expected_nested);
+    EXPECT_EQ(first->nested_wide_data().parents, expected_parents);
+    const auto second = compute_program_facts(program.data(), program.size(), at(0x9000));
+    EXPECT_EQ(second->nested_wide_data().nested, expected_nested);
+    EXPECT_EQ(compute_program_facts_stats().nested_wide_evaluations, 1u)
+        << "a repeated dispatch of one program analyzes the nested inventory once";
+
+    // A program with no nested child: empty inventory, and the parent analysis is skipped
+    // exactly as the un-memoized admission skips it.
+    const std::vector<uint32_t> plain{0x7e020287u, 0xbf810000u};
+    const auto plain_facts = compute_program_facts(plain.data(), plain.size(), at(0x9100));
+    EXPECT_TRUE(plain_facts->nested_wide_data().nested.empty());
+    EXPECT_TRUE(plain_facts->nested_wide_data().parents.empty());
+
+    // Rewritten bytes at the cached address (same dword count) are re-analyzed.
+    std::vector<uint32_t> buffer = program;
+    (void)compute_program_facts(buffer.data(), buffer.size(), at(0x9200))->nested_wide_data();
+    const uint64_t before = compute_program_facts_stats().nested_wide_evaluations;
+    std::fill(buffer.begin(), buffer.end() - 1, 0xbf800000u);   // s_nop ... s_endpgm
+    const auto rewritten = compute_program_facts(buffer.data(), buffer.size(), at(0x9200));
+    EXPECT_TRUE(rewritten->nested_wide_data().nested.empty())
+        << "the rewritten program answers for its own bytes";
+    EXPECT_EQ(compute_program_facts_stats().nested_wide_evaluations, before + 1);
+}
+
+TEST(ComputeProgramFacts, ExecutorTakesNestedWideDataFromTheMemo) {
+    ASSERT_TRUE(compute_nested_wide_facts_memo_enabled())
+        << "run without PROSPER_NO_NESTED_WIDE_FACTS_MEMO";
+    prosper::register_agc_hle();
+    auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+    ASSERT_TRUE(create_shader);
+    alignas(256) static const uint32_t kProgram[] = {
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0xbf810000u,   // s_endpgm
+    };
+    ShaderReg registers[2] = {
+        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
+    };
+    AgcShaderHeader header{};
+    header.file_header = 0x34333231u;
+    header.version = 0x18;
+    header.sh_registers = registers;
+    header.shader_size = sizeof(kProgram);
+    header.type = 0;
+    header.num_sh_registers = 2;
+    void* registered = nullptr;
+    ASSERT_EQ(create_shader(reinterpret_cast<uint64_t>(&registered),
+                            reinterpret_cast<uint64_t>(&header),
+                            reinterpret_cast<uint64_t>(kProgram), 0, 0, 0),
+              0u);
+    ASSERT_EQ(registered, &header);
+
+    auto realize = [&](uint64_t command_order) {
+        GpuState state;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = registers[0].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = registers[1].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_RSRC1] = kDefaultComputePgmRsrc1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_X] = 64;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y] = 1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Z] = 1;
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = 64;
+        dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.modifier =
+            1ull << prosper::agc::Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT;
+        dispatch.command_order = command_order;
+        dispatch.state = std::make_shared<GpuState>(state);
+        state.dispatches.push_back(dispatch);
+        std::vector<OperationRealizationFailure> failures;
+        auto items = realize_compute_dispatches(state, 0x4900, &failures);
+        for (const auto& failure : failures)
+            std::fprintf(stderr, "  realization failure reason=%d\n", static_cast<int>(failure.reason));
+        return items;
+    };
+    reset_compute_program_facts_for_test();
+    const auto first = realize(0x49001u);
+    const auto second = realize(0x49002u);
+    const auto third = realize(0x49003u);
+    // Positive control: all three dispatches were realized, so the executor reached admission.
+    ASSERT_EQ(first.size(), 1u);
+    ASSERT_EQ(second.size(), 1u);
+    ASSERT_EQ(third.size(), 1u);
+    const ComputeProgramFactsStats stats = compute_program_facts_stats();
+    EXPECT_EQ(stats.hits, 2u) << "the program's facts were served from the memo";
+    EXPECT_EQ(stats.nested_wide_evaluations, 1u)
+        << "three dispatches of one program analyze its nested wide-data inventory once";
 }
