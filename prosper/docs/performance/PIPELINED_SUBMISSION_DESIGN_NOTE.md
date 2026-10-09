@@ -156,6 +156,23 @@ staging, command recording and `vkQueueSubmit`). The model lets that CPU work ov
 it cannot, so it OVERSTATES the overlap: the 11-12% is optimistic. A CPU timestamp right after
 `vkQueueSubmit` would split the span and tighten the bound; one title.
 
+### Two more titles, Linux/AMD (2026-10-09)
+
+The same `PROSPER_PIPELINE_OBSERVE=1` report on main `eec8d766b` (Linux, RADV Strix Halo, `prosper-app`, GPU
+present, immediate present; periodic report, so the last 256-dispatch boundary before exit):
+
+| title, route | dispatches | ranges-only d4 / d64 | barriers d4 / d64 |
+| --- | ---: | --- | --- |
+| *The Blood of Dawnwalker* `PPSA28000`, opening cinematic (~175 s) | 200,192 | 89% / 88% | 89% / 88% |
+| *Kena* `PPSA01802`, default launch to the title screen (~235 s) | 104,192 | 89% / 89% | 90% / 90% |
+
+(predicted pipelined time as a share of sequential compute time.) Both land where Black Flag did: **at most
+10-12% of the compute critical path**, for the same structural reason. The `[compute-phase]` totals on the same
+binary put setup plus writeback at 64% (Dawnwalker) and 66% (Kena) of compute time, against 34% and 33% for the
+dispatch span that pipelining could overlap. So on these titles too the larger lever is reducing the CPU setup
+and writeback work, not overlapping it; the first such cut is the GPU retile of compute-written 16-pipe
+`SW_64KB_R_X` volumes (about 7 ms per flip of Kena's compute writeback).
+
 ## What this note does not claim
 
 No speed-up is measured here. The ceiling for Stage 1 on GTA V was bounded at about 5 % of wall time in

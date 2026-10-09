@@ -262,35 +262,33 @@ TEST(ComputeProgramFacts, NestedWideDataIsMemoizedAndExact) {
     EXPECT_EQ(compute_program_facts_stats().nested_wide_evaluations, before + 1);
 }
 
-TEST(ComputeProgramFacts, ExecutorTakesNestedWideDataFromTheMemo) {
-    ASSERT_TRUE(compute_nested_wide_facts_memo_enabled())
-        << "run without PROSPER_NO_NESTED_WIDE_FACTS_MEMO";
-    prosper::register_agc_hle();
-    auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
-    ASSERT_TRUE(create_shader);
-    alignas(256) static const uint32_t kProgram[] = {
-        0x7e040282u,   // v_mov_b32 v2, 2
-        0xbf810000u,   // s_endpgm
-    };
-    ShaderReg registers[2] = {
-        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
-        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
-    };
+// Registers `code` (256-byte aligned static storage, as COMPUTE_PGM_LO requires) as a compute
+// program and realizes one dispatch of it per call. Declare it as a test-local: CreateShader's
+// pointer fix-up does not accept a header in the test binary's static image (the program then
+// resolves to 0x0), which is also how the executor tests in test_shader_recompile_cache build it.
+struct LiveComputeProgram {
+    ShaderReg registers[2] = {{prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+                              {prosper::agc::Pm4::COMPUTE_PGM_HI, 0}};
     AgcShaderHeader header{};
-    header.file_header = 0x34333231u;
-    header.version = 0x18;
-    header.sh_registers = registers;
-    header.shader_size = sizeof(kProgram);
-    header.type = 0;
-    header.num_sh_registers = 2;
-    void* registered = nullptr;
-    ASSERT_EQ(create_shader(reinterpret_cast<uint64_t>(&registered),
-                            reinterpret_cast<uint64_t>(&header),
-                            reinterpret_cast<uint64_t>(kProgram), 0, 0, 0),
-              0u);
-    ASSERT_EQ(registered, &header);
 
-    auto realize = [&](uint64_t command_order) {
+    bool register_code(const uint32_t* code, size_t count) {
+        prosper::register_agc_hle();
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        if (!create_shader || (reinterpret_cast<uintptr_t>(code) & 0xffu)) return false;
+        header.file_header = 0x34333231u;
+        header.version = 0x18;
+        header.sh_registers = registers;
+        header.shader_size = static_cast<uint32_t>(count * sizeof(uint32_t));
+        header.type = 0;
+        header.num_sh_registers = 2;
+        void* registered = nullptr;
+        return create_shader(reinterpret_cast<uint64_t>(&registered),
+                             reinterpret_cast<uint64_t>(&header),
+                             reinterpret_cast<uint64_t>(code), 0, 0, 0) == 0 &&
+               registered == &header;
+    }
+
+    std::vector<ComputeItem> realize(uint64_t command_order) const {
         GpuState state;
         state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = registers[0].value;
         state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = registers[1].value;
@@ -306,22 +304,46 @@ TEST(ComputeProgramFacts, ExecutorTakesNestedWideDataFromTheMemo) {
         dispatch.command_order = command_order;
         dispatch.state = std::make_shared<GpuState>(state);
         state.dispatches.push_back(dispatch);
-        std::vector<OperationRealizationFailure> failures;
-        auto items = realize_compute_dispatches(state, 0x4900, &failures);
-        for (const auto& failure : failures)
-            std::fprintf(stderr, "  realization failure reason=%d\n", static_cast<int>(failure.reason));
-        return items;
+        return realize_compute_dispatches(state, 0x4900);
+    }
+};
+
+TEST(ComputeProgramFacts, ExecutorTakesNestedWideDataFromTheMemo) {
+    ASSERT_TRUE(compute_nested_wide_facts_memo_enabled())
+        << "run without PROSPER_NO_NESTED_WIDE_FACTS_MEMO";
+    alignas(256) static const uint32_t kPlain[] = {
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0xbf810000u,   // s_endpgm
     };
+    LiveComputeProgram plain;
+    ASSERT_TRUE(plain.register_code(kPlain, std::size(kPlain)));
     reset_compute_program_facts_for_test();
-    const auto first = realize(0x49001u);
-    const auto second = realize(0x49002u);
-    const auto third = realize(0x49003u);
-    // Positive control: all three dispatches were realized, so the executor reached admission.
-    ASSERT_EQ(first.size(), 1u);
-    ASSERT_EQ(second.size(), 1u);
-    ASSERT_EQ(third.size(), 1u);
+    // Positive control: every dispatch is realized, so the executor reached the admission.
+    for (uint64_t order : {0x49001u, 0x49002u, 0x49003u}) ASSERT_EQ(plain.realize(order).size(), 1u);
     const ComputeProgramFactsStats stats = compute_program_facts_stats();
-    EXPECT_EQ(stats.hits, 2u) << "the program's facts were served from the memo";
     EXPECT_EQ(stats.nested_wide_evaluations, 1u)
-        << "three dispatches of one program analyze its nested wide-data inventory once";
+        << "three dispatches of one program analyze its nested wide-data inventory once (hits="
+        << stats.hits << " misses=" << stats.misses << " bypasses=" << stats.bypasses << ")";
+}
+
+TEST(ComputeProgramFacts, ExecutorMemoizesANonEmptyNestedInventory) {
+    // The same through the executor for a program that HAS a nested child, so the memoized
+    // inventory the admission receives is the non-empty one, not the trivially empty answer.
+    ASSERT_TRUE(compute_nested_wide_facts_memo_enabled());
+    alignas(256) static uint32_t code[std::size(kNestedChild)];
+    std::memcpy(code, kNestedChild, sizeof(kNestedChild));
+    LiveComputeProgram nested;
+    ASSERT_TRUE(nested.register_code(code, std::size(code)));
+    reset_compute_program_facts_for_test();
+    for (uint64_t order : {0x49101u, 0x49102u, 0x49103u}) (void)nested.realize(order);
+    // The executor is the only caller here, so one evaluation proves it reached the admission
+    // (a removed call reads 0) and memoized it (a per-dispatch derivation reads 0 too: the old
+    // overload never touches the memo; a memo bypass would read 3).
+    EXPECT_EQ(compute_program_facts_stats().nested_wide_evaluations, 1u);
+    const auto facts = compute_program_facts_peek(
+        code, std::size(code), reinterpret_cast<uint64_t>(code));
+    ASSERT_TRUE(facts);
+    EXPECT_EQ(facts->nested_wide_data().nested, std::vector<uint32_t>{2u})
+        << "the inventory the executor memoized names the nested child";
+    EXPECT_FALSE(facts->nested_wide_data().parents.empty());
 }

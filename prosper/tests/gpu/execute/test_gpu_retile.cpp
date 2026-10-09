@@ -159,9 +159,12 @@ int run_case(int argc, char** argv) {
               "full block equation writes every output word exactly once, including nonzero block coordinates");
     check(!equation_covers_block(27, 4, 0, 0, true),
           "equation coverage guard rejects a manually collapsed address bit");
-    for (uint32_t mode : {5u, 9u}) for (uint32_t bpe : {4u, 8u, 16u})
-        check(volume_equation_covers_block(mode, bpe),
-              "3D equation writes every physical word exactly once");
+    // The CPU layout supports SW_64KB_R_X volumes only for the 16-pipe pattern
+    // (PROSPER_RX_PIPES varies it below); the GPU equation must follow exactly that support.
+    const bool rx_volume = tile_mode_supports_volume(27);
+    for (uint32_t mode : {5u, 9u, 27u}) for (uint32_t bpe : {4u, 8u, 16u})
+        check(volume_equation_covers_block(mode, bpe) == (mode != 27 || rx_volume),
+              "3D equation writes every physical word exactly once wherever the CPU layout exists");
     check(!volume_equation_covers_block(9, 8, true),
           "3D coverage guard rejects a collapsed coordinate bit");
     // Metadata-only predicate checks, not execution of a multi-mip/MSAA image.
@@ -263,12 +266,24 @@ int run_case(int argc, char** argv) {
               params.groups_z == 128, "representative 4 MiB standard 3D RGBA16F volume is admitted");
     check(!params.initialize_volume(UINT32_MAX, UINT32_MAX, UINT32_MAX, 16, 9, limits) &&
           !params.initialize_volume(64, 64, 128, 2, 9, limits) &&
-          !params.initialize_volume(64, 64, 128, 8, 27, limits),
+          !params.initialize_volume(64, 64, 128, 2, 27, limits) &&
+          !params.initialize_volume(64, 64, 128, 8, 24, limits),
           "overflow, sub-word texels and unsupported 3D layouts decline");
+    // SW_64KB_R_X volumes (UE's compute-written RGBA32F/RGBA16F volumes) are one 64 KiB block
+    // row per slice: a 64x64x64 RGBA32F volume is 64 slices of one block, exactly
+    // tiled_volume_bytes, so the guest-size equality in the live admission holds.
+    if (rx_volume)
+        check(params.initialize_volume(64, 64, 64, 16, 27, limits) &&
+                  params.linear_bytes == 4194304 && params.groups_z == 64 &&
+                  params.tiled_bytes == tiled_volume_bytes(64, 64, 64, 27, 16),
+              "representative SW_64KB_R_X RGBA32F volume is admitted at its exact tiled size");
+    else
+        check(!params.initialize_volume(64, 64, 64, 16, 27, limits),
+              "an SW_64KB_R_X volume the CPU layout cannot express keeps the CPU path");
     auto depth_limits = limits; depth_limits.maxComputeWorkGroupCount[2] = 21;
     check(!params.initialize_volume(67, 19, 21, 8, 9, depth_limits),
           "3D workgroup limit applies to padded depth");
-    const std::vector<uint32_t> modes = (subword || array16) ? std::vector<uint32_t>{24, 27} : mixed ? std::vector<uint32_t>{9} : volume ? std::vector<uint32_t>{5, 9}
+    const std::vector<uint32_t> modes = (subword || array16) ? std::vector<uint32_t>{24, 27} : mixed ? std::vector<uint32_t>{9} : volume ? std::vector<uint32_t>{5, 9, 27}
                                               : std::vector<uint32_t>{9, 24, 27};
     const std::vector<std::pair<uint32_t, uint32_t>> extents = subword
         ? std::vector<std::pair<uint32_t, uint32_t>>{{260, 131}, {512, 512}, {259, 131}} : array16

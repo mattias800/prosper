@@ -1372,8 +1372,27 @@ bool tile_volume_word_equation(uint32_t mode, uint32_t bpe,
                                std::array<uint32_t, 16>& equation,
                                uint32_t& bw, uint32_t& bh, uint32_t& bd, uint32_t& bits) {
     equation = {};
-    if ((mode != uint32_t(TileMode::Sw4KbS) && mode != uint32_t(TileMode::Sw64KbS)) ||
-        (bpe != 4 && bpe != 8 && bpe != 16)) return false;
+    if (bpe != 4 && bpe != 8 && bpe != 16) return false;
+    if (mode == uint32_t(TileMode::Sw64KbRX)) {
+        // The same layout sw64kb_rx_volume_copy walks on the CPU: every z slice owns its own row
+        // of 64 KiB blocks (block depth 1), and the in-block offset is the XOR of the 2D R_X
+        // x/y equation with the volume's z terms. Only the 16-pipe pattern the CPU path supports
+        // is expressed; any other pipe count keeps the CPU layout.
+        if (sw64kb_rx_pipes_log2() != 4) return false;
+        const auto el = sw64kb_elem_log2(bpe);
+        sw64kb_dims(el, bw, bh);
+        bd = 1;
+        bits = 16;
+        const PatBit* pat = kSw64kRX[4][el];
+        for (uint32_t bit = el; bit < bits; ++bit) {
+            if ((uint32_t(pat[bit].x) | uint32_t(pat[bit].y) |
+                 uint32_t(kSw64kbRXVolumeZ[bit])) & ~255u) return false;
+            equation[bit] = uint32_t(pat[bit].x) | (uint32_t(pat[bit].y) << 8) |
+                            (uint32_t(kSw64kbRXVolumeZ[bit]) << 16);
+        }
+        return true;
+    }
+    if (mode != uint32_t(TileMode::Sw4KbS) && mode != uint32_t(TileMode::Sw64KbS)) return false;
     const auto el = sw64kb_elem_log2(bpe);
     const bool small = mode == uint32_t(TileMode::Sw4KbS);
     const auto* dims = small ? kSw4kbS3Dims[el] : kSw64kbS3Dims[el];

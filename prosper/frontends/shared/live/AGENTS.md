@@ -24,7 +24,8 @@ found Vulkan.
   `render_runner.h` at all. Reflected storage buffers and storage images are materialized from guest
   memory, dispatched, and written back into guest memory synchronously.
 - `gpu_retile.hpp` — exact 2D and standard 3D storage-image writeback layout conversion in the
-  guest compute submission. 3D SW_4KB_S/SW_64KB_S uses a separate pipeline variant and checks
+  guest compute submission. 3D SW_4KB_S/SW_64KB_S, and 16-pipe SW_64KB_R_X volumes (one 64 KiB
+  block row per slice, z terms XORed into the offset), use a separate pipeline variant and check
   padded XYZ dispatch limits. A packed mode-24/27 variant groups four native byte texels or two
   native halfword texels into ordinary 32-bit stores across independent 2D planes/array layers.
   Mode-24 bytes interleave rows and retain CPU conversion.
