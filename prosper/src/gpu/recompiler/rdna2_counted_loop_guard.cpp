@@ -21,7 +21,10 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
     // That is only invisible while nothing reads those scalars after the restore on the skip path;
     // the guarded shapes seen so far (Evergate, Kena's lighting loops) recompute what they use.
     // CONFIDENCE: MED on that property, which this scan does not prove (inherited from the original
-    // s_and_saveexec form).
+    // s_and_saveexec form). The direct-EXEC-narrow form below inherits the same unproven property:
+    // its regions may write VCC/SCC/scalars, and the scan does not check their post-restore
+    // liveness. (Black Flag's filter overwrites its region-written vcc_lo at the restore target
+    // before any read, so the observed shape is benign; the proof does not establish that.)
     // Scan inside-out so an already-proven nested guard may contribute its balanced save/restore
     // pair without making an otherwise-safe outer guarded loop look like it leaks narrowed EXEC.
     struct GuardedExecRegion { uint32_t save_pc, restore_pc; };
@@ -52,10 +55,28 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
         // inside, and no write to EXEC or sN in between, so sN still holds the pre-narrow mask.
         const Rdna2Inst& narrow = ins[previous];
         const Rdna2Inst* saveexec = nullptr;
+        // A direct EXEC write immediately before the branch narrows without saving:
+        //   * s_mov_b64 exec, X / s_or_b64 exec, X, Y  (Black Flag's luma/edge filter
+        //     uses `s_mov_b64 exec, vcc`, then `s_or_b64 exec, s[4:5], vcc`, #4816)
+        // with a constant-full restore (`s_mov_b64 exec, -1`) at/after the branch target.
+        // Unlike the saveexec forms there is no saved mask to match: the restore is the
+        // constant full mask, which the guest executes explicitly, so the model is exact
+        // whatever EXEC held at entry. Only the two observed opcodes admit; other EXEC
+        // writers (v_cmpx_*, saveexec, and/or/xor B64, ...) stay fail-closed.
+        bool direct_exec_narrow = false;
+        if (narrow.fmt == Rdna2Format::SOP1 && narrow.opcode == kSop1OpcodeMovB64 &&
+            narrow.dst.value >= 126) {
+            direct_exec_narrow = true;
+        } else if (narrow.fmt == Rdna2Format::SOP2 && narrow.opcode == kSop2OpcodeOrB64 &&
+                   narrow.dst.value >= 126) {
+            direct_exec_narrow = true;
+        }
         if (narrow.fmt == Rdna2Format::SOP1 && (narrow.opcode == 0x24 || narrow.opcode == 0x25) &&
             narrow.dst.kind == OperandKind::SGPR && narrow.dst.value <= 104) {
             saveexec = &narrow;
-        } else if (narrow.fmt == Rdna2Format::VOPC && vopc_is_cmpx(narrow.opcode)) {
+            direct_exec_narrow = false;
+        } else if (!direct_exec_narrow && narrow.fmt == Rdna2Format::VOPC &&
+                   vopc_is_cmpx(narrow.opcode)) {
             for (size_t k = previous; k-- > 0;) {
                 const Rdna2Inst& candidate = ins[k];
                 if (candidate.fmt == Rdna2Format::SOP1 && candidate.opcode == kSop1OpcodeMovB64 &&
@@ -87,12 +108,15 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
                 if (!straight) saveexec = nullptr;
             }
         }
-        if (!saveexec) continue;
+        if (!saveexec && !direct_exec_narrow) continue;
+        const uint32_t narrow_pc = saveexec ? saveexec->pc : narrow.pc;
         const uint32_t target = branch_target(branch);
         // The matching restore is `s_mov_b64 exec, sN`, at the branch target or a few scalar
-        // instructions after it (UE4 schedules the next s_load ahead of the restore). The window
-        // [target, restore) runs with the narrowed EXEC on both paths, so it is held to the same
-        // side-effect rules as the region below, and it must be straight-line.
+        // instructions after it (UE4 schedules the next s_load ahead of the restore). For the
+        // direct form it is the constant full mask instead (`s_mov_b64 exec, -1`): the only
+        // restore the observed idiom uses, so any other constant or register stays refused.
+        // The window [target, restore) runs with the narrowed EXEC on both paths, so it is held
+        // to the same side-effect rules as the region below, and it must be straight-line.
         const Rdna2Inst* restore = nullptr;
         constexpr uint32_t kRestoreWindow = 8;
         uint32_t window = 0;
@@ -103,9 +127,18 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
             if (!landed && candidate.pc != target) break;
             landed = true;
             if (candidate.fmt == Rdna2Format::SOP1 && candidate.opcode == kSop1OpcodeMovB64 &&
-                candidate.dst.value >= 126 && reg_operand(candidate.src[0], saveexec->dst.value)) {
-                restore = &candidate;
-                break;
+                candidate.dst.value >= 126) {
+                if (!direct_exec_narrow && candidate.n_src >= 1 &&
+                    reg_operand(candidate.src[0], saveexec->dst.value)) {
+                    restore = &candidate;
+                    break;
+                }
+                if (direct_exec_narrow && candidate.n_src >= 1 &&
+                    candidate.src[0].kind == OperandKind::InlineInt &&
+                    candidate.src[0].value == -1) {
+                    restore = &candidate;
+                    break;
+                }
             }
             if (++window > kRestoreWindow || candidate.is_end ||
                 (candidate.fmt == Rdna2Format::SOPP && is_branch_opcode(candidate.opcode)) ||
@@ -129,22 +162,27 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
         // undominated restore. Accept only a pair contained in one straight-line loop segment,
         // or a true preheader-to-postloop wrapper around the complete loop. "Ends before" tests
         // use the restore pc and "ends after" tests use the branch target, so a restore placed
-        // after the target can only make each test stricter.
-        const bool same_preloop = saveexec->pc < L.header_pc && restore_pc < L.header_pc;
-        const bool same_condition = saveexec->pc >= L.header_pc && restore_pc < L.exit_branch_pc;
-        const bool same_body = saveexec->pc > L.exit_branch_pc && restore_pc < L.backedge_pc;
-        const bool same_postloop = saveexec->pc >= L.exit_pc;
-        const bool wraps_loop = saveexec->pc < L.header_pc && target >= L.exit_pc;
+        // after the target can only make each test stricter. The direct form has no saved
+        // register, so its clobber set is empty: EXEC is rewritten by the narrow and the
+        // restore by construction, and any other EXEC write in the region refuses below.
+        const bool same_preloop = narrow_pc < L.header_pc && restore_pc < L.header_pc;
+        const bool same_condition = narrow_pc >= L.header_pc && restore_pc < L.exit_branch_pc;
+        const bool same_body = narrow_pc > L.exit_branch_pc && restore_pc < L.backedge_pc;
+        const bool same_postloop = narrow_pc >= L.exit_pc;
+        const bool wraps_loop = narrow_pc < L.header_pc && target >= L.exit_pc;
         if (!same_preloop && !same_condition && !same_body && !same_postloop && !wraps_loop)
             continue;
         bool side_effect_free = true;
         for (const auto& candidate : ins) {
             if (candidate.pc <= branch.pc || candidate.pc >= restore_pc) continue;
             bool clobbers_guard_mask = false;
-            for_each_scalar_write(candidate, [&](int base, uint32_t width) {
-                clobbers_guard_mask |= base < static_cast<int>(saveexec->dst.value) + 2 &&
-                    static_cast<int>(saveexec->dst.value) < base + static_cast<int>(width);
-            });
+            if (saveexec) {
+                for_each_scalar_write(candidate, [&](int base, uint32_t width) {
+                    clobbers_guard_mask |=
+                        base < static_cast<int>(saveexec->dst.value) + 2 &&
+                        static_cast<int>(saveexec->dst.value) < base + static_cast<int>(width);
+                });
+            }
             bool balanced_nested_exec = false;
             for (const auto& nested : guarded_exec_regions) {
                 if (nested.save_pc > branch.pc && nested.restore_pc < restore_pc &&
@@ -180,7 +218,10 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
         }
         if (!side_effect_free) continue;
         safe.insert(branch.pc);
-        guarded_exec_regions.push_back({saveexec->pc, restore_pc});
+        // Only a restore of the saved mask returns EXEC to what it was before the narrow. The
+        // direct form restores the full mask, so inside an outer guard that the wave skipped it
+        // would widen EXEC for the rest of the outer region: it never counts as balanced there.
+        if (saveexec) guarded_exec_regions.push_back({narrow_pc, restore_pc});
         if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
     }
     return guarded_narrow_entry;
