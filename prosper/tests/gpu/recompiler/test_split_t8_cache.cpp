@@ -20,6 +20,7 @@
 //                                       refuses s106+, so only a sanitizer sees the code-only half's
 //                                       out-of-range read if its bound is dropped (#4712 review B2)
 //   SaveexecOverTheDescriptorIsRefusedByTheProof  a saveexec destination is not treated as written
+//   ReservedSop1EncodingIsAnUnknownWrite  a reserved SOP1 opcode >= 0x20 is charged only its SDST
 //   CacheKeyIncludesTheBaseAndProducers  the cache key drops tbase or the producer pcs
 //   FoldAnalysesPastTheOldCap            the call site clamps the program to 2048 dwords again
 //   SameLengthEditIsReanalysed           a cache hit is checked by length only
@@ -156,6 +157,18 @@ TEST(SplitT8Cache, SaveexecOverTheDescriptorIsRefusedByTheProof) {
     EXPECT_FALSE(proves(code, inputs(), nullptr));
     const auto cache = make_split_t8_proof_cache();
     EXPECT_FALSE(proves(code, inputs(), cache.get()));
+}
+
+TEST(SplitT8Cache, ReservedSop1EncodingIsAnUnknownWrite) {
+    // pc 4 becomes SOP1 opcode 0x23 (reserved on RDNA2) naming s[20:21], away from the T# in
+    // s[8:15]. It has no defined effect, so the proof may not assume it writes only s[20:21].
+    auto code = program(8);
+    ASSERT_TRUE(proves(code, inputs(), nullptr)) << "the s_nop control proves";
+    code[4] = 0xBE94236Au;
+    EXPECT_FALSE(proves(code, inputs(), nullptr));
+    // A defined opcode in the same range that names s[20:21] (s_and_saveexec_b64) still proves.
+    code[4] = 0xBE94246Au;
+    EXPECT_TRUE(proves(code, inputs(), nullptr));
 }
 
 TEST(SplitT8Cache, CacheKeyIncludesTheBaseAndProducers) {

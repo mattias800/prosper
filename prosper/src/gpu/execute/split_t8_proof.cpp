@@ -48,6 +48,17 @@ uint64_t load_tag(size_t producer, uint32_t word) {
     return (static_cast<uint64_t>(producer) << 8u) | word;
 }
 
+// The SOP1 opcodes at or above 0x20 that RDNA2 defines and whose SGPR writes their operands name:
+// the s_*_saveexec_b64/b32 and s_*_wrexec forms (0x24-0x2b, 0x37-0x47), s_quadmask (0x2c/0x2d),
+// s_movrels (0x2e/0x2f: its READ is M0-relative) and s_abs_i32 (0x34). The escapes (PC transfers,
+// s_movreld_*, s_movrelsd_2_b32) are decided before this. A reserved encoding in that range (0x23,
+// 0x32, 0x33, 0x35, 0x36, 0x48, 0x4a and up) has no defined effect, so it stays a write of every
+// SGPR rather than of its SDST pair (fail-closed, #4712 review).
+bool sop1_high_opcode_names_its_writes(uint32_t opcode) {
+    return (opcode >= 0x24u && opcode <= 0x2fu) || opcode == 0x34u ||
+           (opcode >= 0x37u && opcode <= 0x47u);
+}
+
 }   // namespace
 
 // What the proof knows from the code bytes alone, for one (consumer pc, T# base, producer pcs). The
@@ -147,6 +158,9 @@ std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, s
         // shared list names exactly those (s_movreld_*, s_movrelsd_2_b32, PC transfers, calls); an
         // s_*_saveexec form writes only its named destination and EXEC, and falls through below.
         if (rdna2_escapes_decoded_effects(in)) return true;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u &&
+            !sop1_high_opcode_names_its_writes(in.opcode))
+            return true;
         // A plain B32 move writes only its named word. Treating it as a pair incorrectly
         // clobbers the adjacent destination while assembling a T# one lane at a time.
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
