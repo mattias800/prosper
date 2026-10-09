@@ -17,7 +17,8 @@ Fixtures are derived from game content, so they are NEVER committed. They live u
 
 What may be committed is `manifest.json` beside this file: it names fixtures and pins the sha256
 and content version a route expects, so a route can declare the fixture it needs without shipping
-it. `pin` writes an entry; `seed` and `verify` refuse a fixture that disagrees with it.
+it. `pin` writes an entry (sha256, content version and the capture `--note`, which is therefore
+public); `seed` and `verify` refuse a fixture that disagrees with it.
 
 Commands:
 
@@ -91,9 +92,9 @@ def manifest_path() -> Path:
 
 def check_names(title: str, state: str) -> None:
     """Reject names that could escape the fixture root (they become path components)."""
-    if not _TITLE_RE.match(title):
+    if not _TITLE_RE.fullmatch(title):
         raise FixtureError(f"invalid title id {title!r}")
-    if not _STATE_RE.match(state) or state in (".", ".."):
+    if not _STATE_RE.fullmatch(state) or state in (".", ".."):
         raise FixtureError(f"invalid state name {state!r}")
 
 
@@ -346,6 +347,21 @@ def version_warning(title: str, state: str, meta: dict, dump_root: Path | None) 
     return None
 
 
+def _refuse_store_overlap(run_dir: Path) -> None:
+    """Refuse a run dir inside, equal to, or an ancestor of the fixture store.
+
+    Seeding into the store would write inside a fixture (breaking `verify` and every later seed)
+    or leave a stray directory that `list` reports as BROKEN. Paths are resolved through symlinks
+    so a link into the store is caught too.
+    """
+    resolved = Path(os.path.realpath(run_dir))
+    store = Path(os.path.realpath(fixtures_root()))
+    if resolved == store or store in resolved.parents or resolved in store.parents:
+        raise FixtureError(
+            f"run dir {run_dir} overlaps the fixture store {store}: seed into a fresh directory "
+            f"outside it")
+
+
 def seed(title: str, state: str, run_dir: Path, dump_root: Path | None = None,
          strict_version: bool = False, warn=None) -> dict:
     """Copy a fixture into fresh `<run_dir>/savedata` and `<run_dir>/save0`.
@@ -362,8 +378,11 @@ def seed(title: str, state: str, run_dir: Path, dump_root: Path | None = None,
             raise FixtureError(message.replace("WARNING: ", ""))
         warn(message)
     run_dir = Path(run_dir)
+    _refuse_store_overlap(run_dir)
     dests = {name: run_dir / name for name in ROOT_NAMES}
     for dest in dests.values():
+        if dest.is_symlink():
+            raise FixtureError(f"{dest} is a symlink: seed only fills real fresh directories")
         if dest.exists() and any(dest.iterdir()):
             raise FixtureError(f"{dest} is not empty: seed only fills fresh directories")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -494,6 +513,8 @@ def cmd_verify(args) -> int:
 def cmd_pin(args) -> int:
     path = pin(args.title, args.state)
     print(f"pinned {args.title}/{args.state} in {path}")
+    print("note: the description is written to the committed manifest and is public; it must "
+          "not contain paths, names or anything derived from game content", file=sys.stderr)
     return 0
 
 

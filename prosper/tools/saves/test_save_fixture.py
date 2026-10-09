@@ -197,7 +197,8 @@ def test_capture_refuses_overwrite_empty_and_symlinks(env):
 
 
 @pytest.mark.parametrize("title,state", [("../evil", "s"), (TITLE, "../evil"), (TITLE, ".."),
-                                         (TITLE, "a/b"), ("", "s")])
+                                         (TITLE, "a/b"), ("", "s"), (TITLE, "x\n"),
+                                         (TITLE + "\n", "s"), (TITLE, "x y")])
 def test_names_cannot_escape_the_fixture_root(env, title, state):
     with pytest.raises(SF.FixtureError, match="invalid"):
         SF.fixture_dir(title, state)
@@ -263,8 +264,10 @@ def test_snapshot_skips_a_snap_whose_fixture_is_missing(env, monkeypatch, capsys
     assert SNAPSHOT.cmd_check(manifest, []) == 0
     out = capsys.readouterr().out
     assert "SKIPPED" in out and f"{TITLE}/post-setup" in out and "not found" in out
+    assert "0 of 1 guard(s) ran, 1 skipped (missing save fixtures)" in out
     assert SNAPSHOT.cmd_verify(manifest, []) == 0
-    assert "SKIPPED" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "SKIPPED" in out and "1 skipped (missing save fixtures)" in out
     assert ran == []
 
 
@@ -304,3 +307,76 @@ def test_snapshot_without_save_fixture_is_unchanged(env):
     SNAPSHOT.apply_entry_env(run_env, entry, str(env["tmp"] / "plain"))
     assert os.listdir(run_env["PROSPER_SAVEDATA_DIR"]) == []
     assert os.path.basename(run_env["PROSPER_SAVE0"]) == "savedata0"
+
+
+def test_empty_directories_are_part_of_the_tree_hash(env):
+    _capture(env)
+    base = SF.tree_sha256(SF.fixture_dir(TITLE, "post-setup"))[0]
+    store = SF.fixture_dir(TITLE, "post-setup")
+
+    (store / "save0" / "another-empty-dir").mkdir()
+    assert SF.tree_sha256(store)[0] != base
+    with pytest.raises(SF.FixtureError, match="modified after capture"):
+        SF.verify_fixture(TITLE, "post-setup")
+    (store / "save0" / "another-empty-dir").rmdir()
+    (store / "save0" / "empty-dir").rmdir()
+    with pytest.raises(SF.FixtureError, match="modified after capture"):
+        SF.verify_fixture(TITLE, "post-setup")
+
+
+@pytest.mark.parametrize("where", ["savedata", "save0", "fixture", "newstate", "title", "store",
+                                   "link"])
+def test_seed_refuses_run_dirs_that_overlap_the_fixture_store(env, where):
+    _capture(env)
+    store = SF.fixtures_root()
+    fixture = SF.fixture_dir(TITLE, "post-setup")
+    before = _snapshot(fixture)
+    run = {"savedata": fixture / "savedata", "save0": fixture / "save0", "fixture": fixture,
+           "newstate": store / TITLE / "newstate", "title": store / TITLE, "store": store,
+           "link": env["tmp"] / "link"}[where]
+    if where == "link":
+        run.symlink_to(fixture / "savedata")
+
+    with pytest.raises(SF.FixtureError, match="overlaps the fixture store"):
+        SF.seed(TITLE, "post-setup", run)
+
+    assert _snapshot(fixture) == before
+    SF.verify_fixture(TITLE, "post-setup")
+    assert not (store / TITLE / "newstate").exists()
+    assert {r["status"] for r in SF.list_fixtures()} == {"local"}
+
+
+def test_seed_refuses_an_ancestor_of_the_store(env):
+    _capture(env)
+    with pytest.raises(SF.FixtureError, match="overlaps the fixture store"):
+        SF.seed(TITLE, "post-setup", env["tmp"])
+
+
+def test_seed_refuses_symlinked_destinations_with_a_clear_error(env):
+    _capture(env)
+    run = env["tmp"] / "run"
+    run.mkdir()
+    (env["tmp"] / "elsewhere").mkdir()
+    (run / "savedata").symlink_to(env["tmp"] / "elsewhere")
+    with pytest.raises(SF.FixtureError, match="symlink"):
+        SF.seed(TITLE, "post-setup", run)
+
+
+@pytest.mark.parametrize("bad", ["", 7, None, ["post-setup"], "../x", "a b"])
+def test_snapshot_malformed_save_fixture_is_an_error_not_a_skip(env, monkeypatch, capsys, bad):
+    monkeypatch.setattr(SNAPSHOT, "FAIL_DIR", str(env["tmp"] / "failures"))
+    monkeypatch.setattr(SNAPSHOT, "capture_content",
+                        lambda *a, **k: pytest.fail("must not boot"))
+    entry = _entry(save_fixture=bad)
+
+    with pytest.raises(RuntimeError, match="save_fixture"):
+        SNAPSHOT.save_fixture_skip_reason(entry)
+    assert SNAPSHOT.cmd_check({"snapshots": [entry]}, []) == 1
+    assert SNAPSHOT.cmd_verify({"snapshots": [entry]}, []) == 1
+    captured = capsys.readouterr()
+    assert "SKIPPED" not in captured.out and "ERROR" in captured.err
+
+
+def test_snapshot_undecodable_dump_is_an_error_not_a_skip(env):
+    with pytest.raises(RuntimeError, match="invalid save_fixture"):
+        SNAPSHOT.save_fixture_skip_reason(_entry(dump="not-a-title-dir"))
