@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
+#include "gpu/recompiler/rdna2_bfm_b64_data.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -1901,6 +1902,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_bool[in.dst.value] = r;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
                     mask_write_clobbers_pair(rs, in.dst.value);
+                    // Architectural DATA view alongside the mask above
+                    // (rdna2_bfm_b64_data.hpp): #4694's program selects it as data.
+                    if (ok) record_bfm_b64_data(b, rs, in);
                 }
                 return true;
             }
