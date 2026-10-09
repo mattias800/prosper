@@ -386,5 +386,24 @@ TEST(Pm4Decode, Contract) {
         CHECK(work_ops[5].wd_addr == 0x406616c058ull, "op5 wd_addr == 0x406616c058");
         CHECK(work_ops[5].wd_num == 1u && work_ops[5].wd_valid, "op5 wd_num == 1");
     }
+
+    // Hardware IT_WAIT_REG_MEM (0x3C) (Black Flag submit0.bin):
+    {
+        uint32_t wait_stream[] = {
+            // IT_WAIT_REG_MEM: 7 dwords, op 0x3C, func=3, addr=0x406616c058, ref=1, mask=0xffffffff
+            PM4(7, IT_WAIT_REG_MEM, 0),
+            0x13u, 0x6616c058u, 0x00000040u, 1u, 0xffffffffu, 0x19u,
+        };
+        std::vector<Pm4Command> wait_ops;
+        const size_t c = decode_pm4(wait_stream, std::size(wait_stream), wait_ops);
+        CHECK(c == 7, "consumed 7 dwords of hardware wait packet");
+        CHECK(wait_ops.size() == 1, "decoded 1 wait packet");
+
+        CHECK(wait_ops[0].kind == K::WaitRegMem, "op0 is WaitRegMem");
+        CHECK(wait_ops[0].wm_func == 3u, "op0 func == 3");
+        CHECK(wait_ops[0].wm_addr == 0x406616c058ull, "op0 addr == 0x406616c058");
+        CHECK(wait_ops[0].wm_ref == 1u, "op0 ref == 1");
+        CHECK(wait_ops[0].wm_mask == 0xffffffffu && wait_ops[0].wm_valid, "op0 mask == 0xffffffff and valid");
+    }
 }
 
