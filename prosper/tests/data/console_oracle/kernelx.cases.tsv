@@ -138,7 +138,6 @@ kx_file_fstat_bad_fd	libkernel.sprx	sceKernelFstat	i:-1,out:128	ret
 kx_file_fsync_bad_fd	libkernel.sprx	sceKernelFsync	i:-1
 kx_file_ftruncate_bad_fd	libkernel.sprx	sceKernelFtruncate	i:-1,i:0
 kx_file_getdents_bad_fd	libkernel.sprx	sceKernelGetdents	i:-1,out:64,i:64
-kx_file_rmdir_missing	libkernel.sprx	sceKernelRmdir	s:/oracle_nonexistent_dir
 kx_file_unlink_missing	libkernel.sprx	sceKernelUnlink	s:/oracle_nonexistent/file
 # Signals and resource usage. signal() returns the previous disposition; SIGKILL and 0 cannot be caught.
 kx_signal_usr1_ignore	libkernel.sprx	signal	i:30,i:1	r64

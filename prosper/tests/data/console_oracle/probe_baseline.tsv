@@ -221,7 +221,6 @@ kernelx	kx_ef_wait_pattern_zero	66f8fd739d46069a
 kernelx	kx_eq_create_null_name	40827bee4d7fee26
 kernelx	kx_eq_delete_user_twice	4871b0aec2fc324d
 kernelx	kx_eq_trigger_unknown	4871b0aec2fc324d
-kernelx	kx_file_rmdir_missing	a9978b18e7414815
 kernelx	kx_fmem_map_len_unaligned	40827bee4d7fee26
 kernelx	kx_fmem_map_len_zero	aaae440243377821
 kernelx	kx_fmem_munmap_unmapped	*	windows

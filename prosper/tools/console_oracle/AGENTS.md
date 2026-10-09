@@ -84,7 +84,9 @@ been measured. After reviewing the differences, regenerate the rows from the rep
 
 Baselined today: `agcbuild`, `kernelx`, `nethttp`, `posix`. Five `kernelx` cases are deliberately absent:
 using an event flag or equeue after deleting it aborts the replay process in prosper (#4779). Put them back
-with the fix.
+with the fix. `kx_file_rmdir_missing` is absent too: prosper passes an absolute path outside its mounts to
+the host, so the answer depends on whether the host's `/` is writable (#4783). A gating case must not
+change its verdict with the host's filesystem layout.
 
 `expect=default0` compares an UNREGISTERED function against the dispatcher's return-0 default instead of
 reporting "not implemented": what is left is exactly the false-success class (#2081), a function the
