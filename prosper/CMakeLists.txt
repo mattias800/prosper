@@ -2534,6 +2534,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_wave64_host_line
     SOURCES tests/diagnostics/test_wave64_host_line.cpp
     LIBRARIES prosper_core)
+  # A Wave64 compute program's scalar-pair projection refuses a fabricated-zero word (#4714).
+  prosper_add_gtest(test_compute_scalar_pair_mask
+    SOURCES tests/gpu/recompiler/test_compute_scalar_pair_mask.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain

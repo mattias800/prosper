@@ -255,7 +255,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
-    if (in.has_modifier) { ok = false; return true; }
+    VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
+    if (refuse_mask_write(b, rs, in, drop, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
             if (in.opcode == 0x0a &&
@@ -1536,7 +1537,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_b32.erase(106);
                 if (complete_scalar_pair) {
                     auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end()) { ok = false; return true; }
+                    if (vcc_sibling_unavailable(b, rs, 107, high, ok)) return true;
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
                     const uint32_t word = b.sel(
@@ -1841,7 +1842,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
                     const auto high = rs.sreg.find(107);
-                    if (high == rs.sreg.end()) { ok = false; return true; }
+                    if (vcc_sibling_unavailable(b, rs, 107, high, ok)) return true;
                     const uint32_t lane = b.ibin(
                         Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
                     const uint32_t word = b.sel(
@@ -2401,7 +2402,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) {
                         const int sibling = writes_hi ? 106 : 107;
                         auto other = rs.sreg.find(sibling);
-                        if (other == rs.sreg.end()) { ok = false; return true; }
+                        if (vcc_sibling_unavailable(b, rs, sibling, other, ok)) return true;
                         const uint32_t other_bit = b.ucmp(
                             Op_INotEqual,
                             b.ibin(Op_BitwiseAnd,
