@@ -311,5 +311,31 @@ TEST(Pm4Decode, Contract) {
         CHECK(sync_ops[1].rel_addr == 0x40749a2f00ull, "op1 rel_addr == 0x40749a2f00");
         CHECK(sync_ops[1].rel_value_valid && sync_ops[1].rel_value == 0x408cu, "op1 rel_value == 0x408c");
     }
+
+    // Hardware IT_DISPATCH_DIRECT (0x15) and IT_DISPATCH_INDIRECT (0x16) (Black Flag submit0.bin):
+    {
+        uint32_t dispatch_stream[] = {
+            // IT_DISPATCH_DIRECT: 5 dwords, op 0x15, dims=(0x168, 0xcb, 1), modifier=0x41
+            PM4(5, IT_DISPATCH_DIRECT, 0),
+            0x168u, 0xcbu, 1u, 0x41u,
+            // IT_DISPATCH_INDIRECT: 3 dwords, op 0x16, offset=0x2000, modifier=0x41
+            PM4(3, IT_DISPATCH_INDIRECT, 0),
+            0x2000u, 0x41u,
+        };
+        std::vector<Pm4Command> disp_ops;
+        const size_t c = decode_pm4(dispatch_stream, std::size(dispatch_stream), disp_ops);
+        CHECK(c == 8, "consumed 8 dwords of hardware dispatch packets");
+        CHECK(disp_ops.size() == 2, "decoded 2 dispatch packets");
+
+        CHECK(disp_ops[0].kind == K::DispatchDirect, "op0 is DispatchDirect");
+        CHECK(disp_ops[0].threads_x == 0x168u, "op0 threads_x == 0x168");
+        CHECK(disp_ops[0].threads_y == 0xcbu, "op0 threads_y == 0xcb");
+        CHECK(disp_ops[0].threads_z == 1u, "op0 threads_z == 1");
+        CHECK(disp_ops[0].dispatch_modifier == 0x41u, "op0 modifier == 0x41");
+
+        CHECK(disp_ops[1].kind == K::DispatchIndirect, "op1 is DispatchIndirect");
+        CHECK(disp_ops[1].indirect_offset == 0x2000u, "op1 offset == 0x2000");
+        CHECK(disp_ops[1].dispatch_modifier == 0x41u, "op1 modifier == 0x41");
+    }
 }
 
