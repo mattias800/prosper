@@ -1467,6 +1467,9 @@ int getdents_close_fd(int fd);   // #843/#847: atomic cache invalidation + host 
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0);
                int fd = (int)a0;
+               // Unmark first: once the host close returns, another thread may be handed this
+               // number for a file, and a late unmark would then clear (or race) its state.
+               guest_device_forget_fd(fd);
 #ifdef __APPLE__
                int r = getdents_close_fd(fd);
 #elif defined(_WIN32)
@@ -1477,7 +1480,6 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                int r = guest_sync_close_fd(fd);
 #endif
                int err = r < 0 ? errno : 0;
-               guest_device_forget_fd(fd);
                filelog_fd_io("close", fd, 0, 0, r, err);
                if (r == 0) filelog_forget_fd(fd);
                else errno = err;

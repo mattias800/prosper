@@ -139,10 +139,16 @@ protected:
         { std::ofstream(root_ / "app0" / "fixture.bin", std::ios::binary) << "app0"; }
         // resolve_guest() re-roots an empty /app0 from PROSPER_APP0, so a developer's exported
         // variable must not decide what these cases see.
+        // The virtual root lives beside /temp0's host directory, whose default (/tmp/...) does not
+        // exist on Windows; root it in this process's scratch directory on every host. Read once
+        // per process, and each case runs in its own process.
+        const std::string temp0 = (prosper_test::test_scratch_dir() / "temp0").string();
 #ifdef _WIN32
         _putenv_s("PROSPER_APP0", "");
+        _putenv_s("PROSPER_TEMP0", temp0.c_str());
 #else
         unsetenv("PROSPER_APP0");   // NOLINT(concurrency-mt-unsafe): before any thread starts
+        setenv("PROSPER_TEMP0", temp0.c_str(), 1);   // NOLINT(concurrency-mt-unsafe): as above
 #endif
         register_file_hle();
         set_app0_root((root_ / "app0").string());

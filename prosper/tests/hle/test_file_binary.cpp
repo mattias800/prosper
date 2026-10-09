@@ -66,10 +66,15 @@ TEST(FileBinary, Contract) {
     // path this test opens; the case-variant open below proves matching is case-insensitive
     // (the guest namespace resolves case-insensitively since #1233, so a casing variant must
     // not defeat the deny knob).
+    // The virtual root ("/app0/..", opened below) lives beside /temp0's host directory, whose
+    // default (/tmp/...) does not exist on Windows: root it in the scratch directory everywhere.
+    const std::string temp0_root = (prosper_test::test_scratch_dir() / "temp0").string();
 #ifdef _WIN32
     _putenv_s("PROSPER_DENY_SUBSTR", ".TMPDENY");
+    _putenv_s("PROSPER_TEMP0", temp0_root.c_str());
 #else
     setenv("PROSPER_DENY_SUBSTR", ".TMPDENY", 1);
+    setenv("PROSPER_TEMP0", temp0_root.c_str(), 1);
 #endif
     // #1621: fixtures live in this process's own scratch directory rather than under fixed relative
     // names in the shared ctest working directory. Three of them are ALSO addressed as guest paths
