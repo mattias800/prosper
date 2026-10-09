@@ -99,6 +99,17 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.wd_data = &pl[3];
                 c.wd_valid = true;
             }
+        } else if (c.op == IT_WAIT_REG_MEM) {
+            // Hardware PM4 Type-3 WAIT_REG_MEM packet (GFX10 / RDNA2):
+            // payload: [0]=op_func, [1..2]=addr lo/hi, [3]=ref_value, [4]=mask.
+            c.kind = K::WaitRegMem;
+            if (npl >= 1) c.wm_func = pl[0] & 7u;
+            if (npl >= 3) c.wm_addr = lo_hi(&pl[1]);
+            if (npl >= 4) c.wm_ref = pl[3];
+            if (npl >= 5) {
+                c.wm_mask = pl[4];
+                c.wm_valid = true;
+            }
         } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];

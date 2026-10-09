@@ -35,6 +35,7 @@ enum : uint32_t {
     IT_DRAW_INDEX_AUTO = 0x2D,
     IT_NUM_INSTANCES = 0x2F,
     IT_WRITE_DATA = 0x37,
+    IT_WAIT_REG_MEM = 0x3C,
     IT_EVENT_WRITE = 0x46,
     IT_RELEASE_MEM = 0x49,
     IT_ACQUIRE_MEM = 0x58,
