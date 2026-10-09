@@ -349,12 +349,16 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
   authority in the neutral body, restricted to a robust2 word-buffer root with a bounded index (the
   existing `word_buffer_roots` conditions), whose result may reach only an identity-masked export or a
   dead value. Until that lands and the draw is re-run on a 32-lane host with its output compared, the
-- **"Black Flag's main graphics queue submits via single-buffer `sceAgcDriverSubmitDcb` (`UglJIZjGssM`)."**
-  Falsified 2026-10-09 by live PS5 console capture (`PPSA28183` foreground, FW 13.40, ps5debug-NG, PR #4817):
-  a software breakpoint at `sceAgcDriverSubmitDcb` never hits, whereas `sceAgcDriverSubmitMultiDcbs`
-  (`6UzEidRZwkg`, `0x804f6ccc0`) hits on every active frame (captured 115 segments / 23,766 dwords).
-  All 212 compute dispatches in the captured submit request Wave64 (`CS_W32_EN=0`, CONFIDENCE: HIGH).
-
+  draw is not admitted. The recompiler already linearizes an EXEC-masked VALU/VMEM region with no vote
+  at all (`safe_execz_branches`), so a region that still carries a vote holds something that linearizer
+  refuses; here it is the scalar loads and the VCC move.
+- **"Black Flag's main graphics queue submits through the single-buffer `sceAgcDriverSubmitDcb`
+  (`UglJIZjGssM`)."** Falsified 2026-10-09 on PS5 hardware, which is optional human evidence and not
+  reproducible by an agent (`PPSA28183` in the foreground, FW 13.40, ps5debug-NG through
+  `tools/console_capture`, #4817): a software breakpoint at `sceAgcDriverSubmitDcb` never hit, while
+  one at `sceAgcDriverSubmitMultiDcbs` (`6UzEidRZwkg`) hit on every active frame. The captured submit
+  held 115 segments (23,766 dwords), and all 212 of its compute dispatches request Wave64
+  (`CS_W32_EN=0`). The capture itself is not in the repository.
 
 ## Performance, measured 2026-10-06 (PR head of #4586, Windows, RTX 4070 SUPER)
 
