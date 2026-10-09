@@ -79,6 +79,7 @@ testpaths = [
     "prosper/tools/progress/test_progress.py",
     "prosper/tools/console_oracle/test_run_oracle.py",
     "prosper/tools/console_oracle/test_gen_builder_cases.py",
+    "prosper/tools/console_oracle/test_coverage_report.py",
 ]
 # --import-mode=importlib does not put a test's folder on sys.path, and these tests import their
 # sibling tool by bare name.
