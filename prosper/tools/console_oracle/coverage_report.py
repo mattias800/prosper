@@ -305,7 +305,7 @@ def format_text_report(
     db_line_count: int,
     bad_line_count: int,
     only_lib: Optional[str] = None,
-    registered_only: bool = False,
+    all_exports: bool = False,
 ) -> str:
     """Format human-readable coverage report."""
     lines: List[str] = []
@@ -315,8 +315,10 @@ def format_text_report(
     lines.append(f"Unresolved Prosper HLE registration sites: {unresolved_count}")
     if only_lib:
         lines.append(f"Filter library: {only_lib}")
-    if registered_only:
-        lines.append("Filter: --registered-only (candidates limited to registered handlers)")
+    if not all_exports:
+        lines.append("Candidates: registered handlers only (default; pass --all-candidates to show all)")
+    else:
+        lines.append("Candidates: all uncovered exports (--all-candidates)")
     lines.append("")
 
     header = (
@@ -393,8 +395,8 @@ def main() -> int:
     parser.add_argument(
         "--db",
         type=pathlib.Path,
-        default=pathlib.Path(r"C:\dev\ps5\stuffs\nid_db\nid_names_verified.csv"),
-        help="Path to verified NID CSV database.",
+        default=pathlib.Path(os.environ["PROSPER_NID_DB"]) if "PROSPER_NID_DB" in os.environ else None,
+        help="Path to verified NID CSV database <NID_DB> (or set via PROSPER_NID_DB env var).",
     )
     parser.add_argument(
         "--data-dir",
@@ -422,9 +424,15 @@ def main() -> int:
         help="Limit report to a single library.",
     )
     parser.add_argument(
+        "--all-candidates",
+        action="store_true",
+        help="Include all uncovered candidate exports (by default, candidates are limited to registered HLE handlers).",
+    )
+    parser.add_argument(
         "--registered-only",
         action="store_true",
-        help="Limit candidate listing and candidate count to functions Prosper already registers.",
+        default=True,
+        help="Limit candidate listing and candidate count to functions Prosper already registers (default behaviour).",
     )
     parser.add_argument(
         "--json",
@@ -435,6 +443,10 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if not args.db:
+        sys.stderr.write("Error: --db <NID_DB> is required (or set PROSPER_NID_DB environment variable).\n")
+        return 1
 
     repo_root = args.root or pathlib.Path(__file__).resolve().parents[3]
     data_dir = args.data_dir or (repo_root / "prosper" / "tests" / "data" / "console_oracle")
@@ -451,13 +463,15 @@ def main() -> int:
     if args.nid_libs and args.nid_libs.is_file():
         nid_libs = load_nid_libs(args.nid_libs)
 
+    registered_only = not args.all_candidates
+
     per_lib_data = generate_coverage(
         db_entries=entries,
         cases_funcs=cases_funcs,
         reg_names=reg_names,
         nid_libs=nid_libs,
         only_lib=args.only_lib,
-        registered_only=args.registered_only,
+        registered_only=registered_only,
     )
 
     report_text = format_text_report(
@@ -466,7 +480,7 @@ def main() -> int:
         db_line_count=len(entries) + len(bad_lines),
         bad_line_count=len(bad_lines),
         only_lib=args.only_lib,
-        registered_only=args.registered_only,
+        all_exports=args.all_candidates,
     )
 
     print(report_text)
@@ -480,8 +494,9 @@ def main() -> int:
                 "db_bad_lines": len(bad_lines),
                 "unresolved_registration_sites": unresolved_count,
                 "filter_only_lib": args.only_lib,
-                "filter_registered_only": args.registered_only,
+                "filter_registered_only": registered_only,
             },
+
             "libraries": {
                 lib: {
                     "exports": b["db_exports"],
