@@ -550,10 +550,10 @@ struct SpirvCompute {
     // one terminal line so the recorded reason names the cause rather than the effect.
     uint32_t stage_reject_pc = UINT32_MAX;
     std::string stage_reject_reason;
-    // How many lane-bit reads so far were admitted only because a word carried a loop header's
-    // blanket mark (sreg_loop_blanket). A loop compares it at its back edge, where that assumption
-    // is checked (LoopBlanketCheck). Mutable: the admitting predicate takes the builder by const.
-    mutable uint64_t loop_blanket_lane_reads = 0;
+    // The loop-header assumptions (blanket_root keys) some lane-bit read was admitted on, through a
+    // word whose only mark was a header's blanket mark (sreg_loop_blanket). Each loop checks its own
+    // at its back edge (LoopBlanketCheck). Mutable: the admitting predicate takes the builder const.
+    mutable std::set<uint64_t> loop_blanket_roots_read;
     // The first V_MBCNT whose src0 is a general SGPR mask, when the program ALSO builds the
     // canonical all-ones lane-index pair. That mixture disqualifies the flattened-lane vertex model
     // for the whole program, so the reject surfaces at the all-ones instruction -- which is
@@ -2967,8 +2967,9 @@ struct RegState {
     // VCC-as-scratch write from a loop counter drop VCC's lane view, and a loop exit that could not
     // name VCC (Kena's per-cone loop). The assumption that the back-edge value is defined too is
     // checked at the back edge (LoopBlanketCheck), which refuses the program when a word read as
-    // lane bits on it was fabricated there (#4714, #4749 review).
-    std::set<int> sreg_loop_blanket;
+    // lane bits on it was fabricated there (#4714, #4749 review). Each entry names the assumptions
+    // (blanket_root: header pc and carried register) the word depends on.
+    std::map<int, std::set<uint64_t>> sreg_loop_blanket;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
     // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in
@@ -3266,6 +3267,10 @@ inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
 inline bool sreg_word_blanket_only(const RegState& rs, int r) {
     return rs.sreg.contains(r) && rs.sreg_loop_blanket.contains(r);
 }
+// One loop header's assumption about one carried register.
+inline uint64_t blanket_root(uint32_t header_pc, int r) {
+    return (static_cast<uint64_t>(header_pc) << 16u) | static_cast<uint16_t>(r);
+}
 
 // The scalar instructions that read SCC as a value.
 inline bool scalar_reads_scc(const Rdna2Inst& in) {
@@ -3281,22 +3286,25 @@ struct ScalarSourceMarks {
     bool placeholder = false;   // some input word may be the fabricated zero (or derived from it)
     bool memory = false;   // some input word came from memory
     bool hard = false;   // some marked input is not merely a loop-header blanket mark
+    std::set<uint64_t> blanket_roots;   // the header assumptions behind the blanket-marked inputs
 };
 
 // scalar_source_marks() lives in rdna2_cfg_support.hpp, beside the width inventories it reads.
 
 // Set a merged register's marks from its two incoming edges. `rs` is one edge; the caller supplies
 // what the other edge held. The memory mark is a union.
-// `blanket_only` keeps the loop header's blanket mark when every edge that is marked is marked only
-// by it (a merge of such a word with a defined one is defined under the same header assumption).
+// `blanket_roots` keeps the loop header's blanket mark, with these assumptions, when every edge that
+// is marked is marked only by it (a merge of such a word with a defined one is defined under the
+// same header assumptions).
 inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabricated,
-                                   bool other_edge_memory, bool blanket_only = false) {
+                                   bool other_edge_memory,
+                                   const std::set<uint64_t>* blanket_roots = nullptr) {
     if (either_edge_fabricated)
         rs.sreg_merge_placeholder.insert(r);
     else
         rs.sreg_merge_placeholder.erase(r);
-    if (either_edge_fabricated && blanket_only)
-        rs.sreg_loop_blanket.insert(r);
+    if (either_edge_fabricated && blanket_roots)
+        rs.sreg_loop_blanket[r] = *blanket_roots;
     else
         rs.sreg_loop_blanket.erase(r);
     if (other_edge_memory) rs.sreg_memory_pattern.insert(r);
@@ -3305,7 +3313,8 @@ inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabrica
 // One structured-merge edge's marks, captured before the other edge is emitted.
 struct MergeEdgeMarks {
     std::set<int> fabricated;   // registers this edge may hold as a fabricated zero
-    std::set<int> blanket;   // ...of which only by a loop header's blanket mark (sreg_loop_blanket)
+    // ...of which only by a loop header's blanket mark, with its assumptions (sreg_loop_blanket)
+    std::map<int, std::set<uint64_t>> blanket;
     std::set<int> memory;   // this edge's memory-pattern marks
     bool scc = false;   // this edge's SCC is marked or poisoned (merges as bfalse)
     // This edge's v_writelane spill-slot marks. A merge keeps only one edge's slot map, so a slot
@@ -3318,7 +3327,7 @@ MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) 
     for (int r : registers)
         if (merge_edge_word_fabricated(rs, r)) {
             marks.fabricated.insert(r);
-            if (sreg_word_blanket_only(rs, r)) marks.blanket.insert(r);
+            if (sreg_word_blanket_only(rs, r)) marks.blanket[r] = rs.sreg_loop_blanket.at(r);
         }
     marks.memory = rs.sreg_memory_pattern;
     marks.scc = rs.scc_merge_placeholder || !rs.scc;
@@ -3332,7 +3341,11 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
     const bool there = other.fabricated.contains(r);
     const bool blanket_only =
         (!here || sreg_word_blanket_only(rs, r)) && (!there || other.blanket.contains(r));
-    join_merge_placeholder(rs, r, here || there, other.memory.contains(r), blanket_only);
+    std::set<uint64_t> roots;
+    if (here && blanket_only) roots = rs.sreg_loop_blanket.at(r);
+    if (there && blanket_only) roots.insert(other.blanket.at(r).begin(), other.blanket.at(r).end());
+    join_merge_placeholder(rs, r, here || there, other.memory.contains(r),
+                           blanket_only ? &roots : nullptr);
 }
 // Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
 // fabricated too; a slot marked on either edge is marked after it).
@@ -3352,42 +3365,62 @@ inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) 
 // that loop's assumption, which its own back edge checks; GTA V's workgroup-store kernel carries
 // VCC scratch derived from its outer counter into an inner loop), is defined on the preheader edge.
 // An absent word is seeded with the fabricated zero, so it is not.
+// Assumptions are tracked per (header, carried register): a word derived from blanket words carries
+// the union of their roots, and a lane-bit read records the roots it relied on. A violated root only
+// voids the reads that depended on it, so a counter recycled as VCC scratch is not refused because
+// some unrelated carried word (VCC itself, turned into a mask in the body) is not data on the back
+// edge.
 struct LoopBlanketCheck {
-    std::set<int> carried;   // the carried words defined on the preheader edge
-    uint64_t reads_at_header = 0;
+    // The carried words defined on the preheader edge, each with the enclosing assumptions its
+    // preheader value already depends on (empty when it is plainly defined).
+    std::map<int, std::set<uint64_t>> carried;
     uint32_t header_pc = 0;
     template <class Registers>
-    LoopBlanketCheck(const SpirvCompute& b, const RegState& rs, const Registers& registers,
-                     uint32_t header)
-        : reads_at_header(b.loop_blanket_lane_reads), header_pc(header) {
-        for (int r : registers)
-            if (rs.sreg.contains(r) &&
-                (!merge_edge_word_fabricated(rs, r) || sreg_word_blanket_only(rs, r)))
-                carried.insert(r);
+    LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header)
+        : header_pc(header) {
+        for (int r : registers) {
+            if (!rs.sreg.contains(r)) continue;
+            if (!merge_edge_word_fabricated(rs, r))
+                carried[r];
+            else if (sreg_word_blanket_only(rs, r))
+                carried[r] = rs.sreg_loop_blanket.at(r);
+        }
     }
-    // The first header-blanketed word whose back-edge value (`rs` at the back edge) is hard-marked,
-    // or -1 when the assumption held.
-    int violated(const RegState& rs) const {
-        for (int r : carried)
-            if (merge_edge_word_fabricated(rs, r) && !sreg_word_blanket_only(rs, r)) return r;
-        return -1;
-    }
-    bool admitted_reads(const SpirvCompute& b) const {
-        return b.loop_blanket_lane_reads != reads_at_header;
-    }
-    // At the back edge: false, with a terminal reject line, when a lane-bit read relied on a header
-    // blanket mark the back edge does not honour. When nothing read through it, the program stands
-    // but the exits must not keep the blanket.
+    // At the back edge (`rs` is the body's end state): false, with a terminal reject line, when a
+    // lane-bit read relied on a carried word whose back-edge value is hard-marked. A violated word
+    // that nothing read through only stops the exits from handing its assumption on.
     template <class Exits>
     bool holds(SpirvCompute& b, const RegState& rs, Exits& exits) const {
-        const int r = violated(rs);
-        if (r < 0) return true;
-        exits.blanket.clear();
-        if (!admitted_reads(b)) return true;
+        // A carried word is violated when its back-edge value is hard-marked, or blanket-marked on
+        // an assumption of this header that is itself violated (s10 = s11 carries s11's fate).
+        std::set<uint64_t> violated;
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const auto& entry : carried) {
+                const uint64_t root = blanket_root(header_pc, entry.first);
+                if (violated.contains(root) || !merge_edge_word_fabricated(rs, entry.first))
+                    continue;
+                const auto back = rs.sreg_loop_blanket.find(entry.first);
+                const bool held = sreg_word_blanket_only(rs, entry.first) &&
+                                  std::none_of(back->second.begin(), back->second.end(),
+                                               [&](uint64_t r) { return violated.contains(r); });
+                if (!held) grew = violated.insert(root).second || grew;
+            }
+        }
+        int read_word = -1;
+        for (const auto& entry : carried)
+            if (read_word < 0 && violated.contains(blanket_root(header_pc, entry.first)) &&
+                b.loop_blanket_roots_read.contains(blanket_root(header_pc, entry.first)))
+                read_word = entry.first;
+        std::erase_if(exits.blanket, [&](const auto& exit) {
+            return std::any_of(exit.second.begin(), exit.second.end(),
+                               [&](uint64_t root) { return violated.contains(root); });
+        });
+        if (read_word < 0) return true;
         log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                  "loop-carried s%d is fabricated on the back edge but was read as "
                                  "lane bits in the loop (header pc=%u)",
-                                 r, header_pc);
+                                 read_word, header_pc);
         return false;
     }
 };
@@ -3399,10 +3432,14 @@ struct LoopBlanketCheck {
 // way and is marked at the header too.
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
-                       uint32_t lo, uint32_t hi, const std::set<int>& defined_at_preheader) {
+                       uint32_t lo, uint32_t hi, const LoopBlanketCheck& blanket) {
     for (int r : carried) {
         join_merge_placeholder(rs, r, true, false);
-        if (defined_at_preheader.contains(r)) rs.sreg_loop_blanket.insert(r);
+        if (const auto it = blanket.carried.find(r); it != blanket.carried.end()) {
+            auto& roots = rs.sreg_loop_blanket[r];
+            roots = it->second;   // the enclosing assumptions, plus this header's own
+            roots.insert(blanket_root(lo, r));
+        }
     }
     rs.scc_merge_placeholder = true;
     for (const Rdna2Inst& in : ins)
@@ -3416,7 +3453,7 @@ void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector
 struct LoopCheckMarks {
     std::set<int> fabricated, memory;
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
-    std::set<int> blanket;   // the check block's sreg_loop_blanket
+    std::map<int, std::set<uint64_t>> blanket;   // the check block's sreg_loop_blanket
 };
 inline LoopCheckMarks loop_check_marks(const RegState& rs) {
     return {rs.sreg_merge_placeholder, rs.sreg_memory_pattern, rs.lane_slot_merge_placeholder,
@@ -3438,10 +3475,11 @@ inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
                             (body_edge && rs.sreg_merge_placeholder.contains(r));
     const bool memory =
         check.memory.contains(r) || (body_edge && rs.sreg_memory_pattern.contains(r));
-    join_merge_placeholder(rs, r, fabricated, false);
     // A register that leaves as the header phi (or as the check block's own value) and was only
     // blanket-marked there stays blanket-marked; a direct break from the body makes it hard.
-    if (fabricated && !body_edge && check.blanket.contains(r)) rs.sreg_loop_blanket.insert(r);
+    const auto kept = check.blanket.find(r);
+    join_merge_placeholder(rs, r, fabricated, false,
+                           !body_edge && kept != check.blanket.end() ? &kept->second : nullptr);
     if (memory)
         rs.sreg_memory_pattern.insert(r);
     else
@@ -3776,7 +3814,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
             else
                 rs.sreg_merge_placeholder.erase(r);
             if (marks.placeholder && !marks.hard && !ballot)
-                rs.sreg_loop_blanket.insert(r);
+                rs.sreg_loop_blanket[r] = marks.blanket_roots;
             else
                 rs.sreg_loop_blanket.erase(r);
             if (marks.memory && !ballot)

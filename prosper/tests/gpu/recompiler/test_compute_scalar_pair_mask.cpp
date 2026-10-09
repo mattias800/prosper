@@ -615,15 +615,17 @@ const Words kStoreV3 = {0xe0702000u, 0x80020300u, 0xbf810000u};
 const Words kExportV3 = {0x7e000280u, 0x7e020280u, 0x7e040280u,
                          0xf800180fu, 0x03020100u, 0xbf810000u};
 
-Words blanket_loop(Stage stage, const Words& read, const Words& rewrite) {
+Words blanket_loop(Stage stage, const Words& read, const Words& rewrite, const Words& pre = {}) {
     const Words head = {0xbe9003c1u, 0xbe9103c1u, 0xbe960380u,
                         0xbe970383u, 0x7e060280u, 0xbf0a1716u};
     const auto body = static_cast<uint32_t>(read.size() + rewrite.size() + 2);   // +add +branch
     const Words exit_branch = {0xbf840000u | body};   // s_cbranch_scc0 X
     const Words latch = {0x80168116u, 0xbf820000u | ((0x10000u - (body + 2u)) & 0xffffu)};
-    return cat({&kPrefix, &head, &exit_branch, &read, &rewrite, &latch,
+    return cat({&kPrefix, &pre, &head, &exit_branch, &read, &rewrite, &latch,
                 stage == Stage::Fragment ? &kExportV3 : &kStoreV3});
 }
+// s_mov_b32 s20, 7 | s_mov_b32 s21, 7: a second carried pair, defined before the loop
+const Words kDefineS20S21 = {0xbe940387u, 0xbe950387u};
 }   // namespace
 
 TEST(ScalarPairMask, ALoopCarriedWordFabricatedOnTheBackEdgeRefusesItsLaneRead) {
@@ -717,6 +719,35 @@ TEST(ScalarPairMask, ABottomTestedLoopChecksTheBlanketAtItsBackEdgeToo) {
         EXPECT_FALSE(compile_whole(stage, loop(stage, kRewriteDefined)).empty())
             << name(stage) << ": " << last_terminal_reject_reason(kAddress);
         EXPECT_TRUE(compile_whole(stage, loop(stage, kRewriteFabricated)).empty()) << name(stage);
+        const std::string reason = last_terminal_reject_reason(kAddress);
+        EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
+            << name(stage) << ": refused for another reason: " << reason;
+    }
+}
+
+TEST(ScalarPairMask, AnUnrelatedCarriedWordFabricatedOnTheBackEdgeDoesNotVoidTheRead) {
+    // The loop reads s[16:17] as lane bits, rewrites it with -1 (so it is carried and its read is
+    // admitted on the header's blanket), and rewrites s20 from the never-written s24. s20's
+    // assumption fails, but no read depended on it: assumptions are per (header, register).
+    const Words rewrite = {0xbe9004c1u,
+                           0xbe940318u};   // s_mov_b64 s[16:17], -1 | s_mov_b32 s20, s24
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(
+            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, rewrite, kDefineS20S21))
+                .empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ACarriedWordCopiedFromAViolatedOneIsViolatedToo) {
+    // s_mov_b64 s[16:17], s[20:21] | s_mov_b64 s[20:21], s[24:25]: s[16:17] leaves the body
+    // blanket-marked, but on s20/s21's assumption, which the never-written s[24:25] breaks. The next
+    // trip's read of s[16:17] holds that zero, so the read is void.
+    const Words rewrite = {0xbe900414u, 0xbe940418u};
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_TRUE(
+            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, rewrite, kDefineS20S21))
+                .empty())
+            << name(stage);
         const std::string reason = last_terminal_reject_reason(kAddress);
         EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
             << name(stage) << ": refused for another reason: " << reason;

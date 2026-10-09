@@ -410,17 +410,19 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);   // rdn
 inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, int reg,
                                      int words) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
-    bool through_blanket = false;
+    std::set<uint64_t> roots;
     for (int r = reg; r < reg + words; ++r) {
         // A direct-descriptor word in sreg_input, or a copy of one, is real driver data: the
         // exemption lives where absence is decided (sreg_word_may_be_fabricated).
         if (sreg_word_may_be_fabricated(rs, r)) {
-            if (!rs.sreg_loop_blanket.contains(r)) return false;
-            through_blanket = true;   // admitted on the loop header's assumption, checked later
+            const auto blanket = rs.sreg_loop_blanket.find(r);
+            if (blanket == rs.sreg_loop_blanket.end()) return false;
+            // admitted on loop-header assumptions, which each loop's back edge checks
+            roots.insert(blanket->second.begin(), blanket->second.end());
         }
         if (b.is_fragment && rs.sreg_memory_pattern.contains(r)) return false;
     }
-    if (through_blanket) ++b.loop_blanket_lane_reads;
+    b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
     return true;
 }
 

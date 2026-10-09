@@ -1566,7 +1566,11 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     const auto word = [&](int r) {
         const bool fabricated = sreg_word_may_be_fabricated(rs, r);
         marks.placeholder = marks.placeholder || fabricated;
-        marks.hard = marks.hard || (fabricated && !rs.sreg_loop_blanket.contains(r));
+        const auto blanket = rs.sreg_loop_blanket.find(r);
+        if (fabricated && blanket == rs.sreg_loop_blanket.end())
+            marks.hard = true;
+        else if (fabricated)
+            marks.blanket_roots.insert(blanket->second.begin(), blanket->second.end());
         marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
     };
     if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
