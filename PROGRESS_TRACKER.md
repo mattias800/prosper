@@ -182,6 +182,7 @@ of its manifest.
 | Sifu | `PPSA03001` | 0 | `------` | **0.2** fps · 5% active · 4K · flat 4K clear, no content · screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#2935](https://github.com/mattias800/prosper/issues/2935) | [#2885](https://github.com/mattias800/prosper/issues/2885) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | [#2871](https://github.com/mattias800/prosper/issues/2871) | [#2867](https://github.com/mattias800/prosper/issues/2867) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Spacebase Startopia | `PPSA02846` | 0 | `------` | **--** fps · 0% active · 1080p · one black frame, then no further submit · screenshot · 2026-08-22 | - | none | [#2933](https://github.com/mattias800/prosper/issues/2933) | [#2887](https://github.com/mattias800/prosper/issues/2887) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
+| Super Meat Boy 3D | `PPSA31162` | 0 | `------` | - | - | - | [#4790](https://github.com/mattias800/prosper/issues/4790) | [#4791](https://github.com/mattias800/prosper/issues/4791) | - |
 | The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#1880](https://github.com/mattias800/prosper/issues/1880) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/games/KHAZAN_STATUS.md) |
 | The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | - | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/games/GOLLUM_STATUS.md) |
 | Uncharted: Legacy of Thieves Collection | `PPSA05684` | 0 | `------` | - | - | - | - | [#3616](https://github.com/mattias800/prosper/issues/3616) | - |
@@ -197,8 +198,8 @@ of its manifest.
 | 3 -- gameplay with the scene rendering | 12 |
 | 2 -- title screen | 20 |
 | 1 -- any real graphics | 5 |
-| 0 -- not started | 16 |
+| 0 -- not started | 17 |
 
-**4 of 71** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 10 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 72** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 11 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
