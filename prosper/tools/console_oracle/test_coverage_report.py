@@ -14,10 +14,7 @@ Uses synthetic inputs to verify:
 
 from __future__ import annotations
 
-import pathlib
-import pytest
-
-import prosper.tools.console_oracle.coverage_report as cr
+import coverage_report as cr
 
 
 def test_classifier_puts_name_containing_save_in_excluded_state():
@@ -43,7 +40,9 @@ def test_classifier_puts_plain_name_in_candidate():
 
 def test_classifier_other_categories():
     """Verify identity and floating-point/variadic classifications."""
-    assert cr.classify_export("sceUserServiceGetUserId", "libSceUserService.sprx") == cr.CLASS_IDENTITY
+    assert (
+        cr.classify_export("sceUserServiceGetUserId", "libSceUserService.sprx") == cr.CLASS_IDENTITY
+    )
     assert cr.classify_export("sceKernelGetDeviceId", "libkernel.sprx") == cr.CLASS_IDENTITY
     assert cr.classify_export("printf", "libSceLibcInternal.sprx") == cr.CLASS_FP_VARIADIC
     assert cr.classify_export("vsnprintf", "libSceLibcInternal.sprx") == cr.CLASS_FP_VARIADIC
@@ -137,3 +136,17 @@ def test_classifier_mutation_fails(monkeypatch):
     # With 'Save' removed from patterns, sceSaveDataMount must fail to classify as excluded-state
     classification = cr.classify_export("sceSaveDataMount", "libSceSaveData.sprx")
     assert classification != cr.CLASS_STATE
+
+
+def test_nid_db_accepts_comma_and_whitespace_and_flags_anomalies(tmp_path):
+    """The database is described as CSV; a comma row must parse, not read as an anomaly."""
+    db = tmp_path / "nids.txt"
+    db.write_text("AAA sceOne\nBBB,sceTwo\n\nCCC three words\nDDD\n", encoding="utf-8")
+    entries, bad = cr.parse_nid_db(db)
+    assert entries == [("AAA", "sceOne"), ("BBB", "sceTwo")]
+    assert [b[0] for b in bad] == [4, 5]
+
+
+def test_report_names_the_platform_arm():
+    text = cr.format_text_report({}, 0, 0, 0, platform="linux")
+    assert "HLE registration platform arm: linux" in text

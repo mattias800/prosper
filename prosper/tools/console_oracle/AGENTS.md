@@ -22,7 +22,8 @@ re-measure.
 - `test_run_oracle.py` -- pytest for the driver's pure parts and for the committed data.
 - `coverage_report.py` + `test_coverage_report.py` -- offline, read-only coverage report. Answers
   which verified library exports from `--db <NID_DB>` are not yet covered by any cases file and classifies
-  candidate functions to measure next without touching the console or any data files.
+  candidate functions to measure next without touching the console or any data files. `--platform`
+  picks the `#if` arm of the HLE registration tables (default: this host); `--db` also reads `PROSPER_NID_DB`.
 
 The data lives in `tests/data/console_oracle/`: `<family>.cases.tsv` (what to call),
 `<family>.golden.tsv` (what the console returned) and `known_gaps.tsv` (cases where prosper is known to

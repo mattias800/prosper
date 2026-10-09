@@ -17,7 +17,7 @@ import os
 import pathlib
 import re
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 # Classifiers for uncovered exports
 CLASS_STATE = "excluded-state"
@@ -135,21 +135,21 @@ def classify_export(name: str, lib: str = "?") -> str:
     return CLASS_CANDIDATE
 
 
-def parse_nid_db(path: pathlib.Path) -> Tuple[List[Tuple[str, str]], List[Tuple[int, int, str]]]:
-    """Parse NID database (whitespace-separated: NID <name>).
+def parse_nid_db(path: pathlib.Path) -> tuple[list[tuple[str, str]], list[tuple[int, int, str]]]:
+    """Parse NID database (comma- or whitespace-separated: NID <name>).
 
     Returns (valid_entries, bad_lines) where valid_entries is [(nid, name), ...]
     and bad_lines is [(line_no, part_count, line_str), ...].
     """
-    entries: List[Tuple[str, str]] = []
-    bad_lines: List[Tuple[int, int, str]] = []
+    entries: list[tuple[str, str]] = []
+    bad_lines: list[tuple[int, int, str]] = []
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for idx, line in enumerate(f, 1):
             s = line.strip()
             if not s:
                 continue
-            parts = s.split()
+            parts = [p for p in re.split(r"[,\s]+", s) if p]
             if len(parts) == 2:
                 entries.append((parts[0], parts[1]))
             else:
@@ -158,7 +158,7 @@ def parse_nid_db(path: pathlib.Path) -> Tuple[List[Tuple[str, str]], List[Tuple[
     return entries, bad_lines
 
 
-def load_cases_coverage(data_dir: pathlib.Path) -> Dict[str, str]:
+def load_cases_coverage(data_dir: pathlib.Path) -> dict[str, str]:
     """Load all committed cases files and map function name -> library name.
 
     Returns {func_name: lib_name}.
@@ -169,7 +169,7 @@ def load_cases_coverage(data_dir: pathlib.Path) -> Dict[str, str]:
         sys.path.insert(0, str(tools_dir))
     import run_oracle as ro
 
-    cases_funcs: Dict[str, str] = {}
+    cases_funcs: dict[str, str] = {}
     cases_files = sorted(data_dir.glob("*.cases.tsv"))
     for cf in cases_files:
         try:
@@ -184,7 +184,7 @@ def load_cases_coverage(data_dir: pathlib.Path) -> Dict[str, str]:
     return cases_funcs
 
 
-def load_registered_handlers(prosper_root: pathlib.Path) -> Tuple[Set[str], int]:
+def load_registered_handlers(prosper_root: pathlib.Path, platform: str) -> tuple[set[str], int]:
     """Extract registered Sony names using prosper/tools/re/hle_handler_map.py.
 
     Returns (set_of_registered_names, unresolved_site_count).
@@ -195,9 +195,9 @@ def load_registered_handlers(prosper_root: pathlib.Path) -> Tuple[Set[str], int]
     import hle_handler_map as hmap
 
     hle_src = prosper_root / "prosper" / "src" / "hle"
-    sc = hmap.scan_tree(str(hle_src), "windows")
+    sc = hmap.scan_tree(str(hle_src), platform)
 
-    reg_names: Set[str] = set()
+    reg_names: set[str] = set()
     for r in sc.regs:
         if r.name:
             reg_names.add(r.name)
@@ -205,10 +205,10 @@ def load_registered_handlers(prosper_root: pathlib.Path) -> Tuple[Set[str], int]
     return reg_names, len(sc.unresolved)
 
 
-def load_nid_libs(path: pathlib.Path) -> Dict[str, str]:
+def load_nid_libs(path: pathlib.Path) -> dict[str, str]:
     """Load optional NID -> library mapping TSV."""
-    nid_to_lib: Dict[str, str] = {}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    nid_to_lib: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -220,21 +220,21 @@ def load_nid_libs(path: pathlib.Path) -> Dict[str, str]:
 
 
 def generate_coverage(
-    db_entries: List[Tuple[str, str]],
-    cases_funcs: Dict[str, str],
-    reg_names: Set[str],
-    nid_libs: Optional[Dict[str, str]] = None,
-    only_lib: Optional[str] = None,
+    db_entries: list[tuple[str, str]],
+    cases_funcs: dict[str, str],
+    reg_names: set[str],
+    nid_libs: dict[str, str] | None = None,
+    only_lib: str | None = None,
     registered_only: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compute coverage statistics and classify uncovered exports."""
     nid_libs = nid_libs or {}
 
     # Unique exports from DB
-    seen_db_funcs: Set[str] = set()
-    per_lib_data: Dict[str, Dict[str, Any]] = {}
+    seen_db_funcs: set[str] = set()
+    per_lib_data: dict[str, dict[str, Any]] = {}
 
-    def get_lib_bucket(lib_name: str) -> Dict[str, Any]:
+    def get_lib_bucket(lib_name: str) -> dict[str, Any]:
         if lib_name not in per_lib_data:
             per_lib_data[lib_name] = {
                 "db_exports": 0,
@@ -300,23 +300,30 @@ def generate_coverage(
 
 
 def format_text_report(
-    per_lib_data: Dict[str, Any],
+    per_lib_data: dict[str, Any],
     unresolved_count: int,
     db_line_count: int,
     bad_line_count: int,
-    only_lib: Optional[str] = None,
+    only_lib: str | None = None,
     all_exports: bool = False,
+    platform: str | None = None,
 ) -> str:
     """Format human-readable coverage report."""
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("Console Oracle Coverage Report")
     lines.append("==============================")
-    lines.append(f"NID database rows: {db_line_count} (anomalies/non-2-part lines: {bad_line_count})")
+    lines.append(
+        f"NID database rows: {db_line_count} (anomalies/non-2-part lines: {bad_line_count})"
+    )
+    if platform:
+        lines.append(f"HLE registration platform arm: {platform}")
     lines.append(f"Unresolved Prosper HLE registration sites: {unresolved_count}")
     if only_lib:
         lines.append(f"Filter library: {only_lib}")
     if not all_exports:
-        lines.append("Candidates: registered handlers only (default; pass --all-candidates to show all)")
+        lines.append(
+            "Candidates: registered handlers only (default; pass --all-candidates to show all)"
+        )
     else:
         lines.append("Candidates: all uncovered exports (--all-candidates)")
     lines.append("")
@@ -332,14 +339,17 @@ def format_text_report(
     # Sort libraries: known libraries alphabetically, '?' at the end
     sorted_libs = sorted(
         per_lib_data.keys(),
-        key=lambda l: (1 if l == "?" else 0, l),
+        key=lambda name: (1 if name == "?" else 0, name),
     )
 
     total_exports = 0
     total_cases = 0
     total_registered = 0
     total_neither = 0
-    total_classes = {c: 0 for c in (CLASS_STATE, CLASS_IDENTITY, CLASS_NETWORK, CLASS_FP_VARIADIC, CLASS_CANDIDATE)}
+    total_classes = {
+        c: 0
+        for c in (CLASS_STATE, CLASS_IDENTITY, CLASS_NETWORK, CLASS_FP_VARIADIC, CLASS_CANDIDATE)
+    }
     total_candidates_eligible = 0
 
     for lib in sorted_libs:
@@ -395,7 +405,9 @@ def main() -> int:
     parser.add_argument(
         "--db",
         type=pathlib.Path,
-        default=pathlib.Path(os.environ["PROSPER_NID_DB"]) if "PROSPER_NID_DB" in os.environ else None,
+        default=pathlib.Path(os.environ["PROSPER_NID_DB"])
+        if "PROSPER_NID_DB" in os.environ
+        else None,
         help="Path to verified NID CSV database <NID_DB> (or set via PROSPER_NID_DB env var).",
     )
     parser.add_argument(
@@ -429,10 +441,10 @@ def main() -> int:
         help="Include all uncovered candidate exports (by default, candidates are limited to registered HLE handlers).",
     )
     parser.add_argument(
-        "--registered-only",
-        action="store_true",
-        default=True,
-        help="Limit candidate listing and candidate count to functions Prosper already registers (default behaviour).",
+        "--platform",
+        choices=("linux", "windows", "macos"),
+        default={"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux"),
+        help="Which #if arm of the HLE registration tables to evaluate (default: this host).",
     )
     parser.add_argument(
         "--json",
@@ -445,7 +457,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.db:
-        sys.stderr.write("Error: --db <NID_DB> is required (or set PROSPER_NID_DB environment variable).\n")
+        sys.stderr.write(
+            "Error: --db <NID_DB> is required (or set PROSPER_NID_DB environment variable).\n"
+        )
         return 1
 
     repo_root = args.root or pathlib.Path(__file__).resolve().parents[3]
@@ -457,7 +471,7 @@ def main() -> int:
 
     entries, bad_lines = parse_nid_db(args.db)
     cases_funcs = load_cases_coverage(data_dir)
-    reg_names, unresolved_count = load_registered_handlers(repo_root)
+    reg_names, unresolved_count = load_registered_handlers(repo_root, args.platform)
 
     nid_libs = None
     if args.nid_libs and args.nid_libs.is_file():
@@ -481,6 +495,7 @@ def main() -> int:
         bad_line_count=len(bad_lines),
         only_lib=args.only_lib,
         all_exports=args.all_candidates,
+        platform=args.platform,
     )
 
     print(report_text)
@@ -493,10 +508,10 @@ def main() -> int:
                 "db_valid_entries": len(entries),
                 "db_bad_lines": len(bad_lines),
                 "unresolved_registration_sites": unresolved_count,
+                "registration_platform": args.platform,
                 "filter_only_lib": args.only_lib,
                 "filter_registered_only": registered_only,
             },
-
             "libraries": {
                 lib: {
                     "exports": b["db_exports"],
