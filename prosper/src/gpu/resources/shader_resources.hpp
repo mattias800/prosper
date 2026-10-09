@@ -171,14 +171,20 @@ constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t
 
 // 3D optimal images have a dimension-specific Vulkan support query. Keep their capabilities in
 // the upper half of the same replay-stable mask so a device that supports typed 2D storage but not
-// the corresponding 3D image never compiles a shader the live backend cannot bind.
+// the corresponding 3D image never compiles a shader the live backend cannot bind. Bits 0..9 (float
+// and UNORM) mirror to 10..19; the integer bits 20..23 mirror to 25..28. Integer 3D used to have no
+// bit at all, so a one-component Uint16 volume always took the raw RGBA32_UINT interchange path at
+// 16 bytes per texel -- an 8x expansion that put UE4's 512^3 mesh distance-field atlas (256 MiB
+// guest) at 2 GiB, past the backend's image bound, and its upload dispatch was skipped every time.
 constexpr uint32_t native_storage_3d_format_support_bit(DataFormat format,
                                                         uint32_t components) {
     const uint32_t format_bit = native_storage_format_support_bit(format, components);
-    return (format_bit & ((1u << 10) - 1u)) ? format_bit << 10 : 0u;
+    if (format_bit & ((1u << 10) - 1u)) return format_bit << 10;
+    if (format_bit & (((1u << 4) - 1u) << 20)) return format_bit << 5;
+    return 0u;
 }
 
-constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 25) - 1u;
+constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 29) - 1u;
 
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.

@@ -8160,7 +8160,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     native_float_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
-                const bool native_uint = !packed_r11 && native_uint_2d_storage && !is_atomic &&
+                // Integer 3D takes the same device-gated native path as float 3D: the support bit
+                // for an ordinary 3D image is the dimension-specific one chosen above.
+                const bool native_uint = !packed_r11 && (native_uint_2d_storage || ordinary_3d) &&
+                    !is_atomic &&
                     native_uint_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);

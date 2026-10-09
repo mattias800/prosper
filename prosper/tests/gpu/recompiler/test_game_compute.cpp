@@ -2653,6 +2653,94 @@ int main() {
         }
     }
     {
+        // UE4's mesh distance-field atlas upload writes a 512^3 one-component R16_UINT volume
+        // (Kena, #4766). Integer 3D storage used to have no 3D support bit, so it compiled to the
+        // raw RGBA32_UINT interchange at 16 bytes per texel; the 256 MiB guest atlas became a
+        // 2 GiB backend image, past the bound, and the upload dispatch was skipped. With the
+        // dimension-specific bit the store declares exact R16ui and writes guest bytes exactly.
+        constexpr uint32_t VW = 16, VH = 8, VD = 4, kMode = 27;
+        static const uint32_t fill_r16_volume[] = {
+            0x7e080300u,              // v_mov_b32 v4, v0          (x)
+            0x7e0a0301u,              // v_mov_b32 v5, v1          (y)
+            0x7e0c0302u,              // v_mov_b32 v6, v2          (z)
+            0x34100284u,              // v_lshlrev_b32 v8, 4, v1   (y * 16)
+            0x4a101100u,              // v_add_nc_u32 v8, v0, v8   (x + y * 16)
+            0x34120488u,              // v_lshlrev_b32 v9, 8, v2   (z * 256)
+            0x4a001308u,              // v_add_nc_u32 v0, v8, v9   (unique texel value)
+            0xf0200110u, 0x00020004u, // IMAGE_STORE v0 at (v4,v5,v6), DIM=3D, R
+            0xbf810000u,
+        };
+        const size_t tiled = tiled_volume_bytes(VW, VH, VD, kMode, sizeof(uint16_t));
+        std::vector<uint16_t> expected_linear(size_t(VW) * VH * VD);
+        for (uint32_t z = 0; z < VD; ++z)
+            for (uint32_t y = 0; y < VH; ++y)
+                for (uint32_t x = 0; x < VW; ++x)
+                    expected_linear[(size_t(z) * VH + y) * VW + x] =
+                        static_cast<uint16_t>(x + y * 16u + z * 256u);
+        std::vector<uint8_t> expected(tiled, 0xa5), destination(tiled, 0xa5);
+        const bool reference_tiled = tiled != 0 &&
+            tile_volume(expected.data(), expected.size(),
+                        reinterpret_cast<const uint8_t*>(expected_linear.data()),
+                        VW, VH, VD, kMode, sizeof(uint16_t));
+        CHECK(reference_tiled, "CPU reference tiles the R16 volume in the atlas's layout");
+        CHECK(native_storage_3d_format_support_bit(DataFormat::Uint16, 1) != 0 &&
+                  native_storage_3d_format_support_bit(DataFormat::Uint16, 1) !=
+                      native_storage_format_support_bit(DataFormat::Uint16, 1) &&
+                  (native_storage_3d_format_support_bit(DataFormat::Uint16, 1) &
+                   ~kNativeStorageFormatSupportMask) == 0,
+              "integer 3D storage has its own in-mask support bit");
+        ShaderResource output{};
+        output.cls = ResourceClass::StorageImage;
+        output.img_dim = 2;
+        output.binding = 5;
+        output.sgpr_base = 8;
+        output.format = DataFormat::Uint16;
+        output.num_components = 1;
+        output.width = VW;
+        output.height = VH;
+        output.depth = VD;
+        output.tile_mode = kMode;
+        output.gpu_addr = reinterpret_cast<uint64_t>(destination.data());
+        output.size = static_cast<uint32_t>(destination.size());
+        ShaderResourceTable table;
+        table.resources.push_back(output);
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(16);
+        config.local_x = VW;
+        config.local_y = VH;
+        config.local_z = VD;
+        config.tidig_comp_cnt = 2;
+        config.native_storage_format_support =
+            native_storage_3d_format_support_bit(DataFormat::Uint16, 1);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            fill_r16_volume, std::size(fill_r16_volume), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const SpirvDescriptorBinding* binding =
+            find_spirv_descriptor_binding(report, 0, output.binding);
+        CHECK(!spirv.empty() && report.ok() && binding && binding->image_dim == 2u &&
+                  binding->image_numeric_class == SpirvImageNumericClass::Uint &&
+                  binding->storage_image_format == kSpirvImageFormatR16ui,
+              "R16_UINT 3D storage reflects exact typed R16ui, not the raw interchange");
+        bool executed = false;
+        if (!spirv.empty() && report.ok() && binding && reference_tiled) {
+            ComputeItem item;
+            item.spirv = spirv;
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            item.launch.threads_x = VW;
+            item.launch.threads_y = VH;
+            item.launch.threads_z = VD;
+            item.launch.local_x = VW;
+            item.launch.local_y = VH;
+            item.launch.local_z = VD;
+            item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+            item.code_addr = 0x5908ba0u;
+            executed = prosper::frontend::execute_live_compute_items({item});
+        }
+        CHECK(executed && destination == expected,
+              "R16_UINT 3D storage store writes every guest texel exactly in its tiled layout");
+    }
+    {
         std::vector<uint8_t> source(W);
         for (uint32_t x = 0; x < W; ++x)
             source[x] = static_cast<uint8_t>(x * 53u + 7u);
