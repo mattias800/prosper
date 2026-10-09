@@ -99,6 +99,37 @@ TEST(SkippableInstruction, AMaskBranchDoesNotMakeTheUseSkippable) {
     EXPECT_FALSE(program_may_skip_by_scalar_branch(divergent, 2));
 }
 
+TEST(SkippableInstruction, AnSccBranchOnTheLaneMaskIsAMaskBranch) {
+    // #4801 re-review: LLVM's early-terminate shape. s_andn2_b64 exec, exec, vcc sets SCC from the
+    // lane mask, and s_cbranch_scc0 to the end is an alpha kill, not a draw-uniform decision.
+    constexpr uint32_t kAndn2ExecVcc = 0x8AFE6A7Eu;   // s_andn2_b64 exec, exec, vcc
+    EXPECT_FALSE(program_may_skip_by_scalar_branch(
+        decode({kAndn2ExecVcc, sopp(kScc0, 2), kSample0, kSample1, kEnd}), 2));
+    // A compare that reads EXEC itself is a mask test too.
+    constexpr uint32_t kCmpExecZero = 0xBF12807Eu;   // s_cmp_eq_u64 exec, 0
+    EXPECT_FALSE(program_may_skip_by_scalar_branch(
+        decode({kCmpExecZero, sopp(kScc1, 2), kSample0, kSample1, kEnd}), 2));
+    // The uniform control: the same branch fed by a compare of SGPR data is a skip.
+    EXPECT_TRUE(program_may_skip_by_scalar_branch(
+        decode({kCmpS0Zero, sopp(kScc0, 2), kSample0, kSample1, kEnd}), 2));
+    // A compare separated from the branch only by instructions that cannot write SCC still counts.
+    EXPECT_TRUE(program_may_skip_by_scalar_branch(
+        decode({kCmpS0Zero, kNop, sopp(kScc0, 2), kSample0, kSample1, kEnd}), 3));
+    // An intervening scalar ALU op is a possible SCC writer of unknown meaning: not uniform.
+    EXPECT_FALSE(program_may_skip_by_scalar_branch(
+        decode({kCmpS0Zero, kAndn2ExecVcc, sopp(kScc0, 2), kSample0, kSample1, kEnd}), 3));
+}
+
+TEST(SkippableInstruction, AnSccDefinitionFromAnotherBlockIsUnknown) {
+    // pc0 andn2 exec (SCC from the mask); pc1 scc1 -> pc3; pc2 cmp s0; pc3 scc0 -> pc6;
+    // pc4 sample; pc6 endpgm. The compare right before pc3 is uniform, but pc3 is also reached by
+    // the jump from pc1, carrying the mask-derived SCC, so its definition is unknown.
+    constexpr uint32_t kAndn2ExecVcc = 0x8AFE6A7Eu;
+    const auto program = decode(
+        {kAndn2ExecVcc, sopp(kScc1, 1), kCmpS0Zero, sopp(kScc0, 2), kSample0, kSample1, kEnd});
+    EXPECT_FALSE(program_may_skip_by_scalar_branch(program, 4));
+}
+
 TEST(SkippableInstruction, AScalarSkipStillWinsPastAMaskBranch) {
     // pc0 cmp; pc1 scc1 -> pc6 (end); pc2 execz -> pc5; pc3 sample; pc5 nop; pc6 endpgm. The mask
     // branch alone cannot avoid the sample, but the scalar decision before it can.

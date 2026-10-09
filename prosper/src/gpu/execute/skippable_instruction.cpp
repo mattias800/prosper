@@ -18,9 +18,46 @@ bool ends_program(const Rdna2Inst& in) {
                          (in.opcode == 0x01 || in.opcode == 0x1b || in.opcode == 0x1e));
 }
 
-// s_cbranch_scc0 / s_cbranch_scc1: SCC is a scalar bit, so the wave takes one edge as a whole.
-bool scalar_conditional_branch(const Rdna2Inst& in) {
+// s_cbranch_scc0 / s_cbranch_scc1. SCC is one bit per wave, but it is not necessarily draw state:
+// `s_andn2_b64 exec, exec, vcc` sets it from the lane mask, and branching on it is LLVM's
+// early-terminate (alpha-kill) shape. See scc_set_by_uniform_compare.
+bool scc_branch(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05);
+}
+
+// Data a scalar compare may read for its result to count as draw-uniform: an SGPR below VCC
+// (s0..s105) or a constant. VCC, EXEC, M0, the other special registers and VGPRs are excluded,
+// because a lane mask in any of them makes the comparison a mask test.
+bool uniform_scalar_operand(const Operand& op) {
+    switch (op.kind) {
+        case OperandKind::SGPR: return op.value >= 0 && op.value < 106;
+        case OperandKind::InlineInt:
+        case OperandKind::InlineFloat:
+        case OperandKind::Literal: return true;
+        default: return false;
+    }
+}
+
+// An instruction that sets SCC from draw-uniform data: a SOPC compare (not s_setvskip 0x10 or
+// s_set_gpr_idx_on 0x11, which do not compare), or an s_cmpk_* (SOPK 0x03..0x0e) on such an SGPR.
+// Deliberately narrow: any other SCC writer, a scalar ALU op on uniform data included, is treated
+// as a mask test. That costs a skip that could have been claimed, never a false one.
+bool uniform_scc_compare(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::SOPC && in.opcode != 0x10 && in.opcode != 0x11) {
+        for (uint8_t k = 0; k < in.n_src && k < 2; ++k)
+            if (!uniform_scalar_operand(in.src[k])) return false;
+        return in.n_src >= 2;
+    }
+    if (in.fmt == Rdna2Format::SOPK && in.opcode >= 0x03 && in.opcode <= 0x0e)
+        return in.dst.kind == OperandKind::SGPR && uniform_scalar_operand(in.dst);
+    return false;
+}
+
+// May write SCC: every scalar ALU format. Vector, memory, export and non-branch SOPP instructions
+// never do, so the backwards walk steps over them.
+bool scalar_alu(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+           in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::SOPK;
 }
 
 } // namespace
@@ -67,6 +104,36 @@ bool program_may_skip_by_scalar_branch(const std::vector<Rdna2Inst>& instruction
         }
     }
 
+    // Which scc branches are draw-uniform choices (#4801 re-review B3'): walk back from the branch
+    // within its straight-line block to the last instruction that may write SCC, and accept only a
+    // uniform compare. Stepping past an instruction some branch targets, or reaching a branch, an
+    // end or the stream start first, leaves the definition unknown, and unknown counts as a mask.
+    std::vector<char> targeted(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        if (sopp_is_branch(instructions[i]) && succ[2 * i] != kNone) targeted[succ[2 * i]] = 1;
+    std::vector<size_t> before(n, kNone);   // the instruction that falls through into this one
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t next = uint64_t(instructions[i].pc) + instructions[i].len_dwords;
+        if (next <= max_pc && at[next] != kNone) before[at[next]] = i;
+    }
+    std::vector<char> uniform_branch(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (!scc_branch(instructions[i])) continue;
+        size_t cur = i;
+        for (;;) {
+            if (targeted[cur]) break;
+            const size_t prev = before[cur];
+            if (prev == kNone) break;
+            const Rdna2Inst& p = instructions[prev];
+            if (scalar_alu(p)) {
+                uniform_branch[i] = uniform_scc_compare(p) ? 1 : 0;
+                break;
+            }
+            if (sopp_is_branch(p) || ends_program(p)) break;
+            cur = prev;
+        }
+    }
+
     // Attractor of the program ends for the scalar-branch player, with the use removed. A node joins
     // when any successor is winning at a scalar branch, or when all of them are anywhere else (a
     // straight-line instruction has exactly one). Least fixpoint, so a path that loops forever never
@@ -85,7 +152,7 @@ bool program_may_skip_by_scalar_branch(const std::vector<Rdna2Inst>& instruction
             continue;
         }
         const int count = succ[2 * i + 1] == kNone ? 1 : 2;
-        pending[i] = scalar_conditional_branch(instructions[i]) ? 1 : count;
+        pending[i] = uniform_branch[i] ? 1 : count;
         // A branch whose two edges reach the same instruction needs it only once.
         if (count == 2 && succ[2 * i] == succ[2 * i + 1]) pending[i] = 1;
     }

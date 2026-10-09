@@ -15,11 +15,14 @@
 // whose tables had been recycled under prosper (the SDK<13 race, #1226/#2220); with the visibility
 // contract forced on, only the lighting program's switch arms remained.
 //
-// The question is modelled as a two-player reachability game over direct branches. At s_cbranch_scc0
-// and s_cbranch_scc1 (a scalar condition, uniform across the wave) a path may take either edge. At
-// s_cbranch_vccz/vccnz/execz/execnz (a per-lane mask, or one the analysis cannot prove uniform) BOTH
-// edges must avoid the instruction. The answer is true when some choice of scalar decisions reaches
-// a program end without executing `use_pc`, whatever the lane masks do.
+// The question is modelled as a two-player reachability game over direct branches. At an
+// s_cbranch_scc0/scc1 whose SCC was last set, in the same straight-line block, by a scalar compare
+// of SGPR data or constants (no EXEC, VCC or other special register), a path may take either edge.
+// Every other conditional branch, an scc branch fed by anything else or by an unknown definition
+// included, must avoid the instruction on BOTH edges: `s_andn2_b64 exec, exec, vcc` followed by
+// s_cbranch_scc0 is an alpha kill even though it branches on SCC (#4801 re-review). The answer is
+// true when some choice of uniform decisions reaches a program end without executing `use_pc`,
+// whatever the lane masks do.
 //
 // What it does NOT prove: that THIS draw takes that path. A scalar condition can be constant for the
 // draw (a uniform light count of zero skips the whole light loop, but a draw with lights runs it).
