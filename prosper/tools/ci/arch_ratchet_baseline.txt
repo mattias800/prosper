@@ -207,7 +207,10 @@ file-size|prosper/src/hle/kernel/hle_kernel.cpp 5547  # 1 below main (5548): the
 # note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
 # same-origin mapping windows under
 # the private HLE ledger lock; neither VMA remainder nor physical allocation size grants bytes.
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8658  # lowered: mapping-table query templates moved to guest_mapping_queries.hpp
+# note #4796: +7 lines for guest_virtual_address_tracked, the one query that must read the private
+# mapping table (g_maps under g_mx): whether ANY guest mapping covers an address, whatever its CPU
+# protection. Host readability cannot answer it for GPU-only memory (#4801 review B1).
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8665  # was lowered to 8658 when mapping-table query templates moved to guest_mapping_queries.hpp
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
