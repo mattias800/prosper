@@ -25,7 +25,10 @@ struct DumpState {
     std::string directory;       // created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
     bool dir_failure_announced = false;
+    size_t refusal_count = 0;   // distinct programs recorded under each budget
+    size_t declined_count = 0;
     std::atomic<bool> full{false};
+    std::atomic<bool> declined_full{false};
     std::atomic<uint64_t> epoch{kStageBits + 1u};
     std::atomic<uint64_t> hash_evaluations{0};
     std::atomic<uint64_t> hashed_dwords{0};
@@ -92,22 +95,34 @@ std::string make_directory(DumpState& s) {
 
 }  // namespace
 
+namespace {
+bool budget_full(RefusedShaderBudget budget) {
+    return budget == RefusedShaderBudget::BackendDeclined ? backend_declined_dump_full()
+                                                          : refused_shader_dump_full();
+}
+}   // namespace
+
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
-                         const std::string& detail) {
-    if (refused_shader_dump_full()) return false;
+                         const std::string& detail, RefusedShaderBudget budget) {
+    if (budget_full(budget)) return false;
     if (!stage || !code || !dwords) return false;
     const uint64_t hash = hash_code(code, dwords);
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
     if (s.seen.count({stage, hash})) return false;
-    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) return false;
+    const bool declined = budget == RefusedShaderBudget::BackendDeclined;
+    size_t& recorded = declined ? s.declined_count : s.refusal_count;
+    const size_t cap = declined ? kBackendDeclinedDumpMaxPrograms : kRefusedShaderDumpMaxPrograms;
+    if (recorded >= cap) return false;
     s.seen.insert({stage, hash});
-    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) {
-        s.full.store(true, std::memory_order_relaxed);
+    ++recorded;
+    if (recorded >= cap) {
+        (declined ? s.declined_full : s.full).store(true, std::memory_order_relaxed);
         std::fprintf(stderr,
-                     "[refused-shader] %zu distinct programs recorded; further refusals "
+                     "[refused-shader] %zu distinct %sprograms recorded; further %s "
                      "are not dumped (set PROSPER_SHADER_DUMP for an unbounded dump)\n",
-                     kRefusedShaderDumpMaxPrograms);
+                     cap, declined ? "backend-declined " : "",
+                     declined ? "backend declines" : "refusals");
     }
     const std::string dir = make_directory(s);
     if (dir.empty()) return false;
@@ -160,9 +175,8 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
 }
 
 bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
-                         const std::string& detail) {
-    if (refused_shader_dump_full() || !stage || !source.words || source.words->empty())
-        return false;
+                         const std::string& detail, RefusedShaderBudget budget) {
+    if (budget_full(budget) || !stage || !source.words || source.words->empty()) return false;
     const uint64_t bit = stage_bit(stage);
     if (source.memo && bit) {
         const uint64_t epoch = state().epoch.load(std::memory_order_relaxed);
@@ -176,7 +190,8 @@ bool note_refused_shader(const char* stage, uint64_t address, const RefusedShade
                 break;
         }
     }
-    return note_refused_shader(stage, address, source.words->data(), source.words->size(), detail);
+    return note_refused_shader(stage, address, source.words->data(), source.words->size(), detail,
+                               budget);
 }
 
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source) {
@@ -200,6 +215,15 @@ bool refused_shader_dump_full() {
     return state().full.load(std::memory_order_relaxed);
 }
 
+bool backend_declined_dump_full() {
+    if (PROSPER_ENV_ON("PROSPER_NO_REFUSED_SHADER_DUMP")) return true;
+    return state().declined_full.load(std::memory_order_relaxed);
+}
+
+uint64_t refused_shader_dump_epoch() {
+    return state().epoch.load(std::memory_order_relaxed);
+}
+
 RefusedShaderDumpStats refused_shader_dump_stats() {
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
@@ -220,6 +244,9 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.directory.clear();
     s.seen.clear();
     s.full.store(false);
+    s.declined_full.store(false);
+    s.refusal_count = 0;
+    s.declined_count = 0;
     s.epoch.fetch_add(kStageBits + 1u, std::memory_order_relaxed);
     s.hash_evaluations.store(0, std::memory_order_relaxed);
     s.hashed_dwords.store(0, std::memory_order_relaxed);

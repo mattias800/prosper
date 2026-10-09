@@ -205,6 +205,7 @@ measurement is what lets the ladder run long enough to cover a slow boot.
   usable here — the title's menus animate. The scene index and the in-world HUD are the
   discriminators; the aggregates are only a validity check. Cross-title record in
   `GAME_COMPAT_ORCHESTRATION.md`.
+- **"Beneath's blur and *Bendy and the Dark Revival*'s blur share one skipped or declined post-process compute pass."** Falsified by the 2026-10-09 zero-drops census (main `5f2ae5e18`, #4808). Beneath's only skipped compute program is `0x411983c600` (841 dispatches, a straight-line `s_cbranch_execz` reject), and it renders at 1920x1080. Dark Revival's skips are all backend declines of a different program (`0x408bf30100`, a layered 16-slice image read through a 2D declaration).
 
 ## Open, not blocking
 

@@ -5279,6 +5279,7 @@ void report_compute_decline(const prosper::gpu::ComputeItem& item, const char* r
                                             : std::less<const char*>{}(reason, other.reason);
         }
     };
+    prosper::gpu::set_compute_decline_reason(reason);   // the executor's dump reads it (#4808)
     static std::mutex mutex;
     static std::map<DeclineKey, uint64_t> counts;
     uint64_t count = 0;
@@ -7678,8 +7679,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             layout_bindings[descriptor_index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         bool buffer_setup_failure_reported = false;
-        auto skip_buffer = [&](uint32_t binding, const ShaderResource* resource,
-                               const char* why) {
+        auto skip_buffer = [&](uint32_t binding, const ShaderResource* resource, const char* why) {
+            prosper::gpu::set_compute_decline_reason(why);   // `why` is always a literal
             buffer_setup_failure_reported = true;
             if (!trace) return;
             std::fprintf(stderr,
@@ -8063,6 +8064,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // so all decline sites inherit it rather than each having to pass it.
         const SpirvDescriptorBinding* skip_decl = nullptr;
         auto skip_image = [&](const prosper::gpu::ShaderResource* r, const char* why) {
+            prosper::gpu::set_compute_decline_reason(why);   // `why` is always a literal
             static std::vector<uint64_t> warned;
             const uint64_t key = r ? r->gpu_addr : 0;
             if (std::find(warned.begin(), warned.end(), key) == warned.end()) {

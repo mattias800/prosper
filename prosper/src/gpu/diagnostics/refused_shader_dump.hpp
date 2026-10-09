@@ -24,6 +24,13 @@
 namespace prosper::gpu {
 
 inline constexpr size_t kRefusedShaderDumpMaxPrograms = 64;
+// A dispatch the live compute backend declined (#4808) is dumped under its own budget. Those are
+// the largest skip category and every one recompiled cleanly, so letting them share the 64 slots
+// above would let a title with many declined programs hide the recompile refusals this dump
+// exists for.
+inline constexpr size_t kBackendDeclinedDumpMaxPrograms = 24;
+
+enum class RefusedShaderBudget { Refusal, BackendDeclined };
 
 // Observation state belongs to the existing immutable original-code owner, not an address map.
 // Its lifetime/byte budget is the producer's; a replacement owner starts unobserved. The packed
@@ -40,7 +47,8 @@ struct RefusedShaderSource {
 };
 
 bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
-                         const std::string& detail);
+                         const std::string& detail,
+                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal);
 // An owner-version/stage probe, never an address/first-word shortcut. Does not mark an observation.
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source);
 bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
@@ -50,10 +58,15 @@ bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& so
 // length. `detail` is appended to the index line verbatim (sizes, draw order, reject reason).
 // Returns true when this call wrote a new program.
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
-                         const std::string& detail);
+                         const std::string& detail,
+                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal);
 
 // Stops default diagnostic work, not shader execution/rejection or explicit unbounded dumping.
 bool refused_shader_dump_full();
+// The same for the backend-declined budget, which fills independently of the refusal budget.
+bool backend_declined_dump_full();
+// Advances when the dump is reset, so a per-thread cache of what was already tried can tell.
+uint64_t refused_shader_dump_epoch();
 
 struct RefusedShaderDumpStats {
     size_t content_records = 0;   // all process-owned dedup metadata; no address/alias table
