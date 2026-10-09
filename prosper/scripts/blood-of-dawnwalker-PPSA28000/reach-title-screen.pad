@@ -1,0 +1,28 @@
+# The Blood of Dawnwalker (PPSA28000) -- reach the title card ("Press X to continue"), the first screen
+# of the title, from a fresh boot with EMPTY save directories.
+#
+# Recorded by the project owner on 2026-10-09 in prosper-app (Linux) with its input recorder;
+# anchors are fN = display flips since the guest's first pad poll. The Cross presses walk the
+# content warning and the first-boot screens, plus one right-stick-down hold along the way.
+# The title runs at about 8 guest flips/s on the reference Linux box.
+#
+# Replayed three times on 2026-10-09 (main a56a085e1, fresh saves, 6-8 guest flips/s): the brightness
+# screen is up at pad flip 300, the intro cinematic plays through flip 1200, and the title card
+# ("Press X to continue") is up at flip 2000 every time. In the owner's own session one more Cross
+# opened the New Game / Settings menu. That press is not recorded here, because no replay has yet
+# been captured past the card.
+#
+# Use it as PROSPER_PAD_SCRIPT=@<path> -- without the @ the script loads 0 entries.
+f26-27:cross
+f49-50:cross
+f75-76:cross
+f100-101:cross
+f128-129:cross
+f158-257:right-stick-down
+f261-262:cross
+f282-283:cross
+f301-302:cross
+f345-346:cross
+f360-362:cross
+f379-381:cross
+f416-417:cross
