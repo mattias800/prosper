@@ -9,16 +9,23 @@ date: 2026-10-08
 ## Context
 
 ADR 0028 is accepted (#4761) and frozen, so its text cannot be corrected in place. Steps 1-3 of its
-migration order have since landed or been approved (#4749, #4760, #4763), and the Black Flag census
-(2026-10-08 comment on #4131: `prosper-app`, Windows, RTX 4070 SUPER, a thin early-boot sample of one
-flip window, so classes and not counts) shows where the ADR's text and its ordering no longer match
-the code. This ADR records those deltas and the gaps the ADR leaves, and changes no accepted rule.
+migration order have since merged: step 1 is the `s_cbranch_execz` any-vote certificate (#4755), step
+2 the `route=` field and per-route counters (#4754), and step 3 the compute cross-lane classification
+and `PROSPER_WAVE64_EXCHANGE` (#4760, #4763). (#4749, the #4714 scalar-pair fabricated-zero fix, is
+not a migration step.) This ADR records the deltas those steps exposed and the gaps the ADR leaves,
+and changes no accepted rule.
+
+The Black Flag census quoted below is **pre-step evidence**: the 2026-10-08 comment on #4131 ran
+`prosper-app` built on 2026-10-07, before #4754, #4755, #4760 and #4763 merged, on Windows with an
+RTX 4070 SUPER, with no input route, a cold pipeline cache and a thin early-boot sample of one flip
+window, so it gives classes and not counts. It is what prompted this ADR. It does not meet the bar
+Decision 3 sets, and the current-`main` census Decision 3 requires replaces it.
 
 What is now known:
 
 - **Route 3 largely exists.** Compute workgroup exchange for uniform control flow was found already
   present on the default path (recorded in `docs/gpu/RECOMPILER_REMAINING.md` § Ruled out). ADR 0028
-  describes it as work to build. The census agrees: of four refused compute programs, none was
+  describes it as work to build. The pre-step census agrees: of four refused compute programs, none was
   refused for `subgroup-contract`; all four are `compute/recompile` defects (a MIMG NSA address, a
   scalar-pair `s_cselect_b64`, an `s_cbranch_scc1` the structurizer cannot place, and an
   `s_cbranch_execz` inside a counted loop).
@@ -58,12 +65,15 @@ What is now known:
    a separate decision names a route.
 6. **Admitted programs get a self-check mode.** A default-OFF, diagnostic-class switch compares an
    admitted program's output against the exact path (workgroup exchange or the owned wave) on the
-   same inputs and logs a mismatch. It changes nothing the guest sees. It is the control that lets a
+   same inputs and logs a mismatch. It changes nothing the guest sees. Today it can compare only
+   pairs whose exact path exists on `main`: a compute program admitted by a route other than the
+   exchange, against the exchange. The owned fragment wave (#4384) is not merged, so proven fragment
+   programs have no exact path to compare against yet. It is the control that lets a
    route be trusted for a default flip, and it is what ADR 0028's `GPU-5` lacks as an enforcement
    other than review.
 7. **Default flips need the cross-title A/B first.** `PROSPER_WAVE64_EXCHANGE` and any route default
-   wait for a same-binary A/B on Kena, GTA V, Sonic Frontiers and the guarded titles, run by the
-   owner because those dumps are not on every machine, with the manifest slice of ADR 0021/0023 so
+   wait for a same-binary A/B on Kena, GTA V, Sonic Frontiers and the guarded titles, run on a
+   machine that holds those dumps, with the manifest slice of ADR 0021/0023 so
    each arm records head, build and switches.
 
 ## Consequences
@@ -71,8 +81,10 @@ What is now known:
 - No accepted text changes, so CI's frozen-ADR rule is untouched.
 - The next work is ordered by evidence: route-2 rewrites and the four recompile defects first, then
   the longer census, then steps 4-5 only if the census asks for them.
-- `GPU-5` remains violated for Wave32 mask forms, the merged-NGG shell VCC reconstruction and
-  VGPR-routed values until those are closed or a route names them; this ADR does not hide that.
+- `GPU-5` remains violated until each of these is closed or a route names it: the Wave32 mask forms
+  (`allow_b32_masks`) and the merged-NGG shell's VCC reconstruction, both listed as uncovered by
+  #4749 in the spec's `GPU-5` "Violated today" line, and a fabricated scalar word routed through a
+  VGPR (`v_mov` + `v_readfirstlane`, #4787). This ADR does not hide that.
 - Enforcement: review, the `[wave64-route]` and `[wave64-unsupported]` lines, and the self-check
   mode once it exists. No tool can verify a census claim; the census comment on the tracker is the
   record.
