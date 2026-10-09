@@ -290,7 +290,11 @@ int run_case(int argc, char** argv) {
         ? (shape_refusal ? std::vector<std::pair<uint32_t, uint32_t>>{{257, 131}, {258, 131}}
                          : std::vector<std::pair<uint32_t, uint32_t>>{{258, 131}, {512, 512}}) : mixed
         ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}} : volume
-        ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}, {128, 64}}
+        // 160x136x3 spans several 64 KiB blocks in x AND y with more than one slice, so the
+        // whole-volume byte compare exercises the z*blocks_y block-row term, the y bit-6 address
+        // term 8-byte elements use, and x beyond one block -- none of which the single-block
+        // shapes reach.
+        ? std::vector<std::pair<uint32_t, uint32_t>>{{67, 19}, {128, 64}, {160, 136}}
         : std::vector<std::pair<uint32_t, uint32_t>>{{257, 131}, {384, 256}};
     uint64_t code = 0x34070000;
     for (uint32_t mode : modes) for (auto format : formats)
@@ -317,7 +321,7 @@ int run_case(int argc, char** argv) {
         // 2D instruction or an array instruction retaining its layer coordinate.
         const uint32_t resource_dim = volume ? 2u : (array16 || view == 1 || view == 2) ? 5u : 1u;
         const uint32_t instruction_dim = volume ? 2u : (array16 || view == 2 || view == 3) ? 5u : 1u;
-        const uint32_t depth = array16 ? 6u : volume ? (width == 67 ? 21u : 32u) : 1u;
+        const uint32_t depth = array16 ? 6u : volume ? (width == 67 ? 21u : width == 160 ? 3u : 32u) : 1u;
         const size_t linear_bytes = size_t(width) * height * depth * format.bpe;
         const size_t tile_slice = tiled_surface_bytes(width, height, mode, 0, format.bpe);
         const size_t layer_stride = tile_slice + (shape_refusal && !(width & 1) ? 65536 : 0);
