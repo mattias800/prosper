@@ -84,8 +84,9 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             // format (bit 31 clear) or another length stays Unknown rather than being read as
             // pairs. CONFIDENCE: MED (one title's capture; 0x64's role is inferred from it).
             c.kind = K::SetRegsIndirect;
-            c.reg_class = (c.op == IT_LOAD_SH_REG) ? RegClass::Sh
-                        : (c.op == IT_LOAD_UCONFIG_REG) ? RegClass::Uc : RegClass::Cx;
+            c.reg_class = (c.op == IT_LOAD_SH_REG)        ? RegClass::Sh
+                          : (c.op == IT_LOAD_UCONFIG_REG) ? RegClass::Uc
+                                                          : RegClass::Cx;
             c.regs_vaddr = lo_hi(pl);
             c.num_regs = pl[3];
         } else if (c.op == IT_INDIRECT_BUFFER && npl == 13) {

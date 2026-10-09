@@ -243,23 +243,27 @@ int main() {
         uint32_t pkt[] = {
             // IT_LOAD_SH_REG: 5 dwords
             0xC0000000u | (3u << 16) | (IT_LOAD_SH_REG << 8),
-            (uint32_t)sh_addr, (uint32_t)(sh_addr >> 32),
-            0x80000000u, 2u,
+            (uint32_t)sh_addr,
+            (uint32_t)(sh_addr >> 32),
+            0x80000000u,
+            2u,
             // IT_LOAD_CONTEXT_REG: 5 dwords
             0xC0000000u | (3u << 16) | (IT_LOAD_CONTEXT_REG << 8),
-            (uint32_t)cx_addr, (uint32_t)(cx_addr >> 32),
-            0x80000000u, 1u,
+            (uint32_t)cx_addr,
+            (uint32_t)(cx_addr >> 32),
+            0x80000000u,
+            1u,
         };
         GpuState s_load;
         run_cb(pkt, std::size(pkt), s_load);
         CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0) &&
-              s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] == 0x12345678u,
+                  s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] == 0x12345678u,
               "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0");
         CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u) &&
-              s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u] == 0x9abcdef0u,
+                  s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u] == 0x9abcdef0u,
               "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0+1");
         CHECK(s_load.cx.count(prosper::agc::Pm4::DB_DEPTH_SIZE_XY) &&
-              s_load.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] == 0x01000200u,
+                  s_load.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] == 0x01000200u,
               "IT_LOAD_CONTEXT_REG populates DB_DEPTH_SIZE_XY");
     }
 

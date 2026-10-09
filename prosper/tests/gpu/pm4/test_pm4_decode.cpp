@@ -260,13 +260,22 @@ TEST(Pm4Decode, Contract) {
         uint32_t load_stream[] = {
             // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
             PM4(5, IT_LOAD_SH_REG, 0),
-            0x74ec2fbcu, 0x00000040u, 0x80000000u, 10u,
+            0x74ec2fbcu,
+            0x00000040u,
+            0x80000000u,
+            10u,
             // IT_LOAD_CONTEXT_REG: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
             PM4(5, IT_LOAD_CONTEXT_REG, 0),
-            0x6616e000u, 0x00000040u, 0x80000000u, 6u,
+            0x6616e000u,
+            0x00000040u,
+            0x80000000u,
+            6u,
             // IT_LOAD_CONTEXT_REG_INDEX: 5 dwords, op 0x9F, addr 0x4075172000, flags 0x80000000, num_regs 143
             PM4(5, IT_LOAD_CONTEXT_REG_INDEX, 0),
-            0x75172000u, 0x00000040u, 0x80000000u, 143u,
+            0x75172000u,
+            0x00000040u,
+            0x80000000u,
+            143u,
         };
         std::vector<Pm4Command> load_ops;
         const size_t c = decode_pm4(load_stream, std::size(load_stream), load_ops);
@@ -300,6 +309,4 @@ TEST(Pm4Decode, Contract) {
                   other_ops[1].kind == K::Unknown,
               "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
     }
-
 }
-
