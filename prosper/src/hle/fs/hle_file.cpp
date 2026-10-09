@@ -26,6 +26,7 @@
 #include <cstring>
 #include <cerrno>
 #include <climits>
+#include <cstdint>
 #include <string>
 #include <optional>      // #1205: sandbox_normalize_subpath escape check
 #include <mutex>
@@ -737,9 +738,9 @@ namespace {
     // (/dev, /system, ...), which prosper does not serve and never served -- the host files that
     // used to answer were the host's, not the console's.
     enum class GuestPathKind : uint8_t {
-        Mapped,        // inside a served mount, or the virtual root: `host` names the host path
+        Mapped,   // inside a served mount, or the virtual root: `host` names the host path
         SystemEntry,   // a single name directly under the guest root that no served mount owns
-        Absent,        // the parent does not exist in the guest namespace (or PROSPER_DENY_SUBSTR)
+        Absent,   // the parent does not exist in the guest namespace (or PROSPER_DENY_SUBSTR)
     };
     // The namei operation the caller performs: a plain LOOKUP, or a CREATE/DELETE/RENAME.
     enum class GuestPathOp : uint8_t { Lookup, Modify };
@@ -833,10 +834,16 @@ namespace {
         // /savedata0 while no save is mounted. Both fall through to the unmapped answer rather than
         // composing "<empty root>/sub", which is a path on the host's root.
         std::string root; size_t vlen = 0;
-        if (mount_path_matches(p, "/app0")) { root = g_app0; vlen = 5; }
-        else if (mount_path_matches(p, "/temp0")) { root = temp0_root(); vlen = 6; }
-        else if (mount_path_matches(p, "/download0")) { root = download0_root(); vlen = 10; }
-        else if (mount_path_matches(p, "/savedata0")) {
+        if (mount_path_matches(p, "/app0")) {
+            root = g_app0;
+            vlen = 5;
+        } else if (mount_path_matches(p, "/temp0")) {
+            root = temp0_root();
+            vlen = 6;
+        } else if (mount_path_matches(p, "/download0")) {
+            root = download0_root();
+            vlen = 10;
+        } else if (mount_path_matches(p, "/savedata0")) {
             std::lock_guard<std::mutex> lk(g_save0_mx);
             root = g_save0;
             vlen = 10;
@@ -1349,44 +1356,58 @@ static uint32_t file_sce_error(int error) {
     return (uint32_t)prosper::hle::sce_error_from_host_errno(error, prosper::hle::FreeBsdErrno::EIo);
 }
 
-HLE(f_open)  { const GuestPath g = resolve_guest(CS(a0));
-               // FreeBSD O_CREAT (0x0200) makes the open a namei CREATE; anything else is a lookup.
-               if (!g.mapped())
-                   return refuse_unmapped(g, (a1 & 0x0200) ? GuestPathOp::Modify : GuestPathOp::Lookup);
-               const std::string& h = g.host; int host_flags = host_open_flags(a1);
+HLE(f_open) {
+    const GuestPath g = resolve_guest(CS(a0));
+    // FreeBSD O_CREAT (0x0200) makes the open a namei CREATE; anything else is a lookup.
+    if (!g.mapped())
+        return refuse_unmapped(g, (a1 & 0x0200) ? GuestPathOp::Modify : GuestPathOp::Lookup);
+    const std::string& h = g.host;
+    int host_flags = host_open_flags(a1);
 #ifdef _WIN32
-               int fd;
-               if (windows_host_path_is_directory(h)) {
-                   if ((a1 & 3) != 0) { errno = EISDIR; fd = -1; }
-                   else fd = windows_open_directory(h);
-               } else {
-                   fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
-               }
+    int fd;
+    if (windows_host_path_is_directory(h)) {
+        if ((a1 & 3) != 0) {
+            errno = EISDIR;
+            fd = -1;
+        } else
+            fd = windows_open_directory(h);
+    } else {
+        fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
+    }
 #else
-               int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
+    int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
 #endif
 #ifdef _WIN32
-               if (fd >= 0 && fd < 3) {
-                   int low_fd = fd;
-                   fd = windows_duplicate_above_stdio(low_fd);
-                   int duplicate_errno = fd < 0 ? errno : 0;
-                   ::_close(low_fd);
-                   if (fd < 0) errno = duplicate_errno;
-               }
+    if (fd >= 0 && fd < 3) {
+        int low_fd = fd;
+        fd = windows_duplicate_above_stdio(low_fd);
+        int duplicate_errno = fd < 0 ? errno : 0;
+        ::_close(low_fd);
+        if (fd < 0) errno = duplicate_errno;
+    }
 #else
-               while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
+    while (fd >= 0 && fd < 3) {
+        int nfd = fcntl(fd, F_DUPFD, 3);
+        ::close(fd);
+        fd = nfd;
+    }
 #endif
-               int err = fd < 0 ? errno : 0;
-               guest_sync_note_fd(fd);
-               filelog_remember_fd(fd, h);
-               readbytes_note_open(h);
-               readbytes_maybe_report();
-               if (filelog()) fprintf(stderr,
-                   "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
-                   h.c_str(), (unsigned long long)a1, host_flags, fd, err);
-               if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0);
-               else errno = err;
-               return (uint64_t)(int64_t)fd; }
+    int err = fd < 0 ? errno : 0;
+    guest_sync_note_fd(fd);
+    filelog_remember_fd(fd, h);
+    readbytes_note_open(h);
+    readbytes_maybe_report();
+    if (filelog())
+        fprintf(
+            stderr,
+            "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
+            h.c_str(), (unsigned long long)a1, host_flags, fd, err);
+    if (fd >= 0)
+        preadlog("open", (uint64_t)fd, 0, 0);
+    else
+        errno = err;
+    return (uint64_t)(int64_t)fd;
+}
 HLE(k_open)  { uint64_t result = f_open(a0, a1, a2, a3, a4, a5);
                return (int64_t)result < 0 ? file_sce_error(errno) : result; }
 #ifdef __APPLE__
@@ -1932,24 +1953,32 @@ HLE(k_pwritev){ uint64_t r = f_pwritev(a0, a1, a2, a3, a4, a5); int e = errno; r
 HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
 // sceKernelTruncate(path, length): the path-based sibling of ftruncate. Same fake-success -> stale-tail
 // corruption class (NID WlyEA-sLDf0, reached via libc.prx). Translate the path through the mount layer.
-HLE(f_truncate)  { const GuestPath g = resolve_guest(CS(a0));
-                   if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-                   guest_sync_note_path(g.host); return (uint64_t)(int64_t)::truncate(g.host.c_str(), (off_t)a1); }
+HLE(f_truncate) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    guest_sync_note_path(g.host);
+    return (uint64_t)(int64_t)::truncate(g.host.c_str(), (off_t)a1);
+}
 #else
 HLE(f_ftruncate) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                     int error = ::_chsize_s((int)a0, (__int64)a1);
                     if (error) { errno = error; return (uint64_t)(int64_t)-1; }
                     return 0; }
-HLE(f_truncate)  { const GuestPath g = resolve_guest(CS(a0));
-                    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-                    const std::string& h = g.host;
-                    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
-                    int fd = ::_open(h.c_str(), _O_RDWR | _O_BINARY);
-                    if (fd < 0) return (uint64_t)(int64_t)-1;
-                    int resize_error = ::_chsize_s(fd, (__int64)a1);
-                    int close_result = ::_close(fd);
-                    if (resize_error) { errno = resize_error; return (uint64_t)(int64_t)-1; }
-                    return (uint64_t)(int64_t)close_result; }
+HLE(f_truncate) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    const std::string& h = g.host;
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
+    int fd = ::_open(h.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0) return (uint64_t)(int64_t)-1;
+    int resize_error = ::_chsize_s(fd, (__int64)a1);
+    int close_result = ::_close(fd);
+    if (resize_error) {
+        errno = resize_error;
+        return (uint64_t)(int64_t)-1;
+    }
+    return (uint64_t)(int64_t)close_result;
+}
 #endif
 
 // --- sceKernelAio* — the kernel async-IO command API (issue #312 suspect list). -----------------
@@ -2035,8 +2064,15 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 }
 
 #ifndef _WIN32
-HLE(f_stat)  { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               const std::string& h = g.host; struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_stat) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    const std::string& h = g.host;
+    struct stat st;
+    int r = ::stat(h.c_str(), &st);
+    if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
+    return (uint64_t)(int64_t)r;
+}
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
                filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
@@ -2045,13 +2081,25 @@ HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? 
 // lstat: was MISSING -> the return-0 stub reported success while leaving the caller's stat buffer as
 // uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
-HLE(f_lstat) { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               const std::string& h = g.host; struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
-               const GuestPath g = resolve_guest(CS(a0));
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               guest_sync_note_path(g.host);
-               return (uint64_t)(int64_t)::chmod(g.host.c_str(), (mode_t)a1); }
+HLE(f_lstat) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    const std::string& h = g.host;
+    struct stat st;
+    int r = ::lstat(h.c_str(), &st);
+    if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
+    return (uint64_t)(int64_t)r;
+}
+HLE(f_chmod) {
+    if (!a0) {
+        errno = EFAULT;
+        return (uint64_t)(int64_t)-1;
+    }
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    guest_sync_note_path(g.host);
+    return (uint64_t)(int64_t)::chmod(g.host.c_str(), (mode_t)a1);
+}
 HLE(f_fchmod){ return (uint64_t)(int64_t)::fchmod((int)a0, (mode_t)a1); }
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 HLE(f_fdatasync) {
@@ -2070,8 +2118,15 @@ HLE(k_sync) {
     return 0;
 }
 #else
-HLE(f_stat)  { const GuestPath g = resolve_guest(CS(a0)); if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               const std::string& h = g.host; struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_stat) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    const std::string& h = g.host;
+    struct _stat64 st;
+    int r = ::_stat64(h.c_str(), &st);
+    if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1));
+    return (uint64_t)(int64_t)r;
+}
 HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                int r = windows_directory_path((int)a0, &directory_path)
@@ -2083,10 +2138,15 @@ HLE(f_fstat) { struct _stat64 st; std::string directory_path;
                if (r < 0) errno = err;
                return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
-HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
-               const GuestPath g = resolve_guest(CS(a0));
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               return (uint64_t)(int64_t)windows_chmod_path(g.host, a1); }
+HLE(f_chmod) {
+    if (!a0) {
+        errno = EFAULT;
+        return (uint64_t)(int64_t)-1;
+    }
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    return (uint64_t)(int64_t)windows_chmod_path(g.host, a1);
+}
 HLE(f_fchmod){ return (uint64_t)(int64_t)windows_fchmod((int)a0, a1); }
 HLE(f_fsync) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                return (uint64_t)(int64_t)::_commit((int)a0); }
@@ -2192,21 +2252,28 @@ HLE(k_utimes) {
     return updated ? 0 : file_sce_error(windows_directory_errno(error));
 #endif
 }
-HLE(f_access){ const GuestPath g = resolve_guest(CS(a0));
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
-               return (uint64_t)(int64_t)::access(g.host.c_str(), (int)a1); }
-HLE(f_mkdir) { const GuestPath g = resolve_guest(CS(a0));   // sceKernelMkdir(path, mode)
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
-               const std::string& h = g.host; guest_sync_note_path(h);
+HLE(f_access) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Lookup);
+    return (uint64_t)(int64_t)::access(g.host.c_str(), (int)a1);
+}
+HLE(f_mkdir) {
+    const GuestPath g = resolve_guest(CS(a0));   // sceKernelMkdir(path, mode)
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+    const std::string& h = g.host;
+    guest_sync_note_path(h);
 #ifdef _WIN32
     return (uint64_t)(int64_t)::_mkdir(h.c_str());
 #else
     return (uint64_t)(int64_t)::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
 #endif
 }
-HLE(f_rmdir) { const GuestPath g = resolve_guest(CS(a0));
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
-               guest_sync_note_path(g.host); return (uint64_t)(int64_t)::rmdir(g.host.c_str()); }
+HLE(f_rmdir) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+    guest_sync_note_path(g.host);
+    return (uint64_t)(int64_t)::rmdir(g.host.c_str());
+}
 HLE(k_mkdir) { uint64_t r = f_mkdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rmdir) { uint64_t r = f_rmdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
@@ -2381,15 +2448,17 @@ HLE(f_getdents) {
 HLE(f_getdirentries) {
     return directory_result_to_posix(k_getdirentries(a0, a1, a2, a3, a4, a5));
 }
-HLE(f_unlink){ const GuestPath g = resolve_guest(CS(a0));
-               if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
-               const std::string& h = g.host; guest_sync_note_path(h); return (uint64_t)(int64_t)::
+HLE(f_unlink) {
+    const GuestPath g = resolve_guest(CS(a0));
+    if (!g.mapped()) return refuse_unmapped(g, GuestPathOp::Modify);
+    const std::string& h = g.host;
+    guest_sync_note_path(h);
 #ifdef _WIN32
-    _unlink
+    return (uint64_t)(int64_t)::_unlink(h.c_str());
 #else
-    unlink
+    return (uint64_t)(int64_t)::unlink(h.c_str());
 #endif
-    (h.c_str()); }
+}
 // sceKernelRename(from, to): move/rename a file. Was MISSING -> the return-0 stub faked success without
 // moving anything, breaking the near-universal atomic-save idiom (write "save.tmp", then rename it over
 // "save.dat"): the real save file was never produced/updated while the guest believed it saved. BOTH
@@ -2398,16 +2467,19 @@ HLE(f_unlink){ const GuestPath g = resolve_guest(CS(a0));
 // Outside the mounts the order is FreeBSD's kern_renameat: the source is looked up first (a DELETE),
 // then the target (a RENAME), so an unmapped source answers before the target is examined, and an
 // unmapped target answers only once the source is known to exist (#4782).
-HLE(f_rename){ const GuestPath from = resolve_guest(CS(a0));
-               if (!from.mapped()) return refuse_unmapped(from, GuestPathOp::Modify);
-               const GuestPath to = resolve_guest(CS(a1));
-               if (!to.mapped()) {
-                   struct stat st;
-                   if (::stat(from.host.c_str(), &st) != 0) return (uint64_t)(int64_t)-1;   // its errno
-                   return refuse_unmapped(to, GuestPathOp::Modify);
-               }
-               guest_sync_note_path(from.host); guest_sync_note_path(to.host);
-               return (uint64_t)(int64_t)::rename(from.host.c_str(), to.host.c_str()); }
+HLE(f_rename) {
+    const GuestPath from = resolve_guest(CS(a0));
+    if (!from.mapped()) return refuse_unmapped(from, GuestPathOp::Modify);
+    const GuestPath to = resolve_guest(CS(a1));
+    if (!to.mapped()) {
+        struct stat st;
+        if (::stat(from.host.c_str(), &st) != 0) return (uint64_t)(int64_t)-1;   // its errno
+        return refuse_unmapped(to, GuestPathOp::Modify);
+    }
+    guest_sync_note_path(from.host);
+    guest_sync_note_path(to.host);
+    return (uint64_t)(int64_t)::rename(from.host.c_str(), to.host.c_str());
+}
 HLE(k_unlink){ uint64_t r = f_unlink(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rename){ uint64_t r = f_rename(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 

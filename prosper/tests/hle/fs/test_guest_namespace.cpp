@@ -20,14 +20,18 @@
 //     the namespace does not serve. This is what makes the root-level console-code arms fail on a
 //     read-only host root, where the sentinel trick cannot reach.
 //
-// Mutations each arm was written against (all redden at least one arm here):
-//   M1  resolve_guest() returns the guest spelling as a host path for an unmapped path (the
-//       pre-#4782 passthrough)          -> every sentinel and recorder arm
-//   M2  unmapped_errno() answers ENOENT for every operation   -> the EROFS arms
-//   M3  f_open treats O_CREAT as a lookup                     -> the open(O_CREAT) EROFS arms
-//   M4  a relative path is not rooted at the guest root        -> RelativePaths...
-//   M5  a mount with an empty host root is served ("/app0" before set_app0_root composes
-//       "<empty>/sub", a path on the host's root)              -> UnconfiguredApp0...
+// Each arm fails without the fix: against the pre-#4782 hle_file.cpp all seven non-control cases
+// fail. Mutations of the fix, and the cases each one reddens (all measured):
+//   M1  resolve_guest() hands an unmapped path to the host as if mapped (the old passthrough)
+//       -> RootLevelNamespaceChanges, RootLevelCreateOpen, RenameAcross, LookupsAndDeepPaths,
+//          HostPathsAreNotGuestPaths, RelativePaths
+//   M2  unmapped_errno() answers ENOENT for every operation
+//       -> RootLevelNamespaceChanges, RootLevelCreateOpen, RenameAcross, RelativePaths
+//   M3  f_open treats O_CREAT as a lookup       -> RootLevelCreateOpen, RelativePaths
+//   M4  a relative path is not rooted at the guest root, so it names the host's working
+//       directory again                         -> RelativePaths
+//   M5  a mount with an empty host root is served, composing "<empty>/sub" on the host's root
+//       -> LookupsAndDeepPaths (/savedata0), UnconfiguredApp0
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
@@ -37,8 +41,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <string>
+#include <system_error>
 #include <vector>
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -79,7 +85,9 @@ Fn real_symbol(const char* name) {
 }
 #endif
 
-uint64_t ptr(const void* p) { return (uint64_t)(uintptr_t)p; }
+uint64_t ptr(const void* p) {
+    return (uint64_t)(uintptr_t)p;
+}
 
 uint64_t call(const char* name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
     HleFn fn = Hle::lookup(nid_hash(name));
@@ -140,7 +148,7 @@ protected:
     fs::path root_;
 };
 
-} // namespace
+}   // namespace
 
 #if defined(__linux__)
 // The interposed namespace-changing calls. Each records, then forwards to the C library.
@@ -235,8 +243,10 @@ TEST_F(GuestNamespace, RenameAcrossTheMountBoundaryAnswersErofs) {
 TEST_F(GuestNamespace, LookupsAndDeepPathsAnswerEnoent) {
     const char* deep = "/oracle_nonexistent/file";
     EXPECT_EQ(call("sceKernelUnlink", ptr(deep)), kSceEnoent) << "console: kx_file_unlink_missing";
-    EXPECT_EQ(call("sceKernelOpen", ptr(deep), 0, 0), kSceEnoent) << "console: kx_file_open_missing";
-    EXPECT_EQ(call("sceKernelOpen", ptr(""), 0, 0), kSceEnoent) << "console: kx_file_open_empty_path";
+    EXPECT_EQ(call("sceKernelOpen", ptr(deep), 0, 0), kSceEnoent)
+        << "console: kx_file_open_missing";
+    EXPECT_EQ(call("sceKernelOpen", ptr(""), 0, 0), kSceEnoent)
+        << "console: kx_file_open_empty_path";
     uint8_t stat_buffer[0x78] = {};
     EXPECT_EQ(call("sceKernelStat", ptr(deep), ptr(stat_buffer)), kSceEnoent)
         << "console: kx_file_stat_missing";

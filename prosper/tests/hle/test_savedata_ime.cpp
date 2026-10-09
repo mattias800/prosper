@@ -226,7 +226,7 @@ TEST(SavedataIme, Contract) {
                          0,0,0,0) == 0x809F0007ull,
                   "Mount2 CREATE of an existing save -> EXISTS");
             CHECK(all_bytes_are(&guarded, sizeof guarded, 0xAB) &&
-                  resolve_guest_path("/savedata0/probe.bin").empty(),
+                      resolve_guest_path("/savedata0/probe.bin").empty(),
                   "failed exclusive CREATE leaves its result untouched and does not mount");
 
             memset(&guarded, 0xAB, sizeof guarded);

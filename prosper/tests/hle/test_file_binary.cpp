@@ -193,17 +193,18 @@ TEST(FileBinary, Contract) {
     const std::string guest_dir_path = guest_scratch(kMkdirDirName);
     std::error_code remove_error;
     std::filesystem::remove_all(dir_path, remove_error);
-    int64_t mkdir_first = mkdir_fn
-        ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
-        : -1;
+    int64_t mkdir_first =
+        mkdir_fn ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
+                 : -1;
     errno = 0;
-    int64_t mkdir_duplicate = mkdir_fn
-        ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
-        : 0;
+    int64_t mkdir_duplicate =
+        mkdir_fn ? (int64_t)mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
+                 : 0;
     int duplicate_errno = errno;
-    uint64_t kernel_mkdir_duplicate = kernel_mkdir_fn
-        ? kernel_mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
-        : 0;
+    uint64_t kernel_mkdir_duplicate =
+        kernel_mkdir_fn
+            ? kernel_mkdir_fn((uint64_t)(uintptr_t)guest_dir_path.c_str(), 0777, 0, 0, 0, 0)
+            : 0;
     CHECK(mkdir_first == 0, "mkdir creates a new directory");
     CHECK(mkdir_duplicate == -1, "mkdir reports an existing directory as failure");
     CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
@@ -304,7 +305,8 @@ TEST(FileBinary, Contract) {
         "/app0/" + std::filesystem::path(mode_path).filename().string();
     std::array<uint8_t, 0x78> mode_stat{};
     CHECK(mode_fd >= 0 && kernel_chmod_fn && kernel_stat_fn &&
-              kernel_chmod_fn((uint64_t)(uintptr_t)guest_mode_path.c_str(), 0444, 0, 0, 0, 0) == 0 &&
+              kernel_chmod_fn((uint64_t)(uintptr_t)guest_mode_path.c_str(), 0444, 0, 0, 0, 0) ==
+                  0 &&
               kernel_stat_fn((uint64_t)(uintptr_t)guest_mode_path.c_str(),
                              (uint64_t)(uintptr_t)mode_stat.data(), 0, 0, 0, 0) == 0 &&
               (*(const uint16_t*)(mode_stat.data() + 0x08) & 0777) == 0444,
@@ -371,7 +373,7 @@ TEST(FileBinary, Contract) {
     timestamp_stat.fill(0);
     CHECK(precision_fd >= 0 && kernel_utimes_fn && kernel_stat_fn &&
               kernel_utimes_fn((uint64_t)(uintptr_t)guest_precision_path.c_str(),
-                                (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0 &&
+                               (uint64_t)(uintptr_t)explicit_times, 0, 0, 0, 0) == 0 &&
               kernel_stat_fn((uint64_t)(uintptr_t)guest_precision_path.c_str(),
                              (uint64_t)(uintptr_t)timestamp_stat.data(), 0, 0, 0, 0) == 0 &&
               *(const int64_t*)(timestamp_stat.data() + 0x20) == explicit_times[0].usec * 1000 &&
@@ -558,13 +560,12 @@ TEST(FileBinary, Contract) {
     std::error_code missing_remove_error;
     std::filesystem::remove(missing_path, missing_remove_error);
     errno = 0;
-    int64_t posix_missing = posix_open_fn
-        ? (int64_t)posix_open_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0)
-        : 0;
+    int64_t posix_missing =
+        posix_open_fn ? (int64_t)posix_open_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0)
+                      : 0;
     int posix_missing_errno = errno;
-    uint64_t kernel_missing = open_fn
-        ? open_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0)
-        : 0;
+    uint64_t kernel_missing =
+        open_fn ? open_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0) : 0;
     CHECK(posix_missing == -1 && posix_missing_errno == ENOENT,
           "libc open retains the -1 plus errno contract");
     CHECK((uint32_t)kernel_missing == 0x80020002u,
@@ -583,8 +584,8 @@ TEST(FileBinary, Contract) {
         FILE* deny_out = std::fopen(deny_host.c_str(), "wb");
         CHECK(deny_out != nullptr, "create deny fixture");
         if (deny_out) { std::fputs("x", deny_out); std::fclose(deny_out); }
-        const uint64_t denied = open_fn
-            ? open_fn((uint64_t)(uintptr_t)deny_guest.c_str(), 0, 0, 0, 0, 0) : 0;
+        const uint64_t denied =
+            open_fn ? open_fn((uint64_t)(uintptr_t)deny_guest.c_str(), 0, 0, 0, 0, 0) : 0;
         CHECK((uint32_t)denied == 0x80020002u,
               "PROSPER_DENY_SUBSTR denies a case-variant spelling (ENOENT despite the file existing)");
         std::remove(deny_host.c_str());
@@ -613,8 +614,7 @@ TEST(FileBinary, Contract) {
         }
         const uint64_t sibling = open_fn
             ? open_fn((uint64_t)(uintptr_t)"/app0/../etc", 0, 0, 0, 0, 0) : 0;
-        CHECK((uint32_t)sibling == 0x80020002u,
-              "'/app0/../etc' is outside every mount (ENOENT)");
+        CHECK((uint32_t)sibling == 0x80020002u, "'/app0/../etc' is outside every mount (ENOENT)");
     }
     const std::string unreachable_file = std::string("/app0/") + kMissingName;
     std::string overlong_path(256, 'a');
@@ -669,14 +669,14 @@ TEST(FileBinary, Contract) {
         const auto untouched = libc_buffer;
         errno = 0;
         uint64_t libc_result = libc_fn
-            ? libc_fn((uint64_t)(uintptr_t)guest_missing,
-                      (uint64_t)(uintptr_t)libc_buffer.data(), 0, 0, 0, 0)
-            : 0;
+                                   ? libc_fn((uint64_t)(uintptr_t)guest_missing,
+                                             (uint64_t)(uintptr_t)libc_buffer.data(), 0, 0, 0, 0)
+                                   : 0;
         const int libc_error = errno;
-        uint64_t kernel_result = kernel_fn
-            ? kernel_fn((uint64_t)(uintptr_t)guest_missing,
-                        (uint64_t)(uintptr_t)kernel_buffer.data(), 0, 0, 0, 0)
-            : 0;
+        uint64_t kernel_result =
+            kernel_fn ? kernel_fn((uint64_t)(uintptr_t)guest_missing,
+                                  (uint64_t)(uintptr_t)kernel_buffer.data(), 0, 0, 0, 0)
+                      : 0;
         const std::string libc_message = std::string("libc ") + operation +
                                          " retains -1 plus ENOENT";
         const std::string kernel_message = std::string("sceKernel") + operation +
@@ -693,13 +693,11 @@ TEST(FileBinary, Contract) {
     auto check_missing_path_contract = [&](const char* operation, HleFn libc_fn,
                                            HleFn kernel_fn) {
         errno = 0;
-        uint64_t libc_result = libc_fn
-            ? libc_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0)
-            : 0;
+        uint64_t libc_result =
+            libc_fn ? libc_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0) : 0;
         const int libc_error = errno;
-        uint64_t kernel_result = kernel_fn
-            ? kernel_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0)
-            : 0;
+        uint64_t kernel_result =
+            kernel_fn ? kernel_fn((uint64_t)(uintptr_t)guest_missing, 0, 0, 0, 0, 0) : 0;
         const std::string libc_message = std::string("libc ") + operation +
                                          " retains -1 plus ENOENT";
         const std::string kernel_message = std::string("sceKernel") + operation +
@@ -717,23 +715,25 @@ TEST(FileBinary, Contract) {
         guest_scratch("prosper-test-file-binary-missing-renamed.tmp");
     std::filesystem::remove(missing_rename_target, missing_remove_error);
     errno = 0;
-    int64_t libc_missing_rename = rename_fn
-        ? (int64_t)rename_fn((uint64_t)(uintptr_t)guest_missing,
-                             (uint64_t)(uintptr_t)guest_missing_rename_target.c_str(), 0, 0, 0, 0)
-        : 0;
+    int64_t libc_missing_rename =
+        rename_fn ? (int64_t)rename_fn((uint64_t)(uintptr_t)guest_missing,
+                                       (uint64_t)(uintptr_t)guest_missing_rename_target.c_str(), 0,
+                                       0, 0, 0)
+                  : 0;
     const int libc_missing_rename_error = errno;
-    uint64_t kernel_missing_rename = kernel_rename_fn
-        ? kernel_rename_fn((uint64_t)(uintptr_t)guest_missing,
-                           (uint64_t)(uintptr_t)guest_missing_rename_target.c_str(), 0, 0, 0, 0)
-        : 0;
+    uint64_t kernel_missing_rename =
+        kernel_rename_fn
+            ? kernel_rename_fn((uint64_t)(uintptr_t)guest_missing,
+                               (uint64_t)(uintptr_t)guest_missing_rename_target.c_str(), 0, 0, 0, 0)
+            : 0;
     CHECK(libc_missing_rename == -1 && libc_missing_rename_error == ENOENT,
           "libc rename retains -1 plus ENOENT");
     CHECK(kernel_missing_rename == 0x80020002u,
           "sceKernelRename returns SCE_KERNEL_ERROR_ENOENT directly");
 
-    uint64_t kernel_missing_truncate = kernel_truncate_fn
-        ? kernel_truncate_fn((uint64_t)(uintptr_t)guest_missing, 3, 0, 0, 0, 0)
-        : 0;
+    uint64_t kernel_missing_truncate =
+        kernel_truncate_fn ? kernel_truncate_fn((uint64_t)(uintptr_t)guest_missing, 3, 0, 0, 0, 0)
+                           : 0;
     CHECK(kernel_missing_truncate == 0x80020002u,
           "sceKernelTruncate returns SCE_KERNEL_ERROR_ENOENT directly");
 
@@ -751,9 +751,10 @@ TEST(FileBinary, Contract) {
             truncate_bytes.size();
         std::fclose(truncate_out);
     }
-    uint64_t kernel_truncate_result = truncate_fixture_written && kernel_truncate_fn
-        ? kernel_truncate_fn((uint64_t)(uintptr_t)guest_truncate_path.c_str(), 3, 0, 0, 0, 0)
-        : ~uint64_t{0};
+    uint64_t kernel_truncate_result =
+        truncate_fixture_written && kernel_truncate_fn
+            ? kernel_truncate_fn((uint64_t)(uintptr_t)guest_truncate_path.c_str(), 3, 0, 0, 0, 0)
+            : ~uint64_t{0};
     std::error_code truncate_size_error;
     uintmax_t truncated_size = std::filesystem::file_size(truncate_path, truncate_size_error);
     CHECK(truncate_fixture_written && kernel_truncate_result == 0 && !truncate_size_error &&
@@ -776,9 +777,11 @@ TEST(FileBinary, Contract) {
             resize_bytes.size();
         std::fclose(descriptor_resize_out);
     }
-    int64_t descriptor_resize_fd = descriptor_resize_fixture_written && open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_descriptor_resize_path.c_str(), 2, 0, 0, 0, 0)
-        : -1;
+    int64_t descriptor_resize_fd =
+        descriptor_resize_fixture_written && open_fn
+            ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_descriptor_resize_path.c_str(), 2, 0, 0,
+                               0, 0)
+            : -1;
     uint64_t kernel_ftruncate_result = descriptor_resize_fd >= 0 && kernel_ftruncate_fn
         ? kernel_ftruncate_fn((uint64_t)descriptor_resize_fd, 3, 0, 0, 0, 0)
         : ~uint64_t{0};
@@ -803,10 +806,10 @@ TEST(FileBinary, Contract) {
     constexpr uint64_t kGuestOWriteOnly = 0x0001;
     constexpr uint64_t kGuestOCreate = 0x0200;
     constexpr uint64_t kGuestOExclusive = 0x0800;
-    uint64_t kernel_existing = open_fn
-        ? open_fn((uint64_t)(uintptr_t)guest_path,
-                  kGuestOWriteOnly | kGuestOCreate | kGuestOExclusive, 0600, 0, 0, 0)
-        : 0;
+    uint64_t kernel_existing =
+        open_fn ? open_fn((uint64_t)(uintptr_t)guest_path,
+                          kGuestOWriteOnly | kGuestOCreate | kGuestOExclusive, 0600, 0, 0, 0)
+                : 0;
     CHECK((uint32_t)kernel_existing == 0x80020011u,
           "sceKernelOpen translates an exclusive-create collision to EEXIST");
 
@@ -824,8 +827,8 @@ TEST(FileBinary, Contract) {
     std::filesystem::create_symlink(loop_b, loop_a, symlink_error);
     if (!symlink_error) std::filesystem::create_symlink(loop_a, loop_b, symlink_error);
     uint64_t kernel_loop = !symlink_error && open_fn
-        ? open_fn((uint64_t)(uintptr_t)guest_loop_a.c_str(), 0, 0, 0, 0, 0)
-        : 0;
+                               ? open_fn((uint64_t)(uintptr_t)guest_loop_a.c_str(), 0, 0, 0, 0, 0)
+                               : 0;
     CHECK(!symlink_error && (uint32_t)kernel_loop == 0x8002003eu,
           "sceKernelOpen translates host ELOOP to the divergent Orbis value");
     std::filesystem::remove(loop_a, symlink_error);
@@ -1075,9 +1078,8 @@ TEST(FileBinary, Contract) {
 
     // A duplicate is a distinct descriptor for the same open file description: it shares the
     // current offset and remains usable after the original descriptor is closed.
-    int64_t dup_source = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t dup_source =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     int64_t duplicated = dup_source >= 0 && kernel_dup_fn
         ? (int64_t)kernel_dup_fn((uint64_t)dup_source, 0, 0, 0, 0, 0)
         : -1;
@@ -1114,9 +1116,8 @@ TEST(FileBinary, Contract) {
     int stdin_filler = -1;
     if (saved_stdin < 0) stdin_filler = ::_open("NUL", _O_RDONLY | _O_BINARY);
     CHECK(saved_stdin >= 0 || stdin_filler == 0, "occupy fd 0 before low-slot dup test");
-    int64_t low_slot_source = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t low_slot_source =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     CHECK(low_slot_source >= 3, "open dup source outside the stdio range");
     CHECK(::_close(0) == 0, "free fd 0 for deterministic dup reuse");
     int64_t low_slot_duplicate = low_slot_source >= 0 && kernel_dup_fn
@@ -1131,9 +1132,8 @@ TEST(FileBinary, Contract) {
 
     // With fd 0 still free, the Windows CRT will allocate it for the next open. The HLE must move
     // that live file into the guest-visible range before returning it, without losing its contents.
-    int64_t low_slot_open = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t low_slot_open =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     CHECK(low_slot_open >= 3, "sceKernelOpen lifts a recycled Windows stdio descriptor");
     std::array<uint8_t, 16> low_slot_open_chunk{};
     int64_t low_slot_open_n = low_slot_open >= 0 && read_fn
@@ -1157,12 +1157,10 @@ TEST(FileBinary, Contract) {
 
     // dup2 must replace an already-open target, share the source offset, and return the target
     // descriptor. The Windows CRT returns zero on success, so this catches a missing ABI translation.
-    int64_t dup2_source = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
-    int64_t dup2_target = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t dup2_source =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
+    int64_t dup2_target =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     constexpr int64_t source_offset = 73;
     constexpr int64_t old_target_offset = 211;
     int64_t source_seek = dup2_source >= 0 && lseek_fn
@@ -1197,9 +1195,8 @@ TEST(FileBinary, Contract) {
         ? (int64_t)kernel_dup_fn(~uint64_t{0}, 0, 0, 0, 0, 0)
         : 0;
     CHECK(invalid_duplicate == -1, "sceKernelDup safely rejects an invalid source descriptor");
-    int64_t preserved_target = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t preserved_target =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     constexpr int64_t preserved_offset = 137;
     int64_t preserved_seek = preserved_target >= 0 && lseek_fn
         ? (int64_t)lseek_fn((uint64_t)preserved_target, preserved_offset, SEEK_SET, 0, 0, 0)
@@ -1236,9 +1233,8 @@ TEST(FileBinary, Contract) {
     CHECK(sparse != nullptr, "reserve sparse guest-style read buffer");
     void* committed = sparse ? VirtualAlloc(sparse, 0x4000, MEM_COMMIT, PAGE_READWRITE) : nullptr;
     CHECK(committed == sparse, "commit only the first guest page");
-    int64_t sparse_fd = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t sparse_fd =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     CHECK(sparse_fd >= 0, "reopen fixture for sparse-buffer short read");
     int64_t sparse_n = sparse_fd >= 0 && read_fn && sparse
         ? (int64_t)read_fn((uint64_t)sparse_fd, (uint64_t)(uintptr_t)sparse, 0x10000, 0, 0, 0)
@@ -1255,9 +1251,8 @@ TEST(FileBinary, Contract) {
     // Repeating the reviewer's invalid-first-chunk probe verifies both EFAULT and retry position.
     void* invalid_first = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(invalid_first != nullptr, "reserve inaccessible invalid-read destination");
-    int64_t invalid_fd = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t invalid_fd =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     int64_t invalid_n = invalid_fd >= 0 && read_fn && invalid_first
         ? (int64_t)read_fn((uint64_t)invalid_fd, (uint64_t)(uintptr_t)invalid_first,
                            100, 0, 0, 0)
@@ -1291,9 +1286,10 @@ TEST(FileBinary, Contract) {
         ? VirtualAlloc(partial, 0x10000, MEM_COMMIT, PAGE_READWRITE) : nullptr;
     CHECK(partial && partial_committed == partial,
           "commit only first chunk of partial-copy destination");
-    int64_t partial_fd = open_fn && large_written
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_large_path.c_str(), 0, 0, 0, 0, 0)
-        : -1;
+    int64_t partial_fd =
+        open_fn && large_written
+            ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_large_path.c_str(), 0, 0, 0, 0, 0)
+            : -1;
     int64_t partial_n = partial_fd >= 0 && read_fn && partial
         ? (int64_t)read_fn((uint64_t)partial_fd, (uint64_t)(uintptr_t)partial,
                            0x20000, 0, 0, 0)
@@ -1315,9 +1311,8 @@ TEST(FileBinary, Contract) {
     // inaccessible so a host read that probes it reproduces the Windows CRT failure deterministically.
     void* past_eof = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(past_eof != nullptr, "reserve inaccessible past-EOF destination");
-    int64_t past_eof_fd = open_fn
-        ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0)
-        : -1;
+    int64_t past_eof_fd =
+        open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)guest_path, 0, 0, 0, 0, 0) : -1;
     constexpr int64_t past_eof_offset = 4096;
     int64_t seek_result = past_eof_fd >= 0 && lseek_fn
         ? (int64_t)lseek_fn((uint64_t)past_eof_fd, (uint64_t)past_eof_offset,

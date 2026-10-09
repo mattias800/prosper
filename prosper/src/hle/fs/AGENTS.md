@@ -3,8 +3,9 @@
 Two subjects that share a root: what the guest reads and writes through file descriptors, and the
 save data the platform layers on top of it.
 
-- `hle_file` — the POSIX and `sceKernel*` file surface, with `/app0` path translation. The largest
-  thing here and still per-platform in one file; see the note below.
+- `hle_file` — the POSIX and `sceKernel*` file surface, with the guest mount table (`/app0`,
+  `/temp0`, `/savedata0`, `/download0`). The largest thing here and still per-platform in one
+  file; see the note below.
 - `guest_fopen_mode` — the guest's `fopen` mode grammar (Dinkumware `_Foprep`, read from the
   shipped libc.prx), re-spelled for the host C library; on Windows a verbatim mode opened guest
   binary files in text mode. Only titles that ship no libc.prx reach it.
@@ -32,6 +33,17 @@ It is ~4,500 lines of which roughly a fifth is behind an inactive `#if` on any o
 AST tool reading it on Linux is answering about four fifths of the file. Splitting it per platform
 (`*_linux.cpp` / `*_win.cpp` beside a shared header) is tracked separately; until then, check which
 arm you are reading.
+
+## Guest paths never reach the host unmapped
+
+Every path-taking entry point resolves its guest path through `resolve_guest()` in `hle_file.cpp`,
+and only a mapped result carries a host path. A path no served mount owns — an absolute path
+outside the mounts, a relative path, `/app0` before a root is set, `/savedata0` with no save
+mounted — is answered from the guest namespace model (EROFS for a root-level create/remove/rename,
+ENOENT otherwise) and never touches the host (#4782). A new entry point takes a `GuestPath`, checks
+`mapped()`, and only then calls the host; `resolve_guest_path()` is the same rule for code outside
+this file and returns an empty string for an unmapped path. A test fixture is reached through
+`/app0` rooted at its scratch directory, never by its host path.
 
 ## Registration
 

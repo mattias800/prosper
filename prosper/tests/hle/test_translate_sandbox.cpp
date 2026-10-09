@@ -31,7 +31,9 @@ using namespace prosper;
 
 // Unmapped (#4782): no host path at all. Before #4782 an escape was redirected to a
 // "/prosper-denied" host path and any other unmounted path was returned verbatim.
-static bool denied(const std::string& r) { return r.empty(); }
+static bool denied(const std::string& r) {
+    return r.empty();
+}
 
 TEST(TranslateSandbox, Contract) {
     std::printf("== test_translate_sandbox ==\n");

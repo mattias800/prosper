@@ -229,7 +229,7 @@ TEST(AprRegistry, Contract) {
     } else {
         CHECK(false, "create equal-size APR collision fixture");
     }
-    const char* collision_paths[2] = { fixture_guest, collision_guest };
+    const char* collision_paths[2] = {fixture_guest, collision_guest};
     uint32_t collision_ids[2]{};
     uint64_t collision_sizes[2]{};
     uint32_t collision_error = ~uint32_t{0};
@@ -497,7 +497,10 @@ TEST(AprRegistry, Contract) {
     const std::string wp_full_host = resolve_guest_path(wp_full);
     std::array<uint8_t, 321> wp_bytes{};
     for (size_t i = 0; i < wp_bytes.size(); ++i) wp_bytes[i] = (uint8_t)(i * 13u + 5u);
-    if (FILE* wf = std::fopen(wp_full_host.c_str(), "wb")) { std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf); std::fclose(wf); }
+    if (FILE* wf = std::fopen(wp_full_host.c_str(), "wb")) {
+        std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf);
+        std::fclose(wf);
+    }
 
     if (resolve_prefix && resolve_plain) {
         // The prefix path is prepended: prefix="<scratch dir>/prosper-test-apr-", paths[0]="prefix.tmp".
