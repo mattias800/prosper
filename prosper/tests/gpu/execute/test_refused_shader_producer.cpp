@@ -197,6 +197,52 @@ TEST_F(RefusedShaderProducer, SuccessfulComputeCreatesNoRefusalEvidence) {
     EXPECT_TRUE(refused_shader_dump_directory().empty());
 }
 
+TEST_F(RefusedShaderProducer, BackendDeclinedComputeKeepsTheProgramAndItsReason) {
+    // #4808: a dispatch that recompiles and is realized, then declined by the live backend, used
+    // to leave no program evidence -- the largest skip category in the census had no dump at all.
+    // The backend names its reason through set_compute_decline_reason; the executor dumps the
+    // program with it. A decline that names nothing is still dumped, as "unrecorded".
+    alignas(256) static const uint32_t named[] = {0x7e000280u, 0xbf810000u};
+    alignas(256) static const uint32_t unnamed[] = {0x7e000281u, 0xbf810000u};
+    static ComputeShaderBlob named_blob, unnamed_blob;
+    ASSERT_TRUE(register_compute(named, std::size(named), named_blob));
+    ASSERT_TRUE(register_compute(unnamed, std::size(unnamed), unnamed_blob));
+    const auto read_index = [] {
+        std::ifstream index(fs::path(refused_shader_dump_directory()) / "index.txt");
+        return std::string((std::istreambuf_iterator<char>(index)), {});
+    };
+
+    set_submit_compute([](const std::vector<ComputeItem>&) {
+        set_compute_decline_reason("layered image deferred to #657");
+        return false;
+    });
+    testing::internal::CaptureStderr();
+    (void)execute_nonrender_submit_work(compute_state(named_blob.registers, 64), 4808);
+    const std::string log = testing::internal::GetCapturedStderr();
+    const std::vector<uint32_t> named_words(std::begin(named), std::end(named));
+    ASSERT_EQ(recorded_words(), (std::vector<std::vector<uint32_t>>{named_words}))
+        << "the declined program is dumped once, byte for byte";
+    std::string lines = read_index();
+    EXPECT_NE(lines.find("cs addr=0x"), std::string::npos) << lines;
+    EXPECT_NE(lines.find("refusal=backend-declined:layered-image-deferred-to-#657"),
+              std::string::npos)
+        << lines;
+    const size_t announced = log.find("[refused-shader] cs 0x");
+    ASSERT_NE(announced, std::string::npos) << log;
+    const std::string line = log.substr(announced, log.find('\n', announced) - announced);
+    EXPECT_NE(line.find(" refusal=backend-declined:layered-image-deferred-to-#657 -> "),
+              std::string::npos)
+        << line;
+
+    set_submit_compute([](const std::vector<ComputeItem>&) { return false; });
+    (void)execute_nonrender_submit_work(compute_state(unnamed_blob.registers, 64), 4809);
+    set_submit_compute({});
+    EXPECT_EQ(recorded_words().size(), 2u);
+    lines = read_index();
+    EXPECT_NE(lines.find("refusal=backend-declined:unrecorded"), std::string::npos) << lines;
+    EXPECT_EQ(take_compute_decline_reason(), nullptr) << "the executor consumed the slot";
+}
+
 TEST_F(RefusedShaderProducer, GraphicsRewriteKeepsOnlyRefusedStageAndSuccessfulNeighbor) {
     // S_BARRIER is not admitted in a normal fragment stage. Both byte versions must still refuse.
     alignas(256) uint32_t fragment[std::size(vertex_words)] = {
