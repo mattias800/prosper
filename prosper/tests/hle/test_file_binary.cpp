@@ -74,6 +74,7 @@ TEST(FileBinary, Contract) {
     _putenv_s("PROSPER_TEMP0", temp0_root.c_str());
 #else
     setenv("PROSPER_DENY_SUBSTR", ".TMPDENY", 1);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): set once in single-threaded test setup
     setenv("PROSPER_TEMP0", temp0_root.c_str(), 1);
 #endif
     // #1621: fixtures live in this process's own scratch directory rather than under fixed relative
