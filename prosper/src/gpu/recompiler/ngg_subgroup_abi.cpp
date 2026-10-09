@@ -24,6 +24,10 @@ constexpr int kM0 = 124;
 constexpr int kExecLo = 126;
 constexpr int kExecHi = 127;
 constexpr uint32_t kS3GsWaveId = 0x00ff0000u;
+// The s2 fields the shell supplies (ngg_subgroup_plan.hpp, ngg_group_info): the subgroup's ES
+// vertex count [20:12] and primitive count [30:22]. Every other bit is launched as 0 and a read
+// that can observe one is refused.
+constexpr uint32_t kS2Supplied = 0x7fdff000u;
 
 // The three launch VGPRs the shell does not supply: v4 (adjacency offsets 4/5) and v6/v7 (ES user
 // VGPRs). Bit k of a mask names kTrackedVgpr[k].
@@ -37,6 +41,7 @@ uint8_t tracked_bit(int reg) {
 struct State {
     std::bitset<128> sdef;   // scalar registers written on EVERY path (launch values included)
     bool s3_overwritten = false;   // s3 no longer holds the launch value on every path
+    bool s2_overwritten = false;   // the same for s2
     bool exec_full = false;   // EXEC is all-ones on every path
     uint8_t vall = 0;   // tracked VGPRs written for all 64 lanes on every path
     uint8_t vcur = 0;   // tracked VGPRs written for every lane active in the current EXEC
@@ -64,6 +69,7 @@ struct State {
         sdef &= o.sdef;
         scc = scc && o.scc;
         s3_overwritten = s3_overwritten && o.s3_overwritten;
+        s2_overwritten = s2_overwritten && o.s2_overwritten;
         exec_full = exec_full && o.exec_full;
         vall &= o.vall;
         vcur &= o.vcur;
@@ -82,8 +88,9 @@ struct State {
         }
     }
     bool operator==(const State& o) const {
-        return sdef == o.sdef && s3_overwritten == o.s3_overwritten && exec_full == o.exec_full &&
-               vall == o.vall && vcur == o.vcur && scc == o.scc && saved == o.saved;
+        return sdef == o.sdef && s3_overwritten == o.s3_overwritten &&
+               s2_overwritten == o.s2_overwritten && exec_full == o.exec_full && vall == o.vall &&
+               vcur == o.vcur && scc == o.scc && saved == o.saved;
     }
 };
 
@@ -113,7 +120,8 @@ uint32_t sdwa_select_mask(uint8_t select) {
 }
 
 // Which bits of the 32-bit scalar operand `index` the instruction can observe. Only a few exact
-// shapes narrow it; everything else demands the whole register. Used for s3, whose [23:16] the shell
+// shapes narrow it; everything else demands the whole register. Used for s2 and s3, whose
+// unsupplied fields (s2 outside [20:12]/[30:22], s3[23:16]) the shell
 // does not supply.
 uint32_t demanded_bits(const Rdna2Inst& in, uint32_t index) {
     uint32_t c = 0;
@@ -327,7 +335,7 @@ uint32_t definite_vgpr_results(const Rdna2Inst& in) {
 
 enum class ExecEffect : uint8_t { None, Full, Narrow, Other };
 
-ExecEffect exec_effect(const Rdna2Inst& in, bool& writes_lo, bool& writes_hi) {
+ExecEffect exec_effect(const Rdna2Inst& in, bool wave32, bool& writes_lo, bool& writes_hi) {
     writes_lo = writes_hi = false;
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (uint32_t w = 0; w < width; ++w) {
@@ -341,6 +349,12 @@ ExecEffect exec_effect(const Rdna2Inst& in, bool& writes_lo, bool& writes_hi) {
     if (cmpx || saveexec) writes_lo = writes_hi = true;
     if (!writes_lo && !writes_hi && !rdna2_instruction_may_change_exec(in)) return ExecEffect::None;
     if (exec_write_sets_full_mask(in)) return ExecEffect::Full;
+    // A Wave32 wave's EXEC is EXEC_LO alone, so s_mov_b32 exec_lo, -1 enables every lane.
+    if (wave32 && in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 && in.n_src == 1 &&
+        (in.dst.kind == OperandKind::SGPR || in.dst.kind == OperandKind::Special) &&
+        in.dst.value == kExecLo && in.src[0].kind == OperandKind::InlineInt &&
+        in.src[0].value == -1)
+        return ExecEffect::Full;
     const auto is_exec = [](const Operand& op) {
         return (op.kind == OperandKind::SGPR || op.kind == OperandKind::Special) &&
                op.value == kExecLo;
@@ -547,7 +561,7 @@ int sgpr_pair(const Operand& op) {
                : -1;
 }
 
-void transfer(State& s, const Rdna2Inst& in) {
+void transfer(State& s, const Rdna2Inst& in, bool wave32) {
     if (writes_scc(in)) s.scc = true;
     if (const uint32_t results = definite_vgpr_results(in)) {
         for (uint32_t w = 0; w < results; ++w) {
@@ -563,6 +577,7 @@ void transfer(State& s, const Rdna2Inst& in) {
             const int reg = base + static_cast<int>(w);
             if (reg >= 0 && reg <= kExecHi) s.sdef.set(static_cast<size_t>(reg));
             if (reg == 3) s.s3_overwritten = true;
+            if (reg == 2) s.s2_overwritten = true;
             for (State::SavedExec& slot : s.saved)
                 if (slot.pair >= 0 && (reg == slot.pair || reg == slot.pair + 1))
                     slot = State::SavedExec{};   // the copy is gone
@@ -598,7 +613,7 @@ void transfer(State& s, const Rdna2Inst& in) {
         s.sdef.set(kVcc + 1);
     }
     bool lo = false, hi = false;
-    const ExecEffect effect = exec_effect(in, lo, hi);
+    const ExecEffect effect = exec_effect(in, wave32, lo, hi);
     switch (effect) {
         case ExecEffect::None: break;
         case ExecEffect::Full:
@@ -756,6 +771,7 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
 
     // MUST dataflow to a fixpoint (greatest fixpoint: unreached states start at TOP).
     State entry;
+    entry.sdef.set(2);
     entry.sdef.set(3);
     for (uint32_t k = 0; k < launch.user_sgprs && 8u + k <= 105u; ++k) entry.sdef.set(8u + k);
     if (launch.user_data_address_known) {
@@ -780,7 +796,7 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
         const size_t i = worklist.back();
         worklist.pop_back();
         State out = in_state[i];
-        transfer(out, ins[i]);
+        transfer(out, ins[i], launch.wave32);
         for (size_t next : successors(i)) {
             if (!reached[next]) {
                 reached[next] = true;
@@ -802,7 +818,8 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
         const Rdna2Inst& in = ins[i];
         const State& s = in_state[i];
         const Reads reads = instruction_reads(in);
-        if (reads.exec && !(s.sdef.test(kExecLo) && s.sdef.test(kExecHi))) {
+        // A Wave32 wave has no EXEC_HI: its EXEC is defined once EXEC_LO is.
+        if (reads.exec && !(s.sdef.test(kExecLo) && (launch.wave32 || s.sdef.test(kExecHi)))) {
             refuse(facts, "ngg-abi-exec-read-before-write", in.pc);
             return facts;
         }
@@ -816,6 +833,11 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
             return facts;
         }
         for (const ScalarRead& read : reads.scalar) {
+            if (read.reg == 2 && !s.s2_overwritten && (read.demanded & ~kS2Supplied)) {
+                refuse(facts, "ngg-abi-read-s2", in.pc, "demanded=0x%08x",
+                       static_cast<int>(read.demanded));
+                return facts;
+            }
             if (read.reg == 3 && !s.s3_overwritten && (read.demanded & kS3GsWaveId)) {
                 refuse(facts, "ngg-abi-read-s3-gs-wave-id", in.pc, "demanded=0x%08x",
                        static_cast<int>(read.demanded));

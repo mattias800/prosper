@@ -31,7 +31,7 @@ namespace P = prosper::agc::Pm4;
 
 constexpr size_t kStageEntries = 64;
 constexpr size_t kDrawEntries = 128;
-constexpr uint32_t kMaxWaves = 4;
+constexpr uint32_t kMaxWaves = 8;   // four Wave64 or eight Wave32 guest waves (256 threads)
 
 uint64_t mix(uint64_t hash, uint64_t value) {
     for (unsigned i = 0; i < 8; ++i)
@@ -93,6 +93,7 @@ struct StageKey {
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
     uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0, depth_slice_fanout = 0;
+    uint32_t wave_lanes = 64;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
     bool count_violations = false, interpolation = false, user_data_address = false;
@@ -109,6 +110,7 @@ struct StageKeyHash {
         for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
         hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
+        hash = mix(hash, key.wave_lanes);
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -132,7 +134,7 @@ struct DrawKey {
     const StageEntry* stages = nullptr;   // pinned by the stage cache entry, see `stage_owner`
     uint32_t vertices = 0, instances = 0;
     uint8_t topology = 0;
-    std::array<uint32_t, 7> limits{};
+    std::array<uint32_t, 9> limits{};
     std::vector<uint32_t> push_constants;
     // An indexed draw's index VALUES (#3135 P6): the plan, and so every launch record, depends on
     // them. Keyed by a hash computed once per draw, with the decoded vector itself held by
@@ -353,6 +355,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.route = static_cast<uint8_t>(admission.route);
     key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
     key.native_wave64 = admission.native_wave64;
+    key.wave_lanes = admission.limits.wave_lanes;
     key.provoking_vertex_last = admission.provoking_vertex_last;
     key.layer_from_pos1 = admission.layer_from_pos1;
     key.count_violations = admission.count_violations;
@@ -420,7 +423,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                        admission.limits.vert_group_size,
                        admission.limits.max_out_verts_per_subgroup,
                        admission.limits.gs_max_vert_out,
-                       admission.limits.esgs_item_size};
+                       admission.limits.esgs_item_size,
+                       admission.limits.wave_lanes,
+                       admission.limits.passthrough ? 1u : 0u};
     draw_key.push_constants = request.push_constants;
     draw_key.indexed = admission.shape.indices != nullptr;
     if (admission.shape.indices) {

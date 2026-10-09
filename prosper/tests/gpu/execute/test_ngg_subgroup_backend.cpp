@@ -1268,6 +1268,99 @@ TEST(NggSubgroupBackend, VsOnlyLayerAddressesAOneSliceTarget) {
     }
 }
 
+// ---- #4808: a Wave32 passthrough NGG VS --------------------------------------------------------------
+//
+// The shape of Yakuza Kiwami's NGG VS programs (VGT_SHADER_STAGES_EN 0x02402000: PRIMGEN_EN, GS_W32_EN,
+// PRIMGEN_PASSTHRU_EN), synthetic: the wave index from s3[27:24], the subgroup's primitive and vertex
+// counts from s2[30:22] and s2[20:12], an s_barrier, GS_ALLOC_REQ from wave 0 only, the subgroup
+// thread id as mbcnt_lo(-1, wave * 32), `exp prim v0` (the launch's packed primitive, unmodified) on
+// threads below the primitive count, and on threads below the vertex count POS0 from VertexID (v5)
+// as kVsOnlyPrimitiveShader places it, PARAM0 = (0.25, 0.5, 0, 1). EXEC is written as
+// s_mov_b32 exec_lo, -1 (Wave32). PARAM0.y is built the way Yakuza builds a descriptor word: VCC as
+// scalar data, `s_bfe_u64 vcc, s[8:9], 1:32` of s[8:9] = 0x7e000000 set just before it (0.5f), read
+// back by `s_or_b32 s21, vcc_lo, 0` -- after the branches, where only the local same-block proof
+// (rdna2_emit_cfg.cpp) keeps VCC data. Assembled with llvm-mc -mcpu=gfx1030 (branch offsets by hand).
+const uint32_t kWave32PassthroughVs[] = {
+    0x9394FF03u, 0x00040018u, 0xBEFE03C1u, 0x9380FF02u, 0x00090016u, 0x9381FF02u, 0x0009000Cu,
+    0xBF8A0000u, 0xBF071480u, 0xBF850004u, 0x8F158C00u, 0x887C1501u, 0xBF800000u, 0xBF900009u,
+    0x8F158514u, 0xD7650001u, 0x00002AC1u, 0x7DA80200u, 0xBF880002u, 0xF8000941u, 0x00000000u,
+    0xBF8CFF0Fu, 0xBEFE03C1u, 0x7DA80201u, 0xBF880018u, 0x36040A81u, 0x7E040D02u, 0xD54B0002u,
+    0x03CDE902u, 0xD5480003u, 0x02050305u, 0x7E060D03u, 0xD54B0003u, 0x03CDE903u, 0x7E080280u,
+    0x7E0C02F2u, 0xF80008CFu, 0x06040302u, 0x7E0E02FFu, 0x3E800000u, 0xBE8803FFu, 0x7E000000u,
+    0xBE890380u, 0x94EAFF08u, 0x00200001u, 0x8815806Au, 0x7E100215u, 0xF800020Fu, 0x06040807u,
+    0xBF810000u,
+};
+
+// 33 primitives: 32 degenerate (1, 1, 1) that fill wave 0, then (1, 3, 2) -- the upper-right
+// triangle -- as thread 32, lane 0 of wave 1. It is drawn only if wave 1 knows its index (s3), the
+// subgroup's primitive count reaches it (s2 = 33, summed over both waves' s3), and its v0 holds the
+// packed passthrough primitive. Each control breaks exactly one of those and leaves the target clear.
+TEST(NggSubgroupBackend, Wave32PassthroughVsDrawsTheTriangleItsSecondWaveExports) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    std::vector<uint32_t> indices;
+    for (uint32_t k = 0; k < 32; ++k) indices.insert(indices.end(), {1u, 1u, 1u});
+    indices.insert(indices.end(), {1u, 3u, 2u});
+    static const ShaderResourceTable none;
+    const auto build = [&](bool passthrough, uint32_t lanes, bool native, std::string* why) {
+        NggSubgroupDrawRequest request;
+        request.linked_code = kWave32PassthroughVs;
+        request.dwords = std::size(kWave32PassthroughVs);
+        request.resources = &none;
+        request.limits = vs_only_limits();
+        request.limits.wave_lanes = lanes;
+        request.limits.passthrough = passthrough;
+        request.shell.native_wave64 = native;
+        request.shape.topology = NggInputTopology::TriangleList;
+        request.shape.vertex_count = static_cast<uint32_t>(indices.size());
+        request.shape.indices = std::make_shared<const std::vector<uint32_t>>(indices);
+        request.raster.topology = NggOutputTopology::TriangleList;
+        request.raster.route = NggLayerRoute::None;
+        request.raster.count_violations = false;
+        request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e920100ull};
+        return build_ngg_subgroup_draw(request, why);
+    };
+    const ResolvedPipelineState state = flipped_state();
+    const auto render = [&](const std::shared_ptr<const NggSubgroupDraw>& ngg, uint64_t id) {
+        BackendDraw draw;
+        draw.ngg_subgroup = ngg;
+        draw.fs = ngg_param_fragment(0, false);
+        draw.ps = &state;
+        BackendColorTarget target;
+        target.persistent_id = id;
+        target.load_existing = false;
+        target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        return render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    };
+    const bool native32 = ngg_host_capabilities(*ctx).native_wave32;
+    for (const bool native : {false, true}) {
+        if (native && !native32) continue;
+        std::string why;
+        const auto ngg = build(true, 32, native, &why);
+        ASSERT_TRUE(ngg) << why;
+        ASSERT_EQ(ngg->plan.subgroups.size(), 1u);
+        EXPECT_EQ(ngg->plan.subgroups[0].waves, 2u) << "33 threads are two Wave32 waves";
+        EXPECT_EQ(ngg->wave_lanes, 32u);
+        const StatsSnapshot before = stats_now();
+        const auto bytes = render(ngg, 0x4e4747320001ull + (native ? 1u : 0u));
+        const StatsSnapshot after = stats_now();
+        EXPECT_TRUE(upper_right_triangle(bytes, true)) << (native ? "native" : "portable");
+        EXPECT_EQ(after.invalid - before.invalid, 0u) << "one GS_ALLOC_REQ, from wave 0";
+        EXPECT_EQ(after.connectivity - before.connectivity, 0u);
+    }
+    // Controls. Read as Wave64, s_mov_b32 exec_lo, -1 leaves EXEC_HI undefined, and the program is
+    // refused rather than run with half an EXEC.
+    std::string why;
+    EXPECT_FALSE(build(true, 64, false, &why)) << "control: the Wave64 reading of a Wave32 program";
+    EXPECT_NE(why.find("ngg-abi-exec-read-before-write"), std::string::npos) << why;
+    // Without passthrough, v0 holds ITEMSIZE-scaled offsets (0 | 4 << 16 for slots 0, 1) that the
+    // program exports as a primitive naming threads 0, 256 and 0: no triangle survives.
+    const auto offsets = build(false, 32, false, &why);
+    ASSERT_TRUE(offsets) << why;
+    EXPECT_TRUE(upper_right_triangle(render(offsets, 0x4e4747320004ull), false))
+        << "control: offsets instead of the packed primitive";
+}
+
 // ---- Layered depth: a depth-only draw replayed per slice -----------------------------------------
 //
 // The VS-only program above with its layer and depth taken from the vertex: VertexID (v5) bits 0

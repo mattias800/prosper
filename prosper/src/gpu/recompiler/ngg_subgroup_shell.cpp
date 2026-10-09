@@ -19,8 +19,8 @@
 namespace prosper::gpu {
 namespace {
 
-constexpr uint32_t kGuestWaveLanes = 64;
-constexpr uint32_t kMaxShellWaves = 4;
+// 256 invocations: four Wave64 or eight Wave32 guest waves.
+constexpr uint32_t kMaxShellLanes = 256;
 // Vulkan guarantees 128 bytes of push constants.
 constexpr uint32_t kMaxPushWords = 32;
 
@@ -72,9 +72,10 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     if (refusal) refusal->clear();
     if (layout_out) *layout_out = {};
     const uint32_t push_words = config.user_sgprs + (config.user_data_address_known ? 2u : 0u);
-    if (!linked_code || !dwords || config.waves == 0 || config.waves > kMaxShellWaves ||
-        config.rsrc2_gs_lds_size > kNggMaxLdsGranules || config.user_sgprs > 98u ||
-        push_words > kMaxPushWords) {
+    const uint32_t lanes = config.wave_lanes;
+    if (!linked_code || !dwords || (lanes != 32u && lanes != 64u) || config.waves == 0 ||
+        config.waves * lanes > kMaxShellLanes || config.rsrc2_gs_lds_size > kNggMaxLdsGranules ||
+        config.user_sgprs > 98u || push_words > kMaxPushWords) {
         fail(refusal, diagnostic, "ngg-shell-config");
         return {};
     }
@@ -82,6 +83,7 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     rdna2_walk(linked_code, dwords, ins);
     NggSubgroupAbiLaunch launch;
     launch.user_sgprs = config.user_sgprs;
+    launch.wave32 = lanes == 32u;
     launch.user_data_address_known = config.user_data_address_known;
     const NggSubgroupAbiFacts facts = analyze_ngg_subgroup_abi(ins, launch);
     if (!facts.ok()) {
@@ -129,8 +131,8 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
         }
     }
     const NggExportRecordLayout& layout = facts.layout;
-    const uint32_t local = kGuestWaveLanes * config.waves;
-    const uint32_t block_words = layout.block_words(config.waves);
+    const uint32_t local = lanes * config.waves;
+    const uint32_t block_words = layout.block_words(config.waves, lanes);
 
     const bool original_has_waterfall = !waterfall_branches(ins).empty();
     SpirvCompute b;
@@ -138,15 +140,23 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     b.ngg_workgroup_shell = true;
     b.shell_io_descriptor_set = kNggShellDescriptorSet;
     if (config.rsrc2_gs_lds_size) b.lds_dwords = config.rsrc2_gs_lds_size * kNggLdsGranuleDwords;
-    b.native_subgroup_size = config.native_wave64 ? kGuestWaveLanes : 0u;
-    b.begin(kNggLaunchWordsPerLane, resources, local, 1, 1, kGuestWaveLanes, push_words,
+    b.native_subgroup_size = config.native_wave64 ? lanes : 0u;
+    b.begin(kNggLaunchWordsPerLane, resources, local, 1, 1, lanes, push_words,
             /*raw_word_output*/ true, /*raw_word_input*/ true);
-    b.portable_readfirstlane_shader = !config.native_wave64 && !original_has_waterfall;
+    // As recompile_compute: a Wave32 program's masks are 32-bit, and the portable readfirstlane
+    // service is the Wave64 one.
+    b.allow_b32_masks = lanes == 32u;
+    b.portable_readfirstlane_shader =
+        lanes == 64u && !config.native_wave64 && !original_has_waterfall;
     {
         std::vector<uint32_t> marker;
         char text[96];
-        std::snprintf(text, sizeof(text), "Prosper.NggSubgroupShell.Waves=%u.Wave64=%s",
-                      config.waves, config.native_wave64 ? "native" : "portable");
+        if (lanes == 64u)
+            std::snprintf(text, sizeof(text), "Prosper.NggSubgroupShell.Waves=%u.Wave64=%s",
+                          config.waves, config.native_wave64 ? "native" : "portable");
+        else
+            std::snprintf(text, sizeof(text), "Prosper.NggSubgroupShell.Waves=%u.Wave32=%s",
+                          config.waves, config.native_wave64 ? "native" : "portable");
         b.pstr(marker, text);
         b.putv(b.debug, Op_ModuleProcessed, marker);
     }
@@ -202,14 +212,38 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
         rs.sreg[1] = b.load_push_constant(config.user_sgprs + 1u);
     }
 
+    // s2, the NGG group info (ngg_group_info): the subgroup's ES vertex count in [20:12] and its
+    // primitive count in [30:22]. Every wave's s3 carries its own share of both ([7:0], [15:8]), so
+    // their sum over the subgroup's W records is exact for any launch the planner made, and a
+    // launch that misstates s3 misstates s2 the same way rather than disagreeing with it.
+    {
+        const uint32_t subgroup_first =
+            b.ibin(Op_IMul, b.groupid[0], b.uconst(local * kNggLaunchWordsPerLane));
+        uint32_t es = b.uconst(0), gs = b.uconst(0);
+        for (uint32_t wave = 0; wave < config.waves; ++wave) {
+            const uint32_t s3 = b.load_owned_packet_word(
+                b.ibin(Op_IAdd, subgroup_first,
+                       b.uconst(wave * lanes * kNggLaunchWordsPerLane + kNggLaunchS3Word)));
+            es = b.ibin(Op_IAdd, es, b.ibin(Op_BitwiseAnd, s3, b.uconst(0xffu)));
+            gs = b.ibin(Op_IAdd, gs,
+                        b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, s3, b.uconst(8)),
+                               b.uconst(0xffu)));
+        }
+        rs.sreg[2] = b.ibin(
+            Op_BitwiseOr,
+            b.ibin(Op_ShiftLeftLogical, b.ibin(Op_BitwiseAnd, es, b.uconst(0x1ffu)), b.uconst(12)),
+            b.ibin(Op_ShiftLeftLogical, b.ibin(Op_BitwiseAnd, gs, b.uconst(0x1ffu)), b.uconst(22)));
+    }
+
     // store_output_word indexes gidx * words_per_lane + word, where gidx = group * local + thread.
     // Adding group * header + header places thread t of workgroup g at its block's record t.
     b.packet_output_base =
         b.ibin(Op_IAdd, b.ibin(Op_IMul, b.groupid[0], b.uconst(kNggSubgroupHeaderWords)),
                b.uconst(kNggSubgroupHeaderWords));
     const uint32_t block_base = b.ibin(Op_IMul, b.groupid[0], b.uconst(block_words));
-    const uint32_t guest_lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(63));
-    const uint32_t guest_wave = b.ibin(Op_ShiftRightLogical, b.linear_localid, b.uconst(6));
+    const uint32_t guest_lane = b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(lanes - 1u));
+    const uint32_t guest_wave =
+        b.ibin(Op_ShiftRightLogical, b.linear_localid, b.uconst(lanes == 32u ? 5u : 6u));
     // The launch must describe this shell: a wave whose s3 disagrees on W or on its own index
     // marks the block invalid rather than producing triangles sized for another subgroup.
     {

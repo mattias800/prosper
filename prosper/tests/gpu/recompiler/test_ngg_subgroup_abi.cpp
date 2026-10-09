@@ -39,12 +39,13 @@ std::vector<uint32_t> program(std::initializer_list<uint32_t> body, bool exec_fi
 }
 
 NggSubgroupAbiFacts analyze(const std::vector<uint32_t>& code, uint32_t user_sgprs = 0,
-                            bool address = false) {
+                            bool address = false, bool wave32 = false) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
     NggSubgroupAbiLaunch launch;
     launch.user_sgprs = user_sgprs;
     launch.user_data_address_known = address;
+    launch.wave32 = wave32;
     return analyze_ngg_subgroup_abi(ins, launch);
 }
 
@@ -110,6 +111,34 @@ TEST(NggSubgroupAbi, LaunchSgprReadsAreRefusedByName) {
     EXPECT_EQ(analyze(program({0xbe940307u})).reason, "ngg-abi-read-s6-s7");
     // Written first, s2 is ordinary scratch.
     EXPECT_TRUE(analyze(program({0xbe820380u, 0xbe940302u})).ok());   // s_mov s2, 0; s_mov s20, s2
+}
+
+// #4808: s2 carries the subgroup's ES vertex count [20:12] and primitive count [30:22] (Yakuza
+// Kiwami's Wave32 NGG VS reads both with s_bfe_u32 to build its GS_ALLOC_REQ M0). Those two fields
+// are admitted; a read that can see any other bit is not.
+TEST(NggSubgroupAbi, S2IsAdmittedOnlyThroughItsSubgroupCountFields) {
+    EXPECT_TRUE(analyze(program({0x9394ff02u, 0x0009000cu})).ok());   // s_bfe_u32 s20, s2, [20:12]
+    EXPECT_TRUE(analyze(program({0x9394ff02u, 0x00090016u})).ok());   // s_bfe_u32 s20, s2, [30:22]
+    EXPECT_EQ(analyze(program({0x9394ff02u, 0x00080000u})).reason, "ngg-abi-read-s2")
+        << "[7:0] is not supplied";
+    EXPECT_EQ(analyze(program({0x9394ff02u, 0x000a000cu})).reason, "ngg-abi-read-s2")
+        << "one bit wider than the vertex count field reaches bit 21";
+    EXPECT_EQ(analyze(program({0x8714ff02u, 0x7fdff000u})).ok(), true)
+        << "s_and_b32 with exactly the supplied mask";
+    EXPECT_EQ(analyze(program({0x8714ff02u, 0x80000000u})).reason, "ngg-abi-read-s2");
+}
+
+// #4808: under GS_W32_EN a wave's EXEC is EXEC_LO alone. s_mov_b32 exec_lo, -1 enables every lane
+// of a Wave32 wave, so the vector instruction after it reads a defined EXEC; in a Wave64 wave the
+// same write leaves EXEC_HI undefined and the read is refused.
+TEST(NggSubgroupAbi, AWave32ExecIsDefinedByItsLowHalf) {
+    std::vector<uint32_t> code = {0xbefe03c1u,   // s_mov_b32 exec_lo, -1
+                                  0x7e120280u,   // v_mov_b32 v9, 0
+                                  0xb07c3005u, 0xbf900009u};
+    code.insert(code.end(), kExports.begin(), kExports.end());
+    code.push_back(kEnd);
+    EXPECT_TRUE(analyze(code, 0, false, true).ok()) << analyze(code, 0, false, true).refusal;
+    EXPECT_EQ(analyze(code).reason, "ngg-abi-exec-read-before-write");
 }
 
 TEST(NggSubgroupAbi, UserSgprsAboveTheSuppliedRangeAreRefused) {

@@ -2,12 +2,18 @@
 // shell (#3135 P2, design section 4). Pure analysis over decoded instructions: no SPIR-V, no Vulkan.
 //
 // The shell supplies exactly the launch state the hardware contract establishes (launch research on
-// #3135): s3 (merged wave info, without the GS wave id in [23:16]), user SGPRs s8.. from push
+// #3135): s3 (merged wave info, without the GS wave id in [23:16]), s2 (the subgroup's ES vertex
+// count [20:12] and primitive count [30:22], nothing else), user SGPRs s8.. from push
 // constants, s0:s1 only when the caller knows the user-data address, VGPRs v0..v3/v5/v8, and an
 // EXEC the program must write before it reads it. Everything else is refused here, by name:
 //
 //   ngg-abi-read-s0-s1                 s0:s1 read before written without a known user-data address
-//   ngg-abi-read-s2                    s2 (NGG group info; ISA and compilers disagree on it)
+//   ngg-abi-read-s2                    a launch s2 read whose demanded bits leave [20:12]/[30:22].
+//                                      The RDNA2 ISA's initial-state table names s2 the GS2VS ring
+//                                      offset or ordered wave id; Mesa and LLPC read the NGG
+//                                      subgroup counts there, and so does guest code (Yakuza
+//                                      Kiwami's NGG VS builds its GS_ALLOC_REQ M0 from exactly those
+//                                      two fields). CONFIDENCE: MED
 //   ngg-abi-read-s3-gs-wave-id         a launch s3 read whose demanded bits include [23:16]
 //   ngg-abi-read-s4-s5                 off-chip LDS base / scratch offset
 //   ngg-abi-read-s6-s7                 the GS program address (only the link may use it)
@@ -53,6 +59,9 @@ namespace prosper::gpu {
 
 struct NggSubgroupAbiLaunch {
     uint32_t user_sgprs = 0;   // s8 .. s8+user_sgprs-1 hold user data
+    // The waves are Wave32 (VGT_SHADER_STAGES_EN.GS_W32_EN): EXEC is EXEC_LO alone, so
+    // s_mov_b32 exec_lo, -1 fills it and a read needs only EXEC_LO defined.
+    bool wave32 = false;
     bool user_data_address_known = false;   // s0:s1 hold SPI_SHADER_USER_DATA_ADDR_LO/HI_GS
 };
 
