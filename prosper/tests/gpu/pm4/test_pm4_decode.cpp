@@ -255,4 +255,39 @@ TEST(Pm4Decode, Contract) {
               "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
+    // Hardware IT_LOAD_* packets (Task H01 Black Flag console capture submit0.bin):
+    {
+        uint32_t load_stream[] = {
+            // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
+            PM4(5, IT_LOAD_SH_REG, 0),
+            0x74ec2fbcu, 0x00000040u, 0x80000000u, 10u,
+            // IT_LOAD_CONTEXT_REG: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
+            PM4(5, IT_LOAD_CONTEXT_REG, 0),
+            0x6616e000u, 0x00000040u, 0x80000000u, 6u,
+            // IT_LOAD_CONTEXT_REG_INDEX: 5 dwords, op 0x9F, addr 0x4075172000, flags 0x80000000, num_regs 143
+            PM4(5, IT_LOAD_CONTEXT_REG_INDEX, 0),
+            0x75172000u, 0x00000040u, 0x80000000u, 143u,
+        };
+        std::vector<Pm4Command> load_ops;
+        const size_t c = decode_pm4(load_stream, std::size(load_stream), load_ops);
+        CHECK(c == 15, "consumed 15 dwords of IT_LOAD_* packets");
+        CHECK(load_ops.size() == 3, "decoded 3 IT_LOAD_* packets");
+
+        CHECK(load_ops[0].kind == K::SetRegsIndirect, "op0 is SetRegsIndirect");
+        CHECK(load_ops[0].reg_class == RegClass::Sh, "op0 class is Sh");
+        CHECK(load_ops[0].regs_vaddr == 0x4074ec2fbcu, "op0 vaddr matches");
+        CHECK(load_ops[0].num_regs == 10, "op0 num_regs = 10");
+
+        CHECK(load_ops[1].kind == K::SetRegsIndirect, "op1 is SetRegsIndirect");
+        CHECK(load_ops[1].reg_class == RegClass::Cx, "op1 class is Cx");
+        CHECK(load_ops[1].regs_vaddr == 0x406616e000u, "op1 vaddr matches");
+        CHECK(load_ops[1].num_regs == 6, "op1 num_regs = 6");
+
+        CHECK(load_ops[2].kind == K::SetRegsIndirect, "op2 is SetRegsIndirect");
+        CHECK(load_ops[2].reg_class == RegClass::Cx, "op2 class is Cx");
+        CHECK(load_ops[2].regs_vaddr == 0x4075172000u, "op2 vaddr matches");
+        CHECK(load_ops[2].num_regs == 143, "op2 num_regs = 143");
+    }
+
 }
+

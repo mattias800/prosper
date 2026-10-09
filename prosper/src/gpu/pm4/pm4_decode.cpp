@@ -71,6 +71,19 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.reg_offset = pl[0]; c.reg_value = pl[1];
                 c.reg_count = npl - 1; c.reg_data = &pl[1];
             }
+        } else if (c.op == IT_LOAD_SH_REG || c.op == IT_LOAD_CONTEXT_REG ||
+                   c.op == IT_LOAD_CONTEXT_REG_INDEX || c.op == IT_LOAD_UCONFIG_REG) {
+            // Hardware PM4 indirect register load packets (GFX8+ / RDNA2 / AGC):
+            // payload: [0..1] = 64-bit guest address of ShaderReg array (lo/hi),
+            //          [2] = flags / index (e.g. 0x80000000),
+            //          [3] = num_regs (count of {offset, value} pairs in the array).
+            // Emitted by libSceAgc driver on PS5 (Black Flag Task H01 capture submit0.bin: 330
+            // IT_LOAD_SH_REG packets loading user-data SGPRs, plus 0x64 and 0x9F context loads).
+            c.kind = K::SetRegsIndirect;
+            c.reg_class = (c.op == IT_LOAD_SH_REG) ? RegClass::Sh
+                        : (c.op == IT_LOAD_UCONFIG_REG) ? RegClass::Uc : RegClass::Cx;
+            if (npl >= 2) c.regs_vaddr = lo_hi(pl);
+            if (npl >= 4) c.num_regs = pl[3];
         } else if (c.op == IT_INDIRECT_BUFFER && npl == 13) {
             // sceAgcCbBranch's packet (#4540). Other lengths of this opcode are not emitted by any
             // prosper builder and stay Unknown.
