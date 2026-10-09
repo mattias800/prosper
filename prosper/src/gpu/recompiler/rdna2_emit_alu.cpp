@@ -932,6 +932,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
                 return true;
             }
+            // s_cmov_b64 exec, S0 (rdna2_mask_move.cpp); other destinations fall through.
+            if (in.opcode == kSop1OpcodeCmovB64 && (in.dst.value == 126 || in.dst.value == 127)) {
+                ok = emit_s_cmov_b64_exec(b, rs, in);
+                return true;
+            }
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
@@ -2265,11 +2270,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return has_scalar_word(operand.value) &&
                         (!wide || has_scalar_word(operand.value + 1));
                 };
-                const bool retain_vcc_scalar = writes_vcc &&
-                    has_scalar_source(in.src[0], true) &&
-                    has_scalar_source(in.src[1], false) &&
-                    (rs.scalar_presence_has_no_placeholders ||
-                     b.vcc_bfe_u64_scalar_result_pcs.contains(in.pc));
+                const bool retain_vcc_scalar = writes_vcc && has_scalar_source(in.src[0], true) &&
+                                               has_scalar_source(in.src[1], false) &&
+                                               (rs.scalar_presence_has_no_placeholders ||
+                                                b.vcc_bfe_u64_scalar_result_pcs.contains(in.pc) ||
+                                                b.vcc_local_scalar_write_pcs.contains(in.pc));
                 if (writes_exec || writes_vcc) {
                     uint32_t lane = b.guest_lane_id();
                     lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(b.wave_size - 1));
@@ -2330,9 +2335,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 const bool has_proven_scalar_sources =
                     has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]) &&
-                    (!b.is_compute || b.wave_size != 64 ||
-                     rs.scalar_presence_has_no_placeholders ||
-                     b.vcc_b32_scalar_result_pcs.contains(in.pc));
+                    (!b.is_compute || b.wave_size != 64 || rs.scalar_presence_has_no_placeholders ||
+                     b.vcc_b32_scalar_result_pcs.contains(in.pc) ||
+                     b.vcc_local_scalar_write_pcs.contains(in.pc));
                 if ((!b.is_fragment && !b.is_compute) || gtav_wave32_vcchi_scalar_packet ||
                     has_proven_scalar_sources) {
                     // The vertex shell is a complete one-lane virtual wave, so its scalar VCC

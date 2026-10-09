@@ -138,6 +138,16 @@ uint32_t demanded_bits(const Rdna2Inst& in, uint32_t index) {
     if (in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0e && index == 1 &&
         constant_operand(in, in.src[0], c))
         return c;
+    // s_bfm_b32 / s_bfm_b64 read only the low 5 / 6 bits of each source (the field width and
+    // offset). The ES prolog's `s_bfm_b64 exec, s3, 0` takes the wave's ES thread count from s3[5:0]
+    // (#4808, The Pathless).
+    if (in.fmt == Rdna2Format::SOP2 && (in.opcode == 0x24 || in.opcode == 0x25) && index <= 1)
+        return in.opcode == 0x24 ? 0x1fu : 0x3fu;
+    // s_bitcmp0_b32 / s_bitcmp1_b32 with a constant bit index observe that one bit of S0; the same
+    // prolog's `s_bitcmp1_b32 s3, 6` asks whether the count is 64.
+    if (in.fmt == Rdna2Format::SOPC && (in.opcode == 0x0c || in.opcode == 0x0d) && index == 0 &&
+        constant_operand(in, in.src[1], c))
+        return 1u << (c & 31u);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x148 && index == 0) {   // v_bfe_u32
         uint32_t offset = 0, width = 0;
         if (constant_operand(in, in.src[1], offset) && constant_operand(in, in.src[2], width))
@@ -845,6 +855,7 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
             }
             if (!s.sdef.test(static_cast<size_t>(read.reg))) {
                 refuse(facts, sgpr_reason(read.reg), in.pc, "s%d", read.reg);
+                facts.refused_sgpr = read.reg;
                 return facts;
             }
         }

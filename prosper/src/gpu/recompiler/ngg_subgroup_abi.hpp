@@ -68,6 +68,8 @@ struct NggSubgroupAbiLaunch {
 struct NggSubgroupAbiFacts {
     std::string refusal;   // empty when admitted; "reason=<name> pc=<pc> ..."
     std::string reason;   // the bare reason name
+    // The SGPR a read-before-write refusal names (ngg-abi-read-*), -1 for any other refusal.
+    int refused_sgpr = -1;
     NggExportRecordLayout layout;   // valid only when admitted
     std::vector<uint32_t> alloc_request_pcs;   // every s_sendmsg GS_ALLOC_REQ
     bool ok() const { return refusal.empty(); }

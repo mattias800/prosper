@@ -161,6 +161,20 @@ TEST(NggSubgroupAbi, S3IsAdmittedOnlyWithoutItsGsWaveIdBits) {
     EXPECT_EQ(analyze(program({0x8714ff03u, 0x00010000u})).reason, "ngg-abi-read-s3-gs-wave-id");
 }
 
+// #4808: The Pathless's merged ES prolog sets its EXEC from s3 with `s_bfm_b64 exec, s3, 0`
+// (S0[5:0], the ES thread count) and `s_bitcmp1_b32 s3, 6` (is the count 64?) before
+// `s_cmov_b64 exec, -1`. Neither can observe the GS wave id in s3[23:16]; a bit test that can is
+// still refused.
+TEST(NggSubgroupAbi, S3BitFieldMaskAndBitTestDemandOnlyTheirBits) {
+    EXPECT_TRUE(analyze(program({0x92fe8003u, 0xbf0d8603u, 0xbefe06c1u})).ok())
+        << analyze(program({0x92fe8003u, 0xbf0d8603u, 0xbefe06c1u})).refusal;
+    EXPECT_TRUE(analyze(program({0x92148003u})).ok()) << "s_bfm_b32 s20, s3, 0 reads s3[4:0]";
+    EXPECT_EQ(analyze(program({0xbf0d9003u})).reason, "ngg-abi-read-s3-gs-wave-id")
+        << "s_bitcmp1_b32 s3, 16 tests a GS wave id bit";
+    EXPECT_EQ(analyze(program({0xbf0d0303u})).reason, "ngg-abi-read-s3-gs-wave-id")
+        << "a bit index from an SGPR can test any bit";
+}
+
 TEST(NggSubgroupAbi, ExecMustBeWrittenBeforeAnyVectorInstruction) {
     EXPECT_EQ(analyze(program({}, false)).reason, "ngg-abi-exec-read-before-write");
     EXPECT_TRUE(analyze(program({}, true)).ok());

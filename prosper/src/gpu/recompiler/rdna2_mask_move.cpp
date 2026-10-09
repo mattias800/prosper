@@ -139,4 +139,31 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     rs.exec_narrowed = narrowed != rs.sreg_bool_narrowed.end() ? narrowed->second : true;
     return true;
 }
+
+// s_cmov_b64 exec, S0: EXEC = SCC ? S0 : EXEC. SCC is wave-uniform scalar state, so per lane this is
+// a select between the source's lane bit and the current EXEC bit; SCC is read, not written. The
+// Pathless's merged ES prolog sets EXEC from its ES count with `s_bfm_b64 exec, s3, 0` and, when
+// the count is 64 (`s_bitcmp1_b32 s3, 6`), widens it with `s_cmov_b64 exec, -1` (#4808). A mask,
+// EXEC, VCC or inline source is modelled; a literal or a plain data pair refuses.
+bool emit_s_cmov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
+    const Operand& src = in.src[0];
+    uint32_t source = 0;
+    if (src.kind == OperandKind::Literal) return false;
+    if (src.value == 126 || src.value == 127)
+        source = rs.exec;
+    else if (src.kind == OperandKind::InlineInt)
+        source = inline_int_mask_bit(b, src.value);
+    else if (src.value == 106 || src.value == 107)
+        source = rs.vcc;
+    else if (src.kind == OperandKind::SGPR) {
+        const auto it = rs.sreg_bool.find(src.value);
+        if (it != rs.sreg_bool.end()) source = it->second;
+    }
+    if (!source || !rs.scc || !rs.exec) return false;
+    const uint32_t selected = b.id();
+    b.put(b.code, Op_Select, {b.t_bool, selected, rs.scc, source, rs.exec});
+    rs.exec = selected;
+    rs.exec_narrowed = true;   // conservative: predication stays on
+    return true;
+}
 }   // namespace prosper::gpu

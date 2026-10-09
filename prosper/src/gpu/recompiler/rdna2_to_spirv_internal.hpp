@@ -640,6 +640,9 @@ struct SpirvCompute {
     // are scalar words on every path reaching that exact PC. Dispatcher Function variables exist
     // for mask-only lifetimes too, so map membership alone must never select the scalar lowering.
     std::unordered_set<uint32_t> vcc_b32_scalar_result_pcs;
+    // SOP2 writes into VCC whose scalar sources are all written earlier in the same basic block
+    // (rdna2_local_vcc_data.hpp). Recomputed per emit_body; no record pass erases it.
+    std::unordered_set<uint32_t> vcc_local_scalar_write_pcs;
     // S_BFE_U64 may write VCC as both a scalar pair and a per-lane predicate. In a CFG
     // dispatcher, the sreg variables can contain fabricated zero placeholders, so only the
     // MUST-scalar source proof permits retaining its complete scalar result.

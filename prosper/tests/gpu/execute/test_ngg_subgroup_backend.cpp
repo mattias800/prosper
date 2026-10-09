@@ -1103,6 +1103,35 @@ const uint32_t kVsOnlyPrimitiveShader[] = {
     0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
 };
 
+// #4808: the same program with The Pathless's ES-prolog EXEC idiom in place of s_mov_b64 exec, -1:
+// s_bfm_b64 exec, s3, 0 (lanes below s3[5:0]) ; s_bitcmp1_b32 s3, 6 ; s_cmov_b64 exec, -1. With 64
+// ES threads in the wave, s3[5:0] is 0 and only the s_cmov_b64 turns the lanes on.
+const uint32_t kVsOnlyCmovExec[] = {
+    0x92FE8003u, 0xBF0D8603u, 0xBEFE06C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u,
+    0x9395FF03u, 0x00080008u, 0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u,
+    0xBE9703C1u, 0xD7650013u, 0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u,
+    0xD548000Cu, 0x02390501u, 0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u,
+    0x00000009u, 0x361A0A81u, 0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u,
+    0x7E1C0D0Eu, 0xD54B000Eu, 0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80008CFu, 0x100F0E0Du,
+    0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// #4808: the same program with PARAM0.y (0.5f) built the way The Pathless's ES prolog builds an SMEM
+// offset -- VCC as a lane mask first (s_mov_b64 vcc, exec), then VCC_LO reused as scalar data:
+// s_and_b32 vcc_lo, s30, -1 ; s_lshl_b32 vcc_lo, vcc_lo, 1 of s30 = 0x1f800000, read back through
+// s_mov_b32 s31, vcc_lo. After the program's first branch, only the same-block proof
+// (rdna2_local_vcc_data) keeps VCC_LO data in Wave64.
+const uint32_t kVsOnlyVccData[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80008CFu, 0x100F0E0Du, 0x7E2202FFu, 0x3E800000u,
+    0xBEEA047Eu, 0xBE9E03FFu, 0x1F800000u, 0x876AC11Eu, 0x8F6A816Au, 0xBE9F036Au, 0x7E24021Fu,
+    0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
 // The same program also exporting POS1.z = 0 (layer 0) or 1 (layer 1), as Kena's culling VS programs
 // export POS1.z under USE_VTX_RENDER_TARGET_INDX into 2D scene targets.
 const uint32_t kVsOnlyLayer0[] = {
@@ -1232,6 +1261,56 @@ TEST(NggSubgroupBackend, VsOnlyPrimitiveShaderDrawsItsTriangleIntoA2DTarget) {
                        << "," << p[3] << ")";
         }
     return ::testing::AssertionSuccess();
+}
+
+// #4808: a Wave64 B32 write into VCC_LO whose sources were written in the same block stays scalar
+// data after a branch, so PARAM0.y = 0.5 and the draw matches the plain program's picture.
+TEST(NggSubgroupBackend, Wave64VccLoReusedAsScalarDataAfterABranch) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    std::string why;
+    const auto ngg = vs_only_draw({1, 3, 2}, &why, kVsOnlyVccData);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw draw;
+    draw.ngg_subgroup = ngg;
+    draw.fs = ngg_param_fragment(0, false);
+    draw.ps = &state;
+    BackendColorTarget target;
+    target.persistent_id = 0x4e4747330100ull;
+    target.load_existing = false;
+    target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    EXPECT_TRUE(upper_right_triangle(bytes, true));
+}
+
+// #4808: 64 distinct ES vertices in one wave -- (1, 3, 2) then degenerate (k, k, k) for k = 0 and
+// 4..63 -- put 64 in s3[7:0], so s_bfm_b64 exec, s3, 0 enables NO lane and the triangle exists only
+// if s_cmov_b64 exec, -1 (SCC = s3 bit 6) turns them all on. Control: with 63 ES vertices the
+// s_bfm_b64 already enables lanes 0..62 and the s_cmov_b64 must leave EXEC alone; both draw it.
+TEST(NggSubgroupBackend, ConditionalExecMoveOnTheEsCountEnablesAFullWave) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    const ResolvedPipelineState state = flipped_state();
+    for (const uint32_t es : {64u, 63u}) {
+        std::vector<uint32_t> indices = {1, 3, 2, 0, 0, 0};
+        for (uint32_t k = 4; k < es; ++k) indices.insert(indices.end(), {k, k, k});
+        std::string why;
+        const auto ngg = vs_only_draw(indices, &why, kVsOnlyCmovExec);
+        ASSERT_TRUE(ngg) << why;
+        ASSERT_EQ(ngg->plan.subgroups.size(), 1u);
+        ASSERT_EQ(ngg->plan.subgroups[0].es_threads(), es);
+        BackendDraw draw;
+        draw.ngg_subgroup = ngg;
+        draw.fs = ngg_param_fragment(0, false);
+        draw.ps = &state;
+        BackendColorTarget target;
+        target.persistent_id = 0x4e4747330001ull + es;
+        target.load_existing = false;
+        target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+        EXPECT_TRUE(upper_right_triangle(bytes, true)) << es << " ES threads";
+    }
 }
 
 // Kena's culling VS programs export POS1.z into 2D targets. Admitted as a one-slice target: layer 0
