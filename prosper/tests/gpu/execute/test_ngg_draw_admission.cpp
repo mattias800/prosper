@@ -734,6 +734,81 @@ TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
         << "without PRIMGEN_EN the path does not apply";
 }
 
+// #3135 layered NGG depth. A draw that writes no colour has its layer address the depth array:
+// admitted as one replay per slice of the view, routed by no layer stage. Every shape the replay
+// cannot represent is refused by name: no depth attachment, an unprogrammed view, and the two mixed
+// shapes -- a one-slice colour target beside a depth array, and a layered colour volume beside any
+// bound depth/stencil.
+TEST(NggDrawAdmission, ADepthOnlyLayeredDrawIsReplayedPerSlice) {
+    NggDrawFacts f = kena_vs_only_facts();
+    f.target_single_slice = false;   // no colour target is written
+    f.other_attachments_single_slice = false;
+    f.depth_only = true;
+    f.depth_bound = true;
+    f.depth_view_known = true;
+    f.depth_first_slice = 0;
+    f.depth_slice_count = 6;
+    const NggDrawAdmission cube = admit_ngg_draw(kena_vs_only_registers(), f, radv());
+    ASSERT_TRUE(cube.ok()) << cube.refusal;
+    EXPECT_EQ(cube.depth_slice_fanout, 6u);
+    EXPECT_EQ(cube.depth_first_slice, 0u);
+    EXPECT_EQ(cube.layer_slices, 6u) << "a layer at or above 6 is culled";
+    EXPECT_EQ(cube.route, NggLayerRoute::None) << "replayed per slice, not routed";
+
+    NggDrawFacts offset = f;
+    offset.depth_first_slice = 2;
+    offset.depth_slice_count = 2;
+    const NggDrawAdmission pair = admit_ngg_draw(kena_vs_only_registers(), offset, radv());
+    ASSERT_TRUE(pair.ok()) << pair.refusal;
+    EXPECT_EQ(pair.depth_slice_fanout, 2u);
+    EXPECT_EQ(pair.depth_first_slice, 2u);
+
+    NggDrawFacts single = f;
+    single.depth_slice_count = 1;
+    const NggDrawAdmission one = admit_ngg_draw(kena_vs_only_registers(), single, radv());
+    ASSERT_TRUE(one.ok()) << one.refusal;
+    EXPECT_EQ(one.depth_slice_fanout, 0u) << "one slice: the layer only culls";
+    EXPECT_EQ(one.layer_slices, 1u);
+
+    NggDrawFacts unbound = f;
+    unbound.depth_bound = false;
+    const NggDrawAdmission nothing = admit_ngg_draw(kena_vs_only_registers(), unbound, radv());
+    ASSERT_TRUE(nothing.refusal);
+    EXPECT_STREQ(nothing.refusal, "ngg-layer-target-not-layered");
+    NggDrawFacts unknown = f;
+    unknown.depth_view_known = false;
+    unknown.depth_slice_count = 0;
+    const NggDrawAdmission unseen = admit_ngg_draw(kena_vs_only_registers(), unknown, radv());
+    ASSERT_TRUE(unseen.refusal);
+    EXPECT_STREQ(unseen.refusal, "ngg-layer-target-not-single-slice");
+
+    // Mixed: a written one-slice colour target beside the depth array.
+    NggDrawFacts colour_2d = kena_vs_only_facts();
+    colour_2d.depth_bound = true;
+    colour_2d.depth_view_known = true;
+    colour_2d.depth_slice_count = 6;
+    const NggDrawAdmission mixed = admit_ngg_draw(kena_vs_only_registers(), colour_2d, radv());
+    ASSERT_TRUE(mixed.refusal);
+    EXPECT_STREQ(mixed.refusal, "ngg-layer-attachments-mixed");
+    // Mixed: a layered colour volume beside a bound depth/stencil; without it, admitted.
+    NggDrawFacts volume = kena_vs_only_facts();
+    volume.target_single_slice = false;
+    volume.target_slices = 4;
+    const NggDrawAdmission alone = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(alone.ok()) << alone.refusal << ": control, a volume with no depth";
+    EXPECT_EQ(alone.depth_slice_fanout, 0u);
+    volume.depth_bound = true;
+    volume.depth_view_known = true;
+    volume.depth_slice_count = 1;
+    // Depth writes on but no test: the backend attaches nothing, so the volume still renders.
+    const NggDrawAdmission write_only = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(write_only.ok()) << write_only.refusal << ": no attached depth, no mixed shape";
+    volume.depth_attached = true;
+    const NggDrawAdmission with_depth = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(with_depth.refusal);
+    EXPECT_STREQ(with_depth.refusal, "ngg-layer-attachments-mixed");
+}
+
 // A VS-only draw whose input the shell cannot represent is refused by name, not admitted as
 // triangles.
 TEST(NggDrawAdmission, AVsOnlyDrawRefusesInputsItCannotRepresent) {

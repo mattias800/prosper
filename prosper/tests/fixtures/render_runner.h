@@ -9720,7 +9720,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
         VkBool32 depth_bounds_test = VK_FALSE;
         float depth_bounds_min = 0.0f, depth_bounds_max = 1.0f;
-        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1, first_instance = 0;
         bool mesh_draw = false;
         std::array<uint32_t, 3> mesh_groups{1, 1, 1};
         int32_t vertex_offset = 0;
@@ -11065,6 +11065,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
         v.instance_count = bd.instance_count;
+        v.first_instance = bd.first_instance;
         v.vertex_offset = bd.vertex_offset;
         v.scissor = {{0, 0}, {W, H}};
         // PROSPER_IGNORE_EMPTY_SCISSOR (#1287 bring-up diagnostic): render draws whose resolved
@@ -14443,10 +14444,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
+            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, v.first_instance);
         } else {
-            vkCmdDraw(cmd, v.vcount, v.instance_count,
-                      static_cast<uint32_t>(v.vertex_offset), 0);
+            vkCmdDraw(cmd, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset),
+                      v.first_instance);
         }
         breadcrumbs.end(cmd, breadcrumb);
         if (labelled) prosper::gpu::gpu_label_end(dev, cmd);
@@ -15522,8 +15523,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
                     if (v.mesh_draw) ctx.cmd_draw_mesh_tasks(
                         c2, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
-                    else if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
-                    else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
+                    else if (v.icount) {
+                        vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset,
+                                         v.first_instance);
+                    } else
+                        vkCmdDraw(c2, v.vcount, v.instance_count,
+                                  static_cast<uint32_t>(v.vertex_offset), v.first_instance);
                 }
                 vkCmdEndRenderPass(c2);
                 backend_draw_iso_pass_count().fetch_add(1, std::memory_order_relaxed);
@@ -16024,6 +16030,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendResourceReuseStats aggregate_resources{};
     BackendPipelineCacheStats aggregate_pipelines{};
     BackendRenderTimingStats aggregate_timing{};
+    // A colourless call (a depth-only pass) carries nothing between segments: each one starts from
+    // the caller's own seeds and clears, and only the final one reads colour back.
+    const bool colour_unwritten = backend_draws_leave_colour(all);
     std::vector<uint8_t> carried_color0;
     std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> carried_slots;
     std::array<const uint8_t*, prosper::gpu::kColorTargetCount> carried_slot_ptrs{};
@@ -16173,7 +16182,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const bool final = end == all.size();
 
         const SplitSegmentContract segment = split_segment_contract(
-            color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs);
+            color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs, colour_unwritten);
+        const bool restart = begin == 0 || colour_unwritten;
         const BackendColorTarget* segment_target_ptr =
             segment.has_target ? &segment.target : nullptr;
         std::vector<uint8_t> intermediate_color1;
@@ -16185,10 +16195,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         BackendMrtOutputs* segment_mrt = mrt_outputs
             ? (final ? mrt_outputs : &intermediate_mrt) : nullptr;
         std::vector<uint8_t> rendered = render_draw_pass_rgba(
-            all.subspan(begin, end - begin), W, H, next_seed0, begin ? nullptr : clear_rgba,
-            persist_depth_stencil, segment_target_ptr, next_seed1, begin ? nullptr : clear_rgba1,
-            segment_out1, submission_batch, final ? flush_submission_batch : false, all,
-            segment_mrt, want_color_readback);
+            all.subspan(begin, end - begin), W, H, restart ? seed_rgba : next_seed0,
+            restart ? clear_rgba : nullptr, persist_depth_stencil, segment_target_ptr,
+            restart ? seed_rgba1 : next_seed1, restart ? clear_rgba1 : nullptr, segment_out1,
+            submission_batch, final ? flush_submission_batch : false, all, segment_mrt,
+            want_color_readback && (final || !colour_unwritten));
         add_stats();
 
         if (final) {

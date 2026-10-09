@@ -52,6 +52,9 @@ struct BackendDraw {
     std::vector<uint32_t> resource_order;
     uint32_t vcount = 3;
     uint32_t instance_count = 1;
+    uint32_t first_instance = 0;   // vkCmdDraw firstInstance (an NGG replay's selected layer)
+    // A layered depth replay (#3135): the layer this item's ngg_subgroup draws (DrawItem's).
+    uint32_t ngg_layer_select = 0;
     int32_t vertex_offset = 0;
     // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). The live frontend
     // lends the DrawItem's already-owned words for this synchronous backend call; replay and direct
@@ -92,3 +95,30 @@ struct BackendDraw {
         fs_identity = 0;
     }
 };
+
+// Why `draw` may change a colour attachment, or null when it cannot: an ordinary attachment draw
+// whose every slot's write mask is zero. A draw with no resolved state writes RGBA, and a draw that
+// produces colour by another route (raster quads, owned waves) is never claimed. A decoded
+// fast-clear VALUE (has_clear_color, ColorTarget::has_clear) is not a write: it is only the pass's
+// load-op clear, taken from the caller's argument (slots 0 and 1) or from the first decoded value
+// of the whole logical call (slots 2+), so every segment of a split starts from the same one.
+inline const char* backend_draw_colour_writer(const BackendDraw& draw) {
+    if (!draw.ps) return "no-state";
+    if (draw.raster_quads) return "raster-quads";
+    if (draw.owned_waves) return "owned-waves";
+    if (draw.fragment_draw_inputs) return "fragment-inputs";
+    const prosper::gpu::ResolvedPipelineState& ps = *draw.ps;
+    if (ps.color_write_mask) return "mask-slot0";
+    if (ps.color1_write_mask) return "mask-slot1";
+    for (const auto& target : ps.color_targets)
+        if (target.write_mask) return "mask-slot";
+    return nullptr;
+}
+inline bool backend_draw_leaves_colour(const BackendDraw& draw) {
+    return backend_draw_colour_writer(draw) == nullptr;
+}
+// A call none of whose draws changes colour: every physical segment of it starts from the same
+// colour state the first one did and ends with it unchanged, so a split needs no colour carried.
+inline bool backend_draws_leave_colour(std::span<const BackendDraw> draws) {
+    return !draws.empty() && std::all_of(draws.begin(), draws.end(), backend_draw_leaves_colour);
+}

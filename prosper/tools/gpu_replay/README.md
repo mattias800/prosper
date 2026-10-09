@@ -492,6 +492,10 @@ notices. A few places do, and each produces a plausible frame rather than an err
   whether ordinary guest bytes may be read beside a renderer-only volume slice ask the mapping
   table too (`unpublished_volume_may_overlap`), and in a replay they still get Unknown. A title
   that renders to volume targets may replay differently from its live run for that reason.
+- **A layered NGG depth draw replays its slice 0 only** (#4778, instrument trap 293). The live
+  executor expands such a draw into one replay per depth slice after the capture has recorded it,
+  and the slice count is not serialized. So a replayed point-light shadow cube has five empty
+  faces. Measure missing shadows live, not from a bundle.
 - **A DMA copy out of a seeded CB_COLOR ALT (BGRA) target is not swapped into guest order**
   (#4686, review of #4695). The live renderer keeps an ALT target as canonical RGBA8 and hands a
   DMA read the guest's BGRA bytes. An RTT seed records the target's host format but not the
