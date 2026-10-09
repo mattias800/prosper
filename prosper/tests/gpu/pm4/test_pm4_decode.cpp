@@ -337,5 +337,54 @@ TEST(Pm4Decode, Contract) {
         CHECK(disp_ops[1].indirect_offset == 0x2000u, "op1 offset == 0x2000");
         CHECK(disp_ops[1].dispatch_modifier == 0x41u, "op1 modifier == 0x41");
     }
+
+    // Hardware draw and write packets (Black Flag submit0.bin):
+    {
+        uint32_t work_stream[] = {
+            // IT_SET_BASE: 4 dwords, op 0x11, type=1 (compute), addr=0x40756412e0
+            PM4(4, IT_SET_BASE, 0),
+            1u, 0x756412e0u, 0x00000040u,
+            // IT_DRAW_INDEX_AUTO: 3 dwords, op 0x2D, count=0x300, modifier=2
+            PM4(3, IT_DRAW_INDEX_AUTO, 0),
+            0x300u, 2u,
+            // IT_DRAW_INDIRECT: 3 dwords, op 0x24, offset=0x40, modifier=2
+            PM4(3, IT_DRAW_INDIRECT, 0),
+            0x40u, 2u,
+            // IT_DRAW_INDEX_INDIRECT: 3 dwords, op 0x25, offset=0x60, modifier=2
+            PM4(3, IT_DRAW_INDEX_INDIRECT, 0),
+            0x60u, 2u,
+            // IT_INDEX_BASE: 3 dwords, op 0x26, addr=0x403fde86dc
+            PM4(3, IT_INDEX_BASE, 0),
+            0x3fde86dcu, 0x00000040u,
+            // IT_WRITE_DATA: 5 dwords, op 0x37, dst=0x100200, addr=0x406616c058, data=0
+            PM4(5, IT_WRITE_DATA, 0),
+            0x100200u, 0x6616c058u, 0x00000040u, 0u,
+        };
+        std::vector<Pm4Command> work_ops;
+        const size_t c = decode_pm4(work_stream, std::size(work_stream), work_ops);
+        CHECK(c == 21, "consumed 21 dwords of hardware work packets");
+        CHECK(work_ops.size() == 6, "decoded 6 hardware work packets");
+
+        CHECK(work_ops[0].kind == K::SetBaseIndirectArgs, "op0 is SetBaseIndirectArgs");
+        CHECK(work_ops[0].indirect_shader_type == 1u, "op0 type == compute");
+        CHECK(work_ops[0].indirect_base == 0x40756412e0ull, "op0 base == 0x40756412e0");
+
+        CHECK(work_ops[1].kind == K::DrawIndexAuto, "op1 is DrawIndexAuto");
+        CHECK(work_ops[1].index_count == 0x300u, "op1 count == 0x300");
+        CHECK(work_ops[1].di_modifier == 2u, "op1 modifier == 2");
+
+        CHECK(work_ops[2].kind == K::DrawIndirect, "op2 is DrawIndirect");
+        CHECK(work_ops[2].indirect_offset == 0x40u, "op2 offset == 0x40");
+
+        CHECK(work_ops[3].kind == K::DrawIndexIndirect, "op3 is DrawIndexIndirect");
+        CHECK(work_ops[3].indirect_offset == 0x60u, "op3 offset == 0x60");
+
+        CHECK(work_ops[4].kind == K::SetIndexBase, "op4 is SetIndexBase");
+        CHECK(work_ops[4].ib_addr == 0x403fde86dcull, "op4 ib_addr == 0x403fde86dc");
+
+        CHECK(work_ops[5].kind == K::WriteData, "op5 is WriteData");
+        CHECK(work_ops[5].wd_addr == 0x406616c058ull, "op5 wd_addr == 0x406616c058");
+        CHECK(work_ops[5].wd_num == 1u && work_ops[5].wd_valid, "op5 wd_num == 1");
+    }
 }
 
