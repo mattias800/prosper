@@ -8,10 +8,14 @@ those images, pulls out both sections, and writes a local-only store plus a
 hashes-only manifest. It is the extractor; validation/consumption of the raw code
 bytes is a separate step.
 
-Usage: python eboot_shader_elfs.py --eboot <file> --title-id <PPSA...> --out <dir>
+Usage: python eboot_shader_elfs.py --eboot <file> --title-id <PPSA...> [--out <dir>]
        [--manifest <file>] [--no-llvm]
 
-Output (all outside the repo, never committed): each nested ELF at
+The optional llvm-mc decode runs `llvm-mc` from PATH when present, else through WSL Ubuntu
+(Windows hosts); with neither, records are simply left unvalidated.
+
+Output (all outside the repo, never committed; default store is
+~/prosper-work/eboot_shaders/<title_id>): each nested ELF at
 <out>/<sha256-of-elf>.elf (identical ELFs share one file) and each raw
 `.shader_text` at <out>/<text_sha256>.bin. The manifest is JSON lines, one record
 per candidate hit (UTF-8, no host paths or drive letters).
@@ -141,14 +145,27 @@ def parse_nested_elf(data: bytes, off: int):
     return sections, data_end
 
 
+def _llvm_command():
+    """argv prefix that runs llvm-mc, or None when it is unreachable on this host.
+
+    A native `llvm-mc` on PATH wins (Linux/macOS); otherwise a Windows host reaches it
+    through WSL Ubuntu. Anything else degrades to "unvalidated", never to an error.
+    """
+    native = shutil.which("llvm-mc")
+    if native is not None:
+        return [native]
+    if shutil.which("wsl") is not None:
+        return ["wsl", "-d", "Ubuntu", "--", "llvm-mc"]
+    return None
+
+
 def llvm_available() -> bool:
-    """True when llvm-mc is reachable through WSL Ubuntu (probed once per call)."""
-    if shutil.which("wsl") is None:
+    """True when llvm-mc is reachable (native or through WSL Ubuntu); probed per call."""
+    cmd = _llvm_command()
+    if cmd is None:
         return False
     try:
-        proc = subprocess.run(
-            ["wsl", "-d", "Ubuntu", "--", "llvm-mc", "--version"], capture_output=True, timeout=60
-        )
+        proc = subprocess.run([*cmd, "--version"], capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
@@ -160,19 +177,13 @@ def llvm_invalid_count(code: bytes):
     Returns None when llvm-mc is unreachable or the decode itself fails, so a
     broken instrument reads as unvalidated rather than as clean or dirty.
     """
+    cmd = _llvm_command()
+    if cmd is None:
+        return None
     tokens = " ".join(f"0x{b:02x}" for b in code)
     try:
         proc = subprocess.run(
-            [
-                "wsl",
-                "-d",
-                "Ubuntu",
-                "--",
-                "llvm-mc",
-                "--disassemble",
-                "-triple=amdgcn-amd-amdhsa",
-                "-mcpu=gfx1030",
-            ],
+            [*cmd, "--disassemble", "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030"],
             input=tokens,
             capture_output=True,
             text=True,
@@ -273,7 +284,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="store directory (default C:\\dev\\ps5\\work\\eboot_shaders\\<title_id>)",
+        help="store directory (default ~/prosper-work/eboot_shaders/<title_id>; keep it "
+        "outside the repo, extracted game content is never committed)",
     )
     parser.add_argument(
         "--manifest", default=None, help="manifest path (default <out>/manifest.jsonl)"
@@ -290,7 +302,9 @@ def main(argv=None) -> int:
     if not eboot.is_file():
         parser.error(f"--eboot not found: {args.eboot}")
     out_dir = (
-        Path(args.out) if args.out else (Path(r"C:\dev\ps5\work\eboot_shaders") / args.title_id)
+        Path(args.out)
+        if args.out
+        else Path.home() / "prosper-work" / "eboot_shaders" / args.title_id
     )
     manifest_path = Path(args.manifest) if args.manifest else out_dir / "manifest.jsonl"
     result = extract(eboot, args.title_id, out_dir, manifest_path, use_llvm=not args.no_llvm)

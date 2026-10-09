@@ -216,3 +216,50 @@ def test_llvm_validated_status_end_to_end(tmp_path):
     assert len(records) == 1
     assert records[0]["status"] == "ok"
     assert records[0]["llvm_invalid"] == 0
+
+
+def test_default_store_is_under_home_not_a_windows_path(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(ese.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(tmp_path)
+    eboot = tmp_path / "eboot.bin"
+    eboot.write_bytes(PAD * 16 + build_shader_elf())
+    assert ese.main(["--eboot", str(eboot), "--title-id", "PPSA00000", "--no-llvm"]) == 0
+    store = home / "prosper-work" / "eboot_shaders" / "PPSA00000"
+    assert (store / "manifest.jsonl").is_file()
+    assert len(list(store.glob("*.elf"))) == 1
+    # nothing may be created relative to the working directory (e.g. a literal "C:\..." name)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["eboot.bin", "home"]
+
+
+def test_without_llvm_records_degrade_to_unvalidated(tmp_path, monkeypatch):
+    monkeypatch.setattr(ese.shutil, "which", lambda _name: None)
+    assert ese.llvm_available() is False
+    assert ese.llvm_invalid_count(S_ENDPGM) is None
+    _out, records = run_tool(PAD * 16 + build_shader_elf(), tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "unvalidated"
+    assert records[0]["llvm_invalid"] is None
+
+
+def test_native_llvm_mc_is_preferred_over_wsl(monkeypatch):
+    seen = []
+
+    def fake_which(name):
+        return {"llvm-mc": "/opt/llvm/bin/llvm-mc", "wsl": "/usr/bin/wsl"}.get(name)
+
+    class Done:
+        returncode = 0
+        stdout = "invalid instruction encoding\ninvalid instruction encoding\n"
+        stderr = ""
+
+    def fake_run(argv, **_kw):
+        seen.append(argv)
+        return Done()
+
+    monkeypatch.setattr(ese.shutil, "which", fake_which)
+    monkeypatch.setattr(ese.subprocess, "run", fake_run)
+    assert ese.llvm_available() is True
+    assert ese.llvm_invalid_count(S_ENDPGM) == 2
+    assert all(argv[0] == "/opt/llvm/bin/llvm-mc" for argv in seen)

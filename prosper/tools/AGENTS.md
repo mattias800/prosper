@@ -443,8 +443,9 @@ capture/replay without requiring an importable system Python module.
   their eboot's read-only data (`e_machine == 0xE0`, `.shader_header` + `.shader_text`
   sections for `sceAgcCreateShader`). Writes each ELF and each raw `.shader_text` under a
   content-hash name plus a hashes-only JSONL manifest. **Its output is local-only**: the store
-  defaults to `C:\dev\ps5\work\eboot_shaders\<title_id>\`, outside the repo — never commit
-  extracted ELFs, text sections, or the manifest. Read-only on the dumps.
+  defaults to `~/prosper-work/eboot_shaders/<title_id>/`, outside the repo — never commit
+  extracted ELFs, text sections, or the manifest. Read-only on the dumps. The optional `llvm-mc`
+  decode uses `llvm-mc` from PATH, else WSL Ubuntu; with neither, records are `unvalidated`.
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
