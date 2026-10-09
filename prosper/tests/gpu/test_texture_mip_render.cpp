@@ -203,6 +203,31 @@ TEST(TextureMipRender, Contract) {
               grad_center[1] < 0x20 && grad_center[2] > 0x60 && grad_center[2] < 0xA0,
           "IMAGE_SAMPLE_D unit gradients select LOD 2 instead of the literal UV's implicit LOD 0");
 
+    // IMAGE_SAMPLE_CD (0x68, llvm-mc gfx1030: 0xf1a00f08 = "image_sample_cd v[6:9], v[0:5],
+    // s[8:15], s[16:19] dmask:0xf dim:2D") takes the same [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
+    // operands. The gradients here are quad-uniform (literals), where the coarse form's per-quad
+    // LOD and Grad's per-invocation LOD agree, so it must select LOD 2 (purple) exactly as
+    // IMAGE_SAMPLE_D does. Before #4808 it had no lowering and the program was refused.
+    std::vector<uint32_t> ps_coarse_grad(ps_grad, ps_grad + sizeof(ps_grad) / sizeof(ps_grad[0]));
+    ps_coarse_grad[10] = 0xf1a00f08u;
+    ASSERT_EQ(ps_grad[10], 0xf0880f08u) << "the sample_d word the sample_cd arm replaces";
+    std::vector<uint32_t> coarse_frag =
+        recompile_fragment(ps_coarse_grad.data(), ps_coarse_grad.size(), &rt);
+    prosper::test::BackendDraw coarse_draw = grad_draw;
+    coarse_draw.fs = coarse_frag;
+    std::vector<uint8_t> coarse_px = coarse_frag.empty()
+                                         ? std::vector<uint8_t>{}
+                                         : prosper::test::render_draws_rgba({coarse_draw}, W, H);
+    const uint8_t* coarse_center = coarse_px.size() == (size_t)W * H * 4
+                                       ? &coarse_px[((size_t)(H / 2) * W + W / 2) * 4]
+                                       : nullptr;
+    printf("  sample_cd unit-grad center=(%u,%u,%u)\n", coarse_center ? coarse_center[0] : 0,
+           coarse_center ? coarse_center[1] : 0, coarse_center ? coarse_center[2] : 0);
+    CHECK(!coarse_frag.empty(), "IMAGE_SAMPLE_CD recompiles (it was refused before #4808)");
+    CHECK(coarse_center && coarse_center[0] > 0x60 && coarse_center[0] < 0xA0 &&
+              coarse_center[1] < 0x20 && coarse_center[2] > 0x60 && coarse_center[2] < 0xA0,
+          "IMAGE_SAMPLE_CD quad-uniform unit gradients select LOD 2 like IMAGE_SAMPLE_D");
+
     // An identity gradient on a square texture cannot distinguish the required
     // [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy] grouping from its transpose. Use a non-square 8x2 texture and
     // put the only derivative in Dt/Dx: correctly grouped it spans 2*.25=.5 texels and selects

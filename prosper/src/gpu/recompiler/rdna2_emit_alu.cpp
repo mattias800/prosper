@@ -8414,7 +8414,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // wrapped, atlas, and uniform coordinates do not share the screen quad's implicit derivative.
             // CONFIDENCE: HIGH — operand order is ISA-defined and an execution regression distinguishes the
             // requested gradient-selected mip from the implicit-derivative result.
-            const bool is_sample_d = (in.opcode == 0x22);
+            //
+            // image_sample_cd = 0x68 takes the same operands in the same order (llvm-mc gfx1030:
+            // 0xf1a00f08 "image_sample_cd v[6:9], v[0:5], ..." beside 0xf0880f08 "image_sample_d"),
+            // in contiguous and NSA forms, so it takes the same Grad lowering. The Pathless
+            // (PPSA01826, six fragment programs, ~92k draws per census run), Little Nightmares II
+            // (PPSA02154) and Sonic Origins (PPSA05325, NSA) issue it as a plain 2D sample; with no
+            // lowering every one of those draws was dropped (#4808). CONFIDENCE: MED -- the "C"
+            // (coarse) form selects one LOD per 2x2 quad from the supplied derivatives, whereas
+            // Grad evaluates the LOD per invocation. The two agree whenever the supplied
+            // derivatives are uniform across the quad, which is what a coarse-derivative shader
+            // computes them to be; a quad whose lanes pass different derivatives may select a
+            // neighbouring mip per pixel where hardware selects one for the quad.
+            const bool is_sample_d = (in.opcode == 0x22) || (in.opcode == 0x68);
             // These array lowerings preserve the guest's layer operand. The older generic
             // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.
