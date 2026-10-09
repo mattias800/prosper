@@ -7369,7 +7369,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             rs.sreg_absent_read.clear();   // only THIS header's seeds
-        for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+            for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
             LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
