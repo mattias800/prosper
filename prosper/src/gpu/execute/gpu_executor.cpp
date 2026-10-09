@@ -7959,8 +7959,9 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     // (alpha kill and divergent ifs included), and any store all stay refused.
                     // CONFIDENCE: MED, and only while prosper's bytes are the GPU's: a table the
                     // guest recycled under prosper (SDK<13, #2220) looks exactly like a stale slot.
-                    // On Kena that race never reached a scalar-skippable use (#4801); the
-                    // `[t8-unbound]` line names every slot this binds. skippable_instruction.hpp.
+                    // On Kena the race reached one scalar-skippable use, in a program it already
+                    // refuses on an always-run sample (#4801). `[t8-unbound]` names every slot this
+                    // binds, and its RUN TOTAL counts them. See skippable_instruction.hpp.
                     // Pure reads only, by the decoder's fail-closed writer test rather than the
                     // storage classifier, which does not list every gfx10 write op (#4801 review).
                     const bool pure_read_use = u.use_pc < shader_dwords && [&] {

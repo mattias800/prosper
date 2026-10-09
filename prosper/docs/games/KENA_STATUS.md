@@ -56,6 +56,24 @@ pair in the stage's direct user data on an instruction that always runs. It is t
 visibility run showed it. The default is #2220's decision, and #2223 records why a global change needs
 a cross-title pass first.
 
+**The #4801 review narrowed the fix, and these runs back that.** The first version nulled any
+unusable T# on an instruction some path avoids. Diffing the `[t8-unbound]` sites of the four default
+fix runs against the two visibility runs showed what that cost. Every site outside the lighting program
+was default-only: 19 level-load programs whose recycled tables sat behind mask branches. In 10 of those
+programs the null bindings turned a refusal into an admitted draw, a silently wrong one; among them are
+`0x5006ae0000` and `0x5008030000`. The rule now needs three things: words that are not a T# at all (or a base in no
+guest mapping), a skip decided by scalar branches, and a pure read. Same-tree arms, rule compiled in
+(fix3) and out (off3), on the same route:
+
+| run | `[t8-unbound]` RUN TOTAL | programs with null bindings | lighting program | fragment drops |
+| --- | --- | --- | --- | --- |
+| fix3, default | 1,451 uses, 13 sites | lighting; `0x500ac20000` (2 sites), already refused on an always-run sample | refused at pc 27 (16 draws, mechanism 2) | 24 |
+| fix3 + visibility | 1,452 uses, 7 sites | lighting only | admitted | 0 |
+| off3, default | (rule compiled out) | — | refused at pc 172 | 610 |
+
+The flip-1000 and flip-1600 frames of fix3 and off3 are the same picture: 0.0% and 0.5% of pixels
+differ by more than 16 levels.
+
 What these runs do **not** show is a change in the picture. The pulse-prompt frame at flip 1600 has the
 same black world in base-2, fix-1, fix-2 and in the visibility run (#4775).
 
@@ -1128,6 +1146,10 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **Kena's level-load burst of `unresolved-operand` refusals is the stale-slot mechanism** — false.
   Those T#s are read on every path, from tables full of float data. They vanish with
   `PROSPER_POST_SUBMIT_VISIBILITY=1`, which leaves the stale slots in place (2026-10-09, #4796, #2220).
+- **An unusable T# on any instruction some path avoids is an unwritten slot** — false. Mask branches
+  (execz, alpha kill) count as avoiding paths, and behind them the default runs held recycled tables.
+  Binding those null admitted 10 programs that the visibility runs never touched. Only scalar-branch
+  skips qualify now (2026-10-09, #4801 review).
 - **Kena's distance-field AO is empty because the cone trace is mis-compiled** — false as the first
   cause. The cone trace reads clipmaps that are mostly exact zeros, because the mesh-SDF atlas upload
   (`0x5008ba0000`) is skipped by the 512 MiB expanded-image bound (2026-10-09, #4766).
