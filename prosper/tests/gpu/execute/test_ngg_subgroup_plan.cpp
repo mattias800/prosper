@@ -322,4 +322,63 @@ TEST(NggSubgroupPlan, IndexedShapeRefusals) {
     EXPECT_TRUE(refused.subgroups.empty());
 }
 
+// #3135 P7: NGG without a GS. Kena's culling VS registers: onchip 0x10020040 (64 ES verts, 64 prims),
+// GE_CNTL 0x8040, GE_MAX_OUTPUT_PER_SUBGROUP 64, GS_MAX_VERT_OUT 0, ITEMSIZE 4. A merged reading of
+// the same registers has no usable primitive limit (64 output vertices / 0 per primitive); the
+// VS-only partition bounds primitives by GS_PRIMS_PER_SUBGRP and PRIM_GRP_SIZE, ES vertices by the
+// output limit too, and a subgroup has max(es, prims) threads.
+NggSubgroupLimits kena_vs_only_limits() {
+    NggSubgroupLimits l = decode_ngg_subgroup_limits(0x10020040u, 0x8040u, 0x40u, 0u, 4u);
+    l.vs_only = true;
+    return l;
+}
+
+TEST(NggSubgroupPlan, VsOnlyPartitionIgnoresTheGsOutputLimit) {
+    NggSubgroupLimits merged = kena_vs_only_limits();
+    merged.vs_only = false;
+    NggDrawShape list;
+    list.topology = NggInputTopology::TriangleList;
+    list.vertex_count = 3u * 100u;   // 100 disjoint triangles: 300 unique vertices
+    EXPECT_EQ(plan_ngg_subgroups(list, merged).refusal, "ngg-limits-unusable")
+        << "control: read as merged, GS_MAX_VERT_OUT 0 leaves no primitive limit";
+
+    const NggSubgroupPlan plan = plan_ngg_subgroups(list, kena_vs_only_limits());
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    // 64 ES vertices per subgroup: 21 whole triangles (63 vertices) each, so ceil(100 / 21) = 5.
+    ASSERT_EQ(plan.subgroups.size(), 5u);
+    uint32_t prims = 0;
+    for (const NggSubgroup& s : plan.subgroups) {
+        EXPECT_LE(s.es_threads(), 64u);
+        EXPECT_LE(s.gs_threads(), 64u);
+        EXPECT_EQ(s.waves, 1u) << "max(es, prims) threads, not prims x GS_MAX_VERT_OUT";
+        prims += s.gs_threads();
+    }
+    EXPECT_EQ(prims, 100u);
+    EXPECT_EQ(plan.subgroups[0].gs_threads(), 21u);
+
+    // A strip adds one vertex per primitive, so the 64 ES vertices bind before the 64 primitives.
+    NggDrawShape strip;
+    strip.topology = NggInputTopology::TriangleStrip;
+    strip.vertex_count = 130;   // 128 primitives
+    const NggSubgroupPlan strips = plan_ngg_subgroups(strip, kena_vs_only_limits());
+    ASSERT_TRUE(strips.ok()) << strips.refusal;
+    ASSERT_EQ(strips.subgroups.size(), 3u) << "62 prims (64 vertices), then 62, then 4";
+    EXPECT_EQ(strips.subgroups[0].es_threads(), 64u);
+    EXPECT_EQ(strips.subgroups[0].gs_threads(), 62u);
+}
+
+// The output limit bounds ES vertices only for a VS-only draw: with it below the onchip ES limit,
+// a subgroup holds at most that many vertices.
+TEST(NggSubgroupPlan, VsOnlyOutputLimitBoundsEsVertices) {
+    NggSubgroupLimits limits = kena_vs_only_limits();
+    limits.max_out_verts_per_subgroup = 30u;
+    NggDrawShape list;
+    list.topology = NggInputTopology::TriangleList;
+    list.vertex_count = 3u * 20u;
+    const NggSubgroupPlan plan = plan_ngg_subgroups(list, limits);
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    for (const NggSubgroup& s : plan.subgroups) EXPECT_LE(s.es_threads(), 30u);
+    EXPECT_EQ(plan.subgroups[0].gs_threads(), 10u);
+}
+
 }   // namespace

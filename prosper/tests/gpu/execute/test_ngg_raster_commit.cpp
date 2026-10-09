@@ -141,6 +141,7 @@ TEST(NggRasterCommit, LayerConfigurationsThatCannotWorkAreRefused) {
     EXPECT_EQ(why, "reason=ngg-layer-without-pos1");
     config = base_config(NggLayerRoute::None);
     config.layer_from_pos1 = true;
+    config.layer_slices = 2;
     EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty());
     EXPECT_NE(why.find("reason=ngg-layer-route-unavailable"), std::string::npos) << why;
     config = base_config(NggLayerRoute::ForwardingGeometry);
@@ -681,6 +682,40 @@ TEST(NggRasterCommit, LineListsRasterizeAsLines) {
         }
     }
     EXPECT_GT(ran, 0u);
+}
+
+// #3135 P7: a one-slice target needs no route. The layer is read to cull and count a primitive
+// that names another slice, and the vertex stage declares no BuiltIn Layer: writing gl_Layer into
+// a one-layer framebuffer is undefined (Undefined-Value-Layer-Written).
+TEST(NggRasterCommit, AOneSliceTargetReadsTheLayerWithoutWritingIt) {
+    std::string why;
+    NggRasterCommitConfig config = base_config(NggLayerRoute::None);
+    config.layer_from_pos1 = true;
+    config.layer_slices = 1;
+    const std::vector<uint32_t> spirv = build_ngg_raster_commit_vertex(config, nullptr, &why);
+    ASSERT_FALSE(spirv.empty()) << why;
+    bool layer_builtin = false;
+    for (size_t at = 5; at < spirv.size();) {
+        const uint32_t words = spirv[at] >> 16, op = spirv[at] & 0xffffu;
+        if (!words) break;
+        if (op == 71u && words >= 4u && spirv[at + 2] == 11u && spirv[at + 3] == 9u)
+            layer_builtin = true;   // OpDecorate <id> BuiltIn Layer
+        at += words;
+    }
+    EXPECT_FALSE(layer_builtin) << "nothing may write gl_Layer for a one-slice target";
+    config.route = NggLayerRoute::ShaderOutputLayer;
+    config.layer_slices = 2;
+    const std::vector<uint32_t> routed = build_ngg_raster_commit_vertex(config, nullptr, &why);
+    ASSERT_FALSE(routed.empty()) << why << ": control, a routed two-slice target";
+    bool routed_builtin = false;
+    for (size_t at = 5; at < routed.size();) {
+        const uint32_t words = routed[at] >> 16, op = routed[at] & 0xffffu;
+        if (!words) break;
+        if (op == 71u && words >= 4u && routed[at + 2] == 11u && routed[at + 3] == 9u)
+            routed_builtin = true;
+        at += words;
+    }
+    EXPECT_TRUE(routed_builtin) << "control: the scan finds BuiltIn Layer when it is written";
 }
 
 }   // namespace

@@ -75,6 +75,23 @@ TEST(Wave64RefusalLine, ARecompileRefusalSaysTheHostWasNotConsulted) {
     EXPECT_TRUE(has(fragment, "refusal=fragment/recompile")) << fragment;
 }
 
+TEST(Wave64RefusalLine, ACandidateIsPrintedAsSeparateFieldsAndOnlyWhenKnown) {
+    const std::string without =
+        wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {});
+    EXPECT_FALSE(has(without, "candidate-"))
+        << "a caller without a candidate is unchanged: " << without;
+    const std::string with =
+        wave64_refusal_line(Wave64Refusal::ComputeSubgroup, 0x4072, 0, UINT32_MAX, 32, 32, {},
+                            "n-lanes", "cross-lane-in-loop");
+    EXPECT_TRUE(has(with, " candidate-route=n-lanes candidate-reason=cross-lane-in-loop")) << with;
+    EXPECT_TRUE(has(with, " route=refused ")) << "the single route= is #4754's: " << with;
+    EXPECT_EQ(with.find(" route=", with.find(" route=") + 1), std::string::npos)
+        << "never a second `route=`; that field belongs to #4754: " << with;
+    EXPECT_TRUE(has(with, "[wave64-unsupported] stage=compute program=0x4072 "))
+        << "the prefix the census tools key on is unchanged: " << with;
+    EXPECT_EQ(with.back(), '\n');
+}
+
 TEST(Wave64RefusalLine, ASubgroupRefusalStillNamesTheHostRange) {
     const std::string known =
         wave64_refusal_line(Wave64Refusal::FragmentSubgroup, 0x4071, 0x40710001, 2, 32, 32, {});
@@ -124,10 +141,15 @@ TEST(Wave64RouteField, AnAdmittedProgramIsNotTaggedUnsupported) {
     EXPECT_TRUE(has(native, "route=native ")) << native;
 }
 
+TEST(Wave64RouteField, TheExchangeRoutePrintsItsOwnLine) {
+    const std::string line = wave64_route_line(Wave64Route::WorkgroupExchange, true, 0x5028, 0);
+    EXPECT_TRUE(has(line, "[wave64-route] stage=compute program=0x5028 ")) << line;
+    EXPECT_TRUE(has(line, "route=workgroup-exchange ")) << line;
+}
+
 TEST(Wave64RouteField, ARouteThatDoesNotExistYetPrintsNothing) {
-    for (Wave64Route reserved : {Wave64Route::WorkgroupExchange, Wave64Route::NLanes,
-                                 Wave64Route::FragmentPromoted, Wave64Route::OwnedWave,
-                                 Wave64Route::Refused})
+    for (Wave64Route reserved : {Wave64Route::NLanes, Wave64Route::FragmentPromoted,
+                                 Wave64Route::OwnedWave, Wave64Route::Refused})
         EXPECT_TRUE(wave64_route_line(reserved, false, 1, 2).empty())
             << wave64_route_name(reserved);
 }

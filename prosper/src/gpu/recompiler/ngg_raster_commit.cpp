@@ -156,7 +156,10 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
     const bool read_layer = config.layer_from_pos1;
     if (read_layer && (layout.pos1_word == kNggRecordAbsent || !(layout.pos1_channels & 4u)))
         return fail(refusal, "ngg-layer-without-pos1");
-    if (read_layer && config.route == NggLayerRoute::None)
+    // A one-slice target needs no route: the layer is read only to cull (and count) a primitive
+    // that names another slice, and nothing writes gl_Layer, which a one-layer framebuffer leaves
+    // undefined (Undefined-Value-Layer-Written). More slices need a route (#3135 P7).
+    if (read_layer && config.route == NggLayerRoute::None && config.layer_slices != 1u)
         return fail(refusal, "ngg-layer-route-unavailable", "cause=route-none");
     if (config.route == NggLayerRoute::InterpolationGeometry && corners != 3)
         return fail(refusal, "ngg-interpolation-geometry-needs-triangles");
@@ -184,7 +187,7 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
 
     // Layer output: BuiltIn Layer on the vertex stage, or a uint varying for a geometry stage.
     uint32_t layer_output = 0;
-    if (read_layer) {
+    if (read_layer && config.route != NggLayerRoute::None) {
         const uint32_t pointer = b.id();
         layer_output = b.id();
         if (config.route == NggLayerRoute::ShaderOutputLayer) {

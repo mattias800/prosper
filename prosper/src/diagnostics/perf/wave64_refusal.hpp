@@ -49,7 +49,8 @@ inline const char* wave64_route_name(Wave64Route route) {
 }
 // True for the routes that exist today and admit a program.
 inline constexpr bool wave64_route_admits_today(Wave64Route route) {
-    return route == Wave64Route::Native || route == Wave64Route::ProvenWidthIndependent;
+    return route == Wave64Route::Native || route == Wave64Route::ProvenWidthIndependent ||
+           route == Wave64Route::WorkgroupExchange;
 }
 // Uses by route over any counter source with a count(Counter) member (a ledger window). A reserved
 // route reports 0. Refused is the sum of the four refusal counters.
@@ -58,6 +59,7 @@ uint64_t wave64_route_uses(const Source& source, Wave64Route route) {
     switch (route) {
         case Wave64Route::Native: return source.count(Counter::Wave64RouteNative);
         case Wave64Route::ProvenWidthIndependent: return source.count(Counter::Wave64RouteProven);
+        case Wave64Route::WorkgroupExchange: return source.count(Counter::Wave64RouteExchange);
         case Wave64Route::Refused: {
             uint64_t total = 0;
             for (Counter counter : kWave64RefusalCounters) total += source.count(counter);
@@ -90,6 +92,12 @@ template<size_t Capacity> struct Wave64RefusalInventory {
     }
 };
 
+// A candidate route for a refused program: names only, empty = none.
+struct Wave64Candidate {
+    char route[40] = "";
+    char reason[64] = "";
+};
+
 // One refusal as text. Pure, so the wording is testable without capturing stderr.
 //
 // A RECOMPILE refusal never consulted the device. It used to print the same
@@ -97,9 +105,16 @@ template<size_t Capacity> struct Wave64RefusalInventory {
 // read as "this GPU cannot run Wave64": Space Adventure Cobra's missing 3D (#4508) was taken that
 // way on a device that offers 64-lane subgroups. Those sites now say `not-consulted`, and name
 // the recompiler as the cause.
+//
+// `candidate_*` (ADR 0028): what the program's analysis WOULD route it to, as two trailing fields
+// `candidate-route=<name> candidate-reason=<reason>` using the route vocabulary of #4754. They are
+// never a second `route=`: a refused dispatch's route is `refused` and only #4754 prints it. Null
+// prints no field, which is every other caller.
 inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uint64_t identity,
                                        uint32_t wave_reasons, uint32_t host_min, uint32_t host_max,
-                                       const gpu::FragmentVoteLoweringDiagnostic& lowering) {
+                                       const gpu::FragmentVoteLoweringDiagnostic& lowering,
+                                       const char* candidate_route = nullptr,
+                                       const char* candidate_reason = nullptr) {
     const size_t i = static_cast<size_t>(site);
     if (i >= kWave64RefusalCount) return {};
     const bool compute =
@@ -131,12 +146,16 @@ inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uin
                           gpu::fragment_vote_refusal_name(lowering.refusal));
         }
     }
-    char line[1024];
+    char route_field[160] = "";
+    if (candidate_route && *candidate_route)
+        std::snprintf(route_field, sizeof route_field, " candidate-route=%s candidate-reason=%s",
+                      candidate_route, candidate_reason ? candidate_reason : "unspecified");
+    char line[1280];
     std::snprintf(
         line, sizeof line,
         "[wave64-unsupported] stage=%s program=0x%llx identity=0x%llx "
         "refusal=%s route=%s guest-wave=64 host-subgroups=%s wave-reasons=%s consequence=%s "
-        "next=%s%s\n",
+        "next=%s%s%s\n",
         compute ? "compute" : "fragment", (unsigned long long)program, (unsigned long long)identity,
         kWave64RefusalNames[i], wave64_route_name(Wave64Route::Refused), host, reasons,
         compute ? "dispatch-skipped/output-unwritten" : "draw-dropped/content-missing",
@@ -144,7 +163,7 @@ inline std::string wave64_refusal_line(Wave64Refusal site, uint64_t program, uin
             ? "prosper recompiler/resource-binding, NOT a host limit; "
               "PROSPER_DBG_PROGRAM=<program> for rejection pc"
             : "subgroup-contract/lowering; see the adjacent backend skip and wave reason bits",
-        detail);
+        detail, route_field);
     return line;
 }
 
@@ -225,7 +244,9 @@ inline void observe_wave64_shader(uint32_t guest_wave, bool compute) {
 inline void note_wave64_route(Wave64Route route, bool compute, uint32_t guest_wave) {
     if (!enabled() || guest_wave != 64 || !wave64_route_admits_today(route)) return;
     if (compute ? thread_dispatch_skip_suppression() : thread_draw_drop_suppression()) return;
-    add(route == Wave64Route::Native ? Counter::Wave64RouteNative : Counter::Wave64RouteProven);
+    add(route == Wave64Route::Native              ? Counter::Wave64RouteNative
+        : route == Wave64Route::WorkgroupExchange ? Counter::Wave64RouteExchange
+                                                  : Counter::Wave64RouteProven);
 }
 
 // Names one proof-route program once, the way a refusal does. Takes a mutex and scans the
@@ -284,11 +305,12 @@ inline void note_native_fragment_wave64(bool admitted, bool votes_lowered,
 inline void note_wave64_compute_native(uint32_t required_subgroup, uint32_t guest_wave) {
     if (required_subgroup == 64) note_wave64_route(Wave64Route::Native, true, guest_wave);
 }
-inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
-                                    uint64_t program, uint64_t identity = 0,
-                                    uint32_t wave_reasons = UINT32_MAX,
+inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave, uint64_t program,
+                                    uint64_t identity = 0, uint32_t wave_reasons = UINT32_MAX,
                                     uint32_t host_min = 0, uint32_t host_max = 0,
-                                    const gpu::FragmentVoteLoweringDiagnostic& lowering = {}) {
+                                    const gpu::FragmentVoteLoweringDiagnostic& lowering = {},
+                                    Wave64Candidate (*candidate)(const void*) = nullptr,
+                                    const void* candidate_arg = nullptr) {
     const size_t i = static_cast<size_t>(site);
     if (!enabled() || guest_wave != 64 || i >= kWave64RefusalCount) return;
     const bool compute = site == Wave64Refusal::ComputeRecompile ||
@@ -323,8 +345,10 @@ inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
     } else {
         add(Counter::Wave64NewRefusalIdentities);
     }
-    const std::string line =
-        wave64_refusal_line(site, program, identity, wave_reasons, host_min, host_max, lowering);
+    // Only a line that will actually print pays for the analysis (after the dedupe above).
+    const Wave64Candidate cand = candidate ? candidate(candidate_arg) : Wave64Candidate{};
+    const std::string line = wave64_refusal_line(site, program, identity, wave_reasons, host_min,
+                                                 host_max, lowering, cand.route, cand.reason);
     std::fputs(line.c_str(), stderr);
 }
 

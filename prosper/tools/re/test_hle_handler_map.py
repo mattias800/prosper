@@ -539,15 +539,15 @@ def test_real_tree():
         # 13 since #4458: sceLoginDialogInitialize left s_ok for its real handler (-1) and the two
         # WebBrowserDialog Initialize/Terminate stubs, previously unregistered, joined it (+2).
         # 14 since #4478: sceUserServiceInitialize2, previously unregistered, joined it (+1).
-        # 12 since the console-oracle user-service work: sceUserServiceInitialize and
-        # sceUserServiceTerminate left s_ok for real handlers that validate their arguments and keep
-        # the initialized flag (-2). sceUserServiceInitialize2 stays on s_ok.
-        check("[%s] s_ok serves 12" % platform, s.get("s_ok"), 12)
+        # 11 since the console-oracle user-service work: sceUserServiceInitialize, Initialize2 and
+        # Terminate left s_ok for real handlers that validate the priority and keep the initialized
+        # flag (-3).
+        check("[%s] s_ok serves 11" % platform, s.get("s_ok"), 11)
         # 1 since #4577: sceNpUnregisterStateCallbackA left s_np_ok for its real handler in
         # src/hle/np/state_callbacks.cpp (-1), so the sum drops with it.
         check("[%s] s_np_ok serves the other 1" % platform, s.get("s_np_ok"), 1)
-        check("[%s] the two trivial stubs still serve 13 between them" % platform,
-              s.get("s_ok", 0) + s.get("s_np_ok", 0), 13)
+        check("[%s] the two trivial stubs still serve 12 between them" % platform,
+              s.get("s_ok", 0) + s.get("s_np_ok", 0), 12)
         # The five handlers the platform-blind extraction promoted to "shared" (#2070). Each is
         # registered once per `#if` arm of hle_kernel_mem.cpp and answers exactly ONE Sony function.
         for h in ("k_dmem_size", "k_virtual_query", "k_alloc_dmem", "k_mtypeprotect", "k_mprotect"):

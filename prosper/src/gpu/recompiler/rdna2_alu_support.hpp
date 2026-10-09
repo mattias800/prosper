@@ -656,6 +656,23 @@ inline bool is_vadd_nc_u32_dpp_row_shr_bounded(const Rdna2Inst& in) {
         in.src[0].value == in.src[1].value;
 }
 
+// The same bounded ROW_SHR:N shape as an OR: Kena's culling NGG VS programs build a wave-wide OR of
+// their primitive masks with an in-place v_or_b32 ladder (ROW_SHR:1,2,4,8, BOUND_CTRL=1), then
+// cross rows with v_permlanex16 (#3135 P7). A source unavailable at the row edge reads zero, and
+// OR with zero keeps the lane's own SRC1, so the write is unconditional like the bounded ADD's.
+inline bool is_vor_b32_dpp_row_shr_bounded(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x1c && in.has_dpp && !in.has_sdwa &&
+           in.dpp_bound_ctrl && in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
+           in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu &&
+           in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
+           in.src[1].kind == OperandKind::VGPR && in.src[0].value == in.src[1].value;
+}
+
+// Either bounded ROW_SHR form: the NGG workgroup shell routes both through the phased dispatcher.
+inline bool is_dpp_row_shr_bounded(const Rdna2Inst& in) {
+    return is_vadd_nc_u32_dpp_row_shr_bounded(in) || is_vor_b32_dpp_row_shr_bounded(in);
+}
+
 enum class DppRowRor8Op : uint32_t {
     None = 0,
     MovB32 = 1,

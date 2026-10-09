@@ -119,6 +119,14 @@ struct NggDrawFacts {
     // Colour target 0's renderable volume view (color_target_volume_view); zero slices = not layered.
     uint32_t target_slices = 0;
     uint32_t target_first_slice = 0;
+    // Colour target 0 is not a volume and its CB view programs exactly slice 0 (SLICE_START and
+    // SLICE_MAX both present and 0): a one-slice target a layer can address only at 0.
+    bool target_single_slice = false;
+    // EVERY other attachment the draw binds is proven one slice the same way: each colour slot the
+    // draw writes (CB view 0..0, not a volume) and the depth/stencil attachment when one is bound
+    // (DB_DEPTH_VIEW present with SLICE_START and SLICE_MAX 0). A layered depth array behind a 2D
+    // colour target is how a shadow-cascade pass looks, and its layer is real.
+    bool other_attachments_single_slice = false;
     // The user-data range the program's AGC header declares (user_data_range_start/end).
     bool user_data_range_known = false;
     uint32_t user_data_range_start = 0;
@@ -132,7 +140,8 @@ struct NggDrawFacts {
 };
 
 struct NggDrawAdmission {
-    bool applies = false;   // a merged ES+GS NGG draw (GS_EN and PRIMGEN_EN)
+    bool applies = false;   // an NGG draw (PRIMGEN_EN): merged ES+GS, or the VS alone
+    bool vs_only = false;   // PRIMGEN_EN without GS_EN: the VS is the primitive shader (P7)
     const char* refusal = nullptr;   // the rule that refused; null when admitted
     NggSubgroupLimits limits;
     NggDrawShape shape;
@@ -155,7 +164,8 @@ struct NggDrawAdmission {
 //   ngg-gs-instancing             VGT_GS_INSTANCE_CNT enabled with a count above 1 (P6)
 //   ngg-input-topology            anything but a triangle list or strip (adjacency, rect, quad,
 //                                 fan, points, lines, patches)
-//   ngg-output-topology           VGT_GS_OUT_PRIM_TYPE points or rect list
+//   ngg-output-topology           VGT_GS_OUT_PRIM_TYPE points or rect list (merged ES+GS only: a
+//                                 VS-only draw exports its input triangles, CONFIDENCE: MED)
 //   ngg-index-unavailable         an indexed draw whose index buffer was not read: no address or
 //                                 count, an unknown element size, or unreadable bytes
 //   ngg-index-element-size / ngg-index-count / ngg-index-restart-unknown / ngg-index-restart
@@ -164,7 +174,12 @@ struct NggDrawAdmission {
 //   ngg-viewport-index / ngg-point-size / ngg-clip-cull-distance / ngg-user-clip-plane /
 //   ngg-vertex-kill-flag          per-vertex state the pass-through stage does not model
 //   ngg-vs-out-undecoded          PA_CL_VS_OUT_CNTL bits [31:25], until each is decoded
-//   ngg-layer-target-not-layered  the layer is read and colour target 0 is not a layered volume
+//   ngg-layer-target-not-layered  the layer is read and colour target 0 is neither a layered volume
+//                                 nor a proven one-slice view (a 2D array, or a view not programmed)
+//   ngg-layer-target-not-single-slice  the layer is read, colour target 0 is one slice, and another
+//                                 bound attachment (a colour slot, or depth/stencil) is not proven
+//                                 one slice. The layer may then address a real slice of it, which
+//                                 the shell cannot route: refused rather than culled (#3135 P7)
 //   ngg-layer-slice-start         the layer is read and the view's SLICE_START is not 0
 //   ngg-strip-order-visible       a strip with culling, a FRONT_FACE input, a flat input or a raw
 //                                 per-vertex input (odd-triangle order is open question 3).
@@ -184,8 +199,10 @@ struct NggDrawAdmission {
 //   ngg-lds-limit                 RSRC2_GS.LDS_SIZE above 64 KiB or the device's shared memory
 //   ngg-host-compute              no compute on the graphics queue
 //   ngg-layer-route-unavailable / ngg-interpolation-geometry-needs-triangles   (route selection)
-// A draw whose stages are not merged ES+GS NGG returns applies=false and no refusal: the path does
-// not apply to it.
+// A draw without PRIMGEN_EN returns applies=false and no refusal: the path does not apply to it.
+// Without GS_EN the same table applies to the VS alone (vs_only): GS_MAX_VERT_OUT then plays no
+// part in the partition, and VGT_GS_OUT_PRIM_TYPE does NOT name the exported primitive: the
+// draw exports its input triangles (#3135 P7).
 NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDrawFacts& facts,
                                 const NggHostCapabilities& host);
 

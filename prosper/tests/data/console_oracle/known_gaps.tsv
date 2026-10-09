@@ -2,3 +2,31 @@
 # a sentence). A mismatch not listed here fails test_console_oracle_replay; a listed case that now
 # matches also fails, so fixing a gap means deleting its line. This is the measured backlog.
 # id	reason
+agc_size_AcbDispatchIndirect	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_AcbEventWrite	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_CbDispatch	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_DcbDispatchIndirect	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_DcbDrawIndexAuto	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_DcbDrawIndex	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_DcbEventWrite	prosper's builder emits more dwords than the console reserves; GetSize keeps prosper's own size so the guest reserves what is written (#4757)
+agc_size_DcbDrawIndexOffset	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbDrawIndexIndirect	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbDrawIndirect	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetCxRegistersIndirect	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetCxRegistersIndirect_n4	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetShRegistersIndirect	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetShRegistersIndirect_n4	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetUcRegistersIndirect	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetUcRegistersIndirect_n4	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_DcbSetIndexSize	prosper reserves less than the console, the safe direction because the builder emits no more than prosper's own answer (#4757)
+agc_size_CbNop	prosper floors a zero-dword NOP at one dword; the console answers 0 (#4757)
+agc_size_CbSetShRegisterRangeDirect	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetShRegisterRangeDirect_n4	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetUcRegisterRangeDirect	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetUcRegisterRangeDirect_n4	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetShRegistersDirect	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetShRegistersDirect_n4	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetUcRegistersDirect	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_CbSetUcRegistersDirect_n4	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_DcbWriteData	count-dependent size not answered yet: the console's formula is in #4757
+agc_size_DcbWriteData_n4	count-dependent size not answered yet: the console's formula is in #4757
