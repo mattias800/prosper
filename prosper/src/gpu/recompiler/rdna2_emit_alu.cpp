@@ -256,7 +256,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
-    if (refuse_mask_write(b, rs, in, drop, ok)) return true;
+    if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
             if (in.opcode == 0x0a &&
@@ -2266,11 +2266,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return has_scalar_word(operand.value) &&
                         (!wide || has_scalar_word(operand.value + 1));
                 };
-                const bool retain_vcc_scalar = writes_vcc &&
-                    has_scalar_source(in.src[0], true) &&
-                    has_scalar_source(in.src[1], false) &&
-                    (rs.scalar_presence_has_no_placeholders ||
-                     b.vcc_bfe_u64_scalar_result_pcs.contains(in.pc));
+                const bool retain_vcc_scalar = writes_vcc && has_scalar_source(in.src[0], true) &&
+                                               has_scalar_source(in.src[1], false) &&
+                                               (rs.scalar_presence_has_no_placeholders ||
+                                                b.vcc_bfe_u64_scalar_result_pcs.contains(in.pc) ||
+                                                b.vcc_local_scalar_write_pcs.contains(in.pc));
                 if (writes_exec || writes_vcc) {
                     uint32_t lane = b.guest_lane_id();
                     lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(b.wave_size - 1));
@@ -2331,9 +2331,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 const bool has_proven_scalar_sources =
                     has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]) &&
-                    (!b.is_compute || b.wave_size != 64 ||
-                     rs.scalar_presence_has_no_placeholders ||
-                     b.vcc_b32_scalar_result_pcs.contains(in.pc));
+                    (!b.is_compute || b.wave_size != 64 || rs.scalar_presence_has_no_placeholders ||
+                     b.vcc_b32_scalar_result_pcs.contains(in.pc) ||
+                     b.vcc_local_scalar_write_pcs.contains(in.pc));
                 if ((!b.is_fragment && !b.is_compute) || gtav_wave32_vcchi_scalar_packet ||
                     has_proven_scalar_sources) {
                     // The vertex shell is a complete one-lane virtual wave, so its scalar VCC

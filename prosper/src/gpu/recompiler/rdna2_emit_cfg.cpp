@@ -17,6 +17,7 @@
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -6096,6 +6097,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.vcc_b32_low_only_pcs = proven_wave64_vcc_b32_low_only_pcs(ins);
         b.vcc_b32_low_only_analysis_done = true;
     }
+    b.vcc_local_scalar_write_pcs = proven_local_vcc_scalar_write_pcs(ins);
     if (!b.structured_wave64_mask_reduction_analysis_done) {
         b.structured_wave64_mask_reduction_pcs =
             proven_structured_wave64_mask_reduction_pcs(ins);

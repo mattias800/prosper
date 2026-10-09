@@ -47,6 +47,11 @@ struct NggLiveDrawInput {
     // when any of those registers is absent.
     std::vector<uint32_t> user_data;
     bool user_data_complete = false;
+    // The same registers for the program's whole AGC user-data range (facts.user_data_range_end
+    // words), when that range is longer than the RSRC2_GS.USER_SGPR count and every register in it
+    // is present; empty otherwise. Used only for a program that reads a user SGPR past that count
+    // before writing it (ngg_program_user_sgprs).
+    std::vector<uint32_t> user_data_range;
     // SPI_SHADER_USER_DATA_ADDR_LO/HI_GS, which the hardware places in s0:s1 at merged ES+GS entry
     // (#3135). Supplied to the shell (two more push-constant words) only when known and non-zero;
     // otherwise a program reading s0:s1 stays refused (ngg-abi-read-s0-s1).
@@ -99,6 +104,17 @@ bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]);
 // ABI admission without the address refuses ngg-abi-read-s0-s1. Cached per program and count.
 bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector<uint32_t>>& linked,
                                          uint32_t user_sgprs);
+
+// How many user SGPRs (s8..) the linked program needs: `count` (the RSRC2_GS.USER_SGPR count), or
+// `range_end` (its AGC user-data range) when the program reads an SGPR in [8 + count,
+// 8 + range_end) before writing it -- ABI admission with `count` refuses it as
+// ngg-abi-read-undefined-sgpr naming that register. #4808: The Pathless's merged ES prolog reads
+// s16..s31 at entry (24 user SGPRs, its range 0..24) under RSRC2_GS.USER_SGPR 12; a program that
+// reads them unconditionally can only run on hardware that loads them, so the range is the count it
+// was launched with. CONFIDENCE: MED (the guest's code and its AGC header; no register reference
+// for a second user-SGPR count was found). Cached per program, count and range.
+uint32_t ngg_program_user_sgprs(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                uint32_t count, uint32_t range_end);
 
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host);
