@@ -9,6 +9,7 @@
 // the measured backlog. The ratchet runs both ways: a listed case that now matches also fails, so a
 // fixed gap cannot linger in the list.
 #include "console_oracle.hpp"
+#include "fixtures/test_scratch.h"
 
 #include <gtest/gtest.h>
 
@@ -46,7 +47,7 @@ TEST(ConsoleOracleData, GoldenFilesArePresent) {
 }
 
 TEST(ConsoleOracleData, KnownGapsNameRealCases) {
-    std::map<std::string, std::string> gaps;
+    std::map<std::string, co::Gap> gaps;
     std::string err;
     ASSERT_TRUE(co::load_known_gaps(data_dir() + "/known_gaps.tsv", &gaps, &err)) << err;
     std::set<std::string> ids;
@@ -55,9 +56,57 @@ TEST(ConsoleOracleData, KnownGapsNameRealCases) {
         ASSERT_TRUE(co::load_golden(data_dir() + "/" + fam + ".golden.tsv", &cases, &err)) << err;
         for (const auto& c : cases) ids.insert(c.id);
     }
-    for (const auto& [id, reason] : gaps)
-        EXPECT_TRUE(ids.count(id)) << "known_gaps.tsv lists '" << id << "' (" << reason
+    for (const auto& [id, gap] : gaps)
+        EXPECT_TRUE(ids.count(id)) << "known_gaps.tsv lists '" << id << "' (" << gap.reason
                                    << ") but no golden file has that case";
+}
+
+TEST(ConsoleOracleData, KnownGapsSayWhetherTheyNeedFixing) {
+    // The loader already rejects a row without a valid action; this prints the backlog's shape so a reader
+    // sees at a glance how much is `fix` (wrong, should change), `keep` (deliberate) and `triage` (undecided).
+    std::map<std::string, co::Gap> gaps;
+    std::string err;
+    ASSERT_TRUE(co::load_known_gaps(data_dir() + "/known_gaps.tsv", &gaps, &err)) << err;
+    std::map<std::string, size_t> by_verb;
+    for (const auto& [id, gap] : gaps) by_verb[co::gap_verb(gap.action)]++;
+    std::printf("[oracle] known gaps: %zu fix, %zu keep, %zu triage\n", by_verb["fix"], by_verb["keep"],
+                by_verb["triage"]);
+    EXPECT_EQ(by_verb["fix"] + by_verb["keep"] + by_verb["triage"], gaps.size());
+}
+
+TEST(ConsoleOracleHarness, GapActionsAreAClosedVocabularyWithAnOptionalIssue) {
+    for (const char* ok : {"fix", "keep", "triage", "fix:#1", "keep:#4757", "triage:#12345"})
+        EXPECT_TRUE(co::valid_gap_action(ok)) << ok;
+    for (const char* bad : {"", "Fix", "wontfix", "fix:", "fix:4757", "fix:#", "fix:#12a", "fix #4757",
+                            "fix:#4757:x", ":#1", "fix,keep"})
+        EXPECT_FALSE(co::valid_gap_action(bad)) << bad;
+    EXPECT_EQ(co::gap_verb("fix:#4757"), "fix");
+    EXPECT_EQ(co::gap_verb("keep"), "keep");
+}
+
+TEST(ConsoleOracleHarness, KnownGapsLoaderRequiresAnActionAndAReason) {
+    const fs::path p = prosper_test::test_scratch_path("known_gaps_rows.tsv");
+    const auto load = [&](const std::string& body, std::string* err) {
+        {
+            std::ofstream(p) << body;
+        }
+        std::map<std::string, co::Gap> m;
+        const bool ok = co::load_known_gaps(p.string(), &m, err);
+        return std::make_pair(ok, m);
+    };
+    std::string err;
+    auto good = load("# c\n\ncase_a\tfix:#7\tprosper is wrong\ncase_b\tkeep\tdeliberate\n", &err);
+    ASSERT_TRUE(good.first) << err;
+    EXPECT_EQ(good.second.at("case_a").action, "fix:#7");
+    EXPECT_EQ(good.second.at("case_a").reason, "prosper is wrong");
+    EXPECT_EQ(good.second.at("case_b").action, "keep");
+    // the old two column form, a missing reason, an empty id and an unknown action are all errors
+    EXPECT_FALSE(load("case_a\tjust a reason\n", &err).first);
+    EXPECT_FALSE(load("case_a\tfix\n", &err).first);
+    EXPECT_FALSE(load("\tfix\treason\n", &err).first);
+    EXPECT_FALSE(load("case_a\twontfix\treason\n", &err).first);
+    EXPECT_NE(err.find("expected fix, keep or triage"), std::string::npos) << err;
+    fs::remove(p);
 }
 
 // Positive controls for the harness itself: a differential test that cannot fail proves nothing, so
@@ -151,6 +200,81 @@ TEST(ConsoleOracleHarness, UnimplementedFunctionIsReportedUnlessNone) {
     EXPECT_EQ(replay_and_compare(make_case("t", "sceNoSuchFunctionAnywhere", "-", "none", 0)), "");
 }
 
+TEST(ConsoleOracleHarness, Default0ComparesAnUnregisteredFunctionAgainstTheDispatcherDefault) {
+    // The dispatcher answers an unregistered import with 0. A probe whose console answer is also 0 agrees; one
+    // whose console answer is an error is the false-success class and must be reported with both values.
+    EXPECT_EQ(replay_and_compare(
+                  make_case("t", "sceNoSuchFunctionAnywhere", "out:8,i:1", "ret,default0", 0)),
+              "");
+    const std::string d = replay_and_compare(make_case(
+        "t", "sceNoSuchFunctionAnywhere", "out:8,i:1", "ret,default0", 0x80020016ull));
+    EXPECT_EQ(d, "unregistered: prosper's default answers 0, the console answers 0x0000000080020016");
+    // Without the flag an unregistered function stays a plain "not implemented" mismatch even at 0, so the
+    // rule is opt-in per case and no existing golden changes meaning.
+    EXPECT_EQ(replay_and_compare(make_case("t", "sceNoSuchFunctionAnywhere", "out:8,i:1", "ret", 0)),
+              "not implemented in prosper");
+}
+
+TEST(ConsoleOracleHarness, Default0DoesNotRelaxARegisteredFunction) {
+    // strlen is registered: default0 must not turn a wrong console value into agreement.
+    EXPECT_NE(replay_and_compare(make_case("t", "strlen", "s:hello", "ret,default0,r64", 6)), "");
+    EXPECT_EQ(replay_and_compare(make_case("t", "strlen", "s:hello", "ret,default0,r64", 5)), "");
+}
+
+TEST(ConsoleOracleHarness, Default0HonoursR64) {
+    // 0x1_0000_0000 is zero in the low 32 bits but not as a 64 bit value.
+    EXPECT_EQ(replay_and_compare(make_case("t", "sceNoSuchFunctionAnywhere", "-", "ret,default0",
+                                           0x100000000ull)),
+              "");
+    EXPECT_NE(replay_and_compare(make_case("t", "sceNoSuchFunctionAnywhere", "-", "ret,default0,r64",
+                                           0x100000000ull)),
+              "");
+}
+
+TEST(ConsoleOracleHarness, ProbeBaselineParsesAndRejectsMalformedRows) {
+    const fs::path p = prosper_test::test_scratch_path("probe_baseline_rows.tsv");
+    co::ProbeBaseline m;
+    std::string err;
+    {
+        std::ofstream(p) << "# comment\n\nfam\tcase_a\t0123456789abcdef\nfam\tcase_b\t*\twindows,macos\n"
+                         << "fam\tcase_b\tfedcba9876543210\tlinux\n";
+    }
+    ASSERT_TRUE(co::load_probe_baseline(p.string(), &m, &err)) << err;
+    EXPECT_EQ(m.at("fam").size(), 2u);
+    EXPECT_TRUE(m.at("fam").at("case_a")[0].platforms.empty());
+    EXPECT_TRUE(co::probe_row_applies(m.at("fam").at("case_a")[0], "windows"));
+    const auto& b = m.at("fam").at("case_b");
+    ASSERT_EQ(b.size(), 2u);
+    EXPECT_EQ(b[0].signature, "*");
+    EXPECT_TRUE(co::probe_row_applies(b[0], "macos"));
+    EXPECT_FALSE(co::probe_row_applies(b[0], "linux"));
+    EXPECT_TRUE(co::probe_row_applies(b[1], "linux"));
+    for (const char* bad : {"fam\tcase\n", "fam\tcase\tshort\n", "\tcase\t0123456789abcdef\n",
+                            "fam\t\t0123456789abcdef\n", "fam\tcase\t0123456789abcdef\tbeos\n",
+                            "fam\tcase\t0123456789abcdef\tlinux\textra\n",
+                            "fam\tc\t0123456789abcdef\nfam\tc\tfedcba9876543210\n",
+                            "fam\tc\t0123456789abcdef\tlinux\nfam\tc\t*\tlinux,windows\n"}) {
+        {
+            std::ofstream(p) << bad;
+        }
+        co::ProbeBaseline n;
+        EXPECT_FALSE(co::load_probe_baseline(p.string(), &n, &err)) << bad;
+    }
+    fs::remove(p);
+}
+
+TEST(ConsoleOracleHarness, ProbeSignatureSeesTheDwordCountButNotThePayload) {
+    const std::string a = "console a0=3:aabbcc / prosper a0=7:bbddee; ";
+    EXPECT_EQ(co::probe_signature(a).size(), 16u);
+    // Payload bytes are prosper's own packets (and may carry host addresses): not part of the signature.
+    EXPECT_EQ(co::probe_signature(a), co::probe_signature("console a0=3:112233 / prosper a0=7:99; "));
+    // The dword count is the ABI contract: a builder growing by one dword changes it.
+    EXPECT_NE(co::probe_signature(a), co::probe_signature("console a0=3:aabbcc / prosper a0=8:bbddee; "));
+    // So does anything outside a buffer report, such as a return value.
+    EXPECT_NE(co::probe_signature("ret console=0x0 prosper=0x1; "), co::probe_signature("ret console=0x0 prosper=0x2; "));
+    EXPECT_EQ(co::probe_signature_text("x a12=345:ab12 y"), "x a12=345:* y");
+}
+
 TEST(ConsoleOracleHarness, UseTokenReadsAnEarlierCasesBuffer) {
     register_builtin_hle();
     co::State state;
@@ -182,6 +306,69 @@ TEST(ConsoleOracleHarness, MalformedTokensAreRejected) {
     EXPECT_FALSE(co::parse_arg("nocolon", state, &a, &err));
 }
 
+TEST(ConsoleOracleHarness, DcbTokenBuildsADescriptorOverAFreshBuffer) {
+    co::State state;
+    co::Arg a;
+    std::string err;
+    ASSERT_TRUE(co::parse_arg("dcb:16", state, &a, &err)) << err;
+    EXPECT_EQ(a.kind, co::Arg::Kind::Dcb);
+    EXPECT_EQ(a.len, 64u);
+    ASSERT_EQ(a.aux.size(), co::kDcbStructBytes);
+    uint64_t bottom = 0, top = 0, up = 0, down = 0;
+    std::memcpy(&bottom, a.aux.data() + 0x00, 8);
+    std::memcpy(&top, a.aux.data() + 0x08, 8);
+    std::memcpy(&up, a.aux.data() + 0x10, 8);
+    std::memcpy(&down, a.aux.data() + 0x18, 8);
+    EXPECT_EQ(bottom, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a.buf.data())));
+    EXPECT_EQ(top, bottom + 64);
+    EXPECT_EQ(up, bottom);
+    EXPECT_EQ(down, top);
+    EXPECT_EQ(a.value, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a.aux.data())));
+    for (size_t i = 0; i < a.len; i++) EXPECT_EQ(a.buf[i], co::kSentinel) << "dword buffer byte " << i;
+    for (const char* bad : {"dcb:1", "dcb:1025", "dcb:0", "dcb:x", "dcb:"})
+        EXPECT_FALSE(co::parse_arg(bad, state, &a, &err)) << bad;
+}
+
+TEST(ConsoleOracleHarness, DcbBuilderEmissionIsReportedAsTheDwordsWritten) {
+    // sceAgcDcbSetIndexSize appends one packet to the descriptor's buffer and returns its start. The report
+    // must say how many dwords it wrote and show exactly those, and the rest of the buffer must stay
+    // sentinel -- the property that makes an unwritten tail visible.
+    register_builtin_hle();
+    co::State state;
+    co::Outcome o;
+    std::string err;
+    const co::GoldenCase c = make_case("t", "sceAgcDcbSetIndexSize", "dcb:8,i:1,i:0", "r64,retoff:0", 0);
+    ASSERT_TRUE(co::replay_case(c, state, &o, &err)) << err;
+    ASSERT_TRUE(o.implemented);
+    EXPECT_EQ(o.retn, "ptr+0");
+    ASSERT_EQ(o.buffers.size(), 1u);
+    const std::string& rep = o.buffers[0];
+    ASSERT_EQ(rep.compare(0, 3, "a0="), 0) << rep;
+    const size_t colon = rep.find(':');
+    ASSERT_NE(colon, std::string::npos) << rep;
+    const size_t written = static_cast<size_t>(std::stoul(rep.substr(3, colon - 3)));
+    EXPECT_GE(written, 2u);
+    EXPECT_LE(written, 8u);
+    EXPECT_EQ(rep.size() - colon - 1, written * 8);   // 8 hex digits per dword
+    const co::Arg& x = state.at("t")[0];
+    for (size_t i = written * 4; i < x.len; i++) EXPECT_EQ(x.buf[i], co::kSentinel) << "byte " << i;
+}
+
+TEST(ConsoleOracleHarness, DcbBuilderThatCannotFitWritesNothingAndSaysSo) {
+    // A two dword buffer cannot hold the packet: the builder must refuse, the cursor must not move, and
+    // the report is "0:" with no dwords -- not a partial packet.
+    register_builtin_hle();
+    co::State state;
+    co::Outcome o;
+    std::string err;
+    const co::GoldenCase c = make_case("t", "sceAgcDcbDrawIndexAuto", "dcb:2,i:3,i:0", "r64,retoff:0", 0);
+    ASSERT_TRUE(co::replay_case(c, state, &o, &err)) << err;
+    ASSERT_TRUE(o.implemented);
+    EXPECT_EQ(o.ret, 0u);
+    ASSERT_EQ(o.buffers.size(), 1u);
+    EXPECT_EQ(o.buffers[0], "a0=0:");
+}
+
 class ConsoleOracleReplay : public ::testing::TestWithParam<std::string> {};
 
 TEST_P(ConsoleOracleReplay, MatchesConsole) {
@@ -190,8 +377,32 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
     std::vector<co::GoldenCase> cases;
     ASSERT_TRUE(co::load_golden(data_dir() + "/" + GetParam() + ".golden.tsv", &cases, &err))
         << err;
-    std::map<std::string, std::string> gaps;
+    std::map<std::string, co::Gap> gaps;
     ASSERT_TRUE(co::load_known_gaps(data_dir() + "/known_gaps.tsv", &gaps, &err)) << err;
+
+    // A `probe_*` family, or any family with rows in probe_baseline.tsv, is a measured INVENTORY (a generated
+    // set of calls, e.g. every command-buffer builder): its disagreements are leads rather than reviewed gaps.
+    // They are gated by case id AND by a signature of the difference, both ways: a difference that is not listed
+    // fails, a listed case that now matches fails (lower the baseline), and a listed case whose difference
+    // changed fails -- which a bare count cannot see (a builder growing a dword, one difference swapped for
+    // another). Adding a row is a visible line in the diff.
+    co::ProbeBaseline baselines;
+    ASSERT_TRUE(co::load_probe_baseline(data_dir() + "/probe_baseline.tsv", &baselines, &err)) << err;
+    const bool probe = GetParam().rfind("probe_", 0) == 0 || baselines.count(GetParam()) != 0;
+    const std::map<std::string, std::vector<co::ProbeRow>> empty_rows;
+    const auto rows_it = baselines.find(GetParam());
+    const auto& rows = rows_it == baselines.end() ? empty_rows : rows_it->second;
+    // The row for this case that applies on this host, or null.
+    const std::string platform = PROSPER_ORACLE_PLATFORM;
+    const auto row_for = [&](const std::string& id) -> const co::ProbeRow* {
+        const auto it = rows.find(id);
+        if (it == rows.end()) return nullptr;
+        for (const co::ProbeRow& r : it->second)
+            if (co::probe_row_applies(r, platform)) return &r;
+        return nullptr;
+    };
+    size_t differing = 0;
+    std::set<std::string> seen_differing;
 
     co::State state;
     size_t matched = 0, expected_gaps = 0, skipped = 0;
@@ -217,14 +428,34 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
             ADD_FAILURE() << c.id << ": now matches the console -- remove it from known_gaps.tsv";
         } else if (gap != gaps.end()) {
             expected_gaps++;
+        } else if (probe) {
+            differing++;
+            seen_differing.insert(c.id);
+            const std::string sig = co::probe_signature(diff);
+            // `[probe-row]` is the line to put in probe_baseline.tsv once the difference has been reviewed.
+            std::printf("[probe-row] %s\t%s\t%s\n", GetParam().c_str(), c.id.c_str(), sig.c_str());
+            const co::ProbeRow* row = row_for(c.id);
+            if (!row)
+                ADD_FAILURE() << c.id << " (" << c.func << "): differs from the console on " << platform
+                              << " and has no applicable row in probe_baseline.tsv: " << diff;
+            else if (row->signature != "*" && row->signature != sig)
+                ADD_FAILURE() << c.id << " (" << c.func << "): its difference changed from the baselined one (signature "
+                              << row->signature << " -> " << sig << "); review it, then update the row: " << diff;
         } else {
             ADD_FAILURE() << c.id << " (" << c.func << "): " << diff;
         }
     }
     RecordProperty("matched", static_cast<int>(matched));
     RecordProperty("known_gaps", static_cast<int>(expected_gaps));
-    std::printf("[oracle] %s: %zu match the console, %zu known gaps, %zu unmeasured\n",
-                GetParam().c_str(), matched, expected_gaps, skipped);
+    std::printf("[oracle] %s: %zu match the console, %zu known gaps, %zu differ (probe), %zu unmeasured\n",
+                GetParam().c_str(), matched, expected_gaps, differing, skipped);
+    if (probe) {
+        for (const auto& entry : rows)
+            if (row_for(entry.first) && !seen_differing.count(entry.first))
+                ADD_FAILURE() << entry.first << ": listed in probe_baseline.tsv for " << platform
+                              << " but no longer differs from the console (or is gone from the golden) -- progress: "
+                              << "remove or narrow the row";
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Golden, ConsoleOracleReplay, ::testing::ValuesIn(families()),
