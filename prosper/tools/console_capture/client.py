@@ -1,9 +1,18 @@
-"""PS5Debug-NG wire protocol client for console capture.
+"""ps5debug-NG wire protocol client for optional console capture.
 
-This client implements the subset of the ps5debug-NG TCP protocol permitted for
-Task H01: read-only queries (branding, firmware version, foreground app, process
-maps, process memory reading) and bounded single-breakpoint capture/continue
-under the task's safety constraints.
+Implements a deliberately small subset of the ps5debug-NG TCP protocol, for observing a title on
+the developer's own unlocked PS5: read-only queries (branding, firmware version, foreground app,
+process list and maps, bounded process memory reads) plus one software breakpoint for capturing a
+GPU submit, with attach/detach/continue around it.
+
+The one operation that changes console state is the breakpoint: the debugger writes a trap
+instruction into the target process at the breakpoint address. It is therefore off unless the
+caller opts in (``PS5DebugClient(..., allow_breakpoint=True)``), and only slot 0 is usable, so a
+session can never hold more than one patched address. Nothing here writes other console memory, and
+nothing writes captured bytes to disk: callers decide where captures go (never into the repository).
+
+Console evidence is optional human evidence. No test, CI job or agent workflow may depend on a
+console; the tests drive this client against a local fake server only.
 """
 
 from __future__ import annotations
@@ -11,12 +20,11 @@ from __future__ import annotations
 import socket
 import struct
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 PACKET_MAGIC = 0xFFAABBCC
 CMD_PACKET_SIZE = 12
 
-# Commands allowed under Task H01
+# The only commands this client sends.
 CMD_VERSION = 0xBD000001
 CMD_FW_VERSION = 0xBD000500
 CMD_BRANDING = 0xBD000501
@@ -46,6 +54,20 @@ WIRE_CMD_ERROR = 0xF0000001
 WIRE_CMD_DATA_NULL = 0xF0000003
 WIRE_CMD_ALREADY_DEBUG = 0xF0000004
 WIRE_CMD_INVALID_INDEX = 0xF0000005
+
+
+# Upper bounds on what one reply may make the client read. A corrupt or hostile reply cannot make it
+# allocate or wait for more than this.
+MAX_READ_BYTES = 16 * 1024 * 1024
+MAX_STRING_BYTES = 4096
+MAX_LIST_ENTRIES = 65536
+BREAKPOINT_SLOT = 0
+
+
+def _bounded(value: int, limit: int, what: str) -> int:
+    if value < 0 or value > limit:
+        raise ValueError(f"{what} {value} outside 0..{limit}")
+    return value
 
 
 def bitswap32(val: int) -> int:
@@ -117,11 +139,14 @@ class InterruptEvent:
 class PS5DebugClient:
     """Client for talking to ps5debug-NG server over TCP."""
 
-    def __init__(self, host: str, port: int = 744, timeout: float = 10.0):
+    def __init__(
+        self, host: str, port: int = 744, timeout: float = 10.0, allow_breakpoint: bool = False
+    ):
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.sock: Optional[socket.socket] = None
+        self.allow_breakpoint = allow_breakpoint
+        self.sock: socket.socket | None = None
 
     def connect(self) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -175,7 +200,7 @@ class PS5DebugClient:
     def get_version(self) -> str:
         self._send_packet(CMD_VERSION)
         length_bytes = self._recv_all(4)
-        length = struct.unpack("<I", length_bytes)[0]
+        length = _bounded(struct.unpack("<I", length_bytes)[0], MAX_STRING_BYTES, "version length")
         ver_bytes = self._recv_all(length)
         return ver_bytes.decode("ascii", errors="replace").rstrip("\x00")
 
@@ -187,7 +212,7 @@ class PS5DebugClient:
     def get_branding(self) -> str:
         self._send_packet(CMD_BRANDING)
         length_bytes = self._recv_all(4)
-        length = struct.unpack("<I", length_bytes)[0]
+        length = _bounded(struct.unpack("<I", length_bytes)[0], MAX_STRING_BYTES, "branding length")
         raw = self._recv_all(length)
         # Split on NUL if capability string is present
         parts = raw.split(b"\x00", 1)
@@ -202,13 +227,15 @@ class PS5DebugClient:
         contentid = resp_data[20:84].split(b"\x00", 1)[0].decode("ascii", errors="replace")
         name = resp_data[84:124].split(b"\x00", 1)[0].decode("ascii", errors="replace")
         app_ver = resp_data[124:140].split(b"\x00", 1)[0].decode("ascii", errors="replace")
-        return ForegroundAppInfo(pid=pid, titleid=titleid, contentid=contentid, name=name, app_ver=app_ver)
+        return ForegroundAppInfo(
+            pid=pid, titleid=titleid, contentid=contentid, name=name, app_ver=app_ver
+        )
 
-    def get_process_list(self) -> List[ProcessEntry]:
+    def get_process_list(self) -> list[ProcessEntry]:
         self._send_packet(CMD_PROC_LIST)
         self._check_status()
-        num = struct.unpack("<I", self._recv_all(4))[0]
-        entries: List[ProcessEntry] = []
+        num = _bounded(struct.unpack("<I", self._recv_all(4))[0], MAX_LIST_ENTRIES, "process count")
+        entries: list[ProcessEntry] = []
         for _ in range(num):
             entry_raw = self._recv_all(36)
             name = entry_raw[:32].split(b"\x00", 1)[0].decode("latin1", errors="replace")
@@ -216,20 +243,25 @@ class PS5DebugClient:
             entries.append(ProcessEntry(name=name, pid=pid))
         return entries
 
-    def get_memory_maps(self, pid: int) -> List[MemoryMapEntry]:
+    def get_memory_maps(self, pid: int) -> list[MemoryMapEntry]:
         body = struct.pack("<I", pid)
         self._send_packet(CMD_PROC_MAPS, body)
         self._check_status()
-        num = struct.unpack("<I", self._recv_all(4))[0]
-        entries: List[MemoryMapEntry] = []
+        num = _bounded(struct.unpack("<I", self._recv_all(4))[0], MAX_LIST_ENTRIES, "map count")
+        entries: list[MemoryMapEntry] = []
         for _ in range(num):
             entry_raw = self._recv_all(58)
             name = entry_raw[:32].split(b"\x00", 1)[0].decode("latin1", errors="replace")
             start, end, offset, prot = struct.unpack("<QQQH", entry_raw[32:58])
-            entries.append(MemoryMapEntry(name=name, start=start, end=end, offset=offset, prot=prot))
+            entries.append(
+                MemoryMapEntry(name=name, start=start, end=end, offset=offset, prot=prot)
+            )
         return entries
 
     def read_memory(self, pid: int, address: int, length: int) -> bytes:
+        if length <= 0:
+            raise ValueError(f"read length {length} must be positive")
+        _bounded(length, MAX_READ_BYTES, "read length")
         body = struct.pack("<IQI", pid, address, length)
         self._send_packet(CMD_PROC_READ, body)
         self._check_status()
@@ -245,8 +277,14 @@ class PS5DebugClient:
         self._check_status()
 
     def set_breakpoint(self, index: int, enabled: bool, address: int) -> None:
-        if index < 0 or index >= 30:
-            raise ValueError(f"Breakpoint index {index} out of range (0..29)")
+        """Arm or clear the one software breakpoint (writes a trap into the target process)."""
+        if not self.allow_breakpoint:
+            raise PermissionError(
+                "set_breakpoint writes into the console process; construct the client with "
+                "allow_breakpoint=True to opt in"
+            )
+        if index != BREAKPOINT_SLOT:
+            raise ValueError(f"Breakpoint index {index}: only slot {BREAKPOINT_SLOT} is allowed")
         body = struct.pack("<IIQ", index, 1 if enabled else 0, address)
         self._send_packet(CMD_DEBUG_SET_BREAKPOINT, body)
         self._check_status()
@@ -294,16 +332,19 @@ class PS5DebugClient:
 class AsyncInterruptReceiver:
     """Listens on TCP port 755 for debug events sent by the console upon breakpoint hit."""
 
-    def __init__(self, port: int = 755, timeout: float = 30.0):
+    def __init__(self, port: int = 755, timeout: float = 30.0, bind_host: str = "0.0.0.0"):
+        # The console connects back to this host, so the default listens on every interface;
+        # pass the LAN address (or 127.0.0.1 in tests) to narrow it.
         self.port = port
         self.timeout = timeout
-        self.server_sock: Optional[socket.socket] = None
-        self.client_sock: Optional[socket.socket] = None
+        self.bind_host = bind_host
+        self.server_sock: socket.socket | None = None
+        self.client_sock: socket.socket | None = None
 
     def start(self) -> None:
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", self.port))
+        self.server_sock.bind((self.bind_host, self.port))
         self.server_sock.listen(1)
         self.server_sock.settimeout(self.timeout)
 

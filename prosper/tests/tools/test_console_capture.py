@@ -5,26 +5,25 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+
 import pytest
 
 from prosper.tools.console_capture.client import (
-    PS5DebugClient,
-    AsyncInterruptReceiver,
-    PACKET_MAGIC,
-    CMD_SUCCESS,
-    CMD_ERROR,
-    WIRE_CMD_SUCCESS,
-    WIRE_CMD_ERROR,
-    bitswap32,
     CMD_BRANDING,
-    CMD_FW_VERSION,
+    CMD_ERROR,
     CMD_FOREGROUND_APP,
+    CMD_FW_VERSION,
     CMD_PROC_MAPS,
     CMD_PROC_READ,
-    CMD_DEBUG_ATTACH,
-    CMD_DEBUG_SET_BREAKPOINT,
-    CMD_DEBUG_GETREGS,
-    CMD_DEBUG_CONTINUE,
+    CMD_SUCCESS,
+    MAX_LIST_ENTRIES,
+    MAX_READ_BYTES,
+    PACKET_MAGIC,
+    WIRE_CMD_ERROR,
+    WIRE_CMD_SUCCESS,
+    AsyncInterruptReceiver,
+    PS5DebugClient,
+    bitswap32,
 )
 
 
@@ -198,7 +197,7 @@ def test_client_memory_maps_and_read():
 
             mem = client.read_memory(100, 0x10000, 16)
             assert len(mem) == 16
-            assert mem[:3] == b"\x48\x89\xFE"
+            assert mem[:3] == b"\x48\x89\xfe"
     finally:
         server.close()
 
@@ -235,7 +234,7 @@ def test_client_breakpoint_and_registers():
 
     server.start(handle)
     try:
-        with PS5DebugClient("127.0.0.1", port=server.port) as client:
+        with PS5DebugClient("127.0.0.1", port=server.port, allow_breakpoint=True) as client:
             client.debug_attach(100)
             client.set_breakpoint(0, True, 0x123456)
             regs = client.get_registers(1)
@@ -250,7 +249,7 @@ def test_short_read_failure():
     server = FakeServer()
 
     def handle(conn: socket.socket):
-        hdr = conn.recv(12)
+        conn.recv(12)
         # Only send 2 bytes of 4-byte status then close
         conn.sendall(b"\x80\x00")
         conn.close()
@@ -262,3 +261,64 @@ def test_short_read_failure():
                 client.get_foreground_app()
     finally:
         server.close()
+
+
+def test_breakpoint_needs_opt_in_and_slot_zero():
+    """The breakpoint writes into the console process: refused before anything is sent."""
+    client = PS5DebugClient("127.0.0.1")  # never connected: a refusal must not reach the wire
+    with pytest.raises(PermissionError):
+        client.set_breakpoint(0, True, 0x123456)
+    client = PS5DebugClient("127.0.0.1", allow_breakpoint=True)
+    with pytest.raises(ValueError):
+        client.set_breakpoint(1, True, 0x123456)
+
+
+def test_read_memory_length_is_bounded():
+    client = PS5DebugClient("127.0.0.1")  # refused before any I/O
+    for length in (0, -1, MAX_READ_BYTES + 1):
+        with pytest.raises(ValueError):
+            client.read_memory(100, 0x10000, length)
+
+
+def test_reply_count_is_bounded():
+    """A corrupt entry count fails fast instead of waiting for gigabytes."""
+    server = FakeServer()
+
+    def handle(conn: socket.socket):
+        hdr = conn.recv(12)
+        conn.recv(struct.unpack("<III", hdr)[2])
+        conn.sendall(struct.pack("<I", WIRE_CMD_SUCCESS))
+        conn.sendall(struct.pack("<I", MAX_LIST_ENTRIES + 1))
+
+    server.start(handle)
+    try:
+        with PS5DebugClient("127.0.0.1", port=server.port) as client:
+            with pytest.raises(ValueError):
+                client.get_memory_maps(100)
+    finally:
+        server.close()
+
+
+def test_interrupt_receiver_on_loopback():
+    """The receiver parses one 1184-byte event; bound to loopback, on an ephemeral port."""
+    with AsyncInterruptReceiver(port=0, timeout=5.0, bind_host="127.0.0.1") as receiver:
+        port = receiver.server_sock.getsockname()[1]
+        packet = bytearray(1184)
+        struct.pack_into("<II", packet, 0, 77, 5)
+        packet[8:14] = b"render"
+        struct.pack_into("<Q", packet, 48 + 8 * 8, 0x40001000)  # rdi
+        struct.pack_into("<Q", packet, 48 + 15 * 8 + 4 * 4, 0x804F6CCC0)  # rip
+
+        def send():
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
+                sock.sendall(bytes(packet))
+
+        sender = threading.Thread(target=send)
+        sender.start()
+        receiver.wait_for_connection()
+        event = receiver.receive_event()
+        sender.join()
+    assert event.lwpid == 77
+    assert event.tdname == "render"
+    assert event.regs.rdi == 0x40001000
+    assert event.regs.rip == 0x804F6CCC0
