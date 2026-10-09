@@ -80,3 +80,14 @@ TEST(DroppedImageDescriptor, PcNonePrintsForAWholeProgramDecline) {
         format_dropped_image_descriptor(0x10, UINT32_MAX, -1, kKenaNullShaped, "x");
     EXPECT_NE(line.find("pc=none srsrc=unknown reason=x"), std::string::npos) << line;
 }
+
+// #4775: a T# that was bound null instead of dropped prints the same fields under its own verdict,
+// so a reader can tell "this arm's stale slot was bound null" from "this use was refused".
+TEST(DroppedImageDescriptor, UnboundLineNamesItsVerdict) {
+    const std::string line =
+        format_unbound_image_descriptor(0x5007ae0000ull, 73, kKenaNullShaped, "bad-image-type");
+    EXPECT_EQ(line.rfind("[t8-unbound] program=0x5007ae0000 pc=73 ", 0), 0u) << line;
+    EXPECT_NE(line.find("reason=bad-image-type"), std::string::npos) << line;
+    EXPECT_NE(line.find("-> null image (skippable instruction)"), std::string::npos) << line;
+    EXPECT_EQ(line.find("[t8-dropped]"), std::string::npos) << line;
+}

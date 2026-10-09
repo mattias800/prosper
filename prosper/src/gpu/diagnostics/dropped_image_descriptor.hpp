@@ -57,4 +57,16 @@ std::string format_dropped_image_descriptor(uint64_t program, uint32_t pc, int s
 bool note_dropped_image_descriptor(uint64_t program, uint32_t pc, int srsrc,
                                    const std::array<uint32_t, 8>& words, const char* reason);
 
+// #4775: the counterpart for a use that was NOT dropped. When an unusable T# is read only by an
+// instruction the program can skip, build_stage_table binds a null image instead of refusing the
+// program, and prints one `[t8-unbound]` line per (program, pc, reason) with the same fields as
+// `[t8-dropped]`. Same bound and dedupe discipline, separate cap, so neither line can starve the
+// other. It is how a reader tells "this arm's slot was stale and bound null" apart from a resolved
+// texture: a run whose picture is missing a sampled term should look here first.
+std::string format_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                            const std::array<uint32_t, 8>& words,
+                                            const char* reason);
+bool note_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                   const std::array<uint32_t, 8>& words, const char* reason);
+
 }   // namespace prosper::gpu

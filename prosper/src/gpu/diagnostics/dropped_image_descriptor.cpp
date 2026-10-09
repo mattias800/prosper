@@ -48,30 +48,65 @@ std::string format_dropped_image_descriptor(uint64_t program, uint32_t pc, int s
     return line;
 }
 
-bool note_dropped_image_descriptor(uint64_t program, uint32_t pc, int srsrc,
-                                   const std::array<uint32_t, 8>& words, const char* reason) {
-    // After the cap every call returns here without the lock: a title that declines an image use
-    // on every draw pays one relaxed load per decline, never a process-global mutex (P4).
-    static std::atomic<bool> full{false};
-    if (full.load(std::memory_order_relaxed)) return false;
-    static std::mutex mutex;
-    // Keyed by the reason's characters through a string_view of a literal: a repeat below the cap
-    // is a lookup only, with no node or string allocation.
-    using Key = std::tuple<uint64_t, uint32_t, std::string_view>;
-    static std::set<Key> seen;
-    const Key key{program, pc, std::string_view(reason ? reason : "unknown")};
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (seen.size() >= kDroppedImageDescriptorMaxReports) {
-            full.store(true, std::memory_order_relaxed);
+namespace {
+
+// One bounded, deduped report site. Each caller owns its own instance, so the two witnesses keep
+// separate caps.
+class BoundedSiteReport {
+public:
+    // True the first time (program, pc, reason) is seen, until the cap. After the cap every call
+    // returns without the lock: a title that hits the site on every draw pays one relaxed load per
+    // call, never a process-global mutex (P4).
+    bool admit(uint64_t program, uint32_t pc, const char* reason) {
+        if (full_.load(std::memory_order_relaxed)) return false;
+        // Keyed by the reason's characters through a string_view of a literal: a repeat below the
+        // cap is a lookup only, with no node or string allocation.
+        const Key key{program, pc, std::string_view(reason ? reason : "unknown")};
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (seen_.size() >= kDroppedImageDescriptorMaxReports) {
+            full_.store(true, std::memory_order_relaxed);
             return false;
         }
-        if (seen.find(key) != seen.end()) return false;
-        seen.insert(key);
-        if (seen.size() >= kDroppedImageDescriptorMaxReports)
-            full.store(true, std::memory_order_relaxed);
+        if (!seen_.insert(key).second) return false;
+        if (seen_.size() >= kDroppedImageDescriptorMaxReports)
+            full_.store(true, std::memory_order_relaxed);
+        return true;
     }
+
+private:
+    using Key = std::tuple<uint64_t, uint32_t, std::string_view>;
+    std::atomic<bool> full_{false};
+    std::mutex mutex_;
+    std::set<Key> seen_;
+};
+
+}   // namespace
+
+bool note_dropped_image_descriptor(uint64_t program, uint32_t pc, int srsrc,
+                                   const std::array<uint32_t, 8>& words, const char* reason) {
+    static BoundedSiteReport report;
+    if (!report.admit(program, pc, reason)) return false;
     const std::string line = format_dropped_image_descriptor(program, pc, srsrc, words, reason);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    return true;
+}
+
+std::string format_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                            const std::array<uint32_t, 8>& words,
+                                            const char* reason) {
+    // The same fields as the dropped line; only the verdict differs.
+    std::string line = format_dropped_image_descriptor(program, pc, -1, words, reason);
+    constexpr std::string_view kDropped = "[t8-dropped]";
+    if (line.compare(0, kDropped.size(), kDropped) == 0)
+        line.replace(0, kDropped.size(), "[t8-unbound]");
+    return line + " -> null image (skippable instruction)";
+}
+
+bool note_unbound_image_descriptor(uint64_t program, uint32_t pc,
+                                   const std::array<uint32_t, 8>& words, const char* reason) {
+    static BoundedSiteReport report;
+    if (!report.admit(program, pc, reason)) return false;
+    const std::string line = format_unbound_image_descriptor(program, pc, words, reason);
     std::fprintf(stderr, "%s\n", line.c_str());
     return true;
 }

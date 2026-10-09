@@ -38,6 +38,7 @@
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
+#include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4775)
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
 #include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -7160,6 +7161,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                                                    : registered_shader_dwords(*hdr, code_addr);
     const auto full_source = checked_source ? checked_source->source().decoded
                                             : decode_shader_cached(code, shader_dwords);
+    SkippableInstructionQuery skippable(full_source->code, code, shader_dwords);   // #4775, lazy
     if (original_source) {
         *original_source =
             checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
@@ -7947,7 +7949,24 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     const bool exact_null_t8 = reject && std::string_view(reject) == "base-zero" &&
                                                !u.is_storage_image &&
                                                t8_is_null_for_op(u.t8, texel_read);
-                    if (exact_null_t8) {
+                    // #4775: an UNUSABLE T# (a screen reject, or a base that maps no memory) read
+                    // only by an instruction the program can skip is an unbound slot: it binds the
+                    // same null. Switch and feature arms leave the slots of arms a draw never takes
+                    // holding stale ring bytes, and whether those passed the screen decided
+                    // admission run to run on identical bytes. A usable T# still materializes; an
+                    // unusable one on every path and any store stay refused. CONFIDENCE: MED --
+                    // see skippable_instruction.hpp for the evidence and the limit.
+                    const char* unbound_reason = nullptr;
+                    if (!exact_null_t8 && !u.is_storage_image) {
+                        unbound_reason = reject                       ? reject
+                                         : !guest_readable(d.base, 1) ? "base-unmapped"
+                                                                      : nullptr;
+                        if (unbound_reason && !skippable.may_skip(u.use_pc))
+                            unbound_reason = nullptr;
+                    }
+                    if (unbound_reason)
+                        note_unbound_image_descriptor(code_addr, u.use_pc, u.t8, unbound_reason);
+                    if (exact_null_t8 || unbound_reason) {
                         ShaderResource rn;
                         rn.cls      = ResourceClass::Texture;
                         rn.gpu_addr = 0;            // the three fields validate_shader_resources reads
@@ -7992,7 +8011,8 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         // cached read would never see it (cached_env_arming_logic, #4602).
                         // NOLINTNEXTLINE(concurrency-mt-unsafe): read-only diagnostic switch
                         const bool dbg = std::getenv("PROSPER_DBG") != nullptr;
-                        const uint64_t null_ordinal = dbg ? null_images.fetch_add(1) + 1 : 0;
+                        const uint64_t null_ordinal =
+                            dbg && exact_null_t8 ? null_images.fetch_add(1) + 1 : 0;
                         if (null_ordinal &&
                             (null_ordinal <= 8 || (null_ordinal & (null_ordinal - 1)) == 0))
                             fprintf(stderr,
@@ -8000,9 +8020,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                                     "constant-zero selectors)\n",
                                     is_ps ? "PS" : "VS",
                                     static_cast<unsigned long long>(null_ordinal), u.use_pc, u.key);
-                        record_null_image_source_probe(
-                            code_addr, u.use_pc, u.descriptor_source_addr,
-                            draw_command_order, u.t8);
+                        if (exact_null_t8)
+                            record_null_image_source_probe(code_addr, u.use_pc,
+                                                           u.descriptor_source_addr,
+                                                           draw_command_order, u.t8);
                         t.resources.push_back(rn);
                         continue;
                     }
