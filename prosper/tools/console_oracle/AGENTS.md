@@ -20,6 +20,9 @@ re-measure.
   (it needs `make`, the installed SDK and a network path to the console). `--check` verifies an
   existing golden against its cases file without a console.
 - `test_run_oracle.py` -- pytest for the driver's pure parts and for the committed data.
+- `coverage_report.py` + `test_coverage_report.py` -- offline, read-only coverage report. Answers
+  which verified library exports are not yet covered by any cases file and classifies candidate functions
+  to measure next without touching the console or any data files.
 
 The data lives in `tests/data/console_oracle/`: `<family>.cases.tsv` (what to call),
 `<family>.golden.tsv` (what the console returned) and `known_gaps.tsv` (cases where prosper is known to
