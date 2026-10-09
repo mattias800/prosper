@@ -228,7 +228,7 @@ int main() {
         CHECK(su.sh.empty(), "SetShRegsIndirect with an unmapped array is skipped (no OOB read, no regs applied)");
     }
 
-    // Hardware IT_LOAD_* packets (Task H01 Black Flag console capture submit0.bin):
+    // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
     {
         ShaderReg sh_array[] = {
             {prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0, 0x12345678u},

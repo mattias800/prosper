@@ -255,7 +255,7 @@ TEST(Pm4Decode, Contract) {
               "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
-    // Hardware IT_LOAD_* packets (Task H01 Black Flag console capture submit0.bin):
+    // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
     {
         uint32_t load_stream[] = {
             // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
@@ -287,6 +287,18 @@ TEST(Pm4Decode, Contract) {
         CHECK(load_ops[2].reg_class == RegClass::Cx, "op2 class is Cx");
         CHECK(load_ops[2].regs_vaddr == 0x4075172000u, "op2 vaddr matches");
         CHECK(load_ops[2].num_regs == 143, "op2 num_regs = 143");
+
+        // Only the observed shape decodes as pairs: the contiguous-range data format (bit 31
+        // clear) and an index/offset address mode (low address bits) stay Unknown.
+        uint32_t other_shapes[] = {
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbcu, 0x00000040u, 0x00000000u, 10u,
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbdu, 0x00000040u, 0x80000000u, 10u,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_shapes, std::size(other_shapes), other_ops);
+        CHECK(other_ops.size() == 2 && other_ops[0].kind == K::Unknown &&
+                  other_ops[1].kind == K::Unknown,
+              "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
     }
 
 }
