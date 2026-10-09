@@ -643,6 +643,16 @@ TEST(BuildShaderResources, Contract) {
                   linear->width == 16 && linear->height == 9 && !linear->in_mip_tail &&
                   linear->mip_tail_offset == 0 && linear->mip_tail_bytes == 0,
               "resource builder exposes a shifted linear mip view instead of dropping it");
+
+        // 3D volume texture (TYPE 10) with non-zero BASE_LEVEL and base_array == 0 (e.g. Black Flag 32x32x32 LUT)
+        uint32_t sg_3d[8];
+        make_tsharp(sg_3d, 0x20000000ull, 32, 32, /*RGBA8*/56, /*SW_4KB_S*/5, /*3D*/10, /*depth*/32);
+        sg_3d[3] |= 1u << 12; // BASE_LEVEL 1
+        sg_3d[5] |= 5u << 4;  // MAX_MIP 5
+        const ShaderResourceTable res_3d = build_shader_resources(sh, sg_3d, 8);
+        const ShaderResource* r3d = res_3d.by_sgpr_base(0);
+        CHECK(r3d != nullptr && r3d->img_dim == 2u && r3d->width == 16 && r3d->height == 16 && r3d->depth == 32,
+              "3D volume texture with non-zero BASE_LEVEL materializes with shifted level extents");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------

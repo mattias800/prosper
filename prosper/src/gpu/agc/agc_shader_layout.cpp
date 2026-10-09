@@ -599,8 +599,9 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // backend gather the selected level without pretending those levels are tightly packed. 3D and
     // MSAA resources have different slice semantics and remain fail-closed for nonzero views.
     const bool thin_2d = d.type == 9;
+    const bool volume_3d = d.type == 10;
     const bool thin_2d_layered = image_type_has_modeled_layer_stride(d.type);
-    if ((!thin_2d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
+    if ((!thin_2d && !volume_3d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
         view.supported = unshifted_view_supported();
         return view;
     }
