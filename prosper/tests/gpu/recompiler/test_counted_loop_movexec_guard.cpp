@@ -121,7 +121,7 @@ std::vector<float> lane_indices() {
     return input;
 }
 
-}  // namespace
+}   // namespace
 
 TEST(CountedLoopMovExecGuard, AcceptsTheDirectExecNarrowForms) {
     ASSERT_TRUE(guard_proven(kMovExecGuardAtTarget, 4))
