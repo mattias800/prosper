@@ -37,6 +37,13 @@ __attribute__((noinline))
 static int deep_scan(int depth, int want) {
     volatile uint64_t pad[64];          // 512 B of frame, per level
     pad[0] = (uint64_t)depth;
+    // Every index into `pad` is a compile-time constant, and AppleClang at -O3 splits such a
+    // volatile array into independent scalars rather than one contiguous object: the frame shrank
+    // to `subq $0x10,%rsp` (16 B), so deep_scan(32) added ~1 KB of stack, not ~16 KB. The deep
+    // frame then sat ~7 KB below the stack top and the 1024-slot (8 KB) probe clamped to ~883,
+    // failing on macOS while passing on Linux. Escape the array base through an asm memory clobber
+    // so the compiler must keep all 512 B on the stack. POSIX-only block, so GNU asm is available.
+    asm volatile("" : : "r"(pad) : "memory");
     if (depth > 0) {
         const int r = deep_scan(depth - 1, want);
         pad[63] = (uint64_t)r;          // keep pad live across the call
