@@ -9,6 +9,56 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Why the same program was refused in one run and admitted in the next: two mechanisms (2026-10-09, #4796)
+
+Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`, and
+`scripts/kena/linux-reach-level-load.pad` to pad flip 1600. `main` is `643ad45ef`; "fix" is that
+commit plus #4796. Runs marked * overlapped another lane's unlocked `prosper-app`, and base-1 was
+stopped at 900 s (flip 1000+), so read their counts as non-determinism evidence only.
+
+| run | `ps b8e8f38ec3a5fc7f` | `shader-recompile/fragment` drops | refused ps / cs |
+| --- | --- | --- | --- |
+| base-1* | refused, pc 73 | 468 | 1 / 2 |
+| base-2* | refused, pc 172 | 7,799 | 16 / 13 |
+| base-3 | refused, pc 73 | 653 | 8 / 7 |
+| base-4 | refused, pc 180 | 11,887 | 1 / 1 |
+| fix-1* | admitted | 10 | 7 / 8 |
+| fix-2* | admitted | 21 | 11 / 10 |
+| fix-3 | admitted | 6 | 6 / 7 |
+| fix-4 | refused, pc 27 (19 draws) | 24 | 6 / 7 |
+| base + `PROSPER_POST_SUBMIT_VISIBILITY=1` | refused, pc 73 | 611 | 1 / 1 |
+| fix + `PROSPER_POST_SUBMIT_VISIBILITY=1`, run 1 | admitted | 0 | 0 / 1 |
+| fix + `PROSPER_POST_SUBMIT_VISIBILITY=1`, run 2 | admitted | 0 | 0 / 1 |
+
+The one compute refusal left in the last two rows is `cs 8f0cc0f95288edcb` pc 29. It is a buffer store,
+refused at the same pc in every run.
+
+**Mechanism 1: stale slots in arms a draw never takes. Fixed by #4796.** The lighting pixel program
+`ps b8e8f38ec3a5fc7f` (`0x5007ae0000`) loops over lights (pc 91-234) and switches on the light type.
+Each switch arm loads its own T# from the stage table and samples it (pc 172, 180, 188 and 196). A
+fifth sample (pc 73) sits behind a feature branch. The slots of arms the draw never takes are never
+written, so they hold whatever the descriptor ring last held: V# pairs, float and f16 data, half an
+older T#. The `[t8-dropped]` words differ from run to run and from draw to draw. Whether they passed
+the T# screen decided admission. That is why the refused pc moved between runs and the drop count
+spans 468 to 11,887 on one binary. The mechanism is independent of the submit race below: with the
+visibility contract forced on and no fix, the program is still refused at pc 73.
+
+**Mechanism 2: descriptor tables recycled while prosper is still reading the submit (#1226, #2220).
+Not fixed here.** In a default run, a burst of programs at the level load reads T#s that are whole
+tables of float or f16 data, on instructions that run on every path. Those programs are `0x5007340000`
+(the occlusion-mask pass of the black-face reports), `0x5009a60000`, `0x500ac20000`, `0x5008ef0000`,
+`0x5008850000` and up to a dozen compute programs. The burst appeared in 6 of 8 default runs, and
+one of its compute programs (`0x5008b00000`) appeared alone in a seventh. None of it appeared in the 3
+runs with `PROSPER_POST_SUBMIT_VISIBILITY=1`. Kena requests SDK 8, so the post-submit
+visibility contract (armed only for SDK 13 and later) is off, and the guest reuses descriptor memory
+while prosper is still folding the submit, as ArcRunner does (#2219). fix-4's pc 27 refusal is a V#
+pair in the stage's direct user data on an instruction that always runs. It is the same shape, and no
+visibility run showed it. The default is #2220's decision, and #2223 records why a global change needs
+a cross-title pass first.
+
+What these runs do **not** show is a change in the picture. The pulse-prompt frame at flip 1600 has the
+same black world in base-2, fix-1, fix-2 and in the visibility run (#4775).
+
 ## The point-light shadow cubes are drawn: one replay per depth slice (2026-10-09, #3135)
 
 Measured on Linux/RADV:
@@ -1071,6 +1121,13 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The run-to-run refusal of `ps b8e8f38ec3a5fc7f` is a shader-cache key that ignores an input, or
+  a race between draw-realization workers** — false. The graphics compile key includes the resource
+  table, and the variation follows the descriptor words: stale bytes in the slots of switch arms the
+  draw never takes (2026-10-09, #4796).
+- **Kena's level-load burst of `unresolved-operand` refusals is the stale-slot mechanism** — false.
+  Those T#s are read on every path, from tables full of float data. They vanish with
+  `PROSPER_POST_SUBMIT_VISIBILITY=1`, which leaves the stale slots in place (2026-10-09, #4796, #2220).
 - **Kena's distance-field AO is empty because the cone trace is mis-compiled** — false as the first
   cause. The cone trace reads clipmaps that are mostly exact zeros, because the mesh-SDF atlas upload
   (`0x5008ba0000`) is skipped by the 512 MiB expanded-image bound (2026-10-09, #4766).

@@ -14,10 +14,12 @@
 // resolve the same instruction by its SRSRC register.
 //
 // Coverage, so an absence can be read: every image-use decline in resolve_dynamic_fetch_fold's T#
-// admission (fold_t8_decline_reason below) and every `continue` in build_stage_table's texture
-// publication. NOT covered: the fold's whole-program early return when a checked source is no
-// longer current, which declines before any instruction is examined. A `[mimg-unresolved]
-// pc_res=null` with no `[t8-dropped]` line for that program and pc points there, or at the cap.
+// admission (fold_t8_decline_reason below), every `continue` in build_stage_table's texture
+// publication, and the compute table's screen, format, signed-BCn and view declines (#4796). NOT
+// covered: the fold's whole-program early return when a checked source is no longer current, which
+// declines before any instruction is examined, and the backing-size overflow skips. A
+// `[mimg-unresolved] pc_res=null` with no `[t8-dropped]` line for that program and pc points there,
+// or at the cap.
 #pragma once
 
 #include <array>

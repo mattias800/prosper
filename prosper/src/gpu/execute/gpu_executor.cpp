@@ -8693,14 +8693,26 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.type, d.base_array, d.format, d.tile_mode,
                                 reject ? reject : "materialize");
-                    if (reject) continue;                            // garbage/degenerate T#
+                    // The compute decline sites name their words too (#4796): a refused dispatch
+                    // whose `[mimg-unresolved]` has no `[t8-dropped]` line was unreadable before.
+                    if (reject) {   // garbage/degenerate T#
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, reject);
+                        continue;
+                    }
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
                     // recompile (format-free SPIR-V), but remain explicitly Unknown so the live backend
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
-                    if (!mapped_fmt && !u.is_storage_image) continue;
-                    if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    if (!mapped_fmt && !u.is_storage_image) {
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                      "unmapped-img-fmt");
+                        continue;
+                    }
+                    if (mapped_fmt && fi.block_width > 1 && fi.snorm) {   // signed BCn: not wired
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8, "signed-bcn");
+                        continue;
+                    }
                     // The unmapped-format fallback builds a view by hand and therefore never applies
                     // a slice offset. It must fail closed on a non-zero BASE_ARRAY for the same
                     // reason image_base_level_view's early returns do: an unshifted base under a
@@ -8711,6 +8723,8 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                         : unmapped_format_image_view(d);
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
+                        note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
+                                                      "unsupported-image-view");
                         continue;
                     }
                     const ResourceClass wanted = u.is_storage_image ? ResourceClass::StorageImage
