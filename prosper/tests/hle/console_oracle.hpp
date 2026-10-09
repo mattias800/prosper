@@ -11,6 +11,7 @@
 #include "hle/dispatch/nid.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -428,10 +429,53 @@ inline bool load_known_gaps(const std::string& path, std::map<std::string, Gap>*
     return true;
 }
 
-// probe_baseline.tsv: `family<TAB>count`, the number of probe cases allowed to differ from the console.
-// A probe family with no row is an error (the caller reports it), so a new family cannot slip in ungated.
-inline bool load_probe_baseline(const std::string& path, std::map<std::string, size_t>* out,
-                                std::string* err) {
+// probe_baseline.tsv: `family<TAB>case id<TAB>signature`, one row per probe that is ALLOWED to differ from the
+// console. The signature is a hash of the difference text, so a probe that already differs cannot change
+// (prosper's builder growing a dword, a return code swapping) without the row changing, and a row cannot be
+// added without showing up as a line in the diff. A probe family with no rows is an error for the caller
+// (it has nothing to compare against), so a new family cannot slip in ungated.
+using ProbeBaseline = std::map<std::string, std::map<std::string, std::string>>;
+
+// What the signature hashes: the difference text with every command-buffer payload collapsed to its dword
+// count ("a0=7:<hex>" -> "a0=7:*"). Prosper's builders write prosper's own packets, so the payload differs from
+// the console's by design and can carry host-dependent bytes; the COUNT is the ABI contract (see
+// docs/gpu/AGC_PACKET_SIZES.md), and that, the return value and the buffers' other facts are what must not move.
+inline std::string probe_signature_text(const std::string& diff) {
+    std::string out;
+    for (size_t i = 0; i < diff.size();) {
+        out += diff[i];
+        // "a<digits>=<digits>:" opens a command-buffer report; swallow the hex that follows the colon.
+        if (diff[i] == ':' && i >= 3) {
+            size_t j = i;
+            while (j > 0 && std::isdigit(static_cast<unsigned char>(diff[j - 1]))) --j;
+            const bool after_eq = j > 0 && j < i && diff[j - 1] == '=';
+            size_t k = j - 1;
+            while (after_eq && k > 0 && std::isdigit(static_cast<unsigned char>(diff[k - 1]))) --k;
+            if (after_eq && k > 0 && diff[k - 1] == 'a') {
+                size_t e = i + 1;
+                while (e < diff.size() && std::isxdigit(static_cast<unsigned char>(diff[e]))) ++e;
+                out += '*';
+                i = e;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return out;
+}
+
+inline std::string probe_signature(const std::string& diff) {
+    uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a, 64-bit
+    for (unsigned char ch : probe_signature_text(diff)) {
+        h ^= ch;
+        h *= 0x100000001b3ull;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+inline bool load_probe_baseline(const std::string& path, ProbeBaseline* out, std::string* err) {
     std::ifstream in(path);
     if (!in) return true;   // no file == no probe families are baselined (any probe family then fails)
     std::string line;
@@ -439,10 +483,10 @@ inline bool load_probe_baseline(const std::string& path, std::map<std::string, s
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const std::vector<std::string> f = split(line, '\t');
-        uint64_t n = 0;
-        if (f.size() != 2 || f[0].empty() || !parse_int(f[1], &n))
-            return *err = "probe baseline needs 'family<TAB>count': " + line, false;
-        (*out)[f[0]] = static_cast<size_t>(n);
+        if (f.size() != 3 || f[0].empty() || f[1].empty() || f[2].size() != 16)
+            return *err = "probe baseline needs 'family<TAB>case id<TAB>16-hex signature': " + line, false;
+        if (!(*out)[f[0]].emplace(f[1], f[2]).second)
+            return *err = "probe baseline lists a case twice: " + line, false;
     }
     return true;
 }

@@ -233,22 +233,36 @@ TEST(ConsoleOracleHarness, Default0HonoursR64) {
 
 TEST(ConsoleOracleHarness, ProbeBaselineParsesAndRejectsMalformedRows) {
     const fs::path p = prosper_test::test_scratch_path("probe_baseline_rows.tsv");
-    std::map<std::string, size_t> m;
+    co::ProbeBaseline m;
     std::string err;
     {
-        std::ofstream(p) << "# comment\n\nprobe_a\t3\nprobe_b\t0\n";
+        std::ofstream(p) << "# comment\n\nfam\tcase_a\t0123456789abcdef\nfam\tcase_b\tfedcba9876543210\n";
     }
     ASSERT_TRUE(co::load_probe_baseline(p.string(), &m, &err)) << err;
-    EXPECT_EQ(m.at("probe_a"), 3u);
-    EXPECT_EQ(m.at("probe_b"), 0u);
-    for (const char* bad : {"probe_a\tx\n", "probe_a\n", "\t3\n", "probe_a\t3\textra\n"}) {
+    EXPECT_EQ(m.at("fam").size(), 2u);
+    EXPECT_EQ(m.at("fam").at("case_b"), "fedcba9876543210");
+    for (const char* bad : {"fam\tcase\n", "fam\tcase\tshort\n", "\tcase\t0123456789abcdef\n",
+                            "fam\t\t0123456789abcdef\n", "fam\tcase\t0123456789abcdef\textra\n",
+                            "fam\tc\t0123456789abcdef\nfam\tc\t0123456789abcdef\n"}) {
         {
             std::ofstream(p) << bad;
         }
-        std::map<std::string, size_t> n;
+        co::ProbeBaseline n;
         EXPECT_FALSE(co::load_probe_baseline(p.string(), &n, &err)) << bad;
     }
     fs::remove(p);
+}
+
+TEST(ConsoleOracleHarness, ProbeSignatureSeesTheDwordCountButNotThePayload) {
+    const std::string a = "console a0=3:aabbcc / prosper a0=7:bbddee; ";
+    EXPECT_EQ(co::probe_signature(a).size(), 16u);
+    // Payload bytes are prosper's own packets (and may carry host addresses): not part of the signature.
+    EXPECT_EQ(co::probe_signature(a), co::probe_signature("console a0=3:112233 / prosper a0=7:99; "));
+    // The dword count is the ABI contract: a builder growing by one dword changes it.
+    EXPECT_NE(co::probe_signature(a), co::probe_signature("console a0=3:aabbcc / prosper a0=8:bbddee; "));
+    // So does anything outside a buffer report, such as a return value.
+    EXPECT_NE(co::probe_signature("ret console=0x0 prosper=0x1; "), co::probe_signature("ret console=0x0 prosper=0x2; "));
+    EXPECT_EQ(co::probe_signature_text("x a12=345:ab12 y"), "x a12=345:* y");
 }
 
 TEST(ConsoleOracleHarness, UseTokenReadsAnEarlierCasesBuffer) {
@@ -356,13 +370,20 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
     std::map<std::string, co::Gap> gaps;
     ASSERT_TRUE(co::load_known_gaps(data_dir() + "/known_gaps.tsv", &gaps, &err)) << err;
 
-    // A `probe_*` family, or any family with a row in probe_baseline.tsv, is a measured INVENTORY (a generated
-    // set of calls, e.g. every command-buffer builder): its disagreements are leads, not individually listed
-    // gaps, so they are gated as a COUNT that may only go down. probe_baseline.tsv holds the allowed number.
-    std::map<std::string, size_t> baseline;
-    ASSERT_TRUE(co::load_probe_baseline(data_dir() + "/probe_baseline.tsv", &baseline, &err)) << err;
-    const bool probe = GetParam().rfind("probe_", 0) == 0 || baseline.count(GetParam()) != 0;
+    // A `probe_*` family, or any family with rows in probe_baseline.tsv, is a measured INVENTORY (a generated
+    // set of calls, e.g. every command-buffer builder): its disagreements are leads rather than reviewed gaps.
+    // They are gated by case id AND by a signature of the difference, both ways: a difference that is not listed
+    // fails, a listed case that now matches fails (lower the baseline), and a listed case whose difference
+    // changed fails -- which a bare count cannot see (a builder growing a dword, one difference swapped for
+    // another). Adding a row is a visible line in the diff.
+    co::ProbeBaseline baselines;
+    ASSERT_TRUE(co::load_probe_baseline(data_dir() + "/probe_baseline.tsv", &baselines, &err)) << err;
+    const bool probe = GetParam().rfind("probe_", 0) == 0 || baselines.count(GetParam()) != 0;
+    const std::map<std::string, std::string> empty_rows;
+    const auto rows_it = baselines.find(GetParam());
+    const std::map<std::string, std::string>& rows = rows_it == baselines.end() ? empty_rows : rows_it->second;
     size_t differing = 0;
+    std::set<std::string> seen_differing;
 
     co::State state;
     size_t matched = 0, expected_gaps = 0, skipped = 0;
@@ -390,7 +411,17 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
             expected_gaps++;
         } else if (probe) {
             differing++;
-            std::printf("[probe-gap] %s (%s): %s\n", c.id.c_str(), c.func.c_str(), diff.c_str());
+            seen_differing.insert(c.id);
+            const std::string sig = co::probe_signature(diff);
+            // `[probe-row]` is the line to put in probe_baseline.tsv once the difference has been reviewed.
+            std::printf("[probe-row] %s\t%s\t%s\n", GetParam().c_str(), c.id.c_str(), sig.c_str());
+            const auto row = rows.find(c.id);
+            if (row == rows.end())
+                ADD_FAILURE() << c.id << " (" << c.func << "): differs from the console and is not in probe_baseline.tsv: "
+                              << diff;
+            else if (row->second != sig)
+                ADD_FAILURE() << c.id << " (" << c.func << "): its difference changed from the baselined one (signature "
+                              << row->second << " -> " << sig << "); review it, then update the row: " << diff;
         } else {
             ADD_FAILURE() << c.id << " (" << c.func << "): " << diff;
         }
@@ -400,13 +431,10 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
     std::printf("[oracle] %s: %zu match the console, %zu known gaps, %zu differ (probe), %zu unmeasured\n",
                 GetParam().c_str(), matched, expected_gaps, differing, skipped);
     if (probe) {
-        const auto b = baseline.find(GetParam());
-        ASSERT_NE(b, baseline.end())
-            << GetParam() << " has no row in probe_baseline.tsv; add '" << GetParam() << "\t" << differing << "'";
-        EXPECT_EQ(differing, b->second)
-            << GetParam() << ": " << differing << " probes differ but probe_baseline.tsv allows " << b->second
-            << (differing > b->second ? " -- a regression: something that agreed with the console no longer does"
-                                      : " -- progress: lower the baseline to " + std::to_string(differing));
+        for (const auto& [id, sig] : rows)
+            if (!seen_differing.count(id))
+                ADD_FAILURE() << id << ": listed in probe_baseline.tsv but no longer differs from the console (or is gone "
+                              << "from the golden) -- progress: remove the row";
     }
 }
 

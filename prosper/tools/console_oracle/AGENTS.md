@@ -69,10 +69,15 @@ functions, which store through a pointer into a packet built earlier.
 
 ## Probe families and the resumable runner
 
-A family named `probe_*`, or one with a row in `tests/data/console_oracle/probe_baseline.tsv`, is a
-measured inventory rather than a list of individually reviewed gaps. Its differences are not listed one
-by one in `known_gaps.tsv`; the replay counts them and fails if the count differs from the baseline, so
-it can only go down (and the baseline is lowered with it). A mismatch printed as `[probe-gap]` is a lead.
+A family named `probe_*`, or one with rows in `tests/data/console_oracle/probe_baseline.tsv`, is a
+measured inventory rather than a list of individually reviewed gaps. Its differences are not in
+`known_gaps.tsv`; each is a baseline row `family<TAB>case id<TAB>signature`. The replay checks both ways:
+a difference with no row fails, a row whose case now matches fails (delete it), and a row whose
+difference changed fails. The signature hashes the difference with command-buffer payload hex collapsed
+to the dword count, because prosper's builders write prosper's own packets and the count is the ABI
+contract (`docs/gpu/AGC_PACKET_SIZES.md`): a builder that grows a dword changes it. A raised baseline is
+a visible added line. After reviewing the differences, regenerate the rows from the replay's
+`[probe-row]` lines (sorted, one family at a time).
 
 Baselined today: `agcbuild`, `kernelx`, `nethttp`, `posix`. Five `kernelx` cases are deliberately absent:
 using an event flag or equeue after deleting it aborts the replay process in prosper (#4779). Put them back
