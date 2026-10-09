@@ -160,17 +160,20 @@ of its manifest.
 | Sonic Racing: CrossWorlds | `PPSA08804` | 2 | `12----` | - | - | none | [#2361](https://github.com/mattias800/prosper/issues/2361), [#2362](https://github.com/mattias800/prosper/issues/2362), [#2363](https://github.com/mattias800/prosper/issues/2363), [#2309](https://github.com/mattias800/prosper/issues/2309), [#2303](https://github.com/mattias800/prosper/issues/2303) | [#1895](https://github.com/mattias800/prosper/issues/1895) | [`SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/games/SONIC_CROSSWORLDS_STATUS.md) |
 | Stray | `PPSA02101` | 2 | `12----` | **2.4** fps · 85% active · 4K · past the calibration screen to the first map load, world a flat letterboxed clear · screenshot · 2026-08-22 | - | none | - | [#2883](https://github.com/mattias800/prosper/issues/2883) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Syberia - The World Before | `PPSA02777` | 2 | `12----` | - | - | - | - | [#3501](https://github.com/mattias800/prosper/issues/3501) | - |
+| The Blood of Dawnwalker | `PPSA28000` | 2 | `12----` | - | - | - | - | [#4792](https://github.com/mattias800/prosper/issues/4792) | - |
 | The Forgotten City | `PPSA03026` | 2 | `12----` | - | - | none | [#1961](https://github.com/mattias800/prosper/issues/1961), [#1945](https://github.com/mattias800/prosper/issues/1945), [#1226](https://github.com/mattias800/prosper/issues/1226) | [#1890](https://github.com/mattias800/prosper/issues/1890) | - |
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/games/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md) |
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md) |
 | Unbound: Worlds Apart | `PPSA03274` | 2 | `12----` | **17.9** fps · 21% active · 4K · past the title screen and intro to the first level's map load, level a flat clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932), [#2931](https://github.com/mattias800/prosper/issues/2931) | [#2886](https://github.com/mattias800/prosper/issues/2886) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
+| Afterdream | `PPSA18391` | 1 | `1-----` | - | - | - | - | [#4793](https://github.com/mattias800/prosper/issues/4793) | - |
 | Beast of Reincarnation | `PPSA29343` | 1 | `1-----` | **9.2** fps · 56% active · 4K · GAME FREAK logo then the Digital Deluxe bonus dialog, with PROSPER_CB_EFC_NO_COLOR=1 · screenshot · 2026-08-22 | - | none | [#1588](https://github.com/mattias800/prosper/issues/1588), [#2911](https://github.com/mattias800/prosper/issues/2911), [#2915](https://github.com/mattias800/prosper/issues/2915) | [#2916](https://github.com/mattias800/prosper/issues/2916) | [`BEAST_OF_REINCARNATION_STATUS.md`](prosper/docs/games/BEAST_OF_REINCARNATION_STATUS.md) |
 | BlazBlue Entropy Effect X | `PPSA29714` | 1 | `1-----` | - | - | - | - | [#3496](https://github.com/mattias800/prosper/issues/3496) | - |
 | Little Nightmares II | `PPSA02154` | 1 | `1-----` | **6.9** fps · 19% active · 4K · boot logo sequence, then a flat white clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932) | [#2884](https://github.com/mattias800/prosper/issues/2884) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Metaphor: ReFantazio | `PPSA20800` | 1 | `1-----` | **51.0** fps · 95% active · 4K · loading mascot then the language-selection screen, held for the whole run · screenshot · 2026-08-23 | - | none | [#2952](https://github.com/mattias800/prosper/issues/2952), [#2932](https://github.com/mattias800/prosper/issues/2932) | [#2876](https://github.com/mattias800/prosper/issues/2876) | [`METAPHOR_STATUS.md`](prosper/docs/games/METAPHOR_STATUS.md) |
 | SILENT HILL 2 | `PPSA08709` | 1 | `1-----` | - | - | none | [#4025](https://github.com/mattias800/prosper/issues/4025) | [#4024](https://github.com/mattias800/prosper/issues/4024) | - |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/games/ARCRUNNER_STATUS.md) |
+| Assassin's Creed Black Flag Resynced | `PPSA28183` | 0 | `------` | - | - | - | [#4139](https://github.com/mattias800/prosper/issues/4139) | [#4131](https://github.com/mattias800/prosper/issues/4131) | [`AC_BLACK_FLAG_STATUS.md`](prosper/docs/games/AC_BLACK_FLAG_STATUS.md) |
 | Darksiders II Deathinitive Edition | `PPSA23806` | 0 | `------` | - | - | - | - | [#3497](https://github.com/mattias800/prosper/issues/3497) | - |
 | FINAL FANTASY TACTICS - The Ivalice Chronicles | `PPSA21783` | 0 | `------` | - | - | - | - | [#3498](https://github.com/mattias800/prosper/issues/3498) | - |
 | Hades II | `PPSA36082` | 0 | `------` | - | - | none | [#4079](https://github.com/mattias800/prosper/issues/4079) | [#4023](https://github.com/mattias800/prosper/issues/4023) | - |
@@ -182,6 +185,7 @@ of its manifest.
 | Sifu | `PPSA03001` | 0 | `------` | **0.2** fps · 5% active · 4K · flat 4K clear, no content · screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#2935](https://github.com/mattias800/prosper/issues/2935) | [#2885](https://github.com/mattias800/prosper/issues/2885) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | [#2871](https://github.com/mattias800/prosper/issues/2871) | [#2867](https://github.com/mattias800/prosper/issues/2867) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Spacebase Startopia | `PPSA02846` | 0 | `------` | **--** fps · 0% active · 1080p · one black frame, then no further submit · screenshot · 2026-08-22 | - | none | [#2933](https://github.com/mattias800/prosper/issues/2933) | [#2887](https://github.com/mattias800/prosper/issues/2887) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
+| Super Meat Boy 3D | `PPSA31162` | 0 | `------` | - | - | - | [#4790](https://github.com/mattias800/prosper/issues/4790) | [#4791](https://github.com/mattias800/prosper/issues/4791) | - |
 | The First Berserker: Khazan | `PPSA20447` | 0 | `------` | **--** fps · 0% active · 4K · a flat white clear, the only frame it composites · tools/screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#1880](https://github.com/mattias800/prosper/issues/1880) | [#2909](https://github.com/mattias800/prosper/issues/2909) | [`KHAZAN_STATUS.md`](prosper/docs/games/KHAZAN_STATUS.md) |
 | The Lord of the Rings: Gollum | `PPSA06367` | 0 | `------` | **--** fps · 0% active · 1440p · one flat white composited clear before the boot dies at ~4 s · screenshot · 2026-08-22 | - | none | - | [#2900](https://github.com/mattias800/prosper/issues/2900) | [`GOLLUM_STATUS.md`](prosper/docs/games/GOLLUM_STATUS.md) |
 | Uncharted: Legacy of Thieves Collection | `PPSA05684` | 0 | `------` | - | - | - | - | [#3616](https://github.com/mattias800/prosper/issues/3616) | - |
@@ -195,10 +199,10 @@ of its manifest.
 | 5 -- PS5 hardware-oracle comparison | 1 |
 | 4 -- manual visual verification | 3 |
 | 3 -- gameplay with the scene rendering | 12 |
-| 2 -- title screen | 20 |
-| 1 -- any real graphics | 5 |
-| 0 -- not started | 16 |
+| 2 -- title screen | 21 |
+| 1 -- any real graphics | 6 |
+| 0 -- not started | 18 |
 
-**4 of 71** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 10 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 75** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 14 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.

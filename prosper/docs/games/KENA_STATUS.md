@@ -9,6 +9,84 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The point-light shadow cubes are drawn: one replay per depth slice (2026-10-09, #3135)
+
+Measured on Linux/RADV:
+- `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`;
+- `scripts/kena/linux-reach-pulse.pad`, 640-900 s per run.
+
+**What changed.** The culling VS draws from the entry below are depth-only into a 6-slice depth array. They are now admitted. Each draw is replayed once per slice of `DB_DEPTH_VIEW`:
+- replay k draws only the primitives whose layer is k;
+- it is drawn into the backend's single-layer image of guest slice `SLICE_START + k`, which is exactly the shape a face-by-face cube render already takes;
+- the layer is selected at draw time (`gl_InstanceIndex`, through each run's `firstInstance`), so all six replays share one module and one pipeline.
+
+Two neighbouring shapes are refused by name, `ngg-layer-attachments-mixed`: a one-slice colour target beside a depth array, and a layered colour volume beside any bound depth/stencil. Neither shape occurs on this route.
+
+**Dropped draws, same-binary A/B.** The control arm is the same tree with the replay refused.
+
+| run | arm | `ngg-layer-target-not-single-slice` | vertex draws dropped (fired alarm windows) | NGG draws dropped in the backend |
+|---|---|---|---|---|
+| ctl1 | control | refused (128 shape lines) | 65,682 | 0 |
+| ld4 | replay | none | 29,976 | 0 |
+| ld7 | replay | none | 18,846 | 0 |
+
+What remains is `ngg-abi-read-v4` (#4746).
+
+**Picture.**
+- After the first pulse, the replay and control frames match apart from animation. The mean luminance is 32.5 against 32.3, and the difference image is Kena's outline only.
+- This view does not show these lights' shadows distinctly.
+- There is no PS5 oracle of this scene, so whether the shadows are now right is **not established**.
+
+**Two first versions failed. Both are recorded because each looked plausible.**
+1. The first version compiled one vertex variant per slice. It thrashed the pipeline cache: 6.6k evictions in a run. The route never left the level load in 820 s.
+2. The expansion was first placed at the two direct `g_live(...)` calls. The ordered executor is handed `g_live` as a function object, so most submits bypassed it, and only slice 0 was ever written (`[cube-depth] ... slices ever VALID=0x01`). The expansion now wraps the renderer once, at registration.
+
+**Not caused by this work: #4775.** Some runs show a black world at the first Pulse prompt until the first L1 press. The world is black apart from Kena, whose outline is stair-stepped. The same blocky black mask appears over parts of the opening cutscene. The control arm shows both, so neither comes from the replay.
+
+**Cost, still open.** Every replay re-runs the shell dispatch, so a cube costs six shell dispatches and six pass segments. A shell dispatched once and drawn six times is the next step.
+
+## The cave's distance-field AO is empty because the mesh-SDF atlas is never uploaded (2026-10-09, #4766; paused)
+
+**Read this first.** Kena's lighting is fully dynamic, so UE4's distance-field AO is what should occlude the
+sky in the cave. In prosper its bent normals are about zero everywhere (#4766). The cause is found, a fix
+exists on an unmerged branch, and the work is **paused** (owner's call, 2026-10-09).
+Measured on Linux/RADV, `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
+`scripts/kena/linux-reach-pulse.pad`, RenderDoc captures and `PROSPER_COMPUTELOG`.
+
+- **The chain, measured.** UE4 builds the AO in four steps:
+  1. it uploads mesh signed-distance bricks into a 512³ atlas;
+  2. it composites the atlas into four 128³ R16F global-distance-field clipmaps;
+  3. it cone-traces those clipmaps (`0x50071e0000`) into a 400×225×9 visibility buffer;
+  4. it combines the cones into bent normals.
+- **Step 1 never runs.** The upload program `0x5008ba0000` writes the atlas `0x505d380000` as
+  512×512×512 one-component R16_UINT (tile mode 27). Every one of its ~340 brick dispatches is
+  skipped: `expanded image exceeds the 512 MiB backend bound -> dispatch skipped`.
+  - Integer 3D storage has no native typed path. `native_storage_3d_format_support_bit()` only
+    mirrors the float/UNORM bits, and the recompiler admits native integer storage only in 2D.
+  - So the atlas takes the raw RGBA32_UINT interchange at 16 bytes per texel: 2 GiB from 256 MiB.
+- **What that does downstream.**
+  - The clipmaps hold exact-zero boxes (object bounds) beside 659.5 "far" texels, with almost no
+    gradients. 72%/63%/36%/9% of texels are zero across the four clipmaps.
+  - The cone trace therefore min-reduces almost everything to about 0.0035.
+  - The bent normals come out at length 0.003.
+- **Sky lighting is not darkened anyway, so this alone may not fix the brightness.** The composite
+  `0x5008750000` still adds about 0.02 sky diffuse to the cave walls. How its contrast curve and
+  distance fade use the near-zero AO was not settled. The sky-light constants (colour 0.041/0.060/0.100)
+  are small, so the SH irradiance source is the open question (see #4768: the sky cube is copied
+  into a cube by `0x5006e80000`, which is the #3742 gap).
+- **The fix that exists, and why it is not merged.** Branch `kena/dfao-int3d-wip` gives integer
+  formats 3D support bits (25..28) and lets the recompiler declare R16ui/R32ui/R8ui 3D storage.
+  - A test in `test_game_compute` pins it: a 3D R16 store reflects typed R16ui and writes tiled guest
+    bytes exactly. It fails under either half reverted. The `gpu_retile` volume mode now runs integer
+    volumes natively too.
+  - With it, all 340 uploads succeed, but **the level load stalls**: the guest stops reading the pad
+    after about 300 s. The likely reason: every brick dispatch re-materializes and writes back the
+    whole 256 MiB atlas, because the GPU retile declines 2-byte texels and mode 27 for volumes, so it
+    is a CPU detile and retile each time. That is likely, not measured.
+- **Next step.** Keep the atlas resident on the GPU across the upload dispatches:
+  - a GPU volume retile for 2-byte texels in mode 27, or a write-region-only writeback;
+  - then re-measure the bent normals and the cave against the after-Pulse oracle (3.5).
+
 ## Exposure is the guest's own; the cave's excess light is ambient (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window and
@@ -993,6 +1071,11 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Kena's distance-field AO is empty because the cone trace is mis-compiled** — false as the first
+  cause. The cone trace reads clipmaps that are mostly exact zeros, because the mesh-SDF atlas upload
+  (`0x5008ba0000`) is skipped by the 512 MiB expanded-image bound (2026-10-09, #4766).
+- **The AO cone buffer is empty because its clear is broken** — false after #4773. With the clear
+  writing every element, the trace still writes about 0.0035 everywhere (2026-10-09, #4766).
 - **The exposure pass reads an 8-bit texture because prosper's view format differs from the guest's**
   — false. `PROSPER_TEXLOG` shows the guest T# itself is a 1×1 `IMG_FMT 56` (8_8_8_8_UNORM) at
   `0x500f0c0000`, and the 1×1 targets it writes are `IMG_FMT 77` (32_32_32_32_FLOAT), as prosper
@@ -1005,7 +1088,9 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 - **Fixing the typed-buffer clear restores the distance-field AO** — false. With every element of the
   cone buffer now written, the cone trace still leaves it almost unchanged, and the bent normals stay
   at length 0.003 (2026-10-08, #4766).
-- **Kena's culling NGG VS draws can be admitted into a one-slice 2D colour target and their layer culled** — false. They are depth-only (`CB_TARGET_MASK` 0) into a 6-slice depth array (`DB_DEPTH_VIEW` 0..5), so the layer is real. Admitting them on colour target 0's proof culled shadow geometry (`layer-culled` counted on every frame). They are now refused, `ngg-layer-target-not-single-slice` (2026-10-08, #3135 P7).
+- **Kena's culling NGG VS draws can be admitted into a one-slice 2D colour target and their layer culled** — false. They are depth-only (`CB_TARGET_MASK` 0) into a 6-slice depth array (`DB_DEPTH_VIEW` 0..5), so the layer is real. Admitting them on colour target 0's proof culled shadow geometry (`layer-culled` counted on every frame). They were refused, `ngg-layer-target-not-single-slice` (2026-10-08, #3135 P7), and are now replayed once per slice (2026-10-09).
+- **The black world at the first Pulse prompt comes from the layered-depth replay** — false. A control build with the replay refused shows it too (run ctl1, flips 1400-1600). So does the blocky black mask over the opening cutscene (run ctl2). One earlier run blamed a partial cube; that was the same intermittent defect (#4775, 2026-10-09).
+- **Every submit reaches the renderer through the two `g_live(...)` call sites** — false. The ordered executor is handed `g_live` as a function object. An expansion placed at those two calls missed most submits, and only depth slice 0 was ever written. Wrap the renderer at `set_submit_renderer` instead (2026-10-09, #3135).
 - **The black cutscene face is caused by admitting NGG draws** — false. The run that showed it admitted none beyond `main`. It goes with the intermittent refusal of compute `de7035c2` (#4700), and the same build rendered the face correctly in other runs (2026-10-08).
 - **The level-load device loss is an out-of-bounds access or a bad descriptor** — false. The RADV hang dump's `vm_fault.log` is empty, so the GPU hung rather than faulted. The hang is pixel program `0x5007ad0000`'s outer loop, whose spill-slot counter the recompiled loop never advanced (2026-10-08).
 - **`b77161c6`'s pc-55 refusal means prosper has no register-offset descriptor-load support for NGG** — false. The memory-fed raw-offset machinery (#3979, #4578) covers the shape. Its source proof, fold and emitter were limited to an immediate-ZERO x1/x2 source, and Kena reads its selector at +4 (2026-10-08, #3135).

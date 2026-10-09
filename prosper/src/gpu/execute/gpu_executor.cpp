@@ -11,6 +11,7 @@
 #include "gpu/execute/dma_span_authority.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "gpu/execute/checked_graphics_source.hpp"
 #include "gpu/execute/native_graphics_source_lineage.hpp"
@@ -8869,9 +8870,16 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             if (raw_x2_reader)
                 (void)raw_x2_reader->publish_compute_x2(*table, raw_source->owned_raw_x2_write_plan,
                                                         compute_srt_uses);
-            (void)admit_compute_nested_wide_data(
-                mapping_lease ? mapping_lease->get() : nullptr,
-                facts->decoded, compute_srt_uses, *table);
+            // The inventory is a pure function of the program's bytes, so it is taken from the
+            // memoized facts; the decision itself still reads this dispatch's table and memory.
+            if (compute_nested_wide_facts_memo_enabled())
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, facts->nested_wide_data(), compute_srt_uses, *table);
+            else
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, compute_srt_uses, *table);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then
@@ -9840,6 +9848,9 @@ OrderedSubmitResult execute_ordered_items_impl(
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
         g_live_phase.source_submit = source_submit;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11358,6 +11369,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
         // plus the batch's trailing barrier. Every other operation retires first.
         g_live_phase.defer_batch_completion = defer_graphics_wait && before_dispatch &&
                                               !final_span && !authoritative_readback;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -12280,7 +12294,23 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
     return result;
 }
 
-void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
+// The registered renderer is wrapped once, here, because g_live reaches it along several paths
+// (render_submit_items, execute_and_present, and the ordered executor, which is handed g_live as a
+// function object): a layered depth-only NGG draw becomes one item per depth slice before ANY
+// renderer sees the submit (#3135, ngg_depth_slices.hpp), so pass grouping by depth identity treats
+// each slice as the face render it is. The copy is made only for a submit that carries one.
+void set_submit_renderer(LiveRenderFn fn) {
+    if (!fn) {
+        g_live = {};
+        return;
+    }
+    g_live = [render = std::move(fn)](const std::vector<DrawItem>& items, uint32_t width,
+                                      uint32_t height) {
+        std::vector<DrawItem> slice_expanded;
+        return render(expand_ngg_depth_slices(items, slice_expanded) ? slice_expanded : items,
+                      width, height);
+    };
+}
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 uint8_t* compute_gds_backing()            { return g_compute_gds.data(); }
 size_t   compute_gds_size()               { return g_compute_gds.size(); }
@@ -13023,6 +13053,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bo
         operations.push_back({SubmitOperationKind::Draw,
                               static_cast<size_t>(item.draw_index), item.command_order});
     auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
+    expand_ngg_depth_slices_in_place(items);   // see the ordered spans above
     RenderedFrame rendered = g_live(items, width, height);
     if (pending) {
         std::string error;

@@ -191,7 +191,7 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         }
 
     const std::string host_path = resolve_guest_path(guest_path);
-    if (host_path.empty() || host_path.compare(0, 16, "/prosper-denied/") == 0) return kEnoent;
+    if (host_path.empty()) return kEnoent;   // no mount owns the path (#4782): no host file
     if (FILE* f = fopen(host_path.c_str(), "rb")) fclose(f);
     else {
         if (modlog())

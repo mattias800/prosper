@@ -92,7 +92,7 @@ struct StageKey {
     std::vector<uint32_t> program;   // the linked chain, compared exactly
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
-    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
+    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0, depth_slice_fanout = 0;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
     bool count_violations = false, interpolation = false, user_data_address = false;
@@ -108,7 +108,7 @@ struct StageKeyHash {
             hash = mix(hash, (uint64_t{r.binding} << 32) ^ r.fetch_pc ^ (uint64_t{r.cls} << 48));
         for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
-        hash = mix(hash, key.lds_granules);
+        hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -348,6 +348,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.user_sgprs = admission.user_sgprs;
     key.lds_granules = admission.lds_granules;
     key.layer_slices = admission.layer_slices;
+    key.depth_slice_fanout = admission.depth_slice_fanout;
     key.topology = static_cast<uint8_t>(admission.topology);
     key.route = static_cast<uint8_t>(admission.route);
     key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
@@ -375,6 +376,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     request.raster.pixel_inputs = input.pixel_inputs;
     request.raster.float_transport = input.float_transport;
     request.raster.count_violations = admission.count_violations;
+    // A depth array is replayed per slice; the base draw is the slice-0 replay, so a consumer that
+    // knows nothing of the replay draws slice 0's primitives only, never the others into it.
+    if (admission.depth_slice_fanout) request.raster.layer_select = true;
     if (admission.route == NggLayerRoute::InterpolationGeometry)
         request.raster.reserved_locations = input.interpolation.attribute_mask;
     if (interpolation) {
@@ -434,6 +438,8 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
             c.stats.strip_draws += result.strip ? 1u : 0u;
             c.stats.indexed_draws += result.indexed ? 1u : 0u;
             result.draw = found->second.draw;
+            result.depth_slice_count = admission.depth_slice_fanout;
+            result.depth_first_slice = admission.depth_first_slice;
             return result;
         }
     }
@@ -478,6 +484,10 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         c.stats.indexed_draws += result.indexed ? 1u : 0u;
     }
     result.draw = std::move(draw);
+    // The per-slice replay shares this one description: each slice's item selects its layer at
+    // draw time (DrawItem::ngg_layer_select), so nothing here is copied per slice.
+    result.depth_slice_count = admission.depth_slice_fanout;
+    result.depth_first_slice = admission.depth_first_slice;
     return result;
 }
 

@@ -54,6 +54,11 @@ entry can define:
 
 - `pad_script`: input route relative to `prosper/`.
 - `savedata_policy`: `fresh` for an isolated temporary save, or `preserve`.
+- `save_fixture`: optional name of a local save fixture (`tools/saves/AGENTS.md`). Both save roots
+  are seeded from it into fresh per-run directories instead of starting empty, so a route can begin
+  after a game's forced first-boot steps. Fixtures are never committed; when it is absent locally
+  the guard is reported `SKIPPED`, never run with a fresh save. The title id comes from `dump`
+  (`PPSA…-app0`) unless `title_id` is set.
 - `capture_after_seconds` / `capture_before_seconds`: evidence window. Put this
   after the route reaches the state being protected; logos and menus are not
   gameplay evidence.

@@ -201,7 +201,7 @@ bool boot_program(const std::string& dump_root, Program& out, std::string* err,
 // where the dump ships "content/movies/...", #1226) may be decided by exact-case probe on a
 // case-sensitive host filesystem. Returns the corrected path, or `want` unchanged when the path
 // already exists or no entry matches (the caller's absence handling then applies as before).
-// Consumers: boot_program's preload loop, hle_file's translate(), and the unit test.
+// Consumers: boot_program's preload loop, hle_file's resolve_guest(), and the unit test.
 std::string resolve_host_path_case(const std::string& want);
 
 // Enumerate the title's own Unity native plugins that the fixed preload list does not name (#1609).

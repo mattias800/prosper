@@ -96,7 +96,9 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   table or registers does not belong here: the cache key is the program alone. The probe's
   reject-reason records are replayed on every hit, so adding a fact whose derivation has another
   side effect means capturing and replaying that too. `PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1`
-  restores per-dispatch derivation for A/B.
+  restores per-dispatch derivation for A/B. Facts consumed only by some dispatches are computed on first use
+  (`wave_ops()`, and `nested_wide_data()`, the raw nested wide-data inventory the live admission
+  reads; `PROSPER_NO_NESTED_WIDE_FACTS_MEMO=1` re-derives that one per dispatch for A/B).
 - **Device-resolved indirect dispatch (#3656)** — an eligible group-count-mode indirect dispatch is
   realized with an UNKNOWN launch (`resolve_compute_launch` returns zero groups/threads for an
   `indirect` dispatch) and reaches the backend as `ComputeItem::indirect_args_addr`; the backend, not
