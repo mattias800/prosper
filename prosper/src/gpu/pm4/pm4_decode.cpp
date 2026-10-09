@@ -71,6 +71,21 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.reg_offset = pl[0]; c.reg_value = pl[1];
                 c.reg_count = npl - 1; c.reg_data = &pl[1];
             }
+        } else if (c.op == IT_ACQUIRE_MEM) {
+            // Hardware PM4 Type-3 ACQUIRE_MEM packet (GFX10 / RDNA2):
+            // Cache flush / memory acquire barrier.
+            c.kind = K::AcquireMem;
+        } else if (c.op == IT_RELEASE_MEM) {
+            // Hardware PM4 Type-3 RELEASE_MEM packet (GFX10 / RDNA2, 7 payload dwords / 8 dwords total):
+            // payload: [0]=EVENT_CNTL, [1]=DATA_CNTL, [2..3]=ADDR_LO/HI, [4..5]=DATA_LO/HI, [6]=INT_CTXID
+            // DATA_CNTL bits [31:29] encode data_sel (1=32-bit, 2=64-bit, 3=GPU clock).
+            c.kind = K::ReleaseMem;
+            if (npl >= 2) c.rel_data_sel = (pl[1] >> 29) & 7u;
+            if (npl >= 4) c.rel_addr = lo_hi(&pl[2]);
+            if (npl >= 6) {
+                c.rel_value = (uint64_t)pl[4] | ((uint64_t)pl[5] << 32);
+                c.rel_value_valid = true;
+            }
         } else if (c.op == IT_LOAD_SH_REG || c.op == IT_LOAD_CONTEXT_REG ||
                    c.op == IT_LOAD_CONTEXT_REG_INDEX || c.op == IT_LOAD_UCONFIG_REG) {
             // Hardware PM4 indirect register load packets (GFX8+ / RDNA2 / AGC):
