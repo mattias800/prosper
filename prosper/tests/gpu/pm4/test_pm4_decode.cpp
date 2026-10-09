@@ -431,5 +431,34 @@ TEST(Pm4Decode, Contract) {
         CHECK(ctl_ops[3].kind == K::DrawReset, "op3 is DrawReset");
         CHECK(ctl_ops[4].kind == K::StallCommandBufferParser, "op4 is StallCommandBufferParser");
     }
+
+    // Hardware conditional execution, multi-draw indirect, and 64-bit wait packets (Black Flag submit0.bin):
+    {
+        uint32_t cond_stream[] = {
+            // IT_COND_EXEC: 5 dwords, op 0x22: [0..1]=addr, [2]=control, [3]=count
+            PM4(5, IT_COND_EXEC, 0), 0xe0040060u, 0x0000000fu, 0x0u, 0x8u,
+            // IT_DRAW_INDEX_INDIRECT_MULTI: 10 dwords, op 0x38: [0]=offset 0x19000, [1]=count 0x98...
+            PM4(10, IT_DRAW_INDEX_INDIRECT_MULTI, 0), 0x19000u, 0x98u, 0x99u, 0x280u, 0x13u, 0x0u, 0x0u, 0x14u, 0x0u,
+            // IT_WAIT_REG_MEM64: 9 dwords, op 0x93: [0]=func/flags, [1..2]=addr, [3]=ref, [4]=mask...
+            PM4(9, IT_WAIT_REG_MEM64, 0), 0x6000113u, 0x800040a8u, 0xcu, 0x0u, 0x0u, 0xffffffffu, 0xffffffffu, 0x40u,
+        };
+        std::vector<Pm4Command> cond_ops;
+        const size_t c = decode_pm4(cond_stream, std::size(cond_stream), cond_ops);
+        CHECK(c == 24, "consumed 24 dwords of cond/multi-draw/wait64 packets");
+        CHECK(cond_ops.size() == 3, "decoded 3 cond/multi-draw/wait64 packets");
+
+        CHECK(cond_ops[0].kind == K::SetPredication, "op0 is SetPredication");
+        CHECK(cond_ops[0].pred_addr == 0x0000000fe0040060ull, "op0 pred_addr matches");
+        CHECK(cond_ops[0].pred_valid, "op0 pred_valid");
+
+        CHECK(cond_ops[1].kind == K::DrawIndexIndirect, "op1 is DrawIndexIndirect");
+        CHECK(cond_ops[1].indirect_offset == 0x19000u, "op1 indirect_offset == 0x19000");
+        CHECK(cond_ops[1].di_modifier == 0x98u, "op1 di_modifier matches count word");
+
+        CHECK(cond_ops[2].kind == K::WaitRegMem, "op2 is WaitRegMem");
+        CHECK(cond_ops[2].wm_func == (0x6000113u & 7u), "op2 wm_func matches");
+        CHECK(cond_ops[2].wm_addr == 0x0000000c800040a8ull, "op2 wm_addr matches");
+        CHECK(cond_ops[2].wm_ref == 0u, "op2 wm_ref == 0");
+    }
 }
 

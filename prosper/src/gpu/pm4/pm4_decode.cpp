@@ -120,8 +120,22 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 c.wd_data = &pl[3];
                 c.wd_valid = true;
             }
-        } else if (c.op == IT_WAIT_REG_MEM) {
-            // Hardware PM4 Type-3 WAIT_REG_MEM packet (GFX10 / RDNA2):
+        } else if (c.op == IT_COND_EXEC) {
+            // Hardware PM4 Type-3 COND_EXEC packet (GFX10 / RDNA2):
+            // payload: [0..1]=addr lo/hi, [2]=discard / condition control, [3]=count of dwords to skip.
+            // Evaluated like predication or passthrough in current pipeline.
+            c.kind = K::SetPredication;
+            if (npl >= 2) c.pred_addr = lo_hi(pl);
+            if (npl >= 3) c.pred_op = pl[2];
+            c.pred_valid = (npl >= 3);
+        } else if (c.op == IT_DRAW_INDEX_INDIRECT_MULTI) {
+            // Hardware PM4 Type-3 DRAW_INDEX_INDIRECT_MULTI packet (GFX10 / RDNA2):
+            // payload: [0]=data_offset, [1..]=count, stride, modifier.
+            c.kind = K::DrawIndexIndirect;
+            if (npl >= 1) c.indirect_offset = pl[0];
+            if (npl >= 2) c.di_modifier = pl[1];
+        } else if (c.op == IT_WAIT_REG_MEM || c.op == IT_WAIT_REG_MEM64) {
+            // Hardware PM4 Type-3 WAIT_REG_MEM / WAIT_REG_MEM64 packet (GFX10 / RDNA2):
             // payload: [0]=op_func, [1..2]=addr lo/hi, [3]=ref_value, [4]=mask.
             c.kind = K::WaitRegMem;
             if (npl >= 1) c.wm_func = pl[0] & 7u;
