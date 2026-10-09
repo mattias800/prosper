@@ -2963,6 +2963,10 @@ struct RegState {
     // that could not name VCC (Kena's per-cone loop). A word written from fabricated data on the
     // back-edge only is the residue this accepts (#4714).
     std::set<int> sreg_loop_blanket;
+    // SGPRs a structured emitter read while absent (so it seeded a fabricated zero): a loop phi seed
+    // taken from one is not defined on the preheader edge. Only ever grows, so a stale entry is the
+    // conservative answer (the word counts as hard-marked).
+    std::set<int> sreg_absent_read;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
     // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in
@@ -3241,6 +3245,14 @@ inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
 // data registers 106-124 (VCC, ttmp, M0) too, and for an ordinary SGPR whatever `sreg_input` holds:
 // the skipped edge of an if whose arm overwrote a direct-descriptor word merges a zero, not the
 // driver's word.
+// The value a structured emitter seeds a loop phi with for scalar register `r`: the register's
+// value, or the fabricated zero when it is absent (noted in sreg_absent_read, see there).
+inline uint32_t sreg_seed(SpirvCompute& b, RegState& rs, int r) {
+    const auto it = rs.sreg.find(r);
+    if (it != rs.sreg.end()) return it->second;
+    rs.sreg_absent_read.insert(r);
+    return b.uconst(0);
+}
 inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
     if (r >= 106 && r <= 124 && !rs.sreg.contains(r)) return true;
     return sreg_word_absent_unmasked(rs, r) || sreg_word_may_be_fabricated(rs, r);
@@ -3318,7 +3330,8 @@ template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi) {
     for (int r : carried) {
-        const bool defined_at_preheader = !merge_edge_word_fabricated(rs, r);
+        const bool defined_at_preheader =
+            !rs.sreg_absent_read.contains(r) && !merge_edge_word_fabricated(rs, r);
         join_merge_placeholder(rs, r, true, false);
         if (defined_at_preheader) rs.sreg_loop_blanket.insert(r);
     }

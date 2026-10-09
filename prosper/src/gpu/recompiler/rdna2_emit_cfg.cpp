@@ -6531,10 +6531,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             auto it = rs.vreg.find(r);
             return it == rs.vreg.end() ? b.uconst(0) : it->second;
         };
-        auto sget = [&](int r) {
-            auto it = rs.sreg.find(r);
-            return it == rs.sreg.end() ? b.uconst(0) : it->second;
-        };
+        auto sget = [&](int r) { return sreg_seed(b, rs, r); };
         if (preloop_ifs.empty()) {
             if (!emit_range(0, L.header_pc)) return false;
         } else if (preloop_ifs.size() > 1) {
@@ -7285,7 +7282,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // CONFIDENCE: MED-HIGH — guarded by the test suite + exec-diff; DOLL's two-vccz color-grade
         // PS and nested-vccz lighting PS are the motivating real shaders (#273).
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+        auto sget = [&](int r) { return sreg_seed(b, rs, r); };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
         const DivLoop* active_direct_wave_loop = nullptr;
