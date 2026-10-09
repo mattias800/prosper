@@ -753,3 +753,15 @@ TEST(ScalarPairMask, ACarriedWordCopiedFromAViolatedOneIsViolatedToo) {
             << name(stage) << ": refused for another reason: " << reason;
     }
 }
+
+TEST(ScalarPairMask, ExecCmovSelectsOnlyOnADefiniteScc) {
+    // s_cmov_b64 exec, -1 after s_add_u32 s20, s4, 1, which writes SCC from s4 (#4819 review). With
+    // s4 written on one arm of an if, SCC carries the merge mark and must not select EXEC; with s4
+    // written on both arms, it is definite and the program compiles.
+    const Words body = {0x80148104u, 0xbefe06c1u, 0x7e0602f2u};
+    EXPECT_FALSE(
+        compile_whole(Stage::Compute, cat({&kPrefix, &kBothPaths, &body, &kStoreV3})).empty())
+        << "control: a definite SCC selects: " << last_terminal_reject_reason(kAddress);
+    EXPECT_TRUE(compile_whole(Stage::Compute, cat({&kPrefix, &kOnePath, &body, &kStoreV3})).empty())
+        << "a merge-marked SCC must not select EXEC";
+}

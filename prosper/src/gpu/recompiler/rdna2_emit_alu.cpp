@@ -256,7 +256,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
-    if (refuse_mask_write(b, rs, in, drop, ok)) return true;
+    if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
             if (in.opcode == 0x0a &&
@@ -931,11 +931,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_bool_narrowed[106] = true;
                 }
                 rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
-                return true;
-            }
-            // s_cmov_b64 exec, S0 (rdna2_mask_move.cpp); other destinations fall through.
-            if (in.opcode == kSop1OpcodeCmovB64 && (in.dst.value == 126 || in.dst.value == 127)) {
-                ok = emit_s_cmov_b64_exec(b, rs, in);
                 return true;
             }
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave

@@ -159,11 +159,21 @@ bool emit_s_cmov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
         const auto it = rs.sreg_bool.find(src.value);
         if (it != rs.sreg_bool.end()) source = it->second;
     }
-    if (!source || !rs.scc || !rs.exec) return false;
+    // A merge-filled SCC may be the fabricated bfalse, which would select EXEC on no real
+    // condition (GPU-5, #4819 review): only a definite SCC selects.
+    if (!source || !rs.scc || !rs.exec || rs.scc_merge_placeholder) return false;
     const uint32_t selected = b.id();
     b.put(b.code, Op_Select, {b.t_bool, selected, rs.scc, source, rs.exec});
     rs.exec = selected;
     rs.exec_narrowed = true;   // conservative: predication stays on
+    return true;
+}
+
+bool emit_exec_cmov(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
+    if (in.fmt != Rdna2Format::SOP1 || in.opcode != kSop1OpcodeCmovB64 ||
+        (in.dst.value != 126 && in.dst.value != 127))
+        return false;
+    ok = emit_s_cmov_b64_exec(b, rs, in);
     return true;
 }
 }   // namespace prosper::gpu
