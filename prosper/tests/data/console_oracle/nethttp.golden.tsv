@@ -1,0 +1,53 @@
+# console-oracle golden v1
+# source: nethttp.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+nh_htons_0	libSceNet.sprx	sceNetHtons	i:0		ok	0x0000000000000000	-
+nh_ntohs_0	libSceNet.sprx	sceNetNtohs	i:0		ok	0x0000000000000000	-
+nh_htons_1	libSceNet.sprx	sceNetHtons	i:1		ok	0x0000000000000100	-
+nh_ntohs_1	libSceNet.sprx	sceNetNtohs	i:1		ok	0x0000000000000100	-
+nh_htons_1234	libSceNet.sprx	sceNetHtons	i:4660		ok	0x0000000000003412	-
+nh_ntohs_1234	libSceNet.sprx	sceNetNtohs	i:4660		ok	0x0000000000003412	-
+nh_htons_ff	libSceNet.sprx	sceNetHtons	i:255		ok	0x000000000000ff00	-
+nh_ntohs_ff	libSceNet.sprx	sceNetNtohs	i:255		ok	0x000000000000ff00	-
+nh_htons_ff00	libSceNet.sprx	sceNetHtons	i:65280		ok	0x00000000000000ff	-
+nh_ntohs_ff00	libSceNet.sprx	sceNetNtohs	i:65280		ok	0x00000000000000ff	-
+nh_htons_ffff	libSceNet.sprx	sceNetHtons	i:65535		ok	0x000000000000ffff	-
+nh_ntohs_ffff	libSceNet.sprx	sceNetNtohs	i:65535		ok	0x000000000000ffff	-
+nh_htons_12345	libSceNet.sprx	sceNetHtons	i:74565		ok	0x0000000000014523	-
+nh_ntohs_12345	libSceNet.sprx	sceNetNtohs	i:74565		ok	0x0000000000014523	-
+nh_htonl_0	libSceNet.sprx	sceNetHtonl	i:0		ok	0x0000000000000000	-
+nh_htonl_1	libSceNet.sprx	sceNetHtonl	i:1		ok	0x0000000001000000	-
+nh_htonl_12345678	libSceNet.sprx	sceNetHtonl	i:305419896		ok	0x0000000078563412	-
+nh_htonl_ffffffff	libSceNet.sprx	sceNetHtonl	i:4294967295		ok	0x00000000ffffffff	-
+nh_htonl_100000000	libSceNet.sprx	sceNetHtonl	i:4294967296		ok	0x0000000000000000	-
+nh_pton_v4	libSceNet.sprx	sceNetInetPton	i:2,s:10.0.0.1,out:4		ok	0x0000000000000001	-	a2=0a000001
+nh_pton_v4_bad	libSceNet.sprx	sceNetInetPton	i:2,s:10.0.0.256,out:4		ok	0x0000000000000000	-	a2=abababab
+nh_pton_v6	libSceNet.sprx	sceNetInetPton	i:28,s:::1,out:16		ok	0x0000000000000001	-	a2=00000000000000000000000000000001
+nh_pton_bad_family	libSceNet.sprx	sceNetInetPton	i:99,s:10.0.0.1,out:4		ok	0x000000008041012f	-	a2=abababab
+nh_ntop_v4	libSceNet.sprx	sceNetInetNtop	i:2,in:7f000001,out:32,i:32	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=7f000001	a2=3132372e302e302e3100abababababababababababababababababababababab
+nh_ntop_v4_too_small	libSceNet.sprx	sceNetInetNtop	i:2,in:7f000001,out:32,i:4	r64,retoff:2	ok	0x0000000000000000	null	a1=7f000001	a2=abababababababababababababababababababababababababababababababab
+nh_ntop_v6	libSceNet.sprx	sceNetInetNtop	i:28,in:00000000000000000000000000000001,out:64,i:64	r64,retoff:2	ok	0x0000000000000000	ptr+0	a1=00000000000000000000000000000001	a2=3a3a310007000000959000000200000038830800080000002d621300080000000000000000000000000000000000000000000000000000000000000000000000
+nh_escape_plain	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:hello		ok	0x0000000000000000	-	a0=68656c6c6f00abababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=0600000000000000
+nh_escape_space_reserved	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:a b&c=d/e?f		ok	0x0000000000000000	-	a0=61253230622532366325334464253246652533466600abababababababababababababababababababababababababababababababababababababababababab	a1=1600000000000000
+nh_escape_utf8	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:\xc3\xa9\xe2\x82\xac		ok	0x0000000000000000	-	a0=25433325413925453225383225414300abababababababababababababababababababababababababababababababababababababababababababababababab	a1=1000000000000000
+nh_escape_already_escaped	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:%41%20		ok	0x0000000000000000	-	a0=2532353431253235323000ababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=0b00000000000000
+nh_escape_empty	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:		ok	0x0000000000000000	-	a0=00ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=0100000000000000
+nh_escape_size_query	libSceHttp.sprx	sceHttpUriEscape	null,out:8,i:0,s:hello world		ok	0x0000000000000000	-	a1=0e00000000000000
+nh_escape_buffer_too_small	libSceHttp.sprx	sceHttpUriEscape	out:8,out:8,i:4,s:hello world		ok	0x0000000080431022	-	a0=68656c6cabababab	a1=abababababababab
+nh_unescape_basic	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:a%20b%26c		ok	0x0000000000000000	-	a0=612062266300abababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=0600000000000000
+nh_unescape_bad_hex	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:a%zzb		ok	0x0000000080433060	-	a0=abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=abababababababab
+nh_unescape_truncated	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:abc%2		ok	0x0000000080433060	-	a0=abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a1=abababababababab
+nh_unescape_size_query	libSceHttp.sprx	sceHttpUriUnescape	null,out:8,i:0,s:a%20b		ok	0x0000000000000000	-	a1=0400000000000000
+nh_parse_size_query	libSceHttp.sprx	sceHttpUriParse	null,s:http://user:pw@example.com:8080/a/b?q=1#frag,null,out:8,i:0		ok	0x0000000000000000	-	a3=2900000000000000
+nh_parse_size_query_plain	libSceHttp.sprx	sceHttpUriParse	null,s:https://example.com/,null,out:8,i:0		ok	0x0000000000000000	-	a3=1800000000000000
+nh_parse_size_query_no_scheme	libSceHttp.sprx	sceHttpUriParse	null,s:not a uri,null,out:8,i:0		ok	0x0000000000000000	-	a3=1000000000000000
+nh_parse_size_query_empty	libSceHttp.sprx	sceHttpUriParse	null,s:,null,out:8,i:0		ok	0x0000000000000000	-	a3=0700000000000000
+nh_player_dialog_param_init	libSceSystemService.sprx	sceSystemServiceInitializePlayerDialogParam	out:256		ok	0x0000000800693020	-	a0=400000000000000000000000ffffffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+nh_param_getint_1	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:1,out:4	ret	ok	0x0000000000000000	-	a1=volatile
+nh_param_getint_2	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:2,out:4	ret	ok	0x0000000000000000	-	a1=volatile
+nh_param_getint_3	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:3,out:4	ret	ok	0x0000000000000000	-	a1=volatile
+nh_param_getint_4	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:4,out:4	ret	ok	0x0000000000000000	-	a1=volatile
+nh_param_getint_5	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:5,out:4	ret	ok	0x0000000000000000	-	a1=volatile
+nh_param_getint_1000	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:1000,out:4	ret	ok	0x0000000080a10003	-	a1=volatile
+nh_param_getint_9999	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:9999,out:4	ret	ok	0x0000000080a10003	-	a1=volatile

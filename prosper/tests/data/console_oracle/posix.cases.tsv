@@ -1,0 +1,65 @@
+# console-oracle cases: POSIX-named functions libkernel exports. They return -1 on failure (errno is not captured), so
+# the call is the point, not a code. No socket is created or connected and no file is created or changed: every
+# descriptor is -1 and every path is under a directory that does not exist.
+# id	lib	func	args	expect     (grammar and flags: tools/console_oracle/payload/lib_oracle.c)
+# Address text conversion: pure functions of their arguments.
+px_pton_v4	libkernel.sprx	inet_pton	i:2,s:1.2.3.4,out:4
+px_pton_v4_zero	libkernel.sprx	inet_pton	i:2,s:0.0.0.0,out:4
+px_pton_v4_max	libkernel.sprx	inet_pton	i:2,s:255.255.255.255,out:4
+px_pton_v4_octet_over	libkernel.sprx	inet_pton	i:2,s:256.1.1.1,out:4
+px_pton_v4_short	libkernel.sprx	inet_pton	i:2,s:1.2.3,out:4
+px_pton_v4_empty	libkernel.sprx	inet_pton	i:2,s:,out:4
+px_pton_v4_trailing	libkernel.sprx	inet_pton	i:2,s:1.2.3.4x,out:4
+px_pton_v4_leading_zero	libkernel.sprx	inet_pton	i:2,s:01.2.3.4,out:4
+px_pton_v6_loopback	libkernel.sprx	inet_pton	i:28,s:::1,out:16
+px_pton_v6_full	libkernel.sprx	inet_pton	i:28,s:2001:db8:0:0:0:0:2:1,out:16
+px_pton_v6_compressed	libkernel.sprx	inet_pton	i:28,s:fe80::1:2,out:16
+px_pton_v6_v4mapped	libkernel.sprx	inet_pton	i:28,s:::ffff:1.2.3.4,out:16
+px_pton_v6_bad	libkernel.sprx	inet_pton	i:28,s:1:2:3,out:16
+px_pton_bad_family	libkernel.sprx	inet_pton	i:99,s:1.2.3.4,out:4
+px_ntop_v4	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:32	r64,retoff:2
+px_ntop_v4_exact_size	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:8	r64,retoff:2
+px_ntop_v4_too_small	libkernel.sprx	inet_ntop	i:2,in:01020304,out:32,i:7	r64,retoff:2
+px_ntop_v6_loopback	libkernel.sprx	inet_ntop	i:28,in:00000000000000000000000000000001,out:64,i:64	r64,retoff:2
+px_ntop_v6_full	libkernel.sprx	inet_ntop	i:28,in:20010db8000000000000000000020001,out:64,i:64	r64,retoff:2
+px_ntop_bad_family	libkernel.sprx	inet_ntop	i:99,in:01020304,out:32,i:32	r64,retoff:2
+# Constants and trivial queries.
+px_getpagesize	libkernel.sprx	getpagesize	-
+px_sched_max_0	libkernel.sprx	sched_get_priority_max	i:0
+px_sched_min_0	libkernel.sprx	sched_get_priority_min	i:0
+px_sched_max_1	libkernel.sprx	sched_get_priority_max	i:1
+px_sched_min_1	libkernel.sprx	sched_get_priority_min	i:1
+px_sched_max_2	libkernel.sprx	sched_get_priority_max	i:2
+px_sched_min_2	libkernel.sprx	sched_get_priority_min	i:2
+px_sched_max_3	libkernel.sprx	sched_get_priority_max	i:3
+px_sched_min_3	libkernel.sprx	sched_get_priority_min	i:3
+px_sched_max_4	libkernel.sprx	sched_get_priority_max	i:4
+px_sched_min_4	libkernel.sprx	sched_get_priority_min	i:4
+px_sched_max_99	libkernel.sprx	sched_get_priority_max	i:99
+px_sched_min_99	libkernel.sprx	sched_get_priority_min	i:99
+px_usleep_zero	libkernel.sprx	usleep	i:0
+px_usleep_1ms	libkernel.sprx	usleep	i:1000
+# Socket calls on a descriptor that cannot exist: nothing touches a network, and the console's error is the point.
+px_bind_bad_fd	libkernel.sprx	bind	i:-1,in:02000050010203040000000000000000,i:16
+px_listen_bad_fd	libkernel.sprx	listen	i:-1,i:1
+px_accept_bad_fd	libkernel.sprx	accept	i:-1,out:16,out:4
+px_connect_bad_fd	libkernel.sprx	connect	i:-1,in:02000050010203040000000000000000,i:16
+px_send_bad_fd	libkernel.sprx	send	i:-1,in:41424344,i:4,i:0
+px_recv_bad_fd	libkernel.sprx	recv	i:-1,out:16,i:16,i:0
+px_sendto_bad_fd	libkernel.sprx	sendto	i:-1,in:41424344,i:4,i:0,in:02000050010203040000000000000000,i:16
+px_recvfrom_bad_fd	libkernel.sprx	recvfrom	i:-1,out:16,i:16,i:0,out:16,out:4
+px_shutdown_bad_fd	libkernel.sprx	shutdown	i:-1,i:2
+px_getsockname_bad_fd	libkernel.sprx	getsockname	i:-1,out:16,out:4
+px_getpeername_bad_fd	libkernel.sprx	getpeername	i:-1,out:16,out:4
+px_getsockopt_bad_fd	libkernel.sprx	getsockopt	i:-1,i:0xffff,i:4,out:4,out:4
+px_setsockopt_bad_fd	libkernel.sprx	setsockopt	i:-1,i:0xffff,i:4,in:01000000,i:4
+px_socket_bad_domain	libkernel.sprx	socket	i:99,i:1,i:0
+px_socket_bad_type	libkernel.sprx	socket	i:2,i:99,i:0
+# Descriptor calls on a descriptor or path that cannot exist.
+px_close_bad_fd	libkernel.sprx	close	i:-1
+px_read_bad_fd	libkernel.sprx	read	i:-1,out:8,i:8
+px_write_bad_fd	libkernel.sprx	write	i:-1,in:41,i:1
+px_fstat_bad_fd	libkernel.sprx	fstat	i:-1,out:128	ret
+px_fcntl_bad_fd	libkernel.sprx	fcntl	i:-1,i:1,i:0
+px_open_missing	libkernel.sprx	open	s:/oracle_nonexistent/file,i:0,i:0	ret
+px_stat_missing	libkernel.sprx	stat	s:/oracle_nonexistent/file,out:128	ret

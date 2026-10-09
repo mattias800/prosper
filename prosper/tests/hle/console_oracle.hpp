@@ -11,6 +11,7 @@
 #include "hle/dispatch/nid.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -28,11 +29,13 @@ namespace prosper_test::console_oracle {
 
 constexpr int kMaxArgs = 6;
 constexpr uint8_t kSentinel = 0xAB;
+constexpr size_t kDcbStructBytes = 0x80;   // lib_oracle.c's DCB_STRUCT_BYTES
 
 struct Arg {
-    enum class Kind { Int, Null, In, Out, Str, OutPtr } kind = Kind::Null;
+    enum class Kind { Int, Null, In, Out, Str, OutPtr, Dcb } kind = Kind::Null;
     uint64_t value = 0;   // the register value passed
-    std::vector<uint8_t> buf;   // backing store; never resized after its address is taken
+    std::vector<uint8_t> buf;   // backing store; never resized after its address is taken (a Dcb's command dwords)
+    std::vector<uint8_t> aux;   // Dcb: the command-buffer descriptor struct the call receives (value points at it)
     size_t len = 0;   // reported length of buf (a string's NUL is excluded)
     int ref = 0;   // OutPtr: argument whose buffer the pointer is reported relative to
 };
@@ -163,6 +166,21 @@ inline bool parse_arg(const std::string& tok, const State& prior, Arg* a, std::s
         stabilise(a, 8, 16);
         std::memset(a->buf.data(), kSentinel, 8);
         a->ref = static_cast<int>(v);
+    } else if (key == "dcb") {
+        // dcb:<N> -- an Agc command-buffer descriptor over a fresh N dword buffer, as lib_oracle.c builds it:
+        // bottom +0x00, top +0x08, cursor_up +0x10, cursor_down +0x18, then zeros up to kDcbStructBytes.
+        if (!parse_int(val, &v) || v < 2 || v > 1024) return *err = "bad dcb size '" + val + "'", false;
+        a->kind = Arg::Kind::Dcb;
+        stabilise(a, static_cast<size_t>(v) * 4, 16);
+        std::memset(a->buf.data(), kSentinel, a->len);
+        a->aux.assign(kDcbStructBytes, 0);
+        const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a->buf.data()));
+        const uint64_t end = base + a->len;
+        std::memcpy(a->aux.data() + 0x00, &base, 8);   // bottom
+        std::memcpy(a->aux.data() + 0x08, &end, 8);    // top
+        std::memcpy(a->aux.data() + 0x10, &base, 8);   // cursor_up
+        std::memcpy(a->aux.data() + 0x18, &end, 8);    // cursor_down
+        a->value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a->aux.data()));
     } else if (key == "ref") {
         // The ADDRESS of an earlier case's argument buffer, so this call operates on the same object.
         const size_t dot = val.find('.');
@@ -273,6 +291,20 @@ inline bool replay_case(const GoldenCase& c, State& state, Outcome* outcome, std
             const Arg& x = args[i];
             if (x.kind == Arg::Kind::In || x.kind == Arg::Kind::Out) {
                 outcome->buffers.push_back("a" + std::to_string(i) + "=" + hex(x.buf, x.len));
+            } else if (x.kind == Arg::Kind::Dcb) {
+                // "<dwords written>:<hex>" from the cursor the builder advanced; "bad" when the cursor left
+                // the buffer or is not dword aligned. Same rule as lib_oracle.c's report().
+                uint64_t cu = 0;
+                std::memcpy(&cu, x.aux.data() + 0x10, 8);
+                const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(x.buf.data()));
+                std::string s = "a" + std::to_string(i) + "=";
+                if (cu < base || cu > base + x.len || ((cu - base) & 3)) {
+                    s += "bad";
+                } else {
+                    const size_t dw = static_cast<size_t>((cu - base) / 4);
+                    s += std::to_string(dw) + ":" + hex(x.buf, dw * 4);
+                }
+                outcome->buffers.push_back(s);
             } else if (x.kind == Arg::Kind::OutPtr) {
                 bool untouched = true;
                 for (size_t j = 0; j < 8; j++)
@@ -297,6 +329,17 @@ inline std::string hex64(uint64_t v) {
 // "" when prosper agrees with the console under the case's expect flags, else a one-line diff.
 inline std::string compare(const GoldenCase& c, const Outcome& o) {
     if (has_flag(c.expect, "none")) return "";
+    // `default0`: the case is a PROBE of a function prosper may not implement. An import with no handler is
+    // answered by the dispatcher's return-0 default (prosper_on_unimpl), writing nothing, so the console's
+    // own answer is compared against 0 instead of being reported as "not implemented". What is left over is
+    // exactly the false-success class (#2081): the console returns an error and prosper says 0. Only the
+    // return value is compared (the case must also say `ret`); a function that IS registered is compared
+    // normally.
+    if (!o.implemented && !o.registered && has_flag(c.expect, "default0")) {
+        const uint64_t m = has_flag(c.expect, "r64") ? ~0ull : 0xFFFFFFFFull;
+        if ((c.ret & m) == 0) return "";
+        return "unregistered: prosper's default answers 0, the console answers " + hex64(c.ret & m);
+    }
     if (!o.implemented)
         return o.registered
                    ? "registered, but not callable through HleFn (a guest-ABI or typed handler: "
@@ -341,8 +384,32 @@ inline bool load_golden(const std::string& path, std::vector<GoldenCase>* out, s
     return true;
 }
 
-// known_gaps.tsv: `id<TAB>reason`. Every entry needs a reason (an issue number or an explanation).
-inline bool load_known_gaps(const std::string& path, std::map<std::string, std::string>* out,
+// One known difference between prosper and the console, and what to do about it.
+struct Gap {
+    std::string action;   // fix | keep | triage, optionally followed by ":#<issue>"
+    std::string reason;
+};
+
+// "fix", "keep" or "triage", optionally with a tracking issue: "fix:#4757". Anything else is rejected, so a
+// gap cannot sit in the list without saying whether it needs fixing.
+inline bool valid_gap_action(const std::string& a) {
+    const size_t colon = a.find(':');
+    const std::string verb = a.substr(0, colon);
+    if (verb != "fix" && verb != "keep" && verb != "triage") return false;
+    if (colon == std::string::npos) return true;
+    const std::string issue = a.substr(colon + 1);
+    if (issue.size() < 2 || issue[0] != '#') return false;
+    return std::all_of(issue.begin() + 1, issue.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+}
+
+// The verb of an action, with any issue suffix removed ("fix:#4757" -> "fix").
+inline std::string gap_verb(const std::string& action) {
+    return action.substr(0, action.find(':'));
+}
+
+// known_gaps.tsv: `id<TAB>action<TAB>reason`. Every entry says whether it needs fixing (see valid_gap_action)
+// and why prosper differs.
+inline bool load_known_gaps(const std::string& path, std::map<std::string, Gap>* out,
                             std::string* err) {
     std::ifstream in(path);
     if (!in) return true;   // no file == no known gaps
@@ -351,9 +418,102 @@ inline bool load_known_gaps(const std::string& path, std::map<std::string, std::
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const std::vector<std::string> f = split(line, '\t');
-        if (f.size() < 2 || f[0].empty() || f[1].empty())
-            return *err = "known gap needs 'id<TAB>reason': " + line, false;
-        (*out)[f[0]] = f[1];
+        if (f.size() < 3 || f[0].empty() || f[1].empty() || f[2].empty())
+            return *err = "known gap needs 'id<TAB>action<TAB>reason': " + line, false;
+        if (!valid_gap_action(f[1]))
+            return *err = "known gap '" + f[0] + "' has action '" + f[1] +
+                          "'; expected fix, keep or triage, optionally with ':#<issue>'",
+                   false;
+        (*out)[f[0]] = Gap{f[1], f[2]};
+    }
+    return true;
+}
+
+// probe_baseline.tsv: `family<TAB>case id<TAB>signature[<TAB>platforms]`, one row per probe that is ALLOWED to differ
+// from the console. The signature is a hash of the difference text, so a probe that already differs cannot change
+// (prosper's builder growing a dword, a return code swapping) without the row changing, and a row cannot be
+// added without showing up as a line in the diff. `platforms` is an optional comma list of linux, windows, macos
+// the row applies to (default: all) -- prosper's HLE legitimately answers some calls differently per host, and
+// the row says on which. A signature of `*` accepts any difference on that platform: use it only for a row whose
+// platform has not been measured exactly. A probe family with no rows is an error for the caller.
+struct ProbeRow {
+    std::string signature;
+    std::set<std::string> platforms;   // empty == every platform
+};
+using ProbeBaseline = std::map<std::string, std::map<std::string, std::vector<ProbeRow>>>;
+
+inline bool probe_row_applies(const ProbeRow& r, const std::string& platform) {
+    return r.platforms.empty() || r.platforms.count(platform) != 0;
+}
+
+// What the signature hashes: the difference text with every command-buffer payload collapsed to its dword
+// count ("a0=7:<hex>" -> "a0=7:*"). Prosper's builders write prosper's own packets, so the payload differs from
+// the console's by design and can carry host-dependent bytes; the COUNT is the ABI contract (see
+// docs/gpu/AGC_PACKET_SIZES.md), and that, the return value and the buffers' other facts are what must not move.
+inline std::string probe_signature_text(const std::string& diff) {
+    std::string out;
+    for (size_t i = 0; i < diff.size();) {
+        out += diff[i];
+        // "a<digits>=<digits>:" opens a command-buffer report; swallow the hex that follows the colon.
+        if (diff[i] == ':' && i >= 3) {
+            size_t j = i;
+            while (j > 0 && std::isdigit(static_cast<unsigned char>(diff[j - 1]))) --j;
+            const bool after_eq = j > 0 && j < i && diff[j - 1] == '=';
+            size_t k = j - 1;
+            while (after_eq && k > 0 && std::isdigit(static_cast<unsigned char>(diff[k - 1]))) --k;
+            if (after_eq && k > 0 && diff[k - 1] == 'a') {
+                size_t e = i + 1;
+                while (e < diff.size() && std::isxdigit(static_cast<unsigned char>(diff[e]))) ++e;
+                out += '*';
+                i = e;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return out;
+}
+
+inline std::string probe_signature(const std::string& diff) {
+    uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a, 64-bit
+    for (unsigned char ch : probe_signature_text(diff)) {
+        h ^= ch;
+        h *= 0x100000001b3ull;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+inline bool load_probe_baseline(const std::string& path, ProbeBaseline* out, std::string* err) {
+    std::ifstream in(path);
+    if (!in) return true;   // no file == no probe families are baselined (any probe family then fails)
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> f = split(line, '\t');
+        const bool sig_ok = f.size() >= 3 && (f[2] == "*" || f[2].size() == 16);
+        if ((f.size() != 3 && f.size() != 4) || f[0].empty() || f[1].empty() || !sig_ok)
+            return *err = "probe baseline needs 'family<TAB>case id<TAB>16-hex signature or *[<TAB>platforms]': " + line,
+                   false;
+        ProbeRow row;
+        row.signature = f[2];
+        if (f.size() == 4) {
+            for (const std::string& pl : split(f[3], ',')) {
+                if (pl != "linux" && pl != "windows" && pl != "macos")
+                    return *err = "probe baseline platform must be linux, windows or macos: " + line, false;
+                row.platforms.insert(pl);
+            }
+        }
+        auto& rows = (*out)[f[0]][f[1]];
+        for (const ProbeRow& other : rows) {
+            const bool overlap = other.platforms.empty() || row.platforms.empty() ||
+                                 std::any_of(row.platforms.begin(), row.platforms.end(),
+                                             [&](const std::string& q) { return other.platforms.count(q) != 0; });
+            if (overlap) return *err = "probe baseline lists a case twice for one platform: " + line, false;
+        }
+        rows.push_back(std::move(row));
     }
     return true;
 }

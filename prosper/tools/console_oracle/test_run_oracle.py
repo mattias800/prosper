@@ -140,6 +140,148 @@ def test_short_golden_line_is_an_error():
         ro.parse_golden("a\tb\tc\n")
 
 
+# --- resuming a payload that dies or hangs ----------------------------------------------------
+
+
+def _cases(ids):
+    return ro.parse_cases("".join(f"{i}\tlibX.sprx\tf_{i}\tout:8\tret\n" for i in ids))
+
+
+def test_cases_to_text_round_trips_the_spec_columns():
+    cases = ro.parse_cases("a\tlibX.sprx\tf\tout:8,i:1\tret,default0\nb\t-\tg\t-\n")
+    assert ro.parse_cases(ro.cases_to_text(cases)) == cases
+
+
+def test_resumable_run_marks_the_case_the_payload_stopped_on_and_runs_the_rest():
+    ran = []
+
+    def run(text):
+        ids = [line.split("\t")[0] for line in text.splitlines()]
+        ran.append(ids)
+        if ids[0] == "c1":  # first run: c1 completes, c2 hangs the payload, no "# done"
+            return "R\tc1\tok\t0x0\t-\n"
+        return "".join(f"R\t{i}\tok\t0x0\t-\n" for i in ids) + "# done ran=2\n"
+
+    out = ro.run_resumable(_cases(["c1", "c2", "c3", "c4"]), run, max_restarts=3)
+    assert ran == [["c1", "c2", "c3", "c4"], ["c3", "c4"]]  # the hung case is not run again
+    assert out.results["c1"][0] == "ok"
+    assert out.results["c2"][0] == ro.HANG
+    assert out.results["c3"][0] == out.results["c4"][0] == "ok"
+    assert out.done
+
+
+def test_resumable_run_gives_up_after_max_restarts_and_leaves_the_rest_missing():
+    def run(text):  # the payload dies on whatever it runs first
+        return ""
+
+    out = ro.run_resumable(_cases(["a", "b", "c", "d"]), run, max_restarts=2)
+    assert not out.done
+    assert [out.results[i][0] for i in ("a", "b", "c")] == [ro.HANG] * 3  # 2 restarts = 3 attempts
+    assert "d" not in out.results
+
+
+def test_a_console_that_goes_away_mid_run_keeps_what_was_measured():
+    calls = []
+
+    def run(text):
+        calls.append(text)
+        if len(calls) == 1:  # first launch: a, b done, then c hangs the payload
+            return "R\ta\tok\t0x0\t-\nR\tb\tok\t0x0\t-\n"
+        raise SystemExit("build or deploy failed: No route to host")
+
+    out = ro.run_resumable(_cases(["a", "b", "c", "d"]), run, max_restarts=5)
+    assert len(calls) == 2
+    assert out.results["a"][0] == out.results["b"][0] == "ok"
+    assert out.results["c"][0] == ro.HANG  # the case it stopped on is still named
+    assert "d" not in out.results
+    assert not out.done
+
+
+def test_a_first_launch_that_cannot_run_is_still_an_error():
+    def run(text):
+        raise SystemExit("build or deploy failed")
+
+    with pytest.raises(SystemExit, match="build or deploy failed"):
+        ro.run_resumable(_cases(["a"]), run, max_restarts=3)
+
+
+def test_console_reachable_is_false_for_a_closed_port():
+    assert not ro.console_reachable("127.0.0.1", 1, timeout=0.2)
+
+
+def test_console_reachable_is_true_for_a_listening_port():
+    import socket
+
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        assert ro.console_reachable("127.0.0.1", srv.getsockname()[1], timeout=2.0)
+
+
+def test_resumable_run_is_one_pass_when_nothing_hangs():
+    calls = []
+
+    def run(text):
+        calls.append(text)
+        return "R\ta\tok\t0x0\t-\nR\tb\tfault:11\t0x0\t-\n# done ran=2\n"
+
+    out = ro.run_resumable(_cases(["a", "b"]), run, max_restarts=5)
+    assert len(calls) == 1
+    assert out.done
+    assert out.results["b"][0] == "fault:11"  # a fault is a result, not a hang
+
+
+def test_a_run_that_finished_but_skipped_a_case_is_not_resumed_forever():
+    calls = []
+
+    def run(text):
+        calls.append(text)
+        return "R\ta\tok\t0x0\t-\n# done ran=1\n"  # "b" never reported
+
+    out = ro.run_resumable(_cases(["a", "b"]), run, max_restarts=5)
+    assert len(calls) == 1
+    assert not out.done
+    assert "b" not in out.results
+
+
+def test_split_measured_separates_ok_from_everything_else():
+    cases = _cases(["a", "b", "c", "d"])
+    out = ro.Output(
+        results={
+            "a": ["ok", "0x0", "-"],
+            "b": ["fault:11", "0x0", "-"],
+            "c": [ro.HANG, ro.RAW_RET_PLACEHOLDER, "-"],
+        }
+    )
+    ok, rest = ro.split_measured(cases, out)
+    assert [c.id for c in ok] == ["a"]
+    assert [(c.id, s) for c, s in rest] == [("b", "fault:11"), ("c", "hang"), ("d", "missing")]
+
+
+def test_prune_cases_text_keeps_comments_and_only_the_wanted_cases():
+    text = "# header\n\na\tlibX\tf\t-\nb\tlibX\tg\t-\n# trailing\n"
+    pruned = ro.prune_cases_text(text, {"b"})
+    assert pruned == "# header\n\nb\tlibX\tg\t-\n# trailing\n"
+    assert [c.id for c in ro.parse_cases(pruned)] == ["b"]
+
+
+def test_unmeasured_sidecar_lists_id_func_and_status():
+    cases = _cases(["a", "b"])
+    text = ro.unmeasured_text("x.cases.tsv", [(cases[0], "hang"), (cases[1], "nofunc")], "2026-10-08")
+    rows = [line.split("\t") for line in text.splitlines() if not line.startswith("#")]
+    assert rows == [["a", "f_a", "hang"], ["b", "f_b", "nofunc"]]
+
+
+def test_a_timed_out_run_returns_what_the_payload_printed_before_the_hang(monkeypatch):
+    def hung(*args, **kwargs):
+        raise ro.subprocess.TimeoutExpired(cmd="make", timeout=5, output=b"R\ta\tok\t0x0\t-\n")
+
+    monkeypatch.setattr(ro.subprocess, "run", hung)
+    printed = ro.run_on_console("", "/opt/ps5-payload-sdk", "192.168.0.2", 9021, 5)
+    assert ro.parse_output(printed).results["a"][0] == "ok"
+    assert not ro.parse_output(printed).done
+
+
 # --- argument and path validation ---------------------------------------------------------------
 
 
@@ -173,6 +315,19 @@ def test_a_failed_build_is_reported_with_an_sdk_hint(monkeypatch):
     monkeypatch.setattr(ro.subprocess, "run", lambda *args, **kwargs: Failed())
     with pytest.raises(SystemExit, match="installed ps5-payload-sdk"):
         ro.run_on_console("", "/opt/not-an-sdk", "192.168.0.2", 9021, 5)
+
+
+def test_write_data_file_writes_inside_the_data_directory_and_refuses_anything_else(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(ro, "DATA_DIR", data)
+    ro.write_data_file(data / "fam.golden.tsv", "x")
+    assert (data / "fam.golden.tsv").read_text() == "x"
+    for bad in (tmp_path / "elsewhere.tsv", data / "sub" / "f.tsv", data / ".." / "up.tsv"):
+        with pytest.raises(ValueError):
+            ro.write_data_file(bad, "no")
+    assert not (tmp_path / "elsewhere.tsv").exists()
+    assert not (tmp_path / "up.tsv").exists()
 
 
 def test_family_paths_stay_inside_the_data_directory():
