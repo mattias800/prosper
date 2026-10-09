@@ -1901,6 +1901,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_bool[in.dst.value] = r;
                     rs.sreg_bool_narrowed[in.dst.value] = true;
                     mask_write_clobbers_pair(rs, in.dst.value);
+                    record_s_bfm_b64_scalar_data(b, rs, in, width, offset, ok);
                 }
                 return true;
             }
