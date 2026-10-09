@@ -588,3 +588,137 @@ TEST(ScalarPairMask, ANestedLoopWhoseTailRecyclesVccFromItsCounterCompiles) {
     EXPECT_FALSE(compile_whole(Stage::Compute, code).empty())
         << last_terminal_reject_reason(kAddress);
 }
+
+// The loop header's blanket mark is an assumption: a carried word defined on the preheader edge is
+// taken as defined on the back edge too, so a lane-bit read in the body admits it before the back
+// edge exists. The back edge checks it (#4749 review). s[16:17] = -1 before a counted loop whose
+// body first reads s[16:17] as VCC's lane bits (v_cndmask), then rewrites s[16:17] (not s[8:11]:
+// that is the harness's output V#):
+//   s_mov_b32 s16, -1 | s_mov_b32 s17, -1 | s_mov_b32 s22, 0 | s_mov_b32 s23, 3 | v_mov v3, 0
+//   L: s_cmp_lt_u32 s22, s23 | s_cbranch_scc0 X | <read> | <rewrite> | s_add_u32 s22, s22, 1
+//      s_branch L
+//   X: <tail>
+namespace {
+// s_mov_b64 vcc, s[16:17] | v_cndmask_b32_e64 v3, 0, 1.0, vcc
+const Words kBlanketLaneRead = {0xbeea0410u, 0xd5010003u, 0x01a9e480u};
+// v_mov_b32 v3, 1.0 | s_nop | s_nop: the same length, no lane-bit read of s[16:17]
+const Words kNoLaneRead = {0x7e0602f2u, 0xbf800000u, 0xbf800000u};
+// s_mov_b64 s[16:17], s[24:25]: s24/s25 are never written, so the back edge carries the zero
+const Words kRewriteFabricated = {0xbe900418u};
+// s_mov_b64 s[16:17], -1
+const Words kRewriteDefined = {0xbe9004c1u};
+// s_cmp_eq_u32 s0, 0 | s_cbranch_scc1 +2 | s_mov_b32 s16, -1 | s_mov_b32 s17, -1: rewritten on ONE
+// path from a defined value, so the back edge merges the header phi with -1 (defined either way)
+const Words kRewriteDefinedOnOnePath = {0xbf068000u, 0xbf850002u, 0xbe9003c1u, 0xbe9103c1u};
+// store v3 (compute) or export v0..v3 with v0..v2 = 0 (fragment)
+const Words kStoreV3 = {0xe0702000u, 0x80020300u, 0xbf810000u};
+const Words kExportV3 = {0x7e000280u, 0x7e020280u, 0x7e040280u,
+                         0xf800180fu, 0x03020100u, 0xbf810000u};
+
+Words blanket_loop(Stage stage, const Words& read, const Words& rewrite) {
+    const Words head = {0xbe9003c1u, 0xbe9103c1u, 0xbe960380u,
+                        0xbe970383u, 0x7e060280u, 0xbf0a1716u};
+    const auto body = static_cast<uint32_t>(read.size() + rewrite.size() + 2);   // +add +branch
+    const Words exit_branch = {0xbf840000u | body};   // s_cbranch_scc0 X
+    const Words latch = {0x80168116u, 0xbf820000u | ((0x10000u - (body + 2u)) & 0xffffu)};
+    return cat({&kPrefix, &head, &exit_branch, &read, &rewrite, &latch,
+                stage == Stage::Fragment ? &kExportV3 : &kStoreV3});
+}
+}   // namespace
+
+TEST(ScalarPairMask, ALoopCarriedWordFabricatedOnTheBackEdgeRefusesItsLaneRead) {
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_TRUE(
+            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, kRewriteFabricated)).empty())
+            << name(stage);
+        const std::string reason = last_terminal_reject_reason(kAddress);
+        EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
+            << name(stage) << ": refused for another reason: " << reason;
+    }
+}
+
+TEST(ScalarPairMask, ALoopCarriedWordDefinedOnTheBackEdgeKeepsItsLaneRead) {
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(
+            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, kRewriteDefined)).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ALoopCarriedWordRewrittenOnOnePathFromDefinedDataKeepsItsLaneRead) {
+    // The in-body if merges the header phi (blanket-only) with -1: still defined under the header's
+    // assumption, so the merge keeps the blanket and the back edge honours it.
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(
+            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, kRewriteDefinedOnOnePath))
+                .empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ALoopCarriedWordFabricatedOnTheBackEdgeButNeverReadAsLaneBitsCompiles) {
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(
+            compile_whole(stage, blanket_loop(stage, kNoLaneRead, kRewriteFabricated)).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+namespace {
+// Two nested counted loops. s[18:19] is written in the OUTER body by `outer_writes` (two words), then
+// an inner loop reads it as VCC's lane bits and rewrites it with -1:
+//   s_mov_b32 s22, 0 | s_mov_b32 s23, 3 | v_mov v3, 0
+//   OL: s_cmp_lt_u32 s22, s23 | s_cbranch_scc0 OX
+//       <outer_writes> | s_mov_b32 s20, 0
+//       IL: s_cmp_lt_u32 s20, s23 | s_cbranch_scc0 IX
+//           s_mov_b64 vcc, s[18:19] | v_cndmask_b32_e64 v3, 0, 1.0, vcc
+//           s_mov_b64 s[18:19], -1 | s_add_u32 s20, s20, 1 | s_branch IL
+//       IX: s_add_u32 s22, s22, 1 | s_branch OL
+//   OX: <tail>
+Words nested_loops(Stage stage, const Words& outer_writes) {
+    const Words head = {0xbe960380u, 0xbe970383u, 0x7e060280u, 0xbf0a1716u, 0xbf84000du};
+    const Words inner = {0xbe940380u, 0xbf0a1714u, 0xbf840006u, 0xbeea0412u,
+                         0xd5010003u, 0x01a9e480u, 0xbe9204c1u, 0x80148114u,
+                         0xbf82fff8u, 0x80168116u, 0xbf82fff1u};
+    return cat({&kPrefix, &head, &outer_writes, &inner,
+                stage == Stage::Fragment ? &kExportV3 : &kStoreV3});
+}
+}   // namespace
+
+TEST(ScalarPairMask, AnInnerLoopWordDefinedAtItsPreheaderIsNotAbsentFromTheOuterSeed) {
+    // s_mov_b32 s18, -1 | s_mov_b32 s19, -1. s[18:19] is written in the outer body, so the outer
+    // header seeds it absent; the inner preheader defines it, so the inner header must blanket-mark
+    // it (only that header's absent seeds count) and its lane-bit read stays admitted (cc4d1614c).
+    const Words defined = {0xbe9203c1u, 0xbe9303c1u};
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(compile_whole(stage, nested_loops(stage, defined)).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, AnInnerLoopWordDerivedFromTheOuterCounterIsDefinedAtItsPreheader) {
+    // s_mov_b32 s18, s22 | s_mov_b32 s19, s22: the outer counter is blanket-only, so s[18:19] is
+    // defined under the outer header's assumption (which the outer back edge checks), and the inner
+    // header blanket-marks it too. GTA V's workgroup-store kernel has this shape with VCC scratch.
+    const Words from_counter = {0xbe920316u, 0xbe930316u};
+    for (Stage stage : {Stage::Compute, Stage::Fragment})
+        EXPECT_FALSE(compile_whole(stage, nested_loops(stage, from_counter)).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ABottomTestedLoopChecksTheBlanketAtItsBackEdgeToo) {
+    // The same read and rewrite in a bottom-tested loop, which the divergent-loop emitter lowers:
+    //   s_mov_b32 s16, -1 | s_mov_b32 s17, -1 | s_mov_b32 s22, 0 | v_mov v3, 0
+    //   L: s_mov_b64 vcc, s[16:17] | v_cndmask_b32_e64 v3, 0, 1.0, vcc | <rewrite>
+    //      s_add_u32 s22, s22, 1 | s_cmp_lt_u32 s22, 3 | s_cbranch_scc1 L
+    const auto loop = [](Stage stage, const Words& rewrite) {
+        const Words head = {0xbe9003c1u, 0xbe9103c1u, 0xbe960380u, 0x7e060280u};
+        const Words latch = {0x80168116u, 0xbf0a8316u, 0xbf85fff9u};
+        return cat({&kPrefix, &head, &kBlanketLaneRead, &rewrite, &latch,
+                    stage == Stage::Fragment ? &kExportV3 : &kStoreV3});
+    };
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_FALSE(compile_whole(stage, loop(stage, kRewriteDefined)).empty())
+            << name(stage) << ": " << last_terminal_reject_reason(kAddress);
+        EXPECT_TRUE(compile_whole(stage, loop(stage, kRewriteFabricated)).empty()) << name(stage);
+        const std::string reason = last_terminal_reject_reason(kAddress);
+        EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
+            << name(stage) << ": refused for another reason: " << reason;
+    }
+}

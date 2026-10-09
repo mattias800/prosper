@@ -550,6 +550,10 @@ struct SpirvCompute {
     // one terminal line so the recorded reason names the cause rather than the effect.
     uint32_t stage_reject_pc = UINT32_MAX;
     std::string stage_reject_reason;
+    // How many lane-bit reads so far were admitted only because a word carried a loop header's
+    // blanket mark (sreg_loop_blanket). A loop compares it at its back edge, where that assumption
+    // is checked (LoopBlanketCheck). Mutable: the admitting predicate takes the builder by const.
+    mutable uint64_t loop_blanket_lane_reads = 0;
     // The first V_MBCNT whose src0 is a general SGPR mask, when the program ALSO builds the
     // canonical all-ones lane-index pair. That mixture disqualifies the flattened-lane vertex model
     // for the whole program, so the reject surfaces at the all-ones instruction -- which is
@@ -2958,15 +2962,13 @@ struct RegState {
     std::set<int> sreg_merge_placeholder;
     // Which marks are ONLY the loop header's blanket mark (mark_loop_carried marks every loop-carried
     // SGPR before the body exists) on a word that was DEFINED on the preheader edge, or derived only
-    // from such words. Any other cause erases the entry. The lane-bit guard accepts these: refusing
-    // them made a VCC-as-scratch write from a loop counter drop VCC's lane view, and a loop exit
-    // that could not name VCC (Kena's per-cone loop). A word written from fabricated data on the
-    // back-edge only is the residue this accepts (#4714).
+    // from such words (a write from them, or a merge where every marked edge is blanket-only). Any
+    // other cause erases the entry. The lane-bit guard accepts these: refusing them made a
+    // VCC-as-scratch write from a loop counter drop VCC's lane view, and a loop exit that could not
+    // name VCC (Kena's per-cone loop). The assumption that the back-edge value is defined too is
+    // checked at the back edge (LoopBlanketCheck), which refuses the program when a word read as
+    // lane bits on it was fabricated there (#4714, #4749 review).
     std::set<int> sreg_loop_blanket;
-    // SGPRs a structured emitter read while absent (so it seeded a fabricated zero): a loop phi seed
-    // taken from one is not defined on the preheader edge. Only ever grows, so a stale entry is the
-    // conservative answer (the word counts as hard-marked).
-    std::set<int> sreg_absent_read;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
     // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in
@@ -3245,17 +3247,24 @@ inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
 // data registers 106-124 (VCC, ttmp, M0) too, and for an ordinary SGPR whatever `sreg_input` holds:
 // the skipped edge of an if whose arm overwrote a direct-descriptor word merges a zero, not the
 // driver's word.
-// The value a structured emitter seeds a loop phi with for scalar register `r`: the register's
-// value, or the fabricated zero when it is absent (noted in sreg_absent_read, see there).
-inline uint32_t sreg_seed(SpirvCompute& b, RegState& rs, int r) {
+// The value a structured emitter seeds a phi or merge with for register `r`: the register's value,
+// or the fabricated zero when it is absent (LoopBlanketCheck records which loop seeds were held).
+inline uint32_t sreg_seed(SpirvCompute& b, const RegState& rs, int r) {
     const auto it = rs.sreg.find(r);
-    if (it != rs.sreg.end()) return it->second;
-    rs.sreg_absent_read.insert(r);
-    return b.uconst(0);
+    return it == rs.sreg.end() ? b.uconst(0) : it->second;
+}
+inline uint32_t vreg_seed(SpirvCompute& b, const RegState& rs, int r) {
+    const auto it = rs.vreg.find(r);
+    return it == rs.vreg.end() ? b.uconst(0) : it->second;
 }
 inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
     if (r >= 106 && r <= 124 && !rs.sreg.contains(r)) return true;
     return sreg_word_absent_unmasked(rs, r) || sreg_word_may_be_fabricated(rs, r);
+}
+// Whether a held word's only mark is a loop header's blanket mark (sreg_loop_blanket): defined
+// under that header's assumption, which its back edge checks (LoopBlanketCheck).
+inline bool sreg_word_blanket_only(const RegState& rs, int r) {
+    return rs.sreg.contains(r) && rs.sreg_loop_blanket.contains(r);
 }
 
 // The scalar instructions that read SCC as a value.
@@ -3278,19 +3287,25 @@ struct ScalarSourceMarks {
 
 // Set a merged register's marks from its two incoming edges. `rs` is one edge; the caller supplies
 // what the other edge held. The memory mark is a union.
+// `blanket_only` keeps the loop header's blanket mark when every edge that is marked is marked only
+// by it (a merge of such a word with a defined one is defined under the same header assumption).
 inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabricated,
-                                   bool other_edge_memory) {
+                                   bool other_edge_memory, bool blanket_only = false) {
     if (either_edge_fabricated)
         rs.sreg_merge_placeholder.insert(r);
     else
         rs.sreg_merge_placeholder.erase(r);
-    rs.sreg_loop_blanket.erase(r);
+    if (either_edge_fabricated && blanket_only)
+        rs.sreg_loop_blanket.insert(r);
+    else
+        rs.sreg_loop_blanket.erase(r);
     if (other_edge_memory) rs.sreg_memory_pattern.insert(r);
 }
 
 // One structured-merge edge's marks, captured before the other edge is emitted.
 struct MergeEdgeMarks {
     std::set<int> fabricated;   // registers this edge may hold as a fabricated zero
+    std::set<int> blanket;   // ...of which only by a loop header's blanket mark (sreg_loop_blanket)
     std::set<int> memory;   // this edge's memory-pattern marks
     bool scc = false;   // this edge's SCC is marked or poisoned (merges as bfalse)
     // This edge's v_writelane spill-slot marks. A merge keeps only one edge's slot map, so a slot
@@ -3301,7 +3316,10 @@ template <class Registers>
 MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) {
     MergeEdgeMarks marks;
     for (int r : registers)
-        if (merge_edge_word_fabricated(rs, r)) marks.fabricated.insert(r);
+        if (merge_edge_word_fabricated(rs, r)) {
+            marks.fabricated.insert(r);
+            if (sreg_word_blanket_only(rs, r)) marks.blanket.insert(r);
+        }
     marks.memory = rs.sreg_memory_pattern;
     marks.scc = rs.scc_merge_placeholder || !rs.scc;
     marks.slot_fabricated = rs.lane_slot_merge_placeholder;
@@ -3310,8 +3328,11 @@ MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) 
 }
 // Join register `r` at a two-edge merge: `rs` is one edge, `other` the captured other edge.
 inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
-    join_merge_placeholder(rs, r, other.fabricated.contains(r) || merge_edge_word_fabricated(rs, r),
-                           other.memory.contains(r));
+    const bool here = merge_edge_word_fabricated(rs, r);
+    const bool there = other.fabricated.contains(r);
+    const bool blanket_only =
+        (!here || sreg_word_blanket_only(rs, r)) && (!there || other.blanket.contains(r));
+    join_merge_placeholder(rs, r, here || there, other.memory.contains(r), blanket_only);
 }
 // Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
 // fabricated too; a slot marked on either edge is marked after it).
@@ -3321,6 +3342,56 @@ inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) 
                                           other.slot_fabricated.end());
     rs.lane_slot_memory_pattern.insert(other.slot_memory.begin(), other.slot_memory.end());
 }
+// The assumption behind sreg_loop_blanket, checked once the back edge exists (#4749 review). A
+// header blanket-marks a carried word that was defined on the preheader edge, taking its back-edge
+// value as defined too, so lane-bit reads inside the loop may admit it before the body is emitted.
+// If such a word leaves the body hard-marked (fabricated by something other than the blanket), the
+// assumption was false: every lane-bit read admitted on it since the header is void, and the loop
+// exits must not hand the blanket on. Built BEFORE the header seeds its phis, from the preheader
+// state: a word held there unmarked, or marked only by an enclosing loop's blanket (defined under
+// that loop's assumption, which its own back edge checks; GTA V's workgroup-store kernel carries
+// VCC scratch derived from its outer counter into an inner loop), is defined on the preheader edge.
+// An absent word is seeded with the fabricated zero, so it is not.
+struct LoopBlanketCheck {
+    std::set<int> carried;   // the carried words defined on the preheader edge
+    uint64_t reads_at_header = 0;
+    uint32_t header_pc = 0;
+    template <class Registers>
+    LoopBlanketCheck(const SpirvCompute& b, const RegState& rs, const Registers& registers,
+                     uint32_t header)
+        : reads_at_header(b.loop_blanket_lane_reads), header_pc(header) {
+        for (int r : registers)
+            if (rs.sreg.contains(r) &&
+                (!merge_edge_word_fabricated(rs, r) || sreg_word_blanket_only(rs, r)))
+                carried.insert(r);
+    }
+    // The first header-blanketed word whose back-edge value (`rs` at the back edge) is hard-marked,
+    // or -1 when the assumption held.
+    int violated(const RegState& rs) const {
+        for (int r : carried)
+            if (merge_edge_word_fabricated(rs, r) && !sreg_word_blanket_only(rs, r)) return r;
+        return -1;
+    }
+    bool admitted_reads(const SpirvCompute& b) const {
+        return b.loop_blanket_lane_reads != reads_at_header;
+    }
+    // At the back edge: false, with a terminal reject line, when a lane-bit read relied on a header
+    // blanket mark the back edge does not honour. When nothing read through it, the program stands
+    // but the exits must not keep the blanket.
+    template <class Exits>
+    bool holds(SpirvCompute& b, const RegState& rs, Exits& exits) const {
+        const int r = violated(rs);
+        if (r < 0) return true;
+        exits.blanket.clear();
+        if (!admitted_reads(b)) return true;
+        log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                 "loop-carried s%d is fabricated on the back edge but was read as "
+                                 "lane bits in the loop (header pc=%u)",
+                                 r, header_pc);
+        return false;
+    }
+};
+
 // Every loop-carried SGPR, and SCC, is marked at its loop header: the phi takes the preheader value
 // (the fabricated zero when absent) and the back edge, whose marks are unknown until the body has
 // been emitted. A write from definite inputs clears the mark.
@@ -3328,12 +3399,10 @@ inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) 
 // way and is marked at the header too.
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
-                       uint32_t lo, uint32_t hi) {
+                       uint32_t lo, uint32_t hi, const std::set<int>& defined_at_preheader) {
     for (int r : carried) {
-        const bool defined_at_preheader =
-            !rs.sreg_absent_read.contains(r) && !merge_edge_word_fabricated(rs, r);
         join_merge_placeholder(rs, r, true, false);
-        if (defined_at_preheader) rs.sreg_loop_blanket.insert(r);
+        if (defined_at_preheader.contains(r)) rs.sreg_loop_blanket.insert(r);
     }
     rs.scc_merge_placeholder = true;
     for (const Rdna2Inst& in : ins)
