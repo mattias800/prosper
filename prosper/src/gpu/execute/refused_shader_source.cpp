@@ -3,9 +3,11 @@
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/shader_source_window.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 
 namespace prosper::gpu {
 
@@ -77,16 +79,56 @@ const char* take_compute_decline_reason() {
     return reason;
 }
 
+namespace {
+
+// What this thread has already offered the dump for a backend decline. Declines repeat every frame
+// for the same program, so the question "is this one already dumped?" must cost no lock and no read
+// of the program: the key is the address, the size and three sampled words (first, middle, last),
+// which tells a different program reusing a shader-pool address from the one already dumped.
+// Per thread, so a second thread may offer the same program once more; the dump's content hash
+// then drops it. Bounded: once full, a thread offers no further programs.
+constexpr size_t kDeclinedKeysPerThread = 256;
+
+struct DeclinedKey {
+    uint64_t address;
+    uint32_t dwords;
+    uint32_t sample[3];
+    bool operator==(const DeclinedKey& other) const {
+        return address == other.address && dwords == other.dwords &&
+               std::equal(sample, sample + 3, other.sample);
+    }
+};
+struct DeclinedKeyHash {
+    size_t operator()(const DeclinedKey& key) const {
+        uint64_t h = key.address * 0x9e3779b97f4a7c15ull ^ key.dwords;
+        for (uint32_t word : key.sample) h = (h ^ word) * 0x100000001b3ull;
+        return static_cast<size_t>(h);
+    }
+};
+struct DeclinedKeys {
+    uint64_t epoch = 0;
+    std::unordered_set<DeclinedKey, DeclinedKeyHash> seen;
+};
+
+}   // namespace
+
 void note_backend_declined_compute(uint64_t address, uint32_t dwords, uint32_t groups_x,
                                    uint32_t groups_y, uint32_t groups_z, const char* reason) {
-    if (!address || !dwords || refused_shader_dump_full()) return;
+    if (!address || !dwords || backend_declined_dump_full()) return;
+    // The key is the cheap question; everything below runs once per distinct program per thread.
+    thread_local DeclinedKeys keys;
+    if (const uint64_t epoch = refused_shader_dump_epoch(); keys.epoch != epoch) {
+        keys.seen.clear();   // the dump was reset (a test); what it holds is gone
+        keys.epoch = epoch;
+    }
+    const uint32_t* code = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(address));
+    const DeclinedKey key{address, dwords, {code[0], code[dwords / 2], code[dwords - 1]}};
+    if (keys.seen.size() >= kDeclinedKeysPerThread || !keys.seen.insert(key).second) return;
     // The dispatch was realized, so its facts are normally cached; peek neither stores nor
     // replays terminal reject reasons, so it cannot overwrite a recompile reject's record.
-    const auto facts = compute_program_facts_peek(
-        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(address)), dwords, address);
+    const auto facts = compute_program_facts_peek(code, dwords, address);
     if (!facts) return;
     const RefusedShaderSource source{{facts, &facts->code}, &facts->refused_shader_memo};
-    if (refused_shader_already_noted("cs", source)) return;
     // The [refused-shader] line repeats the refusal= field up to its first space, so the reason
     // (often a sentence such as "layered image deferred to #657") is written without spaces.
     std::string why = reason ? reason : "unrecorded";
@@ -95,7 +137,8 @@ void note_backend_declined_compute(uint64_t address, uint32_t dwords, uint32_t g
     char groups[64];
     std::snprintf(groups, sizeof groups, "dispatch groups=%ux%ux%u", groups_x, groups_y, groups_z);
     note_refused_shader("cs", address, source,
-                        std::string(groups) + " refusal=backend-declined:" + why);
+                        std::string(groups) + " refusal=backend-declined:" + why,
+                        RefusedShaderBudget::BackendDeclined);
 }
 
 }   // namespace prosper::gpu

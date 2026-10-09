@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -227,6 +228,27 @@ TEST(TextureMipRender, Contract) {
     CHECK(coarse_center && coarse_center[0] > 0x60 && coarse_center[0] < 0xA0 &&
               coarse_center[1] < 0x20 && coarse_center[2] > 0x60 && coarse_center[2] < 0xA0,
           "IMAGE_SAMPLE_CD quad-uniform unit gradients select LOD 2 like IMAGE_SAMPLE_D");
+
+    // The seven siblings (llvm-mc gfx1030, same operands, dim:2D) add a clamp, a dref or a packed
+    // offset to the address, so the six-dword layout above would read the wrong VGPRs. Each must
+    // stay refused: widening the opcode test to the 0x68-0x6f range would pass every arm above
+    // and silently mis-sample these.
+    struct CdSibling {
+        const char* name;
+        uint32_t word0;
+    };
+    for (const CdSibling& sibling :
+         {CdSibling{"image_sample_cd_cl", 0xf1a40f08u}, CdSibling{"image_sample_c_cd", 0xf1a80f08u},
+          CdSibling{"image_sample_c_cd_cl", 0xf1ac0f08u},
+          CdSibling{"image_sample_cd_o", 0xf1b00f08u},
+          CdSibling{"image_sample_cd_cl_o", 0xf1b40f08u},
+          CdSibling{"image_sample_c_cd_o", 0xf1b80f08u},
+          CdSibling{"image_sample_c_cd_cl_o", 0xf1bc0f08u}}) {
+        std::vector<uint32_t> ps_sibling = ps_coarse_grad;
+        ps_sibling[10] = sibling.word0;
+        CHECK(recompile_fragment(ps_sibling.data(), ps_sibling.size(), &rt).empty(),
+              std::string(sibling.name) + " stays refused: its address layout is not _d's");
+    }
 
     // An identity gradient on a square texture cannot distinguish the required
     // [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy] grouping from its transpose. Use a non-square 8x2 texture and
