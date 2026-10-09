@@ -1,0 +1,160 @@
+# console-oracle golden v1
+# source: kernelx.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+kx_cond_init	libkernel.sprx	scePthreadCondInit	out:8,null,s:oracle_cond	ret	ok	0x0000000000000000	-	a0=volatile
+kx_cond_signal_no_waiters	libkernel.sprx	scePthreadCondSignal	ref:kx_cond_init.0		ok	0x0000000000000000	-
+kx_cond_broadcast_no_waiters	libkernel.sprx	scePthreadCondBroadcast	ref:kx_cond_init.0		ok	0x0000000000000000	-
+kx_cond_destroy	libkernel.sprx	scePthreadCondDestroy	ref:kx_cond_init.0		ok	0x0000000000000000	-
+kx_cond_destroy_twice	libkernel.sprx	scePthreadCondDestroy	ref:kx_cond_init.0		ok	0x0000000080020016	-
+kx_condattr_init	libkernel.sprx	scePthreadCondattrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+kx_condattr_destroy	libkernel.sprx	scePthreadCondattrDestroy	ref:kx_condattr_init.0		ok	0x0000000000000000	-
+kx_tw_mutex_init	libkernel.sprx	scePthreadMutexInit	out:8,null,s:oracle_tw_mutex	ret	ok	0x0000000000000000	-	a0=volatile
+kx_tw_cond_init	libkernel.sprx	scePthreadCondInit	out:8,null,s:oracle_tw_cond	ret	ok	0x0000000000000000	-	a0=volatile
+kx_tw_mutex_lock	libkernel.sprx	scePthreadMutexLock	ref:kx_tw_mutex_init.0		ok	0x0000000000000000	-
+kx_tw_cond_timedwait	libkernel.sprx	scePthreadCondTimedwait	ref:kx_tw_cond_init.0,ref:kx_tw_mutex_init.0,i:1000		ok	0x000000008002003c	-
+kx_tw_mutex_timedlock_held	libkernel.sprx	scePthreadMutexTimedlock	ref:kx_tw_mutex_init.0,i:1000		ok	0x000000008002003c	-
+kx_tw_mutex_unlock	libkernel.sprx	scePthreadMutexUnlock	ref:kx_tw_mutex_init.0		ok	0x0000000000000000	-
+kx_tw_mutex_timedlock_free	libkernel.sprx	scePthreadMutexTimedlock	ref:kx_tw_mutex_init.0,i:1000		ok	0x0000000000000000	-
+kx_tw_mutex_unlock_again	libkernel.sprx	scePthreadMutexUnlock	ref:kx_tw_mutex_init.0		ok	0x0000000000000000	-
+kx_tw_cond_destroy	libkernel.sprx	scePthreadCondDestroy	ref:kx_tw_cond_init.0		ok	0x0000000000000000	-
+kx_tw_mutex_destroy	libkernel.sprx	scePthreadMutexDestroy	ref:kx_tw_mutex_init.0		ok	0x0000000000000000	-
+kx_mattr_init	libkernel.sprx	scePthreadMutexattrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+kx_mattr_settype_0	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:0		ok	0x0000000080020016	-
+kx_mattr_settype_1	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:1		ok	0x0000000000000000	-
+kx_mattr_settype_2	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:2		ok	0x0000000000000000	-
+kx_mattr_settype_3	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:3		ok	0x0000000000000000	-
+kx_mattr_settype_4	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:4		ok	0x0000000000000000	-
+kx_mattr_settype_99	libkernel.sprx	scePthreadMutexattrSettype	ref:kx_mattr_init.0,i:99		ok	0x0000000080020016	-
+kx_mattr_setprotocol_0	libkernel.sprx	scePthreadMutexattrSetprotocol	ref:kx_mattr_init.0,i:0		ok	0x0000000000000000	-
+kx_mattr_setprotocol_1	libkernel.sprx	scePthreadMutexattrSetprotocol	ref:kx_mattr_init.0,i:1		ok	0x0000000000000000	-
+kx_mattr_setprotocol_2	libkernel.sprx	scePthreadMutexattrSetprotocol	ref:kx_mattr_init.0,i:2		ok	0x0000000000000000	-
+kx_mattr_setprotocol_3	libkernel.sprx	scePthreadMutexattrSetprotocol	ref:kx_mattr_init.0,i:3		ok	0x0000000080020016	-
+kx_mattr_setprotocol_99	libkernel.sprx	scePthreadMutexattrSetprotocol	ref:kx_mattr_init.0,i:99		ok	0x0000000080020016	-
+kx_mattr_destroy	libkernel.sprx	scePthreadMutexattrDestroy	ref:kx_mattr_init.0		ok	0x0000000000000000	-
+kx_mattr_destroy_twice	libkernel.sprx	scePthreadMutexattrDestroy	ref:kx_mattr_init.0		ok	0x0000000080020016	-
+kx_rw_init	libkernel.sprx	scePthreadRwlockInit	out:8,null,s:oracle_rwlock	ret	ok	0x0000000000000000	-	a0=volatile
+kx_rw_rdlock	libkernel.sprx	scePthreadRwlockRdlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_tryrdlock_second_reader	libkernel.sprx	scePthreadRwlockTryrdlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_trywrlock_while_read_held	libkernel.sprx	scePthreadRwlockTrywrlock	ref:kx_rw_init.0		ok	0x0000000080020010	-
+kx_rw_unlock_reader_one	libkernel.sprx	scePthreadRwlockUnlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_unlock_reader_two	libkernel.sprx	scePthreadRwlockUnlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_unlock_when_free	libkernel.sprx	scePthreadRwlockUnlock	ref:kx_rw_init.0		ok	0x0000000080020001	-
+kx_rw_wrlock	libkernel.sprx	scePthreadRwlockWrlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_tryrdlock_while_write_held	libkernel.sprx	scePthreadRwlockTryrdlock	ref:kx_rw_init.0		ok	0x0000000080020010	-
+kx_rw_trywrlock_while_write_held	libkernel.sprx	scePthreadRwlockTrywrlock	ref:kx_rw_init.0		ok	0x0000000080020010	-
+kx_rw_timedrdlock_while_write_held	libkernel.sprx	scePthreadRwlockTimedrdlock	ref:kx_rw_init.0,i:1000		ok	0x000000008002003c	-
+kx_rw_timedwrlock_while_write_held	libkernel.sprx	scePthreadRwlockTimedwrlock	ref:kx_rw_init.0,i:1000		ok	0x000000008002003c	-
+kx_rw_unlock_writer	libkernel.sprx	scePthreadRwlockUnlock	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_destroy	libkernel.sprx	scePthreadRwlockDestroy	ref:kx_rw_init.0		ok	0x0000000000000000	-
+kx_rw_destroy_twice	libkernel.sprx	scePthreadRwlockDestroy	ref:kx_rw_init.0		ok	0x0000000080020016	-
+kx_rwattr_init	libkernel.sprx	scePthreadRwlockattrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+kx_rwattr_destroy	libkernel.sprx	scePthreadRwlockattrDestroy	ref:kx_rwattr_init.0		ok	0x0000000000000000	-
+kx_attr_init	libkernel.sprx	scePthreadAttrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+kx_attr_getdetach_default	libkernel.sprx	scePthreadAttrGetdetachstate	ref:kx_attr_init.0,out:4		ok	0x0000000000000000	-	a1=00000000
+kx_attr_setdetach_detached	libkernel.sprx	scePthreadAttrSetdetachstate	ref:kx_attr_init.0,i:1		ok	0x0000000000000000	-
+kx_attr_getdetach_after	libkernel.sprx	scePthreadAttrGetdetachstate	ref:kx_attr_init.0,out:4		ok	0x0000000000000000	-	a1=01000000
+kx_attr_setdetach_bad	libkernel.sprx	scePthreadAttrSetdetachstate	ref:kx_attr_init.0,i:7		ok	0x0000000080020016	-
+kx_attr_getstack_default	libkernel.sprx	scePthreadAttrGetstacksize	ref:kx_attr_init.0,out:8		ok	0x0000000000000000	-	a1=0000010000000000
+kx_attr_setstack_128k	libkernel.sprx	scePthreadAttrSetstacksize	ref:kx_attr_init.0,i:0x20000		ok	0x0000000000000000	-
+kx_attr_getstack_after	libkernel.sprx	scePthreadAttrGetstacksize	ref:kx_attr_init.0,out:8		ok	0x0000000000000000	-	a1=0000020000000000
+kx_attr_setstack_tiny	libkernel.sprx	scePthreadAttrSetstacksize	ref:kx_attr_init.0,i:0x100		ok	0x0000000080020016	-
+kx_attr_setstack_zero	libkernel.sprx	scePthreadAttrSetstacksize	ref:kx_attr_init.0,i:0		ok	0x0000000080020016	-
+kx_attr_setstack_unaligned	libkernel.sprx	scePthreadAttrSetstacksize	ref:kx_attr_init.0,i:0x20123		ok	0x0000000000000000	-
+kx_attr_setschedpolicy_0	libkernel.sprx	scePthreadAttrSetschedpolicy	ref:kx_attr_init.0,i:0		ok	0x000000008002002d	-
+kx_attr_setschedpolicy_1	libkernel.sprx	scePthreadAttrSetschedpolicy	ref:kx_attr_init.0,i:1		ok	0x0000000000000000	-
+kx_attr_setschedpolicy_2	libkernel.sprx	scePthreadAttrSetschedpolicy	ref:kx_attr_init.0,i:2		ok	0x000000008002002d	-
+kx_attr_setschedpolicy_3	libkernel.sprx	scePthreadAttrSetschedpolicy	ref:kx_attr_init.0,i:3		ok	0x0000000000000000	-
+kx_attr_setschedpolicy_7	libkernel.sprx	scePthreadAttrSetschedpolicy	ref:kx_attr_init.0,i:7		ok	0x000000008002002d	-
+kx_attr_setinheritsched_0	libkernel.sprx	scePthreadAttrSetinheritsched	ref:kx_attr_init.0,i:0		ok	0x0000000000000000	-
+kx_attr_setinheritsched_1	libkernel.sprx	scePthreadAttrSetinheritsched	ref:kx_attr_init.0,i:1		ok	0x000000008002002d	-
+kx_attr_setinheritsched_2	libkernel.sprx	scePthreadAttrSetinheritsched	ref:kx_attr_init.0,i:2		ok	0x000000008002002d	-
+kx_attr_destroy	libkernel.sprx	scePthreadAttrDestroy	ref:kx_attr_init.0		ok	0x0000000000000000	-
+kx_attr_destroy_twice	libkernel.sprx	scePthreadAttrDestroy	ref:kx_attr_init.0		ok	0x0000000080020016	-
+kx_key_create	libkernel.sprx	scePthreadKeyCreate	out:4,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_key_getspecific_unset	libkernel.sprx	scePthreadGetspecific	use:kx_key_create.0.0.4	r64	ok	0x0000000000000000	-
+kx_key_setspecific	libkernel.sprx	scePthreadSetspecific	use:kx_key_create.0.0.4,i:0x1234		ok	0x0000000000000000	-
+kx_key_getspecific_set	libkernel.sprx	scePthreadGetspecific	use:kx_key_create.0.0.4	r64	ok	0x0000000000001234	-
+kx_key_delete	libkernel.sprx	scePthreadKeyDelete	use:kx_key_create.0.0.4		ok	0x0000000000000000	-
+kx_key_setspecific_deleted	libkernel.sprx	scePthreadSetspecific	use:kx_key_create.0.0.4,i:0x1234		ok	0x0000000080020016	-
+kx_key_delete_twice	libkernel.sprx	scePthreadKeyDelete	use:kx_key_create.0.0.4		ok	0x0000000080020016	-
+kx_key_delete_never_created	libkernel.sprx	scePthreadKeyDelete	i:0x7ffff		ok	0x0000000080020016	-
+kx_ef_create	libkernel.sprx	sceKernelCreateEventFlag	out:8,s:oracle_evf,i:0x21,i:0,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_ef_wait_or_unset	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:1,i:1,out:8,p32:0	ret	ok	0x000000008002003c	-	a3=volatile	a4=volatile
+kx_ef_set	libkernel.sprx	sceKernelSetEventFlag	use:kx_ef_create.0.0.8,i:5		ok	0x0000000000000000	-
+kx_ef_wait_or_satisfied	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:1,i:1,out:8,p32:0		ok	0x0000000000000000	-	a3=0500000000000000	a4=00000000
+kx_ef_wait_and_unsatisfied	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:6,i:2,out:8,p32:0		ok	0x0000000000000000	-	a3=0500000000000000	a4=00000000
+kx_ef_wait_and_clearpat	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:5,i:0x22,out:8,p32:0		ok	0x0000000000000000	-	a3=0500000000000000	a4=00000000
+kx_ef_wait_after_clear	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:1,i:1,out:8,p32:0		ok	0x000000008002003c	-	a3=0000000000000000	a4=00000000
+kx_ef_set_again	libkernel.sprx	sceKernelSetEventFlag	use:kx_ef_create.0.0.8,i:0xf0		ok	0x0000000000000000	-
+kx_ef_clear	libkernel.sprx	sceKernelClearEventFlag	use:kx_ef_create.0.0.8,i:0xffffffffffffff0f		ok	0x0000000000000000	-
+kx_ef_wait_cleared	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:0xf0,i:1,out:8,p32:0		ok	0x000000008002003c	-	a3=0000000000000000	a4=00000000
+kx_ef_wait_pattern_zero	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:0,i:1,out:8,p32:0		ok	0x0000000080020016	-	a3=abababababababab	a4=00000000
+kx_ef_wait_bad_mode	libkernel.sprx	sceKernelWaitEventFlag	use:kx_ef_create.0.0.8,i:1,i:0,out:8,p32:0		ok	0x0000000080020016	-	a3=abababababababab	a4=00000000
+kx_ef_delete	libkernel.sprx	sceKernelDeleteEventFlag	use:kx_ef_create.0.0.8		ok	0x0000000000000000	-
+kx_ef_create_null_name	libkernel.sprx	sceKernelCreateEventFlag	out:8,null,i:0x21,i:0,null	ret	ok	0x0000000080020016	-	a0=volatile
+kx_ef_create_bad_attr	libkernel.sprx	sceKernelCreateEventFlag	out:8,s:oracle_evf_bad,i:0xffff,i:0,null	ret	ok	0x0000000080020016	-	a0=volatile
+kx_eq_create	libkernel.sprx	sceKernelCreateEqueue	out:8,s:oracle_eq	ret	ok	0x0000000000000000	-	a0=volatile
+kx_eq_wait_empty	libkernel.sprx	sceKernelWaitEqueue	use:kx_eq_create.0.0.8,out:64,i:2,out:4,p32:0		ok	0x000000008002003c	-	a1=abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a3=00000000	a4=00000000
+kx_eq_add_user	libkernel.sprx	sceKernelAddUserEvent	use:kx_eq_create.0.0.8,i:7		ok	0x0000000000000000	-
+kx_eq_trigger_user	libkernel.sprx	sceKernelTriggerUserEvent	use:kx_eq_create.0.0.8,i:7,i:0x1234		ok	0x0000000000000000	-
+kx_eq_wait_one	libkernel.sprx	sceKernelWaitEqueue	use:kx_eq_create.0.0.8,out:64,i:2,out:4,p32:0	ret	ok	0x0000000000000000	-	a1=volatile	a3=volatile	a4=volatile
+kx_eq_trigger_unknown	libkernel.sprx	sceKernelTriggerUserEvent	use:kx_eq_create.0.0.8,i:99,i:0		ok	0x0000000080020002	-
+kx_eq_delete_user	libkernel.sprx	sceKernelDeleteUserEvent	use:kx_eq_create.0.0.8,i:7		ok	0x0000000000000000	-
+kx_eq_delete_user_twice	libkernel.sprx	sceKernelDeleteUserEvent	use:kx_eq_create.0.0.8,i:7		ok	0x0000000080020002	-
+kx_eq_wait_zero_events	libkernel.sprx	sceKernelWaitEqueue	use:kx_eq_create.0.0.8,out:64,i:0,out:4,p32:0		ok	0x0000000080020016	-	a1=abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab	a3=00000000	a4=00000000
+kx_eq_delete	libkernel.sprx	sceKernelDeleteEqueue	use:kx_eq_create.0.0.8		ok	0x0000000000000000	-
+kx_eq_create_null_name	libkernel.sprx	sceKernelCreateEqueue	out:8,null	ret	ok	0x0000000080020016	-	a0=volatile
+kx_fmem_map_ok	libkernel.sprx	sceKernelMapNamedFlexibleMemory	p64:0,i:0x4000,i:3,i:0,s:oracle_fmem	ret	ok	0x0000000000000000	-	a0=volatile
+kx_fmem_unmap_ok	libkernel.sprx	sceKernelMunmap	use:kx_fmem_map_ok.0.0.8,i:0x4000		ok	0x0000000000000000	-
+kx_fmem_unmap_again	libkernel.sprx	sceKernelMunmap	use:kx_fmem_map_ok.0.0.8,i:0x4000		ok	0x0000000000000000	-
+kx_fmem_map_len_zero	libkernel.sprx	sceKernelMapNamedFlexibleMemory	p64:0,i:0,i:3,i:0,s:oracle_fmem	ret	ok	0x0000000080020016	-	a0=volatile
+kx_fmem_map_len_unaligned	libkernel.sprx	sceKernelMapNamedFlexibleMemory	p64:0,i:0x1234,i:3,i:0,s:oracle_fmem	ret	ok	0x0000000080020016	-	a0=volatile
+kx_fmem_map_prot_bad	libkernel.sprx	sceKernelMapNamedFlexibleMemory	p64:0,i:0x4000,i:0x100,i:0,s:oracle_fmem	ret	ok	0x0000000000000000	-	a0=volatile
+kx_fmem_map_len_huge	libkernel.sprx	sceKernelMapNamedFlexibleMemory	p64:0,i:0x7fffffffffffc000,i:3,i:0,s:oracle_fmem	ret	ok	0x000000008002000c	-	a0=volatile
+kx_fmem_munmap_unmapped	libkernel.sprx	sceKernelMunmap	i:0x10000,i:0x4000		ok	0x0000000000000000	-
+kx_fmem_munmap_len_zero	libkernel.sprx	sceKernelMunmap	i:0x10000,i:0		ok	0x0000000080020016	-
+kx_file_open_missing	libkernel.sprx	sceKernelOpen	s:/oracle_nonexistent/file,i:0,i:0	ret	ok	0x0000000080020002	-
+kx_file_open_empty_path	libkernel.sprx	sceKernelOpen	s:,i:0,i:0	ret	ok	0x0000000080020002	-
+kx_file_stat_missing	libkernel.sprx	sceKernelStat	s:/oracle_nonexistent/file,out:128	ret	ok	0x0000000080020002	-	a1=volatile
+kx_file_close_bad_fd	libkernel.sprx	sceKernelClose	i:-1		ok	0x0000000080020009	-
+kx_file_read_bad_fd	libkernel.sprx	sceKernelRead	i:-1,out:16,i:16		ok	0xffffffff80020009	-	a1=abababababababababababababababab
+kx_file_write_bad_fd	libkernel.sprx	sceKernelWrite	i:-1,in:41424344,i:4		ok	0xffffffff80020009	-	a1=41424344
+kx_file_lseek_bad_fd	libkernel.sprx	sceKernelLseek	i:-1,i:0,i:0		ok	0xffffffff80020009	-
+kx_file_pread_bad_fd	libkernel.sprx	sceKernelPread	i:-1,out:16,i:16,i:0		ok	0xffffffff80020009	-	a1=abababababababababababababababab
+kx_file_fstat_bad_fd	libkernel.sprx	sceKernelFstat	i:-1,out:128	ret	ok	0x0000000080020009	-	a1=volatile
+kx_file_fsync_bad_fd	libkernel.sprx	sceKernelFsync	i:-1		ok	0x0000000080020009	-
+kx_file_ftruncate_bad_fd	libkernel.sprx	sceKernelFtruncate	i:-1,i:0		ok	0x0000000080020009	-
+kx_file_getdents_bad_fd	libkernel.sprx	sceKernelGetdents	i:-1,out:64,i:64		ok	0x0000000080020009	-	a1=abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+kx_file_unlink_missing	libkernel.sprx	sceKernelUnlink	s:/oracle_nonexistent/file		ok	0x0000000080020002	-
+kx_signal_usr1_ignore	libkernel.sprx	signal	i:30,i:1	r64	ok	0x0000000000000000	-
+kx_signal_usr1_default	libkernel.sprx	signal	i:30,i:0	r64	ok	0x0000000000000001	-
+kx_signal_sigkill	libkernel.sprx	signal	i:9,i:1	r64	ok	0xffffffffffffffff	-
+kx_signal_zero	libkernel.sprx	signal	i:0,i:1	r64	ok	0xffffffffffffffff	-
+kx_signal_out_of_range	libkernel.sprx	signal	i:1000,i:1	r64	ok	0xffffffffffffffff	-
+kx_getrusage_self	libkernel.sprx	getrusage	i:0,out:144	ret	ok	0x0000000000000000	-	a1=volatile
+kx_getrusage_bad_who	libkernel.sprx	getrusage	i:99,out:144	ret	ok	0xffffffffffffffff	-	a1=volatile
+kx_px_mutex_init	libkernel.sprx	pthread_mutex_init	out:8,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_px_mutex_lock	libkernel.sprx	pthread_mutex_lock	ref:kx_px_mutex_init.0		ok	0x0000000000000000	-
+kx_px_mutex_trylock_held	libkernel.sprx	pthread_mutex_trylock	ref:kx_px_mutex_init.0		ok	0x0000000000000010	-
+kx_px_mutex_unlock	libkernel.sprx	pthread_mutex_unlock	ref:kx_px_mutex_init.0		ok	0x0000000000000000	-
+kx_px_mutex_trylock_free	libkernel.sprx	pthread_mutex_trylock	ref:kx_px_mutex_init.0		ok	0x0000000000000000	-
+kx_px_mutex_unlock_two	libkernel.sprx	pthread_mutex_unlock	ref:kx_px_mutex_init.0		ok	0x0000000000000000	-
+kx_px_mutex_unlock_free	libkernel.sprx	pthread_mutex_unlock	ref:kx_px_mutex_init.0		ok	0x0000000000000001	-
+kx_px_mutex_destroy	libkernel.sprx	pthread_mutex_destroy	ref:kx_px_mutex_init.0		ok	0x0000000000000000	-
+kx_px_cond_init	libkernel.sprx	pthread_cond_init	out:8,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_px_cond_signal	libkernel.sprx	pthread_cond_signal	ref:kx_px_cond_init.0		ok	0x0000000000000000	-
+kx_px_cond_destroy	libkernel.sprx	pthread_cond_destroy	ref:kx_px_cond_init.0		ok	0x0000000000000000	-
+kx_px_rw_init	libkernel.sprx	pthread_rwlock_init	out:8,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_px_rw_rdlock	libkernel.sprx	pthread_rwlock_rdlock	ref:kx_px_rw_init.0		ok	0x0000000000000000	-
+kx_px_rw_trywrlock_while_read_held	libkernel.sprx	pthread_rwlock_trywrlock	ref:kx_px_rw_init.0		ok	0x0000000000000010	-
+kx_px_rw_unlock	libkernel.sprx	pthread_rwlock_unlock	ref:kx_px_rw_init.0		ok	0x0000000000000000	-
+kx_px_rw_destroy	libkernel.sprx	pthread_rwlock_destroy	ref:kx_px_rw_init.0		ok	0x0000000000000000	-
+kx_px_key_create	libkernel.sprx	pthread_key_create	out:4,null	ret	ok	0x0000000000000000	-	a0=volatile
+kx_px_key_setspecific	libkernel.sprx	pthread_setspecific	use:kx_px_key_create.0.0.4,i:0x4321		ok	0x0000000000000000	-
+kx_px_key_getspecific	libkernel.sprx	pthread_getspecific	use:kx_px_key_create.0.0.4	r64	ok	0x0000000000004321	-
+kx_px_key_delete	libkernel.sprx	pthread_key_delete	use:kx_px_key_create.0.0.4		ok	0x0000000000000000	-
+kx_px_attr_init	libkernel.sprx	pthread_attr_init	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+kx_px_attr_setstacksize	libkernel.sprx	pthread_attr_setstacksize	ref:kx_px_attr_init.0,i:0x20000		ok	0x0000000000000000	-
+kx_px_attr_setstacksize_tiny	libkernel.sprx	pthread_attr_setstacksize	ref:kx_px_attr_init.0,i:0x100		ok	0x0000000000000016	-
+kx_px_attr_destroy	libkernel.sprx	pthread_attr_destroy	ref:kx_px_attr_init.0		ok	0x0000000000000000	-

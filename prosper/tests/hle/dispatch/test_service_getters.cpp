@@ -151,6 +151,28 @@ TEST(ServiceGetters, Contract) {
             std::ofstream(app0 / "Content" / "Paks" / "pakchunk7-ps5.ucas").put('\1');
             write_manifest(make_manifest(3));
             CHECK(count_chunks() == 3, "manifest supplies exactly its three chunk identifiers");
+            // #4782: with no /app0 mounted there is nothing to inventory. The unmounted spelling
+            // used to compose "" + "sce_sys/...", a path in the HOST's working directory, so a cwd
+            // that happened to hold a manifest supplied its chunks. Mutation that reddens this: drop
+            // the empty-root guard in discover_playgo_chunks().
+            {
+#ifdef _WIN32
+                _putenv_s("PROSPER_APP0", "");
+#else
+                unsetenv("PROSPER_APP0");   // NOLINT(concurrency-mt-unsafe): single-threaded test
+#endif
+                std::error_code cwd_ec;
+                const fs::path previous = fs::current_path(cwd_ec);
+                fs::current_path(app0, cwd_ec);
+                const bool moved = !cwd_ec;
+                set_app0_root(std::string());
+                const uint32_t unmounted = count_chunks();
+                set_app0_root(app0.string());
+                fs::current_path(previous, cwd_ec);
+                CHECK(count_chunks() == 3, "remounting /app0 restores the declared inventory");
+                CHECK(moved && unmounted == 1, "no /app0 means chunk 0 only, never a manifest in "
+                                               "the host's working directory");
+            }
             uint16_t ids[4] = {99, 99, 99, 99};
             uint32_t entries = 99;
             CHECK(get_ids(1, (uint64_t)(uintptr_t)ids, 4, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 &&

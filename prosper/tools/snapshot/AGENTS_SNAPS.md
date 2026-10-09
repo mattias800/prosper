@@ -339,10 +339,14 @@ them.
 way will not reproduce on a machine whose save state differs, including CI and anyone else's clone.
 
 **Wanting a save is legitimate** — it is how you would skip a long intro and author deep-game content
-without replaying an hour of route. The right shape for that is a save FIXTURE stored with the snap
-set and copied into the fresh directory before the run, so the starting state is part of the
-committed definition rather than a property of one machine. Not built yet; `preserve` is not a
-substitute for it.
+without replaying an hour of route. The right shape for that is a save FIXTURE copied into the
+fresh directory before the run. `prosper/tools/saves/save_fixture.py` builds them: `capture` both
+roots, `seed` them into fresh per-run directories, `verify` the sha256. Because a save is derived
+from game content it is never committed; fixtures live under `~/prosper-saves` and only a
+manifest naming their expected sha256 and content version may be. `tools/snapshot/snapshot.py`
+already honours a per-entry `save_fixture` field (a missing fixture SKIPS the guard). Wiring the
+human-authored `snaps.py` author/check halves to the same tool is not done yet; `preserve` is not a
+substitute for it. See `prosper/tools/saves/AGENTS.md`.
 
 ## Where things live, and what is never committed
 

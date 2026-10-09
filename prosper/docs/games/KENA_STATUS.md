@@ -45,6 +45,48 @@ What remains is `ngg-abi-read-v4` (#4746).
 
 **Cost, still open.** Every replay re-runs the shell dispatch, so a cube costs six shell dispatches and six pass segments. A shell dispatched once and drawn six times is the next step.
 
+## The cave's distance-field AO is empty because the mesh-SDF atlas is never uploaded (2026-10-09, #4766; paused)
+
+**Read this first.** Kena's lighting is fully dynamic, so UE4's distance-field AO is what should occlude the
+sky in the cave. In prosper its bent normals are about zero everywhere (#4766). The cause is found, a fix
+exists on an unmerged branch, and the work is **paused** (owner's call, 2026-10-09).
+Measured on Linux/RADV, `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`,
+`scripts/kena/linux-reach-pulse.pad`, RenderDoc captures and `PROSPER_COMPUTELOG`.
+
+- **The chain, measured.** UE4 builds the AO in four steps:
+  1. it uploads mesh signed-distance bricks into a 512³ atlas;
+  2. it composites the atlas into four 128³ R16F global-distance-field clipmaps;
+  3. it cone-traces those clipmaps (`0x50071e0000`) into a 400×225×9 visibility buffer;
+  4. it combines the cones into bent normals.
+- **Step 1 never runs.** The upload program `0x5008ba0000` writes the atlas `0x505d380000` as
+  512×512×512 one-component R16_UINT (tile mode 27). Every one of its ~340 brick dispatches is
+  skipped: `expanded image exceeds the 512 MiB backend bound -> dispatch skipped`.
+  - Integer 3D storage has no native typed path. `native_storage_3d_format_support_bit()` only
+    mirrors the float/UNORM bits, and the recompiler admits native integer storage only in 2D.
+  - So the atlas takes the raw RGBA32_UINT interchange at 16 bytes per texel: 2 GiB from 256 MiB.
+- **What that does downstream.**
+  - The clipmaps hold exact-zero boxes (object bounds) beside 659.5 "far" texels, with almost no
+    gradients. 72%/63%/36%/9% of texels are zero across the four clipmaps.
+  - The cone trace therefore min-reduces almost everything to about 0.0035.
+  - The bent normals come out at length 0.003.
+- **Sky lighting is not darkened anyway, so this alone may not fix the brightness.** The composite
+  `0x5008750000` still adds about 0.02 sky diffuse to the cave walls. How its contrast curve and
+  distance fade use the near-zero AO was not settled. The sky-light constants (colour 0.041/0.060/0.100)
+  are small, so the SH irradiance source is the open question (see #4768: the sky cube is copied
+  into a cube by `0x5006e80000`, which is the #3742 gap).
+- **The fix that exists, and why it is not merged.** Branch `kena/dfao-int3d-wip` gives integer
+  formats 3D support bits (25..28) and lets the recompiler declare R16ui/R32ui/R8ui 3D storage.
+  - A test in `test_game_compute` pins it: a 3D R16 store reflects typed R16ui and writes tiled guest
+    bytes exactly. It fails under either half reverted. The `gpu_retile` volume mode now runs integer
+    volumes natively too.
+  - With it, all 340 uploads succeed, but **the level load stalls**: the guest stops reading the pad
+    after about 300 s. The likely reason: every brick dispatch re-materializes and writes back the
+    whole 256 MiB atlas, because the GPU retile declines 2-byte texels and mode 27 for volumes, so it
+    is a CPU detile and retile each time. That is likely, not measured.
+- **Next step.** Keep the atlas resident on the GPU across the upload dispatches:
+  - a GPU volume retile for 2-byte texels in mode 27, or a write-region-only writeback;
+  - then re-measure the bent normals and the cave against the after-Pulse oracle (3.5).
+
 ## Exposure is the guest's own; the cave's excess light is ambient (2026-10-08)
 
 **Read this first.** Measured on Linux/RADV with `prosper-app` in a visible window and
@@ -1029,6 +1071,11 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Kena's distance-field AO is empty because the cone trace is mis-compiled** — false as the first
+  cause. The cone trace reads clipmaps that are mostly exact zeros, because the mesh-SDF atlas upload
+  (`0x5008ba0000`) is skipped by the 512 MiB expanded-image bound (2026-10-09, #4766).
+- **The AO cone buffer is empty because its clear is broken** — false after #4773. With the clear
+  writing every element, the trace still writes about 0.0035 everywhere (2026-10-09, #4766).
 - **The exposure pass reads an 8-bit texture because prosper's view format differs from the guest's**
   — false. `PROSPER_TEXLOG` shows the guest T# itself is a 1×1 `IMG_FMT 56` (8_8_8_8_UNORM) at
   `0x500f0c0000`, and the 1×1 targets it writes are `IMG_FMT 77` (32_32_32_32_FLOAT), as prosper

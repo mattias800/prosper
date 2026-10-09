@@ -930,14 +930,24 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # prosper's HLE against what a real PS5 returned: tests/data/console_oracle/*.golden.tsv are
-  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv.
+  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv, and a
+  # generated probe_* family is gated by a count in probe_baseline.tsv that may only go down.
   # No console and no game dump needed.
   prosper_add_gtest(test_console_oracle_replay
     SOURCES tests/hle/test_console_oracle_replay.cpp
-    INCLUDES tests/hle
+    INCLUDES tests/hle tests
     LIBRARIES prosper_core)
+  # probe_baseline.tsv rows can be limited to a host (prosper's HLE answers some calls differently per OS).
+  if(WIN32)
+    set(PROSPER_ORACLE_PLATFORM windows)
+  elseif(APPLE)
+    set(PROSPER_ORACLE_PLATFORM macos)
+  else()
+    set(PROSPER_ORACLE_PLATFORM linux)
+  endif()
   target_compile_definitions(test_console_oracle_replay PRIVATE
-      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+      PROSPER_ORACLE_PLATFORM="${PROSPER_ORACLE_PLATFORM}")
 
   # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
   # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
@@ -2415,6 +2425,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_translate_sandbox.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+
+  # #4782: a guest path no mount owns never reaches the host filesystem. Interposes the host's
+  # rmdir/mkdir/unlink/rename on Linux to prove it, and checks the console-oracle answers.
+  prosper_add_gtest(test_guest_namespace
+    SOURCES tests/hle/fs/test_guest_namespace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core ${CMAKE_DL_LIBS})
 
   prosper_add_gtest(test_service_logging
     SOURCES tests/hle/test_service_logging.cpp

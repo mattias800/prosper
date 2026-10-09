@@ -71,3 +71,6 @@ prosper/scripts/play/
 
 # uv virtualenv
 .venv/
+
+# Local save fixtures (derived from game content; never commit) -- guard in case a store is pointed inside the repo
+prosper-saves/

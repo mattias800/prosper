@@ -104,7 +104,7 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Descriptor decode | `src/gpu/agc/agc_shader_layout.cpp` | CLEAN — see the dimension-clamp section above |
 | Resource/descriptor layer, GPU capture parser | `src/gpu/*` | CLEAN |
 | HLE getters (audio/service/http/json) | `src/hle/*` | CLEAN — output params fully initialized |
-| SELF/save path traversal | `src/hle/fs/hle_file.cpp` | **#1204** savedata `dirName` guard; **#1206** `translate()` `..` normalization |
+| SELF/save path traversal | `src/hle/fs/hle_file.cpp` | **#1204** savedata `dirName` guard; **#1206** `..` normalization; **#4782** one resolver (`resolve_guest()`) for every path entry point, so a path outside every mount never reaches a host filesystem call |
 | `__cxa_guard`/`call_once` recursion | `src/hle/libc/hle_libc.cpp` | **#1196** recursion self-deadlock break |
 
 ## Adding a new guest-input parser?
