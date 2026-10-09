@@ -2426,6 +2426,13 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # #4782: a guest path no mount owns never reaches the host filesystem. Interposes the host's
+  # rmdir/mkdir/unlink/rename on Linux to prove it, and checks the console-oracle answers.
+  prosper_add_gtest(test_guest_namespace
+    SOURCES tests/hle/fs/test_guest_namespace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core ${CMAKE_DL_LIBS})
+
   prosper_add_gtest(test_service_logging
     SOURCES tests/hle/test_service_logging.cpp
     INCLUDES tests

@@ -1161,8 +1161,10 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path, uint32_t
     prosper::video::StreamInfo stream{};
     int backend_id = -1;
     if (selected_backend && !guest_media.empty()) {
-        backend_id = selected_backend->open_memory(host_path, guest_media.data(),
-                                                   guest_media.size());
+        // The name is a debug label here; a path no mount owns has no host spelling (#4782).
+        backend_id =
+            selected_backend->open_memory(host_path.empty() ? std::string(guest_path) : host_path,
+                                          guest_media.data(), guest_media.size());
         // A backend with no in-memory path, or media the demuxer rejects, must not silently lose the
         // titles that work today: fall back to the host file exactly as before.
         if (backend_id < 0)
@@ -1170,7 +1172,8 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path, uint32_t
                     "[avp] the guest-supplied media for '%s' could not be demuxed; falling back to "
                     "the host path (#1955)\n", guest_path);
     }
-    if (backend_id < 0 && selected_backend) backend_id = selected_backend->open(host_path);
+    if (backend_id < 0 && selected_backend && !host_path.empty())
+        backend_id = selected_backend->open(host_path);
     if (backend_id >= 0 && !selected_backend->info(backend_id, stream)) {
         selected_backend->close(backend_id);
         backend_id = -1;

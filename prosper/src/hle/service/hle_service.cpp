@@ -53,15 +53,12 @@
 #include <windows.h>
 #else
 #include <sys/stat.h>   // mkdir
-#include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
-#include <sys/random.h> // getentropy: the host CSPRNG behind sceRandomGetRandomNumber
+#include <sys/uio.h>   // process_vm_readv: fault-contained diagnostic snapshots
 #include <unistd.h>
 #endif
 #include "hle/service/service_trace.hpp"
+#include "host/platform/host_entropy.hpp"   // the host CSPRNG behind sceRandomGetRandomNumber
 #include "hle/service/hle_handles.hpp"
-#ifdef _WIN32
-#include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
-#endif
 
 namespace prosper {
 
@@ -913,6 +910,14 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     bool saw_iostore_index = false;
     std::error_code ec;
     const fs::path app0(resolve_guest_path("/app0"));
+    // No /app0 mounted: nothing to inventory. resolve_guest_path() answers "" for an unserved path
+    // (#4782), and composing below from "" would read sce_sys/ and the pak tree relative to the
+    // HOST's working directory. Answer what an empty dump answers: the non-IoStore chunk 0.
+    if (app0.empty()) {
+        std::fprintf(stderr, "[playgo] /app0 is not mounted; reporting only chunk 0\n");
+        chunks.push_back(0);
+        return chunks;
+    }
 
     // CONFIDENCE: HIGH — the fixed plgx header/table fields agree across nine local PS5
     // declarations; 007 queries ordinal 1 from its two-record manifest (#4030). Read only the
@@ -1619,25 +1624,6 @@ namespace {
 // more, this constant is where to look first.
 constexpr uint64_t kRandomMaxBytes = 64;
 
-// Fill `bytes` from the host CSPRNG. Returns false if the host cannot supply entropy — which the
-// caller MUST surface as an error, never as a zero-filled success. Deterministic zeros presented as
-// random are the same lie in a different costume.
-bool svc_host_entropy(void* dst, size_t bytes) {
-#ifdef _WIN32
-    return BCryptGenRandom(nullptr, (PUCHAR)dst, (ULONG)bytes,
-                           BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
-#else
-    auto* p = static_cast<unsigned char*>(dst);
-    while (bytes) {
-        const size_t chunk = bytes < 256 ? bytes : 256;   // getentropy's published maximum
-        if (getentropy(p, chunk) != 0) return false;
-        p += chunk;
-        bytes -= chunk;
-    }
-    return true;
-#endif
-}
-
 } // namespace
 
 HLE(s_random_get_random_number) {
@@ -1650,7 +1636,7 @@ HLE(s_random_get_random_number) {
     if (!svc_ptrish(buf)) return prosper::hle::kSceKernelErrorEFAULT;
 
     unsigned char tmp[kRandomMaxBytes];
-    if (!svc_host_entropy(tmp, (size_t)size))
+    if (!host::host_entropy_fill(tmp, (size_t)size))
         return prosper::hle::sce_kernel_error(prosper::hle::FreeBsdErrno::EIo);
     // Fault-contained: an unmapped or unwritable guest buffer must return an error, not take down
     // the emulator, and must not report success for a write that did not land.
