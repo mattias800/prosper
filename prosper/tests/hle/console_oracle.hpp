@@ -429,12 +429,22 @@ inline bool load_known_gaps(const std::string& path, std::map<std::string, Gap>*
     return true;
 }
 
-// probe_baseline.tsv: `family<TAB>case id<TAB>signature`, one row per probe that is ALLOWED to differ from the
-// console. The signature is a hash of the difference text, so a probe that already differs cannot change
+// probe_baseline.tsv: `family<TAB>case id<TAB>signature[<TAB>platforms]`, one row per probe that is ALLOWED to differ
+// from the console. The signature is a hash of the difference text, so a probe that already differs cannot change
 // (prosper's builder growing a dword, a return code swapping) without the row changing, and a row cannot be
-// added without showing up as a line in the diff. A probe family with no rows is an error for the caller
-// (it has nothing to compare against), so a new family cannot slip in ungated.
-using ProbeBaseline = std::map<std::string, std::map<std::string, std::string>>;
+// added without showing up as a line in the diff. `platforms` is an optional comma list of linux, windows, macos
+// the row applies to (default: all) -- prosper's HLE legitimately answers some calls differently per host, and
+// the row says on which. A signature of `*` accepts any difference on that platform: use it only for a row whose
+// platform has not been measured exactly. A probe family with no rows is an error for the caller.
+struct ProbeRow {
+    std::string signature;
+    std::set<std::string> platforms;   // empty == every platform
+};
+using ProbeBaseline = std::map<std::string, std::map<std::string, std::vector<ProbeRow>>>;
+
+inline bool probe_row_applies(const ProbeRow& r, const std::string& platform) {
+    return r.platforms.empty() || r.platforms.count(platform) != 0;
+}
 
 // What the signature hashes: the difference text with every command-buffer payload collapsed to its dword
 // count ("a0=7:<hex>" -> "a0=7:*"). Prosper's builders write prosper's own packets, so the payload differs from
@@ -483,10 +493,27 @@ inline bool load_probe_baseline(const std::string& path, ProbeBaseline* out, std
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const std::vector<std::string> f = split(line, '\t');
-        if (f.size() != 3 || f[0].empty() || f[1].empty() || f[2].size() != 16)
-            return *err = "probe baseline needs 'family<TAB>case id<TAB>16-hex signature': " + line, false;
-        if (!(*out)[f[0]].emplace(f[1], f[2]).second)
-            return *err = "probe baseline lists a case twice: " + line, false;
+        const bool sig_ok = f.size() >= 3 && (f[2] == "*" || f[2].size() == 16);
+        if ((f.size() != 3 && f.size() != 4) || f[0].empty() || f[1].empty() || !sig_ok)
+            return *err = "probe baseline needs 'family<TAB>case id<TAB>16-hex signature or *[<TAB>platforms]': " + line,
+                   false;
+        ProbeRow row;
+        row.signature = f[2];
+        if (f.size() == 4) {
+            for (const std::string& pl : split(f[3], ',')) {
+                if (pl != "linux" && pl != "windows" && pl != "macos")
+                    return *err = "probe baseline platform must be linux, windows or macos: " + line, false;
+                row.platforms.insert(pl);
+            }
+        }
+        auto& rows = (*out)[f[0]][f[1]];
+        for (const ProbeRow& other : rows) {
+            const bool overlap = other.platforms.empty() || row.platforms.empty() ||
+                                 std::any_of(row.platforms.begin(), row.platforms.end(),
+                                             [&](const std::string& q) { return other.platforms.count(q) != 0; });
+            if (overlap) return *err = "probe baseline lists a case twice for one platform: " + line, false;
+        }
+        rows.push_back(std::move(row));
     }
     return true;
 }

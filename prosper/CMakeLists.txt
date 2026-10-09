@@ -937,8 +937,17 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_console_oracle_replay.cpp
     INCLUDES tests/hle tests
     LIBRARIES prosper_core)
+  # probe_baseline.tsv rows can be limited to a host (prosper's HLE answers some calls differently per OS).
+  if(WIN32)
+    set(PROSPER_ORACLE_PLATFORM windows)
+  elseif(APPLE)
+    set(PROSPER_ORACLE_PLATFORM macos)
+  else()
+    set(PROSPER_ORACLE_PLATFORM linux)
+  endif()
   target_compile_definitions(test_console_oracle_replay PRIVATE
-      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+      PROSPER_ORACLE_PLATFORM="${PROSPER_ORACLE_PLATFORM}")
 
   # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
   # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,

@@ -213,6 +213,7 @@ kernelx	kx_attr_setinheritsched_2	2a245bec60d661b5
 kernelx	kx_attr_setschedpolicy_0	2a245bec60d661b5
 kernelx	kx_attr_setschedpolicy_2	2a245bec60d661b5
 kernelx	kx_attr_setschedpolicy_7	2a245bec60d661b5
+kernelx	kx_attr_setstack_unaligned	*	macos
 kernelx	kx_ef_create_bad_attr	40827bee4d7fee26
 kernelx	kx_ef_create_null_name	40827bee4d7fee26
 kernelx	kx_ef_wait_bad_mode	d78bcafa4af66d3a
@@ -223,14 +224,19 @@ kernelx	kx_eq_trigger_unknown	4871b0aec2fc324d
 kernelx	kx_file_rmdir_missing	a9978b18e7414815
 kernelx	kx_fmem_map_len_unaligned	40827bee4d7fee26
 kernelx	kx_fmem_map_len_zero	aaae440243377821
+kernelx	kx_fmem_munmap_unmapped	*	windows
 kernelx	kx_getrusage_bad_who	ee7202bb555ada9e
 kernelx	kx_getrusage_self	ee7202bb555ada9e
+kernelx	kx_key_delete_twice	*	windows
+kernelx	kx_key_setspecific_deleted	*	windows
 kernelx	kx_mattr_destroy_twice	40827bee4d7fee26
 kernelx	kx_mattr_setprotocol_3	40827bee4d7fee26
 kernelx	kx_mattr_setprotocol_99	40827bee4d7fee26
 kernelx	kx_rw_destroy_twice	40827bee4d7fee26
-kernelx	kx_rw_timedrdlock_while_write_held	b5387aa7e9929d29
-kernelx	kx_rw_timedwrlock_while_write_held	b5387aa7e9929d29
+kernelx	kx_rw_timedrdlock_while_write_held	b5387aa7e9929d29	linux,macos
+kernelx	kx_rw_timedwrlock_while_write_held	b5387aa7e9929d29	linux,macos
+kernelx	kx_rw_tryrdlock_while_write_held	*	macos
+kernelx	kx_rw_trywrlock_while_write_held	*	macos
 kernelx	kx_signal_out_of_range	ee7202bb555ada9e
 kernelx	kx_signal_sigkill	ee7202bb555ada9e
 kernelx	kx_signal_usr1_default	ee7202bb555ada9e

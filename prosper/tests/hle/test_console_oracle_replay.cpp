@@ -236,14 +236,24 @@ TEST(ConsoleOracleHarness, ProbeBaselineParsesAndRejectsMalformedRows) {
     co::ProbeBaseline m;
     std::string err;
     {
-        std::ofstream(p) << "# comment\n\nfam\tcase_a\t0123456789abcdef\nfam\tcase_b\tfedcba9876543210\n";
+        std::ofstream(p) << "# comment\n\nfam\tcase_a\t0123456789abcdef\nfam\tcase_b\t*\twindows,macos\n"
+                         << "fam\tcase_b\tfedcba9876543210\tlinux\n";
     }
     ASSERT_TRUE(co::load_probe_baseline(p.string(), &m, &err)) << err;
     EXPECT_EQ(m.at("fam").size(), 2u);
-    EXPECT_EQ(m.at("fam").at("case_b"), "fedcba9876543210");
+    EXPECT_TRUE(m.at("fam").at("case_a")[0].platforms.empty());
+    EXPECT_TRUE(co::probe_row_applies(m.at("fam").at("case_a")[0], "windows"));
+    const auto& b = m.at("fam").at("case_b");
+    ASSERT_EQ(b.size(), 2u);
+    EXPECT_EQ(b[0].signature, "*");
+    EXPECT_TRUE(co::probe_row_applies(b[0], "macos"));
+    EXPECT_FALSE(co::probe_row_applies(b[0], "linux"));
+    EXPECT_TRUE(co::probe_row_applies(b[1], "linux"));
     for (const char* bad : {"fam\tcase\n", "fam\tcase\tshort\n", "\tcase\t0123456789abcdef\n",
-                            "fam\t\t0123456789abcdef\n", "fam\tcase\t0123456789abcdef\textra\n",
-                            "fam\tc\t0123456789abcdef\nfam\tc\t0123456789abcdef\n"}) {
+                            "fam\t\t0123456789abcdef\n", "fam\tcase\t0123456789abcdef\tbeos\n",
+                            "fam\tcase\t0123456789abcdef\tlinux\textra\n",
+                            "fam\tc\t0123456789abcdef\nfam\tc\tfedcba9876543210\n",
+                            "fam\tc\t0123456789abcdef\tlinux\nfam\tc\t*\tlinux,windows\n"}) {
         {
             std::ofstream(p) << bad;
         }
@@ -379,9 +389,18 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
     co::ProbeBaseline baselines;
     ASSERT_TRUE(co::load_probe_baseline(data_dir() + "/probe_baseline.tsv", &baselines, &err)) << err;
     const bool probe = GetParam().rfind("probe_", 0) == 0 || baselines.count(GetParam()) != 0;
-    const std::map<std::string, std::string> empty_rows;
+    const std::map<std::string, std::vector<co::ProbeRow>> empty_rows;
     const auto rows_it = baselines.find(GetParam());
-    const std::map<std::string, std::string>& rows = rows_it == baselines.end() ? empty_rows : rows_it->second;
+    const auto& rows = rows_it == baselines.end() ? empty_rows : rows_it->second;
+    // The row for this case that applies on this host, or null.
+    const std::string platform = PROSPER_ORACLE_PLATFORM;
+    const auto row_for = [&](const std::string& id) -> const co::ProbeRow* {
+        const auto it = rows.find(id);
+        if (it == rows.end()) return nullptr;
+        for (const co::ProbeRow& r : it->second)
+            if (co::probe_row_applies(r, platform)) return &r;
+        return nullptr;
+    };
     size_t differing = 0;
     std::set<std::string> seen_differing;
 
@@ -415,13 +434,13 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
             const std::string sig = co::probe_signature(diff);
             // `[probe-row]` is the line to put in probe_baseline.tsv once the difference has been reviewed.
             std::printf("[probe-row] %s\t%s\t%s\n", GetParam().c_str(), c.id.c_str(), sig.c_str());
-            const auto row = rows.find(c.id);
-            if (row == rows.end())
-                ADD_FAILURE() << c.id << " (" << c.func << "): differs from the console and is not in probe_baseline.tsv: "
-                              << diff;
-            else if (row->second != sig)
+            const co::ProbeRow* row = row_for(c.id);
+            if (!row)
+                ADD_FAILURE() << c.id << " (" << c.func << "): differs from the console on " << platform
+                              << " and has no applicable row in probe_baseline.tsv: " << diff;
+            else if (row->signature != "*" && row->signature != sig)
                 ADD_FAILURE() << c.id << " (" << c.func << "): its difference changed from the baselined one (signature "
-                              << row->second << " -> " << sig << "); review it, then update the row: " << diff;
+                              << row->signature << " -> " << sig << "); review it, then update the row: " << diff;
         } else {
             ADD_FAILURE() << c.id << " (" << c.func << "): " << diff;
         }
@@ -431,10 +450,11 @@ TEST_P(ConsoleOracleReplay, MatchesConsole) {
     std::printf("[oracle] %s: %zu match the console, %zu known gaps, %zu differ (probe), %zu unmeasured\n",
                 GetParam().c_str(), matched, expected_gaps, differing, skipped);
     if (probe) {
-        for (const auto& [id, sig] : rows)
-            if (!seen_differing.count(id))
-                ADD_FAILURE() << id << ": listed in probe_baseline.tsv but no longer differs from the console (or is gone "
-                              << "from the golden) -- progress: remove the row";
+        for (const auto& entry : rows)
+            if (row_for(entry.first) && !seen_differing.count(entry.first))
+                ADD_FAILURE() << entry.first << ": listed in probe_baseline.tsv for " << platform
+                              << " but no longer differs from the console (or is gone from the golden) -- progress: "
+                              << "remove or narrow the row";
     }
 }
 

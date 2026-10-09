@@ -76,7 +76,10 @@ a difference with no row fails, a row whose case now matches fails (delete it), 
 difference changed fails. The signature hashes the difference with command-buffer payload hex collapsed
 to the dword count, because prosper's builders write prosper's own packets and the count is the ABI
 contract (`docs/gpu/AGC_PACKET_SIZES.md`): a builder that grows a dword changes it. A raised baseline is
-a visible added line. After reviewing the differences, regenerate the rows from the replay's
+a visible added line. A row may carry a fourth column, a comma list of `linux`, `windows`, `macos`: prosper's
+HLE answers some calls differently per host (key deletion, `munmap` of unmapped memory, try-locks), and the
+row says where. A signature of `*` accepts any difference on that host; use it only until that host has
+been measured. After reviewing the differences, regenerate the rows from the replay's
 `[probe-row]` lines (sorted, one family at a time).
 
 Baselined today: `agcbuild`, `kernelx`, `nethttp`, `posix`. Five `kernelx` cases are deliberately absent:
