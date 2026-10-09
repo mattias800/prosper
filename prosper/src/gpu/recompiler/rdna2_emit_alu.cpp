@@ -8340,31 +8340,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
 
-            // IMAGE_GET_LOD (0x60): RDNA2 returns {sampler-clamped LOD, raw LOD}; SPIR-V's
-            // OpImageQueryLod returns the same pair. House of the Dead 2's Unity scene shaders use
-            // the ordinary non-NSA 2D form in fragment programs. Keep every unverified dimension,
-            // Table 100 control, address shape, and output component fail-visible rather than guessing.
+            // IMAGE_GET_LOD (0x60): rdna2_emit_image_lod.cpp.
             if (in.opcode == 0x60) {
-                if (!b.is_fragment || res->cls != ResourceClass::Texture ||
-                    in.mimg_dim != SQ_DIM_2D || res->img_dim != SQ_DIM_2D ||
-                    in.len_dwords != 2u || mimg_get_lod_has_unmodeled_controls(in) ||
-                    !(in.mimg_dmask & 0x3u) || (in.mimg_dmask & ~0x3u) ||
-                    res->unnormalized || res->depth_compare ||
-                    !b.declare_texture(res->binding, Dim_2D, uint_texture)) {
-                    ok = false;
-                    return true;
-                }
-                uint32_t out[2];
-                b.image_get_lod_2d(res->binding, vread(in.src[0].value),
-                                   vread(in.src[0].value + 1), out);
-                int vd = in.dst.value, written = 0;
-                for (uint32_t component = 0; component < 2; ++component) {
-                    if (!(in.mimg_dmask & (1u << component))) continue;
-                    const uint32_t old = vreg_old(b, rs, vd + written);
-                    rs.vreg[vd + written] = out[component];
-                    predicate_write(b, rs, vd + written, old);
-                    ++written;
-                }
+                ok = emit_image_get_lod(b, rs, in, *res, uint_texture);
                 return true;
             }
 
@@ -8431,6 +8409,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // quad whose lanes differ may get a neighbouring mip per pixel. How the hardware reduces
             // a quad to one LOD (lane 0, an average) is not established. Only quad-uniform is tested.
             const bool is_sample_d = (in.opcode == 0x22) || (in.opcode == 0x68);
+            // image_sample_c (0x28) / image_sample_o (0x30) on a one-level 2D texture (#4808):
+            // mimg_single_level_implicit_form in rdna2_alu_support.hpp has the contract.
+            const bool is_sample_c = in.opcode == 0x28 && mimg_single_level_implicit_form(in, *res);
+            const bool is_sample_o = in.opcode == 0x30 && mimg_single_level_implicit_form(in, *res);
             // These array lowerings preserve the guest's layer operand. The older generic
             // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.
@@ -8462,9 +8444,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fprintf(stderr, "[recompile] 2D_ARRAY image op: resource %s an uploaded array (#325)\n",
                         res_arrayed ? "IS" : "is NOT");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
-                 !is_sample_c_lz && !is_gather_lz && !is_gather &&
-                 !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
-                (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
+                 !is_sample_c_lz && !is_gather_lz && !is_gather && !is_gather_lz_o &&
+                 !is_sample_lz_o && !is_sample_d && !is_sample_c && !is_sample_o) ||
+                (!dim2d && !dim3d && !dimcube && !dim_msaa)) {
+                ok = false;
+                return true;
+            }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // #3048: the guest's mip selector no longer has to be discarded. When the compute
             // backend materializes this resource's whole declared chain -- one derivation,
@@ -8717,7 +8702,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);
                 else                b.image_sample_lod_3d(res->binding, cu, cv, cw,
                                                           b.uconst(0), out);   // _lz: base level
-            } else if (is_sample_c_lz) {
+            } else if (is_sample_c_lz || is_sample_c) {
                 // Astro Bot shadow/visibility packet (opcode 0x2f, dim 2D_ARRAY, NSA). ISA 8.2.5
                 // vaddr order is "{offset}{bias}{z-compare}{derivative}{body}" — the z-compare
                 // reference PRECEDES the coordinates, so SAMPLE_C_LZ 2D_ARRAY reads
@@ -8892,13 +8877,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         normalized_spatial(vread(cvg(1)), res->width),
                         normalized_spatial(vread(cvg(2)), res->height),
                         vread(cvg(0)), out);
+                } else if (is_sample_o) {   // vaddr order for _o: [packed offset, u, v]
+                    b.image_sample_offset_2d(
+                        res->binding, normalized_spatial(vread(cvg(1)), res->width),
+                        normalized_spatial(vread(cvg(2)), res->height), vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(
                         res->binding,
                         normalized_spatial(vread(cvg(1)), res->width),
                         normalized_spatial(vread(cvg(2)), res->height),
                         vread(cvg(0)), out);
-                } else if (is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
+                } else if (
+                    is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
                     b.image_sample_grad_2d(
                         res->binding,
                         normalized_spatial(vread(cvg(4)), res->width),
