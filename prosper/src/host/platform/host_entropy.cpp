@@ -19,7 +19,8 @@ namespace prosper::host {
 
 bool host_entropy_fill(void* dst, std::size_t bytes) {
 #ifdef _WIN32
-    return BCryptGenRandom(nullptr, (PUCHAR)dst, (ULONG)bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+    return BCryptGenRandom(nullptr, (PUCHAR)dst, (ULONG)bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) ==
+           0;
 #else
     auto* p = static_cast<unsigned char*>(dst);
     while (bytes) {

@@ -38,6 +38,8 @@ fault-free write watch could ever track (the `[validation-census]` exit summary)
 
 **`host_entropy.hpp`** is the host CSPRNG (getentropy / BCryptGenRandom) behind every HLE that
 hands the guest random bytes. Use it rather than another per-file BCryptGenRandom copy.
+**`null_device.hpp`** opens the host null device read-only above stdio, for an HLE object that
+needs a real descriptor but answers its own reads (the guest's served `/dev/urandom`).
 
 **This folder is also where the host-platform seam grows**: one interface per OS service (virtual
 memory, futex, threads, fibers, fault install, clocks, files) with one backend file per OS, so

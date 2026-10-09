@@ -278,7 +278,7 @@ platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
 # policy lives in a companion. Linux granule proof and unsupported-host refusal remain separate.
 platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 20
 platform-ifdef|prosper/src/hle/np/np.cpp 2
-platform-ifdef|prosper/src/hle/service/hle_service.cpp 4
+platform-ifdef|prosper/src/hle/service/hle_service.cpp 2
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
 platform-ifdef|prosper/src/hle/sync/hle_fiber.cpp 24
 platform-ifdef|prosper/src/hle/sync/hle_ult.cpp 3

@@ -28,10 +28,22 @@
 //   M2  unmapped_errno() answers ENOENT for every operation
 //       -> RootLevelNamespaceChanges, RootLevelCreateOpen, RenameAcross, RelativePaths
 //   M3  f_open treats O_CREAT as a lookup       -> RootLevelCreateOpen, RelativePaths
-//   M4  a relative path is not rooted at the guest root, so it names the host's working
-//       directory again                         -> RelativePaths
+//   M4  the line rooting a relative path at the guest root is deleted, so a relative spelling of
+//       a mount ("app0/fixture.bin") falls outside every mount   -> RelativeMountSpelling
+//   M6  "/dev/urandom" is not a served device (guest_device_named answers nothing)
+//       -> RandomDevices*
+//   M7  a device descriptor's read is not intercepted (it reads the null backing object)
+//       -> RandomDevicesReadEntropy
+//   M8  closing a device descriptor leaves its mark, so the closed number still reads entropy
+//       -> RandomDeviceMarkDoesNotOutliveItsDescriptor
+//   M9  only ".." (not ".") triggers normalization, so "/." is absent  -> DotSpellings...
+// (The PlayGo half of the review is guarded in test_service_getters: dropping the empty-/app0 guard
+// in discover_playgo_chunks() reddens ServiceGetters.Contract.)
 //   M5  a mount with an empty host root is served, composing "<empty>/sub" on the host's root
 //       -> LookupsAndDeepPaths (/savedata0), UnconfiguredApp0
+// The recorder below defines open/openat. A fortified <fcntl.h> declares them as inline wrappers,
+// which would collide with those definitions, so this file is built unfortified.
+#undef _FORTIFY_SOURCE
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
@@ -46,8 +58,12 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 #if defined(__linux__)
+#include <cstdarg>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mutex>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -89,10 +105,10 @@ uint64_t ptr(const void* p) {
     return (uint64_t)(uintptr_t)p;
 }
 
-uint64_t call(const char* name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
+uint64_t call(const char* name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0) {
     HleFn fn = Hle::lookup(nid_hash(name));
     EXPECT_NE(fn, nullptr) << name << " is registered";
-    return fn ? fn(a, b, c, 0, 0, 0) : ~uint64_t{0};
+    return fn ? fn(a, b, c, d, 0, 0) : ~uint64_t{0};
 }
 
 struct PosixResult {
@@ -121,6 +137,13 @@ protected:
         fs::remove_all(root_, ec);
         fs::create_directories(root_ / "app0");
         { std::ofstream(root_ / "app0" / "fixture.bin", std::ios::binary) << "app0"; }
+        // resolve_guest() re-roots an empty /app0 from PROSPER_APP0, so a developer's exported
+        // variable must not decide what these cases see.
+#ifdef _WIN32
+        _putenv_s("PROSPER_APP0", "");
+#else
+        unsetenv("PROSPER_APP0");   // NOLINT(concurrency-mt-unsafe): before any thread starts
+#endif
         register_file_hle();
         set_app0_root((root_ / "app0").string());
 #if defined(__linux__)
@@ -135,12 +158,14 @@ protected:
 
     // The recorded host calls whose path names something this test only ever spelled as a guest
     // path outside the mounts.
-    static std::vector<std::string> leaked_host_calls() {
+    static std::vector<std::string> leaked_host_calls(const char* marker = kMarker) {
         std::vector<std::string> leaked;
 #if defined(__linux__)
         std::lock_guard<std::mutex> lock(g_record_mx);
         for (const auto& entry : g_recorded)
-            if (entry.find(kMarker) != std::string::npos) leaked.push_back(entry);
+            if (entry.find(marker) != std::string::npos) leaked.push_back(entry);
+#else
+        (void)marker;
 #endif
         return leaked;
     }
@@ -173,6 +198,50 @@ extern "C" int rename(const char* from, const char* to) noexcept {
     static auto real = real_symbol<int (*)(const char*, const char*)>("rename");
     return real ? real(from, to) : (errno = ENOSYS, -1);
 }
+// open/openat, in both the plain and the LFS spelling, so a create or a lookup that reached the
+// host is seen too. The mode is read only when the flags say one was passed.
+namespace {
+mode_t open_mode(int flags, va_list args) {
+    return (flags & O_CREAT) || (flags & __O_TMPFILE) == __O_TMPFILE ? (mode_t)va_arg(args, int)
+                                                                     : 0;
+}
+}   // namespace
+extern "C" int open(const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const mode_t mode = open_mode(flags, args);
+    va_end(args);
+    record_host_call("open", path);
+    static auto real = real_symbol<int (*)(const char*, int, ...)>("open");
+    return real ? real(path, flags, mode) : (errno = ENOSYS, -1);
+}
+extern "C" int open64(const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const mode_t mode = open_mode(flags, args);
+    va_end(args);
+    record_host_call("open", path);
+    static auto real = real_symbol<int (*)(const char*, int, ...)>("open64");
+    return real ? real(path, flags, mode) : (errno = ENOSYS, -1);
+}
+extern "C" int openat(int dir, const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const mode_t mode = open_mode(flags, args);
+    va_end(args);
+    record_host_call("openat", path);
+    static auto real = real_symbol<int (*)(int, const char*, int, ...)>("openat");
+    return real ? real(dir, path, flags, mode) : (errno = ENOSYS, -1);
+}
+extern "C" int openat64(int dir, const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const mode_t mode = open_mode(flags, args);
+    va_end(args);
+    record_host_call("openat", path);
+    static auto real = real_symbol<int (*)(int, const char*, int, ...)>("openat64");
+    return real ? real(dir, path, flags, mode) : (errno = ENOSYS, -1);
+}
 
 // Positive control: the recorder sees prosper_core's calls. Without it, every "no host call" arm
 // below would pass on a recorder that was never linked in.
@@ -181,11 +250,26 @@ TEST_F(GuestNamespace, RecorderSeesTheMountedPathsHostCalls) {
     EXPECT_EQ(call("mkdir", ptr(guest.c_str()), 0777), 0u);
     EXPECT_EQ(call("rmdir", ptr(guest.c_str())), 0u);
     const auto seen = leaked_host_calls();
-    ASSERT_EQ(seen.size(), 2u) << "the mapped mkdir and rmdir both reached the recorder";
-    EXPECT_EQ(seen[0].rfind("mkdir ", 0), 0u);
-    EXPECT_EQ(seen[1].rfind("rmdir ", 0), 0u);
-    EXPECT_NE(seen[0].find((root_ / "app0").string()), std::string::npos)
-        << "the recorded path is the mount's host path: " << seen[0];
+    auto saw = [&](const char* op) {
+        for (const auto& entry : seen)
+            if (entry.rfind(op, 0) == 0 &&
+                entry.find((root_ / "app0").string()) != std::string::npos)
+                return true;
+        return false;
+    };
+    EXPECT_TRUE(saw("mkdir ")) << "the mapped mkdir reached the recorder with its host path";
+    EXPECT_TRUE(saw("rmdir ")) << "the mapped rmdir reached the recorder with its host path";
+    // The open interposer is armed too.
+    { std::ofstream(root_ / "app0" / "prosper_4782_control_file", std::ios::binary) << "x"; }
+    const uint64_t fd = call("sceKernelOpen", ptr("/app0/prosper_4782_control_file"), 0, 0);
+    EXPECT_LT(fd, 0x80000000u);
+    if (fd < 0x80000000u) call("sceKernelClose", fd);
+    bool opened = false;
+    for (const auto& entry : leaked_host_calls())
+        if (entry.rfind("open", 0) == 0 &&
+            entry.find("prosper_4782_control_file") != std::string::npos)
+            opened = true;
+    EXPECT_TRUE(opened) << "the mapped open reached the open recorder";
 }
 #endif
 
@@ -221,6 +305,8 @@ TEST_F(GuestNamespace, RootLevelCreateOpenAnswersErofs) {
     EXPECT_EQ(errno, EROFS);
     // Without O_CREAT the open is a lookup, and nothing is there.
     EXPECT_EQ(call("sceKernelOpen", ptr(kRootName), kGuestOWriteOnly, 0), kSceEnoent);
+    EXPECT_TRUE(leaked_host_calls().empty())
+        << "a root-level guest name reached a host call: " << leaked_host_calls().front();
 }
 
 TEST_F(GuestNamespace, RenameAcrossTheMountBoundaryAnswersErofs) {
@@ -362,3 +448,127 @@ TEST_F(GuestNamespace, UnconfiguredApp0IsNotTheHostRoot) {
         << "the configured mount is unaffected";
 }
 #endif
+
+// M4: the rooting line matters only for a relative spelling of a mount. Rooted, "app0/fixture.bin"
+// is "/app0/fixture.bin"; unrooted, it would fall outside every mount.
+TEST_F(GuestNamespace, RelativeMountSpellingResolvesThroughTheMount) {
+    const uint64_t fd = call("sceKernelOpen", ptr("app0/fixture.bin"), 0, 0);
+    ASSERT_LT(fd, 0x80000000u) << "the relative spelling of /app0 opens the mounted file";
+    char bytes[8] = {};
+    EXPECT_EQ(call("sceKernelRead", fd, ptr(bytes), sizeof bytes), 4u);
+    EXPECT_EQ(std::string(bytes, 4), "app0");
+    call("sceKernelClose", fd);
+}
+
+// "/." and a relative "." are the root, as "/" and "/app0/.." are (#1234/#1323).
+TEST_F(GuestNamespace, DotSpellingsAreTheVirtualRoot) {
+    const std::string root = resolve_guest_path("/");
+    ASSERT_FALSE(root.empty());
+    EXPECT_EQ(resolve_guest_path("/."), root);
+    EXPECT_EQ(resolve_guest_path("/./"), root);
+    for (const char* spelling : {"/.", "."}) {
+        const uint64_t fd = call("sceKernelOpen", ptr(spelling), 0, 0);
+        EXPECT_LT(fd, 0x80000000u) << spelling << " opens as the virtual root";
+        if (fd < 0x80000000u) call("sceKernelClose", fd);
+    }
+    // A "." component inside a mount is the same file.
+    EXPECT_EQ(resolve_guest_path("/app0/./fixture.bin"), resolve_guest_path("/app0/fixture.bin"));
+}
+
+namespace {
+constexpr uint64_t kSceEbadf = 0x80020009ull;
+constexpr uint64_t kSceEacces = 0x8002000dull;
+constexpr uint64_t kSceEexist = 0x80020011ull;
+constexpr uint64_t kGuestONonblock = 0x0004;
+constexpr uint64_t kGuestOExclusive = 0x0800;
+
+bool is_error(uint64_t sce_result) {
+    return sce_result >= 0x80000000u;
+}
+}   // namespace
+
+// Every IL2CPP title's crypto provider opens /dev/urandom O_RDONLY, falls back to /dev/random with
+// O_NONBLOCK, and reads 16 bytes (The Messenger's eboot +0xab8b50). Both must be served, from the
+// host CSPRNG, without the guest's spelling reaching the host.
+TEST_F(GuestNamespace, RandomDevicesReadEntropy) {
+    struct Name {
+        const char* path;
+        uint64_t flags;
+    };
+    for (const Name& n : {Name{"/dev/urandom", 0}, Name{"/dev/random", kGuestONonblock}}) {
+        const uint64_t fd = call("sceKernelOpen", ptr(n.path), n.flags, 0);
+        ASSERT_FALSE(is_error(fd)) << n.path << " opens";
+        uint8_t first[16], second[16];
+        std::memset(first, 0, sizeof first);
+        std::memset(second, 0, sizeof second);
+        EXPECT_EQ(call("sceKernelRead", fd, ptr(first), sizeof first), 16u) << n.path;
+        EXPECT_EQ(call("read", fd, ptr(second), sizeof second), 16u) << n.path;
+        // Two 128-bit draws from a CSPRNG collide with probability 2^-128; zeros mean "not filled".
+        EXPECT_NE(std::memcmp(first, second, sizeof first), 0) << n.path << " returns fresh bytes";
+        static const uint8_t zeros[16] = {};
+        EXPECT_NE(std::memcmp(first, zeros, sizeof zeros), 0) << n.path << " filled the buffer";
+        uint8_t positioned[8] = {};
+        EXPECT_EQ(call("sceKernelPread", fd, ptr(positioned), sizeof positioned, 1 << 20), 8u);
+        // Written through: the descriptor is read-only, as a write to an O_RDONLY descriptor is.
+        EXPECT_EQ(call("sceKernelWrite", fd, ptr(first), sizeof first),
+                  0xffffffff00000000ull | kSceEbadf);
+        call("sceKernelClose", fd);
+    }
+    EXPECT_TRUE(leaked_host_calls("random").empty())
+        << "the guest's device spelling reached a host call: "
+        << leaked_host_calls("random").front();
+}
+
+TEST_F(GuestNamespace, RandomDevicesAreServedReadOnly) {
+    const char* dev = "/dev/urandom";
+    EXPECT_EQ(call("sceKernelOpen", ptr(dev), kGuestOWriteOnly, 0), kSceEacces);
+    EXPECT_EQ(call("sceKernelOpen", ptr(dev), kGuestOCreate | kGuestOExclusive, 0600), kSceEexist);
+    uint8_t stat_buffer[0x78] = {};
+    EXPECT_EQ(call("sceKernelStat", ptr(dev), ptr(stat_buffer)), 0u);
+    uint16_t mode = 0;
+    std::memcpy(&mode, stat_buffer + 0x08, sizeof mode);
+    EXPECT_EQ(mode & 0xf000u, 0x2000u) << "a character device";
+    EXPECT_EQ(call("sceKernelCheckReachability", ptr(dev)), 0u);
+    EXPECT_EQ(call("access", ptr(dev), 4 /*R_OK*/), 0u);
+    const PosixResult writable = posix("access", ptr(dev), 2 /*W_OK*/);
+    EXPECT_EQ(writable.result, kPosixFailure);
+    EXPECT_EQ(writable.error, EACCES);
+    EXPECT_EQ(call("sceKernelUnlink", ptr(dev)), kSceEacces);
+    EXPECT_EQ(call("sceKernelMkdir", ptr(dev), 0777), kSceEexist);
+    EXPECT_EQ(call("sceKernelRename", ptr("/app0/fixture.bin"), ptr(dev)), kSceEacces);
+    EXPECT_EQ(read_file(root_ / "app0" / "fixture.bin"), "app0");
+    // The HLE stdio path cannot serve entropy, so it refuses visibly (titles with libc.prx never
+    // reach it).
+    errno = 0;
+    EXPECT_EQ(call("fopen", ptr(dev), ptr("r")), 0u);
+    EXPECT_EQ(errno, ENODEV);
+    // No other /dev name is served: its parent is not listed, so it is absent.
+    EXPECT_EQ(call("sceKernelOpen", ptr("/dev/prosper_4782_null"), 0, 0), kSceEnoent);
+    EXPECT_EQ(call("sceKernelMkdir", ptr("/dev/prosper_4782_dir"), 0777), kSceEnoent);
+    EXPECT_TRUE(leaked_host_calls().empty())
+        << "an unserved /dev name reached a host call: " << leaked_host_calls().front();
+}
+
+// The device mark follows the descriptor: a dup is a device too, and a closed number that is
+// reused for a file reads the file.
+TEST_F(GuestNamespace, RandomDeviceMarkDoesNotOutliveItsDescriptor) {
+    const uint64_t dev = call("sceKernelOpen", ptr("/dev/urandom"), 0, 0);
+    ASSERT_FALSE(is_error(dev));
+    const uint64_t copy = call("sceKernelDup", dev);
+    ASSERT_FALSE(is_error(copy));
+    EXPECT_EQ(call("sceKernelClose", dev), 0u);
+    uint8_t bytes[16] = {};
+    EXPECT_EQ(call("sceKernelRead", dev, ptr(bytes), sizeof bytes),
+              0xffffffff00000000ull | kSceEbadf)
+        << "a closed device descriptor is closed, not a source of entropy";
+    EXPECT_EQ(call("sceKernelRead", copy, ptr(bytes), sizeof bytes), 16u) << "the dup is a device";
+    EXPECT_EQ(call("sceKernelClose", copy), 0u);
+    const uint64_t file = call("sceKernelOpen", ptr("/app0/fixture.bin"), 0, 0);
+    ASSERT_FALSE(is_error(file));
+    ASSERT_TRUE(file == dev || file == copy)
+        << "precondition: the file reuses a closed device descriptor number (got " << file << ")";
+    char text[8] = {};
+    EXPECT_EQ(call("sceKernelRead", file, ptr(text), sizeof text), 4u);
+    EXPECT_EQ(std::string(text, 4), "app0");
+    call("sceKernelClose", file);
+}

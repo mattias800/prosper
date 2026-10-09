@@ -53,7 +53,7 @@
 #include <windows.h>
 #else
 #include <sys/stat.h>   // mkdir
-#include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
+#include <sys/uio.h>   // process_vm_readv: fault-contained diagnostic snapshots
 #include <unistd.h>
 #endif
 #include "hle/service/service_trace.hpp"
@@ -910,6 +910,14 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     bool saw_iostore_index = false;
     std::error_code ec;
     const fs::path app0(resolve_guest_path("/app0"));
+    // No /app0 mounted: nothing to inventory. resolve_guest_path() answers "" for an unserved path
+    // (#4782), and composing below from "" would read sce_sys/ and the pak tree relative to the
+    // HOST's working directory. Answer what an empty dump answers: the non-IoStore chunk 0.
+    if (app0.empty()) {
+        std::fprintf(stderr, "[playgo] /app0 is not mounted; reporting only chunk 0\n");
+        chunks.push_back(0);
+        return chunks;
+    }
 
     // CONFIDENCE: HIGH — the fixed plgx header/table fields agree across nine local PS5
     // declarations; 007 queries ordinal 1 from its two-record manifest (#4030). Read only the
