@@ -480,3 +480,78 @@ TEST(ScalarPairMask, ADispatcherReloadedFabricatedExecPairStillRefuses) {
         {&kPrefix, &one_path, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
     EXPECT_TRUE(compile_whole(Stage::Fragment, code).empty());
 }
+
+// A v_readlane result is defined only when the slot it reads is (#4749 review): a fabricated word
+// spilled into v21, read back into s[44:45] and re-spilled into v20 before the dispatcher would
+// otherwise reach the EXEC restore as a defined slot. Each chain row puts a different source in
+// front of kWriteLanes, so the restore that refuses is the dispatcher-reloaded one. Fragment only:
+// on compute even the EXEC control below refuses at the restore (with and without this rule), so a
+// compute refusal there could not tell the relay from that.
+// NOLINTBEGIN(bugprone-throwing-static-initialization): fixture instruction words, as above.
+namespace {
+// v_writelane v21, s50, 0 | v_writelane v21, s51, 1
+const Words kSpillS50ToV21 = {0xd7610015u, 0x00010032u, 0xd7610015u, 0x00010233u};
+// v_readlane s44, v21, 0 | v_readlane s45, v21, 1
+const Words kReadV21ToS44 = {0xd760002cu, 0x00010115u, 0xd760002du, 0x00010315u};
+// v_readlane s46, v21, 0 | v_readlane s47, v21, 1 | s_mov_b64 s[44:45], s[46:47]
+const Words kReadV21ViaS46 = {0xd760002eu, 0x00010115u, 0xd760002fu, 0x00010315u, 0xbeac042eu};
+// s_cmp_eq_u32 s0, 0 | s_cbranch_scc1 +2 | s_mov_b32 s50, -1 | s_mov_b32 s51, -1
+const Words kS50OnOnePath = {0xbf068000u, 0xbf850002u, 0xbeb203c1u, 0xbeb303c1u};
+const Words kS50FromExec = {0xbeb2047eu};   // s_mov_b64 s[50:51], exec
+// v_readlane s6, v21, 0 | v_readlane s7, v21, 1: v21 read back into the pair EXEC is later
+// restored from, with no second spill.
+const Words kReadV21ToS6 = {0xd7600006u, 0x00010115u, 0xd7600007u, 0x00010315u};
+const Words kRestoreS6 = {0xbefe0406u};   // s_mov_b64 exec, s[6:7]
+const Words kNothing = {};
+
+// Every chain row's code: `source` + the v21 round trip (`relay`) + kWriteLanes + the dispatcher.
+Words relay_chain(const Words& source, const Words& relay) {
+    return cat({&kPrefix, &source, &kSpillS50ToV21, &relay, &kWriteLanes, &kDispatcherBody,
+                &kReadLanesAndRestore, &kExecTail});
+}
+
+// The refusal is the restore itself, at its own pc. Inside a dispatcher case the guard's refusal
+// reaches the terminal line as the case's unresolved operand, as for the PR's own dispatcher arm.
+void expect_restore_refused(const Words& code, uint32_t restore_word) {
+    EXPECT_TRUE(compile_whole(Stage::Fragment, code).empty());
+    size_t pc = 0;
+    while (pc < code.size() && code[pc] != restore_word) ++pc;
+    const std::string reason = last_terminal_reject_reason(kAddress);
+    EXPECT_NE(reason.find("mode=unresolved-operand pc=" + std::to_string(pc) + " "),
+              std::string::npos)
+        << "not refused at the restore: " << reason;
+}
+}   // namespace
+// NOLINTEND(bugprone-throwing-static-initialization)
+
+TEST(ScalarPairMask, ADefinedWordRelayedThroughAReadlaneCompiles) {
+    // Control: s[50:51] holds EXEC, so v21's slots and the readlane'd s[44:45] are all defined.
+    EXPECT_FALSE(compile_whole(Stage::Fragment, relay_chain(kS50FromExec, kReadV21ToS44)).empty())
+        << last_terminal_reject_reason(kAddress);
+    EXPECT_FALSE(compile_whole(Stage::Fragment, relay_chain(kS50FromExec, kReadV21ViaS46)).empty())
+        << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, ANeverWrittenWordRelayedThroughAReadlaneRefuses) {
+    expect_restore_refused(relay_chain(kNothing, kReadV21ToS44), 0xbefe0406u);
+}
+
+TEST(ScalarPairMask, AOnePathWordRelayedThroughAReadlaneRefuses) {
+    expect_restore_refused(relay_chain(kS50OnOnePath, kReadV21ToS44), 0xbefe0406u);
+}
+
+TEST(ScalarPairMask, ARelayedWordCopiedBeforeTheSpillRefuses) {
+    // The readlane result reaches slot B through an s_mov_b64, not directly.
+    expect_restore_refused(relay_chain(kNothing, kReadV21ViaS46), 0xbefe0406u);
+    expect_restore_refused(relay_chain(kS50OnOnePath, kReadV21ViaS46), 0xbefe0406u);
+}
+
+TEST(ScalarPairMask, AReadlanedFabricatedWordCrossingTheDispatcherRefuses) {
+    // No second spill: s[6:7] is read back from v21 BEFORE the dispatcher and restored after it.
+    const Words never =
+        cat({&kPrefix, &kSpillS50ToV21, &kReadV21ToS6, &kDispatcherBody, &kRestoreS6, &kExecTail});
+    const Words one_path = cat({&kPrefix, &kS50OnOnePath, &kSpillS50ToV21, &kReadV21ToS6,
+                                &kDispatcherBody, &kRestoreS6, &kExecTail});
+    expect_restore_refused(never, 0xbefe0406u);
+    expect_restore_refused(one_path, 0xbefe0406u);
+}

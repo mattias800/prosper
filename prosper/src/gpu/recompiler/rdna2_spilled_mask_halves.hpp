@@ -13,6 +13,8 @@
 
 namespace prosper::gpu {
 
+struct RegState;
+
 // One 32-bit half of a saved B64 mask pair. `def_pc` names the INSTANCE: the pc of the mask write
 // that defined the pair. A new write at that pc ends every older fact naming it, so on any one
 // path all live facts with the same `def_pc` describe the same value.
@@ -32,16 +34,30 @@ struct SpilledMaskHalves {
     // possibly fabricated except these, so a spill/restore of defined words reads back as defined
     // while one spilled from a fabricated word still refuses (#4714). Any stage.
     std::set<std::pair<int, int>> defined_slots;
+    // SGPR words, and SCC as `kRelayedScc`, that may hold a word V_READLANE read from a slot
+    // outside `defined_slots`, directly or through scalar instructions reading one. A MAY fact
+    // (union at joins). The MUST scalar-word analysis counts every V_READLANE result as written,
+    // so without it a fabricated word relayed through one slot re-spills into another as defined,
+    // or crosses a dispatcher edge as a defined SGPR (#4749 review).
+    std::set<int> relayed_words;
     bool operator==(const SpilledMaskHalves&) const = default;
 };
+inline constexpr int kRelayedScc = 253;
 
-// CFG join: keep only the facts every incoming path agrees on.
+// CFG join: keep only the facts every incoming path agrees on (`relayed_words`, a MAY fact, takes
+// every path's).
 void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& incoming);
 
-// The transfer of `defined_slots` for one instruction (`masks` and `scalar_words` are the MUST sets).
-void advance_defined_spill_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
-                                 const std::set<int>& masks, const std::set<int>& scalar_words,
-                                 const std::vector<int>& vector_writes);
+// The transfer of `defined_slots` and `relayed_words` for one instruction (`masks` and
+// `scalar_words` are the MUST sets; `scalar_writes` the (base, width) SGPR ranges `in` writes).
+void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
+                           const std::set<int>& masks, const std::set<int>& scalar_words,
+                           const std::vector<std::pair<int, uint32_t>>& scalar_writes,
+                           const std::vector<int>& vector_writes);
+
+// At a dispatcher block entry: the reloaded SGPR words (and SCC) that may be relayed fabricated
+// words get the emitter's merge-placeholder mark, as they carried inside the case they left.
+void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs);
 
 // True when `in` is `s_mov_b64 dst, s[N:N+1]` and sN / sN+1 hold the low / high half of the same
 // saved-mask instance. Evaluated BEFORE `in`'s own transfer.

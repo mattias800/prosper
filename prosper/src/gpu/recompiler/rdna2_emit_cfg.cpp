@@ -2727,7 +2727,7 @@ bool emit_cfg_state_machine(
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
-            advance_defined_spill_slots(halves, in, masks, scalar_words, vector_writes);
+            advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes);
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
@@ -3639,13 +3639,13 @@ bool emit_cfg_state_machine(
         };
         // A slot never written on some path reloads the prologue's zero: mark every reloaded slot
         // (#4706) except one written on EVERY path from a defined word (defined_slots, #4714).
-        const auto& defined_slots =
-            wave64_spilled_halves_in[entry_block % starts.size()].defined_slots;
+        const SpilledMaskHalves& halves_in = wave64_spilled_halves_in[entry_block % starts.size()];
+        if (entry_wave64_b64) mark_relayed_words(halves_in, state);   // and relayed SGPRs, #4749
         for (const auto& kv : lv)
             if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
-                if (!(entry_wave64_b64 && defined_slots.contains(kv.first)))
+                if (!(entry_wave64_b64 && halves_in.defined_slots.contains(kv.first)))
                     state.lane_slot_merge_placeholder.insert(kv.first);
             }
         for (const auto& kv : lmv)
