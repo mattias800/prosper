@@ -47,7 +47,19 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         const uint32_t npl = len - 1;                   // payload dword count
 
         using K = Pm4Command::Kind;
-        if (c.op == IT_INDEX_TYPE) {
+        if (c.op == IT_DISPATCH_DIRECT) {
+            // Hardware PM4 Type-3 DISPATCH_DIRECT packet (GFX10 / RDNA2):
+            // payload: [0..2]=dimensions x/y/z, [3]=initiator / flags (ShaderDispatchModifier).
+            c.kind = K::DispatchDirect;
+            if (npl >= 3) { c.threads_x = pl[0]; c.threads_y = pl[1]; c.threads_z = pl[2]; }
+            if (npl >= 4) c.dispatch_modifier = pl[3];
+        } else if (c.op == IT_DISPATCH_INDIRECT) {
+            // Hardware PM4 Type-3 DISPATCH_INDIRECT packet (GFX10 / RDNA2):
+            // payload: [0]=data_offset, [1]=initiator / flags (ShaderDispatchModifier).
+            c.kind = K::DispatchIndirect;
+            if (npl >= 1) c.indirect_offset = pl[0];
+            if (npl >= 2) c.dispatch_modifier = pl[1];
+        } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
         } else if (c.op == IT_NUM_INSTANCES) {
