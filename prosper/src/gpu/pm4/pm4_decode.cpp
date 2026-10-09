@@ -59,6 +59,46 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.kind = K::DispatchIndirect;
             if (npl >= 1) c.indirect_offset = pl[0];
             if (npl >= 2) c.dispatch_modifier = pl[1];
+        } else if (c.op == IT_SET_BASE) {
+            // Hardware PM4 Type-3 SET_BASE packet (GFX10 / RDNA2):
+            // payload: [0]=base_index (1=indirect argument buffer), [1..2]=addr lo/hi.
+            c.kind = K::SetBaseIndirectArgs;
+            if (npl >= 1) c.indirect_shader_type = pl[0] & 1u;
+            if (npl >= 3) c.indirect_base = lo_hi(&pl[1]);
+        } else if (c.op == IT_DRAW_INDEX_AUTO) {
+            // Hardware PM4 Type-3 DRAW_INDEX_AUTO packet (GFX10 / RDNA2):
+            // payload: [0]=index_count, [1]=initiator / flags.
+            c.kind = K::DrawIndexAuto;
+            if (npl >= 1) c.index_count = pl[0];
+            if (npl >= 2) c.di_modifier = pl[1];
+        } else if (c.op == IT_DRAW_INDIRECT) {
+            // Hardware PM4 Type-3 DRAW_INDIRECT packet (GFX10 / RDNA2):
+            // payload: [0]=data_offset, [1]=initiator / flags.
+            c.kind = K::DrawIndirect;
+            if (npl >= 1) c.indirect_offset = pl[0];
+            if (npl >= 2) c.di_modifier = pl[1];
+        } else if (c.op == IT_DRAW_INDEX_INDIRECT) {
+            // Hardware PM4 Type-3 DRAW_INDEX_INDIRECT packet (GFX10 / RDNA2):
+            // payload: [0]=data_offset, [1]=initiator / flags.
+            c.kind = K::DrawIndexIndirect;
+            if (npl >= 1) c.indirect_offset = pl[0];
+            if (npl >= 2) c.di_modifier = pl[1];
+        } else if (c.op == IT_INDEX_BASE) {
+            // Hardware PM4 Type-3 INDEX_BASE packet (GFX10 / RDNA2):
+            // payload: [0..1]=addr lo/hi.
+            c.kind = K::SetIndexBase;
+            if (npl >= 2) c.ib_addr = lo_hi(pl);
+        } else if (c.op == IT_WRITE_DATA) {
+            // Hardware PM4 Type-3 WRITE_DATA packet (GFX10 / RDNA2):
+            // payload: [0]=control/dst, [1..2]=addr lo/hi, [3..]=inline data dwords.
+            c.kind = K::WriteData;
+            if (npl >= 3) c.wd_addr = lo_hi(&pl[1]);
+            if (npl >= 4) {
+                c.wd_declared_num = npl - 3;
+                c.wd_num = c.wd_declared_num;
+                c.wd_data = &pl[3];
+                c.wd_valid = true;
+            }
         } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
