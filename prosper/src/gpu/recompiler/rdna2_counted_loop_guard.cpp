@@ -218,7 +218,10 @@ bool mark_counted_loop_exec_guards(const std::vector<Rdna2Inst>& ins, const Coun
         }
         if (!side_effect_free) continue;
         safe.insert(branch.pc);
-        guarded_exec_regions.push_back({narrow_pc, restore_pc});
+        // Only a restore of the saved mask returns EXEC to what it was before the narrow. The
+        // direct form restores the full mask, so inside an outer guard that the wave skipped it
+        // would widen EXEC for the rest of the outer region: it never counts as balanced there.
+        if (saveexec) guarded_exec_regions.push_back({narrow_pc, restore_pc});
         if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
     }
     return guarded_narrow_entry;

@@ -87,6 +87,16 @@ const uint32_t kGuardThenWriteAfterRestore[] = {
     0xBF82FFFBu, 0x7E060D01u, 0xBEFE04C1u, 0x060606F2u, 0xBF810000u,
 };
 
+// N_nested. P1's direct guard inside an outer s_and_saveexec guard. The inner restore sets EXEC
+// to -1, not to the outer mask, so when the wave skips the outer region the linearized inner
+// restore would run the rest of it (v_add after pc 16) on every lane. Hand-placed displacements:
+// the outer execz at pc 4 targets its restore at pc 18, the inner at pc 6 targets pc 16.
+const uint32_t kDirectGuardInsideSaveexecGuard[] = {
+    0x7E000F00u, 0x7E060280u, 0x7D8800A0u, 0xBE8A246Au, 0xBF88000Du, 0xBEFE046Au, 0xBF880009u,
+    0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u,
+    0xBF82FFFBu, 0x7E060D01u, 0xBEFE04C1u, 0x060606F2u, 0xBEFE040Au, 0xBF810000u,
+};
+
 // Decode `code`, find its counted loop and report whether the guard branch at `execz_pc` was proven.
 template <size_t N>
 bool guard_proven(const uint32_t (&code)[N], uint32_t execz_pc) {
@@ -150,4 +160,11 @@ TEST(CountedLoopMovExecGuard, SwitchedOffLanesKeepTheirValueAndReturnAtTheRestor
     // Inside the guard only x < 32 add the loop's sum (10); after the restore every lane adds 1.
     for (uint32_t lane = 0; lane < kLanes; ++lane)
         EXPECT_FLOAT_EQ(got[lane], lane < 32 ? 11.0f : 1.0f) << "lane " << lane;
+}
+
+TEST(CountedLoopMovExecGuard, ADirectGuardIsNotABalancedRegionForAnOuterGuard) {
+    EXPECT_TRUE(guard_proven(kDirectGuardInsideSaveexecGuard, 6))
+        << "control: the inner direct guard is proven on its own";
+    EXPECT_FALSE(guard_proven(kDirectGuardInsideSaveexecGuard, 4))
+        << "its full-mask restore would widen EXEC inside an outer region the wave skipped";
 }
