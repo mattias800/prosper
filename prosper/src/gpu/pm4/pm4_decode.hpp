@@ -28,9 +28,13 @@ enum : uint32_t {
     IT_INDEX_TYPE = 0x2A,
     IT_NUM_INSTANCES = 0x2F,
     IT_EVENT_WRITE = 0x46,
+    IT_LOAD_UCONFIG_REG = 0x5E,
+    IT_LOAD_SH_REG = 0x63,
+    IT_LOAD_CONTEXT_REG = 0x64,
     IT_SET_CONTEXT_REG = 0x69,
     IT_SET_SH_REG = 0x76,
     IT_SET_UCONFIG_REG = 0x79,
+    IT_LOAD_CONTEXT_REG_INDEX = 0x9F,
     IT_INDIRECT_BUFFER = 0x3F,   // sceAgcCbBranch's 14-dword conditional form (#4540)
 };
 enum : uint32_t {
