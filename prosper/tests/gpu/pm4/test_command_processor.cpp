@@ -228,6 +228,41 @@ int main() {
         CHECK(su.sh.empty(), "SetShRegsIndirect with an unmapped array is skipped (no OOB read, no regs applied)");
     }
 
+    // Hardware IT_LOAD_* packets (Task H01 Black Flag console capture submit0.bin):
+    {
+        ShaderReg sh_array[] = {
+            {prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0, 0x12345678u},
+            {prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u, 0x9abcdef0u},
+        };
+        ShaderReg cx_array[] = {
+            {prosper::agc::Pm4::DB_DEPTH_SIZE_XY, 0x01000200u},
+        };
+        const uint64_t sh_addr = (uint64_t)(uintptr_t)sh_array;
+        const uint64_t cx_addr = (uint64_t)(uintptr_t)cx_array;
+
+        uint32_t pkt[] = {
+            // IT_LOAD_SH_REG: 5 dwords
+            0xC0000000u | (3u << 16) | (IT_LOAD_SH_REG << 8),
+            (uint32_t)sh_addr, (uint32_t)(sh_addr >> 32),
+            0x80000000u, 2u,
+            // IT_LOAD_CONTEXT_REG: 5 dwords
+            0xC0000000u | (3u << 16) | (IT_LOAD_CONTEXT_REG << 8),
+            (uint32_t)cx_addr, (uint32_t)(cx_addr >> 32),
+            0x80000000u, 1u,
+        };
+        GpuState s_load;
+        run_cb(pkt, std::size(pkt), s_load);
+        CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0) &&
+              s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] == 0x12345678u,
+              "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0");
+        CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u) &&
+              s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u] == 0x9abcdef0u,
+              "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0+1");
+        CHECK(s_load.cx.count(prosper::agc::Pm4::DB_DEPTH_SIZE_XY) &&
+              s_load.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] == 0x01000200u,
+              "IT_LOAD_CONTEXT_REG populates DB_DEPTH_SIZE_XY");
+    }
+
     // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
     // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
     // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content
