@@ -2031,44 +2031,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (it != rs.sreg_bool.end()) return it->second; }
                     if (o.kind == OperandKind::InlineInt)
                         return inline_int_mask_bit(b, o.value);
-                    // Project an ordinary scalar pair into the same per-invocation Bool representation
-                    // used for wave masks: select this guest lane's 32-bit half, then extract its bit.
-                    // GTA copies EXEC_LO/HI ballots into scalar scratch and intersects that pair with
-                    // VCC at pc1467; Sonic Frontiers Cyber Space uses s[0:1]={1,1} intersected with VCC.
-                    // Both halves must exist.
-                    if (b.is_compute && b.wave_size == 64 &&
-                        (o.kind == OperandKind::SGPR ||
-                         (o.kind == OperandKind::Special &&
-                          (o.value == 106 || o.value == 107)))) {
-                        auto scalar_word = [&](int reg, uint32_t& value) {
-                            auto current = rs.sreg.find(reg);
-                            if (current != rs.sreg.end()) {
-                                value = current->second;
-                                return true;
-                            }
-                            auto input = rs.sreg_input.find(reg);
-                            if (input != rs.sreg_input.end()) {
-                                value = input->second;
-                                return true;
-                            }
-                            return false;
-                        };
-                        uint32_t lo = 0, hi = 0;
-                        if (scalar_word(o.value, lo) && scalar_word(o.value + 1, hi)) {
-                            // Invert the ballot with the subgroup-local index if native 64, or guest_lane_id.
-                            const uint32_t lane = b.native_subgroup_size == 64
-                                ? b.ibin(Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63))
-                                : b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
-                            const uint32_t word = b.sel(
-                                b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
-                            const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
-                            return b.ucmp(
-                                Op_INotEqual,
-                                b.ibin(Op_BitwiseAnd,
-                                       b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
-                                b.uconst(0));
-                        }
-                    }
+                    // An ordinary scalar pair projected onto this lane's bit (rdna2_alu_support.hpp).
+                    if (const uint32_t bit = scalar_pair_lane_bit(b, rs, o)) return bit;
                     // Name WHICH representation is missing. A wave-mask op that cannot resolve
                     // an operand rejects the whole shader, and the reject line downstream says
                     // only `mode=unresolved-operand` -- which cannot distinguish these states,
@@ -2119,10 +2083,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                : b.is_fragment ? "fragment"
                                                                : "vertex";
                         if (first)
-                            std::fprintf(stderr,
+                            std::fprintf(
+                                stderr,
                                 "[wave-mask-unresolved] program=0x%llx pc=%u operand=%d kind=%u "
                                 "sreg_bool=%d sreg=%d/%d sreg_input=%d/%d "
-                                "no_placeholders=%d stage=%s wave=%u native_sg=%u\n",
+                                "no_placeholders=%d merge_placeholder=%d/%d stage=%s wave=%u "
+                                "native_sg=%u\n",
                                 static_cast<unsigned long long>(b.diagnostic.program_address),
                                 in.pc, o.value,
                                 static_cast<unsigned>(
@@ -2133,6 +2099,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 static_cast<int>(rs.sreg_input.contains(o.value)),
                                 static_cast<int>(rs.sreg_input.contains(o.value + 1)),
                                 static_cast<int>(rs.scalar_presence_has_no_placeholders),
+                                static_cast<int>(rs.sreg_merge_placeholder.contains(o.value)),
+                                static_cast<int>(rs.sreg_merge_placeholder.contains(o.value + 1)),
                                 stage_name, b.wave_size, b.native_subgroup_size);
                     }
                     return 0;
@@ -4950,14 +4918,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
                 // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
-                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP and
-                // OMOD keep rejecting too -- their denormal behaviour needs its own contract.
-                if (in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[1] || in.src_neg[2] ||
-                    in.clamp || in.omod) {
+                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP is
+                // the ordinary float saturate of the exact result via fresult() (Kena #4706,
+                // `d762800c,0001850c`; CONFIDENCE: HIGH). OMOD keeps rejecting: hardware ignores it
+                // on f32 with denormals enabled, so it needs the MODE contract.
+                if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = b.ldexp_f32_bits(fv(0), val(in.src[1]));
+                    vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
                 }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):
@@ -5860,8 +5828,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source || owned_nested_source)
-                ? 0 : in.literal >> 2;
+            // A raw-offset scalar source's snapshot holds the words at the EFFECTIVE address
+            // (immediate included), so it is read from index zero like the owned sources (#3135).
+            const bool raw_offset_scalar_source =
+                rs.smem_raw_offset_scalar_source_pcs.contains(in.pc);
+            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source ||
+                                 owned_nested_source || raw_offset_scalar_source)
+                                    ? 0
+                                    : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
@@ -7230,6 +7204,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.cbuf_store(dword_idx, value, binding, rs.exec_narrowed, rs.exec,
                                  coherent_store);
                 };
+                // The DATA FORMAT owns the physical component COUNT of every format store: a wider
+                // opcode writes only the components the format has. For MTBUF the format is the
+                // instruction's; for MUBUF it is the descriptor's (`fmt_ncomp` above). Table 31 gives
+                // MTBUF stores identity routing ("X000, XY00, XYZ0, or XYZW" by that component count)
+                // but gives MUBUF format stores the descriptor's DST_SEL. Writing components 0..n-1
+                // in order is therefore right for MUBUF only because a routed MUBUF store was
+                // rejected above (`reject-dst-sel-store`), so what reaches here is identity.
+                // The clamp used to apply to MTBUF only, so buffer_store_format_xyzw through a
+                // one-component 32-bit V# wrote four dwords per lane at a four-byte stride: every lane
+                // overwrote its three neighbours, and only one element per wave kept its value. That
+                // is UE4's typed-buffer clear and Kena's distance-field AO cone buffer. Raw stores
+                // leave `fmt_ncomp` at 0 and keep the opcode's width.
+                const uint32_t store_n = is_format && fmt_ncomp && fmt_ncomp < n ? fmt_ncomp : n;
                 if (dyn_int_store) {
                     // Integer sub-dword store: clear then set THIS lane's disjoint field of the containing
                     // dword with two atomics. Disjoint fields commute (And clears only this field's bits,
@@ -7241,7 +7228,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shader never has. A straddling field (excluded by the alignment guard above) is the
                     // one shape this can't express and stays deferred.
                     const uint32_t field_mask = comp_bytes == 2 ? 0xffffu : 0xffu;
-                    for (uint32_t k = 0; k < n; k++) {
+                    for (uint32_t k = 0; k < store_n; k++) {
                         const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
                         const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                         const uint32_t bitpos = b.ibin(Op_ShiftLeftLogical,
@@ -7264,15 +7251,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (packed && !packed_word && (is_uint || is_sint)) {
                     buf_op.how = "reject-subword-int-store"; ok = false; return true;
                 }
-                // MTBUF's instruction format owns the physical component COUNT, and a wider opcode
-                // still writes only those components (for example XY00), so Z/W must not spill into
-                // adjacent memory. This line is about the COUNT, but the identity claim it makes is
-                // now settled rather than assumed: RDNA2 ISA Table 31 gives TBUFFER_STORE_FORMAT_* a
-                // DST SEL of "identity", so an MTBUF store really does ignore the descriptor's
-                // routing, while BUFFER_STORE_FORMAT_* does not and reaches `reject-dst-sel-store`
-                // above when routed (#2869). Everything below is therefore identity routing.
-                const uint32_t store_n = in.fmt == Rdna2Format::MTBUF && fmt_ncomp < n
-                                           ? fmt_ncomp : n;
+                // The identity claim the code below makes is settled rather than assumed: RDNA2 ISA
+                // Table 31 gives TBUFFER_STORE_FORMAT_* a DST SEL of "identity", so an MTBUF store
+                // really does ignore the descriptor's routing, while BUFFER_STORE_FORMAT_* does not
+                // and reaches `reject-dst-sel-store` above when routed (#2869). Everything below is
+                // therefore identity routing, written `store_n` components wide (see above).
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < store_n; k++) {
@@ -7294,8 +7277,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     //
                     // The component count comes from the FORMAT, not from the opcode: a
                     // buffer_store_format_xyzw through a 3-component 10_11_11 must not write a fourth
-                    // field, which at k=3 would land back on top of B. Same hazard the MTBUF count
-                    // clamp above addresses, one level down.
+                    // field, which at k=3 would land back on top of B. Same hazard the format
+                    // component-count clamp (`store_n`) above addresses, one level down.
                     // `packed_10_11_11` and `packed_2_10_10_10` name a BIT LAYOUT, not a channel
                     // count. GFX10 names packed formats from the HIGH field down, so 10_11_11 puts
                     // 11 bits at [10:0] and 10 at [31:22] -- while 11_11_10 and 10_10_10_2, which

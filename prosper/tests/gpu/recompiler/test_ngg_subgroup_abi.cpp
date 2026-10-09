@@ -157,6 +157,117 @@ TEST(NggSubgroupAbi, AVgprWrittenUnderNarrowEXECIsDefinedOnlyWhileEXECStaysNarro
         analyze(program({0xbefe0481u, 0x7e0c0280u, 0xbe940480u, 0x87fe147eu, 0x7e120306u})).ok());
 }
 
+// #3135 P6: the compiler's EXEC save/restore idiom. Kena's indexed producer writes v7 under the ES
+// EXEC, saves EXEC with s_mov_b64 s[36:37], exec, changes EXEC, restores it with s_mov_b64 exec,
+// s[36:37] and then stores v7 to LDS. The restored EXEC is the saved one, so v7 is defined on every
+// lane the store reads. Each control is one edit away and must stay refused.
+TEST(NggSubgroupAbi, RestoringASavedExecBringsBackItsDefinitions) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1 (a narrow launch EXEC)
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    constexpr uint32_t kSave = 0xbea4047eu;   // s_mov_b64 s[36:37], exec
+    constexpr uint32_t kRestore = 0xbefe0424u;   // s_mov_b64 exec, s[36:37]
+    constexpr uint32_t kClobber = 0xbea40480u;   // s_mov_b64 s[36:37], 0
+    constexpr uint32_t kZero20 = 0xbe940480u;   // s_mov_b64 s[20:21], 0
+    constexpr uint32_t kNarrow = 0x87fe147eu;   // s_and_b64 exec, exec, s[20:21]
+    constexpr uint32_t kAndSave = 0xbea42414u;   // s_and_saveexec_b64 s[36:37], s[20:21]
+    EXPECT_TRUE(analyze(program({kExecOne, kWriteV7, kSave, kExecAllOnes, kRestore, kReadV7})).ok())
+        << "the restored EXEC is the one v7 was written under";
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kSave, kExecAllOnes, kReadV7})).reason,
+              "ngg-abi-read-v6-v7")
+        << "control: without the restore the widened EXEC exposes unwritten lanes";
+    EXPECT_EQ(
+        analyze(program({kExecOne, kWriteV7, kSave, kClobber, kExecAllOnes, kRestore, kReadV7}))
+            .reason,
+        "ngg-abi-read-v6-v7")
+        << "control: the saved pair was overwritten, so the restore is not that EXEC";
+    EXPECT_TRUE(analyze(program({kExecOne, kSave, kWriteV7, kExecAllOnes, kRestore, kReadV7})).ok())
+        << "a write after the save, under the unchanged EXEC, covers the saved lanes too";
+    EXPECT_EQ(analyze(program({kExecOne, kSave, kZero20, kNarrow, kWriteV7, kExecAllOnes, kRestore,
+                               kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: written under a narrower EXEC than the one saved";
+    EXPECT_TRUE(
+        analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kExecAllOnes, kRestore, kReadV7}))
+            .ok())
+        << "a SAVEEXEC saves the EXEC from before it narrows";
+    // #4733 review: s_and_saveexec_b32 s38, s20 changes EXEC_LO implicitly -- its only named
+    // destination is s38 -- and with s20 = 0 it leaves no lane on which the v7 write lands.
+    EXPECT_EQ(analyze(program({kExecOne, kSave, kZero20, 0xbea63c14u, kWriteV7, kExecAllOnes,
+                               kRestore, kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: an implicit B32 SAVEEXEC EXEC write ends the saved EXEC";
+    // s_cbranch_execz +1 skips the save on one path (s[36:37] is written on both, so the restore
+    // reads a defined pair): the join has no common saved EXEC.
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kClobber, 0xbf880001u, kSave, kExecAllOnes,
+                               kRestore, kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: saved on one path only";
+    // The same join reached first by the path that KEEPS the save: s_cbranch_execz +1 skips the
+    // clobber, so the branch target's first state still holds the pair, and only the meet with the
+    // fall-through (which overwrote s[36:37]) can drop it.
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kSave, 0xbf880001u, kClobber, kExecAllOnes,
+                               kRestore, kReadV7}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: the pair is overwritten on one path into the join";
+}
+
+// #3135: nested saves inside a loop, the shape of Kena's indexed producer 11562c72 (its main saves
+// the loop EXEC into s[4:5] and the inner EXEC into s[6:7], restores s[6:7] in the body and s[4:5]
+// before the back edge, and reads a VGPR written before the loop at the top of the body). The read
+// is defined only if the analysis keeps BOTH saved pairs: with one slot, the inner save evicts the
+// outer one, the back edge arrives with EXEC widened, and the loop-head join loses v7.
+TEST(NggSubgroupAbi, NestedSavedExecPairsSurviveALoop) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    constexpr uint32_t kZero20 = 0xbe940480u;   // s_mov_b64 s[20:21], 0
+    constexpr uint32_t kAndSave = 0xbea42414u;   // s_and_saveexec_b64 s[36:37], s[20:21]
+    constexpr uint32_t kSaveInner = 0xbea6047eu;   // s_mov_b64 s[38:39], exec
+    constexpr uint32_t kRestoreInner = 0xbefe0426u;   // s_mov_b64 exec, s[38:39]
+    constexpr uint32_t kRestoreOuter = 0xbefe0424u;   // s_mov_b64 exec, s[36:37]
+    constexpr uint32_t kCmp = 0xbf068014u;   // s_cmp_eq_u32 s20, 0
+    constexpr uint32_t kBack = 0xbf84fff8u;   // s_cbranch_scc0 -> the s_and_saveexec
+    EXPECT_TRUE(analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kReadV7, kSaveInner,
+                                 kExecAllOnes, kRestoreInner, kRestoreOuter, kCmp, kBack}))
+                    .ok())
+        << "both pairs are tracked: the back edge restores the loop EXEC";
+    EXPECT_EQ(analyze(program({kExecOne, kWriteV7, kZero20, kAndSave, kReadV7, kSaveInner,
+                               kRestoreInner, kExecAllOnes, kCmp, kBack, kRestoreOuter}))
+                  .reason,
+              "ngg-abi-read-v6-v7")
+        << "control: the back edge leaves with EXEC widened past the loop EXEC";
+}
+
+// Five nested saves overflow the four slots: the oldest record is dropped, which only forgets
+// definitions. A restore from the newest still brings back v7; one from the dropped oldest pair is
+// no longer recognised and the read is refused (#4735 review).
+TEST(NggSubgroupAbi, AFifthNestedSaveDropsOnlyTheOldest) {
+    constexpr uint32_t kExecOne = 0xbefe0481u;   // s_mov_b64 exec, 1
+    constexpr uint32_t kWriteV7 = 0x7e0e0280u;   // v_mov_b32 v7, 0
+    constexpr uint32_t kReadV7 = 0x7e120307u;   // v_mov_b32 v9, v7
+    const std::vector<uint32_t> saves = {0xbea4047eu, 0xbea6047eu, 0xbea8047eu, 0xbeaa047eu,
+                                         0xbeac047eu};   // s_mov_b64 s[36..45 by pairs], exec
+    const auto with = [&](uint32_t restore) {
+        std::vector<uint32_t> body = {kExecOne, kWriteV7};
+        body.insert(body.end(), saves.begin(), saves.end());
+        body.insert(body.end(), {kExecAllOnes, restore, kReadV7});
+        std::vector<uint32_t> code = {kExecAllOnes, 0x7e120280u};
+        code.insert(code.end(), body.begin(), body.end());
+        code.insert(code.end(), {0xb07c3005u, 0xbf900009u});
+        code.insert(code.end(), kExports.begin(), kExports.end());
+        code.push_back(kEnd);
+        return analyze(code);
+    };
+    EXPECT_TRUE(with(0xbefe042cu).ok()) << "s_mov_b64 exec, s[44:45]: the newest save is kept";
+    EXPECT_EQ(with(0xbefe0424u).reason, "ngg-abi-read-v6-v7")
+        << "s_mov_b64 exec, s[36:37]: the oldest was dropped, so the restore is not recognised";
+}
+
 TEST(NggSubgroupAbi, MemoryEffectsAreRefused) {
     // buffer_store_dword v9, off, s[8:11], 0 versus buffer_load_dword v10 with the same operands.
     EXPECT_EQ(analyze(program({0xe0700000u, 0x80020900u}), 4).reason, "ngg-side-effect");

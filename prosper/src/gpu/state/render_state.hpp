@@ -213,6 +213,13 @@ struct RenderState {
     bool     z_write_enable = false;
     bool     stencil_enable = false;
     uint32_t zfunc          = 0;      // compare op, 0..7 (RDNA2 order == VkCompareOp order)
+    // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE with DB_DEPTH_BOUNDS_MIN/MAX (IEEE-754 floats). The test
+    // compares the depth already STORED in the attachment, independent of Z_ENABLE, and discards the
+    // fragment when that value lies outside [min, max]. UE4 restricts each shadow cascade's
+    // projection and each deferred light's volume to its depth slice this way.
+    bool     depth_bounds_enable = false;
+    float    depth_bounds_min    = 0.0f;
+    float    depth_bounds_max    = 1.0f;
 
     // Depth/stencil CLEAR values (DB_DEPTH_CLEAR = float depth, DB_STENCIL_CLEAR = 8-bit stencil).
     // has_depth_clear == the game PROGRAMMED DB_DEPTH_CLEAR (register present); otherwise resolve picks
@@ -361,6 +368,12 @@ struct ResolvedPipelineState {
     bool     depth_test_enable  = false;
     bool     depth_write_enable = false;
     uint32_t depth_compare_op  = 0;  // == VkCompareOp
+    // Depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE): fragments whose STORED depth lies
+    // outside [depth_bounds_min, depth_bounds_max] are discarded. It reads the depth attachment
+    // even when depth_test_enable is false, so such a draw must still bind it.
+    bool     depth_bounds_enable = false;
+    float    depth_bounds_min    = 0.0f;
+    float    depth_bounds_max    = 1.0f;
     // Depth/stencil CLEAR value for VK_ATTACHMENT_LOAD_OP_CLEAR. Resolve sets depth_clear_value from the
     // guest's DB_DEPTH_CLEAR when programmed, else a compare-op-appropriate default (1.0 for LESS/LEQUAL,
     // 0.0 for GREATER/GEQUAL) — never a fixed 0.5, which wrongly rejects far-half geometry under a
@@ -497,6 +510,23 @@ ColorStateTraceSnapshot snapshot_color_state_trace(const RenderState& rs,
                                                    const ResolvedPipelineState& ps);
 bool color_state_trace_matches_dimension(const ColorStateTraceSnapshot& snapshot,
                                          uint32_t width, uint32_t height);
+
+// The TESTS that make a draw bind its depth/stencil attachment: depth, depth bounds, stencil. The
+// backend's attach decision is this or an effective clear (render_runner.h), and NGG layer
+// admission's single-slice proof is uses_depth_stencil_attachment below, which contains it -- one
+// list, so a reason the backend attaches for cannot be missed by the proof (#4750 review: depth
+// bounds with Z off is UE4's shadow-cascade shape).
+inline bool depth_stencil_tests_enabled(const ResolvedPipelineState& ps) {
+    return ps.depth_test_enable || ps.depth_bounds_enable || ps.stencil_enable;
+}
+
+// The draw reads or writes the depth/stencil attachment, so the pass must bind one. The depth-bounds
+// test belongs here although it writes nothing: it reads the stored depth, and a draw drawn without
+// its attachment silently loses the test and covers every pixel.
+inline bool uses_depth_stencil_attachment(const ResolvedPipelineState& ps) {
+    return depth_stencil_tests_enabled(ps) || ps.depth_write_enable || ps.depth_clear_enable ||
+           ps.stencil_clear_enable;
+}
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed
 // by later draws. KEEP-only stencil tests without a depth write have no attachment side effect.

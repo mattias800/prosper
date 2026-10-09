@@ -67,8 +67,13 @@ struct SplitSegmentContract {
 };
 inline SplitSegmentContract split_segment_contract(
     const BackendColorTarget* whole, const BackendMrtOutputs* whole_mrt, bool first, bool final,
-    const std::array<const uint8_t*, prosper::gpu::kColorTargetCount>& carried_slots = {}) {
+    const std::array<const uint8_t*, prosper::gpu::kColorTargetCount>& carried_slots = {},
+    bool colour_unwritten = false) {
     SplitSegmentContract out;
+    // A call that writes no colour (backend_draws_leave_colour): every segment starts exactly as the
+    // first does -- same loads, seeds and clears -- because no segment changed what it would have
+    // carried, and only the final one reads anything back. Nothing is carried through the CPU.
+    if (colour_unwritten && !first) first = true;
     // The attachment shape never varies by segment. A pass is five-MRT for all of its segments or
     // none of them; splitting is a synchronisation boundary, not a change of render target.
     out.color_count = whole_mrt ? whole_mrt->color_count : 1u;
@@ -107,6 +112,7 @@ inline SplitSegmentContract split_segment_contract(
         out.target.readback = false;
         out.target.readback1 = false;
         out.target.readback_slots.fill(false);
+        if (colour_unwritten) return out;   // nothing to carry: the next segment restarts
         // ...but every slot this segment may have to CARRY must be copied out, or there is nothing
         // to seed the next segment with. That is slot 1 (which the live renderer takes through
         // BackendMrtOutputs) and every active slot 2+, unconditionally: whether a slot's image

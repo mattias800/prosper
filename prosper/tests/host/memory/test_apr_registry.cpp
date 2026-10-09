@@ -160,8 +160,12 @@ TEST(AprRegistry, Contract) {
     // not only the completion record's data pointer. Evergate loads globalgamemanagers this way.
     // #1621: every fixture below lives in this process's own scratch directory, not under a fixed
     // relative name in the shared ctest working directory.
-    const std::string fixture_path_storage =
-        prosper_test::test_scratch_file("prosper-test-apr-read.tmp");
+    // #4782: APR resolves GUEST paths, and a host path is not one -- a path outside every mount
+    // never reaches the host. Root /app0 at the scratch directory and take each fixture's host path
+    // from the resolver itself, so a registry comparison sees the exact string resolution produces.
+    set_app0_root(prosper_test::test_scratch_dir().string());
+    const char* fixture_guest = "/app0/prosper-test-apr-read.tmp";
+    const std::string fixture_path_storage = resolve_guest_path(fixture_guest);
     const char* fixture_path = fixture_path_storage.c_str();
     std::array<uint8_t, 257> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 29u + 7u);
@@ -211,8 +215,8 @@ TEST(AprRegistry, Contract) {
     // #1901: equal total sizes do not make real ID-resolved reads ambiguous. Register a second,
     // byte-distinct fixture through the public resolve HLE so this also proves its warning describes
     // only the unresolved-id fallback rather than falsely declaring both files unreadable.
-    const std::string collision_path_storage =
-        prosper_test::test_scratch_file("prosper-test-apr-read-collision.tmp");
+    const char* collision_guest = "/app0/prosper-test-apr-read-collision.tmp";
+    const std::string collision_path_storage = resolve_guest_path(collision_guest);
     const char* collision_path = collision_path_storage.c_str();
     std::array<uint8_t, expected.size()> collision_bytes{};
     for (size_t i = 0; i < collision_bytes.size(); ++i)
@@ -225,7 +229,7 @@ TEST(AprRegistry, Contract) {
     } else {
         CHECK(false, "create equal-size APR collision fixture");
     }
-    const char* collision_paths[2] = { fixture_path, collision_path };
+    const char* collision_paths[2] = {fixture_guest, collision_guest};
     uint32_t collision_ids[2]{};
     uint64_t collision_sizes[2]{};
     uint32_t collision_error = ~uint32_t{0};
@@ -469,8 +473,8 @@ TEST(AprRegistry, Contract) {
     // the prefix-taking twin of the plain resolve. It must prepend `prefix` to each guest path,
     // stat the resolved container, and write its id/size outputs. Stubbing it to
     // success without populating the outputs makes RAGE proceed on a garbage file id (0xffffffff was
-    // observed live at the next GetFileStat) and wild-write over its allocator. translate() passes a
-    // non-mount path through unchanged, so a relative fixture path exercises the real handler.
+    // observed live at the next GetFileStat) and wild-write over its allocator. The fixtures are
+    // guest paths under /app0, which this test roots at its scratch directory (#4782).
     auto resolve_prefix = Hle::lookup(nid_hash("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes"));
     auto resolve_ids    = Hle::lookup("WT-5NKy42fw");
     auto wait_cb        = Hle::lookup("rqwFKI4PAiM");
@@ -481,17 +485,22 @@ TEST(AprRegistry, Contract) {
           "APR id-only resolver and synchronous completion wait registered");
 
     // #1621: the SHAPE of this name is part of the test — APR's path-prefix resolution is exercised
-    // by splitting it into a prefix and a tail and having the HLE rejoin them. So the scratch
-    // directory goes into the PREFIX ("<scratch dir>/prosper-test-apr-") and the tail is left exactly
-    // as it was; wp_full stays prefix + tail by construction rather than by a repeated literal.
-    const std::string wp_prefix_storage = prosper_test::test_scratch_file("prosper-test-apr-");
+    // by splitting it into a prefix and a tail and having the HLE rejoin them. So the mount goes
+    // into the PREFIX ("/app0/prosper-test-apr-") and the tail is left exactly as it was; wp_full
+    // stays prefix + tail by construction rather than by a repeated literal. wp_full is the GUEST
+    // spelling; wp_full_host is where it lives on the host (#4782).
+    const std::string wp_prefix_storage = "/app0/prosper-test-apr-";
     const char* wp_prefix = wp_prefix_storage.c_str();
     const char* wp_tail   = "prefix.tmp";
     const std::string wp_full_storage = wp_prefix_storage + wp_tail;   // prefix + tail == this path
     const char* wp_full = wp_full_storage.c_str();
+    const std::string wp_full_host = resolve_guest_path(wp_full);
     std::array<uint8_t, 321> wp_bytes{};
     for (size_t i = 0; i < wp_bytes.size(); ++i) wp_bytes[i] = (uint8_t)(i * 13u + 5u);
-    if (FILE* wf = std::fopen(wp_full, "wb")) { std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf); std::fclose(wf); }
+    if (FILE* wf = std::fopen(wp_full_host.c_str(), "wb")) {
+        std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf);
+        std::fclose(wf);
+    }
 
     if (resolve_prefix && resolve_plain) {
         // The prefix path is prepended: prefix="<scratch dir>/prosper-test-apr-", paths[0]="prefix.tmp".
@@ -505,7 +514,7 @@ TEST(AprRegistry, Contract) {
               "WithPrefix resolve prepends the prefix and stats the combined path");
         CHECK(ids[0] >= 1 && error_index == 0,
               "WithPrefix resolve populates the id and clears the scalar error index");
-        CHECK(prosper_apr_path_for_id(ids[0]) == wp_full,
+        CHECK(prosper_apr_path_for_id(ids[0]) == wp_full_host,
               "WithPrefix registers the combined host path under the returned id");
 
         // Sonic/CRI uses the compact (paths,count,ids,errorIndex) resolver.  errorIndex is a scalar,
@@ -618,7 +627,7 @@ TEST(AprRegistry, Contract) {
             CHECK(overlay_is_overlay && base_is_base,
                   "each spelling registers its own file: the mount path is never served the base one");
 
-            set_app0_root(".");
+            set_app0_root(prosper_test::test_scratch_dir().string());   // back to the shared root
             fs::remove(overlay_awb);
             fs::remove(overlay_dir);
             fs::remove(dlc_mount);
@@ -649,9 +658,7 @@ TEST(AprRegistry, Contract) {
         // trapping startup in a multi-billion-iteration loop. Resolve the preceding valid entry,
         // then fail at the missing entry with its scalar index and without writing past that scalar.
         prosper_apr_reset_for_test();
-        const std::string absent_path_storage =
-            prosper_test::test_scratch_file("prosper-test-apr-does-not-exist.tmp");
-        const char* absent_path = absent_path_storage.c_str();
+        const char* absent_path = "/app0/prosper-test-apr-does-not-exist.tmp";
         const char* miss_paths[2] = { wp_full, absent_path };
         uint32_t miss_ids[2] = { 0x55, 0x55 }; uint64_t miss_sizes[2] = { 0x55, 0x55 };
         uint32_t miss_error_guard[3] = { 0x11111111u, 0xDEADBEEFu, 0x22222222u };
@@ -713,7 +720,7 @@ TEST(AprRegistry, Contract) {
         CHECK((uint32_t)resolve_prefix((uint64_t)(uintptr_t)"", 0, 1, 0, 0, 0) == 0x80020016u,
               "WithPrefix resolve rejects a null paths array");
     }
-    std::remove(wp_full);
+    std::remove(wp_full_host.c_str());
     prosper_apr_reset_for_test();
 
     // sceAmprCommandBufferWriteAddress (GTA V / PPSA04263, RAGE, issue #1149): the APR completion-

@@ -83,7 +83,11 @@ struct ScalarMergeBlocker {
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                                ScalarMergeProof proof = ScalarMergeProof::AnyRead,
-                               ScalarMergeBlocker* blocker = nullptr) {
+                               ScalarMergeBlocker* blocker = nullptr,
+                               // A non-cmpx VOPC with an explicit SGPR destination (the e64 form)
+                               // overwrites the whole 64-bit pair, so it redefines both words. Off
+                               // by default: other callers keep the older, more conservative walk.
+                               bool vopc_sgpr_pair_kills = false) {
     const auto block = [&](const Rdna2Inst& at, const char* kind) {
         if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
         return false;
@@ -125,6 +129,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 return block(in, "vop2-implicit-vcc");
             if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
                 return block(in, "vccz-branch");
+            // NOTE: v_div_fmas_f32/f64 (VOP3 0x16f/0x170) also read VCC implicitly and are NOT
+            // listed above. Neither is emitted by the recompiler today (an unsupported opcode
+            // fails the whole recompile), so no liveness question reaches them; add the reader
+            // here before one is lowered.
         }
         switch (in.fmt) {
             // Most SOPK instructions remain fail-closed: s_addk/s_mulk/s_cmovk/s_cmpk read or
@@ -229,6 +237,11 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 // block whose vcc scratch-write hardware would have skipped.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
+                    continue;
+                if (vopc_sgpr_pair_kills && in.fmt == Rdna2Format::VOPC &&
+                    !vopc_is_cmpx(in.opcode) && in.dst.kind == OperandKind::SGPR &&
+                    in.dst.value >= 0 && in.dst.value <= 104 &&
+                    (R == in.dst.value || R == in.dst.value + 1))
                     continue;
                 // A scalar redefinition kills every word covered by its opcode's write width. Keep
                 // this after the explicit/implicit read checks above: B64 read-modify-write forms
@@ -1543,6 +1556,71 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
         case 0x1e: return 2; // s_bitset1_b64
         default: return 0;
     }
+}
+
+// The input marks of one instruction (#4706; RegState::sreg_merge_placeholder). Defined here, not
+// in rdna2_to_spirv_internal.hpp, because it reads the two width inventories above; every caller
+// of snapshot_saved_b64_masks() includes this header.
+inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
+    ScalarSourceMarks marks;
+    const auto word = [&](int r) {
+        marks.placeholder = marks.placeholder || sreg_word_may_be_fabricated(rs, r);
+        marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
+    };
+    if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
+        marks.memory = true;
+        return marks;
+    }
+    if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
+        if (in.opcode == 0x360) {   // v_readlane: a constant-lane read of a spill slot
+            if (in.src[1].kind == OperandKind::InlineInt) {
+                const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
+                marks.placeholder = rs.lane_slot_merge_placeholder.contains(slot);
+                marks.memory = rs.lane_slot_memory_pattern.contains(slot);
+            }
+        } else if (in.src[0].kind == OperandKind::SGPR ||
+                   (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124)) {
+            word(in.src[0].value);   // v_writelane's data word
+        }
+        return marks;
+    }
+    for (uint32_t k = 0; k < in.n_src && k < 3; ++k) {
+        const Operand& o = in.src[k];
+        // Every register whose marks propagation can set: SGPRs, and the special data words VCC,
+        // ttmp0-15 and M0 (106-124).
+        const bool scalar = o.kind == OperandKind::SGPR ||
+                            (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
+        if (!scalar) continue;
+        uint32_t width = scalar_alu_source_words(in, k);
+        if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
+        if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range
+        for (uint32_t w = 0; w < width; ++w) word(o.value + static_cast<int>(w));
+    }
+    // A read-modify-write keeps the destination's old bits (s_bitset*, s_cmov*, s_addk, ...).
+    const uint32_t implicit = scalar_implicit_destination_read_width(in);
+    for (uint32_t w = 0; w < implicit; ++w) word(in.dst.value + static_cast<int>(w));
+    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = true;
+    return marks;
+}
+
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Inst& in) {
+    SavedB64MaskSnapshot snapshot;
+    snapshot.source_marks = scalar_source_marks(rs, in);
+    // The widest write form is deliberate: this set only FILTERS what record_scalar_write may
+    // expire, and that function applies its own exact `effective_width`, so an extra candidate root
+    // here can never widen the erase set.
+    for_each_scalar_write(
+        in,
+        [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word) {
+                const int root = base + static_cast<int>(word);
+                if (root > 105 || rs.sreg_bool_b32.contains(root)) continue;
+                const auto mask = rs.sreg_bool.find(root);
+                if (mask != rs.sreg_bool.end()) snapshot.entries.emplace_back(root, mask->second);
+            }
+        },
+        /*wave32_one_word_masks*/ false);
+    return snapshot;
 }
 
 // ---------------------------------------------------------------------------------------------

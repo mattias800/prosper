@@ -241,7 +241,9 @@ void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
 // Resolve a guest filesystem path through the same mount table used by libkernel file I/O.
-// Host frontends such as native media decoders must never receive raw /app0 paths.
+// Host frontends such as native media decoders must never receive raw /app0 paths. Returns an
+// EMPTY string for a path no served mount owns: such a path has no host file, and the raw guest
+// spelling must never be handed to the host in its place (#4782).
 std::string resolve_guest_path(const char* guest_path);
 // Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName.
 // The policy/result distinction preserves SaveData's exclusive CREATE versus CREATE2
@@ -369,6 +371,9 @@ void register_audio_spatial_hle();
 // libSceAgc "Gen5" Draw Command Buffer HLE (real PM4-building Dcb functions); see hle_agc.cpp.
 // Call AFTER register_graphics_hle so these override the observe-only glog stubs.
 void register_agc_hle();
+// libSceAgc fixed-size sceAgc*GetSize answers for packets prosper has no builder for, taken from the
+// console's own library (hle_agc_getsize.cpp). Call after register_agc_hle.
+void register_agc_getsize_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().

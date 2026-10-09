@@ -3,6 +3,7 @@
 #include "diagnostics/worker_spawn_census.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -92,12 +93,38 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
     return bytes <= std::numeric_limits<size_t>::max() ? static_cast<size_t>(bytes) : 0;
 }
 
+bool gfx10_dcc_format_never_depth(DataFormat format) {
+    // Depth views sample D32 as Float32, D16 as Unorm16, and stencil as Uint8/Uint32; none of
+    // those is listed, so their planes are never taken for DCC without a positive correlation.
+    // CONFIDENCE: MED-HIGH for Float16 (no 16-bit float depth format exists). CONFIDENCE: MED for
+    // Snorm16/Sint16/Unorm8/Snorm8/Sint8 (no depth or stencil format samples as these).
+    switch (format) {
+        case DataFormat::Float16:
+        case DataFormat::Snorm16:
+        case DataFormat::Sint16:
+        case DataFormat::Unorm8:
+        case DataFormat::Snorm8:
+        case DataFormat::Sint8: return true;
+        default: return false;
+    }
+}
+
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc,
+                                 bool metadata_is_htile, bool format_cannot_be_depth) {
+    if (num_components >= 3u) return true;
+    // The materializer writes RGBA8 texels, so a narrow surface needs a decoded RGBA8 buffer. HTILE
+    // bytes (a depth view) are not clear codes even when they look uniform, so a plane known to be
+    // HTILE is refused, and a plane nobody could classify (guest-produced, not retained by the
+    // renderer) is taken as DCC only when its format cannot be a depth view at all (#4699 N1).
+    return decoded_rgba8 && !metadata_is_htile && (metadata_is_dcc || format_cannot_be_depth);
+}
+
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,
                                 uint8_t* clear_code) {
-    if (!metadata || !metadata_bytes ||
-        (num_components != 3 && num_components != 4) || (!dst && texel_count))
+    if (!metadata || !metadata_bytes || num_components < 1 || num_components > 4 ||
+        (!dst && texel_count))
         return false;
     const uint8_t code = metadata[0];
     if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0)
@@ -106,8 +133,21 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                      [=](uint8_t value) { return value == code; }))
         return false;
 
+    // 0x40 / 0x80 give colour and alpha different values (0001 / 1110). Which narrow component is
+    // the alpha channel is the descriptor's call, and a one- or two-component surface has no
+    // alpha to give it a meaning, so only the codes where colour == alpha (0x00, 0xc0) are
+    // materialized there; the others stay refused instead of guessing (#4699 review B1).
+    if (num_components < 3 && (code == 0x40 || code == 0x80)) return false;
     const uint8_t color = (code == 0x80 || code == 0xc0) ? 255 : 0;
     uint8_t pixel[4] = {color, color, color, 255};
+    // One- and two-component surfaces: the clear colour fills the components that exist, and the
+    // absent ones read the sampled-format default (0,0,0,1) like every other narrow decode here.
+    if (num_components == 1) {
+        pixel[1] = 0;
+        pixel[2] = 0;
+    } else if (num_components == 2) {
+        pixel[2] = 0;
+    }
     if (num_components == 4) {
         const uint8_t alpha = (code == 0x40 || code == 0xc0) ? 255 : 0;
         const uint32_t alpha_component = alpha_is_on_msb ? 3u : 0u;
@@ -1332,8 +1372,27 @@ bool tile_volume_word_equation(uint32_t mode, uint32_t bpe,
                                std::array<uint32_t, 16>& equation,
                                uint32_t& bw, uint32_t& bh, uint32_t& bd, uint32_t& bits) {
     equation = {};
-    if ((mode != uint32_t(TileMode::Sw4KbS) && mode != uint32_t(TileMode::Sw64KbS)) ||
-        (bpe != 4 && bpe != 8 && bpe != 16)) return false;
+    if (bpe != 4 && bpe != 8 && bpe != 16) return false;
+    if (mode == uint32_t(TileMode::Sw64KbRX)) {
+        // The same layout sw64kb_rx_volume_copy walks on the CPU: every z slice owns its own row
+        // of 64 KiB blocks (block depth 1), and the in-block offset is the XOR of the 2D R_X
+        // x/y equation with the volume's z terms. Only the 16-pipe pattern the CPU path supports
+        // is expressed; any other pipe count keeps the CPU layout.
+        if (sw64kb_rx_pipes_log2() != 4) return false;
+        const auto el = sw64kb_elem_log2(bpe);
+        sw64kb_dims(el, bw, bh);
+        bd = 1;
+        bits = 16;
+        const PatBit* pat = kSw64kRX[4][el];
+        for (uint32_t bit = el; bit < bits; ++bit) {
+            if ((uint32_t(pat[bit].x) | uint32_t(pat[bit].y) |
+                 uint32_t(kSw64kbRXVolumeZ[bit])) & ~255u) return false;
+            equation[bit] = uint32_t(pat[bit].x) | (uint32_t(pat[bit].y) << 8) |
+                            (uint32_t(kSw64kbRXVolumeZ[bit]) << 16);
+        }
+        return true;
+    }
+    if (mode != uint32_t(TileMode::Sw4KbS) && mode != uint32_t(TileMode::Sw64KbS)) return false;
     const auto el = sw64kb_elem_log2(bpe);
     const bool small = mode == uint32_t(TileMode::Sw4KbS);
     const auto* dims = small ? kSw4kbS3Dims[el] : kSw64kbS3Dims[el];

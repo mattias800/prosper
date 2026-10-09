@@ -7,6 +7,34 @@
 
 namespace prosper::gpu {
 
+// #3231 — is the CFG region's ENTRY-BLOCK VCC value dead?
+//
+// The dispatcher stores one value into `vcc_var` before its loop, then dispatches block 0 first,
+// exactly once, with every invocation active (`selector = active ? pc : UINT32_MAX`, and
+// `active_var` is seeded true when the caller has no partial-workgroup extent). So that stored
+// value is observable only until block 0 overwrites it: if block 0 DEFINES the complete VCC pair
+// before any instruction in it can read VCC, nothing anywhere in the region can see the entry
+// value, and persisting `false` for it invents nothing. Block 0's own `save_state` publishes the
+// real definition before the iteration's common phases run, so the two direct `vcc_var` readers
+// (portable readlane into 106, and the vote-to-VCC merge) see it too.
+//
+// This is deliberately narrow, because the failure the caller's gate prevents is silent-wrong
+// rather than a crash. What it does NOT admit:
+//   * anything but a `v_cmp_*` (VOPC, never `v_cmpx_*`) whose destination is the VCC pair. That is
+//     the one encoding that defines both words for every lane in a single instruction, and it is
+//     the form the live evidence uses. A VOP3B carry-out into VCC, a 64-bit scalar write of the
+//     pair, and `v_cmpx_*`'s EXEC write are all left rejected.
+//   * a b32 write of vcc_lo or vcc_hi alone — half the pair would still carry the entry value, so
+//     the scan stops there rather than continuing to a later full define.
+//   * an entry block that reads VCC first, in ANY form. "Reads" is over-approximated: the implicit
+//     consumers this file already enumerates for the mask-domain analyses, plus any operand that
+//     can name a word of the pair — including a wide scalar read rooted low enough to reach s106.
+//     An operand the decoder left stale is read too (all four source slots, not `n_src`), because
+//     over-reading only ever moves the answer to "not dead".
+//
+// `lo`/`hi` are the entry block's half-open pc range as the dispatcher itself partitions it
+// (`starts[0]` and `starts[1]`), so a block split by a branch target, or by one of the synchronized
+// cross-lane events that each get their own block, shortens the window rather than widening it.
 inline bool entry_block_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins, uint32_t lo,
                                                     uint32_t hi) {
     auto may_name_vcc = [](const Operand& operand) {

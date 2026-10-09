@@ -399,6 +399,72 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
     }
 }
 
+// A B64 wave-mask logical (s_and_b64 and family) whose operand is an ordinary scalar DATA pair:
+// project the pair onto this invocation's lane bit -- this lane's 32-bit half, then its bit -- so
+// it joins the per-invocation Bool representation. Returns 0 when the projection is not admitted,
+// and the caller refuses. Both words must exist.
+//
+// Compute (Wave64) projects any present pair: GTA copies EXEC_LO/HI ballots into scalar scratch and
+// intersects that pair with VCC at pc1467; Sonic Frontiers Cyber Space intersects s[0:1]={1,1}.
+//
+// Wave64 fragment (#4706) is admitted only when three things hold, because RECOMPILER_REMAINING.md's
+// #2790 row records why presence alone proves nothing there:
+//   1. Lane identity. guest_lane_id() is subgroup_local_id() under the stage's enforced 64-lane
+//      (or partial-wave) subgroup contract, so a word that IS a ballot of this wave projects back
+//      onto exactly the lanes it came from. Kena's 0x5008cc0000 reaches this by spilling a compare
+//      mask with v_writelane (which stores the exact ballot words) and reloading it with
+//      v_readlane before `s_and_b64 s[30:31], s[30:31], s[36:37]` at pc308.
+//   2. Definite assignment. The structured emitter's if-merges and loop phis fill a register that
+//      is absent on one edge with a fabricated zero. `sreg_merge_placeholder` marks such words and
+//      every word computed from one: through explicit sources, a destination's own old bits
+//      (s_bitset*, s_cmov*), SCC (s_cmp -> s_cselect, s_addc/s_subb), a spill slot, the special
+//      data words (VCC, ttmp, M0), and a source that was never written (operand_bits' zero).
+//      Spill-slot marks are joined at merges and loop exits like SGPR marks, and a loop exit
+//      takes the marks its check block had. A marked word refuses instead of projecting.
+//   3. Not a memory pattern. A per-lane pattern loaded from memory (SMEM, or scalar ALU over one)
+//      is not a ballot of this wave: unless it is all-0 or all-1, it would select different pixels
+//      than on PS5, because the host's pixel-to-lane assignment is not the PS5's. Such a word
+//      refuses.
+// Fragment user-data words, which `sreg_input` never holds, count as never-written, so they refuse.
+// In a CFG-dispatcher case, SGPR words are proven by load_state's Wave64 MUST filter, and every
+// reloaded spill slot is marked (slots carry no definite-write fact across a case edge), so a
+// projection of a reloaded slot refuses there. Not tracked: a value routed through a VGPR
+// (v_readfirstlane, a dynamic-lane v_readlane), and the MEMORY mark on an SGPR across a dispatcher
+// case edge (each case starts from a fresh RegState). The marks exist for compute too but are not
+// consulted there, so compute's projection keeps its behaviour, fabricated zeros included (#4714).
+inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operand& o) {
+    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return 0;
+    if (o.kind != OperandKind::SGPR &&
+        !(o.kind == OperandKind::Special && (o.value == 106 || o.value == 107)))
+        return 0;
+    if (b.is_fragment)
+        for (int r = o.value; r <= o.value + 1; ++r)
+            if (rs.sreg_merge_placeholder.contains(r) || rs.sreg_memory_pattern.contains(r))
+                return 0;
+    auto scalar_word = [&](int reg, uint32_t& value) {
+        if (auto current = rs.sreg.find(reg); current != rs.sreg.end()) {
+            value = current->second;
+            return true;
+        }
+        if (auto input = rs.sreg_input.find(reg); input != rs.sreg_input.end()) {
+            value = input->second;
+            return true;
+        }
+        return false;
+    };
+    uint32_t lo = 0, hi = 0;
+    if (!scalar_word(o.value, lo) || !scalar_word(o.value + 1, hi)) return 0;
+    // Invert the ballot with the subgroup-local index if native 64, or guest_lane_id.
+    const uint32_t lane = b.native_subgroup_size == 64
+                              ? b.ibin(Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63))
+                              : b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
+    const uint32_t word = b.sel(b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
+    const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
+    return b.ucmp(Op_INotEqual,
+                  b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
+                  b.uconst(0));
+}
+
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
 // prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
 inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {
@@ -473,6 +539,23 @@ inline bool is_vadd_nc_u32_dpp_row_shr_bounded(const Rdna2Inst& in) {
         in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
         in.src[1].kind == OperandKind::VGPR &&
         in.src[0].value == in.src[1].value;
+}
+
+// The same bounded ROW_SHR:N shape as an OR: Kena's culling NGG VS programs build a wave-wide OR of
+// their primitive masks with an in-place v_or_b32 ladder (ROW_SHR:1,2,4,8, BOUND_CTRL=1), then
+// cross rows with v_permlanex16 (#3135 P7). A source unavailable at the row edge reads zero, and
+// OR with zero keeps the lane's own SRC1, so the write is unconditional like the bounded ADD's.
+inline bool is_vor_b32_dpp_row_shr_bounded(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x1c && in.has_dpp && !in.has_sdwa &&
+           in.dpp_bound_ctrl && in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
+           in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu &&
+           in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
+           in.src[1].kind == OperandKind::VGPR && in.src[0].value == in.src[1].value;
+}
+
+// Either bounded ROW_SHR form: the NGG workgroup shell routes both through the phased dispatcher.
+inline bool is_dpp_row_shr_bounded(const Rdna2Inst& in) {
+    return is_vadd_nc_u32_dpp_row_shr_bounded(in) || is_vor_b32_dpp_row_shr_bounded(in);
 }
 
 enum class DppRowRor8Op : uint32_t {

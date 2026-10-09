@@ -929,6 +929,33 @@ if(TARGET prosper_core)
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
     LIBRARIES prosper_core)
 
+  # prosper's HLE against what a real PS5 returned: tests/data/console_oracle/*.golden.tsv are
+  # measurements taken by tools/console_oracle; mismatches fail unless listed in known_gaps.tsv, and a
+  # generated probe_* family is gated by a count in probe_baseline.tsv that may only go down.
+  # No console and no game dump needed.
+  prosper_add_gtest(test_console_oracle_replay
+    SOURCES tests/hle/test_console_oracle_replay.cpp
+    INCLUDES tests/hle tests
+    LIBRARIES prosper_core)
+  # probe_baseline.tsv rows can be limited to a host (prosper's HLE answers some calls differently per OS).
+  if(WIN32)
+    set(PROSPER_ORACLE_PLATFORM windows)
+  elseif(APPLE)
+    set(PROSPER_ORACLE_PLATFORM macos)
+  else()
+    set(PROSPER_ORACLE_PLATFORM linux)
+  endif()
+  target_compile_definitions(test_console_oracle_replay PRIVATE
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+      PROSPER_ORACLE_PLATFORM="${PROSPER_ORACLE_PLATFORM}")
+
+  # The shared NID<->name readers (tools/common/nid_stub_names.hpp): the sprx_dlsym firmware dump
+  # and the flat `NID name` community-database path nid_census --names resolves through. Header-only,
+  # no prosper_core and no game dump.
+  prosper_add_gtest(test_nid_stub_names
+    SOURCES tests/tools/test_nid_stub_names.cpp
+    INCLUDES tests)
+
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
   prosper_add_gtest(test_storage_dst_sel
@@ -1336,10 +1363,28 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_ngg_draw_admission.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  # #3135 P6: an indexed merged-NGG draw's index decode and primitive restart. Pure CPU.
+  prosper_add_gtest(test_ngg_draw_indices
+    SOURCES tests/gpu/execute/test_ngg_draw_indices.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  # #3135 P6 (#4733 review): an indexed merged-NGG draw through realize_draw_item, and the shared
+  # index-source rule's DrawIndexOffset branch. CPU only: realization compiles, nothing renders.
+  prosper_add_gtest(test_ngg_indexed_realize
+    SOURCES tests/gpu/execute/test_ngg_indexed_realize.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   # #3135 P5: the v72 capture record of a merged-NGG draw description.
   prosper_add_gtest(test_ngg_subgroup_codec
     SOURCES tests/gpu/capture/test_ngg_subgroup_codec.cpp
     INCLUDES src tests
+    LIBRARIES prosper_core)
+  # #3807: a draw buffer the live source gate refuses is captured as a v74 placeholder, and the
+  # per-resource ceiling still fires for a mapped source. Pure CPU; the gate arm reads the frontend
+  # header directly.
+  prosper_add_gtest(test_capture_unavailable_source
+    SOURCES tests/gpu/capture/test_capture_unavailable_source.cpp
+    INCLUDES src frontends tests
     LIBRARIES prosper_core)
 
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
@@ -1510,6 +1555,11 @@ if(TARGET prosper_core)
   # #2168: a condvar destroy must refuse while a thread is parked inside it.
   prosper_add_gtest(test_cond_destroy_busy
     SOURCES tests/hle/test_cond_destroy_busy.cpp
+    LIBRARIES prosper_core)
+
+  # #2168: a mutex destroy must refuse while the mutex is held (bare 16 POSIX, 0x80020010 Sony).
+  prosper_add_gtest(test_mutex_destroy_busy
+    SOURCES tests/hle/test_mutex_destroy_busy.cpp
     LIBRARIES prosper_core)
 
   # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
@@ -2186,6 +2236,12 @@ if(TARGET prosper_core)
     INCLUDES frontends src
     LIBRARIES prosper_core)
 
+  # Native FP16 or the RGBA8 conversion for a compute-sampled texture: metadata-only.
+  prosper_add_gtest(test_sampled_float16_view
+    SOURCES frontends/shared/tests/test_sampled_float16_view.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_texture_decode_diagnostic
     SOURCES frontends/shared/tests/test_texture_decode_diagnostic.cpp
     INCLUDES frontends src
@@ -2377,6 +2433,13 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_translate_sandbox.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+
+  # #4782: a guest path no mount owns never reaches the host filesystem. Interposes the host's
+  # rmdir/mkdir/unlink/rename on Linux to prove it, and checks the console-oracle answers.
+  prosper_add_gtest(test_guest_namespace
+    SOURCES tests/hle/fs/test_guest_namespace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core ${CMAKE_DL_LIBS})
 
   prosper_add_gtest(test_service_logging
     SOURCES tests/hle/test_service_logging.cpp
@@ -2967,7 +3030,7 @@ if(TARGET prosper_core)
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
     SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
-            tests/gpu/state/test_render_state_memo.cpp
+            tests/gpu/state/test_render_state_memo.cpp tests/gpu/state/test_depth_bounds_state.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -3000,6 +3063,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_workgroup_uniformity
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
+
+  # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
+  prosper_add_gtest(test_compute_wave_route
+    SOURCES tests/gpu/recompiler/test_compute_wave_route.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
@@ -3233,6 +3302,15 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_wave64_exchange_execution
+      SOURCES tests/gpu/execute/test_wave64_exchange.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 120)
+    prosper_add_gtest(test_compute_wave_admission
+      SOURCES tests/gpu/execute/test_compute_wave_admission.cpp
+      INCLUDES tests frontends
+      LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
@@ -3251,6 +3329,10 @@ if(TARGET prosper_core)
   add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
   target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
+  # ADR 0028 step 1: the s_cbranch_execz any-vote certificate (guest-region classifier + SPIR-V proof).
+  prosper_add_gtest(test_fragment_exec_skip_vote
+    SOURCES tests/gpu/recompiler/test_fragment_exec_skip_vote.cpp
+    LIBRARIES prosper_core)
   add_executable(test_fragment_neutral_selection tests/gpu/recompiler/test_fragment_neutral_selection.cpp)
   target_link_libraries(test_fragment_neutral_selection PRIVATE prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)
@@ -3828,6 +3910,9 @@ endif()
   prosper_add_gtest(test_raster_launch_capture
     SOURCES tests/gpu/capture/test_raster_launch_capture.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_depth_bounds_capture
+    SOURCES tests/gpu/capture/test_depth_bounds_capture.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_gpu_capture_observation
     SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
     INCLUDES tests
@@ -4170,6 +4255,12 @@ endif()
   # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
   prosper_add_gtest(test_agc_multi_dcb_empty_segment
     SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
+    LIBRARIES prosper_core)
+
+  # sceAgcDriverSubmitMultiAcbs: folds into the queue's own compute context, in 128-descriptor
+  # chunks, with the empty-batch code of the project's libSceAgcDriver.sprx (worker 0x4570).
+  prosper_add_gtest(test_agc_multi_acb
+    SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
@@ -5248,6 +5339,20 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # Constant-lane V_WRITELANE spill slots across structured loop headers, loop exits and if
+      # merges (Kena 0x5007ad0000's spilled loop counter hung the GPU), executed per lane.
+      # The bounded DPP OR ladder of Kena's culling NGG VS programs in the NGG shell (#3135 P7),
+      # portable and native Wave64, executed.
+      prosper_add_gtest(test_ngg_dpp_or_ladder
+        SOURCES tests/gpu/execute/test_ngg_dpp_or_ladder.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      prosper_add_gtest(test_lane_slot_carry
+        SOURCES tests/gpu/recompiler/test_lane_slot_carry.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # A counted SCC loop whose prelude holds a bottom-tested EXEC loop (Kena 0x5006fb0000): the
       # counted-loop route declines and the general route lowers both loops, executed per lane.
       prosper_add_gtest(test_counted_loop_prelude_exec_loop
@@ -5266,6 +5371,27 @@ endif()
       # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
       prosper_add_gtest(test_cfg_spilled_mask_halves
         SOURCES tests/gpu/recompiler/test_cfg_spilled_mask_halves.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A Wave64 pixel shader's B64 mask logical over a scalar DATA pair projects the pair onto
+      # the pixel's own lane bit (Kena 0x5008cc0000, #4706); rendered where 64 lanes can be required.
+      prosper_add_gtest(test_fragment_scalar_pair_mask
+        SOURCES tests/gpu/execute/test_fragment_scalar_pair_mask.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # #3135: a memory-fed register offset whose x1 source has a non-zero immediate (Kena's
+      # indexed NGG prolog). Proof and owned snapshot on the CPU; the emitted load executed.
+      prosper_add_gtest(test_raw_offset_immediate_source
+        SOURCES tests/gpu/recompiler/test_raw_offset_immediate_source.cpp
+        INCLUDES src tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # A register that saved entry M0 and was reused for data stays data across a CFG-dispatcher
+      # edge when the Wave64 MUST analysis proves the write on every path (Kena 0x5008dc0000).
+      prosper_add_gtest(test_entry_m0_wave64_kill
+        SOURCES tests/gpu/recompiler/test_entry_m0_wave64_kill.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -5436,6 +5562,20 @@ endif()
       # #4291: BGRA render targets reach compute in guest component order on every path.
       prosper_add_gtest(test_live_compute_bgra_target
         SOURCES tests/shared/live/test_live_compute_bgra_target.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+      # A compute UNORM16 view of a Z16 plane reads the renderer's retained depth, not the
+      # guest bytes (UE4 volumetric-fog shadowing; Kena's washed-out title scene).
+      # A guest-backed one/two-channel FP16 texture keeps signed and >1 values in compute
+      # (UE4 depth-of-field tiles; Kena's foreground blur).
+      prosper_add_gtest(test_live_compute_narrow_float16
+        SOURCES tests/shared/live/test_live_compute_narrow_float16.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+      prosper_add_gtest(test_live_compute_depth_unorm16
+        SOURCES tests/shared/live/test_live_compute_depth_unorm16.cpp
         INCLUDES tests frontends src
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
@@ -5755,11 +5895,26 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      # Guest depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) against a retained depth
+      # surface with the depth test off. Reaches `shared/...` through render_runner.h.
+      prosper_add_gtest(test_depth_bounds_render
+        SOURCES tests/gpu/test_depth_bounds_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
       # Generated mip chains bounded by the T#'s declared levels (#1272), end-to-end.
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_texture_mip_render
         SOURCES tests/gpu/test_texture_mip_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # #4703: integer colour targets written through compressed (16-bit) exports -- the export
+      # decode, the uvec4 output, the R16_UINT attachment and an R16_UINT sampled reader. Same
+      # block and include roots as the other render_runner.h tests; needs a real Vulkan device.
+      prosper_add_gtest(test_integer_color_export
+        SOURCES tests/gpu/test_integer_color_export.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
@@ -7031,6 +7186,14 @@ if(TARGET gpu_replay)
     PROPERTIES TIMEOUT 60)
   target_compile_definitions(test_gpu_capture_observation_cli PRIVATE PROSPER_OBSERVATION_CLI_TESTS=1)
   add_dependencies(test_gpu_capture_observation_cli gpu_replay)
+  # #4703 review B2: both gpu_replay fragment-regeneration routes use the captured export formats.
+  prosper_add_gtest(test_replay_export_formats
+    SOURCES tests/gpu/capture/test_replay_export_formats.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    PROPERTIES TIMEOUT 60)
+  add_dependencies(test_replay_export_formats gpu_replay)
 endif()
 
 # CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links

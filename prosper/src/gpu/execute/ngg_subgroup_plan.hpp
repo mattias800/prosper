@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,12 @@ struct NggSubgroupLimits {
     uint32_t max_out_verts_per_subgroup = 0;   // GE_MAX_OUTPUT_PER_SUBGROUP [9:0]
     uint32_t gs_max_vert_out = 0;   // VGT_GS_MAX_VERT_OUT [10:0]
     uint32_t esgs_item_size = 0;   // VGT_ESGS_RING_ITEMSIZE [14:0], in dwords
+    // NGG without a GS (VGT_SHADER_STAGES_EN: PRIMGEN_EN, no GS_EN): the VS is the primitive
+    // shader. Each lane is at once ES vertex t and primitive t, and the vertices a subgroup exports
+    // are its ES vertices, so GS_MAX_VERT_OUT plays no part: a subgroup has max(es, prims) threads,
+    // GE_MAX_OUTPUT_PER_SUBGROUP bounds its ES vertices, and primitives are bounded by
+    // GS_PRIMS_PER_SUBGRP and GE_CNTL.PRIM_GRP_SIZE alone (#3135 P7).
+    bool vs_only = false;
 };
 
 NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32_t ge_cntl,
@@ -55,12 +62,18 @@ NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32
 // Input topologies the planner models. Anything else is refused.
 enum class NggInputTopology : uint8_t { TriangleList, TriangleStrip };
 
-// A non-indexed draw (indexed draws are a later phase).
+// The draw. Input vertex k of an instance (k < vertex_count) is vertex k for a non-indexed draw and
+// vertex indices[k] for an indexed one (#3135 P6). Either way VertexID (v5) = first_vertex + that
+// vertex, and ES vertices are deduplicated by it within a subgroup -- so an indexed draw that
+// repeats an index runs it on one ES lane, as the hardware's vertex grouper does.
 struct NggDrawShape {
     NggInputTopology topology = NggInputTopology::TriangleList;
-    uint32_t vertex_count = 0;
+    uint32_t vertex_count = 0;   // an indexed draw: indices->size()
     uint32_t instance_count = 1;
     uint32_t first_vertex = 0;   // added to every VertexID (v5)
+    // The guest's indices, widened to 32 bits, in API order (ngg_draw_indices.hpp). Null for a
+    // non-indexed draw.
+    std::shared_ptr<const std::vector<uint32_t>> indices;
 };
 
 struct NggSubgroupBudget {
@@ -75,8 +88,8 @@ struct NggSubgroup {
     uint32_t instance = 0;
     uint32_t first_vertex = 0;   // the draw's, carried so the launch has one source for VertexID
     uint32_t first_prim = 0;   // the instance-local index of the first primitive
-    // Unique vertex indices (VertexID before first_vertex), in first-use order: ES lane e runs
-    // es_vertex[e].
+    // Unique input vertices (VertexID before first_vertex: the index VALUE for an indexed draw), in
+    // first-use order: ES lane e runs es_vertex[e].
     std::vector<uint32_t> es_vertex;
     // Per primitive, the ES lanes of its three vertices in input order.
     std::vector<uint32_t> prim_slot;   // 3 per primitive
@@ -91,6 +104,10 @@ struct NggSubgroupPlan {
     bool ok() const { return refusal.empty(); }
 };
 
+// Every instance is partitioned identically (instances are never packed), so the plan is one
+// instance's partition repeated with each InstanceID. Refusals: ngg-limits-unusable,
+// ngg-subgroup-too-wide, ngg-subgroup-plan-budget, ngg-index-count-mismatch (an indexed shape whose
+// vertex_count is not its index count).
 NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLimits& limits,
                                    const NggSubgroupBudget& budget = {});
 

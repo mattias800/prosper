@@ -17,7 +17,7 @@ import tempfile
 DATA_NID = "CensusDataA"
 LOCAL_NID = "CensusLocal"
 FUNC_NID = "CensusFuncA"
-TSV_HEADER = "nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list"
+TSV_HEADER = "nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\tname_src"
 failures = 0
 
 
@@ -94,8 +94,8 @@ def data_line(path, count, prefix=""):
 def tsv_rows(output):
     lines = [line for line in output.split("\n") if line and not line.startswith("# ")]
     check(bool(lines) and lines[0] == TSV_HEADER, "TSV control: the legacy data header is unchanged")
-    check(all(len(line.split("\t")) == 8 for line in lines),
-          "TSV control: every noncomment line retains eight columns")
+    check(all(len(line.split("\t")) == 9 for line in lines),
+          "TSV control: every noncomment line retains nine columns (incl. name_src)")
     return {columns[0]: columns for columns in (line.split("\t") for line in lines[1:])}
 
 
@@ -219,6 +219,47 @@ def exercise_path_controls(binary, scratch):
           "path DATA context: apply the same escaping to the independent input label")
 
 
+def exercise_names(binary, scratch, importer):
+    # A flat `NID name` database is a SECONDARY source: its provenance must be visible (TSV
+    # `# names:` comment) and its names shown only when they hash back to the NID. The fixture NIDs
+    # are arbitrary constants, so a flat entry for one is not a valid preimage and is dropped; this
+    # arm pins the wiring and the marker, not a specific resolved name.
+    names_csv = scratch / "names.csv"
+    names_csv.write_text(f"{DATA_NID} sceFixtureName\n", encoding="utf-8")
+    result = run_census(binary, importer, "--names", str(names_csv), "--data-only", "--tsv")
+    comment = next((line for line in result.stdout.split("\n") if line.startswith("# names:")), "")
+    check(
+        "source=flat database (secondary)" in comment,
+        "names provenance: a flat database is reported as a secondary source in TSV",
+    )
+    check(
+        "dropped=1" in comment,
+        "names verification: an unverifiable flat pair is dropped, not shown as authoritative",
+    )
+    rows = tsv_rows(result.stdout)
+    check(
+        DATA_NID in rows and rows[DATA_NID][1] == "?" and rows[DATA_NID][-1] == "-",
+        "names row: a dropped flat name leaves the row unnamed with name_src '-'",
+    )
+
+
+def exercise_name_selection(binary, scratch):
+    # N1: a flat database may list a wrong name before the real preimage; the real one must win.
+    real = "PI7jIZj4pcE"   # nid_hash("sceRandomGetRandomNumber")
+    module = scratch / "names-select" / "m.prx"
+    write_module(module, imports=[(real, 1)])
+    csv = scratch / "names-select.csv"
+    csv.write_text(f"{real} notTheRealName\n{real} sceRandomGetRandomNumber\n", encoding="utf-8")
+    result = run_census(binary, module, "--names", str(csv), "--data-only", "--tsv")
+    rows = tsv_rows(result.stdout)
+    check(real in rows and rows[real][1] == "sceRandomGetRandomNumber",
+          "names selection: the candidate that hashes to the NID wins over an earlier wrong one")
+    # N3: an unreadable names path must not be labelled as an authoritative dump.
+    missing = run_census(binary, module, "--names", str(scratch / "no-such-names"), "--data-only")
+    check("[names] no names loaded" in missing.stdout and "authoritative" not in missing.stdout,
+          "names label: a missing names source is not reported as authoritative")
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_nid_census_context.py <nid_census executable>")
@@ -236,6 +277,8 @@ def main():
         exercise_repeated_labels(binary, scratch)
         exercise_tsv(binary, root, importer, provider)
         exercise_path_controls(binary, scratch)
+        exercise_names(binary, scratch, importer)
+        exercise_name_selection(binary, scratch)
     print(f"== FAIL: {failures} ==" if failures else "== PASS ==")
     return int(failures != 0)
 

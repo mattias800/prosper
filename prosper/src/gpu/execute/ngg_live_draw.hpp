@@ -22,8 +22,8 @@
 // A refused compile is cached too, so a refused program is not recompiled per draw. Compilation
 // happens at first use inside realization, which runs on the draw realization workers like every
 // other shader compile in prosper; once warm, no draw compiles. The planner and the launch records
-// are rebuilt per distinct draw shape, and an assembled description is reused while the shape and
-// the push-constant words repeat. Both caches are bounded (least recently used is evicted).
+// are rebuilt per distinct draw shape, and an assembled description is reused while the shape, the
+// push-constant words and (for an indexed draw) the index values repeat. Both caches are bounded (least recently used is evicted).
 #pragma once
 
 #include "gpu/execute/ngg_draw_admission.hpp"
@@ -47,6 +47,11 @@ struct NggLiveDrawInput {
     // when any of those registers is absent.
     std::vector<uint32_t> user_data;
     bool user_data_complete = false;
+    // SPI_SHADER_USER_DATA_ADDR_LO/HI_GS, which the hardware places in s0:s1 at merged ES+GS entry
+    // (#3135). Supplied to the shell (two more push-constant words) only when known and non-zero;
+    // otherwise a program reading s0:s1 stays refused (ngg-abi-read-s0-s1).
+    bool user_data_address_known = false;
+    uint32_t user_data_address[2] = {};
     // The chain as the hardware runs it (ngg_linked_chain), and the resource table folded over
     // exactly those words: the prolog alone cannot prove the raw register-offset loads that
     // feed its vertex fetches, because its own analysis stops at the link (#3135 P5).
@@ -66,11 +71,17 @@ struct NggLiveDrawResult {
     // An admitted triangle STRIP: its odd triangles reach the guest GS in natural order, which
     // open question 3 (#3135) leaves unsettled. Counted so P6 can find the titles relying on it.
     bool strip = false;
+    bool indexed = false;   // an admitted indexed draw (#3135 P6)
+    // A depth-only draw whose layer addresses a depth array of this many slices (0 otherwise):
+    // `draw` is replayed once per slice, slice depth_first_slice + k drawing layer k's primitives.
+    uint32_t depth_slice_count = 0;
+    uint32_t depth_first_slice = 0;
 };
 
 // The prolog up to its s_setpc, then the main program's code span. The copy is kept by a bounded
 // content-keyed cache, so a repeated chain has one stable address (the stage-table fold's decode
-// cache is keyed by address). Null when the main has no code span.
+// cache is keyed by address). Null when the main has no code span. A null prolog with a zero
+// prefix is the main alone: an NGG VS that is its own primitive shader (#3135 P7).
 std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* prolog,
                                                               size_t prefix_dwords,
                                                               const uint32_t* main,
@@ -80,6 +91,14 @@ std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* pr
 NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primitive_type);
 // The user-data words s8.. for `count` user SGPRs; false when one is absent.
 bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint32_t>* words);
+// The GS user-data address s0:s1 (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS); false when either register
+// is absent or the address is zero. The ONE rule for "the address is known": the live producer and
+// the resource fold (fused GS backs and linked chains) both ask it.
+bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]);
+// Whether the linked program reads s0:s1 as launch values, i.e. needs the user-data address: its
+// ABI admission without the address refuses ngg-abi-read-s0-s1. Cached per program and count.
+bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                         uint32_t user_sgprs);
 
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host);
@@ -88,6 +107,7 @@ struct NggLiveDrawCacheStats {
     uint64_t stage_hits = 0, stage_compiles = 0, stage_evictions = 0;
     uint64_t draw_hits = 0, draw_assemblies = 0;
     uint64_t strip_draws = 0;   // admitted strip draws (see NggLiveDrawResult::strip)
+    uint64_t indexed_draws = 0;   // admitted indexed draws
 };
 NggLiveDrawCacheStats ngg_live_draw_cache_stats();
 void reset_ngg_live_draw_cache_for_test();

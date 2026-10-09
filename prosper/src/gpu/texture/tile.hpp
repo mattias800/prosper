@@ -15,6 +15,8 @@
 
 namespace prosper::gpu {
 
+enum class DataFormat : uint32_t;   // gpu/resources/shader_resources.hpp
+
 // AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 1 = SW_256B_S (small
 // standard-swizzled textures), 5 = SW_4KB_S (the RGBA render target). 9 = SW_64KB_S (standard 64KB,
 // DOLL's material textures), 24 = SW_64KB_Z_X
@@ -57,8 +59,11 @@ bool tile64_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,
                           std::array<uint32_t, 16>& equation,
                           uint32_t& block_width, uint32_t& block_height);
 
-// Standard 3D word tiling: each equation packs x/y/z masks in successive bytes.
-// Only 4/8/16-byte texels have independently writable 32-bit output words.
+// 3D word tiling: each equation packs x/y/z masks in successive bytes, and each address bit is
+// the parity of the masked coordinates. Standard 3D (SW_4KB_S/SW_64KB_S) blocks are 3D; the
+// 16-pipe SW_64KB_R_X volume layout is a stack of 2D block rows (block depth 1) whose z terms XOR
+// into the in-block offset, exactly as tile_volume lays it out. Only 4/8/16-byte texels have
+// independently writable 32-bit output words.
 bool tile_volume_word_equation(uint32_t tile_mode, uint32_t bytes_per_texel,
                                std::array<uint32_t, 16>& equation,
                                uint32_t& block_width, uint32_t& block_height,
@@ -293,11 +298,21 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
                                 bool pipe_aligned);
 
 // Materialize a uniform, self-contained GFX8-GFX10 DCC fast-clear code into the renderer's RGBA8
-// upload format. The validated path is deliberately limited to three-component color surfaces,
-// four-component color/alpha surfaces, and the embedded 0000/0001/1110/1111 codes; register clears,
-// single-color codes, uncompressed (0xff), and actual compressed blocks return false. Three-component
-// formats receive the sampled-format default alpha of one. `alpha_is_on_msb` selects the raw component
+// upload format. The path covers one- to four-component color surfaces and the embedded
+// 0000/0001/1110/1111 codes; register clears, single-color codes, uncompressed (0xff), and actual
+// compressed blocks return false. Formats without an alpha channel receive the sampled-format
+// default alpha of one, and absent colour components the default zero (one component -> (c,0,0,1),
+// two -> (c,c,0,1)); on those the codes 0x40/0x80, whose colour and alpha differ, stay refused. One and two components were added when Black Flag's fast-cleared R16F pool
+// surfaces were sampled as their stale base bytes instead of the clear colour (#4131). `alpha_is_on_msb` selects the raw component
 // that receives the clear alpha on four-component formats before the T# destination swizzle is applied.
+// Whether a surface may be handed to gfx10_dcc_fast_clear_rgba8 at all: three or more components,
+// or a narrow surface with an RGBA8 decode buffer whose plane is DCC, or is unclassified but cannot be
+// HTILE because its format is never a depth view. A plane known to be HTILE is always refused.
+// Whether no depth/stencil view ever uses this sampled format, so its metadata plane cannot be
+// HTILE. This list is the depth-safety boundary of the narrow fast-clear admission.
+bool gfx10_dcc_format_never_depth(DataFormat format);
+bool gfx10_dcc_fast_clear_admits(uint32_t num_components, bool decoded_rgba8, bool metadata_is_dcc,
+                                 bool metadata_is_htile, bool format_cannot_be_depth);
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,

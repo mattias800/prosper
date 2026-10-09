@@ -41,8 +41,26 @@ void SpirvCompute::export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t b
         // Fragment I/O tap (PROSPER_FS_TAP): if an intermediate was snapshotted at the tapped PC, store THAT
         // as the MRT0 colour instead of the shader's real colour, so the rendered frame visualises the value.
         uint32_t v;
-        if (tap_vec && mrt == 0) { v = tap_vec; }
-        else { v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)}); }
+        const FragmentOutputClass output_class = color_output_class[mrt];
+        if (tap_vec && mrt == 0) {
+            v = tap_vec;
+            // The tap is a float vec4; an integer output takes its bits unchanged.
+            if (output_class != FragmentOutputClass::Float) {
+                const uint32_t cast = id();
+                put(code, Op_Bitcast,
+                    {output_class == FragmentOutputClass::Uint ? t_v4u() : t_v4i(), cast, v});
+                v = cast;
+            }
+        } else if (output_class == FragmentOutputClass::Uint) {
+            v = id();
+            putv(code, Op_CompositeConstruct, {t_v4u(), v, r, g, bl, a});
+        } else if (output_class == FragmentOutputClass::Sint) {
+            v = id();
+            putv(code, Op_CompositeConstruct, {t_v4i(), v, bcs(r), bcs(g), bcs(bl), bcs(a)});
+        } else {
+            v = id();
+            putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)});
+        }
         put(code, Op_Store, {v_color[mrt], v});
     }
 

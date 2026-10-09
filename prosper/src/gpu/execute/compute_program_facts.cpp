@@ -7,6 +7,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "diagnostics/env_cache.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"            // raw wide-data analyses
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"   // recompile_diagnostic_verbose
 
 namespace prosper::gpu {
@@ -52,7 +54,9 @@ FactsCache& facts_cache() {
 
 uint64_t facts_bytes(const ComputeProgramFacts& facts) {
     uint64_t bytes = sizeof(ComputeProgramFacts) + facts.code.size() * sizeof(uint32_t) +
-                     facts.decoded.size() * sizeof(Rdna2Inst);
+                     facts.decoded.size() * sizeof(Rdna2Inst) +
+                     facts.decoded.size() * sizeof(ComputeCrossLaneOp) +  // wave_ops, worst case
+                     facts.decoded.size() * 2 * sizeof(uint32_t);         // nested_wide_data, worst case
     for (const auto& [tag, payload] : facts.probe_reject_reasons)
         bytes += tag.size() + payload.size() + 2 * sizeof(std::string);
     return bytes;
@@ -80,6 +84,29 @@ std::shared_ptr<ComputeProgramFacts> analyze(const uint32_t* code, size_t dwords
 }
 
 } // namespace
+
+const ComputeWaveOpFacts& ComputeProgramFacts::wave_ops() const {
+    std::call_once(wave_ops_once, [this] {
+        wave_ops_value = analyze_compute_wave_ops(decoded, code.data(), code.size());
+    });
+    return wave_ops_value;
+}
+
+const NestedWideDataFacts& ComputeProgramFacts::nested_wide_data() const {
+    std::call_once(nested_wide_once, [this] {
+        nested_wide_value.nested = rdna2_proven_raw_nested_wide_data_loads(decoded);
+        if (!nested_wide_value.nested.empty())
+            nested_wide_value.parents = rdna2_proven_raw_immediate_wide_data_loads(decoded);
+        FactsCache& cache = facts_cache();
+        std::lock_guard lock(cache.mutex);
+        ++cache.stats.nested_wide_evaluations;
+    });
+    return nested_wide_value;
+}
+
+bool compute_nested_wide_facts_memo_enabled() {
+    return !PROSPER_ENV_ON("PROSPER_NO_NESTED_WIDE_FACTS_MEMO");
+}
 
 bool compute_program_facts_cache_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE") == nullptr;
@@ -136,6 +163,24 @@ std::shared_ptr<const ComputeProgramFacts> compute_program_facts(
         cache.entries.emplace(key, facts);
         cache.bytes += bytes;
     }
+    return facts;
+}
+
+std::shared_ptr<const ComputeProgramFacts>
+compute_program_facts_peek(const uint32_t* code, size_t dwords, uint64_t program_address) {
+    {
+        FactsCache& cache = facts_cache();
+        std::lock_guard lock(cache.mutex);
+        const auto found = cache.entries.find(FactsKey{program_address, dwords});
+        if (found != cache.entries.end() && found->second->code.size() == dwords &&
+            (dwords == 0 ||
+             std::memcmp(found->second->code.data(), code, dwords * sizeof(uint32_t)) == 0))
+            return found->second;
+    }
+    auto facts = std::make_shared<ComputeProgramFacts>();
+    facts->address = program_address;
+    facts->code.assign(code, code + dwords);
+    rdna2_walk(code, dwords, facts->decoded);
     return facts;
 }
 

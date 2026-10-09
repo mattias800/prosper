@@ -45,10 +45,14 @@
 // Each input's selection and parse counts are reported beside the aggregate census. Passing several
 // dump roots ranks each NID by how many of them import it, which is the signal #2081 asks for.
 //
-// `--names` points at the PS5 3.20 stub dump, whose loader lines carry `<NID> <-> <funcName>`
-// pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
-// any disagreement: the name table is the instrument this tool reads the census through, so it
-// gets a control of its own rather than being trusted.
+// `--names` points at the PS5 stub dump (a directory of `sprx_dlsym(...)` libraries), which is
+// AUTHORITATIVE, OR at a flat `NID name` database file (aerolib.csv / ps5rs), which is a SECONDARY
+// fallback. Both carry `<NID> <-> <funcName>` pairs directly. A flat source's names are verified
+// against prosper's `nid_hash` unconditionally and only proven preimages are shown (the rest are
+// dropped and counted), because a community string is only trustworthy once it hashes to the NID.
+// For the authoritative dump, `--self-check` re-derives each pair and reports any disagreement:
+// there a mismatch points at prosper's own `nid_hash`, so the dump name is kept and flagged rather
+// than dropped.
 #include "host/image/boot_program.hpp"
 #include "../common/nid_stub_names.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -73,10 +77,10 @@ namespace {
 
 struct Row {
     std::string nid;
-    std::string name;                 // "" when the stub dump does not name it
-    std::set<std::string> libs;       // import library names as the module declares them
-    std::set<std::string> titles;     // legacy aggregate labels: distinct input basenames
-    size_t modules = 0;               // how many modules import it
+    std::string name;   // "" when the stub dump does not name it
+    std::set<std::string> libs;   // import library names as the module declares them
+    std::set<std::string> titles;   // legacy aggregate labels: distinct input basenames
+    size_t modules = 0;   // how many modules import it
     // ELF64_ST_TYPE values this NID was imported with. A set, not a scalar: nothing stops two
     // modules from declaring the same NID with different types, and collapsing that to one value
     // would hide it. STT_OBJECT here means the linker binds it to the import-data aperture (#3529).
@@ -102,12 +106,14 @@ std::string input_label(const std::string& input) {
     constexpr char hex[] = "0123456789abcdef";
     std::string label;
     for (unsigned char c : input) {
-        if (c == '\\') label += "\\\\";
+        if (c == '\\')
+            label += "\\\\";
         else if (c < 0x20 || c == 0x7f) {
             label += "\\x";
             label += hex[c >> 4];
             label += hex[c & 0xf];
-        } else label += static_cast<char>(c);
+        } else
+            label += static_cast<char>(c);
     }
     return label;
 }
@@ -115,55 +121,94 @@ std::string input_label(const std::string& input) {
 // The ELF symbol types this corpus actually carries, spelled for a report.
 const char* sym_type_name(unsigned t) {
     switch (t) {
-        case STT_NOTYPE:  return "NOTYPE";
-        case STT_OBJECT:  return "OBJECT";
-        case STT_FUNC:    return "FUNC";
+        case STT_NOTYPE: return "NOTYPE";
+        case STT_OBJECT: return "OBJECT";
+        case STT_FUNC: return "FUNC";
         case STT_SECTION: return "SECTION";
-        case STT_FILE:    return "FILE";
-        case STT_COMMON:  return "COMMON";
-        case STT_TLS:     return "TLS";
-        default:          return "?";
+        case STT_FILE: return "FILE";
+        case STT_COMMON: return "COMMON";
+        case STT_TLS: return "TLS";
+        default: return "?";
     }
 }
 std::string sym_types_of(const Row& r) {
     std::string out;
-    for (unsigned t : r.elf_types) { if (!out.empty()) out += "+"; out += sym_type_name(t); }
+    for (unsigned t : r.elf_types) {
+        if (!out.empty()) out += "+";
+        out += sym_type_name(t);
+    }
     return out.empty() ? "-" : out;
 }
 
-// ---- the PS5 3.20 stub dump: authoritative <NID> <-> <funcName> pairs --------------------------
-// Each generated library has one loader line per export:
+// ---- the name table: authoritative firmware dump, or a secondary flat database ----------------
+// The authoritative source is the PS5 stub dump; each generated library has one loader line per
+// export:
 //     if(sprx_dlsym(__handle, "PI7jIZj4pcE", &__ptr_sceRandomGetRandomNumber)) return;
-// so the pair is read off directly. No hashing is required to build the map, which is what makes
-// --self-check meaningful: the hash is checked AGAINST the dump rather than used to produce it.
+// so the pair is read off directly. No hashing is required to build it, which is what makes
+// --self-check meaningful: the hash is checked AGAINST the dump rather than used to produce it. A
+// flat `NID name` database (aerolib.csv / ps5rs) is a secondary fallback whose names are instead
+// verified by nid_hash before they are shown (see load_names). `StubNames::source` records which.
 //
 // The reading of the dump itself lives in tools/common/nid_stub_names.hpp so that self_dump
 // --import-slots names its imports from the identical parse; only the --self-check control and its
 // mismatch accounting are this tool's.
 struct NameTable {
-    std::map<std::string, std::string> by_nid;   // nid -> function name
+    std::map<std::string, std::string>
+        by_nid;   // nid -> function name (verified, for a flat source)
     std::map<std::string, std::string> lib_of;   // nid -> library file stem
-    size_t pairs = 0, mismatches = 0;
+    size_t pairs = 0, mismatches = 0, dropped = 0, rejected = 0, conflicts = 0;
+    prosper_tools::NameSource source = prosper_tools::NameSource::None;
+    bool dir_ok = false;
 };
 
-NameTable load_names(const std::string& dir, bool self_check) {
+NameTable load_names(const std::string& path, bool self_check) {
     NameTable t;
-    auto stub = prosper_tools::load_stub_names(
-        dir, [&](const std::string& nid, const std::string& name) {
-            // The dump states the NID; prosper computes it. They must agree, and a disagreement
-            // means one of the two is wrong for that name — report it rather than silently
-            // preferring either. This is the control on the name table itself.
-            if (!self_check || nid_hash(name) == nid) return;
-            t.mismatches++;
-            // stderr, not stdout: under --tsv these land above the header and corrupt the
-            // stream a consumer parses. The control's result belongs with the diagnostics,
-            // and its COUNT is reported in the scope block below in both modes.
-            fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
-                    name.c_str(), nid.c_str(), nid_hash(name).c_str());
-        });
-    t.by_nid = std::move(stub.by_nid);
-    t.lib_of = std::move(stub.lib_of);
+    // A DIRECTORY is the authoritative per-library sprx_dlsym firmware dump; a FILE is a flat
+    // `NID name` community database (aerolib.csv / ps5rs), which is SECONDARY. load_nid_names
+    // dispatches on that. No on_pair here: a NID is the hash of its name, so every pair is
+    // independently checkable, and that check is run below.
+    auto stub = prosper_tools::load_nid_names(path);
+    t.source = stub.source;
     t.pairs = stub.pairs;
+    t.rejected = stub.rejected;
+    t.conflicts = stub.conflicts;
+    t.dir_ok = stub.dir_ok;
+    const bool flat = (stub.source == prosper_tools::NameSource::FlatDb);
+    for (const auto& [nid, name] : stub.by_nid) {
+        std::string chosen = name;
+        bool verified = (nid_hash(name) == nid);
+        if (!verified && flat) {
+            // A flat database may list several names for one NID; the first need not be the real
+            // preimage, so take whichever candidate hashes back to the NID (N1).
+            if (auto ci = stub.candidates.find(nid); ci != stub.candidates.end())
+                for (const auto& cand : ci->second)
+                    if (nid_hash(cand) == nid) {
+                        chosen = cand;
+                        verified = true;
+                        break;
+                    }
+        }
+        if (!verified) {
+            // A flat (secondary) name that is not a proven preimage of the NID is dropped: it would
+            // otherwise present an unverifiable community string as if it were the real symbol. An
+            // authoritative dump name is kept, and --self-check reports the disagreement instead,
+            // since there it means prosper's own nid_hash is what to look at.
+            if (flat) {
+                t.dropped++;
+                continue;
+            }
+            if (self_check) {
+                t.mismatches++;
+                // stderr, not stdout: under --tsv these land above the header and corrupt the
+                // stream a consumer parses. The COUNT is reported in the scope block below.
+                fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
+                        name.c_str(), nid.c_str(), nid_hash(name).c_str());
+            }
+        }
+        t.by_nid.emplace(nid, chosen);
+        if (auto li = stub.lib_of.find(nid); li != stub.lib_of.end())
+            t.lib_of.emplace(nid, li->second);
+    }
     return t;
 }
 
@@ -212,24 +257,24 @@ ModuleSelection collect_modules(const std::string& input) {
 // `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the human report.
 void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
                  size_t unregistered, size_t shown, size_t shown_unregistered,
-                 size_t satisfied_cross_module,
-                 const std::vector<InputScope>& input_scopes,
-                 size_t data_satisfied_cross_module,
-                 size_t mismatches, const std::string& lib_filter, bool self_check,
-                 bool data_only) {
+                 size_t satisfied_cross_module, const std::vector<InputScope>& input_scopes,
+                 size_t data_satisfied_cross_module, size_t mismatches,
+                 const std::string& lib_filter, bool self_check, bool data_only) {
     for (const auto& input : input_scopes) {
         printf("%sinput: %s -> ", prefix, input_label(input.input).c_str());
-        if (input.single_module) printf("single module");
-        else printf("link set, %zu module%s", input.selected, input.selected == 1 ? "" : "s");
+        if (input.single_module)
+            printf("single module");
+        else
+            printf("link set, %zu module%s", input.selected, input.selected == 1 ? "" : "s");
         printf(" (%zu read, %zu unreadable)\n", input.read, input.failed);
     }
-    printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
-           prefix, total, modules_read, modules_failed);
-    printf("%sscope: %zu unregistered before filtering, %zu shown (%zu unregistered)%s%s\n",
-           prefix, unregistered, shown, shown_unregistered,
+    printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n", prefix,
+           total, modules_read, modules_failed);
+    printf("%sscope: %zu unregistered before filtering, %zu shown (%zu unregistered)%s%s\n", prefix,
+           unregistered, shown, shown_unregistered,
            lib_filter.empty() ? "" : ", --lib filter=", lib_filter.c_str());
-    printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n",
-           prefix, satisfied_cross_module);
+    printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n", prefix,
+           satisfied_cross_module);
     {
         // #3529: what reaches the writable import-data aperture. A data import a sibling module
         // DEFINES is bound to that definition and never comes here, which is why the exclusion
@@ -247,11 +292,10 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
         // is not a title, and its imports are classified without any sibling from another input.
         if (data_only)
             for (const auto& input : input_scopes)
-                printf("%sdata input: %s -> %zu unresolved DATA binding(s)\n",
-                       prefix, input_label(input.input).c_str(), input.data_bindings);
+                printf("%sdata input: %s -> %zu unresolved DATA binding(s)\n", prefix,
+                       input_label(input.input).c_str(), input.data_bindings);
     }
-    if (self_check)
-        printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
+    if (self_check) printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
     if (modules_failed)
         printf("%sWARNING: %zu module(s) did not parse -- their imports are ABSENT from this "
                "census, so a NID missing below may be unmeasured rather than unimported\n",
@@ -261,33 +305,40 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
     // #1756 plus sceKernelWaitCommandBufferCompletion — a ready-made explanation for its fault — and
     // calls NONE of them. The runtime unimplemented-call census over a full faulting run was 12 NIDs,
     // none in libSceAgc/libSceAgcDriver/libkernel (#1226).
-    printf("%sNOTE: this is a STATIC import census -- what the selected modules MAY call, not what they did. A NID "
-           "listed here may never execute, and a fault is not explained by its presence. For what a "
-           "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
-           "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n", prefix);
+    printf(
+        "%sNOTE: this is a STATIC import census -- what the selected modules MAY call, not what "
+        "they did. A NID "
+        "listed here may never execute, and a fault is not explained by its presence. For what a "
+        "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
+        "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n",
+        prefix);
     printf("%sNOTE: dump roots use the loader's link set (boot_program.cpp); explicit module "
            "inputs inspect that module alone. Cross-module exclusions use the modules "
            "selected for each input.\n",
            prefix);
     printf("%sNOTE: aggregate #lbl (TSV titles/title_list) groups inputs by basename; "
-           "the per-input lines identify each argument.\n", prefix);
+           "the per-input lines identify each argument.\n",
+           prefix);
 }
 
 void usage(const char* argv0) {
-    fprintf(stderr,
-            "usage: %s <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]\n"
-            "         [--registered] [--tsv] [--lib <substr>] [--self-check]\n\n"
-            "  --names DIR    resolve NIDs through the PS5 3.20 stub dump\n"
-            "  --registered   also list imports that DO have a handler (default: only unregistered)\n"
-            "  --tsv          machine-readable output\n"
-            "  --lib SUBSTR   only report NIDs whose import library contains SUBSTR\n"
-            "  --self-check   verify every dump NID against prosper's nid_hash()\n"
-            "  --data-only    only DATA imports (ELF STT_OBJECT) -- what the linker binds to the\n"
-            "                 writable import-data aperture rather than to a code stub (#3529)\n",
-            argv0);
+    fprintf(
+        stderr,
+        "usage: %s <app0-dir|module> [more...] [--names <dump-dir|nid-csv>]\n"
+        "         [--registered] [--tsv] [--lib <substr>] [--self-check]\n\n"
+        "  --names PATH   name NIDs from the PS5 stub dump (a directory, authoritative) or a\n"
+        "                 flat `NID name` database file (aerolib.csv / ps5rs, secondary: its\n"
+        "                 names are shown only when they hash back to the NID)\n"
+        "  --registered   also list imports that DO have a handler (default: only unregistered)\n"
+        "  --tsv          machine-readable output\n"
+        "  --lib SUBSTR   only report NIDs whose import library contains SUBSTR\n"
+        "  --self-check   verify every dump NID against prosper's nid_hash()\n"
+        "  --data-only    only DATA imports (ELF STT_OBJECT) -- what the linker binds to the\n"
+        "                 writable import-data aperture rather than to a code stub (#3529)\n",
+        argv0);
 }
 
-} // namespace
+}   // namespace
 
 int main(int argc, char** argv) {
     std::vector<std::string> inputs;
@@ -296,26 +347,58 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--names" && i + 1 < argc) names_dir = argv[++i];
-        else if (a == "--lib" && i + 1 < argc) lib_filter = argv[++i];
-        else if (a == "--registered") show_registered = true;
-        else if (a == "--tsv") tsv = true;
-        else if (a == "--self-check") self_check = true;
-        else if (a == "--data-only") data_only = true;
-        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
-        else if (!a.empty() && a[0] == '-') { usage(argv[0]); return 2; }
-        else inputs.push_back(a);
+        if (a == "--names" && i + 1 < argc)
+            names_dir = argv[++i];
+        else if (a == "--lib" && i + 1 < argc)
+            lib_filter = argv[++i];
+        else if (a == "--registered")
+            show_registered = true;
+        else if (a == "--tsv")
+            tsv = true;
+        else if (a == "--self-check")
+            self_check = true;
+        else if (a == "--data-only")
+            data_only = true;
+        else if (a == "-h" || a == "--help") {
+            usage(argv[0]);
+            return 0;
+        } else if (!a.empty() && a[0] == '-') {
+            usage(argv[0]);
+            return 2;
+        } else
+            inputs.push_back(a);
     }
-    if (inputs.empty()) { usage(argv[0]); return 2; }
+    if (inputs.empty()) {
+        usage(argv[0]);
+        return 2;
+    }
 
     NameTable names;
     if (!names_dir.empty()) {
         names = load_names(names_dir, self_check);
-        if (!tsv)
-            printf("[names] %zu NID<->name pairs from %s%s\n", names.pairs, names_dir.c_str(),
-                   self_check ? "" : "  (pass --self-check to verify them)");
-        if (self_check && !tsv)
-            printf("[names] self-check: %zu mismatch(es) against nid_hash()\n", names.mismatches);
+        const bool flat = (names.source == prosper_tools::NameSource::FlatDb);
+        if (!names.dir_ok)
+            fprintf(stderr,
+                    "[names] WARNING: %s is not a readable dump directory or database "
+                    "file -- NO names loaded, every NID below reads as '?'\n",
+                    names_dir.c_str());
+        if (!tsv) {
+            printf("[names] %zu name(s) from %s (%s)\n", names.by_nid.size(), names_dir.c_str(),
+                   prosper_tools::name_source_str(names.source));
+            if (flat)
+                printf(
+                    "[names] secondary source: %zu verified by nid_hash, %zu dropped unverified, "
+                    "%zu malformed line(s), %zu conflict(s)\n",
+                    names.by_nid.size(), names.dropped, names.rejected, names.conflicts);
+            else if (names.source != prosper_tools::NameSource::FirmwareDump)
+                printf("[names] no names loaded\n");
+            else if (self_check)
+                printf("[names] self-check: %zu mismatch(es) against nid_hash()\n",
+                       names.mismatches);
+            else
+                printf(
+                    "[names] authoritative dump (pass --self-check to verify against nid_hash)\n");
+        }
     }
 
     // The registry is the ground truth for "is there a handler?". Populate it exactly the way a
@@ -386,14 +469,18 @@ int main(int argc, char** argv) {
         if (!registered) unregistered++;
         // A variable has no handler to register, so the registration filter would silently drop
         // every row in this mode. --data-only selects on the symbol type instead.
-        if (data_only) { if (!r.object()) continue; }
-        else if (registered && !show_registered) continue;
+        if (data_only) {
+            if (!r.object()) continue;
+        } else if (registered && !show_registered)
+            continue;
         if (auto it = names.by_nid.find(nid); it != names.by_nid.end()) r.name = it->second;
         if (!lib_filter.empty()) {
             bool hit = false;
-            for (const auto& l : r.libs) if (l.find(lib_filter) != std::string::npos) hit = true;
+            for (const auto& l : r.libs)
+                if (l.find(lib_filter) != std::string::npos) hit = true;
             if (auto it = names.lib_of.find(nid);
-                it != names.lib_of.end() && it->second.find(lib_filter) != std::string::npos) hit = true;
+                it != names.lib_of.end() && it->second.find(lib_filter) != std::string::npos)
+                hit = true;
             if (!hit) continue;
         }
         selected.push_back(&r);
@@ -407,16 +494,35 @@ int main(int argc, char** argv) {
         return a->nid < b->nid;
     });
 
+    // Where a shown name came from: a flat database is secondary, so a consumer can tell its names
+    // apart from authoritative dump names on the row itself (not only from the [names] header).
+    const char* name_src_tag = names.source == prosper_tools::NameSource::FlatDb ? "flat_db"
+                               : names.source == prosper_tools::NameSource::FirmwareDump
+                                   ? "firmware_dump"
+                                   : "-";
+
     if (tsv) {
-        printf("nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\n");
+        if (!names_dir.empty())
+            printf("# names: source=%s path=%s named=%zu dropped=%zu malformed=%zu conflicts=%zu\n",
+                   prosper_tools::name_source_str(names.source), names_dir.c_str(),
+                   names.by_nid.size(), names.dropped, names.rejected, names.conflicts);
+        // name_src is appended as the LAST column so the legacy 0-7 column positions a consumer
+        // depends on stay put; a flat-sourced name is still distinguishable per row.
+        printf("nid\tname\tsym_type\tregistered\ttitles\tmodules\tlibs\ttitle_list\tname_src\n");
         for (const Row* r : selected) {
             std::string libs, tl;
-            for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
-            for (const auto& t : r->titles) { if (!tl.empty()) tl += ","; tl += t; }
-            printf("%s\t%s\t%s\t%d\t%zu\t%zu\t%s\t%s\n", r->nid.c_str(),
+            for (const auto& l : r->libs) {
+                if (!libs.empty()) libs += ",";
+                libs += l;
+            }
+            for (const auto& t : r->titles) {
+                if (!tl.empty()) tl += ",";
+                tl += t;
+            }
+            printf("%s\t%s\t%s\t%d\t%zu\t%zu\t%s\t%s\t%s\n", r->nid.c_str(),
                    r->name.empty() ? "?" : r->name.c_str(), sym_types_of(*r).c_str(),
-                   Hle::registered(r->nid) ? 1 : 0,
-                   r->titles.size(), r->modules, libs.c_str(), tl.c_str());
+                   Hle::registered(r->nid) ? 1 : 0, r->titles.size(), r->modules, libs.c_str(),
+                   tl.c_str(), r->name.empty() ? "-" : name_src_tag);
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
                     shown_unregistered, satisfied_cross_module, input_scopes,
@@ -425,16 +531,19 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    printf("%s", data_only
-        ? "\n== DATA imports (STT_OBJECT) no sibling module defines -> import-data aperture ==\n"
-        : show_registered
-        ? "\n== imports (registered and unregistered) ==\n"
-        : "\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
-    printf("%-13s %-52s %-8s %10s %5s  %s\n",
-           "NID", "name", "sym type", "registered", "#lbl", "import library");
+    printf("%s", data_only ? "\n== DATA imports (STT_OBJECT) no sibling module defines -> "
+                             "import-data aperture ==\n"
+                 : show_registered
+                     ? "\n== imports (registered and unregistered) ==\n"
+                     : "\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
+    printf("%-13s %-52s %-8s %10s %5s  %s\n", "NID", "name", "sym type", "registered", "#lbl",
+           "import library");
     for (const Row* r : selected) {
         std::string libs;
-        for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
+        for (const auto& l : r->libs) {
+            if (!libs.empty()) libs += ",";
+            libs += l;
+        }
         printf("%-13s %-52s %-8s %10s %5zu  %s\n", r->nid.c_str(),
                r->name.empty() ? "?" : r->name.c_str(), sym_types_of(*r).c_str(),
                Hle::registered(r->nid) ? "yes" : "no", r->titles.size(), libs.c_str());
@@ -442,7 +551,6 @@ int main(int argc, char** argv) {
     printf("\n");
     print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
                 shown_unregistered, satisfied_cross_module, input_scopes,
-                data_satisfied_cross_module, names.mismatches, lib_filter, self_check,
-                data_only);
+                data_satisfied_cross_module, names.mismatches, lib_filter, self_check, data_only);
     return 0;
 }

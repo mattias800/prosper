@@ -542,6 +542,11 @@ struct ShaderResource {
     // Effective parent/child x4/x8 observation. This is a replay obligation, not a code proof
     // or a live mapping/producer certificate. Graphics re-derives the complete original chain.
     uint32_t owned_nested_snapshot_bytes = 0;
+    // Replay-only (#3807): this resource replays a capture placeholder for a draw buffer the live
+    // renderer's source gate found unmapped, so it carries no bytes and must take the same all-zero
+    // fallback the live renderer took. Decided by the record, never by the replay process's own
+    // address space. Production tables leave it false.
+    bool replay_source_unavailable = false;
 };
 
 inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource,

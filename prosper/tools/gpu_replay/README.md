@@ -113,6 +113,21 @@ Inspection reports each descriptor's declared size, capture-planned footprint, a
 count separately, so a thin capsule can still expose a pathological range. Capture v28+ retains the exact
 planned span and reports the resolved `row-pitch` for linear sampled images; older captures derive the
 guest pitch while retaining their historical tight byte span.
+
+**A draw buffer with nothing mapped behind it is a placeholder, not a capture gap (#3807, capture
+v74).** The live draw path asks one question of a non-image buffer with no host-owned bytes: is any
+guest mapping there? When none is, it reads nothing and binds an all-zero buffer sized from the
+shader's reflected requirement. UE4 titles bind exactly this as a whole-range V# (NUM_RECORDS
+`0xffffffff`); *Kena* binds one at `0xf00000000000`, above the 47-bit user address space, and every
+F9 grab used to abort on it with the 1 GiB per-resource ceiling. The capture now asks the renderer's
+own gate (`src/gpu/capture/capture_source_gate.hpp`) and records such a binding with no blob and an
+explicit mark; replay binds the same all-zero fallback **because the record says so**, not because the
+replay process has nothing mapped there. The summary line counts them, `--list-resources` prints
+`source unmapped live: all-zero fallback`, and `--dump-resource` on one says why there are no bytes.
+A whole-range descriptor over a source that IS mapped keeps the per-resource ceiling and still fails
+closed. Images, compute tables and owned fragment-wave tables never take this path. A capture with
+no placeholder is still written as v71/v72, byte for byte.
+
 The `vs=` and `fs=` summaries identify whether each recompiled shader is retained as `owned` or
 `shared`; their size and hash always describe the accessor-selected words the renderer consumes.
 
@@ -477,6 +492,10 @@ notices. A few places do, and each produces a plausible frame rather than an err
   whether ordinary guest bytes may be read beside a renderer-only volume slice ask the mapping
   table too (`unpublished_volume_may_overlap`), and in a replay they still get Unknown. A title
   that renders to volume targets may replay differently from its live run for that reason.
+- **A layered NGG depth draw replays its slice 0 only** (#4778, instrument trap 293). The live
+  executor expands such a draw into one replay per depth slice after the capture has recorded it,
+  and the slice count is not serialized. So a replayed point-light shadow cube has five empty
+  faces. Measure missing shadows live, not from a bundle.
 - **A DMA copy out of a seeded CB_COLOR ALT (BGRA) target is not swapped into guest order**
   (#4686, review of #4695). The live renderer keeps an ALT target as canonical RGBA8 and hands a
   DMA read the guest's BGRA bytes. An RTT seed records the target's host format but not the

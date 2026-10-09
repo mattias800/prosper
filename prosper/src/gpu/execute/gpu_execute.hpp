@@ -21,6 +21,7 @@
 #include "gpu/state/fragment_entry_observation.hpp"
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
+#include "gpu/state/fragment_export_state.hpp"   // #4703: per-draw fragment export compile input
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include "gpu/pm4/vgt_shader_stages.hpp"   // NGG shape in the refused-shader index
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
@@ -32,6 +33,7 @@
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"   // merged-NGG draw description (#3135 P4)
 #include "gpu/execute/ngg_live_draw.hpp"   // its live producer (#3135 P5)
+#include "gpu/execute/ngg_draw_indices.hpp"   // an indexed draw's index fetch (#3135 P6)
 #include <span>
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
@@ -117,6 +119,15 @@ struct DrawItem {
     // A merged ES+GS NGG draw the backend runs through its subgroup shell (#3135 P4). No producer
     // sets it yet: live admission is P5.
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
+    // A depth-only NGG draw into a depth array of ngg_depth_slice_count slices (#3135 layered
+    // depth): ngg_subgroup is replayed once per slice, slice ngg_depth_first_slice + k drawing layer
+    // k's primitives. The executor expands such an item into one item per slice
+    // (expand_ngg_depth_slices) before the submit renderer sees it; each expanded item carries its
+    // layer in ngg_layer_select (the raster stage reads it as gl_InstanceIndex through the run's
+    // firstInstance) and a count of 0. Not serialized: a capture keeps the slice-0 replay only.
+    uint32_t ngg_depth_slice_count = 0;
+    uint32_t ngg_depth_first_slice = 0;
+    uint32_t ngg_layer_select = 0;
     // Ordered source authority only. Never serialized or interpreted as ready resource backing.
     std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
@@ -499,6 +510,15 @@ bool admit_compute_nested_wide_data(const prosper::GuestMappingLease* mapping_le
                                     const std::vector<Rdna2Inst>& decoded,
                                     const std::vector<SrtUse>& uses,
                                     ShaderResourceTable& table);
+// The same admission from an inventory already derived for these exact `decoded` instructions
+// (ComputeProgramFacts::nested_wide_data()), so a repeated dispatch does not re-run the analysis.
+// The inventory must be the one the overload above would compute; the decision is then identical.
+struct NestedWideDataFacts;   // gpu/execute/compute_program_facts.hpp
+bool admit_compute_nested_wide_data(const prosper::GuestMappingLease* mapping_lease,
+                                    const std::vector<Rdna2Inst>& decoded,
+                                    const NestedWideDataFacts& inventory,
+                                    const std::vector<SrtUse>& uses,
+                                    ShaderResourceTable& table);
 
 // Apply the exact dispatch-scoped resource-path specialization used by the live compute executor.
 // The report makes the production decision observable to tests and diagnostics: callers can verify
@@ -652,6 +672,8 @@ ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t d
 uint64_t compute_dispatch_code_addr(const GpuState& submit,
                                     const GpuState::Dispatch& dispatch);
 
+struct ComputeProgramFacts;   // gpu/execute/compute_program_facts.hpp
+
 struct ComputeItem {
     std::vector<uint32_t> spirv;
     std::vector<uint32_t> user_sgprs;
@@ -672,6 +694,13 @@ struct ComputeItem {
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
     uint32_t required_subgroup_size = 0;
+    // ADR 0028: dword count of the program at code_addr, so a decline that prints its line can fetch
+    // the memoized program facts (and from them the cross-lane inventory) lazily. 0 = unknown
+    // (capture replay, hand-built records): reported as unanalyzed, never as "no cross-lane op".
+    uint32_t code_dwords = 0;
+    // Only when PROSPER_WAVE64_EXCHANGE set a width for this dispatch: the memoized program facts, so
+    // the admission check needs no cache lookup per dispatch. Null (no refcount traffic) otherwise.
+    std::shared_ptr<const ComputeProgramFacts> exchange_facts;
     ComputeCpuFastPath cpu_fast_path = ComputeCpuFastPath::None;
     // Capture v39 retains the raw compute program and every semantic launch/recompiler input. The
     // stored SPIR-V remains the default replay artifact; --recompile-raw may rebuild it with the
@@ -765,7 +794,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr);
+    RefusedShaderSource* original_source = nullptr,
+    FragmentExportFormats fragment_export_formats = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
@@ -776,7 +806,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
     RefusedShaderSource* original_source = nullptr,
     const CheckedGraphicsSource* checked_source = nullptr,
-    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr);
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr,
+    FragmentExportFormats fragment_export_formats = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -1112,6 +1143,36 @@ inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
                          (unsigned long long)retained_draw_attempts().load());
         }
     }
+}
+
+// PROSPER_DROPPED_DRAW_CENSUS=1, second view: shader-recompile drops by the PROGRAM that refused.
+// The target view above says where draws were lost; this one says whose refusal lost them, so a
+// census ranks refusals by dropped draws rather than by refused programs (one refused vertex
+// program can own most of a level's draws). The refusal reason itself is in the run's
+// refused-shader index and on the program's terminal reject line; join on the address, which is
+// run-local. Bounded like the target view: 256 keys, reported at powers of two.
+inline void report_dropped_draw_program(const char* stage, uint64_t program, const char* reason) {
+    if (!dropped_draw_census_enabled()) return;
+    static std::mutex mutex;
+    static std::map<std::tuple<std::string, uint64_t, std::string>, uint64_t> dropped;
+    static uint64_t total = 0;
+    std::lock_guard lock(mutex);
+    const auto key = std::make_tuple(std::string(stage), program, std::string(reason));
+    if (dropped.size() < 256 || dropped.count(key)) ++dropped[key];
+    const uint64_t n = ++total;
+    if ((n & (n - 1)) != 0 || n < 256) return;
+    std::vector<std::pair<uint64_t, const decltype(key)*>> ranked;
+    ranked.reserve(dropped.size());
+    for (const auto& e : dropped) ranked.push_back({e.second, &e.first});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[dropped-draw-program] %llu shader-recompile draws dropped\n",
+                 (unsigned long long)n);
+    for (size_t i = 0; i < ranked.size() && i < 16; ++i)
+        std::fprintf(stderr, "[dropped-draw-program]   %s=0x%llx reason=%s x%llu\n",
+                     std::get<0>(*ranked[i].second).c_str(),
+                     (unsigned long long)std::get<1>(*ranked[i].second),
+                     std::get<2>(*ranked[i].second).c_str(), (unsigned long long)ranked[i].first);
 }
 
 enum class RealizationFailureReason : uint8_t {
@@ -1569,7 +1630,10 @@ constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Ref
 struct LiveTargetImageRequest {
     uint32_t width = 0, height = 0;
     uint32_t render_scale = 1;
-    bool allow_depth = false;
+    // Nonzero only for a one-component view that reads a depth plane: the guest bytes per texel
+    // of the plane it reads (2 = Z16, 4 = Z32; frontends/shared/rtt/depth_plane_view.hpp). The
+    // importer serves a retained depth plane only when the plane's own width matches.
+    uint32_t depth_texel_bytes = 0;
     // True only when reflection proves this descriptor is read exclusively through normalized
     // sample/gather operations. Integer image fetch/read must retain the exact declared extent.
     bool normalized_sampling = false;
@@ -1976,6 +2040,88 @@ inline bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const ui
     return (have_even && even_const && even0 != 0) || (have_odd && odd_const && odd0 != 0);
 }
 
+// The bound vertex buffers' UNCLAMPED record count (size/stride, the largest) -- the bound the #304
+// part-two detector needs. 0 when the table has none.
+inline uint32_t vertex_buffer_records_unclamped(const ShaderResourceTable* table) {
+    uint32_t records = 0;
+    if (table)
+        for (const auto& r : table->resources)
+            if (r.cls == ResourceClass::VertexBuffer && r.stride)
+                records = std::max(records, r.size / r.stride);
+    return records;
+}
+
+// Where an indexed draw's `n` indices live and at what element size: the announced size, or -- for a
+// title that announced none (#3009) -- the size the #304 detectors recover from the bytes, with a
+// DrawIndexOffset's address recomputed at that stride. ONE rule for every consumer: the ordinary
+// path binds what this names for vkCmdDrawIndexed, and the merged-NGG path (#3135 P6) reads the
+// same bytes into its subgroup plan, so the two can never read one buffer two ways.
+// `element_bytes` is 0 for an unknown announced size. `detected` names the detector that fired.
+struct DrawIndexSource {
+    uint64_t addr = 0;
+    uint64_t addr32 = 0;   // the same buffer at a 4-byte stride (differs only for an offset draw)
+    uint32_t element_bytes = 0;
+    const char* detected = nullptr;
+};
+inline DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Draw& draw,
+                                                 uint32_t n, uint32_t vb_records_unclamped) {
+    DrawIndexSource source;
+    source.element_bytes = index_elem_bytes(ds.index_type);
+    source.addr = draw.index_addr;
+    source.addr32 =
+        draw.from_offset ? (draw.index_base + (uint64_t)draw.index_offset * 4u) : draw.index_addr;
+    if (!index_size_detection_permitted(ds.index_type, ds.index_type_announced) || n < 2)
+        return source;
+    if (!guest_readable(draw.index_addr, n * 2u) || !guest_readable(source.addr32, n * 4u))
+        return source;
+    const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw.index_addr;
+    const uint32_t* p32 = (const uint32_t*)(uintptr_t)source.addr32;
+    // Zero high halves first, so every buffer that detector already classifies keeps its existing
+    // verdict; the constant-non-zero form (#304 part two) only ever sees what it rejected.
+    if (index_buffer_is_unannounced_32bit(p16, p32, n))
+        source.detected = "zero-high-half";
+    else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
+        source.detected = "constant-high-half";
+    if (source.detected) {
+        source.element_bytes = 4;
+        source.addr = source.addr32;
+    }
+    return source;
+}
+
+// #3135 P6: an indexed merged-NGG draw's indices, read where and at the size the ordinary path would
+// bind them (resolve_draw_index_source), then decoded by ngg_draw_indices. `vertex_range` (max index
+// + 1) is what sizes the linked fold and the vertex buffers, never the index count. `refusal` names
+// the rule when no indices were read: ngg-index-count, ngg-index-unavailable (no address or count, an
+// unknown element size, or unreadable bytes), or the decode's own refusal.
+struct NggDrawIndexFetch {
+    std::shared_ptr<const std::vector<uint32_t>> indices;
+    const char* refusal = nullptr;
+    uint32_t vertex_range = 0;
+};
+inline NggDrawIndexFetch fetch_ngg_draw_indices(const GpuState& ds, const GpuState::Draw& draw,
+                                                uint32_t vb_records_unclamped) {
+    NggDrawIndexFetch out;
+    if (draw.index_count > kNggMaxIndices) {
+        out.refusal = "ngg-index-count";
+        return out;
+    }
+    out.refusal = "ngg-index-unavailable";
+    if (!draw.index_addr || !draw.index_count) return out;
+    const DrawIndexSource source =
+        resolve_draw_index_source(ds, draw, draw.index_count, vb_records_unclamped);
+    if (!source.element_bytes ||
+        !guest_readable(source.addr, draw.index_count * source.element_bytes))
+        return out;
+    const NggDrawIndices fetched =
+        decode_ngg_draw_indices(reinterpret_cast<const void*>(static_cast<uintptr_t>(source.addr)),
+                                source.element_bytes, draw.index_count, read_ngg_index_restart(ds));
+    out.indices = fetched.indices;
+    out.refusal = fetched.refusal;
+    if (fetched.indices) out.vertex_range = fetched.max_index + 1u;
+    return out;
+}
+
 // #1163: choose a NON-INDEXED draw's vertex count. A DrawIndexAuto packet's count (draw_count) is the
 // AUTHORITATIVE hardware vertex count — the GPU draws exactly that many vertices with auto indices
 // 0..draw_count-1. The bound vertex buffer's record count (vb_records = size/stride) is ONLY a fallback for
@@ -2127,6 +2273,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     out.native_ps_source.reset();
     out.original_graphics_effects.reset();
     out.ngg_subgroup.reset();
+    out.ngg_depth_slice_count = 0;
+    out.ngg_layer_select = 0;
+    out.ngg_depth_first_slice = 0;
     const uint64_t scalar_order = draw ? draw->command_order : 0;
     const auto checked_vertex =
         scalar_read_point ? checked_graphics_source(scalar_read_point, ds, rs.es_addr, scalar_order,
@@ -2739,6 +2888,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     }
     uint64_t vs_identity = 0, fs_identity = 0;
     RefusedShaderSource vs_original, fs_original;
+    // #4703: compressed-export unpack and integer outputs follow the bound targets.
+    const FragmentExportFormats fragment_exports = fragment_export_formats(resolved_pipeline);
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words || checked_vertex) {
@@ -2763,7 +2914,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
                 rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original, checked_fragment.get(),
-                &out.native_ps_source);
+                &out.native_ps_source, fragment_exports);
     } else {
         if (owned_vertex) {
         }   // execution and native export commit happen at the actual device owner
@@ -2787,7 +2938,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
+                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original, fragment_exports);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -2883,15 +3034,33 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // subgroup shell instead (ngg_live_draw.hpp). Strictly additive: only a draw dropped below can
     // change, and a refusal keeps it dropped, now with the rule named.
     std::shared_ptr<const NggSubgroupDraw> ngg_subgroup;
+    uint32_t ngg_depth_slice_count = 0;
+    uint32_t ngg_depth_first_slice = 0;
     const char* ngg_refusal = nullptr;
-    if (vs_words.empty() && !owned_vertex && vertex_chain && !owned_fragment && !scalar_bank &&
-        !fs_words.empty() && !rect_list_synthesis && !dcc_decompress &&
-        std::strcmp(refused_ngg_class, "merged-gs") == 0) {
+    uint32_t ngg_vertex_range = vcount_hint;   // an indexed NGG draw: max index + 1 (#3135 P6)
+    // #3135 P7: an NGG VS without a GS (the VS is the primitive shader) runs through the same shell,
+    // as its own program (no fetch prolog) or linked like a merged chain. A fused back half is
+    // neither and stays on the per-vertex path.
+    const bool ngg_vs_alone = std::strcmp(refused_ngg_class, "ngg-vs") == 0 &&
+                              (vertex_chain || vs_program_addr == rs.es_addr);
+    if (vs_words.empty() && !owned_vertex && !owned_fragment && !scalar_bank && !fs_words.empty() &&
+        !rect_list_synthesis && !dcc_decompress &&
+        ((vertex_chain && std::strcmp(refused_ngg_class, "merged-gs") == 0) || ngg_vs_alone)) {
         NggLiveDrawInput ngg;
         ngg.registers = read_ngg_draw_registers(ds, rs.prim_type);
         ngg.facts.vertex_count = vcount_hint;
         ngg.facts.instance_count = draw ? draw->instance_count : ds.num_instances;
         ngg.facts.indexed = draw && draw->indexed;
+        // #3135 P6: an indexed draw's indices feed the subgroup plan, read from the place and at
+        // the size the ordinary path would bind them (resolve_draw_index_source). The vertex RANGE
+        // they address, not the index count, sizes the linked fold's vertex fetches below.
+        if (ngg.facts.indexed) {
+            const NggDrawIndexFetch fetched =
+                fetch_ngg_draw_indices(ds, *draw, vertex_buffer_records_unclamped(vrt.get()));
+            ngg.facts.indices = fetched.indices;
+            ngg.facts.index_refusal = fetched.refusal;
+            if (fetched.indices) ngg_vertex_range = fetched.vertex_range;
+        }
         ngg.facts.indirect = draw && (draw->indirect || draw->indirect_args_addr);
         ngg.facts.vertex_offset =
             rs.ge_indx_offset != 0 ||
@@ -2899,6 +3068,49 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         const auto volume = color_target_volume_view(rs.color_targets[0]);
         ngg.facts.target_slices = volume.slice_count;
         ngg.facts.target_first_slice = volume.first_slice;
+        const ColorTargetState& target0 = rs.color_targets[0];
+        const auto one_slice = [](const ColorTargetState& target) {
+            return target.has_view && target.has_attrib3 && target.resource_type != 2u &&
+                   target.slice_start == 0u && target.slice_max == 0u;
+        };
+        ngg.facts.target_single_slice = one_slice(target0);
+        // #3135 P7 review: every OTHER bound attachment must be one slice too. A colour slot is
+        // bound when the draw writes it; depth/stencil when it has a surface and a test or clear
+        // that touches it (the backend then attaches it).
+        bool others = true;
+        bool colour_written = (rs.cb_target_mask & 0xfu) && rs.color_targets[0].base;
+        for (uint32_t slot = 1; slot < rs.color_targets.size(); ++slot)
+            if (((rs.cb_target_mask >> (4u * slot)) & 0xfu) && rs.color_targets[slot].base) {
+                others = others && one_slice(rs.color_targets[slot]);
+                colour_written = true;
+            }
+        ngg.facts.depth_only = !colour_written;
+        // The backend attaches depth/stencil for depth_stencil_tests_enabled() or a clear; the
+        // proof takes the superset, uses_depth_stencil_attachment(), so depth bounds alone (Z off)
+        // counts as bound (#4750 review).
+        const bool depth_bound = (rs.depth_read_base || rs.depth_write_base ||
+                                  rs.stencil_read_base || rs.stencil_write_base) &&
+                                 uses_depth_stencil_attachment(resolved_pipeline);
+        if (depth_bound) {
+            const bool view_present = ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) != 0;
+            const uint32_t v = rs.db_depth_view;
+            const uint32_t first = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START) |
+                                   (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_START_HI) << 11);
+            const uint32_t last = PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX) |
+                                  (PM4_FIELD(v, DB_DEPTH_VIEW, SLICE_MAX_HI) << 11);
+            others = others && view_present && first == 0u && last == 0u;
+            ngg.facts.depth_view_known = view_present && last >= first;
+            ngg.facts.depth_first_slice = first;
+            ngg.facts.depth_slice_count = ngg.facts.depth_view_known ? last - first + 1u : 0u;
+        }
+        ngg.facts.depth_bound = depth_bound;
+        // What the backend itself attaches: depth_stencil_tests_enabled() (an effective depth or
+        // stencil clear needs its test enabled too). A REFUSAL keys on this, not on the proof's
+        // superset, so a draw the backend renders without depth is never refused for it.
+        ngg.facts.depth_attached = (rs.depth_read_base || rs.depth_write_base ||
+                                    rs.stencil_read_base || rs.stencil_write_base) &&
+                                   depth_stencil_tests_enabled(resolved_pipeline);
+        ngg.facts.other_attachments_single_slice = others;
         if (vertex_header && vertex_header->specials &&
             guest_readable(reinterpret_cast<uintptr_t>(vertex_header->specials),
                            sizeof(AgcShaderSpecials))) {
@@ -2922,15 +3134,22 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         std::shared_ptr<ShaderResourceTable> ngg_vrt;
         if (ngg_admission.ok()) {
             ngg.user_data_complete =
-                read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data);
-            ngg.linked = ngg_linked_chain(
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
-                vertex_prolog.prefix_dwords,
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)),
-                chain_dwords);
+                read_ngg_user_data(ds, ngg_admission.user_sgprs, &ngg.user_data);
+            ngg.user_data_address_known = read_ngg_user_data_address(ds, ngg.user_data_address);
+            ngg.linked =
+                vertex_chain
+                    ? ngg_linked_chain(
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                          vertex_prolog.prefix_dwords,
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)),
+                          chain_dwords)
+                    : ngg_linked_chain(
+                          nullptr, 0,
+                          reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                          vs_program_dwords);
             // The shell runs the LINKED program, so its table is folded over the linked words.
             if (ngg.linked)
-                ngg_vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint,
+                ngg_vrt = build_stage_table(ds, rs.es_addr, false, ngg_vertex_range,
                                             draw ? draw->command_order : 0, raw_context, nullptr,
                                             nullptr, *ngg.linked);
             ngg.resources = ngg_vrt.get();
@@ -2941,10 +3160,107 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             result = realize_ngg_live_draw(ngg, ngg_host);
         }
         ngg_subgroup = result.draw;
+        if (ngg_subgroup) {
+            ngg_depth_slice_count = result.depth_slice_count;
+            ngg_depth_first_slice = result.depth_first_slice;
+        }
         if (ngg_subgroup) vrt = ngg_vrt;   // set 0 is the shell's: the linked fold's table
+        // Always on, bounded: an ADMITTED indexed draw's shape, once per program. The [ngg-refused]
+        // line below named these draws while they were dropped (ngg-indexed); this is the evidence
+        // that one now runs, readable without PROSPER_DBG (which desyncs the routes reaching them).
+        // Once 32 programs are logged the full flag skips the mutex: realization workers never
+        // contend on it for the rest of the run.
+        static std::atomic<bool> ngg_indexed_log_full{false};
+        if (ngg_subgroup && result.indexed &&
+            !ngg_indexed_log_full.load(std::memory_order_relaxed)) {
+            static std::mutex ngg_indexed_mutex;
+            static std::set<uint64_t> ngg_indexed_logged;
+            const std::lock_guard lock(ngg_indexed_mutex);
+            if (ngg_indexed_logged.size() >= 32)
+                ngg_indexed_log_full.store(true);
+            else if (ngg_indexed_logged.insert(rs.es_addr).second)
+                std::fprintf(
+                    stderr,
+                    "[ngg-indexed] es=0x%llx chain=0x%llx ps=0x%llx admitted indices=%zu "
+                    "vertex-range=%u instances=%u subgroups=%zu target=0x%llx "
+                    "slices=%u\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(chain_addr),
+                    static_cast<unsigned long long>(rs.ps_addr),
+                    ngg.facts.indices ? ngg.facts.indices->size() : size_t{0}, ngg_vertex_range,
+                    ngg.facts.instance_count, ngg_subgroup->plan.subgroups.size(),
+                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices);
+        }
+        // Always on, bounded like [ngg-indexed]: an admitted VS-only NGG program, once, with the
+        // partition registers its plan was built from (#3135 P7).
+        static std::atomic<bool> ngg_vs_log_full{false};
+        if (ngg_subgroup && ngg_vs_alone && !ngg_vs_log_full.load(std::memory_order_relaxed)) {
+            static std::mutex ngg_vs_mutex;
+            static std::set<uint64_t> ngg_vs_logged;
+            const std::lock_guard lock(ngg_vs_mutex);
+            if (ngg_vs_logged.size() >= 32)
+                ngg_vs_log_full.store(true);
+            else if (ngg_vs_logged.insert(rs.es_addr).second)
+                std::fprintf(
+                    stderr,
+                    "[ngg-vs] es=0x%llx ps=0x%llx admitted prim=%u vertices=%u "
+                    "instances=%u indexed=%d subgroups=%zu onchip=%08x ge-cntl=%08x "
+                    "max-out=%08x itemsize=%08x gs-out-prim=%08x depth-slices=%zu@%u\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(rs.ps_addr), rs.prim_type,
+                    ngg.facts.vertex_count, ngg.facts.instance_count, ngg.facts.indexed ? 1 : 0,
+                    ngg_subgroup->plan.subgroups.size(), ngg.registers.vgt_gs_onchip_cntl,
+                    ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
+                    ngg.registers.vgt_esgs_ring_itemsize, ngg.registers.vgt_gs_out_prim_type,
+                    size_t{ngg_depth_slice_count}, ngg_depth_first_slice);
+        }
         ngg_refusal = result.applies && !ngg_subgroup
                           ? (result.refusal ? result.refusal : "ngg-refused")
                           : nullptr;
+        // Always on, bounded: the draw SHAPE a refused merged-NGG draw had, once per (program,
+        // rule). The refused-shader index names the rule but not the shape, and the widening work
+        // each rule waits on (#3135 P6: indexed, indirect, vertex offset, ...) is gated on exactly
+        // that evidence. A PROSPER_DBG run desyncs the pad route that reaches these draws.
+        if (ngg_refusal) {
+            static std::mutex ngg_shape_mutex;
+            static std::set<std::pair<uint64_t, std::string>> ngg_shape_logged;
+            const std::lock_guard lock(ngg_shape_mutex);
+            if (ngg_shape_logged.size() < 32 &&
+                ngg_shape_logged.emplace(rs.es_addr, ngg_refusal).second)
+                std::fprintf(
+                    stderr,
+                    "[ngg-refused] es=0x%llx chain=0x%llx ps=0x%llx reason=%s "
+                    "order=%llu prim=%u vertices=%u instances=%u indexed=%d "
+                    "index-count=%u index-type=%u indirect=%d vertex-offset=%d "
+                    "gs-out-prim=%08x stages=%08x target=0x%llx slices=%u "
+                    "rsrc2-user-sgprs=%u user-data-range=%u..%u%s vs-out-cntl=%08x "
+                    "onchip=%08x ge-cntl=%08x max-out=%08x max-vert-out=%08x itemsize=%08x "
+                    "missing=%s cb-target-mask=%08x db-depth-view=%08x%s depth-bound=%d "
+                    "z=%d/%d stencil=%d\n",
+                    static_cast<unsigned long long>(rs.es_addr),
+                    static_cast<unsigned long long>(chain_addr),
+                    static_cast<unsigned long long>(rs.ps_addr), ngg_refusal,
+                    static_cast<unsigned long long>(draw ? draw->command_order : 0), rs.prim_type,
+                    ngg.facts.vertex_count, ngg.facts.instance_count, ngg.facts.indexed ? 1 : 0,
+                    draw ? draw->index_count : 0u, ds.index_type, ngg.facts.indirect ? 1 : 0,
+                    ngg.facts.vertex_offset ? 1 : 0, ngg.registers.vgt_gs_out_prim_type,
+                    ngg.registers.vgt_shader_stages_en,
+                    static_cast<unsigned long long>(rs.color0_base), ngg.facts.target_slices,
+                    ngg_rsrc2_gs_user_sgprs(ngg.registers.spi_shader_pgm_rsrc2_gs),
+                    ngg.facts.user_data_range_start, ngg.facts.user_data_range_end,
+                    ngg.facts.user_data_range_known ? "" : "(unknown)",
+                    ngg.registers.pa_cl_vs_out_cntl, ngg.registers.vgt_gs_onchip_cntl,
+                    ngg.registers.ge_cntl, ngg.registers.ge_max_output_per_subgroup,
+                    ngg.registers.vgt_gs_max_vert_out, ngg.registers.vgt_esgs_ring_itemsize,
+                    ngg.registers.missing ? ngg.registers.missing : "none", rs.cb_target_mask,
+                    rs.db_depth_view,
+                    ds.cx.count(prosper::agc::Pm4::DB_DEPTH_VIEW) ? "" : "(absent)",
+                    (rs.depth_read_base || rs.depth_write_base || rs.stencil_read_base ||
+                     rs.stencil_write_base)
+                        ? 1
+                        : 0,
+                    rs.z_enable ? 1 : 0, rs.z_write_enable ? 1 : 0, rs.stencil_enable ? 1 : 0);
+        }
         // Per submit, not process-lifetime: tests arm PROSPER_DBG at runtime.
         // NOLINTNEXTLINE(concurrency-mt-unsafe): one read per submit
         if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_DBG") && result.applies) {
@@ -2998,6 +3314,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             ngg_refusal ? (std::string("shader-recompile/ngg:") + ngg_refusal).c_str()
                         : "shader-recompile",
             rs.cb_target_mask, rs.cb_shader_mask);
+        if (vs_words.empty())
+            report_dropped_draw_program("es", rs.es_addr, ngg_refusal ? ngg_refusal : "recompile");
+        else if (fs_words.empty())
+            report_dropped_draw_program("ps", rs.ps_addr, "recompile");
+        else
+            report_dropped_draw_program("gs", rs.es_addr, "geometry");
         // #3951: a draw lost here never reaches the renderer's pass loop, so neither the frontend
         // drop sites nor [draw-disposition] could see it and `dropped-draws` stayed at 0 while a
         // recompiler refusal removed ~99.7% of GTA V's gameplay draws. Name the failing stage.
@@ -3204,10 +3526,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // value for these NGG draws (4 of ~20 verts -> a degenerate sliver), while the VB's record count is
     // the whole mesh. A shader fetching past a real vertex reads 0 under robustBufferAccess -> a
     // degenerate, clipped vertex, so a slightly-generous count is harmless.
-    uint32_t vb_entries = 0;
-    if (vrt) for (const auto& r : vrt->resources)
-        if (r.cls == ResourceClass::VertexBuffer && r.stride)
-            vb_entries = std::max(vb_entries, r.size / r.stride);
+    uint32_t vb_entries = vertex_buffer_records_unclamped(vrt.get());
     // The unclamped count, kept only as an INDEX-RANGE BOUND for the #304 part-two detector below.
     // vb_entries itself is clamped next, and that clamp would defeat the bound: Tomb Raider's level
     // pool holds 775,111 records and its real 32-bit indices reach 774,898, so a 65,536 ceiling would
@@ -3223,17 +3542,18 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     // non-indexed draw of the hint count instead of reading garbage.
     static constexpr uint32_t kMaxIndices = 1u << 20;   // sanity cap (largest seen live: 0x61e)
     if (owned_vertex) out.indices = std::move(owned_indices);
-    if (!owned_vertex && draw && draw->indexed && draw->index_addr && draw->index_count) {
-        uint32_t esz = index_elem_bytes(ds.index_type);
+    // A merged-NGG draw's indices were read into its subgroup plan; the backend refuses an index
+    // buffer on it (ngg_backend_draw_structure_refusal).
+    if (!owned_vertex && !ngg_subgroup && draw && draw->indexed && draw->index_addr &&
+        draw->index_count) {
         uint32_t n = std::min(draw->index_count, kMaxIndices);
-        uint64_t index_addr = draw->index_addr;
-        // The address the same buffer would be read from at a 4-byte stride. For a DrawIndexOffset
-        // the two differ (index_base + offset*2 against index_base + offset*4); otherwise they are
-        // the same bytes. Computed for every indexed draw so the instrument below can print both
-        // readings whatever the announced size says -- it is arithmetic, nothing is dereferenced.
-        const uint64_t addr32 = draw->from_offset
-                                    ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
-                                    : draw->index_addr;
+        // Where the indices live and at what size (#304/#3009): one rule, shared with the merged-NGG
+        // path. For a DrawIndexOffset the 2- and 4-byte strides name different addresses; the
+        // instrument below prints both readings whatever the announced size says.
+        const DrawIndexSource index_source =
+            resolve_draw_index_source(ds, *draw, n, vb_records_unclamped);
+        const uint64_t addr32 = index_source.addr32;
+        uint32_t esz = index_elem_bytes(ds.index_type);   // the announced size, for the instrument
         {
             // PROSPER_INDEXTYPE_LOG=1 -- what the guest ANNOUNCED against what its bytes actually
             // hold. Without it, "the title never set an index size" and "it set one and we dropped
@@ -3297,27 +3617,15 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         //
         // #3009 gates the whole thing on the guest NOT having announced a size. `esz == 2` used to
         // stand in for that and could not: it is true both for an announced 16-bit buffer and for a
-        // title that never announced anything.
-        if (index_size_detection_permitted(ds.index_type, ds.index_type_announced) && n >= 2) {
-            if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u)) {
-                const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw->index_addr;
-                const uint32_t* p32 = (const uint32_t*)(uintptr_t)addr32;
-                // Zero high halves first, so every buffer that detector already classifies keeps
-                // its existing verdict; the constant-non-zero form (#304 part two) only ever sees
-                // what it rejected.
-                const char* how = nullptr;
-                if (index_buffer_is_unannounced_32bit(p16, p32, n))            how = "zero-high-half";
-                else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
-                    how = "constant-high-half";
-                if (how) {
-                    esz = 4; index_addr = addr32;
-                    if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "
-                                     "(unannounced, %s) at 0x%llx (was 16-bit 0x%llx)\n",
-                                     how, (unsigned long long)addr32,
-                                     (unsigned long long)draw->index_addr);
-                }
-            }
-        }
+        // title that never announced anything. resolve_draw_index_source above applies both.
+        esz = index_source.element_bytes;
+        uint64_t index_addr = index_source.addr;
+        if (index_source.detected && log)
+            fprintf(stderr,
+                    "[exec] indexed draw: auto-detected 32-bit index buffer "
+                    "(unannounced, %s) at 0x%llx (was 16-bit 0x%llx)\n",
+                    index_source.detected, (unsigned long long)addr32,
+                    (unsigned long long)draw->index_addr);
         if (esz == 0) {
             if (log) fprintf(stderr, "[exec] indexed draw: UNKNOWN index_type=%u — falling back to non-indexed\n",
                              ds.index_type);
@@ -3369,6 +3677,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         return false;
     }
     if (out.indices.empty()) vertex_count = resolve_nonindexed_vertex_count(vcount_hint, vb_entries);
+    // An indexed merged-NGG draw carries no index buffer (its indices are in the launch records),
+    // but its vertex buffers must still span the vertices those indices address (#3135 P6).
+    if (ngg_subgroup && draw && draw->indexed) vertex_count = ngg_vertex_range;
     // PS5 RectList (primitive 7; standard AMD RectList is 17) consumes three procedural vertices but
     // covers the rectangle's synthesized fourth corner. Vulkan has no rectangle-list topology. The
     // Blasphemous 2 clear shader explicitly computes all four clip-space corners from VertexIndex, has
@@ -3608,6 +3919,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             out.fragment_draw_inputs ? out.fragment_draw_inputs->original_fragment_producer
                                      : nullptr);
     out.ngg_subgroup = std::move(ngg_subgroup);
+    out.ngg_depth_slice_count = ngg_depth_slice_count;
+    out.ngg_depth_first_slice = ngg_depth_first_slice;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for
@@ -3861,6 +4174,8 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           uint32_t width, uint32_t height);
 
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
+// Every submit it receives has its layered depth-only NGG draws expanded per slice
+// (ngg_depth_slices.hpp).
 void set_submit_renderer(LiveRenderFn fn);
 bool have_submit_renderer();
 

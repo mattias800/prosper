@@ -13,6 +13,7 @@
 #include "gpu_detile_upload.h"
 #include "mapped_staging.h"
 #include "buffer_range_plan.h"
+#include "backend_color_formats.h"   // guest -> host colour/texture format tables
 #include "gpu/resources/device_storage_reads.hpp"   // published at device creation
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
@@ -434,53 +435,6 @@ struct BackendMrtOutputs {
     std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> colors;
 };
 
-// Block-compressed sampled formats the backend carries natively: guest BCn blocks are copied
-// straight into the staging buffer instead of being decoded to RGBA8 on the CPU. These are
-// SAMPLED-texture formats only -- never a colour target, storage image or blit destination.
-// Returns the bytes of one 4x4 block, or 0 for every non-block format.
-inline uint32_t backend_block_compressed_bytes(VkFormat format) {
-    switch (format) {
-        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-        case VK_FORMAT_BC4_UNORM_BLOCK:
-            return 8u;
-        case VK_FORMAT_BC2_UNORM_BLOCK:
-        case VK_FORMAT_BC3_UNORM_BLOCK:
-        case VK_FORMAT_BC5_UNORM_BLOCK:
-        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-        case VK_FORMAT_BC7_UNORM_BLOCK:
-            return 16u;
-        default:
-            return 0u;
-    }
-}
-
-inline VkFormat backend_color_format(VkFormat format) {
-    if (backend_block_compressed_bytes(format) != 0u)
-        return format;
-    if (format == VK_FORMAT_R16_SFLOAT ||
-        format == VK_FORMAT_R16G16_SFLOAT ||
-        format == VK_FORMAT_R16G16B16A16_SFLOAT ||
-        format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
-        return format;
-    if (format == VK_FORMAT_R8_UNORM)
-        return VK_FORMAT_R8_UNORM;
-    if (format == VK_FORMAT_R8_UINT)
-        return VK_FORMAT_R8_UINT;
-    if (format == VK_FORMAT_R8G8B8A8_UINT)
-        return VK_FORMAT_R8G8B8A8_UINT;
-    if (format == VK_FORMAT_R8G8_UNORM)
-        return VK_FORMAT_R8G8_UNORM;
-    if (format == VK_FORMAT_R32_UINT)
-        return VK_FORMAT_R32_UINT;
-    if (format == VK_FORMAT_R32G32B32A32_UINT)
-        return VK_FORMAT_R32G32B32A32_UINT;
-    if (format == VK_FORMAT_R32G32B32A32_SFLOAT)
-        return VK_FORMAT_R32G32B32A32_SFLOAT;
-    if (format == VK_FORMAT_R32_SFLOAT)
-        return VK_FORMAT_R32_SFLOAT;
-    return VK_FORMAT_R8G8B8A8_UNORM;
-}
-
 inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
     const FrameResource& resource) {
     std::array<uint32_t, 4> result{
@@ -491,90 +445,18 @@ inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
     // components, so translate R<->B selectors into the canonical host image's component space.
     // Constants, G/A, ordinary textures, and targets whose storage order was already RGBA remain
     // unchanged. This is composition, not suppression: semantic permutations still survive.
-    if ((resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_UNORM ||
-         resource.render_target_guest_format == VK_FORMAT_B8G8R8A8_SRGB) &&
-        backend_color_format(resource.render_target_guest_format) ==
-            VK_FORMAT_R8G8B8A8_UNORM) {
+    // The integer BGRA / A2R10G10B10 orders are canonicalized the same way (#4703).
+    const VkFormat guest = resource.render_target_guest_format;
+    if (((guest == VK_FORMAT_B8G8R8A8_UNORM || guest == VK_FORMAT_B8G8R8A8_SRGB) &&
+         backend_color_format(guest) == VK_FORMAT_R8G8B8A8_UNORM) ||
+        guest == VK_FORMAT_B8G8R8A8_UINT || guest == VK_FORMAT_B8G8R8A8_SINT ||
+        guest == VK_FORMAT_A2R10G10B10_UINT_PACK32) {
         for (uint32_t& selector : result) {
             if (selector == 4u) selector = 6u;
             else if (selector == 6u) selector = 4u;
         }
     }
     return result;
-}
-
-// Bytes per TEXEL. A block-compressed format has no per-texel size, so it answers 0: every caller
-// that can see a BC texture must size it with backend_texture_bytes() instead, and a caller that
-// was missed fails closed (its `!bpp` guard) rather than over- or under-running a buffer.
-inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
-    format = backend_color_format(format);
-    if (backend_block_compressed_bytes(format) != 0u) return 0u;
-    if (format == VK_FORMAT_R32G32B32A32_UINT ||
-        format == VK_FORMAT_R32G32B32A32_SFLOAT) return 16u;
-    if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
-    if (format == VK_FORMAT_R16G16_SFLOAT) return 4u;
-    if (format == VK_FORMAT_R16_SFLOAT) return 2u;
-    if (format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_UINT) return 1u;
-    if (format == VK_FORMAT_R8G8_UNORM) return 2u;
-    return 4u;
-}
-
-// Bytes of a width x height x depth x layers texture at one mip level, block-granular for a BC
-// format (ceil(w/4) * ceil(h/4) blocks per slice) and texel-granular otherwise. This is exactly the
-// tightly packed buffer layout vkCmdCopyBufferToImage reads with bufferRowLength = 0 and
-// bufferImageHeight = 0. Saturates to UINT64_MAX on overflow so a caller's size check refuses it.
-inline uint64_t backend_texture_bytes(VkFormat format, uint32_t width, uint32_t height,
-                                      uint32_t depth = 1u, uint32_t layers = 1u) {
-    const uint32_t block = backend_block_compressed_bytes(backend_color_format(format));
-    uint64_t result = block ? block : backend_color_bytes_per_pixel(format);
-    const uint64_t factors[4] = {
-        block ? (uint64_t(width) + 3u) / 4u : uint64_t(width),
-        block ? (uint64_t(height) + 3u) / 4u : uint64_t(height),
-        std::max<uint64_t>(depth, 1u), std::max<uint64_t>(layers, 1u)};
-    for (const uint64_t factor : factors) {
-        if (factor && result > UINT64_MAX / factor) return UINT64_MAX;
-        result *= factor;
-    }
-    return result;
-}
-
-// Bytes of levels [0, levels) of a 2D chain, each level tightly packed at max(w>>L,1) x max(h>>L,1)
-// and concatenated level 0 first: the staging layout of FrameResource::uploaded_mip_levels.
-inline uint64_t backend_texture_chain_bytes(VkFormat format, uint32_t width, uint32_t height,
-                                            uint32_t levels) {
-    uint64_t total = 0;
-    for (uint32_t level = 0; level < std::max(levels, 1u); ++level) {
-        const uint64_t bytes = backend_texture_bytes(
-            format, std::max(width >> level, 1u), std::max(height >> level, 1u));
-        if (bytes == UINT64_MAX || total > UINT64_MAX - bytes) return UINT64_MAX;
-        total += bytes;
-    }
-    return total;
-}
-
-inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat format) {
-    using NumericClass = prosper::gpu::SpirvImageNumericClass;
-    if (backend_block_compressed_bytes(backend_color_format(format)) != 0u)
-        return NumericClass::Float;
-    switch (backend_color_format(format)) {
-        case VK_FORMAT_R8_UINT:
-        case VK_FORMAT_R8G8B8A8_UINT:
-        case VK_FORMAT_R32_UINT:
-        case VK_FORMAT_R32G32B32A32_UINT:
-            return NumericClass::Uint;
-        case VK_FORMAT_R8_UNORM:
-        case VK_FORMAT_R8G8_UNORM:
-        case VK_FORMAT_R8G8B8A8_UNORM:
-        case VK_FORMAT_R16_SFLOAT:
-        case VK_FORMAT_R16G16_SFLOAT:
-        case VK_FORMAT_R16G16B16A16_SFLOAT:
-        case VK_FORMAT_R32G32B32A32_SFLOAT:
-        case VK_FORMAT_R32_SFLOAT:
-        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-            return NumericClass::Float;
-        default:
-            return NumericClass::Unknown;
-    }
 }
 
 inline bool backend_storage_image_numeric_contract_valid(const FrameResource& resource) {
@@ -1717,6 +1599,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.depth_bias_clamp_enabled = supported.depthBiasClamp;
         if (r.depth_bias_clamp_enabled) feats.depthBiasClamp = VK_TRUE;
         r.logic_op_enabled = supported.logicOp;
+        // The guest's depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) maps 1:1 onto this
+        // feature. Without it the bounds are not applied and the renderer says so once per run.
+        r.depth_bounds_enabled = supported.depthBounds;
+        if (r.depth_bounds_enabled) feats.depthBounds = VK_TRUE;
+        else
+            fprintf(stderr, "[gpu] WARNING: this Vulkan device lacks depthBounds; the guest's "
+                            "depth-bounds test (DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE) will not "
+                            "be applied, so shadow cascades and light volumes cover every pixel\n");
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
         if (r.logic_op_enabled) feats.logicOp = VK_TRUE;
@@ -8645,8 +8535,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // span. Segment-local use/write/layout decisions and explicit clears remain local below.
     const std::span<const BackendDraw> logical_draws = logical_ds_draws.empty()
         ? draws : logical_ds_draws;
-    // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
-    // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
+    // Depth attachment is created if ANY draw enables the depth test or the depth-bounds test (the
+    // shared render pass has one fixed attachment set; the bounds test reads the stored depth even
+    // with the depth test off); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false, use_stencil = false;
     // Initial values for a newly-created depth/stencil attachment (#371). Existing guest-identified
@@ -8685,7 +8576,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
+        // The depth aspect: the shared test list (depth_stencil_tests_enabled) less stencil.
+        if (d.ps->depth_test_enable || d.ps->depth_bounds_enable || effective_depth_clear(d.ps))
+            use_depth = true;
         if (d.ps->stencil_enable ||
             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))
@@ -8844,11 +8737,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                              d.ps->stencil_write_mask[0],
                                              d.ps->stencil_write_mask[1])))
             logical_use_stencil = true;
-        if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
-                     effective_depth_clear(d.ps) ||
-                     stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
-                                             d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1]))) {
+        if (d.ps &&
+            (prosper::gpu::depth_stencil_tests_enabled(*d.ps) || effective_depth_clear(d.ps) ||
+             stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
+                                     d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]))) {
             if (!identity) identity = d.ps;
             pass_depth_slice_max = std::max(pass_depth_slice_max,
                                             ds_depth_view_slice_max(d.ps->db_depth_view));
@@ -8873,8 +8765,17 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool depth_may_be_written = false;
     uint64_t depth_write_command_order = 0;
     bool stencil_may_be_written = false;
-    for (const auto& d : draws) {
+    // The first draw of this pass that can write depth. A depth-bounds test compares the STORED
+    // depth, so it is meaningful only against depth the guest produced: a plane that was already
+    // valid when the pass began, or one an earlier draw of this same pass wrote (see the
+    // depth-bounds block in the per-draw setup).
+    size_t first_depth_writer = draws.size();
+    for (size_t draw_index = 0; draw_index < draws.size(); ++draw_index) {
+        const auto& d = draws[draw_index];
         if (!d.ps) continue;
+        // A depth-bounds test is NOT here: it only reads the plane, so a bounds-only pass must not
+        // mark a never-written plane valid. That would make later passes LOAD, and the sampled-depth
+        // bridge serve, a cleared value the guest never wrote.
         depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
@@ -8882,6 +8783,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
             d.ps->depth_compare_op);
         depth_may_be_written |= draw_may_write_depth;
+        if (draw_may_write_depth && first_depth_writer == draws.size())
+            first_depth_writer = draw_index;
         if (draw_may_write_depth)
             depth_write_command_order = std::max(depth_write_command_order, d.command_order);
         stencil_may_be_written |= stencil_clear_effective(
@@ -9815,7 +9718,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
         VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
-        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
+        VkBool32 depth_bounds_test = VK_FALSE;
+        float depth_bounds_min = 0.0f, depth_bounds_max = 1.0f;
+        uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1, first_instance = 0;
         bool mesh_draw = false;
         std::array<uint32_t, 3> mesh_groups{1, 1, 1};
         int32_t vertex_offset = 0;
@@ -10947,7 +10852,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     required_fragment_subgroup_features, available_fragment_subgroup_features);
                 const uint64_t shader_key = bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
                 static std::unordered_set<uint64_t> proven_logged;
-                if (proven_logged.insert(shader_key).second) {
+                const bool first_sighting = proven_logged.insert(shader_key).second;
+                // ADR 0028 route= field: admitted by proof, unless the lowered module still needs
+                // a subgroup feature this device lacks (then the refusal below names it).
+                prosper::diagnostics::perf::note_proven_fragment_wave64(
+                    !fragment_subgroup_skip, first_sighting, bd.fs_guest_addr, bd.fs_identity);
+                if (first_sighting) {
                     std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
                         "(uniform=%u dead=%u neutral=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
                         lowered->neutral_votes,
@@ -11027,6 +10937,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fragment_subgroup_skip = false;
             }
         }
+        // ADR 0028 route= field: the device itself offers the required 64-lane subgroup.
+        prosper::diagnostics::perf::note_native_fragment_wave64(
+            !fragment_subgroup_skip, fragment_votes_lowered, required_fragment_subgroup_size);
         if (fragment_subgroup_skip) {
             prosper::diagnostics::perf::note_unsupported_wave64(
                 prosper::diagnostics::perf::Wave64Refusal::FragmentSubgroup,
@@ -11152,6 +11065,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
         v.instance_count = bd.instance_count;
+        v.first_instance = bd.first_instance;
         v.vertex_offset = bd.vertex_offset;
         v.scissor = {{0, 0}, {W, H}};
         // PROSPER_IGNORE_EMPTY_SCISSOR (#1287 bring-up diagnostic): render draws whose resolved
@@ -11300,6 +11214,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
             VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
             VK_DYNAMIC_STATE_STENCIL_OP,
+            // Depth bounds vary per light and per shadow cascade: UE4 draws dozens of distinct
+            // ranges a frame, so baking them into the pipeline would create pipelines per draw.
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS,
             VK_DYNAMIC_STATE_CULL_MODE,
             VK_DYNAMIC_STATE_FRONT_FACE,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -11386,6 +11304,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cba[slot].alphaBlendOp = static_cast<VkBlendOp>(target.alpha_blend_op);
             }
         }
+        for (uint32_t slot = 0; slot < color_count; ++slot)   // integer targets never blend (#4703)
+            if (backend_color_format_is_integer(color_formats[slot]))
+                cba[slot].blendEnable = VK_FALSE;
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         if (ps && ps->logic_op_enable) {
             if (ctx.logic_op_enabled) {
@@ -11475,6 +11396,44 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ps->stencil_compare_op[1], ps->stencil_ref[1],
                         ps->stencil_fail_op[1], ps->stencil_pass_op[1], ps->stencil_depth_fail_op[1],
                         dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
+        }
+        if (ps && ps->depth_bounds_enable) {
+            // The test compares the depth already in the attachment. Apply it only when that depth
+            // is the guest's: the retained plane was valid when the pass began, or an earlier draw
+            // of this pass wrote it. Otherwise the attachment holds the value prosper cleared it to,
+            // which no bound range can stand in for (#371 approximates unknown depth by the value
+            // that always passes a compare; a range has no such value). There, as on a target with
+            // no depth surface at all, the draw runs untested -- the behaviour before the test
+            // existed -- and the run says so once.
+            const bool depth_known = (persistent_ds && depth_was_valid) || di > first_depth_writer;
+            const bool applied = depth_known && render_vk_ctx().depth_bounds_enabled;
+            static std::once_flag first_draw;
+            std::call_once(first_draw, [&] {
+                fprintf(stderr, "[gpu] first depth-bounds draw: bounds [%g, %g] %s\n",
+                        ps->depth_bounds_min, ps->depth_bounds_max,
+                        applied ? "applied"
+                        : !render_vk_ctx().depth_bounds_enabled ? "NOT applied (device lacks depthBounds)"
+                                                                 : "NOT applied (depth contents unknown)");
+            });
+            if (applied) {
+                v.depth_bounds_test = VK_TRUE;
+                v.depth_bounds_min = ps->depth_bounds_min;
+                v.depth_bounds_max = ps->depth_bounds_max;
+            } else if (!depth_known) {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] depth-bounds test skipped: the draw's depth plane holds "
+                                    "no guest-written depth (no DS surface, or never written), so "
+                                    "the draw is untested (reported once per run)\n");
+                });
+            } else {
+                static std::once_flag logged;
+                std::call_once(logged, [] {
+                    fprintf(stderr, "[gpu] Vulkan device lacks depthBounds: the guest's "
+                                    "depth-bounds test is NOT applied, so those draws cover "
+                                    "every pixel\n");
+                });
+            }
         }
         v.stencil_front = dss.front;
         v.stencil_back = dss.back;
@@ -12387,8 +12346,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.staging_lease = readback.lease;
                             } else if (r.has_uniform_color) {
                                 upload.uniform_clear = true;
+                                float clear_rgba[4];
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
-                                          upload.uniform_color.float32);
+                                          clear_rgba);
+                                upload.uniform_color = backend_clear_color_value(
+                                    backend_color_format(r.texture_format), clear_rgba);
                             } else if (!upload.feedback_snapshot &&
                                        !upload.assembled_target_mips && !upload.stacked_compute) {
                                 // Block-granular for a native BCn texture: the frontend hands
@@ -14135,6 +14097,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         clear[slot].color = {{value[0], value[1], value[2], value[3]}};
     }
+    for (uint32_t slot = 0; slot < color_count; ++slot)   // integer attachments clear by value
+        clear[slot].color =
+            backend_clear_color_value(color_formats[slot], clear[slot].color.float32);
     clear[ds_attachment].depthStencil = {depth_clear, stencil_clear}; // guest DB clear/default
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}};
@@ -14329,6 +14294,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkCmdSetDepthWriteEnable(command, v.depth_write);
         vkCmdSetDepthCompareOp(command, v.depth_compare);
         vkCmdSetStencilTestEnable(command, v.stencil_test);
+        vkCmdSetDepthBoundsTestEnable(command, v.depth_bounds_test);
+        vkCmdSetDepthBounds(command, v.depth_bounds_min, v.depth_bounds_max);
         vkCmdSetCullMode(command, v.cull_mode);
         vkCmdSetFrontFace(command, v.front_face);
         if (!v.mesh_draw) {
@@ -14477,10 +14444,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {
             vkCmdBindIndexBuffer(cmd, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, 0);
+            vkCmdDrawIndexed(cmd, v.icount, v.instance_count, 0, v.vertex_offset, v.first_instance);
         } else {
-            vkCmdDraw(cmd, v.vcount, v.instance_count,
-                      static_cast<uint32_t>(v.vertex_offset), 0);
+            vkCmdDraw(cmd, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset),
+                      v.first_instance);
         }
         breadcrumbs.end(cmd, breadcrumb);
         if (labelled) prosper::gpu::gpu_label_end(dev, cmd);
@@ -15556,8 +15523,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
                     if (v.mesh_draw) ctx.cmd_draw_mesh_tasks(
                         c2, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
-                    else if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset, 0); }
-                    else vkCmdDraw(c2, v.vcount, v.instance_count, static_cast<uint32_t>(v.vertex_offset), 0);
+                    else if (v.icount) {
+                        vkCmdBindIndexBuffer(c2, v.ibuf, v.ioffset, VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(c2, v.icount, v.instance_count, 0, v.vertex_offset,
+                                         v.first_instance);
+                    } else
+                        vkCmdDraw(c2, v.vcount, v.instance_count,
+                                  static_cast<uint32_t>(v.vertex_offset), v.first_instance);
                 }
                 vkCmdEndRenderPass(c2);
                 backend_draw_iso_pass_count().fetch_add(1, std::memory_order_relaxed);
@@ -16058,6 +16030,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendResourceReuseStats aggregate_resources{};
     BackendPipelineCacheStats aggregate_pipelines{};
     BackendRenderTimingStats aggregate_timing{};
+    // A colourless call (a depth-only pass) carries nothing between segments: each one starts from
+    // the caller's own seeds and clears, and only the final one reads colour back.
+    const bool colour_unwritten = backend_draws_leave_colour(all);
     std::vector<uint8_t> carried_color0;
     std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> carried_slots;
     std::array<const uint8_t*, prosper::gpu::kColorTargetCount> carried_slot_ptrs{};
@@ -16207,7 +16182,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const bool final = end == all.size();
 
         const SplitSegmentContract segment = split_segment_contract(
-            color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs);
+            color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs, colour_unwritten);
+        const bool restart = begin == 0 || colour_unwritten;
         const BackendColorTarget* segment_target_ptr =
             segment.has_target ? &segment.target : nullptr;
         std::vector<uint8_t> intermediate_color1;
@@ -16219,10 +16195,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         BackendMrtOutputs* segment_mrt = mrt_outputs
             ? (final ? mrt_outputs : &intermediate_mrt) : nullptr;
         std::vector<uint8_t> rendered = render_draw_pass_rgba(
-            all.subspan(begin, end - begin), W, H, next_seed0, begin ? nullptr : clear_rgba,
-            persist_depth_stencil, segment_target_ptr, next_seed1, begin ? nullptr : clear_rgba1,
-            segment_out1, submission_batch, final ? flush_submission_batch : false, all,
-            segment_mrt, want_color_readback);
+            all.subspan(begin, end - begin), W, H, restart ? seed_rgba : next_seed0,
+            restart ? clear_rgba : nullptr, persist_depth_stencil, segment_target_ptr,
+            restart ? seed_rgba1 : next_seed1, restart ? clear_rgba1 : nullptr, segment_out1,
+            submission_batch, final ? flush_submission_batch : false, all, segment_mrt,
+            want_color_readback && (final || !colour_unwritten));
         add_stats();
 
         if (final) {

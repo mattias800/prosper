@@ -32,8 +32,10 @@
 //
 // "Read before written" is a MUST analysis over the CFG: a register counts as written only when
 // every path from entry writes it. A VGPR counts as written for a lane only through a full-dword
-// write while that lane is in EXEC: either under a provably full EXEC, or under an EXEC that has only
-// narrowed since the write. The read inventory is fail-closed where it is unsure: an unknown scalar
+// write while that lane is in EXEC: either under a provably full EXEC, under an EXEC that has only
+// narrowed since the write, or under an EXEC restored (s_mov_b64 exec, sP) from a pair that saved
+// the EXEC of the write (s_mov_b64 sP, exec or a SAVEEXEC) and was not overwritten since (#3135 P6:
+// the compiler's if/else idiom, which Kena's indexed producer uses for v7). The read inventory is fail-closed where it is unsure: an unknown scalar
 // source width reads two registers, DS data fields are always read, a MIMG address is charged
 // through v7, and a vector source whose width is not classified refuses the program. Not
 // inventoried: cross-lane reads (v_readlane, ds_bpermute, permlane) of lanes outside the EXEC a

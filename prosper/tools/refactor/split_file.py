@@ -60,12 +60,16 @@ Plan syntax, one output per line -- `path: <region indices and ranges>`:
 """
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 REPLICATED_ROLES = ("preamble", "open", "close")
 
@@ -496,6 +500,51 @@ def selftest() -> int:
             print(f"  [FAIL] {label}")
             bad += 1
 
+    # Exercise the real CLI path against a disposable Git checkout. In particular, the Unicode
+    # fixture distinguishes UTF-8 bytes from decoded characters in the reconstruction report.
+    # Skipped on Windows: under the MinGW runner `git rev-parse --show-toplevel` answers an MSYS path
+    # ("/tmp/...") that Windows Python resolves against the current drive, so main() cannot find the
+    # fixture. The byte/character distinction it pins is platform-independent and covered on Linux/macOS.
+    cli_cases = () if sys.platform == "win32" else (
+        ("ASCII", b"// ASCII source\n"),
+        ("Unicode", "// caf\u00e9 \U0001f642\n".encode("utf-8")),
+    )
+    for label, source_bytes in cli_cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=root, check=True)
+            (root / "source.cpp").write_bytes(source_bytes)
+            map_data = {
+                "file": "source.cpp",
+                "sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "total_lines": 1,
+                "parse_errors": [],
+                "regions": [{"index": 0, "start": 1, "end": 1, "role": "body",
+                             "name": "fixture"}],
+                "edges": {},
+            }
+            map_path = root / "map.json"
+            map_path.write_text(json.dumps(map_data), encoding="utf-8")
+            plan_path = root / "plan.txt"
+            plan_path.write_text("source.cpp: 0\n", encoding="utf-8")
+            previous_cwd, previous_argv = os.getcwd(), sys.argv
+            previous_selftest = globals()["selftest"]
+            output = io.StringIO()
+            try:
+                os.chdir(root)
+                sys.argv = ["split_file.py", "--map", str(map_path), "--plan", str(plan_path)]
+                globals()["selftest"] = lambda: 0
+                with contextlib.redirect_stdout(output):
+                    result = main()
+            finally:
+                globals()["selftest"] = previous_selftest
+                sys.argv = previous_argv
+                os.chdir(previous_cwd)
+            expected = f"original {len(source_bytes)} bytes exactly"
+            check(result == 0 and expected in output.getvalue(),
+                  f"{label} CLI reconstruction reports {len(source_bytes)} bytes")
+
     outputs, problems = split(SAMPLE_MAP, {"a.cpp": [1], "b.cpp": [2]}, SAMPLE)
     check(not problems, f"a valid plan produces no problems (got {problems})")
     # THE defect that was shipped: replicated regions must actually appear in every output.
@@ -741,7 +790,7 @@ def main() -> int:
         print("  the written files do not reconstruct the original; nothing was deleted")
         return 1
     print(f"  [ok]   reconstruction: {len(on_disk)} file(s) read back from disk rebuild the "
-          f"original {len(original)} bytes exactly")
+          f"original {len(original_bytes)} bytes exactly")
 
     # One output usually KEEPS the original's name -- a split is "this file, minus what moved out".
     # Removing the source then would delete the file just written, so the rm applies only when the

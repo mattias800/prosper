@@ -11,6 +11,7 @@
 #include "gpu/execute/dma_span_authority.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "gpu/execute/checked_graphics_source.hpp"
 #include "gpu/execute/native_graphics_source_lineage.hpp"
@@ -1130,7 +1131,8 @@ ShaderCompileKey make_shader_compile_key(
     bool capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false) {
+    RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false,
+    FragmentExportFormats fragment_export_formats = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1155,6 +1157,8 @@ ShaderCompileKey make_shader_compile_key(
         ? fragment_float_flags : FragmentFloatFlags{};
     key.fragment_launch_rsrc1 = stage == ShaderProgramStage::Fragment
         ? fragment_launch_rsrc1 : FragmentLaunchRsrc1{};
+    key.fragment_export_formats =
+        stage == ShaderProgramStage::Fragment ? fragment_export_formats : FragmentExportFormats{};
     key.float_transport = compute_config ? compute_config->float_transport : float_transport;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
@@ -1175,6 +1179,7 @@ ShaderCompileKey make_shader_compile_key(
         key.compute_tg_size_en = compute_config->tg_size_en;
         key.compute_lds_bytes = compute_config->lds_bytes;
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
+        key.compute_wave64_exchange_width = compute_config->wave64_exchange_width;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
         key.compute_storage_buffer_int64_atomics =
@@ -1295,6 +1300,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             record->float_transport = key.float_transport;
             record->float_flags = key.fragment_float_flags;
             record->launch_rsrc1 = key.fragment_launch_rsrc1;
+            record->export_formats = key.fragment_export_formats;
             record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
             record->trip = key.trip_bound;
             try {
@@ -1310,13 +1316,14 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         // The normal compiler still consumes its existing inputs. The case's independent owned
         // replay must reproduce the whole resulting SOURCE (or refusal) before it is COMPLETE.
         CompilerChoiceTrace trace;
-        auto compile = [&] { return recompile_fragment(code, code_size, resources,
-                                  key.has_system_inputs ? &key.system_inputs : nullptr,
-                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
-                                  &interpolation, key.fragment_wave32,
-                                  {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode, arithmetic_observation, key.float_transport,
-                                  key.fragment_float_flags); };
+        auto compile = [&] {
+            return recompile_fragment(
+                code, code_size, resources, key.has_system_inputs ? &key.system_inputs : nullptr,
+                key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX, &interpolation,
+                key.fragment_wave32, {RecompileDiagnosticStage::Fragment, program_address},
+                key.fragment_float_mode, arithmetic_observation, key.float_transport,
+                key.fragment_float_flags, key.fragment_export_formats);
+        };
         std::vector<uint32_t> result;
         if (record) {
             std::vector<std::pair<std::string, std::string>> rejects;
@@ -1931,7 +1938,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
     FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
     const CheckedGraphicsSource* checked_source,
-    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation) {
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation,
+    FragmentExportFormats fragment_export_formats) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
     if (checked_compilation) *checked_compilation = {};
@@ -1939,7 +1947,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
                            checked_source->address() != reinterpret_cast<uint64_t>(code)))
         return {};
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
-        !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical()) {
+        !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical() ||
+        !fragment_export_formats.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
@@ -1949,7 +1958,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         nullptr, fragment_wave32, vertex_capture_position,
         checked_source ? checked_source->analysis() : captured_analysis, fragment_float_mode,
         float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source,
-        checked_source != nullptr);
+        checked_source != nullptr, fragment_export_formats);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -2036,12 +2045,13 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     uint32_t vertex_lds_dwords, bool vertex_capture_position,
     const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
-    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source) {
+    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
+    FragmentExportFormats fragment_export_formats) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
         fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1,
-        original_source);
+        original_source, nullptr, nullptr, fragment_export_formats);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -3137,7 +3147,7 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
     else {
         const auto plan_start = profile_fold && pcrel_dispatch_target != UINT32_MAX
             ? FoldClock::now() : FoldClock::time_point{};
-        local_control_plan = build_fold_control_plan(ins);
+        local_control_plan = build_fold_control_plan(ins, decoded->fold_tail);
         if (profile_fold && pcrel_dispatch_target != UINT32_MAX)
             pcrel_plan_ms = std::chrono::duration<double, std::milli>(
                 FoldClock::now() - plan_start).count();
@@ -3437,17 +3447,22 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
     // THE QUALIFYING SHAPE, stated as what the code actually tests (#2202 review, B1/B2):
     //
     //   * `ins` is the COMPACTED fold stream (`retain_fold_instructions`), which drops ordinary
-    //     VALU/EXP/DS/FLAT while preserving original PCs. So "the previous element" is the previous
-    //     RETAINED instruction, and a dropped VALU block between it and the target would be
-    //     invisible. The check is therefore PHYSICAL: `prev.pc + prev.len_dwords == ins[k].pc`
-    //     proves prev immediately precedes the target in the real program, whatever was compacted
-    //     away. Without it a target with a genuine fall-through predecessor can qualify, and the
-    //     restore then installs a *known* wrong value — a worse failure than the bug being fixed.
-    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the target.
-    //   * EXACTLY ONE branch in the DECODED STREAM targets it, counted over BOTH directions. A
-    //     backward edge into the target is a second predecessor and disqualifies it. "Decoded
-    //     stream" rather than "program" is deliberate: the decode stops at the first s_endpgm, so
-    //     anything past it is not scanned. B1 existed because a property of a stream was described
+    //     VALU/EXP/DS/FLAT while preserving original PCs but keeps every control transfer. So the
+    //     code between the previous retained instruction and this one -- the gap -- is straight-line
+    //     code that falls through to it and is entered only by branches landing in it.
+    //   * prev must be an UNCONDITIONAL `s_branch`, so no fall-through edge enters the gap.
+    //   * EXACTLY ONE branch in the DECODED STREAM targets the gap or the instruction, counted over
+    //     BOTH directions, and it is FORWARD. A backward edge disqualifies it, alone or not. A
+    //     SECOND edge -- landing inside the gap or on the instruction -- disqualifies it too: that
+    //     is the real fall-through #2202 B1 guarded against. A single forward edge landing inside
+    //     the gap still fires. A gap no edge reaches is dead code.
+    //   * Edges the plan cannot count make it decline for the whole program: the debug branches
+    //     (s_cbranch_cdbg*), s_subvector_loop_begin/end, and any branch into code past the first
+    //     s_endpgm unless that tail is proven closed (FoldStreamTail). The first version demanded a retained instruction AT
+    //     the target (`prev.pc + prev.len_dwords == ins[k].pc`), which missed every block opening
+    //     with VALU: UE4's depth-of-field gather then bound its own output as its input (Kena).
+    //     "Decoded stream" rather than "program" is deliberate: the decode stops at the first
+    //     s_endpgm, so anything past it is not scanned. B1 existed because a property of a stream was described
     //     as a property of a program, so the distinction is spelled out rather than assumed.
     //   * The program contains no indirect control transfer at all; one makes the CFG
     //     unrepresentable by any scan over SOPP displacements, so the rule declines to fire.
@@ -4511,7 +4526,8 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
                 const bool latched_offset_source =
-                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u && in.literal == 0u &&
+                    !is_buffer && (n == 1u || n == 2u) && soff_field == 125u &&
+                    static_cast<int32_t>(in.literal) >= 0 && (in.literal & 3u) == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
                 const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
@@ -6124,7 +6140,8 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
 
 // A memory-fed register offset must use the exact x1/x2 words observed by the fold. Re-reading
 // the guest pointer during upload could select one wide range on the CPU and another on the
-// GPU. The proof authenticates this immediate-zero read point; the table owns its 4 or 8 bytes.
+// GPU. The proof authenticates this read point (any aligned non-negative immediate: `addr` is the
+// effective address, immediate included); the table owns its 4 or 8 bytes from index zero.
 static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
                                            const uint32_t* code, size_t dwords) {
     const bool x2 = use.required_size == 2u * sizeof(uint32_t);
@@ -7635,15 +7652,14 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
         uint32_t system_sgprs[2] = {};
         uint32_t system_count = 0;
-        if (hdr->type == 6) { // fused GS back: s[0:1] points at the driver stage-data table
-            const auto sh_value = [&](uint32_t reg) {
-                const auto found = st.sh.find(reg);
-                return found == st.sh.end() ? 0u : found->second;
-            };
-            system_sgprs[0] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
-            system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
-            system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
-        }
+        // A fused GS back, and a LINKED merged ES+GS chain (#3135), enter with s[0:1] = the GS
+        // user-data address (SPI_SHADER_USER_DATA_ADDR_LO/HI_GS: the launch research on #3135,
+        // where the ISA and two independent compilers agree). Kena's indexed producer 11562c72
+        // reloads its user SGPRs with `s_load_dwordx8 s[8:15], s[0:1], 0`.
+        // One rule with the live NGG path (read_ngg_user_data_address): both registers present
+        // and the address non-zero.
+        if ((hdr->type == 6 || !linked.empty()) && read_ngg_user_data_address(st, system_sgprs))
+            system_count = 2u;
         dyn_vb = resolve_dynamic_fetch(code, shader_dwords, primary_sgprs, kUserSgprs, 8, &srt_uses,
                                        UINT32_MAX, nullptr, system_sgprs, system_count,
                                        nested_reader.get(), checked_source);
@@ -8855,9 +8871,16 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             if (raw_x2_reader)
                 (void)raw_x2_reader->publish_compute_x2(*table, raw_source->owned_raw_x2_write_plan,
                                                         compute_srt_uses);
-            (void)admit_compute_nested_wide_data(
-                mapping_lease ? mapping_lease->get() : nullptr,
-                facts->decoded, compute_srt_uses, *table);
+            // The inventory is a pure function of the program's bytes, so it is taken from the
+            // memoized facts; the decision itself still reads this dispatch's table and memory.
+            if (compute_nested_wide_facts_memo_enabled())
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, facts->nested_wide_data(), compute_srt_uses, *table);
+            else
+                (void)admit_compute_nested_wide_data(
+                    mapping_lease ? mapping_lease->get() : nullptr,
+                    facts->decoded, compute_srt_uses, *table);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then
@@ -8986,6 +9009,17 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr;
         config.native_subgroup_size = select_native_compute_subgroup_size(
             shared_vulkan, config, native_multiwave_requested, native_subgroup_disabled);
+        // PROSPER_WAVE64_EXCHANGE (ADR 0028 route 3; a guest-behaviour SELECTOR, default OFF,
+        // tracker in tools/env/switch_registry.txt): on a host whose compute subgroups are narrower
+        // than the guest wave, let a module that would need a wider subgroup be recompiled through
+        // the exact exchange dispatcher. Inert unless the device's compute subgroup range is known
+        // and narrower than 64, so a native or unknown host keeps the ordinary lowering.
+        if (PROSPER_ENV_ON("PROSPER_WAVE64_EXCHANGE") && config.wave_size == 64 &&
+            !config.native_subgroup_size && shared_vulkan.max_compute_subgroup_size &&
+            shared_vulkan.max_compute_subgroup_size < 64)
+            config.wave64_exchange_width = shared_vulkan.min_compute_subgroup_size
+                                               ? shared_vulkan.min_compute_subgroup_size
+                                               : shared_vulkan.max_compute_subgroup_size;
         // PROSPER_SUBGROUP_LOG (#2429): the resolved native-subgroup contract is a GUARD CONDITION in
         // several recompiler paths and was printable NOWHERE -- so any claim that turned on it could
         // only be inferred from the device's reported subgroup size, which is a different value with a
@@ -9163,6 +9197,8 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             recompile_diagnostic, program_uses_guest_gds_for_item ? nullptr : &compiled_trip_witness);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
+        item.code_dwords = static_cast<uint32_t>(shader_dwords);
+        if (config.wave64_exchange_width) item.exchange_facts = facts;
         item.cpu_fast_path = classify_compute_cpu_fast_path(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.recompile_config = config;
@@ -9813,6 +9849,9 @@ OrderedSubmitResult execute_ordered_items_impl(
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
                         authoritative_readback};
         g_live_phase.source_submit = source_submit;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11331,6 +11370,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
         // plus the batch's trailing barrier. Every other operation retires first.
         g_live_phase.defer_batch_completion = defer_graphics_wait && before_dispatch &&
                                               !final_span && !authoritative_readback;
+        // A layered depth replay becomes one item per slice here, moving the span's own items
+        // (ngg_depth_slices.hpp); the registered renderer's wrapper then finds nothing to copy.
+        expand_ngg_depth_slices_in_place(span);
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -12253,7 +12295,23 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
     return result;
 }
 
-void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
+// The registered renderer is wrapped once, here, because g_live reaches it along several paths
+// (render_submit_items, execute_and_present, and the ordered executor, which is handed g_live as a
+// function object): a layered depth-only NGG draw becomes one item per depth slice before ANY
+// renderer sees the submit (#3135, ngg_depth_slices.hpp), so pass grouping by depth identity treats
+// each slice as the face render it is. The copy is made only for a submit that carries one.
+void set_submit_renderer(LiveRenderFn fn) {
+    if (!fn) {
+        g_live = {};
+        return;
+    }
+    g_live = [render = std::move(fn)](const std::vector<DrawItem>& items, uint32_t width,
+                                      uint32_t height) {
+        std::vector<DrawItem> slice_expanded;
+        return render(expand_ngg_depth_slices(items, slice_expanded) ? slice_expanded : items,
+                      width, height);
+    };
+}
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 uint8_t* compute_gds_backing()            { return g_compute_gds.data(); }
 size_t   compute_gds_size()               { return g_compute_gds.size(); }
@@ -12996,6 +13054,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bo
         operations.push_back({SubmitOperationKind::Draw,
                               static_cast<size_t>(item.draw_index), item.command_order});
     auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
+    expand_ngg_depth_slices_in_place(items);   // see the ordered spans above
     RenderedFrame rendered = g_live(items, width, height);
     if (pending) {
         std::string error;

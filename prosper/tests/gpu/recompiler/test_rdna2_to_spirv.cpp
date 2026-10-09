@@ -4475,6 +4475,106 @@ int main() {
               bad24mt_store_xy00 == 0,
           "MTBUF XYZW store honors XY00 format width and leaves the adjacent dword untouched");
 
+    // The MUBUF half of the same rule. buffer_store_format_xyzw takes its format from the V#, and a
+    // one-component 32-bit V# (UE4's typed RWBuffer<float>, Kena's distance-field AO cone buffer)
+    // has identity X000: each lane writes ONE dword at index*4. Writing all four overlapped the next
+    // three lanes' elements, so the surviving values depended on lane order and only one element per
+    // wave kept X. Values are distinct per component so any overlap is visible: X=1, Y=2, Z=4, W=-1.
+    const uint32_t code24mubuf_store_x000[] = {
+        0x7e0202f2u,   // v_mov_b32 v1, 1.0
+        0x7e0402f4u,   // v_mov_b32 v2, 2.0
+        0x7e0602f6u,   // v_mov_b32 v3, 4.0
+        0x7e0802f3u,   // v_mov_b32 v4, -1.0
+        0x7e0a0f00u,   // v_cvt_u32_f32 v5, v0      (the element index)
+        0xe01c2000u, 0x80020105u,   // buffer_store_format_xyzw v[1:4], v5, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt24mubuf_store = rt24mt_store;   // Float32 x1, stride 4, binding 3
+    rt24mubuf_store.resources[0].fetch_pc = 5;
+    const std::vector<uint32_t> spv24mubuf_store_x000 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store);
+    std::vector<uint32_t> x000_store_in(N, 0xdeadbeefu), x000_store_out;
+    if (!spv24mubuf_store_x000.empty())
+        prosper::test::run_compute(spv24mubuf_store_x000, in24, N, N, {}, x000_store_in,
+                                   &x000_store_out);
+    uint32_t bad24mubuf_store_x000 = 0;
+    for (uint32_t i = 0; i < N && x000_store_out.size() == N; ++i)
+        if (x000_store_out[i] != 0x3f800000u) ++bad24mubuf_store_x000;
+    CHECK(!spv24mubuf_store_x000.empty() && x000_store_out.size() == N &&
+              bad24mubuf_store_x000 == 0,
+          "MUBUF XYZW store through a one-component V# writes X only, one dword per lane");
+
+    // Two components in a three-dword record: identity XY00 writes X and Y, and the record's third
+    // dword (where Z would have landed) and the next record's X (where W would) stay untouched.
+    ShaderResourceTable rt24mubuf_store_xy00 = rt24mubuf_store;
+    rt24mubuf_store_xy00.resources[0].num_components = 2;
+    rt24mubuf_store_xy00.resources[0].stride = 12;
+    const std::vector<uint32_t> spv24mubuf_store_xy00 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store_xy00);
+    const size_t xy00_words = static_cast<size_t>(N) * 3u;
+    std::vector<uint32_t> mubuf_xy00_in(xy00_words, 0xdeadbeefu), mubuf_xy00_out;
+    if (!spv24mubuf_store_xy00.empty())
+        prosper::test::run_compute(spv24mubuf_store_xy00, in24, N, N, {}, mubuf_xy00_in,
+                                   &mubuf_xy00_out);
+    uint32_t bad24mubuf_store_xy00 = 0;
+    for (size_t i = 0; i < N && mubuf_xy00_out.size() == xy00_words; ++i)
+        if (mubuf_xy00_out[i * 3u] != 0x3f800000u || mubuf_xy00_out[i * 3u + 1u] != 0x40000000u ||
+            mubuf_xy00_out[i * 3u + 2u] != 0xdeadbeefu)
+            ++bad24mubuf_store_xy00;
+    CHECK(!spv24mubuf_store_xy00.empty() && mubuf_xy00_out.size() == xy00_words &&
+              bad24mubuf_store_xy00 == 0,
+          "MUBUF XYZW store through a two-component V# writes XY and leaves the record's tail");
+
+    // The packed 16-bit path takes the same count. A two-component Float16 V# packs X and Y into
+    // ONE dword (0x4000_3c00 = 2.0h:1.0h); four components would pack Z and W into the record's
+    // second dword, which must keep its 0xdeadbeef.
+    ShaderResourceTable rt24mubuf_store_h2 = rt24mubuf_store;
+    rt24mubuf_store_h2.resources[0].format = DataFormat::Float16;
+    rt24mubuf_store_h2.resources[0].num_components = 2;
+    rt24mubuf_store_h2.resources[0].stride = 8;
+    const std::vector<uint32_t> spv24mubuf_store_h2 = recompile_valu(
+        code24mubuf_store_x000, std::size(code24mubuf_store_x000), 1, 0, &rt24mubuf_store_h2);
+    const size_t h2_words = static_cast<size_t>(N) * 2u;
+    std::vector<uint32_t> mubuf_h2_in(h2_words, 0xdeadbeefu), mubuf_h2_out;
+    if (!spv24mubuf_store_h2.empty())
+        prosper::test::run_compute(spv24mubuf_store_h2, in24, N, N, {}, mubuf_h2_in, &mubuf_h2_out);
+    uint32_t bad24mubuf_store_h2 = 0;
+    for (size_t i = 0; i < N && mubuf_h2_out.size() == h2_words; ++i)
+        if (mubuf_h2_out[i * 2u] != 0x40003c00u || mubuf_h2_out[i * 2u + 1u] != 0xdeadbeefu)
+            ++bad24mubuf_store_h2;
+    CHECK(!spv24mubuf_store_h2.empty() && mubuf_h2_out.size() == h2_words &&
+              bad24mubuf_store_h2 == 0,
+          "MUBUF XYZW store through a two-component Float16 V# packs XY into one dword");
+
+    // And the sub-dword integer path (atomic clear+set per byte). A one-component Uint8 V# with a
+    // one-byte stride gives lane i byte i, so every byte must hold X (1). Four components would
+    // also write Y/Z/W (2/3/4) into the next three lanes' bytes.
+    const uint32_t code24mubuf_store_u8[] = {
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x7e040282u,   // v_mov_b32 v2, 2
+        0x7e060283u,   // v_mov_b32 v3, 3
+        0x7e080284u,   // v_mov_b32 v4, 4
+        0x7e0a0f00u,   // v_cvt_u32_f32 v5, v0      (the element index)
+        0xe01c2000u, 0x80020105u,   // buffer_store_format_xyzw v[1:4], v5, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt24mubuf_store_u8 = rt24mubuf_store;
+    rt24mubuf_store_u8.resources[0].format = DataFormat::Uint8;
+    rt24mubuf_store_u8.resources[0].num_components = 1;
+    rt24mubuf_store_u8.resources[0].stride = 1;
+    const std::vector<uint32_t> spv24mubuf_store_u8 = recompile_valu(
+        code24mubuf_store_u8, std::size(code24mubuf_store_u8), 1, 0, &rt24mubuf_store_u8);
+    const size_t u8_words = (static_cast<size_t>(N) + 3u) / 4u;
+    std::vector<uint32_t> mubuf_u8_in(u8_words, 0xdeadbeefu), mubuf_u8_out;
+    if (!spv24mubuf_store_u8.empty())
+        prosper::test::run_compute(spv24mubuf_store_u8, in24, N, N, {}, mubuf_u8_in, &mubuf_u8_out);
+    uint32_t bad24mubuf_store_u8 = 0;
+    for (size_t i = 0; i < u8_words && mubuf_u8_out.size() == u8_words; ++i)
+        if (mubuf_u8_out[i] != 0x01010101u) ++bad24mubuf_store_u8;
+    CHECK(!spv24mubuf_store_u8.empty() && mubuf_u8_out.size() == u8_words &&
+              bad24mubuf_store_u8 == 0,
+          "MUBUF XYZW store through a one-component Uint8 V# writes one byte per lane");
+
     // Kernel 24atomic (#590): the MUBUF 32-bit atomic RMW family. buffer_atomic_add over a binding-3
     // storage buffer — all N dispatched lanes each add 3 to element 0, so the final memory word is 3N.
     // This exercises the opcode -> SPIR-V-atomic mapping end-to-end through the proven cbuf_atomic_rtn
@@ -7406,6 +7506,54 @@ int main() {
     }
     CHECK(got32r19c.size() == std::size(ldexp_vectors) && bad32r19c == 0,
           "kernel 32r19c preserves ldexp zero/normal/subnormal/overflow/Inf/NaN contracts");
+
+    // Kernel 32r19d: the same packet with CLAMP (`d7628000`), the shape Kena's post-New-Game pixel
+    // program `0x5052b20000` uses (`v_ldexp_f32 v12, v12, -2 clamp`). CLAMP saturates the exact
+    // ldexp result to [0, 1] with NaN -> 0. Every expected value differs from 32r19c's unclamped
+    // answer except the in-range rows, so a dropped CLAMP fails rows 0/1/3/4/5 and a clamp applied
+    // to the SOURCE instead of the result fails row 0 (1.5 -> 1.0 -> 4.0, not 6 -> 1.0) and row 2.
+    const uint32_t code32r19d[] = {
+        0xd7628000u,
+        0x0002030du,
+        0xbf810000u,
+    };
+    const LdexpVector ldexp_clamp_vectors[] = {
+        {0x3fc00000u, 2, 0x3f800000u},   // 1.5 * 4 = 6 -> 1.0
+        {0xbfc00000u, -1, 0x00000000u},   // -0.75 -> +0
+        {0x3fc00000u, -2, 0x3ec00000u},   // 1.5 / 4 = 0.375 stays
+        {0x7fc12345u, 3, 0x00000000u},   // NaN -> 0
+        {0x7f800000u, -5, 0x3f800000u},   // +Inf -> 1.0
+        {0xff800000u, 5, 0x00000000u},   // -Inf -> 0
+        {0x3f800000u, 0, 0x3f800000u},   // exactly 1.0 stays
+    };
+    const std::vector<uint32_t> spv32r19d =
+        recompile_valu(code32r19d, std::size(code32r19d), 14, 0);
+    CHECK(!spv32r19d.empty(), "recompiled kernel 32r19d (v_ldexp_f32 with CLAMP) -> SPIR-V");
+    std::vector<float> in32r19d(std::size(ldexp_clamp_vectors) * 14, 0.0f);
+    for (size_t i = 0; i < std::size(ldexp_clamp_vectors); ++i) {
+        in32r19d[i * 14 + 13] = std::bit_cast<float>(ldexp_clamp_vectors[i].x);
+        in32r19d[i * 14 + 1] =
+            std::bit_cast<float>(static_cast<uint32_t>(ldexp_clamp_vectors[i].exponent));
+    }
+    const std::vector<float> got32r19d =
+        spv32r19d.empty()
+            ? std::vector<float>()
+            : prosper::test::run_compute(spv32r19d, in32r19d, std::size(ldexp_clamp_vectors),
+                                         std::size(ldexp_clamp_vectors));
+    uint32_t bad32r19d = 0;
+    for (size_t i = 0;
+         i < std::size(ldexp_clamp_vectors) && got32r19d.size() == std::size(ldexp_clamp_vectors);
+         ++i) {
+        const uint32_t got_bits = bits_of(got32r19d[i]);
+        if (got_bits != ldexp_clamp_vectors[i].expected) {
+            ++bad32r19d;
+            printf("  ldexp-clamp[%zu] x=%08x exp=%d got=%08x expect=%08x\n", i,
+                   ldexp_clamp_vectors[i].x, ldexp_clamp_vectors[i].exponent, got_bits,
+                   ldexp_clamp_vectors[i].expected);
+        }
+    }
+    CHECK(got32r19d.size() == std::size(ldexp_clamp_vectors) && bad32r19d == 0,
+          "kernel 32r19d saturates the ldexp result to [0,1] with NaN -> 0");
 
     // Kernel 32r20 (LIVE encoding, exec_cs_290000eb00 pc=34; raised in review): the **SDWA** form of
     // the 16-bit compare. 32r16 covers the plain e32 encodings, so nothing executed the composition

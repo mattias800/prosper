@@ -100,7 +100,7 @@ inline void publish_ngg_backend_capabilities(const RenderVkCtx& ctx) {
 // One merged-NGG draw lost in the backend: counted under backend/ngg-subgroup in the alarm ledger
 // (and, when the draw was already counted seen in a pass, in the draw-disposition census), with a
 // bounded log line.
-inline void note_ngg_backend_drop(const char* reason, bool in_pass) {
+inline void note_ngg_backend_drop(const char* reason, bool in_pass, const char* detail = nullptr) {
     if (in_pass)
         prosper::gpu::draw_disposition_census().note_dropped(prosper::gpu::DrawDrop::NggSubgroup);
     else
@@ -109,7 +109,8 @@ inline void note_ngg_backend_drop(const char* reason, bool in_pass) {
     ngg_subgroup_backend_stats().refused.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<uint32_t> reported{0};
     if (reported.fetch_add(1, std::memory_order_relaxed) < 16u)
-        std::fprintf(stderr, "[ngg-backend] dropped draw reason=%s (first 16 reported)\n", reason);
+        std::fprintf(stderr, "[ngg-backend] dropped draw reason=%s%s%s (first 16 reported)\n",
+                     reason, detail ? " " : "", detail ? detail : "");
 }
 
 // ---- Scratch ring ---------------------------------------------------------------------------------
@@ -721,6 +722,8 @@ private:
             expanded.vcount = run.blocks * per_block;
             expanded.vertex_offset = static_cast<int32_t>(run.first_block * per_block);
             expanded.instance_count = 1;
+            expanded.first_instance =
+                draw.ngg_layer_select;   // the replay's layer, as InstanceIndex
             const NggScratchSlice& exports = prelude.exports[run.group];
             add_view(expanded, kNggRasterExportBinding,
                      FragmentDrawGpuBuffer::view(ctx_.dev, exports.buffer(), exports.offset,
@@ -833,7 +836,7 @@ inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
                                             const prosper::gpu::NggHostCapabilities& host,
                                             size_t draws, bool persist_depth_stencil,
                                             const BackendColorTarget* color_target,
-                                            uint32_t colors = 1) {
+                                            uint32_t colors = 1, bool colour_unwritten = false) {
     if (!draw.ngg_subgroup) return nullptr;
     const prosper::gpu::NggSubgroupDraw& ngg = *draw.ngg_subgroup;
     if (const char* device = prosper::gpu::ngg_device_refusal(ngg, host)) return device;
@@ -843,8 +846,11 @@ inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
                                 static_cast<uint32_t>(ngg.push_constants.size()),
                                 ngg.native_wave64))
             return "ngg-backend-pipeline";
-    const bool splits_safely = draws == 1u || (persist_depth_stencil &&
-                                               backend_split_carries_on_gpu(color_target, colors));
+    // A call that writes no colour (a depth-only pass: backend_draws_leave_colour) carries nothing
+    // but depth between segments, and persistent depth carries on the GPU (#3135 layered depth).
+    const bool splits_safely =
+        draws == 1u || (persist_depth_stencil &&
+                        (colour_unwritten || backend_split_carries_on_gpu(color_target, colors)));
     if (!persist_depth_stencil && !splits_safely) return "ngg-backend-transient-depth-split";
     if (!splits_safely) return "ngg-backend-readback-split";
     return nullptr;
@@ -869,15 +875,24 @@ inline std::span<const BackendDraw> ngg_admit_backend_draws(const std::vector<Ba
                      [](const BackendDraw& d) { return bool(d.ngg_subgroup); }))
         return draws;
     const prosper::gpu::NggHostCapabilities host = ngg_host_capabilities(render_vk_ctx());
+    const bool colour_unwritten = backend_draws_leave_colour(draws);
     const auto refusal = [&](const BackendDraw& d) {
         return ngg_backend_draw_refusal(d, host, draws.size(), persist_depth_stencil, color_target,
-                                        colors);
+                                        colors, colour_unwritten);
     };
     if (std::none_of(draws.begin(), draws.end(), refusal)) return draws;
+    // What made a split carry colour: the first draw of the call that may write it, and why.
+    char detail[96] = {};
+    for (size_t i = 0; i < draws.size() && !colour_unwritten; ++i)
+        if (const char* writer = backend_draw_colour_writer(draws[i])) {
+            std::snprintf(detail, sizeof detail, "draws=%zu colour-writer=%zu:%s%s", draws.size(),
+                          i, writer, draws[i].ngg_subgroup ? "(ngg)" : "");
+            break;
+        }
     kept.clear();
     for (const BackendDraw& d : draws) {
         if (const char* reason = refusal(d)) {
-            note_ngg_backend_drop(reason, false);
+            note_ngg_backend_drop(reason, false, detail[0] ? detail : nullptr);
             continue;
         }
         kept.push_back(d);

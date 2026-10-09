@@ -52,6 +52,13 @@ std::vector<uint32_t> build_compute_depth_to_rgba8();
 // Binding 0: storage buffer of uint32 texels; push constant: texel count.
 std::vector<uint32_t> build_compute_rgba8_to_packed10();
 
+// The reverse, exactly as the CPU unpack rounds it (unorm10_snapshot.hpp): channel = (v*255+511)/1023,
+// alpha = a*85. Word i of the first half is converted into word i+count, so the packed result in the
+// first half stays intact for guest writeback. Binding 0: storage buffer of 2*count uint32 words;
+// push constant: count. Integer arithmetic, so the result does not depend on a driver's
+// float-to-UNORM rounding (which RADV and lavapipe resolve differently, #4709). Local size 128.
+std::vector<uint32_t> build_compute_packed10_to_rgba8_append();
+
 // #3656: bound a device-produced vkCmdDispatchIndirect argument record before the dispatch reads it.
 // Binding 0: storage buffer of at least seven uint32 words -- x, y, z group counts, an output flag,
 // then the per-axis limits (maxComputeWorkGroupCount[0..2]) in words 4..6. If any count exceeds its

@@ -5,6 +5,7 @@
 
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -90,10 +92,10 @@ struct StageKey {
     std::vector<uint32_t> program;   // the linked chain, compared exactly
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
-    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0;
+    uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0, depth_slice_fanout = 0;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
-    bool count_violations = false, interpolation = false;
+    bool count_violations = false, interpolation = false, user_data_address = false;
     uint64_t interpolation_layout = 0;
     bool operator==(const StageKey&) const = default;
 };
@@ -106,14 +108,14 @@ struct StageKeyHash {
             hash = mix(hash, (uint64_t{r.binding} << 32) ^ r.fetch_pc ^ (uint64_t{r.cls} << 48));
         for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
-        hash = mix(hash, key.lds_granules);
+        hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
         hash = mix(hash, key.interpolation_layout);
-        hash = mix(hash, key.topology | (key.route << 8) | (key.float_transport << 16) |
-                             (uint64_t{key.native_wave64} << 24) |
-                             (uint64_t{key.provoking_vertex_last} << 25) |
-                             (uint64_t{key.layer_from_pos1} << 26) |
-                             (uint64_t{key.count_violations} << 27) |
-                             (uint64_t{key.interpolation} << 28));
+        hash = mix(
+            hash,
+            key.topology | (key.route << 8) | (key.float_transport << 16) |
+                (uint64_t{key.native_wave64} << 24) | (uint64_t{key.provoking_vertex_last} << 25) |
+                (uint64_t{key.layer_from_pos1} << 26) | (uint64_t{key.count_violations} << 27) |
+                (uint64_t{key.interpolation} << 28) | (uint64_t{key.user_data_address} << 29));
         return static_cast<size_t>(hash);
     }
 };
@@ -132,10 +134,24 @@ struct DrawKey {
     uint8_t topology = 0;
     std::array<uint32_t, 7> limits{};
     std::vector<uint32_t> push_constants;
+    // An indexed draw's index VALUES (#3135 P6): the plan, and so every launch record, depends on
+    // them. Keyed by a hash computed once per draw, with the decoded vector itself held by
+    // reference (never copied into the key); two keys whose hashes match are compared exactly, so a
+    // collision is never a hit. An indexed draw never keys equal to a non-indexed one (`indexed`).
+    bool indexed = false;
+    uint64_t index_hash = 0;
+    std::shared_ptr<const std::vector<uint32_t>> indices;
     auto tie() const {
-        return std::tie(stages, vertices, instances, topology, limits, push_constants);
+        return std::tie(stages, vertices, instances, topology, limits, push_constants, indexed,
+                        index_hash);
     }
-    bool operator<(const DrawKey& other) const { return tie() < other.tie(); }
+    bool operator<(const DrawKey& other) const {
+        const auto a = tie(), b = other.tie();
+        if (a < b) return true;
+        if (b < a || indices == other.indices) return false;
+        if (!indices || !other.indices) return !indices;
+        return *indices < *other.indices;
+    }
 };
 
 struct DrawEntry {
@@ -230,10 +246,12 @@ std::shared_ptr<const std::vector<uint32_t>> ngg_linked_chain(const uint32_t* pr
                                                               size_t prefix_dwords,
                                                               const uint32_t* main,
                                                               size_t main_dwords) {
-    if (!prolog || !prefix_dwords || !main || !main_dwords) return nullptr;
+    // No prolog: an NGG VS that is its own primitive shader runs as one program (#3135 P7).
+    if (!prolog != !prefix_dwords || !main || !main_dwords) return nullptr;
     const size_t main_span = rdna2_recompile_code_span(main, main_dwords);
     if (!main_span) return nullptr;
-    std::vector<uint32_t> words(prolog, prolog + prefix_dwords);
+    std::vector<uint32_t> words;
+    if (prolog) words.assign(prolog, prolog + prefix_dwords);
     words.insert(words.end(), main, main + main_span);
     static std::mutex mutex;
     static std::map<std::vector<uint32_t>,
@@ -263,12 +281,45 @@ bool read_ngg_user_data(const GpuState& state, uint32_t count, std::vector<uint3
     return true;
 }
 
+bool read_ngg_user_data_address(const GpuState& state, uint32_t words[2]) {
+    const auto lo = state.sh.find(P::SPI_SHADER_USER_DATA_ADDR_LO_GS);
+    const auto hi = state.sh.find(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
+    if (lo == state.sh.end() || hi == state.sh.end() || (!lo->second && !hi->second)) return false;
+    words[0] = lo->second;
+    words[1] = hi->second;
+    return true;
+}
+
+bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                         uint32_t user_sgprs) {
+    if (!linked || linked->empty()) return false;
+    // Keyed by the shared program (ngg_linked_chain hands out one copy per content), which the
+    // entry also owns, so an address is never reused for other words while it is cached.
+    static std::mutex mutex;
+    static std::map<std::pair<std::shared_ptr<const std::vector<uint32_t>>, uint32_t>, bool> cache;
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto found = cache.find({linked, user_sgprs}); found != cache.end())
+            return found->second;
+    }
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(linked->data(), linked->size(), ins);
+    NggSubgroupAbiLaunch launch;
+    launch.user_sgprs = user_sgprs;
+    const bool reads = analyze_ngg_subgroup_abi(ins, launch).reason == "ngg-abi-read-s0-s1";
+    const std::lock_guard lock(mutex);
+    if (cache.size() >= 64u) cache.clear();
+    cache[{linked, user_sgprs}] = reads;
+    return reads;
+}
+
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host) {
     NggLiveDrawResult result;
     const NggDrawAdmission admission = admit_ngg_draw(input.registers, input.facts, host);
     result.applies = admission.applies;
     result.strip = admission.shape.topology == NggInputTopology::TriangleStrip;
+    result.indexed = admission.shape.indices != nullptr;
     if (!admission.applies) return result;
     const auto refuse = [&](const char* reason, std::string detail = {}) {
         result.refusal = reason;
@@ -280,6 +331,13 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     if (!input.user_data_complete || input.user_data.size() != admission.user_sgprs)
         return refuse("ngg-user-data-unavailable");
     if (!input.linked || input.linked->empty()) return refuse("ngg-program-unavailable");
+    // s0:s1 costs two push words, so it is supplied only to a program that reads it (#4735
+    // review): a program with 31-32 user SGPRs that never touches s0:s1 keeps its admission.
+    const bool supply_address =
+        input.user_data_address_known &&
+        ngg_program_reads_user_data_address(input.linked, admission.user_sgprs);
+    if (supply_address && admission.user_sgprs + 2u > kNggShellMaxPushWords)
+        return refuse("ngg-user-sgpr-count");
     const bool interpolation = input.interpolation.requires_geometry;
     if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
 
@@ -290,6 +348,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.user_sgprs = admission.user_sgprs;
     key.lds_granules = admission.lds_granules;
     key.layer_slices = admission.layer_slices;
+    key.depth_slice_fanout = admission.depth_slice_fanout;
     key.topology = static_cast<uint8_t>(admission.topology);
     key.route = static_cast<uint8_t>(admission.route);
     key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
@@ -299,12 +358,14 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.count_violations = admission.count_violations;
     key.interpolation = interpolation;
     key.interpolation_layout = interpolation ? interpolation_hash(input.interpolation) : 0u;
+    key.user_data_address = supply_address;
 
     NggSubgroupDrawRequest request;
     request.resources = input.resources;
     request.shell.rsrc2_gs_lds_size = admission.lds_granules;
     request.shell.user_sgprs = admission.user_sgprs;
     request.shell.native_wave64 = admission.native_wave64;
+    request.shell.user_data_address_known = supply_address;
     request.limits = admission.limits;
     request.shape = admission.shape;
     request.raster.topology = admission.topology;
@@ -315,6 +376,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     request.raster.pixel_inputs = input.pixel_inputs;
     request.raster.float_transport = input.float_transport;
     request.raster.count_violations = admission.count_violations;
+    // A depth array is replayed per slice; the base draw is the slice-0 replay, so a consumer that
+    // knows nothing of the replay draws slice 0's primitives only, never the others into it.
+    if (admission.depth_slice_fanout) request.raster.layer_select = true;
     if (admission.route == NggLayerRoute::InterpolationGeometry)
         request.raster.reserved_locations = input.interpolation.attribute_mask;
     if (interpolation) {
@@ -326,6 +390,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         };
     }
     request.push_constants = input.user_data;
+    if (supply_address)
+        request.push_constants.insert(request.push_constants.end(), input.user_data_address,
+                                      input.user_data_address + 2);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, input.program_address};
 
     request.linked_code = key.program.data();
@@ -354,7 +421,14 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                        admission.limits.max_out_verts_per_subgroup,
                        admission.limits.gs_max_vert_out,
                        admission.limits.esgs_item_size};
-    draw_key.push_constants = input.user_data;
+    draw_key.push_constants = request.push_constants;
+    draw_key.indexed = admission.shape.indices != nullptr;
+    if (admission.shape.indices) {
+        draw_key.index_hash = 1469598103934665603ull;
+        for (uint32_t index : *admission.shape.indices)
+            draw_key.index_hash = (draw_key.index_hash ^ index) * 1099511628211ull;
+        draw_key.indices = admission.shape.indices;
+    }
     {
         const std::lock_guard lock(c.mutex);
         const auto found = c.draws.find(draw_key);
@@ -362,7 +436,10 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
             found->second.last_use = ++c.clock;
             ++c.stats.draw_hits;
             c.stats.strip_draws += result.strip ? 1u : 0u;
+            c.stats.indexed_draws += result.indexed ? 1u : 0u;
             result.draw = found->second.draw;
+            result.depth_slice_count = admission.depth_slice_fanout;
+            result.depth_first_slice = admission.depth_first_slice;
             return result;
         }
     }
@@ -401,11 +478,16 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         c.draws[std::move(draw_key)] = std::move(stored);
         evict(c.draws, kDrawEntries, nullptr);
     }
-    if (result.strip) {
+    if (result.strip || result.indexed) {
         const std::lock_guard lock(c.mutex);
-        ++c.stats.strip_draws;
+        c.stats.strip_draws += result.strip ? 1u : 0u;
+        c.stats.indexed_draws += result.indexed ? 1u : 0u;
     }
     result.draw = std::move(draw);
+    // The per-slice replay shares this one description: each slice's item selects its layer at
+    // draw time (DrawItem::ngg_layer_select), so nothing here is copied per slice.
+    result.depth_slice_count = admission.depth_slice_fanout;
+    result.depth_first_slice = admission.depth_first_slice;
     return result;
 }
 

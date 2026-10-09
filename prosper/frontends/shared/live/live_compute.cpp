@@ -20,11 +20,14 @@
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
 #include "shared/compute/storage_image_alias_plan.hpp"
+#include "shared/compute/sampled_float16_view.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/unorm10_snapshot.hpp"
+#include "shared/live/unorm10_mirror.hpp"
+#include "shared/live/staging_mirror_copy.hpp"
 #include "shared/live/bgra_seed_scratch.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
@@ -32,6 +35,7 @@
 #include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/depth_plane_view.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
@@ -111,6 +115,7 @@
 // The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
 extern "C" int prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
+#include "shared/live/compute_wave_admission.hpp"
 #include "shared/live/live_compute_storage_codec.hpp"
 
 namespace prosper::frontend {
@@ -1343,6 +1348,9 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
+    PackedRttConversion unorm10_mirror_conversion{
+        .build = prosper::gpu::build_compute_packed10_to_rgba8_append,
+        .debug_name = "prosper unorm10_mirror_conversion"};
     BgraSeedScratch bgra_seed_scratch;
     // #3656: device-side bounding of a device-resolved indirect dispatch's argument record.
     IndirectDispatchValidator indirect_validator;
@@ -1502,6 +1510,7 @@ struct VulkanComputeContext {
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
         packed_rtt_conversion.destroy();
+        unorm10_mirror_conversion.destroy();
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
         packed_retile_pipeline.destroy();
@@ -7150,9 +7159,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
     }
-    prosper::diagnostics::perf::observe_wave64_shader(
-        item.recompile_config_available ? item.recompile_config.wave_size : item.required_subgroup_size,
-        true);
+    const uint32_t guest_wave = item.recompile_config_available ? item.recompile_config.wave_size
+                                                                : item.required_subgroup_size;
+    prosper::diagnostics::perf::observe_wave64_shader(guest_wave, true);
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -7161,18 +7170,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "[compute] program 0x%llx requires subgroup=%u on a context without "
                      "that enabled contract -> dispatch skipped\n",
                      (unsigned long long)item.code_addr, item.required_subgroup_size);
-        prosper::diagnostics::perf::note_unsupported_wave64(
-            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
-            item.required_subgroup_size, item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+        prosper::frontend::note_compute_wave_refusal(ctx, item, item.required_subgroup_size);
         return decline("subgroup-contract-absent");
     }
-    const uint32_t dispatch_groups[3] = {
-        item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
+    const uint32_t dispatch_groups[3] = {item.launch.groups_x, item.launch.groups_y,
+                                         item.launch.groups_z};
+    if (!device_indirect && !(dispatch_groups[0] && dispatch_groups[1] && dispatch_groups[2]))
+        return true;   // zero groups on an axis launch no wave: a hardware no-op (#4131)
     for (uint32_t axis = 0; axis < 3 && !device_indirect; ++axis) {   // #3656: bounded on the device
-        if (dispatch_groups[axis] &&
-            dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis])
-            continue;
+        if (dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis]) continue;
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -7198,13 +7204,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "of at least %u lanes (host=%u stages=0x%x operations=0x%x)\n",
                      static_cast<unsigned long long>(item.code_addr), min_subgroup,
                      effective_subgroup, ctx.subgroup_stages, ctx.subgroup_operations);
-        prosper::diagnostics::perf::note_unsupported_wave64(
-            prosper::diagnostics::perf::Wave64Refusal::ComputeSubgroup,
-            item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup,
-            item.code_addr, 0, UINT32_MAX,
-            ctx.min_native_subgroup_size, ctx.max_native_subgroup_size);
+        prosper::frontend::note_compute_wave_refusal(
+            ctx, item,
+            item.recompile_config_available ? item.recompile_config.wave_size : min_subgroup);
         return decline("subgroup-too-narrow");
     }
+    if (const char* why = prosper::frontend::exchange_limit(ctx, item)) return decline(why);
+    prosper::diagnostics::perf::note_wave64_compute_native(   // ADR 0028 route= field
+        item.required_subgroup_size, guest_wave);
     // Coverage observed on a previous dispatch cannot authorize discarding inputs:
     // runtime predicates, coordinates and loop bounds may change with identical code and launch.
     // Preserve current input contents instead. Exact cached images can omit the upload only after
@@ -7623,8 +7630,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (images[i].imported || images[i].depth_bits_source || images[i].color_bits_source ||
                 images[i].packed10_source)
                 release_live_render_target_image(images[i].imported_addr);
-            if (images[i].packed10_pool)
-                vkDestroyDescriptorPool(ctx.device, images[i].packed10_pool, nullptr);
+            for (VkDescriptorPool pool : {images[i].packed10_pool, images[i].unorm10_pool})
+                if (pool) vkDestroyDescriptorPool(ctx.device, pool, nullptr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
@@ -8465,16 +8472,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // may also consume canonical RGBA8 because byte*257/65535 == byte/255. The independent
             // extent check below still rejects a scaled image for texel fetch/query access. Other
             // aliases and numeric conversions keep the snapshot path below.
-            const bool depth_float_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Float32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_bits_import_eligible = !bi.storage && !dim_1d && !dim_3d &&
-                !dim_2d_array && r->depth == 1 && r->img_dim == 1 &&
-                r->format == DataFormat::Uint32 &&
-                (r->num_components ? r->num_components : 1u) == 1u;
-            const bool depth_import_eligible =
-                depth_float_import_eligible || depth_bits_import_eligible;
+            using prosper::frontend::DepthPlaneRead;   // shared/rtt/depth_plane_view.hpp
+            const bool plain_2d_sample = !bi.storage && !dim_1d && !dim_3d && !dim_2d_array &&
+                                         r->depth == 1 && r->img_dim == 1;
+            const prosper::frontend::DepthPlaneView depth_view =
+                plain_2d_sample ? prosper::frontend::depth_plane_view(r->format, r->num_components)
+                                : prosper::frontend::DepthPlaneView{};
+            const bool depth_float_import_eligible = depth_view.read == DepthPlaneRead::Float;
+            const bool depth_bits_import_eligible = depth_view.read == DepthPlaneRead::Bits;
+            const bool depth_import_eligible = depth_view.read != DepthPlaneRead::None;
             // Persistent renderer images do not carry VK_IMAGE_USAGE_STORAGE_BIT, and a writable
             // storage import would also leave overlapping guest buffer aliases stale. Storage
             // descriptors therefore retain the owned-image + guest-writeback path.
@@ -8489,9 +8495,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     image_descriptors[i].normalized_sampling &&
                     !image_descriptors[i].texel_access;
                 const bool format_float_sampling = image_descriptors[i].sampled_float;
-                const LiveTargetImageRequest import_request{
-                    r->width, r->height, render_scale, depth_import_eligible,
-                    scalable_normalized_sampling};
+                const LiveTargetImageRequest import_request{r->width, r->height, render_scale,
+                                                            depth_view.texel_bytes,
+                                                            scalable_normalized_sampling};
                 const auto import_start = ComputeClock::now();
                 const bool import_available = import_live_render_target_image(
                     r->gpu_addr, import_request, import);
@@ -8709,8 +8715,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         LiveTargetImageImport source;
                         // Integer texel coordinates require exact actual extents. A configured render
                         // scale does not matter when the imported Vulkan image itself matches.
-                        const LiveTargetImageRequest request{
-                            r->width, r->height, render_scale, false, false};
+                        const LiveTargetImageRequest request{r->width, r->height, render_scale, 0u,
+                                                             false};
                         const bool time_seed = image_timing && perf_capture_timing;
                         const auto seed_start = time_seed
                             ? ComputeClock::now() : ComputeClock::time_point{};
@@ -8998,20 +9004,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // R32 image to RGBA32F every dispatch. Three-channel optimal images are not universally
             // supported, so retain the portable four-channel expansion for that uncommon case.
             const bool sampled_float32_native = sampled_float32 && sampled_components != 3;
-            // Renderer imports and compute 3D RGBA16F textures can use their exact native sampled
-            // representation. Narrowing a volume to RGBA8 discarded its HDR range and prevented a
-            // retained native storage result from seeding the next ping-pong sample on the GPU.
-            // Ordinary guest-backed 2D FP16 keeps its historical RGBA8 conversion: native RGBA16F
-            // sampling was measured 7x slower in Astro Bot's full-resolution composite on RADV.
-            const bool sampled_renderer_narrow_float16 = renderer_owned &&
-                ((live_target.format == LiveTargetPixelFormat::R16Float &&
-                  sampled_components == 1) ||
-                 (live_target.format == LiveTargetPixelFormat::Rg16Float &&
-                  sampled_components == 2));
-            const bool sampled_float16_native = !bi.storage &&
-                r->format == DataFormat::Float16 && sampled_components != 3 &&
-                ((sampled_components == 4 && (bi.imported || dim_3d)) ||
-                 sampled_renderer_narrow_float16);
+            // Native FP16 or the RGBA8 conversion: shared/compute/sampled_float16_view.hpp.
+            const bool renderer_narrow_float16 =
+                (live_target.format == LiveTargetPixelFormat::R16Float &&
+                 sampled_components == 1) ||
+                (live_target.format == LiveTargetPixelFormat::Rg16Float && sampled_components == 2);
+            const bool sampled_float16_native = !bi.storage && r->format == DataFormat::Float16 &&
+                                                prosper::frontend::sample_float16_natively(
+                                                    {sampled_components, renderer_owned,
+                                                     renderer_narrow_float16, bi.imported, dim_3d});
             const bool sampled_unorm8x2 = !bi.storage && r->format == DataFormat::Unorm8 &&
                                           sampled_components == 2;
             const bool sampled_unorm16_native = !bi.storage && r->format == DataFormat::Unorm16 &&
@@ -9631,8 +9632,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      (bi.standalone_seed.valid() && bi.packed_r11_storage) ||
                      (!bi.has_renderer_seed() && !bi.compute_transfer_seed_borrowed &&
                       !(bi.persistent && bi.upload_skipped)))) {
+                    bi.unorm10_mirror_scratch =
+                        prosper::frontend::unorm10_mirror_wants_scratch(bi, *r, sbytes);
                     VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                    sci.size = sbytes;
+                    sci.size = bi.unorm10_mirror_scratch ? sbytes * 2u : sbytes;
                     sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
                     if (!vk_ok(vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]),
@@ -11824,7 +11827,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto decline = [](ExactResultDecline why) {
                 prosper::diagnostics::perf::note_exact_result(why);
             };
-            const auto format = storage_target_format(*r);
+            // Packed R10G10B10A2 converts exactly into the renderer's RGBA8 image (unorm10_mirror.hpp).
+            const bool unorm10_convert = prosper::frontend::is_unorm10_rgba_storage(*r);
+            const auto format =
+                unorm10_convert
+                    ? std::optional<LiveTargetPixelFormat>(LiveTargetPixelFormat::Rgba8Unorm)
+                    : storage_target_format(*r);
             if (!format) { decline(ExactResultDecline::FormatUnmapped); continue; }
             // A GPU-authoritative result must remain readable by the next partial writer.
             // Only these exact formats currently have a renderer-image storage seed path.
@@ -11838,6 +11846,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if ((*format == LiveTargetPixelFormat::Rgba16Float &&
                  (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
                 (*format == LiveTargetPixelFormat::R8Unorm && !bi.native_float_storage) ||
+                (unorm10_convert && !prosper::frontend::unorm10_mirror_ready(
+                                        ctx, bi, staging[i], staging_bytes[i], vk_soft_ok)) ||
                 (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
                 decline(ExactResultDecline::FormatNotNative);
                 continue;
@@ -11910,6 +11920,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // import, can share the destination when they name this same allocation. Their
             // reads end with the dispatch before the result copy below; each import owns a pin.
             const bool own_seed_destination =
+                !unorm10_convert &&
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
                  (*format == LiveTargetPixelFormat::R8Unorm && bi.native_float_storage) ||
@@ -11988,6 +11999,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             bi.mirror_destination = destination;
             bi.mirror_destination_shared_import = shares_read_only_import;
+            bi.mirror_unorm10_convert = unorm10_convert;
             mirror_census.borrowed.add();
         }
 
@@ -12665,51 +12677,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (perf_gpu_timing) storage_timestamp_spans.emplace_back(retile_start, true);
                 }
             }
-            if (bi.mirror_result_to_imported) {
-                const BoundImage& mirror = images[bi.seed_from_imported];
-                VkImageMemoryBarrier mirror_to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                mirror_to_dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                mirror_to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                mirror_to_dst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                mirror_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                mirror_to_dst.srcQueueFamilyIndex = mirror_to_dst.dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                mirror_to_dst.image = mirror.image;
-                mirror_to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                     1, &mirror_to_dst);
-                VkImageCopy mirror_copy{};
-                mirror_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                mirror_copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                mirror_copy.extent = {r->width, r->height, r->depth};
-                vkCmdCopyImage(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               mirror.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                               1, &mirror_copy);
-                VkImageMemoryBarrier mirror_to_general = mirror_to_dst;
-                mirror_to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                mirror_to_general.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                mirror_to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                mirror_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                                     nullptr, 1, &mirror_to_general);
-            }
+            if (bi.mirror_result_to_imported)
+                prosper::frontend::record_result_to_imported_copy(
+                    command, bi.image, images[bi.seed_from_imported].image, r->width, r->height,
+                    r->depth);
             if (bi.mirror_destination.valid()) {
-                // The direct-retile shader or image transfer already produced canonical packed
-                // row-major guest texels in staging[i]. A buffer-to-image copy preserves R11 bits
-                // even though its private storage image is typed R32_UINT rather than R11G11B10F.
-                VkBufferMemoryBarrier linear_ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-                linear_ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
-                                             VK_ACCESS_TRANSFER_WRITE_BIT;
-                linear_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                linear_ready.srcQueueFamilyIndex = linear_ready.dstQueueFamilyIndex =
-                    VK_QUEUE_FAMILY_IGNORED;
-                linear_ready.buffer = staging[i];
-                linear_ready.size = staging_bytes[i];
-                vkCmdPipelineBarrier(command,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linear_ready, 0, nullptr);
+                // staging[i] holds canonical row-major guest texels (staging_mirror_copy.hpp).
+                prosper::frontend::record_staging_ready_for_transfer(command, staging[i],
+                                                                     staging_bytes[i]);
                 VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 to_dst.srcAccessMask = bi.mirror_destination.fresh_uninitialized
                     ? 0u : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -12729,12 +12704,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_dst);
-                VkBufferImageCopy region{};
-                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.imageExtent = {r->width, r->height, 1};
-                vkCmdCopyBufferToImage(command, staging[i],
-                    static_cast<VkImage>(bi.mirror_destination.image),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                if (bi.mirror_unorm10_convert) {
+                    ctx.unorm10_mirror_conversion.record_packed10_to_rgba8(
+                        command, staging[i], bi.unorm10_set,
+                        static_cast<VkImage>(bi.mirror_destination.image), r->width, r->height);
+                } else {
+                    prosper::frontend::record_staging_to_image_copy(
+                        command, staging[i], static_cast<VkImage>(bi.mirror_destination.image),
+                        r->width, r->height);
+                }
                 VkImageMemoryBarrier restore = to_dst;
                 restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 restore.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;

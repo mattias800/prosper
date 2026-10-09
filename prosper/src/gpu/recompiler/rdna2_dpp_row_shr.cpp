@@ -96,6 +96,14 @@ bool emit_portable_compute_dpp_row_shr_phase(SpirvCompute& b,
         const uint32_t maximum = b.load_function(b.t_bool, variables.maximum);
         dpp_result = b.sel(maximum, b.uext2(Glsl_UMax, dpp_source, dpp_shifted), dpp_result);
     }
+    // The bounded OR (NGG shell only): the unavailable source reads zero, as for the bounded ADD.
+    if (variables.bitwise_or) {
+        const uint32_t bitwise_or = b.load_function(b.t_bool, variables.bitwise_or);
+        dpp_result =
+            b.sel(bitwise_or,
+                  b.ibin(Op_BitwiseOr, dpp_source, b.sel(dpp_valid_source, dpp_shifted, zero)),
+                  dpp_result);
+    }
     const uint32_t dpp_write =
         b.land(b.land(dpp_pending, dpp_active),
                b.ngg_workgroup_shell ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);

@@ -1298,6 +1298,43 @@ int main(int argc, char** argv) {
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4), "recompile_fragment"); }
+    // Fragment: compressed and uncompressed colour exports under every SPI_SHADER_COL_FORMAT
+    // decode and output class (#4703): u16/s16 halves into uvec4/ivec4 outputs (Kena's R16_UINT
+    // lighting channels), unorm16/snorm16 into a float output, the mismatched value conversions,
+    // and raw 32-bit bits into integer outputs. Two MRTs so mixed output classes share a module.
+    {
+        const uint32_t compr[] = {0x7e0002ffu, 0xbeef0001u, 0x7e0202ffu, 0x00020003u, 0xf800140fu,
+                                  0x00000100u, 0xf8001c1fu, 0x00000100u, 0xbf810000u};
+        const uint32_t raw[] = {0x7e0002ffu, 0xbeef0001u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+                                0xf800100fu, 0x03020100u, 0xf800181fu, 0x03020100u, 0xbf810000u};
+        struct Variant {
+            const char* name;
+            uint32_t col_format;
+            FragmentOutputClass mrt0, mrt1;
+            bool compressed;
+        };
+        constexpr auto F = FragmentOutputClass::Float, U = FragmentOutputClass::Uint,
+                       S = FragmentOutputClass::Sint;
+        const Variant variants[] = {
+            {"fragment_export_uint16_uint", 0x77u, U, U, true},
+            {"fragment_export_sint16_sint", 0x88u, S, S, true},
+            {"fragment_export_norm16_float", 0x65u, F, F, true},
+            {"fragment_export_fp16_into_uint", 0x44u, U, S, true},
+            {"fragment_export_int16_into_float", 0x87u, F, F, true},
+            {"fragment_export_raw32_uint_sint", 0x91u, U, S, false},
+        };
+        for (const auto& v : variants) {
+            FragmentOutputClass classes[8]{};
+            classes[0] = v.mrt0;
+            classes[1] = v.mrt1;
+            const auto& code = v.compressed ? compr : raw;
+            const size_t words = v.compressed ? std::size(compr) : std::size(raw);
+            dump(dir, v.name,
+                 recompile_fragment(code, words, nullptr, nullptr, UINT32_MAX, nullptr, false,
+                                    {RecompileDiagnosticStage::Fragment, 0}, {}, nullptr, {}, {},
+                                    make_fragment_export_formats(v.col_format, classes)));
+        }
+    }
     // Fragment: Astro's exact wave64 MBCNT + device-global append allocation shape.
     { const uint32_t c[] = {
           0xD7660007u,0x0001007Fu,0xBEFC0380u,0xD8FA0014u,0x06000000u,
@@ -1616,6 +1653,52 @@ int main(int argc, char** argv) {
       vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
       vb.num_components=4; rt.resources.push_back(vb);
       dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // #4706: a Wave64 pixel program reloads a spilled compare-mask ballot with v_readlane and ANDs
+    // it with a fresh compare mask, so the data pair is projected onto the lane bit.
+    {
+        const uint32_t c[] = {0xD7650005u, 0x000100C1u, 0xD7660005u, 0x00020AC1u, 0xD4C40002u,
+                              0x00020AA0u, 0xD761000Cu, 0x00010202u, 0xD761000Cu, 0x00010403u,
+                              0xD7600004u, 0x0001030Cu, 0xD7600005u, 0x0001050Cu, 0xD4C20006u,
+                              0x00010080u, 0x87880604u, 0xD5010001u, 0x0021E480u, 0x7E000280u,
+                              0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_scalar_pair_mask_projection", recompile_fragment(c, std::size(c)));
+    }
+    // #4706: v_ldexp_f32 with CLAMP (the float saturate routed through fresult).
+    {
+        const uint32_t c[] = {0xD7628000u, 0x0002030Du, 0xBF810000u};
+        dump(dir, "compute_ldexp_clamp", recompile_valu(c, sizeof(c) / 4, 14, 0));
+    }
+    // #4706: the dispatcher's entry-M0 KILL. s2 saves M0, is overwritten with data, and is read at
+    // a loop header (its own dispatcher case); the irreducible tail forces the dispatcher. Compute
+    // (native Wave64) and pixel forms.
+    {
+        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+                              0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0xBEFE04C1u, 0xE0702000u,
+                              0x80020300u, 0x7E040280u, 0x7C020300u, 0xBF860001u, 0x7E040281u,
+                              0x7D840100u, 0xBF870001u, 0xBF82FFFDu, 0x7E040D02u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource out{};
+        out.cls = ResourceClass::ConstantBuffer;
+        out.format = DataFormat::Uint32;
+        out.num_components = 1;
+        out.binding = 3;
+        out.stride = 4;
+        out.sgpr_base = 8;
+        rt.resources.push_back(out);
+        ComputeShaderConfig config;
+        config.local_x = 64;
+        config.wave_size = 64;
+        config.native_subgroup_size = 64;
+        dump(dir, "compute_entry_m0_kill", recompile_compute(c, std::size(c), &rt, config));
+    }
+    {
+        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+                              0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0x7E040280u, 0x7C020300u,
+                              0xBF860001u, 0x7E040281u, 0x7D840100u, 0xBF870001u, 0xBF82FFFDu,
+                              0x7E020D03u, 0x100202FFu, 0x3B808081u, 0x7E000280u, 0x7E040280u,
+                              0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_entry_m0_kill", recompile_fragment(c, std::size(c)));
+    }
     // GTA V Wave64 survivor-mask join: one arm retains scalar EXEC words while the other computes
     // the same physical pair through S_ANDN2_B64. Validate the native subgroup ballots that make
     // the logical result scalar-readable at the exact trailing S_CMP_EQ_U64.
@@ -1717,6 +1800,37 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_vcc_scratch_loop_voted",
              recompile_fragment(voted, sizeof(voted) / 4, nullptr));
     }
+    // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
+    // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
+    // the structured loop route, and the one-arm if phis a slot written on the taken arm only.
+    // test_lane_slot_carry executes all three; these lock spirv-val on the new phi shapes.
+    {
+        const uint32_t counted[] = {0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE850385u,
+                                    0xD7610014u, 0x00012005u, 0x7E020280u, 0xBE8B0380u, 0xD7600006u,
+                                    0x00012114u, 0xD7600007u, 0x00015114u, 0xBF040607u, 0x850A8081u,
+                                    0xBF0AC00Bu, 0x850C8081u, 0x870A0C0Au, 0xBF07800Au, 0xBF840008u,
+                                    0x4A020282u, 0x800B810Bu, 0xD7600006u, 0x00015114u, 0x80068106u,
+                                    0xD7610014u, 0x00015006u, 0xBF82FFEDu, 0xD7600008u, 0x00015114u,
+                                    0x4A020208u, 0x4A020300u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_counted_loop",
+             recompile_valu(counted, sizeof(counted) / 4, 1, 3));
+        const uint32_t nested[] = {0x7E000F00u, 0xBE840380u, 0xD7610014u, 0x00015004u, 0xBE850383u,
+                                   0xD7610014u, 0x00012005u, 0x7E020280u, 0xBE8B0380u, 0xD7600006u,
+                                   0x00012114u, 0xD7600007u, 0x00015114u, 0xBF040607u, 0x850A8081u,
+                                   0xBF0AC00Bu, 0x850C8081u, 0x870A0C0Au, 0xBF07800Au, 0xBF84000Du,
+                                   0x800B810Bu, 0xBE8D0380u, 0xBF0A820Du, 0xBF840003u, 0x4A020281u,
+                                   0x800D810Du, 0xBF82FFFBu, 0xD7600006u, 0x00015114u, 0x80068106u,
+                                   0xD7610014u, 0x00015006u, 0xBF82FFE8u, 0xD7600008u, 0x00015114u,
+                                   0x4A020208u, 0x4A020300u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_nested_loop",
+             recompile_valu(nested, sizeof(nested) / 4, 1, 3));
+        const uint32_t one_arm_if[] = {0x7E000F00u, 0xBE840387u, 0xD7610014u, 0x00010604u,
+                                       0xBE890381u, 0xBF068109u, 0xBF840003u, 0xB0040064u,
+                                       0xD7610014u, 0x00010604u, 0xD7600008u, 0x00010714u,
+                                       0x4A020008u, 0x7E060D01u, 0xBF810000u};
+        dump(dir, "compute_lane_slot_one_arm_if",
+             recompile_valu(one_arm_if, sizeof(one_arm_if) / 4, 1, 3));
+    }
     // Fragment: a COUNTED loop whose induction variable is VCC_HI (#4680, Kena's light-list loop):
     // the counted emitter's VCC mask phi closes with a placeholder while the scalar halves ride
     // their own phis. test_fragment_loop_vcc_scratch executes it; this locks spirv-val.
@@ -1793,6 +1907,8 @@ int main(int argc, char** argv) {
         }
     dump(dir, "builder_rgba8_to_packed10", build_compute_rgba8_to_packed10(),
          "build_compute_rgba8_to_packed10");
+    dump(dir, "builder_packed10_to_rgba8_append", build_compute_packed10_to_rgba8_append(),
+         "build_compute_packed10_to_rgba8_append");
     dump(dir, "builder_depth_to_rgba8", build_compute_depth_to_rgba8(),
          "build_compute_depth_to_rgba8");
     dump(dir, "builder_indirect_dispatch_validate", build_compute_indirect_dispatch_validate(),

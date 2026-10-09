@@ -661,6 +661,7 @@ PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE  unclassified
 PROSPER_NO_NATIVE_COMPUTE_SUBGROUP  unclassified
 PROSPER_NO_NATIVE_R11_SAMPLED  unclassified
 PROSPER_NO_NATIVE_SINGLE_LAYER_ARRAY_STORAGE  unclassified
+PROSPER_NO_NESTED_WIDE_FACTS_MEMO  diagnostic  # A/B control: re-derive the nested wide-data admission inventory per dispatch; guest-visible result identical
 PROSPER_NO_NORMALIZED_UNORM_RTT_BIND  unclassified
 PROSPER_NO_PACKED_R11_STORAGE  unclassified
 PROSPER_NO_PACK_RANGE  unclassified
@@ -982,6 +983,7 @@ PROSPER_WATCH_PHYS_TIMING  unclassified
 PROSPER_WATCH_PROMOTE_CENSUS  unclassified
 PROSPER_WATCH_QUERY_AUDIT  unclassified
 PROSPER_WATCH_SHIFT  unclassified
+PROSPER_WAVE64_EXCHANGE  selector  #4753  # ADR 0028 route 3: compile a narrow-host-refused Wave64 module through the exact exchange dispatcher
 PROSPER_WAVE64_SKIP_CENSUS  unclassified
 PROSPER_WIN_BP  unclassified
 PROSPER_WIN_BP_REPEAT  unclassified

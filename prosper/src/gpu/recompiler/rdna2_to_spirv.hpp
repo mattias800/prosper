@@ -20,6 +20,7 @@
 #include <span>
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/recompiler/fragment_export_formats.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
@@ -815,6 +816,17 @@ struct ComputeShaderConfig {
     // complex guest-wave CFGs may replace portable workgroup-scratch vote/scan emulation with native
     // subgroup operations without assuming Vulkan's LocalInvocationIndex ordering.
     uint32_t native_subgroup_size = 0;
+    // ADR 0028 route 3 (PROSPER_WAVE64_EXCHANGE, default OFF): the narrowest compute subgroup the
+    // host may run this module on, or 0 for "route off". When non-zero and the ordinary lowering
+    // would need a native subgroup wider than this (a Wave64 v_readlane the structured paths lower
+    // to a shuffle), the module is recompiled through the exact guest-wave dispatcher, which
+    // exchanges across the workgroup's host subgroups through workgroup memory. The retry is only
+    // taken when it compiles AND no longer needs a wider subgroup; otherwise the original module is
+    // returned unchanged, so the refusal stays visible. Not serialized into captures: a replay
+    // recompiles with this off.
+    uint32_t wave64_exchange_width = 0;
+    // Internal to the retry above: compile through the exact guest-wave dispatcher.
+    bool force_exchange_dispatcher = false;
     // Per-format VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT support published by the device-owning
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
     // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
@@ -856,25 +868,33 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instr
 // (rather than miscompiles) a module on a narrower host.
 // Zero means that the module does not use a native compute-subgroup operation.
 uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
+// ADR 0028: true when the module was compiled through the exact exchange dispatcher
+// (`Prosper.ComputeWave64Exchange=1`), so it needs workgroup memory beyond the guest's own LDS.
+bool compute_spirv_wave64_exchange(const std::vector<uint32_t>& spirv);
+// How many times compute_spirv_wave64_exchange walked a module (a test hook: with the switch off the
+// per-dispatch path must never reach it).
+uint64_t compute_spirv_wave64_exchange_scans_for_test();
+// True when the module contains any OpGroupNonUniform* instruction (native subgroup operation).
+bool compute_spirv_uses_group_non_uniform(const std::vector<uint32_t>& spirv);
 
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to MRT0/1
-// write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
+// write vec4(src0..3) to the matching color output. `export_formats` (#4703) selects how a
+// compressed export is unpacked and which outputs are uvec4/ivec4; {} is the historical
+// f16-unpack, all-float-output module. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF/MTBUF) with resolved bindings.
 // A nonnull arithmetic_observation transfers reporting to the owning cache request; it must replay
 // the retained observation on every return. Default direct callers announce once per request.
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* rt = nullptr,
-                                         const PixelSystemInputMapping* system_inputs = nullptr,
-                                         uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                         const FragmentInterpolationLayout* interpolation = nullptr,
-                                         bool wave32 = false,
-                                         RecompileDiagnosticContext diagnostic = {
-                                             RecompileDiagnosticStage::Fragment, 0},
-                                         FragmentFloatMode float_mode = {},
-                                         FragmentArithmeticObservation* arithmetic_observation = nullptr,
-                                         FloatTransportConfig float_transport = {},
-                                         FragmentFloatFlags float_flags = {});
+std::vector<uint32_t>
+recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt = nullptr,
+                   const PixelSystemInputMapping* system_inputs = nullptr,
+                   uint32_t pcrel_dispatch_target = UINT32_MAX,
+                   const FragmentInterpolationLayout* interpolation = nullptr, bool wave32 = false,
+                   RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Fragment, 0},
+                   FragmentFloatMode float_mode = {},
+                   FragmentArithmeticObservation* arithmetic_observation = nullptr,
+                   FloatTransportConfig float_transport = {}, FragmentFloatFlags float_flags = {},
+                   FragmentExportFormats export_formats = {});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

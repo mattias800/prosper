@@ -22,19 +22,33 @@
 //  * PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1 recomputes every dispatch on the same binary.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "gpu/recompiler/compute_wave_route.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/diagnostics/refused_shader_dump.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
 namespace prosper::gpu {
+
+// The raw nested wide-data inventory admit_compute_nested_wide_data needs: the proven nested child
+// loads (rdna2_proven_raw_nested_wide_data_loads) and, only when there is a child, the proven
+// immediate parent loads (rdna2_proven_raw_immediate_wide_data_loads). Both are pure functions of
+// the decoded program and the most expensive per-dispatch analysis left on the submit thread once
+// decode was memoized: The Blood of Dawnwalker's AgcSubmission thread spent 18 of 40 gdb stack
+// samples in them (2026-10-09), recomputing the same answer for every dispatch.
+struct NestedWideDataFacts {
+    std::vector<uint32_t> nested;    // child load PCs; empty for almost every program
+    std::vector<uint32_t> parents;   // immediate parent PCs; computed only when `nested` is not empty
+};
 
 struct ComputeProgramFacts {
     std::vector<uint32_t> code;   // exact bytes the facts were derived from
@@ -43,6 +57,20 @@ struct ComputeProgramFacts {
     std::vector<Rdna2Inst> decoded;   // rdna2_walk(code, dwords)
     bool prefers_native_multiwave = false;  // compute_shader_prefers_native_multiwave(decoded, ...)
     bool uses_gds = false;                  // a DS GDS access the dispatch must bind a buffer for
+    // ADR 0028: every cross-lane operation and the control-flow context it sits in. Host
+    // independent, so it is memoized with the program; the route is chosen per host at the decline
+    // site (select_compute_wave_route).
+    // Computed on first use (a decline that is about to print its line), so a host that never refuses
+    // a Wave64 compute program never pays for it.
+    const ComputeWaveOpFacts& wave_ops() const;
+    mutable std::once_flag wave_ops_once;
+    mutable ComputeWaveOpFacts wave_ops_value;
+    // Computed on first use and then served for every later dispatch of these exact bytes.
+    const NestedWideDataFacts& nested_wide_data() const;
+    mutable std::once_flag nested_wide_once;
+    mutable NestedWideDataFacts nested_wide_value;
+    // The exchange route was announced for this program (first sighting, lock-free).
+    mutable std::atomic<bool> exchange_announced{false};
     // Terminal reject reasons the probe recorded, replayed for the current address on every use.
     std::vector<std::pair<std::string, std::string>> probe_reject_reasons;
 };
@@ -52,6 +80,7 @@ struct ComputeProgramFactsStats {
     uint64_t misses = 0;
     uint64_t bypasses = 0;       // opt-out or verbose diagnostics: computed, not cached
     uint64_t probe_evaluations = 0;
+    uint64_t nested_wide_evaluations = 0;   // nested_wide_data() analyses actually run
     uint64_t entries = 0;
     uint64_t bytes = 0;
 };
@@ -63,7 +92,19 @@ std::shared_ptr<const ComputeProgramFacts> compute_program_facts(
 
 // False under PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1: every dispatch re-derives its facts and
 // the executor also restores the unconditional path-specialization copy (a same-binary A/B arm).
+// Side-effect-free lookup for a diagnostic: the cached facts when the exact bytes are cached, else
+// a fresh analysis that is NOT stored. It touches no statistics and replays no terminal reject
+// reasons (the full compute_program_facts overwrites `terminal_reject_reasons()[program]` with the
+// probe's record on a hit, which could clobber a later, more specific reason).
+std::shared_ptr<const ComputeProgramFacts>
+compute_program_facts_peek(const uint32_t* code, size_t dwords, uint64_t program_address);
+
 bool compute_program_facts_cache_enabled();
+
+// False under PROSPER_NO_NESTED_WIDE_FACTS_MEMO=1: the executor re-derives the nested wide-data
+// inventory on every dispatch, as it did before the memo (the same-binary A/B control arm).
+// Diagnostic algorithm control; the admission decision is identical in both arms.
+bool compute_nested_wide_facts_memo_enabled();
 
 ComputeProgramFactsStats compute_program_facts_stats();
 void reset_compute_program_facts_for_test();

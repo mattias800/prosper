@@ -14,6 +14,12 @@
 //     is an atomic add, so a stale count would invalidate every block.
 //   * The violation counters are read lazily: nothing is read until the batch completes for its own
 //     reasons, and an out-of-range layer is then counted.
+//   * #3135 P6, indexed draws: an instanced triangle list of scattered 16- and 32-bit indices
+//     covers every instance's layer, the index VALUES (not their positions) decide which half of
+//     the screen one triangle covers, and each instance's primitives land on their own slice.
+//   * Layered NGG depth: a depth-only VS-only draw whose layer addresses a depth array, replayed
+//     per slice, leaves layer k's exact depth in slice k, and two such draws split one pass with no
+//     colour carried.
 #include "fixtures/render_runner.h"
 
 #include "fixtures/ngg_merged_lut_fixture.hpp"
@@ -21,6 +27,8 @@
 #include "fixtures/ngg_subgroup_runner.h"
 #include "fixtures/test_data.h"
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
+#include "gpu/execute/ngg_draw_indices.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/ngg_subgroup_plan.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
@@ -40,6 +48,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -81,21 +90,18 @@ const KenaInputs& kena_inputs() {
     return inputs;
 }
 
-std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_t vertices,
-                                                 uint32_t instances, uint32_t slices,
-                                                 std::string* why,
-                                                 std::optional<NggLayerRoute> route = {}) {
+std::shared_ptr<const NggSubgroupDraw>
+kena_shape_draw(const RenderVkCtx& ctx, const NggDrawShape& shape, const ShaderResourceTable& table,
+                uint32_t slices, std::string* why, std::optional<NggLayerRoute> route = {}) {
     const KenaInputs& in = kena_inputs();
     NggSubgroupDrawRequest request;
     request.linked_code = in.linked.data();
     request.dwords = in.linked.size();
-    request.resources = &in.table;
+    request.resources = &table;
     request.shell.rsrc2_gs_lds_size = ngg_rsrc2_gs_lds_size(ngg::kKenaRsrc2Gs);
     request.shell.user_sgprs = ngg::kKenaUserSgprs;
     request.limits = ngg::kena_limits();
-    request.shape.topology = NggInputTopology::TriangleStrip;
-    request.shape.vertex_count = vertices;
-    request.shape.instance_count = instances;
+    request.shape = shape;
     request.raster.topology = NggOutputTopology::TriangleList;
     request.raster.layer_from_pos1 = true;
     request.raster.layer_slices = slices;
@@ -104,6 +110,17 @@ std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_
     request.push_constants.assign(ngg::kKenaUserSgprs, 0u);
     request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x5009440000ull};
     return build_ngg_subgroup_draw(request, why);
+}
+
+std::shared_ptr<const NggSubgroupDraw> kena_draw(const RenderVkCtx& ctx, uint32_t vertices,
+                                                 uint32_t instances, uint32_t slices,
+                                                 std::string* why,
+                                                 std::optional<NggLayerRoute> route = {}) {
+    NggDrawShape shape;
+    shape.topology = NggInputTopology::TriangleStrip;
+    shape.vertex_count = vertices;
+    shape.instance_count = instances;
+    return kena_shape_draw(ctx, shape, kena_inputs().table, slices, why, route);
 }
 
 // The guest's convention: a negative viewport height puts clip y = +1 on the top row.
@@ -912,6 +929,561 @@ TEST(NggSubgroupBackend, ShellPipelineCacheIsKeyedOnceAndBounded) {
     EXPECT_LE(stats.entries, kNggShellPipelineCacheEntries);
     EXPECT_GT(stats.evictions, evictions);
     EXPECT_TRUE(first->pipeline) << "an evicted entry a holder still owns stays valid";
+}
+
+// ---- P6: indexed draws ------------------------------------------------------------------------------
+//
+// Kena's LUT producer driven by an INDEX BUFFER instead of its strip: the shapes Kena submits past
+// New Game (#3135 P6) are small instanced triangle lists into a 64-slice volume. Eight vertex
+// records; the quad's corners sit at the scattered indices 6 (1,-1), 1 (1,1), 4 (-1,-1) and 3 (-1,1).
+// The other records are decoys placed so that reading index POSITIONS instead of index VALUES draws
+// the complementary half: records 0, 1, 2 are the upper-left triangle, and 3, 4, 5 a degenerate one.
+// Each record's PARAM is its own normalized screen position, so a covered pixel must read its own
+// position whichever records drew it -- coverage is what each arm discriminates.
+
+const std::vector<std::array<float, 2>>& scattered_records() {
+    static const std::vector<std::array<float, 2>> positions = {
+        {-1, 1}, {1, 1}, {-1, -1}, {-1, 1}, {-1, -1}, {-1, 1}, {1, -1}, {-1, -1}};
+    return positions;
+}
+
+const ShaderResourceTable& scattered_table() {
+    static const ShaderResourceTable table = ngg::kena_resources(8);
+    return table;
+}
+
+std::shared_ptr<const std::vector<uint32_t>> decoded(const std::vector<uint32_t>& values,
+                                                     uint32_t element_bytes) {
+    std::vector<unsigned char> bytes(values.size() * element_bytes);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (element_bytes == 2u) {
+            const uint16_t narrow = static_cast<uint16_t>(values[i]);
+            std::memcpy(bytes.data() + 2u * i, &narrow, 2u);
+        } else {
+            std::memcpy(bytes.data() + 4u * i, &values[i], 4u);
+        }
+    }
+    return decode_ngg_draw_indices(bytes.data(), element_bytes,
+                                   static_cast<uint32_t>(values.size()), {})
+        .indices;
+}
+
+std::shared_ptr<const NggSubgroupDraw>
+kena_indexed_draw(const RenderVkCtx& ctx, std::shared_ptr<const std::vector<uint32_t>> indices,
+                  uint32_t instances, uint32_t slices, std::string* why) {
+    NggDrawShape shape;
+    shape.topology = NggInputTopology::TriangleList;
+    shape.indices = std::move(indices);
+    shape.vertex_count = shape.indices ? static_cast<uint32_t>(shape.indices->size()) : 0u;
+    shape.instance_count = instances;
+    return kena_shape_draw(ctx, shape, scattered_table(), slices, why);
+}
+
+// The quad as two triangles of scattered 16-bit and 32-bit indices, 5 instances into an 8-slice
+// volume: layers 0..4 complete, 5..7 clear, and the two encodings give identical bytes. Without the
+// index mapping the planner would run records 0..5 and only the upper-left half would draw.
+TEST(NggSubgroupBackend, IndexedListDrawsItsIndexedVerticesOnEveryInstanceLayer) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    const std::vector<uint32_t> quad = {6, 1, 4, 4, 1, 3};
+    const ResolvedPipelineState state = flipped_state();
+    const auto records = ngg::vertex_records(scattered_records());
+    std::vector<uint8_t> by_width[2];
+    for (uint32_t w = 0; w < 2u; ++w) {
+        std::string why;
+        const auto ngg = kena_indexed_draw(*ctx, decoded(quad, w ? 4u : 2u), 5, 8, &why);
+        ASSERT_TRUE(ngg) << why;
+        ASSERT_EQ(ngg->plan.subgroups.size(), 5u);
+        EXPECT_EQ(ngg->plan.subgroups[0].es_threads(), 4u) << "6 references, 4 ES lanes";
+        const BackendColorTarget target = volume_target(0x4e4747340010ull + w, 8);
+        const StatsSnapshot before = stats_now();
+        by_width[w] = render_draws_rgba({ngg_backend_draw(ngg, records, &state)}, kSize, kSize,
+                                        nullptr, kClear, true, &target);
+        const StatsSnapshot after = stats_now();
+        EXPECT_TRUE(lut_layers(by_width[w], 8, 5)) << (w ? "32-bit" : "16-bit") << " indices";
+        EXPECT_EQ(after.invalid - before.invalid, 0u);
+        EXPECT_EQ(after.connectivity - before.connectivity, 0u);
+        EXPECT_EQ(after.culled - before.culled, 0u);
+    }
+    EXPECT_EQ(by_width[0], by_width[1]) << "16- and 32-bit encodings of one list";
+}
+
+// Which records a primitive reads is what decides coverage. One triangle, indices (6, 1, 4), is
+// the lower-right half of the screen (clip y < x); the records at positions 0, 1, 2 are the
+// upper-left half. Pixels on either side of the diagonal (one-pixel margin) are checked.
+TEST(NggSubgroupBackend, IndexValuesDecideWhichHalfIsCovered) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    // Two slices, not one: the vertex stage writes gl_Layer, which a one-layer framebuffer leaves
+    // undefined (the validation layer's Undefined-Value-Layer-Written). Slice 1 stays clear.
+    const auto ngg = kena_indexed_draw(*ctx, decoded({6, 1, 4}, 2), 1, 2, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    const BackendColorTarget target = volume_target(0x4e4747340012ull, 2);
+    const auto bytes =
+        render_draws_rgba({ngg_backend_draw(ngg, ngg::vertex_records(scattered_records()), &state)},
+                          kSize, kSize, nullptr, kClear, true, &target);
+    ASSERT_EQ(bytes.size(), 2u * kSize * kSize * 16u);
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x)
+            ASSERT_EQ(texel(bytes, 1, x, y)[0], -1.0f) << "slice 1 (" << x << "," << y << ")";
+    uint32_t covered = 0, clear = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float sx = (static_cast<float>(x) + 0.5f) / kSize;
+            const float sy = (static_cast<float>(y) + 0.5f) / kSize;
+            const float cx = 2.0f * sx - 1.0f, cy = 1.0f - 2.0f * sy;   // clip y = +1 on top
+            const float* p = texel(bytes, 0, x, y);
+            if (cy < cx - 0.13f) {
+                EXPECT_NEAR(p[0], sx, 1e-4f) << "lower-right (" << x << "," << y << ")";
+                EXPECT_NEAR(p[1], sy, 1e-4f) << "lower-right (" << x << "," << y << ")";
+                ++covered;
+            } else if (cy > cx + 0.13f) {
+                EXPECT_EQ(p[0], -1.0f) << "upper-left must stay clear (" << x << "," << y << ")";
+                ++clear;
+            }
+        }
+    EXPECT_EQ(covered, 105u) << "x + y >= 17";
+    EXPECT_EQ(clear, 105u) << "x + y <= 13";
+}
+
+// Slice routing per primitive: each primitive's layer is its instance plus the layer base the
+// prolog reads from the constant buffer at binding 5 (word 0, pc 12). Base 2, 5 instances, into an
+// 8-slice volume: layers 2..6 complete, 0, 1 and 7 clear.
+TEST(NggSubgroupBackend, IndexedInstancesRouteToTheirOwnSlices) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    if (backend_route(*ctx) == NggLayerRoute::None) GTEST_SKIP() << "no layer route";
+    std::string why;
+    const auto ngg = kena_indexed_draw(*ctx, decoded({6, 1, 4, 4, 1, 3}, 2), 5, 8, &why);
+    ASSERT_TRUE(ngg) << why;
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw draw = ngg_backend_draw(ngg, ngg::vertex_records(scattered_records()), &state);
+    bool based = false;
+    for (FrameBufferResource& buffer : draw.B)
+        if (buffer.set == 0 && buffer.binding == 5) {
+            buffer.dwords[0] = 2;
+            based = true;
+        }
+    ASSERT_TRUE(based);
+    const BackendColorTarget target = volume_target(0x4e4747340013ull, 8);
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    ASSERT_EQ(bytes.size(), 8u * kSize * kSize * 16u);
+    for (uint32_t layer = 0; layer < 8u; ++layer) {
+        const bool drawn = layer >= 2u && layer < 7u;
+        for (uint32_t y = 0; y < kSize; ++y)
+            for (uint32_t x = 0; x < kSize; ++x) {
+                const float* p = texel(bytes, layer, x, y);
+                if (drawn) {
+                    ASSERT_NEAR(p[0], (static_cast<float>(x) + 0.5f) / kSize, 1e-4f) << layer;
+                    ASSERT_NEAR(p[1], (static_cast<float>(y) + 0.5f) / kSize, 1e-4f) << layer;
+                } else {
+                    ASSERT_EQ(p[0], -1.0f) << "layer " << layer << " must stay clear";
+                }
+            }
+    }
+}
+
+// ---- P7: NGG without a GS -----------------------------------------------------------------------------
+//
+// A primitive shader with no GS (VGT_SHADER_STAGES_EN 0x2000), the launch Kena's culling VS programs
+// read: GS_ALLOC_REQ from s3's counts, PRIM = the three ES slots from v0/v1 (scaled by ITEMSIZE 4),
+// POS0 from VertexID (v5) bit 0 -> x and bit 1 -> y (each -1 or +1), PARAM0 = (0.25, 0.5, 0, 1).
+// Assembled with llvm-mc -mcpu=gfx1030; the same words as test_ngg_indexed_realize's kVsOnly.
+const uint32_t kVsOnlyPrimitiveShader[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80008CFu, 0x100F0E0Du, 0x7E2202FFu, 0x3E800000u,
+    0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// The same program also exporting POS1.z = 0 (layer 0) or 1 (layer 1), as Kena's culling VS programs
+// export POS1.z under USE_VTX_RENDER_TARGET_INDX into 2D scene targets.
+const uint32_t kVsOnlyLayer0[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+const uint32_t kVsOnlyLayer1[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280281u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// Kena's culling-VS partition registers: onchip 0x10020040, GE_CNTL 0x8040, GE_MAX_OUTPUT 64,
+// GS_MAX_VERT_OUT 0, ITEMSIZE 4, read as VS-only.
+NggSubgroupLimits vs_only_limits() {
+    NggSubgroupLimits l = decode_ngg_subgroup_limits(0x10020040u, 0x8040u, 0x40u, 0u, 4u);
+    l.vs_only = true;
+    return l;
+}
+
+std::shared_ptr<const NggSubgroupDraw>
+vs_only_draw(std::vector<uint32_t> indices, std::string* why,
+             std::span<const uint32_t> program = kVsOnlyPrimitiveShader,
+             const RenderVkCtx* layered = nullptr) {
+    static const ShaderResourceTable none;
+    NggSubgroupDrawRequest request;
+    request.linked_code = program.data();
+    request.dwords = program.size();
+    request.resources = &none;
+    request.limits = vs_only_limits();
+    request.shape.topology = NggInputTopology::TriangleList;
+    request.shape.vertex_count = static_cast<uint32_t>(indices.size());
+    request.shape.indices = std::make_shared<const std::vector<uint32_t>>(std::move(indices));
+    request.raster.topology = NggOutputTopology::TriangleList;
+    request.raster.route = NggLayerRoute::None;
+    request.raster.count_violations = false;
+    if (layered) {   // the layer addresses a one-slice 2D target (#3135 P7 admission)
+        request.raster.layer_from_pos1 = true;
+        request.raster.layer_slices = 1;
+        request.raster.route = NggLayerRoute::None;   // one slice: cull only, no gl_Layer
+        request.raster.count_violations = ngg_backend_counts_violations(*layered);
+    }
+    request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e920000ull};
+    return build_ngg_subgroup_draw(request, why);
+}
+
+// One triangle, indices (1, 3, 2) = (+1,-1), (+1,+1), (-1,+1): the half of the screen with
+// clip x + y > 0, i.e. pixel x > y. The pixels a one-pixel margin either side of the diagonal are
+// exact: PARAM0 (0.25, 0.5, 0, 1) above, the clear below. The VS-only partition is what lets the
+// draw exist at all: read as merged, GS_MAX_VERT_OUT 0 leaves no primitive limit and the plan is
+// refused.
+TEST(NggSubgroupBackend, VsOnlyPrimitiveShaderDrawsItsTriangleIntoA2DTarget) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    std::string why;
+    const auto ngg = vs_only_draw({1, 3, 2}, &why);
+    ASSERT_TRUE(ngg) << why;
+    ASSERT_EQ(ngg->plan.subgroups.size(), 1u);
+    EXPECT_EQ(ngg->plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}));
+    const ResolvedPipelineState state = flipped_state();
+    BackendDraw draw;
+    draw.ngg_subgroup = ngg;
+    draw.fs = ngg_param_fragment(0, false);
+    draw.ps = &state;
+    BackendColorTarget target;
+    target.persistent_id = 0x4e4747340070ull;
+    target.load_existing = false;
+    target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    const StatsSnapshot before = stats_now();
+    const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+    const StatsSnapshot after = stats_now();
+    ASSERT_EQ(bytes.size(), static_cast<size_t>(kSize) * kSize * 16u);
+    EXPECT_EQ(after.draws - before.draws, 1u);
+    EXPECT_EQ(after.invalid - before.invalid, 0u) << "the GS_ALLOC_REQ counts were accepted";
+    EXPECT_EQ(after.connectivity - before.connectivity, 0u);
+    uint32_t covered = 0, clear = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float* p = texel(bytes, 0, x, y);
+            if (x >= y + 2u) {
+                EXPECT_EQ(p[0], 0.25f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[1], 0.5f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[2], 0.0f) << "covered (" << x << "," << y << ")";
+                EXPECT_EQ(p[3], 1.0f) << "covered (" << x << "," << y << ")";
+                ++covered;
+            } else if (y >= x + 2u) {
+                EXPECT_EQ(p[0], -1.0f) << "clear (" << x << "," << y << ")";
+                ++clear;
+            }
+        }
+    EXPECT_EQ(covered, 105u);
+    EXPECT_EQ(clear, 105u);
+
+    NggSubgroupLimits merged = vs_only_limits();
+    merged.vs_only = false;
+    NggDrawShape triangle;
+    triangle.topology = NggInputTopology::TriangleList;
+    triangle.vertex_count = 3;
+    EXPECT_EQ(plan_ngg_subgroups(triangle, merged).refusal, "ngg-limits-unusable")
+        << "control: the same registers read as merged cannot be planned";
+}
+
+// The upper-right half (x >= y + 2) holds PARAM0 and the lower-left half (y >= x + 2) the clear.
+::testing::AssertionResult upper_right_triangle(const std::vector<uint8_t>& bytes, bool drawn) {
+    if (bytes.size() != static_cast<size_t>(kSize) * kSize * 16u)
+        return ::testing::AssertionFailure() << "readback of " << bytes.size() << " bytes";
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float* p = texel(bytes, 0, x, y);
+            const bool inside = x >= y + 2u;
+            if (!inside && y < x + 2u) continue;   // the diagonal margin
+            const bool ok = inside && drawn
+                                ? p[0] == 0.25f && p[1] == 0.5f && p[2] == 0.0f && p[3] == 1.0f
+                                : p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f && p[3] == -1.0f;
+            if (!ok)
+                return ::testing::AssertionFailure()
+                       << "(" << x << "," << y << ") = (" << p[0] << "," << p[1] << "," << p[2]
+                       << "," << p[3] << ")";
+        }
+    return ::testing::AssertionSuccess();
+}
+
+// Kena's culling VS programs export POS1.z into 2D targets. Admitted as a one-slice target: layer 0
+// draws exactly the unlayered picture, and layer 1 -- a slice the view does not have -- is culled
+// and counted, not drawn at slice 0.
+TEST(NggSubgroupBackend, VsOnlyLayerAddressesAOneSliceTarget) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    const ResolvedPipelineState state = flipped_state();
+    for (const bool second_layer : {false, true}) {
+        std::string why;
+        const auto ngg = vs_only_draw({1, 3, 2}, &why,
+                                      second_layer ? std::span<const uint32_t>(kVsOnlyLayer1)
+                                                   : std::span<const uint32_t>(kVsOnlyLayer0),
+                                      ctx);
+        ASSERT_TRUE(ngg) << why;
+        BackendDraw draw;
+        draw.ngg_subgroup = ngg;
+        draw.fs = ngg_param_fragment(0, false);
+        draw.ps = &state;
+        BackendColorTarget target;
+        target.persistent_id = 0x4e4747340071ull + (second_layer ? 1u : 0u);
+        target.load_existing = false;
+        target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        const StatsSnapshot before = stats_now();
+        const auto bytes = render_draws_rgba({draw}, kSize, kSize, nullptr, kClear, true, &target);
+        const StatsSnapshot after = stats_now();
+        EXPECT_TRUE(upper_right_triangle(bytes, !second_layer))
+            << (second_layer ? "layer 1" : "layer 0");
+        EXPECT_EQ(after.invalid - before.invalid, 0u);
+        if (ngg_backend_counts_violations(*ctx))
+            EXPECT_EQ(after.culled - before.culled, second_layer ? 1u : 0u)
+                << "the out-of-range layer is counted";
+    }
+}
+
+// ---- Layered depth: a depth-only draw replayed per slice -----------------------------------------
+//
+// The VS-only program above with its layer and depth taken from the vertex: VertexID (v5) bits 0
+// and 1 place the corner as before, layer = VertexID >> 2 is exported in POS1.z, and POS0.z =
+// (layer + 1) / 8. Assembled with llvm-mc -mcpu=gfx1030.
+const uint32_t kVsOnlyDepthLayers[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x2C280A82u, 0x4A1E2881u, 0x7E1E0D0Fu, 0x101E1EFFu, 0x3E000000u, 0x7E2002F2u,
+    0xF80000CFu, 0x100F0E0Du, 0xF80008D4u, 0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u,
+    0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// One depth-only draw compiled to select its layer at draw time, as ngg_live_draw builds it. Its
+// per-slice replays are this same description with BackendDraw::ngg_layer_select = k.
+std::shared_ptr<const NggSubgroupDraw> depth_slice_draw(const RenderVkCtx& ctx,
+                                                        std::vector<uint32_t> indices,
+                                                        uint32_t slices, std::string* why) {
+    static const ShaderResourceTable none;
+    NggSubgroupDrawRequest request;
+    request.linked_code = kVsOnlyDepthLayers;
+    request.dwords = std::size(kVsOnlyDepthLayers);
+    request.resources = &none;
+    request.limits = vs_only_limits();
+    request.shape.topology = NggInputTopology::TriangleList;
+    request.shape.vertex_count = static_cast<uint32_t>(indices.size());
+    request.shape.indices = std::make_shared<const std::vector<uint32_t>>(std::move(indices));
+    request.raster.topology = NggOutputTopology::TriangleList;
+    request.raster.layer_from_pos1 = true;
+    request.raster.layer_slices = slices;
+    request.raster.route = NggLayerRoute::None;
+    request.raster.layer_select = true;
+    request.raster.count_violations = ngg_backend_counts_violations(ctx);
+    request.diagnostic = {RecompileDiagnosticStage::Vertex, 0x512e930000ull};
+    return build_ngg_subgroup_draw(request, why);
+}
+
+// Depth-only state for one slice of the array at `base`: Z test LESS with writes (a fresh image
+// starts at the far value 1.0), CB_TARGET_MASK 0, DB_DEPTH_VIEW naming exactly `slice`.
+ResolvedPipelineState depth_slice_state(uint64_t base, uint32_t slice) {
+    ResolvedPipelineState state = flipped_state();
+    state.depth_test_enable = true;
+    state.depth_write_enable = true;
+    state.depth_compare_op = VK_COMPARE_OP_LESS;
+    state.depth_read_base = base;
+    state.depth_write_base = base;
+    // The guest's whole-array view, slices 1..4, narrowed as expand_ngg_depth_slices narrows it.
+    const uint32_t array_view = 1u | (4u << prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT);
+    state.db_depth_view = depth_view_for_slice(array_view, slice);
+    state.color_write_mask = 0;
+    state.color1_write_mask = 0;
+    return state;
+}
+
+// Two depth-only draws into a four-slice depth array (guest slices 1..4), each replayed per slice
+// in one pass per slice, as the renderer groups them. Draw A covers the upper-right half on layers
+// 0..3 plus one primitive on layer 4, which the view does not have; draw B the lower-left half on
+// layers 0..3. Every slice k then holds exactly (k + 1) / 8 in both halves:
+//   * the layer chose the slice: an unselected replay puts layer 0's 0.125 in every slice;
+//   * the pass split between A and B carried depth: a lost segment leaves A's half at 1.0;
+//   * the pass wrote no colour, so its split needs no colour target and reads nothing back.
+// The layer-4 primitive is culled and counted once, in the slice-0 replay.
+TEST(NggSubgroupBackend, LayeredDepthOnlyDrawLandsEachLayerInItsSlice) {
+    const RenderVkCtx* ctx = backend();
+    if (!ctx) GTEST_SKIP() << "no backend device";
+    constexpr uint32_t kSlices = 4, kFirst = 1;
+    constexpr uint64_t kDepth = 0x4e474734d000ull;
+    std::vector<uint32_t> upper, lower;
+    for (uint32_t layer = 0; layer < kSlices; ++layer) {
+        const uint32_t v = 4u * layer;
+        upper.insert(upper.end(), {v + 1u, v + 3u, v + 2u});
+        lower.insert(lower.end(), {v + 0u, v + 1u, v + 2u});
+    }
+    upper.insert(upper.end(), {17u, 19u, 18u});   // layer 4
+    std::string why;
+    const auto a = depth_slice_draw(*ctx, upper, kSlices, &why);
+    ASSERT_TRUE(a) << why;
+    const auto b = depth_slice_draw(*ctx, lower, kSlices, &why);
+    ASSERT_TRUE(b) << why;
+
+    std::array<ResolvedPipelineState, kSlices> states;
+    const StatsSnapshot before = stats_now();
+    for (uint32_t k = 0; k < kSlices; ++k) {
+        states[k] = depth_slice_state(kDepth, kFirst + k);
+        std::vector<BackendDraw> pass(2);
+        for (uint32_t i = 0; i < 2; ++i) {
+            pass[i].ngg_subgroup = i ? b : a;
+            pass[i].ngg_layer_select = k;
+            pass[i].fs = ngg_param_fragment(0, false);
+            pass[i].ps = &states[k];
+        }
+        ASSERT_TRUE(backend_draws_leave_colour(pass));
+        (void)render_draws_rgba(pass, kSize, kSize, nullptr, nullptr, true, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, true, nullptr, false);
+    }
+    const StatsSnapshot after = stats_now();
+    EXPECT_EQ(after.draws - before.draws, 2u * kSlices) << "no replay was dropped";
+    EXPECT_EQ(after.invalid - before.invalid, 0u);
+    if (ngg_backend_counts_violations(*ctx))
+        EXPECT_EQ(after.culled - before.culled, 1u) << "layer 4 is culled, counted once";
+
+    std::vector<float> depth;
+    std::string error;
+    ASSERT_EQ(read_persistent_ds_depth_array(kDepth, kSize, kSize, kFirst, kSlices, depth, error),
+              PersistentDsDepthArrayStatus::Ready)
+        << error;
+    ASSERT_EQ(depth.size(), static_cast<size_t>(kSlices) * kSize * kSize);
+    for (uint32_t k = 0; k < kSlices; ++k) {
+        const float expected = static_cast<float>(k + 1u) / 8.0f;
+        uint32_t upper_px = 0, lower_px = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+            for (uint32_t x = 0; x < kSize; ++x) {
+                if (x < y + 2u && y < x + 2u) continue;   // the diagonal margin
+                const float z = depth[(static_cast<size_t>(k) * kSize + y) * kSize + x];
+                ASSERT_EQ(z, expected) << "slice " << kFirst + k << " (" << x << "," << y << ")";
+                (x >= y + 2u ? upper_px : lower_px)++;
+            }
+        EXPECT_EQ(upper_px, 105u);
+        EXPECT_EQ(lower_px, 105u);
+    }
+
+    // The colour attachment of a colourless split restarts from the caller's clear in every
+    // segment, so the final readback is that clear -- exactly what one unsplit draw returns, and
+    // not the default clear a segment without the caller's arguments would show.
+    const float kColour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    std::vector<BackendDraw> split_pass(2);
+    for (uint32_t i = 0; i < 2; ++i) {
+        split_pass[i].ngg_subgroup = i ? b : a;
+        split_pass[i].fs = ngg_param_fragment(0, false);
+        split_pass[i].ps = &states[0];
+    }
+    const auto split = render_draws_rgba(split_pass, kSize, kSize, nullptr, kColour, true);
+    const auto whole = render_draws_rgba({split_pass[0]}, kSize, kSize, nullptr, kColour, true);
+    const auto unset = render_draws_rgba({split_pass[0]}, kSize, kSize, nullptr, nullptr, true);
+    ASSERT_FALSE(split.empty());
+    EXPECT_EQ(split, whole) << "every segment starts from the caller's clear";
+    EXPECT_NE(split, unset) << "control: the clear is visible in the readback";
+
+    // Control: the same pair writing colour has no colour target to carry it across the split,
+    // and is dropped by name rather than drawn with a readback per segment.
+    ResolvedPipelineState coloured = states[0];
+    coloured.color_write_mask = 0xfu;
+    BackendDraw pair_a, pair_b;
+    pair_a.ngg_subgroup = a;
+    pair_b.ngg_subgroup = b;
+    pair_a.ps = pair_b.ps = &coloured;
+    pair_a.fs = pair_b.fs = ngg_param_fragment(0, false);
+    const auto host = ngg_host_capabilities(*ctx);
+    EXPECT_STREQ(ngg_backend_draw_refusal(
+                     pair_a, host, 2, true, nullptr, 1,
+                     backend_draws_leave_colour(std::vector<BackendDraw>{pair_a, pair_b})),
+                 "ngg-backend-readback-split");
+    EXPECT_EQ(ngg_backend_draw_refusal(pair_a, host, 2, true, nullptr, 1, true), nullptr)
+        << "control: the colourless call splits safely";
+    EXPECT_STREQ(ngg_backend_draw_refusal(pair_a, host, 2, false, nullptr, 1, true),
+                 "ngg-backend-transient-depth-split")
+        << "transient depth is never carried, colour or not";
+}
+
+// The rule the split uses: a draw leaves colour only when no slot's write mask is set and it has
+// no other colour route; and the contract each segment of such a call renders under.
+TEST(NggSubgroupBackend, OnlyAMaskedCallSplitsWithoutCarryingColour) {
+    ResolvedPipelineState state;
+    state.color_write_mask = 0;
+    BackendDraw draw;
+    draw.ps = &state;
+    EXPECT_TRUE(backend_draw_leaves_colour(draw));
+    ResolvedPipelineState slot0 = state;
+    slot0.color_write_mask = 0x1u;
+    ResolvedPipelineState slot1 = state;
+    slot1.color1_write_mask = 0x8u;
+    ResolvedPipelineState slot5 = state;
+    slot5.color_targets[5].write_mask = 0x2u;
+    for (const ResolvedPipelineState* writes : {&slot0, &slot1, &slot5}) {
+        BackendDraw w = draw;
+        w.ps = writes;
+        EXPECT_FALSE(backend_draw_leaves_colour(w));
+        EXPECT_FALSE(backend_draws_leave_colour(std::vector<BackendDraw>{draw, w}))
+            << "one writer makes the call coloured";
+    }
+    // A decoded fast-clear value is register state, not a write: the backend never acts on it per
+    // draw (Kena's shadow passes carry one with CB_TARGET_MASK 0).
+    ResolvedPipelineState cleared = state;
+    cleared.has_clear_color = true;
+    cleared.has_clear_color1 = true;
+    cleared.color_targets[3].has_clear = true;
+    BackendDraw clear_value = draw;
+    clear_value.ps = &cleared;
+    EXPECT_TRUE(backend_draw_leaves_colour(clear_value));
+    BackendDraw stateless;
+    EXPECT_FALSE(backend_draw_leaves_colour(stateless)) << "no state: a draw writes RGBA";
+    EXPECT_FALSE(backend_draws_leave_colour(std::span<const BackendDraw>{}))
+        << "an empty call proves nothing";
+
+    // The segment contract of a colourless call: a later segment starts as the first does (it
+    // loads only what the caller asked the whole call to load) and no non-final segment copies
+    // anything out; the final one reads back what the caller asked for.
+    BackendColorTarget target;
+    target.persistent_id = 0x4e47473400d0ull;
+    target.load_existing = false;
+    target.readback = true;
+    BackendMrtOutputs mrt;
+    mrt.color_count = 3;
+    const auto later = split_segment_contract(&target, &mrt, false, false, {}, true);
+    EXPECT_FALSE(later.target.load_existing) << "a later segment restarts, it does not load";
+    EXPECT_FALSE(later.target.readback || later.target.readback1 || later.target.readback_slots[2])
+        << "a non-final colourless segment carries nothing through the CPU";
+    const auto last = split_segment_contract(&target, &mrt, false, true, {}, true);
+    EXPECT_TRUE(last.target.readback) << "the final segment answers the caller";
+    EXPECT_FALSE(last.target.load_existing);
+    const auto coloured = split_segment_contract(&target, &mrt, false, false, {}, false);
+    EXPECT_TRUE(coloured.target.load_existing && coloured.target.readback1)
+        << "control: a coloured split loads and carries";
 }
 
 }   // namespace

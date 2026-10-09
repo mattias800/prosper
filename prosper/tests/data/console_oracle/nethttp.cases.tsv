@@ -1,0 +1,56 @@
+# console-oracle cases: libSceNet byte order and address text, libSceHttp URI helpers, libSceSystemService settings.
+# No socket is opened and no request is made; every case is a function of its arguments (or, for a system setting,
+# compared by return code only).
+# id	lib	func	args	expect     (grammar and flags: tools/console_oracle/payload/lib_oracle.c)
+# libSceNet byte order and address text: pure functions.
+nh_htons_0	libSceNet.sprx	sceNetHtons	i:0
+nh_ntohs_0	libSceNet.sprx	sceNetNtohs	i:0
+nh_htons_1	libSceNet.sprx	sceNetHtons	i:1
+nh_ntohs_1	libSceNet.sprx	sceNetNtohs	i:1
+nh_htons_1234	libSceNet.sprx	sceNetHtons	i:4660
+nh_ntohs_1234	libSceNet.sprx	sceNetNtohs	i:4660
+nh_htons_ff	libSceNet.sprx	sceNetHtons	i:255
+nh_ntohs_ff	libSceNet.sprx	sceNetNtohs	i:255
+nh_htons_ff00	libSceNet.sprx	sceNetHtons	i:65280
+nh_ntohs_ff00	libSceNet.sprx	sceNetNtohs	i:65280
+nh_htons_ffff	libSceNet.sprx	sceNetHtons	i:65535
+nh_ntohs_ffff	libSceNet.sprx	sceNetNtohs	i:65535
+nh_htons_12345	libSceNet.sprx	sceNetHtons	i:74565
+nh_ntohs_12345	libSceNet.sprx	sceNetNtohs	i:74565
+nh_htonl_0	libSceNet.sprx	sceNetHtonl	i:0
+nh_htonl_1	libSceNet.sprx	sceNetHtonl	i:1
+nh_htonl_12345678	libSceNet.sprx	sceNetHtonl	i:305419896
+nh_htonl_ffffffff	libSceNet.sprx	sceNetHtonl	i:4294967295
+nh_htonl_100000000	libSceNet.sprx	sceNetHtonl	i:4294967296
+nh_pton_v4	libSceNet.sprx	sceNetInetPton	i:2,s:10.0.0.1,out:4
+nh_pton_v4_bad	libSceNet.sprx	sceNetInetPton	i:2,s:10.0.0.256,out:4
+nh_pton_v6	libSceNet.sprx	sceNetInetPton	i:28,s:::1,out:16
+nh_pton_bad_family	libSceNet.sprx	sceNetInetPton	i:99,s:10.0.0.1,out:4
+nh_ntop_v4	libSceNet.sprx	sceNetInetNtop	i:2,in:7f000001,out:32,i:32	r64,retoff:2
+nh_ntop_v4_too_small	libSceNet.sprx	sceNetInetNtop	i:2,in:7f000001,out:32,i:4	r64,retoff:2
+nh_ntop_v6	libSceNet.sprx	sceNetInetNtop	i:28,in:00000000000000000000000000000001,out:64,i:64	r64,retoff:2
+# libSceHttp URI helpers: pure string functions. out may be NULL to ask for the size needed.
+nh_escape_plain	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:hello
+nh_escape_space_reserved	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:a b&c=d/e?f
+nh_escape_utf8	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:\xc3\xa9\xe2\x82\xac
+nh_escape_already_escaped	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:%41%20
+nh_escape_empty	libSceHttp.sprx	sceHttpUriEscape	out:64,out:8,i:64,s:
+nh_escape_size_query	libSceHttp.sprx	sceHttpUriEscape	null,out:8,i:0,s:hello world
+nh_escape_buffer_too_small	libSceHttp.sprx	sceHttpUriEscape	out:8,out:8,i:4,s:hello world
+nh_unescape_basic	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:a%20b%26c
+nh_unescape_bad_hex	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:a%zzb
+nh_unescape_truncated	libSceHttp.sprx	sceHttpUriUnescape	out:64,out:8,i:64,s:abc%2
+nh_unescape_size_query	libSceHttp.sprx	sceHttpUriUnescape	null,out:8,i:0,s:a%20b
+nh_parse_size_query	libSceHttp.sprx	sceHttpUriParse	null,s:http://user:pw@example.com:8080/a/b?q=1#frag,null,out:8,i:0
+nh_parse_size_query_plain	libSceHttp.sprx	sceHttpUriParse	null,s:https://example.com/,null,out:8,i:0
+nh_parse_size_query_no_scheme	libSceHttp.sprx	sceHttpUriParse	null,s:not a uri,null,out:8,i:0
+nh_parse_size_query_empty	libSceHttp.sprx	sceHttpUriParse	null,s:,null,out:8,i:0
+# libSceSystemService: a parameter initialiser, and settings queried by id. Only the return code is compared for a setting.
+nh_player_dialog_param_init	libSceSystemService.sprx	sceSystemServiceInitializePlayerDialogParam	out:256
+nh_param_getint_1	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:1,out:4	ret
+nh_param_getint_2	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:2,out:4	ret
+nh_param_getint_3	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:3,out:4	ret
+nh_param_getint_4	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:4,out:4	ret
+nh_param_getint_5	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:5,out:4	ret
+nh_param_getint_1000	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:1000,out:4	ret
+nh_param_getint_9999	libSceSystemService.sprx	sceSystemServiceParamGetInt	i:9999,out:4	ret

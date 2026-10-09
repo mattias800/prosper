@@ -14,13 +14,16 @@
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_subgroup_shell.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -121,12 +124,27 @@ TEST(NggDrawAdmission, KenaDecodes) {
               NggInputTopology::TriangleList);
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (8u << 1);
     EXPECT_STREQ(refusal(r, kena_facts()), "admitted") << "RSRC2 USER_SGPR equal to the range";
+    EXPECT_EQ(admit_ngg_draw(r, kena_facts(), radv()).user_sgprs, 8u);
+    // #3135: RSRC2's count is what the SPI loads. Kena's 4324d9f3 has USER_SGPR 12 and a 0..24
+    // range; the other 12 words are reached through s0:s1.
+    auto wide = kena_facts();
+    wide.user_data_range_end = 24;
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (12u << 1);
+    EXPECT_STREQ(refusal(r, wide), "admitted");
+    EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 12u) << "the hardware's count";
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs;
+    EXPECT_EQ(admit_ngg_draw(r, wide, radv()).user_sgprs, 24u) << "zero: the AGC range";
+    // The whole 32-word push budget is usable: s0:s1's two words are reserved only for a program
+    // that reads them, and the live producer checks that (#4735 review).
     r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (1u << 27);   // USER_SGPR_MSB: 32
-    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count");
+    EXPECT_STREQ(refusal(r, kena_facts()), "admitted");
+    r.spi_shader_pgm_rsrc2_gs = ngg::kKenaRsrc2Gs | (1u << 27) | (1u << 1);   // 33
+    EXPECT_STREQ(refusal(r, kena_facts()), "ngg-user-sgpr-count") << "past the push budget";
 }
 
+// Without PRIMGEN_EN there is no NGG draw. (PRIMGEN_EN without GS_EN is the VS-only draw, P7.)
 TEST(NggDrawAdmission, NotMergedDoesNotApply) {
-    for (uint32_t stages : {0x00002010u /* no GS_EN */, 0x00000030u /* no PRIMGEN_EN */, 0u}) {
+    for (uint32_t stages : {0x00000030u /* no PRIMGEN_EN */, 0x00000010u, 0u}) {
         auto r = kena_registers();
         r.vgt_shader_stages_en = stages;
         const NggDrawAdmission a = admit_ngg_draw(r, kena_facts(), radv());
@@ -155,7 +173,12 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 2u; }},   // lines
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 0u; }},
         {"ngg-output-topology", [](auto& r, auto&, auto&) { r.vgt_gs_out_prim_type = 3u; }},
-        {"ngg-indexed", [](auto&, auto& f, auto&) { f.indexed = true; }},
+        {"ngg-index-unavailable", [](auto&, auto& f, auto&) { f.indexed = true; }},
+        {"ngg-index-restart",
+         [](auto&, auto& f, auto&) {
+             f.indexed = true;
+             f.index_refusal = "ngg-index-restart";
+         }},
         {"ngg-indirect", [](auto&, auto& f, auto&) { f.indirect = true; }},
         {"ngg-vertex-offset", [](auto&, auto& f, auto&) { f.vertex_offset = true; }},
         {"ngg-viewport-index",
@@ -183,7 +206,7 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_start = 1; }},
         {"ngg-user-data-range", [](auto&, auto& f, auto&) { f.user_data_range_end = 33; }},
         {"ngg-user-sgpr-count",
-         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= 4u << 1; }},
+         [](auto& r, auto&, auto&) { r.spi_shader_pgm_rsrc2_gs |= (1u << 27) | (1u << 1); }},
         {"ngg-lds-limit", [](auto&, auto&, auto& h) { h.max_compute_shared_memory = 4096; }},
         {"ngg-host-compute", [](auto&, auto&, auto& h) { h.compute = false; }},
         {"ngg-layer-route-unavailable",
@@ -243,6 +266,32 @@ TEST(NggDrawAdmission, AdmittedTwins) {
         << "no vertex stores: admitted without counting";
 }
 
+// #3135 P6: an indexed draw is admitted with its indices, and the INDEX count -- not the packet's
+// vertex count the caller passed, which a stale or non-indexed reading would leave -- sizes the
+// shape. Kena's past-New-Game shape: an 18-index list, 41 instances, into a 64-slice volume.
+TEST(NggDrawAdmission, IndexedListIsAdmittedWithItsIndices) {
+    auto r = kena_registers();
+    r.primitive_type = 4u;   // triangle list
+    auto f = kena_facts(41);
+    f.target_slices = 64;
+    f.indexed = true;
+    std::vector<uint32_t> values;
+    for (uint32_t quad = 0; quad < 3u; ++quad)
+        values.insert(values.end(), {4 * quad, 4 * quad + 1, 4 * quad + 2, 4 * quad + 2,
+                                     4 * quad + 1, 4 * quad + 3});
+    f.indices = std::make_shared<const std::vector<uint32_t>>(values);
+    f.vertex_count = 4;   // what a non-indexed reading of the packet would say
+    const NggDrawAdmission a = admit_ngg_draw(r, f, radv());
+    ASSERT_TRUE(a.ok()) << a.refusal;
+    EXPECT_EQ(a.shape.indices, f.indices);
+    EXPECT_EQ(a.shape.vertex_count, 18u);
+    EXPECT_EQ(a.shape.instance_count, 41u);
+    EXPECT_EQ(a.shape.topology, NggInputTopology::TriangleList);
+    EXPECT_EQ(a.layer_slices, 64u);
+    f.indexed = false;   // the same facts read as non-indexed carry no indices into the shape
+    EXPECT_EQ(admit_ngg_draw(r, f, radv()).shape.indices, nullptr);
+}
+
 TEST(NggDrawAdmission, RegistersAndUserDataAreReadFromTheDrawState) {
     namespace P = prosper::agc::Pm4;
     GpuState state;
@@ -268,6 +317,20 @@ TEST(NggDrawAdmission, RegistersAndUserDataAreReadFromTheDrawState) {
     state.uc[P::GE_CNTL] = 0x8040u;
     state.cx.erase(P::VGT_GS_INSTANCE_CNT);
     EXPECT_EQ(read_ngg_draw_registers(state, 6u).missing, nullptr) << "reset value 0";
+
+    // #3135: the GS user-data address s0:s1, known only when both registers are present and the
+    // address is not zero.
+    uint32_t address[2] = {};
+    EXPECT_FALSE(read_ngg_user_data_address(state, address));
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = 0x12340000u;
+    EXPECT_FALSE(read_ngg_user_data_address(state, address)) << "HI absent";
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = 0x5u;
+    ASSERT_TRUE(read_ngg_user_data_address(state, address));
+    EXPECT_EQ(address[0], 0x12340000u);
+    EXPECT_EQ(address[1], 0x5u);
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = 0;
+    state.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = 0;
+    EXPECT_FALSE(read_ngg_user_data_address(state, address)) << "a zero address is no address";
 
     std::vector<uint32_t> words;
     for (uint32_t k2 = 0; k2 < 8; ++k2) state.sh[P::SPI_SHADER_USER_DATA_GS_0 + k2] = 0x100 + k2;
@@ -450,6 +513,87 @@ TEST_F(NggLiveDraw, AWarmEntryIsNotReusedAcrossAResourceAdmissionChange) {
     EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, compiles + 1);
 }
 
+// #3135 P6: the draw cache keys an indexed draw on its index VALUES. Two indexed draws with the
+// same count, instances and push words but different indices must get different descriptions (the
+// launch records carry different VertexIDs), the same indices must hit, and the compiled stages are
+// shared by all of them.
+TEST_F(NggLiveDraw, IndexedDrawsAreCachedByTheirIndexValues) {
+    const auto with = [](std::vector<uint32_t> values) {
+        auto in = kena_input(3);
+        in.registers.primitive_type = 4u;   // triangle list
+        in.facts.indexed = true;
+        in.facts.indices = std::make_shared<const std::vector<uint32_t>>(std::move(values));
+        return in;
+    };
+    const auto first = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 3}), radv());
+    ASSERT_TRUE(first.draw) << (first.refusal ? first.refusal : "") << " " << first.detail;
+    EXPECT_TRUE(first.indexed);
+    const auto launch_v5 = [](const NggSubgroupDraw& draw, uint32_t lane) {
+        return draw.groups[0].launch_words[lane * kNggLaunchWordsPerLane + 5u];
+    };
+    EXPECT_EQ(launch_v5(*first.draw, 3), 3u);
+
+    const auto same = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 3}), radv());
+    EXPECT_EQ(same.draw, first.draw) << "the same index values reuse the description";
+
+    const auto other = realize_ngg_live_draw(with({0, 1, 2, 2, 1, 7}), radv());
+    ASSERT_TRUE(other.draw);
+    EXPECT_NE(other.draw, first.draw) << "different index values are a different plan";
+    EXPECT_EQ(launch_v5(*other.draw, 3), 7u) << "lane 3 runs index 7";
+    EXPECT_EQ(other.draw->groups[0].stages, first.draw->groups[0].stages)
+        << "indices never reach the compiled stages";
+
+    // The same draw read as non-indexed (vertices 0..5) is not the indexed one.
+    auto plain = kena_input(3);
+    plain.registers.primitive_type = 4u;
+    plain.facts.vertex_count = 6;
+    const auto unindexed = realize_ngg_live_draw(plain, radv());
+    ASSERT_TRUE(unindexed.draw);
+    EXPECT_NE(unindexed.draw, first.draw);
+    EXPECT_FALSE(unindexed.indexed);
+    EXPECT_EQ(ngg_live_draw_cache_stats().indexed_draws, 3u) << "first, same and other";
+}
+
+// #4735 review: a program that never reads s0:s1 is not charged its two push words. Kena's LUT
+// chain with 31 user SGPRs and a known user-data address is admitted, and the address is not
+// pushed: the push constants are exactly the 31 user words.
+TEST_F(NggLiveDraw, TheUserDataAddressIsSuppliedOnlyToAProgramThatReadsIt) {
+    const KenaProgram& p = kena_program();
+    EXPECT_FALSE(ngg_program_reads_user_data_address(
+        ngg_linked_chain(p.prolog.data(), p.prefix, p.main.data(), p.main.size()), 31))
+        << "the LUT chain never reads s0:s1";
+    auto in = kena_input();
+    in.facts.user_data_range_end = 31;
+    in.user_data.assign(31, 0u);
+    in.user_data_address_known = true;
+    in.user_data_address[0] = 0x12340000u;
+    in.user_data_address[1] = 0x5u;
+    const auto result = realize_ngg_live_draw(in, radv());
+    ASSERT_TRUE(result.draw) << (result.refusal ? result.refusal : "") << " " << result.detail;
+    EXPECT_EQ(result.draw->push_constants.size(), 31u) << "no s0:s1 words for a non-reader";
+
+    // A program that DOES read s0:s1 (it reloads its user SGPRs from the address, as Kena's
+    // 11562c72 does) needs those two words: with 31 user SGPRs there is no room, refused by name
+    // before anything compiles; with 30 the same program is not refused by that rule.
+    auto reader = std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{
+        0xbefe04c1u,   // s_mov_b64 exec, -1
+        0xf4100200u, 0xfa000000u,   // s_load_dwordx8 s[8:15], s[0:1], 0
+        0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+        0xb07c3005u, 0xbf900009u,   // s_movk_i32 m0, 0x3005; s_sendmsg GS_ALLOC_REQ
+        0xf8000941u, 0x00000009u,   // exp prim v9
+        0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
+        0xbf810000u});
+    EXPECT_TRUE(ngg_program_reads_user_data_address(reader, 31));
+    in.linked = reader;
+    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-user-sgpr-count")
+        << "31 user SGPRs + s0:s1 exceed the 32-word push budget";
+    in.facts.user_data_range_end = 30;
+    in.user_data.assign(30, 0u);
+    const auto roomy = realize_ngg_live_draw(in, radv());
+    EXPECT_FALSE(roomy.refusal && std::string(roomy.refusal) == "ngg-user-sgpr-count")
+        << "30 + 2 fits";
+}
+
 TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {
     auto in = kena_input();
     in.user_data_complete = false;
@@ -459,7 +603,7 @@ TEST_F(NggLiveDraw, RefusalsAreNamedAndARefusedCompileIsCached) {
 
     in = kena_input();
     in.facts.indexed = true;
-    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-indexed");
+    EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-index-unavailable");
 
     // Four user SGPRs where the chain reads eight: the shell refuses, by the ABI rule's name.
     in = kena_input();
@@ -517,6 +661,170 @@ TEST_F(NggLiveDraw, DeviceRefusals) {
         "ngg-backend-workgroup-limit", [](auto& h) { h.max_compute_workgroup_subgroups = 0; },
         none);
     expect("ngg-backend-buffer-range", [](auto& h) { h.max_storage_buffer_range = 4096; }, none);
+}
+
+// ---- #3135 P7: NGG without a GS ---------------------------------------------------------------------
+//
+// Kena's culling VS programs, as their draws arrive past the first level load: VGT_SHADER_STAGES_EN
+// 0x2000 (PRIMGEN_EN, no GS), VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0, GE_MAX_OUTPUT_PER_SUBGROUP
+// 64, an indexed triangle list into a 2D target, 25 user SGPRs.
+NggDrawRegisters kena_vs_only_registers() {
+    NggDrawRegisters r = kena_registers();
+    r.vgt_shader_stages_en = 0x00002000u;
+    r.vgt_gs_out_prim_type = 0u;
+    r.vgt_gs_max_vert_out = 0u;
+    r.ge_max_output_per_subgroup = 0x40u;
+    r.spi_shader_pgm_rsrc2_gs = 25u << 1;
+    r.pa_su_sc_mode_cntl = 0x240u;
+    r.primitive_type = 4u;   // triangle list
+    return r;
+}
+
+NggDrawFacts kena_vs_only_facts() {
+    NggDrawFacts f;
+    f.vertex_count = 6;
+    f.instance_count = 1;
+    f.target_single_slice = true;   // a 2D scene target, CB view slices 0..0
+    f.other_attachments_single_slice = true;   // and every other attachment one slice too
+    f.user_data_range_known = true;
+    f.user_data_range_end = 25;
+    return f;
+}
+
+// The draw is admitted as a VS-only NGG draw whose output is triangles, although the GS output
+// primitive type register says points: there is no GS to apply it. The same registers with GS_EN
+// set are a merged draw, where the register does apply, and stay refused by its name.
+TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
+    const NggDrawAdmission vs =
+        admit_ngg_draw(kena_vs_only_registers(), kena_vs_only_facts(), radv());
+    ASSERT_TRUE(vs.applies);
+    ASSERT_TRUE(vs.ok()) << vs.refusal;
+    EXPECT_TRUE(vs.vs_only);
+    EXPECT_TRUE(vs.limits.vs_only) << "the planner must partition it as VS-only";
+    EXPECT_EQ(vs.topology, NggOutputTopology::TriangleList);
+    EXPECT_EQ(vs.user_sgprs, 25u);
+
+    NggDrawRegisters merged = kena_vs_only_registers();
+    merged.vgt_shader_stages_en = 0x00002030u;
+    const NggDrawAdmission gs = admit_ngg_draw(merged, kena_vs_only_facts(), radv());
+    EXPECT_FALSE(gs.vs_only);
+    ASSERT_TRUE(gs.refusal);
+    EXPECT_STREQ(gs.refusal, "ngg-output-topology") << "a GS's point output is still refused";
+
+    // The layer (USE_VTX_RENDER_TARGET_INDX) addresses the one-slice target's only slice.
+    EXPECT_TRUE(vs.layer_from_pos1);
+    EXPECT_EQ(vs.layer_slices, 1u);
+    EXPECT_EQ(vs.route, NggLayerRoute::None) << "one slice needs no layer route";
+    NggDrawFacts array = kena_vs_only_facts();
+    array.target_single_slice = false;   // a 2D array, or an unprogrammed view
+    const NggDrawAdmission unknown = admit_ngg_draw(kena_vs_only_registers(), array, radv());
+    ASSERT_TRUE(unknown.refusal);
+    EXPECT_STREQ(unknown.refusal, "ngg-layer-target-not-layered")
+        << "a target not proven to be one slice keeps the refusal";
+    NggDrawFacts layered_depth = kena_vs_only_facts();
+    layered_depth.other_attachments_single_slice = false;   // e.g. a cascade depth array
+    const NggDrawAdmission depth = admit_ngg_draw(kena_vs_only_registers(), layered_depth, radv());
+    ASSERT_TRUE(depth.refusal);
+    EXPECT_STREQ(depth.refusal, "ngg-layer-target-not-single-slice")
+        << "a layered attachment beside a one-slice colour target is refused, not culled";
+
+    NggDrawRegisters legacy = kena_vs_only_registers();
+    legacy.vgt_shader_stages_en = 0u;
+    EXPECT_FALSE(admit_ngg_draw(legacy, kena_vs_only_facts(), radv()).applies)
+        << "without PRIMGEN_EN the path does not apply";
+}
+
+// #3135 layered NGG depth. A draw that writes no colour has its layer address the depth array:
+// admitted as one replay per slice of the view, routed by no layer stage. Every shape the replay
+// cannot represent is refused by name: no depth attachment, an unprogrammed view, and the two mixed
+// shapes -- a one-slice colour target beside a depth array, and a layered colour volume beside any
+// bound depth/stencil.
+TEST(NggDrawAdmission, ADepthOnlyLayeredDrawIsReplayedPerSlice) {
+    NggDrawFacts f = kena_vs_only_facts();
+    f.target_single_slice = false;   // no colour target is written
+    f.other_attachments_single_slice = false;
+    f.depth_only = true;
+    f.depth_bound = true;
+    f.depth_view_known = true;
+    f.depth_first_slice = 0;
+    f.depth_slice_count = 6;
+    const NggDrawAdmission cube = admit_ngg_draw(kena_vs_only_registers(), f, radv());
+    ASSERT_TRUE(cube.ok()) << cube.refusal;
+    EXPECT_EQ(cube.depth_slice_fanout, 6u);
+    EXPECT_EQ(cube.depth_first_slice, 0u);
+    EXPECT_EQ(cube.layer_slices, 6u) << "a layer at or above 6 is culled";
+    EXPECT_EQ(cube.route, NggLayerRoute::None) << "replayed per slice, not routed";
+
+    NggDrawFacts offset = f;
+    offset.depth_first_slice = 2;
+    offset.depth_slice_count = 2;
+    const NggDrawAdmission pair = admit_ngg_draw(kena_vs_only_registers(), offset, radv());
+    ASSERT_TRUE(pair.ok()) << pair.refusal;
+    EXPECT_EQ(pair.depth_slice_fanout, 2u);
+    EXPECT_EQ(pair.depth_first_slice, 2u);
+
+    NggDrawFacts single = f;
+    single.depth_slice_count = 1;
+    const NggDrawAdmission one = admit_ngg_draw(kena_vs_only_registers(), single, radv());
+    ASSERT_TRUE(one.ok()) << one.refusal;
+    EXPECT_EQ(one.depth_slice_fanout, 0u) << "one slice: the layer only culls";
+    EXPECT_EQ(one.layer_slices, 1u);
+
+    NggDrawFacts unbound = f;
+    unbound.depth_bound = false;
+    const NggDrawAdmission nothing = admit_ngg_draw(kena_vs_only_registers(), unbound, radv());
+    ASSERT_TRUE(nothing.refusal);
+    EXPECT_STREQ(nothing.refusal, "ngg-layer-target-not-layered");
+    NggDrawFacts unknown = f;
+    unknown.depth_view_known = false;
+    unknown.depth_slice_count = 0;
+    const NggDrawAdmission unseen = admit_ngg_draw(kena_vs_only_registers(), unknown, radv());
+    ASSERT_TRUE(unseen.refusal);
+    EXPECT_STREQ(unseen.refusal, "ngg-layer-target-not-single-slice");
+
+    // Mixed: a written one-slice colour target beside the depth array.
+    NggDrawFacts colour_2d = kena_vs_only_facts();
+    colour_2d.depth_bound = true;
+    colour_2d.depth_view_known = true;
+    colour_2d.depth_slice_count = 6;
+    const NggDrawAdmission mixed = admit_ngg_draw(kena_vs_only_registers(), colour_2d, radv());
+    ASSERT_TRUE(mixed.refusal);
+    EXPECT_STREQ(mixed.refusal, "ngg-layer-attachments-mixed");
+    // Mixed: a layered colour volume beside a bound depth/stencil; without it, admitted.
+    NggDrawFacts volume = kena_vs_only_facts();
+    volume.target_single_slice = false;
+    volume.target_slices = 4;
+    const NggDrawAdmission alone = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(alone.ok()) << alone.refusal << ": control, a volume with no depth";
+    EXPECT_EQ(alone.depth_slice_fanout, 0u);
+    volume.depth_bound = true;
+    volume.depth_view_known = true;
+    volume.depth_slice_count = 1;
+    // Depth writes on but no test: the backend attaches nothing, so the volume still renders.
+    const NggDrawAdmission write_only = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(write_only.ok()) << write_only.refusal << ": no attached depth, no mixed shape";
+    volume.depth_attached = true;
+    const NggDrawAdmission with_depth = admit_ngg_draw(kena_vs_only_registers(), volume, radv());
+    ASSERT_TRUE(with_depth.refusal);
+    EXPECT_STREQ(with_depth.refusal, "ngg-layer-attachments-mixed");
+}
+
+// A VS-only draw whose input the shell cannot represent is refused by name, not admitted as
+// triangles.
+TEST(NggDrawAdmission, AVsOnlyDrawRefusesInputsItCannotRepresent) {
+    for (uint32_t prim : {1u /* points */, 2u /* lines */, 5u /* fan */, 17u /* rect list */}) {
+        NggDrawRegisters r = kena_vs_only_registers();
+        r.primitive_type = prim;
+        const NggDrawAdmission a = admit_ngg_draw(r, kena_vs_only_facts(), radv());
+        ASSERT_TRUE(a.refusal) << "prim type " << prim;
+        EXPECT_STREQ(a.refusal, "ngg-input-topology") << "prim type " << prim;
+    }
+    NggDrawRegisters strip = kena_vs_only_registers();
+    strip.primitive_type = 6u;
+    strip.pa_su_sc_mode_cntl = 0u;   // no culling, so strip order is not visible
+    const NggDrawAdmission a = admit_ngg_draw(strip, kena_vs_only_facts(), radv());
+    EXPECT_TRUE(a.ok()) << a.refusal << ": control, a strip without culling";
+    EXPECT_EQ(a.topology, NggOutputTopology::TriangleList);
 }
 
 }   // namespace

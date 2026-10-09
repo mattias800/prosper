@@ -141,6 +141,7 @@ TEST(NggRasterCommit, LayerConfigurationsThatCannotWorkAreRefused) {
     EXPECT_EQ(why, "reason=ngg-layer-without-pos1");
     config = base_config(NggLayerRoute::None);
     config.layer_from_pos1 = true;
+    config.layer_slices = 2;
     EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty());
     EXPECT_NE(why.find("reason=ngg-layer-route-unavailable"), std::string::npos) << why;
     config = base_config(NggLayerRoute::ForwardingGeometry);
@@ -681,6 +682,82 @@ TEST(NggRasterCommit, LineListsRasterizeAsLines) {
         }
     }
     EXPECT_GT(ran, 0u);
+}
+
+// #3135 P7: a one-slice target needs no route. The layer is read to cull and count a primitive
+// that names another slice, and the vertex stage declares no BuiltIn Layer: writing gl_Layer into
+// a one-layer framebuffer is undefined (Undefined-Value-Layer-Written).
+TEST(NggRasterCommit, AOneSliceTargetReadsTheLayerWithoutWritingIt) {
+    std::string why;
+    NggRasterCommitConfig config = base_config(NggLayerRoute::None);
+    config.layer_from_pos1 = true;
+    config.layer_slices = 1;
+    const std::vector<uint32_t> spirv = build_ngg_raster_commit_vertex(config, nullptr, &why);
+    ASSERT_FALSE(spirv.empty()) << why;
+    bool layer_builtin = false;
+    for (size_t at = 5; at < spirv.size();) {
+        const uint32_t words = spirv[at] >> 16, op = spirv[at] & 0xffffu;
+        if (!words) break;
+        if (op == 71u && words >= 4u && spirv[at + 2] == 11u && spirv[at + 3] == 9u)
+            layer_builtin = true;   // OpDecorate <id> BuiltIn Layer
+        at += words;
+    }
+    EXPECT_FALSE(layer_builtin) << "nothing may write gl_Layer for a one-slice target";
+    config.route = NggLayerRoute::ShaderOutputLayer;
+    config.layer_slices = 2;
+    const std::vector<uint32_t> routed = build_ngg_raster_commit_vertex(config, nullptr, &why);
+    ASSERT_FALSE(routed.empty()) << why << ": control, a routed two-slice target";
+    bool routed_builtin = false;
+    for (size_t at = 5; at < routed.size();) {
+        const uint32_t words = routed[at] >> 16, op = routed[at] & 0xffffu;
+        if (!words) break;
+        if (op == 71u && words >= 4u && routed[at + 2] == 11u && routed[at + 3] == 9u)
+            routed_builtin = true;
+        at += words;
+    }
+    EXPECT_TRUE(routed_builtin) << "control: the scan finds BuiltIn Layer when it is written";
+}
+
+// A per-slice replay (#3135 layered NGG depth) selects its layer at draw time: one module for every
+// slice, reading the selection as gl_InstanceIndex, with route None and no gl_Layer. A selection
+// without a layer read, or beside a route, is a configuration error refused by name.
+TEST(NggRasterCommit, ALayerSelectionIsAReplayOfOneSliceOnly) {
+    std::string why;
+    NggRasterCommitConfig config = base_config(NggLayerRoute::None);
+    config.layer_from_pos1 = true;
+    config.layer_slices = 6;
+    EXPECT_TRUE(build_ngg_raster_commit_vertex(config, nullptr, &why).empty())
+        << "control: six slices with no route and no selection cannot be drawn";
+    config.layer_select = true;
+    const auto spirv = build_ngg_raster_commit_vertex(config, nullptr, &why);
+    ASSERT_FALSE(spirv.empty()) << why;
+    bool layer_builtin = false, instance_read = false;
+    uint32_t instance_id = 0;
+    for (size_t at = 5; at < spirv.size();) {
+        const uint32_t words = spirv[at] >> 16, op = spirv[at] & 0xffffu;
+        if (!words) break;
+        if (op == 71u && words >= 4u && spirv[at + 2] == 11u && spirv[at + 3] == 9u)
+            layer_builtin = true;   // OpDecorate <id> BuiltIn Layer
+        if (op == 71u && words >= 4u && spirv[at + 2] == 11u && spirv[at + 3] == 43u)
+            instance_id = spirv[at + 1];   // OpDecorate <id> BuiltIn InstanceIndex
+        if (op == 61u && words >= 4u && instance_id && spirv[at + 3] == instance_id)
+            instance_read = true;   // OpLoad of it
+        at += words;
+    }
+    EXPECT_FALSE(layer_builtin) << "a replay writes no gl_Layer";
+    EXPECT_TRUE(instance_read) << "the selected layer is read at draw time";
+
+    const auto refused = [&](const NggRasterCommitConfig& c) {
+        why.clear();
+        return build_ngg_raster_commit_vertex(c, nullptr, &why).empty() &&
+               why.find("cause=layer-select") != std::string::npos;
+    };
+    NggRasterCommitConfig unread = config;
+    unread.layer_from_pos1 = false;
+    EXPECT_TRUE(refused(unread)) << why;
+    NggRasterCommitConfig routed = config;
+    routed.route = NggLayerRoute::ShaderOutputLayer;
+    EXPECT_TRUE(refused(routed)) << why;
 }
 
 }   // namespace

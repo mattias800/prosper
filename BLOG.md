@@ -19,7 +19,50 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-08
+
+### Kena's dark cave is too bright, but not because of exposure
+
+Kena's exposure is a constant the game computes, and prosper reproduces it correctly. prosper's cave is nine times too bright because sky and ambient light reach the walls unoccluded; on PS5, distance-field occlusion blocks them ([#4766](https://github.com/mattias800/prosper/issues/4766)).
+
+### Kena: Bridge of Spirits gets its depth of field
+
+The grass and stones nearest the camera in Kena's title-menu forest now blur, as they do on PS5; the frame is still brighter than the console's and the white flowers are still missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-dof.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, with the foreground grass and the stone cat statues on the right softly out of focus; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 420"></p>
+
+The path below the shrine: `main` (top), with the fix (middle), and the PS5 oracle (bottom).
+
+<p align="center"><img src="prosper/docs/screenshots/kena-title-dof-main-fix-oracle.webp" alt="Three crops of the foreground below Kena's shrine: on main every leaf is sharp; with the fix the nearest foliage and stones are blurred; the PS5 oracle shows the same blur with white flowers"></p>
+
+### Kena: Bridge of Spirits gets past its first level load and into gameplay
+
+On Linux, Kena now gets through the first level load: the opening cutscene plays, and the world draws behind the first gameplay prompt. It is dim and blue, and Kena's hair is black ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-opening-cutscene.webp" alt="Kena: Bridge of Spirits opening cutscene, letterboxed: Kena's staff glows blue beside a green lens flare among forest roots; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 1450"></p>
+<p align="center"><img src="assets/screenshots/kena-first-gameplay-prompt-world.webp" alt="Kena: Bridge of Spirits first gameplay prompt 'Press … to Pulse' over the rendered cave, with Kena from behind, tree roots, ferns and a stone path; her hair is black and the scene is dim and blue; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 1600"></p>
+
+### Kena: Bridge of Spirits gets its ferns, its canopy and its light shafts
+
+Kena's title-menu forest now has its ferns, grass, tree canopy and sun shafts, and the grey haze is reduced, with the fog adding about half the light it did; it is still brighter and paler than on PS5, and the white flowers are missing ([tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-foliage.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, now with ferns and grass in the foreground, a leafy canopy overhead and sun shafts through the trees; Linux prosper-app, route linux-reach-level-load.pad, snapshot at pad flip 420"></p>
+
+`main` (top left), with shadows reaching the fog (top right), with the foliage fix as well (bottom left), and the PS5 oracle (bottom right).
+
+<p align="center"><img src="prosper/docs/screenshots/kena-title-grade-main-fixes-oracle.webp" alt="Four Kena title-menu frames: main is washed out by uniform grey haze; with the shadow fix the haze is reduced; with the foliage fix ferns, grass and canopy appear; the PS5 oracle is darker and more saturated with white flowers"></p>
+
 ## 2026-10-07
+
+### Kena: Bridge of Spirits gets its sun back
+
+Sunlight and leaf shadows fall on the path in front of Kena's title-menu shrine; the grade is still far too bright and the ferns and flowers are still missing ([#4703](https://github.com/mattias800/prosper/issues/4703), [tracker #3787](https://github.com/mattias800/prosper/issues/3787)).
+
+<p align="center"><img src="assets/screenshots/kena-title-menu-sunlit.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine, with a sunlit patch of grass and leaf shadows on the path in the foreground; Linux prosper-app, route linux-reach-level-load.pad, F9 frame at 222 s"></p>
+
+Left to right: `main`, this fix, and the PS5 oracle, cropped to the path below the shrine.
+
+<p align="center"><img src="prosper/docs/screenshots/issue-4703-kena-sun-main-fix-oracle.webp" alt="Three crops of the path below Kena's shrine: on main the ground is black; with the fix a sunlit grass patch and shadows appear; the PS5 oracle shows dense ferns, flowers and a darker grade"></p>
 
 ### Kena: Bridge of Spirits draws its title-menu world
 

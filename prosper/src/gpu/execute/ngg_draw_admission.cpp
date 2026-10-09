@@ -2,6 +2,7 @@
 #include "gpu/execute/ngg_draw_admission.hpp"
 
 #include "gpu/pm4/vgt_shader_stages.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -22,7 +23,6 @@ NggHostCapabilities& host_slot() {
 
 constexpr uint32_t kPrimTriangleList = 4;
 constexpr uint32_t kPrimTriangleStrip = 6;
-constexpr uint32_t kMaxPushWords = 32;   // the shell's push-constant budget (128 bytes)
 constexpr uint32_t kWaveLanes = 64;
 
 }   // namespace
@@ -42,7 +42,15 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
                                 const NggHostCapabilities& host) {
     NggDrawAdmission admission;
     const VgtShaderStages stages{registers.vgt_shader_stages_en};
-    if (!stages.gs_enabled() || !stages.primgen_enabled()) return admission;
+    if (!stages.primgen_enabled()) return admission;
+    // #3135 P7: NGG without a GS runs the VS as the primitive shader. Its launch is the merged
+    // one (s3 counts, v0/v1 vertex offsets scaled by ESGS_RING_ITEMSIZE, v5 VertexID, v8
+    // InstanceID): Kena's culling VS programs read exactly those, and the ABI analysis admits them
+    // unchanged. Only the partition differs (NggSubgroupLimits::vs_only). CONFIDENCE: MED -- the
+    // layout rests on the merged path's evidence (Kena's merged LUT producer, checked against its
+    // guest code) and on what these programs read; no VS-only draw has rendered on hardware-
+    // checked output yet.
+    admission.vs_only = !stages.gs_enabled();
     admission.applies = true;
     const auto refuse = [&](const char* reason) {
         admission.refusal = reason;
@@ -59,9 +67,20 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         admission.shape.topology = NggInputTopology::TriangleStrip;
     else
         return refuse("ngg-input-topology");
-    admission.topology = ngg_output_topology(registers.vgt_gs_out_prim_type);
+    // Without a GS there is no GS output primitive type to read: the primitive shader exports the
+    // INPUT primitives it keeps (culling drops some, never changes their kind), so a triangle list
+    // or strip comes out as triangles. VGT_GS_OUT_PRIM_TYPE is not consulted for it. Kena's culling
+    // VS programs run with that register at 0 -- POINTLIST if it applied -- while the title draws
+    // their geometry as triangles on PS5. CONFIDENCE: MED (Kena's register values and its PS5
+    // picture; no published register reference states the VS-only rule). Inputs other than a
+    // triangle list or strip were refused above (ngg-input-topology), by name.
+    admission.topology = admission.vs_only ? NggOutputTopology::TriangleList
+                                           : ngg_output_topology(registers.vgt_gs_out_prim_type);
     if (admission.topology == NggOutputTopology::Unsupported) return refuse("ngg-output-topology");
-    if (facts.indexed) return refuse("ngg-indexed");
+    if (facts.indexed) {
+        if (facts.index_refusal) return refuse(facts.index_refusal);
+        if (!facts.indices) return refuse("ngg-index-unavailable");
+    }
     if (facts.indirect) return refuse("ngg-indirect");
     if (facts.vertex_offset) return refuse("ngg-vertex-offset");
 
@@ -76,9 +95,42 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     if (vs_out & kVsOutUndecodedMask) return refuse("ngg-vs-out-undecoded");
     admission.layer_from_pos1 = (vs_out & kVsOutUseVtxRenderTargetIndx) != 0;
     if (admission.layer_from_pos1) {
-        if (!facts.target_slices) return refuse("ngg-layer-target-not-layered");
-        if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
-        admission.layer_slices = facts.target_slices;
+        if (facts.depth_only) {
+            // No colour slot is written: the layer addresses the depth attachment. A depth array
+            // is replayed once per slice (the backend keeps one single-layer image per guest
+            // slice, keyed by SLICE_START). The layer is taken relative to SLICE_START, as an
+            // array view's index is. CONFIDENCE: MED (Kena's cube shadow passes program
+            // SLICE_START 0, so the two readings agree on every observed draw).
+            if (!facts.depth_bound) return refuse("ngg-layer-target-not-layered");
+            if (!facts.depth_view_known || !facts.depth_slice_count)
+                return refuse("ngg-layer-target-not-single-slice");
+            admission.layer_slices = facts.depth_slice_count;
+            if (facts.depth_slice_count > 1u) {
+                admission.depth_slice_fanout = facts.depth_slice_count;
+                admission.depth_first_slice = facts.depth_first_slice;
+            }
+        } else if (facts.target_slices) {
+            if (facts.target_first_slice) return refuse("ngg-layer-slice-start");
+            // A layered colour pass binds its depth/stencil as one single-layer image, so a layer
+            // above 0 would test and write depth nowhere the guest's surface has it.
+            if (facts.depth_attached) return refuse("ngg-layer-attachments-mixed");
+            admission.layer_slices = facts.target_slices;
+        } else if (facts.target_single_slice) {
+            if (facts.depth_bound && facts.depth_view_known && facts.depth_slice_count > 1u)
+                return refuse("ngg-layer-attachments-mixed");
+            // Every bound attachment must be one slice, not colour target 0 alone: otherwise the
+            // layer may address a real slice the raster commit would cull (#3135 P7 review).
+            if (!facts.other_attachments_single_slice)
+                return refuse("ngg-layer-target-not-single-slice");
+            // A one-slice view: layer 0 is its only slice. A primitive naming another layer is
+            // culled and counted by the raster commit, the rule a volume's out-of-range layers
+            // already follow (CONFIDENCE: LOW on cull versus clamp, ngg_raster_commit.hpp) -- here
+            // it is visible as a counted cull rather than a draw silently placed at slice 0.
+            // Kena's culling VS programs export POS1.z into 2D scene targets (#3135 P7).
+            admission.layer_slices = 1;
+        } else {
+            return refuse("ngg-layer-target-not-layered");
+        }
     }
     admission.provoking_vertex_last = (registers.pa_su_sc_mode_cntl >> 19) & 1u;
     if (admission.shape.topology == NggInputTopology::TriangleStrip) {
@@ -89,12 +141,18 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     }
 
     if (!facts.user_data_range_known || facts.user_data_range_start != 0 ||
-        facts.user_data_range_end > kMaxPushWords)
+        facts.user_data_range_end > kNggShellMaxPushWords)
         return refuse("ngg-user-data-range");
+    // The SPI loads RSRC2_GS.USER_SGPR user SGPRs (s8..) from SPI_SHADER_USER_DATA_GS_*: that is
+    // the hardware's count. AGC leaves the field zero on some programs (Kena's LUT producer reads
+    // exactly its 8-dword range), and then the range is the count. A count below a longer range is
+    // ordinary: the rest of the user data is reached through the user-data address in s0:s1, as
+    // Kena's 4324d9f3 does (USER_SGPR 12, range 0..24). CONFIDENCE: HIGH on the field's meaning,
+    // MED on reading zero as "the range" (#3135). Whether two more push words are needed for s0:s1
+    // depends on the program, so the live producer checks that room (ngg_live_draw.cpp).
     const uint32_t rsrc2_sgprs = ngg_rsrc2_gs_user_sgprs(registers.spi_shader_pgm_rsrc2_gs);
-    if (rsrc2_sgprs && rsrc2_sgprs != facts.user_data_range_end)
-        return refuse("ngg-user-sgpr-count");
-    admission.user_sgprs = facts.user_data_range_end;
+    admission.user_sgprs = rsrc2_sgprs ? rsrc2_sgprs : facts.user_data_range_end;
+    if (admission.user_sgprs > kNggShellMaxPushWords) return refuse("ngg-user-sgpr-count");
 
     admission.lds_granules = ngg_rsrc2_gs_lds_size(registers.spi_shader_pgm_rsrc2_gs);
     const uint64_t lds_bytes = uint64_t{admission.lds_granules} * kNggLdsGranuleDwords * 4u;
@@ -105,13 +163,21 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     admission.limits = decode_ngg_subgroup_limits(
         registers.vgt_gs_onchip_cntl, registers.ge_cntl, registers.ge_max_output_per_subgroup,
         registers.vgt_gs_max_vert_out, registers.vgt_esgs_ring_itemsize);
+    admission.limits.vs_only = admission.vs_only;
     admission.shape.vertex_count = facts.vertex_count;
+    if (facts.indexed) {
+        admission.shape.indices = facts.indices;
+        admission.shape.vertex_count = static_cast<uint32_t>(facts.indices->size());
+    }
     admission.shape.instance_count = facts.instance_count;
     admission.shape.first_vertex = 0;
 
     NggLayerRouteQuery query;
     query.topology = admission.topology;
-    query.layer_from_pos1 = admission.layer_from_pos1;
+    // A one-slice target is addressed without a layer route (ngg_raster_commit: cull only), and a
+    // depth array by per-slice replay, also without one.
+    query.layer_from_pos1 =
+        admission.layer_from_pos1 && admission.layer_slices > 1u && !admission.depth_slice_fanout;
     query.interpolation_geometry_required = facts.interpolation_geometry_required;
     query.shader_output_layer = host.shader_output_layer;
     query.geometry_shader = host.geometry_shader;

@@ -53,15 +53,12 @@
 #include <windows.h>
 #else
 #include <sys/stat.h>   // mkdir
-#include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
-#include <sys/random.h> // getentropy: the host CSPRNG behind sceRandomGetRandomNumber
+#include <sys/uio.h>   // process_vm_readv: fault-contained diagnostic snapshots
 #include <unistd.h>
 #endif
 #include "hle/service/service_trace.hpp"
+#include "host/platform/host_entropy.hpp"   // the host CSPRNG behind sceRandomGetRandomNumber
 #include "hle/service/hle_handles.hpp"
-#ifdef _WIN32
-#include <bcrypt.h>     // BCryptGenRandom (prosper_core already links bcrypt on Windows)
-#endif
 
 namespace prosper {
 
@@ -116,11 +113,73 @@ const char* gameintent_activity_id(size_t* length = nullptr) {
 }
 
 // --- user service ---
-HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
-HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
+// Return codes measured on a console (tests/data/console_oracle/userservice.golden.tsv, replayed by
+// test_console_oracle_replay). CONFIDENCE: HIGH for each fault taken alone; MED for the order checks run
+// in when several apply at once (null argument, then unknown user, then short buffer), which was not
+// measured in combination.
+constexpr uint64_t kUserServiceAlreadyInitialized = 0x80960003ull;
+constexpr uint64_t kUserServiceInvalidArgument = 0x80960005ull;
+constexpr uint64_t kUserServiceBufferTooShort = 0x8096000aull;
+constexpr uint64_t kUserServiceNoSuchUser = 0x80960105ull;
+constexpr int32_t kLocalUserId = 1;   // the single local user this model exposes
+constexpr uint64_t kUserNameBufferSize = 17;   // SCE_USER_SERVICE_MAX_USER_NAME_LENGTH (16) + NUL
+std::atomic<bool> g_user_service_initialized{false};
+
+// Both Initialize spellings validate a priority, then share one initialized flag: the first success sets
+// it and a second reports ALREADY_INITIALIZED until Terminate. Read from the library's own code
+// (system libSceUserService, the two 31/42-byte export wrappers and the common body they jump to):
+//   * sceUserServiceInitialize(const Params*) reads the priority from the first int of the struct and
+//     uses 700 (0x2bc) for a NULL pointer;
+//   * sceUserServiceInitialize2(int priority) takes the priority itself;
+//   * a priority outside [0x100, 0x2ff] is INVALID_ARGUMENT, checked BEFORE the initialized flag, so an
+//     out-of-range call fails the same way whether or not the service is already up.
+// CONFIDENCE: HIGH for the range and the order (both read from the code); the console cases in
+// userservice.cases.tsv measure them.
+constexpr int32_t kUserServiceDefaultPriority = 0x2bc;
+constexpr uint32_t kUserServiceMinPriority = 0x100;
+constexpr uint32_t kUserServiceMaxPriority = 0x2ff;
+uint64_t user_service_init(int32_t priority) {
+    if (static_cast<uint32_t>(priority) < kUserServiceMinPriority ||
+        static_cast<uint32_t>(priority) > kUserServiceMaxPriority)
+        return kUserServiceInvalidArgument;
+    return g_user_service_initialized.exchange(true) ? kUserServiceAlreadyInitialized : 0;
+}
+HLE(s_user_initialize) {
+    int32_t priority = kUserServiceDefaultPriority;
+    if (a0)
+        std::memcpy(&priority, reinterpret_cast<const void*>(static_cast<uintptr_t>(a0)),
+                    sizeof priority);
+    return user_service_init(priority);
+}
+HLE(s_user_initialize2) {
+    return user_service_init(static_cast<int32_t>(a0));
+}
+HLE(s_user_terminate) {
+    g_user_service_initialized = false;
+    return 0;
+}
+HLE(s_user_initial) {   // GetInitialUser / GetForegroundUser -> userId 1; a null out-pointer is an argument error
+    if (!a0) return kUserServiceInvalidArgument;
+    *(int32_t*)PW(a0) = kLocalUserId;
+    return 0;
+}
+HLE(s_user_idlist) {
+    if (!a0) return kUserServiceInvalidArgument;
+    int32_t* p = (int32_t*)PW(a0);
+    p[0] = kLocalUserId;
+    for (int i = 1; i < 4; i++) p[i] = -1;
+    return 0;
+}
 // Bounded, non-padding write (strncpy would zero-pad the whole a2-byte buffer -> a
-// stack-smash if a2 is large/garbage). snprintf writes only the string + NUL.
-HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
+// stack-smash if a2 is large/garbage). snprintf writes only the string + NUL. The console refuses a
+// buffer under 17 bytes (including 0) with BUFFER_TOO_SHORT rather than truncating.
+HLE(s_user_name) {
+    if (!a1) return kUserServiceInvalidArgument;
+    if ((int32_t)a0 != kLocalUserId) return kUserServiceNoSuchUser;
+    if (a2 < kUserNameBufferSize) return kUserServiceBufferTooShort;
+    snprintf((char*)PW(a1), (size_t)a2, "%s", "Player");
+    return 0;
+}
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
 HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
 // sceUserServiceGetUserNumber(userId, number): each local user has a stable controller/user number.
@@ -851,6 +910,14 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     bool saw_iostore_index = false;
     std::error_code ec;
     const fs::path app0(resolve_guest_path("/app0"));
+    // No /app0 mounted: nothing to inventory. resolve_guest_path() answers "" for an unserved path
+    // (#4782), and composing below from "" would read sce_sys/ and the pak tree relative to the
+    // HOST's working directory. Answer what an empty dump answers: the non-IoStore chunk 0.
+    if (app0.empty()) {
+        std::fprintf(stderr, "[playgo] /app0 is not mounted; reporting only chunk 0\n");
+        chunks.push_back(0);
+        return chunks;
+    }
 
     // CONFIDENCE: HIGH — the fixed plgx header/table fields agree across nine local PS5
     // declarations; 007 queries ordinal 1 from its two-record manifest (#4030). Read only the
@@ -1557,25 +1624,6 @@ namespace {
 // more, this constant is where to look first.
 constexpr uint64_t kRandomMaxBytes = 64;
 
-// Fill `bytes` from the host CSPRNG. Returns false if the host cannot supply entropy — which the
-// caller MUST surface as an error, never as a zero-filled success. Deterministic zeros presented as
-// random are the same lie in a different costume.
-bool svc_host_entropy(void* dst, size_t bytes) {
-#ifdef _WIN32
-    return BCryptGenRandom(nullptr, (PUCHAR)dst, (ULONG)bytes,
-                           BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
-#else
-    auto* p = static_cast<unsigned char*>(dst);
-    while (bytes) {
-        const size_t chunk = bytes < 256 ? bytes : 256;   // getentropy's published maximum
-        if (getentropy(p, chunk) != 0) return false;
-        p += chunk;
-        bytes -= chunk;
-    }
-    return true;
-#endif
-}
-
 } // namespace
 
 HLE(s_random_get_random_number) {
@@ -1588,7 +1636,7 @@ HLE(s_random_get_random_number) {
     if (!svc_ptrish(buf)) return prosper::hle::kSceKernelErrorEFAULT;
 
     unsigned char tmp[kRandomMaxBytes];
-    if (!svc_host_entropy(tmp, (size_t)size))
+    if (!host::host_entropy_fill(tmp, (size_t)size))
         return prosper::hle::sce_kernel_error(prosper::hle::FreeBsdErrno::EIo);
     // Fault-contained: an unmapped or unwritable guest buffer must return an error, not take down
     // the emulator, and must not report success for a write that did not land.
@@ -1642,9 +1690,9 @@ void register_service_hle() {
     // UpdateStatus, GetResult and the other exports remain unregistered (#4463).
     R("sceWebBrowserDialogInitialize", s_ok);
     R("sceWebBrowserDialogTerminate", s_ok);
-    R("sceUserServiceInitialize", s_ok);
-    R("sceUserServiceInitialize2", s_ok);
-    R("sceUserServiceTerminate", s_ok);
+    R("sceUserServiceInitialize", s_user_initialize);
+    R("sceUserServiceInitialize2", s_user_initialize2);
+    R("sceUserServiceTerminate", s_user_terminate);
     // PlatformPrivacyWs1 (userId, int* out): a deterministic default with a NULL check, like the
     // module (s_user_privacy_ws1). Not in the 3.20 list: it lives in the newer
     // libSceUserServicePlatformPrivacyWs1 sub-library that the shipped libSceUserService.sprx

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace prosper::gpu {
 
@@ -33,15 +34,21 @@ uint32_t prims_per_instance(const NggDrawShape& draw) {
     return draw.vertex_count >= 3u ? draw.vertex_count - 2u : 0u;
 }
 
-// The three vertex indices of instance-local primitive `p`, in input order. A strip's odd
-// triangles are kept in natural order (p, p+1, p+2); whether the hardware swaps them for the GS is
-// open question 3 on #3135, so admission accepts strips only where the order cannot matter.
+// The three input vertices of instance-local primitive `p`, in input order: positions in the
+// vertex stream, mapped through the index buffer for an indexed draw. A strip's odd triangles are
+// kept in natural order (p, p+1, p+2); whether the hardware swaps them for the GS is open question 3
+// on #3135, so admission accepts strips only where the order cannot matter.
 std::array<uint32_t, 3> prim_vertices(const NggDrawShape& draw, uint32_t p) {
-    if (draw.topology == NggInputTopology::TriangleList) return {3u * p, 3u * p + 1u, 3u * p + 2u};
-    return {p, p + 1u, p + 2u};
+    std::array<uint32_t, 3> at = draw.topology == NggInputTopology::TriangleList
+                                     ? std::array<uint32_t, 3>{3u * p, 3u * p + 1u, 3u * p + 2u}
+                                     : std::array<uint32_t, 3>{p, p + 1u, p + 2u};
+    if (draw.indices)
+        for (uint32_t& v : at) v = (*draw.indices)[v];
+    return at;
 }
 
 uint32_t threads_of(const NggSubgroup& s, const NggSubgroupLimits& limits) {
+    if (limits.vs_only) return std::max(s.es_threads(), s.gs_threads());
     return std::max({s.es_threads(), s.gs_threads(), s.gs_threads() * limits.gs_max_vert_out});
 }
 
@@ -50,12 +57,17 @@ uint32_t threads_of(const NggSubgroup& s, const NggSubgroupLimits& limits) {
 NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLimits& limits,
                                    const NggSubgroupBudget& budget) {
     NggSubgroupPlan plan;
-    const uint32_t prim_limit = std::min(
-        {limits.gs_prims_per_subgroup, limits.prim_group_size,
-         limits.gs_max_vert_out ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out : 0u});
-    const uint32_t es_limit = limits.vert_group_size == 256u
-                                  ? limits.es_verts_per_subgroup
-                                  : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    const uint32_t prim_limit =
+        limits.vs_only ? std::min(limits.gs_prims_per_subgroup, limits.prim_group_size)
+                       : std::min({limits.gs_prims_per_subgroup, limits.prim_group_size,
+                                   limits.gs_max_vert_out
+                                       ? limits.max_out_verts_per_subgroup / limits.gs_max_vert_out
+                                       : 0u});
+    uint32_t es_limit = limits.vert_group_size == 256u
+                            ? limits.es_verts_per_subgroup
+                            : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
+    // Without a GS the exported vertices are the ES vertices themselves.
+    if (limits.vs_only) es_limit = std::min(es_limit, limits.max_out_verts_per_subgroup);
     const uint32_t max_waves = std::min(budget.max_waves_per_subgroup, 15u);
     // A primitive must fit, and a vertex offset (lane x ITEMSIZE) must fit its 16-bit field.
     if (prim_limit == 0 || es_limit < 3u || limits.esgs_item_size == 0 ||
@@ -63,63 +75,71 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
         plan.refusal = "ngg-limits-unusable";
         return plan;
     }
+    if (draw.indices && draw.indices->size() != draw.vertex_count) {
+        plan.refusal = "ngg-index-count-mismatch";
+        return plan;
+    }
     const uint32_t prims = prims_per_instance(draw);
     if (prims == 0 || draw.instance_count == 0) return plan;   // nothing to draw
 
-    for (uint32_t instance = 0; instance < draw.instance_count; ++instance) {
-        NggSubgroup current;
-        current.instance = instance;
-        current.first_vertex = draw.first_vertex;
-        const auto close = [&]() -> bool {
-            if (current.prim_slot.empty()) return true;
-            const uint32_t threads = threads_of(current, limits);
-            current.waves = (threads + kWaveLanes - 1u) / kWaveLanes;
-            if (current.waves > max_waves) {
-                plan.refusal = "ngg-subgroup-too-wide";
-                return false;
-            }
-            if (plan.subgroups.size() >= budget.max_subgroups) {
-                plan.refusal = "ngg-subgroup-plan-budget";
-                return false;
-            }
-            plan.subgroups.push_back(std::move(current));
-            return true;
-        };
-        for (uint32_t p = 0; p < prims; ++p) {
-            const auto verts = prim_vertices(draw, p);
-            uint32_t added = 0;
-            for (uint32_t k = 0; k < 3u; ++k) {
-                const bool seen = std::find(current.es_vertex.begin(), current.es_vertex.end(),
-                                            verts[k]) != current.es_vertex.end();
-                // A vertex repeated inside one primitive counts once.
-                const bool repeated =
-                    (k >= 1u && verts[k] == verts[0]) || (k == 2u && verts[2] == verts[1]);
-                if (!seen && !repeated) ++added;
-            }
-            if (current.gs_threads() + 1u > prim_limit || current.es_threads() + added > es_limit) {
-                if (!close()) {
-                    plan.subgroups.clear();
-                    return plan;
-                }
-                current = NggSubgroup{};
-                current.instance = instance;
-                current.first_vertex = draw.first_vertex;
-            }
-            if (current.prim_slot.empty()) current.first_prim = p;
-            for (uint32_t v : verts) {
-                auto it = std::find(current.es_vertex.begin(), current.es_vertex.end(), v);
-                if (it == current.es_vertex.end()) {
-                    current.es_vertex.push_back(v);
-                    it = current.es_vertex.end() - 1;
-                }
-                current.prim_slot.push_back(static_cast<uint32_t>(it - current.es_vertex.begin()));
-            }
+    // Instance 0's partition. Every instance has the same primitives and the planner never packs
+    // instances, so the others differ only in InstanceID.
+    std::vector<NggSubgroup> one;
+    NggSubgroup current;
+    current.first_vertex = draw.first_vertex;
+    const auto close = [&]() -> bool {
+        if (current.prim_slot.empty()) return true;
+        const uint32_t threads = threads_of(current, limits);
+        current.waves = (threads + kWaveLanes - 1u) / kWaveLanes;
+        if (current.waves > max_waves) {
+            plan.refusal = "ngg-subgroup-too-wide";
+            return false;
         }
-        if (!close()) {
-            plan.subgroups.clear();
-            return plan;
+        if (one.size() >= budget.max_subgroups) {
+            plan.refusal = "ngg-subgroup-plan-budget";
+            return false;
+        }
+        one.push_back(std::move(current));
+        return true;
+    };
+    for (uint32_t p = 0; p < prims; ++p) {
+        const auto verts = prim_vertices(draw, p);
+        uint32_t added = 0;
+        for (uint32_t k = 0; k < 3u; ++k) {
+            const bool seen = std::find(current.es_vertex.begin(), current.es_vertex.end(),
+                                        verts[k]) != current.es_vertex.end();
+            // A vertex repeated inside one primitive counts once.
+            const bool repeated =
+                (k >= 1u && verts[k] == verts[0]) || (k == 2u && verts[2] == verts[1]);
+            if (!seen && !repeated) ++added;
+        }
+        if (current.gs_threads() + 1u > prim_limit || current.es_threads() + added > es_limit) {
+            if (!close()) return plan;
+            current = NggSubgroup{};
+            current.first_vertex = draw.first_vertex;
+        }
+        if (current.prim_slot.empty()) current.first_prim = p;
+        for (uint32_t v : verts) {
+            auto it = std::find(current.es_vertex.begin(), current.es_vertex.end(), v);
+            if (it == current.es_vertex.end()) {
+                current.es_vertex.push_back(v);
+                it = current.es_vertex.end() - 1;
+            }
+            current.prim_slot.push_back(static_cast<uint32_t>(it - current.es_vertex.begin()));
         }
     }
+    if (!close()) return plan;
+
+    if (uint64_t{one.size()} * draw.instance_count > budget.max_subgroups) {
+        plan.refusal = "ngg-subgroup-plan-budget";
+        return plan;
+    }
+    plan.subgroups.reserve(one.size() * draw.instance_count);
+    for (uint32_t instance = 0; instance < draw.instance_count; ++instance)
+        for (const NggSubgroup& subgroup : one) {
+            plan.subgroups.push_back(subgroup);
+            plan.subgroups.back().instance = instance;
+        }
     return plan;
 }
 

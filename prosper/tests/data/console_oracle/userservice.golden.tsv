@@ -1,0 +1,30 @@
+# console-oracle golden v1
+# source: userservice.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+us_initialize	libSceUserService.sprx	sceUserServiceInitialize	null		ok	0x0000000000000000	-
+us_initialize_again	libSceUserService.sprx	sceUserServiceInitialize	null		ok	0x0000000080960003	-
+us_foreground_user	libSceUserService.sprx	sceUserServiceGetForegroundUser	out:4	redact	ok	0x0000000000000000	-	a0=redacted(4)
+us_foreground_user_null	libSceUserService.sprx	sceUserServiceGetForegroundUser	null		ok	0x0000000080960005	-
+us_login_list	libSceUserService.sprx	sceUserServiceGetLoginUserIdList	out:16	redact	ok	0x0000000000000000	-	a0=redacted(16)
+us_login_list_null	libSceUserService.sprx	sceUserServiceGetLoginUserIdList	null		ok	0x0000000080960005	-
+us_name_foreground_user	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:17	redact	ok	0x0000000000000000	-	a1=redacted(17)
+us_name_buffer_one	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:1	redact	ok	0x000000008096000a	-	a1=redacted(17)
+us_name_buffer_sixteen	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:16	redact	ok	0x000000008096000a	-	a1=redacted(17)
+us_name_size_zero	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,out:17,i:0	redact	ok	0x000000008096000a	-	a1=redacted(17)
+us_name_null_buffer	libSceUserService.sprx	sceUserServiceGetUserName	use:us_foreground_user.0.0.4,null,i:17		ok	0x0000000080960005	-
+us_name_invalid_user_minus1	libSceUserService.sprx	sceUserServiceGetUserName	i:-1,out:17,i:17	redact	ok	0x0000000080960105	-	a1=redacted(17)
+us_name_invalid_user_zero	libSceUserService.sprx	sceUserServiceGetUserName	i:0,out:17,i:17	redact	ok	0x0000000080960105	-	a1=redacted(17)
+us_initialize_priority_700	libSceUserService.sprx	sceUserServiceInitialize	in:bc020000		ok	0x0000000080960003	-	a0=bc020000
+us_initialize_priority_zero	libSceUserService.sprx	sceUserServiceInitialize	in:00000000		ok	0x0000000080960005	-	a0=00000000
+us_initialize_priority_255	libSceUserService.sprx	sceUserServiceInitialize	in:ff000000		ok	0x0000000080960005	-	a0=ff000000
+us_initialize_priority_256	libSceUserService.sprx	sceUserServiceInitialize	in:00010000		ok	0x0000000080960003	-	a0=00010000
+us_initialize_priority_767	libSceUserService.sprx	sceUserServiceInitialize	in:ff020000		ok	0x0000000080960003	-	a0=ff020000
+us_initialize_priority_768	libSceUserService.sprx	sceUserServiceInitialize	in:00030000		ok	0x0000000080960005	-	a0=00030000
+us_initialize2_priority_700	libSceUserService.sprx	sceUserServiceInitialize2	i:700		ok	0x0000000080960003	-
+us_initialize2_priority_zero	libSceUserService.sprx	sceUserServiceInitialize2	i:0		ok	0x0000000080960005	-
+us_initialize2_priority_255	libSceUserService.sprx	sceUserServiceInitialize2	i:255		ok	0x0000000080960005	-
+us_initialize2_priority_256	libSceUserService.sprx	sceUserServiceInitialize2	i:256		ok	0x0000000080960003	-
+us_initialize2_priority_767	libSceUserService.sprx	sceUserServiceInitialize2	i:767		ok	0x0000000080960003	-
+us_initialize2_priority_768	libSceUserService.sprx	sceUserServiceInitialize2	i:768		ok	0x0000000080960005	-
+us_initialize2_priority_negative	libSceUserService.sprx	sceUserServiceInitialize2	i:-1		ok	0x0000000080960005	-

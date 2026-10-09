@@ -46,6 +46,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `ngg_draw_admission` — which merged-NGG draws that path may run (P5): the register and
   draw-shape table every refusal is named in, and the device half (`ngg_device_refusal`) the
   producer, the backend and replay all ask. Vulkan-free; the backend publishes its capabilities.
+- `ngg_draw_indices` — an indexed merged-NGG draw's index buffer (P6). It decodes the guest indices
+  into the plan's input and refuses primitive restart wherever restart could fire. WHERE the indices
+  are, and at what size, is the ordinary path's rule (`resolve_draw_index_source`, gpu_execute.hpp).
+  Do not give this path its own rule.
 - `ngg_live_draw` — the live producer (P5), called only where a linked vertex chain just failed the
   ordinary per-vertex compile. It owns the bounded compile and description caches, so no draw
   compiles once warm.
@@ -92,7 +96,9 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   table or registers does not belong here: the cache key is the program alone. The probe's
   reject-reason records are replayed on every hit, so adding a fact whose derivation has another
   side effect means capturing and replaying that too. `PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1`
-  restores per-dispatch derivation for A/B.
+  restores per-dispatch derivation for A/B. Facts consumed only by some dispatches are computed on first use
+  (`wave_ops()`, and `nested_wide_data()`, the raw nested wide-data inventory the live admission
+  reads; `PROSPER_NO_NESTED_WIDE_FACTS_MEMO=1` re-derives that one per dispatch for A/B).
 - **Device-resolved indirect dispatch (#3656)** — an eligible group-count-mode indirect dispatch is
   realized with an UNKNOWN launch (`resolve_compute_launch` returns zero groups/threads for an
   `indirect` dispatch) and reaches the backend as `ComputeItem::indirect_args_addr`; the backend, not

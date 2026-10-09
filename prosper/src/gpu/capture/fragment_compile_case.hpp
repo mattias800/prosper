@@ -56,6 +56,9 @@ struct FragmentCompileCase {
     // inputs from FLOAT_MODE, SOURCE, width or a host device and stays inspectable INCOMPLETE.
     FragmentFloatFlags float_flags{};
     FragmentLaunchRsrc1 launch_rsrc1{}; // schema 4 evidence; not an unused compiler argument
+    // Schema 6 (#4703). Older schemas predate the input, and their compiler built exactly what
+    // the all-zero value builds, so they replay with {} and stay complete.
+    FragmentExportFormats export_formats{};
     uint32_t pcrel_target = UINT32_MAX;
     ComputeTripBoundSettings trip{};
     ShaderResourceTable resources;

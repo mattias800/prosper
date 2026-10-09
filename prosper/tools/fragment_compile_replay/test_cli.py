@@ -24,6 +24,21 @@ def run(*args, code=0, extra=None):
     return p.stdout + p.stderr
 
 
+# Schema 6 (#4703) appends a six-byte export-format tail after every older tail. The offset checks
+# below were written against schema 5, so they read each official case through as_v5(), which
+# first proves the schema-6 tail is present and holds the all-zero (historical) value.
+EXPORT_TAIL = 6
+
+
+def as_v5(blob):
+    blob = bytearray(blob)
+    assert blob[8:12] == (6).to_bytes(4, "little"), "current cases are schema 6"
+    assert blob[-8 - EXPORT_TAIL:-8] == bytes(EXPORT_TAIL), "default export formats are all zero"
+    del blob[-8 - EXPORT_TAIL:-8]
+    blob[8:12] = (5).to_bytes(4, "little")
+    return rechecksum(blob)
+
+
 def rechecksum(blob):
     value = 14695981039346656037
     for byte in blob[:-8]:
@@ -59,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     assert mode_outputs[0] != mode_outputs[1], "captured guest mode must reach live compiler relation"
     for profile, value in (("unknown", 0), ("implicit", 1), ("explicit-nonfinite32", 2)):
         case = root / f"transport-{profile}.prfc"
-        wire = case.read_bytes()
+        wire = as_v5(case.read_bytes())
         assert wire[8:12] == (5).to_bytes(4, "little") and wire[-21] == value and wire[-20:-12] == bytes(8) and wire[-12:-8] == bytes(4), "exact official profile/launch tails followed by nested5 zero count"
         source = root / f"transport-{profile}.spv"
         candidate = root / f"transport-{profile}-candidate.spv"
@@ -73,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     for ieee in (0, 1):
         for dx10 in (0, 1):
             case = root / f"flags-i{ieee}-d{dx10}.prfc"
-            wire = case.read_bytes()
+            wire = as_v5(case.read_bytes())
             assert wire[-20:-17] == bytes((1, ieee, dx10)) and wire[-17:-12] == bytes(5)
             for mode in ("--baseline", "--candidate"):
                 report = run(replay, mode, str(case))
@@ -84,7 +99,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     for value in (0,1<<29,(1<<29)|(1<<22)):
         case=root/f"raw-launch-{value}.prfc"
         output=root/f"raw-launch-{value}.spv"
-        wire=case.read_bytes()
+        wire=as_v5(case.read_bytes())
         assert wire[-20:-17]==bytes(3) and wire[-17]==1
         assert int.from_bytes(wire[-16:-12],"little")==value
         for mode in ("--baseline","--candidate"):
@@ -97,7 +112,11 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     assert "BASELINE MATCH REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     saved = root / "preserved.spv"
     saved.write_bytes(b"previous-output")
-    current = bytearray((root / "transport-unknown.prfc").read_bytes())
+    current = bytearray(as_v5((root / "transport-unknown.prfc").read_bytes()))
+    schema5_case = root / "official-schema5.prfc"
+    schema5_case.write_bytes(bytes(current))
+    report = run(replay, "--baseline", str(schema5_case))
+    assert "input=COMPLETE" in report and "export_formats=0/0/0" in report and "BASELINE MATCH PRODUCED" in report
     official4 = bytearray(current)
     del official4[-12:-8]
     official4[8:12] = (4).to_bytes(4,"little")

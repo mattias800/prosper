@@ -1,0 +1,73 @@
+# console-oracle golden v1
+# source: kernel.cases.tsv
+# captured: 2026-10-08
+# columns: id	lib	func	args	expect	status	ret	retn	buffers...
+kernel_tsc_frequency	libkernel.sprx	sceKernelGetTscFrequency	-	r64,none	ok	0x0000000000000000	-
+kernel_counter_frequency	libkernel.sprx	sceKernelGetProcessTimeCounterFrequency	-	r64,none	ok	0x0000000000000000	-
+sema_create	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema,i:0,i:2,i:3,null	ret	ok	0x0000000000000000	-	a0=volatile
+sema_poll_one	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:1		ok	0x0000000000000000	-
+sema_poll_two_while_one_left	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:2		ok	0x0000000080020010	-
+sema_poll_zero	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:0		ok	0x0000000080020016	-
+sema_poll_more_than_max	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:100		ok	0x0000000080020016	-
+sema_signal_past_max	libkernel.sprx	sceKernelSignalSema	use:sema_create.0.0.8,i:5		ok	0x0000000080020016	-
+sema_signal_one	libkernel.sprx	sceKernelSignalSema	use:sema_create.0.0.8,i:1		ok	0x0000000000000000	-
+sema_signal_zero	libkernel.sprx	sceKernelSignalSema	use:sema_create.0.0.8,i:0		ok	0x0000000080020016	-
+sema_poll_two_now_ok	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:2		ok	0x0000000000000000	-
+sema_delete	libkernel.sprx	sceKernelDeleteSema	use:sema_create.0.0.8		ok	0x0000000000000000	-
+sema_poll_deleted	libkernel.sprx	sceKernelPollSema	use:sema_create.0.0.8,i:1		ok	0x0000000080020003	-
+sema_signal_deleted	libkernel.sprx	sceKernelSignalSema	use:sema_create.0.0.8,i:1		ok	0x0000000080020003	-
+sema_delete_twice	libkernel.sprx	sceKernelDeleteSema	use:sema_create.0.0.8		ok	0x0000000080020003	-
+sema_create_initial_over_max	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema_bad,i:0,i:5,i:3,null	ret	ok	0x0000000080020016	-	a0=volatile
+sema_create_max_zero	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema_bad,i:0,i:0,i:0,null	ret	ok	0x0000000080020016	-	a0=volatile
+sema_create_negative_initial	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema_bad,i:0,i:-1,i:3,null	ret	ok	0x0000000080020016	-	a0=volatile
+sema_create_null_name	libkernel.sprx	sceKernelCreateSema	out:8,null,i:0,i:0,i:1,null	ret	ok	0x0000000080020016	-	a0=volatile
+mutex_init	libkernel.sprx	scePthreadMutexInit	out:8,null,s:oracle_mutex	ret	ok	0x0000000000000000	-	a0=volatile
+mutex_lock	libkernel.sprx	scePthreadMutexLock	ref:mutex_init.0		ok	0x0000000000000000	-
+mutex_trylock_while_held	libkernel.sprx	scePthreadMutexTrylock	ref:mutex_init.0		ok	0x0000000080020010	-
+mutex_unlock	libkernel.sprx	scePthreadMutexUnlock	ref:mutex_init.0		ok	0x0000000000000000	-
+mutex_unlock_when_free	libkernel.sprx	scePthreadMutexUnlock	ref:mutex_init.0		ok	0x0000000080020001	-
+mutex_trylock_when_free	libkernel.sprx	scePthreadMutexTrylock	ref:mutex_init.0		ok	0x0000000000000000	-
+mutex_destroy_while_held	libkernel.sprx	scePthreadMutexDestroy	ref:mutex_init.0		ok	0x0000000080020010	-
+mutex_unlock_again	libkernel.sprx	scePthreadMutexUnlock	ref:mutex_init.0		ok	0x0000000000000000	-
+mutex_destroy	libkernel.sprx	scePthreadMutexDestroy	ref:mutex_init.0		ok	0x0000000000000000	-
+mutexattr_init	libkernel.sprx	scePthreadMutexattrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+mutexattr_settype_recursive	libkernel.sprx	scePthreadMutexattrSettype	ref:mutexattr_init.0,i:2		ok	0x0000000000000000	-
+mutexattr_settype_invalid	libkernel.sprx	scePthreadMutexattrSettype	ref:mutexattr_init.0,i:99		ok	0x0000000080020016	-
+mutexattr_settype_recursive_again	libkernel.sprx	scePthreadMutexattrSettype	ref:mutexattr_init.0,i:2		ok	0x0000000000000000	-
+recursive_init	libkernel.sprx	scePthreadMutexInit	out:8,ref:mutexattr_init.0,s:oracle_recursive	ret	ok	0x0000000000000000	-	a0=volatile
+recursive_lock_1	libkernel.sprx	scePthreadMutexLock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_lock_2	libkernel.sprx	scePthreadMutexLock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_trylock	libkernel.sprx	scePthreadMutexTrylock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_unlock_1	libkernel.sprx	scePthreadMutexUnlock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_unlock_2	libkernel.sprx	scePthreadMutexUnlock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_unlock_3	libkernel.sprx	scePthreadMutexUnlock	ref:recursive_init.0		ok	0x0000000000000000	-
+recursive_unlock_4_too_many	libkernel.sprx	scePthreadMutexUnlock	ref:recursive_init.0		ok	0x0000000080020001	-
+recursive_destroy	libkernel.sprx	scePthreadMutexDestroy	ref:recursive_init.0		ok	0x0000000000000000	-
+mutexattr_destroy	libkernel.sprx	scePthreadMutexattrDestroy	ref:mutexattr_init.0		ok	0x0000000000000000	-
+errcheck_attr_init	libkernel.sprx	scePthreadMutexattrInit	out:8	ret	ok	0x0000000000000000	-	a0=volatile
+errcheck_attr_settype	libkernel.sprx	scePthreadMutexattrSettype	ref:errcheck_attr_init.0,i:1		ok	0x0000000000000000	-
+errcheck_init	libkernel.sprx	scePthreadMutexInit	out:8,ref:errcheck_attr_init.0,s:oracle_errcheck	ret	ok	0x0000000000000000	-	a0=volatile
+errcheck_lock	libkernel.sprx	scePthreadMutexLock	ref:errcheck_init.0		ok	0x0000000000000000	-
+errcheck_lock_again	libkernel.sprx	scePthreadMutexLock	ref:errcheck_init.0		ok	0x000000008002000b	-
+errcheck_unlock	libkernel.sprx	scePthreadMutexUnlock	ref:errcheck_init.0		ok	0x0000000000000000	-
+errcheck_unlock_again	libkernel.sprx	scePthreadMutexUnlock	ref:errcheck_init.0		ok	0x0000000080020001	-
+errcheck_destroy	libkernel.sprx	scePthreadMutexDestroy	ref:errcheck_init.0		ok	0x0000000000000000	-
+errcheck_attr_destroy	libkernel.sprx	scePthreadMutexattrDestroy	ref:errcheck_attr_init.0		ok	0x0000000000000000	-
+sema2_create	libkernel.sprx	sceKernelCreateSema	out:8,s:oracle_sema2,i:0,i:2,i:3,null	ret	ok	0x0000000000000000	-	a0=volatile
+sema2_signal_two_over_by_sum	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:2		ok	0x0000000080020016	-
+sema2_signal_one_reaches_max	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:1		ok	0x0000000000000000	-
+sema2_signal_one_past_max	libkernel.sprx	sceKernelSignalSema	use:sema2_create.0.0.8,i:1		ok	0x0000000080020016	-
+sema2_delete	libkernel.sprx	sceKernelDeleteSema	use:sema2_create.0.0.8		ok	0x0000000000000000	-
+pm_init	libkernel.sprx	pthread_mutex_init	out:8,null	ret	ok	0x0000000000000000	-	a0=volatile
+pm_lock	libkernel.sprx	pthread_mutex_lock	ref:pm_init.0		ok	0x0000000000000000	-
+pm_destroy_while_held	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0		ok	0x0000000000000010	-
+pm_unlock	libkernel.sprx	pthread_mutex_unlock	ref:pm_init.0		ok	0x0000000000000000	-
+pm_destroy	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0		ok	0x0000000000000000	-
+pm_destroy_again	libkernel.sprx	pthread_mutex_destroy	ref:pm_init.0		ok	0x0000000000000016	-
+cond_init	libkernel.sprx	scePthreadCondInit	out:8,null,s:oracle_cond	ret	ok	0x0000000000000000	-	a0=volatile
+cond_destroy	libkernel.sprx	scePthreadCondDestroy	ref:cond_init.0		ok	0x0000000000000000	-
+cond_destroy_again	libkernel.sprx	scePthreadCondDestroy	ref:cond_init.0		ok	0x0000000080020016	-
+barrier_init	libkernel.sprx	scePthreadBarrierInit	out:8,null,i:1,s:oracle_barrier	ret	ok	0x0000000000000000	-	a0=volatile
+barrier_destroy	libkernel.sprx	scePthreadBarrierDestroy	ref:barrier_init.0		ok	0x0000000000000000	-
+barrier_destroy_again	libkernel.sprx	scePthreadBarrierDestroy	ref:barrier_init.0		ok	0x0000000080020016	-
+barrier_init_count_zero	libkernel.sprx	scePthreadBarrierInit	out:8,null,i:0,s:oracle_barrier_bad		ok	0x0000000080020016	-	a0=abababababababab

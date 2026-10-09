@@ -11,6 +11,8 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
+#include "gpu/recompiler/rdna2_exec_skip_region.hpp"
+#include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
@@ -643,11 +645,6 @@ int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint3
     return -1;
 }
 
-namespace {
-
-
-} // namespace
-
 // True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
 // buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
 // a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
@@ -733,39 +730,6 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
     }
     return bound;
 }
-
-namespace {
-
-// #3231 — is the CFG region's ENTRY-BLOCK VCC value dead?
-//
-// The dispatcher stores one value into `vcc_var` before its loop, then dispatches block 0 first,
-// exactly once, with every invocation active (`selector = active ? pc : UINT32_MAX`, and
-// `active_var` is seeded true when the caller has no partial-workgroup extent). So that stored
-// value is observable only until block 0 overwrites it: if block 0 DEFINES the complete VCC pair
-// before any instruction in it can read VCC, nothing anywhere in the region can see the entry
-// value, and persisting `false` for it invents nothing. Block 0's own `save_state` publishes the
-// real definition before the iteration's common phases run, so the two direct `vcc_var` readers
-// (portable readlane into 106, and the vote-to-VCC merge) see it too.
-//
-// This is deliberately narrow, because the failure the caller's gate prevents is silent-wrong
-// rather than a crash. What it does NOT admit:
-//   * anything but a `v_cmp_*` (VOPC, never `v_cmpx_*`) whose destination is the VCC pair. That is
-//     the one encoding that defines both words for every lane in a single instruction, and it is
-//     the form the live evidence uses. A VOP3B carry-out into VCC, a 64-bit scalar write of the
-//     pair, and `v_cmpx_*`'s EXEC write are all left rejected.
-//   * a b32 write of vcc_lo or vcc_hi alone — half the pair would still carry the entry value, so
-//     the scan stops there rather than continuing to a later full define.
-//   * an entry block that reads VCC first, in ANY form. "Reads" is over-approximated: the implicit
-//     consumers this file already enumerates for the mask-domain analyses, plus any operand that
-//     can name a word of the pair — including a wide scalar read rooted low enough to reach s106.
-//     An operand the decoder left stale is read too (all four source slots, not `n_src`), because
-//     over-reading only ever moves the answer to "not dead".
-//
-// `lo`/`hi` are the entry block's half-open pc range as the dispatcher itself partitions it
-// (`starts[0]` and `starts[1]`), so a block split by a branch target, or by one of the synchronized
-// cross-lane events that each get their own block, shortens the window rather than widening it.
-
-}  // namespace
 
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
@@ -1006,7 +970,7 @@ bool emit_cfg_state_machine(
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
         return b.is_compute &&
                (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
-                (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
+                (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -1190,6 +1154,7 @@ bool emit_cfg_state_machine(
     std::unordered_map<uint32_t, uint32_t> compute_dpp_row_shr_event_for_pc;
     std::set<int> compute_dpp_row_shr_dsts;
     bool has_compute_dpp_row_maximum = false;
+    bool has_compute_dpp_row_or = false;
     std::unordered_set<uint32_t> compute_dpp_row_ror8_pcs;
     std::unordered_map<uint32_t, uint32_t> compute_dpp_ror8_event_for_pc;
     std::set<int> compute_dpp_row_ror8_dsts;
@@ -1265,6 +1230,7 @@ bool emit_cfg_state_machine(
         }
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
+            has_compute_dpp_row_or |= is_vor_b32_dpp_row_shr_bounded(in);
             compute_dpp_row_shr_pcs.insert(in.pc);
             compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
@@ -1629,7 +1595,14 @@ bool emit_cfg_state_machine(
     // -- "over-rejects rather than fabricates ... left as the safe direction" -- and without a KILL
     // this dispatcher path now agrees with the emitter instead of being more permissive than it.
     // A precise KILL wants a value-publishing predicate shared with `emit_alu`, so that the two
-    // cannot drift; that is follow-up work, not a thing to approximate here.
+    // cannot drift. For Wave64 that predicate is the MUST set `wave64_scalar_word_in`, applied in
+    // `load_state` (#4706); Wave32 and the terminal call keep this MAY set unchanged. Where a token
+    // STARTS agrees too: the analysis's `m0_token_save` needs `!scalar_words.contains(124)`,
+    // emit_alu's needs `!rs.sreg.contains(124)`, and at each block entry `load_state` makes
+    // `state.sreg` (words <= 124) equal to the MUST set. Counting a word as data where the emitter
+    // has none would reload a fabricated zero for ANY register, an invariant the dispatcher already
+    // rests on; the converse starts a token only in the analysis, so the KILL does not fire and the
+    // read rejects (the safe side).
     //
     // BOTH BOUNDS ARE SCOPED TO ONE DISPATCHER REGION, and `emit_body` runs several: a
     // barrier-phased compute kernel calls this function once per phase with the SAME `RegState&`
@@ -3313,6 +3286,9 @@ bool emit_cfg_state_machine(
         has_portable_compute_dpp_row_shr && has_compute_dpp_row_maximum
             ? b.function_var(b.t_bool, ptr_bool)
             : 0;
+    const uint32_t dpp_shr_or_var = has_portable_compute_dpp_row_shr && has_compute_dpp_row_or
+                                        ? b.function_var(b.t_bool, ptr_bool)
+                                        : 0;
     const uint32_t dpp_ror8_pending_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_bool, ptr_bool) : 0;
     const uint32_t dpp_ror8_active_var = has_portable_compute_dpp_ror8
@@ -3497,6 +3473,7 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_shr_dst_var, zero);
         b.store_function(dpp_shr_event_var, zero);
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
+        if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_src0_var, zero);
@@ -3579,7 +3556,17 @@ bool emit_cfg_state_machine(
             entry_block != UINT32_MAX && entry_m0_reachable[entry_block];
         const std::set<int>& entry_m0_here =
             narrow ? entry_m0_in[entry_block] : entry_m0_may_hold;
+        // The Wave64 MUST scalar-word set is this MAY set's KILL (#4706): a word in it had a value-
+        // publishing write after the last save on every path here (a save of a value-less M0 drops
+        // the word from it), the same tag the filter below trusts for every reloaded scalar. Kena's
+        // compute `0x5008dc0000` saves M0 into s14 at pc85, reuses s14 as a loop counter, and was
+        // refused at pc491 without it.
+        const std::set<int>* m0_kill_words = nullptr;
+        if (narrow && (b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+            wave64_b64_reachable[entry_block])
+            m0_kill_words = &wave64_scalar_word_in[entry_block];
         for (int reg : entry_m0_here) {
+            if (m0_kill_words && m0_kill_words->contains(reg)) continue;
             state.sreg.erase(reg);
             state.sreg_entry_m0.insert(reg);
         }
@@ -3649,10 +3636,14 @@ bool emit_cfg_state_machine(
             return found != entry_slots->end() &&
                    (mask ? is_mask_domain(found->second) : found->second == SpillSlotDomain::Data);
         };
+        // A data slot carries no definite-write fact across a case edge, and one never written on
+        // some path reloads the prologue's zero: mark every reloaded slot (#4706, #4725 review).
         for (const auto& kv : lv)
-            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true)))
+            if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
+                state.lane_slot_merge_placeholder.insert(kv.first);
+            }
         for (const auto& kv : lmv)
             if (!(lv.contains(kv.first) && slot_holds(kv.first, /*mask*/ false)))
                 state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
@@ -3711,6 +3702,14 @@ bool emit_cfg_state_machine(
                 for (int word : *entry_wave64_scalar_words)
                     if (state.sreg.contains(word))
                         state.terminal_wave64_scalar_words.insert(word);
+        } else if (filters_wave64_b64) {
+            // An entry block the MUST walk never reached (only edges it does not model lead there:
+            // s_trap, proven_exit_target) gets no filtering above, so no reloaded word is proven.
+            // Mark them all, and SCC, so the fragment projection refuses in such a case (#4725).
+            for (const auto* words : {&state.sreg, &state.sreg_input})
+                for (const auto& kv : *words)
+                    if (kv.first <= 124) state.sreg_merge_placeholder.insert(kv.first);
+            state.scc_merge_placeholder = true;
         }
         if (entry_b32) {
             for (int reg : *entry_b32) {
@@ -3854,6 +3853,7 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_shr_active_var, no);
         b.store_function(dpp_shr_event_var, zero);
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
+        if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_pending_var, no);
@@ -4690,7 +4690,8 @@ bool emit_cfg_state_machine(
                 return reject_cfg(dpp_row_shr->pc, "dpp-add-row-shr-event");
             const int dst = dpp_row_shr->dst.value;
             const bool maximum = is_inplace_vmax_u32_dpp_row_shr(*dpp_row_shr);
-            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr);
+            const bool bitwise_or = is_vor_b32_dpp_row_shr_bounded(*dpp_row_shr);
+            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr) || bitwise_or;
             const auto source = state.vreg.find(bounded ? dpp_row_shr->src[0].value : dst);
             uint32_t source_value = source == state.vreg.end() ? zero : source->second;
             if (maximum) {
@@ -4722,7 +4723,7 @@ bool emit_cfg_state_machine(
                 // the ordinary unbounded path retains its existing validity rule.
                 const uint32_t result =
                     maximum ? b.uext2(Glsl_UMax, source_value, shifted)
-                            : b.ibin(Op_IAdd, source_value,
+                            : b.ibin(bitwise_or ? Op_BitwiseOr : Op_IAdd, source_value,
                                      bounded ? b.sel(valid_source, shifted, zero) : shifted);
                 state.vreg[dst] = b.sel(
                     bounded ? state.exec : b.land(state.exec, valid_source),
@@ -4739,6 +4740,7 @@ bool emit_cfg_state_machine(
                 b.store_function(dpp_shr_dst_var, b.uconst(static_cast<uint32_t>(dst)));
                 b.store_function(dpp_shr_event_var, b.uconst(event->second));
                 if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, maximum ? yes : no);
+                if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, bitwise_or ? yes : no);
             }
         }
         if (dpp_row_ror8) {
@@ -5554,7 +5556,7 @@ bool emit_cfg_state_machine(
         !emit_portable_compute_dpp_row_shr_phase(
             b,
             {dpp_shr_pending_var, dpp_shr_active_var, dpp_shr_source_var, dpp_shr_amount_var,
-             dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var},
+             dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var, dpp_shr_or_var},
             dpp_value_base, dpp_metadata_base, compute_dpp_row_shr_dsts, vv, lv, lmv))
         return reject_cfg(0, "missing-dpp-row-shr-dst");
 
@@ -6180,7 +6182,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               (b.ngg_workgroup_shell && is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
+                               (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
@@ -6587,6 +6589,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 ++idx; // consume the then arm's jump to the merge
             }
             const uint32_t then_block = b.cur_block;
+            const LaneSlotEdge then_slots = LaneSlotEdge::of(rs, then_block);
             std::unordered_map<int, uint32_t> then_v, then_s;
             for (int reg : written_v) then_v[reg] = vget(reg);
             for (int reg : written_s) then_s[reg] = sget(reg);
@@ -6596,6 +6599,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::set<int> then_entry_m0;
             for (int reg : written_s)
                 if (entry_m0_live(rs, reg)) then_entry_m0.insert(reg);
+            const MergeEdgeMarks then_marks = merge_edge_marks(rs, written_s);   // #4706
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
@@ -6618,12 +6622,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
             for (int reg : written_s) {
                 const uint32_t else_value = sget(reg);
+                join_merge_edge(rs, reg, then_marks);
                 // `rs` is the else edge here; skip the phi entirely when the token decides (#3133).
                 if (!join_entry_m0(rs, reg, then_entry_m0.count(reg) != 0)) continue;
                 if (then_s[reg] != else_value)
                     rs.sreg[reg] = b.emit_phi_2way(
                         b.t_u32, then_s[reg], then_block, else_value, else_block);
             }
+            join_merge_scc_and_slots(rs, then_marks);   // #4706, before SCC becomes the phi
             if (then_scc != rs.scc)
                 // A poisoned (0) input degrades to bfalse across the merge — no invalid SPIR-V and
                 // no stricter rejection than the pre-poison behavior; straight-line consumers of a
@@ -6635,6 +6641,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.t_bool, then_vcc, then_block, rs.vcc, else_block);
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
+            join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, else_block), F.branch_pc);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
             rs.sreg_written.insert(then_written.begin(), then_written.end());
             for (int reg : then_written) rs.sreg_input.erase(reg);
@@ -6713,6 +6720,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+        mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -6723,6 +6731,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             rs.exec = ph;
             phis.push_back({0, 4, ph, p});
         }
+        // V_WRITELANE spill slots are loop-carried state too (Kena 0x5007ad0000 keeps its loop
+        // counter in v20 lane 40; without these phis the exit test read the preheader value).
+        LaneSlotLoopCarry lane_slots;
+        lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
         // The header executes again after the back-edge. A direct/SRT descriptor overwritten
         // anywhere in the loop is therefore not an invariant entry descriptor at header compile
         // time. An exact descriptor load in the header may establish fresh provenance afterward.
@@ -6739,6 +6751,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
         for (int r : conds) conds_val[r] = sget(r);
+        const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
+        lane_slots.record_check(rs);
         const uint32_t cond_exec = rs.exec;
         const bool cond_exec_narrowed = rs.exec_narrowed;
         // VCC as the exit sees it (#4680). The merge's ONLY predecessor is this check block, so its
@@ -6779,6 +6793,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 nv = b.bfalse(); // poisoned SCC back-edge value: false when dead in practice
             b.patch_phi(pr.patch, nv, cont);
         }
+        if (!lane_slots.patch_backedge(b, rs, cont)) return false;
         b.emit_branch(hdr);
         // 6. Merge (loop exit): a condition-region reg keeps its exit-iteration (%check) value; a body-only
         //    reg (and scc) takes the header phi (its value when the loop exited). VCC takes the check
@@ -6788,19 +6803,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (auto& pr : phis) {
             if (pr.dom == 0)
                 rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
-            else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+            else if (pr.dom == 1) {
+                mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks, false);
+                rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+            }
             // SCC takes the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
             // not a real codegen pattern (flags are transient, consumed by their branch), so the A-class
             // exit-iteration refinement is intentionally omitted for it.
-            else if (pr.dom == 2) rs.scc = pr.phi;
+            else if (pr.dom == 2)
+                rs.scc = pr.phi;
             else if (pr.dom == 3)
                 rs.vcc = cond_vcc;
             else                  rs.exec = cond_exec;
         }
+        // The merge's only predecessor is the check block: each slot keeps the value it had there.
+        if (!lane_slots.finish_exit(b, rs, /*body_edge*/ false, 0, 0)) return false;
         // A VCC half the check block overwrote with a mask holds that mask's dword on exit, not the
         // body scratch its header phi carries; leave it untracked so a data read takes the exact
         // ballot or refuses loudly (#4680, the counted-loop form of #4526).
         cond_vcc_halves.finish_exit(rs);
+        mark_loop_exit_slots(rs, check_marks);   // #4706
         if (carry_vertex_exec) rs.exec_narrowed = cond_exec_narrowed;
         // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
@@ -7343,6 +7365,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+            mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc);   // #4706
             // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
             // practice — the loop shapes re-produce SCC before any read).
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -7352,6 +7375,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
+            LaneSlotLoopCarry lane_slots;   // V_WRITELANE spill slots, as in the counted loop
+            lane_slots.open(b, rs, ins, L.header_pc, L.backedge_pc, preheader);
             invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             // See the sibling loop above: the zero-trip path carries these aliases, not the body's.
             const auto loop_entry_ud_alias = rs.sreg_ud_alias;
@@ -7379,8 +7404,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::unordered_map<int, uint32_t> condv_val, conds_val;
             for (int r : condv) condv_val[r] = vget(r);
             for (int r : conds) conds_val[r] = sget(r);
+            const LoopCheckMarks check_marks = loop_check_marks(rs);   // #4706
             const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
             const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
+            lane_slots.record_check(rs);
             LoopVccCarry vcc_carry(rs);   // #4508: a body may recycle VCC as scalar scratch
             uint32_t loop_cond = L.condition == DivLoop::Condition::Exec ? rs.exec
                                : L.condition == DivLoop::Condition::Vcc ? rs.vcc : rs.scc;
@@ -7438,6 +7465,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
             }
+            if (!lane_slots.patch_backedge(b, rs, cont)) return false;
             b.emit_branch(hdr);
             b.emit_label(merge);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
@@ -7462,13 +7490,21 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                       chk_value, chk_end, body_value, body_end)
                     : chk_value;
                 if (pr.dom == 0)      rs.vreg[pr.reg] = merged;
-                else if (pr.dom == 1) rs.sreg[pr.reg] = merged;
-                else if (pr.dom == 2) rs.scc = merged;
+                else if (pr.dom == 1) {
+                    mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks,
+                                   L.direct_exec_breaks || L.direct_wave_breaks);   // #4706
+                    rs.sreg[pr.reg] = merged;
+                } else if (pr.dom == 2)
+                    rs.scc = merged;
                 else if (pr.dom == 3) rs.vcc = merged;
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
+            if (!lane_slots.finish_exit(b, rs, L.direct_exec_breaks || L.direct_wave_breaks,
+                                        chk_end, body_end))
+                return false;
             vcc_carry.finish_exit(rs);
+            mark_loop_exit_slots(rs, check_marks);   // #4706
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
                 if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
@@ -7535,6 +7571,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                          !(F.on_vcc && rs.vcc == rs.vcc_wave_uniform &&
                            vcc_exit_is_wave_uniform(ins, F.branch_pc)))
                     cond_reg = b.fragment_wave_any(cond_reg);
+                // ADR 0028 route 2: tell lower_fragment_votes that the GUEST region this execz skips
+                // holds no scalar, memory, wave-level or exit effect -- facts the SPIR-V cannot
+                // carry. Only the forward execz one-arm form; the vote just taken is its sole user.
+                if (b.is_fragment && F.on_exec && F.on_scc0 && !F.has_else && cond_reg != rs.exec &&
+                    classify_exec_skip_region(ins, F.branch_pc, F.target_pc).clean())
+                    b.fragment_exec_skip_votes.push_back(cond_reg);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&
                     active_direct_wave_loop->direct_wave_breaks && F.on_vcc &&
@@ -7545,6 +7587,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         b.land(*active_direct_wave_continue, exec_cond);
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {
+                    const LaneSlotEdge pre_slots = LaneSlotEdge::of(rs, preblock);   // skipped edge
                     std::set<int> ifv, ifs;
                     loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
                     omit_promoted_scalar_phis(ifs);
@@ -7556,6 +7599,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> pre_entry_m0;
                     for (int r : ifs)
                         if (entry_m0_live(rs, r)) pre_entry_m0.insert(r);
+                    const MergeEdgeMarks pre_marks = merge_edge_marks(rs, ifs);   // #4706
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
@@ -7597,9 +7641,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
                     for (int r : ifs) {   // `rs` is the taken arm; the skipped edge is `pre_*`
+                        join_merge_edge(rs, r, pre_marks);
                         if (!join_entry_m0(rs, r, pre_entry_m0.count(r) != 0)) continue;   // #3133
                         rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
                     }
+                    join_merge_scc_and_slots(rs, pre_marks);   // #4706
                     if (then_scc != pre_scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, pre_scc ? pre_scc : b.bfalse(), preblock,
                                                  then_scc ? then_scc : b.bfalse(), thenEnd);
@@ -7620,6 +7666,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
                         }
                     }
+                    join_lane_slots(b, rs, pre_slots, LaneSlotEdge::of(rs, thenEnd), F.branch_pc);
                     // A differing physical-word domain needs no validity phi when that word is
                     // provably overwritten before every post-merge read. Drop its stale typed view
                     // on both synthesized paths; the later defining instruction recreates the
@@ -7665,12 +7712,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> then_entry_m0;                 // #3133, the then edge's tokens
                     for (int r : ws)
                         if (entry_m0_live(rs, r)) then_entry_m0.insert(r);
+                    const MergeEdgeMarks then_marks = merge_edge_marks(rs, ws);   // #4706
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
                     const auto then_bool_b32 = rs.sreg_bool_b32;
                     const auto then_written = rs.sreg_written;
                     const auto then_ud_alias = rs.sreg_ud_alias;   // the then edge's alias claims
+                    const LaneSlotEdge then_slots = LaneSlotEdge::of(rs, thenEnd);
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
                     b.emit_label(elseL);
@@ -7680,9 +7729,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     for (int r : wv) { uint32_t ev = vget(r);
                         if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
                     for (int r : ws) { uint32_t es = sget(r);
+                        join_merge_edge(rs, r, then_marks);
                         // `rs` is the else edge here (the then arm's state was rolled back).
                         if (!join_entry_m0(rs, r, then_entry_m0.count(r) != 0)) continue;   // #3133
                         if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
+                    join_merge_scc_and_slots(rs, then_marks);   // #4706
                     if (then_scc != rs.scc)   // poisoned (0) inputs degrade to bfalse across the merge
                         rs.scc = b.emit_phi_2way(b.t_bool, then_scc ? then_scc : b.bfalse(), thenEnd,
                                                  rs.scc ? rs.scc : b.bfalse(), elseEnd);
@@ -7715,6 +7766,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : b.emit_phi_2way(b.t_bool, tv, thenEnd, ev, elseEnd);
                         if (tv != ev) rs.sreg_bool_narrowed[key] = true;
                     }
+                    join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, elseEnd), F.branch_pc);
                     lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)
                 }
             }

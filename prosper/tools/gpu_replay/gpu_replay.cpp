@@ -719,6 +719,19 @@ void print_frame_summary(const prosper::gpu::GpuReplayFrame& replay, size_t shad
         shader_count, replay.failure_diagnostics.size(), replay.raw_shader_versions.size(),
         replay.blobs.size(), replay.rtt_seeds.size(), replay.ds_seeds.size(),
         replay.expected_output_valid ? "yes" : "no", metadata_only ? "omitted" : "present");
+    // #3807: placeholders are part of the frame, not gaps; say how many so a reader does not go
+    // looking for bytes that never existed.
+    size_t unmapped_sources = 0;
+    for (const auto& item : replay.items)
+        for (const auto* table : {item.vrt.get(), item.prt.get()})
+            if (table)
+                for (const auto& resource : table->resources)
+                    unmapped_sources += resource.replay_source_unavailable ? 1u : 0u;
+    if (unmapped_sources)
+        std::fprintf(stderr,
+                     "[gpureplay] %zu draw binding(s) had no mapped source live; replay binds the "
+                     "same all-zero fallback (capture v74 placeholders, #3807)\n",
+                     unmapped_sources);
     const auto history_lower_bound =
         std::find_if(m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
             return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT";
@@ -1398,8 +1411,7 @@ BundleDsIdentity ds_identity(const prosper::gpu::ResolvedPipelineState& ps) {
 }
 
 bool uses_depth_stencil(const prosper::gpu::ResolvedPipelineState& ps) {
-    return ps.depth_test_enable || ps.depth_write_enable || ps.stencil_enable ||
-           ps.depth_clear_enable || ps.stencil_clear_enable;
+    return prosper::gpu::uses_depth_stencil_attachment(ps);
 }
 
 struct BundleDsProgramming {
@@ -3398,10 +3410,12 @@ int main(int argc, char** argv) {
                     const auto fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
                         raw_fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
                     fs = prosper::gpu::recompile_fragment(
-                        raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
-                        UINT32_MAX, &interpolation, fragment_wave.wave32(),
-                        {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
-                        it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
+                        raw.words.data(), raw.words.size(), it.prt.get(), system_inputs, UINT32_MAX,
+                        &interpolation, fragment_wave.wave32(),
+                        {prosper::gpu::RecompileDiagnosticStage::Fragment, 0}, it.ps_float_mode,
+                        nullptr, it.float_transport, it.ps_float_flags,
+                        // #4703: the captured col_format and target classes, exactly as live.
+                        prosper::gpu::fragment_export_formats(it.ps));
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(
@@ -3608,13 +3622,12 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(),
                     it.has_system_inputs ? &it.system_inputs : nullptr,
                     it.has_pixel_inputs ? &it.pixel_inputs : nullptr);
-                auto fs = prosper::gpu::recompile_fragment(raw.words.data(), raw.words.size(),
-                                                           it.prt.get(),
-                                                           it.has_system_inputs ? &it.system_inputs : nullptr,
-                                                           UINT32_MAX, &interpolation,
-                                                           fragment_wave.wave32(),
-                                                           {prosper::gpu::RecompileDiagnosticStage::Fragment,
-                                                            0}, it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
+                auto fs = prosper::gpu::recompile_fragment(
+                    raw.words.data(), raw.words.size(), it.prt.get(),
+                    it.has_system_inputs ? &it.system_inputs : nullptr, UINT32_MAX, &interpolation,
+                    fragment_wave.wave32(), {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
+                    it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags,
+                    prosper::gpu::fragment_export_formats(it.ps));
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -3779,7 +3792,10 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(r.gpu_addr),
                         static_cast<unsigned long long>(r.size),
                         static_cast<unsigned long long>(r.host_data ? r.host_data_size : 0),
-                        r.host_data ? "" : "  <- no captured bytes");
+                        r.host_data ? ""
+                        : r.replay_source_unavailable
+                            ? "  <- source unmapped live: all-zero fallback, no bytes by design"
+                            : "  <- no captured bytes");
         }
         if (positional.size() == 1 && !inspect && dump_spec.empty()) return 0;
     }
@@ -3821,6 +3837,15 @@ int main(int argc, char** argv) {
                          "gpu_replay: draw %llu stage %s has no binding %d. Present: %s\n",
                          draw_index, stage.c_str(), binding,
                          present.empty() ? "(none)" : present.c_str());
+            return 2;
+        }
+        if (!found->host_data && found->replay_source_unavailable) {
+            // #3807: not a gap. The live renderer found nothing mapped there and bound zeros.
+            std::fprintf(stderr,
+                         "gpu_replay: draw %llu stage %s binding %d had no mapped source live; the "
+                         "renderer bound its all-zero fallback and the capture recorded that, so "
+                         "there are no bytes to dump\n",
+                         draw_index, stage.c_str(), binding);
             return 2;
         }
         if (!found->host_data) {
@@ -4153,12 +4178,20 @@ int main(int argc, char** argv) {
                     failure.ps_launch_rsrc1, "failure", static_cast<uint64_t>(failure_index), capture.format_version);
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
-                    raw.words.data(), raw.words.size(), resources,
-                    system_inputs, /*pcrel_dispatch_target=*/UINT32_MAX,
+                    raw.words.data(), raw.words.size(), resources, system_inputs,
+                    /*pcrel_dispatch_target=*/UINT32_MAX,
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
-                    failure.ps_float_mode, nullptr, failure.float_transport, failure.ps_float_flags);
+                    failure.ps_float_mode, nullptr, failure.float_transport, failure.ps_float_flags,
+                    // #4703: a failure record without its pipeline cannot name the targets, so
+                    // it retries with the historical f16/float module and says so.
+                    failure.pipeline_present
+                        ? prosper::gpu::fragment_export_formats(failure.pipeline)
+                        : prosper::gpu::FragmentExportFormats{});
+                if (!failure.pipeline_present)
+                    std::fprintf(stderr, "[retry-failed-stage] fragment-export-formats=unavailable "
+                                         "(no captured pipeline; f16 decode, float outputs)\n");
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

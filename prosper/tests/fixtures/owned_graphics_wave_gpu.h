@@ -262,9 +262,8 @@ inline bool materialize_owned_graphics_draw(const RenderVkCtx& ctx, BackendDraw&
     }
     if (owner->fragment_pending) {
         if (!draw.ps || !owner->fragment_raster_inputs || !owner->fragment_code ||
-            owner->fragment_code->empty() || draw.ps->depth_test_enable ||
-            draw.ps->depth_write_enable || draw.ps->stencil_enable || draw.ps->depth_clear_enable ||
-            draw.ps->stencil_clear_enable)
+            owner->fragment_code->empty() ||
+            prosper::gpu::uses_depth_stencil_attachment(*draw.ps))
             return reject("graphics-wave-live-predepth-domain-unavailable");
         auto inputs = std::make_shared<RasterQuadInputs>(*owner->fragment_raster_inputs);
         inputs->source_vs = std::make_shared<const std::vector<uint32_t>>(draw.vs_words());

@@ -1,0 +1,709 @@
+// An indexed merged-NGG draw through realize_draw_item (#3135 P6, #4733 review). The other P6 tests
+// drive the planner, the decode, admission and the backend directly; this one drives the block in
+// gpu_execute.hpp that joins them, which no live run has reached yet (both of Kena's indexed producers
+// are still refused further down).
+//
+// The chain is synthetic and small: an ES fetch prolog that only transfers through s[6:7], and a
+// merged main that requests GS_ALLOC_REQ, reads a constant buffer through the user-data V# at
+// s[8:11] (so the linked fold publishes a table), uses the general SGPR-mask v_mbcnt (fail-closed in
+// a vertex stage, so the per-vertex compile refuses and the NGG path is the one tried), and exports
+// PRIM, POS0 and PARAM0 = (VertexID, InstanceID, cbuf, ...). Nothing renders: the assertions are on
+// the DrawItem realization hands the backend.
+//
+// Also here, because the merged-NGG fetch and the ordinary fetch share it: the index-source rule's
+// DrawIndexOffset branch, the only one where the 2- and 4-byte addresses differ.
+#include "gpu/execute/gpu_execute.hpp"
+
+#include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/execute/ngg_draw_admission.hpp"
+#include "gpu/execute/ngg_depth_slices.hpp"
+#include "gpu/execute/ngg_draw_indices.hpp"
+#include "gpu/execute/ngg_live_draw.hpp"
+#include "gpu/execute/ngg_subgroup_draw.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/ngg_raster_commit.hpp"
+#include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "hle/dispatch/dispatch.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <ios>
+#include <vector>
+
+using namespace prosper::gpu;
+namespace P = prosper::agc::Pm4;
+
+namespace {
+
+// s_mov_b32 s20, 0; s_setpc_b64 s[6:7]; s_code_end padding.
+alignas(256) const uint32_t kProlog[] = {0xbe940380u, 0xbe802006u, 0xbf9f0000u, 0xbf9f0000u};
+
+alignas(256) const uint32_t kMain[] = {
+    0xbefe04c1u,   // s_mov_b64 exec, -1
+    0x9394ff03u, 0x00040018u,   // s_bfe_u32 s20, s3, [27:24]: wave index
+    0xbf068014u,   // s_cmp_eq_u32 s20, 0
+    0xbf840002u,   // s_cbranch_scc0 +2
+    0xb07c2004u,   // s_movk_i32 m0, 0x2004: 4 vertices, 2 primitives
+    0xbf900009u,   // s_sendmsg GS_ALLOC_REQ
+    0xf4200544u, 0xfa000000u,   // s_buffer_load_dword s21, s[8:11], 0
+    0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+    0x7e140215u,   // v_mov_b32 v10, s21
+    0x7e120302u,   // v_mov_b32 v9, v2
+    0xbe9603c1u,   // s_mov_b32 s22, -1
+    0xd765000bu, 0x00010016u,   // v_mbcnt_lo_u32_b32 v11, s22, 0 (a general SGPR mask)
+    0xf8000941u, 0x00000009u,   // exp prim v9
+    0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
+    0xf800020fu, 0x030a0805u,   // exp param0 v5, v8, v10, v3
+    0xbf810000u,   // s_endpgm
+};
+
+// #3135: the same main, but it first reloads its user SGPRs from the GS user-data address, as
+// Kena's indexed producer 11562c72's main does: `s_load_dwordx8 s[8:15], s[0:1], 0` at entry.
+alignas(256) const uint32_t kMainReload[] = {
+    0xbefe04c1u,   // s_mov_b64 exec, -1
+    0xf4100200u, 0xfa000000u,   // s_load_dwordx8 s[8:15], s[0:1], 0
+    0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+    0x9394ff03u, 0x00040018u,   // s_bfe_u32 s20, s3, [27:24]: wave index
+    0xbf068014u,   // s_cmp_eq_u32 s20, 0
+    0xbf840002u,   // s_cbranch_scc0 +2
+    0xb07c2004u,   // s_movk_i32 m0, 0x2004
+    0xbf900009u,   // s_sendmsg GS_ALLOC_REQ
+    0xf4200544u, 0xfa000000u,   // s_buffer_load_dword s21, s[8:11], 0
+    0xbf8cc07fu,   // s_waitcnt lgkmcnt(0)
+    0x7e140215u,   // v_mov_b32 v10, s21
+    0x7e120302u,   // v_mov_b32 v9, v2
+    0xbe9603c1u,   // s_mov_b32 s22, -1
+    0xd765000bu, 0x00010016u,   // v_mbcnt_lo_u32_b32 v11, s22, 0 (a general SGPR mask)
+    0xf8000941u, 0x00000009u,   // exp prim v9
+    0xf80000cfu, 0x03020100u,   // exp pos0 v0..v3
+    0xf800020fu, 0x030a0805u,   // exp param0 v5, v8, v10, v3
+    0xbf810000u,   // s_endpgm
+};
+
+// #3135 P7: an NGG VS that is its own primitive shader (no GS, no fetch prolog), the launch Kena's
+// culling VS programs read: GS_ALLOC_REQ from s3's counts on wave 0; PRIM = the three ES slots from
+// v0/v1 (offsets scaled by ITEMSIZE 4) packed 9/10 bits apart; POS0 from VertexID (v5) bit 0 -> x,
+// bit 1 -> y, each -1 or +1; POS1.z = 0 (the layer, when read); PARAM0 = (0.25, 0.5, 0, 1). The general SGPR-mask v_mbcnt (unused) makes
+// the per-vertex compile refuse, as Kena's culling programs' compaction does. Assembled with llvm-mc
+// -mcpu=gfx1030.
+alignas(256) const uint32_t kVsOnly[] = {
+    0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u, 0x00080008u,
+    0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u, 0xD7650013u,
+    0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu, 0x02390501u,
+    0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u, 0x361A0A81u,
+    0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu, 0xD54B000Eu,
+    0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u, 0xF80008D4u,
+    0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
+};
+
+// Solid-green pixel stage (llvm-mc gfx1030; the same words test_gpu_execute uses).
+alignas(256) const uint32_t kPs[] = {
+    0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
+};
+
+alignas(16) const uint32_t kConstants[4] = {0x1234u, 0, 0, 0};
+// The constant buffer the reloaded user data names, and that user-data table (8 words: a V# for
+// s[8:11], then s12..s15). Filled at run time: it holds a host address.
+alignas(16) const uint32_t kReloadedConstants[4] = {0x5678u, 0, 0, 0};
+alignas(16) uint32_t g_user_table[8] = {};
+
+void set_pgm(GpuState& st, uint32_t lo, uint32_t hi, const void* code) {
+    const uint64_t a = reinterpret_cast<uint64_t>(code);
+    st.sh[lo] = static_cast<uint32_t>((a >> 8) & 0xffffffffu);
+    st.sh[hi] = static_cast<uint32_t>((a >> 40) & 0xffu);
+}
+
+// An AGC shader blob as the SDK lays it out: the header's pointer fields are SELF-RELATIVE forward
+// offsets that sceAgcCreateShader relocates in place (agc_fix_ptr). A test binary's static data can
+// sit below 4 GiB, where an absolute pointer would be mistaken for an offset, so the fields are
+// written as offsets to members that follow them.
+struct ShaderBlob {
+    AgcShaderHeader header{};
+    ShaderReg registers[2]{};
+    AgcShaderSpecials specials{};
+};
+
+template <typename T>
+T* self_relative(T* const& field, const void* target) {
+    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(target) -
+                                reinterpret_cast<uintptr_t>(&field));
+}
+
+bool register_blob(ShaderBlob& blob, const uint32_t* code, size_t bytes, uint32_t pgm_lo,
+                   uint32_t pgm_hi, uint16_t user_data_end) {
+    blob.header.file_header = 0x34333231u;
+    blob.header.version = 0x18;
+    blob.header.type = 2;
+    blob.header.num_sh_registers = 2;
+    blob.header.shader_size = static_cast<uint32_t>(bytes);
+    blob.registers[0] = {pgm_lo, 0};
+    blob.registers[1] = {pgm_hi, 0};
+    blob.specials.user_data_range_start = 0;
+    blob.specials.user_data_range_end = user_data_end;
+    blob.header.sh_registers = self_relative(blob.header.sh_registers, blob.registers);
+    blob.header.specials = self_relative(blob.header.specials, &blob.specials);
+    auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+    void* out = nullptr;
+    return create_shader &&
+           create_shader(reinterpret_cast<uint64_t>(&out), reinterpret_cast<uint64_t>(&blob.header),
+                         reinterpret_cast<uint64_t>(code), 0, 0, 0) == 0 &&
+           out == &blob.header && blob.header.specials == &blob.specials;
+}
+
+// The ES prolog (user data s8..s11: one V#) and the chained main, registered so realization can
+// bound both programs and link the chain. Once per process.
+bool register_chain_headers() {
+    static const bool registered = [] {
+        prosper::register_agc_hle();
+        static ShaderBlob prolog, main, reload, vs_only;
+        return register_blob(prolog, kProlog, sizeof(kProlog), P::SPI_SHADER_PGM_LO_ES,
+                             P::SPI_SHADER_PGM_HI_ES, 4) &&
+               register_blob(vs_only, kVsOnly, sizeof(kVsOnly), P::SPI_SHADER_PGM_LO_ES,
+                             P::SPI_SHADER_PGM_HI_ES, 0) &&
+               register_blob(main, kMain, sizeof(kMain), P::SPI_SHADER_PGM_LO_GS,
+                             P::SPI_SHADER_PGM_HI_GS, 4) &&
+               register_blob(reload, kMainReload, sizeof(kMainReload), P::SPI_SHADER_PGM_LO_GS,
+                             P::SPI_SHADER_PGM_HI_GS, 4);
+    }();
+    return registered;
+}
+
+NggHostCapabilities radv_like() {
+    NggHostCapabilities h;
+    h.compute = true;
+    h.vertex_pipeline_stores = true;
+    h.shader_output_layer = true;
+    h.geometry_shader = true;
+    h.native_wave64 = false;
+    h.max_compute_workgroup_subgroups = 16;
+    h.max_compute_shared_memory = 65536;
+    h.max_compute_workgroup_size_x = 1024;
+    h.max_compute_workgroup_invocations = 1024;
+    h.max_compute_workgroup_count_x = 65535;
+    h.max_storage_buffer_range = 1u << 30;
+    h.max_push_constants_size = 256;
+    return h;
+}
+
+// The merged ES+GS NGG draw state of Kena's recorded registers, as a triangle LIST, into a 2D target.
+GpuState merged_state() {
+    GpuState st;
+    set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kProlog);
+    set_pgm(st, P::SPI_SHADER_PGM_LO_GS, P::SPI_SHADER_PGM_HI_GS, kMain);
+    set_pgm(st, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kPs);
+    st.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+    st.cx[P::CB_TARGET_MASK] = 0xf;
+    st.cx[P::VGT_SHADER_STAGES_EN] = 0x2030u;
+    st.cx[P::VGT_GS_ONCHIP_CNTL] = 0x10020040u;
+    st.uc[P::GE_CNTL] = 0x8040u;
+    st.cx[P::GE_MAX_OUTPUT_PER_SUBGROUP] = 0xc0u;
+    st.cx[P::VGT_GS_MAX_VERT_OUT] = 3u;
+    st.cx[P::VGT_ESGS_RING_ITEMSIZE] = 4u;
+    st.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 0;
+    st.cx[P::VGT_GS_OUT_PRIM_TYPE] = 2u;
+    const uint64_t cbuf = reinterpret_cast<uint64_t>(kConstants);
+    st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 0] = static_cast<uint32_t>(cbuf);
+    st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 1] = static_cast<uint32_t>((cbuf >> 32) & 0xffffu);
+    st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 2] = sizeof(kConstants);
+    st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 3] = (22u << 12) | 0xfacu;
+    st.index_type = 0;
+    st.index_type_announced = true;
+    return st;
+}
+
+class NggIndexedRealize : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_TRUE(register_chain_headers());
+        publish_ngg_host_capabilities(radv_like());
+        reset_ngg_live_draw_cache_for_test();
+    }
+    // realize_draw_item on one indexed draw of `indices` (16-bit), `instances` instances.
+    bool realize(GpuState st, const uint16_t* indices, uint32_t count, uint32_t instances,
+                 DrawItem& out) {
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_count = count;
+        draw.index_addr = reinterpret_cast<uint64_t>(indices);
+        draw.instance_count = instances;
+        st.draws.clear();
+        st.draws.push_back(draw);
+        return realize_draw_item(st, &st.draws[0], count, 0x10000u, /*log*/ false, out);
+    }
+};
+
+// Scattered indices whose largest is 12: the realized NGG draw carries no index buffer, its vertex
+// count is the vertex RANGE 13 (not the 6 indices), the linked table is folded over that range, and
+// lane e of each subgroup runs VertexID = the e-th distinct index.
+TEST_F(NggIndexedRealize, AnIndexedMergedDrawIsRealizedThroughTheSubgroupPath) {
+    alignas(4) static const uint16_t kIndices[6] = {7, 3, 12, 12, 3, 9};
+    DrawItem item;
+    ASSERT_TRUE(realize(merged_state(), kIndices, 6, 2, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the draw was not realized through the subgroup path";
+    EXPECT_TRUE(item.indices.empty()) << "the backend refuses an NGG draw that carries indices";
+    EXPECT_EQ(item.vertex_count, 13u) << "max index + 1, not the index count";
+    ASSERT_TRUE(item.vrt);
+    EXPECT_EQ(item.vrt->vertices_per_instance, 13u) << "the fold is sized by the vertex range";
+    const NggSubgroupDraw& ngg = *item.ngg_subgroup;
+    ASSERT_EQ(ngg.plan.subgroups.size(), 2u) << "one subgroup per instance";
+    ASSERT_EQ(ngg.groups.size(), 1u);
+    const std::vector<uint32_t>& launch = ngg.groups[0].launch_words;
+    const uint32_t expect[4] = {7, 3, 12, 9};
+    for (uint32_t block = 0; block < 2u; ++block)
+        for (uint32_t lane = 0; lane < 4u; ++lane) {
+            const size_t at = (static_cast<size_t>(block) * 64u + lane) * kNggLaunchWordsPerLane;
+            EXPECT_EQ(launch[at + 5], expect[lane]) << "block " << block << " lane " << lane;
+            EXPECT_EQ(launch[at + 8], block) << "InstanceID";
+        }
+    EXPECT_EQ(ngg_live_draw_cache_stats().indexed_draws, 1u);
+}
+
+// #3135: a main that reads s0:s1 is admitted when the GS user-data address is in the draw state.
+// The linked fold follows s0:s1 into the table, so the constant buffer it resolves is the one the
+// RELOADED V# names (not the one in SPI_SHADER_USER_DATA_GS_0..3), and the shell receives the
+// address as the two push-constant words after the user SGPRs. Without the address registers the
+// same draw is refused by the ABI rule's name.
+TEST_F(NggIndexedRealize, AMainReadingTheUserDataAddressIsSuppliedIt) {
+    const uint64_t cbuf = reinterpret_cast<uint64_t>(kReloadedConstants);
+    g_user_table[0] = static_cast<uint32_t>(cbuf);
+    g_user_table[1] = static_cast<uint32_t>((cbuf >> 32) & 0xffffu);
+    g_user_table[2] = sizeof(kReloadedConstants);
+    g_user_table[3] = (22u << 12) | 0xfacu;
+    GpuState st = merged_state();
+    set_pgm(st, P::SPI_SHADER_PGM_LO_GS, P::SPI_SHADER_PGM_HI_GS, kMainReload);
+    alignas(4) static const uint16_t kIndices[3] = {0, 1, 2};
+    DrawItem refused;
+    EXPECT_FALSE(realize(st, kIndices, 3, 1, refused));
+    EXPECT_FALSE(refused.ngg_subgroup) << "control: no address registers, s0 is undefined";
+
+    const uint64_t table = reinterpret_cast<uint64_t>(g_user_table);
+    st.sh[P::SPI_SHADER_USER_DATA_ADDR_LO_GS] = static_cast<uint32_t>(table);
+    st.sh[P::SPI_SHADER_USER_DATA_ADDR_HI_GS] = static_cast<uint32_t>(table >> 32);
+    DrawItem item;
+    ASSERT_TRUE(realize(st, kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the draw was not realized through the subgroup path";
+    EXPECT_EQ(item.ngg_subgroup->push_constants,
+              (std::vector<uint32_t>{
+                  st.sh[P::SPI_SHADER_USER_DATA_GS_0], st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 1],
+                  st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 2], st.sh[P::SPI_SHADER_USER_DATA_GS_0 + 3],
+                  static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32)}))
+        << "s8..s11, then s0:s1";
+    ASSERT_TRUE(item.vrt);
+    bool reloaded = false, original = false;
+    for (const ShaderResource& r : item.vrt->resources) {
+        reloaded |= r.gpu_addr == cbuf;
+        original |= r.gpu_addr == reinterpret_cast<uint64_t>(kConstants);
+    }
+    EXPECT_TRUE(reloaded) << "the fold followed s0:s1 to the reloaded V#";
+    EXPECT_FALSE(original) << "the stale user-data V# is not what the main reads";
+
+    // A reader of s0:s1 needs two push words beyond its user SGPRs: with RSRC2's count at 31
+    // there is no room, and the draw is refused by name rather than pushing past the budget.
+    for (uint32_t k = 4; k < 31; ++k) st.sh[P::SPI_SHADER_USER_DATA_GS_0 + k] = 0;
+    st.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 31u << 1;
+    DrawItem full;
+    EXPECT_FALSE(realize(st, kIndices, 3, 1, full));
+    EXPECT_FALSE(full.ngg_subgroup) << "31 user SGPRs + s0:s1 exceed the 32-word push budget";
+}
+
+// The same draw with a garbage index is refused by name rather than sized to 2^28 vertices (#461).
+TEST_F(NggIndexedRealize, AGarbageIndexIsRefusedByName) {
+    alignas(4) static const uint32_t kGarbage[3] = {0, 1, 0x0F000000u};
+    GpuState st = merged_state();
+    st.index_type = 1;   // announced 32-bit
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 3;
+    draw.index_addr = reinterpret_cast<uint64_t>(kGarbage);
+    st.draws.push_back(draw);
+    DrawItem item;
+    OperationRealizationFailure failure;
+    EXPECT_FALSE(realize_draw_item(st, &st.draws[0], 3, 0x10000u, /*log*/ false, item, &failure));
+    EXPECT_FALSE(item.ngg_subgroup);
+    const NggDrawIndexFetch fetched =
+        fetch_ngg_draw_indices(st, st.draws[0], /*vb_records_unclamped*/ 0);
+    EXPECT_STREQ(fetched.refusal, "ngg-index-range");
+}
+
+// A DrawIndexOffset whose guest never announced an index size: the CP computed index_addr at the
+// 2-byte stride, and the #304 detector re-reads the buffer at 4 bytes from index_base + offset * 4.
+// The rule must move the ADDRESS with the size; reading 4-byte elements at the 2-byte address gives
+// different indices. Both paths are checked: the shared rule, the ordinary fetch's realized indices,
+// and the merged-NGG fetch.
+TEST(DrawIndexSource, AnOffsetDrawRecomputesTheAddressAtTheDetectedSize) {
+    // Two leading 32-bit words, then the real quad at 32-bit element 2. Read at the CP's 2-byte
+    // address (base + 4) the six 16-bit words are 5, 0, 0, 0, 1, 0: every odd word zero, so the
+    // unannounced-32-bit fingerprint matches. Read as 4-byte elements from that same address they
+    // would be 5, 0, 1, 2, 2, 1 -- the wrong quad.
+    alignas(4) static const uint32_t kBuffer[8] = {0x00090008u, 5, 0, 1, 2, 2, 1, 3};
+    GpuState st;
+    st.index_type = 0;
+    st.index_type_announced = false;
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 6;
+    draw.from_offset = true;
+    draw.index_base = reinterpret_cast<uint64_t>(kBuffer);
+    draw.index_offset = 2;
+    draw.index_addr = draw.index_base + uint64_t{2} * draw.index_offset;   // what the CP computed
+    const DrawIndexSource source = resolve_draw_index_source(st, draw, 6, 0);
+    EXPECT_STREQ(source.detected, "zero-high-half");
+    EXPECT_EQ(source.element_bytes, 4u);
+    EXPECT_EQ(source.addr32, draw.index_base + 8u);
+    EXPECT_EQ(source.addr, source.addr32) << "the address moves with the detected size";
+
+    const NggDrawIndexFetch fetched = fetch_ngg_draw_indices(st, draw, 0);
+    ASSERT_TRUE(fetched.indices) << (fetched.refusal ? fetched.refusal : "");
+    EXPECT_EQ(*fetched.indices, (std::vector<uint32_t>{0, 1, 2, 2, 1, 3}));
+    EXPECT_EQ(fetched.vertex_range, 4u);
+
+    // Announced 16-bit: no detection, the CP's address and size stand.
+    st.index_type_announced = true;
+    const DrawIndexSource announced = resolve_draw_index_source(st, draw, 6, 0);
+    EXPECT_EQ(announced.detected, nullptr);
+    EXPECT_EQ(announced.element_bytes, 2u);
+    EXPECT_EQ(announced.addr, draw.index_addr);
+}
+
+// #3135 P7: Kena's culling-VS draw state. VGT_SHADER_STAGES_EN 0x2000 (PRIMGEN_EN, no GS), the
+// program in the ES registers with no chain, VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0,
+// GE_MAX_OUTPUT_PER_SUBGROUP 64, an indexed triangle list.
+GpuState vs_only_state() {
+    GpuState st = merged_state();
+    set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVsOnly);
+    st.sh.erase(P::SPI_SHADER_PGM_LO_GS);
+    st.sh.erase(P::SPI_SHADER_PGM_HI_GS);
+    st.cx[P::VGT_SHADER_STAGES_EN] = 0x2000u;
+    st.cx[P::VGT_GS_OUT_PRIM_TYPE] = 0u;
+    st.cx[P::VGT_GS_MAX_VERT_OUT] = 0u;
+    st.cx[P::GE_MAX_OUTPUT_PER_SUBGROUP] = 0x40u;
+    return st;
+}
+
+// The per-vertex compile refuses the program (its general-mask MBCNT), and the draw is realized
+// through the subgroup shell as the program alone: one subgroup, ES lanes = the distinct indices.
+// The same state with GS_EN set is a merged draw with no chain, which stays dropped.
+TEST_F(NggIndexedRealize, AVsOnlyNggDrawIsRealizedThroughTheSubgroupPath) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    DrawItem item;
+    ASSERT_TRUE(realize(vs_only_state(), kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the VS-only draw was not realized through the subgroup path";
+    const NggSubgroupDraw& ngg = *item.ngg_subgroup;
+    ASSERT_EQ(ngg.plan.subgroups.size(), 1u);
+    EXPECT_EQ(ngg.plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}));
+    ASSERT_EQ(ngg.groups.size(), 1u);
+    const std::vector<uint32_t>& launch = ngg.groups[0].launch_words;
+    EXPECT_EQ(launch[0], 0u | (4u << 16)) << "lane 0's v0: slots 0 and 1 scaled by ITEMSIZE";
+    EXPECT_EQ(launch[1], 8u) << "lane 0's v1: slot 2 x 4";
+
+    // Kena's culling VS programs also read the layer (USE_VTX_RENDER_TARGET_INDX + MISC_VEC_ENA).
+    // Into colour target 0 programmed as one 2D slice (CB view slices 0..0, ATTRIB3 type 2D) the
+    // layer has one slice to address and the draw is admitted; without the view programmed the
+    // target is not proven to be one slice and the draw stays dropped.
+    GpuState layered = vs_only_state();
+    layered.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    layered.cx[P::CB_COLOR0_BASE] = 0x30u;   // a bound colour target: the draw writes colour
+    layered.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    DrawItem unproven;
+    EXPECT_FALSE(realize(layered, kIndices, 3, 1, unproven));
+    EXPECT_FALSE(unproven.ngg_subgroup) << "no CB view: the target is not proven to be one slice";
+    layered.cx[P::CB_COLOR0_VIEW] = 0u;
+    DrawItem one_slice;
+    ASSERT_TRUE(realize(layered, kIndices, 3, 1, one_slice));
+    ASSERT_TRUE(one_slice.ngg_subgroup) << "a one-slice 2D target is admitted for a layered draw";
+    EXPECT_EQ(one_slice.ngg_subgroup->route, NggLayerRoute::None)
+        << "one slice: the layer is read to cull, never written to gl_Layer";
+    // A layered DEPTH array beside the one-slice colour target: one layer cannot address a 2D
+    // colour target and a depth array, so the draw is refused by name (ngg-layer-attachments-mixed)
+    // -- never admitted and culled. A depth view of slice 0 alone is admitted.
+    GpuState depth = layered;
+    depth.cx[P::DB_DEPTH_CONTROL] = 1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT;
+    depth.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    depth.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    depth.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+    DrawItem depth_array;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_array));
+    EXPECT_FALSE(depth_array.ngg_subgroup) << "a two-slice depth array is not one slice";
+    depth.cx.erase(P::DB_DEPTH_VIEW);
+    DrawItem depth_unknown;
+    EXPECT_FALSE(realize(depth, kIndices, 3, 1, depth_unknown));
+    EXPECT_FALSE(depth_unknown.ngg_subgroup) << "an unprogrammed depth view proves nothing";
+    depth.cx[P::DB_DEPTH_VIEW] = 0u;
+    DrawItem depth_one;
+    ASSERT_TRUE(realize(depth, kIndices, 3, 1, depth_one));
+    EXPECT_TRUE(depth_one.ngg_subgroup) << "a one-slice depth view is admitted";
+
+    layered.cx[P::CB_COLOR0_VIEW] = 1u << 13;   // SLICE_MAX 1: a two-slice view of a 2D array
+    DrawItem array;
+    EXPECT_FALSE(realize(layered, kIndices, 3, 1, array));
+    EXPECT_FALSE(array.ngg_subgroup) << "a 2D array view is not one slice";
+    layered.cx[P::CB_COLOR0_VIEW] = 0u;
+
+    // #4750 review: every reason the backend binds depth/stencil counts, not only the depth test.
+    // Depth bounds alone (Z off) is UE4's shadow-cascade shape; stencil alone binds it too. Each
+    // arm is refused into a two-slice depth view and admitted into a one-slice one.
+    for (const uint32_t control : {1u << P::DB_DEPTH_CONTROL_DEPTH_BOUNDS_ENABLE_SHIFT,
+                                   1u << P::DB_DEPTH_CONTROL_STENCIL_ENABLE_SHIFT}) {
+        GpuState tested = layered;
+        tested.cx[P::DB_DEPTH_CONTROL] = control;
+        tested.cx[P::DB_Z_READ_BASE] = 0x1000u;
+        tested.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+        tested.cx[P::DB_DEPTH_VIEW] = 1u << P::DB_DEPTH_VIEW_SLICE_MAX_SHIFT;   // slices 0..1
+        DrawItem two;
+        EXPECT_FALSE(realize(tested, kIndices, 3, 1, two));
+        EXPECT_FALSE(two.ngg_subgroup)
+            << "DB_DEPTH_CONTROL 0x" << std::hex << control << ": a two-slice depth array is bound";
+        tested.cx[P::DB_DEPTH_VIEW] = 0u;
+        DrawItem one;
+        ASSERT_TRUE(realize(tested, kIndices, 3, 1, one)) << "control 0x" << std::hex << control;
+        EXPECT_TRUE(one.ngg_subgroup) << "control: a one-slice depth view is admitted";
+    }
+
+    // A second colour slot the draw writes counts too: slot 1 as a two-slice view is refused,
+    // as one slice admitted.
+    constexpr uint32_t kSlot1 = 0xf;   // CB_COLORn main-block register stride
+    GpuState mrt = layered;
+    mrt.cx[P::CB_TARGET_MASK] = 0xffu;
+    mrt.cx[P::CB_COLOR0_BASE + kSlot1] = 0x2000u;
+    mrt.cx[P::CB_COLOR0_INFO + kSlot1] = mrt.cx[P::CB_COLOR0_INFO];
+    mrt.cx[P::CB_COLOR0_ATTRIB3 + 1u] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 1u << 13;   // slices 0..1
+    DrawItem mrt_array;
+    EXPECT_FALSE(realize(mrt, kIndices, 3, 1, mrt_array));
+    EXPECT_FALSE(mrt_array.ngg_subgroup) << "a written two-slice colour slot 1";
+    mrt.cx[P::CB_COLOR0_VIEW + kSlot1] = 0u;
+    DrawItem mrt_one;
+    ASSERT_TRUE(realize(mrt, kIndices, 3, 1, mrt_one));
+    EXPECT_TRUE(mrt_one.ngg_subgroup) << "control: a one-slice colour slot 1 is admitted";
+
+    GpuState merged = vs_only_state();
+    merged.cx[P::VGT_SHADER_STAGES_EN] = 0x2030u;
+    DrawItem dropped;
+    EXPECT_FALSE(realize(merged, kIndices, 3, 1, dropped));
+    EXPECT_FALSE(dropped.ngg_subgroup) << "control: a merged draw without its chain is not linked";
+}
+
+// #3135 layered NGG depth: Kena's point-light shadow shape. A VS-only draw with CB_TARGET_MASK 0
+// whose layer addresses a six-slice depth array (DB_DEPTH_VIEW 0x0000a000, slices 0..5) is
+// admitted as six per-slice replays: replay k is the same plan, launch records and compiled stages
+// selecting layer k at draw time, and expand_ngg_depth_slices turns the item into six items whose
+// DB_DEPTH_VIEW names exactly slice k.
+GpuState depth_only_layered_state() {
+    GpuState st = vs_only_state();
+    st.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    st.cx[P::CB_TARGET_MASK] = 0u;
+    st.cx[P::DB_DEPTH_CONTROL] = (1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT) |
+                                 (1u << P::DB_DEPTH_CONTROL_Z_WRITE_ENABLE_SHIFT);
+    st.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    st.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    st.cx[P::DB_DEPTH_VIEW] = 0x0000a000u;
+    return st;
+}
+
+TEST_F(NggIndexedRealize, ALayeredDepthOnlyDrawIsReplayedOncePerSlice) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    DrawItem item;
+    ASSERT_TRUE(realize(depth_only_layered_state(), kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "the layered depth-only draw was not admitted";
+    EXPECT_EQ(item.ngg_depth_slice_count, 6u);
+    EXPECT_EQ(item.ngg_depth_first_slice, 0u);
+    EXPECT_EQ(item.ngg_layer_select, 0u);
+    EXPECT_EQ(item.ngg_subgroup->route, NggLayerRoute::None)
+        << "a replay routes nothing: one layer per pass";
+
+    // Each replay is the SAME description (plan, launch records, compiled stages: nothing is
+    // copied per slice) selecting its own layer, into its own slice.
+    std::vector<DrawItem> expanded;
+    ASSERT_TRUE(expand_ngg_depth_slices({item}, expanded));
+    ASSERT_EQ(expanded.size(), 6u);
+    for (uint32_t k = 0; k < 6u; ++k) {
+        EXPECT_EQ(expanded[k].ngg_subgroup, item.ngg_subgroup) << "slice " << k;
+        EXPECT_EQ(expanded[k].ngg_layer_select, k) << "replay " << k << " selects its own layer";
+        EXPECT_EQ(expanded[k].ngg_depth_slice_count, 0u) << "an expanded item is final";
+        EXPECT_EQ(expanded[k].ps.db_depth_view, (k << 13) | k) << "slice " << k << " alone";
+    }
+    // The in-place form (the executor's) gives the same items.
+    std::vector<DrawItem> owned = {item};
+    ASSERT_TRUE(expand_ngg_depth_slices_in_place(owned));
+    ASSERT_EQ(owned.size(), 6u);
+    for (uint32_t k = 0; k < 6u; ++k) {
+        EXPECT_EQ(owned[k].ngg_subgroup, item.ngg_subgroup);
+        EXPECT_EQ(owned[k].ngg_layer_select, k);
+        EXPECT_EQ(owned[k].ps.db_depth_view, (k << 13) | k);
+    }
+
+    // Slices 2..3 of a larger array: two replays, the first naming slice 2.
+    GpuState offset = depth_only_layered_state();
+    offset.cx[P::DB_DEPTH_VIEW] = 2u | (3u << 13);
+    DrawItem pair;
+    ASSERT_TRUE(realize(offset, kIndices, 3, 1, pair));
+    ASSERT_EQ(pair.ngg_depth_slice_count, 2u);
+    EXPECT_EQ(pair.ngg_depth_first_slice, 2u);
+
+    // One slice: the layer only culls, nothing is replayed.
+    GpuState one = depth_only_layered_state();
+    one.cx[P::DB_DEPTH_VIEW] = 0u;
+    DrawItem single;
+    ASSERT_TRUE(realize(one, kIndices, 3, 1, single));
+    EXPECT_TRUE(single.ngg_subgroup);
+    EXPECT_EQ(single.ngg_depth_slice_count, 0u);
+
+    // Refused by name: no depth attachment at all (the layer addresses nothing proven), and a
+    // depth view that was never programmed.
+    GpuState unbound = depth_only_layered_state();
+    unbound.cx[P::DB_Z_READ_BASE] = 0u;
+    unbound.cx[P::DB_Z_WRITE_BASE] = 0u;
+    DrawItem none;
+    EXPECT_FALSE(realize(unbound, kIndices, 3, 1, none));
+    EXPECT_FALSE(none.ngg_subgroup);
+    GpuState unknown = depth_only_layered_state();
+    unknown.cx.erase(P::DB_DEPTH_VIEW);
+    DrawItem unseen;
+    EXPECT_FALSE(realize(unknown, kIndices, 3, 1, unseen));
+    EXPECT_FALSE(unseen.ngg_subgroup);
+}
+
+// A layered colour VOLUME beside depth/stencil is refused only when the backend actually attaches
+// depth: a draw with depth writes on but the depth test off renders without it, so it must not be
+// refused for a mixed shape (#4778 review).
+TEST_F(NggIndexedRealize, AVolumeIsRefusedBesideAttachedDepthOnly) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    GpuState volume = vs_only_state();
+    volume.cx[P::PA_CL_VS_OUT_CNTL] = 0x01240000u;
+    volume.cx[P::CB_COLOR0_BASE] = 0x30u;
+    volume.cx[P::CB_COLOR0_ATTRIB3] = (2u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT) | 3u;
+    volume.cx[P::CB_COLOR0_VIEW] = 3u << 13;   // slices 0..3 of a 4-deep volume
+    DrawItem alone;
+    ASSERT_TRUE(realize(volume, kIndices, 3, 1, alone)) << "control: the volume on its own";
+    ASSERT_TRUE(alone.ngg_subgroup);
+    volume.cx[P::DB_Z_READ_BASE] = 0x1000u;
+    volume.cx[P::DB_Z_WRITE_BASE] = 0x1000u;
+    volume.cx[P::DB_DEPTH_VIEW] = 0u;
+    volume.cx[P::DB_DEPTH_CONTROL] = 1u << P::DB_DEPTH_CONTROL_Z_WRITE_ENABLE_SHIFT;   // no test
+    DrawItem write_only;
+    ASSERT_TRUE(realize(volume, kIndices, 3, 1, write_only)) << "depth writes without the test";
+    EXPECT_TRUE(write_only.ngg_subgroup) << "the backend attaches no depth: not a mixed shape";
+    volume.cx[P::DB_DEPTH_CONTROL] |= 1u << P::DB_DEPTH_CONTROL_Z_ENABLE_SHIFT;
+    DrawItem tested;
+    EXPECT_FALSE(realize(volume, kIndices, 3, 1, tested));
+    EXPECT_FALSE(tested.ngg_subgroup)
+        << "attached depth beside a volume: ngg-layer-attachments-mixed";
+}
+
+// DB_DEPTH_VIEW narrowed to one slice keeps every other field and carries the high bits.
+TEST(NggDepthSlices, AViewNarrowsToOneSliceKeepingItsOtherFields) {
+    const uint32_t flags =
+        (1u << P::DB_DEPTH_VIEW_Z_READ_ONLY_SHIFT) | (5u << P::DB_DEPTH_VIEW_MIPID_SHIFT);
+    const uint32_t whole = flags | 0x7ffu | (3u << 11) | (0x7ffu << 13) | (3u << 30);
+    EXPECT_EQ(depth_view_for_slice(whole, 4u), flags | 4u | (4u << 13));
+    // Slice 0x900: low bits 0x100, high bits 1, in both START and MAX.
+    EXPECT_EQ(depth_view_for_slice(flags, 0x900u),
+              flags | 0x100u | (1u << 11) | (0x100u << 13) | (1u << 30));
+}
+
+// Consecutive replayed items into one depth surface and view are emitted slice-major, so each
+// slice's draws stay in guest order and form one pass; a different view starts a new run, and
+// every other item keeps its place.
+TEST(NggDepthSlices, ARunOfReplayedDrawsIsEmittedSliceMajor) {
+    const auto draw = [] { return std::make_shared<const NggSubgroupDraw>(); };
+    const auto replayed = [&](uint64_t order, uint32_t view, uint32_t slices) {
+        DrawItem item;
+        item.command_order = order;
+        item.ps.depth_read_base = item.ps.depth_write_base = 0x1000u;
+        item.ps.db_depth_view = view;
+        item.ngg_depth_first_slice = view & 0x7ffu;   // as admission records SLICE_START
+        item.ngg_depth_slice_count = slices;
+        item.ngg_subgroup = draw();
+        return item;
+    };
+    DrawItem plain_before, plain_after;
+    plain_before.command_order = 1;
+    plain_after.command_order = 9;
+    const uint32_t three = 2u << 13;   // slices 0..2
+    const std::vector<DrawItem> items = {plain_before, replayed(2, three, 3), replayed(3, three, 3),
+                                         replayed(4, 1u | (2u << 13), 2), plain_after};
+    std::vector<DrawItem> out;
+    ASSERT_TRUE(expand_ngg_depth_slices(items, out));
+    const std::vector<std::pair<uint64_t, uint32_t>> expect = {
+        {1, 0}, {2, 0}, {3, 0}, {2, 1}, {3, 1}, {2, 2}, {3, 2}, {4, 1}, {4, 2}, {9, 0}};
+    ASSERT_EQ(out.size(), expect.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_EQ(out[i].command_order, expect[i].first) << "item " << i;
+        if (out[i].ngg_subgroup)
+            EXPECT_EQ(out[i].ps.db_depth_view & 0x7ffu, expect[i].second) << "item " << i;
+    }
+    // The slice-k item carries the slice-k replay.
+    EXPECT_EQ(out[3].ngg_subgroup, items[1].ngg_subgroup);
+    EXPECT_EQ(out[3].ngg_layer_select, 1u);
+    EXPECT_EQ(out[6].ngg_subgroup, items[2].ngg_subgroup);
+    EXPECT_EQ(out[6].ngg_layer_select, 2u);
+    // The in-place form moves the items and gives the same order and layers.
+    std::vector<DrawItem> owned = items;
+    ASSERT_TRUE(expand_ngg_depth_slices_in_place(owned));
+    ASSERT_EQ(owned.size(), expect.size());
+    for (size_t i = 0; i < owned.size(); ++i) {
+        EXPECT_EQ(owned[i].command_order, out[i].command_order) << "item " << i;
+        EXPECT_EQ(owned[i].ngg_layer_select, out[i].ngg_layer_select) << "item " << i;
+        EXPECT_EQ(owned[i].ps.db_depth_view, out[i].ps.db_depth_view) << "item " << i;
+    }
+
+    std::vector<DrawItem> untouched;
+    EXPECT_FALSE(expand_ngg_depth_slices({plain_before, plain_after}, untouched));
+    EXPECT_TRUE(untouched.empty()) << "nothing to expand leaves the output alone";
+}
+
+// The executor expands before the renderer sees the submit: every renderer is handed one item per
+// slice, so no frontend has to know about the replay.
+TEST(NggDepthSlices, TheRendererIsHandedOneItemPerSlice) {
+    DrawItem item;
+    item.ps.depth_read_base = item.ps.depth_write_base = 0x1000u;
+    item.ps.db_depth_view = 2u << 13;   // slices 0..2
+    item.ngg_depth_slice_count = 3;
+    item.ngg_subgroup = std::make_shared<const NggSubgroupDraw>();
+    std::vector<uint32_t> views;
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const DrawItem& seen : items) views.push_back(seen.ps.db_depth_view);
+        return RenderedFrame{};
+    });
+    (void)render_submit_items({item}, 4, 4);
+    set_submit_renderer({});
+    EXPECT_EQ(views, (std::vector<uint32_t>{0u, 1u | (1u << 13), 2u | (2u << 13)}));
+}
+
+// The same through the ordered executor, which is handed the renderer as a function object rather
+// than through render_submit_items (#4778 review): a realized layered depth draw reaches the
+// registered renderer as six items, one per slice.
+TEST_F(NggIndexedRealize, TheOrderedExecutorHandsTheRendererOneItemPerSlice) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    GpuState st = depth_only_layered_state();
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 3;
+    draw.index_addr = reinterpret_cast<uint64_t>(kIndices);
+    draw.instance_count = 1;
+    st.draws.push_back(draw);
+    std::vector<uint32_t> views, layers;
+    size_t ngg = 0;
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const DrawItem& seen : items) {
+            views.push_back(seen.ps.db_depth_view);
+            layers.push_back(seen.ngg_layer_select);
+            ngg += seen.ngg_subgroup && seen.ngg_depth_slice_count == 0 ? 1u : 0u;
+        }
+        return RenderedFrame{};
+    });
+    (void)execute_ordered_and_present(st, 4, 4, 1, /*publish=*/false);
+    set_submit_renderer({});
+    ASSERT_EQ(views.size(), 6u) << "one item per slice of DB_DEPTH_VIEW 0..5";
+    EXPECT_EQ(ngg, 6u) << "each item is a final replay";
+    for (uint32_t k = 0; k < 6u; ++k) {
+        EXPECT_EQ(views[k], (k << 13) | k) << "slice " << k;
+        EXPECT_EQ(layers[k], k) << "slice " << k;
+    }
+}
+
+}   // namespace
