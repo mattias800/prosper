@@ -221,6 +221,21 @@ def golden_spec_problems(golden_text: str, cases_text: str) -> list[str]:
     return problems
 
 
+def write_data_file(path: Path, text: str) -> None:
+    """Write `text` to `path`, which must resolve to a file directly inside DATA_DIR.
+
+    `family_paths` already confines a family name to DATA_DIR; this repeats the check at the write itself,
+    on the real path, so the guarantee holds however the path reached here (and is visible to a reader of
+    the write rather than only of the function that built the path).
+    """
+    base = os.path.realpath(DATA_DIR)
+    target = os.path.realpath(path)
+    if os.path.dirname(target) != base:
+        raise ValueError(f"{target} is not a file directly inside {base}")
+    with open(target, "w", encoding="utf-8") as out:
+        out.write(text)
+
+
 def family_paths(family: str) -> tuple[Path, Path]:
     """The cases and golden files of a family.
 
@@ -427,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     cases = parse_cases(cases_text)
 
     if args.scrub:
-        out_path.write_text(scrub_golden_text(out_path.read_text()))
+        write_data_file(out_path, scrub_golden_text(out_path.read_text()))
         print(f"scrubbed {out_path}")
         return 0
 
@@ -461,10 +476,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.prune_unmeasured:
         ok, rest = split_measured(cases, output)
-        cases_path.write_text(prune_cases_text(cases_text, {c.id for c in ok}))
-        out_path.write_text(build_golden(cases_path.name, ok, output, date))
+        write_data_file(cases_path, prune_cases_text(cases_text, {c.id for c in ok}))
+        write_data_file(out_path, build_golden(cases_path.name, ok, output, date))
         unmeasured_path = out_path.with_name(f"{args.family}.unmeasured.tsv")
-        unmeasured_path.write_text(unmeasured_text(cases_path.name, rest, date))
+        write_data_file(unmeasured_path, unmeasured_text(cases_path.name, rest, date))
         print(
             f"{len(ok)}/{len(cases)} cases measured -> {out_path}; "
             f"{len(rest)} unmeasured -> {unmeasured_path}"
@@ -472,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if output.done else 2
 
     missing = [c.id for c in cases if c.id not in output.results]
-    out_path.write_text(build_golden(cases_path.name, cases, output, date))
+    write_data_file(out_path, build_golden(cases_path.name, cases, output, date))
 
     print(f"{len(cases) - len(missing)}/{len(cases)} cases measured -> {out_path}")
     if not output.done:

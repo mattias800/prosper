@@ -317,6 +317,19 @@ def test_a_failed_build_is_reported_with_an_sdk_hint(monkeypatch):
         ro.run_on_console("", "/opt/not-an-sdk", "192.168.0.2", 9021, 5)
 
 
+def test_write_data_file_writes_inside_the_data_directory_and_refuses_anything_else(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(ro, "DATA_DIR", data)
+    ro.write_data_file(data / "fam.golden.tsv", "x")
+    assert (data / "fam.golden.tsv").read_text() == "x"
+    for bad in (tmp_path / "elsewhere.tsv", data / "sub" / "f.tsv", data / ".." / "up.tsv"):
+        with pytest.raises(ValueError):
+            ro.write_data_file(bad, "no")
+    assert not (tmp_path / "elsewhere.tsv").exists()
+    assert not (tmp_path / "up.tsv").exists()
+
+
 def test_family_paths_stay_inside_the_data_directory():
     cases, golden = ro.family_paths("rtc")
     base = ro.DATA_DIR.resolve()
