@@ -1514,10 +1514,23 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // dropped: 20,998 in 120 s of Alex Kidd, 85,840 in 140 s of Summer Sports.
             // Its integer siblings 0x158 / 0x159 and the min3/max3 forms 0x151-0x156 are B32 too
             // and still fall to the default, under the add-on-evidence rule above.
-            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x157 ||
-                in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 || in.opcode == 0x36f ||
-                in.opcode == kVop3OpcodeAdd3U32 || in.opcode == kVop3OpcodeAndOrB32 ||
-                in.opcode == kVop3OpcodeMulLoU32 || in.opcode == kVop3OpcodeMulHiU32)
+            //
+            // V_BFE_U32 (0x148): `D.u32 = (S0.u32 >> S1.u32[4:0]) & ((1 << S2.u32[4:0]) - 1)`,
+            // three 32-bit operands (RDNA2 ISA 70648; emit_alu lowers S0 with a one-dword read).
+            // House of the Dead 2's fragment programs 0x41c7dfd500 / 0x41d05bd900 (#4848) recycle
+            // VCC as scalar scratch in a table-search loop that one path skips, then reload VCC_LO:
+            //
+            //     s_buffer_load_dword vcc_lo, s[0:3], 0xae4   VCC_LO scalar; VCC_HI still ambiguous
+            //     v_bfe_u32           v0, vcc_lo, s4, 1       a 32-BIT read of that dword
+            //     v_cmp_ne_u32        vcc, 0, v0              complete VCC replacement
+            //
+            // Charged the pair, the read demanded VCC_HI too and both programs were declined with
+            // `wave64-ambiguous-mask-read`. The signed sibling 0x149 stays at the default.
+            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x148 ||
+                in.opcode == 0x157 || in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
+                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
+                in.opcode == kVop3OpcodeAndOrB32 || in.opcode == kVop3OpcodeMulLoU32 ||
+                in.opcode == kVop3OpcodeMulHiU32)
                 return 1;
             return 2;
         default:
