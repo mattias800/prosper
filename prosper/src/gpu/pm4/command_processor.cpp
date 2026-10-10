@@ -3700,7 +3700,11 @@ void publish_memory_effect(const Pm4Command& command) {
         apply_deferred_effect(command);
     } else {
         pend_enqueue(command);
-        prosper_gpu_drain_renderer_writes();
+        // A completion cannot make a blocked resource write eligible. Avoid rescanning the
+        // growing completion queue for each label in a completion-only burst.
+        if (command.kind == Pm4Command::Kind::WriteData ||
+            command.kind == Pm4Command::Kind::DmaData)
+            prosper_gpu_drain_renderer_writes();
     }
 }
 } // namespace
