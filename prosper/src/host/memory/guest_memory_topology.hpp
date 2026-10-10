@@ -3,6 +3,7 @@
 #include "host/memory/guest_direct_allocation.hpp"
 #include <cstdint>
 #include <shared_mutex>
+#include <vector>
 
 namespace prosper {
 
@@ -35,6 +36,21 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(uint64_t first_addres
                                                            uint64_t first_size,
                                                            uint64_t second_address,
                                                            uint64_t second_size);
+
+// Exact committed mapping slices, including protection splits and GPU-only direct views.
+// The lease keeps the mapping identity stable; this observation does not establish current bytes.
+// False means incomplete/unknown topology, never physical isolation. Non-direct slices carry no
+// pool offset. The output is empty on failure, so no partial mapping proof escapes.
+// Optional coverage distinguishes a wholly untracked span from one with tracked but incomplete or
+// uncommitted backing. Neither establishes physical isolation; consumers must preserve that status.
+struct GuestMemoryMappingSlice {
+    uint64_t offset = 0, bytes = 0, physical = 0;
+    bool direct = false;
+};
+enum class GuestMemoryMappingCoverage : uint8_t { Complete, Untracked, Incomplete };
+bool guest_memory_mapping_slices(const GuestMappingLease& lease, uint64_t address, uint64_t bytes,
+                                 std::vector<GuestMemoryMappingSlice>& slices,
+                                 GuestMemoryMappingCoverage* coverage = nullptr);
 
 // True when the kernel-memory HLE tracks a guest mapping that contains `address`, whatever its CPU
 // protection and whether or not it is committed yet. This is the guest's own view, so GPU-only

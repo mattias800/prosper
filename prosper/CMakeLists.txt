@@ -3003,6 +3003,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/pm4/test_submit_visibility_default.cpp
     LIBRARIES prosper_core
     PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "PROSPER_EOP_WRITE_SYNC=unset:;PROSPER_WAIT_DEFER=set:1")
+  # The mixed tracked/native fixture needs a genuinely unmapped tail. Windows partial unmaps
+  # retain HLE-owned placeholders, which ordinary VirtualAlloc must not replace or release.
+  if(NOT WIN32)
+    target_compile_definitions(test_submit_visibility_default PRIVATE
+      PROSPER_TEST_NATIVE_UNTRACKED_TAIL=1)
+  endif()
 
   # #1945: the interior free-chain poison scan — its structural predicate, and the census that keeps
   # a zero from reading as "the chains are clean" when the walk reached nothing. POSIX only: the test
