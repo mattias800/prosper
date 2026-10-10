@@ -69,10 +69,9 @@ const Rdna2Inst& at(const std::vector<Rdna2Inst>& instructions, uint32_t pc) {
     return instructions.front();
 }
 
-const std::vector<uint32_t> kLoad{kLoadPc};
-
 // The decode the arms rely on: the load, its register offset, the back edge and the store.
 TEST(RawWideLoopAfterLoad, DecodePreconditions) {
+    const std::vector<uint32_t> kLoad{kLoadPc};
     const auto ins = program(kSOffsetS2, kLoopPc, {kStore0, kStore1});
     const Rdna2Inst& load = at(ins, kLoadPc);
     EXPECT_EQ(load.fmt, Rdna2Format::SMEM);
@@ -91,6 +90,7 @@ TEST(RawWideLoopAfterLoad, DecodePreconditions) {
 }
 
 TEST(RawWideLoopAfterLoad, BackEdgeAfterTheLoadIsAdmitted) {
+    const std::vector<uint32_t> kLoad{kLoadPc};
     EXPECT_EQ(rdna2_proven_raw_immediate_wide_data_loads(program(kSOffsetNull, kLoopPc)), kLoad);
     EXPECT_EQ(rdna2_proven_raw_register_wide_entry_loads(program(kSOffsetS2, kLoopPc)), kLoad);
     EXPECT_EQ(rdna2_proven_raw_register_wide_data_loads(program(kSOffsetS2, kLoopPc)), kLoad);
