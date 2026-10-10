@@ -26,6 +26,7 @@ inline constexpr uint32_t kDmaDataAddressSource = 1u << 16;
 enum : uint32_t {
     IT_NOP = 0x10,
     IT_SET_BASE = 0x11,
+    IT_INDEX_BUFFER_SIZE = 0x13,
     IT_DISPATCH_DIRECT = 0x15,
     IT_DISPATCH_INDIRECT = 0x16,
     IT_DRAW_INDIRECT = 0x24,
@@ -36,6 +37,7 @@ enum : uint32_t {
     IT_NUM_INSTANCES = 0x2F,
     IT_WRITE_DATA = 0x37,
     IT_WAIT_REG_MEM = 0x3C,
+    IT_PFP_SYNC_ME = 0x42,
     IT_EVENT_WRITE = 0x46,
     IT_RELEASE_MEM = 0x49,
     IT_ACQUIRE_MEM = 0x58,

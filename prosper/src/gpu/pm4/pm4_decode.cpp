@@ -82,6 +82,19 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.kind = K::SetBaseIndirectArgs;
             c.indirect_shader_type = (h >> 1) & 1u;
             c.indirect_base = lo_hi(&pl[1]);
+        } else if (c.op == IT_INDEX_BUFFER_SIZE && npl == 1) {
+            // Hardware PM4 INDEX_BUFFER_SIZE (GFX10, 2 dwords): [0] = the bound index buffer's size
+            // in indices -- the state sceAgcDcbSetIndexCount binds (R_INDEX_COUNT).
+            c.kind = K::SetIndexCount;
+            c.index_count = pl[0];
+        } else if (c.op == IT_PFP_SYNC_ME && npl == 1) {
+            // Hardware PM4 PFP_SYNC_ME (GFX10, 2 dwords, [0] = DUMMY): the prefetch parser waits
+            // for the micro engine -- the same ordering point as R_STALL_COMMAND_BUFFER_PARSER.
+            c.kind = K::StallCommandBufferParser;
+            // CLEAR_STATE (0x12), CONTEXT_CONTROL (0x28) and ATOMIC_MEM (0x1E) deliberately stay
+            // Unknown: none of them is a draw reset or an acquire barrier, and labelling them as
+            // one would hide a real, unimplemented effect (a context-register reset to clear-state
+            // values; shadow load control; an atomic memory write) from every Unknown census.
         } else if (c.op == IT_DRAW_INDEX_AUTO && npl == 2) {
             // Hardware PM4 DRAW_INDEX_AUTO (GFX10, 3 dwords): [0] = INDEX_COUNT, [1] =
             // VGT_DRAW_INITIATOR. The initiator is not a ShaderDrawModifier, so di_modifier keeps

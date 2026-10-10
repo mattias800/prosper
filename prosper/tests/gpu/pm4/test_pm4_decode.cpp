@@ -522,4 +522,42 @@ TEST(Pm4Decode, Contract) {
                   other_ops[1].kind == K::Unknown && other_ops[2].kind == K::Unknown,
               "register, write-then-wait and short WAIT_REG_MEM stay Unknown");
     }
+
+    // Hardware control and barrier packets (Black Flag submit0.bin):
+    {
+        uint32_t ctl_stream[] = {
+            // IT_INDEX_BUFFER_SIZE: 2 dwords, op 0x13, count=0x38a
+            PM4(2, IT_INDEX_BUFFER_SIZE, 0),
+            0x38au,
+            // IT_PFP_SYNC_ME: 2 dwords, op 0x42
+            PM4(2, IT_PFP_SYNC_ME, 0),
+            0u,
+            // CLEAR_STATE (0x12), ATOMIC_MEM (0x1E, 9 dwords), CONTEXT_CONTROL (0x28, 3 dwords):
+            // not a reset, a barrier or a no-op the processor can claim, so they stay Unknown.
+            PM4(2, 0x12u, 0),
+            0u,
+            PM4(9, 0x1Eu, 0),
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            PM4(3, 0x28u, 0),
+            0x80000000u,
+            0x80000000u,
+        };
+        std::vector<Pm4Command> ctl_ops;
+        const size_t c = decode_pm4(ctl_stream, std::size(ctl_stream), ctl_ops);
+        CHECK(c == 18, "consumed 18 dwords of control/barrier packets");
+        CHECK(ctl_ops.size() == 5, "walked 5 control/barrier packets");
+        CHECK(ctl_ops[0].kind == K::SetIndexCount && ctl_ops[0].index_count == 0x38au,
+              "op0 is SetIndexCount");
+        CHECK(ctl_ops[1].kind == K::StallCommandBufferParser, "op1 is StallCommandBufferParser");
+        CHECK(ctl_ops[2].kind == K::Unknown && ctl_ops[3].kind == K::Unknown &&
+                  ctl_ops[4].kind == K::Unknown,
+              "CLEAR_STATE, ATOMIC_MEM and CONTEXT_CONTROL stay Unknown");
+    }
 }
