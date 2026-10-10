@@ -44,15 +44,22 @@ bool address_range(uint64_t base, uint32_t offset, uint32_t count, uint64_t* add
 }
 }  // namespace
 
-void apply_context_control(const Pm4Command& command, GpuState& state) {
+bool apply_context_control(const Pm4Command& command, GpuState& state) {
     // Published GFX10 fields and AMD's SI programming guide agree on the independent update
     // bits; each unselected dword leaves its existing enables intact. CONFIDENCE: HIGH.
     const uint32_t load = command.payload[0], shadow = command.payload[1];
+    bool changed = false;
     if (load & kUpdate) {
+        changed =
+            !state.context_control.load_known || state.context_control.load != (load & ~kUpdate);
         state.context_control.load = load & ~kUpdate;
         state.context_control.load_known = true;
     }
-    if (shadow & kUpdate) state.context_control.shadow = shadow & ~kUpdate;
+    if (shadow & kUpdate) {
+        changed |= state.context_control.shadow != (shadow & ~kUpdate);
+        state.context_control.shadow = shadow & ~kUpdate;
+    }
+    return changed;
 }
 
 bool apply_register_ranges(const Pm4Command& command, GpuState& state) {
@@ -95,6 +102,7 @@ bool apply_register_ranges(const Pm4Command& command, GpuState& state) {
             registers.push_back({offset + n, *value});
         }
     }
+    const bool base_changed = controls.bases[selected] != command.regs_vaddr;
     controls.bases[selected] = command.regs_vaddr;
     auto& file = command.reg_class == RegClass::Cx   ? state.cx
                  : command.reg_class == RegClass::Uc ? state.uc
@@ -104,7 +112,7 @@ bool apply_register_ranges(const Pm4Command& command, GpuState& state) {
         if (command.reg_class == RegClass::Sh)
             record_loaded_shader_register(state, command, reg.offset);
     }
-    return !registers.empty();
+    return base_changed || !registers.empty();
 }
 
 void shadow_direct_registers(const Pm4Command& command, GpuState& state) {

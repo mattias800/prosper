@@ -4244,6 +4244,7 @@ const std::shared_ptr<const GpuState>& GpuState::refresh_state_snapshot() {
     if (state_dirty_ || !last_snapshot_) {
         auto snap = std::make_shared<GpuState>();
         snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+        snap->context_control = context_control;
         snap->index_type_announced = index_type_announced;
         snap->num_instances = num_instances;
         snap->command_order = command_order;   // #305 instrument: order at snapshot
@@ -4272,7 +4273,7 @@ void GpuState::apply(const Pm4Command& c) {
     using K = Pm4Command::Kind;
     command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
-        case K::ContextControl: apply_context_control(c, *this); break;
+        case K::ContextControl: state_dirty_ |= apply_context_control(c, *this); break;
         case K::LoadRegRanges: state_dirty_ |= apply_register_ranges(c, *this); break;
         case K::SetRegsIndirect: {
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;

@@ -43,6 +43,71 @@ protected:
     void TearDown() override { prosper_gpu_drain_completion_writes(); }
 };
 
+// Execution-time register effects need the controls at their packet, not the final submit's
+// enables or bases. In particular, a count-zero LOAD changes a shadow base without loading values.
+TEST_F(Pm4Context, SnapshotsRetainControlUpdatesAtEachDraw) {
+    Words buffer;
+    control(buffer, 0x80010000, 0x80010000);
+    packet(buffer, 0x2d, {3, 2});
+    control(buffer, 0, 0x80000000);
+    packet(buffer, 0x2d, {3, 2});
+    control(buffer, 0x80000000, 0);
+    packet(buffer, 0x2d, {3, 2});
+    GpuState state;
+    run_command_buffer(buffer.data(), buffer.size(), state);
+    ASSERT_EQ(state.draws.size(), 3u);
+    const auto& first = state.state_at_draw(0).context_control;
+    const auto& second = state.state_at_draw(1).context_control;
+    const auto& third = state.state_at_draw(2).context_control;
+    EXPECT_TRUE(first.load_known);
+    EXPECT_EQ(first.load, 0x10000u);
+    EXPECT_EQ(first.shadow, 0x10000u);
+    EXPECT_TRUE(second.load_known);
+    EXPECT_EQ(second.load, 0x10000u);
+    EXPECT_EQ(second.shadow, 0u);
+    EXPECT_TRUE(third.load_known);
+    EXPECT_EQ(third.load, 0u);
+    EXPECT_EQ(third.shadow, 0u);
+    EXPECT_NE(state.draws[0].state, state.draws[1].state);
+    EXPECT_NE(state.draws[1].state, state.draws[2].state);
+    EXPECT_TRUE(state.sh.empty());
+}
+
+TEST_F(Pm4Context, CountZeroRangeBaseChangesReachSnapshots) {
+    std::array<uint32_t, 4> first_backing{}, second_backing{};
+    Words buffer;
+    control(buffer, 0x80010000, 0x80010000);
+    load(buffer, 0x5f, first_backing.data(), 0, 0);
+    packet(buffer, 0x2d, {3, 2});
+    load(buffer, 0x5f, second_backing.data(), 0, 0);
+    packet(buffer, 0x2d, {3, 2});
+    GpuState state;
+    run_command_buffer(buffer.data(), buffer.size(), state);
+    ASSERT_EQ(state.draws.size(), 2u);
+    EXPECT_EQ(state.state_at_draw(0).context_control.bases[2],
+              reinterpret_cast<uint64_t>(first_backing.data()));
+    EXPECT_EQ(state.state_at_draw(1).context_control.bases[2],
+              reinterpret_cast<uint64_t>(second_backing.data()));
+    EXPECT_NE(state.draws[0].state, state.draws[1].state);
+    EXPECT_TRUE(state.sh.empty());
+    EXPECT_FALSE(state.dma_execution_rejected);
+}
+
+TEST_F(Pm4Context, UnselectedAndUnchangedControlsShareSnapshot) {
+    Words buffer;
+    control(buffer, 0x80010000, 0x80000000);
+    packet(buffer, 0x2d, {3, 2});
+    control(buffer, 0x10000, 0x10000); // Neither word selects an update.
+    packet(buffer, 0x2d, {3, 2});
+    control(buffer, 0x80010000, 0x80000000);   // Selected, but identical to the existing controls.
+    packet(buffer, 0x2d, {3, 2});
+    GpuState state;
+    run_command_buffer(buffer.data(), buffer.size(), state);
+    ASSERT_EQ(state.draws.size(), 3u);
+    EXPECT_EQ(state.draws[0].state, state.draws[1].state);
+    EXPECT_EQ(state.draws[1].state, state.draws[2].state);
+}
+
 TEST_F(Pm4Context, OrdinaryRangesUseOffsetsInMemoryAndRegisterSpace) {
     std::array<uint32_t, 32> backing{};
     backing[3] = 0x1234;

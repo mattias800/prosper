@@ -14,7 +14,7 @@ struct Pm4ContextControl {
     std::array<uint64_t, 4> bases{};  // Cx, Uc, graphics SH, compute SH
 };
 
-void apply_context_control(const Pm4Command& command, GpuState& state);
+bool apply_context_control(const Pm4Command& command, GpuState& state);
 bool apply_register_ranges(const Pm4Command& command, GpuState& state);
 void shadow_direct_registers(const Pm4Command& command, GpuState& state);
 bool register_shadow_operand_valid(const Pm4Command& command);
