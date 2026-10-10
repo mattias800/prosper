@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace prosper::gpu {
@@ -27,6 +28,13 @@ struct ImageWriteExtent {
 // pad256(width) texels.
 bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo, uint64_t& hi);
 
+// Code-only half of the proof, kept per decoded program version so the CFG analysis runs once per
+// consumer instead of on every fold. Opaque; create one with make_split_t8_proof_cache().
+struct SplitT8ProofCache;
+std::shared_ptr<SplitT8ProofCache> make_split_t8_proof_cache();
+// The largest program the proof analyses. A memory guard: with a cache the cost is paid once.
+inline constexpr size_t kSplitT8MaxDwords = 16384;
+
 // `image_writes` lists the earlier storage-image uses whose extents are known. A write through one of
 // them that cannot reach the descriptor bytes does not revoke the proof; any other writer still does.
 bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
@@ -34,6 +42,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
                                  const std::array<uint64_t, 8>& source_addr,
                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                  uint32_t user_sgpr_base,
-                                 const std::vector<ImageWriteExtent>& image_writes = {});
+                                 const std::vector<ImageWriteExtent>& image_writes = {},
+                                 SplitT8ProofCache* cache = nullptr);
 
 } // namespace prosper::gpu

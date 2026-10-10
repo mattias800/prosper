@@ -11,13 +11,14 @@
 //   4. a barrier from COMPUTE_SHADER to the vertex (and geometry) stage;
 //   5. the pass-through draws, one per RUN, in run order.
 //
-// WAVE-COUNT GROUPS AND RUNS. The shell is compiled for one W (its LocalSize is 64W), and
-// workgroup g of a dispatch reads launch record g * 64W + i and writes export block g. So the
+// WAVE-COUNT GROUPS AND RUNS. The shell is compiled for one W (its LocalSize is LW, L the guest wave
+// width: 64, or 32 for a Wave32 program), and workgroup g of a dispatch reads launch record
+// g * LW + i and writes export block g. So the
 // subgroups of one W are dispatched together, in plan order, into their own export region. The
 // planner can interleave wave counts (a strip's last subgroup per instance is often smaller), and
 // guest primitive order is plan order, so the draw side visits blocks in PLAN order: a run is a
 // maximal stretch of consecutive plan subgroups with one W, drawn by that W's pass-through stage
-// with firstVertex = first_block * 64W * K over that W's region.
+// with firstVertex = first_block * LW * K over that W's region.
 //
 // SET-0 RESOURCES. The shell reads its guest resources through set 0, at the bindings listed in
 // `guest_bindings` (storage buffers only; a shell declaring an image, sampler or uniform block is
@@ -42,8 +43,8 @@ namespace prosper::gpu {
 // The stages compiled for one wave count W. Immutable and shared: a live producer caches them per
 // program and register state (ngg_live_draw.hpp), so every draw of that shape reuses one copy.
 struct NggSubgroupStages {
-    uint32_t waves = 0;   // W, 1..4
-    std::shared_ptr<const std::vector<uint32_t>> shell;   // compute module, LocalSize 64W
+    uint32_t waves = 0;   // W, 1..4 (Wave64) or 1..8 (Wave32)
+    std::shared_ptr<const std::vector<uint32_t>> shell;   // compute module, LocalSize LW
     std::shared_ptr<const std::vector<uint32_t>> raster_vertex;   // pass-through vertex stage
     std::vector<uint32_t> raster_geometry;   // the route's geometry stage, or empty
     // FNV-1a of `shell`, computed once here so the backend's pipeline cache never hashes the
@@ -58,12 +59,12 @@ struct NggSubgroupStages {
 
 // The subgroups of one wave count W.
 struct NggSubgroupWaveGroup {
-    uint32_t waves = 0;   // W, 1..4
+    uint32_t waves = 0;   // W, 1..4 (Wave64) or 1..8 (Wave32)
     uint32_t blocks = 0;   // subgroups of this W = workgroups dispatched = export blocks
     std::shared_ptr<const NggSubgroupStages> stages;
-    // kNggLaunchWordsPerLane words per invocation, blocks * 64W invocations, plan order.
+    // kNggLaunchWordsPerLane words per invocation, blocks * LW invocations, plan order.
     std::vector<uint32_t> launch_words;
-    uint32_t export_words = 0;   // blocks * layout.block_words(waves)
+    uint32_t export_words = 0;   // blocks * layout.block_words(waves, L)
 };
 
 // A maximal stretch of consecutive plan subgroups with one wave count.
@@ -80,7 +81,8 @@ struct NggSubgroupDraw {
     NggLayerRoute route = NggLayerRoute::None;
     uint32_t vertices_per_primitive = 3;   // K
     bool count_violations = true;   // the vertex stage writes set 2 binding 2
-    bool native_wave64 = false;   // every shell requires a 64-lane subgroup
+    bool native_wave64 = false;   // every shell requires a native subgroup of wave_lanes lanes
+    uint32_t wave_lanes = 64;   // L: 64, or 32 for a Wave32 program (GS_W32_EN)
     uint32_t lds_bytes = 0;   // the shell's workgroup LDS (RSRC2_GS.LDS_SIZE), for device admission
     std::vector<NggSubgroupWaveGroup> groups;   // ascending W: the dispatch order
     std::vector<NggSubgroupRun> runs;   // plan order: the draw order
@@ -92,11 +94,13 @@ struct NggSubgroupDrawRequest {
     const uint32_t* linked_code = nullptr;   // the linked ES+GS program
     size_t dwords = 0;
     const ShaderResourceTable* resources = nullptr;
-    NggSubgroupShellConfig shell;   // `waves` is ignored: each group sets its own
+    // `waves` is ignored: each group sets its own. `wave_lanes` is taken from `limits` (the plan, the
+    // shell and the raster stage share one width).
+    NggSubgroupShellConfig shell;
     NggSubgroupLimits limits;
     NggDrawShape shape;
     NggSubgroupBudget budget;
-    // `layout` and `waves` are ignored: the builder fills them per group from the shell.
+    // `layout`, `waves` and `wave_lanes` are ignored: the builder fills them per group.
     NggRasterCommitConfig raster;
     // The interpolation geometry stage the draw's pixel stage needs, built against the vertex
     // stage's published interface (its layer location). Required for the InterpolationGeometry

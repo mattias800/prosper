@@ -19,8 +19,8 @@ static_assert(kNggRasterDescriptorSet == kNggShellDescriptorSet &&
                   kNggRasterExportBinding == kNggShellExportBinding,
               "the raster commit reads the export buffer where the shell writes it");
 
-constexpr uint32_t kGuestWaveLanes = 64;
-constexpr uint32_t kMaxWaves = 4;
+// The shell's workgroup bound: four Wave64 or eight Wave32 guest waves.
+constexpr uint32_t kMaxLanes = 256;
 // The largest layer count a target can have: gfx10's CB_COLOR*_VIEW.SLICE_MAX is 11 bits, and 2048 is
 // also RADV's maxFramebufferLayers (Vulkan only guarantees 256, so a device may allow fewer).
 constexpr uint32_t kMaxLayerSlices = 2048;
@@ -123,7 +123,7 @@ NggLayerRoute select_ngg_layer_route(const NggLayerRouteQuery& query, std::strin
 }
 
 uint32_t ngg_raster_commit_vertex_count(const NggRasterCommitConfig& config, uint32_t blocks) {
-    return blocks * kGuestWaveLanes * config.waves * vertices_per_primitive(config.topology);
+    return blocks * config.wave_lanes * config.waves * vertices_per_primitive(config.topology);
 }
 
 std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig& config,
@@ -132,8 +132,10 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
     const uint32_t corners = vertices_per_primitive(config.topology);
     if (!corners) return fail(refusal, "ngg-raster-topology-unsupported");
     const NggExportRecordLayout& layout = config.layout;
-    if (!config.float_transport.canonical() || config.waves < 1 || config.waves > kMaxWaves ||
-        !layout.words_per_lane || layout.param_targets.size() > kNggMaxParamTargets ||
+    if (!config.float_transport.canonical() ||
+        (config.wave_lanes != 32u && config.wave_lanes != 64u) || config.waves < 1 ||
+        config.waves * config.wave_lanes > kMaxLanes || !layout.words_per_lane ||
+        layout.param_targets.size() > kNggMaxParamTargets ||
         layout.param_targets.size() != layout.param_channels.size() || !config.layer_slices ||
         config.layer_slices > kMaxLayerSlices)
         return fail(refusal, "ngg-raster-config");
@@ -209,13 +211,14 @@ std::vector<uint32_t> build_ngg_raster_commit_vertex(const NggRasterCommitConfig
         b.iface.push_back(layer_output);
     }
 
-    const uint32_t lanes = kGuestWaveLanes * config.waves;
+    const uint32_t lanes = config.wave_lanes * config.waves;
     const uint32_t vertex = b.load_vertex_index();
     const uint32_t slot = b.ibin(Op_UDiv, vertex, b.uconst(corners));
     const uint32_t corner = b.ibin(Op_UMod, vertex, b.uconst(corners));
     const uint32_t block = b.ibin(Op_UDiv, slot, b.uconst(lanes));
     const uint32_t thread = b.ibin(Op_UMod, slot, b.uconst(lanes));
-    const uint32_t header = b.ibin(Op_IMul, block, b.uconst(layout.block_words(config.waves)));
+    const uint32_t header =
+        b.ibin(Op_IMul, block, b.uconst(layout.block_words(config.waves, config.wave_lanes)));
     const auto header_word = [&](uint32_t word) {
         return load(b.ibin(Op_IAdd, header, b.uconst(word)));
     };
