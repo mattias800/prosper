@@ -12,6 +12,9 @@ namespace prosper::gpu {
 
 struct GpuState;
 
+// Conservative guest destination used by pending queues and checked scalar overlays.
+void pm4_memory_effect_span(const Pm4Command& command, uint64_t* address, uint64_t* bytes);
+
 bool integer_atomic_mem_op(uint32_t op);
 uint32_t atomic_mem_bytes(uint32_t op);
 std::optional<uint64_t> atomic_mem_value(uint32_t op, uint64_t old_value, uint64_t source,

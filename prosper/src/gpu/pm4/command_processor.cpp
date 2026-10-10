@@ -3590,22 +3590,6 @@ std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount> g_ga
 // different fold, while the numerically equal guest address remains unrelated.
 std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount>
     g_gated_gds_ranges; // [offset, offset + bytes)
-// The guest-memory span a command writes (0 bytes = writes nothing we track).
-void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
-    using K = Pm4Command::Kind;
-    switch (c.kind) {
-        case K::ReleaseMem: *addr = c.rel_addr;   *bytes = 8; break;
-        case K::EventWrite: *addr = c.event_addr; *bytes = 8; break;
-        case K::WriteData:  *addr = c.wd_addr;
-                            *bytes = (uint64_t)c.wd_declared_num * 4; break;
-        case K::DmaData:    *addr = c.dd_dst;     *bytes = c.dd_bytes; break;
-        case K::AtomicMem:
-            *addr = c.atomic_addr;
-            *bytes = atomic_mem_bytes(c.atomic_op);
-            break;
-        default:            *addr = 0;            *bytes = 0; break;
-    }
-}
 void gated_register(const Pm4Command& c) {
     if (c.kind == Pm4Command::Kind::DmaData &&
         dma_data_dst_sel(c) == kDmaSelGds) {
@@ -3619,7 +3603,7 @@ void gated_register(const Pm4Command& c) {
         return;
     }
     uint64_t a = 0, n = 0;
-    effect_span(c, &a, &n);
+    pm4_memory_effect_span(c, &a, &n);
     if (!a || !n) return;
     const size_t queue = deferred_queue(c.queue_origin);
     if (n <= 32) {
@@ -3650,7 +3634,7 @@ bool effect_gated(const Pm4Command& c) {
         dma_data_dst_sel(c) == kDmaSelGds)
         return gds_gated(c.dd_dst, c.dd_bytes, c.queue_origin);
     uint64_t a = 0, n = 0;
-    effect_span(c, &a, &n);
+    pm4_memory_effect_span(c, &a, &n);
     return addr_gated(a, n, c.queue_origin);
 }
 
@@ -3908,7 +3892,7 @@ static bool retained_ordered_effect_destination_overlaps(
             dma_data_dst_sel(command) == kDmaSelGds)
             continue;
         uint64_t destination = 0, effect_bytes = 0;
-        effect_span(command, &destination, &effect_bytes);
+        pm4_memory_effect_span(command, &destination, &effect_bytes);
         if (!destination || !effect_bytes) continue;
         if (guest_memory_topology_relation(address, bytes, destination, effect_bytes) !=
             GuestMemoryTopologyRelation::Disjoint)
@@ -3927,7 +3911,7 @@ OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
     diagnostic.value_after = value_before;
 
     const Pm4Command& command = effect.cmd;
-    effect_span(command, &diagnostic.address, &diagnostic.bytes);
+    pm4_memory_effect_span(command, &diagnostic.address, &diagnostic.bytes);
     if (!diagnostic.address || !diagnostic.bytes ||
         guest_memory_topology_relation(
             wait_address, sizeof(value_before), diagnostic.address, diagnostic.bytes) ==

@@ -13,6 +13,37 @@ bool guest_writable(uint64_t address, uint32_t bytes);
 void notify_guest_gpu_write(uint64_t address, uint64_t bytes);
 void set_guest_gpu_write_origin(const char* origin);
 
+// The guest-memory span a command writes (0 bytes = writes nothing we track).
+void pm4_memory_effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
+    using K = Pm4Command::Kind;
+    switch (c.kind) {
+        case K::ReleaseMem:
+            *addr = c.rel_addr;
+            *bytes = 8;
+            break;
+        case K::EventWrite:
+            *addr = c.event_addr;
+            *bytes = 8;
+            break;
+        case K::WriteData:
+            *addr = c.wd_addr;
+            *bytes = (uint64_t)c.wd_declared_num * 4;
+            break;
+        case K::DmaData:
+            *addr = c.dd_dst;
+            *bytes = c.dd_bytes;
+            break;
+        case K::AtomicMem:
+            *addr = c.atomic_addr;
+            *bytes = atomic_mem_bytes(c.atomic_op);
+            break;
+        default:
+            *addr = 0;
+            *bytes = 0;
+            break;
+    }
+}
+
 bool integer_atomic_mem_op(uint32_t op) {
     if (op > 0x7f) return false;
     const uint32_t operation = op & 0x1f;
