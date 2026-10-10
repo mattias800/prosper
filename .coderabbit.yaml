@@ -24,6 +24,7 @@ reviews:
   auto_review:
     enabled: true
     auto_incremental_review: true           # re-review each new push
+    auto_pause_after_reviewed_commits: 0    # never pause: the reviewer agent pushes fixes late in a PR
     drafts: false                           # drafts here are work-in-progress checkpoints
     base_branches:
       - main
