@@ -2241,6 +2241,13 @@ bool detile_volume_tail_level(uint8_t* dst, const uint8_t* src, size_t src_bytes
     const uint32_t el = sw64kb_elem_log2(bytes_per_texel);
     if (el == UINT32_MAX) return false;
     const PatBit3* pat = kSw64kbS3[el];
+    // The translated level must fit inside the shared 64 KiB block it names: without
+    // this a mismatched descriptor aliases another level's texels instead of reading
+    // zeros, breaking the header contract that bytes outside the level are never read.
+    const uint32_t* bd = kSw64kbS3Dims[el];
+    if (static_cast<uint64_t>(tail_x) + width > bd[0] ||
+        static_cast<uint64_t>(tail_y) + height > bd[1] || depth > bd[2])
+        return false;
     const uint64_t linear_texels = static_cast<uint64_t>(width) * height * depth;
     if (linear_texels > SIZE_MAX / bytes_per_texel) return false;
     // The shared-block S3 equation at translated coordinates
