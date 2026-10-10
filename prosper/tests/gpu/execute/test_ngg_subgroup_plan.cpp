@@ -382,3 +382,44 @@ TEST(NggSubgroupPlan, VsOnlyOutputLimitBoundsEsVertices) {
 }
 
 }   // namespace
+
+// #4808: a Wave32 passthrough VS-only draw (Yakuza Kiwami's GS_W32_EN | PRIMGEN_PASSTHRU_EN). 40
+// triangles over 40 distinct vertices (a strip of 42) fill two 32-lane waves: s3 counts each wave's
+// share of 32, s2 the subgroup totals, and v0 is the packed PRIM form of the three subgroup-thread
+// indices with v1 left empty. The same draw at Wave64 needs one wave, which is the control that
+// the width, not the thread count alone, decides the waves.
+TEST(NggSubgroupPlan, Wave32PassthroughSplitsWavesAtThirtyTwoAndPacksThePrimitive) {
+    NggSubgroupLimits limits = decode_ngg_subgroup_limits(0x10020040u, 0x8040u, 0x40u, 0u, 0u);
+    limits.vs_only = true;
+    limits.wave_lanes = 32;
+    limits.passthrough = true;   // ITEMSIZE 0 is fine: passthrough indices are not scaled
+    NggDrawShape draw;
+    draw.topology = NggInputTopology::TriangleStrip;
+    draw.vertex_count = 42;
+    const NggSubgroupPlan plan = plan_ngg_subgroups(draw, limits);
+    ASSERT_TRUE(plan.ok()) << plan.refusal;
+    ASSERT_EQ(plan.subgroups.size(), 1u);
+    const NggSubgroup& s = plan.subgroups[0];
+    EXPECT_EQ(s.es_threads(), 42u);
+    EXPECT_EQ(s.gs_threads(), 40u);
+    EXPECT_EQ(s.waves, 2u);
+    EXPECT_EQ(ngg_merged_wave_info(s, 0, 32), (2u << 28) | (32u << 8) | 32u);
+    EXPECT_EQ(ngg_merged_wave_info(s, 1, 32), (2u << 28) | (1u << 24) | (8u << 8) | 10u);
+    EXPECT_EQ(ngg_group_info(s), (42u << 12) | (40u << 22));
+    const NggLaneLaunch t33 = ngg_lane_launch(s, limits, 1, 1);   // thread 33: triangle 33
+    EXPECT_EQ(t33.v[0], 33u | 34u << 10 | 35u << 20);
+    EXPECT_EQ(t33.v[1], 0u);
+    EXPECT_EQ(t33.v[2], 33u) << "PrimitiveID";
+    EXPECT_EQ(t33.v[5], 33u) << "VertexID";
+    const NggLaneLaunch t41 = ngg_lane_launch(s, limits, 1, 9);
+    EXPECT_EQ(t41.v[0], 0u) << "no primitive past the 40th";
+    EXPECT_EQ(t41.v[5], 41u);
+
+    NggSubgroupLimits wave64 = limits;
+    wave64.wave_lanes = 64;
+    EXPECT_EQ(plan_ngg_subgroups(draw, wave64).subgroups.at(0).waves, 1u);
+    NggSubgroupLimits offsets = limits;
+    offsets.passthrough = false;
+    EXPECT_EQ(plan_ngg_subgroups(draw, offsets).refusal, "ngg-limits-unusable")
+        << "control: without passthrough the offsets need an ITEMSIZE";
+}

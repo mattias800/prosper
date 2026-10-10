@@ -80,6 +80,9 @@ inline prosper::gpu::NggHostCapabilities ngg_host_capabilities(const RenderVkCtx
     host.native_wave64 = ctx.subgroup_size_control && ctx.compute_full_subgroups &&
                          (ctx.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                          ctx.min_subgroup_size <= 64u && ctx.max_subgroup_size >= 64u;
+    host.native_wave32 = ctx.subgroup_size_control && ctx.compute_full_subgroups &&
+                         (ctx.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                         ctx.min_subgroup_size <= 32u && ctx.max_subgroup_size >= 32u;
     host.max_compute_workgroup_subgroups = ctx.max_compute_workgroup_subgroups;
     host.max_compute_shared_memory = ctx.detile_limits.maxComputeSharedMemorySize;
     host.max_compute_workgroup_size_x = ctx.max_compute_workgroup_size_x;
@@ -262,7 +265,7 @@ inline constexpr size_t kNggShellPipelineCacheEntries = 64;
 inline std::shared_ptr<const NggShellPipeline>
 ngg_shell_pipeline(const RenderVkCtx& ctx, const prosper::gpu::NggSubgroupStages& stages,
                    const std::vector<uint32_t>& guest_bindings, uint32_t push_words,
-                   bool native_wave64) {
+                   bool native_wave64, uint32_t wave_lanes = 64) {
     struct Entry {
         std::shared_ptr<const NggShellPipeline> pipeline;
         std::vector<uint32_t> key;
@@ -277,7 +280,10 @@ ngg_shell_pipeline(const RenderVkCtx& ctx, const prosper::gpu::NggSubgroupStages
     const std::lock_guard lock(mutex);
     auto& stats = ngg_shell_pipeline_cache_stats();
     const auto& shell = *stages.shell;
-    std::vector<uint32_t> key = {stages.waves, push_words, native_wave64 ? 1u : 0u,
+    std::vector<uint32_t> key = {stages.waves,
+                                 wave_lanes,
+                                 push_words,
+                                 native_wave64 ? 1u : 0u,
                                  static_cast<uint32_t>(shell.size()),
                                  static_cast<uint32_t>(guest_bindings.size())};
     key.insert(key.end(), guest_bindings.begin(), guest_bindings.end());
@@ -327,7 +333,7 @@ ngg_shell_pipeline(const RenderVkCtx& ctx, const prosper::gpu::NggSubgroupStages
         return nullptr;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-    required.requiredSubgroupSize = 64;
+    required.requiredSubgroupSize = wave_lanes;   // one native subgroup per guest wave
     // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization): every stage field is set below.
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -670,7 +676,7 @@ private:
             // The workgroup and buffer limits were checked by ngg_device_refusal above.
             auto pipeline = ngg_shell_pipeline(ctx_, *group.stages, ngg.guest_bindings,
                                                static_cast<uint32_t>(ngg.push_constants.size()),
-                                               ngg.native_wave64);
+                                               ngg.native_wave64, ngg.wave_lanes);
             prelude.pipelines.push_back(pipeline);
             prelude.launch.push_back(ring.acquire(ctx_, true, launch_bytes));
             prelude.exports.push_back(ring.acquire(ctx_, false, export_bytes));
@@ -711,7 +717,7 @@ private:
         strip_set0(later_runs);
         for (const NggSubgroupRun& run : ngg.runs) {
             const NggSubgroupWaveGroup& group = ngg.groups[run.group];
-            const uint32_t per_block = 64u * group.waves * ngg.vertices_per_primitive;
+            const uint32_t per_block = ngg.wave_lanes * group.waves * ngg.vertices_per_primitive;
             BackendDraw expanded = &run == &ngg.runs.front() ? draw : later_runs;
             expanded.ngg_subgroup.reset();
             expanded.vs.clear();
@@ -843,8 +849,8 @@ inline const char* ngg_backend_draw_refusal(const BackendDraw& draw,
     if (const char* shape = ngg_backend_draw_structure_refusal(draw)) return shape;
     for (const prosper::gpu::NggSubgroupWaveGroup& group : ngg.groups)
         if (!ngg_shell_pipeline(render_vk_ctx(), *group.stages, ngg.guest_bindings,
-                                static_cast<uint32_t>(ngg.push_constants.size()),
-                                ngg.native_wave64))
+                                static_cast<uint32_t>(ngg.push_constants.size()), ngg.native_wave64,
+                                ngg.wave_lanes))
             return "ngg-backend-pipeline";
     // A call that writes no colour (a depth-only pass: backend_draws_leave_colour) carries nothing
     // but depth between segments, and persistent depth carries on the GPU (#3135 layered depth).

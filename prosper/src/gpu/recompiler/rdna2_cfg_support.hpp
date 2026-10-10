@@ -1564,7 +1564,13 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
 inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
     ScalarSourceMarks marks;
     const auto word = [&](int r) {
-        marks.placeholder = marks.placeholder || sreg_word_may_be_fabricated(rs, r);
+        const bool fabricated = sreg_word_may_be_fabricated(rs, r);
+        marks.placeholder = marks.placeholder || fabricated;
+        const auto blanket = rs.sreg_loop_blanket.find(r);
+        if (fabricated && blanket == rs.sreg_loop_blanket.end())
+            marks.hard = true;
+        else if (fabricated)
+            marks.blanket_roots.insert(blanket->second.begin(), blanket->second.end());
         marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
     };
     if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
@@ -1576,6 +1582,7 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
             if (in.src[1].kind == OperandKind::InlineInt) {
                 const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
                 marks.placeholder = rs.lane_slot_merge_placeholder.contains(slot);
+                marks.hard = marks.placeholder;
                 marks.memory = rs.lane_slot_memory_pattern.contains(slot);
             }
         } else if (in.src[0].kind == OperandKind::SGPR ||
@@ -1599,7 +1606,7 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     // A read-modify-write keeps the destination's old bits (s_bitset*, s_cmov*, s_addk, ...).
     const uint32_t implicit = scalar_implicit_destination_read_width(in);
     for (uint32_t w = 0; w < implicit; ++w) word(in.dst.value + static_cast<int>(w));
-    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = true;
+    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = marks.hard = true;
     return marks;
 }
 
@@ -1621,6 +1628,43 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
         },
         /*wave32_one_word_masks*/ false);
     return snapshot;
+}
+
+// A scalar write that replaces only the ROOT word of a saved Wave64 B64 mask ends the mask
+// (expire_saved_b64_mask), yet on the hardware the HIGH word still holds its half of that mask.
+// Kena's level-load pixel program 0x5007ad0000 saves EXEC into s[100:101], spills both halves,
+// reloads s100 from memory at pc 146, and re-spills s101 inside its loop at pc 853. With the mask
+// gone and no data view, s101 read as operand_bits' absent-SGPR zero there: EXEC_HI went to the
+// spill slot as a fabricated 0, which the restore at pc 882 then put back into EXEC (#4749
+// review). So, before such a write, give the high word the data view a data read of it would
+// have materialized from the still-live mask, when anything may still read it.
+inline void keep_surviving_mask_high_half(SpirvCompute& b, RegState& rs,
+                                          const std::vector<Rdna2Inst>& ins, const Rdna2Inst& in) {
+    if (b.wave_size != 64 || !(b.is_fragment || (b.is_compute && b.native_subgroup_size == 64)))
+        return;
+    // A V_READLANE into the root is a spill reload; it manages the halves itself.
+    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) return;
+    std::vector<std::pair<int, uint32_t>> writes;
+    for_each_scalar_write(in, [&](int base, uint32_t width) { writes.emplace_back(base, width); });
+    const auto written = [&](int r) {
+        for (const auto& [base, width] : writes)
+            if (r >= base && r < base + static_cast<int>(width)) return true;
+        return false;
+    };
+    for (const auto& [base, width] : writes)
+        for (int root = base; root < base + static_cast<int>(width) && root < 105; ++root) {
+            const int high = root + 1;
+            const auto mask = rs.sreg_bool.find(root);
+            if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root) || written(high) ||
+                rs.sreg.contains(high) || sgpr_dead_at_merge(ins, in.pc + in.len_dwords, high))
+                continue;
+            const uint32_t half = b.is_fragment ? b.fragment_wave_ballot_half(mask->second, 1)
+                                                : b.native_wave_ballot_half(mask->second, 1);
+            if (!half) continue;
+            rs.sreg[high] = half;   // a ballot of this wave: it carries neither mark
+            rs.sreg_merge_placeholder.erase(high);
+            rs.sreg_memory_pattern.erase(high);
+        }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -31,7 +31,7 @@ namespace P = prosper::agc::Pm4;
 
 constexpr size_t kStageEntries = 64;
 constexpr size_t kDrawEntries = 128;
-constexpr uint32_t kMaxWaves = 4;
+constexpr uint32_t kMaxWaves = 8;   // four Wave64 or eight Wave32 guest waves (256 threads)
 
 uint64_t mix(uint64_t hash, uint64_t value) {
     for (unsigned i = 0; i < 8; ++i)
@@ -93,6 +93,7 @@ struct StageKey {
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
     uint32_t user_sgprs = 0, lds_granules = 0, layer_slices = 0, depth_slice_fanout = 0;
+    uint32_t wave_lanes = 64;
     uint8_t topology = 0, route = 0, float_transport = 0;
     bool native_wave64 = false, provoking_vertex_last = false, layer_from_pos1 = false;
     bool count_violations = false, interpolation = false, user_data_address = false;
@@ -109,6 +110,7 @@ struct StageKeyHash {
         for (uint32_t word : key.pixel_inputs) hash = mix(hash, word);
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
         hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
+        hash = mix(hash, key.wave_lanes);
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -132,7 +134,7 @@ struct DrawKey {
     const StageEntry* stages = nullptr;   // pinned by the stage cache entry, see `stage_owner`
     uint32_t vertices = 0, instances = 0;
     uint8_t topology = 0;
-    std::array<uint32_t, 7> limits{};
+    std::array<uint32_t, 9> limits{};
     std::vector<uint32_t> push_constants;
     // An indexed draw's index VALUES (#3135 P6): the plan, and so every launch record, depends on
     // them. Keyed by a hash computed once per draw, with the decoded vector itself held by
@@ -313,6 +315,39 @@ bool ngg_program_reads_user_data_address(const std::shared_ptr<const std::vector
     return reads;
 }
 
+uint32_t ngg_program_user_sgprs(const std::shared_ptr<const std::vector<uint32_t>>& linked,
+                                uint32_t count, uint32_t range_end) {
+    if (!linked || linked->empty() || range_end <= count || range_end > kNggShellMaxPushWords)
+        return count;
+    static std::mutex mutex;
+    static std::map<std::tuple<std::shared_ptr<const std::vector<uint32_t>>, uint32_t, uint32_t>,
+                    uint32_t>
+        cache;
+    const auto key = std::make_tuple(linked, count, range_end);
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(linked->data(), linked->size(), ins);
+    NggSubgroupAbiLaunch launch;
+    launch.user_sgprs = count;
+    // s0:s1 is supplied separately when known; assume it here so its refusal cannot hide a user
+    // SGPR read that comes later.
+    launch.user_data_address_known = true;
+    const NggSubgroupAbiFacts facts = analyze_ngg_subgroup_abi(ins, launch);
+    const int reg = facts.refused_sgpr;
+    const uint32_t needed = facts.reason == "ngg-abi-read-undefined-sgpr" &&
+                                    reg >= static_cast<int>(8u + count) &&
+                                    reg < static_cast<int>(8u + range_end)
+                                ? range_end
+                                : count;
+    const std::lock_guard lock(mutex);
+    if (cache.size() >= 64u) cache.clear();
+    cache[key] = needed;
+    return needed;
+}
+
 NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                         const NggHostCapabilities& host) {
     NggLiveDrawResult result;
@@ -331,12 +366,17 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     if (!input.user_data_complete || input.user_data.size() != admission.user_sgprs)
         return refuse("ngg-user-data-unavailable");
     if (!input.linked || input.linked->empty()) return refuse("ngg-program-unavailable");
+    // The user SGPRs the program actually reads: the RSRC2_GS count, or its whole user-data range.
+    const uint32_t user_sgprs =
+        ngg_program_user_sgprs(input.linked, admission.user_sgprs, input.facts.user_data_range_end);
+    const std::vector<uint32_t>& user_data =
+        user_sgprs == admission.user_sgprs ? input.user_data : input.user_data_range;
+    if (user_data.size() != user_sgprs) return refuse("ngg-user-data-unavailable");
     // s0:s1 costs two push words, so it is supplied only to a program that reads it (#4735
     // review): a program with 31-32 user SGPRs that never touches s0:s1 keeps its admission.
-    const bool supply_address =
-        input.user_data_address_known &&
-        ngg_program_reads_user_data_address(input.linked, admission.user_sgprs);
-    if (supply_address && admission.user_sgprs + 2u > kNggShellMaxPushWords)
+    const bool supply_address = input.user_data_address_known &&
+                                ngg_program_reads_user_data_address(input.linked, user_sgprs);
+    if (supply_address && user_sgprs + 2u > kNggShellMaxPushWords)
         return refuse("ngg-user-sgpr-count");
     const bool interpolation = input.interpolation.requires_geometry;
     if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
@@ -345,7 +385,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.program = *input.linked;
     key.resources = resource_key(input.resources, input.linked);
     key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
-    key.user_sgprs = admission.user_sgprs;
+    key.user_sgprs = user_sgprs;
     key.lds_granules = admission.lds_granules;
     key.layer_slices = admission.layer_slices;
     key.depth_slice_fanout = admission.depth_slice_fanout;
@@ -353,6 +393,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.route = static_cast<uint8_t>(admission.route);
     key.float_transport = static_cast<uint8_t>(input.float_transport.profile);
     key.native_wave64 = admission.native_wave64;
+    key.wave_lanes = admission.limits.wave_lanes;
     key.provoking_vertex_last = admission.provoking_vertex_last;
     key.layer_from_pos1 = admission.layer_from_pos1;
     key.count_violations = admission.count_violations;
@@ -363,7 +404,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     NggSubgroupDrawRequest request;
     request.resources = input.resources;
     request.shell.rsrc2_gs_lds_size = admission.lds_granules;
-    request.shell.user_sgprs = admission.user_sgprs;
+    request.shell.user_sgprs = user_sgprs;
     request.shell.native_wave64 = admission.native_wave64;
     request.shell.user_data_address_known = supply_address;
     request.limits = admission.limits;
@@ -389,7 +430,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                                                     i.layer_location);
         };
     }
-    request.push_constants = input.user_data;
+    request.push_constants = user_data;
     if (supply_address)
         request.push_constants.insert(request.push_constants.end(), input.user_data_address,
                                       input.user_data_address + 2);
@@ -420,7 +461,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
                        admission.limits.vert_group_size,
                        admission.limits.max_out_verts_per_subgroup,
                        admission.limits.gs_max_vert_out,
-                       admission.limits.esgs_item_size};
+                       admission.limits.esgs_item_size,
+                       admission.limits.wave_lanes,
+                       admission.limits.passthrough ? 1u : 0u};
     draw_key.push_constants = request.push_constants;
     draw_key.indexed = admission.shape.indices != nullptr;
     if (admission.shape.indices) {

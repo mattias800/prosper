@@ -255,18 +255,27 @@ TEST(Pm4Decode, Contract) {
               "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
-    // Hardware IT_LOAD_* packets (Task H01 Black Flag console capture submit0.bin):
+    // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
     {
         uint32_t load_stream[] = {
             // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
             PM4(5, IT_LOAD_SH_REG, 0),
-            0x74ec2fbcu, 0x00000040u, 0x80000000u, 10u,
+            0x74ec2fbcu,
+            0x00000040u,
+            0x80000000u,
+            10u,
             // IT_LOAD_CONTEXT_REG: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
             PM4(5, IT_LOAD_CONTEXT_REG, 0),
-            0x6616e000u, 0x00000040u, 0x80000000u, 6u,
+            0x6616e000u,
+            0x00000040u,
+            0x80000000u,
+            6u,
             // IT_LOAD_CONTEXT_REG_INDEX: 5 dwords, op 0x9F, addr 0x4075172000, flags 0x80000000, num_regs 143
             PM4(5, IT_LOAD_CONTEXT_REG_INDEX, 0),
-            0x75172000u, 0x00000040u, 0x80000000u, 143u,
+            0x75172000u,
+            0x00000040u,
+            0x80000000u,
+            143u,
         };
         std::vector<Pm4Command> load_ops;
         const size_t c = decode_pm4(load_stream, std::size(load_stream), load_ops);
@@ -287,6 +296,18 @@ TEST(Pm4Decode, Contract) {
         CHECK(load_ops[2].reg_class == RegClass::Cx, "op2 class is Cx");
         CHECK(load_ops[2].regs_vaddr == 0x4075172000u, "op2 vaddr matches");
         CHECK(load_ops[2].num_regs == 143, "op2 num_regs = 143");
+
+        // Only the observed shape decodes as pairs: the contiguous-range data format (bit 31
+        // clear) and an index/offset address mode (low address bits) stay Unknown.
+        uint32_t other_shapes[] = {
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbcu, 0x00000040u, 0x00000000u, 10u,
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbdu, 0x00000040u, 0x80000000u, 10u,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_shapes, std::size(other_shapes), other_ops);
+        CHECK(other_ops.size() == 2 && other_ops[0].kind == K::Unknown &&
+                  other_ops[1].kind == K::Unknown,
+              "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
     }
 
     // Hardware IT_ACQUIRE_MEM (0x58) and IT_RELEASE_MEM (0x49) (Black Flag submit0.bin):
@@ -310,6 +331,18 @@ TEST(Pm4Decode, Contract) {
         CHECK(sync_ops[1].rel_data_sel == 1, "op1 data_sel == 1");
         CHECK(sync_ops[1].rel_addr == 0x40749a2f00ull, "op1 rel_addr == 0x40749a2f00");
         CHECK(sync_ops[1].rel_value_valid && sync_ops[1].rel_value == 0x408cu, "op1 rel_value == 0x408c");
+
+        // Only the GFX10 8-dword length decodes; a shorter packet of either opcode stays Unknown
+        // rather than having its fields read from the wrong slots.
+        uint32_t short_sync[] = {
+            PM4(6, IT_ACQUIRE_MEM, 0), 0u, 0u, 0u, 0u, 0u,
+            PM4(6, IT_RELEASE_MEM, 0), 0x06000528u, 1u << 29, 0x749a2f00u, 0x40u, 0x408cu,
+        };
+        std::vector<Pm4Command> short_ops;
+        decode_pm4(short_sync, std::size(short_sync), short_ops);
+        CHECK(short_ops.size() == 2 && short_ops[0].kind == K::Unknown &&
+                  short_ops[1].kind == K::Unknown,
+              "short ACQUIRE_MEM / RELEASE_MEM stay Unknown");
     }
 
     // Hardware IT_DISPATCH_DIRECT (0x15) and IT_DISPATCH_INDIRECT (0x16) (Black Flag submit0.bin):
@@ -336,6 +369,20 @@ TEST(Pm4Decode, Contract) {
         CHECK(disp_ops[1].kind == K::DispatchIndirect, "op1 is DispatchIndirect");
         CHECK(disp_ops[1].indirect_offset == 0x2000u, "op1 offset == 0x2000");
         CHECK(disp_ops[1].dispatch_modifier == 0x41u, "op1 modifier == 0x41");
+        CHECK(!disp_ops[1].indirect_address_absolute, "op1 is base-relative");
+
+        // The compute-queue form carries an absolute address; any other length stays Unknown.
+        uint32_t more_dispatch[] = {
+            PM4(4, IT_DISPATCH_INDIRECT, 0), 0x12345600u, 0x40u, 0x41u,
+            PM4(4, IT_DISPATCH_DIRECT, 0), 8u, 8u, 1u,
+        };
+        std::vector<Pm4Command> more_ops;
+        decode_pm4(more_dispatch, std::size(more_dispatch), more_ops);
+        CHECK(more_ops.size() == 2, "decoded 2 more dispatch packets");
+        CHECK(more_ops[0].kind == K::DispatchIndirect && more_ops[0].indirect_address_absolute &&
+                  more_ops[0].indirect_address == 0x4012345600ull &&
+                  more_ops[0].dispatch_modifier == 0x41u,
+              "MEC DISPATCH_INDIRECT decodes an absolute address");
+        CHECK(more_ops[1].kind == K::Unknown, "short DISPATCH_DIRECT stays Unknown");
     }
 }
-
