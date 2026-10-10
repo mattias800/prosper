@@ -3423,6 +3423,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_entry_vcc_dead.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_wave64_vop3_b32_vcc_read
+    SOURCES tests/gpu/recompiler/test_wave64_vop3_b32_vcc_read.cpp
+    LIBRARIES prosper_core)
+
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
