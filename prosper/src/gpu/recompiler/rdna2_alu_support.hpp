@@ -43,6 +43,8 @@ bool emit_s_cmov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
 // emit_alu's entry for it: true (with `ok` set) when `in` is s_cmov_b64 into EXEC; any other
 // instruction, including s_cmov_b64 to another destination, returns false and falls through.
 bool emit_exec_cmov(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok);
+void record_s_bfm_b64_scalar_data(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
+                                  uint32_t width, uint32_t offset, bool ok);
 uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
 uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                                          uint32_t fallback);

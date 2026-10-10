@@ -176,4 +176,58 @@ bool emit_exec_cmov(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok
     ok = emit_s_cmov_b64_exec(b, rs, in);
     return true;
 }
+
+// Architectural DATA view (#4694's program selects it as data): D.u64 from the same width/offset
+// the mask above used, so the two views agree bit-for-bit on every input by construction. Recorded
+// only when both source words are defined DATA: #4749's mark (or a non-data operand kind) withholds
+// it, and the mask path above proceeds exactly as before — so a fabricated word can never become a
+// tracked zero here, while genuinely undefined sources keep today's behavior. Split with every
+// emitted shift amount masked below 32: a 32-bit SPIR-V shift of 32 or more must select, never
+// execute. sreg_srt stays erased by the clobber above (a rewritten value carries no provenance);
+// sreg_bool keeps the mask view, which mask consumers read unchanged.
+// CONFIDENCE: HIGH on the bitfield formula; MED on operand field widths above 31, shared verbatim
+// with the mask preparation (one place to fix if the ISA's S0/S1 field widths say otherwise).
+void record_s_bfm_b64_scalar_data(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
+                                  uint32_t width, uint32_t offset, bool ok) {
+    auto data_defined = [&](const Operand& o) -> bool {
+        if (o.kind == OperandKind::InlineInt || o.kind == OperandKind::Literal) return true;
+        if (o.kind == OperandKind::Special && o.value == 125)
+            return true;   // SGPR_NULL: the one Special whose data is 0
+        if (o.kind == OperandKind::SGPR) return !sreg_word_may_be_fabricated(rs, o.value);
+        return false;   // VGPR, masks-as-data and everything else
+    };
+    if (!ok || !data_defined(in.src[0]) || !data_defined(in.src[1])) return;
+    const uint32_t w_ge_32 = b.ucmp(Op_UGreaterThanEqual, width, b.uconst(32));
+    const uint32_t w_sub =
+        b.ibin(Op_BitwiseAnd, b.ibin(Op_ISub, width, b.uconst(32)), b.uconst(31));
+    const uint32_t w_low = b.ibin(Op_BitwiseAnd, width, b.uconst(31));
+    const uint32_t ones_lo =
+        b.sel(w_ge_32, b.uconst(0xFFFFFFFFu),
+              b.ibin(Op_ISub, b.ibin(Op_ShiftLeftLogical, b.uconst(1), w_low), b.uconst(1)));
+    const uint32_t ones_hi = b.sel(
+        w_ge_32, b.ibin(Op_ISub, b.ibin(Op_ShiftLeftLogical, b.uconst(1), w_sub), b.uconst(1)),
+        b.uconst(0));
+    const uint32_t o_ge_32 = b.ucmp(Op_UGreaterThanEqual, offset, b.uconst(32));
+    const uint32_t o_low = b.ibin(Op_BitwiseAnd, offset, b.uconst(31));
+    const uint32_t o_sub =
+        b.ibin(Op_BitwiseAnd, b.ibin(Op_ISub, offset, b.uconst(32)), b.uconst(31));
+    const uint32_t data_lo =
+        b.sel(o_ge_32, b.uconst(0), b.ibin(Op_ShiftLeftLogical, ones_lo, o_low));
+    // For offset < 32 the high word is the low word's carry-out (none at offset 0, where the
+    // shift amount 32 - offset would wrap to 0) OR the high ones shifted by the same offset. The
+    // second term must survive offset 0: bfm(33, 0) = 0x1_ffffffff has its high bit set there.
+    const uint32_t o_is_zero = b.ucmp(Op_IEqual, offset, b.uconst(0));
+    const uint32_t carry_out =
+        b.sel(o_is_zero, b.uconst(0),
+              b.ibin(Op_ShiftRightLogical, ones_lo,
+                     b.ibin(Op_BitwiseAnd, b.ibin(Op_ISub, b.uconst(32), offset), b.uconst(31))));
+    const uint32_t hi_low_part =
+        b.ibin(Op_BitwiseOr, carry_out, b.ibin(Op_ShiftLeftLogical, ones_hi, o_low));
+    const uint32_t data_hi = b.sel(o_ge_32,
+                                   b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, ones_lo, o_sub),
+                                          b.ibin(Op_ShiftLeftLogical, ones_hi, o_sub)),
+                                   hi_low_part);
+    rs.sreg[in.dst.value] = data_lo;
+    rs.sreg[in.dst.value + 1] = data_hi;
+}
 }   // namespace prosper::gpu
