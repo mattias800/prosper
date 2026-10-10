@@ -844,3 +844,35 @@ TEST(ScalarPairMask, Wave64VccLoCselectFromAOnePathVccHiRefusesItsLaneRead) {
         << "a defined scalar VCC_HI selects and projects: "
         << last_terminal_reject_reason(kAddress);
 }
+
+// #4846: Wave64 `s_and_b32 vcc_lo, vcc_lo, 12` after a structured if that wrote an UNRELATED
+// register, then `s_cselect_b32 vcc_lo, 4, 5`, as in PPSA28000 0x26005ba000 pc7-pc15. The if clears
+// the whole-path "no placeholders" flag, but VCC_LO and the constant are defined on every path, so
+// the low-only B32 write is scalar data and SCC=(result!=0) stays defined for the select. Dropping the
+// `b32_sources_defined` disjunct from emit_alu's has_proven_scalar_sources gate turns this red.
+TEST(ScalarPairMask, Wave64VccLoAndAfterAnUnrelatedMergeKeepsSccForTheCselect) {
+    // s_mov s15,7 | s_mov vcc_lo,s15 | s_bitcmp1_b32 vcc_lo,13 | s_cbranch_scc0 +1 | s_mov s14,5 |
+    // s_and_b32 vcc_lo,vcc_lo,12 | s_cselect_b32 vcc_lo,4,5
+    const Words body = {0xbe8f0387u, 0xbeea030fu, 0xbf0d8d6au, 0xbf840001u,
+                        0xbe8e0385u, 0x876a8c6au, 0x856a8584u};
+    EXPECT_FALSE(compile_vcc_as_data(Stage::Compute, body).empty())
+        << "VCC_LO and the constant are defined on both paths; SCC=(result!=0) is scalar";
+}
+
+// The same shape with a merge-marked or fabricated source word must keep refusing: the made-up
+// word would otherwise define SCC for the select. Making b32_source_word_defined() ignore
+// sreg_merge_placeholder turns the VCC_LO arm red; ignoring sreg_word_may_be_fabricated turns the
+// SGPR arm red.
+TEST(ScalarPairMask, Wave64VccLoAndReadingAOnePathWordStillRefuses) {
+    // VCC_LO written on one path only: s_mov s15,7 | s_bitcmp1_b32 s15,1 | s_cbranch_scc0 +1 |
+    // s_mov vcc_lo,s15 | s_and_b32 vcc_lo,vcc_lo,12 | s_cselect_b32 vcc_lo,4,5
+    const Words one_path_vcc_lo = {0xbe8f0387u, 0xbf0d810fu, 0xbf840001u,
+                                   0xbeea030fu, 0x876a8c6au, 0x856a8584u};
+    EXPECT_TRUE(compile_vcc_as_data(Stage::Compute, one_path_vcc_lo).empty())
+        << "a merge-marked VCC_LO must not become scalar data that defines SCC";
+    // s14 written on one path only, read by `s_and_b32 vcc_lo, vcc_lo, s14` (PPSA02154's word).
+    const Words one_path_sgpr = {0xbe8f0387u, 0xbeea030fu, 0xbf0d8d6au, 0xbf840001u,
+                                 0xbe8e0385u, 0x876a0e6au, 0x856a8584u};
+    EXPECT_TRUE(compile_vcc_as_data(Stage::Compute, one_path_sgpr).empty())
+        << "a one-path s14 is the structured emitter's fabricated zero";
+}
