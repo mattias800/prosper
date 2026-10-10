@@ -228,6 +228,112 @@ int main() {
         CHECK(su.sh.empty(), "SetShRegsIndirect with an unmapped array is skipped (no OOB read, no regs applied)");
     }
 
+    // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
+    {
+        ShaderReg sh_array[] = {
+            {prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0, 0x12345678u},
+            {prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u, 0x9abcdef0u},
+        };
+        ShaderReg cx_array[] = {
+            {prosper::agc::Pm4::DB_DEPTH_SIZE_XY, 0x01000200u},
+        };
+        const uint64_t sh_addr = (uint64_t)(uintptr_t)sh_array;
+        const uint64_t cx_addr = (uint64_t)(uintptr_t)cx_array;
+
+        uint32_t pkt[] = {
+            // IT_LOAD_SH_REG: 5 dwords
+            0xC0000000u | (3u << 16) | (IT_LOAD_SH_REG << 8),
+            (uint32_t)sh_addr,
+            (uint32_t)(sh_addr >> 32),
+            0x80000000u,
+            2u,
+            // IT_LOAD_CONTEXT_REG: 5 dwords
+            0xC0000000u | (3u << 16) | (IT_LOAD_CONTEXT_REG << 8),
+            (uint32_t)cx_addr,
+            (uint32_t)(cx_addr >> 32),
+            0x80000000u,
+            1u,
+        };
+        GpuState s_load;
+        run_cb(pkt, std::size(pkt), s_load);
+        CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0) &&
+                  s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0] == 0x12345678u,
+              "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0");
+        CHECK(s_load.sh.count(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u) &&
+                  s_load.sh[prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + 1u] == 0x9abcdef0u,
+              "IT_LOAD_SH_REG populates SPI_SHADER_USER_DATA_PS_0+1");
+        CHECK(s_load.cx.count(prosper::agc::Pm4::DB_DEPTH_SIZE_XY) &&
+                  s_load.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] == 0x01000200u,
+              "IT_LOAD_CONTEXT_REG populates DB_DEPTH_SIZE_XY");
+    }
+
+    // Hardware IT_RELEASE_MEM packet execution (completion writeback to mapped label):
+    {
+        // A qword: honor_eop_write() reads the 8-byte label before writing its low 32 bits.
+        uint64_t fence_label = 0;
+        const uint64_t fence_addr = (uint64_t)(uintptr_t)&fence_label;
+        uint32_t rel_pkt[] = {
+            // IT_RELEASE_MEM: 8 dwords, data_sel=1 (32-bit), value=0x1234
+            0xC0000000u | (6u << 16) | (IT_RELEASE_MEM << 8),
+            0x06000528u, (1u << 29) | 0x00010000u,
+            (uint32_t)fence_addr, (uint32_t)(fence_addr >> 32),
+            0x00001234u, 0x00000000u, 0x00000000u,
+        };
+        GpuState s_rel;
+        run_cb(rel_pkt, std::size(rel_pkt), s_rel);
+        CHECK(fence_label == 0x1234u, "IT_RELEASE_MEM writes 32-bit fence value to label");
+    }
+
+    // Hardware IT_DISPATCH_DIRECT packet execution:
+    {
+        uint32_t disp_pkt[] = {
+            // IT_DISPATCH_DIRECT: 5 dwords, dims=(64, 16, 1), modifier=0x41
+            0xC0000000u | (3u << 16) | (IT_DISPATCH_DIRECT << 8), 64u, 16u, 1u, 0x41u,
+        };
+        GpuState s_disp;
+        run_cb(disp_pkt, std::size(disp_pkt), s_disp);
+        CHECK(s_disp.dispatches.size() == 1, "IT_DISPATCH_DIRECT records one dispatch");
+        if (!s_disp.dispatches.empty()) {
+            CHECK(s_disp.dispatches[0].threads_x == 64u && s_disp.dispatches[0].threads_y == 16u &&
+                      s_disp.dispatches[0].threads_z == 1u,
+                  "IT_DISPATCH_DIRECT dimensions match");
+            CHECK(s_disp.dispatches[0].modifier == 0x41u, "IT_DISPATCH_DIRECT modifier matches");
+        }
+    }
+
+    // Hardware IT_DRAW_INDEX_AUTO packet execution:
+    {
+        uint32_t draw_pkt[] = {
+            // IT_DRAW_INDEX_AUTO: 3 dwords, count=128, modifier=2
+            0xC0000000u | (1u << 16) | (IT_DRAW_INDEX_AUTO << 8),
+            128u,
+            2u,
+        };
+        GpuState s_draw;
+        run_cb(draw_pkt, std::size(draw_pkt), s_draw);
+        CHECK(s_draw.draws.size() == 1, "IT_DRAW_INDEX_AUTO records one draw");
+        if (!s_draw.draws.empty()) {
+            CHECK(s_draw.draws[0].index_count == 128u, "IT_DRAW_INDEX_AUTO index_count matches");
+        }
+    }
+
+    // Hardware IT_WRITE_DATA packet execution:
+    {
+        uint32_t mem_target = 0;
+        const uint64_t target_addr = (uint64_t)(uintptr_t)&mem_target;
+        uint32_t wd_pkt[] = {
+            // IT_WRITE_DATA: 5 dwords, DST_SEL=5 (memory), addr=target_addr, data=0xbeefcafe
+            0xC0000000u | (3u << 16) | (IT_WRITE_DATA << 8),
+            5u << 8,
+            (uint32_t)target_addr,
+            (uint32_t)(target_addr >> 32),
+            0xbeefcafeu,
+        };
+        GpuState s_wd;
+        run_cb(wd_pkt, std::size(wd_pkt), s_wd);
+        CHECK(mem_target == 0xbeefcafeu, "IT_WRITE_DATA writes inline data to target address");
+    }
+
     // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
     // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
     // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content

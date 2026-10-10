@@ -102,6 +102,7 @@ NggLayerRoute select_ngg_layer_route(const NggLayerRouteQuery& query, std::strin
 struct NggRasterCommitConfig {
     NggExportRecordLayout layout;   // what the shell wrote
     uint32_t waves = 1;   // the shell's W
+    uint32_t wave_lanes = 64;   // the shell's wave width L (32 for a Wave32 program)
     NggOutputTopology topology = NggOutputTopology::TriangleList;
     bool provoking_vertex_last = false;   // PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST
     bool layer_from_pos1 = false;   // PA_CL_VS_OUT_CNTL.USE_VTX_RENDER_TARGET_INDX

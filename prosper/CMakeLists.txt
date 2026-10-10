@@ -2534,6 +2534,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_wave64_host_line
     SOURCES tests/diagnostics/test_wave64_host_line.cpp
     LIBRARIES prosper_core)
+  # A Wave64 compute program's scalar-pair projection refuses a fabricated-zero word (#4714).
+  prosper_add_gtest(test_compute_scalar_pair_mask
+    SOURCES tests/gpu/recompiler/test_compute_scalar_pair_mask.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
@@ -3069,6 +3073,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_wave_route.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+
+  # A wave-empty EXEC guard around a counted loop in Black Flag's direct-EXEC-write
+  # form (#4816): s_mov_b64/s_or_b64 into EXEC with a constant-full restore.
+  prosper_add_gtest(test_counted_loop_movexec_guard
+    SOURCES tests/gpu/recompiler/test_counted_loop_movexec_guard.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan)
 
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
@@ -5898,6 +5909,13 @@ endif()
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       prosper_add_gtest(test_shadow_compare_render
         SOURCES tests/gpu/test_shadow_compare_render.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # #4808: the NSA fragment MIMG forms image_sample_c, image_sample_o and image_get_lod, executed
+      # (one-level textures) with their refusal controls. Reaches `shared/...` through render_runner.h.
+      prosper_add_gtest(test_mimg_nsa_forms_render
+        SOURCES tests/gpu/test_mimg_nsa_forms_render.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
