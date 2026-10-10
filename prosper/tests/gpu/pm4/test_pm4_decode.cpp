@@ -309,4 +309,315 @@ TEST(Pm4Decode, Contract) {
                   other_ops[1].kind == K::Unknown,
               "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
     }
+
+    // Hardware IT_ACQUIRE_MEM (0x58) and IT_RELEASE_MEM (0x49) (Black Flag submit0.bin):
+    {
+        uint32_t sync_stream[] = {
+            // IT_ACQUIRE_MEM: 8 dwords, op 0x58
+            PM4(8, IT_ACQUIRE_MEM, 0),
+            0x80000000u, 0x00000001u, 0x00000000u, 0x40056300u, 0x00000000u, 0x00000019u, 0x00009000u,
+            // IT_RELEASE_MEM: 8 dwords, op 0x49, data_sel=1 (32-bit write), addr=0x40749a2f00, value=0x408c
+            PM4(8, IT_RELEASE_MEM, 0),
+            0x06000528u, (1u << 29) | 0x00010000u, 0x749a2f00u, 0x00000040u, 0x0000408cu, 0x00000000u, 0x00000000u,
+        };
+        std::vector<Pm4Command> sync_ops;
+        const size_t c = decode_pm4(sync_stream, std::size(sync_stream), sync_ops);
+        CHECK(c == 16, "consumed 16 dwords of hardware sync packets");
+        CHECK(sync_ops.size() == 2, "decoded 2 sync packets");
+
+        CHECK(sync_ops[0].kind == K::AcquireMem, "op0 is AcquireMem");
+
+        CHECK(sync_ops[1].kind == K::ReleaseMem, "op1 is ReleaseMem");
+        CHECK(sync_ops[1].rel_data_sel == 1, "op1 data_sel == 1");
+        CHECK(sync_ops[1].rel_addr == 0x40749a2f00ull, "op1 rel_addr == 0x40749a2f00");
+        CHECK(sync_ops[1].rel_value_valid && sync_ops[1].rel_value == 0x408cu, "op1 rel_value == 0x408c");
+
+        // Only the GFX10 8-dword length decodes; a shorter packet of either opcode stays Unknown
+        // rather than having its fields read from the wrong slots.
+        uint32_t short_sync[] = {
+            PM4(6, IT_ACQUIRE_MEM, 0), 0u, 0u, 0u, 0u, 0u,
+            PM4(6, IT_RELEASE_MEM, 0), 0x06000528u, 1u << 29, 0x749a2f00u, 0x40u, 0x408cu,
+        };
+        std::vector<Pm4Command> short_ops;
+        decode_pm4(short_sync, std::size(short_sync), short_ops);
+        CHECK(short_ops.size() == 2 && short_ops[0].kind == K::Unknown &&
+                  short_ops[1].kind == K::Unknown,
+              "short ACQUIRE_MEM / RELEASE_MEM stay Unknown");
+    }
+
+    // Hardware IT_DISPATCH_DIRECT (0x15) and IT_DISPATCH_INDIRECT (0x16) (Black Flag submit0.bin):
+    {
+        uint32_t dispatch_stream[] = {
+            // IT_DISPATCH_DIRECT: 5 dwords, op 0x15, dims=(0x168, 0xcb, 1), modifier=0x41
+            PM4(5, IT_DISPATCH_DIRECT, 0),
+            0x168u,
+            0xcbu,
+            1u,
+            0x41u,
+            // IT_DISPATCH_INDIRECT: 3 dwords, op 0x16, offset=0x2000, modifier=0x41
+            PM4(3, IT_DISPATCH_INDIRECT, 0),
+            0x2000u,
+            0x41u,
+        };
+        std::vector<Pm4Command> disp_ops;
+        const size_t c = decode_pm4(dispatch_stream, std::size(dispatch_stream), disp_ops);
+        CHECK(c == 8, "consumed 8 dwords of hardware dispatch packets");
+        CHECK(disp_ops.size() == 2, "decoded 2 dispatch packets");
+
+        CHECK(disp_ops[0].kind == K::DispatchDirect, "op0 is DispatchDirect");
+        CHECK(disp_ops[0].threads_x == 0x168u, "op0 threads_x == 0x168");
+        CHECK(disp_ops[0].threads_y == 0xcbu, "op0 threads_y == 0xcb");
+        CHECK(disp_ops[0].threads_z == 1u, "op0 threads_z == 1");
+        CHECK(disp_ops[0].dispatch_modifier == 0x41u, "op0 modifier == 0x41");
+
+        CHECK(disp_ops[1].kind == K::DispatchIndirect, "op1 is DispatchIndirect");
+        CHECK(disp_ops[1].indirect_offset == 0x2000u, "op1 offset == 0x2000");
+        CHECK(disp_ops[1].dispatch_modifier == 0x41u, "op1 modifier == 0x41");
+        CHECK(!disp_ops[1].indirect_address_absolute, "op1 is base-relative");
+
+        // The compute-queue form carries an absolute address; any other length stays Unknown.
+        uint32_t more_dispatch[] = {
+            PM4(4, IT_DISPATCH_INDIRECT, 0), 0x12345600u, 0x40u, 0x41u,
+            PM4(4, IT_DISPATCH_DIRECT, 0),   8u,          8u,    1u,
+        };
+        std::vector<Pm4Command> more_ops;
+        decode_pm4(more_dispatch, std::size(more_dispatch), more_ops);
+        CHECK(more_ops.size() == 2, "decoded 2 more dispatch packets");
+        CHECK(more_ops[0].kind == K::DispatchIndirect && more_ops[0].indirect_address_absolute &&
+                  more_ops[0].indirect_address == 0x4012345600ull &&
+                  more_ops[0].dispatch_modifier == 0x41u,
+              "MEC DISPATCH_INDIRECT decodes an absolute address");
+        CHECK(more_ops[1].kind == K::Unknown, "short DISPATCH_DIRECT stays Unknown");
+    }
+
+    // Hardware draw and write packets (Black Flag submit0.bin):
+    {
+        uint32_t work_stream[] = {
+            // IT_SET_BASE: 4 dwords, op 0x11, SHADER_TYPE=1 (compute), BASE_INDEX=1,
+            // addr=0x40756412e0
+            PM4(4, IT_SET_BASE, 0) | 2u,
+            1u,
+            0x756412e0u,
+            0x00000040u,
+            // IT_DRAW_INDEX_AUTO: 3 dwords, op 0x2D, count=0x300, modifier=2
+            PM4(3, IT_DRAW_INDEX_AUTO, 0),
+            0x300u,
+            2u,
+            // IT_DRAW_INDIRECT: 5 dwords, op 0x24, offset=0x40, BASE_VTX_LOC, START_INST_LOC, initiator
+            PM4(5, IT_DRAW_INDIRECT, 0),
+            0x40u,
+            0u,
+            0u,
+            2u,
+            // IT_DRAW_INDEX_INDIRECT: 5 dwords, op 0x25, offset=0x60
+            PM4(5, IT_DRAW_INDEX_INDIRECT, 0),
+            0x60u,
+            0u,
+            0u,
+            0u,
+            // IT_INDEX_BASE: 3 dwords, op 0x26, addr=0x403fde86dc
+            PM4(3, IT_INDEX_BASE, 0),
+            0x3fde86dcu,
+            0x00000040u,
+            // IT_WRITE_DATA: 5 dwords, op 0x37, dst=0x100200, addr=0x406616c058, data=0
+            PM4(5, IT_WRITE_DATA, 0),
+            0x100200u,
+            0x6616c058u,
+            0x00000040u,
+            0u,
+        };
+        std::vector<Pm4Command> work_ops;
+        const size_t c = decode_pm4(work_stream, std::size(work_stream), work_ops);
+        CHECK(c == 25, "consumed 25 dwords of hardware work packets");
+        CHECK(work_ops.size() == 6, "decoded 6 hardware work packets");
+
+        CHECK(work_ops[0].kind == K::SetBaseIndirectArgs, "op0 is SetBaseIndirectArgs");
+        CHECK(work_ops[0].indirect_shader_type == 1u, "op0 type == compute");
+        CHECK(work_ops[0].indirect_base == 0x40756412e0ull, "op0 base == 0x40756412e0");
+
+        CHECK(work_ops[1].kind == K::DrawIndexAuto, "op1 is DrawIndexAuto");
+        CHECK(work_ops[1].index_count == 0x300u, "op1 count == 0x300");
+        CHECK(work_ops[1].di_modifier == 0u, "op1 initiator is not read as a draw modifier");
+
+        CHECK(work_ops[2].kind == K::DrawIndirect, "op2 is DrawIndirect");
+        CHECK(work_ops[2].indirect_offset == 0x40u, "op2 offset == 0x40");
+
+        CHECK(work_ops[3].kind == K::DrawIndexIndirect, "op3 is DrawIndexIndirect");
+        CHECK(work_ops[3].indirect_offset == 0x60u, "op3 offset == 0x60");
+
+        CHECK(work_ops[4].kind == K::SetIndexBase, "op4 is SetIndexBase");
+        CHECK(work_ops[4].ib_addr == 0x403fde86dcull, "op4 ib_addr == 0x403fde86dc");
+
+        CHECK(work_ops[5].kind == K::WriteData, "op5 is WriteData");
+        CHECK(work_ops[5].wd_addr == 0x406616c058ull, "op5 wd_addr == 0x406616c058");
+        CHECK(work_ops[5].wd_num == 1u && work_ops[5].wd_valid, "op5 wd_num == 1");
+
+        // Shapes whose fields are not what the custom kinds mean stay Unknown: a graphics
+        // SET_BASE is graphics, a non-indirect base index, a register-destination WRITE_DATA,
+        // a single-address WRITE_DATA, and the short draw-indirect shape.
+        uint32_t other_work[] = {
+            PM4(4, IT_SET_BASE, 0),
+            1u,
+            0x756412e0u,
+            0x40u,
+            PM4(4, IT_SET_BASE, 0),
+            2u,
+            0x756412e0u,
+            0x40u,
+            PM4(5, IT_WRITE_DATA, 0),
+            0x100000u,
+            0x2800u,
+            0u,
+            7u,
+            PM4(6, IT_WRITE_DATA, 0),
+            0x110500u,
+            0x6616c058u,
+            0x40u,
+            1u,
+            2u,
+            PM4(3, IT_DRAW_INDIRECT, 0),
+            0x40u,
+            2u,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_work, std::size(other_work), other_ops);
+        CHECK(other_ops.size() == 5, "decoded 5 other work packets");
+        CHECK(other_ops[0].kind == K::SetBaseIndirectArgs &&
+                  other_ops[0].indirect_shader_type == 0u,
+              "SET_BASE without SHADER_TYPE sets the graphics base");
+        CHECK(other_ops[1].kind == K::Unknown, "SET_BASE base index 2 stays Unknown");
+        CHECK(other_ops[2].kind == K::Unknown, "register-destination WRITE_DATA stays Unknown");
+        CHECK(other_ops[3].kind == K::Unknown, "WR_ONE_ADDR WRITE_DATA stays Unknown");
+        CHECK(other_ops[4].kind == K::Unknown, "short DRAW_INDIRECT stays Unknown");
+    }
+
+    // Hardware IT_WAIT_REG_MEM (0x3C) (Black Flag submit0.bin):
+    {
+        uint32_t wait_stream[] = {
+            // IT_WAIT_REG_MEM: 7 dwords, op 0x3C, func=3, addr=0x406616c058, ref=1, mask=0xffffffff
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x13u, 0x6616c058u, 0x00000040u, 1u, 0xffffffffu, 0x19u,
+        };
+        std::vector<Pm4Command> wait_ops;
+        const size_t c = decode_pm4(wait_stream, std::size(wait_stream), wait_ops);
+        CHECK(c == 7, "consumed 7 dwords of hardware wait packet");
+        CHECK(wait_ops.size() == 1, "decoded 1 wait packet");
+
+        CHECK(wait_ops[0].kind == K::WaitRegMem, "op0 is WaitRegMem");
+        CHECK(wait_ops[0].wm_func == 3u, "op0 func == 3");
+        CHECK(wait_ops[0].wm_addr == 0x406616c058ull, "op0 addr == 0x406616c058");
+        CHECK(wait_ops[0].wm_ref == 1u, "op0 ref == 1");
+        CHECK(wait_ops[0].wm_mask == 0xffffffffu && wait_ops[0].wm_valid,
+              "op0 mask == 0xffffffff and valid");
+
+        // A register poll (MEM_SPACE 0), a write-then-wait (OPERATION 1) and a short packet stay
+        // Unknown: none of them is a plain memory poll.
+        uint32_t other_waits[] = {
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x03u, 0x2800u,     0u,    1u, 0xffffffffu, 0x19u,
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x53u, 0x6616c058u, 0x40u, 1u, 0xffffffffu, 0x19u,
+            PM4(6, IT_WAIT_REG_MEM, 0), 0x13u, 0x6616c058u, 0x40u, 1u, 0xffffffffu,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_waits, std::size(other_waits), other_ops);
+        CHECK(other_ops.size() == 3 && other_ops[0].kind == K::Unknown &&
+                  other_ops[1].kind == K::Unknown && other_ops[2].kind == K::Unknown,
+              "register, write-then-wait and short WAIT_REG_MEM stay Unknown");
+    }
+
+    // Hardware control and barrier packets (Black Flag submit0.bin):
+    {
+        uint32_t ctl_stream[] = {
+            // IT_INDEX_BUFFER_SIZE: 2 dwords, op 0x13, count=0x38a
+            PM4(2, IT_INDEX_BUFFER_SIZE, 0),
+            0x38au,
+            // IT_PFP_SYNC_ME: 2 dwords, op 0x42
+            PM4(2, IT_PFP_SYNC_ME, 0),
+            0u,
+            // CLEAR_STATE (0x12), ATOMIC_MEM (0x1E, 9 dwords), CONTEXT_CONTROL (0x28, 3 dwords):
+            // not a reset, a barrier or a no-op the processor can claim, so they stay Unknown.
+            PM4(2, 0x12u, 0),
+            0u,
+            PM4(9, 0x1Eu, 0),
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            PM4(3, 0x28u, 0),
+            0x80000000u,
+            0x80000000u,
+        };
+        std::vector<Pm4Command> ctl_ops;
+        const size_t c = decode_pm4(ctl_stream, std::size(ctl_stream), ctl_ops);
+        CHECK(c == 18, "consumed 18 dwords of control/barrier packets");
+        CHECK(ctl_ops.size() == 5, "walked 5 control/barrier packets");
+        CHECK(ctl_ops[0].kind == K::SetIndexCount && ctl_ops[0].index_count == 0x38au,
+              "op0 is SetIndexCount");
+        CHECK(ctl_ops[1].kind == K::StallCommandBufferParser, "op1 is StallCommandBufferParser");
+        CHECK(ctl_ops[2].kind == K::Unknown && ctl_ops[3].kind == K::Unknown &&
+                  ctl_ops[4].kind == K::Unknown,
+              "CLEAR_STATE, ATOMIC_MEM and CONTEXT_CONTROL stay Unknown");
+    }
+
+    // Hardware WAIT_REG_MEM64 plus COND_EXEC / DRAW_INDEX_INDIRECT_MULTI (Black Flag submit0.bin):
+    {
+        uint32_t cond_stream[] = {
+            // IT_COND_EXEC: 5 dwords, op 0x22: [0..1]=addr, [2]=control, [3]=exec count
+            PM4(5, 0x22u, 0),
+            0xe0040060u,
+            0x0000000fu,
+            0x0u,
+            0x8u,
+            // IT_DRAW_INDEX_INDIRECT_MULTI: 10 dwords, op 0x38
+            PM4(10, 0x38u, 0),
+            0x19000u,
+            0x98u,
+            0x99u,
+            0x280u,
+            0x13u,
+            0x0u,
+            0x0u,
+            0x14u,
+            0x0u,
+            // IT_WAIT_REG_MEM64: 9 dwords, op 0x93: [0]=control (func 3, memory), [1..2]=addr,
+            // [3..4]=reference, [5..6]=mask, [7]=poll interval
+            PM4(9, IT_WAIT_REG_MEM64, 0),
+            0x6000113u,
+            0x800040a8u,
+            0xcu,
+            0x5u,
+            0x0u,
+            0xffffffffu,
+            0x0000ffffu,
+            0x40u,
+        };
+        std::vector<Pm4Command> cond_ops;
+        const size_t c = decode_pm4(cond_stream, std::size(cond_stream), cond_ops);
+        CHECK(c == 24, "consumed 24 dwords of cond/multi-draw/wait64 packets");
+        CHECK(cond_ops.size() == 3, "walked 3 cond/multi-draw/wait64 packets");
+        CHECK(cond_ops[0].kind == K::Unknown, "COND_EXEC stays Unknown (it is not predication)");
+        CHECK(cond_ops[1].kind == K::Unknown, "DRAW_INDEX_INDIRECT_MULTI stays Unknown");
+        CHECK(cond_ops[2].kind == K::WaitRegMem && cond_ops[2].wm_valid, "op2 is WaitRegMem");
+        CHECK(cond_ops[2].wm_func == 3u, "op2 wm_func == 3");
+        CHECK(cond_ops[2].wm_addr == 0x0000000c800040a8ull, "op2 wm_addr matches");
+        CHECK(cond_ops[2].wm_ref == 5u, "op2 reference comes from [3..4]");
+        CHECK(cond_ops[2].wm_mask == 0x0000ffffffffffffull, "op2 mask comes from [5..6]");
+
+        // A register poll stays Unknown, as for WAIT_REG_MEM.
+        uint32_t reg_wait[] = {PM4(9, IT_WAIT_REG_MEM64, 0),
+                               0x6000103u,
+                               0x2800u,
+                               0u,
+                               5u,
+                               0u,
+                               0xffffffffu,
+                               0xffffffffu,
+                               0x40u};
+        std::vector<Pm4Command> reg_ops;
+        decode_pm4(reg_wait, std::size(reg_wait), reg_ops);
+        CHECK(reg_ops.size() == 1 && reg_ops[0].kind == K::Unknown,
+              "register-space WAIT_REG_MEM64 stays Unknown");
+    }
 }
