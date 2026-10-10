@@ -4980,6 +4980,10 @@ endif()
         SOURCES tests/shared/live/test_float32_array_upload.cpp
         INCLUDES frontends src tests
         LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
+      prosper_add_gtest(test_tiled_nv12_upload
+        SOURCES tests/shared/live/test_tiled_nv12_upload.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
       target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
       target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

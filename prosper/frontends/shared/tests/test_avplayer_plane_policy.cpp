@@ -11,6 +11,8 @@
 #include "gpu/texture/guest_texture_layout.hpp"
 
 #include <cstdio>
+#include <iomanip>
+#include <utility>
 #include <vector>
 
 using prosper::frontend::AvpChromaReason;
@@ -355,9 +357,8 @@ TEST(AvplayerPlanePolicy, Contract) {
         CHECK(!classify(table[1], table).match);
     }
 
-    // ---- 8. #2731: a GPU-TILED plane pair. A tiled surface has no row pitch, so none of the pitch
-    // reasoning applies -- but its padded TILED size does land exactly on the second plane, which is
-    // the strongest evidence a pair can carry, so this route keeps adjacency as a requirement. ----
+    // ---- 8. #2731: a GPU-TILED plane pair. The padded size, rather than the tight size, determines
+    // the stronger adjacent-pair verdict. Separate allocations are covered below (#4811). ----
     {
         // The tiled size is load-bearing: the tight w*h figure misses the chroma plane entirely.
         CHECK(prosper::gpu::tiled_surface_bytes(3840, 2160, kSonicTileMode, 0, 1u) ==
@@ -383,16 +384,6 @@ TEST(AvplayerPlanePolicy, Contract) {
         CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
     }
     {
-        // The tiled route does NOT inherit the separate-allocation licence: with no adjacency there
-        // is no pitch to corroborate the pair, so a detached tiled RG8 surface stays unclaimed.
-        ShaderResource chroma = sonic_chroma_plane();
-        chroma.gpu_addr = kSonicChromaAddr + 0x200000ull;
-        const std::vector<ShaderResource> table{sonic_luma_plane(), chroma};
-        const auto v = classify(chroma, table);
-        CHECK(!v.match);
-        CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
-    }
-    {
         // A tiled 2-channel surface with no luma partner at all is an ordinary game texture and
         // must keep the historical coverage broadcast.
         const std::vector<ShaderResource> table{sonic_chroma_plane()};
@@ -401,4 +392,80 @@ TEST(AvplayerPlanePolicy, Contract) {
         CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
     }
 
+}
+
+TEST(AvplayerPlanePolicy, SeparateTiledPlanesAreRecognized) {
+    // CONFIDENCE: HIGH. Captured submit 25003/draw 1 binds these two single-layer SW_64KB_S
+    // descriptors in the same fragment stage. The shader samples R8 luma and both RG8 channels;
+    // captured chroma has distinct U/V bytes, but the adjacency-only classifier rejected it.
+    ShaderResource luma = sonic_luma_plane();
+    ShaderResource chroma = sonic_chroma_plane();
+    luma.gpu_addr = 0x4038940000ull;
+    chroma.gpu_addr = 0x4068b60000ull;
+    for (const bool chroma_before_luma : {false, true}) {
+        if (chroma_before_luma) std::swap(luma.gpu_addr, chroma.gpu_addr);
+        const std::vector<ShaderResource> table{luma, chroma};
+        const auto v = classify(chroma, table);
+        EXPECT_TRUE(v.match);
+        EXPECT_EQ(v.reason, AvpChromaReason::MatchedSeparateLumaPlane);
+        EXPECT_EQ(v.sibling_luma_addr, luma.gpu_addr);
+        EXPECT_FALSE(classify(luma, table).match);
+    }
+}
+
+TEST(AvplayerPlanePolicy, TiledPlaneRangesMustNotOverlapOrWrap) {
+    const ShaderResource luma = sonic_luma_plane();
+    const ShaderResource chroma = sonic_chroma_plane();
+    const uint64_t luma_bytes =
+        prosper::gpu::tiled_surface_bytes(luma.width, luma.height, luma.tile_mode, 0, 1u);
+    const uint64_t chroma_bytes =
+        prosper::gpu::tiled_surface_bytes(chroma.width, chroma.height, chroma.tile_mode, 0, 2u);
+    ASSERT_GT(luma_bytes, uint64_t{luma.width} * luma.height);
+    ASSERT_GT(chroma_bytes, uint64_t{chroma.width} * chroma.height * 2u);
+
+    for (const uint64_t addr : {luma.gpu_addr, luma.gpu_addr + uint64_t{luma.width} * luma.height,
+                                luma.gpu_addr - uint64_t{chroma.width} * chroma.height * 2u,
+                                UINT64_MAX - chroma_bytes + 1u}) {
+        ShaderResource invalid = chroma;
+        invalid.gpu_addr = addr;
+        const std::vector<ShaderResource> table{luma, invalid};
+        EXPECT_FALSE(classify(invalid, table).match) << std::hex << addr;
+    }
+    ShaderResource wrapped_luma = luma;
+    wrapped_luma.gpu_addr = UINT64_MAX - luma_bytes + 1u;
+    const std::vector<ShaderResource> table{wrapped_luma, chroma};
+    EXPECT_FALSE(classify(chroma, table).match);
+}
+
+TEST(AvplayerPlanePolicy, AdjacentTiledLumaWinsOverSeparateCandidate) {
+    ShaderResource separate_luma = sonic_luma_plane();
+    separate_luma.gpu_addr -= 0x1000000ull;
+    const std::vector<ShaderResource> table{separate_luma, sonic_chroma_plane(),
+                                            sonic_luma_plane()};
+    const auto v = classify(table[1], table);
+    EXPECT_TRUE(v.match);
+    EXPECT_EQ(v.reason, AvpChromaReason::MatchedAdjacentLumaPlane);
+    EXPECT_EQ(v.sibling_luma_addr, kSonicLumaAddr);
+}
+
+TEST(AvplayerPlanePolicy, TiledPlanePairRequiresFlatMatchingViews) {
+    for (const bool change_luma : {false, true}) {
+        for (unsigned field = 0; field < 7; ++field) {
+            ShaderResource luma = sonic_luma_plane();
+            ShaderResource chroma = sonic_chroma_plane();
+            auto& invalid = change_luma ? luma : chroma;
+            switch (field) {
+                case 0: invalid.depth = 2; break;
+                case 1: invalid.layer_stride_bytes = 0x10000; break;
+                case 2: invalid.layer_mip_offset_bytes = 0x10000; break;
+                case 3: invalid.declared_mip_levels = 2; break;
+                case 4: invalid.in_mip_tail = true; break;
+                case 5: invalid.compression_enabled = true; break;
+                case 6: invalid.height -= 2; break;
+            }
+            const std::vector<ShaderResource> table{luma, chroma};
+            EXPECT_FALSE(classify(chroma, table).match)
+                << "change_luma=" << change_luma << " field=" << field;
+        }
+    }
 }
