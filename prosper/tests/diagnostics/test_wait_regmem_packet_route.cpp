@@ -109,7 +109,6 @@ int main(int argc, char** argv) {
     const bool deferred = !std::strcmp(argv[2], "defer");
     environment("PROSPER_WAIT_DEFER", deferred ? "1" : "0");
     environment("PROSPER_EOP_WRITE_SYNC", nullptr);
-    prosper_gpu_enable_post_submit_visibility();
     const bool disabled = !perf::enabled();
     std::printf("Actual CPU packet route; mode=%s observers=%s; Vulkan UNRUN\n",
                 argv[2], disabled ? "disabled" : "enabled");
@@ -176,6 +175,10 @@ int main(int argc, char** argv) {
         }
         condition = 1u;
         const auto recheck_before = counts();
+        flush_deferred_streams();
+        // Releasing the barrier now hands completion effects to the post-submit FIFO. Wait for
+        // those writes before rechecking a later deferred stream that consumes the same label.
+        prosper_gpu_drain_completion_writes();
         flush_deferred_streams();
         check(downstream == 9u && !deferred_pending(), "producer releases all downstream effects in order");
         delta(recheck_before, {}, disabled, "released deferred waits do not inflate direct incidence");

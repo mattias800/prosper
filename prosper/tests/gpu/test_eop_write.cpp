@@ -113,8 +113,6 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 }
 
 TEST(EopWrite, Contract) {
-    // Exercise the SDK-13 post-submit queue policy; older callers use the eager compatibility path.
-    prosper_gpu_enable_post_submit_visibility();
     // Keep an inherited developer environment from turning this unit test into the destructive
     // #1226 all-forge-suppressed arm. Individual checks opt into that arm below.
     prosper_rel1_forge_suppress_all_override_for_test(0);

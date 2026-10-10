@@ -2996,8 +2996,13 @@ if(TARGET prosper_core)
       "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/test_pending_drain_gate.map")
   endif()
   add_test(NAME pending_drain_gate COMMAND test_pending_drain_gate)
-  add_test(NAME pending_drain_legacy COMMAND test_pending_drain_gate --legacy)
-  set_tests_properties(pending_drain_gate pending_drain_legacy PROPERTIES TIMEOUT 15)
+  set_tests_properties(pending_drain_gate PROPERTIES TIMEOUT 15)
+
+  # #2220: no SDK version may expose completion labels while its submit import is active.
+  prosper_add_gtest(test_submit_visibility_default
+    SOURCES tests/gpu/pm4/test_submit_visibility_default.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "PROSPER_EOP_WRITE_SYNC=unset:;PROSPER_WAIT_DEFER=set:1")
 
   # #1945: the interior free-chain poison scan — its structural predicate, and the census that keeps
   # a zero from reading as "the chains are clean" when the walk reached nothing. POSIX only: the test
