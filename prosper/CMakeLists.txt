@@ -559,6 +559,10 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
+  # The root review configuration must be admitted without admitting unrelated root payloads.
+  add_test(NAME contribution_shape_selftest
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_contribution_shape.py"
+                   --selftest)
   # `print(__doc__)` is a usage message only while the header is a docstring; rewritten as `#`
   # comments it prints the literal string `None` and the tool still exits non-zero, so nothing
   # looks broken and the caller is told nothing (#2399). Three tools have shipped that way, the

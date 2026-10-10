@@ -27,7 +27,7 @@ reviews:
     auto_pause_after_reviewed_commits: 0    # never pause: the reviewer agent pushes fixes late in a PR
     drafts: false                           # drafts here are work-in-progress checkpoints
     base_branches:
-      - main
+      - "^main$"
 
   path_filters:
     - "!assets/**"
@@ -53,8 +53,9 @@ reviews:
       instructions: >-
         Reimplemented Sony library (HLE). Behaviour must come from evidence (live traces, the
         PS5 3.20 NID list, guest disassembly) — never copied from other emulators. Error codes
-        and encodings must match the real API (POSIX names return bare errno; sce* names return
-        the Sony-encoded value). Entitlement/ownership queries must answer from local inventory,
+        and encodings must match each API: pthread-style APIs return bare guest errno, POSIX
+        syscall-style APIs return a failure sentinel and set errno, and Sony error APIs use the
+        Sony encoding. Entitlement/ownership queries must answer from local inventory,
         never a blanket "owned".
     - path: "prosper/tests/**"
       instructions: >-
