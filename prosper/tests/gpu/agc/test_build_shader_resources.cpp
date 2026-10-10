@@ -338,9 +338,11 @@ TEST(BuildShaderResources, Contract) {
         // Black Flag's 32x32x32 R8 3D mip pyramid (#4814): six title-live single-level
         // views (PROSPER_TDUMP=1), one per level, sharing one allocation base. The decoder
         // must read every level's fields exactly; the level-zero view keeps the historical
-        // unshifted placement, while levels 1..5 stay refused until a 3D mip layout exists
-        // to place them — binding one at the allocation base would silently sample level
-        // zero's texels for a view selecting another level.
+        // unshifted placement, while levels 1..5 take the thick-3D tail placement (#4842):
+        // each selects its proven in-block origin at the shared allocation base, so no
+        // level silently samples another's texels.
+        const uint32_t bf_tail_x[6] = {32, 0, 16, 8, 0, 0};
+        const uint32_t bf_tail_y[6] = {0, 16, 0, 8, 12, 8};
         const uint32_t bf_lut[6][8] = {
             {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0900facu, 0x0000001fu, 0x00700050u,
              0x00000000u, 0x00000000u},
@@ -365,13 +367,16 @@ TEST(BuildShaderResources, Contract) {
                       d.last_level == level && d.max_mip == 5 && d.base_array == 0,
                   "Black Flag 32^3 level T# decodes base/extent/type/levels exactly");
             const DecodedImageView v = image_base_level_view(d, bf_format);
+            const uint32_t extent = std::max(32u >> level, 1u);
             if (level == 0) {
                 CHECK(v.supported && v.base == 0x4067090000ull && v.width == 32 && v.height == 32,
                       "level-zero 3D view keeps the unshifted historical placement");
-            } else {
-                CHECK(!v.supported,
-                      "nonzero-BASE_LEVEL 3D view stays refused until a 3D mip layout places it");
             }
+            CHECK(v.supported && v.base == 0x4067090000ull && v.width == extent &&
+                      v.height == extent && v.depth == extent && v.in_mip_tail &&
+                      v.mip_tail_bytes == 65536u && v.mip_tail_x == bf_tail_x[level] &&
+                      v.mip_tail_y == bf_tail_y[level],
+                  "nonzero-BASE_LEVEL 3D view takes its proven tail placement at the shared base");
         }
         // The same level-1 words with LAST_LEVEL widened to the chain end: a BASE_LEVEL=1,
         // LAST_LEVEL=5 chain view. Single-level fixtures cannot tell the two fields apart
@@ -1365,6 +1370,21 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
             << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
     }
+    // Block-compressed 3D keeps the base-level-only rule: the tail math is element-based
+    // and the upload has no BCn volume-tail reader. Level 0 stays admitted unshifted.
+    // Sized 16^3 so the layout itself would admit level 1 (16 <= tail width): only the
+    // format guard refuses it, and removing the guard reddens exactly this arm.
+    {
+        Gen5ImageFormatInfo bc1;
+        ASSERT_TRUE(gen5_image_format(169, &bc1)) << "BC1 fixture format maps";
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 16, 16, /*fmt*/ 169, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 16);
+        t[3] |= (1u << 12) | (1u << 16);
+        t[5] |= 1u << 4;
+        EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), bc1).supported)
+            << "BC1 3D level stays refused (no BCn tail reader)";
+    }
 }
 
 // The tail detile at the zero translation is byte-identical to the proven whole-block
@@ -1404,4 +1424,48 @@ TEST(BuildShaderResources, VolumeTailDetileMechanism) {
         detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1, 9, 1, 32, 0))
         << "tail detile admits the translated origin";
     EXPECT_EQ(one[0], 0xD3) << "translated origin (32,0,0) reads byte 32768";
+    // A translation naming bytes outside the shared block fails closed instead of
+    // aliasing another level: 32 texels at x=33 overrun the 64-wide block.
+    std::vector<uint8_t> over(32 * 32 * 32, 0);
+    EXPECT_FALSE(
+        detile_volume_tail_level(over.data(), spot.data(), spot.size(), 32, 32, 32, 9, 1, 33, 0))
+        << "out-of-block translation refuses";
+}
+
+// A 3D tail view must not bind as STORAGE: the seed reads whole-block bytes and the
+// writeback writes them, neither through the tail origin, so either direction would
+// address sibling texels. The same words in the read-only category bind (control),
+// since sampled upload detiles through the proven coordinates.
+TEST(BuildShaderResources, VolumeTailStorageRefused) {
+    uint32_t sg[8];
+    make_tsharp(sg, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                /*depth*/ 32);
+    sg[3] |= (1u << 12) | (1u << 16);
+    sg[5] |= 5u << 4;
+    AgcShaderSharp sharp[1];
+    sharp[0].bits = 0;
+    AgcShaderHeader sh{};
+    sh.file_header = 0x34333231u;
+    sh.version = 0x18;
+    sh.type = 1;
+    {
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[1] = sharp;
+        ud.sharp_resource_count[1] = 1;
+        sh.user_data = &ud;
+        EXPECT_TRUE(build_shader_resources(sh, sg, 8).by_sgpr_base(0) == nullptr)
+            << "3D tail view in the writable category stays unbound";
+    }
+    {
+        AgcShaderUserData ud{};
+        ud.sharp_resource_offset[0] = sharp;
+        ud.sharp_resource_count[0] = 1;
+        sh.user_data = &ud;
+        const ShaderResourceTable ro_table = build_shader_resources(sh, sg, 8);
+        const ShaderResource* r = ro_table.by_sgpr_base(0);
+        ASSERT_TRUE(r != nullptr) << "same words in the read-only category bind (control)";
+        EXPECT_TRUE(r->cls == ResourceClass::Texture && r->in_mip_tail && r->mip_tail_x == 0 &&
+                    r->mip_tail_y == 16)
+            << "control binds the level-1 tail view with proven coordinates";
+    }
 }

@@ -993,6 +993,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 wr_drop("unsupported image view (mip/array layout)");
                 continue;
             }
+            // A 3D tail view shares its macroblock with sibling levels: the storage seed
+            // reads whole-block bytes and the writeback writes them, neither through the
+            // tail origin, so either direction addresses the wrong texels. Sampled views
+            // detile through the proven coordinates; storage waits for a proven writeback.
+            if (d.type == 10 && view.in_mip_tail) {
+                wr_drop("3D tail storage view (volume-tail writeback unproven)");
+                continue;
+            }
             const uint64_t backing_bytes_per_sample =
                 is_bcn ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) *
                              view.depth * fi.bytes_per_block
