@@ -139,6 +139,23 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.wm_ref = pl[3];
             c.wm_mask = pl[4];
             c.wm_valid = true;
+        } else if (c.op == IT_WAIT_REG_MEM64 && npl == 8 && ((pl[0] >> 4) & 3u) == 1u &&
+                   ((pl[0] >> 6) & 3u) == 0u) {
+            // Hardware PM4 WAIT_REG_MEM64 (GFX10, 9 dwords, see AGC_PACKET_SIZES.md): [0] = the same
+            // control dword as WAIT_REG_MEM, [1..2] = POLL_ADDRESS lo/hi, [3..4] = REFERENCE lo/hi,
+            // [5..6] = MASK lo/hi, [7] = POLL_INTERVAL -- reference BEFORE mask, the reverse of the
+            // custom R_WAIT_MEM_64 payload. Same memory-poll-only gate as WAIT_REG_MEM.
+            c.kind = K::WaitRegMem;
+            c.wm_func = pl[0] & 7u;
+            c.wm_addr = lo_hi(&pl[1]) & ~7ull;
+            c.wm_ref = lo_hi(&pl[3]);
+            c.wm_mask = lo_hi(&pl[5]);
+            c.wm_valid = true;
+            // COND_EXEC (0x22) and DRAW_INDEX_INDIRECT_MULTI (0x38) deliberately stay Unknown.
+            // COND_EXEC skips the next EXEC_COUNT dwords when *addr == 0, which is not draw
+            // predication; MULTI issues COUNT draws (count possibly read from memory) at a stride,
+            // so mapping it to one DrawIndexIndirect draws the wrong number. Each needs its own
+            // processor support, not a relabel.
         } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];

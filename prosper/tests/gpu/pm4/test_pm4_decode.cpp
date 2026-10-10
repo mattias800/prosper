@@ -560,4 +560,64 @@ TEST(Pm4Decode, Contract) {
                   ctl_ops[4].kind == K::Unknown,
               "CLEAR_STATE, ATOMIC_MEM and CONTEXT_CONTROL stay Unknown");
     }
+
+    // Hardware WAIT_REG_MEM64 plus COND_EXEC / DRAW_INDEX_INDIRECT_MULTI (Black Flag submit0.bin):
+    {
+        uint32_t cond_stream[] = {
+            // IT_COND_EXEC: 5 dwords, op 0x22: [0..1]=addr, [2]=control, [3]=exec count
+            PM4(5, 0x22u, 0),
+            0xe0040060u,
+            0x0000000fu,
+            0x0u,
+            0x8u,
+            // IT_DRAW_INDEX_INDIRECT_MULTI: 10 dwords, op 0x38
+            PM4(10, 0x38u, 0),
+            0x19000u,
+            0x98u,
+            0x99u,
+            0x280u,
+            0x13u,
+            0x0u,
+            0x0u,
+            0x14u,
+            0x0u,
+            // IT_WAIT_REG_MEM64: 9 dwords, op 0x93: [0]=control (func 3, memory), [1..2]=addr,
+            // [3..4]=reference, [5..6]=mask, [7]=poll interval
+            PM4(9, IT_WAIT_REG_MEM64, 0),
+            0x6000113u,
+            0x800040a8u,
+            0xcu,
+            0x5u,
+            0x0u,
+            0xffffffffu,
+            0x0000ffffu,
+            0x40u,
+        };
+        std::vector<Pm4Command> cond_ops;
+        const size_t c = decode_pm4(cond_stream, std::size(cond_stream), cond_ops);
+        CHECK(c == 24, "consumed 24 dwords of cond/multi-draw/wait64 packets");
+        CHECK(cond_ops.size() == 3, "walked 3 cond/multi-draw/wait64 packets");
+        CHECK(cond_ops[0].kind == K::Unknown, "COND_EXEC stays Unknown (it is not predication)");
+        CHECK(cond_ops[1].kind == K::Unknown, "DRAW_INDEX_INDIRECT_MULTI stays Unknown");
+        CHECK(cond_ops[2].kind == K::WaitRegMem && cond_ops[2].wm_valid, "op2 is WaitRegMem");
+        CHECK(cond_ops[2].wm_func == 3u, "op2 wm_func == 3");
+        CHECK(cond_ops[2].wm_addr == 0x0000000c800040a8ull, "op2 wm_addr matches");
+        CHECK(cond_ops[2].wm_ref == 5u, "op2 reference comes from [3..4]");
+        CHECK(cond_ops[2].wm_mask == 0x0000ffffffffffffull, "op2 mask comes from [5..6]");
+
+        // A register poll stays Unknown, as for WAIT_REG_MEM.
+        uint32_t reg_wait[] = {PM4(9, IT_WAIT_REG_MEM64, 0),
+                               0x6000103u,
+                               0x2800u,
+                               0u,
+                               5u,
+                               0u,
+                               0xffffffffu,
+                               0xffffffffu,
+                               0x40u};
+        std::vector<Pm4Command> reg_ops;
+        decode_pm4(reg_wait, std::size(reg_wait), reg_ops);
+        CHECK(reg_ops.size() == 1 && reg_ops[0].kind == K::Unknown,
+              "register-space WAIT_REG_MEM64 stays Unknown");
+    }
 }

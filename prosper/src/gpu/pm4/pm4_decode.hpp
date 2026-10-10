@@ -47,6 +47,7 @@ enum : uint32_t {
     IT_SET_CONTEXT_REG = 0x69,
     IT_SET_SH_REG = 0x76,
     IT_SET_UCONFIG_REG = 0x79,
+    IT_WAIT_REG_MEM64 = 0x93,
     IT_LOAD_CONTEXT_REG_INDEX = 0x9F,
     IT_INDIRECT_BUFFER = 0x3F,   // sceAgcCbBranch's 14-dword conditional form (#4540)
 };
