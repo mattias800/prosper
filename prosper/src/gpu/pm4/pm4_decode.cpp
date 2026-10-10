@@ -53,7 +53,9 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             // register's bit layout (USE_THREAD_DIMENSIONS, CS_W32_EN, ...), so the initiator
             // feeds resolve_compute_launch() unchanged. Other lengths stay Unknown.
             c.kind = K::DispatchDirect;
-            c.threads_x = pl[0]; c.threads_y = pl[1]; c.threads_z = pl[2];
+            c.threads_x = pl[0];
+            c.threads_y = pl[1];
+            c.threads_z = pl[2];
             c.dispatch_modifier = pl[3];
         } else if (c.op == IT_DISPATCH_INDIRECT && npl == 2) {
             // Hardware PM4 DISPATCH_INDIRECT, graphics-ring form (GFX10, 3 dwords): [0] =
