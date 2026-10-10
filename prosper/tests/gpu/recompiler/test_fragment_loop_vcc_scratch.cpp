@@ -142,7 +142,9 @@ constexpr uint32_t kMaskReadAfterLoop[] = {
 
 //  kScratchLoop with an interior EXECZ that leaves the loop from INSIDE the body, after the scratch
 //  writes. That path reaches the merge with VCC holding scalar data, while the check path reaches
-//  it with a mask: the join has no Bool.
+//  it with a mask: the join has no Bool. Nothing after the loop reads VCC, so the join is never
+//  observed and the loop compiles with a placeholder on that edge (#4848: House of the Dead 2's
+//  light loops, whose exit redefines VCC with a v_cmp three instructions later).
 constexpr uint32_t kBreakFromScratchBody[] = {
     0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u,
     0x7D020200u,   //  4  v_cmp_lt_i32 vcc, s0, v1
@@ -155,6 +157,17 @@ constexpr uint32_t kBreakFromScratchBody[] = {
     0xBE80036Au,   // 12  s_mov_b32 s0, vcc_lo
     0xBF82FFF7u,   // 13  s_branch 5
     0x7E020300u, 0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
+};
+
+//  The same loop, but the exit READS vcc_lo as data before redefining it. On the break edge that
+//  is the body's scratch, so the join is observable and must still refuse. (An exit that reads the
+//  pair as a MASK -- v_cndmask e32, s_mov_b64 -- never reaches this proof: the emitter takes
+//  another route for a loop whose VCC mask is live out, and those shapes compiled before #4848.)
+constexpr uint32_t kBreakFromScratchBodyThenDataRead[] = {
+    0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u, 0x7D020200u, 0x7D020200u, 0xBF860007u,
+    0x816A8100u, 0x876B8300u, 0xBF880004u, 0x060000FFu, 0x3E000000u, 0xBE80036Au, 0xBF82FFF7u,
+    0xBE81036Au,   // 14  s_mov_b32 s1, vcc_lo        <<< reads the joined VCC as data
+    0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u,
 };
 
 //  #4680: a COUNTED loop (SCC exit, unconditional back-edge) whose induction variable lives in
@@ -377,11 +390,37 @@ TEST(FragmentLoopVccScratch, HeaderReadOfTheCarriedPairStillRejects) {
     EXPECT_NE(loop.reason.find("blocker pc=5 kind=source-dword"), std::string::npos) << loop.reason;
 }
 
-TEST(FragmentLoopVccScratch, BreakOutOfAScratchBodyStillRejects) {
-    const Compiled loop = compile(kBreakFromScratchBody, 0x4508A008ull);
-    EXPECT_TRUE(loop.spirv.empty()) << "the merge would join a mask with scalar data";
-    EXPECT_NE(loop.reason.find("direct break reaches the merge (header pc=5)"), std::string::npos)
+TEST(FragmentLoopVccScratch, BreakOutOfAScratchBodyCompilesWhenVccIsDeadAtTheExit) {
+    // #4848. Red if the exit-dead proof is removed and the direct-break shape is refused again,
+    // which is what dropped House of the Dead 2's light pass.
+    const Compiled loop = compile(kBreakFromScratchBody, 0x4848A001ull);
+    ASSERT_FALSE(loop.spirv.empty())
+        << "VCC is redefined or unread on every path from the exit, so the join is "
+           "unobservable; reason: "
         << loop.reason;
+    if (!device_can_execute(loop.spirv))
+        GTEST_SKIP() << "device cannot execute the fragment wave64 contract this module declares";
+    // Red if the break edge's merge input is not supplied (an id-0 phi operand): the module
+    // then fails to build a pipeline and the triangle does not render.
+    const std::vector<uint8_t> pixel = centre_pixel(loop.spirv);
+    ASSERT_EQ(pixel.size(), 4u) << "the triangle did not render";
+    // Four trips of +0.125: the same band ScratchLoopRunsExactlyFourIterations pins.
+    for (int channel = 0; channel < 3; ++channel) {
+        EXPECT_GT(pixel[channel], 0x70) << "channel " << channel;
+        EXPECT_LT(pixel[channel], 0x90) << "channel " << channel;
+    }
+}
+
+TEST(FragmentLoopVccScratch, BreakOutOfAScratchBodyStillRejectsWhenTheExitReadsVcc) {
+    // Red if the exit proof is dropped, or walks from the header (where the v_cmp redefines VCC
+    // at once) instead of from the exit: either admits the placeholder into an observed join.
+    const Compiled data = compile(kBreakFromScratchBodyThenDataRead, 0x4848A003ull);
+    EXPECT_TRUE(data.spirv.empty()) << "the exit's s_mov would read the break edge's scratch";
+    EXPECT_NE(data.reason.find("direct break reaches the merge (header pc=5)"), std::string::npos)
+        << data.reason;
+    EXPECT_NE(data.reason.find("s106 is live (exit pc=14 blocker pc=14 kind=source-dword)"),
+              std::string::npos)
+        << data.reason;
 }
 
 TEST(FragmentLoopVccScratch, DataReadAfterTheLoopIsNotServedFromScratch) {

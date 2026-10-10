@@ -2,6 +2,7 @@
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -143,6 +145,70 @@ bool needs_resource_table(Rdna2Format fmt, const std::string& stage) {
     }
 }
 
+// --synthetic-table: a COMPILE PROBE, never an admission verdict. A raw dump has no descriptors, so
+// a graphics program whose first SMEM or MIMG needs one stops there and every later refusal is
+// hidden behind it. This fabricates one resource per descriptor USE, keyed by the consuming
+// instruction's exact pc (the provenance route the recompiler consults first), plus one per
+// immediate s_load_dwordx4/x8 key so the load itself is treated as a decoded descriptor:
+//   * every MIMG              -> Texture, or StorageImage for the storage-only opcodes, img_dim
+//                                from the instruction;
+//   * every S_BUFFER_LOAD     -> ConstantBuffer;
+//   * every MUBUF/MTBUF       -> VertexBuffer;
+//   * immediate S_LOAD x4/x8  -> ConstantBuffer / Texture at srt_offset = the immediate.
+// What a pass then proves is only that NOTHING OUTSIDE DESCRIPTOR RESOLUTION refuses the program:
+// control flow, ALU, exports. It cannot say the program's descriptors resolve live, and the
+// fabricated classes can themselves be wrong (an x4 that is really an S#). So the status line and
+// the exit code are distinct from a real pass, and the output says so.
+ShaderResourceTable synthetic_resource_table(const std::vector<Rdna2Inst>& instructions) {
+    ShaderResourceTable table;
+    uint32_t binding = 32;
+    const auto add = [&](ResourceClass cls, uint32_t fetch_pc, uint32_t srt_offset,
+                         uint32_t img_dim) {
+        ShaderResource r{};
+        r.cls = cls;
+        r.binding = binding++;
+        r.gpu_addr = 0x100000000ull;
+        r.size = 0x10000;
+        r.stride = 16;
+        r.num_components = 4;
+        r.width = 64;
+        r.height = 64;
+        r.img_dim = img_dim;
+        r.fetch_pc = fetch_pc;
+        r.srt_offset = srt_offset;
+        table.resources.push_back(r);
+    };
+    for (const auto& in : instructions) {
+        if (in.fmt == Rdna2Format::MIMG) {
+            // Same storage-only opcode set as the recompiler's ImageResourceRequirement.
+            const bool storage = in.opcode == 0x08 || in.opcode == 0x09 || in.opcode == 0x0f ||
+                                 (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
+            add(storage ? ResourceClass::StorageImage : ResourceClass::Texture, in.pc, 0xFFFFFFFFu,
+                in.mimg_dim);
+            // The _C sample/gather forms need a comparison S#, or the recompiler refuses them as
+            // drifted provenance: give exactly those a LESS compare.
+            const uint32_t low = in.opcode & 0x0fu;
+            if (in.opcode >= 0x20 && in.opcode < 0x60 && low >= 0x8u) {
+                table.resources.back().depth_compare = true;
+                table.resources.back().depth_compare_func = 1;
+            }
+        } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+            add(ResourceClass::VertexBuffer, in.pc, 0xFFFFFFFFu, 1);
+        } else if (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x08 && in.opcode <= 0x0c) {
+            add(ResourceClass::ConstantBuffer, in.pc, 0xFFFFFFFFu, 1);
+        } else if (in.fmt == Rdna2Format::SMEM && (in.opcode == 0x02 || in.opcode == 0x03)) {
+            const uint32_t key = in.literal;
+            const ResourceClass cls =
+                in.opcode == 0x02 ? ResourceClass::ConstantBuffer : ResourceClass::Texture;
+            const bool seen = std::any_of(
+                table.resources.begin(), table.resources.end(),
+                [&](const ShaderResource& r) { return r.srt_offset == key && r.cls == cls; });
+            if (!seen) add(cls, UINT32_MAX, key, 1);
+        }
+    }
+    return table;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -157,6 +223,8 @@ int main(int argc, char** argv) {
     bool wave_reasons = false;
     bool raw_wide_proof = false;
     bool wave64 = false;
+    bool synthetic_table = false;
+    std::string spirv_out;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -173,6 +241,13 @@ int main(int argc, char** argv) {
             raw_wide_proof = true;
         } else if (arg == "--wave64") {
             wave64 = true;
+        } else if (arg == "--synthetic-table") {
+            synthetic_table = true;
+        } else if (arg == "--spirv-out") {
+            if (i + 1 >= argc)
+                bad_usage = true;
+            else
+                spirv_out = argv[++i];
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -185,9 +260,15 @@ int main(int argc, char** argv) {
         (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
         (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
         (wave64 && !raw_wide_proof) ||
+        (synthetic_table && stage != "vertex" && stage != "fragment") ||
+        (!spirv_out.empty() && !synthetic_table) ||
         (skippable_mimg && (!stage.empty() || mimg_sites || wave_reasons || raw_wide_proof)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
+        std::fprintf(stderr,
+                     "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table "
+                     "[--spirv-out FILE]\n",
+                     argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
@@ -233,8 +314,13 @@ int main(int argc, char** argv) {
             "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
             "  gpu_replay <capture>.prgcap --inspect-only\n"
             "\n"
+            "--synthetic-table (vertex/fragment only) fabricates one descriptor per use so the\n"
+            "recompile runs past descriptor resolution. It is a COMPILE PROBE: a pass shows only\n"
+            "that nothing outside descriptor resolution refuses the program, never that it is\n"
+            "admitted live. It reports status=ok-synthetic-table / rejected-synthetic-table.\n"
+            "\n"
             "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource "
-            "table).\n");
+            "table), 4 synthetic-table compile passed, 5 synthetic-table compile refused.\n");
         return 2;
     }
 
@@ -493,6 +579,31 @@ int main(int argc, char** argv) {
     bool stage_undetermined = false;
     if (!stage.empty()) {
         std::vector<uint32_t> spirv;
+        const ShaderResourceTable synthetic =
+            synthetic_table ? synthetic_resource_table(instructions) : ShaderResourceTable{};
+        if (synthetic_table) {
+            spirv = stage == "vertex" ? recompile_vertex(words.data(), words.size(), &synthetic)
+                                      : recompile_fragment(words.data(), words.size(), &synthetic);
+            std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu resources=%zu\n",
+                        stage.c_str(),
+                        spirv.empty() ? "rejected-synthetic-table" : "ok-synthetic-table",
+                        spirv.size(), synthetic.resources.size());
+            std::printf("stage-recompile NOTE: SYNTHETIC TABLE - a compile probe, not an admission "
+                        "verdict.\n");
+            // The module, for spirv-val: a compile probe that emits invalid SPIR-V is a defect the
+            // status line cannot show.
+            if (!spirv_out.empty() && !spirv.empty()) {
+                std::ofstream out(spirv_out, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(spirv.data()),
+                          static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+                out.close();   // Check errors from flushing buffered data during close.
+                if (!out) {
+                    std::fprintf(stderr, "cannot write %s\n", spirv_out.c_str());
+                    return 2;
+                }
+            }
+            return spirv.empty() ? 5 : 4;
+        }
         if (stage == "vertex") {
             spirv = recompile_vertex(words.data(), words.size());
         } else if (stage == "fragment") {

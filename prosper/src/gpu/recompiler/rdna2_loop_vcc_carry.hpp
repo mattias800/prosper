@@ -28,6 +28,9 @@
 // CONFIDENCE: HIGH for the back-edge (the placeholder is unobservable by the proof); HIGH for the
 // exit state (it restores the emitter's own "a mask write clobbers the pair" rule, see finish_exit).
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 #include <vector>
 
 namespace prosper::gpu {
@@ -38,6 +41,9 @@ struct LoopVccCarry {
     bool check_tracks_half[2] = {false, false};
     // The back-edge was closed with a placeholder: the body left VCC as scalar data.
     bool placeholder_backedge = false;
+    // A direct break also carries the body's VCC to the merge, and the pair was proven dead at the
+    // loop exit, so the same placeholder is the break edge's merge input (#4848).
+    bool placeholder_reaches_merge = false;
 
     explicit LoopVccCarry(const RegState& at_check_end)
         : check_tracks_half{at_check_end.sreg.contains(106), at_check_end.sreg.contains(107)} {}
@@ -46,15 +52,34 @@ struct LoopVccCarry {
     // be emitted; the terminal reason is logged here so the caller's `return false` is not silent.
     //
     // `merge_reads_body_vcc`: a direct break reaches the merge from inside the body, where VCC is
-    // scalar data. The merge would then join a mask with data, which has no Bool.
-    uint32_t backedge_value(SpirvCompute& b, const std::vector<Rdna2Inst>& ins, uint32_t header_pc,
-                            bool merge_reads_body_vcc) {
+    // scalar data. The merge then joins the check block's mask with data, which has no Bool. That
+    // join is unobservable when VCC is dead at the loop exit in every domain -- every path from
+    // `exit_pc` redefines both halves before any read -- and then the placeholder is as good an
+    // input there as on the back-edge. House of the Dead 2's light loops are this shape: the body
+    // ends in `s_buffer_load_dword vcc_lo, ...` scratch, interior EXECZ breaks leave for the exit,
+    // and the exit's third instruction is a `v_cmp` into VCC (program 0x407da20100, header pc
+    // 2691, exit pc 3367, redefinition pc 3370). The proof is the same AnyRead walk the header
+    // uses, so a mask read (v_cndmask e32, vccz, a pair source) or a data read of either half
+    // before the redefinition still refuses, and names the blocker.
+    // CONFIDENCE: HIGH -- a value no path reads cannot change the program's result.
+    uint32_t backedge_value(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
+                            const DivLoop& loop) {
+        const uint32_t header_pc = loop.header_pc, exit_pc = loop.exit_pc;
+        const bool merge_reads_body_vcc = loop.direct_exec_breaks || loop.direct_wave_breaks;
         if (merge_reads_body_vcc) {
-            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
-                                     "loop-carried VCC is scalar data at the back-edge and a "
-                                     "direct break reaches the merge (header pc=%u)",
-                                     header_pc);
-            return 0;
+            for (int half : {106, 107}) {
+                ScalarMergeBlocker blocker;
+                if (sgpr_dead_at_merge(ins, exit_pc, half, ScalarMergeProof::AnyRead, &blocker))
+                    continue;
+                log_recompile_diagnostic(
+                    b.diagnostic, "recompile-reject", "terminal",
+                    "loop-carried VCC is scalar data at the back-edge and a "
+                    "direct break reaches the merge (header pc=%u) where "
+                    "s%d is live (exit pc=%u blocker pc=%d kind=%s)",
+                    header_pc, half, exit_pc,
+                    blocker.pc == UINT32_MAX ? -1 : static_cast<int>(blocker.pc), blocker.kind);
+                return 0;
+            }
         }
         for (int half : {106, 107}) {
             ScalarMergeBlocker blocker;
@@ -76,12 +101,36 @@ struct LoopVccCarry {
             return 0;
         }
         placeholder_backedge = true;
+        placeholder_reaches_merge = merge_reads_body_vcc;
         return b.bfalse();
     }
 
-    // Whether the merge can name VCC. With a placeholder back-edge only the check block reaches the
-    // merge (backedge_value refused the direct-break shape), so the body's missing mask is not an
-    // input. Logs the reason when it cannot.
+    // The direct-break edge's VCC at the merge: the body's mask, or the placeholder when
+    // backedge_value proved the pair dead at the exit. 0 when neither exists.
+    uint32_t merge_body_value(SpirvCompute& b, uint32_t body_vcc) const {
+        if (body_vcc) return body_vcc;
+        return placeholder_reaches_merge ? b.bfalse() : 0u;
+    }
+
+    // VCC with no header phi (no mask was live on entry) is not loop-carried, so a mask the BODY
+    // created is still in rs.vcc at the merge, and its id does not dominate the merge. Same rule as
+    // the body-created saved masks the emitter drops there: the merge takes the check block's VCC,
+    // which dominates it, and a direct-break edge carrying a different body mask leaves VCC
+    // untracked, so a later read refuses instead of naming an id from inside the loop. House of the
+    // Dead 2 (0x407da20100, loop pc 743) builds such a mask at pc 774-775 and the if after the loop
+    // made a VCC phi on it: invalid SPIR-V once the program compiled (#4848). Both loop emitters.
+    // `body_edge`: a direct break reaches the merge from the body end.
+    template <class Phis>
+    static void exit_without_phi(RegState& rs, const Phis& phis, uint32_t check_vcc,
+                                 bool body_edge) {
+        for (const auto& phi : phis)
+            if (phi.dom == 3) return;
+        rs.vcc = !body_edge || rs.vcc == check_vcc ? check_vcc : 0u;
+    }
+
+    // Whether the merge can name VCC. With a placeholder back-edge, a direct-break edge reaches
+    // the merge only when backedge_value proved VCC dead at the exit; merge_body_value supplies
+    // that edge's input. Logs the reason when it cannot.
     bool merge_has_mask(SpirvCompute& b, uint32_t check_vcc, uint32_t body_vcc,
                         uint32_t header_pc) const {
         if (check_vcc && (body_vcc || placeholder_backedge)) return true;

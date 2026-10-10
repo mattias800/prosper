@@ -298,9 +298,9 @@ unless another admission route applies (the tool has no resource table to evalua
 
 ## `--stage` cannot prove a shader is unsupported (#1571)
 
-**`shader_inspect` has no resource table, and a table-less stage rejection is NOT evidence of a shader
-defect.** A raw dump carries instructions but no descriptors, so the tool can never build a
-`ShaderResourceTable`. The recompiler then refuses — by design — to lower anything that resolves a
+**A table-less stage rejection is NOT evidence of a shader defect.** A raw dump carries instructions
+but no descriptors, so the tool cannot recover the live `ShaderResourceTable`. By default the
+recompiler then refuses — by design — to lower anything that resolves a
 V#/T#/S# through that table: `MIMG`, `MUBUF` and `MTBUF` in every stage, and additionally `SMEM` in the
 **vertex and fragment** stages, which gate scalar memory on `allow_smem = (rt != nullptr)`. Compute
 passes `allow_smem = true`, so constant-buffer loads are fine there — but compute image and buffer ops
@@ -361,9 +361,25 @@ gpu_replay <capture>.prgcap --inspect-only                     # per-draw realiz
 gpu_replay <capture>.prgcap --dump-failed-shader FAILURE:STAGE out.bin   # a genuinely failed stage
 ```
 
+`--stage vertex|fragment --synthetic-table` is an explicit offline compile probe. It fabricates
+descriptors at consuming instruction PCs and immediate descriptor-load offsets to expose later
+control-flow or ALU refusals. These descriptors can have the wrong class or shape; a successful
+compile cannot establish live descriptor resolution, shader admission, or valid SPIR-V.
+
+```bash
+./build-linux/shader_inspect shader.bin --stage fragment --synthetic-table --spirv-out shader.spv
+spirv-val --target-env vulkan1.1 shader.spv
+```
+
+The probe reports `status=ok-synthetic-table` or `status=rejected-synthetic-table`. `--spirv-out`
+requires this mode and writes a module only after a successful compile; output errors exit `2`.
+Check the exit code before using an existing output file: a refusal leaves it untouched.
+
 Exit codes: `0` recompiled, `1` genuine defect (truncated stream, or a rejection attributable to the
 shader), `2` usage/IO error, `3` undetermined because no resource table could be supplied. `3` is
-deliberately non-zero — a table-less run is never reported as a pass.
+deliberately non-zero — a table-less run is never reported as a pass. Synthetic probes exit `4`
+when compilation succeeds and `5` when the translator refuses, keeping both results distinct from
+a table-accurate verdict.
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 
