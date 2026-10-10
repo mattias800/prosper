@@ -10332,15 +10332,30 @@ int main() {
     CHECK(gotX4c.size()==N && badX4c==0,
           "kernel X4c round-trips the chained vcc_lo source (9, not 11 and not 0)");
 
-    //   X4d: same-site source mutation to VCC_HI (Special 107) stays REJECTED. This is a real
-    //        discriminator at this shape: VCC_HI holds tracked scalar data here, so operand_bits
-    //        would resolve it and a Special 106..125 widening would ACCEPT. The narrow
-    //        Special == 106 form is what keeps the two GTA packet-drift guards above passing.
-    const uint32_t codeX4d[] = {
-        0xBEA40387u, 0xBEA50389u, 0xBEEB0380u, 0xBF06806Bu,
-        0x856A6B25u, 0x4A02006Au, 0xBF810000u };
-    CHECK(recompile_valu(codeX4d, std::size(codeX4d), 1, /*out_vgpr*/1).empty(),
-          "kernel X4d (same-site vcc_hi source) remains REJECTED");
+    //   X4d: the same site with VCC_HI as the selected source. This arm used to assert REJECTED as
+    //        a proxy: a wholesale Special 106..125 widening of is_wave64_vcc_lo_scalar_cselect broke
+    //        the two GTA packet-drift guards above. #4808 admits VCC_HI here ONLY when it already
+    //        holds a tracked scalar dword inside a complete scalar pair (emit_alu's
+    //        is_wave64_vcc_lo_cselect_reading_vcc_hi gate), leaving the shared predicate -- and so those guards -- untouched;
+    //        a mask-domain VCC_HI stays refused (test_compute_scalar_pair_mask). Live Wave64 compute
+    //        in PPSA28000/PPSA29343 selects `s_cselect_b32 vcc_lo, 1, vcc_hi` exactly this way.
+    //        s_mov vcc_hi,5 ; s_cmp_eq_u32 vcc_hi,0 (SCC=0) ; s_cselect_b32 vcc_lo, s37, vcc_hi
+    //        => vcc_lo = 5: reading s37 would give 9, and a ballot or a dropped read would not give 5.
+    const uint32_t codeX4d[] = {0xBEA40387u, 0xBEA50389u, 0xBEEB0385u, 0xBF06806Bu,
+                                0x856A6B25u, 0x4A02006Au, 0xBF810000u};
+    std::vector<uint32_t> spvX4d = recompile_valu(codeX4d, std::size(codeX4d), 1, /*out_vgpr*/ 1);
+    CHECK(!spvX4d.empty(), "kernel X4d (s_cselect_b32 vcc_lo from a scalar vcc_hi) recompiles");
+    std::vector<float> gotX4d =
+        spvX4d.empty() ? std::vector<float>() : prosper::test::run_compute(spvX4d, inX, N, N);
+    uint32_t badX4d = 0;
+    for (uint32_t i = 0; i < N && gotX4d.size() == N; i++) {
+        uint32_t gb;
+        std::memcpy(&gb, &gotX4d[i], 4);
+        if (gb != bits_of(inX[i]) + 5u) badX4d++;
+    }
+    printf("  kernelX4d(vcc cselect vcc_hi) mismatches=%u\n", badX4d);
+    CHECK(gotX4d.size() == N && badX4d == 0,
+          "kernel X4d selects the SCC-false vcc_hi dword (5, not 9) into vcc_lo");
 
     // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
     // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the

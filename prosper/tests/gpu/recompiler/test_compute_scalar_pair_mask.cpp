@@ -779,3 +779,68 @@ TEST(ScalarPairMask, ExecSourceIsAdmittedAsLaneMask) {
             << ": s_mov_b64 vcc, exec must be admitted: " << last_terminal_reject_reason(kAddress);
     }
 }
+
+// #4808: Wave64 compute builds a 64-bit select in the VCC pair one dword at a time and reads the
+// halves back as data -- `s_cselect_b32 vcc_hi, 1, 0; s_cselect_b32 vcc_lo, 1, vcc_hi`, the shape
+// of PPSA28000's cs 0x258009de00 and PPSA29343's matching programs. VCC_HI is a scalar DATA word
+// there, so the second select is an ordinary dword select. Removing the is_wave64_vcc_lo_cselect_reading_vcc_hi
+// disjunct from emit_alu's Wave64 VCC_LO cselect gate turns the first arm red.
+TEST(ScalarPairMask, Wave64VccLoCselectReadingScalarVccHiCompiles) {
+    // s_mov_b32 s0,0 | s_cmp_eq_u32 s0,0 | s_cselect_b32 vcc_hi,1,0 | s_cselect_b32 vcc_lo,1,vcc_hi
+    const Words body = {0xbe800380u, 0xbf068000u, 0x856b8081u, 0x856a6b81u};
+    EXPECT_FALSE(compile_vcc_as_data(Stage::Compute, body).empty())
+        << "VCC_HI holds a scalar dword; selecting it into VCC_LO is plain scalar data";
+    // Both operand orders: `s_cselect_b32 vcc_lo, vcc_hi, 64`.
+    const Words swapped = {0xbe800380u, 0xbf068000u, 0x856b8081u, 0x856ac06bu};
+    EXPECT_FALSE(compile_vcc_as_data(Stage::Compute, swapped).empty());
+}
+
+TEST(ScalarPairMask, Wave64VccLoCselectReadingMaskVccHiStillRefuses) {
+    // v_cmp_eq_u32 vcc, 0, v0 leaves VCC_HI a MASK half, which has no scalar dword to select:
+    // s_mov_b32 s0,0 | v_cmp_eq_u32 vcc,0,v0 | s_cmp_eq_u32 s0,0 | s_cselect_b32 vcc_lo,1,vcc_hi
+    const Words body = {0xbe800380u, 0x7d840080u, 0xbf068000u, 0x856a6b81u};
+    EXPECT_TRUE(compile_vcc_as_data(Stage::Compute, body).empty())
+        << "a mask-domain VCC_HI must not be read back as a scalar dword";
+}
+
+// v_mov_b32 v3, vcc_lo | buffer_store_dword v3 -> out[x] | s_endpgm (compile_vcc_as_data's tail).
+const Words kVccLoStoreTail = {0x7e06026au, 0xe0702000u, 0x80020300u, 0xbf810000u};   // NOLINT
+
+TEST(ScalarPairMask, Wave64VccLoCselectReadingVccHiAcrossADispatcherEdgeCompiles) {
+    // The same select with VCC_HI written in an EARLIER block of a program that only the CFG
+    // dispatcher emits (a portable v_readlane, as in test_entry_m0_dispatcher). Each dispatcher block
+    // reloads its state with placeholders, so acceptance needs the Wave64 record pass to prove the
+    // pair complete at the select, as in PPSA28000 cs 0x29800f9600 pc14. Removing
+    // is_wave64_vcc_lo_cselect_reading_vcc_hi from emit_cfg's b32_vcc_scalar_write turns this red.
+    // s_mov s15,7 | s_lshr_b32 vcc_hi,s15,1 | s_cmp_eq_u32 s0,0 | s_cbranch_scc0 +1 | s_mov s1,5 |
+    // v_readlane_b32 s2,v0,0 | s_cmp_eq_u32 s15,7 | s_cselect_b32 vcc_lo,64,vcc_hi
+    const Words body = {0xbe8f0387u, 0x906b810fu, 0xbf068000u, 0xbf840001u, 0xbe810385u,
+                        0xd7600002u, 0x00010100u, 0xbf06870fu, 0x856a6bc0u};
+    // No native subgroup: the readlane is portable, which routes the stream to the dispatcher.
+    const Words code = cat({&kPrefix, &body, &kVccLoStoreTail});
+    ComputeShaderConfig config;
+    config.local_x = 64;
+    config.wave_size = 64;
+    config.native_subgroup_size = 0;
+    const ShaderResourceTable table = output_table();
+    EXPECT_FALSE(recompile_compute(code.data(), code.size(), &table, config,
+                                   {RecompileDiagnosticStage::Compute, kAddress})
+                     .empty());
+}
+
+TEST(ScalarPairMask, Wave64VccLoCselectFromAOnePathVccHiRefusesItsLaneRead) {
+    // VCC_HI written on ONE path only is the structured emitter's fabricated zero at the select
+    // (#4714). As DATA it is VCC-as-scratch, like any one-path word; what must never happen is the
+    // selected pair being read back as this lane's VCC bit. kComputeTail is that lane read.
+    // kOnePath's if, writing VCC_HI instead: s_cmp_eq_u32 s0,0 | s_cbranch_scc1 +1 |
+    // s_mov_b32 vcc_hi,5 ; then kScc and s_cselect_b32 vcc_lo,1,vcc_hi.
+    const Words one_path_vcc_hi = {0xbf068000u, 0xbf850001u, 0xbeeb0385u};
+    const Words both_paths_vcc_hi = {0xbeeb0385u};
+    const Words select = {0x856a6b81u};
+    EXPECT_TRUE(compile(Stage::Compute, program(one_path_vcc_hi, select)).empty())
+        << "a merge-marked VCC_HI must not reach a VCC lane read through the #4808 select";
+    // Control: VCC_HI written unconditionally, the same select and lane read compile.
+    EXPECT_FALSE(compile(Stage::Compute, program(both_paths_vcc_hi, select)).empty())
+        << "a defined scalar VCC_HI selects and projects: "
+        << last_terminal_reject_reason(kAddress);
+}
