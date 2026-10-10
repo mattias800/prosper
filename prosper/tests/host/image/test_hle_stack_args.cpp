@@ -134,7 +134,6 @@ int main(int argc, char** argv) {
 
     constexpr const char* kNid = "test.hle.stack.args";
     register_builtin_hle();
-    prosper_gpu_enable_post_submit_visibility();
     Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle10_entry),
                      "prosper_test_hle10_entry", &prosper_test_hle_return_hook);
     // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS

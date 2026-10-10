@@ -115,7 +115,7 @@ getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3
 # #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
 # This renames one existing site; no new raw environment read or switch was introduced.
 getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
-getenv|prosper/src/gpu/pm4/command_processor.cpp 59
+getenv|prosper/src/gpu/pm4/command_processor.cpp 58
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
 getenv|prosper/src/gpu/recompiler/rdna2_alu_support.hpp 1

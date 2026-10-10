@@ -2917,50 +2917,18 @@ static void honor_write_data(const Pm4Command& c) {
 // and our later label writes stomp MallocBinned3 free-block headers (live-attributed: the GPU
 // write-ring shows our RELEASE_MEM value-1 writes at exactly the corrupted qword).
 //
-// Model: honor_* enqueue writes; modern callers retain them until the actual import-return
-// checkpoint, then the FIFO worker applies them without an added latency. Older callers retain
-// the legacy 1 ms worker delay. Existing synchronous drain points preserve their dependencies:
-//   - WaitRegMem fold checks drain first (a prior submit's fence must be visible to its consumer),
-//   - execute_and_present's callers drain first (the renderer reads WRITE_DATA-uploaded memory),
-//   - the EOP-event worker drains before posting (an event must never overtake its data writes).
+// Model: honor_* enqueue writes; every submit retains them until its actual import-return
+// checkpoint, then the FIFO worker applies them without an added latency. Renderer resource
+// writes and in-queue scalar overlays preserve dependencies without publishing completions:
+//   - WaitRegMem checks overlay queued scalar writes in command order,
+//   - renderer drains select resource writes that do not overlap a queued completion,
+//   - the EOP-event worker drains after retirement before posting its event.
 // PROSPER_EOP_WRITE_SYNC=1 restores the old synchronous writes (A/B lever + fallback).
-// CONFIDENCE: HIGH on the invariant (completion is post-submit by construction on real HW; Kyty
-// writes fences from its GPU thread, never inside the submit call). The cross-queue wait ordering
+// CONFIDENCE: HIGH on the required ownership boundary: #2219's per-fold trace and #2220's
+// SDK-8 descriptor recycling both show damage from publishing while the fold is active.
+// The SDK table version does not identify a completion owner. The cross-queue wait ordering
 // is handled by the WAIT_REG_MEM barrier model below (opt-in, PROSPER_WAIT_DEFER=1).
 namespace {
-std::atomic<bool> g_post_submit_visibility{false};
-
-// #1226 (arc7) A/B lever, default OFF and log-only in the sense that it changes nothing unless
-// set: `PROSPER_POST_SUBMIT_VISIBILITY=1` forces this model on regardless of the SDK version the
-// guest asked for, `=0` forces it off. (`on`/`true`/`yes`/`enabled` and `off`/`false`/`no`/
-// `disabled` work too, in either case; anything ELSE -- including a number that is neither 0 nor 1
-// -- is treated as unset and says so, because a typo must not pick an arm of a live experiment.
-// #3304.) It exists because the per-fold census (see
-// `ARCRUNNER_STATUS.md` § arc7) localised ArcRunner's corruption to the guest's builder thread
-// being released MID-FOLD by completion writes prosper applies while it is still executing the rest
-// of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
-// that exists precisely to prevent that is not armed for it. Whether the contract is correct for a
-// pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
-bool post_submit_visibility_enabled() {
-    static const int forced = [] {
-        // #3304: the tri-state is right and the PARSE was not. `strtol` answers 0 for text it
-        // cannot read, so `=on`, `=true`, `=yes` and `=enabled` all landed on the FORCED-OFF arm
-        // and printed the line below as though that had been asked for -- a confidently mislabelled
-        // result on a lever whose verdict is open (#2217/#2219/#2223). A value that is neither on
-        // nor off is now UNSET (follow the SDK version) and says so; it is never a silent third arm.
-        const int v = prosper::diag::env_tristate_or_unset("PROSPER_POST_SUBMIT_VISIBILITY",
-                                                           getenv("PROSPER_POST_SUBMIT_VISIBILITY"));
-        if (v == 1)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
-                            "stay private until the submit scope closes, regardless of SDK version\n");
-        else if (v == 0)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED OFF (#1226 A/B)\n");
-        return v;
-    }();
-    if (forced >= 0) return forced != 0;
-    return g_post_submit_visibility.load(std::memory_order_acquire);
-}
-
 bool eop_write_sync() {
     // #1226: announce the arm. This is an A/B lever whose whole purpose is to be compared against the
     // default, and a result from it was already recorded as "non-discriminating, not negative" partly
@@ -3059,8 +3027,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
         // A CV wait or apply/relock can outlive the caller's zero-active observation. A new
         // submit may have admitted meanwhile, so qualify every pop under the same queue lock.
-        // Older SDK callers retain their existing worker delay and eager compatibility policy.
-        if (post_submit_visibility_enabled()) pend_wait_post_submit(p, lk);
+        pend_wait_post_submit(p, lk);
         if (p.inflight > 0) {            // another drainer is mid-apply: WAIT — never overtake it
 #ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
             prosper_pending_drain_inflight_wait_for_test();
@@ -3114,15 +3081,7 @@ void pend_worker() {
     std::unique_lock<std::mutex> lk(p.mx);
     for (;;) {
         p.cv.wait(lk, [&] { return !p.q.empty(); });
-        if (post_submit_visibility_enabled()) {
-            pend_wait_post_submit(p, lk);
-        } else {
-            // Preserve the established compatibility path for older SDK callers.
-            lk.unlock();
-            struct timespec ts{0, 1000000};
-            nanosleep(&ts, nullptr);
-            lk.lock();
-        }
+        pend_wait_post_submit(p, lk);
         pend_drain_locked(p, lk);
     }
 }
@@ -3177,12 +3136,7 @@ extern "C" void prosper_gpu_drain_completion_writes() {
     pend_drain_locked(p, lk);
 }
 
-extern "C" void prosper_gpu_enable_post_submit_visibility() {
-    g_post_submit_visibility.store(true, std::memory_order_release);
-}
-
 extern "C" void prosper_gpu_submit_scope_begin() {
-    if (!post_submit_visibility_enabled()) return;
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
     // At the zero-active boundary, give the worker its existing post-return drain before
@@ -3218,7 +3172,6 @@ extern "C" void prosper_gpu_submit_scope_begin() {
 }
 
 extern "C" void prosper_gpu_submit_scope_end() {
-    if (!post_submit_visibility_enabled()) return;
     // Invalid/rejected calls to a submit NID still pass through its generated return hook. Such a
     // call has no local token and must not retire a valid submit executing on another thread.
     if (t_submit_scope_depth == 0) return;
@@ -3237,7 +3190,6 @@ extern "C" void prosper_gpu_submit_scope_end() {
 }
 
 extern "C" bool prosper_gpu_submit_scope_active() {
-    if (!post_submit_visibility_enabled()) return false;
     PendQueue& p = pend_q();
     std::lock_guard<std::mutex> lk(p.mx);
     return p.active_submits > 0;
@@ -3252,10 +3204,6 @@ extern "C" bool prosper_gpu_submit_scope_active() {
 // the same label. This boundary retains small descriptor/constant uploads used by older titles;
 // size/content heuristics left those writes one frame behind.
 extern "C" void prosper_gpu_drain_renderer_writes() {
-    if (!post_submit_visibility_enabled()) {
-        prosper_gpu_drain_completion_writes();
-        return;
-    }
     PendQueue& p = pend_q();
     static const bool batch_enabled =
         std::getenv("PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN") == nullptr;
@@ -3743,11 +3691,23 @@ void apply_deferred_effect(const Pm4Command& c) {
     }
     apply_effect(c);
 }
+void publish_memory_effect(const Pm4Command& command) {
+    // Finishing preceding GPU work does not retire an active submit import. Keep completion and
+    // same-label suffix writes private, while unrelated resources remain available to the renderer.
+    // GDS offsets occupy a separate domain: offset zero is valid and must reach later compute.
+    if (eop_write_sync() ||
+        (command.kind == Pm4Command::Kind::DmaData && dma_data_dst_sel(command) == kDmaSelGds)) {
+        apply_deferred_effect(command);
+    } else {
+        pend_enqueue(command);
+        prosper_gpu_drain_renderer_writes();
+    }
+}
 } // namespace
 
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
     const GraphicsExecutionActivity execution;
-    apply_deferred_effect(effect.cmd);
+    publish_memory_effect(effect.cmd);
 }
 
 bool last_fold_deferred() { return g_fold_deferring; }
@@ -3791,9 +3751,7 @@ void submit_completion_pulse(bool submit_rejected) {
 // backstop). Returns how many streams fully completed across both queues.
 int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
-    // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
-    // scalar overlay instead, so their completion labels remain post-submit.
-    if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+    // Consult pending scalar writes without publishing completion labels from an active submit.
     int completed = 0;
     std::array<int, kDeferredQueueCount> signalable_completed{};
     std::array<bool, kDeferredQueueCount> blocked_queue{};
@@ -3849,7 +3807,7 @@ int flush_deferred_streams() {
                 s.next++;
                 continue;
             }
-            apply_deferred_effect(it.cmd);
+            publish_memory_effect(it.cmd);
             s.next++;
         }
         if (blocked) {
@@ -4929,9 +4887,7 @@ void GpuState::apply(const Pm4Command& c) {
                     defer_push(c);
                     break;
                 }
-                // Legacy callers consume the concrete value. Modern callers keep it private to the
-                // submit and let the evaluator overlay the queued scalar value.
-                if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+                // Evaluate the queued scalar overlay while keeping its bytes private to the submit.
                 if (!ordered_wait_satisfied) {
                     const WaitRegMemPredicateSample decision = evaluate_wait_regmem_predicate(c);
                     diagnostics::perf::note_wait_regmem_direct_evaluation(

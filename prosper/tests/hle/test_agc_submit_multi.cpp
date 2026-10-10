@@ -135,7 +135,6 @@ int main(int argc, char** argv) {
     CHECK(hook == &::prosper_gpu_submit_scope_end, "MultiDcbs owns the established return hook");
     if (!submit || !hook) return 1;
 
-    ::prosper_gpu_enable_post_submit_visibility();
     uint32_t first[] = {header(3, gpu::IT_SET_SH_REG), 0x123, 0x11223344,
                        header(3, gpu::IT_NOP, gpu::R_DRAW_INDEX_AUTO), 3, 0};
     uint32_t second[] = {0x80000000u, header(2, gpu::IT_NOP), 0xa5a5a5a5,
