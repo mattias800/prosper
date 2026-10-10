@@ -3249,8 +3249,19 @@ int main() {
         printf("  [FAIL] GTA structured CSELECT did not retain its path-local scalar VCC pair\n");
         return 1;
     }
+    // Same pc22 site with VCC_HI as the source. VCC_HI is the pc13 readfirstlane DWORD here, a
+    // tracked scalar word in a complete pair, so #4808 admits it as a plain dword select.
+    gta_structured_vcc_scalar_pair[22] = 0x856a806bu;
+    if (recompile_compute(gta_structured_vcc_scalar_pair.data(),
+                          gta_structured_vcc_scalar_pair.size(), nullptr,
+                          gta_structured_vcc_config).empty()) {
+        printf("  [FAIL] GTA structured CSELECT refused its scalar-data VCC_HI source\n");
+        return 1;
+    }
+    // A genuine mask half (EXEC_HI) at the same site stays refused. This arm used to mutate to
+    // VCC_HI, which only pinned that the shape predicate excluded it; that word is data here.
     gta_structured_vcc_scalar_pair[22] =
-        0x856a806bu;                         // same pc22 site: scalar inline source -> VCC_HI
+        0x856a807fu;                         // same pc22 site: s_cselect_b32 vcc_lo,exec_hi,0
     if (!recompile_compute(gta_structured_vcc_scalar_pair.data(),
                            gta_structured_vcc_scalar_pair.size(), nullptr,
                            gta_structured_vcc_config).empty()) {

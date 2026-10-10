@@ -1523,9 +1523,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.scalar_presence_has_no_placeholders && rs.sreg.contains(107);
                 const bool complete_scalar_pair =
                     path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
-                if (!is_wave64_vcc_lo_scalar_cselect(in) ||
-                    (!complete_scalar_pair &&
-                     !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc) {
+                if ((!is_wave64_vcc_lo_scalar_cselect(in) &&
+                     !(complete_scalar_pair && rs.sreg.contains(107) &&
+                       is_wave64_vcc_lo_cselect_reading_vcc_hi(in))) ||
+                    (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc) {
                     ok = false; return true;
                 }
                 const uint32_t selected = b.sel(

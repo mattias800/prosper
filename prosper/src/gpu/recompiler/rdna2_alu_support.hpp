@@ -200,7 +200,8 @@ inline uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Oper
 // VCC_HI word may be discarded or must form a complete scalar pair is never a property of the
 // select itself.
 //
-// VCC_HI (Special 107) is deliberately NOT admitted as a source. Where the low-only proof applies
+// VCC_HI (Special 107) is deliberately NOT admitted as a source here (its scalar-DATA form has its
+// own gate, is_wave64_vcc_lo_cselect_reading_vcc_hi below). Where the low-only proof applies
 // it has just declared that word dead, and reading it back as data at native subgroup 64 would
 // materialize a ballot half the proof said nobody can observe. Two packet-drift guards in
 // test_rdna2_to_spirv.cpp exist to keep that fail-visible, and admitting Special 106..125 wholesale
@@ -228,6 +229,32 @@ inline bool is_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOP2 && in.opcode == kSop2OpcodeCselectB32 &&
         in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
         scalar_source_kind(in.src[0]) && scalar_source_kind(in.src[1]);
+}
+
+// The one VCC_HI form the predicate above leaves out: a Wave64 `s_cselect_b32 vcc_lo, a, b` where
+// at least one source is VCC_HI and the other is a kind that predicate admits. The exclusion above
+// is about a VCC_HI that holds a MASK half; this shape is only the operand pattern, and emit_alu
+// admits it solely when VCC_HI already holds a scalar DATA dword and the pair is a complete scalar
+// pair at that PC -- so the read returns the tracked dword and no ballot is materialized.
+//
+// Seen live (#4808): Wave64 compute programs in PPSA28000 and PPSA29343 build a 64-bit select in
+// the VCC pair as `s_cselect_b32 vcc_hi, 1, 0; ...; s_cselect_b32 vcc_lo, 1, vcc_hi` and move
+// both halves to VGPRs as data; PPSA05325 selects `s_cselect_b32 vcc_lo, vcc_lo, vcc_hi`.
+// CONFIDENCE: HIGH (S_CSELECT_B32 is a plain dword select on SCC, RDNA2 ISA 70648 SOP2).
+inline bool is_wave64_vcc_lo_cselect_reading_vcc_hi(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOP2 || in.opcode != kSop2OpcodeCselectB32 ||
+        in.dst.kind != OperandKind::SGPR || in.dst.value != 106)
+        return false;
+    const auto is_vcc_hi = [](const Operand& o) {
+        return o.kind == OperandKind::Special && o.value == 107;
+    };
+    if (!is_vcc_hi(in.src[0]) && !is_vcc_hi(in.src[1])) return false;
+    // Substitute an admitted kind for each VCC_HI source and reuse the base predicate, so the two
+    // can never disagree about any other operand.
+    Rdna2Inst probe = in;
+    for (Operand& source : probe.src)
+        if (is_vcc_hi(source)) source = Operand{OperandKind::InlineInt, 0};
+    return is_wave64_vcc_lo_scalar_cselect(probe);
 }
 
 // IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
