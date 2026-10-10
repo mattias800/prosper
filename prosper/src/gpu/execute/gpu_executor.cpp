@@ -10639,7 +10639,8 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item, OperationRealizationFailure* failure = nullptr,
                            const GraphicsRawSnapshotContext* raw_context = nullptr,
-                           OrderedScalarDrawInputs scalar = {}) {
+                           OrderedScalarDrawInputs scalar = {},
+                           std::span<const uint8_t> indirect_arguments = {}) {
     if (dropped_draw_census_enabled())
         retained_draw_attempts().fetch_add(1, std::memory_order_relaxed);
     const auto note = [&](RealizationFailureReason reason) {
@@ -10674,7 +10675,7 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     const bool per_draw = use_per_draw_policy(st);
     const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
     GpuState::Draw draw;
-    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw))
+    if (!resolve_indirect_draw_arguments(st, st.draws[index], draw, indirect_arguments))
         return note(RealizationFailureReason::IndirectArguments);
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || PROSPER_ENV_ON("PROSPER_EXECLOG");
     if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item, failure, true,
@@ -11554,8 +11555,21 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                     }
                 }
                 if (!render) break;
+                if (st.draws[operation.index].indirect) {
+                    const bool graphics_produced =
+                        !span.empty() || result.render_spans != 0 || graphics_epoch.pending;
+                    // Argument records are reads of earlier graphics output. Retire the producer
+                    // before reading its owned RTT bytes; a normal flush preserves volume passes.
+                    flush_span();
+                    retire_deferred_graphics();
+                    const auto completed = graphics_producer_status();
+                    if (graphics_produced &&
+                        (!graphics_epoch.known || !completed.known || completed.pending ||
+                         completed.failures != graphics_epoch.failures))
+                        graphics_epoch_ok = false;
+                }
                 if (st.draws[operation.index].indirect &&
-                    (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    (!indirect_dependencies_ok || !producer_epoch_ok || !graphics_epoch_ok)) {
                     // The indirect latch drops this draw SILENTLY on an ordinary run -- the failure
                     // is recorded only when a capture trace happens to be active. On a title whose
                     // world is GPU-driven that is the difference between "the world is missing" and
@@ -11570,11 +11584,11 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                     if ((dropped & (dropped - 1)) == 0)
                         std::fprintf(stderr,
                                      "[agc] indirect DRAW dropped by the dependency latch "
-                                     "(count=%llu, submit=%llu, deps-ok=%u producer-ok=%u)\n",
-                                     (unsigned long long)dropped,
-                                     (unsigned long long)submit_no,
+                                     "(count=%llu, submit=%llu, deps-ok=%u producer-ok=%u "
+                                     "graphics-ok=%u)\n",
+                                     (unsigned long long)dropped, (unsigned long long)submit_no,
                                      indirect_dependencies_ok ? 1u : 0u,
-                                     producer_epoch_ok ? 1u : 0u);
+                                     producer_epoch_ok ? 1u : 0u, graphics_epoch_ok ? 1u : 0u);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Draw, operation.index,
@@ -11589,6 +11603,18 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                 notify_compute_authority_unknown(
                     ComputeAuthorityBoundaryKind::Draw,
                     submit_no, operation.command_order);
+                std::vector<uint8_t> indirect_arguments;
+                if (st.draws[operation.index].indirect &&
+                    !read_indirect_draw_argument_source(st.draws[operation.index],
+                                                        indirect_arguments)) {
+                    graphics_epoch_ok = false;
+                    notify_compute_authority_draw_unrealized(submit_no, operation.command_order);
+                    if (capture_trace)
+                        capture_trace->failures.push_back(
+                            {SubmitOperationKind::Draw, operation.index, operation.command_order,
+                             RealizationFailureReason::IndirectArguments});
+                    break;
+                }
                 DrawItem item;
                 const GpuState& read_state =
                     use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st;
@@ -11670,9 +11696,10 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                     // ordered path, so the reason costs a struct fill, not a throughput mode.
                     static const bool want_reason = PROSPER_ENV_ON("PROSPER_PRESENT_WHY");
                     const bool collect = capture_trace != nullptr || want_reason;
-                    realized = realize_retained_draw(
-                        st, operation.index, scale_x, scale_y, item, collect ? &failure : nullptr,
-                        nested_inputs ? &raw_context : nullptr, std::move(scalar_inputs));
+                    realized = realize_retained_draw(st, operation.index, scale_x, scale_y, item,
+                                                     collect ? &failure : nullptr,
+                                                     nested_inputs ? &raw_context : nullptr,
+                                                     std::move(scalar_inputs), indirect_arguments);
                     failure_known = collect;
                     if (!realized && want_reason) {
                         static std::atomic<uint64_t> n{0};

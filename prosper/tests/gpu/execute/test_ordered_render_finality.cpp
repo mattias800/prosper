@@ -1,5 +1,7 @@
 // Internal snapshot flushes are producer boundaries, not submit ends. A premature final callback
 // can publish an earlier draw and suppress the terminal scanout/timing callback for later work.
+// Indirect argument reads must also retire prior graphics and consume authoritative target bytes;
+// stale CPU counts otherwise suppress draws or execute the previous record after a failed producer.
 #include "diagnostics/env_submit.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
@@ -163,6 +165,7 @@ protected:
     void TearDown() override {
         set_submit_renderer({});
         set_submit_compute({});
+        set_live_target_byte_range_reader({});
         set_graphics_producer_status_query({});
         set_graphics_raw_source_authority({});
         set_deferred_graphics_retirer(nullptr);
@@ -196,6 +199,27 @@ protected:
             draw.command_order = order;
             state.draws.push_back(draw);
         }
+        return state;
+    }
+
+    GpuState indirect_after_flat_draw(uint64_t arguments, uint64_t indices) const {
+        auto state = two_draws();
+        state.draws.resize(1);
+        for (const auto& reg : flat_fragment_.registers) state.sh[reg.offset] = reg.value;
+        state.cx[P::SPI_PS_IN_CONTROL] = 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+        const uint64_t target = arguments - 16u;
+        state.cx[P::CB_COLOR0_BASE] = static_cast<uint32_t>(target >> 8u);
+        state.cx[P::CB_COLOR0_BASE_EXT] = static_cast<uint32_t>(target >> 40u);
+        state.cx[P::CB_COLOR0_INFO] = 0xau << P::CB_COLOR0_INFO_FORMAT_SHIFT;
+        state.cx[P::CB_COLOR0_ATTRIB2] = (15u << P::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) | 7u;
+        state.cx[P::CB_COLOR0_ATTRIB3] = 1u << P::CB_COLOR0_ATTRIB3_RESOURCE_TYPE_SHIFT;
+        state.index_type_announced = true;
+        GpuState::Draw draw;
+        draw.indexed = draw.indirect = true;
+        draw.index_base = indices;
+        draw.indirect_args_addr = arguments;
+        draw.command_order = 200;
+        state.draws.push_back(draw);
         return state;
     }
 
@@ -441,6 +465,124 @@ TEST_F(OrderedRenderFinality, GraphicsOnlySubmitRendersInsideOneEnvWindow) {
     for (const uint64_t window : windows)
         EXPECT_NE(window, 0u) << "the backend rendered with no per-submit env window open";
     EXPECT_EQ(prosper::diag::submit_env_window(), 0u) << "the window must close with the submit";
+}
+
+TEST_F(OrderedRenderFinality, IndirectArgumentsRetireGraphicsProducerBeforeReading) {
+    const uint64_t arguments = guest_ + 0x2010u;
+    const uint64_t target = arguments - 16u;
+    auto* stale = reinterpret_cast<uint32_t*>(arguments);
+    std::fill_n(stale, 5u, 0u);
+    const uint16_t indices[] = {99, 0, 1, 2, 2, 3, 0};
+    auto state = indirect_after_flat_draw(arguments, reinterpret_cast<uint64_t>(indices));
+    ASSERT_FALSE(draw_requires_owned_nested_snapshot(state));
+    ASSERT_FALSE(draw_requires_original_scalar_bank(state));
+
+    // The registered renderer source owns its bytes. Completing the producer updates that cache,
+    // while guest RAM deliberately remains stale, just as an RTT-only GPU write does in production.
+    std::array<uint8_t, 16u * 8u * 4u> cache{};
+    const uint32_t generated[] = {6, 3, 1, 7, 0};
+    bool published = false;
+    size_t reads = 0;
+    std::vector<DrawItem> submitted;
+    set_live_target_byte_range_reader(
+        [&](uint64_t address, uint32_t bytes, std::vector<uint8_t>& output) {
+            ++reads;
+            EXPECT_TRUE(published) << "arguments were read before their graphics producer ran";
+            EXPECT_EQ(address, arguments);
+            EXPECT_EQ(bytes, sizeof(generated));
+            if (!published || address != arguments || bytes != sizeof(generated))
+                return LiveTargetByteReadResult::InvalidRange;
+            const auto offset = static_cast<size_t>(address - target);
+            output.assign(cache.begin() + offset, cache.begin() + offset + bytes);
+            return LiveTargetByteReadResult::Success;
+        });
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const auto& item : items) {
+            submitted.push_back(item);
+            if (item.draw_index == 0u) {
+                EXPECT_EQ(item.color0_base, target);
+                std::memcpy(cache.data() + 16u, generated, sizeof(generated));
+                published = true;
+            }
+        }
+        return RenderedFrame{};
+    });
+    (void)execute_ordered_and_present(state, 1, 1, submit_, false);
+
+    ASSERT_EQ(submitted.size(), 2u);
+    EXPECT_EQ(submitted[0].draw_index, 0u);
+    EXPECT_EQ(submitted[1].draw_index, 1u);
+    EXPECT_EQ(submitted[1].raw_draw_count, 6u);
+    EXPECT_EQ(submitted[1].instance_count, 3u);
+    EXPECT_EQ(submitted[1].vertex_offset, 7);
+    EXPECT_EQ(submitted[1].indices, (std::vector<uint32_t>{0, 1, 2, 2, 3, 0}));
+    EXPECT_EQ(reads, 1u);
+    EXPECT_TRUE(std::all_of(stale, stale + 5u, [](uint32_t word) { return word == 0u; }))
+        << "the producer's authoritative source must not be replaced by a guest-memory write";
+}
+
+TEST_F(OrderedRenderFinality, IndirectArgumentsRefuseFailedGraphicsProducer) {
+    const uint64_t arguments = guest_ + 0x2010u;
+    const uint32_t stale[] = {6, 3, 1, 7, 0};
+    std::memcpy(reinterpret_cast<void*>(arguments), stale, sizeof(stale));
+    const uint16_t indices[] = {99, 0, 1, 2, 2, 3, 0};
+    auto state = indirect_after_flat_draw(arguments, reinterpret_cast<uint64_t>(indices));
+    ASSERT_FALSE(draw_requires_owned_nested_snapshot(state));
+    ASSERT_FALSE(draw_requires_original_scalar_bank(state));
+
+    uint64_t failures = 0;
+    size_t reads = 0;
+    std::vector<uint64_t> submitted;
+    set_graphics_producer_status_query(
+        [&] { return GraphicsProducerStatus{true, false, failures}; });
+    set_live_target_byte_range_reader([&](uint64_t, uint32_t, std::vector<uint8_t>&) {
+        ++reads;
+        ADD_FAILURE() << "a failed graphics producer must latch before any source read";
+        return LiveTargetByteReadResult::InvalidRange;
+    });
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const auto& item : items) submitted.push_back(item.draw_index);
+        if (!items.empty()) ++failures;
+        return RenderedFrame{};
+    });
+    (void)execute_ordered_and_present(state, 1, 1, submit_, false);
+
+    EXPECT_EQ(submitted, (std::vector<uint64_t>{0u}));
+    EXPECT_EQ(reads, 0u);
+    EXPECT_EQ(failures, 1u);
+}
+
+TEST_F(OrderedRenderFinality, IndirectArgumentsNeverFallBackFromInvalidRendererBytes) {
+    const uint64_t arguments = guest_ + 0x2010u;
+    const uint32_t stale[] = {6, 3, 1, 7, 0};
+    std::memcpy(reinterpret_cast<void*>(arguments), stale, sizeof(stale));
+    const uint16_t indices[] = {99, 0, 1, 2, 2, 3, 0};
+    auto state = indirect_after_flat_draw(arguments, reinterpret_cast<uint64_t>(indices));
+
+    for (const auto response :
+         {LiveTargetByteReadResult::InvalidRange, LiveTargetByteReadResult::Success}) {
+        SCOPED_TRACE(response == LiveTargetByteReadResult::InvalidRange ? "invalid claimed range"
+                                                                        : "incorrect byte count");
+        size_t reads = 0;
+        std::vector<uint64_t> submitted;
+        set_live_target_byte_range_reader(
+            [&](uint64_t address, uint32_t bytes, std::vector<uint8_t>& output) {
+                ++reads;
+                EXPECT_EQ(address, arguments);
+                EXPECT_EQ(bytes, sizeof(stale));
+                // A successful but truncated indexed record is just as unusable as a rejected
+                // target range. Neither answer grants authority to the valid stale CPU record.
+                output.assign(16u, 0u);
+                return response;
+            });
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (const auto& item : items) submitted.push_back(item.draw_index);
+            return RenderedFrame{};
+        });
+        (void)execute_ordered_and_present(state, 1, 1, submit_, false);
+        EXPECT_EQ(submitted, (std::vector<uint64_t>{0u}));
+        EXPECT_EQ(reads, 1u);
+    }
 }
 
 TEST(SingleFramebufferSubmitFrame, FinalConsumesExactProducerOnce) {

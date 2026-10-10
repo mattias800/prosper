@@ -8,8 +8,30 @@
 
 namespace prosper::gpu {
 
+bool read_indirect_draw_argument_source(const GpuState::Draw& source, std::vector<uint8_t>& owned) {
+    owned.clear();
+    if (!source.indirect) return true;
+    const uint32_t bytes = (source.indexed ? 5u : 4u) * sizeof(uint32_t);
+    if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
+        source.indirect_args_addr > UINT64_MAX - bytes)
+        return false;
+    // Guest-visible index/instance counts depend on the earlier draw's exact output. Read only
+    // this record through the renderer's owned source, rather than publishing an entire target.
+    const auto result = read_live_render_target_bytes(source.indirect_args_addr, bytes, owned);
+    if (result == LiveTargetByteReadResult::Success && owned.size() == bytes) return true;
+    owned.clear();
+    if (result == LiveTargetByteReadResult::NotFound) return true;
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1) < 24)
+        std::fprintf(stderr,
+                     "[agc] indirect draw skipped: invalid renderer argument range at 0x%llx "
+                     "bytes=%u\n",
+                     static_cast<unsigned long long>(source.indirect_args_addr), bytes);
+    return false;
+}
+
 bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Draw& source,
-                                     GpuState::Draw& resolved) {
+                                     GpuState::Draw& resolved, std::span<const uint8_t> owned) {
     resolved = source;
     if (!source.indirect) return true;
     if (!source.indexed) {
@@ -23,7 +45,8 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
         // vkCmdDraw's firstVertex).
         constexpr uint32_t kArgumentBytes = 4u * sizeof(uint32_t);
         if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
-            !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+            (owned.empty() ? !guest_readable(source.indirect_args_addr, kArgumentBytes)
+                           : owned.size() != kArgumentBytes)) {
             static std::atomic<int> warned{0};
             if (warned.fetch_add(1) < 24)
                 std::fprintf(stderr,
@@ -32,7 +55,10 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
             return false;
         }
         uint32_t args[4] = {};
-        std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+        std::memcpy(args,
+                    owned.empty() ? reinterpret_cast<const void*>(source.indirect_args_addr)
+                                  : owned.data(),
+                    sizeof(args));
         const uint32_t vertex_count = args[0];
         const uint32_t instance_count = args[1];
         const uint32_t first_vertex = args[2];
@@ -69,7 +95,8 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
     }
     constexpr uint32_t kArgumentBytes = 5u * sizeof(uint32_t);
     if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
-        !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
+        (owned.empty() ? !guest_readable(source.indirect_args_addr, kArgumentBytes)
+                       : owned.size() != kArgumentBytes)) {
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -78,7 +105,10 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
         return false;
     }
     uint32_t args[5] = {};
-    std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    std::memcpy(args,
+                owned.empty() ? reinterpret_cast<const void*>(source.indirect_args_addr)
+                              : owned.data(),
+                sizeof(args));
     const uint32_t index_count = args[0];
     const uint32_t instance_count = args[1];
     const uint32_t first_index = args[2];
