@@ -25,6 +25,8 @@ inline constexpr uint32_t kDmaDataAddressSource = 1u << 16;
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
     IT_NOP = 0x10,
+    IT_DISPATCH_DIRECT = 0x15,
+    IT_DISPATCH_INDIRECT = 0x16,
     IT_INDEX_TYPE = 0x2A,
     IT_NUM_INSTANCES = 0x2F,
     IT_EVENT_WRITE = 0x46,

@@ -47,7 +47,33 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         const uint32_t npl = len - 1;                   // payload dword count
 
         using K = Pm4Command::Kind;
-        if (c.op == IT_INDEX_TYPE) {
+        if (c.op == IT_DISPATCH_DIRECT && npl == 4) {
+            // Hardware PM4 DISPATCH_DIRECT (GFX10, 5 dwords): [0..2] = DIM_X/Y/Z, [3] =
+            // COMPUTE_DISPATCH_INITIATOR. The custom R_DISPATCH_DIRECT modifier is that same
+            // register's bit layout (USE_THREAD_DIMENSIONS, CS_W32_EN, ...), so the initiator
+            // feeds resolve_compute_launch() unchanged. Other lengths stay Unknown.
+            c.kind = K::DispatchDirect;
+            c.threads_x = pl[0];
+            c.threads_y = pl[1];
+            c.threads_z = pl[2];
+            c.dispatch_modifier = pl[3];
+        } else if (c.op == IT_DISPATCH_INDIRECT && npl == 2) {
+            // Hardware PM4 DISPATCH_INDIRECT, graphics-ring form (GFX10, 3 dwords): [0] =
+            // DATA_OFFSET from the compute indirect base set by SET_BASE, [1] =
+            // COMPUTE_DISPATCH_INITIATOR.
+            c.kind = K::DispatchIndirect;
+            c.indirect_offset = pl[0];
+            c.dispatch_modifier = pl[1];
+        } else if (c.op == IT_DISPATCH_INDIRECT && npl == 3) {
+            // Hardware PM4 DISPATCH_INDIRECT, compute-queue (MEC) form (4 dwords): [0..1] = the
+            // argument buffer's whole address, [2] = COMPUTE_DISPATCH_INITIATOR. A compute queue has
+            // no SET_BASE, so the address is absolute -- the same contract as R_DISPATCH_INDIRECT_ADDR.
+            // CONFIDENCE: MED (published MEC layout; not yet observed in a PS5 capture).
+            c.kind = K::DispatchIndirect;
+            c.indirect_address = lo_hi(pl) & ~3ull;
+            c.indirect_address_absolute = true;
+            c.dispatch_modifier = pl[2];
+        } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
         } else if (c.op == IT_NUM_INSTANCES) {

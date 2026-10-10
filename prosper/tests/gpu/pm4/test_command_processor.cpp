@@ -284,6 +284,23 @@ int main() {
         CHECK(fence_label == 0x1234u, "IT_RELEASE_MEM writes 32-bit fence value to label");
     }
 
+    // Hardware IT_DISPATCH_DIRECT packet execution:
+    {
+        uint32_t disp_pkt[] = {
+            // IT_DISPATCH_DIRECT: 5 dwords, dims=(64, 16, 1), modifier=0x41
+            0xC0000000u | (3u << 16) | (IT_DISPATCH_DIRECT << 8), 64u, 16u, 1u, 0x41u,
+        };
+        GpuState s_disp;
+        run_cb(disp_pkt, std::size(disp_pkt), s_disp);
+        CHECK(s_disp.dispatches.size() == 1, "IT_DISPATCH_DIRECT records one dispatch");
+        if (!s_disp.dispatches.empty()) {
+            CHECK(s_disp.dispatches[0].threads_x == 64u && s_disp.dispatches[0].threads_y == 16u &&
+                      s_disp.dispatches[0].threads_z == 1u,
+                  "IT_DISPATCH_DIRECT dimensions match");
+            CHECK(s_disp.dispatches[0].modifier == 0x41u, "IT_DISPATCH_DIRECT modifier matches");
+        }
+    }
+
     // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
     // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
     // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content
