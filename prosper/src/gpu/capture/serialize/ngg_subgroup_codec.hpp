@@ -4,7 +4,9 @@
 // Written: everything the backend reads (ngg_subgroup_gpu.h) -- per wave-count group the compiled
 // shell, pass-through vertex and geometry stages, launch records and export size; the runs; the
 // record layout; topology, route, K, violation counting, native Wave64, LDS size; the shell's
-// guest bindings and the push-constant words. Not written: the planner's subgroups (the launch
+// guest bindings and the push-constant words. The flags byte's bit 2 marks a Wave32 description
+// (#4808: NggSubgroupDraw::wave_lanes 32, up to 8 waves); a reader from before it refuses the value
+// (flags > 3) rather than misreading the records, and every Wave64 description keeps its bytes. Not written: the planner's subgroups (the launch
 // records already encode them, and nothing downstream of the builder reads the plan). The shell
 // hash is recomputed on read rather than trusted.
 //
@@ -22,7 +24,7 @@
 
 namespace prosper::gpu {
 
-inline constexpr uint32_t kNggCodecMaxGroups = 4;
+inline constexpr uint32_t kNggCodecMaxGroups = 8;   // W 1..4 for Wave64, 1..8 for Wave32
 inline constexpr uint32_t kNggCodecMaxRuns = 1u << 20;
 inline constexpr uint32_t kNggCodecMaxSmall = 64;   // bindings, push words, PARAM targets
 
@@ -61,8 +63,9 @@ inline bool write_ngg_subgroup_draw(Writer& w, const std::shared_ptr<const NggSu
     w.u8(static_cast<uint8_t>(draw->topology));
     w.u8(static_cast<uint8_t>(draw->route));
     w.u32(draw->vertices_per_primitive);
-    w.u8(
-        static_cast<uint8_t>((draw->count_violations ? 1u : 0u) | (draw->native_wave64 ? 2u : 0u)));
+    if (draw->wave_lanes != 32u && draw->wave_lanes != 64u) return false;
+    w.u8(static_cast<uint8_t>((draw->count_violations ? 1u : 0u) | (draw->native_wave64 ? 2u : 0u) |
+                              (draw->wave_lanes == 32u ? 4u : 0u)));
     w.u32(draw->lds_bytes);
     w.words(draw->guest_bindings);
     w.words(draw->push_constants);
@@ -103,25 +106,28 @@ inline bool read_ngg_subgroup_draw(Reader& r, std::shared_ptr<const NggSubgroupD
     if (topology != static_cast<uint8_t>(NggOutputTopology::LineList) &&
         topology != static_cast<uint8_t>(NggOutputTopology::TriangleList))
         return false;
-    if (route > static_cast<uint8_t>(NggLayerRoute::ForwardingGeometry) || flags > 3u ||
+    if (route > static_cast<uint8_t>(NggLayerRoute::ForwardingGeometry) || flags > 7u ||
         (draw->vertices_per_primitive != 2u && draw->vertices_per_primitive != 3u))
         return false;
     draw->topology = static_cast<NggOutputTopology>(topology);
     draw->route = static_cast<NggLayerRoute>(route);
     draw->count_violations = flags & 1u;
     draw->native_wave64 = flags & 2u;
+    draw->wave_lanes = (flags & 4u) ? 32u : 64u;
+    const uint32_t max_waves = draw->wave_lanes == 32u ? 8u : 4u;
     for (uint32_t g = 0; g < groups; ++g) {
         NggSubgroupWaveGroup group;
         auto stages = std::make_shared<NggSubgroupStages>();
         std::vector<uint32_t> shell, vertex;
-        if (!r.u32(group.waves) || !group.waves || group.waves > 4u || !r.u32(group.blocks) ||
-            !group.blocks || !r.u32(group.export_words) || !r.words(group.launch_words) ||
-            !r.words(shell) || shell.empty() || !r.words(vertex) || vertex.empty() ||
-            !r.words(stages->raster_geometry))
+        if (!r.u32(group.waves) || !group.waves || group.waves > max_waves ||
+            !r.u32(group.blocks) || !group.blocks || !r.u32(group.export_words) ||
+            !r.words(group.launch_words) || !r.words(shell) || shell.empty() || !r.words(vertex) ||
+            vertex.empty() || !r.words(stages->raster_geometry))
             return false;
         if (group.launch_words.size() !=
-                uint64_t{group.blocks} * 64u * group.waves * kNggLaunchWordsPerLane ||
-            group.export_words != uint64_t{group.blocks} * draw->layout.block_words(group.waves))
+                uint64_t{group.blocks} * draw->wave_lanes * group.waves * kNggLaunchWordsPerLane ||
+            group.export_words !=
+                uint64_t{group.blocks} * draw->layout.block_words(group.waves, draw->wave_lanes))
             return false;
         stages->waves = group.waves;
         stages->shell_hash = ngg_words_hash(shell);

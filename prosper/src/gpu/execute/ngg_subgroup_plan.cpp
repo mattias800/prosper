@@ -27,8 +27,6 @@ NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32
 
 namespace {
 
-constexpr uint32_t kWaveLanes = 64;
-
 uint32_t prims_per_instance(const NggDrawShape& draw) {
     if (draw.topology == NggInputTopology::TriangleList) return draw.vertex_count / 3u;
     return draw.vertex_count >= 3u ? draw.vertex_count - 2u : 0u;
@@ -68,10 +66,17 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
                             : std::min(limits.es_verts_per_subgroup, limits.vert_group_size);
     // Without a GS the exported vertices are the ES vertices themselves.
     if (limits.vs_only) es_limit = std::min(es_limit, limits.max_out_verts_per_subgroup);
-    const uint32_t max_waves = std::min(budget.max_waves_per_subgroup, 15u);
-    // A primitive must fit, and a vertex offset (lane x ITEMSIZE) must fit its 16-bit field.
-    if (prim_limit == 0 || es_limit < 3u || limits.esgs_item_size == 0 ||
-        (es_limit - 1u) * limits.esgs_item_size > 0xffffu) {
+    const uint32_t lanes = limits.wave_lanes;
+    const uint32_t max_waves = std::min(
+        lanes == 32u ? budget.max_waves_per_subgroup * 2u : budget.max_waves_per_subgroup, 15u);
+    // A primitive must fit, and a vertex offset (lane x ITEMSIZE) must fit its 16-bit field. A
+    // passed-through primitive carries subgroup-thread indices instead (9-bit PRIM fields), and s2
+    // carries both subgroup counts in 9 bits: a subgroup above 511 of either is refused when it
+    // closes (ngg-subgroup-too-wide), which the default 256-thread budget never reaches.
+    const bool offsets_fit =
+        limits.passthrough ||
+        (limits.esgs_item_size != 0 && (es_limit - 1u) * limits.esgs_item_size <= 0xffffu);
+    if ((lanes != 32u && lanes != 64u) || prim_limit == 0 || es_limit < 3u || !offsets_fit) {
         plan.refusal = "ngg-limits-unusable";
         return plan;
     }
@@ -90,8 +95,9 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
     const auto close = [&]() -> bool {
         if (current.prim_slot.empty()) return true;
         const uint32_t threads = threads_of(current, limits);
-        current.waves = (threads + kWaveLanes - 1u) / kWaveLanes;
-        if (current.waves > max_waves) {
+        current.waves = (threads + lanes - 1u) / lanes;
+        if (current.waves > max_waves || current.es_threads() > 0x1ffu ||
+            current.gs_threads() > 0x1ffu) {
             plan.refusal = "ngg-subgroup-too-wide";
             return false;
         }
@@ -143,24 +149,32 @@ NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLi
     return plan;
 }
 
-uint32_t ngg_merged_wave_info(const NggSubgroup& subgroup, uint32_t wave) {
+uint32_t ngg_merged_wave_info(const NggSubgroup& subgroup, uint32_t wave, uint32_t wave_lanes) {
     const auto in_wave = [&](uint32_t threads) {
-        const uint32_t base = wave * kWaveLanes;
-        return threads > base ? std::min(threads - base, kWaveLanes) : 0u;
+        const uint32_t base = wave * wave_lanes;
+        return threads > base ? std::min(threads - base, wave_lanes) : 0u;
     };
     return (subgroup.waves & 0xfu) << 28 | (wave & 0xfu) << 24 |
            (in_wave(subgroup.gs_threads()) & 0xffu) << 8 | (in_wave(subgroup.es_threads()) & 0xffu);
 }
 
+uint32_t ngg_group_info(const NggSubgroup& subgroup) {
+    return (subgroup.es_threads() & 0x1ffu) << 12 | (subgroup.gs_threads() & 0x1ffu) << 22;
+}
+
 NggLaneLaunch ngg_lane_launch(const NggSubgroup& subgroup, const NggSubgroupLimits& limits,
                               uint32_t wave, uint32_t lane) {
     NggLaneLaunch launch;
-    const uint32_t t = wave * kWaveLanes + lane;
+    const uint32_t t = wave * limits.wave_lanes + lane;
     if (t < subgroup.gs_threads()) {
-        const uint32_t item = limits.esgs_item_size;
         const uint32_t* slot = subgroup.prim_slot.data() + static_cast<size_t>(t) * 3u;
-        launch.v[0] = slot[0] * item | (slot[1] * item) << 16;
-        launch.v[1] = slot[2] * item;
+        if (limits.passthrough) {
+            launch.v[0] = slot[0] | slot[1] << 10 | slot[2] << 20;
+        } else {
+            const uint32_t item = limits.esgs_item_size;
+            launch.v[0] = slot[0] * item | (slot[1] * item) << 16;
+            launch.v[1] = slot[2] * item;
+        }
         launch.v[2] = subgroup.first_prim + t;
     }
     if (t < subgroup.es_threads()) {

@@ -71,6 +71,7 @@ struct NggHostCapabilities {
     bool shader_output_layer = false;   // vertex-stage gl_Layer
     bool geometry_shader = false;
     bool native_wave64 = false;   // compute requiredSubgroupSize 64 with full subgroups
+    bool native_wave32 = false;   // compute requiredSubgroupSize 32 with full subgroups
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_shared_memory = 0;   // bytes
     uint32_t max_compute_workgroup_size_x = 0;
@@ -165,6 +166,8 @@ struct NggDrawAdmission {
     uint32_t layer_slices = 1;
     NggLayerRoute route = NggLayerRoute::None;
     bool count_violations = false;
+    // The shell runs native subgroups of the guest's wave width (64, or 32 under GS_W32_EN). The
+    // name predates Wave32.
     bool native_wave64 = false;
     // A depth-only draw whose layer addresses a depth array of this many slices (0: none). It is
     // replayed once per slice: slice depth_first_slice + k draws the primitives of layer k, into
@@ -177,7 +180,8 @@ struct NggDrawAdmission {
 // The section 4 admission table. Refusal names (each a rule, in check order):
 //   ngg-host-unpublished          no backend device has published its capabilities
 //   ngg-register-missing          a partition/launch register is absent from the draw state
-//   ngg-gs-wave32                 VGT_SHADER_STAGES_EN.GS_W32_EN (P6)
+//   ngg-passthrough-gs            PRIMGEN_PASSTHRU_EN with a GS stage: the passthrough launch
+//                                 (v0 = the packed primitive) is modelled for an NGG VS only
 //   ngg-gs-instancing             VGT_GS_INSTANCE_CNT enabled with a count above 1 (P6)
 //   ngg-input-topology            anything but a triangle list or strip (adjacency, rect, quad,
 //                                 fan, points, lines, patches)

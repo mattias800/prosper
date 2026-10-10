@@ -100,6 +100,30 @@ alignas(256) const uint32_t kVsOnly[] = {
     0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u, 0xBF810000u,
 };
 
+// #4808: the same program reading s20 -- user SGPR 12 -- first (s_mov_b32 s21, s20), as The
+// Pathless's merged ES prolog reads s16..s31 at entry under RSRC2_GS.USER_SGPR 12 with a user-data
+// range of 0..24. Two copies, so one can be registered with each range.
+alignas(256) const uint32_t kVsOnlyReadsS20[] = {
+    0xBE950314u, 0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u,
+    0x00080008u, 0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u,
+    0xD7650013u, 0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu,
+    0x02390501u, 0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u,
+    0x361A0A81u, 0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu,
+    0xD54B000Eu, 0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u,
+    0xF80008D4u, 0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u,
+    0xBF810000u,
+};
+alignas(256) const uint32_t kVsOnlyReadsS20Narrow[] = {
+    0xBE950314u, 0xBEFE04C1u, 0x9394FF03u, 0x00040018u, 0xBF068014u, 0xBF840007u, 0x9395FF03u,
+    0x00080008u, 0x8716FF03u, 0x000000FFu, 0x8F158C15u, 0x887C1615u, 0xBF900009u, 0xBE9703C1u,
+    0xD7650013u, 0x00010017u, 0xD548000Au, 0x02390500u, 0xD548000Bu, 0x02392500u, 0xD548000Cu,
+    0x02390501u, 0x3416168Au, 0x34181894u, 0xD7720009u, 0x0432170Au, 0xF8000941u, 0x00000009u,
+    0x361A0A81u, 0x7E1A0D0Du, 0xD54B000Du, 0x03CDE90Du, 0xD548000Eu, 0x02050305u, 0x7E1C0D0Eu,
+    0xD54B000Eu, 0x03CDE90Eu, 0x7E1E0280u, 0x7E2002F2u, 0xF80000CFu, 0x100F0E0Du, 0x7E280280u,
+    0xF80008D4u, 0x00140000u, 0x7E2202FFu, 0x3E800000u, 0x7E2402F0u, 0xF800020Fu, 0x100F1211u,
+    0xBF810000u,
+};
+
 // Solid-green pixel stage (llvm-mc gfx1030; the same words test_gpu_execute uses).
 alignas(256) const uint32_t kPs[] = {
     0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
@@ -159,11 +183,15 @@ bool register_blob(ShaderBlob& blob, const uint32_t* code, size_t bytes, uint32_
 bool register_chain_headers() {
     static const bool registered = [] {
         prosper::register_agc_hle();
-        static ShaderBlob prolog, main, reload, vs_only;
+        static ShaderBlob prolog, main, reload, vs_only, reads_s20, reads_s20_narrow;
         return register_blob(prolog, kProlog, sizeof(kProlog), P::SPI_SHADER_PGM_LO_ES,
                              P::SPI_SHADER_PGM_HI_ES, 4) &&
                register_blob(vs_only, kVsOnly, sizeof(kVsOnly), P::SPI_SHADER_PGM_LO_ES,
                              P::SPI_SHADER_PGM_HI_ES, 0) &&
+               register_blob(reads_s20, kVsOnlyReadsS20, sizeof(kVsOnlyReadsS20),
+                             P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, 24) &&
+               register_blob(reads_s20_narrow, kVsOnlyReadsS20Narrow, sizeof(kVsOnlyReadsS20Narrow),
+                             P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, 12) &&
                register_blob(main, kMain, sizeof(kMain), P::SPI_SHADER_PGM_LO_GS,
                              P::SPI_SHADER_PGM_HI_GS, 4) &&
                register_blob(reload, kMainReload, sizeof(kMainReload), P::SPI_SHADER_PGM_LO_GS,
@@ -382,6 +410,45 @@ GpuState vs_only_state() {
     st.cx[P::VGT_GS_MAX_VERT_OUT] = 0u;
     st.cx[P::GE_MAX_OUTPUT_PER_SUBGROUP] = 0x40u;
     return st;
+}
+
+// #4808: a program that reads a user SGPR past the RSRC2_GS.USER_SGPR count (12) but inside its AGC
+// user-data range (0..24) is launched with the whole range: 24 push words, word 12 = USER_DATA_GS_12.
+// Controls: the same program with a range of 12 stays refused (s20 is then not user data at all),
+// and a range register the state lacks refuses rather than pushing a guess.
+TEST_F(NggIndexedRealize, AUserSgprPastTheRsrc2CountIsSuppliedFromTheUserDataRange) {
+    alignas(4) static const uint16_t kIndices[3] = {1, 3, 2};
+    GpuState st = vs_only_state();
+    set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVsOnlyReadsS20);
+    st.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 12u << 1;   // USER_SGPR 12
+    for (uint32_t k = 4; k < 24; ++k) st.sh[P::SPI_SHADER_USER_DATA_GS_0 + k] = 0x5000u + k;
+    DrawItem item;
+    ASSERT_TRUE(realize(st, kIndices, 3, 1, item));
+    ASSERT_TRUE(item.ngg_subgroup) << "s20 lies inside the user-data range";
+    ASSERT_EQ(item.ngg_subgroup->push_constants.size(), 24u);
+    EXPECT_EQ(item.ngg_subgroup->push_constants[12], 0x500cu);
+    EXPECT_EQ(item.ngg_subgroup->push_constants[23], 0x5017u);
+
+    GpuState missing = st;
+    missing.sh.erase(P::SPI_SHADER_USER_DATA_GS_0 + 20);
+    DrawItem incomplete;
+    EXPECT_FALSE(realize(missing, kIndices, 3, 1, incomplete));
+    EXPECT_FALSE(incomplete.ngg_subgroup) << "a missing range register is not guessed";
+
+    GpuState narrow = st;
+    set_pgm(narrow, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVsOnlyReadsS20Narrow);
+    DrawItem refused;
+    EXPECT_FALSE(realize(narrow, kIndices, 3, 1, refused));
+    EXPECT_FALSE(refused.ngg_subgroup) << "with a range of 12, s20 is not user data";
+
+    GpuState plain = vs_only_state();
+    plain.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 12u << 1;
+    for (uint32_t k = 4; k < 24; ++k) plain.sh[P::SPI_SHADER_USER_DATA_GS_0 + k] = 0x5000u + k;
+    DrawItem unchanged;
+    ASSERT_TRUE(realize(plain, kIndices, 3, 1, unchanged));
+    ASSERT_TRUE(unchanged.ngg_subgroup);
+    EXPECT_EQ(unchanged.ngg_subgroup->push_constants.size(), 12u)
+        << "a program that reads no SGPR past the count keeps its count";
 }
 
 // The per-vertex compile refuses the program (its general-mask MBCNT), and the draw is realized

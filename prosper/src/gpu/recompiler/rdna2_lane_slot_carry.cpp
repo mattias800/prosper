@@ -175,7 +175,8 @@ void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rd
         size_t patch = 0;
         const uint32_t phi = b.emit_phi2(is_mask ? b.t_bool : b.t_u32, seed, preheader, patch);
         set_slot(rs, vgpr, lane, is_mask, phi);
-        slots_.push_back({vgpr, lane, is_mask, phi, patch, phi, seed, seeded, false});
+        slots_.push_back({vgpr, lane, is_mask, phi, patch, phi, seed, seeded, false,
+                          !seeded || preheader_marks_.contains(key), true});
     }
 }
 
@@ -195,6 +196,7 @@ bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint
                                          slot.vgpr, slot.lane);
         if (same) {
             b.patch_phi(slot.patch, *same, cont);
+            slot.backedge_marked = rs.lane_slot_merge_placeholder.contains({slot.vgpr, slot.lane});
             continue;
         }
         const bool other = find_slot(slot.mask ? rs.vgpr_lane_slots : rs.vgpr_lane_mask_slots,
@@ -219,6 +221,19 @@ bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint
         slot.uncarried = true;
     }
     return true;
+}
+
+LaneSlotLoopCarry::LaneSlotLoopCarry(const RegState& rs)
+    : preheader_marks_(rs.lane_slot_merge_placeholder) {}
+
+void LaneSlotLoopCarry::refine_exit_marks(RegState& rs) const {
+    for (const Slot& slot : slots_) {
+        if (slot.uncarried || slot.at_check != slot.phi) continue;
+        if (slot.seed_marked || slot.backedge_marked)
+            rs.lane_slot_merge_placeholder.insert({slot.vgpr, slot.lane});
+        else
+            rs.lane_slot_merge_placeholder.erase({slot.vgpr, slot.lane});
+    }
 }
 
 bool LaneSlotLoopCarry::finish_exit(SpirvCompute& b, RegState& rs, bool body_edge,

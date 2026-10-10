@@ -17,8 +17,6 @@ namespace prosper::gpu {
 
 namespace {
 
-constexpr uint32_t kWaveLanes = 64;
-
 std::shared_ptr<const NggSubgroupDraw> fail(std::string* refusal, std::string reason) {
     if (refusal) *refusal = "reason=" + std::move(reason);
     return nullptr;
@@ -98,6 +96,7 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     stages->waves = waves;
     NggSubgroupShellConfig shell = request.shell;
     shell.waves = waves;
+    shell.wave_lanes = request.limits.wave_lanes;   // one width for the plan, shell and raster
     std::string why;
     auto module = recompile_ngg_subgroup(request.linked_code, request.dwords, request.resources,
                                          shell, &stages->layout, request.diagnostic, &why);
@@ -118,6 +117,7 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     NggRasterCommitConfig raster = request.raster;
     raster.layout = stages->layout;
     raster.waves = waves;
+    raster.wave_lanes = request.limits.wave_lanes;
     NggRasterCommitInterface published;
     auto vertex = build_ngg_raster_commit_vertex(raster, &published, &why);
     if (vertex.empty()) return refuse(why);
@@ -143,7 +143,7 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
 std::shared_ptr<const NggSubgroupDraw>
 assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
                            const NggSubgroupStagesSource& stages_for, std::string* refusal) {
-    // The launch record is v0..v8 then s3 (ngg_subgroup_shell.hpp).
+    // The launch record is v0..v8 then s3 (ngg_subgroup_shell.hpp); the shell derives s2.
     static_assert(kNggLaunchWordsPerLane == std::size(NggLaneLaunch{}.v) + 1u &&
                       kNggLaunchS3Word == std::size(NggLaneLaunch{}.v),
                   "a launch record is the lane's VGPRs v0..v8 followed by s3");
@@ -160,6 +160,7 @@ assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
     draw->route = request.raster.route;
     draw->count_violations = request.raster.count_violations;
     draw->native_wave64 = request.shell.native_wave64;
+    draw->wave_lanes = request.limits.wave_lanes;
     draw->lds_bytes = request.shell.rsrc2_gs_lds_size * kNggLdsGranuleDwords * 4u;
     // The interpolation stage's input is Triangles (select_ngg_layer_route refuses the same case).
     const bool interpolation =
@@ -198,9 +199,10 @@ assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
     for (const NggSubgroup& subgroup : draw->plan.subgroups) {
         const uint32_t index = group_of[subgroup.waves];
         NggSubgroupWaveGroup& group = draw->groups[index];
+        const uint32_t lanes = request.limits.wave_lanes;
         for (uint32_t wave = 0; wave < group.waves; ++wave) {
-            const uint32_t s3 = ngg_merged_wave_info(subgroup, wave);
-            for (uint32_t lane = 0; lane < kWaveLanes; ++lane) {
+            const uint32_t s3 = ngg_merged_wave_info(subgroup, wave, lanes);
+            for (uint32_t lane = 0; lane < lanes; ++lane) {
                 const NggLaneLaunch launch = ngg_lane_launch(subgroup, request.limits, wave, lane);
                 group.launch_words.insert(group.launch_words.end(), std::begin(launch.v),
                                           std::end(launch.v));
@@ -214,7 +216,7 @@ assemble_ngg_subgroup_draw(const NggSubgroupDrawRequest& request,
         ++group.blocks;
     }
     for (NggSubgroupWaveGroup& group : draw->groups)
-        group.export_words = group.blocks * draw->layout.block_words(group.waves);
+        group.export_words = group.blocks * draw->layout.block_words(group.waves, draw->wave_lanes);
     return draw;
 }
 
