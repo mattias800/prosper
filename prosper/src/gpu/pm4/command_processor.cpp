@@ -3,6 +3,7 @@
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
+#include "gpu/pm4/pending_memory_view.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
@@ -2831,19 +2832,6 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     return true;
 }
 
-bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
-    const GraphicsExecutionActivity execution;
-    Pm4Command c{};
-    c.kind = Pm4Command::Kind::DmaData;
-    c.dd_dst = copy.dst;
-    c.dd_src = copy.src;
-    c.dd_bytes = copy.bytes;
-    c.dd_sels = copy.sels;
-    c.dd_valid = true;
-    c.stream_order = copy.command_order;
-    return honor_dma_data(c, copy.packet_addr, authoritative_source);
-}
-
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled()) return;
@@ -2947,6 +2935,8 @@ bool eop_write_sync() {
 struct PendWrite {
     Pm4Command cmd;
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
+    std::vector<uint8_t> dma_copy;   // source bytes captured at the ordered DMA operation
+    uint64_t packet_addr = 0;
     std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
 };
 // #1945: how long a completion write actually sat in this queue before it landed in guest memory.
@@ -3003,8 +2993,8 @@ PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 // arguments before opening a submit scope. Track scopes on the calling thread as well as globally:
 // only the synchronous import call that began a scope may retire it at its return checkpoint.
 thread_local uint32_t t_submit_scope_depth = 0;
-void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
-void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
+void apply_deferred_effect(const Pm4Command& c, const uint8_t* source = nullptr,
+                           uint64_t packet_addr = 0);   // guarded apply (#449)
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk);
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
@@ -3053,7 +3043,8 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
         pend_age_note(w.queued);
-        apply_deferred_effect(w.cmd);
+        apply_deferred_effect(w.cmd, w.dma_copy.empty() ? nullptr : w.dma_copy.data(),
+                              w.packet_addr);
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -3246,7 +3237,8 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             p.inflight++;
             lk.unlock();
             pend_age_note(w.queued);
-            apply_deferred_effect(w.cmd);
+            apply_deferred_effect(w.cmd, w.dma_copy.empty() ? nullptr : w.dma_copy.data(),
+                                  w.packet_addr);
             lk.lock();
             p.inflight--;
             p.cv.notify_all();
@@ -3336,7 +3328,9 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
         lk.unlock();
         for (const PendWrite& write : ready) {
             pend_age_note(write.queued);
-            apply_deferred_effect(write.cmd);
+            apply_deferred_effect(write.cmd,
+                                  write.dma_copy.empty() ? nullptr : write.dma_copy.data(),
+                                  write.packet_addr);
         }
         lk.lock();
         p.inflight--;
@@ -3355,29 +3349,9 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
     bool touched = false;
     for (const PendWrite& w : p.q) {
         const Pm4Command& c = w.cmd;
-        using K = Pm4Command::Kind;
-        if (c.kind == K::ReleaseMem && c.rel_addr == addr && c.rel_value_valid) {
-            if (c.rel_data_sel == 1) {
-                uint32_t lo = (uint32_t)c.rel_value;
-                memcpy(&v, &lo, sizeof lo);
-                touched = true;
-            } else if (c.rel_data_sel == 2) {
-                v = c.rel_value;
-                touched = true;
-            }
-        } else if (c.kind == K::WriteData && c.wd_valid && c.wd_addr == addr &&
-                   c.wd_data && c.wd_num) {
-            const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
-            memcpy(&v, c.wd_data, n);
-            touched = true;
-        } else if (c.kind == K::DmaData && c.dd_dst == addr && c.dd_valid &&
-                   dma_data_immediate_source(c)) {
-            const uint32_t word = (uint32_t)c.dd_src;
-            const size_t n = std::min<size_t>(c.dd_bytes, sizeof v);
-            for (size_t off = 0; off < n; off += sizeof word)
-                memcpy((uint8_t*)&v + off, &word, std::min(sizeof word, n - off));
-            touched = true;
-        }
+        touched |= overlay_pending_memory(c, w.dma_copy, addr,
+                                          {reinterpret_cast<uint8_t*>(&v), sizeof(v)}) ==
+                   PendingMemoryOverlay::Applied;
     }
     if (touched) *value = v;
     return touched;
@@ -3654,13 +3628,13 @@ void defer_push(const Pm4Command& c) {
     g_deferred.back().items.push_back(std::move(it));
     g_defer_items++;
 }
-void apply_effect(const Pm4Command& c) {
+void apply_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
     using K = Pm4Command::Kind;
     switch (c.kind) {
         case K::ReleaseMem: honor_eop_write(c); break;
         case K::EventWrite: honor_event_write(c); break;
         case K::WriteData:  honor_write_data(c); break;
-        case K::DmaData:    honor_dma_data(c); break;
+        case K::DmaData: honor_dma_data(c, packet_addr, source); break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -3679,7 +3653,7 @@ uint64_t effect_target(const Pm4Command& c, uint32_t* bytes) {
         default: *bytes = 0; return 0;
     }
 }
-void apply_deferred_effect(const Pm4Command& c) {
+void apply_deferred_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
     uint32_t bytes = 0;
     uint64_t t = effect_target(c, &bytes);
     if (t && bytes && !guest_readable(t, bytes)) {
@@ -3689,7 +3663,7 @@ void apply_deferred_effect(const Pm4Command& c) {
                     (unsigned)c.kind, (unsigned long long)t, bytes);
         return;
     }
-    apply_effect(c);
+    apply_effect(c, source, packet_addr);
 }
 void publish_memory_effect(const Pm4Command& command) {
     // Finishing preceding GPU work does not retire an active submit import. Keep completion and
@@ -3712,6 +3686,73 @@ void publish_memory_effect(const Pm4Command& command) {
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
     const GraphicsExecutionActivity execution;
     publish_memory_effect(effect.cmd);
+}
+
+bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
+    const GraphicsExecutionActivity execution;
+    Pm4Command c{};
+    c.kind = Pm4Command::Kind::DmaData;
+    c.dd_dst = copy.dst;
+    c.dd_src = copy.src;
+    c.dd_bytes = copy.bytes;
+    c.dd_sels = copy.sels;
+    c.dd_valid = true;
+    c.stream_order = copy.command_order;
+    const auto form = dma_data_form(c, authoritative_source != nullptr);
+    if ((form != DmaDataForm::Copy && form != DmaDataForm::MemoryToGds) || eop_write_sync())
+        return honor_dma_data(c, copy.packet_addr, authoritative_source);
+    PendQueue& p = pend_q();
+    std::unique_lock lock(p.mx);
+    p.cv.wait(lock, [&] { return p.inflight == 0; });
+    std::vector<std::pair<Pm4Command, std::span<const uint8_t>>> overlays;
+    bool private_destination = false;
+    for (const auto& write : p.q) {
+        const auto span = pending_memory_span(write.cmd);
+        if (pending_memory_overlaps(span, {copy.src, copy.bytes}))
+            overlays.emplace_back(write.cmd, write.dma_copy);
+        if (form != DmaDataForm::MemoryToGds && pending_memory_completion(write.cmd))
+            private_destination |= pending_memory_overlaps(span, {copy.dst, copy.bytes});
+    }
+    if (overlays.empty() && !private_destination) {
+        lock.unlock();
+        return honor_dma_data(c, copy.packet_addr, authoritative_source);
+    }
+    // Pin the borrowed queue payloads while copying outside mx. Admission/drainers already
+    // qualify p.inflight, so they cannot recycle these bytes. CONFIDENCE: HIGH (ordered tests).
+    ++p.inflight;
+    lock.unlock();
+    struct Inflight {
+        PendQueue& queue;
+        ~Inflight() {
+            std::lock_guard guard(queue.mx);
+            --queue.inflight;
+            queue.cv.notify_all();
+        }
+    } inflight{p};
+    std::vector<uint8_t> captured(copy.bytes);
+    std::memcpy(captured.data(),
+                authoritative_source ? authoritative_source
+                                     : reinterpret_cast<const uint8_t*>(uintptr_t(copy.src)),
+                copy.bytes);
+    for (const auto& [command, payload] : overlays) {
+        if (overlay_pending_memory(command, payload, copy.src, captured) ==
+            PendingMemoryOverlay::Unresolved) {
+            std::fprintf(stderr,
+                         "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
+            return false;
+        }
+    }
+    if (!private_destination) return honor_dma_data(c, copy.packet_addr, captured.data());
+    PendWrite write;
+    write.cmd = c;
+    write.dma_copy = std::move(captured);
+    write.packet_addr = copy.packet_addr;
+    write.queued = std::chrono::steady_clock::now();
+    {
+        std::lock_guard guard(p.mx);
+        p.q.push_back(std::move(write));
+    }
+    return true;
 }
 
 bool last_fold_deferred() { return g_fold_deferring; }

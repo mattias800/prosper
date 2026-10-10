@@ -47,6 +47,18 @@ void append_dma(std::vector<uint32_t>& stream, uint64_t destination, uint64_t so
     stream.insert(stream.end(), std::begin(packet), std::end(packet));
 }
 
+void append_release(std::vector<uint32_t>& stream, uint64_t* destination, uint64_t value) {
+    const auto address = reinterpret_cast<uint64_t>(destination);
+    const uint32_t packet[] = {header(7, R_RELEASE_MEM),
+                               static_cast<uint32_t>(address),
+                               static_cast<uint32_t>(address >> 32u),
+                               2u,
+                               static_cast<uint32_t>(value),
+                               static_cast<uint32_t>(value >> 32u),
+                               0x04u};
+    stream.insert(stream.end(), std::begin(packet), std::end(packet));
+}
+
 struct SubmitReturn {
     void (*hook)() = nullptr;
     ~SubmitReturn() {
@@ -306,5 +318,123 @@ TEST(SubmitVisibilityDefault, RejectedImportRetiresItsScope) {
     hook();
     retirement.hook = nullptr;
     EXPECT_FALSE(prosper_gpu_submit_scope_active());
+}
+
+class SubmitVisibilityDma : public testing::TestWithParam<bool> {};
+
+TEST_P(SubmitVisibilityDma, ReadsPrivateCompletionAtItsOrderedPosition) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0xaaaaaaaa55555555ull, copied = 0;
+    constexpr uint64_t completed = 0x0123456789abcdefull;
+    const uint32_t offset = GetParam() ? 2u : 0u, bytes = GetParam() ? 4u : 8u;
+    uint64_t expected = 0;
+    std::memcpy(&expected, reinterpret_cast<const uint8_t*>(&completed) + offset, bytes);
+    std::vector<uint32_t> stream;
+    append_release(stream, &label, completed);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied),
+               reinterpret_cast<uint64_t>(&label) + offset, bytes, kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_EQ(copied, expected) << "GPU consumers read private bytes in command order";
+    EXPECT_EQ(label, 0xaaaaaaaa55555555ull) << "the CPU cannot recycle this completion yet";
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(label, completed);
+}
+
+TEST_P(SubmitVisibilityDma, AliasingCopyOwnsItsSourceAndFeedsALaterCopy) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0xaaaaaaaa55555555ull, source = 0x1020304050607080ull, copied = 0;
+    uint64_t expected = 0x0123456789abcdefull;
+    const uint32_t offset = GetParam() ? 2u : 0u, bytes = GetParam() ? 3u : 8u;
+    std::memcpy(reinterpret_cast<uint8_t*>(&expected) + offset, &source, bytes);
+    std::vector<uint32_t> stream;
+    append_release(stream, &label, 0x0123456789abcdefull);
+    append_dma(stream, reinterpret_cast<uint64_t>(&label) + offset,
+               reinterpret_cast<uint64_t>(&source), bytes, kDmaDataAddressSource);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied), reinterpret_cast<uint64_t>(&label),
+               sizeof(label), kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_EQ(label, 0xaaaaaaaa55555555ull) << "address DMA must retain aliasing writes too";
+    EXPECT_EQ(copied, expected) << "the later copy consumes the first copy's owned private payload";
+    source = ~source; // The guest can recycle the input after the DMA operation consumed it.
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(label, expected) << "retirement must not reread a later generation of the source";
+}
+
+INSTANTIATE_TEST_SUITE_P(ExactAndPartialOverlap, SubmitVisibilityDma, testing::Bool());
+
+TEST(SubmitVisibilityDefault, MemoryToGdsConsumesPrivateCompletionAtOffsetZero) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    auto* gds = compute_gds_backing();
+    ASSERT_NE(gds, nullptr);
+    ASSERT_GE(compute_gds_size(), sizeof(uint32_t));
+    uint32_t previous = 0;
+    std::memcpy(&previous, gds, sizeof(previous));
+    uint64_t label = 0xaaaaaaaa55555555ull;
+    std::vector<uint32_t> stream;
+    append_release(stream, &label, 0x0123456789abcdefull);
+    append_dma(stream, 0, reinterpret_cast<uint64_t>(&label), sizeof(uint32_t),
+               1u | (3u << 8u) | kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    uint32_t observed = 0;
+    std::memcpy(&observed, gds, sizeof(observed));
+    std::memcpy(gds, &previous, sizeof(previous));
+    EXPECT_EQ(observed, 0x89abcdefu)
+        << "GDS has its own domain but reads the ordered private source";
+    EXPECT_EQ(label, 0xaaaaaaaa55555555ull);
+}
+
+TEST(SubmitVisibilityDefault, UncapturedTimestampDependencyIsRefused) {
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0, copied = 0x1122334455667788ull;
+    Pm4Command event{};
+    event.kind = Pm4Command::Kind::EventWrite;
+    event.event_addr = reinterpret_cast<uint64_t>(&label);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    execute_ordered_memory_effect(GpuState::MemoryEffect(event, 1));
+    GpuState::DmaCopy copy{};
+    copy.dst = reinterpret_cast<uint64_t>(&copied);
+    copy.src = reinterpret_cast<uint64_t>(&label);
+    copy.bytes = sizeof(label);
+    copy.sels = kDmaDataAddressSource;
+    copy.command_order = 2;
+    EXPECT_FALSE(execute_ordered_dma_copy(copy))
+        << "an early invented timestamp is not ordered data";
+    EXPECT_EQ(copied, 0x1122334455667788ull);
+    EXPECT_EQ(label, 0u);
 }
 } // namespace
