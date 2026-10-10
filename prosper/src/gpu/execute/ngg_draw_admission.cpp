@@ -23,7 +23,6 @@ NggHostCapabilities& host_slot() {
 
 constexpr uint32_t kPrimTriangleList = 4;
 constexpr uint32_t kPrimTriangleStrip = 6;
-constexpr uint32_t kWaveLanes = 64;
 
 }   // namespace
 
@@ -58,7 +57,10 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     };
     if (!host.published) return refuse("ngg-host-unpublished");
     if (registers.missing) return refuse("ngg-register-missing");
-    if (stages.gs_wave32()) return refuse("ngg-gs-wave32");
+    // GS_W32_EN: the program runs in Wave32 waves. The shell, the planner and the raster commit all
+    // take the width (NggSubgroupLimits::wave_lanes), so it is no longer refused (#4808: Yakuza
+    // Kiwami's NGG VS programs). A passthrough launch is modelled without a GS only.
+    if (stages.primgen_passthrough() && !admission.vs_only) return refuse("ngg-passthrough-gs");
     if (ngg_gs_instance_count(registers.vgt_gs_instance_cnt) > 1u)
         return refuse("ngg-gs-instancing");
     if (registers.primitive_type == kPrimTriangleList)
@@ -164,6 +166,8 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
         registers.vgt_gs_onchip_cntl, registers.ge_cntl, registers.ge_max_output_per_subgroup,
         registers.vgt_gs_max_vert_out, registers.vgt_esgs_ring_itemsize);
     admission.limits.vs_only = admission.vs_only;
+    admission.limits.wave_lanes = stages.gs_wave32() ? 32u : 64u;
+    admission.limits.passthrough = stages.primgen_passthrough();
     admission.shape.vertex_count = facts.vertex_count;
     if (facts.indexed) {
         admission.shape.indices = facts.indices;
@@ -189,7 +193,7 @@ NggDrawAdmission admit_ngg_draw(const NggDrawRegisters& registers, const NggDraw
     if (facts.interpolation_geometry_required && !host.geometry_shader)
         return refuse("ngg-layer-route-unavailable");
     admission.count_violations = host.vertex_pipeline_stores;
-    admission.native_wave64 = host.native_wave64;
+    admission.native_wave64 = stages.gs_wave32() ? host.native_wave32 : host.native_wave64;
     return admission;
 }
 
@@ -211,10 +215,11 @@ const char* ngg_device_refusal(const NggSubgroupDraw& draw, const NggHostCapabil
     if ((draw.route == NggLayerRoute::ShaderOutputLayer && !host.shader_output_layer) ||
         (any_geometry && !host.geometry_shader))
         return "ngg-backend-layer-route-unavailable";
-    if (draw.native_wave64 && !host.native_wave64) return "ngg-backend-wave64-unavailable";
+    if (draw.native_wave64 && !(draw.wave_lanes == 32u ? host.native_wave32 : host.native_wave64))
+        return "ngg-backend-wave64-unavailable";
     if (draw.lds_bytes > host.max_compute_shared_memory) return "ngg-backend-lds-limit";
     for (const NggSubgroupWaveGroup& group : draw.groups) {
-        const uint32_t local = kWaveLanes * group.waves;
+        const uint32_t local = draw.wave_lanes * group.waves;
         if (local > host.max_compute_workgroup_size_x ||
             local > host.max_compute_workgroup_invocations ||
             group.blocks > host.max_compute_workgroup_count_x ||

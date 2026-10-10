@@ -3235,6 +3235,9 @@ int main() {
     ComputeShaderConfig gta_structured_vcc_config = portable_wave64_compute_config;
     gta_structured_vcc_config.local_x = 64;
     gta_structured_vcc_config.native_subgroup_size = 64;
+    // The kernel reads s0, s2 and s7 as launch data. A config with no user SGPRs seeds none of them,
+    // and an unseeded register reads as the fabricated zero (#4714), so supply the launch shape.
+    gta_structured_vcc_config.user_sgprs.assign(16, 0u);
     const auto gta_structured_vcc_scalar_pair_spv = recompile_compute(
         gta_structured_vcc_scalar_pair.data(), gta_structured_vcc_scalar_pair.size(), nullptr,
         gta_structured_vcc_config);
@@ -5806,17 +5809,18 @@ int main() {
         std::vector<uint32_t> instruction;
     };
     const std::vector<UnsupportedGetLod> unsupported_get_lod = {
-        {"NSA",      {0xf180010au, 0x01480809u, 0x0000000au}},
-        {"UNRM",     {0xf1801108u, 0x01480809u}},
-        {"A16",      {0xf1800108u, 0x41480809u}},
-        {"DLC",      {0xf1800188u, 0x01480809u}},
-        {"GLC",      {0xf1802108u, 0x01480809u}},
-        {"SLC",      {0xf3800108u, 0x01480809u}},
-        {"R128",     {0xf1808108u, 0x01480809u}},
-        {"TFE",      {0xf1810108u, 0x01480809u}},
-        {"LWE",      {0xf1820108u, 0x01480809u}},
-        {"D16-raw",  {0xf1800108u, 0x81480809u}},
-        {"reserved-w0-b6",  {0xf1800148u, 0x01480809u}},
+        // The two-address NSA form [v9, v10] is lowered (#4808); a third address byte is not.
+        {"NSA-third-address", {0xf180010au, 0x01480809u, 0x00000b0au}},
+        {"UNRM", {0xf1801108u, 0x01480809u}},
+        {"A16", {0xf1800108u, 0x41480809u}},
+        {"DLC", {0xf1800188u, 0x01480809u}},
+        {"GLC", {0xf1802108u, 0x01480809u}},
+        {"SLC", {0xf3800108u, 0x01480809u}},
+        {"R128", {0xf1808108u, 0x01480809u}},
+        {"TFE", {0xf1810108u, 0x01480809u}},
+        {"LWE", {0xf1820108u, 0x01480809u}},
+        {"D16-raw", {0xf1800108u, 0x81480809u}},
+        {"reserved-w0-b6", {0xf1800148u, 0x01480809u}},
         {"reserved-w0-b14", {0xf1804108u, 0x01480809u}},
         {"reserved-w1-b26", {0xf1800108u, 0x05480809u}},
         {"reserved-w1-b27", {0xf1800108u, 0x09480809u}},

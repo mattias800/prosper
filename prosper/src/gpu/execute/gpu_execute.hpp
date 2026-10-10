@@ -3135,6 +3135,11 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         if (ngg_admission.ok()) {
             ngg.user_data_complete =
                 read_ngg_user_data(ds, ngg_admission.user_sgprs, &ngg.user_data);
+            // The whole AGC user-data range too, for a program that reads past the RSRC2 count
+            // (ngg_program_user_sgprs decides; #4808).
+            if (ngg.facts.user_data_range_end > ngg_admission.user_sgprs &&
+                !read_ngg_user_data(ds, ngg.facts.user_data_range_end, &ngg.user_data_range))
+                ngg.user_data_range.clear();
             ngg.user_data_address_known = read_ngg_user_data_address(ds, ngg.user_data_address);
             ngg.linked =
                 vertex_chain

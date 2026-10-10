@@ -52,6 +52,17 @@ struct NggSubgroupLimits {
     // GE_MAX_OUTPUT_PER_SUBGROUP bounds its ES vertices, and primitives are bounded by
     // GS_PRIMS_PER_SUBGRP and GE_CNTL.PRIM_GRP_SIZE alone (#3135 P7).
     bool vs_only = false;
+    // The guest wave width (VGT_SHADER_STAGES_EN.GS_W32_EN selects 32): how many threads one wave
+    // holds, so how many waves a subgroup needs and what s3 counts per wave.
+    uint32_t wave_lanes = 64;
+    // VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_EN: the hardware hands each primitive thread its
+    // primitive already packed in v0, in the PRIM export format (subgroup-thread vertex indices at
+    // [8:0], [18:10], [28:20]), and the program exports it as is. v1 carries nothing then. Mesa
+    // (ac_nir_lower_ngg, "packed passthrough primitive") and LLPC (NggPrimShader's passthrough
+    // path) both read v0 that way, and Yakuza Kiwami's Wave32 NGG VS programs export `prim v0`
+    // without touching it. CONFIDENCE: MED (two compilers and the guest agree; the RDNA2 ISA does
+    // not describe NGG launch VGPRs).
+    bool passthrough = false;
 };
 
 NggSubgroupLimits decode_ngg_subgroup_limits(uint32_t vgt_gs_onchip_cntl, uint32_t ge_cntl,
@@ -78,7 +89,8 @@ struct NggDrawShape {
 
 struct NggSubgroupBudget {
     uint32_t max_subgroups = 1u << 16;
-    // 256 threads: the compute shell's workgroup bound. Values above 15 are clamped: s3 carries the
+    // In Wave64 waves: 4 is 256 threads, the compute shell's workgroup bound. A Wave32 draw gets
+    // the same thread budget (twice the waves). Wave counts above 15 are clamped: s3 carries the
     // wave count in four bits.
     uint32_t max_waves_per_subgroup = 4;
 };
@@ -111,14 +123,22 @@ struct NggSubgroupPlan {
 NggSubgroupPlan plan_ngg_subgroups(const NggDrawShape& draw, const NggSubgroupLimits& limits,
                                    const NggSubgroupBudget& budget = {});
 
-// The merged wave info SGPR (s3) for wave `wave` of `subgroup`:
+// The merged wave info SGPR (s3) for wave `wave` of `subgroup`, whose waves hold `wave_lanes` threads:
 //   [31:28] waves in subgroup, [27:24] wave index, [23:16] GS wave id (0; programs reading it are
 //   refused at admission), [15:8] GS threads in this wave, [7:0] ES threads in this wave.
-uint32_t ngg_merged_wave_info(const NggSubgroup& subgroup, uint32_t wave);
+uint32_t ngg_merged_wave_info(const NggSubgroup& subgroup, uint32_t wave, uint32_t wave_lanes = 64);
 
-// The launch VGPRs v0..v8 for lane `lane` (0..63) of wave `wave`. Thread t = wave * 64 + lane.
+// The NGG group info SGPR (s2) every wave of `subgroup` receives: [20:12] the subgroup's ES vertex
+// count, [30:22] its primitive (GS thread) count, every other bit 0. The fields Mesa and LLPC read
+// (gs_tg_info / mergedGroupInfo); see ngg_subgroup_abi.hpp for the disagreement with the ISA table.
+// The planner keeps both counts below 512 (ngg-limits-unusable otherwise).
+uint32_t ngg_group_info(const NggSubgroup& subgroup);
+
+// The launch VGPRs v0..v8 for lane `lane` of wave `wave`. Thread t = wave * limits.wave_lanes + lane.
 //   GS threads (t < gs): v0 = slot0*ITEMSIZE | (slot1*ITEMSIZE) << 16, v1 = slot2*ITEMSIZE,
 //     v2 = PrimitiveID (instance-local), v3 = 0 (GS instance; GS instancing is refused), v4 = 0.
+//     Under limits.passthrough instead v0 = slot0 | slot1 << 10 | slot2 << 20 (edge flags and the
+//     null bit clear) and v1 = 0.
 //   ES threads (t < es): v5 = VertexID (first_vertex + index), v8 = InstanceID.
 //   v6/v7 (ES user VGPRs) are not established and stay 0; admission refuses programs reading them.
 //   Every other value is 0 (the hardware leaves it undefined; a correct program cannot depend on it).
