@@ -129,7 +129,7 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `DcbDrawIndex` | 7 | `DRAW_INDEX_2` | 6 | LOW | payload carries a 64-bit AGC draw modifier |
 | `DcbDrawIndexAuto` | 7 | `DRAW_INDEX_AUTO` | 3 | LOW | same modifier; not a bare PM4 draw |
 | `DcbDrawIndexOffset` | 3 | `DRAW_INDEX_OFFSET_2` | 5 | LOW | prosper emits **fewer** — safe direction |
-| `DcbDrawIndexIndirect` | 4 | `DRAW_INDEX_INDIRECT` | 6 | LOW | fewer — safe direction |
+| `DcbDrawIndexIndirect` | 4 | `DRAW_INDEX_INDIRECT` | 5 | HIGH | 3.20 builder emits `0xC0032500`; `mStuvI0zOtc` returns 20 bytes. Prosper's own 4-dword encoding is smaller |
 | `DcbDrawIndirect` | 4 | `DRAW_INDIRECT` | 5 | MED | **new (#2929)**, and the count is derived rather than copied from the indexed row. prosper's payload is the API's own operand list — 32-bit byte offset + 64-bit `ShaderDrawModifier` — so it cannot be smaller; the hardware packet spends header + `DATA_OFFSET` + `BASE_VTX_LOC` + `START_INST_LOC` + `DRAW_INITIATOR`, the same field list as the indexed form. No dump was observed inlining the real size, so the equality is inferred, not measured; only the **upper** bound is load-bearing and 4 ≤ 5 settles it. prosper answers `sceAgcDcbDrawIndirectGetSize` (`cxPZ4Wgvdj8`) from the same constant |
 | `CbDispatch` | 6 | `DISPATCH_DIRECT` | 5 | LOW | no title evidence |
 | `DcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
@@ -156,6 +156,29 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 
 **Nothing in this table was changed on the strength of the "published dw" column.** The rows that
 differ and have no title evidence are recorded as open, not fixed; see *Open* below.
+
+### Indirect multi-draw ABI cross-check (#4840, 2026-10-10)
+
+The 3.20 NID list identifies `ypVBz4uPKcQ` as `sceAgcDcbDrawIndexIndirectMulti` and
+`r98I08t+LOg` as its `GetSize`. The native builder emits a ten-dword `0xC0083800` packet, surrounded
+by optional marker packets. Its size helper includes both wrappers in the reservation; ten dwords
+is therefore the draw packet size, not an unconditional size for the whole library operation.
+The single-draw builder `t1vNu082-jM` emits five dwords, independently corroborated by its size
+helper's 20-byte result. CONFIDENCE: HIGH on these checked sizes and NID identities.
+
+The native multi builder and the
+[AMD PFP packet definition](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_f32_pfp_pm4_packets.h)
+agree that ordinal 3 contains separate physical SH locations for base vertex (low 16 bits) and
+start index (high 16 bits). Control bit 28 enables the start-index write; bit 30 enables the
+memory-backed count, and bit 31 enables the draw-index write. The native builder emits location
+`0x280` for disabled locations. A nonzero location alone therefore does not authorize a write.
+CONFIDENCE: HIGH for the field packing and enable bits; MED for `0x280` as a general disabled-write
+sentinel, pending an observed consumer of that form.
+
+This evidence does not implement multi-draw execution. Count and argument reads must occur after
+their producers retire, each child needs its effective SH state before scalar read-point sealing,
+and captures must retain distinct child identities at the parent packet's command order. These
+requirements remain open in [#4840](https://github.com/mattias800/prosper/issues/4840).
 
 ## Which builders are genuinely oversized
 
