@@ -2753,7 +2753,14 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     bool used_direct_backing = false;
     if (form == DmaDataForm::Immediate) {
         const uint32_t v32 = (uint32_t)c.dd_src;
-        uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: generation/membership pre-content
+        // A masked retirement may own only a later-page label; the published prefix has no
+        // remaining lifetime. The small-fill form separately validates its journal qword.
+        const bool owns_base_qword =
+            c.dd_bytes < 8 ||
+            std::any_of(
+                ranges.begin(), ranges.end(),
+                [](const auto& range) { return range.offset == 0 && range.bytes >= 8; });
+        const uint64_t pre_dma = owns_base_qword ? peek_qword(c.dd_dst) : 0;
         // The exact consumed-marker initializer is a 4-byte immediate zero. Test allocator
         // membership BEFORE touching it: memset(0) would erase a free node's NextFreeBlock.
         if (mb3_freelist_guard() && c.dd_bytes == 4 && v32 == 0 &&

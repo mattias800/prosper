@@ -102,6 +102,8 @@ static std::string summary(perf::AlarmEngine& engine) {
 }
 
 int main(int argc, char** argv) {
+    // Preserve the last completed control when a platform failure interrupts captured stderr.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc != 3 || (std::strcmp(argv[2], "proceed") && std::strcmp(argv[2], "defer"))) {
         std::fprintf(stderr, "usage: test_wait_regmem_packet_route <jsonl-output> <proceed|defer>\n");
         return 2;

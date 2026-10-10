@@ -150,6 +150,39 @@ TEST(SubmitVisibilityDefault, BeforeAnySdkQuery) {
     check_import_visibility();
 }
 
+TEST(SubmitVisibilityDefault, RawStackWaitScopesRetireBeforeAnyHleRegistration) {
+    // Match the diagnostic packet route's first two scopes without redirecting crash output.
+    // Each ctest case runs in its own process, so no other case registers HLE for this control.
+    for (bool satisfied : {false, true}) {
+        alignas(8) uint64_t label = 0;
+        std::vector<uint32_t> stream;
+        append_release(stream, &label, 2);
+        const auto address = reinterpret_cast<uint64_t>(&label);
+        const uint32_t wait[] = {header(8, R_WAIT_MEM_64),
+                                 static_cast<uint32_t>(address),
+                                 static_cast<uint32_t>(address >> 32u),
+                                 UINT32_MAX,
+                                 UINT32_MAX,
+                                 satisfied ? 2u : 3u,
+                                 0,
+                                 3};
+        stream.insert(stream.end(), std::begin(wait), std::end(wait));
+        GpuState state;
+        prosper_gpu_submit_scope_begin();
+        SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+        EXPECT_EQ(run_command_buffer(stream.data(), stream.size(), state), 2u);
+        EXPECT_EQ(label, 0u);
+        EXPECT_TRUE(prosper_gpu_submit_scope_active());
+        prosper_gpu_submit_scope_end();
+        retirement.hook = nullptr;
+        prosper_gpu_drain_completion_writes();
+        EXPECT_EQ(label, 2u);
+        label = satisfied ? 2u : 3u;
+        flush_deferred_streams();
+        EXPECT_FALSE(deferred_pending());
+    }
+}
+
 class SubmitVisibilitySdk : public testing::TestWithParam<unsigned int> {};
 
 TEST_P(SubmitVisibilitySdk, PublicDefaults) {
@@ -457,7 +490,7 @@ TEST_P(SubmitVisibilityDma, AliasingCopyOwnsItsSourceAndFeedsALaterCopy) {
     SubmitReturn retirement{hook};
     EXPECT_EQ(label, 0xaaaaaaaa55555555ull) << "address DMA must retain aliasing writes too";
     EXPECT_EQ(copied, expected) << "the later copy consumes the first copy's owned private payload";
-    source = ~source; // The guest can recycle the input after the DMA operation consumed it.
+    source = ~source;   // The guest can recycle the input after the DMA operation consumed it.
     hook();
     retirement.hook = nullptr;
     prosper_gpu_drain_completion_writes();
@@ -665,7 +698,7 @@ TEST_P(SubmitVisibilityIndex, OrderedUploadsAndDisjointCopiesVisitALinearNumberO
     const auto after = observe_queue();
     ASSERT_TRUE(after);
     if (!before || !after)
-        return; // ASSERT_TRUE reports the failure; make optional access explicit.
+        return;   // ASSERT_TRUE reports the failure; make optional access explicit.
     EXPECT_EQ(uploads, sources);
     EXPECT_EQ(copied, sources);
     EXPECT_EQ(labels, (std::array<uint64_t, count>{}));
@@ -801,7 +834,7 @@ TEST_P(SubmitVisibilityFragments, InteriorLabelsKeepOnlyTheirBytesAndPublishedPr
     }
     for (size_t i = 0; i < destination.size(); ++i)
         EXPECT_EQ(destination[i], (i == 2 || i == 3 || i == 8 || i == 9) ? 0u : source[i]);
-    destination[12] = 0xabcdefu; // later GPU producer in an already consumed public suffix
+    destination[12] = 0xabcdefu;   // later GPU producer in an already consumed public suffix
     uint32_t copied = 0;
     ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
                                           reinterpret_cast<uint64_t>(&destination[12]),
@@ -931,6 +964,52 @@ TEST_P(SubmitVisibilityFragments, RetirementDoesNotRequireAnAlreadyPublishedUnma
     prosper_gpu_drain_completion_writes();
     EXPECT_EQ(*label, 0x1234567812345678ull)
         << "the retained head owns its payload and has no dependency on the consumed tail";
+}
+
+TEST_P(SubmitVisibilityFragments, RetirementDoesNotReadAnAlreadyPublishedUnmappedPrefix) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    prosper_gpu_drain_completion_writes();
+    const uint64_t destination = aliases.first + 0x128;
+    auto* label = aliases.label();
+    *label = 0;
+    std::vector<uint32_t> source((DirectAliases::page + 32) / 4, 0x12345678u);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(label);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    if (GetParam() == 2) {
+        ASSERT_TRUE(execute_ordered_dma_copy(
+            {destination, reinterpret_cast<uint64_t>(source.data()),
+             static_cast<uint32_t>(source.size() * 4), kDmaDataAddressSource, 2}));
+    } else {
+        Pm4Command resource{};
+        resource.kind = GetParam() == 0 ? Pm4Command::Kind::WriteData : Pm4Command::Kind::DmaData;
+        resource.wd_addr = resource.dd_dst = destination;
+        resource.wd_data = source.data();
+        resource.wd_num = source.size();
+        resource.wd_valid = resource.dd_valid = true;
+        resource.dd_src = source[0];
+        resource.dd_bytes = source.size() * 4;
+        execute_ordered_memory_effect(GpuState::MemoryEffect(resource, 2));
+    }
+    EXPECT_EQ(*label, 0u);
+    EXPECT_EQ(*reinterpret_cast<const uint32_t*>(destination), source[0]);
+    ASSERT_EQ(aliases.unmap(aliases.first, DirectAliases::page, 0, 0, 0, 0), 0u);
+    // Keep fixture cleanup on the remaining page. The resource's original base is now invalid;
+    // retirement owns only the second-page label and must not sample the consumed prefix.
+    aliases.first += DirectAliases::page;
+    aliases.first_bytes = DirectAliases::page;
+    source.assign(source.size(), 0x79);
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*label, 0x1234567812345678ull);
 }
 
 TEST(SubmitVisibilityDefault, MappingChangeRetainsTheEarlierResourceFragmentAsAFifoBlocker) {
