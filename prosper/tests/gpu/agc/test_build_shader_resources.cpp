@@ -1405,15 +1405,15 @@ TEST(BuildShaderResources, VolumeTailDetileMechanism) {
     EXPECT_EQ(cube[2], 0xB2) << "texel (0,1,0) reads byte 8";
     EXPECT_EQ(cube[4], 0xC4) << "texel (0,0,1) reads byte 4";
     std::vector<uint8_t> one(1, 0);
-    ASSERT_TRUE(detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1,
-                                         9, 1, 32, 0))
+    ASSERT_TRUE(
+        detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1, 9, 1, 32, 0))
         << "tail detile admits the translated origin";
     EXPECT_EQ(one[0], 0xD3) << "translated origin (32,0,0) reads byte 32768";
     // A translation naming bytes outside the shared block fails closed instead of
     // aliasing another level: 32 texels at x=33 overrun the 64-wide block.
     std::vector<uint8_t> over(32 * 32 * 32, 0);
-    EXPECT_FALSE(detile_volume_tail_level(over.data(), spot.data(), spot.size(), 32, 32, 32,
-                                          9, 1, 33, 0))
+    EXPECT_FALSE(
+        detile_volume_tail_level(over.data(), spot.data(), spot.size(), 32, 32, 32, 9, 1, 33, 0))
         << "out-of-block translation refuses";
 }
 
@@ -1423,8 +1423,8 @@ TEST(BuildShaderResources, VolumeTailDetileMechanism) {
 // since sampled upload detiles through the proven coordinates.
 TEST(BuildShaderResources, VolumeTailStorageRefused) {
     uint32_t sg[8];
-    make_tsharp(sg, 0x4066a90000ull, 32, 32, /*fmt*/1, /*tile*/9, /*type 3D*/10,
-                /*depth*/32);
+    make_tsharp(sg, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                /*depth*/ 32);
     sg[3] |= (1u << 12) | (1u << 16);
     sg[5] |= 5u << 4;
     AgcShaderSharp sharp[1];
@@ -1449,8 +1449,8 @@ TEST(BuildShaderResources, VolumeTailStorageRefused) {
         const ShaderResourceTable ro_table = build_shader_resources(sh, sg, 8);
         const ShaderResource* r = ro_table.by_sgpr_base(0);
         ASSERT_TRUE(r != nullptr) << "same words in the read-only category bind (control)";
-        EXPECT_TRUE(r->cls == ResourceClass::Texture && r->in_mip_tail &&
-                    r->mip_tail_x == 0 && r->mip_tail_y == 16)
+        EXPECT_TRUE(r->cls == ResourceClass::Texture && r->in_mip_tail && r->mip_tail_x == 0 &&
+                    r->mip_tail_y == 16)
             << "control binds the level-1 tail view with proven coordinates";
     }
 }

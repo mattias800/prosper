@@ -8092,8 +8092,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     // Same storage hazard as the header builder's equivalent arm: a 3D tail
                     // view shares its block, and neither the storage seed nor the writeback
                     // addresses it through the tail origin.
-                    if (wanted == ResourceClass::StorageImage && d.type == 10 &&
-                        view.in_mip_tail) {
+                    if (wanted == ResourceClass::StorageImage && d.type == 10 && view.in_mip_tail) {
                         note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
                                                       "3d-tail-storage-unproven");
                         continue;
@@ -8163,9 +8162,11 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     r.proven_zero_mip = proven_zero_mip;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
-                    const uint64_t backing_bytes_per_sample = is_bcn
-                        ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * view.depth * fi.bytes_per_block
-                        : static_cast<uint64_t>(view.width) * view.height * view.depth * fi.bytes_per_block;
+                    const uint64_t backing_bytes_per_sample =
+                        is_bcn ? static_cast<uint64_t>((view.width + 3) / 4) *
+                                     ((view.height + 3) / 4) * view.depth * fi.bytes_per_block
+                               : static_cast<uint64_t>(view.width) * view.height * view.depth *
+                                     fi.bytes_per_block;
                     if (!d.sample_count ||
                         backing_bytes_per_sample > UINT32_MAX / d.sample_count) continue;
                     const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;
@@ -8764,8 +8765,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                     // Same storage hazard as the header builder's equivalent arm (a 3D tail
                     // view shares its block; seed and writeback do not use the tail origin).
                     // Placed after `wanted`: the sampled use of the same view stays admitted.
-                    if (wanted == ResourceClass::StorageImage && d.type == 10 &&
-                        view.in_mip_tail) {
+                    if (wanted == ResourceClass::StorageImage && d.type == 10 && view.in_mip_tail) {
                         note_dropped_image_descriptor(code_addr, u.use_pc, -1, u.t8,
                                                       "3d-tail-storage-unproven");
                         continue;

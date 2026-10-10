@@ -608,9 +608,7 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // refused for the same silent-wrong-texels reason as every path below.
     const bool volume_tail_3d = d.type == 10 && d.base_array == 0 && d.base_level == d.last_level;
     if (volume_tail_3d) {
-        // Block-compressed volumes: the tail rule is in elements and the upload has no BCn
-        // volume-tail reader, so they keep the base-level-only rule.
-        if (!fi.bytes_per_block || fi.block_width > 1) {
+        if (!fi.bytes_per_block) {
             view.supported = unshifted_view_supported();
             return view;
         }
@@ -997,7 +995,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // reads whole-block bytes and the writeback writes them, neither through the
             // tail origin, so either direction addresses the wrong texels. Sampled views
             // detile through the proven coordinates; storage waits for a proven writeback.
-            if (d.type == 10 && view.in_mip_tail && d.base_array != 0) {
+            if (d.type == 10 && view.in_mip_tail) {
                 wr_drop("3D tail storage view (volume-tail writeback unproven)");
                 continue;
             }
