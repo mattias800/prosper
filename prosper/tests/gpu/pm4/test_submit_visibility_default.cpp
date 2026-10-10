@@ -4,14 +4,21 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
+#include "host/memory/guest_memory_map.hpp"
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <thread>
 #include <vector>
+#ifdef PROSPER_TEST_NATIVE_UNTRACKED_TAIL
+#include <sys/mman.h>
+#endif
 
 extern "C" void* prosper_agc_reg_defaults(unsigned int version);
 extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version);
@@ -244,6 +251,68 @@ TEST(SubmitVisibilityDefault, OrderedGdsOffsetZeroRemainsAvailable) {
     EXPECT_EQ(observed, 0x87654321u) << "GDS offset zero is not a null guest address";
 }
 
+class SubmitVisibilityGdsPrefix : public testing::TestWithParam<uint32_t> {};
+
+TEST_P(SubmitVisibilityGdsPrefix, UploadPrecedesFirstAddressCopy) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    uint32_t source = 0x12345678u, copied = 0;
+    auto* gds = compute_gds_backing();
+    ASSERT_NE(gds, nullptr);
+    ASSERT_GE(compute_gds_size(), GetParam() + sizeof(source));
+    uint32_t previous = 0, observed = 0;
+    std::memcpy(&previous, gds + GetParam(), sizeof(previous));
+    std::vector<uint32_t> stream;
+    append_dma(stream, GetParam(), previous ^ 0xffffffffu, sizeof(source), 1u | (3u << 8u));
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied), reinterpret_cast<uint64_t>(&source),
+               sizeof(source), kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    std::memcpy(&observed, gds + GetParam(), sizeof(observed));
+    EXPECT_EQ(copied, source) << "the address copy selects the ordered executor";
+    EXPECT_TRUE(prosper_gpu_submit_scope_active());
+    EXPECT_EQ(observed, previous ^ 0xffffffffu)
+        << "prefix GDS uploads use their own domain and execute before the copy";
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    std::memcpy(gds + GetParam(), &previous, sizeof(previous));
+}
+
+INSTANTIATE_TEST_SUITE_P(ZeroAndNonzeroOffsets, SubmitVisibilityGdsPrefix,
+                         testing::Values(0u, 0x24u));
+
+TEST(SubmitVisibilityDefault, AddresslessPipelineEventDoesNotBlockResources) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    uint32_t upload = 0, source = 0x12345678u, copied = 0;
+    std::vector<uint32_t> stream{0xc0000000u | (IT_EVENT_WRITE << 8u), 0x16u};
+    append_write(stream, &upload, 0x87654321u);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied), reinterpret_cast<uint64_t>(&source),
+               sizeof(source), kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_TRUE(prosper_gpu_submit_scope_active());
+    EXPECT_EQ(upload, 0x87654321u);
+    EXPECT_EQ(copied, source) << "an address-less pipeline event has no private memory footprint";
+}
+
 TEST(SubmitVisibilityDefault, ReadyDeferredTailRetainsCompletionOwnership) {
     register_builtin_hle();
     const auto submit = Hle::lookup("UglJIZjGssM");
@@ -385,6 +454,316 @@ TEST_P(SubmitVisibilityDma, AliasingCopyOwnsItsSourceAndFeedsALaterCopy) {
 }
 
 INSTANTIATE_TEST_SUITE_P(ExactAndPartialOverlap, SubmitVisibilityDma, testing::Bool());
+
+// Map a second virtual window onto the second physical page, then split the first tracker
+// record. Neither a virtual overlap nor the first mapping record can identify this alias.
+struct DirectAliases {
+    static constexpr uint64_t page = 0x10000;
+    using Function = decltype(Hle::lookup(""));
+    Function unmap = nullptr, release = nullptr;
+    uint64_t physical = 0, first = 0, second = 0, first_bytes = 2 * page;
+    bool initialize(bool first_page_alias = false) {
+        register_builtin_hle();
+        const auto allocate = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
+        const auto map = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+        const auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
+        unmap = Hle::lookup(nid_hash("sceKernelMunmap"));
+        release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
+        return allocate && map && protect && unmap && release &&
+               allocate(0, 16ull << 30, 2 * page, page, 0, reinterpret_cast<uint64_t>(&physical)) ==
+                   0 &&
+               physical &&
+               map(reinterpret_cast<uint64_t>(&first), 2 * page, 2, 0, physical, page) == 0 &&
+               first &&
+               map(reinterpret_cast<uint64_t>(&second), page, 2, 0,
+                   physical + (first_page_alias ? 0 : page), page) == 0 &&
+               second && second != first && protect(first + page, 0x4000, 2, 0, 0, 0) == 0;
+    }
+    ~DirectAliases() {
+        if (first && unmap) EXPECT_EQ(unmap(first, first_bytes, 0, 0, 0, 0), 0u);
+        if (second && unmap) EXPECT_EQ(unmap(second, page, 0, 0, 0, 0), 0u);
+        if (physical && release) EXPECT_EQ(release(physical, 2 * page, 0, 0, 0, 0), 0u);
+    }
+    uint64_t* label() const { return reinterpret_cast<uint64_t*>(first + page + 0x128); }
+    uint64_t alias() const { return second + 0x128; }
+};
+
+TEST_P(SubmitVisibilityDma, ReadsPrivateCompletionViaPhysicalAlias) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    ASSERT_EQ(guest_memory_topology_relation(reinterpret_cast<uint64_t>(aliases.label()), 8,
+                                             aliases.alias(), 8),
+              GuestMemoryTopologyRelation::Overlap);
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    *aliases.label() = 0xaaaaaaaa55555555ull;
+    constexpr uint64_t completed = 0x0123456789abcdefull;
+    const uint32_t offset = GetParam() ? 2u : 0u, bytes = GetParam() ? 4u : 8u;
+    uint64_t copied = 0, expected = 0;
+    std::memcpy(&expected, reinterpret_cast<const uint8_t*>(&completed) + offset, bytes);
+    std::vector<uint32_t> stream;
+    append_release(stream, aliases.label(), completed);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied), aliases.alias() + offset, bytes,
+               kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_EQ(copied, expected) << "a second VA names the same private physical bytes";
+    EXPECT_EQ(*aliases.label(), 0xaaaaaaaa55555555ull);
+}
+
+TEST_P(SubmitVisibilityDma, CopyToPhysicalAliasRemainsPrivate) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    *aliases.label() = 0xaaaaaaaa55555555ull;
+    uint64_t source = 0x1020304050607080ull, copied = 0;
+    uint64_t expected = 0x0123456789abcdefull;
+    const uint32_t offset = GetParam() ? 2u : 0u, bytes = GetParam() ? 3u : 8u;
+    std::memcpy(reinterpret_cast<uint8_t*>(&expected) + offset, &source, bytes);
+    std::vector<uint32_t> stream;
+    append_release(stream, aliases.label(), 0x0123456789abcdefull);
+    append_dma(stream, aliases.alias() + offset, reinterpret_cast<uint64_t>(&source), bytes,
+               kDmaDataAddressSource);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied),
+               reinterpret_cast<uint64_t>(aliases.label()), 8, kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_EQ(*aliases.label(), 0xaaaaaaaa55555555ull)
+        << "a physically aliased destination must not release the CPU-visible label";
+    EXPECT_EQ(copied, expected) << "a later consumer sees the alias write after the completion";
+    source = ~source;
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*aliases.label(), expected);
+}
+
+TEST_P(SubmitVisibilityDma, ResourceWriteToPhysicalAliasRemainsPrivate) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    *aliases.label() = 0xaaaaaaaa55555555ull;
+    uint64_t expected = 0x0123456789abcdefull;
+    const uint32_t offset = GetParam() ? 4u : 0u, value = 0x10203040u;
+    uint64_t copied = 0;
+    std::memcpy(reinterpret_cast<uint8_t*>(&expected) + offset, &value, sizeof(value));
+    std::vector<uint32_t> stream;
+    append_release(stream, aliases.label(), 0x0123456789abcdefull);
+    append_write(stream, reinterpret_cast<void*>(aliases.alias() + offset), value);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied),
+               reinterpret_cast<uint64_t>(aliases.label()), 8, kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    EXPECT_EQ(*aliases.label(), 0xaaaaaaaa55555555ull);
+    EXPECT_EQ(copied, expected) << "renderer drain cannot expose a physically aliased label write";
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*aliases.label(), expected);
+}
+
+TEST(SubmitVisibilityDefault, MappingSlicesAreExactAndFailWithoutPartialProof) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    {
+        const GuestMappingLease lease;
+        std::vector<GuestMemoryMappingSlice> slices;
+        GuestMemoryMappingCoverage coverage = GuestMemoryMappingCoverage::Untracked;
+        ASSERT_TRUE(guest_memory_mapping_slices(lease, aliases.first, 2 * DirectAliases::page,
+                                                slices, &coverage));
+        EXPECT_EQ(coverage, GuestMemoryMappingCoverage::Complete);
+        ASSERT_EQ(slices.size(), 1u) << "a protection split preserves contiguous physical bytes";
+        EXPECT_EQ(slices[0].offset, 0u);
+        EXPECT_EQ(slices[0].physical, aliases.physical);
+        EXPECT_EQ(slices[0].bytes, 2 * DirectAliases::page);
+        EXPECT_TRUE(slices[0].direct);
+        ASSERT_TRUE(guest_memory_mapping_slices(lease, aliases.alias(), 8, slices));
+        ASSERT_EQ(slices.size(), 1u);
+        EXPECT_EQ(slices[0].physical, aliases.physical + DirectAliases::page + 0x128);
+        for (const auto& range : std::array<std::array<uint64_t, 2>, 3>{
+                 {{0, 8}, {aliases.first, 0}, {UINT64_MAX - 3, 8}}}) {
+            EXPECT_FALSE(guest_memory_mapping_slices(lease, range[0], range[1], slices, &coverage));
+            EXPECT_EQ(coverage, GuestMemoryMappingCoverage::Incomplete);
+            EXPECT_TRUE(slices.empty()) << "unknown topology cannot leave an earlier proof";
+        }
+    }
+    ASSERT_EQ(aliases.unmap(aliases.first + DirectAliases::page, DirectAliases::page, 0, 0, 0, 0),
+              0u);
+    aliases.first_bytes = DirectAliases::page;
+    {
+        const GuestMappingLease lease;
+        std::vector<GuestMemoryMappingSlice> slices{{0, 8, aliases.physical, true}};
+        GuestMemoryMappingCoverage coverage = GuestMemoryMappingCoverage::Complete;
+        EXPECT_FALSE(guest_memory_mapping_slices(lease, aliases.first, 2 * DirectAliases::page,
+                                                 slices, &coverage));
+        EXPECT_EQ(coverage, GuestMemoryMappingCoverage::Incomplete);
+        EXPECT_TRUE(slices.empty()) << "a mapped prefix cannot prove the missing suffix";
+    }
+}
+
+#ifdef PROSPER_TEST_NATIVE_UNTRACKED_TAIL
+// Replace only our unmapped tail, without overwriting another allocation. The resulting source
+// is readable across a direct prefix and an untracked native suffix: readability is not topology.
+struct UntrackedTail {
+    uint64_t address = 0;
+    bool initialize(uint64_t requested) {
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+        flags |= MAP_FIXED_NOREPLACE;
+#endif
+        void* mapped = mmap(reinterpret_cast<void*>(requested), DirectAliases::page,
+                            PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (mapped == MAP_FAILED) return false;
+        if (reinterpret_cast<uint64_t>(mapped) != requested) {
+            munmap(mapped, DirectAliases::page);
+            return false;
+        }
+        address = requested;
+        host::notify_guest_mapping_added(address, DirectAliases::page, true);
+        return true;
+    }
+    ~UntrackedTail() {
+        if (!address) return;
+        host::notify_guest_mapping_removed(address, DirectAliases::page);
+        EXPECT_EQ(munmap(reinterpret_cast<void*>(address), DirectAliases::page), 0);
+    }
+};
+
+class SubmitVisibilityIncomplete : public testing::TestWithParam<bool> {};
+
+TEST_P(SubmitVisibilityIncomplete, ReadableMixedRangeCannotBypassPrivateAlias) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize(true));
+    ASSERT_EQ(aliases.unmap(aliases.first + DirectAliases::page, DirectAliases::page, 0, 0, 0, 0),
+              0u);
+    aliases.first_bytes = DirectAliases::page;
+    UntrackedTail tail;
+    ASSERT_TRUE(tail.initialize(aliases.first + DirectAliases::page));
+    auto* label = reinterpret_cast<uint64_t*>(aliases.second + DirectAliases::page - 8);
+    const uint64_t mixed = aliases.first + DirectAliases::page - 8;
+    {
+        const GuestMappingLease lease;
+        GuestMemoryMappingCoverage coverage = GuestMemoryMappingCoverage::Complete;
+        std::vector<GuestMemoryMappingSlice> slices;
+        EXPECT_FALSE(guest_memory_mapping_slices(lease, mixed, 16, slices, &coverage));
+        EXPECT_EQ(coverage, GuestMemoryMappingCoverage::Incomplete);
+        EXPECT_TRUE(slices.empty());
+        EXPECT_FALSE(guest_memory_mapping_slices(lease, tail.address, 8, slices, &coverage));
+        EXPECT_EQ(coverage, GuestMemoryMappingCoverage::Untracked);
+        EXPECT_TRUE(slices.empty());
+    }
+    *label = 0xaaaaaaaa55555555ull;
+    std::memset(reinterpret_cast<void*>(tail.address), 0x53, 8);
+    std::array<uint8_t, 16> copied{};
+    GpuState::DmaCopy copy{};
+    copy.src = mixed;
+    copy.dst = reinterpret_cast<uint64_t>(copied.data());
+    copy.bytes = copied.size();
+    copy.sels = kDmaDataAddressSource;
+    prosper_gpu_drain_completion_writes();
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn noop_retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command pipeline_event{};
+    pipeline_event.kind = Pm4Command::Kind::EventWrite;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(pipeline_event, 1));
+    ASSERT_TRUE(execute_ordered_dma_copy(copy))
+        << "both halves are readable; an address-less event adds no private dependency";
+    ASSERT_EQ(std::memcmp(copied.data(), reinterpret_cast<void*>(mixed), copied.size()), 0);
+    prosper_gpu_submit_scope_end();
+    noop_retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    copied.fill(0x79);
+    if (GetParam()) std::swap(copy.src, copy.dst);
+    std::array<uint8_t, 16> before;
+    std::memcpy(before.data(), reinterpret_cast<void*>(copy.dst), before.size());
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(label);
+    completion.rel_value = 0x0123456789abcdefull;
+    completion.rel_value_valid = true;
+    completion.rel_data_sel = 2;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    EXPECT_FALSE(execute_ordered_dma_copy(copy))
+        << "partial mapping identity cannot establish independence from a private physical alias";
+    EXPECT_EQ(std::memcmp(before.data(), reinterpret_cast<void*>(copy.dst), before.size()), 0);
+    EXPECT_EQ(*label, 0xaaaaaaaa55555555ull);
+}
+
+INSTANTIATE_TEST_SUITE_P(SourceAndDestination, SubmitVisibilityIncomplete, testing::Bool());
+#endif
+
+class SubmitVisibilitySuffix : public testing::TestWithParam<bool> {};
+
+TEST_P(SubmitVisibilitySuffix, OverlappingTailPreservesPrivateWriteOrder) {
+    register_builtin_hle();
+    const auto submit = Hle::lookup("UglJIZjGssM");
+    const auto hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit, nullptr);
+    ASSERT_NE(hook, nullptr);
+    prosper_gpu_drain_completion_writes();
+    alignas(8) std::array<uint8_t, 32> destination{};
+    std::array<uint8_t, 32> source;
+    source.fill(0x53);
+    uint32_t suffix = 0x12345678u, copied = 0;
+    std::vector<uint32_t> stream;
+    append_release(stream, reinterpret_cast<uint64_t*>(destination.data()), 1);
+    append_dma(stream, reinterpret_cast<uint64_t>(destination.data()),
+               reinterpret_cast<uint64_t>(source.data()), source.size(), kDmaDataAddressSource);
+    if (GetParam())
+        append_dma(stream, reinterpret_cast<uint64_t>(destination.data() + 16),
+                   reinterpret_cast<uint64_t>(&suffix), sizeof(suffix), kDmaDataAddressSource);
+    else
+        append_write(stream, destination.data() + 16, suffix);
+    append_dma(stream, reinterpret_cast<uint64_t>(&copied),
+               reinterpret_cast<uint64_t>(destination.data() + 16), sizeof(copied),
+               kDmaDataAddressSource);
+    struct Packet {
+        uint32_t* address;
+        uint32_t words, padding;
+    } packet{stream.data(), static_cast<uint32_t>(stream.size()), 0};
+    EXPECT_EQ(submit(reinterpret_cast<uint64_t>(&packet), 0, 0, 0, 0, 0), 0u);
+    SubmitReturn retirement{hook};
+    uint32_t public_tail = 0;
+    std::memcpy(&public_tail, destination.data() + 16, sizeof(public_tail));
+    EXPECT_EQ(public_tail, 0u) << "the tail overlaps an earlier private DMA, outside its fence";
+    EXPECT_EQ(copied, suffix) << "the final consumer must see the suffix in FIFO order";
+    source.fill(0x79);
+    suffix = ~suffix;
+    hook();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    uint32_t retired_tail = 0;
+    std::memcpy(&retired_tail, destination.data() + 16, sizeof(retired_tail));
+    EXPECT_EQ(retired_tail, 0x12345678u) << "the older large DMA cannot overwrite a later write";
+    EXPECT_EQ(destination[0], 0x53u) << "the private DMA owns its already consumed source";
+}
+
+INSTANTIATE_TEST_SUITE_P(WriteAndDmaSuffix, SubmitVisibilitySuffix, testing::Bool());
 
 TEST(SubmitVisibilityDefault, MemoryToGdsConsumesPrivateCompletionAtOffsetZero) {
     register_builtin_hle();

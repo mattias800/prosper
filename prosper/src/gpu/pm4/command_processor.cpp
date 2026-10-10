@@ -3198,127 +3198,43 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
     PendQueue& p = pend_q();
     static const bool batch_enabled =
         std::getenv("PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN") == nullptr;
-    if (!batch_enabled) {
-        for (;;) {
-            std::unique_lock<std::mutex> lk(p.mx);
-            if (p.inflight > 0) {
-                p.cv.wait(lk);
-                continue;
-            }
-            auto overlaps_completion = [&](uint64_t addr, uint64_t bytes) {
-                if (!addr || !bytes) return true;
-                const uint64_t end = addr + bytes;
-                if (end < addr) return true;
-                for (const PendWrite& queued : p.q) {
-                    uint64_t target = 0, target_bytes = 0;
-                    if (queued.cmd.kind == Pm4Command::Kind::ReleaseMem) {
-                        target = queued.cmd.rel_addr;
-                        target_bytes = queued.cmd.rel_data_sel == 1 ? 4 : 8;
-                    } else if (queued.cmd.kind == Pm4Command::Kind::EventWrite) {
-                        target = queued.cmd.event_addr;
-                        target_bytes = 8;
-                    }
-                    if (target && target < end && addr < target + target_bytes) return true;
-                }
-                return false;
-            };
-            auto it = std::find_if(p.q.begin(), p.q.end(), [&](const PendWrite& w) {
-                using K = Pm4Command::Kind;
-                if (w.cmd.kind == K::DmaData)
-                    return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
-                if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num)
-                    return false;
-                const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
-                return !overlaps_completion(w.cmd.wd_addr, bytes);
-            });
-            if (it == p.q.end()) return;
-            PendWrite w = std::move(*it);
-            p.q.erase(it);
-            p.inflight++;
-            lk.unlock();
-            pend_age_note(w.queued);
-            apply_deferred_effect(w.cmd, w.dma_copy.empty() ? nullptr : w.dma_copy.data(),
-                                  w.packet_addr);
-            lk.lock();
-            p.inflight--;
-            p.cv.notify_all();
-        }
-    }
-
-    struct CompletionSpan {
-        uint64_t begin = 0;
-        uint64_t end = 0;
-    };
     for (;;) {
+        // Observe topology before taking the completion lock. Mapping transactions cannot replace
+        // these physical identities while selection and resource publication use them.
+        const GuestMappingLease lease;
         std::unique_lock<std::mutex> lk(p.mx);
         if (p.inflight > 0) {
             p.cv.wait(lk);
             continue;
         }
-        std::vector<CompletionSpan> completion_spans;
-        completion_spans.reserve(p.q.size());
-        for (const PendWrite& queued : p.q) {
-            uint64_t target = 0, target_bytes = 0;
-            if (queued.cmd.kind == Pm4Command::Kind::ReleaseMem) {
-                target = queued.cmd.rel_addr;
-                target_bytes = queued.cmd.rel_data_sel == 1 ? 4 : 8;
-            } else if (queued.cmd.kind == Pm4Command::Kind::EventWrite) {
-                target = queued.cmd.event_addr;
-                target_bytes = 8;
-            }
-            if (!target || !target_bytes) continue;
-            completion_spans.push_back({
-                target,
-                target > UINT64_MAX - target_bytes ? UINT64_MAX : target + target_bytes});
+        std::vector<Pm4Command> commands;
+        std::vector<PendingMemoryGeometry> geometry;
+        commands.reserve(p.q.size());
+        geometry.reserve(p.q.size());
+        for (const auto& write : p.q) {
+            commands.push_back(write.cmd);
+            geometry.push_back(pending_memory_geometry(lease, pending_memory_span(write.cmd)));
         }
-        std::sort(completion_spans.begin(), completion_spans.end(),
-                  [](const CompletionSpan& a, const CompletionSpan& b) {
-                      return a.begin < b.begin || (a.begin == b.begin && a.end < b.end);
-                  });
-        size_t merged_count = 0;
-        for (const CompletionSpan& span : completion_spans) {
-            if (merged_count && span.begin <= completion_spans[merged_count - 1].end) {
-                completion_spans[merged_count - 1].end =
-                    std::max(completion_spans[merged_count - 1].end, span.end);
-            } else {
-                completion_spans[merged_count++] = span;
+        auto selected = pending_renderer_selection(commands, geometry);
+        if (!batch_enabled) {
+            bool found = false;
+            for (size_t i = 0; i < selected.size(); ++i) {
+                if (found) selected[i] = false;
+                found |= selected[i];
             }
         }
-        completion_spans.resize(merged_count);
-        auto overlaps_completion = [&](uint64_t addr, uint64_t bytes) {
-            if (!addr || !bytes || addr > UINT64_MAX - bytes) return true;
-            const uint64_t end = addr + bytes;
-            const auto found = std::lower_bound(
-                completion_spans.begin(), completion_spans.end(), addr,
-                [](const CompletionSpan& span, uint64_t value) {
-                    return span.end <= value;
-                });
-            return found != completion_spans.end() && found->begin < end;
-        };
-        auto renderer_write = [&](const PendWrite& w) {
-            using K = Pm4Command::Kind;
-            if (w.cmd.kind == K::DmaData)
-                return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
-            if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num) return false;
-            const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
-            return !overlaps_completion(w.cmd.wd_addr, bytes);
-        };
-        const size_t ready_count = static_cast<size_t>(std::count_if(
-            p.q.begin(), p.q.end(), renderer_write));
+        const size_t ready_count = std::count(selected.begin(), selected.end(), true);
         if (!ready_count) return;
-
-        // Extract every currently eligible resource write in one stable partition. The previous
-        // loop searched the complete queue for every candidate and erased one deque element at a
-        // time. A submit with thousands of private completion labels therefore became quadratic
-        // before Vulkan saw any work. The lock makes this snapshot atomic with enqueue; writes
-        // appended after the partition are later in queue order and cannot be overtaken.
+        // Stable partition preserves selected resource order. The closure also keeps a suffix
+        // private when only its earlier large write, rather than the fence itself, overlaps it.
         std::vector<PendWrite> ready;
         ready.reserve(ready_count);
         std::deque<PendWrite> blocked;
+        size_t index = 0;
         while (!p.q.empty()) {
             PendWrite write = std::move(p.q.front());
             p.q.pop_front();
-            if (renderer_write(write))
+            if (selected[index++])
                 ready.push_back(std::move(write));
             else
                 blocked.push_back(std::move(write));
@@ -3698,20 +3614,45 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* auth
     c.dd_sels = copy.sels;
     c.dd_valid = true;
     c.stream_order = copy.command_order;
+    const GuestMappingLease lease;
     const auto form = dma_data_form(c, authoritative_source != nullptr);
     if ((form != DmaDataForm::Copy && form != DmaDataForm::MemoryToGds) || eop_write_sync())
         return honor_dma_data(c, copy.packet_addr, authoritative_source);
     PendQueue& p = pend_q();
     std::unique_lock lock(p.mx);
     p.cv.wait(lock, [&] { return p.inflight == 0; });
-    std::vector<std::pair<Pm4Command, std::span<const uint8_t>>> overlays;
+    struct Overlay {
+        Pm4Command command;
+        std::span<const uint8_t> payload;
+        std::vector<PendingMemoryPatch> patches;
+    };
+    std::vector<Overlay> overlays;
+    const auto source_geometry = pending_memory_geometry(lease, {copy.src, copy.bytes});
+    const auto destination_geometry = form == DmaDataForm::MemoryToGds
+                                          ? PendingMemoryGeometry{}
+                                          : pending_memory_geometry(lease, {copy.dst, copy.bytes});
+    const auto unresolved_topology = [] {
+        std::fprintf(stderr, "[agc] DMA_DATA private alias topology unresolved; copy REFUSED\n");
+        return false;
+    };
+    const bool private_memory = std::any_of(p.q.begin(), p.q.end(), [](const auto& write) {
+        const auto span = pending_memory_span(write.cmd);
+        return span.address && span.bytes;
+    });
+    if (private_memory && (source_geometry.coverage == GuestMemoryMappingCoverage::Incomplete ||
+                           destination_geometry.coverage == GuestMemoryMappingCoverage::Incomplete))
+        return unresolved_topology();
     bool private_destination = false;
     for (const auto& write : p.q) {
-        const auto span = pending_memory_span(write.cmd);
-        if (pending_memory_overlaps(span, {copy.src, copy.bytes}))
-            overlays.emplace_back(write.cmd, write.dma_copy);
-        if (form != DmaDataForm::MemoryToGds && pending_memory_completion(write.cmd))
-            private_destination |= pending_memory_overlaps(span, {copy.dst, copy.bytes});
+        const auto geometry = pending_memory_geometry(lease, pending_memory_span(write.cmd));
+        if (geometry.virtual_span.bytes &&
+            geometry.coverage == GuestMemoryMappingCoverage::Incomplete)
+            return unresolved_topology();
+        auto patches = pending_memory_patches(geometry, source_geometry);
+        if (!patches.empty()) overlays.push_back({write.cmd, write.dma_copy, std::move(patches)});
+        // Every earlier queued write is an ordering blocker, including the part of a private DMA
+        // outside its original completion label. Physical aliases share that same byte order.
+        private_destination |= !pending_memory_patches(geometry, destination_geometry).empty();
     }
     if (overlays.empty() && !private_destination) {
         lock.unlock();
@@ -3734,12 +3675,14 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* auth
                 authoritative_source ? authoritative_source
                                      : reinterpret_cast<const uint8_t*>(uintptr_t(copy.src)),
                 copy.bytes);
-    for (const auto& [command, payload] : overlays) {
-        if (overlay_pending_memory(command, payload, copy.src, captured) ==
-            PendingMemoryOverlay::Unresolved) {
-            std::fprintf(stderr,
-                         "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
-            return false;
+    for (const auto& overlay : overlays) {
+        for (const auto& patch : overlay.patches) {
+            if (overlay_pending_memory_patch(overlay.command, overlay.payload, patch, captured) ==
+                PendingMemoryOverlay::Unresolved) {
+                std::fprintf(stderr,
+                             "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
+                return false;
+            }
         }
     }
     if (!private_destination) return honor_dma_data(c, copy.packet_addr, captured.data());

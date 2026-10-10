@@ -148,11 +148,12 @@ a typo silently ran a different experiment than the one asked for (#3253, after 
 measurement). `env_u64_or_default*` refuses loudly and keeps the default; the accepted grammar is
 exactly `[0-9]+`.
 
-`env_tristate_or_unset` in the same header is the one non-numeric member, and it exists because an
-A/B **lever** has a third answer that a number cannot express: `PROSPER_POST_SUBMIT_VISIBILITY` is
-`1` forced on, `0` forced off, and UNSET meaning "follow the SDK version the guest asked for". Read
-with `strtol` that collapsed -- `=on`, `=true`, `=yes` and `=enabled` all parse to 0, so every word
-spelling ran the FORCED-OFF arm and the site announced it as deliberate (#3304). It accepts
+`env_tristate_or_unset` in the same header handles an A/B lever's third answer: preserve its
+default. Its original caller, `PROSPER_POST_SUBMIT_VISIBILITY`, formerly used `1` for forced on,
+`0` for forced off, and UNSET to follow the requested SDK version. #2220 removes that selector;
+completion ownership belongs to the submit import for every SDK. With `strtol`, `=on`, `=true`,
+`=yes` and `=enabled` all parsed to 0, so every word spelling ran the FORCED-OFF arm and the site
+announced it as deliberate (#3304). The helper accepts
 `1`/`on`/`true`/`yes`/`enabled` and `0`/`off`/`false`/`no`/`disabled` in either case, plus `0x1` and
 `0x0` because the site it was written for read base 0; anything else -- including a number that is
 neither 0 nor 1 -- is UNSET with a line naming the value, never a silent third arm.
