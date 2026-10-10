@@ -10638,9 +10638,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         static_cast<size_t>(r->width) * bpt);
                             }
                         } else if (r->tile_mode && dim_3d && r->depth > 1) {
-                            if (!detile_volume(linear.get(), src, need,
-                                               r->width, r->height, r->depth,
-                                               r->tile_mode, bpt)) {
+                            if (r->in_mip_tail) {
+                                if (!detile_volume_tail_level(linear.get(), src, need, r->width,
+                                                              r->height, r->depth, r->tile_mode,
+                                                              bpt, r->mip_tail_x, r->mip_tail_y)) {
+                                    skip_image(r, "sampled volume tail detile failed");
+                                    break;
+                                }
+                            } else if (!detile_volume(linear.get(), src, need, r->width, r->height,
+                                                      r->depth, r->tile_mode, bpt)) {
                                 skip_image(r, "sampled volume detile failed"); break;
                             }
                         } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {

@@ -3081,6 +3081,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core Vulkan::Vulkan)
 
+  # Explicit-LOD 3D sampling carries the guest LOD (#4814): image_sample_l dim:3D
+  # compiles to OpImageSampleExplicitLod instead of refusing.
+  prosper_add_gtest(test_3d_sample_l
+    SOURCES tests/gpu/recompiler/test_3d_sample_l.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
     LIBRARIES prosper_core)

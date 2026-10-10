@@ -4,11 +4,14 @@
 // base/stride/size/format and assigns provenance (srt_offset) + bindings — the contract the recompiler
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/texture/tile.hpp"
 #include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 using namespace prosper::gpu;
 
@@ -1232,4 +1235,117 @@ TEST(BuildShaderResources, Contract) {
     }
 
     EXPECT_EQ(fails, 0);
+}
+
+// Thick-3D tail placement (#4814): Black Flag's 32^3 R8 six-level pyramid (SW_64KB_S)
+// packs every level into the allocation's first 64 KiB block. The coordinates below are
+// AddrLib ComputeSurfaceInfoMacroTiled's thick branch evaluated for that pyramid AND the
+// live PS5 carve: detiling each level through its coordinates reproduces the level above
+// at correlation 1.0000 down the whole chain (L5 byte-exact). A wrong coordinate binds
+// silent wrong texels, so each arm pins exact values, and the refusal arms pin the
+// shapes the proof does not cover.
+TEST(BuildShaderResources, VolumeTailLayout) {
+    constexpr uint32_t kTailX[6] = {32, 0, 16, 8, 0, 0};
+    constexpr uint32_t kTailY[6] = {0, 16, 0, 8, 12, 8};
+    for (uint32_t level = 0; level < 6; ++level) {
+        const TiledVolumeTailLayout layout = tiled_volume_tail_layout(32, 32, 32, 1, 9, 5, level);
+        EXPECT_TRUE(layout.supported) << "pyramid level " << level << " places";
+        EXPECT_EQ(layout.tail_x, kTailX[level]) << "level " << level << " tail_x";
+        EXPECT_EQ(layout.tail_y, kTailY[level]) << "level " << level << " tail_y";
+        EXPECT_EQ(layout.tail_block_bytes, 65536u) << "level " << level << " shares block zero";
+    }
+    // Outside the proof: 4KB S3 packs under different tail dims, thin modes swizzle Z as
+    // 2D rows, and a level past MAX_MIP has no placement at all.
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 32, 1, 5, 5, 1).supported)
+        << "Sw4KbS volume tail stays refused";
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 32, 1, 27, 5, 1).supported)
+        << "Sw64KbRX volume tail stays refused";
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 32, 1, 9, 5, 6).supported)
+        << "level past MAX_MIP stays refused";
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 32, 3, 9, 5, 1).supported)
+        << "unmodelled element size stays refused";
+    // A chain whose level zero is not itself in the tail owns disjoint bytes no in-block
+    // coordinate can name: 512^3 needs its own first block per level.
+    EXPECT_FALSE(tiled_volume_tail_layout(512, 512, 512, 1, 9, 9, 0).supported)
+        << "non-tail level zero stays refused";
+}
+
+// The six single-level views over that pyramid decode to supported views at the proven
+// coordinates, with the allocation base unshifted and the level extent selected.
+TEST(BuildShaderResources, VolumeTailView) {
+    Gen5ImageFormatInfo fi;
+    ASSERT_TRUE(gen5_image_format(1, &fi)) << "R8 fixture format maps";
+    constexpr uint32_t kTailX[6] = {32, 0, 16, 8, 0, 0};
+    constexpr uint32_t kTailY[6] = {0, 16, 0, 8, 12, 8};
+    for (uint32_t level = 0; level < 6; ++level) {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (level << 12) | (level << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor d = decode_image_descriptor(t);
+        ASSERT_EQ(d.base_level, level) << "fixture selects level " << level;
+        ASSERT_EQ(d.last_level, level) << "fixture is single-level";
+        ASSERT_EQ(d.max_mip, 5u) << "fixture chain ends at level 5";
+        const DecodedImageView v = image_base_level_view(d, fi);
+        EXPECT_TRUE(v.supported) << "pyramid level " << level << " view admits";
+        EXPECT_EQ(v.base, 0x4066a90000ull) << "tail view keeps the allocation base";
+        EXPECT_EQ(v.width, std::max(32u >> level, 1u)) << "level extent shifts";
+        EXPECT_EQ(v.height, std::max(32u >> level, 1u)) << "level extent shifts";
+        EXPECT_EQ(v.depth, std::max(32u >> level, 1u)) << "level depth shifts";
+        EXPECT_TRUE(v.in_mip_tail) << "level lives in the shared block";
+        EXPECT_EQ(v.mip_tail_bytes, 65536u) << "upload reads the shared block";
+        EXPECT_EQ(v.mip_tail_x, kTailX[level]) << "proven tail_x";
+        EXPECT_EQ(v.mip_tail_y, kTailY[level]) << "proven tail_y";
+    }
+    // A multi-level chain view stays refused: per-level materialization needs volume
+    // support in mip_chain_plan, which does not exist yet.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (1u << 12) | (5u << 16);
+        t[5] |= 5u << 4;
+        EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
+            << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
+    }
+}
+
+// The tail detile at the zero translation is byte-identical to the proven whole-block
+// detile: the translation mechanism cannot drift from the path the carve validated.
+TEST(BuildShaderResources, VolumeTailDetileMechanism) {
+    uint64_t lcg = 0x123456789abcdefull;
+    std::vector<uint8_t> block(65536);
+    for (auto& b : block) {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        b = static_cast<uint8_t>(lcg >> 33);
+    }
+    std::vector<uint8_t> whole(32 * 32 * 32), tail(32 * 32 * 32);
+    ASSERT_TRUE(detile_volume(whole.data(), block.data(), block.size(), 32, 32, 32, 9, 1))
+        << "whole-block detile admits the synthetic block";
+    ASSERT_TRUE(
+        detile_volume_tail_level(tail.data(), block.data(), block.size(), 32, 32, 32, 9, 1, 0, 0))
+        << "tail detile admits the zero translation";
+    EXPECT_EQ(tail, whole) << "zero-translation tail detile is the proven block detile";
+    // Hand-computed equation spots (1B S3 pattern row, read off kSw64kbS3[0] by hand, not
+    // through the implementation): texel (1,0,0)->byte 1, (0,1,0)->byte 8, (0,0,1)->byte 4,
+    // and the translated origin (32,0,0)->byte 32768. A transcription slip in either the
+    // test or the implementation breaks these; the carve breaks a shared one.
+    std::vector<uint8_t> spot(65536, 0);
+    spot[1] = 0xA1;
+    spot[8] = 0xB2;
+    spot[4] = 0xC4;
+    spot[32768] = 0xD3;
+    std::vector<uint8_t> cube(2 * 2 * 2, 0);
+    ASSERT_TRUE(
+        detile_volume_tail_level(cube.data(), spot.data(), spot.size(), 2, 2, 2, 9, 1, 0, 0))
+        << "tail detile admits the spot block";
+    EXPECT_EQ(cube[1], 0xA1) << "texel (1,0,0) reads byte 1";
+    EXPECT_EQ(cube[2], 0xB2) << "texel (0,1,0) reads byte 8";
+    EXPECT_EQ(cube[4], 0xC4) << "texel (0,0,1) reads byte 4";
+    std::vector<uint8_t> one(1, 0);
+    ASSERT_TRUE(
+        detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1, 9, 1, 32, 0))
+        << "tail detile admits the translated origin";
+    EXPECT_EQ(one[0], 0xD3) << "translated origin (32,0,0) reads byte 32768";
 }

@@ -2174,12 +2174,102 @@ bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
         return sw4kb_s3_volume_copy<true>(dst, src, need, width, height, depth,
                                         bytes_per_texel);
     return tile_mode == (uint32_t)TileMode::Sw64KbS
-               ? sw64kb_s3_volume_copy<true>(dst, src, need, width, height, depth,
-                                              bytes_per_texel)
-               : sw64kb_rx_volume_copy<true>(dst, src, need, width, height, depth,
-                                              bytes_per_texel);
+               ? sw64kb_s3_volume_copy<true>(dst, src, need, width, height, depth, bytes_per_texel)
+               : sw64kb_rx_volume_copy<true>(dst, src, need, width, height, depth, bytes_per_texel);
 }
 
+// AddrLib Block256_3d: the 256-byte microblock geometry per element size, row-indexed by
+// log2(bytes-per-element) like kSw64kbS3Dims. A tail level's origin is (mipX * w, mipY * h)
+// inside the shared 64 KiB block; the d column sizes the conservative byte origin below.
+constexpr uint32_t kBlock256S3[5][3] = {{8, 4, 8}, {4, 4, 8}, {4, 4, 4}, {4, 2, 4}, {2, 2, 4}};
+
+TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, uint32_t depth,
+                                               uint32_t bytes_per_texel, uint32_t tile_mode,
+                                               uint32_t max_mip, uint32_t mip_level) {
+    TiledVolumeTailLayout result;
+    // Proven only for SW_64KB_S thick-3D all-in-tail chains (see tile.hpp). A 4KB S3 chain
+    // packs under different tail dims, thin modes swizzle Z slices as 2D rows, and a level
+    // outside the tail owns disjoint bytes no in-block coordinate can name.
+    if (tile_mode != (uint32_t)TileMode::Sw64KbS) return result;
+    if (!width || !height || !depth || !bytes_per_texel) return result;
+    if (mip_level > max_mip || max_mip >= 16u) return result;
+    const uint32_t el = sw64kb_elem_log2(bytes_per_texel);
+    if (el == UINT32_MAX) return result;
+    // AddrLib Lib::GetMipTailDim, thick branch: log2(64KiB) % 3 == 1 halves the width.
+    const uint32_t tail_w = kSw64kbS3Dims[el][0] >> 1;
+    const uint32_t tail_h = kSw64kbS3Dims[el][1];
+    // AddrLib Gfx10Lib::GetMaxNumMipsInTail(16, /*isThin=*/false).
+    const uint32_t effective_log2 = 16u - (16u - 8u) / 3u;
+    const uint32_t max_tail_levels =
+        effective_log2 <= 11u ? 1u + (1u << (effective_log2 - 9u)) : effective_log2 - 4u;
+    const uint32_t num_levels = max_mip + 1u;
+    // AddrLib Gfx10Lib::IsInMipTail: the chain is addressable this way only when its
+    // largest level is itself in the tail; smaller levels then follow monotonically.
+    if (width > tail_w || height > tail_h || num_levels > max_tail_levels) return result;
+    // AddrLib ComputeSurfaceInfoMacroTiled tail walk, firstMipInTail == 0.
+    const uint32_t m = max_tail_levels - 1u - mip_level;
+    const uint32_t mip_offset = m > 6u ? (16u << m) : (m << 8u);
+    const uint32_t mip_x = ((mip_offset >> 9) & 1u) | ((mip_offset >> 10) & 2u) |
+                           ((mip_offset >> 11) & 4u) | ((mip_offset >> 12) & 8u) |
+                           ((mip_offset >> 13) & 16u) | ((mip_offset >> 14) & 32u);
+    const uint32_t mip_y = ((mip_offset >> 8) & 1u) | ((mip_offset >> 9) & 2u) |
+                           ((mip_offset >> 10) & 4u) | ((mip_offset >> 11) & 8u) |
+                           ((mip_offset >> 12) & 16u) | ((mip_offset >> 13) & 32u);
+    result.tail_x = mip_x * kBlock256S3[el][0];
+    result.tail_y = mip_y * kBlock256S3[el][1];
+    // AddrLib's conservative in-block origin: mipOffset times the tail depth in
+    // microblock rows (PowTwoAlign of the first tail level's depth). The exact texel
+    // bytes come from (tail_x, tail_y) through the block equation, never from here.
+    const uint32_t micro_d = kBlock256S3[el][2];
+    const uint32_t aligned_depth = (depth + micro_d - 1u) / micro_d;
+    result.byte_offset = static_cast<size_t>(mip_offset) * aligned_depth;
+    result.tail_block_bytes = 1u << 16;
+    result.supported = true;
+    return result;
+}
+
+bool detile_volume_tail_level(uint8_t* dst, const uint8_t* src, size_t src_bytes, uint32_t width,
+                              uint32_t height, uint32_t depth, uint32_t tile_mode,
+                              uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y) {
+    tile_census_note("detile_volume_tail_level", width, census_rows(height, depth), bytes_per_texel,
+                     tile_mode);
+    if (!width || !height || !depth || !bytes_per_texel) return false;
+    if (tile_mode != (uint32_t)TileMode::Sw64KbS) return false;
+    const uint32_t el = sw64kb_elem_log2(bytes_per_texel);
+    if (el == UINT32_MAX) return false;
+    const PatBit3* pat = kSw64kbS3[el];
+    const uint64_t linear_texels = static_cast<uint64_t>(width) * height * depth;
+    if (linear_texels > SIZE_MAX / bytes_per_texel) return false;
+    // The shared-block S3 equation at translated coordinates
+    // (AddrLib ComputeSurfaceAddrFromCoordMacroTiled's tail path: x + tailX, y + tailY,
+    // macroBlockOffset 0). Same per-bit parity as s3_volume_copy; only the inputs shift.
+    for (uint32_t z = 0; z < depth; ++z) {
+        uint32_t fz = 0;
+        for (uint32_t i = el; i < 16u; ++i)
+            fz |= static_cast<uint32_t>(__builtin_popcount(z & pat[i].z) & 1) << i;
+        for (uint32_t y = 0; y < height; ++y) {
+            uint32_t fy = 0;
+            const uint32_t yy = y + tail_y;
+            for (uint32_t i = el; i < 16u; ++i)
+                fy |= static_cast<uint32_t>(__builtin_popcount(yy & pat[i].y) & 1) << i;
+            const uint32_t fzy = fy ^ fz;
+            for (uint32_t x = 0; x < width; ++x) {
+                uint32_t fx = 0;
+                const uint32_t xx = x + tail_x;
+                for (uint32_t i = el; i < 16u; ++i)
+                    fx |= static_cast<uint32_t>(__builtin_popcount(xx & pat[i].x) & 1) << i;
+                const uint64_t tiled = static_cast<uint64_t>(fx ^ fzy);
+                uint8_t* out =
+                    dst + ((static_cast<size_t>(z) * height + y) * width + x) * bytes_per_texel;
+                if (tiled + bytes_per_texel <= src_bytes)
+                    std::memcpy(out, src + tiled, bytes_per_texel);
+                else
+                    std::memset(out, 0, bytes_per_texel);
+            }
+        }
+    }
+    return true;
+}
 
 TileCensusScope::TileCensusScope(const char* who) : prev(g_tile_census_tag) {
     g_tile_census_tag = who;
