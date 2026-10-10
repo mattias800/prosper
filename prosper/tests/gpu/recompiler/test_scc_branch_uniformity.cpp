@@ -196,4 +196,54 @@ TEST(SccBranchUniformity, Contract) {
               "a scalar branch whose load address came from v_readfirstlane is NOT uniform");
     }
 
+    // ---- positive: intervening image loads and waitcnts leave SCC unmodified --------------------
+    // Guest compute shader shape (e.g. Black Flag cs 0x407ed65200 pc 78..93): an s_cmp_eq_u32
+    // produces SCC from uniform launch-derived data, followed by image loads and s_waitcnts before
+    // the s_cbranch_scc1. Memory operations and waitcnts do not modify SCC.
+    const uint32_t mem_intervening_guard[] = {
+        0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
+        0xBF0B811Cu,                // s_cmp_eq_u32 s28, 1
+        0xBF8C3F73u,                // s_waitcnt
+        0xF0200F08u, 0x00080916u,   // image_load_mip v[8:11], ...
+        0xBF8C3F70u,                // s_waitcnt
+        0xBF850001u,                // s_cbranch_scc1 +1
+        0xBF800000u,                // s_nop
+        0xBF810000u,                // s_endpgm
+    };
+    {
+        const std::vector<Rdna2Inst> ins = walk(mem_intervening_guard, std::size(mem_intervening_guard));
+        uint32_t branch_pc = 0;
+        bool saw_image = false;
+        for (const auto& in : ins) {
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+            if (in.fmt == Rdna2Format::MIMG) saw_image = true;
+        }
+        CHECK(saw_image && branch_pc != 0, "fixture contains image_load and s_cbranch_scc1");
+        CHECK(scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "intervening image operations and waitcnts leave SCC unmodified");
+    }
+
+    // ---- negative: intervening VOPC overwrites SCC domain / condition ---------------------------
+    // If a vector compare (VOPC) or other condition writer intervenes before the branch, the
+    // uniform compare condition is clobbered.
+    const uint32_t vopc_intervening_guard[] = {
+        0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
+        0xBF0B811Cu,                // s_cmp_eq_u32 s28, 1
+        0x7D020300u,                // v_cmp_lt_i32 vcc, v0, v1 (VOPC)
+        0xBF850001u,                // s_cbranch_scc1 +1
+        0xBF800000u,
+        0xBF810000u,
+    };
+    {
+        const std::vector<Rdna2Inst> ins = walk(vopc_intervening_guard, std::size(vopc_intervening_guard));
+        uint32_t branch_pc = 0;
+        bool saw_vopc = false;
+        for (const auto& in : ins) {
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+            if (in.fmt == Rdna2Format::VOPC) saw_vopc = true;
+        }
+        CHECK(saw_vopc && branch_pc != 0, "fixture contains v_cmp and s_cbranch_scc1");
+        CHECK(!scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "intervening VOPC stops the uniform SCC walk");
+    }
 }

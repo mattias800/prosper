@@ -2061,12 +2061,23 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             // one asks whether SCC is still scalar-valued, which an SCC WRITER can satisfy. See its
             // definition for the `s_bcnt1_i32_b64` case that separates them.
             //
-            // Everything else still stops the walk. Any other scalar ALU or SOPK instruction may
-            // write SCC, and consuming an older compare through an unmodeled writer would prove
-            // uniformity of a condition the branch never saw.
+            // Likewise, memory loads/stores (IMAGE/MUBUF/MTBUF/MIMG/FLAT/DS/SMEM) and other instructions
+            // that do not write SCC (such as SOPK waitcnts) do not modify SCC.
+            //
+            // Everything else that may write SCC still stops the walk. Any other scalar ALU or SOPK
+            // instruction may write SCC, and consuming an older compare through an unmodeled writer would
+            // prove uniformity of a condition the branch never saw.
             if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode)) continue;
+            if (in.fmt == Rdna2Format::SOPK &&
+                (in.opcode == kSopkOpcodeWaitcntVscnt || in.opcode == kSopkOpcodeWaitcntLgkmcnt))
+                continue;
+            if (in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MIMG ||
+                in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
+                in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::DS ||
+                in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::VINTRP)
+                continue;
             if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                in.fmt == Rdna2Format::SOPK)
+                in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::VOPC)
                 return false;
         }
         return false;                 // SCC entering the region from outside is not proved
