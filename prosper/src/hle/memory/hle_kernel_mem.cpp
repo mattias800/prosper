@@ -18,6 +18,7 @@
 #include "diagnostics/diag_clock.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: -1 here overflowed the MiB multiply
 #include "hle/memory/dmem_caller_chain.hpp"
+#include "hle/memory/ampr_amm_physical_pool.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/memory/guest_mapping_queries.hpp"
 #include "hle/memory/renderer_tracked_mapping.hpp"
@@ -933,6 +934,7 @@ namespace {
         int32_t memory_type;        // direct-memory type; meaningful only with is_direct
         uint32_t query_flags;       // is_flexible / is_direct bits (commit state is separate)
         bool committed;
+        bool amm_owned;   // survives protection retags and partial mapping splits
         char name[32];
     };
     std::mutex g_mx;
@@ -1138,9 +1140,9 @@ namespace {
 
     // A successful host map replaces any reservation record under it. Keeping both as overlays
     // lets the older uncommitted record win same-base queries after the real commit.
-    void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot,
-               bool committed, const char* nm, uint32_t query_flags = 0,
-               uint64_t offset = 0, int32_t memory_type = 0) {
+    void track(uint64_t base, uint64_t size, int prot, uint32_t guest_prot, bool committed,
+               const char* nm, uint32_t query_flags = 0, uint64_t offset = 0,
+               int32_t memory_type = 0, bool amm_owned = false) {
         if (!size || base > UINT64_MAX - size) return;
         const uint64_t end = base + size;
         {
@@ -1169,6 +1171,7 @@ namespace {
             m.memory_type = memory_type;
             m.query_flags = query_flags;
             m.committed = committed;
+            m.amm_owned = amm_owned;
             if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
             insert_mapping_by_base(out, m);
             g_maps.swap(out);
@@ -3162,73 +3165,33 @@ std::atomic<uint64_t> g_amm_no_lazy_commit_base{0};
 
 // --- libSceAmpr AMM (asynchronous memory manager) ----------------------------------------------
 //
-// AMM is the memory-mapping sibling of the APR file reader above (and in hle_file.cpp): the guest
-// records commands into an Ampr command buffer, submits it, and waits for completion — except that
-// the commands MAP and UNMAP pages of a large, sparsely populated virtual heap instead of reading
-// files. Yakuza Kiwami (PPSA31334) runs its entire game heap through it, which is why a boot with
-// these NIDs unimplemented dies at 0.0 s writing to a low address: every one of them fell to the
-// dispatcher's return-0 default, so the guest's AMM virtual-address window stayed whatever its
-// stack happened to hold and its allocator walked into it (#2864).
+// AMM records Map/Unmap operations on a global virtual heap, then submits and waits. Prosper
+// executes both at record time, matching APR reads, so submission is already complete (#2864).
+// Yakuza Kiwami (PPSA31334) runs its heap through AMM. Its SDK wrappers (+0xcc4bb0..+0xcc4ca0),
+// initialiser (+0xdbf390), heap growth (+0xdbbdc6), and traces establish these layouts. Names/NIDs
+// are confirmed against the PS5 3.20 database, which gives names, not signatures:
 //
-// EVIDENCE. Argument order comes from the SDK's own inline wrappers, which are in the eboot at
-// 0xcc4bb0..0xcc4ca0 and are what turn a register dump into a signature; the semantics come from
-// the guest's AMM initialiser at eboot+0xdbf390 and its heap-grow path at eboot+0xdbbdc6. Names
-// and NIDs are the PS5 3.20 firmware database's (`stub_nid_map.py --names ../PS5-3.20_Libs`
-// resolves all seven). The firmware database gives names only — every argument layout below is
-// re-derived from this title's own code.
+// GetVirtualAddressRanges(u64* start, u64* end, u64* r2, u64* r3): the wrapper derives four slots
+// from one struct. The guest uses end-start, deducts 4 GiB, and classifies pointers against the
+// resulting window at +0xda0f61/+0xda2ac0. Its 512 GiB request is address space, not residency.
+// GiveDirectMemory(searchStart, searchEnd, len, alignment, memoryType, off_t* out): the kernel
+// allocator's order. Live arguments are (0, 16 GiB, 10 GiB, 2 MiB, 1, &state+0xec98); a negative
+// result aborts init. The physical allocation remains AMM's across individual Unmap operations.
+// Map(cb, va, size, memoryType, protection): live sizes 0x10000..0x240000, type 0xb..0x12
+// (+0xd9f7cc), protections 0xc3/0xf3. Their 0x30 difference is the GPU read/write pair.
+// SubmitCommandBuffer2(bufferBase, usedBytes, flags, u32* out, u32* completion): the wrapper
+// (+0xcc4c40) reads the base and cursor first. All nine sites wait on state+0xed30 (LAST output),
+// beside state+0xed34, so stores must be 32 bits. WaitCommandBufferCompletion(completionId) follows.
+// Unmap/destructor evidence is beside their handlers below; #2873 records the refused re-Map fault.
 //
-//   sceAmprAmmGetVirtualAddressRanges(u64* r0, u64* r1, u64* r2, u64* r3)
-//       Reports the virtual-address window AMM maps into. The SDK wrapper at 0xcc4c10 takes one
-//       struct pointer and passes &s[0]..&s[3], so all four are out-parameters. The guest uses
-//       r1 - r0 as the span, keeps min(requested, span - 4 GiB) of it, and thereafter classifies
-//       a pointer as AMM memory with (p - r0) < that size (eboot+0xda0f61, +0xda2ac0). It
-//       requests 0x8000000000 (512 GiB), so the window is address space, not memory.
-//   sceAmprAmmGiveDirectMemory(searchStart, searchEnd, len, alignment, memoryType, off_t* out)
-//       Hands AMM a physical pool — the kernel allocator's own six-argument order, and the live
-//       call says so: (0, 0x400000000 = sceKernelGetDirectMemorySize(), 0x280000000 = 10 GiB,
-//       0x200000, 1, &state+0xec98). A negative return aborts the guest's whole AMM init.
-//       Reading a3/a4 the other way round produced a "memory type" of 2,097,152 and a 16 KiB
-//       alignment where the guest asked for 2 MiB — visible in the [amm] pool line, which is why
-//       that line prints both.
-//   sceAmprAmmCommandBufferMap(cb, va, size, memoryType, protection)
-//       Live: (cb, <a VA inside the window>, 0x10000..0x240000, 0xb, 0xc3 or 0xf3). Here a3 really
-//       IS the memory type — it is constant at 0xb across every call, the variable form computes
-//       it as 0xb + (x & 7) (eboot+0xd9f7cc), and 0xf3 - 0xc3 = 0x30 is the GPU read/write pair,
-//       so a4 is as clearly a protection as a3 is not an alignment.
-//   sceAmprAmmSubmitCommandBuffer2(bufferBase, usedBytes, flags, u32* out, u32* outCompletionId)
-//       The wrapper at 0xcc4c40 turns Submit(cb, flags, p1, p2) into this by calling
-//       GetBufferBaseAddress(cb) and GetCurrentOffset(cb) first — which is why
-//       sceAmprCommandBufferGetBufferBaseAddress had to be implemented too. All nine call sites
-//       pass p1 = &state+0xed34 and p2 = &state+0xed30 and then wait on *(u32*)(state+0xed30), so
-//       the COMPLETION ID is the last argument and both slots are 32 bits wide (they are adjacent
-//       dwords — a 64-bit store through either clobbers the other).
-//   sceAmprAmmWaitCommandBufferCompletion(completionId)
-//
-// prosper performs the mapping at RECORD time, exactly as the APR reader performs its reads at
-// append time, so submit == complete and the wait is already satisfied when it is made.
-//
-// THE INVARIANT THAT KEEPS THIS FROM CORRUPTING THE GUEST. A map is refused unless it lands inside
-// the window prosper itself reserved for AMM. That window is a PROT_NONE reservation prosper tracks
-// as UNCOMMITTED, so map_phys_at's no-clobber discipline (#137, and the clobbers it exists to stop
-// — #88, #107) independently refuses to place a mapping anywhere else. Two guards, either of which
-// alone turns a wrong VA into a refusal instead of a MAP_FIXED over live guest memory.
-//
-// A refusal is only *visible* because of the third thing, and this paragraph claimed the opposite
-// until review caught it. On Linux a tracked-but-uncommitted range above 0x1000000000 is a
-// LAZY-COMMIT TARGET: exec_image_linux.cpp's SIGSEGV handler backs a touch of one with a 64 KiB
-// anonymous page and re-executes. Left that way, a refused AMM map would be silently rescued with
-// memory that has no physical alias, no write-watch coverage and a g_maps record still reading
-// "uncommitted" — and the guest could not tell, because it does not test Map's return value
-// (eboot+0xdbbe64 is followed straight by a `lea`, with no `test %eax,%eax` before eax is
-// clobbered). So the window is registered as DECLINING lazy commit (g_no_lazy_commit_*), which
-// turns a refused map into a fault at the exact VA the guest asked for, with this file's log line
-// naming the reason immediately above it. That also closes a straddle: the lazy commit rounds to
-// 64 KiB while a map is only required to be 16 KiB aligned, so a fault in the uncommitted half of a
-// 64 KiB page could otherwise have MAP_FIXED anonymous memory over the committed half — the #88 /
-// #107 clobber class arriving through the fault handler rather than through map_at.
-// CONFIDENCE: HIGH on the argument layouts (SDK wrappers + nine consistent call sites), MED on the
-// window's size and placement (prosper chooses those; the guest only requires the span), LOW on
-// the meaning of the three out-parameters this title never reads — see each below.
+// Map only commits inside our tracked PROT_NONE window; map_phys_at independently refuses live
+// targets (#88/#107). Unmap checks AMM ownership across the ENTIRE span before replacing backing.
+// The window declines lazy commit: otherwise Linux's fault handler substitutes anonymous 64 KiB
+// pages for refused direct maps, defeating aliasing/write-watch and potentially clobbering a live
+// 16 KiB neighbor. The guest never checks Map's result (+0xdbbe64), so refusal must remain visible.
+// CONFIDENCE: HIGH on observed layouts; MED on the chosen window size/placement; LOW on the
+// unobserved output meanings, detailed in the individual handlers below.
+
 namespace {
     // 4 GiB the guest deducts from the span before using it, plus 64 GiB it can actually use. The
     // residency cap is the guest's own: it counts mapped bytes against the direct memory it gave
@@ -3243,7 +3206,7 @@ namespace {
     struct AmmState {
         std::mutex mx;
         uint64_t va_base = 0, va_size = 0;                   // the reported window
-        uint64_t pool_base = 0, pool_end = 0, pool_cursor = 0; // physical pool from GiveDirectMemory
+        AmprAmmPhysicalPool pool;
         std::atomic<uint32_t> next_completion{1};
         // Separate counters: a run that trips the protection-0 NOTE sixteen times must not go on to
         // swallow the first real REFUSED line, which is the one that explains a fault. Raised in
@@ -3294,47 +3257,26 @@ namespace {
                va - state.va_base <= state.va_size - len;
     }
 
-    // Publish the physical pool AMM was given. A second, NON-CONTIGUOUS pool is refused rather
-    // than allowed to replace the first: replacing it would rewind the cursor across physical
-    // pages already mapped into the guest's heap and hand them out a second time — the silent
-    // double-allocation this whole change is written to avoid. Contiguous growth cannot alias, so
-    // it is accepted. No title is known to give twice; if one does, the caller says so loudly and
-    // the fix is a range list rather than one span.
-    bool amm_pool_publish(uint64_t phys, uint64_t len) {
-        AmmState& state = amm();
-        std::lock_guard<std::mutex> lk(state.mx);
-        if (!state.pool_end) {
-            state.pool_base = phys;
-            state.pool_end = phys + len;
-            state.pool_cursor = phys;
-            return true;
+    // Snapshot every physical slice being released BEFORE touching the host mapping. The mapping
+    // lifetime lease excludes other writers; g_mx protects queries. Check the entire span so a
+    // hole or a kernel mapping inside the AMM window cannot turn Unmap into a clobber.
+    bool amm_mapped_parts(uint64_t va, uint64_t len, std::vector<Mapping>& parts) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        const uint64_t end = va + len;
+        uint64_t cursor = va;
+        for (const auto& mapping : g_maps) {
+            if (mapping.base + mapping.size <= cursor) continue;
+            if (mapping.base > cursor || !mapping.committed || !mapping.amm_owned ||
+                !(mapping.query_flags & kVirtualQueryDirect))
+                return false;
+            Mapping part = mapping;
+            rebase_mapping(part, cursor);
+            part.size = std::min(end, mapping.base + mapping.size) - cursor;
+            parts.push_back(part);
+            cursor += part.size;
+            if (cursor == end) return true;
         }
-        if (phys == state.pool_end) { state.pool_end = phys + len; return true; }
         return false;
-    }
-
-    // Carve the next `len` bytes of the pool the guest gave AMM. A bump cursor, not a free list:
-    // nothing returns pages to it yet because sceAmprAmmCommandBufferUnmap is still unimplemented
-    // (deliberately out of scope here — see the note at the registration site, and #2873), so a
-    // free list would have no callers and would only look like one.
-    bool amm_pool_take(uint64_t len, uint64_t& phys_out) {
-        AmmState& state = amm();
-        std::lock_guard<std::mutex> lk(state.mx);
-        if (!state.pool_end || !len) return false;
-        const uint64_t base = align_up(state.pool_cursor, kGuestPageSize);
-        if (base < state.pool_cursor || len > state.pool_end - base) return false;
-        state.pool_cursor = base + len;
-        phys_out = base;
-        return true;
-    }
-
-    // Give back the most recent carve when the map that asked for it could not be placed. Only
-    // valid while the cursor still sits at its end — anything else means another thread has
-    // already carved past it, and rewinding then would alias.
-    void amm_pool_untake(uint64_t phys, uint64_t len) {
-        AmmState& state = amm();
-        std::lock_guard<std::mutex> lk(state.mx);
-        if (state.pool_cursor == phys + len) state.pool_cursor = phys;
     }
 
     // Bounded so a guest that asks for something impossible in a loop cannot flood the log, but
@@ -3482,7 +3424,7 @@ HLE(k_amm_give_dmem) {
     // sparse); the Darwin branch memsets through a scratch mapping, which a multi-GiB pool makes
     // genuinely expensive — worth knowing, not worth skipping.
     dmem_zero(phys, a2);
-    if (!amm_pool_publish(phys, a2)) {
+    if (!amm().pool.publish(phys, a2)) {
         amm_say(true, "REFUSED give-direct-memory: AMM already holds a pool and this one is not "
                 "contiguous with it -- prosper tracks a single span", phys, a2, 0);
         dmem_release(phys, a2);
@@ -3504,13 +3446,29 @@ HLE(k_amm_cb_construct) {
     return 0;
 }
 
+// The SDK wrapper at eboot+0xcc4bd0 calls this with only cb, then the base destructor.
+// A command buffer records operations on a GLOBAL heap; it does not own the completed mappings
+// or the caller's SetBuffer storage (the guest frees that storage separately at +0xdba2f8).
+// CONFIDENCE: HIGH on the one-argument layout; MED on bookkeeping-only lifetime and EINVAL for
+// implausible cb values (the sibling Submit wrapper explicitly uses that error for null cb).
+HLE(k_amm_cb_destruct) {
+    ampr_arglog("pvUFDOHilnE(AmmCommandBufferDestructor)", a0, a1, a2, a3, a4, a5);
+    if (a0 <= 0xffff) return 0x80020016ull;
+    apr_cb_destroy_binding(a0);
+    ampr_cb_reset(a0);
+    std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    g_ampr_cb_state.erase(a0);
+    return 0;
+}
+
 // sceAmprAmmCommandBufferMap(cb, va, size, memoryType, protection). Performed here rather than at
 // submit, matching how prosper serves APR reads at append time.
 HLE(k_amm_cb_map) {
     GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
     ampr_arglog("JEVYGhDc97M(AmmCommandBufferMap)", a0, a1, a2, a3, a4, a5);
     const uint64_t va = a1, len = a2;
-    if (!va || !len || (va & (kGuestPageSize - 1)) != 0 || (len & (kGuestPageSize - 1)) != 0) {
+    if (a0 <= 0xffff || !va || !len || (va & (kGuestPageSize - 1)) != 0 ||
+        (len & (kGuestPageSize - 1)) != 0) {
         amm_say(true, "REFUSED map: address or length is not 16 KiB aligned", va, len, a0);
         return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
     }
@@ -3520,7 +3478,7 @@ HLE(k_amm_cb_map) {
         return 0x80020016ull;
     }
     uint64_t phys = 0;
-    if (!amm_pool_take(len, phys)) {
+    if (!amm().pool.take(len, phys)) {
         amm_say(true, "REFUSED map: AMM's own direct-memory pool is exhausted", va, len, 0);
         return 0x8002000cull;                                   // SCE_KERNEL_ERROR_ENOMEM
     }
@@ -3540,17 +3498,53 @@ HLE(k_amm_cb_map) {
     void* p = map_phys_at(va, len, prot, phys);
     if (!p) {
         amm_say(true, "REFUSED map: the host refused the mapping (target is not a free reservation)", va, len, phys);
-        amm_pool_untake(phys, len);
+        amm().pool.give_back(phys, len);
         return 0x8002000cull;
     }
     // The physical range keeps the type it was pooled with; only the VA record carries the type
     // the guest declares per map. Retyping the pool per 2 MiB map would shatter the direct-memory
     // allocator's range list into thousands of entries for a distinction no observed caller reads.
-    track((uint64_t)p, len, prot, (uint32_t)a4, true, "ampr-amm-map",
-          kVirtualQueryDirect, phys, (int32_t)(a3 <= (uint64_t)kMaxDirectMemoryType ? a3 : 0));
+    track((uint64_t)p, len, prot, (uint32_t)a4, true, "ampr-amm-map", kVirtualQueryDirect, phys,
+          (int32_t)(a3 <= (uint64_t)kMaxDirectMemoryType ? a3 : 0), true);
     MLOG("amm map va=0x%llx len=0x%llx phys=0x%llx mtype=0x%llx prot=0x%llx\n",
          (unsigned long long)va, (unsigned long long)len, (unsigned long long)phys,
          (unsigned long long)a3, (unsigned long long)a4);
+    return 0;
+}
+
+// sceAmprAmmCommandBufferUnmap(cb, va, size): eboot+0xd9f7ac passes rdi=cb, rsi=va,
+// edx=0x40000, then maps those pages elsewhere before submitting. Execute at record time,
+// like Map. Preserve the VA reservation and return backing only after it is inaccessible.
+// CONFIDENCE: HIGH on the layout and reusable reservation (guest traces in #2873).
+// MED on EINVAL for invalid/unowned spans: no bad-argument hardware trace is available.
+HLE(k_amm_cb_unmap) {
+    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    ampr_arglog("M-VFI2DJWQA(AmmCommandBufferUnmap)", a0, a1, a2, a3, a4, a5);
+    const uint64_t va = a1, len = a2;
+    if (a0 <= 0xffff || !va || !len || (va & (kGuestPageSize - 1)) ||
+        (len & (kGuestPageSize - 1)) || !amm_window_contains(va, len))
+        return 0x80020016ull;
+    std::vector<Mapping> parts;
+    if (!amm_mapped_parts(va, len, parts)) {
+        amm_say(true, "REFUSED unmap: target is not entirely mapped by AMM", va, len, a0);
+        return 0x80020016ull;
+    }
+    host::guest_write_watch_notify_direct_mapping_removed(va, len);
+    // mmap's fixed replacement discards the direct view while keeping the VA occupied; a
+    // munmap/reserve pair would expose a host-allocation race between the two calls.
+    void* reserved =
+        mmap((void*)va, len, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserved == MAP_FAILED) {
+        for (const auto& part : parts)
+            host::guest_write_watch_notify_direct_mapping_added(part.base, part.size, part.offset,
+                                                                (uint32_t)part.prot);
+        amm_say(true, "REFUSED unmap: host could not restore the reservation", va, len, errno);
+        return 0x8002000cull;
+    }
+    untrack(va, len);
+    track(va, len, 0, 0, false, "ampr-amm-window");
+    for (const auto& part : parts) amm().pool.give_back(part.offset, part.size);
+    MLOG("amm unmap va=0x%llx len=0x%llx\n", (unsigned long long)va, (unsigned long long)len);
     return 0;
 }
 
@@ -4123,20 +4117,8 @@ void register_kernel_mem_hle() {
     Hle::register_fn("Q07J7XpvhrU", (HleFn)k_amm_give_dmem, "sceAmprAmmGiveDirectMemory");
     Hle::register_fn("wkQR9+xTFKY", (HleFn)k_amm_get_va_ranges,
                      "sceAmprAmmGetVirtualAddressRanges");
-    // DELIBERATELY NOT registered, and a real gap rather than an oversight:
-    //   pvUFDOHilnE  sceAmprAmmCommandBufferDestructor
-    //   M-VFI2DJWQA  sceAmprAmmCommandBufferUnmap      (7 call sites in PPSA31334)
-    // Unmap is k_amm_cb_map's symmetric operation and its absence LEAKS: the guest believes a range
-    // went back to AMM's pool while prosper keeps it mapped and keeps its pages carved out of
-    // amm_pool_take's bump cursor.
-    //
-    // That is a bounded leak rather than a corruption, and the reason is the bump cursor itself: it
-    // only ever moves forward, and amm_pool_untake rewinds only its own just-taken tail, so a page
-    // carved for a VA the guest later "unmaps" is NEVER reissued to a second VA. The failure mode is
-    // exhaustion, not aliasing, and both ends of it are named in the log — a re-map of a still-mapped
-    // VA is refused as "target is not a free reservation", and the pool running dry is refused as
-    // "AMM's own direct-memory pool is exhausted". Spelled out here (raised in review) so the next
-    // reader does not have to re-derive that the leak cannot alias. Tracked as #2873.
+    Hle::register_fn("pvUFDOHilnE", (HleFn)k_amm_cb_destruct, "sceAmprAmmCommandBufferDestructor");
+    Hle::register_fn("M-VFI2DJWQA", (HleFn)k_amm_cb_unmap, "sceAmprAmmCommandBufferUnmap");
 }
 
 // #1755 test hook: exposes the internal scan clamp so a unit test can prove the walk stays inside

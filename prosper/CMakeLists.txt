@@ -2717,6 +2717,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_ampr_amm
     SOURCES tests/hle/memory/test_ampr_amm.cpp
     LIBRARIES prosper_core)
+  if(NOT WIN32)
+    prosper_add_gtest(test_ampr_amm_unmap
+      SOURCES tests/hle/memory/test_ampr_amm_unmap.cpp
+      LIBRARIES prosper_core)
+  endif()
 
   prosper_add_gtest(test_mprotect_unaligned
     SOURCES tests/hle/memory/test_mprotect_unaligned.cpp
