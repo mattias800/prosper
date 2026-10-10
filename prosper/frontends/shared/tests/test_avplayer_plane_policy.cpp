@@ -11,7 +11,8 @@
 #include "gpu/texture/guest_texture_layout.hpp"
 
 #include <cstdio>
-#include <iomanip>
+#include <cstdint>
+#include <ios>
 #include <utility>
 #include <vector>
 

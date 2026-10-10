@@ -2,6 +2,7 @@
 // upload. Broadcasting the first RG8 byte makes decoded pictures collapse to green/magenta (#4811).
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_renderer.hpp"
@@ -9,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
