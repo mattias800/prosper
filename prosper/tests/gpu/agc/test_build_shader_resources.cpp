@@ -332,6 +332,58 @@ TEST(BuildShaderResources, Contract) {
         CHECK(build_shader_resources(sh, sg_3d_uav, 8).by_sgpr_base(0) == nullptr,
               "3D UAV view with BASE_ARRAY=1 stays refused");
 
+        // Black Flag's 32x32x32 R8 3D mip pyramid (#4814): six title-live single-level
+        // views (PROSPER_TDUMP=1), one per level, sharing one allocation base. The decoder
+        // must read every level's fields exactly; the level-zero view keeps the historical
+        // unshifted placement, while levels 1..5 stay refused until a 3D mip layout exists
+        // to place them — binding one at the allocation base would silently sample level
+        // zero's texels for a view selecting another level.
+        const uint32_t bf_lut[6][8] = {
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0900facu, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0911204u, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0922204u, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0933204u, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0944204u, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+            {0x40670900u, 0xc0100000u, 0x0007c007u, 0xa0955204u, 0x0000001fu, 0x00700050u,
+             0x00000000u, 0x00000000u},
+        };
+        Gen5ImageFormatInfo bf_format;
+        CHECK(gen5_image_format(1, &bf_format) && bf_format.bytes_per_block == 1,
+              "pyramid fixture format maps to 1 B/texel R8");
+        for (uint32_t level = 0; level < 6; ++level) {
+            const DecodedImageDescriptor d = decode_image_descriptor(bf_lut[level]);
+            CHECK(d.base == 0x4067090000ull && d.width == 32 && d.height == 32 && d.depth == 32 &&
+                      d.format == 1 && d.type == 10 && d.tile_mode == 9 && d.base_level == level &&
+                      d.last_level == level && d.max_mip == 5 && d.base_array == 0,
+                  "Black Flag 32^3 level T# decodes base/extent/type/levels exactly");
+            const DecodedImageView v = image_base_level_view(d, bf_format);
+            if (level == 0) {
+                CHECK(v.supported && v.base == 0x4067090000ull && v.width == 32 && v.height == 32,
+                      "level-zero 3D view keeps the unshifted historical placement");
+            } else {
+                CHECK(!v.supported,
+                      "nonzero-BASE_LEVEL 3D view stays refused until a 3D mip layout places it");
+            }
+        }
+        // The same level-1 words with LAST_LEVEL widened to the chain end: a BASE_LEVEL=1,
+        // LAST_LEVEL=5 chain view. Single-level fixtures cannot tell the two fields apart
+        // (both nibbles hold N), so without this arm a decoder that swaps them stays green.
+        uint32_t bf_chain[8];
+        memcpy(bf_chain, bf_lut[1], sizeof bf_chain);
+        bf_chain[3] = (bf_chain[3] & ~(0xfu << 16)) | (5u << 16);
+        const DecodedImageDescriptor bf_chain_d = decode_image_descriptor(bf_chain);
+        CHECK(bf_chain_d.base_level == 1 && bf_chain_d.last_level == 5 && bf_chain_d.max_mip == 5,
+              "3D chain view decodes BASE_LEVEL and LAST_LEVEL distinctly");
+        Gen5ImageFormatInfo bf_chain_format;
+        CHECK(gen5_image_format(1, &bf_chain_format), "chain-view fixture format is mapped");
+        CHECK(!image_base_level_view(bf_chain_d, bf_chain_format).supported,
+              "nonzero-BASE_LEVEL 3D chain view stays refused like the single-level ones");
+
         // A layered TYPE is necessary but not sufficient: image_base_level_view only applies the
         // slice offset once it has a proven mip-chain layout, and it legitimately does not have one
         // for any tile mode outside {LINEAR, 256B_S, 4KB_S, 64KB_S, 64KB_Z_X, 64KB_R_X}. That early
