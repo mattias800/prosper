@@ -53,6 +53,7 @@ testpaths = [
     "prosper/tests/tools/test_dump_hygiene.py",
     "prosper/tests/tools/test_eboot_shader_elfs.py",
     "prosper/tests/tools/test_console_capture.py",
+    "prosper/tests/tools/test_rdna2_ref.py",
     "prosper/tools/ci",
     "prosper/tools/doctor/test_doctor.py",
     "prosper/tools/docs/test_check_arch_docs.py",

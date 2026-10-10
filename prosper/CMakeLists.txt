@@ -3074,12 +3074,26 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # s_bfm_b64 records its architectural DATA pair, not only its lane-mask view (#4694):
+  # the execution arm runs modules on a device, so like all Vulkan-linking tests this
+  # needs Vulkan (see test_gpu_breadcrumbs for the MinGW/macOS precedent).
+  if(TARGET Vulkan::Vulkan)
+  prosper_add_gtest(test_bfm_b64_scalar_data
+    SOURCES tests/gpu/recompiler/test_bfm_b64_scalar_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan)
+  endif()
+
   # A wave-empty EXEC guard around a counted loop in Black Flag's direct-EXEC-write
   # form (#4816): s_mov_b64/s_or_b64 into EXEC with a constant-full restore.
+  # The execution arm runs modules on a device, so like all Vulkan-linking tests this
+  # needs Vulkan: MinGW and macOS runners have no Vulkan headers (see test_gpu_breadcrumbs).
+  if(TARGET Vulkan::Vulkan)
   prosper_add_gtest(test_counted_loop_movexec_guard
     SOURCES tests/gpu/recompiler/test_counted_loop_movexec_guard.cpp
     INCLUDES tests
     LIBRARIES prosper_core Vulkan::Vulkan)
+  endif()
 
   prosper_add_gtest(test_direct_descriptor_copy
     SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
