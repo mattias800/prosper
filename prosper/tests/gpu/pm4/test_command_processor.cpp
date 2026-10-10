@@ -834,6 +834,7 @@ int main() {
     // PROSPER_REGWATCH selector (#1459). The parse is pure so the register-write watch can be
     // validated without a guest, a GPU, or an environment variable.
     {
+        // Pure selector parsing lives in reg_watch_selector; processor reporting is separate.
         using prosper::gpu::parse_reg_watch;
         using prosper::gpu::RegClass;
 

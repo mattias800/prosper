@@ -67,52 +67,6 @@ bool aperture_recovery_enabled() {
 }
 
 
-std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
-    std::vector<RegWatchEntry> entries;
-    if (!setting || !*setting) return entries;
-    const std::string text(setting);
-    size_t start = 0;
-    while (start <= text.size()) {
-        const size_t comma = text.find(',', start);
-        std::string item = text.substr(start, comma == std::string::npos ? std::string::npos
-                                                                         : comma - start);
-        start = comma == std::string::npos ? text.size() + 1 : comma + 1;
-        // Trim surrounding spaces so a human-written list stays forgiving.
-        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front())))
-            item.erase(item.begin());
-        while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back())))
-            item.pop_back();
-        if (item.empty()) continue;
-        RegWatchEntry entry;
-        const size_t colon = item.find(':');
-        if (colon != std::string::npos) {
-            const std::string cls = item.substr(0, colon);
-            if (cls == "Cx" || cls == "cx") entry.reg_class = RegClass::Cx;
-            else if (cls == "Sh" || cls == "sh") entry.reg_class = RegClass::Sh;
-            else if (cls == "Uc" || cls == "uc") entry.reg_class = RegClass::Uc;
-            else continue;   // unknown class: skip this entry, keep the rest of the list
-            item = item.substr(colon + 1);
-            if (item.empty()) continue;
-        }
-        if (item == "*") {
-            // Whole-class watch; only meaningful with an explicit class prefix (a bare "*" would
-            // not say which file to watch, so it is skipped like any other unparsable entry).
-            if (colon == std::string::npos) continue;
-            entry.all_offsets = true;
-            if (std::find(entries.begin(), entries.end(), entry) == entries.end())
-                entries.push_back(entry);
-            continue;
-        }
-        char* end = nullptr;
-        errno = 0;
-        const unsigned long parsed = std::strtoul(item.c_str(), &end, 0);
-        if (errno || !end || *end || parsed > 0xFFFFFFFFul) continue;
-        entry.offset = static_cast<uint32_t>(parsed);
-        if (std::find(entries.begin(), entries.end(), entry) == entries.end())
-            entries.push_back(entry);
-    }
-    return entries;
-}
 
 namespace {
 const std::vector<RegWatchEntry>& reg_watch_entries() {
@@ -3923,36 +3877,6 @@ static bool retained_ordered_effect_destination_overlaps(
 }
 
 enum class OrderedQwordOverlay { Untouched, Touched, Ambiguous };
-
-const char* ordered_wait_effect_class_name(OrderedWaitEffectClass effect_class) {
-    switch (effect_class) {
-        case OrderedWaitEffectClass::Disjoint: return "disjoint";
-        case OrderedWaitEffectClass::ImmediateDma: return "immediate-dma";
-        case OrderedWaitEffectClass::AddressDma: return "address-dma";
-        case OrderedWaitEffectClass::FixedRelease32: return "fixed-release32";
-        case OrderedWaitEffectClass::FixedRelease64: return "fixed-release64";
-        case OrderedWaitEffectClass::InterruptOnlyRelease: return "interrupt-only-release";
-        case OrderedWaitEffectClass::DynamicRelease: return "dynamic-release";
-        case OrderedWaitEffectClass::WriteData: return "write-data";
-        case OrderedWaitEffectClass::WriteDataPartial: return "write-data-partial";
-        case OrderedWaitEffectClass::WriteDataOversized: return "write-data-oversized";
-        case OrderedWaitEffectClass::WriteDataUnowned: return "write-data-unowned";
-        case OrderedWaitEffectClass::EventTimestamp: return "event-timestamp";
-        case OrderedWaitEffectClass::OffsetOverlap: return "offset-overlap";
-        case OrderedWaitEffectClass::AliasedOverlap: return "aliased-overlap";
-        case OrderedWaitEffectClass::Unsupported: return "unsupported";
-    }
-    return "unsupported";
-}
-
-const char* ordered_wait_effect_overlay_name(OrderedWaitEffectOverlay overlay) {
-    switch (overlay) {
-        case OrderedWaitEffectOverlay::None: return "none";
-        case OrderedWaitEffectOverlay::Applied: return "applied";
-        case OrderedWaitEffectOverlay::Ambiguous: return "ambiguous";
-    }
-    return "ambiguous";
-}
 
 OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
         const GpuState::MemoryEffect& effect, uint64_t wait_address, uint64_t value_before) {

@@ -21,6 +21,8 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `gpu_executor` — the executor: builds each stage's resource table, runs the scalar const-fold that
   recovers descriptors the shader header does not declare, and issues the work. Large; navigate it by
   symbol rather than by reading it.
+- `indirect_draw_arguments` — `resolve_indirect_draw_arguments` decodes checked CPU-visible draw
+  operands; ordered producer authority stays with the executor.
 - `split_t8_proof` — whether the const-fold may publish an image descriptor assembled from two
   scalar loads: a must-dataflow over the program's CFG, so every path into the consumer has to
   deliver the same load words. `sopp_cfg` holds the direct-branch helpers the executor's CFG

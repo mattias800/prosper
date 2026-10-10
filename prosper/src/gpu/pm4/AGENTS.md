@@ -6,6 +6,10 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
 - `pm4_registers` — the register namespace and offsets the packets address.
 - `command_processor` — walks a submission, applies register writes, and emits the draws and
   dispatches the rest of the stack consumes.
+- `reg_watch_selector` — pure `parse_reg_watch` selector parsing; live reporting stays in the
+  command processor.
+- `ordered_wait_diagnostics` — names for memory-effect classes and checked overlay outcomes;
+  classification stays in the command processor.
 - `vgt_shader_stages.hpp` — decodes VGT_SHADER_STAGES_EN's routing fields (GS_EN, PRIMGEN_EN, the
   wave-32 bits) and names a draw's NGG shape (`merged-gs`, `ngg-vs`, `legacy`).
 - `cond_indirect_buffer` — what a Jump-style segment does when the command processor reaches it:
