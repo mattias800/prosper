@@ -6,15 +6,23 @@
 #include "hle/memory/guest_memory_topology.hpp"
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #define route_dup _dup
 #define route_dup2 _dup2
 #define route_close _close
@@ -101,11 +109,84 @@ static std::string summary(perf::AlarmEngine& engine) {
     return result;
 }
 
+// CONFIDENCE: HIGH: a worker can terminate while the fixture captures stderr. Report the
+// failure class and thread through the original stdout without taking a stdio stream lock.
+// These observers preserve fatal failure; they do not change any packet assertion or policy.
+static uint64_t failure_main_thread = 0;
+#ifdef _WIN32
+static HANDLE failure_output = nullptr;
+static uint64_t failure_thread() noexcept {
+    return GetCurrentThreadId();
+}
+#else
+static int failure_output = -1;
+static uint64_t failure_thread() noexcept {
+    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+#endif
+static void failure_line(const char* kind, const char* detail, int value) noexcept {
+    char message[768];
+    const int count = std::snprintf(
+        message, sizeof message,
+        "[packet-route-failure] class=%s thread=%llu main-thread=%llu value=%d detail=%.512s\n",
+        kind, static_cast<unsigned long long>(failure_thread()),
+        static_cast<unsigned long long>(failure_main_thread), value, detail);
+    if (count <= 0) return;
+    const auto bytes = static_cast<unsigned int>(
+        static_cast<size_t>(count) < sizeof message ? count : sizeof message - 1);
+#ifdef _WIN32
+    DWORD written = 0;
+    (void)WriteFile(failure_output, message, bytes, &written, nullptr);
+#else
+    (void)write(failure_output, message, bytes);
+#endif
+}
+[[noreturn]] static void route_terminate() noexcept {
+    failure_line("terminate", "examining current exception", 0);
+    if (const auto exception = std::current_exception()) {
+        try {
+            std::rethrow_exception(exception);
+        } catch (const std::system_error& error) {
+            failure_line("system-error", error.what(), error.code().value());
+        } catch (const std::exception& error) {
+            failure_line("exception", error.what(), 0);
+        } catch (...) { failure_line("non-standard-exception", "unknown exception type", 0); }
+    }
+    std::abort();
+}
+#ifdef _WIN32
+[[noreturn]] static void route_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*,
+                                                 unsigned int line, uintptr_t) {
+    // Release UCRT can supply null expression/function/file pointers. Do not dereference them.
+    failure_line("crt-invalid-parameter", "CRT rejected an argument; value is source line",
+                 static_cast<int>(line));
+    // Returning from a custom CRT handler could turn a fatal failure into a recoverable error.
+    std::abort();
+}
+#endif
+static bool install_failure_diagnostics() {
+    failure_main_thread = failure_thread();
+#ifdef _WIN32
+    failure_output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!failure_output || failure_output == INVALID_HANDLE_VALUE) return false;
+    _set_invalid_parameter_handler(route_invalid_parameter);
+#else
+    // Keep the descriptor alive until process exit: the detached worker may report a late failure.
+    failure_output = route_dup(route_fileno(stdout));
+    if (failure_output < 0) return false;
+#endif
+    std::set_terminate(route_terminate);
+    return true;
+}
+
 int main(int argc, char** argv) {
     // Preserve the last completed control when a platform failure interrupts captured stderr.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc != 3 || (std::strcmp(argv[2], "proceed") && std::strcmp(argv[2], "defer"))) {
-        std::fprintf(stderr, "usage: test_wait_regmem_packet_route <jsonl-output> <proceed|defer>\n");
+    if (!install_failure_diagnostics()) return 2;
+    if (argc != 3 || (std::strcmp(argv[2], "proceed") != 0 && std::strcmp(argv[2], "defer") != 0 &&
+                      std::strcmp(argv[2], "terminate-control") != 0)) {
+        std::fprintf(stderr, "usage: test_wait_regmem_packet_route <jsonl-output> "
+                             "<proceed|defer|terminate-control>\n");
         return 2;
     }
     const bool deferred = !std::strcmp(argv[2], "defer");
@@ -121,6 +202,15 @@ int main(int argc, char** argv) {
     if (route_dup2(route_fileno(captured.get()), route_fileno(stderr)) < 0) {
         route_close(saved);
         return 2;
+    }
+    if (std::strcmp(argv[2], "terminate-control") == 0) {
+        // An external positive control: a known worker exception must remain fatal and observable
+        // through stdout even after exactly the same stderr redirection as the real packet cases.
+        std::thread([] {
+            throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                    "packet-route synthetic worker termination");
+        }).join();
+        return 1;
     }
 
     // A real active submit holds the queued ReleaseMem private. Its overlay must satisfy the wait
