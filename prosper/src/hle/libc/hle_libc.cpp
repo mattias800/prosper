@@ -5,6 +5,7 @@
 #include "hle/dispatch/nid.hpp"
 #include "host/abi/guest_varargs.hpp"   // #3246: the guest's variadic list, re-expressed for the host
 #include "hle/libc/libc_variadic_capture.hpp"
+#include "hle/libc/reallocf.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -364,9 +365,7 @@ HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
 // the header check rejects reaches guest_windows_free, which re-validates the magic and refuses
 // safely, so the BSD rule needs no platform-specific exception there either.
 HLE(h_reallocf) {
-    void* p = P(a0);
-    void* r = guest_realloc_portable(p, a1);
-    if (!r && p && a1) guest_free_portable(p);
+    void* r = libc::realloc_free_on_failure(P(a0), a1, guest_realloc_portable, guest_free_portable);
     return (uint64_t)(uintptr_t)r;
 }
 // reallocalign(ptr, size, alignment).

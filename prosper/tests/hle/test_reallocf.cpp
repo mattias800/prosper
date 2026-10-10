@@ -7,32 +7,14 @@
 // succeeded reported allocation failure. So the registration arm below is the whole defect, and it
 // is structurally red without the fix (Hle::lookup returns nullptr).
 //
-// THE DISCRIMINATOR, and it is the reason this file is longer than the change it covers.
-//
-// #2203 flagged the trap when it filed the bug: asserting the return is NULL on failure is
-// necessary and NOT sufficient, because a plain `realloc` alias returns NULL there too. Such an arm
-// passes whether or not the original was freed, so it cannot fail for the reason it claims — the
-// exact "true assertion, mechanism never ran" shape the charter warns about.
-//
-// What actually separates the two is observable without reading freed memory: **a live block's
-// address can never be handed out again.** So after a failed reallocf, allocate a batch of blocks
-// in the same size class and look for the original address among them.
-//
-//   - If the handler is reallocf (correct): the block was freed, and glibc's tcache returns it to
-//     the very next same-size request. The address reappears.
-//   - If the handler were realloc (the defect): the block is STILL LIVE, and no allocator may
-//     return its address for a new allocation. The address CANNOT reappear.
-//
-// The failing direction is therefore guaranteed by allocator correctness rather than by allocator
-// policy, which is what makes this a real discriminator: mutate `h_reallocf` into `h_realloc` and
-// this arm goes red deterministically. The passing direction relies on same-size-class reuse, so it
-// is given several attempts rather than one, and the block is small enough to be a tcache candidate.
-//
-// The mutation was run: replacing the body with plain `guest_realloc_portable` turns
-// "the failed resize RELEASED the original block" red while every other arm stays green.
+// A null result alone cannot distinguish reallocf from realloc. The ownership tests exercise the
+// registered handler's shared policy with an allocator that records each release. Omitting the
+// release fails deterministically, without assuming the host will reuse a freed address. The old
+// eight-allocation reuse probe intermittently failed on macOS even when the block was released.
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
+#include "hle/libc/reallocf.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -91,35 +73,18 @@ TEST(Reallocf, Contract) {
         if (fresh) free_fn(U(fresh), 0, 0, 0, 0, 0);
     }
 
-    // --- THE ARM THAT DISTINGUISHES reallocf FROM realloc ---------------------------------------
-    // A resize the allocator must refuse, then look for the original address in a fresh batch.
+    // The real host allocator refuses an impossible resize. Release ownership is checked below
+    // against the same policy used by this registered handler, rather than host reuse timing.
     {
-        const size_t kSize = 96;                 // small: a tcache size class
+        const size_t kSize = 96;
         const size_t kImpossible = (size_t)-1;   // SIZE_MAX: no allocator can satisfy this
         auto* victim = (uint8_t*)(uintptr_t)malloc_fn(kSize, 0, 0, 0, 0, 0);
         CHECK(victim != nullptr, "malloc returns the block that the failed resize must release");
         if (victim) {
-            const uintptr_t victim_addr = (uintptr_t)victim;
-
             auto* r = (void*)(uintptr_t)reallocf_fn(U(victim), kImpossible, 0, 0, 0, 0);
             // Necessary but NOT sufficient on its own -- a realloc alias also returns NULL here.
             // Recorded as such so nobody later reads this line as the coverage.
             CHECK(r == nullptr, "a resize to SIZE_MAX fails and returns NULL (true for realloc too)");
-
-            // Sufficient. A live block's address cannot be reissued, so seeing it again proves the
-            // failed resize released it.
-            const int kTries = 8;
-            void* probe[kTries] = {};
-            bool reissued = false;
-            for (int i = 0; i < kTries; ++i) {
-                probe[i] = (void*)(uintptr_t)malloc_fn(kSize, 0, 0, 0, 0, 0);
-                if ((uintptr_t)probe[i] == victim_addr) reissued = true;
-            }
-            CHECK(reissued,
-                  "the failed resize RELEASED the original block -- its address is reissued to a "
-                  "later same-size allocation, which a still-live block's address never could be");
-            for (int i = 0; i < kTries; ++i)
-                if (probe[i]) free_fn(U(probe[i]), 0, 0, 0, 0, 0);
         }
     }
 
@@ -160,4 +125,78 @@ TEST(Reallocf, Contract) {
     }
 
     EXPECT_EQ(fails, 0);
+}
+
+TEST(Reallocf, FailedResizeReleasesOriginalExactlyOnce) {
+    int original = 0;
+    void* released = nullptr;
+    int releases = 0;
+    auto resize = [&](void* p, size_t size) -> void* {
+        EXPECT_EQ(p, &original) << "the allocator receives the original block";
+        EXPECT_EQ(size, SIZE_MAX) << "the requested failing size reaches the allocator";
+        return nullptr;
+    };
+    auto release = [&](void* p) {
+        released = p;
+        ++releases;
+    };
+    EXPECT_EQ(libc::realloc_free_on_failure(&original, SIZE_MAX, resize, release), nullptr)
+        << "the allocator's failure is returned unchanged";
+    EXPECT_EQ(released, &original) << "allocation failure transfers the original to release";
+    EXPECT_EQ(releases, 1) << "the original is released exactly once";
+}
+
+TEST(Reallocf, SuccessfulResizeDoesNotReleaseReturnedStorage) {
+    int original = 0;
+    int replacement = 0;
+    int releases = 0;
+    auto resize = [&](void* p, size_t size) -> void* {
+        EXPECT_EQ(p, &original) << "the allocator receives the original block";
+        EXPECT_EQ(size, 4096u) << "the successful requested size reaches the allocator";
+        return &replacement;
+    };
+    auto release = [&](void*) { ++releases; };
+    EXPECT_EQ(libc::realloc_free_on_failure(&original, 4096, resize, release), &replacement)
+        << "the allocator's replacement is returned unchanged";
+    EXPECT_EQ(releases, 0) << "a successful resize owes no extra release";
+}
+
+TEST(Reallocf, NullOriginalHasNothingToReleaseOnFailure) {
+    int releases = 0;
+    auto resize = [](void* p, size_t size) -> void* {
+        EXPECT_EQ(p, nullptr) << "a null original is passed through";
+        EXPECT_EQ(size, SIZE_MAX) << "a fresh allocation can also fail";
+        return nullptr;
+    };
+    auto release = [&](void*) { ++releases; };
+    EXPECT_EQ(libc::realloc_free_on_failure(nullptr, SIZE_MAX, resize, release), nullptr)
+        << "fresh allocation failure also returns null";
+    EXPECT_EQ(releases, 0) << "there is no original allocation to release";
+}
+
+TEST(Reallocf, ZeroSizeRespectsBothAllocatorPolicies) {
+    int original = 0;
+    int minimum_block = 0;
+    int releases = 0;
+    auto release = [&](void* p) {
+        EXPECT_EQ(p, &original) << "only the original allocation is eligible for release";
+        ++releases;
+    };
+    auto resize_and_release = [&](void* p, size_t size) -> void* {
+        EXPECT_EQ(size, 0u) << "the allocator decides the zero-size policy";
+        release(p);
+        return nullptr;
+    };
+    EXPECT_EQ(libc::realloc_free_on_failure(&original, 0, resize_and_release, release), nullptr)
+        << "the null zero-size policy is preserved";
+    EXPECT_EQ(releases, 1) << "a null zero-size result must not release the block twice";
+    auto resize_to_minimum = [&](void* p, size_t size) -> void* {
+        EXPECT_EQ(p, &original) << "the other policy receives the same original";
+        EXPECT_EQ(size, 0u) << "a zero-size resize may return valid minimum storage";
+        return &minimum_block;
+    };
+    EXPECT_EQ(libc::realloc_free_on_failure(&original, 0, resize_to_minimum, release),
+              &minimum_block)
+        << "the minimum-allocation zero-size policy is also preserved";
+    EXPECT_EQ(releases, 1) << "a non-null zero-size result also owes no extra release";
 }
