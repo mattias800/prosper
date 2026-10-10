@@ -301,6 +301,39 @@ int main() {
         }
     }
 
+    // Hardware IT_DRAW_INDEX_AUTO packet execution:
+    {
+        uint32_t draw_pkt[] = {
+            // IT_DRAW_INDEX_AUTO: 3 dwords, count=128, modifier=2
+            0xC0000000u | (1u << 16) | (IT_DRAW_INDEX_AUTO << 8),
+            128u,
+            2u,
+        };
+        GpuState s_draw;
+        run_cb(draw_pkt, std::size(draw_pkt), s_draw);
+        CHECK(s_draw.draws.size() == 1, "IT_DRAW_INDEX_AUTO records one draw");
+        if (!s_draw.draws.empty()) {
+            CHECK(s_draw.draws[0].index_count == 128u, "IT_DRAW_INDEX_AUTO index_count matches");
+        }
+    }
+
+    // Hardware IT_WRITE_DATA packet execution:
+    {
+        uint32_t mem_target = 0;
+        const uint64_t target_addr = (uint64_t)(uintptr_t)&mem_target;
+        uint32_t wd_pkt[] = {
+            // IT_WRITE_DATA: 5 dwords, DST_SEL=5 (memory), addr=target_addr, data=0xbeefcafe
+            0xC0000000u | (3u << 16) | (IT_WRITE_DATA << 8),
+            5u << 8,
+            (uint32_t)target_addr,
+            (uint32_t)(target_addr >> 32),
+            0xbeefcafeu,
+        };
+        GpuState s_wd;
+        run_cb(wd_pkt, std::size(wd_pkt), s_wd);
+        CHECK(mem_target == 0xbeefcafeu, "IT_WRITE_DATA writes inline data to target address");
+    }
+
     // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
     // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
     // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content

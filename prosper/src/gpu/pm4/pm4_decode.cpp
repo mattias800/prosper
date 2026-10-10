@@ -73,6 +73,44 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.indirect_address = lo_hi(pl) & ~3ull;
             c.indirect_address_absolute = true;
             c.dispatch_modifier = pl[2];
+        } else if (c.op == IT_SET_BASE && npl == 3 && (pl[0] & 0xfu) == 1u) {
+            // Hardware PM4 SET_BASE (GFX10, 4 dwords): [0] = BASE_INDEX, [1..2] = address lo/hi.
+            // BASE_INDEX 1 is the indirect-argument base; header bit 1 (SHADER_TYPE) says whose:
+            // 0 = graphics (DRAW_*_INDIRECT), 1 = compute (DISPATCH_INDIRECT) -- the same 0/1
+            // convention as the custom R_SET_BASE_INDIRECT_ARGS. Other base indices (GDS / CE
+            // partition bases, display-list patch table) stay Unknown.
+            c.kind = K::SetBaseIndirectArgs;
+            c.indirect_shader_type = (h >> 1) & 1u;
+            c.indirect_base = lo_hi(&pl[1]);
+        } else if (c.op == IT_DRAW_INDEX_AUTO && npl == 2) {
+            // Hardware PM4 DRAW_INDEX_AUTO (GFX10, 3 dwords): [0] = INDEX_COUNT, [1] =
+            // VGT_DRAW_INITIATOR. The initiator is not a ShaderDrawModifier, so di_modifier keeps
+            // its zero value (the R_DRAW_INDEX_AUTO legacy three-dword rule).
+            c.kind = K::DrawIndexAuto;
+            c.index_count = pl[0];
+        } else if ((c.op == IT_DRAW_INDIRECT || c.op == IT_DRAW_INDEX_INDIRECT) && npl == 4) {
+            // Hardware PM4 DRAW_INDIRECT / DRAW_INDEX_INDIRECT (GFX10, 5 dwords, see
+            // AGC_PACKET_SIZES.md): [0] = DATA_OFFSET from the graphics indirect base, [1] =
+            // BASE_VTX_LOC, [2] = START_INST_LOC, [3] = VGT_DRAW_INITIATOR. The argument layout
+            // follows from the opcode, exactly as for R_DRAW_INDIRECT / R_DRAW_INDEX_INDIRECT.
+            c.kind = c.op == IT_DRAW_INDIRECT ? K::DrawIndirect : K::DrawIndexIndirect;
+            c.indirect_offset = pl[0];
+        } else if (c.op == IT_INDEX_BASE && npl == 2) {
+            // Hardware PM4 INDEX_BASE (GFX10, 3 dwords): [0..1] = index buffer address lo/hi.
+            c.kind = K::SetIndexBase;
+            c.ib_addr = lo_hi(pl);
+        } else if (c.op == IT_WRITE_DATA && npl >= 4 && (pl[0] & (1u << 16)) == 0 &&
+                   (((pl[0] >> 8) & 0xfu) == 2u || ((pl[0] >> 8) & 0xfu) == 5u)) {
+            // Hardware PM4 WRITE_DATA (GFX10): [0] = CONTROL, [1..2] = DST_ADDR lo/hi, [3..] =
+            // data. Only memory destinations decode -- CONTROL.DST_SEL 2 (TC_L2) or 5 (memory) --
+            // with consecutive addressing (WR_ONE_ADDR, bit 16, clear). A register, GDS or
+            // single-address destination stays Unknown: its "address" is not a guest pointer.
+            c.kind = K::WriteData;
+            c.wd_addr = lo_hi(&pl[1]);
+            c.wd_declared_num = npl - 3;
+            c.wd_num = c.wd_declared_num;
+            c.wd_data = &pl[3];
+            c.wd_valid = true;
         } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];

@@ -389,4 +389,105 @@ TEST(Pm4Decode, Contract) {
               "MEC DISPATCH_INDIRECT decodes an absolute address");
         CHECK(more_ops[1].kind == K::Unknown, "short DISPATCH_DIRECT stays Unknown");
     }
+
+    // Hardware draw and write packets (Black Flag submit0.bin):
+    {
+        uint32_t work_stream[] = {
+            // IT_SET_BASE: 4 dwords, op 0x11, SHADER_TYPE=1 (compute), BASE_INDEX=1,
+            // addr=0x40756412e0
+            PM4(4, IT_SET_BASE, 0) | 2u,
+            1u,
+            0x756412e0u,
+            0x00000040u,
+            // IT_DRAW_INDEX_AUTO: 3 dwords, op 0x2D, count=0x300, modifier=2
+            PM4(3, IT_DRAW_INDEX_AUTO, 0),
+            0x300u,
+            2u,
+            // IT_DRAW_INDIRECT: 5 dwords, op 0x24, offset=0x40, BASE_VTX_LOC, START_INST_LOC, initiator
+            PM4(5, IT_DRAW_INDIRECT, 0),
+            0x40u,
+            0u,
+            0u,
+            2u,
+            // IT_DRAW_INDEX_INDIRECT: 5 dwords, op 0x25, offset=0x60
+            PM4(5, IT_DRAW_INDEX_INDIRECT, 0),
+            0x60u,
+            0u,
+            0u,
+            0u,
+            // IT_INDEX_BASE: 3 dwords, op 0x26, addr=0x403fde86dc
+            PM4(3, IT_INDEX_BASE, 0),
+            0x3fde86dcu,
+            0x00000040u,
+            // IT_WRITE_DATA: 5 dwords, op 0x37, dst=0x100200, addr=0x406616c058, data=0
+            PM4(5, IT_WRITE_DATA, 0),
+            0x100200u,
+            0x6616c058u,
+            0x00000040u,
+            0u,
+        };
+        std::vector<Pm4Command> work_ops;
+        const size_t c = decode_pm4(work_stream, std::size(work_stream), work_ops);
+        CHECK(c == 25, "consumed 25 dwords of hardware work packets");
+        CHECK(work_ops.size() == 6, "decoded 6 hardware work packets");
+
+        CHECK(work_ops[0].kind == K::SetBaseIndirectArgs, "op0 is SetBaseIndirectArgs");
+        CHECK(work_ops[0].indirect_shader_type == 1u, "op0 type == compute");
+        CHECK(work_ops[0].indirect_base == 0x40756412e0ull, "op0 base == 0x40756412e0");
+
+        CHECK(work_ops[1].kind == K::DrawIndexAuto, "op1 is DrawIndexAuto");
+        CHECK(work_ops[1].index_count == 0x300u, "op1 count == 0x300");
+        CHECK(work_ops[1].di_modifier == 0u, "op1 initiator is not read as a draw modifier");
+
+        CHECK(work_ops[2].kind == K::DrawIndirect, "op2 is DrawIndirect");
+        CHECK(work_ops[2].indirect_offset == 0x40u, "op2 offset == 0x40");
+
+        CHECK(work_ops[3].kind == K::DrawIndexIndirect, "op3 is DrawIndexIndirect");
+        CHECK(work_ops[3].indirect_offset == 0x60u, "op3 offset == 0x60");
+
+        CHECK(work_ops[4].kind == K::SetIndexBase, "op4 is SetIndexBase");
+        CHECK(work_ops[4].ib_addr == 0x403fde86dcull, "op4 ib_addr == 0x403fde86dc");
+
+        CHECK(work_ops[5].kind == K::WriteData, "op5 is WriteData");
+        CHECK(work_ops[5].wd_addr == 0x406616c058ull, "op5 wd_addr == 0x406616c058");
+        CHECK(work_ops[5].wd_num == 1u && work_ops[5].wd_valid, "op5 wd_num == 1");
+
+        // Shapes whose fields are not what the custom kinds mean stay Unknown: a graphics
+        // SET_BASE is graphics, a non-indirect base index, a register-destination WRITE_DATA,
+        // a single-address WRITE_DATA, and the short draw-indirect shape.
+        uint32_t other_work[] = {
+            PM4(4, IT_SET_BASE, 0),
+            1u,
+            0x756412e0u,
+            0x40u,
+            PM4(4, IT_SET_BASE, 0),
+            2u,
+            0x756412e0u,
+            0x40u,
+            PM4(5, IT_WRITE_DATA, 0),
+            0x100000u,
+            0x2800u,
+            0u,
+            7u,
+            PM4(6, IT_WRITE_DATA, 0),
+            0x110500u,
+            0x6616c058u,
+            0x40u,
+            1u,
+            2u,
+            PM4(3, IT_DRAW_INDIRECT, 0),
+            0x40u,
+            2u,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_work, std::size(other_work), other_ops);
+        CHECK(other_ops.size() == 5, "decoded 5 other work packets");
+        CHECK(other_ops[0].kind == K::SetBaseIndirectArgs &&
+                  other_ops[0].indirect_shader_type == 0u,
+              "SET_BASE without SHADER_TYPE sets the graphics base");
+        CHECK(other_ops[1].kind == K::Unknown, "SET_BASE base index 2 stays Unknown");
+        CHECK(other_ops[2].kind == K::Unknown, "register-destination WRITE_DATA stays Unknown");
+        CHECK(other_ops[3].kind == K::Unknown, "WR_ONE_ADDR WRITE_DATA stays Unknown");
+        CHECK(other_ops[4].kind == K::Unknown, "short DRAW_INDIRECT stays Unknown");
+    }
 }
