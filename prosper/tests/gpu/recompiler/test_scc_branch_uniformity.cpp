@@ -204,14 +204,21 @@ TEST(SccBranchUniformity, Contract) {
         0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
         0xBF0B811Cu,                // s_cmp_eq_u32 s28, 1
         0xBF8C3F73u,                // s_waitcnt
+        0xBBFD0000u,                // s_waitcnt_vscnt null, 0 (SOPK)
         0xF0200F08u, 0x00080916u,   // image_load_mip v[8:11], ...
         0xBF8C3F70u,                // s_waitcnt
+        0xBD7D0000u,                // s_waitcnt_lgkmcnt null, 0 (SOPK)
         0xBF850001u,                // s_cbranch_scc1 +1
         0xBF800000u,                // s_nop
         0xBF810000u,                // s_endpgm
     };
     {
         const std::vector<Rdna2Inst> ins = walk(mem_intervening_guard, std::size(mem_intervening_guard));
+        ASSERT_GE(ins.size(), 8u);
+        ASSERT_EQ(ins[3].fmt, Rdna2Format::SOPK) << "fixture decodes s_waitcnt_vscnt as SOPK";
+        ASSERT_EQ(ins[3].opcode, 0x17u) << "fixture decodes s_waitcnt_vscnt";
+        ASSERT_EQ(ins[6].fmt, Rdna2Format::SOPK) << "fixture decodes s_waitcnt_lgkmcnt as SOPK";
+        ASSERT_EQ(ins[6].opcode, 0x1au) << "fixture decodes s_waitcnt_lgkmcnt";
         uint32_t branch_pc = 0;
         bool saw_image = false;
         for (const auto& in : ins) {
