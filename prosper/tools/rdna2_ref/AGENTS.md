@@ -13,6 +13,6 @@ This directory contains an **independent reference interpreter and decoder** for
 ## Modules
 - `decode.py`: Independent RDNA2 instruction decoder and complete opcode tables from ISA chapter 13.
 - `machine.py`: Wave state (Wave64/Wave32, SGPRs, VGPRs, EXEC, VCC, SCC, memory) and instruction semantics.
-- `llvm_check.py`: Decode cross-check harness using LLVM AMDGPU disassembler via WSL Ubuntu.
+- `llvm_check.py`: Decode cross-check harness using the LLVM AMDGPU disassembler (native `llvm-mc`/`llvm-objdump` on PATH, else WSL Ubuntu).
 - `corpus.py`: Parsers and program carvers for local firmware and census shader stores.
 - `cli.py`: Command-line tool for disassembling, running, and generating coverage/cross-check reports.
