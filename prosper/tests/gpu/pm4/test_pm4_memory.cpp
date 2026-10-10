@@ -187,6 +187,20 @@ TEST_F(Pm4Memory, ConditionalRefusesUnretiredComputeProducer) {
     EXPECT_EQ(state.cx.count(0x40), 0u);
 }
 
+TEST_F(Pm4Memory, ConditionalRefusesUnretiredGraphicsProducer) {
+    uint32_t predicate = 1;
+    Words buffer;
+    append(buffer, IT_DRAW_INDEX_AUTO, {3, 2});
+    conditional(buffer, reinterpret_cast<uint64_t>(&predicate), 3);
+    reg(buffer, 0x999);
+    GpuState state;
+    run_command_buffer(buffer.data(), buffer.size(), state);
+    ASSERT_EQ(state.draws.size(), 1u);
+    EXPECT_TRUE(state.dma_execution_rejected)
+        << "a retained draw has not established CPU authority for its possible predicate write";
+    EXPECT_EQ(state.cx.count(0x40), 0u) << "the stale CPU value must not select the suffix";
+}
+
 TEST_F(Pm4Memory, InvalidPacketFieldsAndTruncationRemainUnsupported) {
     uint32_t predicate = 1;
     Words valid;

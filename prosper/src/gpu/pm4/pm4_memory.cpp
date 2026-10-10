@@ -110,9 +110,10 @@ void refused(const char* reason, const Pm4Command& command) {
 
 std::optional<bool> conditional_value(const Pm4Command& command, const GpuState& state) {
     const uint64_t address = command.cond_exec_addr;
-    // A dispatch is retained until the ordered executor runs. No write-range proof exists here,
-    // so its CPU view cannot establish a predicate. Keep that unsupported producer shape visible.
-    if (last_fold_deferred() || !state.dispatches.empty() || !state.dma_copies.empty()) {
+    // Draws and dispatches are retained until the ordered executor runs. No write-range proof
+    // exists here, so their CPU view cannot establish a predicate. Keep that producer shape visible.
+    if (last_fold_deferred() || !state.draws.empty() || !state.dispatches.empty() ||
+        !state.dma_copies.empty()) {
         refused("conditional-producer-not-retired", command);
         return std::nullopt;
     }
