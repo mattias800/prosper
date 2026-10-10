@@ -5,6 +5,8 @@
 #include "gpu/execute/sopp_cfg.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -31,28 +33,100 @@ namespace prosper::gpu {
 // outright, and only a pointer register that was never written counts as entry-rooted (a copy,
 // even of itself, drops that identity). A loop that re-runs a COPY is admitted when the copied
 // word still carries the same load tag, since a copy captures bits.
-bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
-                                 const std::array<uint32_t, 8>& source_pc,
-                                 const std::array<uint64_t, 8>& source_addr,
-                                 const uint32_t* user_sgprs, uint32_t nsgpr,
-                                 uint32_t user_sgpr_base,
-                                 const std::vector<ImageWriteExtent>& image_writes) {
-    constexpr int kSgprs = 106;
-    // This rare fallback reparses the owned code. Keep its CFG analysis bounded; larger programs
-    // retain the ordinary unresolved path until they have a cached analysis.
-    if (!code || !user_sgprs || dwords > 2048 || tbase < 0 || tbase + 7 >= kSgprs)
-        return false;
+namespace {
+
+constexpr int kSgprs = 106;
+constexpr uint64_t kUnknown = ~0ull;
+constexpr uint64_t kEntryBit = 1ull << 63;
+
+// s_load_dwordx4/x8/x16 (opcodes 2, 3, 4) load 4, 8 or 16 dwords.
+uint32_t descriptor_load_dwords(uint32_t opcode) {
+    return 4u << (opcode - 2u);
+}
+
+uint64_t load_tag(size_t producer, uint32_t word) {
+    return (static_cast<uint64_t>(producer) << 8u) | word;
+}
+
+// The SOP1 opcodes at or above 0x20 that RDNA2 defines and whose SGPR writes their operands name:
+// the s_*_saveexec_b64/b32 and s_*_wrexec forms (0x24-0x2b, 0x37-0x47), s_quadmask (0x2c/0x2d),
+// s_movrels (0x2e/0x2f: its READ is M0-relative) and s_abs_i32 (0x34). The escapes (PC transfers,
+// s_movreld_*, s_movrelsd_2_b32) are decided before this. A reserved encoding in that range (0x23,
+// 0x32, 0x33, 0x35, 0x36, 0x48, 0x4a and up) has no defined effect, so it stays a write of every
+// SGPR rather than of its SDST pair (fail-closed, #4712 review).
+bool sop1_high_opcode_names_its_writes(uint32_t opcode) {
+    return (opcode >= 0x24u && opcode <= 0x2fu) || opcode == 0x34u ||
+           (opcode >= 0x37u && opcode <= 0x47u);
+}
+
+}   // namespace
+
+// What the proof knows from the code bytes alone, for one (consumer pc, T# base, producer pcs). The
+// address-dependent half -- which word of each producer the CPU snapshot read, and whether a known
+// image-write footprint misses those bytes -- is checked per call against this.
+struct SplitT8Structure {
+    bool ok = false;
+    // Every dword the analysis read, including tail blocks past the first s_endpgm. The decoded
+    // program a cache hangs off is validated only up to that s_endpgm, so a hit must re-check these.
+    std::vector<uint32_t> analysed;
+    std::array<uint64_t, 8> tags_at_use{};   // the meet-over-paths tag of each descriptor word
+    struct Lane {
+        size_t producer = 0;   // instruction index: the tag's producer field
+        int base_reg = 0;   // the entry pointer pair the load reads through
+        int dst = 0;
+        uint32_t width = 0;
+        uint32_t literal = 0;
+    };
+    std::array<Lane, 8> lanes{};
+    struct Writer {
+        uint32_t pc = 0;
+        bool image = false;
+    };
+    std::vector<Writer> writers_before_use;   // every reachable memory writer the use can follow
+};
+
+struct SplitT8ProofCache {
+    struct Key {
+        uint32_t use_pc = 0;
+        int tbase = 0;
+        std::array<uint32_t, 8> source_pc{};
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            uint64_t h = 0xCBF29CE484222325ULL ^ k.use_pc ^ (static_cast<uint64_t>(k.tbase) << 32u);
+            for (uint32_t pc : k.source_pc) h = (h ^ pc) * 0x100000001B3ULL;
+            return static_cast<size_t>(h);
+        }
+    };
+    std::mutex mutex;
+    std::unordered_map<Key, std::shared_ptr<const SplitT8Structure>, KeyHash> entries;
+};
+
+std::shared_ptr<SplitT8ProofCache> make_split_t8_proof_cache() {
+    return std::make_shared<SplitT8ProofCache>();
+}
+
+namespace {
+
+std::shared_ptr<const SplitT8Structure> analyze_split_t8(const uint32_t* code, size_t dwords,
+                                                         uint32_t use_pc, int tbase,
+                                                         const std::array<uint32_t, 8>& source_pc) {
+    auto result = std::make_shared<SplitT8Structure>();
+    result->analysed.assign(code, code + dwords);
     std::vector<Rdna2Inst> full;
     rdna2_walk(code, dwords, full);
-    if (full.empty() || !full.back().is_end || !rdna2_append_closed_tail_blocks(code, dwords, full) ||
-        has_indirect_control_flow(full)) return false;
+    if (full.empty() || !full.back().is_end ||
+        !rdna2_append_closed_tail_blocks(code, dwords, full) || has_indirect_control_flow(full))
+        return result;
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t i = 0; i < full.size(); ++i) {
         if (full[i].fmt == Rdna2Format::Unknown || !full[i].len_dwords ||
-            !by_pc.emplace(full[i].pc, i).second) return false;
+            !by_pc.emplace(full[i].pc, i).second)
+            return result;
     }
     const auto use_it = by_pc.find(use_pc);
-    if (use_it == by_pc.end()) return false;
+    if (use_it == by_pc.end()) return result;
     const size_t use = use_it->second;
     constexpr size_t no_edge = SIZE_MAX;
     std::vector<std::array<size_t, 2>> edges(full.size());
@@ -62,29 +136,31 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         if (in.is_end) continue;
         // The debug conditional branches have different predicates, and an indirect transfer
         // has no statically enumerable successor. Decline rather than treating either as fallthrough.
-        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a)
-            return false;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a) return result;
         // s_subvector_loop_begin/end (SOPK 0x1b/0x1c) branch by their SIMM16, which this CFG does
         // not model.
-        if (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c))
-            return false;
+        if (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c)) return result;
         if (sopp_is_branch(in)) {
             const int64_t target = sopp_branch_target(in);
-            if (target < 0 || target > UINT32_MAX) return false;
+            if (target < 0 || target > UINT32_MAX) return result;
             const auto branch = by_pc.find(static_cast<uint32_t>(target));
-            if (branch == by_pc.end()) return false;
+            if (branch == by_pc.end()) return result;
             edges[i][0] = branch->second;
             if (sopp_is_unconditional_branch(in)) continue;
-            if (i + 1 >= full.size()) return false;
+            if (i + 1 >= full.size()) return result;
             edges[i][1] = i + 1;
         } else if (i + 1 < full.size()) {
             edges[i][0] = i + 1;
         }
     }
     auto may_write = [&](const Rdna2Inst& in, int reg) {
-        // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base.
-        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return true;
+        // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base. The
+        // shared list names exactly those (s_movreld_*, s_movrelsd_2_b32, PC transfers, calls); an
+        // s_*_saveexec form writes only its named destination and EXEC, and falls through below.
+        if (rdna2_escapes_decoded_effects(in)) return true;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u &&
+            !sop1_high_opcode_names_its_writes(in.opcode))
+            return true;
         // A plain B32 move writes only its named word. Treating it as a pair incorrectly
         // clobbers the adjacent destination while assembling a T# one lane at a time.
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
@@ -120,43 +196,25 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         return overlaps(in.dst, width) || overlaps(in.sdst, 2);
     };
 
-    // Validate each lane's producer and name the tag its descriptor word must carry at the use.
-    // A tag is (instruction index << 8 | word) for a load word, and the two sentinels below.
-    constexpr uint64_t kUnknown = ~0ull;
-    constexpr uint64_t kEntryBit = 1ull << 63;
-    auto load_tag = [](size_t producer, uint32_t word) {
-        return (static_cast<uint64_t>(producer) << 8u) | word;
-    };
+    // Validate each lane's producer from its encoding alone. Which word it supplies is decided per call.
     std::vector<uint8_t> is_producer(full.size());
-    std::array<uint64_t, 8> expected{};
     for (int lane = 0; lane < 8; ++lane) {
         const auto found = by_pc.find(source_pc[static_cast<size_t>(lane)]);
-        if (found == by_pc.end()) return false;
+        if (found == by_pc.end()) return result;
         const size_t producer = found->second;
         const Rdna2Inst& load = full[producer];
-        if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u ||
-            load.opcode < 2u || load.dst.kind != OperandKind::SGPR ||
-            load.src[0].kind != OperandKind::SGPR ||
-            ((load.words[1] >> 25u) & 0x7fu) != 125u ||
-            static_cast<int32_t>(load.literal) < 0) return false;
-        const uint32_t width = load.opcode == 2u ? 4u : load.opcode == 3u ? 8u : 16u;
-        const int base_reg = load.src[0].value;
-        if (base_reg < static_cast<int>(user_sgpr_base) ||
-            base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) ||
-            base_reg + 1 >= kSgprs) return false;
-        const size_t seed = static_cast<size_t>(base_reg - static_cast<int>(user_sgpr_base));
-        const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
-                              (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
-        if (base > UINT64_MAX - load.literal) return false;
-        const uint64_t first_addr = base + load.literal;
-        const uint64_t addr = source_addr[static_cast<size_t>(lane)];
-        if (addr < first_addr || addr - first_addr >= width * sizeof(uint32_t) ||
-            ((addr - first_addr) & 3u)) return false;
-        const uint32_t word = static_cast<uint32_t>((addr - first_addr) / sizeof(uint32_t));
-        if (load.dst.value < 0 || load.dst.value + static_cast<int>(word) >= kSgprs)
-            return false;
+        if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u || load.opcode < 2u ||
+            load.dst.kind != OperandKind::SGPR || load.src[0].kind != OperandKind::SGPR ||
+            ((load.words[1] >> 25u) & 0x7fu) != 125u || static_cast<int32_t>(load.literal) < 0 ||
+            load.dst.value < 0 || load.src[0].value < 0 || load.src[0].value + 1 >= kSgprs)
+            return result;
         is_producer[producer] = 1;
-        expected[static_cast<size_t>(lane)] = load_tag(producer, word);
+        auto& out = result->lanes[static_cast<size_t>(lane)];
+        out.producer = producer;
+        out.base_reg = load.src[0].value;
+        out.dst = load.dst.value;
+        out.width = descriptor_load_dwords(load.opcode);
+        out.literal = load.literal;
     }
 
     using State = std::array<uint64_t, kSgprs>;
@@ -164,7 +222,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const Rdna2Inst& in = full[i];
         if (is_producer[i]) {
             const int base_reg = in.src[0].value;
-            const uint32_t width = in.opcode == 2u ? 4u : in.opcode == 3u ? 8u : 16u;
+            const uint32_t width = descriptor_load_dwords(in.opcode);
             const bool entry_pointer = s[static_cast<size_t>(base_reg)] ==
                                            (kEntryBit | static_cast<uint64_t>(base_reg)) &&
                                        s[static_cast<size_t>(base_reg + 1)] ==
@@ -196,7 +254,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         for (size_t next : edges[producer])
             if (next != no_edge) { seen[next] = 1; queue.push_back(next); }
         for (size_t q = 0; q < queue.size(); ++q) {
-            if (queue[q] == producer) return false;
+            if (queue[q] == producer) return result;
             for (size_t next : edges[queue[q]])
                 if (next != no_edge && !seen[next]) { seen[next] = 1; queue.push_back(next); }
         }
@@ -239,10 +297,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             }
         }
     }
-    if (!reached[use]) return false;
+    if (!reached[use]) return result;
     for (int lane = 0; lane < 8; ++lane)
-        if (in_state[use][static_cast<size_t>(tbase + lane)] != expected[static_cast<size_t>(lane)])
-            return false;
+        result->tags_at_use[static_cast<size_t>(lane)] =
+            in_state[use][static_cast<size_t>(tbase) + static_cast<size_t>(lane)];
 
     // A guest-visible write that can execute before the consumer could alter descriptor backing
     // after the CPU snapshot. That is every reachable instruction from which the consumer can be
@@ -264,10 +322,74 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             back.push_back(p);
         }
     }
-    // A storage-image write whose footprint is known and disjoint from every descriptor byte read here
-    // cannot change what the loads observed, so it does not revoke the proof.
-    auto cannot_reach_descriptor = [&](const Rdna2Inst& writer) {
-        if (writer.fmt != Rdna2Format::MIMG) return false;
+    for (size_t i = 0; i < full.size(); ++i)
+        if (before_use[i] && reached[i] && rdna2_instruction_may_write_memory(full[i]))
+            result->writers_before_use.push_back({full[i].pc, full[i].fmt == Rdna2Format::MIMG});
+    result->ok = true;
+    return result;
+}
+
+}   // namespace
+
+bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc, int tbase,
+                                 const std::array<uint32_t, 8>& source_pc,
+                                 const std::array<uint64_t, 8>& source_addr,
+                                 const uint32_t* user_sgprs, uint32_t nsgpr,
+                                 uint32_t user_sgpr_base,
+                                 const std::vector<ImageWriteExtent>& image_writes,
+                                 SplitT8ProofCache* cache) {
+    // With a cache the CFG analysis is paid once per program version and consumer, so the bound is
+    // a memory guard rather than a per-dispatch cost guard.
+    if (!code || !user_sgprs || dwords > kSplitT8MaxDwords || tbase < 0 || tbase + 7 >= kSgprs)
+        return false;
+    std::shared_ptr<const SplitT8Structure> structure;
+    if (cache) {
+        const SplitT8ProofCache::Key key{use_pc, tbase, source_pc};
+        {
+            std::scoped_lock lock(cache->mutex);
+            const auto found = cache->entries.find(key);
+            if (found != cache->entries.end()) structure = found->second;
+        }
+        // Same body, different tail: the live bytes are no longer the ones the entry describes.
+        if (structure &&
+            (structure->analysed.size() != dwords ||
+             !std::equal(structure->analysed.begin(), structure->analysed.end(), code)))
+            structure.reset();
+        if (!structure) {
+            structure = analyze_split_t8(code, dwords, use_pc, tbase, source_pc);
+            std::scoped_lock lock(cache->mutex);
+            cache->entries.insert_or_assign(key, structure);
+        }
+    } else {
+        structure = analyze_split_t8(code, dwords, use_pc, tbase, source_pc);
+    }
+    if (!structure || !structure->ok) return false;
+
+    // Each word the fold read must be the word of its producer that reaches the use on every path.
+    for (int lane = 0; lane < 8; ++lane) {
+        const SplitT8Structure::Lane& l = structure->lanes[static_cast<size_t>(lane)];
+        if (l.base_reg < static_cast<int>(user_sgpr_base) ||
+            l.base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) || l.base_reg + 1 >= kSgprs)
+            return false;
+        const auto seed = static_cast<size_t>(l.base_reg - static_cast<int>(user_sgpr_base));
+        const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
+                              (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
+        if (base > UINT64_MAX - l.literal) return false;
+        const uint64_t first_addr = base + l.literal;
+        const uint64_t addr = source_addr[static_cast<size_t>(lane)];
+        if (addr < first_addr || addr - first_addr >= l.width * sizeof(uint32_t) ||
+            ((addr - first_addr) & 3u))
+            return false;
+        const auto word = static_cast<uint32_t>((addr - first_addr) / sizeof(uint32_t));
+        if (l.dst + static_cast<int>(word) >= kSgprs) return false;
+        if (structure->tags_at_use[static_cast<size_t>(lane)] != load_tag(l.producer, word))
+            return false;
+    }
+
+    // A storage-image write whose footprint is known and disjoint from every descriptor byte read
+    // here cannot change what the loads observed, so it does not revoke the proof.
+    auto cannot_reach_descriptor = [&](const SplitT8Structure::Writer& writer) {
+        if (!writer.image) return false;
         for (const ImageWriteExtent& extent : image_writes) {
             if (extent.pc != writer.pc) continue;
             for (int lane = 0; lane < 8; ++lane) {
@@ -278,11 +400,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         }
         return false;
     };
-    for (size_t i = 0; i < full.size(); ++i)
-        if (before_use[i] && reached[i] && rdna2_instruction_may_write_memory(full[i]) &&
-            !cannot_reach_descriptor(full[i]))
-            return false;
-    return true;
+    return std::all_of(structure->writers_before_use.begin(), structure->writers_before_use.end(),
+                       cannot_reach_descriptor);
 }
 
 bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo, uint64_t& hi) {

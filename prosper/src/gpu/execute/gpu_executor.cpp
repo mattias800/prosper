@@ -5308,9 +5308,10 @@ resolve_dynamic_fetch_fold(const uint32_t* code, size_t dwords, const uint32_t* 
                             same_code &&
                             mapped_split_t8_reaches_use(
                                 code,
-                                std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u),
+                                std::min<size_t>(rdna2_recompile_code_span(code, dwords),
+                                                 kSplitT8MaxDwords),
                                 in.pc, tbase, mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr,
-                                user_sgpr_base, image_writes);
+                                user_sgpr_base, image_writes, decoded->split_t8_cache.get());
                     }
                     // The admission predicate lives in fold_t8_decline_reason so every decline
                     // names its gate in the [t8-dropped] witness (#4700).

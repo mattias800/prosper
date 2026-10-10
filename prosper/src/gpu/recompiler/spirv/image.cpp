@@ -199,6 +199,30 @@ void SpirvCompute::image_sample_lz_offset_2d(uint32_t binding, uint32_t u_bits, 
         image_sample_lod_2d(binding, fbin(Op_FAdd, u_bits, du), fbin(Op_FAdd, v_bits, dv), uconst(0), out);
     }
 
+    void SpirvCompute::image_sample_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                              uint32_t off_bits, uint32_t out[4]) {
+        if (!declared_image_query) {
+            put(caps, Op_Capability, {Cap_ImageQuery});
+            declared_image_query = true;
+        }
+        uint32_t si = id();
+        put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img = id();
+        put(code, Op_Image, {tex_binding_img[binding], img, si});
+        const uint32_t q_type = tex_is_arrayed(binding) ? t_v3i() : t_v2i();
+        uint32_t size = id();
+        put(code, Op_ImageQuerySizeLod, {q_type, size, img, uconst(0)});
+        uint32_t w_i = id();
+        put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
+        uint32_t h_i = id();
+        put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
+        uint32_t ox = bfe_s(off_bits, uconst(0), uconst(6)),
+                 oy = bfe_s(off_bits, uconst(8), uconst(6));
+        uint32_t du = fbin(Op_FDiv, cvt_i2f(ox), cvt_i2f(i2u(w_i)));
+        uint32_t dv = fbin(Op_FDiv, cvt_i2f(oy), cvt_i2f(i2u(h_i)));
+        image_sample_2d(binding, fbin(Op_FAdd, u_bits, du), fbin(Op_FAdd, v_bits, dv), out);
+    }
+
 void SpirvCompute::image_get_resinfo(uint32_t binding, uint32_t dim, uint32_t lod_bits, uint32_t out[4]) {
         if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
         const uint32_t simg = tex_binding_simg[binding];

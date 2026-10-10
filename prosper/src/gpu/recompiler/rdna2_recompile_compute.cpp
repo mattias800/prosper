@@ -1052,6 +1052,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
     b.vcc_b32_low_only_analysis_done = true;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    // No launch state is seeded here, for any stage, so an SGPR this census never saw written may
+    // be real launch data (a VS's s3, a fragment's user data): it is not a fabricated word (#4714).
+    rs.absent_sgpr_reads_fabricated_zero = false;
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)

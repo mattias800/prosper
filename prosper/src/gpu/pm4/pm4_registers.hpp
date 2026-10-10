@@ -48,9 +48,6 @@ constexpr uint32_t IT_RELEASE_MEM               = 0x49;
 constexpr uint32_t IT_DMA_DATA                  = 0x50;
 constexpr uint32_t IT_ACQUIRE_MEM               = 0x58;
 constexpr uint32_t IT_REWIND                    = 0x59;
-constexpr uint32_t IT_LOAD_UCONFIG_REG          = 0x5E;
-constexpr uint32_t IT_LOAD_SH_REG               = 0x63;
-constexpr uint32_t IT_LOAD_CONTEXT_REG          = 0x64;
 constexpr uint32_t IT_SET_CONFIG_REG            = 0x68;
 constexpr uint32_t IT_SET_CONTEXT_REG           = 0x69;
 constexpr uint32_t IT_SET_SH_REG                = 0x76;
@@ -64,7 +61,6 @@ constexpr uint32_t IT_WAIT_ON_CE_COUNTER        = 0x86;
 constexpr uint32_t IT_WAIT_ON_DE_COUNTER_DIFF   = 0x88;
 constexpr uint32_t IT_DISPATCH_DRAW_PREAMBLE    = 0x8C;
 constexpr uint32_t IT_DISPATCH_DRAW             = 0x8D;
-constexpr uint32_t IT_LOAD_CONTEXT_REG_INDEX    = 0x9F;
 // NOTE: the custom IT_NOP sub-opcode enum (R_*) is NOT defined here. It was a vendored copy of Kyty's
 // GNM-era set that DIVERGED from the values prosper actually encodes/decodes (e.g. R_DISPATCH_DIRECT was
 // 0x08 vs the real 0x1a, and DMA_DATA/INDEX_BASE/INDEX_COUNT/DRAW_INDEX_OFFSET/JUMP/SET_PRED were
