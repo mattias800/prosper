@@ -765,3 +765,15 @@ TEST(ScalarPairMask, ExecCmovSelectsOnlyOnADefiniteScc) {
     EXPECT_TRUE(compile_whole(Stage::Compute, cat({&kPrefix, &kOnePath, &body, &kStoreV3})).empty())
         << "a merge-marked SCC must not select EXEC";
 }
+
+TEST(ScalarPairMask, ExecSourceIsAdmittedAsLaneMask) {
+    // EXEC (SGPR 126/127) is active lane mask state, not unprojectable scalar data. Copying EXEC
+    // into VCC (`s_mov_b64 vcc, exec`: 0xbeea047eu) preserves the live execution mask and admits
+    // subsequent VCC mask reads without scalar-fabricated-lane-mask refusal.
+    const Words mov_vcc_exec = {0xbeea047eu};
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_FALSE(compile(stage, program(kDefined, mov_vcc_exec)).empty())
+            << name(stage) << ": s_mov_b64 vcc, exec must be admitted: "
+            << last_terminal_reject_reason(kAddress);
+    }
+}

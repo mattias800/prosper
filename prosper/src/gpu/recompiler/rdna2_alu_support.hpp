@@ -485,8 +485,11 @@ inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
                                       const Rdna2Inst& in, uint32_t k) {
     const Operand& o = in.src[k];
     const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
-    if (o.kind != OperandKind::SGPR && !special_data) return true;
+    const bool special_exec =
+        o.kind == OperandKind::Special && (o.value == 126 || o.value == 127);
+    if (o.kind != OperandKind::SGPR && !special_data && !special_exec) return true;
     if ((o.value == 106 || o.value == 107) && rs.vcc) return true;   // the live predicate wins
+    if (special_exec) return rs.exec != 0;                           // the live execution mask wins
     if (rs.sreg_bool.contains(o.value)) return true;
     // A NEVER-WRITTEN source counts: operand_bits reads its absence as uconst(0).
     return scalar_words_projectable(b, rs, o.value, scalar_alu_source_words(in, k) == 1u ? 1 : 2);
