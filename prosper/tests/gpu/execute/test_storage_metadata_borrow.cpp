@@ -210,10 +210,13 @@ struct Fixture {
     void run() {
         if (!metadata_bytes || metadata_bytes > 65536 || metadata_bytes % (W * 4)) return;
         set_metadata_kind_query([&](const MetadataKindRequest& request) {
-            return request.resource_addr == image.gpu_addr && request.metadata_addr == image.metadata_addr &&
-                   request.num_components == image.num_components && request.img_dim == 1 &&
-                   (request.format == image.format || request.format == sampled().format)
-                       ? kind : CompressionMetadataKind::Unknown;
+            return request.resource_addr == image.gpu_addr &&
+                           request.metadata_addr == image.metadata_addr &&
+                           request.num_components == image.num_components && request.img_dim == 1 &&
+                           (request.format == image.format || request.format == sampled().format ||
+                            request.format == DataFormat::Unorm16)
+                       ? kind
+                       : CompressionMetadataKind::Unknown;
         });
         auto producer = writer(), meta = metadata_writer(), consumer = reader();
         // Exercise repeated publication before testing public retained-result authority.
@@ -238,6 +241,30 @@ struct Fixture {
                     base_oracle();
                     held = borrow(sampled(), true, "full-FF native result initially imports");
                     check(center(draw_lease(held), true), "real GPU draw reads initial imported native color");
+                    if (numeric_alias && !transfer_test) {
+                        // #4810: the importer admits an R16_UNORM consumer of this R16_UINT result
+                        // and returns R16_UNORM. The renderer used to view the borrowed image in
+                        // backend_color_format(R16_UNORM) = R8G8B8A8_UNORM: a 4-byte view of a
+                        // 2-byte image, which reads past the allocation (The Pathless lost its
+                        // device that way) and here reads (0, 60, 0, 60). Viewed as created, the
+                        // stored 0x3c00 is 15360/65535 = 0.234 -> 60 in red, alpha one.
+                        auto unorm = sampled();
+                        unorm.format = DataFormat::Unorm16;
+                        const auto lease =
+                            borrow(unorm, true, "R16_UNORM consumer borrows the R16_UINT result");
+                        check(lease.native_format == static_cast<uint32_t>(VK_FORMAT_R16_UNORM),
+                              "the importer names the consumer's R16_UNORM format");
+                        const auto rgba = draw_lease(lease);
+                        const size_t at = (H / 2 * W + W / 2) * 4;
+                        const bool exact = rgba.size() == N * 4 && rgba[at] >= 58 &&
+                                           rgba[at] <= 62 && rgba[at + 1] == 0 &&
+                                           rgba[at + 2] == 0 && rgba[at + 3] == 255;
+                        if (!exact && rgba.size() == N * 4)
+                            std::fprintf(stderr, "R16_UNORM borrow center=(%u,%u,%u,%u)\n",
+                                         rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]);
+                        check(exact, "#4810: a borrowed R16_UNORM image is viewed as R16_UNORM, "
+                                     "not as the renderer's folded RGBA8 host format");
+                    }
                     saved_pixels = pixels;
                     if (transfer_test) {
                         const auto count = prosper::frontend::live_compute_storage_transfer_seeds();

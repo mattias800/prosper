@@ -162,7 +162,7 @@ TEST(NggDrawAdmission, EveryRefusalIsNamed) {
     const std::vector<Arm> arms = {
         {"ngg-host-unpublished", [](auto&, auto&, auto& h) { h.published = false; }},
         {"ngg-register-missing", [](auto& r, auto&, auto&) { r.missing = "GE_CNTL"; }},
-        {"ngg-gs-wave32", [](auto& r, auto&, auto&) { r.vgt_shader_stages_en |= 1u << 22; }},
+        {"ngg-passthrough-gs", [](auto& r, auto&, auto&) { r.vgt_shader_stages_en |= 1u << 25; }},
         {"ngg-gs-instancing",
          [](auto& r, auto&, auto&) { r.vgt_gs_instance_cnt = kGsInstanceEnable | (2u << 2); }},
         {"ngg-input-topology", [](auto& r, auto&, auto&) { r.primitive_type = 5u; }},   // fan
@@ -732,6 +732,39 @@ TEST(NggDrawAdmission, AVsOnlyDrawExportsItsInputTriangles) {
     legacy.vgt_shader_stages_en = 0u;
     EXPECT_FALSE(admit_ngg_draw(legacy, kena_vs_only_facts(), radv()).applies)
         << "without PRIMGEN_EN the path does not apply";
+}
+
+// #4808: Yakuza Kiwami's NGG VS draws, VGT_SHADER_STAGES_EN 0x02402000 -- PRIMGEN_EN, GS_W32_EN and
+// PRIMGEN_PASSTHRU_EN, no GS. Admitted as a Wave32, passthrough VS-only draw: the planner gets the
+// width and the launch form, and the shell's native subgroup follows the host's 32-lane capability,
+// not its 64-lane one. Passthrough with a GS stays refused by name.
+TEST(NggDrawAdmission, AWave32PassthroughVsOnlyDrawIsAdmittedWithItsWidth) {
+    NggDrawRegisters r = kena_vs_only_registers();
+    r.vgt_shader_stages_en = 0x02402000u;
+    NggHostCapabilities host = radv();
+    host.native_wave64 = true;
+    host.native_wave32 = false;
+    const NggDrawAdmission w32 = admit_ngg_draw(r, kena_vs_only_facts(), host);
+    ASSERT_TRUE(w32.ok()) << w32.refusal;
+    EXPECT_TRUE(w32.vs_only);
+    EXPECT_EQ(w32.limits.wave_lanes, 32u);
+    EXPECT_TRUE(w32.limits.passthrough);
+    EXPECT_FALSE(w32.native_wave64) << "a 64-lane native subgroup does not run a Wave32 wave";
+    host.native_wave32 = true;
+    EXPECT_TRUE(admit_ngg_draw(r, kena_vs_only_facts(), host).native_wave64);
+
+    const NggDrawAdmission w64 =
+        admit_ngg_draw(kena_vs_only_registers(), kena_vs_only_facts(), host);
+    ASSERT_TRUE(w64.ok()) << w64.refusal;
+    EXPECT_EQ(w64.limits.wave_lanes, 64u);
+    EXPECT_FALSE(w64.limits.passthrough);
+
+    NggDrawRegisters merged = r;
+    merged.vgt_shader_stages_en |= 0x30u;   // GS_EN, ES_EN
+    merged.vgt_gs_out_prim_type = 2u;
+    const NggDrawAdmission gs = admit_ngg_draw(merged, kena_vs_only_facts(), host);
+    ASSERT_TRUE(gs.refusal);
+    EXPECT_STREQ(gs.refusal, "ngg-passthrough-gs");
 }
 
 // #3135 layered NGG depth. A draw that writes no colour has its layer address the depth array:

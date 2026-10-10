@@ -2,8 +2,9 @@
 // one guest subgroup per Vulkan workgroup and writes every lane's exports to a record buffer
 // (#3135 phase P2). Compile and offline execution only: nothing live dispatches it yet.
 //
-// Execution model. LocalSize is 64 * waves, one Wave64 guest wave per 64 invocations, so the guest's
-// waves share LDS and s_barrier exactly as in one hardware subgroup. The host runs one dispatch per
+// Execution model. LocalSize is L * waves, one guest wave per L invocations (L = 64, or 32 for a
+// Wave32 program: VGT_SHADER_STAGES_EN.GS_W32_EN), so the guest's waves share LDS and s_barrier
+// exactly as in one hardware subgroup. The host runs one dispatch per
 // wave count W, one workgroup per subgroup of that W; a planner (gpu/execute/ngg_subgroup_plan)
 // supplies the launch values.
 //
@@ -11,11 +12,14 @@
 //
 //   set 2, binding 0  LAUNCH records, kNggLaunchWordsPerLane raw uint words per invocation:
 //                     v0..v8, then s3. Invocation (g, i) -- workgroup g, guest thread
-//                     i = wave * 64 + lane -- reads record g * 64 * W + i. That is the identity
+//                     i = wave * L + lane -- reads record g * L * W + i. That is the identity
 //                     mapping from workgroup ordinal to subgroup: there is no subgroup table yet,
 //                     so the host lays the records of the subgroups it dispatches out in dispatch
 //                     order and binds the buffer at that dispatch's first record. s3 must be equal
-//                     for the 64 lanes of a wave (the planner's ngg_merged_wave_info).
+//                     for the L lanes of a wave (the planner's ngg_merged_wave_info). s2 is not
+//                     stored: every invocation derives it from the s3 of its subgroup's waves
+//                     (ES and GS thread counts summed over the W records at g * L * W + w * L),
+//                     which is ngg_group_info by construction and needs no capsule change.
 //   set 2, binding 1  EXPORT records: one block per workgroup, see ngg_export_record.hpp.
 //
 // Push constants carry the user SGPRs: word k is s(8 + k). When the user-data address is known, the
@@ -57,16 +61,18 @@ inline uint32_t ngg_rsrc2_gs_lds_size(uint32_t spi_shader_pgm_rsrc2_gs) {
 }
 
 struct NggSubgroupShellConfig {
-    uint32_t waves = 1;   // 1..4 Wave64 waves; LocalSize is 64 * waves
+    uint32_t waves = 1;   // 1..4 Wave64 waves, or 1..8 Wave32 waves; LocalSize is lanes * waves
+    uint32_t wave_lanes = 64;   // 64, or 32 for a Wave32 program (GS_W32_EN)
     // The RAW SPI_SHADER_PGM_RSRC2_GS.LDS_SIZE field: 512-byte (128-dword) granules, at most 128.
     // Decode it with ngg_rsrc2_gs_lds_size(); never pass bytes or dwords here. A program that uses
     // LDS with this left at 0 is refused (ngg-shell-config cause=lds-unsized).
     uint32_t rsrc2_gs_lds_size = 0;
     uint32_t user_sgprs = 0;   // s8.. count (AGC user_data_range_end); one push-constant word each
     bool user_data_address_known = false;   // two more push-constant words supply s0:s1
-    // Require one exact 64-lane Vulkan subgroup per guest wave. The pipeline must then be created
-    // with requiredSubgroupSize = 64 and full subgroups; without it the portable shell emulates
-    // cross-lane operations through workgroup memory.
+    // Require one exact Vulkan subgroup of `wave_lanes` invocations per guest wave. The pipeline must
+    // then be created with requiredSubgroupSize = wave_lanes and full subgroups; without it the
+    // portable shell emulates cross-lane operations through workgroup memory. (The name predates
+    // Wave32: for a Wave32 program it means a native 32-lane subgroup.)
     bool native_wave64 = false;
 };
 
