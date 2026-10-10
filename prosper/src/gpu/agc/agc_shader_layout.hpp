@@ -257,6 +257,10 @@ struct DecodedImageView {
 
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
+    // Selected level's depth (3D views shift it by BASE_LEVEL like width/height; 2D views
+    // carry the descriptor depth through). Callers sizing a backing store must use this,
+    // not the descriptor's allocation-wide depth.
+    uint32_t depth = 0;
     size_t mip_offset = 0;
     // Packed-tail views keep `base` at the allocation's first shared macroblock. mip_offset is the
     // byte origin inside that block and must be applied by the tail-aware detile/writeback helpers.
@@ -303,6 +307,7 @@ inline DecodedImageView unmapped_format_image_view(const DecodedImageDescriptor&
     view.base = d.base;
     view.width = d.width;
     view.height = d.height;
+    view.depth = d.depth;
     view.supported = d.base_level == 0 && d.base_array == 0;
     // Everything else stays at its default: no mip offset, no tail, no layer stride, and no
     // allocation-wide mip placement (zero element extent = not modelled, #3048).

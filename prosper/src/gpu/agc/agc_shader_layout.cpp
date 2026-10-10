@@ -580,6 +580,7 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     view.base = d.base;
     view.width = d.width;
     view.height = d.height;
+    view.depth = d.depth;
     if (d.depth == 0) {
         view.supported = false;
         return view;
@@ -600,6 +601,42 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // MSAA resources have different slice semantics and remain fail-closed for nonzero views.
     const bool thin_2d = d.type == 9;
     const bool thin_2d_layered = image_type_has_modeled_layer_stride(d.type);
+    // Thick-3D (type 10) single-level views pack every level into the allocation's first
+    // 64 KiB block (tiled_volume_tail_layout, proven against live Black Flag bytes).
+    // Multi-level chain views stay refused: their per-level materialization needs volume
+    // support in mip_chain_plan, which does not exist yet. Non-tailable shapes stay
+    // refused for the same silent-wrong-texels reason as every path below.
+    const bool volume_tail_3d = d.type == 10 && d.base_array == 0 && d.base_level == d.last_level;
+    if (volume_tail_3d) {
+        // Block-compressed volumes: the tail rule is in elements and the upload has no BCn
+        // volume-tail reader, so they keep the base-level-only rule.
+        if (!fi.bytes_per_block || fi.block_width > 1) {
+            view.supported = unshifted_view_supported();
+            return view;
+        }
+        const TiledVolumeTailLayout tlayout = tiled_volume_tail_layout(
+            d.width, d.height, d.depth, fi.bytes_per_block, d.tile_mode, d.max_mip, d.base_level);
+        if (!tlayout.supported) {
+            view.supported = unshifted_view_supported();
+            return view;
+        }
+        view.chain_element_width = d.width;
+        view.chain_element_height = d.height;
+        view.chain_bytes_per_block = fi.bytes_per_block;
+        view.chain_max_mip = d.max_mip;
+        view.chain_base_level = d.base_level;
+        view.mip_offset = tlayout.byte_offset;
+        view.in_mip_tail = true;
+        view.mip_tail_bytes = tlayout.tail_block_bytes;
+        view.mip_tail_x = tlayout.tail_x;
+        view.mip_tail_y = tlayout.tail_y;
+        view.width = std::max(d.width >> d.base_level, 1u);
+        view.height = std::max(d.height >> d.base_level, 1u);
+        view.depth = std::max(d.depth >> d.base_level, 1u);
+        // Tail levels share block zero: shifting base would lose the siblings (the same
+        // rule as the thin-2D tail path at the bottom of this function).
+        return view;
+    }
     if ((!thin_2d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
         view.supported = unshifted_view_supported();
         return view;
@@ -956,9 +993,11 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 wr_drop("unsupported image view (mip/array layout)");
                 continue;
             }
-            const uint64_t backing_bytes_per_sample = is_bcn
-                ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
-                : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+            const uint64_t backing_bytes_per_sample =
+                is_bcn ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) *
+                             view.depth * fi.bytes_per_block
+                       : static_cast<uint64_t>(view.width) * view.height * view.depth *
+                             fi.bytes_per_block;
             if (!d.sample_count || backing_bytes_per_sample > UINT32_MAX / d.sample_count) {
                 wr_drop("implausible multisample backing byte size");
                 continue;
@@ -976,7 +1015,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = view.base;
             r.width         = view.width;
             r.height        = view.height;
-            r.depth         = d.depth;
+            r.depth = view.depth;
             r.sample_count  = d.sample_count;
             r.declared_mip_levels = d.sample_count > 1u ? 1u :
                 (d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
@@ -1306,7 +1345,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = view.base;
             r.width         = view.width;
             r.height        = view.height;
-            r.depth         = d.depth;
+            r.depth = view.depth;
             r.sample_count  = d.sample_count;
             r.declared_mip_levels = d.sample_count > 1u ? 1u :
                 (d.last_level >= d.base_level ? (uint32_t)(d.last_level - d.base_level) + 1u : 1u);
@@ -1343,9 +1382,11 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
-            const uint64_t backing_bytes_per_sample = is_bcn
-                ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
-                : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+            const uint64_t backing_bytes_per_sample =
+                is_bcn ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) *
+                             view.depth * fi.bytes_per_block
+                       : static_cast<uint64_t>(view.width) * view.height * view.depth *
+                             fi.bytes_per_block;
             if (!d.sample_count || backing_bytes_per_sample > UINT32_MAX / d.sample_count) {
                 tex_drop(slot, off, s.size(), "implausible multisample backing byte size"); continue; }
             const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;

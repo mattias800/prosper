@@ -275,6 +275,34 @@ void detile_elements_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                            uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
                            uint32_t tail_x, uint32_t tail_y);
 
+// One level of a THICK-3D (SW_64KB_S) mip chain's shared tail block. GFX10 packs every
+// level of a small 3D pyramid into the allocation's first 64 KiB macroblock at the
+// element coordinates below (AddrLib ComputeSurfaceInfoMacroTiled's thick branch:
+// tailMaxDim is the block with width halved, at most 10 tail levels, per-level origin
+// from the alternating-bit mipOffset times the 256-byte-block geometry). Proven against
+// live Black Flag bytes: a 32^3 R8 six-level pyramid detiled through these coordinates
+// reproduces every level from the level above at correlation 1.0000 down the whole
+// chain (ps5debug-NG carve, base 0x4066a90000: L0 (32,0), L1 (0,16), L2 (16,0),
+// L3 (8,8), L4 (0,12), L5 (0,8), means 86.0-86.2). Anything outside that proof --
+// Sw4KbS, thin modes, a chain whose level zero is not itself in the tail -- stays
+// unsupported: the byte pattern of a wrong tail origin is silent wrong texels.
+struct TiledVolumeTailLayout {
+    uint32_t tail_x = 0, tail_y = 0;
+    uint32_t tail_block_bytes = 0;
+    size_t byte_offset = 0;
+    bool supported = false;
+};
+TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, uint32_t depth,
+                                               uint32_t bytes_per_texel, uint32_t tile_mode,
+                                               uint32_t max_mip, uint32_t mip_level);
+
+// Detile one tail-packed level through the coordinates above. `src` names the shared
+// block base; bytes outside this level are never read. Mirrors detile_surface_level's
+// contract for the volume case.
+bool detile_volume_tail_level(uint8_t* dst, const uint8_t* src, size_t src_bytes, uint32_t width,
+                              uint32_t height, uint32_t depth, uint32_t tile_mode,
+                              uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y);
+
 // GFX10 volume layouts. SW_64KB_S (mode 9) uses AddrLib's true 3D S3 macroblocks, whose XYZ extent
 // depends on bytes-per-element; SW_64KB_R_X (mode 27) is a thin/view-as-2D volume where each Z slice
 // owns a padded grid of 2D blocks and Z participates in the pipe-XOR bits. These helpers return

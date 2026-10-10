@@ -8097,7 +8097,7 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                         for (auto& r0 : t.resources)
                             if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
-                                r0.depth == d.depth && r0.format == fi.format &&
+                                r0.depth == view.depth && r0.format == fi.format &&
                                 r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
                                 r0.depth_compare == u.is_depth_compare &&
                                 r0.proven_zero_mip == proven_zero_mip &&
@@ -8120,7 +8120,10 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     ShaderResource r;
                     r.cls = wanted;
                     r.format = fi.format; r.num_components = fi.num_components;
-                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
+                    r.gpu_addr = view.base;
+                    r.width = view.width;
+                    r.height = view.height;
+                    r.depth = view.depth;
                     r.sample_count = d.sample_count;
                     r.declared_mip_levels = d.sample_count > 1u ? 1u :
                         (d.last_level >= d.base_level ?
@@ -8764,7 +8767,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                         for (auto& r0 : table->resources)
                             if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
-                                r0.depth == d.depth && r0.format == view_format &&
+                                r0.depth == view.depth && r0.format == view_format &&
                                 r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
                                 r0.depth_compare == u.is_depth_compare &&
                                 r0.proven_zero_mip == proven_zero_mip &&
@@ -8789,9 +8792,11 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
-                        const uint64_t bytes_per_sample = is_bcn
-                            ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
-                            : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
+                        const uint64_t bytes_per_sample =
+                            is_bcn ? static_cast<uint64_t>((view.width + 3) / 4) *
+                                         ((view.height + 3) / 4) * view.depth * fi.bytes_per_block
+                                   : static_cast<uint64_t>(view.width) * view.height * view.depth *
+                                         fi.bytes_per_block;
                         if (!d.sample_count || bytes_per_sample > UINT32_MAX / d.sample_count)
                             continue;
                         const uint64_t bytes = bytes_per_sample * d.sample_count;
@@ -8808,7 +8813,10 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
-                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
+                    r.gpu_addr = view.base;
+                    r.width = view.width;
+                    r.height = view.height;
+                    r.depth = view.depth;
                     r.sample_count = d.sample_count;
                     shader_resource_apply_mip_chain_provenance(r, view);
                     r.tile_mode = d.tile_mode;

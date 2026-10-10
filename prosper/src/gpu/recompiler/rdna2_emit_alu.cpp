@@ -8689,9 +8689,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
                 }
             } else if (dim3d) {
-                // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
-                // color-grade 3D LUT, #273).
-                if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }
+                // 3D: implicit-LOD / explicit-LOD / LOD-0 sample, or an integer texel FETCH
+                // (image_load — DOLL's color-grade 3D LUT, #273). Explicit LOD lowers with the
+                // guest level, as the 2D path does: a single-level view's image has one mip, so
+                // a nonzero LOD can only address what the view selected (#4814).
+                if (!is_sample && !is_sample_l && !is_sample_lz && !is_load) {
+                    ok = false;
+                    return true;
+                }
                 if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
                     ok = false; return true;
                 }
@@ -8703,6 +8708,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 if (is_sample)      b.image_sample_3d(res->binding, cu, cv, cw, out);
                 else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);
+                else if (is_sample_l)
+                    b.image_sample_lod_3d(res->binding, cu, cv, cw, vread(cvg(3)), out);
                 else                b.image_sample_lod_3d(res->binding, cu, cv, cw,
                                                           b.uconst(0), out);   // _lz: base level
             } else if (is_sample_c_lz || is_sample_c) {
