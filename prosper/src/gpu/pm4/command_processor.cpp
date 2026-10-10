@@ -2939,9 +2939,14 @@ static void honor_write_data(const Pm4Command& c, std::span<const PendingMemoryR
     for (const auto& range : ranges) {
         const uint64_t address = c.wd_addr + range.offset;
         const auto* source = reinterpret_cast<const uint8_t*>(c.wd_data) + range.offset;
-        if (write_trap_armed())
-            write_trap_scan("WDATA", address, peek_qword(c.wd_addr), source, range.bytes,
-                            pkt_addr(c));
+        if (write_trap_armed()) {
+            // CONFIDENCE: HIGH — the range was validated above; a published prefix can already
+            // be unmapped. Keep this diagnostic pre-read inside the fragment we actually own.
+            uint64_t pre = 0;
+            memcpy(&pre, reinterpret_cast<const void*>(address),
+                   std::min<uint64_t>(sizeof(pre), range.bytes));
+            write_trap_scan("WDATA", address, pre, source, range.bytes, pkt_addr(c));
+        }
         memcpy(reinterpret_cast<void*>(address), source, range.bytes);
         applied_bytes += range.bytes;
         set_guest_gpu_write_origin("WRITE_DATA");

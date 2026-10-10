@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <thread>
@@ -24,6 +25,7 @@
 
 extern "C" void* prosper_agc_reg_defaults(unsigned int version);
 extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version);
+extern "C" uint64_t prosper_gpu_write_trap_matches();
 
 namespace {
 using namespace prosper;
@@ -966,7 +968,7 @@ TEST_P(SubmitVisibilityFragments, RetirementDoesNotRequireAnAlreadyPublishedUnma
         << "the retained head owns its payload and has no dependency on the consumed tail";
 }
 
-TEST_P(SubmitVisibilityFragments, RetirementDoesNotReadAnAlreadyPublishedUnmappedPrefix) {
+void check_unmapped_published_prefix(unsigned kind) {
     DirectAliases aliases;
     ASSERT_TRUE(aliases.initialize());
     prosper_gpu_drain_completion_writes();
@@ -983,13 +985,13 @@ TEST_P(SubmitVisibilityFragments, RetirementDoesNotReadAnAlreadyPublishedUnmappe
     completion.rel_value_valid = true;
     completion.rel_value = 1;
     execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
-    if (GetParam() == 2) {
+    if (kind == 2) {
         ASSERT_TRUE(execute_ordered_dma_copy(
             {destination, reinterpret_cast<uint64_t>(source.data()),
              static_cast<uint32_t>(source.size() * 4), kDmaDataAddressSource, 2}));
     } else {
         Pm4Command resource{};
-        resource.kind = GetParam() == 0 ? Pm4Command::Kind::WriteData : Pm4Command::Kind::DmaData;
+        resource.kind = kind == 0 ? Pm4Command::Kind::WriteData : Pm4Command::Kind::DmaData;
         resource.wd_addr = resource.dd_dst = destination;
         resource.wd_data = source.data();
         resource.wd_num = source.size();
@@ -1010,6 +1012,24 @@ TEST_P(SubmitVisibilityFragments, RetirementDoesNotReadAnAlreadyPublishedUnmappe
     retirement.hook = nullptr;
     prosper_gpu_drain_completion_writes();
     EXPECT_EQ(*label, 0x1234567812345678ull);
+}
+
+TEST_P(SubmitVisibilityFragments, RetirementDoesNotReadAnAlreadyPublishedUnmappedPrefix) {
+    check_unmapped_published_prefix(GetParam());
+}
+
+TEST(SubmitVisibilityDefault, WriteTrapReadsOnlyTheRetainedWriteDataFragment) {
+    // CTest starts this case in its own process, before any worker or cached environment read.
+    // The trap stays armed for this process's lifetime; changing it after workers start is unsafe.
+#ifdef _WIN32
+    ASSERT_EQ(_putenv_s("PROSPER_WRITE_TRAP", "0x12345678"), 0);
+#else
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): isolated CTest process, before any worker starts
+    ASSERT_EQ(setenv("PROSPER_WRITE_TRAP", "0x12345678", 1), 0);
+#endif
+    const auto before = prosper_gpu_write_trap_matches();
+    check_unmapped_published_prefix(0);
+    EXPECT_GT(prosper_gpu_write_trap_matches(), before) << "the trap must actually be armed";
 }
 
 TEST(SubmitVisibilityDefault, MappingChangeRetainsTheEarlierResourceFragmentAsAFifoBlocker) {
