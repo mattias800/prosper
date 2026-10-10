@@ -474,7 +474,7 @@ def self_test() -> int:
 # fixed cannot stay, because the gate refuses to be silently over-broad. A stale allowlist is how a
 # gate keeps passing a tree it no longer describes.
 QUARANTINE = {
-    "src/gpu/pm4/command_processor.cpp": 17,
+    "src/gpu/pm4/command_processor.cpp": 16,
     "src/gpu/capture/gpu_capture_bundle.cpp": 1,
     "src/gpu/execute/gpu_execute.hpp": 3,
     "src/gpu/execute/gpu_executor.cpp": 4,
