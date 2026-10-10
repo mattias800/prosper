@@ -517,6 +517,14 @@ have rendered, together with the pass identity that decides which surface receiv
 the first place. One line each: the dead hypothesis, the evidence, the link. Extend this rather than
 re-deriving — and read it before forming a hypothesis about a frozen, black, or missing frame.
 
+- **The existing `GetRegisterDefaults2` table is not a verified `CLEAR_STATE` image.** A 2026-10-10
+  comparison against the native driver's clear-patch baseline disagreed for all three checked
+  context registers: `CB_TARGET_MASK`, `CB_BLEND0_CONTROL`, and `CB_COLOR_CONTROL`. The native
+  patch path starts with 921 context dwords and sends only changed offset/value pairs through its
+  clear-state ioctl; `NotifyDefaultStates` instead groups offsets for shadow ranges. Reusing the
+  returned ABI table as a clear image would therefore change register values without evidence.
+  CONFIDENCE: HIGH on the checked mismatches; remaining image installation is tracked in
+  [#4840](https://github.com/mattias800/prosper/issues/4840).
 - **(Texture upload, not present: recorded here for want of a texture-path list.) On *Summer
   Sports Games*, a pale, over-bright lit surface that `PROSPER_NO_NATIVE_BC_MIP_CHAIN=1` fixed was
   not misplaced mip data.** One title's evidence: its track rendered pale pink, and the switch restored it, which
