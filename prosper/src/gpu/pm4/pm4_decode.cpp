@@ -47,7 +47,116 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         const uint32_t npl = len - 1;                   // payload dword count
 
         using K = Pm4Command::Kind;
-        if (c.op == IT_INDEX_TYPE) {
+        if (c.op == IT_DISPATCH_DIRECT && npl == 4) {
+            // Hardware PM4 DISPATCH_DIRECT (GFX10, 5 dwords): [0..2] = DIM_X/Y/Z, [3] =
+            // COMPUTE_DISPATCH_INITIATOR. The custom R_DISPATCH_DIRECT modifier is that same
+            // register's bit layout (USE_THREAD_DIMENSIONS, CS_W32_EN, ...), so the initiator
+            // feeds resolve_compute_launch() unchanged. Other lengths stay Unknown.
+            c.kind = K::DispatchDirect;
+            c.threads_x = pl[0];
+            c.threads_y = pl[1];
+            c.threads_z = pl[2];
+            c.dispatch_modifier = pl[3];
+        } else if (c.op == IT_DISPATCH_INDIRECT && npl == 2) {
+            // Hardware PM4 DISPATCH_INDIRECT, graphics-ring form (GFX10, 3 dwords): [0] =
+            // DATA_OFFSET from the compute indirect base set by SET_BASE, [1] =
+            // COMPUTE_DISPATCH_INITIATOR.
+            c.kind = K::DispatchIndirect;
+            c.indirect_offset = pl[0];
+            c.dispatch_modifier = pl[1];
+        } else if (c.op == IT_DISPATCH_INDIRECT && npl == 3) {
+            // Hardware PM4 DISPATCH_INDIRECT, compute-queue (MEC) form (4 dwords): [0..1] = the
+            // argument buffer's whole address, [2] = COMPUTE_DISPATCH_INITIATOR. A compute queue has
+            // no SET_BASE, so the address is absolute -- the same contract as R_DISPATCH_INDIRECT_ADDR.
+            // CONFIDENCE: MED (published MEC layout; not yet observed in a PS5 capture).
+            c.kind = K::DispatchIndirect;
+            c.indirect_address = lo_hi(pl) & ~3ull;
+            c.indirect_address_absolute = true;
+            c.dispatch_modifier = pl[2];
+        } else if (c.op == IT_SET_BASE && npl == 3 && (pl[0] & 0xfu) == 1u) {
+            // Hardware PM4 SET_BASE (GFX10, 4 dwords): [0] = BASE_INDEX, [1..2] = address lo/hi.
+            // BASE_INDEX 1 is the indirect-argument base; header bit 1 (SHADER_TYPE) says whose:
+            // 0 = graphics (DRAW_*_INDIRECT), 1 = compute (DISPATCH_INDIRECT) -- the same 0/1
+            // convention as the custom R_SET_BASE_INDIRECT_ARGS. Other base indices (GDS / CE
+            // partition bases, display-list patch table) stay Unknown.
+            c.kind = K::SetBaseIndirectArgs;
+            c.indirect_shader_type = (h >> 1) & 1u;
+            c.indirect_base = lo_hi(&pl[1]);
+        } else if (c.op == IT_INDEX_BUFFER_SIZE && npl == 1) {
+            // Hardware PM4 INDEX_BUFFER_SIZE (GFX10, 2 dwords): [0] = the bound index buffer's size
+            // in indices -- the state sceAgcDcbSetIndexCount binds (R_INDEX_COUNT).
+            c.kind = K::SetIndexCount;
+            c.index_count = pl[0];
+        } else if (c.op == IT_PFP_SYNC_ME && npl == 1) {
+            // Hardware PM4 PFP_SYNC_ME (GFX10, 2 dwords, [0] = DUMMY): the prefetch parser waits
+            // for the micro engine -- the same ordering point as R_STALL_COMMAND_BUFFER_PARSER.
+            c.kind = K::StallCommandBufferParser;
+            // CLEAR_STATE (0x12), CONTEXT_CONTROL (0x28) and ATOMIC_MEM (0x1E) deliberately stay
+            // Unknown: none of them is a draw reset or an acquire barrier, and labelling them as
+            // one would hide a real, unimplemented effect (a context-register reset to clear-state
+            // values; shadow load control; an atomic memory write) from every Unknown census.
+        } else if (c.op == IT_DRAW_INDEX_AUTO && npl == 2) {
+            // Hardware PM4 DRAW_INDEX_AUTO (GFX10, 3 dwords): [0] = INDEX_COUNT, [1] =
+            // VGT_DRAW_INITIATOR. The initiator is not a ShaderDrawModifier, so di_modifier keeps
+            // its zero value (the R_DRAW_INDEX_AUTO legacy three-dword rule).
+            c.kind = K::DrawIndexAuto;
+            c.index_count = pl[0];
+        } else if ((c.op == IT_DRAW_INDIRECT || c.op == IT_DRAW_INDEX_INDIRECT) && npl == 4) {
+            // Hardware PM4 DRAW_INDIRECT / DRAW_INDEX_INDIRECT (GFX10, 5 dwords, see
+            // AGC_PACKET_SIZES.md): [0] = DATA_OFFSET from the graphics indirect base, [1] =
+            // BASE_VTX_LOC, [2] = START_INST_LOC, [3] = VGT_DRAW_INITIATOR. The argument layout
+            // follows from the opcode, exactly as for R_DRAW_INDIRECT / R_DRAW_INDEX_INDIRECT.
+            c.kind = c.op == IT_DRAW_INDIRECT ? K::DrawIndirect : K::DrawIndexIndirect;
+            c.indirect_offset = pl[0];
+        } else if (c.op == IT_INDEX_BASE && npl == 2) {
+            // Hardware PM4 INDEX_BASE (GFX10, 3 dwords): [0..1] = index buffer address lo/hi.
+            c.kind = K::SetIndexBase;
+            c.ib_addr = lo_hi(pl);
+        } else if (c.op == IT_WRITE_DATA && npl >= 4 && (pl[0] & (1u << 16)) == 0 &&
+                   (((pl[0] >> 8) & 0xfu) == 2u || ((pl[0] >> 8) & 0xfu) == 5u)) {
+            // Hardware PM4 WRITE_DATA (GFX10): [0] = CONTROL, [1..2] = DST_ADDR lo/hi, [3..] =
+            // data. Only memory destinations decode -- CONTROL.DST_SEL 2 (TC_L2) or 5 (memory) --
+            // with consecutive addressing (WR_ONE_ADDR, bit 16, clear). A register, GDS or
+            // single-address destination stays Unknown: its "address" is not a guest pointer.
+            c.kind = K::WriteData;
+            c.wd_addr = lo_hi(&pl[1]);
+            c.wd_declared_num = npl - 3;
+            c.wd_num = c.wd_declared_num;
+            c.wd_data = &pl[3];
+            c.wd_valid = true;
+        } else if (c.op == IT_WAIT_REG_MEM && npl == 6 && ((pl[0] >> 4) & 3u) == 1u &&
+                   ((pl[0] >> 6) & 3u) == 0u) {
+            // Hardware PM4 WAIT_REG_MEM (GFX10, 7 dwords): [0] = FUNCTION[2:0] | MEM_SPACE[5:4] |
+            // OPERATION[7:6] | ENGINE_SEL, [1..2] = POLL_ADDRESS lo/hi, [3] = REFERENCE, [4] = MASK,
+            // [5] = POLL_INTERVAL. FUNCTION uses the numbering wait_regmem_value_satisfied()
+            // already implements (0 always .. 6 greater). Only a plain memory poll decodes:
+            // MEM_SPACE 0 polls a register (its "address" is a register offset) and OPERATION != 0
+            // writes before waiting, so either stays Unknown. The 32-bit MASK zero-extends, so the
+            // qword the processor reads compares on its low dword only.
+            c.kind = K::WaitRegMem;
+            c.wm_func = pl[0] & 7u;
+            c.wm_addr = lo_hi(&pl[1]) & ~3ull;
+            c.wm_ref = pl[3];
+            c.wm_mask = pl[4];
+            c.wm_valid = true;
+        } else if (c.op == IT_WAIT_REG_MEM64 && npl == 8 && ((pl[0] >> 4) & 3u) == 1u &&
+                   ((pl[0] >> 6) & 3u) == 0u) {
+            // Hardware PM4 WAIT_REG_MEM64 (GFX10, 9 dwords, see AGC_PACKET_SIZES.md): [0] = the same
+            // control dword as WAIT_REG_MEM, [1..2] = POLL_ADDRESS lo/hi, [3..4] = REFERENCE lo/hi,
+            // [5..6] = MASK lo/hi, [7] = POLL_INTERVAL -- reference BEFORE mask, the reverse of the
+            // custom R_WAIT_MEM_64 payload. Same memory-poll-only gate as WAIT_REG_MEM.
+            c.kind = K::WaitRegMem;
+            c.wm_func = pl[0] & 7u;
+            c.wm_addr = lo_hi(&pl[1]) & ~7ull;
+            c.wm_ref = lo_hi(&pl[3]);
+            c.wm_mask = lo_hi(&pl[5]);
+            c.wm_valid = true;
+            // COND_EXEC (0x22) and DRAW_INDEX_INDIRECT_MULTI (0x38) deliberately stay Unknown.
+            // COND_EXEC skips the next EXEC_COUNT dwords when *addr == 0, which is not draw
+            // predication; MULTI issues COUNT draws (count possibly read from memory) at a stride,
+            // so mapping it to one DrawIndexIndirect draws the wrong number. Each needs its own
+            // processor support, not a relabel.
+        } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
         } else if (c.op == IT_NUM_INSTANCES) {

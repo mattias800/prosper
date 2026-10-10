@@ -25,8 +25,19 @@ inline constexpr uint32_t kDmaDataAddressSource = 1u << 16;
 // IT_* opcodes and the R_* sub-opcodes carried inside IT_NOP (mirror hle_agc.cpp).
 enum : uint32_t {
     IT_NOP = 0x10,
+    IT_SET_BASE = 0x11,
+    IT_INDEX_BUFFER_SIZE = 0x13,
+    IT_DISPATCH_DIRECT = 0x15,
+    IT_DISPATCH_INDIRECT = 0x16,
+    IT_DRAW_INDIRECT = 0x24,
+    IT_DRAW_INDEX_INDIRECT = 0x25,
+    IT_INDEX_BASE = 0x26,
     IT_INDEX_TYPE = 0x2A,
+    IT_DRAW_INDEX_AUTO = 0x2D,
     IT_NUM_INSTANCES = 0x2F,
+    IT_WRITE_DATA = 0x37,
+    IT_WAIT_REG_MEM = 0x3C,
+    IT_PFP_SYNC_ME = 0x42,
     IT_EVENT_WRITE = 0x46,
     IT_RELEASE_MEM = 0x49,
     IT_ACQUIRE_MEM = 0x58,
@@ -36,6 +47,7 @@ enum : uint32_t {
     IT_SET_CONTEXT_REG = 0x69,
     IT_SET_SH_REG = 0x76,
     IT_SET_UCONFIG_REG = 0x79,
+    IT_WAIT_REG_MEM64 = 0x93,
     IT_LOAD_CONTEXT_REG_INDEX = 0x9F,
     IT_INDIRECT_BUFFER = 0x3F,   // sceAgcCbBranch's 14-dword conditional form (#4540)
 };
