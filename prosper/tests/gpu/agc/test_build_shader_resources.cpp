@@ -1370,6 +1370,21 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
             << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
     }
+    // Block-compressed 3D keeps the base-level-only rule: the tail math is element-based
+    // and the upload has no BCn volume-tail reader. Level 0 stays admitted unshifted.
+    // Sized 16^3 so the layout itself would admit level 1 (16 <= tail width): only the
+    // format guard refuses it, and removing the guard reddens exactly this arm.
+    {
+        Gen5ImageFormatInfo bc1;
+        ASSERT_TRUE(gen5_image_format(169, &bc1)) << "BC1 fixture format maps";
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 16, 16, /*fmt*/ 169, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 16);
+        t[3] |= (1u << 12) | (1u << 16);
+        t[5] |= 1u << 4;
+        EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), bc1).supported)
+            << "BC1 3D level stays refused (no BCn tail reader)";
+    }
 }
 
 // The tail detile at the zero translation is byte-identical to the proven whole-block
