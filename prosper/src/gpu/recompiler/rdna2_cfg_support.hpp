@@ -2061,23 +2061,19 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             // one asks whether SCC is still scalar-valued, which an SCC WRITER can satisfy. See its
             // definition for the `s_bcnt1_i32_b64` case that separates them.
             //
-            // Likewise, memory loads/stores (IMAGE/MUBUF/MTBUF/MIMG/FLAT/DS/SMEM) and other instructions
-            // that do not write SCC (such as SOPK waitcnts) do not modify SCC.
+            // The SOPK waitcnt family (s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt, 0x17..0x1a) only
+            // waits on counters and never writes SCC, so it is stepped over like the SOP1s above.
             //
-            // Everything else that may write SCC still stops the walk. Any other scalar ALU or SOPK
-            // instruction may write SCC, and consuming an older compare through an unmodeled writer would
-            // prove uniformity of a condition the branch never saw.
+            // Everything else in SOP1/SOP2/SOPK may write SCC and still stops the walk: consuming an
+            // older compare through an unmodeled writer would prove uniformity of a condition the
+            // branch never saw. Vector, memory, export and SOPP instructions do not write SCC
+            // (VOPC writes VCC/EXEC, not SCC) and fall through, as before.
             if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode)) continue;
-            if (in.fmt == Rdna2Format::SOPK &&
-                (in.opcode == kSopkOpcodeWaitcntVscnt || in.opcode == kSopkOpcodeWaitcntLgkmcnt))
-                continue;
-            if (in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MIMG ||
-                in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
-                in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::DS ||
-                in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::VINTRP)
+            if (in.fmt == Rdna2Format::SOPK && in.opcode >= kSopkOpcodeWaitcntVscnt &&
+                in.opcode <= kSopkOpcodeWaitcntLgkmcnt)
                 continue;
             if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::VOPC)
+                in.fmt == Rdna2Format::SOPK)
                 return false;
         }
         return false;                 // SCC entering the region from outside is not proved
