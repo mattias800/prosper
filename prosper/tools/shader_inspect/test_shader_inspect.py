@@ -119,6 +119,72 @@ def main() -> int:
     check("usage text warns about the missing resource table",
           "resource table" in done.stderr, "\n" + done.stderr)
 
+    # Synthetic descriptors deliberately have a distinct verdict: a successful compile is
+    # neither an undetermined table-less run nor evidence that live descriptors resolve.
+    def probe_words(stage):
+        return cbuf_load[:-1] + [
+            0x7E000280, 0x7E020280, 0x7E040280, 0x7E0602F2,
+            0xF800180F if stage == "fragment" else 0xF80008CF, 0x03020100, S_ENDPGM,
+        ]
+
+    for stage in ("fragment", "vertex"):
+        code, out = run(binary, probe_words(stage), stage, ["--synthetic-table"])
+        check(f"{stage} synthetic cbuf compile reports its own status",
+              "status=ok-synthetic-table" in out and "resources=1" in out, "\n" + out)
+        check(f"{stage} synthetic cbuf compile exits 4",
+              code == 4, f"got exit {code}")
+        check(f"{stage} synthetic compile retains the admission caveat",
+              "SYNTHETIC TABLE - a compile probe, not an admission verdict" in out, "\n" + out)
+
+    # A decoded but unsupported scalar trap reaches the translator, rather than failing the
+    # input walk. Its refusal must keep the synthetic vocabulary and exit 5.
+    code, out = run(binary, [0xBF920001, S_ENDPGM], "fragment", ["--synthetic-table"])
+    check("synthetic translator refusal reports its own status",
+          "status=rejected-synthetic-table" in out, "\n" + out)
+    check("synthetic translator refusal exits 5", code == 5, f"got exit {code}")
+
+    for stage, extra in ((None, ["--synthetic-table"]),
+                         ("compute", ["--synthetic-table"]),
+                         ("fragment", ["--spirv-out", "unused.spv"])):
+        code, out = run(binary, cbuf_load, stage, extra)
+        check(f"invalid synthetic/output combination {extra} exits 2",
+              code == 2, f"got exit {code}\n{out}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "shader.bin"
+        output_words = probe_words("fragment")
+        raw.write_bytes(struct.pack(f"<{len(output_words)}I", *output_words))
+        output = Path(tmp) / "shader.spv"
+        cmd = [binary, str(raw), "--stage", "fragment", "--synthetic-table", "--spirv-out"]
+        done = subprocess.run(cmd + [str(output)], capture_output=True, text=True)
+        emitted = output.read_bytes() if output.exists() else b""
+        check("synthetic output is a complete SPIR-V word stream",
+              done.returncode == 4 and len(emitted) >= 20 and len(emitted) % 4 == 0 and
+              emitted[:4] == struct.pack("<I", 0x07230203) and
+              f"spirv_dwords={len(emitted) // 4} " in done.stdout,
+              "\n" + done.stdout + done.stderr)
+
+        missing_parent = Path(tmp) / "missing" / "shader.spv"
+        done = subprocess.run(cmd + [str(missing_parent)], capture_output=True, text=True)
+        check("synthetic output open failure is reported as IO error",
+              done.returncode == 2 and f"cannot write {missing_parent}" in done.stderr,
+              f"got exit {done.returncode}\n{done.stderr}")
+
+        # /dev/full also fails buffered writes at flush/close, after opening successfully.
+        # Hosts without this sink still run the portable open-failure arm above.
+        if sys.platform.startswith("linux") and Path("/dev/full").exists():
+            done = subprocess.run(cmd + ["/dev/full"], capture_output=True, text=True)
+            check("synthetic buffered output failure is reported as IO error",
+                  done.returncode == 2 and "cannot write /dev/full" in done.stderr,
+                  f"got exit {done.returncode}\n{done.stderr}")
+
+        raw.write_bytes(struct.pack("<2I", 0xBF920001, S_ENDPGM))
+        refused_output = Path(tmp) / "refused.spv"
+        done = subprocess.run(cmd + [str(refused_output)], capture_output=True, text=True)
+        check("a synthetic refusal creates no SPIR-V output",
+              done.returncode == 5 and "status=rejected-synthetic-table" in done.stdout and
+              not refused_output.exists(), "\n" + done.stdout + done.stderr)
+
     # ---- #3464: offline wave-reason census -----------------------------------------------
     #
     # A fragment shader that votes (compare, then branch on the result) requires the guest wave

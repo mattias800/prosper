@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -595,6 +596,7 @@ int main(int argc, char** argv) {
                 std::ofstream out(spirv_out, std::ios::binary);
                 out.write(reinterpret_cast<const char*>(spirv.data()),
                           static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+                out.close();   // Check errors from flushing buffered data during close.
                 if (!out) {
                     std::fprintf(stderr, "cannot write %s\n", spirv_out.c_str());
                     return 2;

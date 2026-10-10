@@ -28,6 +28,9 @@
 // CONFIDENCE: HIGH for the back-edge (the placeholder is unobservable by the proof); HIGH for the
 // exit state (it restores the emitter's own "a mask write clobbers the pair" rule, see finish_exit).
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 #include <vector>
 
 namespace prosper::gpu {
