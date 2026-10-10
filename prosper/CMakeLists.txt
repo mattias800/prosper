@@ -1319,6 +1319,11 @@ if(TARGET prosper_core)
   add_test(NAME videodec2_decode_optout COMMAND test_videodec2_decode --no-decode)
   add_test(NAME videodec2_decode_format COMMAND test_videodec2_decode --format-probe)
 
+  prosper_add_gtest(test_videodec2_layout
+    SOURCES tests/hle/video/test_videodec2_layout.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   # #3669. libSceVdecsw software video decoder test. Verifies 0x50 config adaptation,
   # asynchronous FIFO AU staging, staging-time memory copying, pictureCount offset (+0x0B),
   # TrySyncDecodeInput zeroing, and lifecycle management (Reset / DeleteDecoder).

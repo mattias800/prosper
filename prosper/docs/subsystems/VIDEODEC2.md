@@ -164,7 +164,7 @@ Every executable image in the local corpus scanned for `sceVideodec2Decode`'s NI
 | *Sonic Racing: CrossWorlds* `PPSA08804` | yes | 2382845 (VP9) | carried **through** its post-logo wall — another lane's measurement, `SONIC_CROSSWORLDS_STATUS.md` |
 | *Dragon Quest VII Reimagined* `PPSA17942` | no — `QueryComputeMemoryInfo` only | — | unaffected |
 | *Balan Wonderworld* `PPSA02058` | no record | — | unaffected |
-| *Crisis Core –FFVII– Reunion* `PPSA07809` | no record | — | unaffected |
+| *Crisis Core –FFVII– Reunion* `PPSA07809` | yes (2026-10-10, #4852) | 1 (AVC High, 1920x1088) | directly samples the decoded NV12 allocation; movies and menu backgrounds render correctly after publishing the producer's plane pitches |
 
 A title that never reaches `Decode` cannot be affected: the decode path is entered only from inside
 `sceVideodec2Decode` on a live decoder handle.
@@ -229,6 +229,20 @@ that its rendering works.
 
 ## Ruled out
 
+- **"Crisis Core's striped movies need a different decoder output tiling or chroma offset."**
+  Falsified by the 2026-10-10 visible `prosper-app` baseline on `fca8179ba8b1`: its sampled
+  descriptors are linear (`tile_mode=0`) R8/RG8 views into the decoder's own allocation, with
+  chroma at exactly the published `1920 * 1088 = 2088960` offset. The guest frame argument has
+  no input pitch or tiling selector. The missing fact was producer provenance: Videodec2 wrote
+  1920-byte rows but registered neither plane, so the renderer resolved absent descriptor pitch
+  to 2048 bytes and did not recognise the UV view as chroma. Registering both linear plane
+  ranges makes the existing resolver use the delivered pitches; the fixed live run reports
+  `registered=1920` and `CHROMA matched-registered-pitch`, and the owner confirmed correct movies
+  and menus. The guest owns these ranges, so decoder deletion preserves them and guest unmap
+  retires them. Synthetic entry-point tests cover both planes, odd widths, replacement and that
+  lifetime. **CONFIDENCE: HIGH.** This does not explain Metaphor #3801: that guest has no
+  Videodec2/AvPlayer imports and uses its CPU CRI decoder. The dark 3D scene after Crisis Core's
+  movie is also separate. #4852.
 - **"A movie compositing with its two chroma components collapsed (`Cr == Cb`) is a Videodec2 output
   problem — the unestablished `VdecOutput::format` misdescribing the chroma layout, or the delivered
   NV12 bytes."** Falsified on both halves. The bytes were already verified byte-identical to an

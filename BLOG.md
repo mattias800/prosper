@@ -19,6 +19,25 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-10
+
+### Metaphor reaches its name prompt, with hard-to-read text
+
+*Metaphor: ReFantazio* reaches the protagonist-name prompt, where the owner noticed the letters align to the top instead of the bottom; this run does not establish a fix for its movies ([tracker #2876](https://github.com/mattias800/prosper/issues/2876), [movie issue #3801](https://github.com/mattias800/prosper/issues/3801)).
+
+<p align="center"><img src="assets/screenshots/issue-4852-metaphor-name-prompt.webp" alt="Metaphor protagonist-name prompt, Who are you who shall guide the protagonist?, with hard-to-read letter alignment; Linux RADV prosper-app, immediate present, existing SYSTEM save copy, scripts/metaphor/reach-title-screen.pad, scheduled host frame 2500; no movie checkpoint claimed"></p>
+<p align="center"><img src="assets/screenshots/issue-4852-metaphor-name-prompt-f9.webp" alt="The same Metaphor name prompt held later in the visible run, with the owner-reported text alignment defect; owner F9 screenshot, producer_submit_captured sidecar and serialized three-submit bundle; replay pixel match unverified"></p>
+
+### Crisis Core's movies and menu backgrounds lose their stripes
+
+*Crisis Core –Final Fantasy VII– Reunion* now plays correct movies and menu backgrounds, which the owner checked by eye; the later 3D scene remains nearly black ([#4852](https://github.com/mattias800/prosper/issues/4852), [tracker #1894](https://github.com/mattias800/prosper/issues/1894), [3D follow-up #4858](https://github.com/mattias800/prosper/issues/4858)).
+
+<p align="center"><img src="assets/screenshots/issue-4852-crisis-movie-fixed.webp" alt="Crisis Core movie after the fix: a correctly arranged Shinra Electric Power Company industrial sign; Linux RADV prosper-app, immediate present, Cross at 60 seconds then owner-operated route, scheduled frame 1500; full renderer cadence"></p>
+<p align="center"><img src="assets/screenshots/issue-4852-crisis-movie-before.webp" alt="Crisis Core movie before the fix: horizontal stripes across the scene and a solid green lower band; Linux RADV prosper-app baseline fca8179ba8b1, immediate present, same route, owner F9 screenshot"></p>
+<p align="center"><img src="assets/screenshots/issue-4852-crisis-menu-before.webp" alt="Crisis Core main menu before the fix: readable NEW GAME and LOAD GAME UI over striped movie pixels and a magenta lower band; same baseline run, scheduled frame 1500"></p>
+<p align="center"><img src="assets/screenshots/issue-4852-crisis-language-before.webp" alt="Crisis Core voice-language menu before the fix: readable settings over a horizontally striped movie background; same baseline run, owner F9 screenshot"></p>
+<p align="center"><img src="assets/screenshots/issue-4852-crisis-3d-still-dark.webp" alt="Crisis Core first 3D scene after the movie fix: nearly black geometry with green highlights; same fixed visible run, owner F9 screenshot; its replay bundle failed the 1 GiB RTT seed limit"></p>
+
 ## 2026-10-09
 
 ### Yakuza Kiwami shows its first picture
