@@ -878,7 +878,9 @@ HLE(s_videodec2_decode) {
                 // so its unmap, rather than DeleteDecoder, retires the layout.
                 const uint64_t y_bytes = static_cast<uint64_t>(pic.y_stride) * pic.height;
                 if (y_bytes < pic.nv12_bytes && pic.nv12_bytes <= frame->data_size) {
-                    gpu::unregister_guest_linear_texture_layouts_in(frame->data, pic.nv12_bytes);
+                    // Reusing a destination buffer replaces its previous picture, including any
+                    // old chroma plane beyond a smaller replacement's written extent.
+                    gpu::unregister_guest_linear_texture_layouts_in(frame->data, frame->data_size);
                     gpu::register_guest_linear_texture_layout(frame->data, y_bytes, pic.y_stride);
                     gpu::register_guest_linear_texture_layout(
                         frame->data + y_bytes, pic.nv12_bytes - y_bytes, pic.uv_stride);

@@ -2,6 +2,8 @@
 // pitch turns 1920-byte movie rows into stripes and reads beyond the chroma plane (#4852).
 // Exercise the guest entry point and the renderer's shared pitch resolver with synthetic pixels.
 #include "gpu/resources/linear_row_pitch.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/video/video_backend.hpp"
 #include "hle/video/videodec2_guest_abi.hpp"
@@ -10,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace {
@@ -137,19 +141,32 @@ TEST_F(Videodec2Layout, OddWidthPublishesDifferentPlanePitches) {
     ASSERT_EQ(submit(), 0u);
     EXPECT_EQ(output.pitch_bytes, 65u);
     EXPECT_EQ(gpu::resolved_linear_row_pitch(plane(frame.data), 65, 1), 65u);
-    EXPECT_EQ(gpu::resolved_linear_row_pitch(plane(frame.data + 65 * 33), 33, 2), 66u);
+    EXPECT_EQ(gpu::resolved_linear_row_pitch(plane(frame.data + 65ull * 33), 33, 2), 66u);
 }
 
 TEST_F(Videodec2Layout, ReplacingPictureRetiresPreviousPlaneBoundary) {
     backend.width = 65;
     backend.height = 33;
     ASSERT_EQ(submit(), 0u);
-    const uint64_t old_uv = frame.data + 65 * 33;
+    const uint64_t old_uv = frame.data + 65ull * 33;
     backend.width = 1920;
     backend.height = 1088;
     ASSERT_EQ(submit(), 0u);
     EXPECT_EQ(gpu::guest_linear_texture_row_pitch(old_uv, 1920), 1920u)
         << "the old UV interval must not shadow the new larger luma plane";
+}
+
+TEST_F(Videodec2Layout, SmallerPictureRetiresOldChromaLayout) {
+    ASSERT_EQ(submit(), 0u);
+    const uint64_t old_uv = frame.data + 1920ull * 1088;
+    ASSERT_EQ(gpu::guest_linear_texture_row_pitch(old_uv, 1920), 1920u);
+    backend.width = 65;
+    backend.height = 33;
+    ASSERT_EQ(submit(), 0u);
+    EXPECT_EQ(gpu::guest_linear_texture_row_pitch(old_uv, 1920), 0u)
+        << "unused destination-buffer bytes must not retain the replaced picture's pitch";
+    EXPECT_EQ(gpu::resolved_linear_row_pitch(plane(frame.data), 65, 1), 65u);
+    EXPECT_EQ(gpu::resolved_linear_row_pitch(plane(frame.data + 65ull * 33), 33, 2), 66u);
 }
 
 TEST_F(Videodec2Layout, NoPictureDoesNotPublishLayout) {
