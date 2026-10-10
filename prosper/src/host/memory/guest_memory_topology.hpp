@@ -32,6 +32,10 @@ private:
     std::shared_lock<std::shared_mutex> lock_;
 };
 
+// Version of authoritative mapping geometry under this lease. Excludes write-watch protection
+// churn; mapping transactions (including guest protection changes) invalidate cached slices.
+uint64_t guest_memory_mapping_generation(const GuestMappingLease& lease);
+
 GuestMemoryTopologyRelation guest_memory_topology_relation(uint64_t first_address,
                                                            uint64_t first_size,
                                                            uint64_t second_address,

@@ -4,6 +4,7 @@
 #include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "gpu/pm4/pending_memory_view.hpp"
+#include "gpu/pm4/pending_memory_queue.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
@@ -2584,7 +2585,8 @@ static bool dma_data_immediate_source(const Pm4Command& c) {
     return !dma_data_address_source(c) && c.dd_src <= UINT32_MAX;
 }
 
-static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false) {
+static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false,
+                                 std::span<const PendingMemoryRange> ranges = {}) {
     constexpr uint32_t kMaxImmediateBytes = 0x1000000;   // existing 16 MiB fill safety bound
     constexpr uint32_t kMaxCopyBytes = 0x10000000;      // HLE builder's 256 MiB API bound
     if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes) return DmaDataForm::Invalid;
@@ -2610,21 +2612,33 @@ static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized =
                    : DmaDataForm::Invalid;
     }
     if (c.dd_dst < 0x10000) return DmaDataForm::Invalid;
+    const auto destinations_valid = [&](bool readable) {
+        const PendingMemoryRange whole{0, c.dd_bytes};
+        const auto stores =
+            ranges.empty() ? std::span<const PendingMemoryRange>(&whole, 1) : ranges;
+        for (const auto& range : stores) {
+            if (range.offset > c.dd_bytes || range.bytes > c.dd_bytes - range.offset ||
+                c.dd_dst > UINT64_MAX - range.offset)
+                return false;
+            const uint64_t address = c.dd_dst + range.offset;
+            if ((readable && !guest_readable(address, range.bytes)) ||
+                (!guest_writable(address, range.bytes) &&
+                 !prosper::guest_memory_gpu_write_supported(address, range.bytes)))
+                return false;
+        }
+        return true;
+    };
     // sourceKind=2 is authoritative even for a low or currently-unmapped source address. Legacy
     // packets without that metadata retain the established >32-bit address discriminator.
     if (dma_data_immediate_source(c)) {
         // The immediate path peeks one qword for the consumed-marker safety journal.
-        const uint32_t probe_bytes = c.dd_bytes < 8 ? 8 : c.dd_bytes;
         return c.dd_bytes <= kMaxImmediateBytes && !(c.dd_dst & 3) &&
-                       guest_readable(c.dd_dst, probe_bytes) &&
-                       (guest_writable(c.dd_dst, c.dd_bytes) ||
-                        prosper::guest_memory_gpu_write_supported(c.dd_dst, c.dd_bytes))
+                       (c.dd_bytes >= 8 || guest_readable(c.dd_dst, 8)) && destinations_valid(true)
                    ? DmaDataForm::Immediate
                    : DmaDataForm::Invalid;
     }
     return (source_materialized || guest_readable(c.dd_src, c.dd_bytes)) &&
-                   (guest_writable(c.dd_dst, c.dd_bytes) ||
-                    prosper::guest_memory_gpu_write_supported(c.dd_dst, c.dd_bytes))
+                   destinations_valid(false)
                ? DmaDataForm::Copy
                : DmaDataForm::Invalid;
 }
@@ -2639,11 +2653,50 @@ static void report_invalid_dma_data(const Pm4Command& c) {
                 (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
 }
 
+static bool dma_store_ranges(const Pm4Command& c, const uint8_t* source,
+                             std::span<const PendingMemoryRange> ranges, bool force_backing,
+                             bool& used_backing) {
+    const uint32_t pattern = static_cast<uint32_t>(c.dd_src);
+    std::vector<uint8_t> fill;
+    for (const auto& range : ranges) {
+        const uint64_t address = c.dd_dst + range.offset;
+        if (guest_writable(address, range.bytes) && !force_backing) {
+            auto* target = reinterpret_cast<uint8_t*>(address);
+            if (source)
+                memmove(target, source + range.offset, range.bytes);
+            else if (!pattern)
+                memset(target, 0, range.bytes);
+            else
+                for (size_t i = 0; i < range.bytes; ++i)
+                    target[i] = reinterpret_cast<const uint8_t*>(&pattern)[(range.offset + i) & 3u];
+        } else {
+            if (!source && fill.empty())
+                fill.resize(std::min<size_t>(c.dd_bytes, 64u * size_t{1024}));
+            size_t done = 0;
+            while (done < range.bytes) {
+                const size_t take =
+                    source ? range.bytes : std::min(fill.size(), range.bytes - done);
+                if (!source)
+                    for (size_t i = 0; i < take; ++i)
+                        fill[i] = reinterpret_cast<const uint8_t*>(
+                            &pattern)[(range.offset + done + i) & 3u];
+                if (!dma_backing_write(address + done,
+                                       source ? source + range.offset + done : fill.data(), take))
+                    return false;
+                done += take;
+            }
+            used_backing = true;
+        }
+    }
+    return true;
+}
+
 static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0,
-                           const uint8_t* authoritative_source = nullptr) {
+                           const uint8_t* authoritative_source = nullptr,
+                           std::span<const PendingMemoryRange> ranges = {}) {
     if (eop_writes_disabled() || !c.dd_valid) return false;
     const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
-    const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr);
+    const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr, ranges);
     // #1124 (gated): trace every DMA that targets a specific guest region — used to find whether a
     // texture's backing is (or should be) written by a CP-DMA the fold might drop/mis-form.
     if (const char* w = getenv("PROSPER_DMA_WATCH_DST")) {
@@ -2689,7 +2742,14 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         }
         return true;
     }
-    uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    const PendingMemoryRange whole{0, c.dd_bytes};
+    if (ranges.empty()) ranges = {&whole, 1};
+    size_t applied_bytes = 0;
+    for (const auto& range : ranges)
+        if (range.offset > c.dd_bytes || range.bytes > c.dd_bytes - range.offset)
+            return false;
+        else
+            applied_bytes += range.bytes;
     bool used_direct_backing = false;
     if (form == DmaDataForm::Immediate) {
         const uint32_t v32 = (uint32_t)c.dd_src;
@@ -2732,41 +2792,27 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             label_hist_dma_skip(c.dd_dst);
             return false;
         }
-        if (guest_writable(c.dd_dst, c.dd_bytes)) {
-            if (v32 == 0) {
-                memset(dst, 0, c.dd_bytes);
-            } else {
-                uint32_t i = 0;
-                for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
-                if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
-            }
-        } else {
-            // Device fills are allowed to target CPU-read-only direct memory too. Materialize a
-            // bounded repeated chunk and write the physical backing without changing VA protection.
-            constexpr size_t kFillChunk = 64u * 1024u;
-            std::vector<uint8_t> fill(std::min<size_t>(c.dd_bytes, kFillChunk));
-            for (size_t i = 0; i < fill.size(); ++i)
-                fill[i] = reinterpret_cast<const uint8_t*>(&v32)[i & 3u];
-            size_t done = 0;
-            while (done < c.dd_bytes) {
-                const size_t take = std::min<size_t>(fill.size(), c.dd_bytes - done);
-                if (!dma_backing_write(c.dd_dst + done, fill.data(), take)) {
-                    report_invalid_dma_data(c);
-                    return false;
-                }
-                done += take;
-            }
-            used_direct_backing = true;
+        if (!dma_store_ranges(c, nullptr, ranges, false, used_direct_backing)) {
+            report_invalid_dma_data(c);
+            return false;
         }
         // The value trap answers "which prosper write STORED this dword". Attribute only after the
         // whole fallible backing operation succeeds; a partial/failing write is conservatively
         // dirtied by guest_memory_gpu_write but is not a proven full payload store.
-        write_trap_scan("DMA-imm", c.dd_dst, pre_dma, &v32, sizeof v32, packet_addr);
-        poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, packet_addr);
+        for (const auto& range : ranges) {
+            std::array<uint8_t, 4> prefix;
+            for (size_t i = 0; i < prefix.size(); ++i)
+                prefix[i] = reinterpret_cast<const uint8_t*>(&v32)[(range.offset + i) & 3u];
+            write_trap_scan("DMA-imm", c.dd_dst + range.offset, pre_dma, prefix.data(),
+                            std::min(range.bytes, prefix.size()), packet_addr);
+            poolshift_check("DMA", c.dd_dst + range.offset, range.bytes, c.dd_src, packet_addr);
+        }
         if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma, c.queue_origin);
         if (getenv("PROSPER_GFXLOG"))
-            fprintf(stderr, "[agc]   DmaData fill [0x%llx] := 0x%x (%u bytes)\n",
-                    (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+            fprintf(stderr,
+                    "[agc] DmaData fill command [0x%llx] := 0x%x "
+                    "(requested=%u applied=%zu bytes ranges=%zu)\n",
+                    (unsigned long long)c.dd_dst, v32, c.dd_bytes, applied_bytes, ranges.size());
     } else {
         // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
         // while remaining deterministic if an unusual packet overlaps its endpoints.
@@ -2789,23 +2835,25 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
             prosper::guest_memory_gpu_write_supported(c.dd_dst, c.dd_bytes) &&
             prosper::guest_memory_topology_relation(c.dd_dst, c.dd_bytes, c.dd_src, c.dd_bytes) ==
                 prosper::GuestMemoryTopologyRelation::Overlap;
-        if (guest_writable(c.dd_dst, c.dd_bytes) && !hidden_direct_overlap) {
-            memmove(dst, copy_src, c.dd_bytes);
-        } else if (!dma_backing_write(c.dd_dst, copy_src, c.dd_bytes)) {
+        if (!dma_store_ranges(c, copy_src, ranges, hidden_direct_overlap, used_direct_backing)) {
             report_invalid_dma_data(c);
             return false;
-        } else {
-            used_direct_backing = true;
         }
         // #1226 value trap: bound the scan — a copy DMA can move megabytes and this is diagnostic.
         // `pre` is 0 because bulk destination pre-content is not meaningful. As above, scan only
         // after the complete virtual or physical write has succeeded.
-        if (!write_trap_payload.empty())
-            write_trap_scan("DMA-copy", c.dd_dst, 0, write_trap_payload.data(),
-                            write_trap_payload.size(), packet_addr);
+        for (const auto& range : ranges)
+            if (range.offset < write_trap_payload.size())
+                write_trap_scan("DMA-copy", c.dd_dst + range.offset, 0,
+                                write_trap_payload.data() + range.offset,
+                                std::min(range.bytes, write_trap_payload.size() - range.offset),
+                                packet_addr);
         if (getenv("PROSPER_GFXLOG"))
-            fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
-                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
+            fprintf(stderr,
+                    "[agc] DmaData copy command [0x%llx] <- [0x%llx] "
+                    "(requested=%u applied=%zu bytes ranges=%zu)\n",
+                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes,
+                    applied_bytes, ranges.size());
     }
     if (used_direct_backing && getenv("PROSPER_DMA_BACKING_LOG")) {
         // Exact positive control for device writes that bypass a CPU-read-only guest VA. Keep a
@@ -2816,24 +2864,27 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
         const uint64_t ordinal = ordinals[slot].fetch_add(1, std::memory_order_relaxed) + 1;
         if (prosper::diag_should_print(ordinal, 8))
             fprintf(stderr,
-                    "[agc] DMA_DATA direct-backing %s #%llu dst=0x%llx bytes=%u\n",
+                    "[agc] DMA_DATA direct-backing %s #%llu command_dst=0x%llx "
+                    "requested=%u applied=%zu bytes ranges=%zu\n",
                     slot == 0 ? "fill" : "copy", (unsigned long long)ordinal,
-                    (unsigned long long)c.dd_dst, c.dd_bytes);
+                    (unsigned long long)c.dd_dst, c.dd_bytes, applied_bytes, ranges.size());
     }
-    set_guest_gpu_write_origin("DMA_DATA");
-    notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
-    set_guest_gpu_write_origin(nullptr);
-    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
-    if (writer_provenance_enabled() &&
-        (c.dd_bytes >= 256 || writer_provenance_full_enabled()))
-        record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
-                           0, 0, c.stream_order, packet_addr);
-    wake_on_label(c.dd_dst);
+    for (const auto& range : ranges) {
+        set_guest_gpu_write_origin("DMA_DATA");
+        notify_guest_gpu_write(c.dd_dst + range.offset, range.bytes);
+        set_guest_gpu_write_origin(nullptr);
+        ring_record(c.dd_dst + range.offset, c.dd_src,
+                    static_cast<uint8_t>(std::min<size_t>(range.bytes, 255)), 4, packet_addr);
+        if (writer_provenance_enabled() && (c.dd_bytes >= 256 || writer_provenance_full_enabled()))
+            record_guest_write(GuestWriterKind::DmaData, c.dd_dst + range.offset, range.bytes, 0, 0,
+                               c.stream_order, packet_addr);
+        wake_on_label(c.dd_dst + range.offset);
+    }
     return true;
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
-static void honor_write_data(const Pm4Command& c) {
+static void honor_write_data(const Pm4Command& c, std::span<const PendingMemoryRange> ranges = {}) {
     if (eop_writes_disabled()) return;
     if (!c.wd_valid) {
         static std::atomic<int> n{0};
@@ -2848,7 +2899,15 @@ static void honor_write_data(const Pm4Command& c) {
     // #729: guard both the payload span and the 8-byte #312 pre-read below (a 4-byte label write
     // still pre-reads one qword). The deferred path's #449 guard only covers the payload size.
     uint32_t wbytes = c.wd_num * 4;
-    if (!guest_readable(c.wd_addr, wbytes > 8 ? wbytes : 8)) {
+    const PendingMemoryRange whole{0, wbytes};
+    const bool masked = !ranges.empty();
+    if (!masked) ranges = {&whole, 1};
+    const bool destinations_readable =
+        std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+            return range.offset <= wbytes && range.bytes <= wbytes - range.offset &&
+                   guest_readable(c.wd_addr + range.offset, range.bytes);
+        });
+    if (!destinations_readable || (!masked && wbytes < 8 && !guest_readable(c.wd_addr, 8))) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 24)
             fprintf(stderr, "[agc] WRITE_DATA target unmapped — write SKIPPED: addr=0x%llx dwords=%u\n",
@@ -2857,7 +2916,7 @@ static void honor_write_data(const Pm4Command& c) {
     }
     // #312 stomp-catcher (same as the ReleaseMem one): a small label-init WriteData landing over
     // pointer-like memory, or targeting the allocator-metadata region, is a suspect stomp.
-    if (c.wd_num <= 4) {
+    if (c.wd_num <= 4 && guest_readable(c.wd_addr, 8)) {
         uint64_t pre = 0; memcpy(&pre, (const void*)(uintptr_t)c.wd_addr, sizeof pre);
         if (ptr_like(pre))
             report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
@@ -2869,24 +2928,34 @@ static void honor_write_data(const Pm4Command& c) {
         // `wd_num == 1` can pass the sub-qword shape test anyway, and it is inside this branch.
         liveptr_trip("WDATA", c.wd_addr, pre, c.wd_data[0], (uint64_t)c.wd_num * 4, pkt_addr(c));
     }
-    if (write_trap_armed())
-        write_trap_scan("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data,
-                        (uint64_t)c.wd_num * 4, pkt_addr(c));
-    memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
-    set_guest_gpu_write_origin("WRITE_DATA");
-    notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
-    set_guest_gpu_write_origin(nullptr);
-    ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
-    poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
+    size_t applied_bytes = 0;
+    for (const auto& range : ranges) {
+        const uint64_t address = c.wd_addr + range.offset;
+        const auto* source = reinterpret_cast<const uint8_t*>(c.wd_data) + range.offset;
+        if (write_trap_armed())
+            write_trap_scan("WDATA", address, peek_qword(c.wd_addr), source, range.bytes,
+                            pkt_addr(c));
+        memcpy(reinterpret_cast<void*>(address), source, range.bytes);
+        applied_bytes += range.bytes;
+        set_guest_gpu_write_origin("WRITE_DATA");
+        notify_guest_gpu_write(address, range.bytes);
+        set_guest_gpu_write_origin(nullptr);
+        uint32_t first = 0;
+        memcpy(&first, source, std::min<size_t>(sizeof(first), range.bytes));
+        ring_record(address, first, static_cast<uint8_t>(std::min<size_t>(range.bytes, 255)), 3,
+                    pkt_addr(c));
+        poolshift_check("WDATA", address, range.bytes, first, pkt_addr(c));
+        if (writer_provenance_enabled() && (c.wd_num >= 64 || writer_provenance_full_enabled()))
+            record_guest_write(GuestWriterKind::WriteData, address, range.bytes, 0, 0,
+                               c.stream_order, pkt_addr(c));
+        wake_on_label(address);
+    }
     if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
-                (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
-    if (writer_provenance_enabled() &&
-        (c.wd_num >= 64 || writer_provenance_full_enabled()))
-        record_guest_write(GuestWriterKind::WriteData, c.wd_addr,
-                           static_cast<uint64_t>(c.wd_num) * 4, 0, 0,
-                           c.stream_order, pkt_addr(c));
-    wake_on_label(c.wd_addr);   // wake any sync_on_address futex waiter on this written label
+        fprintf(stderr,
+                "[agc] WriteData command [0x%llx] requested=%u dwords "
+                "applied=%zu bytes ranges=%zu (first=0x%08x)\n",
+                (unsigned long long)c.wd_addr, c.wd_num, applied_bytes, ranges.size(),
+                c.wd_data[0]);
 }
 
 // --- Deferred completion writes: the pipe-drain model for fence/label writes (issue #312). ------
@@ -2932,13 +3001,7 @@ bool eop_write_sync() {
     }();
     return v;
 }
-struct PendWrite {
-    Pm4Command cmd;
-    std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
-    std::vector<uint8_t> dma_copy;   // source bytes captured at the ordered DMA operation
-    uint64_t packet_addr = 0;
-    std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
-};
+using PendWrite = PendingMemoryWrite;
 // #1945: how long a completion write actually sat in this queue before it landed in guest memory.
 // The original model promised "post-submit plus ~1 ms of modeled pipe drain"; the WAF family this queue was
 // built to prevent only happens when a write lands after the guest has recycled its 0x20-byte
@@ -2975,7 +3038,7 @@ static void pend_age_note(std::chrono::steady_clock::time_point queued) {
 struct PendQueue {
     std::mutex mx;
     std::condition_variable cv;
-    std::deque<PendWrite> q;
+    PendingMemoryQueue q;
     bool worker_started = false;
     int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
     int  active_submits = 0; // fence writes stay private until the import return checkpoint
@@ -2993,8 +3056,15 @@ PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 // arguments before opening a submit scope. Track scopes on the calling thread as well as globally:
 // only the synchronous import call that began a scope may retire it at its return checkpoint.
 thread_local uint32_t t_submit_scope_depth = 0;
-void apply_deferred_effect(const Pm4Command& c, const uint8_t* source = nullptr,
-                           uint64_t packet_addr = 0);   // guarded apply (#449)
+void apply_deferred_effect(
+    const Pm4Command& c, const uint8_t* source = nullptr, uint64_t packet_addr = 0,
+    std::span<const PendingMemoryRange> ranges = {});   // guarded apply (#449)
+void apply_pending_write(const PendWrite& write) {
+    const auto& dma = write.payload->dma;
+    apply_deferred_effect(write.cmd, dma.empty() ? nullptr : dma.data(), write.packet_addr,
+                          write.fragmented ? std::span<const PendingMemoryRange>(write.ranges)
+                                           : std::span<const PendingMemoryRange>{});
+}
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk);
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
@@ -3033,8 +3103,14 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
             continue;
         }
         if (p.q.empty()) break;
-        PendWrite w = std::move(p.q.front());
-        p.q.pop_front();
+        // Own topology before becoming inflight. Taking a new reader lease AFTER pinning could
+        // deadlock behind a mapping writer while another leased reader waits for this pin.
+        lk.unlock();
+        const GuestMappingLease lease;
+        lk.lock();
+        if (p.active_submits != 0 || p.inflight > 0) continue;
+        if (p.q.empty()) break;
+        PendWrite w = p.q.pop_front();
         p.inflight++;
         lk.unlock();                     // the write itself never needs the queue lock
         // Guard the target's mappedness (#449/#483): the pend queue applies completion writes
@@ -3043,8 +3119,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
         pend_age_note(w.queued);
-        apply_deferred_effect(w.cmd, w.dma_copy.empty() ? nullptr : w.dma_copy.data(),
-                              w.packet_addr);
+        apply_pending_write(w);
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -3080,8 +3155,9 @@ void pend_enqueue(const Pm4Command& c) {
     PendQueue& p = pend_q();
     PendWrite w; w.cmd = c; w.queued = std::chrono::steady_clock::now();
     if (c.kind == Pm4Command::Kind::WriteData && c.wd_data && c.wd_num) {
-        w.wd_copy.assign(c.wd_data, c.wd_data + c.wd_num);   // cb memory may be recycled before drain
-        w.cmd.wd_data = w.wd_copy.data();
+        w.payload->words.assign(c.wd_data,
+                                c.wd_data + c.wd_num);   // cb may be recycled before drain
+        w.cmd.wd_data = w.payload->words.data();
     }
     {
         std::lock_guard<std::mutex> lk(p.mx);
@@ -3115,6 +3191,8 @@ std::optional<PendingWriteSnapshot> try_pending_write_snapshot() {
     result.admission_wait_max_ns = p.admission_wait_max_ns;
     result.admission_retired_wait_count = p.admission_retired_wait_count;
     result.admission_retired_wait_ns = p.admission_retired_wait_ns;
+    result.pending_records_examined = p.q.records_examined();
+    result.pending_geometry_queries = p.q.geometry_queries();
     return result;
 }
 
@@ -3189,11 +3267,8 @@ extern "C" bool prosper_gpu_submit_scope_active() {
 // The renderer runs synchronously inside the submit import and needs resource initialization before
 // it samples guest memory. A full drain here is unsafe: it also exposes ReleaseMem and EVENT_WRITE
 // completion fences before the submit handler and its cleanup have finished, allowing another
-// thread to recycle their 0x20-byte labels (#312). Extract every queued
-// WriteData/DmaData resource update except one whose destination overlaps a queued completion
-// fence/event. Selected resource writes may pass unrelated completion records, but never a write to
-// the same label. This boundary retains small descriptor/constant uploads used by older titles;
-// size/content heuristics left those writes one frame behind.
+// thread to recycle their 0x20-byte labels (#312). Publish the byte complement of private labels,
+// preserving FIFO order at each byte. Retained fragments never replay an already consumed tail.
 extern "C" void prosper_gpu_drain_renderer_writes() {
     PendQueue& p = pend_q();
     static const bool batch_enabled =
@@ -3207,46 +3282,13 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             p.cv.wait(lk);
             continue;
         }
-        std::vector<Pm4Command> commands;
-        std::vector<PendingMemoryGeometry> geometry;
-        commands.reserve(p.q.size());
-        geometry.reserve(p.q.size());
-        for (const auto& write : p.q) {
-            commands.push_back(write.cmd);
-            geometry.push_back(pending_memory_geometry(lease, pending_memory_span(write.cmd)));
-        }
-        auto selected = pending_renderer_selection(commands, geometry);
-        if (!batch_enabled) {
-            bool found = false;
-            for (size_t i = 0; i < selected.size(); ++i) {
-                if (found) selected[i] = false;
-                found |= selected[i];
-            }
-        }
-        const size_t ready_count = std::count(selected.begin(), selected.end(), true);
-        if (!ready_count) return;
-        // Stable partition preserves selected resource order. The closure also keeps a suffix
-        // private when only its earlier large write, rather than the fence itself, overlaps it.
-        std::vector<PendWrite> ready;
-        ready.reserve(ready_count);
-        std::deque<PendWrite> blocked;
-        size_t index = 0;
-        while (!p.q.empty()) {
-            PendWrite write = std::move(p.q.front());
-            p.q.pop_front();
-            if (selected[index++])
-                ready.push_back(std::move(write));
-            else
-                blocked.push_back(std::move(write));
-        }
-        p.q.swap(blocked);
+        auto ready = p.q.renderer_writes(lease, batch_enabled);
+        if (ready.empty()) return;
         p.inflight++;
         lk.unlock();
         for (const PendWrite& write : ready) {
             pend_age_note(write.queued);
-            apply_deferred_effect(write.cmd,
-                                  write.dma_copy.empty() ? nullptr : write.dma_copy.data(),
-                                  write.packet_addr);
+            apply_pending_write(write);
         }
         lk.lock();
         p.inflight--;
@@ -3265,9 +3307,22 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
     bool touched = false;
     for (const PendWrite& w : p.q) {
         const Pm4Command& c = w.cmd;
-        touched |= overlay_pending_memory(c, w.dma_copy, addr,
-                                          {reinterpret_cast<uint8_t*>(&v), sizeof(v)}) ==
-                   PendingMemoryOverlay::Applied;
+        const auto span = pending_memory_span(c);
+        const PendingMemoryRange whole{0, static_cast<size_t>(span.bytes)};
+        const auto ranges = w.fragmented ? std::span<const PendingMemoryRange>(w.ranges)
+                                         : std::span<const PendingMemoryRange>(&whole, 1);
+        for (const auto& range : ranges) {
+            const PendingMemorySpan fragment{span.address + range.offset, range.bytes};
+            if (!pending_memory_overlaps(fragment, {addr, sizeof(v)})) continue;
+            const uint64_t begin = std::max(fragment.address, addr);
+            const uint64_t end = std::min(fragment.address + fragment.bytes, addr + sizeof(v));
+            touched |= overlay_pending_memory_patch(c, w.payload->dma,
+                                                    {static_cast<size_t>(begin - span.address),
+                                                     static_cast<size_t>(begin - addr),
+                                                     static_cast<size_t>(end - begin)},
+                                                    {reinterpret_cast<uint8_t*>(&v), sizeof(v)}) ==
+                       PendingMemoryOverlay::Applied;
+        }
     }
     if (touched) *value = v;
     return touched;
@@ -3544,13 +3599,14 @@ void defer_push(const Pm4Command& c) {
     g_deferred.back().items.push_back(std::move(it));
     g_defer_items++;
 }
-void apply_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
+void apply_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr,
+                  std::span<const PendingMemoryRange> ranges) {
     using K = Pm4Command::Kind;
     switch (c.kind) {
         case K::ReleaseMem: honor_eop_write(c); break;
         case K::EventWrite: honor_event_write(c); break;
-        case K::WriteData:  honor_write_data(c); break;
-        case K::DmaData: honor_dma_data(c, packet_addr, source); break;
+        case K::WriteData: honor_write_data(c, ranges); break;
+        case K::DmaData: honor_dma_data(c, packet_addr, source, ranges); break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -3569,17 +3625,18 @@ uint64_t effect_target(const Pm4Command& c, uint32_t* bytes) {
         default: *bytes = 0; return 0;
     }
 }
-void apply_deferred_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
+void apply_deferred_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr,
+                           std::span<const PendingMemoryRange> ranges) {
     uint32_t bytes = 0;
     uint64_t t = effect_target(c, &bytes);
-    if (t && bytes && !guest_readable(t, bytes)) {
+    if (ranges.empty() && t && bytes && !guest_readable(t, bytes)) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 24)
             fprintf(stderr, "[agc] deferred effect target unmapped — write SKIPPED: kind=%u addr=0x%llx bytes=%u\n",
                     (unsigned)c.kind, (unsigned long long)t, bytes);
         return;
     }
-    apply_effect(c, source, packet_addr);
+    apply_effect(c, source, packet_addr, ranges);
 }
 void publish_memory_effect(const Pm4Command& command) {
     // Finishing preceding GPU work does not retire an active submit import. Keep completion and
@@ -3606,95 +3663,78 @@ void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
 
 bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
     const GraphicsExecutionActivity execution;
-    Pm4Command c{};
-    c.kind = Pm4Command::Kind::DmaData;
-    c.dd_dst = copy.dst;
-    c.dd_src = copy.src;
-    c.dd_bytes = copy.bytes;
-    c.dd_sels = copy.sels;
-    c.dd_valid = true;
-    c.stream_order = copy.command_order;
-    const GuestMappingLease lease;
-    const auto form = dma_data_form(c, authoritative_source != nullptr);
-    if ((form != DmaDataForm::Copy && form != DmaDataForm::MemoryToGds) || eop_write_sync())
-        return honor_dma_data(c, copy.packet_addr, authoritative_source);
-    PendQueue& p = pend_q();
-    std::unique_lock lock(p.mx);
-    p.cv.wait(lock, [&] { return p.inflight == 0; });
-    struct Overlay {
-        Pm4Command command;
-        std::span<const uint8_t> payload;
-        std::vector<PendingMemoryPatch> patches;
-    };
-    std::vector<Overlay> overlays;
-    const auto source_geometry = pending_memory_geometry(lease, {copy.src, copy.bytes});
-    const auto destination_geometry = form == DmaDataForm::MemoryToGds
-                                          ? PendingMemoryGeometry{}
-                                          : pending_memory_geometry(lease, {copy.dst, copy.bytes});
-    const auto unresolved_topology = [] {
-        std::fprintf(stderr, "[agc] DMA_DATA private alias topology unresolved; copy REFUSED\n");
-        return false;
-    };
-    const bool private_memory = std::any_of(p.q.begin(), p.q.end(), [](const auto& write) {
-        const auto span = pending_memory_span(write.cmd);
-        return span.address && span.bytes;
-    });
-    if (private_memory && (source_geometry.coverage == GuestMemoryMappingCoverage::Incomplete ||
-                           destination_geometry.coverage == GuestMemoryMappingCoverage::Incomplete))
-        return unresolved_topology();
-    bool private_destination = false;
-    for (const auto& write : p.q) {
-        const auto geometry = pending_memory_geometry(lease, pending_memory_span(write.cmd));
-        if (geometry.virtual_span.bytes &&
-            geometry.coverage == GuestMemoryMappingCoverage::Incomplete)
-            return unresolved_topology();
-        auto patches = pending_memory_patches(geometry, source_geometry);
-        if (!patches.empty()) overlays.push_back({write.cmd, write.dma_copy, std::move(patches)});
-        // Every earlier queued write is an ordering blocker, including the part of a private DMA
-        // outside its original completion label. Physical aliases share that same byte order.
-        private_destination |= !pending_memory_patches(geometry, destination_geometry).empty();
-    }
-    if (overlays.empty() && !private_destination) {
-        lock.unlock();
-        return honor_dma_data(c, copy.packet_addr, authoritative_source);
-    }
-    // Pin the borrowed queue payloads while copying outside mx. Admission/drainers already
-    // qualify p.inflight, so they cannot recycle these bytes. CONFIDENCE: HIGH (ordered tests).
-    ++p.inflight;
-    lock.unlock();
-    struct Inflight {
-        PendQueue& queue;
-        ~Inflight() {
-            std::lock_guard guard(queue.mx);
-            --queue.inflight;
-            queue.cv.notify_all();
-        }
-    } inflight{p};
-    std::vector<uint8_t> captured(copy.bytes);
-    std::memcpy(captured.data(),
-                authoritative_source ? authoritative_source
-                                     : reinterpret_cast<const uint8_t*>(uintptr_t(copy.src)),
-                copy.bytes);
-    for (const auto& overlay : overlays) {
-        for (const auto& patch : overlay.patches) {
-            if (overlay_pending_memory_patch(overlay.command, overlay.payload, patch, captured) ==
-                PendingMemoryOverlay::Unresolved) {
-                std::fprintf(stderr,
-                             "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
-                return false;
-            }
-        }
-    }
-    if (!private_destination) return honor_dma_data(c, copy.packet_addr, captured.data());
-    PendWrite write;
-    write.cmd = c;
-    write.dma_copy = std::move(captured);
-    write.packet_addr = copy.packet_addr;
-    write.queued = std::chrono::steady_clock::now();
+    // Land preceding resource complements before taking a source snapshot. This is an O(1) no-op
+    // when no new records were appended; published bytes cannot be replayed by a private overlay.
+    prosper_gpu_drain_renderer_writes();
     {
+        Pm4Command c{};
+        c.kind = Pm4Command::Kind::DmaData;
+        c.dd_dst = copy.dst;
+        c.dd_src = copy.src;
+        c.dd_bytes = copy.bytes;
+        c.dd_sels = copy.sels;
+        c.dd_valid = true;
+        c.stream_order = copy.command_order;
+        const GuestMappingLease lease;
+        const auto form = dma_data_form(c, authoritative_source != nullptr);
+        if ((form != DmaDataForm::Copy && form != DmaDataForm::MemoryToGds) || eop_write_sync())
+            return honor_dma_data(c, copy.packet_addr, authoritative_source);
+        PendQueue& p = pend_q();
+        std::unique_lock lock(p.mx);
+        p.cv.wait(lock, [&] { return p.inflight == 0; });
+        const auto source = p.q.geometry(lease, {copy.src, copy.bytes});
+        const auto destination = form == DmaDataForm::MemoryToGds
+                                     ? PendingMemoryGeometry{}
+                                     : p.q.geometry(lease, {copy.dst, copy.bytes});
+        if (p.q.topology_unresolved(lease) ||
+            (p.q.has_private_memory(lease) &&
+             (source.coverage == GuestMemoryMappingCoverage::Incomplete ||
+              destination.coverage == GuestMemoryMappingCoverage::Incomplete))) {
+            std::fprintf(stderr,
+                         "[agc] DMA_DATA private alias topology unresolved; copy REFUSED\n");
+            return false;
+        }
+        auto overlays = p.q.source_overlays(lease, source);
+        const bool private_destination = !p.q.private_ranges(lease, destination).empty();
+        if (overlays.empty() && !private_destination) {
+            lock.unlock();
+            return honor_dma_data(c, copy.packet_addr, authoritative_source);
+        }
+        // Pin shared queue payloads while capturing once, before ANY fragment is published.
+        ++p.inflight;
+        lock.unlock();
+        struct Inflight {
+            PendQueue& queue;
+            ~Inflight() {
+                std::lock_guard guard(queue.mx);
+                --queue.inflight;
+                queue.cv.notify_all();
+            }
+        } inflight{p};
+        std::vector<uint8_t> captured(copy.bytes);
+        std::memcpy(captured.data(),
+                    authoritative_source ? authoritative_source
+                                         : reinterpret_cast<const uint8_t*>(uintptr_t(copy.src)),
+                    copy.bytes);
+        PendingMemoryOverlayState visibility;
+        for (const auto& overlay : overlays)
+            for (const auto& patch : overlay.patches)
+                visibility.apply(overlay.write.cmd, overlay.write.payload->dma, patch, captured);
+        if (!visibility.resolved()) {
+            std::fprintf(stderr,
+                         "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
+            return false;
+        }
+        if (!private_destination) return honor_dma_data(c, copy.packet_addr, captured.data());
+        PendWrite write;
+        write.cmd = c;
+        write.payload->dma = std::move(captured);
+        write.packet_addr = copy.packet_addr;
+        write.queued = std::chrono::steady_clock::now();
         std::lock_guard guard(p.mx);
         p.q.push_back(std::move(write));
-    }
+    }   // Release both the in-flight pin and topology lease before the publication checkpoint.
+    prosper_gpu_drain_renderer_writes();
     return true;
 }
 

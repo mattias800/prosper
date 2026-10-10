@@ -3,6 +3,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <iterator>
 #include <thread>
+#include <tuple>
 #include <vector>
 #ifdef PROSPER_TEST_NATIVE_UNTRACKED_TAIL
 #include <sys/mman.h>
@@ -497,6 +499,482 @@ struct DirectAliases {
     uint64_t alias() const { return second + 0x128; }
 };
 
+// A completion at the head of a resource must not hide its unrelated argument tail from an
+// ordered consumer. A backend write to that tail must also survive later completion retirement.
+class SubmitVisibilityResourceTail : public testing::TestWithParam<std::tuple<bool, bool>> {};
+
+TEST_P(SubmitVisibilityResourceTail, IndirectConsumerSeesTailAndRetirementKeepsLaterProducer) {
+    register_builtin_hle();
+    prosper_gpu_drain_completion_writes();
+    const auto create_shader = Hle::lookup("f3dg2CSgRKY");
+    ASSERT_NE(create_shader, nullptr);
+    namespace P = prosper::agc::Pm4;
+    alignas(256) static const uint32_t code[] = {0xbf810000u};
+    ShaderReg registers[] = {{P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0}};
+    AgcShaderHeader shader{};
+    shader.file_header = 0x34333231u;
+    shader.version = 0x18;
+    shader.sh_registers = registers;
+    shader.shader_size = sizeof(code);
+    shader.num_sh_registers = 2;
+    void* registered = nullptr;
+    ASSERT_EQ(create_shader(reinterpret_cast<uint64_t>(&registered),
+                            reinterpret_cast<uint64_t>(&shader), reinterpret_cast<uint64_t>(code),
+                            0, 0, 0),
+              0u);
+    ASSERT_EQ(registered, &shader);
+    const auto [physical_alias, device_indirect] = GetParam();
+    DirectAliases aliases;
+    if (physical_alias) ASSERT_TRUE(aliases.initialize());
+    std::array<uint64_t, 4> storage{};
+    auto* label = physical_alias ? aliases.label() : storage.data();
+    const uint64_t destination =
+        physical_alias ? aliases.alias() : reinterpret_cast<uint64_t>(label);
+    std::memset(label, 0, sizeof(storage));
+    const uint64_t arguments = reinterpret_cast<uint64_t>(label) + 16;
+    std::array<uint32_t, 8> source{0x1234u, 0u, 0u, 0u, 2u, 3u, 4u, 0u};
+    uint64_t scratch_source = 0x42, scratch_destination = 0;
+    GpuState state;
+    state.sh[P::COMPUTE_PGM_LO] = registers[0].value;
+    state.sh[P::COMPUTE_PGM_HI] = registers[1].value;
+    state.dma_copies.push_back({reinterpret_cast<uint64_t>(&scratch_destination),
+                                reinterpret_cast<uint64_t>(&scratch_source), 8,
+                                kDmaDataAddressSource, 1});
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(label);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    state.ordered_memory_effects.emplace_back(completion, 2);
+    state.dma_copies.push_back({destination, reinterpret_cast<uint64_t>(source.data()),
+                                sizeof(source), kDmaDataAddressSource, 3});
+    state.parser_stalls.push_back({4});
+    GpuState::Dispatch dispatch;
+    dispatch.indirect = true;
+    dispatch.indirect_args_addr = arguments;
+    dispatch.command_order = 5;
+    state.dispatches.push_back(dispatch);
+    uint32_t calls = 0;
+    struct ResetBackend {
+        ~ResetBackend() {
+            set_submit_compute({});
+            set_submit_compute_indirect_dispatch(false);
+        }
+    } reset_backend;
+    set_submit_compute([&](const std::vector<ComputeItem>& items) {
+        for (const auto& item : items) {
+            ++calls;
+            EXPECT_TRUE(item.indirect_dispatch) << "the item retains the source packet form";
+            EXPECT_EQ(item.indirect_args_addr, device_indirect ? arguments : 0u)
+                << "only the device route retains an argument address";
+            std::array<uint32_t, 3> observed{};
+            if (device_indirect && item.indirect_args_addr)
+                std::memcpy(observed.data(), reinterpret_cast<const void*>(item.indirect_args_addr),
+                            sizeof(observed));
+            else
+                observed = {item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
+            EXPECT_EQ(observed, (std::array<uint32_t, 3>{2, 3, 4}));
+            EXPECT_EQ(*label, 0u) << "GPU resource admission must not publish the completion";
+            const std::array<uint32_t, 3> produced{5, 6, 7};
+            std::memcpy(reinterpret_cast<void*>(arguments), produced.data(), sizeof(produced));
+        }
+        return !items.empty();
+    });
+    set_submit_compute_indirect_dispatch(device_indirect);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    EXPECT_TRUE(execute_nonrender_submit_work(state, 1));
+    EXPECT_EQ(calls, 1u) << "private labels cannot turn a nonzero indirect dispatch into a no-op";
+    source.fill(0x79);
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*label, 0x1234u) << "the completion-overlapping fragment owns the original source";
+    std::array<uint32_t, 3> tail{};
+    std::memcpy(tail.data(), reinterpret_cast<const void*>(arguments), sizeof(tail));
+    EXPECT_EQ(tail, (std::array<uint32_t, 3>{5, 6, 7}))
+        << "retirement cannot replay an already consumed tail over its later producer";
+}
+
+INSTANTIATE_TEST_SUITE_P(VirtualAndPhysicalCpuAndDevice, SubmitVisibilityResourceTail,
+                         testing::Combine(testing::Bool(), testing::Bool()));
+
+class SubmitVisibilityIndex : public testing::TestWithParam<unsigned> {};
+
+TEST_P(SubmitVisibilityIndex, OrderedUploadsAndDisjointCopiesVisitALinearNumberOfRecords) {
+    prosper_gpu_drain_completion_writes();
+    constexpr size_t count = 128;
+    std::array<uint64_t, count> labels{}, uploads{}, copied{};
+    std::array<uint64_t, count> sources;
+    sources.fill(0x12345678u);
+    std::array<std::array<uint32_t, 2>, count> words;
+    words.fill({0x12345678u, 0u});
+    uint64_t scratch_source = 1, scratch_destination = 0;
+    GpuState state;
+    uint64_t order = 1;
+    state.dma_copies.push_back({reinterpret_cast<uint64_t>(&scratch_destination),
+                                reinterpret_cast<uint64_t>(&scratch_source), 8,
+                                kDmaDataAddressSource, order++});
+    const auto completion = [&](size_t i) {
+        Pm4Command command{};
+        command.kind = Pm4Command::Kind::ReleaseMem;
+        command.rel_addr = reinterpret_cast<uint64_t>(&labels[i]);
+        command.rel_data_sel = 2;
+        command.rel_value_valid = true;
+        command.rel_value = 0x42;
+        state.ordered_memory_effects.emplace_back(command, order++);
+    };
+    const auto upload = [&](size_t i) {
+        Pm4Command command{};
+        command.kind = Pm4Command::Kind::WriteData;
+        command.wd_addr = reinterpret_cast<uint64_t>(&uploads[i]);
+        command.wd_data = words[i].data();
+        command.wd_num = 2;
+        command.wd_valid = true;
+        state.ordered_memory_effects.emplace_back(command, order++);
+    };
+    const auto copy = [&](size_t i) {
+        state.dma_copies.push_back({reinterpret_cast<uint64_t>(&copied[i]),
+                                    reinterpret_cast<uint64_t>(&sources[i]), 8,
+                                    kDmaDataAddressSource, order++});
+    };
+    if (GetParam() == 0) {
+        for (size_t i = 0; i < count; ++i) completion(i);
+        for (size_t i = 0; i < count; ++i) upload(i);
+        for (size_t i = 0; i < count; ++i) copy(i);
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            completion(i);
+            if (GetParam() == 1)
+                upload(i);
+            else
+                copy(i);
+        }
+        for (size_t i = 0; i < count; ++i)
+            if (GetParam() == 1)
+                copy(i);
+            else
+                upload(i);
+    }
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    const auto before = observe_queue();
+    ASSERT_TRUE(before);
+    EXPECT_TRUE(execute_nonrender_submit_work(state, 1));
+    const auto after = observe_queue();
+    ASSERT_TRUE(after);
+    if (!before || !after)
+        return; // ASSERT_TRUE reports the failure; make optional access explicit.
+    EXPECT_EQ(uploads, sources);
+    EXPECT_EQ(copied, sources);
+    EXPECT_EQ(labels, (std::array<uint64_t, count>{}));
+    EXPECT_EQ(after->queued, count);
+    // Count actual record visits, including cached visits. A full scan per ordered upload/copy
+    // violates this bound even when all mapping queries themselves were cached.
+    EXPECT_LE(after->pending_records_examined - before->pending_records_examined,
+              8u * (3u * count + 1u));
+    EXPECT_LE(after->pending_geometry_queries - before->pending_geometry_queries,
+              8u * (3u * count + 1u));
+}
+
+INSTANTIATE_TEST_SUITE_P(BurstAndAlternatingWriteAndDma, SubmitVisibilityIndex,
+                         testing::Values(0u, 1u, 2u));
+
+TEST_P(SubmitVisibilityIndex, SkippedUnalignedEffectCannotSupplyAPrivateOverlay) {
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0, copied = 0;
+    uint32_t invalid_payload = 0x12345678u;
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(&label);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    Pm4Command invalid{};
+    invalid.kind = GetParam() == 0   ? Pm4Command::Kind::WriteData
+                   : GetParam() == 1 ? Pm4Command::Kind::ReleaseMem
+                                     : Pm4Command::Kind::EventWrite;
+    invalid.wd_addr = invalid.rel_addr = invalid.event_addr =
+        reinterpret_cast<uint64_t>(&label) + 1;
+    invalid.wd_data = &invalid_payload;
+    invalid.wd_num = 1;
+    invalid.wd_valid = true;
+    invalid.rel_data_sel = 2;
+    invalid.rel_value_valid = true;
+    invalid.rel_value = 2;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(invalid, 2));
+    EXPECT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
+                                          reinterpret_cast<uint64_t>(&label), sizeof(copied),
+                                          kDmaDataAddressSource, 3}));
+    EXPECT_EQ(copied, 1u) << "a skipped packet is not an ordered byte producer";
+    EXPECT_EQ(label, 0u);
+}
+
+TEST_P(SubmitVisibilityIndex, RejectedImmediateDmaCannotSupplyAPrivateOverlay) {
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0, copied = 0;
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(&label);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    Pm4Command invalid{};
+    invalid.kind = Pm4Command::Kind::DmaData;
+    invalid.dd_valid = true;
+    invalid.dd_dst = reinterpret_cast<uint64_t>(&label) + (GetParam() == 1 ? 1u : 0u);
+    invalid.dd_src = 0x1234;
+    invalid.dd_sels = GetParam() == 0 ? 0x103u : 3u;
+    invalid.dd_bytes = GetParam() == 2 ? 0x1000001u : 8u;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(invalid, 2));
+    EXPECT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
+                                          reinterpret_cast<uint64_t>(&label), sizeof(copied),
+                                          kDmaDataAddressSource, 3}));
+    EXPECT_EQ(copied, 1u) << "a rejected DMA form is not an ordered byte producer";
+    EXPECT_EQ(label, 0u);
+}
+
+TEST(SubmitVisibilityDefault, RetiredIntervalsCannotBlockANewSubmit) {
+    prosper_gpu_drain_completion_writes();
+    uint64_t destination = 0, source = 0x12345678u;
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(&destination);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    prosper_gpu_drain_renderer_writes();
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    ASSERT_EQ(destination, 1u);
+    prosper_gpu_submit_scope_begin();
+    retirement.hook = &prosper_gpu_submit_scope_end;
+    ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&destination),
+                                          reinterpret_cast<uint64_t>(&source), 8,
+                                          kDmaDataAddressSource, 1}));
+    EXPECT_EQ(destination, source) << "a drained completion has no private footprint";
+}
+
+class SubmitVisibilityFragments : public testing::TestWithParam<unsigned> {};
+
+TEST_P(SubmitVisibilityFragments, InteriorLabelsKeepOnlyTheirBytesAndPublishedProducerSurvives) {
+    prosper_gpu_drain_completion_writes();
+    alignas(8) std::array<uint32_t, 16> destination{};
+    std::array<uint32_t, 16> source;
+    source.fill(0x12345678u);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    for (size_t word : {2u, 8u}) {
+        Pm4Command completion{};
+        completion.kind = Pm4Command::Kind::ReleaseMem;
+        completion.rel_addr = reinterpret_cast<uint64_t>(&destination[word]);
+        completion.rel_data_sel = 2;
+        completion.rel_value_valid = true;
+        completion.rel_value = 1;
+        execute_ordered_memory_effect(GpuState::MemoryEffect(completion, word));
+    }
+    if (GetParam() == 2) {
+        ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(destination.data()),
+                                              reinterpret_cast<uint64_t>(source.data()),
+                                              sizeof(source), kDmaDataAddressSource, 10}));
+    } else {
+        Pm4Command command{};
+        command.kind = GetParam() == 0 ? Pm4Command::Kind::WriteData : Pm4Command::Kind::DmaData;
+        command.wd_addr = command.dd_dst = reinterpret_cast<uint64_t>(destination.data());
+        command.wd_data = source.data();
+        command.wd_num = source.size();
+        command.wd_valid = command.dd_valid = true;
+        command.dd_src = source[0];
+        command.dd_bytes = sizeof(source);
+        execute_ordered_memory_effect(GpuState::MemoryEffect(command, 10));
+    }
+    for (size_t i = 0; i < destination.size(); ++i)
+        EXPECT_EQ(destination[i], (i == 2 || i == 3 || i == 8 || i == 9) ? 0u : source[i]);
+    destination[12] = 0xabcdefu; // later GPU producer in an already consumed public suffix
+    uint32_t copied = 0;
+    ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
+                                          reinterpret_cast<uint64_t>(&destination[12]),
+                                          sizeof(copied), kDmaDataAddressSource, 11}));
+    EXPECT_EQ(copied, 0xabcdefu) << "private overlays cannot replay a published suffix";
+    source.fill(0x79);
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    for (size_t i = 0; i < destination.size(); ++i)
+        EXPECT_EQ(destination[i], i == 12 ? 0xabcdefu : 0x12345678u);
+}
+
+INSTANTIATE_TEST_SUITE_P(WriteImmediateAndAddressDma, SubmitVisibilityFragments,
+                         testing::Values(0u, 1u, 2u));
+
+class SubmitVisibilityUnknownSource : public testing::TestWithParam<bool> {};
+
+TEST_P(SubmitVisibilityUnknownSource, LaterFixedWriteResolvesOnlyTheBytesItOverwrites) {
+    prosper_gpu_drain_completion_writes();
+    uint64_t label = 0, copied = 0xaaaaaaaa55555555ull;
+    std::array<uint32_t, 2> fixed{0x12345678u, 0xabcdefu};
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command timestamp{};
+    timestamp.kind = Pm4Command::Kind::EventWrite;
+    timestamp.event_addr = reinterpret_cast<uint64_t>(&label);
+    execute_ordered_memory_effect(GpuState::MemoryEffect(timestamp, 1));
+    Pm4Command write{};
+    write.kind = Pm4Command::Kind::WriteData;
+    write.wd_addr = reinterpret_cast<uint64_t>(&label);
+    write.wd_data = fixed.data();
+    write.wd_num = GetParam() ? 1 : 2;
+    write.wd_valid = true;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(write, 2));
+    const bool copied_ok = execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
+                                                     reinterpret_cast<uint64_t>(&label),
+                                                     sizeof(copied), kDmaDataAddressSource, 3});
+    EXPECT_EQ(copied_ok, !GetParam());
+    if (GetParam())
+        EXPECT_EQ(copied, 0xaaaaaaaa55555555ull);
+    else
+        EXPECT_EQ(std::memcmp(&copied, fixed.data(), sizeof(copied)), 0);
+    EXPECT_EQ(label, 0u) << "neither a timestamp nor its fixed suffix becomes CPU-visible";
+}
+
+INSTANTIATE_TEST_SUITE_P(FullAndPartialOverwrite, SubmitVisibilityUnknownSource, testing::Bool());
+
+TEST(SubmitVisibilityDefault, PartialByteFragmentsKeepOriginalPayloadOffsets) {
+    prosper_gpu_drain_completion_writes();
+    alignas(8) std::array<uint8_t, 24> destination{};
+    std::array<uint8_t, 17> source;
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<uint8_t>(i + 1);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(destination.data() + 8);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(destination.data() + 3),
+                                          reinterpret_cast<uint64_t>(source.data()), source.size(),
+                                          kDmaDataAddressSource, 2}));
+    for (size_t i = 0; i < source.size(); ++i)
+        EXPECT_EQ(destination[i + 3], i >= 5 && i < 13 ? 0u : source[i]);
+    uint64_t copied = 0;
+    ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied),
+                                          reinterpret_cast<uint64_t>(destination.data() + 8),
+                                          sizeof(copied), kDmaDataAddressSource, 3}));
+    EXPECT_EQ(std::memcmp(&copied, source.data() + 5, sizeof(copied)), 0);
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(std::memcmp(destination.data() + 3, source.data(), source.size()), 0);
+    EXPECT_EQ(destination[2], 0u);
+    EXPECT_EQ(destination[20], 0u);
+}
+
+TEST_P(SubmitVisibilityFragments, RetirementDoesNotRequireAnAlreadyPublishedUnmappedTail) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    prosper_gpu_drain_completion_writes();
+    const uint64_t address = aliases.first + 0x128;
+    auto* label = reinterpret_cast<uint64_t*>(address);
+    *label = 0;
+    std::vector<uint32_t> source((DirectAliases::page + 32) / 4, 0x12345678u);
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = address;
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    if (GetParam() == 2) {
+        ASSERT_TRUE(execute_ordered_dma_copy({address, reinterpret_cast<uint64_t>(source.data()),
+                                              static_cast<uint32_t>(source.size() * 4),
+                                              kDmaDataAddressSource, 2}));
+    } else {
+        Pm4Command resource{};
+        resource.kind = GetParam() == 0 ? Pm4Command::Kind::WriteData : Pm4Command::Kind::DmaData;
+        resource.wd_addr = resource.dd_dst = address;
+        resource.wd_data = source.data();
+        resource.wd_num = source.size();
+        resource.wd_valid = resource.dd_valid = true;
+        resource.dd_src = source[0];
+        resource.dd_bytes = source.size() * 4;
+        execute_ordered_memory_effect(GpuState::MemoryEffect(resource, 2));
+    }
+    EXPECT_EQ(*label, 0u);
+    EXPECT_EQ(*reinterpret_cast<const uint32_t*>(aliases.first + DirectAliases::page + 0x128),
+              source[0]);
+    ASSERT_EQ(aliases.unmap(aliases.first + DirectAliases::page, DirectAliases::page, 0, 0, 0, 0),
+              0u);
+    aliases.first_bytes = DirectAliases::page;
+    uint64_t copied = 0;
+    EXPECT_TRUE(execute_ordered_dma_copy(
+        {reinterpret_cast<uint64_t>(&copied), address, sizeof(copied), kDmaDataAddressSource, 3}))
+        << "a consumed tail has no lifetime dependency for a retained-head consumer";
+    EXPECT_EQ(copied, 0x1234567812345678ull);
+    source.assign(source.size(), 0x79);
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*label, 0x1234567812345678ull)
+        << "the retained head owns its payload and has no dependency on the consumed tail";
+}
+
+TEST(SubmitVisibilityDefault, MappingChangeRetainsTheEarlierResourceFragmentAsAFifoBlocker) {
+    DirectAliases aliases;
+    ASSERT_TRUE(aliases.initialize());
+    const auto map = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    ASSERT_NE(map, nullptr);
+    prosper_gpu_drain_completion_writes();
+    auto* label = aliases.label();
+    auto* alias = reinterpret_cast<uint64_t*>(aliases.alias());
+    *label = 0;
+    uint64_t source = 2, copied = 0;
+    prosper_gpu_submit_scope_begin();
+    SubmitReturn retirement{&prosper_gpu_submit_scope_end};
+    Pm4Command completion{};
+    completion.kind = Pm4Command::Kind::ReleaseMem;
+    completion.rel_addr = reinterpret_cast<uint64_t>(label);
+    completion.rel_data_sel = 2;
+    completion.rel_value_valid = true;
+    completion.rel_value = 1;
+    execute_ordered_memory_effect(GpuState::MemoryEffect(completion, 1));
+    ASSERT_TRUE(execute_ordered_dma_copy({aliases.alias(), reinterpret_cast<uint64_t>(&source),
+                                          sizeof(source), kDmaDataAddressSource, 2}));
+    EXPECT_EQ(*alias, 0u);
+    // Move the completion VA to the OTHER physical page while its old resource alias stays put.
+    uint64_t remapped = aliases.first + DirectAliases::page;
+    ASSERT_EQ(map(reinterpret_cast<uint64_t>(&remapped), DirectAliases::page, 2, 0x10,
+                  aliases.physical, DirectAliases::page),
+              0u);
+    ASSERT_EQ(remapped, aliases.first + DirectAliases::page);
+    source = 3;
+    ASSERT_TRUE(execute_ordered_dma_copy({aliases.alias(), reinterpret_cast<uint64_t>(&source),
+                                          sizeof(source), kDmaDataAddressSource, 3}));
+    EXPECT_EQ(*alias, 0u) << "a retained residual still blocks later writes after remapping";
+    ASSERT_TRUE(execute_ordered_dma_copy({reinterpret_cast<uint64_t>(&copied), aliases.alias(),
+                                          sizeof(copied), kDmaDataAddressSource, 4}));
+    EXPECT_EQ(copied, 3u) << "the private consumer observes both resource writes in FIFO order";
+    prosper_gpu_submit_scope_end();
+    retirement.hook = nullptr;
+    prosper_gpu_drain_completion_writes();
+    EXPECT_EQ(*label, 1u);
+    EXPECT_EQ(*alias, 3u) << "retirement cannot replay the older residual over a public suffix";
+}
+
 TEST_P(SubmitVisibilityDma, ReadsPrivateCompletionViaPhysicalAlias) {
     DirectAliases aliases;
     ASSERT_TRUE(aliases.initialize());
@@ -759,7 +1237,8 @@ TEST_P(SubmitVisibilitySuffix, OverlappingTailPreservesPrivateWriteOrder) {
     SubmitReturn retirement{hook};
     uint32_t public_tail = 0;
     std::memcpy(&public_tail, destination.data() + 16, sizeof(public_tail));
-    EXPECT_EQ(public_tail, 0u) << "the tail overlaps an earlier private DMA, outside its fence";
+    EXPECT_EQ(public_tail, suffix) << "bytes outside a private completion remain available";
+    EXPECT_EQ(destination[0], 0u) << "the completion-overlapping fragment stays private";
     EXPECT_EQ(copied, suffix) << "the final consumer must see the suffix in FIFO order";
     source.fill(0x79);
     suffix = ~suffix;
@@ -825,4 +1304,4 @@ TEST(SubmitVisibilityDefault, UncapturedTimestampDependencyIsRefused) {
     EXPECT_EQ(copied, 0x1122334455667788ull);
     EXPECT_EQ(label, 0u);
 }
-} // namespace
+}   // namespace

@@ -23,6 +23,10 @@ struct PendingWriteSnapshot {
     uint64_t admission_wait_max_ns = 0;
     uint64_t admission_retired_wait_count = 0;
     uint64_t admission_retired_wait_ns = 0;
+    // Actual queue-record visits and authoritative geometry observations, under the queue lock.
+    // These distinguish linear incremental indexing from repeated scans without timing assertions.
+    uint64_t pending_records_examined = 0;
+    uint64_t pending_geometry_queries = 0;
 };
 
 // Empty means lock contention, never an empty queue. Does not drain or wait for any work.

@@ -15,8 +15,9 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
 - `pending_write_snapshot` — nonblocking observations of that processor's completion queue for
   bounded performance capture; it does not alter visibility, execute writes or wait for them.
 - `pending_memory_view` — byte-range overlays and physical-alias geometry for captured private
-  writes, plus the FIFO closure selecting renderer resource writes; it neither publishes labels
-  nor invents unresolved timestamp values.
+  writes; it neither publishes labels nor invents unresolved timestamp values.
+- `pending_memory_queue` — owns captured payloads, indexes private byte intervals and selects
+  renderer-visible resource fragments. The processor supplies synchronization and applies effects.
 - `wait_regmem_sample` — retains the exact value used by a wait predicate so later diagnostic
   reads cannot be presented as that decision's sample; queue policy stays in the processor.
 

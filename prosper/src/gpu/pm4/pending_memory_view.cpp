@@ -6,28 +6,43 @@
 #include <map>
 
 namespace prosper::gpu {
-// CONFIDENCE: HIGH on byte identity and FIFO closure: #2220's actual-submit regressions exercise
+// CONFIDENCE: HIGH on byte identity and FIFO fragments: #2220's actual-submit regressions exercise
 // distinct direct-memory VAs, protection splits, partial copies, and overlapping resource suffixes.
 PendingMemorySpan pending_memory_span(const Pm4Command& command) {
     using K = Pm4Command::Kind;
+    const auto checked = [](uint64_t address, uint64_t bytes) -> PendingMemorySpan {
+        return address && bytes && address <= UINT64_MAX - bytes ? PendingMemorySpan{address, bytes}
+                                                                 : PendingMemorySpan{};
+    };
     switch (command.kind) {
         case K::ReleaseMem:
+            if (!command.rel_addr || (command.rel_addr & 3u)) break;
             if (command.rel_data_sel == 3 ||
                 (command.rel_value_valid &&
                  (command.rel_data_sel == 1 || command.rel_data_sel == 2)))
-                return {command.rel_addr, command.rel_data_sel == 1 ? 4u : 8u};
+                return checked(command.rel_addr, command.rel_data_sel == 1 ? 4u : 8u);
             break;
         case K::EventWrite:
-            if (command.event_addr) return {command.event_addr, 8};
+            if (command.event_addr && !(command.event_addr & 3u))
+                return checked(command.event_addr, 8);
             break;
         case K::WriteData:
-            if (command.wd_valid && command.wd_data)
-                return {command.wd_addr, uint64_t(command.wd_num) * 4};
+            if (command.wd_valid && command.wd_data && command.wd_num && command.wd_addr &&
+                !(command.wd_addr & 3u))
+                return checked(command.wd_addr, uint64_t(command.wd_num) * 4);
             break;
-        case K::DmaData:
-            if (command.dd_valid && (command.dd_sels & 0xffu) != 1u)
-                return {command.dd_dst, command.dd_bytes};
+        case K::DmaData: {
+            const bool immediate =
+                !(command.dd_sels & kDmaDataAddressSource) && command.dd_src <= UINT32_MAX;
+            // Match dma_data_form's static no-store shapes before a private overlay can supply
+            // their bytes. Runtime access checks still occur at the actual guarded store.
+            if (command.dd_valid && command.dd_bytes && command.dd_bytes <= 0x10000000u &&
+                command.dd_dst >= 0x10000 && (command.dd_sels & 0xffu) != 1u &&
+                ((command.dd_sels >> 8u) & 0xffu) != 1u &&
+                (!immediate || (!(command.dd_dst & 3u) && command.dd_bytes <= 0x1000000u)))
+                return checked(command.dd_dst, command.dd_bytes);
             break;
+        }
         default: break;
     }
     return {};
@@ -83,65 +98,85 @@ std::vector<PendingMemoryPatch> pending_memory_patches(const PendingMemoryGeomet
     return patches;
 }
 
-std::vector<bool> pending_renderer_selection(std::span<const Pm4Command> commands,
-                                             std::span<const PendingMemoryGeometry> geometry) {
-    struct Intervals {
-        std::map<uint64_t, uint64_t> spans;
-        bool overlaps(uint64_t begin, uint64_t bytes) const {
-            if (!bytes || begin > UINT64_MAX - bytes) return true;
-            const auto next = spans.upper_bound(begin);
-            return (next != spans.begin() && std::prev(next)->second > begin) ||
-                   (next != spans.end() && next->first < begin + bytes);
-        }
-        void add(uint64_t begin, uint64_t bytes) {
-            if (!bytes || begin > UINT64_MAX - bytes) return;
-            uint64_t end = begin + bytes;
-            auto next = spans.lower_bound(begin);
-            if (next != spans.begin() && std::prev(next)->second >= begin) --next;
-            while (next != spans.end() && next->first <= end) {
-                begin = std::min(begin, next->first);
-                end = std::max(end, next->second);
-                next = spans.erase(next);
-            }
-            spans.emplace(begin, end);
-        }
-    } virtual_spans, physical_spans;
-    std::vector<bool> selected(commands.size(), false);
-    if (commands.size() != geometry.size()) return selected;
-    const auto retain = [&](const PendingMemoryGeometry& write) {
-        if (write.virtual_span.address)
-            virtual_spans.add(write.virtual_span.address, write.virtual_span.bytes);
-        for (const auto& mapping : write.mappings)
-            if (mapping.direct) physical_spans.add(mapping.physical, mapping.bytes);
-    };
-    bool uncertain_aliases = false;
-    for (size_t i = 0; i < commands.size(); ++i)
-        if (pending_memory_completion(commands[i])) {
-            retain(geometry[i]);
-            uncertain_aliases |= geometry[i].virtual_span.bytes &&
-                                 geometry[i].coverage == GuestMemoryMappingCoverage::Incomplete;
-        }
-    for (size_t i = 0; i < commands.size(); ++i) {
-        using K = Pm4Command::Kind;
-        if (commands[i].kind != K::WriteData && commands[i].kind != K::DmaData) continue;
-        // GDS offsets (including zero) cannot alias guest completion bytes. Prefix uploads still
-        // have to execute before the first address-copy consumer, in their original FIFO order.
-        if (commands[i].kind == K::DmaData && commands[i].dd_valid &&
-            (commands[i].dd_sels & 0xffu) == 1u) {
-            selected[i] = true;
-            continue;
-        }
-        const auto& write = geometry[i];
-        const bool incomplete = write.coverage == GuestMemoryMappingCoverage::Incomplete;
-        bool blocked = uncertain_aliases || incomplete || !write.virtual_span.address ||
-                       virtual_spans.overlaps(write.virtual_span.address, write.virtual_span.bytes);
-        for (const auto& mapping : write.mappings)
-            if (mapping.direct) blocked |= physical_spans.overlaps(mapping.physical, mapping.bytes);
-        selected[i] = !blocked;
-        if (blocked) retain(write);
-        uncertain_aliases |= incomplete && write.virtual_span.bytes;
+PendingMemoryGeometry pending_memory_subgeometry(const PendingMemoryGeometry& shape,
+                                                 PendingMemoryRange range) {
+    PendingMemoryGeometry result{
+        {shape.virtual_span.address + range.offset, range.bytes}, {}, shape.coverage};
+    for (const auto& mapping : shape.mappings) {
+        const uint64_t begin = std::max<uint64_t>(range.offset, mapping.offset);
+        const uint64_t end =
+            std::min<uint64_t>(range.offset + range.bytes, mapping.offset + mapping.bytes);
+        if (begin < end)
+            result.mappings.push_back(
+                {begin - range.offset, end - begin,
+                 mapping.direct ? mapping.physical + begin - mapping.offset : 0, mapping.direct});
     }
-    return selected;
+    return result;
+}
+
+namespace {
+void add_interval(std::map<uint64_t, uint64_t>& spans, uint64_t begin, uint64_t bytes) {
+    if (!bytes || begin > UINT64_MAX - bytes) return;
+    uint64_t end = begin + bytes;
+    auto next = spans.lower_bound(begin);
+    if (next != spans.begin() && std::prev(next)->second >= begin) --next;
+    while (next != spans.end() && next->first <= end) {
+        begin = std::min(begin, next->first);
+        end = std::max(end, next->second);
+        next = spans.erase(next);
+    }
+    spans.emplace(begin, end);
+}
+}   // namespace
+
+void PendingMemoryIndex::add(const PendingMemoryGeometry& shape) {
+    if (!shape.virtual_span.address || !shape.virtual_span.bytes) return;
+    add_interval(virtual_, shape.virtual_span.address, shape.virtual_span.bytes);
+    for (const auto& mapping : shape.mappings)
+        if (mapping.direct) add_interval(physical_, mapping.physical, mapping.bytes);
+    incomplete_ |= shape.coverage == GuestMemoryMappingCoverage::Incomplete;
+}
+
+bool PendingMemoryIndex::empty() const {
+    return !incomplete_ && virtual_.empty() && physical_.empty();
+}
+
+std::vector<PendingMemoryRange>
+PendingMemoryIndex::project(const PendingMemoryGeometry& shape) const {
+    const size_t bytes = shape.virtual_span.bytes;
+    if (!bytes || empty()) return {};
+    if (incomplete_ || shape.coverage == GuestMemoryMappingCoverage::Incomplete)
+        return {{0, bytes}};
+    std::map<uint64_t, uint64_t> offsets;
+    const auto intersect = [&](const auto& spans, uint64_t begin, uint64_t count, uint64_t offset) {
+        if (!count || begin > UINT64_MAX - count) return;
+        auto next = spans.upper_bound(begin);
+        if (next != spans.begin()) --next;
+        for (; next != spans.end() && next->first < begin + count; ++next) {
+            const uint64_t start = std::max(begin, next->first);
+            const uint64_t end = std::min(begin + count, next->second);
+            if (start < end) add_interval(offsets, offset + start - begin, end - start);
+        }
+    };
+    intersect(virtual_, shape.virtual_span.address, bytes, 0);
+    for (const auto& mapping : shape.mappings)
+        if (mapping.direct) intersect(physical_, mapping.physical, mapping.bytes, mapping.offset);
+    std::vector<PendingMemoryRange> result;
+    result.reserve(offsets.size());
+    for (const auto& [begin, end] : offsets) result.push_back({begin, end - begin});
+    return result;
+}
+
+std::vector<PendingMemoryRange>
+pending_memory_complement(size_t bytes, std::span<const PendingMemoryRange> private_ranges) {
+    std::vector<PendingMemoryRange> result;
+    size_t begin = 0;
+    for (const auto& range : private_ranges) {
+        if (begin < range.offset) result.push_back({begin, range.offset - begin});
+        begin = range.offset + range.bytes;
+    }
+    if (begin < bytes) result.push_back({begin, bytes - begin});
+    return result;
 }
 
 PendingMemoryOverlay overlay_pending_memory_patch(const Pm4Command& command,
@@ -176,6 +211,38 @@ PendingMemoryOverlay overlay_pending_memory_patch(const Pm4Command& command,
     std::memcpy(destination.data() + patch.target_offset, source + patch.source_offset,
                 patch.bytes);
     return PendingMemoryOverlay::Applied;
+}
+
+void PendingMemoryOverlayState::apply(const Pm4Command& command,
+                                      std::span<const uint8_t> captured_dma,
+                                      PendingMemoryPatch patch, std::span<uint8_t> destination) {
+    if (patch.target_offset > destination.size() ||
+        patch.bytes > destination.size() - patch.target_offset) {
+        invalid_ = true;
+        return;
+    }
+    const auto outcome = overlay_pending_memory_patch(command, captured_dma, patch, destination);
+    const uint64_t begin = patch.target_offset, end = begin + patch.bytes;
+    if (outcome == PendingMemoryOverlay::Unresolved) {
+        add_interval(unknown_, begin, patch.bytes);
+        return;
+    }
+    if (outcome != PendingMemoryOverlay::Applied) return;
+    auto next = unknown_.upper_bound(begin);
+    if (next != unknown_.begin()) --next;
+    while (next != unknown_.end() && next->first < end) {
+        const auto [old_begin, old_end] = *next;
+        if (old_end <= begin) {
+            ++next;
+            continue;
+        }
+        next = unknown_.erase(next);
+        if (old_begin < begin) unknown_.emplace(old_begin, begin);
+        if (old_end > end) {
+            unknown_.emplace(end, old_end);
+            break;
+        }
+    }
 }
 
 PendingMemoryOverlay overlay_pending_memory(const Pm4Command& command,
