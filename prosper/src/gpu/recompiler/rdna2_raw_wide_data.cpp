@@ -812,13 +812,26 @@ rdna2_raw_wide_data_load_diagnoses(const std::vector<Rdna2Inst>& ins, bool wave6
 
 // A small, deliberately stricter subset of the above refusal population can use a current-byte
 // buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
-// admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
-// an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
+// admission. Here every branch of the decoded program has a valid target, every control edge into
+// the load's textual prefix is a forward one, and the raw pointer is an unchanged entry pair. A
+// load then observes one dispatch-local upload on every visit.
 // `pointer_until_read` ends the entry-pointer lifetime at the load instead of the program end. Only
 // the register-offset path asks for it: its load reads the fold's exact per-PC snapshot and never
 // the base register again, and forward-only control means the load runs at most once, so only
 // writes BEFORE it can change which bytes it reads (#4578 follow-up). The strict immediate set and
 // the owned read points keep their own lifetimes, so their consumers are unchanged.
+//
+// Loops (#4847). A backward branch used to cost the whole program its proofs. What the proof needs
+// is narrower: forward-only control over the code that can run BEFORE the load. Let the loop floor
+// be the lowest target of any backward branch (a self-branch included). For a load below the floor,
+// every edge into a pc at or below the load is a forward edge, since a back edge lands at or above
+// the floor. So every path that reaches the load is strictly increasing in pc: the load runs at most
+// once, everything that can precede it lies in its textual prefix, and that prefix is itself
+// loop-free. The only way past the load without running it is then a forward branch out of the
+// prefix to a pc above the load, which is exactly the bypass the walk below checks; that walk and
+// the lifetime walks already follow back edges to a fixed point. A load at or above the floor may
+// run again after code that follows it textually, and stays refused. The Pathless's NGG GS loops
+// at pc 982 after reading its wide constants at pc 37 (hash 5006269a9073860b).
 static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<Rdna2Inst>& ins,
                                                               bool owned_read_point,
                                                               bool pointer_until_read = false) {
@@ -828,13 +841,15 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<
     for (size_t i = 0; i < ins.size(); ++i)
         if (ins[i].fmt == Rdna2Format::Unknown || !ins[i].len_dwords ||
             !by_pc.emplace(ins[i].pc, i).second) return proven;
+    int64_t loop_floor = INT64_MAX;   // lowest backward-branch target; no load at or above it
     for (const Rdna2Inst& in : ins) {
         if (rdna2_may_write_unnamed_register_or_leave_cfg(in)) return proven;
         if (in.fmt != Rdna2Format::SOPP || in.is_end) continue;
         if (sopp_opcode_is_direct_branch(in.opcode)) {
             const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
-            if (target <= static_cast<int64_t>(in.pc) || target > UINT32_MAX ||
-                !by_pc.contains(static_cast<uint32_t>(target))) return proven;
+            if (target < 0 || target > UINT32_MAX || !by_pc.contains(static_cast<uint32_t>(target)))
+                return proven;
+            if (target <= static_cast<int64_t>(in.pc)) loop_floor = std::min(loop_floor, target);
         } else if (!sopp_is_noop(in) && in.opcode != kSoppOpcodeBarrier &&
                    // GS_ALLOC_REQ reads M0 to request parameter-cache space; it changes no
                    // scalar value or guest source bytes (RDNA2 ISA 12.5.1). The emitter already
@@ -846,21 +861,22 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& load = ins[i];
         const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
-        if (load.fmt != Rdna2Format::SMEM ||
-            (load.opcode != 0x2u && load.opcode != 0x3u) ||
+        if (load.fmt != Rdna2Format::SMEM || (load.opcode != 0x2u && load.opcode != 0x3u) ||
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
             load.dst.value + static_cast<int>(words) > 106 ||
             load.src[0].kind != OperandKind::SGPR || load.src[0].value < 0 ||
-            load.src[0].value + 1 > 105 ||
-            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
-            static_cast<int32_t>(load.literal) < 0 || (load.literal & 3u) ||
-            !std::binary_search(needs_backing.begin(), needs_backing.end(), load.pc))
+            load.src[0].value + 1 > 105 || load.src[1].kind != OperandKind::Special ||
+            load.src[1].value != 125 || static_cast<int32_t>(load.literal) < 0 ||
+            (load.literal & 3u) ||
+            !std::binary_search(needs_backing.begin(), needs_backing.end(), load.pc) ||
+            static_cast<int64_t>(load.pc) >= loop_floor)
             continue;
         bool stable_entry_pointer = true;
         const RawWideLifetime lifetime(ins, by_pc, i, words);
         for (const Rdna2Inst& in : ins) {
-            // Forward-only control permits a textual prefix scan: any earlier global/image
-            // store might alias the raw source after the CPU upload was captured.
+            // Forward-only control into the prefix (the loop floor above) permits a textual
+            // prefix scan: any earlier global/image store might alias the raw source after the
+            // CPU upload was captured.
             if ((owned_read_point || in.pc < load.pc) && rdna2_may_write_guest_memory(in))
                 stable_entry_pointer = false;
             // A predecessor may bypass the load only if every bypass path overwrites all
@@ -999,7 +1015,8 @@ rdna2_proven_raw_register_wide_data_loads(const std::vector<Rdna2Inst>& ins,
                 bool entry_at_read = true;
                 for (size_t prefix = 0; prefix < j && entry_at_read; ++prefix) {
                     const auto& before = ins[prefix];
-                    // Control is forward-only (entry_proven). A branch before the source matters
+                    // Control into the load's prefix is forward-only (entry_proven: the load
+                    // lies below every back-edge target). A branch before the source matters
                     // only if it lands after the source and at or before the load: then the load
                     // can run without this read. One landing at or before the source joins
                     // ahead of it; one landing past the load skips both, which the wide load's
