@@ -15,8 +15,8 @@
 // The test is deliberately narrower than "any RG8 texture": several established game paths still
 // rely on the historical coverage broadcast for their own two-channel surfaces. What keeps it narrow
 // is the PAIR -- a two-channel surface is only claimed when the same draw also binds a
-// single-channel partner of the same tile mode, same element format, one-layer 2D, whose width is
-// exactly twice its own, whose height is (h+1)/2, and whose bytes do not overlap it. An ordinary
+// single-channel partner of the same tile mode, same element format, one-layer 2D, with matching
+// half-resolution geometry and disjoint memory. An ordinary
 // two-channel game texture has no such partner.
 //
 // One clause listed here previously that is NOT doing the work, recorded so nobody credits it:
@@ -111,7 +111,8 @@ constexpr bool avp_plane_is_one_layer_2d(const gpu::ShaderResource& r) {
 // 2048x1088 R8 luma plane and a 1024x544 RG8 chroma plane 0x111000 bytes past its end, and that gap
 // alone sent every movie frame down the coverage broadcast. What makes the pair an NV12 pair is the
 // GEOMETRY -- one luma texel per chroma byte across the row, two luma rows per chroma row, the same
-// physical row pitch, both linear, both one-layer 2D, both Unorm8, and both bound by the same draw.
+// physical row pitch when linear, the same tile mode, both one-layer 2D, both Unorm8, and both bound
+// by the same draw.
 // Adjacency is kept as a separate, stronger verdict so the log still distinguishes the two routes.
 inline AvpChromaVerdict classify_avplayer_chroma_plane(
     const gpu::ShaderResource& r, uint32_t tw, uint32_t th,
@@ -140,17 +141,31 @@ inline AvpChromaVerdict classify_avplayer_chroma_plane(
     // A TILED plane pair has no row pitch to reason about, so neither the HLE registry nor the
     // resolved-pitch comparison applies: the whole surface is a padded block of micro-tiles whose
     // size depends on the mode and the element width. Sonic Origins (PPSA05325) stages its decoded
-    // 3840x2160 NV12 exactly that way -- both planes SW_64KB_S, declared as one-layer 2D arrays --
-    // and its luma plane's TILED size (0x870000 for 3840x2160 at 1 B/texel, against 0x7e9000 tight)
-    // lands precisely on the chroma plane's address, four allocations out of four. So the tiled
-    // route keeps adjacency as a REQUIREMENT: it is available here, it is exact, and it is much the
-    // strongest evidence a pair can carry. Measured live with PROSPER_AVPCHROMA_LOG (#2731).
+    // 3840x2160 NV12 exactly that way -- both planes SW_64KB_S, declared as one-layer 2D arrays.
+    // The initially measured pairs were adjacent (#2731), but captured submit 25003/draw 1 also
+    // binds separately allocated planes with the same shape; its chroma bytes and shader preserve
+    // distinct U/V components (#4811, CONFIDENCE: HIGH). As for linear pairs, adjacency is a stronger
+    // verdict, not a requirement. Disjointness must use BOTH padded tiled footprints.
     if (tiled) {
+        // The footprint below describes one complete level. A mip chain or a shared packed-tail
+        // block needs different range accounting and is not evidence for this plane-pair contract.
+        if (r.declared_mip_levels != 1u || r.in_mip_tail) {
+            v.reason = AvpChromaReason::NotNarrowRg8Plane;
+            return v;
+        }
+        const uint64_t chroma_bytes = gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, 2u);
+        if (!chroma_bytes || r.gpu_addr > UINT64_MAX - chroma_bytes) {
+            v.reason = AvpChromaReason::NoSiblingLumaPlane;
+            return v;
+        }
+        const uint64_t chroma_end = r.gpu_addr + chroma_bytes;
+        const gpu::ShaderResource* adjacent_luma = nullptr;
+        const gpu::ShaderResource* separate_luma = nullptr;
         for (const auto& luma : table) {
             if (luma.cls != RC::Texture || luma.format != gpu::DataFormat::Unorm8 ||
                 luma.num_components != 1 || !avp_plane_is_one_layer_2d(luma) ||
                 luma.tile_mode != r.tile_mode || luma.compression_enabled ||
-                !luma.width || !luma.height ||
+                luma.declared_mip_levels != 1u || luma.in_mip_tail || !luma.width || !luma.height ||
                 (static_cast<uint64_t>(luma.width) + 1u) / 2u != tw ||
                 (static_cast<uint64_t>(luma.height) + 1u) / 2u != th)
                 continue;
@@ -158,14 +173,21 @@ inline AvpChromaVerdict classify_avplayer_chroma_plane(
                 luma.width, luma.height, luma.tile_mode, 0, 1u);
             if (!luma_bytes || luma.gpu_addr > UINT64_MAX - luma_bytes) continue;
             const uint64_t luma_end = luma.gpu_addr + luma_bytes;
+            if (!(luma_end <= r.gpu_addr || chroma_end <= luma.gpu_addr)) continue;
             if (luma_end == r.gpu_addr ||
                 (luma_end <= UINT64_MAX - 0xffffu &&
                  ((luma_end + 0xffffu) & ~uint64_t{0xffffu}) == r.gpu_addr)) {
-                v.match = true;
-                v.reason = AvpChromaReason::MatchedAdjacentLumaPlane;
-                v.sibling_luma_addr = luma.gpu_addr;
-                return v;
+                adjacent_luma = &luma;
+                break;
             }
+            if (!separate_luma) separate_luma = &luma;
+        }
+        if (const gpu::ShaderResource* luma = adjacent_luma ? adjacent_luma : separate_luma) {
+            v.match = true;
+            v.reason = adjacent_luma ? AvpChromaReason::MatchedAdjacentLumaPlane
+                                     : AvpChromaReason::MatchedSeparateLumaPlane;
+            v.sibling_luma_addr = luma->gpu_addr;
+            return v;
         }
         v.reason = AvpChromaReason::NoSiblingLumaPlane;
         return v;
