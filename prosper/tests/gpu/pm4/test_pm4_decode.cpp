@@ -258,14 +258,14 @@ TEST(Pm4Decode, Contract) {
     // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
     {
         uint32_t load_stream[] = {
-            // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
-            PM4(5, IT_LOAD_SH_REG, 0),
+            // IT_LOAD_SH_REG_INDEX: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
+            PM4(5, IT_LOAD_SH_REG_INDEX, 0),
             0x74ec2fbcu,
             0x00000040u,
             0x80000000u,
             10u,
-            // IT_LOAD_CONTEXT_REG: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
-            PM4(5, IT_LOAD_CONTEXT_REG, 0),
+            // IT_LOAD_UCONFIG_REG_INDEX: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
+            PM4(5, IT_LOAD_UCONFIG_REG_INDEX, 0),
             0x6616e000u,
             0x00000040u,
             0x80000000u,
@@ -288,7 +288,7 @@ TEST(Pm4Decode, Contract) {
         CHECK(load_ops[0].num_regs == 10, "op0 num_regs = 10");
 
         CHECK(load_ops[1].kind == K::SetRegsIndirect, "op1 is SetRegsIndirect");
-        CHECK(load_ops[1].reg_class == RegClass::Cx, "op1 class is Cx");
+        CHECK(load_ops[1].reg_class == RegClass::Uc, "op1 class is Uc");
         CHECK(load_ops[1].regs_vaddr == 0x406616e000u, "op1 vaddr matches");
         CHECK(load_ops[1].num_regs == 6, "op1 num_regs = 6");
 
@@ -300,14 +300,14 @@ TEST(Pm4Decode, Contract) {
         // Only the observed shape decodes as pairs: the contiguous-range data format (bit 31
         // clear) and an index/offset address mode (low address bits) stay Unknown.
         uint32_t other_shapes[] = {
-            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbcu, 0x00000040u, 0x00000000u, 10u,
-            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbdu, 0x00000040u, 0x80000000u, 10u,
+            PM4(5, IT_LOAD_SH_REG_INDEX, 0), 0x74ec2fbcu, 0x00000040u, 0x00000000u, 10u,
+            PM4(5, IT_LOAD_SH_REG_INDEX, 0), 0x74ec2fbdu, 0x00000040u, 0x80000000u, 10u,
         };
         std::vector<Pm4Command> other_ops;
         decode_pm4(other_shapes, std::size(other_shapes), other_ops);
         CHECK(other_ops.size() == 2 && other_ops[0].kind == K::Unknown &&
                   other_ops[1].kind == K::Unknown,
-              "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
+              "range-format and index-mode IT_LOAD_SH_REG_INDEX stay Unknown");
     }
 
     // Hardware IT_ACQUIRE_MEM (0x58) and IT_RELEASE_MEM (0x49) (Black Flag submit0.bin):

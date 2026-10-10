@@ -198,22 +198,24 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.rel_addr = lo_hi(&pl[2]);
             c.rel_value = lo_hi(&pl[4]);
             c.rel_value_valid = true;
-        } else if ((c.op == IT_LOAD_SH_REG || c.op == IT_LOAD_CONTEXT_REG ||
-                    c.op == IT_LOAD_CONTEXT_REG_INDEX || c.op == IT_LOAD_UCONFIG_REG) &&
+        } else if ((c.op == IT_LOAD_SH_REG_INDEX || c.op == IT_LOAD_UCONFIG_REG_INDEX ||
+                    c.op == IT_LOAD_CONTEXT_REG_INDEX) &&
                    npl == 4 && (pl[0] & 3u) == 0 && (pl[2] & 0x80000000u) != 0) {
-            // Hardware PM4 indirect register loads, as the PS5's own libSceAgc emits them (#4822):
+            // Hardware PM4 indexed register loads, as libSceAgc emits them (#4822, #4866):
             //   [0..1] = 64-bit guest address of a ShaderReg {offset, value} array (lo/hi),
             //   [2]    = bit 31 set: the array holds offset/value pairs,
             //   [3]    = number of pairs.
             // Seen in a Black Flag (PPSA28183) submit captured on PS5 hardware: 330 0x63 packets
-            // loading user-data SGPRs, plus 0x64 and 0x9F context loads. Only that observed shape
+            // loading user-data SGPRs, plus 0x64 user-config and 0x9F context loads. Only that shape
             // decodes: an index/offset address mode (low address bits), the contiguous-range data
             // format (bit 31 clear) or another length stays Unknown rather than being read as
-            // pairs. CONFIDENCE: MED (one title's capture; 0x64's role is inferred from it).
+            // pairs. Ordinary LOAD opcodes have different range fields and remain unsupported.
+            // AMD's GFX10 opcode table and the 3.20 SetUc/Cx/ShRegistersIndirect builders agree
+            // on these register classes. CONFIDENCE: HIGH on opcode identities.
             c.kind = K::SetRegsIndirect;
-            c.reg_class = (c.op == IT_LOAD_SH_REG)        ? RegClass::Sh
-                          : (c.op == IT_LOAD_UCONFIG_REG) ? RegClass::Uc
-                                                          : RegClass::Cx;
+            c.reg_class = (c.op == IT_LOAD_SH_REG_INDEX)        ? RegClass::Sh
+                          : (c.op == IT_LOAD_UCONFIG_REG_INDEX) ? RegClass::Uc
+                                                                : RegClass::Cx;
             c.regs_vaddr = lo_hi(pl);
             c.num_regs = pl[3];
         } else if (c.op == IT_INDIRECT_BUFFER && npl == 13) {

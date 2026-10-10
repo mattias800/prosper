@@ -2963,6 +2963,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/pm4/test_pm4_decode.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_pm4_indexed_load
+    SOURCES tests/gpu/pm4/test_pm4_indexed_load.cpp
+    LIBRARIES prosper_core)
+
   # CommandProcessor apply stage: replay a decoded stream into a GpuState (register files + draws).
   add_executable(test_command_processor tests/gpu/pm4/test_command_processor.cpp)
   target_link_libraries(test_command_processor PRIVATE prosper_core)
