@@ -1025,7 +1025,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  // `s_mov_b64 vcc, s[4:5]` before its vccz break, #273): the branch reads
                                  // rs.vcc, so it must be updated too — sreg_bool[106] alone left the
                                  // branch on a stale VCC. (The SOP2 mask ops already special-case 106.)
-                                 if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = m; }
+                                 if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = m;
+                        }
                         // s_mov_b64 ALSO moves a plain 64-bit VALUE (a descriptor pair, a scratch pair,
                         // an inline constant) — compilers use it to shuffle T#/V# halves and constants,
                         // not just wave masks. Copy the data SSA + descriptor provenance (sreg_srt) for
