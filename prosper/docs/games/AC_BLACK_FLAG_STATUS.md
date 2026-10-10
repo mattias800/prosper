@@ -186,9 +186,12 @@ Type-3 opcodes the PS5's `libSceAgc` emits were all `Kind::Unknown`. Over PRs #4
 #4827, #4828 and #4829 the following raw opcodes now decode. Each decodes only at its GFX10 packet
 length and field shape, and any other shape stays Unknown:
 
-- Indirect register loads: `0x63` `IT_LOAD_SH_REG`, `0x64` `IT_LOAD_CONTEXT_REG`, `0x9F`
-  `IT_LOAD_CONTEXT_REG_INDEX`, `0x5E` `IT_LOAD_UCONFIG_REG` (#4822). These carry 3,472 SH registers,
-  including the user-data SGPRs for descriptor tables, and 36,221 context registers per frame.
+- Indirect register loads: `0x63` `IT_LOAD_SH_REG_INDEX`, `0x64` `IT_LOAD_UCONFIG_REG_INDEX`, and
+  `0x9F` `IT_LOAD_CONTEXT_REG_INDEX` (#4822, corrected by #4866). The original census reported
+  3,472 SH registers, including user-data SGPRs for descriptor tables. Its historical 36,221
+  "context registers" total requires reclassification because `0x64` targets user-config registers;
+  separate CX/UC totals have not been re-measured. Ordinary `0x5E` `IT_LOAD_UCONFIG_REG` carries
+  range fields, not indexed offset/data pairs, and remains unsupported.
 - Synchronization: `0x58` `IT_ACQUIRE_MEM` and `0x49` `IT_RELEASE_MEM` (#4823): 543 cache barriers and
   431 end-of-pipe fence writes.
 - Compute dispatches: `0x15` `IT_DISPATCH_DIRECT` and `0x16` `IT_DISPATCH_INDIRECT` (#4825): 247
@@ -316,6 +319,10 @@ for those formats (recompiler typed storage view, renderer seed path, mirror), n
 
 ## Ruled out
 
+- **"Opcode `0x64` loads context registers."** Falsified by AMD's published GFX10 opcode table
+  and the 3.20 `sceAgcDcbSetUcRegistersIndirect` builder (`hvUfkUIQcOE`): it is
+  `LOAD_UCONFIG_REG_INDEX`. Context indexed loads use `0x9F`. The decoder correction is #4866;
+  the historical mixed register total above has not been re-measured.
 - **"Write-watch can take over the per-frame compare of the constant ring on Windows."** Not available:
   on Windows `GuestWriteWatch::create` always reports unsupported (page-protection watches corrupt the
   guest SysV red zone, and direct memory is section-backed so `MEM_WRITE_WATCH` cannot see it), so every
