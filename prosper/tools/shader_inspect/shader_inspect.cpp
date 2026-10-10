@@ -182,8 +182,8 @@ ShaderResourceTable synthetic_resource_table(const std::vector<Rdna2Inst>& instr
             // Same storage-only opcode set as the recompiler's ImageResourceRequirement.
             const bool storage = in.opcode == 0x08 || in.opcode == 0x09 || in.opcode == 0x0f ||
                                  (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
-            add(storage ? ResourceClass::StorageImage : ResourceClass::Texture, in.pc,
-                0xFFFFFFFFu, in.mimg_dim);
+            add(storage ? ResourceClass::StorageImage : ResourceClass::Texture, in.pc, 0xFFFFFFFFu,
+                in.mimg_dim);
             // The _C sample/gather forms need a comparison S#, or the recompiler refuses them as
             // drifted provenance: give exactly those a LESS compare.
             const uint32_t low = in.opcode & 0x0fu;
@@ -199,10 +199,9 @@ ShaderResourceTable synthetic_resource_table(const std::vector<Rdna2Inst>& instr
             const uint32_t key = in.literal;
             const ResourceClass cls =
                 in.opcode == 0x02 ? ResourceClass::ConstantBuffer : ResourceClass::Texture;
-            const bool seen = std::any_of(table.resources.begin(), table.resources.end(),
-                                          [&](const ShaderResource& r) {
-                                              return r.srt_offset == key && r.cls == cls;
-                                          });
+            const bool seen = std::any_of(
+                table.resources.begin(), table.resources.end(),
+                [&](const ShaderResource& r) { return r.srt_offset == key && r.cls == cls; });
             if (!seen) add(cls, UINT32_MAX, key, 1);
         }
     }
@@ -224,6 +223,7 @@ int main(int argc, char** argv) {
     bool raw_wide_proof = false;
     bool wave64 = false;
     bool synthetic_table = false;
+    std::string spirv_out;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -242,6 +242,11 @@ int main(int argc, char** argv) {
             wave64 = true;
         } else if (arg == "--synthetic-table") {
             synthetic_table = true;
+        } else if (arg == "--spirv-out") {
+            if (i + 1 >= argc)
+                bad_usage = true;
+            else
+                spirv_out = argv[++i];
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -255,10 +260,13 @@ int main(int argc, char** argv) {
         (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
         (wave64 && !raw_wide_proof) ||
         (synthetic_table && stage != "vertex" && stage != "fragment") ||
+        (!spirv_out.empty() && !synthetic_table) ||
         (skippable_mimg && (!stage.empty() || mimg_sites || wave_reasons || raw_wide_proof)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
-        std::fprintf(stderr, "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table\n",
+        std::fprintf(stderr,
+                     "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table "
+                     "[--spirv-out FILE]\n",
                      argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
@@ -573,15 +581,25 @@ int main(int argc, char** argv) {
         const ShaderResourceTable synthetic =
             synthetic_table ? synthetic_resource_table(instructions) : ShaderResourceTable{};
         if (synthetic_table) {
-            spirv = stage == "vertex"
-                        ? recompile_vertex(words.data(), words.size(), &synthetic)
-                        : recompile_fragment(words.data(), words.size(), &synthetic);
+            spirv = stage == "vertex" ? recompile_vertex(words.data(), words.size(), &synthetic)
+                                      : recompile_fragment(words.data(), words.size(), &synthetic);
             std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu resources=%zu\n",
                         stage.c_str(),
                         spirv.empty() ? "rejected-synthetic-table" : "ok-synthetic-table",
                         spirv.size(), synthetic.resources.size());
             std::printf("stage-recompile NOTE: SYNTHETIC TABLE - a compile probe, not an admission "
                         "verdict.\n");
+            // The module, for spirv-val: a compile probe that emits invalid SPIR-V is a defect the
+            // status line cannot show.
+            if (!spirv_out.empty() && !spirv.empty()) {
+                std::ofstream out(spirv_out, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(spirv.data()),
+                          static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+                if (!out) {
+                    std::fprintf(stderr, "cannot write %s\n", spirv_out.c_str());
+                    return 2;
+                }
+            }
             return spirv.empty() ? 5 : 4;
         }
         if (stage == "vertex") {

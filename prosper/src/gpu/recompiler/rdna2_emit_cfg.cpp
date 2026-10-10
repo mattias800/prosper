@@ -6819,6 +6819,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             else                  rs.exec = cond_exec;
         }
         // The merge's only predecessor is the check block: each slot keeps the value it had there.
+        LoopVccCarry::exit_without_phi(rs, phis, cond_vcc, false);   // #4848
         if (!lane_slots.finish_exit(b, rs, /*body_edge*/ false, 0, 0)) return false;
         // A VCC half the check block overwrote with a mask holds that mask's dword on exit, not the
         // body scratch its header phi carries; leave it untracked so a data read takes the exact
@@ -7462,9 +7463,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             : pr.dom == 3 ? rs.vcc
                             : pr.dom == 4 ? rs.exec
                             : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
-                if (!nv && pr.dom == 3)
-                    nv = vcc_carry.backedge_value(b, ins, L.header_pc,
-                                                  L.direct_exec_breaks || L.direct_wave_breaks);
+                if (!nv && pr.dom == 3) nv = vcc_carry.backedge_value(b, ins, L);
                 if (!nv && pr.dom == 3) return false;
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
@@ -7482,12 +7481,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                    : pr.dom == 3 ? vcc_chk
                                    : pr.dom == 4 ? exec_chk
                                    : (bool_chk.count(pr.reg) ? bool_chk.at(pr.reg) : pr.phi);
-                uint32_t body_value = pr.dom == 0 ? vget(pr.reg)
-                                    : pr.dom == 1 ? sget(pr.reg)
-                                    : pr.dom == 2 ? (rs.scc ? rs.scc : b.bfalse())
-                                    : pr.dom == 3 ? rs.vcc
-                                    : pr.dom == 4 ? rs.exec
-                                    : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                uint32_t body_value =
+                    pr.dom == 0   ? vget(pr.reg)
+                    : pr.dom == 1 ? sget(pr.reg)
+                    : pr.dom == 2 ? (rs.scc ? rs.scc : b.bfalse())
+                    : pr.dom == 3 ? vcc_carry.merge_body_value(b, rs.vcc)
+                    : pr.dom == 4 ? rs.exec
+                                  : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
                 const uint32_t merged = (L.direct_exec_breaks || L.direct_wave_breaks) &&
                                                 chk_value != body_value
                     ? b.emit_phi_2way(pr.dom <= 1 ? b.t_u32 : b.t_bool,
@@ -7504,6 +7504,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
+            LoopVccCarry::exit_without_phi(rs, phis, vcc_chk,
+                                           L.direct_exec_breaks || L.direct_wave_breaks);
             if (!lane_slots.finish_exit(b, rs, L.direct_exec_breaks || L.direct_wave_breaks,
                                         chk_end, body_end))
                 return false;

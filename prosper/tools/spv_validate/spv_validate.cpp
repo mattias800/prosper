@@ -1800,6 +1800,36 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_vcc_scratch_loop_voted",
              recompile_fragment(voted, sizeof(voted) / 4, nullptr));
     }
+    // Fragment (#4848, House of the Dead 2's light loops): the scratch loop with an interior EXECZ
+    // break after the scratch writes. The break edge reaches the merge with VCC holding scalar
+    // data; VCC is unread at the exit, so that edge's merge input is the placeholder.
+    {
+        const uint32_t c[] = {0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u, 0x7D020200u,
+                              0x7D020200u, 0xBF860007u, 0x816A8100u, 0x876B8300u, 0xBF880004u,
+                              0x060000FFu, 0x3E000000u, 0xBE80036Au, 0xBF82FFF7u, 0x7E020300u,
+                              0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_vcc_scratch_break_loop", recompile_fragment(c, sizeof(c) / 4, nullptr));
+    }
+    // Fragment (#4848): VCC is scalar data on entry (so it gets no header phi), the BODY of an
+    // EXEC loop with a direct break creates a VCC mask, and a one-arm if after the loop writes VCC.
+    // Before the fix the body's mask outlived the loop and the if-merge phi named an id that does
+    // not dominate it (House of the Dead 2, 0x407da20100, loop pc 743).
+    {
+        const uint32_t c[] = {0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u, 0x816A8100u,
+                              0x876B8300u, 0xBE84047Eu, 0xBF880007u, 0x7D020200u, 0x87FE6A7Eu,
+                              0xBF880004u, 0x060000FFu, 0x3E000000u, 0x81008100u, 0xBF82FFF8u,
+                              0xBEFE0404u, 0xBF068400u, 0xBF840001u, 0x7D020200u, 0x7E020300u,
+                              0x7E040300u, 0xF800080Fu, 0x03020100u, 0xBF810000u};
+        dump(dir, "fragment_loop_body_vcc_then_if", recompile_fragment(c, sizeof(c) / 4, nullptr));
+        // The counted-loop form (SCC exit, unconditional back-edge) of the same leak.
+        const uint32_t counted[] = {0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u, 0x816A8100u,
+                                    0x876B8300u, 0xBF048400u, 0xBF840005u, 0x7D020200u, 0x060000FFu,
+                                    0x3E000000u, 0x81008100u, 0xBF82FFF9u, 0xBF068400u, 0xBF840001u,
+                                    0x7D020200u, 0x7E020300u, 0x7E040300u, 0xF800080Fu, 0x03020100u,
+                                    0xBF810000u};
+        dump(dir, "fragment_counted_loop_body_vcc_then_if",
+             recompile_fragment(counted, sizeof(counted) / 4, nullptr));
+    }
     // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
     // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
     // the structured loop route, and the one-arm if phis a slot written on the taken arm only.
