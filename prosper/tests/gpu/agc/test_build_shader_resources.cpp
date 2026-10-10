@@ -1268,6 +1268,10 @@ TEST(BuildShaderResources, VolumeTailLayout) {
     // coordinate can name: 512^3 needs its own first block per level.
     EXPECT_FALSE(tiled_volume_tail_layout(512, 512, 512, 1, 9, 9, 0).supported)
         << "non-tail level zero stays refused";
+    // A level zero that fits the tail in x/y but is deeper than one macroblock (32 for R8):
+    // the in-block z would alias its upper slices, so it must refuse rather than place.
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 64, 1, 9, 5, 0).supported)
+        << "a volume deeper than the tail block does not place";
 }
 
 // The six single-level views over that pyramid decode to supported views at the proven

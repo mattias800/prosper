@@ -608,7 +608,9 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // refused for the same silent-wrong-texels reason as every path below.
     const bool volume_tail_3d = d.type == 10 && d.base_array == 0 && d.base_level == d.last_level;
     if (volume_tail_3d) {
-        if (!fi.bytes_per_block) {
+        // Block-compressed volumes: the tail rule is in elements and the upload has no BCn
+        // volume-tail reader, so they keep the base-level-only rule.
+        if (!fi.bytes_per_block || fi.block_width > 1) {
             view.supported = unshifted_view_supported();
             return view;
         }

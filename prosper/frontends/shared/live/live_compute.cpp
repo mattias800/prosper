@@ -9279,7 +9279,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             skip_image(r, "sampled cube-face backing size overflows"); break;
                         }
                         sampled_guest_need = level_offset + selected_slice;
-                    } else if (r->tile_mode && dim_3d && r->depth > 1) {
+                    } else if (r->tile_mode && dim_3d && (r->depth > 1 || r->in_mip_tail)) {
                         sampled_guest_need = tiled_volume_bytes(
                             r->width, r->height, r->depth, r->tile_mode, bpt);
                     } else if ((dim_2d_array || dim_cube_stacked || native_cube_sampled) && sampled_layers > 1) {
@@ -10637,8 +10637,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         selected + static_cast<size_t>(y) * row_pitch,
                                         static_cast<size_t>(r->width) * bpt);
                             }
-                        } else if (r->tile_mode && dim_3d && r->depth > 1) {
-                            if (r->in_mip_tail) {
+                        } else if (r->tile_mode && dim_3d && (r->depth > 1 || r->in_mip_tail)) {
+                            if (r->in_mip_tail) {   // a 1^3 level too: never the 2D tail detile
                                 if (!detile_volume_tail_level(linear.get(), src, need, r->width,
                                                               r->height, r->depth, r->tile_mode,
                                                               bpt, r->mip_tail_x, r->mip_tail_y)) {

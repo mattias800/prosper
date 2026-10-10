@@ -2206,6 +2206,9 @@ TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, 
     // AddrLib Gfx10Lib::IsInMipTail: the chain is addressable this way only when its
     // largest level is itself in the tail; smaller levels then follow monotonically.
     if (width > tail_w || height > tail_h || num_levels > max_tail_levels) return result;
+    // The tail origins are in-block (x, y) only; z indexes the block's own depth, so a volume
+    // deeper than one macroblock would alias its upper slices onto the lower ones.
+    if (depth > kSw64kbS3Dims[el][2]) return result;
     // AddrLib ComputeSurfaceInfoMacroTiled tail walk, firstMipInTail == 0.
     const uint32_t m = max_tail_levels - 1u - mip_level;
     const uint32_t mip_offset = m > 6u ? (16u << m) : (m << 8u);
