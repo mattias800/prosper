@@ -176,33 +176,45 @@ ended with process exit code -1 and no final log line, at 41 to 180 s (no fault 
 line); the cause was not established and they are not evidence either way. Stop only your own PID when
 scripting runs, since other sessions may be running `prosper-app` on the same machine.
 
-## Progress 2026-10-09: PM4 hardware Type-3 packet decoding resolves 100% of captured stream
+## Progress 2026-10-09: hardware PM4 Type-3 packets decoded from the captured stream
 
 Measured against the offline capture of a complete 115-segment frame (23,766 dwords, 4,272 Type-3 packets)
-dumped from PS5 hardware (`submit0.bin` via `tools/console_capture`, #4817):
+dumped from PS5 hardware (`submit0.bin` via `tools/console_capture`, #4817).
 
-Previously, prosper only decoded commands wrapped under synthetic `IT_NOP` custom packets, meaning direct
-hardware PM4 Type-3 opcodes emitted by modern `libSceAgc` drivers were categorized as `Kind::Unknown`.
-Over PRs #4822, #4823, #4825, #4826, #4827, #4828, and #4829, full hardware decoding was implemented across
-all 17 previously unmapped raw opcodes:
-- Indirect register loads: `0x63` `IT_LOAD_SH_REG`, `0x64` `IT_LOAD_CONTEXT_REG`, `0x9F` `IT_LOAD_CONTEXT_REG_INDEX`,
-  and `0x5E` `IT_LOAD_UCONFIG_REG` (#4822). Restores 3,472 SH registers (including shader user data SGPRs for
-  descriptor tables) and 36,221 context registers previously dropped per frame.
-- Synchronization and cache controls: `0x58` `IT_ACQUIRE_MEM` and `0x49` `IT_RELEASE_MEM` (#4823). Restores
-  543 cache barriers and 431 EOP completion fence writes.
-- Compute dispatches: `0x15` `IT_DISPATCH_DIRECT` and `0x16` `IT_DISPATCH_INDIRECT` (#4825). Restores 247 compute
+Before this work prosper decoded only its own commands wrapped in `IT_NOP` custom packets, so the raw
+Type-3 opcodes the PS5's `libSceAgc` emits were all `Kind::Unknown`. Over PRs #4822, #4823, #4825, #4826,
+#4827, #4828 and #4829 the following raw opcodes now decode. Each decodes only at its GFX10 packet
+length and field shape, and any other shape stays Unknown:
+
+- Indirect register loads: `0x63` `IT_LOAD_SH_REG`, `0x64` `IT_LOAD_CONTEXT_REG`, `0x9F`
+  `IT_LOAD_CONTEXT_REG_INDEX`, `0x5E` `IT_LOAD_UCONFIG_REG` (#4822). These carry 3,472 SH registers,
+  including the user-data SGPRs for descriptor tables, and 36,221 context registers per frame.
+- Synchronization: `0x58` `IT_ACQUIRE_MEM` and `0x49` `IT_RELEASE_MEM` (#4823): 543 cache barriers and
+  431 end-of-pipe fence writes.
+- Compute dispatches: `0x15` `IT_DISPATCH_DIRECT` and `0x16` `IT_DISPATCH_INDIRECT` (#4825): 247
   dispatches per frame.
-- Draws, bases, and memory writes: `0x11` `IT_SET_BASE`, `0x2D` `IT_DRAW_INDEX_AUTO`, `0x24` `IT_DRAW_INDIRECT`,
-  `0x25` `IT_DRAW_INDEX_INDIRECT`, `0x26` `IT_INDEX_BASE`, and `0x37` `IT_WRITE_DATA` (#4826). Restores 1,328 draws
-  and indirect base configurations per frame.
-- Polling barriers: `0x3C` `IT_WAIT_REG_MEM` (#4827). Restores 67 hardware memory polling barriers.
-- Pipeline control: `0x12` `IT_CLEAR_STATE`, `0x13` `IT_INDEX_BUFFER_SIZE`, `0x1E` `IT_ATOMIC_MEM`,
-  `0x28` `IT_CONTEXT_CONTROL`, and `0x42` `IT_PFP_SYNC_ME` (#4828).
-- Predication and multi-draw: `0x22` `IT_COND_EXEC`, `0x38` `IT_DRAW_INDEX_INDIRECT_MULTI`, and
-  `0x93` `IT_WAIT_REG_MEM64` (#4829).
+- Draws, bases and memory writes: `0x11` `IT_SET_BASE` (indirect-argument base only), `0x2D`
+  `IT_DRAW_INDEX_AUTO`, `0x24` `IT_DRAW_INDIRECT`, `0x25` `IT_DRAW_INDEX_INDIRECT`, `0x26` `IT_INDEX_BASE`,
+  and `0x37` `IT_WRITE_DATA` to memory destinations only (#4826).
+- Memory polls: `0x3C` `IT_WAIT_REG_MEM` and `0x93` `IT_WAIT_REG_MEM64` (#4827, #4829).
+- `0x13` `IT_INDEX_BUFFER_SIZE` and `0x42` `IT_PFP_SYNC_ME` (#4828).
 
-This resolves 100.0% of all hardware Type-3 PM4 packets in the frame (4,272 / 4,272 mapped, 0 unknown opcodes),
-ensuring zero dropped commands during CommandProcessor stream evaluation.
+The per-opcode counts above are the author's census of the capture. They were taken before review
+added the length and field gates, and have not been re-measured since.
+
+**Not decoded, deliberately: coverage is not 100%.** Five opcodes stay `Unknown` because no existing
+command kind performs what they do, and relabelling them would hide a real gap:
+
+| Opcode | Packet | What it actually does |
+| --- | --- | --- |
+| `0x12` | `IT_CLEAR_STATE` | resets context registers to their clear-state values |
+| `0x28` | `IT_CONTEXT_CONTROL` | controls shadow-register loading |
+| `0x1E` | `IT_ATOMIC_MEM` | performs an atomic memory write |
+| `0x22` | `IT_COND_EXEC` | skips the next N dwords when a memory value is zero (this is not draw predication) |
+| `0x38` | `IT_DRAW_INDEX_INDIRECT_MULTI` | issues COUNT draws at a stride |
+
+`COND_EXEC` and `DRAW_INDEX_INDIRECT_MULTI` are the two that change what renders, so they need command
+processor support of their own.
 
 ## Current frontier
 
