@@ -765,3 +765,17 @@ TEST(ScalarPairMask, ExecCmovSelectsOnlyOnADefiniteScc) {
     EXPECT_TRUE(compile_whole(Stage::Compute, cat({&kPrefix, &kOnePath, &body, &kStoreV3})).empty())
         << "a merge-marked SCC must not select EXEC";
 }
+
+TEST(ScalarPairMask, ExecSourceIsAdmittedAsLaneMask) {
+    // EXEC (126/127) is the live lane mask, not scalar data, so copying it into VCC
+    // (`s_mov_b64 vcc, exec`: 0xbeea047eu) must not reach the fabricated-word check. A pin, not a
+    // regression: before #4841 EXEC was admitted too, as 126/127 lay outside the special-data
+    // range. A fabricated word cannot reach EXEC in the first place; the restore tests above
+    // (AFabricatedWordSpilledThroughALoopRefusesAtTheRestore and its siblings) refuse it there.
+    const Words mov_vcc_exec = {0xbeea047eu};
+    for (Stage stage : {Stage::Compute, Stage::Fragment}) {
+        EXPECT_FALSE(compile(stage, program(kDefined, mov_vcc_exec)).empty())
+            << name(stage)
+            << ": s_mov_b64 vcc, exec must be admitted: " << last_terminal_reject_reason(kAddress);
+    }
+}
