@@ -519,7 +519,10 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
 
 - **The existing `GetRegisterDefaults2` table is not a verified `CLEAR_STATE` image.** A 2026-10-10
   comparison against the native driver's clear-patch baseline disagreed for all three checked
-  context registers: `CB_TARGET_MASK`, `CB_BLEND0_CONTROL`, and `CB_COLOR_CONTROL`. The native
+  context registers: `CB_TARGET_MASK`, `CB_BLEND0_CONTROL`, and `CB_COLOR_CONTROL`. A separate
+  bounded comparison of those same registers in six native SDK descriptor branches also
+  disagreed in all 18 checked cells; this is not solely a defect in the existing HLE table. No
+  native default values or image arrays were copied into prosper. The native
   patch path starts with 921 context dwords and sends only changed offset/value pairs through its
   clear-state ioctl; `NotifyDefaultStates` instead groups offsets for shadow ranges. Reusing the
   returned ABI table as a clear image would therefore change register values without evidence.
