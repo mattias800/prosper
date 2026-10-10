@@ -129,7 +129,7 @@ alone** — that is how a working title gets broken to satisfy a table. Only a g
 | `DcbDrawIndex` | 7 | `DRAW_INDEX_2` | 6 | LOW | payload carries a 64-bit AGC draw modifier |
 | `DcbDrawIndexAuto` | 7 | `DRAW_INDEX_AUTO` | 3 | LOW | same modifier; not a bare PM4 draw |
 | `DcbDrawIndexOffset` | 3 | `DRAW_INDEX_OFFSET_2` | 5 | LOW | prosper emits **fewer** — safe direction |
-| `DcbDrawIndexIndirect` | 4 | `DRAW_INDEX_INDIRECT` | 5 | HIGH | 3.20 builder emits `0xC0032500`; `mStuvI0zOtc` returns 20 bytes. Prosper's own 4-dword encoding is smaller |
+| `DcbDrawIndexIndirect` | **5** | `DRAW_INDEX_INDIRECT` | 5 | HIGH | 3.20 builder emits `0xC0032500`; `mStuvI0zOtc` returns 20 bytes. Corrected from 4 by #4840; metadata offset/modifier retained with initialized padding |
 | `DcbDrawIndirect` | 4 | `DRAW_INDIRECT` | 5 | MED | **new (#2929)**, and the count is derived rather than copied from the indexed row. prosper's payload is the API's own operand list — 32-bit byte offset + 64-bit `ShaderDrawModifier` — so it cannot be smaller; the hardware packet spends header + `DATA_OFFSET` + `BASE_VTX_LOC` + `START_INST_LOC` + `DRAW_INITIATOR`, the same field list as the indexed form. No dump was observed inlining the real size, so the equality is inferred, not measured; only the **upper** bound is load-bearing and 4 ≤ 5 settles it. prosper answers `sceAgcDcbDrawIndirectGetSize` (`cxPZ4Wgvdj8`) from the same constant |
 | `CbDispatch` | 6 | `DISPATCH_DIRECT` | 5 | LOW | no title evidence |
 | `DcbDispatchIndirect` | 4 | `DISPATCH_INDIRECT` | 3–4 | LOW | no title evidence |
@@ -165,6 +165,9 @@ by optional marker packets. Its size helper includes both wrappers in the reserv
 is therefore the draw packet size, not an unconditional size for the whole library operation.
 The single-draw builder `t1vNu082-jM` emits five dwords, independently corroborated by its size
 helper's 20-byte result. CONFIDENCE: HIGH on these checked sizes and NID identities.
+Prosper's indexed single builder and size helper now use that five-dword extent. The extra metadata
+slot is initialized without changing its offset/modifier semantics. GoogleTests independently pin
+the native size, exact cursor advance, short-window refusal, guards, and following-packet placement.
 
 The native multi builder and the
 [AMD PFP packet definition](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_f32_pfp_pm4_packets.h)
@@ -301,8 +304,7 @@ it a stronger reference than the "published dw" column above. What it showed:
   `DcbDrawIndex` 7 vs 6, `CbDispatch` 6 vs 5, `DcbDispatchIndirect` 4 vs 3, `AcbDispatchIndirect`
   5 vs 4, `Dcb/AcbEventWrite` 4 vs 2, `DcbWriteData` 5+n vs 4+n, `CbSetShRegisterRangeDirect` n+4 vs
   2+n. Tracked in #4757 and listed in `known_gaps.tsv`; none is changed here.
-* **Prosper reserves less** (the safe direction): `DcbDrawIndexOffset`, `DcbDrawIndexIndirect`,
-  `DcbDrawIndirect`, the three `*RegistersIndirect` forms and `DcbSetIndexSize`.
+* **Prosper reserves less**: `DcbDrawIndexOffset`, `DcbDrawIndirect`, the three `*RegistersIndirect` forms and `DcbSetIndexSize`.
 * **Unanswered queries**: 30 fixed-size queries had no answer (the generic stub returns 0, the failure
   #1137 records) and now answer the console's size (`src/hle/graphics/hle_agc_getsize.cpp`); they all
   stand for packets prosper has no builder for. Five count-dependent queries are still unanswered

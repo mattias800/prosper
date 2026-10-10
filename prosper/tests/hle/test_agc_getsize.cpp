@@ -9,13 +9,17 @@
 // == that × 4, so any drift fails here. Rewind has no builder (reserve-only); its GetSize is asserted
 // against the documented 2-dword contract that a future REWIND builder must honor.
 #include "hle/dispatch/dispatch.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace prosper;
 
@@ -58,6 +62,78 @@ static uint64_t emitted(HleFn builder, uint64_t a1, uint64_t a2, uint64_t a3, ui
     return (uint64_t)(d.cursor_up - g_buf);
 }
 
+// The 3.20 native size helper returns 20 bytes, independently of prosper's builder constant. A
+// shorter self-consistent metadata packet still answers the guest reservation query incorrectly.
+TEST(AgcGetsize, NativeIndexedIndirectSizeIsTwentyBytes) {
+    register_builtin_hle();
+    const auto size = Hle::lookup("mStuvI0zOtc");
+    ASSERT_TRUE(size);
+    EXPECT_EQ(size(0, 0, 0, 0, 0, 0), 20u);
+}
+
+TEST(AgcGetsize, NativeIndexedIndirectExtentPreservesMetadataAndGuards) {
+    register_builtin_hle();
+    const auto build = Hle::lookup("t1vNu082-jM");
+    ASSERT_TRUE(build);
+    constexpr uint32_t guard = 0xa5a5a5a5u;
+    std::array<uint32_t, 8> words;
+    words.fill(guard);
+    Dcb d{words.data() + 1, words.data() + 6, words.data() + 1, words.data() + 6};
+    constexpr uint64_t modifier = 0x1122334455667788ull;
+    EXPECT_EQ(build(reinterpret_cast<uint64_t>(&d), 0x90u, modifier, 0, 0, 0),
+              reinterpret_cast<uint64_t>(words.data() + 1));
+    EXPECT_EQ(d.cursor_up, words.data() + 6);
+    EXPECT_EQ(((words[1] >> 16u) & 0x3fffu) + 2u, 5u);
+    EXPECT_EQ(words[0], guard);
+    EXPECT_EQ(words[6], guard);
+    EXPECT_EQ(words[7], guard);
+    EXPECT_EQ(words[5], 0u) << "the metadata encoding's extra ABI dword must be initialized";
+    std::vector<gpu::Pm4Command> decoded;
+    EXPECT_EQ(gpu::decode_pm4(words.data() + 1, 5u, decoded), 5u);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0].kind, gpu::Pm4Command::Kind::DrawIndexIndirect);
+    EXPECT_EQ(decoded[0].indirect_offset, 0x90u);
+    EXPECT_EQ(decoded[0].di_modifier, modifier);
+}
+
+TEST(AgcGetsize, NativeIndexedIndirectRefusesFourDwordWindowWithoutWrites) {
+    register_builtin_hle();
+    const auto build = Hle::lookup("t1vNu082-jM");
+    ASSERT_TRUE(build);
+    constexpr uint32_t guard = 0xa5a5a5a5u;
+    std::array<uint32_t, 6> words;
+    words.fill(guard);
+    Dcb d{words.data() + 1, words.data() + 5, words.data() + 1, words.data() + 5};
+    EXPECT_EQ(build(reinterpret_cast<uint64_t>(&d), 0x90u, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(d.cursor_up, words.data() + 1);
+    EXPECT_TRUE(
+        std::all_of(words.begin(), words.end(), [=](uint32_t word) { return word == guard; }));
+}
+
+TEST(AgcGetsize, NativeIndexedIndirectFollowingPacketStartsAfterTwentyBytes) {
+    register_builtin_hle();
+    const auto build = Hle::lookup("t1vNu082-jM");
+    const auto instances = Hle::lookup("tSBxhAPyytQ");
+    ASSERT_TRUE(build && instances);
+    constexpr uint32_t guard = 0xa5a5a5a5u;
+    std::array<uint32_t, 10> words;
+    words.fill(guard);
+    Dcb d{words.data() + 1, words.data() + 8, words.data() + 1, words.data() + 8};
+    const auto address = reinterpret_cast<uint64_t>(&d);
+    ASSERT_NE(build(address, 0x90u, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(instances(address, 9u, 0, 0, 0, 0), reinterpret_cast<uint64_t>(words.data() + 6));
+    EXPECT_EQ(d.cursor_up, words.data() + 8);
+    EXPECT_EQ(words[0], guard);
+    EXPECT_EQ(words[8], guard);
+    EXPECT_EQ(words[9], guard);
+    std::vector<gpu::Pm4Command> decoded;
+    EXPECT_EQ(gpu::decode_pm4(words.data() + 1, 7u, decoded), 7u);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_EQ(decoded[0].kind, gpu::Pm4Command::Kind::DrawIndexIndirect);
+    EXPECT_EQ(decoded[1].kind, gpu::Pm4Command::Kind::SetNumInstances);
+    EXPECT_EQ(decoded[1].instance_count, 9u);
+}
+
 TEST(AgcGetsize, Contract) {
     std::printf("== test_agc_getsize (#1143 builder/GetSize drift guard) ==\n");
     register_builtin_hle();
@@ -74,44 +150,48 @@ TEST(AgcGetsize, Contract) {
     struct Case { const char* name; const char* gs_nid; const char* build_nid; uint64_t exp_dw;
                   uint64_t a1,a2,a3,a4,a5; };
     const Case cases[] = {
-        { "Jump",           "VEGu4dixjUg", "xSAR0LTcRKM", 4, 0, 0, 0x1000, 0, 0 },  // sceAgcDcbJump -> 4 dw (#3676)
-        { "AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 8, 0, 0, 0,      0, 0 },  // sceAgcDcbAcquireMem -> 8 dw
-        { "AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 8, 0, 0, 0,      0, 0 },  // sceAgcAcbAcquireMem -> 8 dw
-        { "ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 8, 0, 0, 0,      0, 0 },  // sceAgcCbReleaseMem -> 8 dw
+        {"Jump", "VEGu4dixjUg", "xSAR0LTcRKM", 4, 0, 0, 0x1000, 0,
+         0},   // sceAgcDcbJump -> 4 dw (#3676)
+        {"AcquireMem/Dcb", "-vnlTPPXPrw", "57labkp+rSQ", 8, 0, 0, 0, 0,
+         0},   // sceAgcDcbAcquireMem -> 8 dw
+        {"AcquireMem/Acb", "ewobAQeMo5k", "KT-hTp-Ch14", 8, 0, 0, 0, 0,
+         0},   // sceAgcAcbAcquireMem -> 8 dw
+        {"ReleaseMem/EOP", "hL7C0IRpWZI", "wr23dPKyWc0", 8, 0, 0, 0, 0,
+         0},   // sceAgcCbReleaseMem -> 8 dw
         // #1756: the rest of the family. libSceAgc 3.20 exports 65 GetSize functions and prosper
         // answered 6; the other 59 fell through to the unimplemented path and returned 0, which
         // makes a guest that sizes its buffer from GetSize reserve NOTHING. Every pair below is
         // asserted the same way — the GetSize must equal what the builder actually writes — so the
         // fix cannot drift back apart. (The three size-carrying builders are excluded: their
         // GetSize argument position is unknown. See #1756.)
-        { "DrawIndex",          "6ee9Hd3EWXQ", "q88lQ+GP5Yk", 7, 0, 0, 0, 0, 0 },
-        { "DrawIndexAuto",      "WrdP9Zxx3lQ", "Yw0jKSqop+E", 7, 0, 0, 0, 0, 0 },
-        { "DrawIndexOffset",    "qMlfB1ZhMDc", "B+aG9DUnTKA", 3, 0, 0, 0, 0, 0 },
-        { "DrawIndexIndirect",  "mStuvI0zOtc", "t1vNu082-jM", 4, 0, 0, 0, 0, 0 },
+        {"DrawIndex", "6ee9Hd3EWXQ", "q88lQ+GP5Yk", 7, 0, 0, 0, 0, 0},
+        {"DrawIndexAuto", "WrdP9Zxx3lQ", "Yw0jKSqop+E", 7, 0, 0, 0, 0, 0},
+        {"DrawIndexOffset", "qMlfB1ZhMDc", "B+aG9DUnTKA", 3, 0, 0, 0, 0, 0},
+        {"DrawIndexIndirect", "mStuvI0zOtc", "t1vNu082-jM", 5, 0, 0, 0, 0, 0},
         // #2929: the NON-indexed sibling. Registered late, so this row is also the guard that the
         // pair exists at all — Hle::lookup of either NID returning null fails the first CHECK.
-        { "DrawIndirect",       "cxPZ4Wgvdj8", "1q1titRBL6o", 4, 0, 0, 0, 0, 0 },
-        { "Dispatch",           "Abendgtz+3o", "k3GhuSNmBLU", 6, 0, 0, 0, 0, 0 },
-        { "DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 4, 0, 0, 0, 0, 0 },
+        {"DrawIndirect", "cxPZ4Wgvdj8", "1q1titRBL6o", 4, 0, 0, 0, 0, 0},
+        {"Dispatch", "Abendgtz+3o", "k3GhuSNmBLU", 6, 0, 0, 0, 0, 0},
+        {"DispatchIndirect/D", "w8HVkEeXPv8", "CtB+A9-VxO0", 4, 0, 0, 0, 0, 0},
         // The ACB form is 5, not 4: it carries a whole 64-bit argument address where the DCB form
         // carries a 32-bit offset, because no sceAgcAcb* export sets an indirect-argument base
         // (#3218). Sharing the DCB builder truncated that address to 32 bits.
-        { "DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 5, 0, 0, 0, 0, 0 },
-        { "DmaData/Dcb",        "2ccJz9LQI+w", "WmAc2MEj6Io", 7, 0, 0, 0, 0, 0 },
-        { "DmaData/Acb",        "M0ttm8h7SKA", "-RnpfpxIhec", 7, 0, 0, 0, 0, 0 },
-        { "EventWrite/Dcb",     "C4l9fB17t8w", "aJf+j5yntiU", 4, 0, 0, 0, 0, 0 },
-        { "EventWrite/Acb",     "Y-5vneiBtzk", "cFazmnXpJOE", 4, 0, 0, 0, 0, 0 },
-        { "SetIndexBuffer",     "j4emHHndCPY", "l4fM9K-Lyks", 3, 0, 0, 0, 0, 0 },
-        { "SetIndexCount",      "mljzuGDZRQ4", "8N2tmT3jmC8", 2, 0, 0, 0, 0, 0 },
-        { "SetIndexSize",       "ca4KPvp0qLQ", "GIIW2J37e70", 2, 0, 0, 0, 0, 0 },
-        { "SetNumInstances",    "6DFuRKT4C9w", "tSBxhAPyytQ", 2, 0, 0, 0, 0, 0 },
-        { "StallCbParser",      "+u6dKSLWM2o", "u2T2DiA5hRI", 2, 0, 0, 0, 0, 0 },
-        { "SetShRegDirect",     "QhPDD513V0w", "pFLArOT53+w", 3, 0, 0, 0, 0, 0 },
-        { "SetCxRegDirect",     "1DeUNpRIDDA", "LHFXRrlTPD8", 3, 0, 0, 0, 0, 0 },
-        { "SetUcRegDirect",     "aP1Ki9G3++4", "w4-d0n60hdo", 3, 0, 0, 0, 0, 0 },
-        { "SetShRegsIndirect",  "nNlUtdDDvZ0", "-HOOCn0JY48", 4, 0, 0, 0, 0, 0 },
-        { "SetCxRegsIndirect",  "GBCh3zCihoU", "ZvwO9euwYzc", 4, 0, 0, 0, 0, 0 },
-        { "SetUcRegsIndirect",  "UQGTw4xRlcM", "hvUfkUIQcOE", 4, 0, 0, 0, 0, 0 },
+        {"DispatchIndirect/A", "PxKWV2fVAps", "j3EtxFkSIhQ", 5, 0, 0, 0, 0, 0},
+        {"DmaData/Dcb", "2ccJz9LQI+w", "WmAc2MEj6Io", 7, 0, 0, 0, 0, 0},
+        {"DmaData/Acb", "M0ttm8h7SKA", "-RnpfpxIhec", 7, 0, 0, 0, 0, 0},
+        {"EventWrite/Dcb", "C4l9fB17t8w", "aJf+j5yntiU", 4, 0, 0, 0, 0, 0},
+        {"EventWrite/Acb", "Y-5vneiBtzk", "cFazmnXpJOE", 4, 0, 0, 0, 0, 0},
+        {"SetIndexBuffer", "j4emHHndCPY", "l4fM9K-Lyks", 3, 0, 0, 0, 0, 0},
+        {"SetIndexCount", "mljzuGDZRQ4", "8N2tmT3jmC8", 2, 0, 0, 0, 0, 0},
+        {"SetIndexSize", "ca4KPvp0qLQ", "GIIW2J37e70", 2, 0, 0, 0, 0, 0},
+        {"SetNumInstances", "6DFuRKT4C9w", "tSBxhAPyytQ", 2, 0, 0, 0, 0, 0},
+        {"StallCbParser", "+u6dKSLWM2o", "u2T2DiA5hRI", 2, 0, 0, 0, 0, 0},
+        {"SetShRegDirect", "QhPDD513V0w", "pFLArOT53+w", 3, 0, 0, 0, 0, 0},
+        {"SetCxRegDirect", "1DeUNpRIDDA", "LHFXRrlTPD8", 3, 0, 0, 0, 0, 0},
+        {"SetUcRegDirect", "aP1Ki9G3++4", "w4-d0n60hdo", 3, 0, 0, 0, 0, 0},
+        {"SetShRegsIndirect", "nNlUtdDDvZ0", "-HOOCn0JY48", 4, 0, 0, 0, 0, 0},
+        {"SetCxRegsIndirect", "GBCh3zCihoU", "ZvwO9euwYzc", 4, 0, 0, 0, 0, 0},
+        {"SetUcRegsIndirect", "UQGTw4xRlcM", "hvUfkUIQcOE", 4, 0, 0, 0, 0, 0},
     };
     for (const auto& c : cases) {
         HleFn gs = Hle::lookup(c.gs_nid), build = Hle::lookup(c.build_nid);

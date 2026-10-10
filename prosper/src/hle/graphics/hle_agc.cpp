@@ -102,24 +102,11 @@ constexpr uint32_t R_NUM = 0x40;
 constexpr uint32_t kDwDrawIndex          = 7;
 constexpr uint32_t kDwDrawIndexAuto      = 7;
 constexpr uint32_t kDwDrawIndexOffset    = 3;
-constexpr uint32_t kDwDrawIndexIndirect  = 4;
-// sceAgcDcbDrawIndirect (#2929) — the non-indexed sibling, and deliberately the SAME 4 dwords as the
-// indexed one rather than a count copied from it by assumption. Two independent arguments, both for
-// the safe direction:
-//   * prosper's payload is its own encoding and carries exactly what the API call carries: the
-//     32-bit byte offset into the graphics argument base plus the 64-bit ShaderDrawModifier. There
-//     is no fourth operand for the non-indexed form to drop, so it cannot be smaller than this.
-//   * The hardware packet this stands for, PM4 `DRAW_INDIRECT`, spends header + DATA_OFFSET +
-//     BASE_VTX_LOC + START_INST_LOC + DRAW_INITIATOR = 5 dwords — the same field list as
-//     `DRAW_INDEX_INDIRECT`. So 4 is at or below the real library's reservation on the published
-//     layout, which is the only direction that matters: emitting FEWER than the real AGC function
-//     wastes reserved space, emitting MORE overruns a reservation the guest made in good faith
-//     (#1748). See docs/gpu/AGC_PACKET_SIZES.md.
-// prosper also answers sceAgcDcbDrawIndirectGetSize (cxPZ4Wgvdj8) from this same constant, so a
-// guest that ASKS reserves exactly what is written here and is self-consistent regardless.
-// CONFIDENCE: MED — no local dump was observed inlining the real size, so the equality with the real
-// AGC packet is inferred from the published PM4 layout rather than measured from a guest reservation.
-// CONFIDENCE: HIGH that 4 is not an overrun, which is the property #1748 makes load-bearing.
+constexpr uint32_t kDwDrawIndexIndirect = 5;
+// sceAgcDcbDrawIndirect (#2929) retains its independent four-dword metadata encoding: header,
+// byte offset, and 64-bit ShaderDrawModifier. Its native reservation has not been checked here;
+// the indexed sibling's proven five-dword extent does not establish this API's GetSize contract.
+// CONFIDENCE: MED on this extent, pending its own native builder and reservation check.
 constexpr uint32_t kDwDrawIndirect       = 4;
 constexpr uint32_t kDwDispatch           = 6;
 constexpr uint32_t kDwDispatchIndirect   = 4;
@@ -3641,11 +3628,14 @@ HLE(agc_dcb_stall_command_buffer_parser) {
     cmd[1] = 0;
     return reinterpret_cast<uint64_t>(cmd);
 }
+// CONFIDENCE: HIGH: 3.20 builder and mStuvI0zOtc both establish a five-dword extent.
+// Keep prosper's offset/modifier metadata; the extra slot is initialized padding.
 HLE(agc_dcb_draw_index_indirect) {
     uint32_t* cmd; if (!begin_packet(a0, kDwDrawIndexIndirect, IT_NOP, R_DRAW_INDEX_INDIRECT, &cmd)) return 0;
     cmd[1] = static_cast<uint32_t>(a1);
     cmd[2] = static_cast<uint32_t>(a2);
     cmd[3] = static_cast<uint32_t>(a2 >> 32u);
+    cmd[4] = 0;
     return reinterpret_cast<uint64_t>(cmd);
 }
 // sceAgcDcbDrawIndirect (NID 1q1titRBL6o) — the NON-indexed indirect draw, and the sibling that had
