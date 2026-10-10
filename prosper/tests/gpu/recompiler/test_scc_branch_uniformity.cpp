@@ -196,4 +196,86 @@ TEST(SccBranchUniformity, Contract) {
               "a scalar branch whose load address came from v_readfirstlane is NOT uniform");
     }
 
+    // ---- positive: intervening image loads and waitcnts leave SCC unmodified --------------------
+    // Guest compute shader shape (e.g. Black Flag cs 0x407ed65200 pc 78..93): an s_cmp_eq_u32
+    // produces SCC from uniform launch-derived data, followed by image loads and s_waitcnts before
+    // the s_cbranch_scc1. Memory operations and waitcnts do not modify SCC.
+    const uint32_t mem_intervening_guard[] = {
+        0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
+        0xBF0B811Cu,   // s_cmp_eq_u32 s28, 1
+        0xBF8C3F73u,   // s_waitcnt
+        0xBBFD0000u,   // s_waitcnt_vscnt null, 0 (SOPK)
+        0xF0200F08u, 0x00080916u,   // image_load_mip v[8:11], ...
+        0xBF8C3F70u,   // s_waitcnt
+        0xBD7D0000u,   // s_waitcnt_lgkmcnt null, 0 (SOPK)
+        0xBF850001u,   // s_cbranch_scc1 +1
+        0xBF800000u,   // s_nop
+        0xBF810000u,   // s_endpgm
+    };
+    {
+        const std::vector<Rdna2Inst> ins =
+            walk(mem_intervening_guard, std::size(mem_intervening_guard));
+        ASSERT_GE(ins.size(), 8u);
+        ASSERT_EQ(ins[3].fmt, Rdna2Format::SOPK) << "fixture decodes s_waitcnt_vscnt as SOPK";
+        ASSERT_EQ(ins[3].opcode, 0x17u) << "fixture decodes s_waitcnt_vscnt";
+        ASSERT_EQ(ins[6].fmt, Rdna2Format::SOPK) << "fixture decodes s_waitcnt_lgkmcnt as SOPK";
+        ASSERT_EQ(ins[6].opcode, 0x1au) << "fixture decodes s_waitcnt_lgkmcnt";
+        uint32_t branch_pc = 0;
+        bool saw_image = false;
+        for (const auto& in : ins) {
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+            if (in.fmt == Rdna2Format::MIMG) saw_image = true;
+        }
+        CHECK(saw_image && branch_pc != 0, "fixture contains image_load and s_cbranch_scc1");
+        CHECK(scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "intervening image operations and waitcnts leave SCC unmodified");
+    }
+
+    // ---- positive: an intervening VOPC writes VCC, not SCC -------------------------------------
+    // The branch still consumes the scalar compare's SCC, so the walk steps over the v_cmp.
+    const uint32_t vopc_intervening_guard[] = {
+        0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
+        0xBF0B811Cu,   // s_cmp_eq_u32 s28, 1
+        0x7D020300u,   // v_cmp_lt_i32 vcc, v0, v1 (VOPC)
+        0xBF850001u,   // s_cbranch_scc1 +1
+        0xBF800000u, 0xBF810000u,
+    };
+    {
+        const std::vector<Rdna2Inst> ins =
+            walk(vopc_intervening_guard, std::size(vopc_intervening_guard));
+        uint32_t branch_pc = 0;
+        bool saw_vopc = false;
+        for (const auto& in : ins) {
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+            if (in.fmt == Rdna2Format::VOPC) saw_vopc = true;
+        }
+        CHECK(saw_vopc && branch_pc != 0, "fixture contains v_cmp and s_cbranch_scc1");
+        CHECK(scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "an intervening VOPC does not write SCC and is stepped over");
+    }
+
+    // ---- negative: an intervening SCC writer stops the walk -------------------------------------
+    // s_add_u32 writes SCC (its carry), so the branch no longer sees the uniform compare.
+    const uint32_t sop2_intervening_guard[] = {
+        0xF4200704u, 0xFA000000u,   // s_buffer_load_dword s28, s[8:11], null
+        0xBF0B811Cu,   // s_cmp_eq_u32 s28, 1
+        0xBF8C3F73u,   // s_waitcnt
+        0x801D811Du,   // s_add_u32 s29, s29, 1 (SOP2, writes SCC)
+        0xBD7D0000u,   // s_waitcnt_lgkmcnt null, 0 (SOPK)
+        0xBF850001u,   // s_cbranch_scc1 +1
+        0xBF800000u, 0xBF810000u,
+    };
+    {
+        const std::vector<Rdna2Inst> ins =
+            walk(sop2_intervening_guard, std::size(sop2_intervening_guard));
+        ASSERT_GE(ins.size(), 5u);
+        ASSERT_EQ(ins[3].fmt, Rdna2Format::SOP2) << "fixture decodes s_add_u32 as SOP2";
+        ASSERT_EQ(ins[3].opcode, 0x00u) << "fixture decodes s_add_u32";
+        uint32_t branch_pc = 0;
+        for (const auto& in : ins)
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x05u) branch_pc = in.pc;
+        CHECK(branch_pc != 0, "fixture contains s_cbranch_scc1");
+        CHECK(!scc_branch_is_workgroup_uniform(ins, branch_pc),
+              "an intervening SCC writer stops the walk even past a SOPK waitcnt");
+    }
 }
