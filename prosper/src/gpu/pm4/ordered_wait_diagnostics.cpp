@@ -16,6 +16,7 @@ const char* ordered_wait_effect_class_name(OrderedWaitEffectClass effect_class) 
         case OrderedWaitEffectClass::WriteDataPartial: return "write-data-partial";
         case OrderedWaitEffectClass::WriteDataOversized: return "write-data-oversized";
         case OrderedWaitEffectClass::WriteDataUnowned: return "write-data-unowned";
+        case OrderedWaitEffectClass::AtomicInteger: return "atomic-integer";
         case OrderedWaitEffectClass::EventTimestamp: return "event-timestamp";
         case OrderedWaitEffectClass::OffsetOverlap: return "offset-overlap";
         case OrderedWaitEffectClass::AliasedOverlap: return "aliased-overlap";

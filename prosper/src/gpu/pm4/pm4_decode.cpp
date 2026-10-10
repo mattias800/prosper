@@ -4,6 +4,7 @@
 #include <mutex>
 #include <set>
 #include "gpu/pm4/pm4_decode.hpp"
+#include "gpu/pm4/pm4_memory.hpp"
 
 namespace prosper::gpu {
 
@@ -20,9 +21,11 @@ inline uint32_t hdr_r  (uint32_t h) { return (h >> 2) & 0x3fu; }
 uint64_t lo_hi(const uint32_t* p) { return (uint64_t)p[0] | ((uint64_t)p[1] << 32); }
 }  // namespace
 
-size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& out) {
+size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& out,
+                  size_t max_commands) {
     size_t i = 0;
-    while (i < dwords) {
+    const size_t initial_size = out.size();
+    while (i < dwords && out.size() - initial_size < max_commands) {
         uint32_t h = buf[i];
         if (!is_type3(h)) {
             // PM4 TYPE-2 (bits[31:30] == 0b10, e.g. 0x80000000) is a single-dword filler NOP — the CP
@@ -47,7 +50,25 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         const uint32_t npl = len - 1;                   // payload dword count
 
         using K = Pm4Command::Kind;
-        if (c.op == IT_DISPATCH_DIRECT && npl == 4) {
+        if (c.op == IT_COND_EXEC && npl == 4 && pl[2] == 0 && (pl[0] & 3u) == 0 &&
+            (pl[3] & ~0x3fffu) == 0) {
+            // GFX10 COND_EXEC is five dwords, as observed in the console packet fixture (#4840).
+            // It tests a dword at address lo/hi; the reserved control word is not predication.
+            // Skipping belongs to the command processor, before any skipped bytes are decoded.
+            c.kind = K::CondExec;
+            c.cond_exec_addr = lo_hi(pl);
+            c.cond_exec_dwords = pl[3];
+        } else if (c.op == IT_ATOMIC_MEM && npl == 8 && ((pl[0] >> 8) & 0xfu) == 0 &&
+                   (pl[0] >> 30) <= 1 && integer_atomic_mem_op(pl[0] & 0x7fu)) {
+            // GFX10 ATOMIC_MEM is nine dwords. Only single-pass integer operations have an
+            // established implementation; loop-until-compare and float/unused TC_OPs stay Unknown.
+            // AMD's published PM4_ME/PFP_ATOMIC_MEM fields. CONFIDENCE: HIGH on the layout.
+            c.kind = K::AtomicMem;
+            c.atomic_op = pl[0] & 0x7fu;
+            c.atomic_addr = lo_hi(&pl[1]);
+            c.atomic_source = lo_hi(&pl[3]);
+            c.atomic_compare = lo_hi(&pl[5]);
+        } else if (c.op == IT_DISPATCH_DIRECT && npl == 4) {
             // Hardware PM4 DISPATCH_DIRECT (GFX10, 5 dwords): [0..2] = DIM_X/Y/Z, [3] =
             // COMPUTE_DISPATCH_INITIATOR. The custom R_DISPATCH_DIRECT modifier is that same
             // register's bit layout (USE_THREAD_DIMENSIONS, CS_W32_EN, ...), so the initiator
@@ -91,10 +112,10 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             // Hardware PM4 PFP_SYNC_ME (GFX10, 2 dwords, [0] = DUMMY): the prefetch parser waits
             // for the micro engine -- the same ordering point as R_STALL_COMMAND_BUFFER_PARSER.
             c.kind = K::StallCommandBufferParser;
-            // CLEAR_STATE (0x12), CONTEXT_CONTROL (0x28) and ATOMIC_MEM (0x1E) deliberately stay
+            // CLEAR_STATE (0x12) and CONTEXT_CONTROL (0x28) deliberately stay
             // Unknown: none of them is a draw reset or an acquire barrier, and labelling them as
             // one would hide a real, unimplemented effect (a context-register reset to clear-state
-            // values; shadow load control; an atomic memory write) from every Unknown census.
+            // values; shadow load control) from every Unknown census.
         } else if (c.op == IT_DRAW_INDEX_AUTO && npl == 2) {
             // Hardware PM4 DRAW_INDEX_AUTO (GFX10, 3 dwords): [0] = INDEX_COUNT, [1] =
             // VGT_DRAW_INITIATOR. The initiator is not a ShaderDrawModifier, so di_modifier keeps
@@ -151,9 +172,8 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.wm_ref = lo_hi(&pl[3]);
             c.wm_mask = lo_hi(&pl[5]);
             c.wm_valid = true;
-            // COND_EXEC (0x22) and DRAW_INDEX_INDIRECT_MULTI (0x38) deliberately stay Unknown.
-            // COND_EXEC skips the next EXEC_COUNT dwords when *addr == 0, which is not draw
-            // predication; MULTI issues COUNT draws (count possibly read from memory) at a stride,
+            // DRAW_INDEX_INDIRECT_MULTI (0x38) deliberately stays Unknown.
+            // MULTI issues COUNT draws (count possibly read from memory) at a stride,
             // so mapping it to one DrawIndexIndirect draws the wrong number. Each needs its own
             // processor support, not a relabel.
         } else if (c.op == IT_INDEX_TYPE) {

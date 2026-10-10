@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_memory.hpp"
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
@@ -3313,6 +3314,8 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             using K = Pm4Command::Kind;
             if (w.cmd.kind == K::DmaData)
                 return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
+            if (w.cmd.kind == K::AtomicMem)
+                return !overlaps_completion(w.cmd.atomic_addr, atomic_mem_bytes(w.cmd.atomic_op));
             if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num) return false;
             const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
             return !overlaps_completion(w.cmd.wd_addr, bytes);
@@ -3387,6 +3390,23 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
     }
     if (touched) *value = v;
     return touched;
+}
+
+std::optional<uint32_t> pending_conditional_value(uint64_t address) {
+    PendQueue& pending = pend_q();
+    std::lock_guard<std::mutex> lock(pending.mx);
+    if (pending.inflight) return std::nullopt;
+    // Qualify the CPU read under the queue lock too: a worker could otherwise retire a write
+    // between that read and the overlay snapshot, leaving neither view with its new value.
+    uint32_t before = 0;
+    std::memcpy(&before, reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), 4);
+    for (const PendWrite& write : pending.q) {
+        const auto value = overlay_conditional_memory_effect(
+            GpuState::MemoryEffect(write.cmd, write.cmd.stream_order), address, before);
+        if (!value) return std::nullopt;
+        before = *value;
+    }
+    return before;
 }
 
 // --- WAIT_REG_MEM per-queue barrier model (issue #312 heap-corruption root cause). ---------------
@@ -3579,6 +3599,10 @@ void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
         case K::WriteData:  *addr = c.wd_addr;
                             *bytes = (uint64_t)c.wd_declared_num * 4; break;
         case K::DmaData:    *addr = c.dd_dst;     *bytes = c.dd_bytes; break;
+        case K::AtomicMem:
+            *addr = c.atomic_addr;
+            *bytes = atomic_mem_bytes(c.atomic_op);
+            break;
         default:            *addr = 0;            *bytes = 0; break;
     }
 }
@@ -3667,6 +3691,9 @@ void apply_effect(const Pm4Command& c) {
         case K::EventWrite: honor_event_write(c); break;
         case K::WriteData:  honor_write_data(c); break;
         case K::DmaData:    honor_dma_data(c); break;
+        case K::AtomicMem:
+            if (execute_atomic_mem(c)) wake_on_label(c.atomic_addr);
+            break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -3697,11 +3724,25 @@ void apply_deferred_effect(const Pm4Command& c) {
     }
     apply_effect(c);
 }
+
+void publish_memory_effect(const Pm4Command& command) {
+    if (eop_write_sync() ||
+        (command.kind == Pm4Command::Kind::DmaData && dma_data_dst_sel(command) == kDmaSelGds))
+        apply_deferred_effect(command);
+    else
+        pend_enqueue(command);
+    prosper_gpu_drain_renderer_writes();
+}
 } // namespace
 
-void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
+bool execute_ordered_memory_effect(const GpuState::MemoryEffect& effect, bool producers_retired) {
     const GraphicsExecutionActivity execution;
-    apply_deferred_effect(effect.cmd);
+    if (effect.cmd.kind == Pm4Command::Kind::AtomicMem && !producers_retired)
+        return refuse_atomic_mem_producer(effect.cmd);
+    if (effect.cmd.kind == Pm4Command::Kind::AtomicMem && !atomic_mem_operand_valid(effect.cmd))
+        return execute_atomic_mem(effect.cmd);
+    publish_memory_effect(effect.cmd);
+    return true;
 }
 
 bool last_fold_deferred() { return g_fold_deferring; }
@@ -3948,6 +3989,21 @@ OrderedWaitEffectDiagnostic diagnose_ordered_wait_effect(
         return diagnostic;
     }
 
+    if (command.kind == Pm4Command::Kind::AtomicMem) {
+        if (command.atomic_addr != wait_address) {
+            diagnostic.effect_class = OrderedWaitEffectClass::AliasedOverlap;
+            return diagnostic;
+        }
+        const auto value = atomic_mem_value(command.atomic_op, value_before, command.atomic_source,
+                                            command.atomic_compare);
+        if (!value) return diagnostic;
+        diagnostic.value_after = atomic_mem_bytes(command.atomic_op) == 4
+                                     ? (value_before & 0xffffffff00000000ull) | *value
+                                     : *value;
+        diagnostic.effect_class = OrderedWaitEffectClass::AtomicInteger;
+        diagnostic.overlay = OrderedWaitEffectOverlay::Applied;
+        return diagnostic;
+    }
     if (command.kind == Pm4Command::Kind::WriteData) {
         if (command.wd_addr != wait_address) {
             const bool virtual_overlap =
@@ -4683,6 +4739,13 @@ void GpuState::apply(const Pm4Command& c) {
             draws.push_back(std::move(d));
             break;
         }
+        case K::AtomicMem:
+            if (defer_gate(c)) {
+                defer_push(c);
+                break;
+            }
+            ordered_memory_effects.emplace_back(c, command_order);
+            break;
         case K::ReleaseMem:
             last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             // EOP completion label write. While the queue is paused (this fold hit an unsatisfied
@@ -4691,7 +4754,7 @@ void GpuState::apply(const Pm4Command& c) {
             // what let the game free live label memory. Otherwise it goes through the pipe-drain
             // queue: completion becomes guest-visible only after the submit returns.
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty()) {
+            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4699,7 +4762,7 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::WriteData:
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty()) {
+            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4708,7 +4771,7 @@ void GpuState::apply(const Pm4Command& c) {
         case K::EventWrite:
             last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty()) {
+            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4772,7 +4835,7 @@ void GpuState::apply(const Pm4Command& c) {
                 break;
             }
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty()) {
+            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -5348,13 +5411,8 @@ static size_t run_command_buffer_segment(const uint32_t* buf, size_t dwords, Gpu
         g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
     }
     std::vector<Pm4Command> ops;
-    const size_t consumed = decode_pm4(buf, dwords, ops);
+    const size_t consumed = fold_pm4_segment(buf, dwords, st, ops, g_fold_origin);
     if (consumed_dwords) *consumed_dwords = consumed;
-    for (auto& c : ops) {
-        c.stream_order = st.command_order + 1;
-        c.queue_origin = g_fold_origin;   // #1226: retained by deferred/pended effects
-        st.apply(c);
-    }
     // PROSPER_BINDTRACE (#305): per-top-level-fold census. A stream that issues draws but contains
     // no shader-program bind of its own is running on the register state a PREVIOUS submit left —
     // legitimate on a shared ring, and the exact shape to check when a draw's user-data block does

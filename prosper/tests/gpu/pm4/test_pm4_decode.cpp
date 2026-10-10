@@ -597,7 +597,10 @@ TEST(Pm4Decode, Contract) {
         const size_t c = decode_pm4(cond_stream, std::size(cond_stream), cond_ops);
         CHECK(c == 24, "consumed 24 dwords of cond/multi-draw/wait64 packets");
         CHECK(cond_ops.size() == 3, "walked 3 cond/multi-draw/wait64 packets");
-        CHECK(cond_ops[0].kind == K::Unknown, "COND_EXEC stays Unknown (it is not predication)");
+        CHECK(cond_ops[0].kind == K::CondExec &&
+                  cond_ops[0].cond_exec_addr == 0x0000000fe0040060ull &&
+                  cond_ops[0].cond_exec_dwords == 8,
+              "COND_EXEC retains a dword predicate address and raw dword skip count");
         CHECK(cond_ops[1].kind == K::Unknown, "DRAW_INDEX_INDIRECT_MULTI stays Unknown");
         CHECK(cond_ops[2].kind == K::WaitRegMem && cond_ops[2].wm_valid, "op2 is WaitRegMem");
         CHECK(cond_ops[2].wm_func == 3u, "op2 wm_func == 3");

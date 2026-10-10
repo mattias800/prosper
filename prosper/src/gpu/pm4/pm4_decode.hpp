@@ -10,6 +10,7 @@
 //   header = 0xC0000000 | ((len-2) & 0x3fff)<<16 | (op & 0xff)<<8 | (r & 0x3f)<<2
 // where len = total dwords incl. header, op = IT_* opcode, r = custom sub-op carried in IT_NOP.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -29,6 +30,8 @@ enum : uint32_t {
     IT_INDEX_BUFFER_SIZE = 0x13,
     IT_DISPATCH_DIRECT = 0x15,
     IT_DISPATCH_INDIRECT = 0x16,
+    IT_ATOMIC_MEM = 0x1E,
+    IT_COND_EXEC = 0x22,
     IT_DRAW_INDIRECT = 0x24,
     IT_DRAW_INDEX_INDIRECT = 0x25,
     IT_INDEX_BASE = 0x26,
@@ -128,6 +131,8 @@ struct Pm4Command {
         DmaData,
         Unknown,
         CondIndirectBuffer,   // appended after Unknown so no existing value moves
+        CondExec,
+        AtomicMem,
     } kind = Kind::Unknown;
 
     uint64_t stream_order = 0;          // assigned before apply and retained by deferred effects
@@ -170,6 +175,16 @@ struct Pm4Command {
     // that reads the wrong one gets an obviously wrong address instead of a plausible one.
     uint64_t indirect_address = 0;
     bool indirect_address_absolute = false;
+
+    // GFX10 COND_EXEC: compare one dword, then skip EXEC_COUNT raw dwords if it is zero.
+    uint64_t cond_exec_addr = 0;
+    uint32_t cond_exec_dwords = 0;
+
+    // GFX10 ATOMIC_MEM: only established single-pass integer TC_OP forms decode.
+    uint32_t atomic_op = 0;
+    uint64_t atomic_addr = 0;
+    uint64_t atomic_source = 0;
+    uint64_t atomic_compare = 0;
 
     // DrawIndex/DrawIndexAuto modifier. Both custom HLE packets retain the shader's trailing
     // 64-bit ShaderDrawModifier; DrawIndex additionally carries an index-buffer address.
@@ -302,6 +317,9 @@ struct Pm4Command {
 // Decode `dwords` dwords starting at `buf` into `out` (appended). Returns the number of dwords
 // consumed (== dwords on a clean stream). Stops early and returns the consumed count if it hits a
 // dword that is not a valid type-3 header (top two bits != 0b11) or a packet that would overrun.
-size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& out);
+// max_commands bounds appended commands for execution-time raw-span control; TYPE-2 fillers
+// contribute to the returned dword extent but not that command count.
+size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& out,
+                  size_t max_commands = SIZE_MAX);
 
 } // namespace prosper::gpu

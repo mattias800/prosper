@@ -37,6 +37,7 @@
 #include "gpu/resources/mip_chain_plan.hpp"  // shader_resource_compute_mip_chain_levels (#3048)
 #include "gpu/execute/indirect_draw_arguments.hpp"
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
+#include "gpu/pm4/pm4_memory.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
 #include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4796)
@@ -9619,7 +9620,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     const GraphicsExecutionActivity execution;
-    if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
+    if (st.dma_copies.empty() && st.ordered_memory_effects.empty() &&
+        (!g_compute || st.dispatches.empty()))
+        return false;
     GuestReadableSubmitScope guest_readable_scope;
     notify_compute_authority_unknown(
         ComputeAuthorityBoundaryKind::SubmitBegin, submit_no);
@@ -10484,8 +10487,6 @@ bool use_per_draw_policy(const GpuState& st) {
 bool retained_draw_selected(const GpuState& st, size_t index) {
     return use_per_draw_policy(st) || index + 1 == st.draws.size();
 }
-
-
 
 enum class DispatchArgumentResolution : uint8_t { Ready, Noop, Invalid };
 
@@ -12233,6 +12234,13 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                                 exact = command.wd_addr != 0 && command.wd_num != 0;
                             }
                             break;
+                        case Pm4Command::Kind::AtomicMem:
+                            notify_compute_authority_range(
+                                ComputeAuthorityBoundaryKind::OrderedMemoryEffect, submit_no,
+                                operation.command_order, command.atomic_addr,
+                                atomic_mem_bytes(command.atomic_op));
+                            exact = command.atomic_addr != 0;
+                            break;
                         case Pm4Command::Kind::DmaData: {
                             // Selector byte 1 names the 64 KiB GDS offset domain, not guest VA.
                             // Every other valid destination is an exact guest write range.  A
@@ -12267,7 +12275,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                         notify_compute_authority_unknown(
                             ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
                             submit_no, operation.command_order);
-                    execute_ordered_memory_effect(effect);
+                    producer_epoch_ok &= execute_ordered_memory_effect(
+                        effect, producer_epoch_ok && graphics_epoch_ok && indirect_dependencies_ok);
                     read_point_dependencies_ok = false;
                 }
                 break;
@@ -12711,8 +12720,10 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no, bool publish) {
     const GraphicsExecutionActivity execution;
-    if ((!g_live && !g_compute && st.dma_copies.empty()) ||
-        (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty())) return false;
+    if ((!g_live && !g_compute && st.dma_copies.empty() && st.ordered_memory_effects.empty()) ||
+        (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty() &&
+         st.ordered_memory_effects.empty()))
+        return false;
     // One per-submit sampling window around the WHOLE submit, both branches below. Without it a
     // graphics-only submit (execute_ordered_guest_items) renders with no scope open -- the one in
     // realize_gpustate_draws closes before rendering -- so every PROSPER_ENV_ON_PER_SUBMIT site in
@@ -12765,15 +12776,16 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             return draw_requires_original_scalar_bank(
                 use_per_draw_policy(st) ? st.state_at_draw(index) : st);
         });
-    const bool needs_ordered_realization = has_ordered_dma || has_indirect ||
-                                           !st.dispatches.empty() || has_nested_inputs ||
-                                           has_scalar_bank_inputs;
+    const bool needs_ordered_realization = has_ordered_dma || !st.ordered_memory_effects.empty() ||
+                                           has_indirect || !st.dispatches.empty() ||
+                                           has_nested_inputs || has_scalar_bank_inputs;
     // Draws without DMA/indirect arguments remain safe to prepare in parallel. Compute resources,
     // however, are always realized at their ordered position: a preceding dispatch in the same
     // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
     // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
-    const bool can_eagerly_realize_draws =
-        !has_ordered_dma && !has_indirect && !has_nested_inputs && !has_scalar_bank_inputs;
+    const bool can_eagerly_realize_draws = !has_ordered_dma && st.ordered_memory_effects.empty() &&
+                                           !has_indirect && !has_nested_inputs &&
+                                           !has_scalar_bank_inputs;
     // The normal AGC path is serialized, but execute_ordered_and_present is public and tests may
     // call it concurrently. The active collection generation is process-global because eager draw
     // workers need to see it, so serialize armed executions only; the default path never locks.

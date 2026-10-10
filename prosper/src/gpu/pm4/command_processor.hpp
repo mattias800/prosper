@@ -12,6 +12,7 @@
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
@@ -323,7 +324,7 @@ struct GpuState {
     // executing the submit would consume stale bytes. Preserve the DMA record for diagnostics and
     // capture truthfulness, but reject backend execution of the whole submit.
     bool dma_execution_rejected = false;
-    // Once a submit retains an address-backed DMA, later modeled memory effects must remain beside
+    // Once a submit retains an address-backed DMA or an atomic, later memory effects remain beside
     // it instead of entering the asynchronous completion FIFO and overtaking it. Own WRITE_DATA's
     // inline payload because the command buffer may be recycled before ordered execution.
     struct MemoryEffect {
@@ -435,6 +436,7 @@ enum class OrderedWaitEffectClass : uint8_t {
     OffsetOverlap,
     AliasedOverlap,
     Unsupported,
+    AtomicInteger,
 };
 
 enum class OrderedWaitEffectOverlay : uint8_t { None, Applied, Ambiguous };
@@ -462,7 +464,8 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
                               const uint8_t* authoritative_source = nullptr);
 // Execute a retained post-DMA memory effect through the same mappedness, generation, freelist, and
 // label-wakeup guards as the legacy completion path, then invalidate renderer-owned guest caches.
-void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect);
+bool execute_ordered_memory_effect(const GpuState::MemoryEffect& effect,
+                                   bool producers_retired = true);
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 // Folds `dwords` of PM4 into `st` and returns the number of PACKETS applied.
@@ -539,6 +542,12 @@ struct RegWatchEntry {
 // Parses the selector. Unparsable or out-of-range entries are skipped rather than aborting the list,
 // so one bad entry cannot silently disable a whole watch. An empty/absent setting yields no entries.
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting);
+
+// Checked low-dword overlay for an eager COND_EXEC read. Unknown producers refuse instead of
+// treating a stale CPU snapshot as a GPU predicate. Pending writes remain unpublished.
+std::optional<uint32_t> overlay_conditional_memory_effect(const GpuState::MemoryEffect& effect,
+                                                          uint64_t address, uint32_t before);
+std::optional<uint32_t> pending_conditional_value(uint64_t address);
 
 // Whether GpuState::sh_prov write provenance is being recorded for #305 or selected capture #1853.
 bool udprov_enabled();
