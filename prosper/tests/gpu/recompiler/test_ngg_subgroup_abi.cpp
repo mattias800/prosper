@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "fixtures/test_data.h"
 
 #include <gtest/gtest.h>
@@ -39,12 +40,13 @@ std::vector<uint32_t> program(std::initializer_list<uint32_t> body, bool exec_fi
 }
 
 NggSubgroupAbiFacts analyze(const std::vector<uint32_t>& code, uint32_t user_sgprs = 0,
-                            bool address = false) {
+                            bool address = false, bool wave32 = false) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
     NggSubgroupAbiLaunch launch;
     launch.user_sgprs = user_sgprs;
     launch.user_data_address_known = address;
+    launch.wave32 = wave32;
     return analyze_ngg_subgroup_abi(ins, launch);
 }
 
@@ -112,6 +114,34 @@ TEST(NggSubgroupAbi, LaunchSgprReadsAreRefusedByName) {
     EXPECT_TRUE(analyze(program({0xbe820380u, 0xbe940302u})).ok());   // s_mov s2, 0; s_mov s20, s2
 }
 
+// #4808: s2 carries the subgroup's ES vertex count [20:12] and primitive count [30:22] (Yakuza
+// Kiwami's Wave32 NGG VS reads both with s_bfe_u32 to build its GS_ALLOC_REQ M0). Those two fields
+// are admitted; a read that can see any other bit is not.
+TEST(NggSubgroupAbi, S2IsAdmittedOnlyThroughItsSubgroupCountFields) {
+    EXPECT_TRUE(analyze(program({0x9394ff02u, 0x0009000cu})).ok());   // s_bfe_u32 s20, s2, [20:12]
+    EXPECT_TRUE(analyze(program({0x9394ff02u, 0x00090016u})).ok());   // s_bfe_u32 s20, s2, [30:22]
+    EXPECT_EQ(analyze(program({0x9394ff02u, 0x00080000u})).reason, "ngg-abi-read-s2")
+        << "[7:0] is not supplied";
+    EXPECT_EQ(analyze(program({0x9394ff02u, 0x000a000cu})).reason, "ngg-abi-read-s2")
+        << "one bit wider than the vertex count field reaches bit 21";
+    EXPECT_EQ(analyze(program({0x8714ff02u, 0x7fdff000u})).ok(), true)
+        << "s_and_b32 with exactly the supplied mask";
+    EXPECT_EQ(analyze(program({0x8714ff02u, 0x80000000u})).reason, "ngg-abi-read-s2");
+}
+
+// #4808: under GS_W32_EN a wave's EXEC is EXEC_LO alone. s_mov_b32 exec_lo, -1 enables every lane
+// of a Wave32 wave, so the vector instruction after it reads a defined EXEC; in a Wave64 wave the
+// same write leaves EXEC_HI undefined and the read is refused.
+TEST(NggSubgroupAbi, AWave32ExecIsDefinedByItsLowHalf) {
+    std::vector<uint32_t> code = {0xbefe03c1u,   // s_mov_b32 exec_lo, -1
+                                  0x7e120280u,   // v_mov_b32 v9, 0
+                                  0xb07c3005u, 0xbf900009u};
+    code.insert(code.end(), kExports.begin(), kExports.end());
+    code.push_back(kEnd);
+    EXPECT_TRUE(analyze(code, 0, false, true).ok()) << analyze(code, 0, false, true).refusal;
+    EXPECT_EQ(analyze(code).reason, "ngg-abi-exec-read-before-write");
+}
+
 TEST(NggSubgroupAbi, UserSgprsAboveTheSuppliedRangeAreRefused) {
     const auto code = program({0xbe940309u});   // s_mov_b32 s20, s9
     EXPECT_EQ(analyze(code, 1).reason, "ngg-abi-read-undefined-sgpr");
@@ -130,6 +160,20 @@ TEST(NggSubgroupAbi, S3IsAdmittedOnlyWithoutItsGsWaveIdBits) {
     // s_and_b32 with a mask clear of [23:16] is admitted.
     EXPECT_TRUE(analyze(program({0x8714ff03u, 0x0f00ffffu})).ok());
     EXPECT_EQ(analyze(program({0x8714ff03u, 0x00010000u})).reason, "ngg-abi-read-s3-gs-wave-id");
+}
+
+// #4808: The Pathless's merged ES prolog sets its EXEC from s3 with `s_bfm_b64 exec, s3, 0`
+// (S0[5:0], the ES thread count) and `s_bitcmp1_b32 s3, 6` (is the count 64?) before
+// `s_cmov_b64 exec, -1`. Neither can observe the GS wave id in s3[23:16]; a bit test that can is
+// still refused.
+TEST(NggSubgroupAbi, S3BitFieldMaskAndBitTestDemandOnlyTheirBits) {
+    EXPECT_TRUE(analyze(program({0x92fe8003u, 0xbf0d8603u, 0xbefe06c1u})).ok())
+        << analyze(program({0x92fe8003u, 0xbf0d8603u, 0xbefe06c1u})).refusal;
+    EXPECT_TRUE(analyze(program({0x92148003u})).ok()) << "s_bfm_b32 s20, s3, 0 reads s3[4:0]";
+    EXPECT_EQ(analyze(program({0xbf0d9003u})).reason, "ngg-abi-read-s3-gs-wave-id")
+        << "s_bitcmp1_b32 s3, 16 tests a GS wave id bit";
+    EXPECT_EQ(analyze(program({0xbf0d0303u})).reason, "ngg-abi-read-s3-gs-wave-id")
+        << "a bit index from an SGPR can test any bit";
 }
 
 TEST(NggSubgroupAbi, ExecMustBeWrittenBeforeAnyVectorInstruction) {
@@ -434,4 +478,23 @@ TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
     EXPECT_EQ(analyze(program({0xd501000au, 0x00020300u})).reason, "ngg-abi-read-s0-s1");
     // A real read of s0 is still counted: v_add_nc_u32_e64 v10, s0, v1 reads it through SRC0.
     EXPECT_EQ(analyze(program({0xd525000au, 0x00020200u})).reason, "ngg-abi-read-s0-s1");
+}
+
+// rdna2_local_vcc_data: a scalar write into VCC keeps data only when its sources were written
+// earlier in the same basic block. A branch INTO the block between the writes and the VCC write
+// joins a path on which they never ran, the debugger-conditional branches included (#4819 review).
+TEST(NggSubgroupAbi, ALocalVccWriteNeedsItsSourcesWrittenInItsOwnBlock) {
+    // pc0 <first> | s_mov_b32 s8, 1 | s_mov_b32 s9, 1 | s_mov_b32 vcc_hi, 3
+    // pc4 s_bfe_u64 vcc, s[8:9], vcc_hi | s_endpgm
+    const auto proven = [](uint32_t first) {
+        const std::vector<uint32_t> code = {first,       0xBE880381u, 0xBE890381u,
+                                            0xBEEB0383u, 0x94EA6B08u, 0xBF810000u};
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        return proven_local_vcc_scalar_write_pcs(ins).contains(4u);
+    };
+    EXPECT_TRUE(proven(0xBF800000u)) << "control: s_nop, every source written in the block";
+    // s_cbranch_scc0 +2 and s_cbranch_cdbgsys +2 both land on pc 3, past the s[8:9] writes.
+    EXPECT_FALSE(proven(0xBF840002u)) << "a conditional branch joins at pc 3";
+    EXPECT_FALSE(proven(0xBF970002u)) << "a debugger-conditional branch joins at pc 3";
 }

@@ -12496,9 +12496,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     const VkImageViewType view_type = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
                         : (r.guest_array || r.sample_count > 1u) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                                  : VK_IMAGE_VIEW_TYPE_2D;
-                    const VkFormat view_format = upload.borrowed_ds
-                        ? upload.ds_format
-                        : backend_color_format(r.texture_format);
+                    const VkFormat view_format = upload.borrowed_ds ? upload.ds_format
+                                                 : upload.borrowed_compute
+                                                     ? r.texture_format   // never folded (#4810)
+                                                     : backend_color_format(r.texture_format);
                     // SQ_SEL: 0/1 are the constants, 4/5/6/7 the stored R/G/B/A component. 2 and 3
                     // are RESERVED, and everything above 7 is unrepresentable in the three-bit field
                     // a descriptor decode produces. Both used to fall into a silent `default:`
