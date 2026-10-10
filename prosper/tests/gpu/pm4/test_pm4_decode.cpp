@@ -309,4 +309,39 @@ TEST(Pm4Decode, Contract) {
                   other_ops[1].kind == K::Unknown,
               "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
     }
+
+    // Hardware IT_ACQUIRE_MEM (0x58) and IT_RELEASE_MEM (0x49) (Black Flag submit0.bin):
+    {
+        uint32_t sync_stream[] = {
+            // IT_ACQUIRE_MEM: 8 dwords, op 0x58
+            PM4(8, IT_ACQUIRE_MEM, 0),
+            0x80000000u, 0x00000001u, 0x00000000u, 0x40056300u, 0x00000000u, 0x00000019u, 0x00009000u,
+            // IT_RELEASE_MEM: 8 dwords, op 0x49, data_sel=1 (32-bit write), addr=0x40749a2f00, value=0x408c
+            PM4(8, IT_RELEASE_MEM, 0),
+            0x06000528u, (1u << 29) | 0x00010000u, 0x749a2f00u, 0x00000040u, 0x0000408cu, 0x00000000u, 0x00000000u,
+        };
+        std::vector<Pm4Command> sync_ops;
+        const size_t c = decode_pm4(sync_stream, std::size(sync_stream), sync_ops);
+        CHECK(c == 16, "consumed 16 dwords of hardware sync packets");
+        CHECK(sync_ops.size() == 2, "decoded 2 sync packets");
+
+        CHECK(sync_ops[0].kind == K::AcquireMem, "op0 is AcquireMem");
+
+        CHECK(sync_ops[1].kind == K::ReleaseMem, "op1 is ReleaseMem");
+        CHECK(sync_ops[1].rel_data_sel == 1, "op1 data_sel == 1");
+        CHECK(sync_ops[1].rel_addr == 0x40749a2f00ull, "op1 rel_addr == 0x40749a2f00");
+        CHECK(sync_ops[1].rel_value_valid && sync_ops[1].rel_value == 0x408cu, "op1 rel_value == 0x408c");
+
+        // Only the GFX10 8-dword length decodes; a shorter packet of either opcode stays Unknown
+        // rather than having its fields read from the wrong slots.
+        uint32_t short_sync[] = {
+            PM4(6, IT_ACQUIRE_MEM, 0), 0u, 0u, 0u, 0u, 0u,
+            PM4(6, IT_RELEASE_MEM, 0), 0x06000528u, 1u << 29, 0x749a2f00u, 0x40u, 0x408cu,
+        };
+        std::vector<Pm4Command> short_ops;
+        decode_pm4(short_sync, std::size(short_sync), short_ops);
+        CHECK(short_ops.size() == 2 && short_ops[0].kind == K::Unknown &&
+                  short_ops[1].kind == K::Unknown,
+              "short ACQUIRE_MEM / RELEASE_MEM stay Unknown");
+    }
 }

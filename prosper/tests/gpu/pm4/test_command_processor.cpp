@@ -267,6 +267,23 @@ int main() {
               "IT_LOAD_CONTEXT_REG populates DB_DEPTH_SIZE_XY");
     }
 
+    // Hardware IT_RELEASE_MEM packet execution (completion writeback to mapped label):
+    {
+        // A qword: honor_eop_write() reads the 8-byte label before writing its low 32 bits.
+        uint64_t fence_label = 0;
+        const uint64_t fence_addr = (uint64_t)(uintptr_t)&fence_label;
+        uint32_t rel_pkt[] = {
+            // IT_RELEASE_MEM: 8 dwords, data_sel=1 (32-bit), value=0x1234
+            0xC0000000u | (6u << 16) | (IT_RELEASE_MEM << 8),
+            0x06000528u, (1u << 29) | 0x00010000u,
+            (uint32_t)fence_addr, (uint32_t)(fence_addr >> 32),
+            0x00001234u, 0x00000000u, 0x00000000u,
+        };
+        GpuState s_rel;
+        run_cb(rel_pkt, std::size(rel_pkt), s_rel);
+        CHECK(fence_label == 0x1234u, "IT_RELEASE_MEM writes 32-bit fence value to label");
+    }
+
     // WriteData(null data, num>0): the packet declares 5+num dwords and cmd[4]=num tells the CP how many
     // inline dwords to write to the destination. With a null data pointer the builder must zero-fill the
     // tail cmd[5..], never leave STALE ring-buffer memory there (the CP would write that stale content
