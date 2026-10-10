@@ -11,6 +11,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -183,6 +185,26 @@ TEST(SubmitVisibilityDefault, RawStackWaitScopesRetireBeforeAnyHleRegistration) 
         flush_deferred_streams();
         EXPECT_FALSE(deferred_pending());
     }
+}
+
+TEST(SubmitVisibilityDefault, ConcurrentFirstMappingLeasesAreShared) {
+    // Each ctest case is a fresh process. Release first readers together before any mapping
+    // HLE operation can initialize the native lock; all leases must coexist, rather than
+    // serializing readers to conceal the cold-lock race seen by the raw packet-route case.
+    std::barrier rendezvous(5);
+    std::atomic<unsigned> acquired{0};
+    std::array<std::jthread, 4> readers;
+    for (auto& reader : readers) {
+        reader = std::jthread([&] {
+            rendezvous.arrive_and_wait();
+            const GuestMappingLease lease;
+            acquired.fetch_add(1, std::memory_order_relaxed);
+            rendezvous.arrive_and_wait();
+        });
+    }
+    rendezvous.arrive_and_wait();
+    rendezvous.arrive_and_wait();
+    EXPECT_EQ(acquired.load(std::memory_order_relaxed), readers.size());
 }
 
 class SubmitVisibilitySdk : public testing::TestWithParam<unsigned int> {};

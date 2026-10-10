@@ -20,6 +20,7 @@
 #include "hle/memory/dmem_caller_chain.hpp"
 #include "hle/memory/ampr_amm_physical_pool.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "hle/memory/guest_mapping_lifetime_mutex.hpp"
 #include "hle/memory/guest_mapping_queries.hpp"
 #include "hle/memory/renderer_tracked_mapping.hpp"
 #include "hle/memory/renderer_tracked_mapping_cache.hpp"
@@ -66,9 +67,6 @@ inline constexpr uint64_t kGuestAutoMapLimit = 0xfc00000000ull;
 inline constexpr uint64_t kGuestHugeReserveBase = 0x2000000000ull;   // 128 GiB
 
 namespace {
-// This is separate from g_mx. A renderer may hold the shared side across a synchronous Vulkan
-// fence; it must still be able to make short mapping/topology and writeback queries under g_mx.
-std::shared_mutex g_guest_mapping_lifetime_mutex;
 std::atomic<void (*)()> g_mapping_contention_observer{nullptr};
 class GuestMappingMutationScope {
 public:
@@ -85,7 +83,7 @@ private:
 };
 } // namespace
 
-GuestMappingLease::GuestMappingLease() : lock_(g_guest_mapping_lifetime_mutex) {}
+GuestMappingLease::GuestMappingLease() : lock_(guest_mapping_lifetime_mutex()) {}
 void set_guest_mapping_mutation_contention_observer_for_test(void (*observer)()) {
     g_mapping_contention_observer.store(observer, std::memory_order_release);
 }
@@ -1775,7 +1773,7 @@ namespace {
 // "MallocBinned3 Corruption Canary" spam-loop. CONFIDENCE: HIGH (reserve args live-captured;
 // the corrupting write watched in-place; search semantics cross-checked against shadPS4).
 HLE(k_reserve_vrange) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     uint64_t align = a3 ? a3 : 0x4000;
     const bool fixed = (a2 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
@@ -1863,7 +1861,7 @@ HLE(k_reserve_vrange) {
 
 // sceKernelMapNamedFlexibleMemory(void** addrInOut, size_t len, int prot, int flags, const char* name)
 HLE(k_map_flexible) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     const bool fixed = (a3 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
     if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
@@ -1926,7 +1924,7 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 // sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
 //                           off_t* physAddrOut)
 HLE(k_pool_expand) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
     // call that then faults writing the result -- the allocation is unrecoverable because nothing
     // has the offset yet. Raised in review of #3505.
@@ -2052,7 +2050,7 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // log is what settles it -- if a run ever shows a2 carrying something that is not a small flag
 // word, this reading is wrong.
 HLE(k_pool_decommit) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
     // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
     //
@@ -2166,7 +2164,7 @@ HLE(k_pagetable_stats) {
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!valid_dmem_allocation(a2, a3, a4, a5))
         return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
@@ -2198,7 +2196,7 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
 // DIFFERENT signature (4 args) from AllocateDirectMemory: physOut is arg3, not arg5. Aliasing them
 // to one handler wrote the result through arg5 (uninitialized garbage, e.g. 0xa) -> crash.
 HLE(k_alloc_main_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!valid_dmem_allocation(a0, a1, a2, a3))
         return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
@@ -2244,7 +2242,7 @@ HLE(k_direct_memory_query) {
 static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
                               uint64_t flags, uint64_t phys, uint64_t align,
                               int32_t memory_type, bool set_memory_type) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed, fixed);
@@ -2548,7 +2546,7 @@ HLE(k_wake_by_address) {
 }
 
 HLE(k_munmap) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     constexpr uint64_t mask = kGuestPageSize - 1;
     if (!a0 || !a1 || (a0 & mask) || (a1 & mask) || a1 > UINT64_MAX - a0)
         return 0x80020016ull;
@@ -2603,7 +2601,7 @@ static uint64_t sce_mprotect_error(int error) {
 // CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
 // test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
@@ -2631,7 +2629,7 @@ HLE7(k_map_dmem2) {
 // sceKernelMtypeprotect(addr, size, mtype, prot): apply the CPU protection (arg a3) then set the direct-
 // memory type (a2). Only publish either change after the host protection operation succeeds.
 HLE(k_mtypeprotect) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
@@ -2958,7 +2956,7 @@ HLE(k_ampr_begin) {
     return 0;
 }
 HLE(k_ampr_push_map) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     MLOG("ampr SetBuffer args a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
          (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
@@ -3304,7 +3302,7 @@ namespace {
 // exists to remove. Zero is the absent/empty answer in every reading of a "ranges" out-parameter.
 // CONFIDENCE: LOW on r2/r3 specifically; HIGH that writing something defined beats writing nothing.
 HLE(k_amm_get_va_ranges) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     ampr_arglog("wkQR9+xTFKY(AmmGetVirtualAddressRanges)", a0, a1, a2, a3, a4, a5);
     // Same rule as GiveDirectMemory below, applied to the two slots the guest demonstrably reads:
     // reporting SCE_OK for a window we did not write is the silent-error class the whole change is
@@ -3379,7 +3377,7 @@ HLE(k_amm_get_va_ranges) {
 // than by trust. Failure is reported as ENOMEM, which the guest handles by abandoning AMM init —
 // the fail-visible direction, since the alternative is an allocator with no memory behind it.
 HLE(k_amm_give_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     ampr_arglog("Q07J7XpvhrU(AmmGiveDirectMemory)", a0, a1, a2, a3, a4, a5);
     // a3 is the ALIGNMENT and a4 the MEMORY TYPE — the same order sceKernelAllocateDirectMemory
     // uses, established from the live call (a3 = 0x200000, a4 = 1) and not from the name. Both are
@@ -3464,7 +3462,7 @@ HLE(k_amm_cb_destruct) {
 // sceAmprAmmCommandBufferMap(cb, va, size, memoryType, protection). Performed here rather than at
 // submit, matching how prosper serves APR reads at append time.
 HLE(k_amm_cb_map) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     ampr_arglog("JEVYGhDc97M(AmmCommandBufferMap)", a0, a1, a2, a3, a4, a5);
     const uint64_t va = a1, len = a2;
     if (a0 <= 0xffff || !va || !len || (va & (kGuestPageSize - 1)) != 0 ||
@@ -3518,7 +3516,7 @@ HLE(k_amm_cb_map) {
 // CONFIDENCE: HIGH on the layout and reusable reservation (guest traces in #2873).
 // MED on EINVAL for invalid/unowned spans: no bad-argument hardware trace is available.
 HLE(k_amm_cb_unmap) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     ampr_arglog("M-VFI2DJWQA(AmmCommandBufferUnmap)", a0, a1, a2, a3, a4, a5);
     const uint64_t va = a1, len = a2;
     if (a0 <= 0xffff || !va || !len || (va & (kGuestPageSize - 1)) ||
@@ -3594,7 +3592,7 @@ HLE(k_ampr_get_buffer_base) {
 // mapped to it is the guest's problem (same as the real kernel); UE4 releases only unmapped probe
 // allocations here.
 HLE(k_release_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     dmem_release(a0, a1);
     MLOG("release_dmem [0x%llx,0x%llx)\n", (unsigned long long)a0, (unsigned long long)(a0 + a1));
     return 0;
@@ -3661,7 +3659,7 @@ extern "C" uint64_t prosper_renderer_guest_mapped_readable_prefix(
 // CONFIDENCE: MED on the exact entry ABI (PS4-documented layout; call sites disassembled match:
 // 0x4000-byte entry buffer = 512 * 0x20, count compared against numberOfEntriesOut).
 HLE(k_batch_map) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     const uint8_t* e = (const uint8_t*)(uintptr_t)a0;
     int n = (int)(int64_t)a1, done = 0;
     if (!e || n < 0) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
@@ -7073,7 +7071,7 @@ extern "C" uint64_t prosper_renderer_guest_mapped_readable_prefix(
 
 // sceKernelReserveVirtualRange(void** addrInOut, size_t len, int flags, size_t align)
 HLE(k_reserve_vrange) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     uint64_t align = a3 ? a3 : 0x4000;
     const bool fixed = (a2 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
@@ -7105,7 +7103,7 @@ HLE(k_reserve_vrange) {
 
 // sceKernelMapNamedFlexibleMemory(void** addrInOut, size_t len, int prot, int flags, const char* name)
 HLE(k_map_flexible) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     const bool fixed = (a3 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
     if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
@@ -7161,7 +7159,7 @@ HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0
 // sceKernelMemoryPoolExpand(off_t searchStart, off_t searchEnd, size_t len, size_t align,
 //                           off_t* physAddrOut)
 HLE(k_pool_expand) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     // Every rejection below happens BEFORE dmem_take. Validating after it would consume arena on a
     // call that then faults writing the result -- the allocation is unrecoverable because nothing
     // has the offset yet. Raised in review of #3505.
@@ -7287,7 +7285,7 @@ std::vector<std::pair<uint64_t, uint64_t>> committed_parts_in(uint64_t base, uin
 // log is what settles it -- if a run ever shows a2 carrying something that is not a small flag
 // word, this reading is wrong.
 HLE(k_pool_decommit) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0 || !a1) return 0x80020016ull;                            // SCE_KERNEL_ERROR_EINVAL
     // 64 KiB granularity, rounded INWARD -- and both halves of that are load-bearing.
     //
@@ -7401,7 +7399,7 @@ HLE(k_pagetable_stats) {
 
 // sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
 HLE(k_alloc_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!valid_dmem_allocation(a2, a3, a4, a5))
         return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a3 ? a3 : 0x4000;
@@ -7423,7 +7421,7 @@ HLE(k_alloc_dmem) {
 }
 // sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
 HLE(k_alloc_main_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!valid_dmem_allocation(a0, a1, a2, a3))
         return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     uint64_t align = a1 ? a1 : 0x4000;
@@ -7464,7 +7462,7 @@ HLE(k_direct_memory_query) {
 static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
                               uint64_t flags, uint64_t phys, uint64_t align,
                               int32_t memory_type, bool set_memory_type) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = win_map_phys(hint, len, host_prot(prot), phys, align, fixed);
@@ -7499,7 +7497,7 @@ HLE7(k_map_dmem2) {
 }
 
 HLE(k_munmap) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     constexpr uint64_t mask = kGuestPageSize - 1;
     if (!a0 || !a1 || (a0 & mask) || (a1 & mask) || a1 > UINT64_MAX - a0)
         return 0x80020016ull;
@@ -7551,7 +7549,7 @@ static uint64_t sce_win_mprotect_error(DWORD error) {
 // CONFIDENCE: HIGH. The failing call is live-captured, the EINVAL is observed at the guest's own
 // test instruction (eboot+0x9779), and the normalization matches the sibling entry point.
 HLE(k_mprotect) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
@@ -7574,7 +7572,7 @@ HLE(k_mprotect) {
     return 0;
 }
 HLE(k_mtypeprotect) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     if (!a0) return 0x80020016ull;
     uint64_t base = 0, len = 0;
     if (!normalize_guest_page_range(a0, a1, base, len)) return 0x80020016ull;
@@ -7598,7 +7596,7 @@ HLE(k_avail_dmem) {
     return 0;
 }
 HLE(k_release_dmem) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     MLOG("release_dmem phys=0x%llx len=0x%llx\n",
          (unsigned long long)a0, (unsigned long long)a1);
     dmem_release(a0, a1);
@@ -7608,7 +7606,7 @@ HLE(k_release_dmem) {
 // sceKernelBatchMap(entries, num, int* numOut) — entry 0x20 bytes: start@0, phys@8, len@0x10,
 // prot@0x18(char), type@0x19, op@0x1c. Ops: 0=MAP_DIRECT 1=UNMAP 2=PROTECT 3=MAP_FLEXIBLE 4=TYPE_PROTECT.
 HLE(k_batch_map) {
-    GuestMappingMutationScope mapping_transaction(g_guest_mapping_lifetime_mutex);
+    GuestMappingMutationScope mapping_transaction(guest_mapping_lifetime_mutex());
     const uint8_t* e = (const uint8_t*)(uintptr_t)a0;
     int n = (int)(int64_t)a1, done = 0;
     if (!e || n < 0) return 0x80020016ull;
