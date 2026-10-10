@@ -47,6 +47,7 @@ inline NativeTexelLayout native_texel_layout(prosper::gpu::LiveTargetPixelFormat
         case F::Rgba32Float:    return {"Rgba32Float", 16, 4};
         case F::Rg16Float:      return {"Rg16Float", 4, 2};
         case F::R16Float:       return {"R16Float", 2, 1};
+        case F::R16Uint: return {"R16Uint", 2, 1};
     }
     return {};
 }
@@ -97,6 +98,14 @@ inline std::string native_texel_line(prosper::gpu::LiveTargetPixelFormat format,
             case F::R32Uint: {
                 uint32_t u = 0; std::memcpy(&u, p, sizeof u);
                 std::snprintf(piece, sizeof piece, "%08x", u);
+                raw += piece;
+                decoded += std::to_string(u);
+                break;
+            }
+            case F::R16Uint: {
+                uint16_t u = 0;
+                std::memcpy(&u, p, sizeof u);
+                std::snprintf(piece, sizeof piece, "%04x", u);
                 raw += piece;
                 decoded += std::to_string(u);
                 break;

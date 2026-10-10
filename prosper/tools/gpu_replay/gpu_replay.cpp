@@ -262,6 +262,9 @@ std::vector<uint8_t> inspect_live_target(const prosper::gpu::LiveTargetSnapshot&
         case prosper::gpu::LiveTargetPixelFormat::R16Float:
             seed.format = prosper::gpu::GpuCaptureColorFormat::R16Float;
             break;
+        case prosper::gpu::LiveTargetPixelFormat::R16Uint:
+            // The capture inspection contract has no unsigned 16-bit seed format.
+            return {};
     }
     return inspect_rtt_seed(seed);
 }

@@ -81,6 +81,7 @@ enum class LiveTargetSourceLayout : uint8_t {
     Float32x4,
     Float16x2,
     Float16x1,
+    Uint16x1,
 };
 
 constexpr LiveTargetSourceLayout live_target_source_layout(
@@ -106,6 +107,7 @@ constexpr LiveTargetSourceLayout live_target_source_layout(
             return LiveTargetSourceLayout::Float16x2;
         case prosper::gpu::LiveTargetPixelFormat::R16Float:
             return LiveTargetSourceLayout::Float16x1;
+        case prosper::gpu::LiveTargetPixelFormat::R16Uint: return LiveTargetSourceLayout::Uint16x1;
     }
     return LiveTargetSourceLayout::Unorm8x4;
 }
@@ -135,6 +137,9 @@ constexpr VkFormat live_target_pixel_format_vk(prosper::gpu::LiveTargetPixelForm
             return VK_FORMAT_R16G16_SFLOAT;
         case prosper::gpu::LiveTargetPixelFormat::R16Float:
             return VK_FORMAT_R16_SFLOAT;
+        // CONFIDENCE: HIGH. The renderer retains the producer's integer words unchanged; treating
+        // this storage as FP16 or UNORM changes values and cannot satisfy an unsigned image load.
+        case prosper::gpu::LiveTargetPixelFormat::R16Uint: return VK_FORMAT_R16_UINT;
     }
     return VK_FORMAT_UNDEFINED;
 }
@@ -153,6 +158,7 @@ constexpr uint32_t live_target_pixel_format_bytes(prosper::gpu::LiveTargetPixelF
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return 16u;
         case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return 4u;
         case prosper::gpu::LiveTargetPixelFormat::R16Float:        return 2u;
+        case prosper::gpu::LiveTargetPixelFormat::R16Uint: return 2u;
     }
     return 0u;
 }
@@ -171,6 +177,7 @@ constexpr const char* live_target_pixel_format_name(prosper::gpu::LiveTargetPixe
         case prosper::gpu::LiveTargetPixelFormat::Rgba32Float:     return "rgba32f";
         case prosper::gpu::LiveTargetPixelFormat::Rg16Float:       return "rg16f";
         case prosper::gpu::LiveTargetPixelFormat::R16Float:        return "r16f";
+        case prosper::gpu::LiveTargetPixelFormat::R16Uint: return "r16ui";
     }
     return "unknown";
 }
@@ -219,6 +226,10 @@ constexpr bool live_target_pixel_format_from_vk(VkFormat vk_format,
     }
     if (vk_format == VK_FORMAT_R16_SFLOAT) {
         format = prosper::gpu::LiveTargetPixelFormat::R16Float;
+        return true;
+    }
+    if (vk_format == VK_FORMAT_R16_UINT) {
+        format = prosper::gpu::LiveTargetPixelFormat::R16Uint;
         return true;
     }
     return false;
@@ -327,6 +338,7 @@ inline bool live_target_format_matches_declaration(prosper::gpu::LiveTargetPixel
         case LTF::Rgba16Float:    return declared == DF::Float16 && nc == 4;
         case LTF::Rg16Float:      return declared == DF::Float16 && nc == 2;
         case LTF::R16Float:       return declared == DF::Float16 && nc == 1;
+        case LTF::R16Uint: return declared == DF::Uint16 && nc == 1;
         case LTF::R11G11B10Float: return declared == DF::Float10_11_11 && nc == 3;
         case LTF::R8Unorm:        return declared == DF::Unorm8 && nc == 1;
         case LTF::Rg8Unorm:       return declared == DF::Unorm8 && nc == 2;

@@ -121,16 +121,13 @@ TEST(LiveTargetFormat, Contract) {
     // The mapping itself. VK_FORMAT_UNDEFINED would mean "unnamed", which the notifier treats as a
     // decline; every real enumerator must name its exact backend format and round-trip back.
     using prosper::gpu::LiveTargetPixelFormat;
-    const LiveTargetPixelFormat all[] = {LiveTargetPixelFormat::Rgba8Unorm,
-                                         LiveTargetPixelFormat::Rgba16Float,
-                                         LiveTargetPixelFormat::R11G11B10Float,
-                                         LiveTargetPixelFormat::R8Unorm,
-                                         LiveTargetPixelFormat::R32Uint,
-                                         LiveTargetPixelFormat::R32Float,
-                                         LiveTargetPixelFormat::Rg8Unorm,
-                                         LiveTargetPixelFormat::Rgba32Float,
-                                         LiveTargetPixelFormat::Rg16Float,
-                                         LiveTargetPixelFormat::R16Float};
+    const LiveTargetPixelFormat all[] = {
+        LiveTargetPixelFormat::Rgba8Unorm,     LiveTargetPixelFormat::Rgba16Float,
+        LiveTargetPixelFormat::R11G11B10Float, LiveTargetPixelFormat::R8Unorm,
+        LiveTargetPixelFormat::R32Uint,        LiveTargetPixelFormat::R32Float,
+        LiveTargetPixelFormat::Rg8Unorm,       LiveTargetPixelFormat::Rgba32Float,
+        LiveTargetPixelFormat::Rg16Float,      LiveTargetPixelFormat::R16Float,
+        LiveTargetPixelFormat::R16Uint};
     bool mapped = true, round_trips = true;
     for (LiveTargetPixelFormat format : all) {
         const VkFormat vk = prosper::frontend::live_target_pixel_format_vk(format);

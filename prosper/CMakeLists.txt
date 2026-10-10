@@ -5607,6 +5607,11 @@ endif()
         INCLUDES tests frontends src
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
+      prosper_add_gtest(test_live_compute_integer_target
+        SOURCES tests/shared/live/test_live_compute_integer_target.cpp
+        INCLUDES tests frontends src
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
       # A compute UNORM16 view of a Z16 plane reads the renderer's retained depth, not the
       # guest bytes (UE4 volumetric-fog shadowing; Kena's washed-out title scene).
       # A guest-backed one/two-channel FP16 texture keeps signed and >1 values in compute

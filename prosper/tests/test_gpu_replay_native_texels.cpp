@@ -186,8 +186,8 @@ TEST(GpuReplayNativeTexels, Contract) {
     // formatter silently degrades to "not handled here" on a real target.
     {
         const F all[] = {F::Rgba8Unorm, F::Rgba16Float, F::R11G11B10Float, F::R8Unorm,
-                         F::R32Uint, F::R32Float, F::Rg8Unorm, F::Rgba32Float,
-                         F::Rg16Float, F::R16Float};
+                         F::R32Uint,    F::R32Float,    F::Rg8Unorm,       F::Rgba32Float,
+                         F::Rg16Float,  F::R16Float,    F::R16Uint};
         // Calling the formatter, not just reading the layout table: a loop that only checks
         // `layout.bytes != 0` reads like format coverage and exercises none of the decode --
         // the same "looks like coverage" shape already caught one level up in this file.
@@ -234,4 +234,12 @@ TEST(GpuReplayNativeTexels, Contract) {
     }
 
     EXPECT_EQ(failures, 0);
+}
+
+TEST(GpuReplayNativeTexels, R16UintWordsRemainUnsigned) {
+    const uint16_t words[] = {0, 0x4000, 0xffff};
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words);
+    const auto report = format_native_texels(F::R16Uint, bytes, sizeof(words), 3, 1, 3);
+    EXPECT_EQ(values_only(report), "0;16384;65535;");
+    EXPECT_TRUE(has(report, "texel[2] (2,0) raw=ffff value=65535"));
 }
