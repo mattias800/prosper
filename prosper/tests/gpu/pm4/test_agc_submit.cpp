@@ -51,6 +51,9 @@ TEST(AgcSubmit, Contract) {
     auto draw   = Hle::lookup("Yw0jKSqop+E");   // GraphicsDcbDrawIndexAuto
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
     auto submit_acb = Hle::lookup("gSRnr79F8tQ"); // GraphicsDriverSubmitAcb
+    const auto submit_hook = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit_hook, nullptr);
+    ASSERT_EQ(submit_hook, Hle::return_hook_of("gSRnr79F8tQ"));
     auto regmem = Hle::lookup("AOLcoIkQDgM");   // QueryResourceRegistrationUserMemoryRequirements
     auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
     auto release = reinterpret_cast<HostHle9>(Hle::lookup("wr23dPKyWc0")); // GraphicsCbReleaseMem
@@ -104,6 +107,7 @@ TEST(AgcSubmit, Contract) {
     // Submit it through the real driver entrypoint.
     Packet pkt{ buffer, dw, {0,0,0,0} };
     uint64_t rc = submit((uint64_t)(uintptr_t)&pkt, 0, 0, 0, 0, 0);
+    submit_hook();   // Direct HLE calls must model the generated import's return checkpoint.
     CHECK(rc == 0, "SubmitDcb returned OK (0)");
 
     uint64_t s1 = 0, d1 = 0; prosper_agc_submit_stats(&s1, &d1);
@@ -173,6 +177,7 @@ TEST(AgcSubmit, Contract) {
         uint64_t before = 0, ignored = 0; prosper_agc_submit_stats(&before, &ignored);
         CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&packet, 4, packet.dw_num, 0, 0) == 0,
               "SubmitAcb returns OK");
+        submit_hook();
         uint64_t after = 0; prosper_agc_submit_stats(&after, &ignored);
         CHECK(after == before + 1, "SubmitAcb folds one async command stream");
 
@@ -186,6 +191,7 @@ TEST(AgcSubmit, Contract) {
                          packet.dw_num /*count mirrored in a2*/, 0x20 /*a3 = queue id, not count*/,
                          0, 0) == 0,
               "SubmitAcb accepts the ArcRunner ABI (count in a2, queue id mirrored in a3)");
+        submit_hook();
         uint64_t after2 = 0; prosper_agc_submit_stats(&after2, &ignored);
         CHECK(after2 == before2 + 1, "ArcRunner-ABI SubmitAcb folds one async command stream");
 
@@ -198,6 +204,7 @@ TEST(AgcSubmit, Contract) {
                          packet.dw_num /*count mirrored in a2*/, 0x20 /*queue mirror*/,
                          0, 0) == 0,
               "SubmitAcb reads Plucky's count and non-zero flags as separate 32-bit fields");
+        submit_hook();
         uint64_t after3 = 0; prosper_agc_submit_stats(&after3, &ignored);
         CHECK(after3 == before3 + 1,
               "flagged Plucky-ABI SubmitAcb folds one async command stream");
@@ -214,6 +221,7 @@ TEST(AgcSubmit, Contract) {
         Packet gfx_packet{gfx_buffer, (uint32_t)(gfx.cursor_up - gfx_buffer), {0,0,0,0}};
         CHECK(submit((uint64_t)(uintptr_t)&gfx_packet, 0, 0, 0, 0, 0) == 0,
               "graphics SH-register setup submits");
+        submit_hook();
 
         static uint32_t isolated_acb_buffer[16]{};
         Dcb isolated_acb{};
@@ -230,6 +238,7 @@ TEST(AgcSubmit, Contract) {
         CHECK(submit_acb(0x20, (uint64_t)(uintptr_t)&isolated_packet,
                          isolated_packet.dw_num, 0x20, 0, 0) == 0,
               "async-compute SH-register setup submits");
+        submit_hook();
         static uint32_t second_acb_buffer[16]{};
         Dcb second_acb{};
         second_acb.bottom = second_acb_buffer; second_acb.top = second_acb_buffer + 16;
@@ -243,6 +252,7 @@ TEST(AgcSubmit, Contract) {
         CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&second_packet,
                          second_packet.dw_num, 0x40, 0, 0) == 0,
               "second async-compute queue SH-register setup submits");
+        submit_hook();
         uint32_t graphics_value = 0, compute_value = 0, second_compute_value = 0;
         CHECK(prosper_agc_submit_sh_reg(0, 0x123, &graphics_value) &&
               prosper_agc_submit_sh_reg(0x20, 0x123, &compute_value) &&
@@ -278,6 +288,7 @@ TEST(AgcSubmit, Contract) {
             Packet packet{boundary_stream, 2, {0,0,0,0}};
             CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&packet, 4, 2, 0, 0) != 0,
                   "SubmitAcb rejects a stream whose full dword range crosses a guard page");
+            submit_hook();
         }
 #ifdef _WIN32
         if (pages) VirtualFree(pages, 0, MEM_RELEASE);
@@ -321,12 +332,10 @@ TEST(AgcSubmit, Contract) {
     // a submit. It is a command-buffer builder (#4540): it must carry NO submit return hook, or a
     // hook would close a scope the builder never opened.
     {
-        auto submit_hook = Hle::return_hook_of("UglJIZjGssM");
         CHECK(submit_hook && submit_hook == Hle::return_hook_of("gSRnr79F8tQ"),
               "the tagged submit imports expose their shared return hook");
         CHECK(Hle::lookup_address("w1KFAHVqpaU") && !Hle::return_hook_of("w1KFAHVqpaU"),
               "sceAgcCbBranch is registered as a builder, without the submit return hook");
-        prosper_gpu_enable_post_submit_visibility();
         CHECK(submit(0, 0, 0, 0, 0, 0) != 0 && prosper_gpu_submit_scope_active(),
               "rejected outer DCB invocation opens a scope before validation");
         CHECK(submit_acb(0, 0, 0, 0, 0, 0) != 0 && prosper_gpu_submit_scope_active(),

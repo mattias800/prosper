@@ -8565,6 +8565,13 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
                                      second_address, second_size);
 }
 
+bool guest_memory_mapping_slices(const GuestMappingLease&, uint64_t address, uint64_t bytes,
+                                 std::vector<GuestMemoryMappingSlice>& slices,
+                                 GuestMemoryMappingCoverage* coverage) {
+    return mapped_memory_slices(g_maps, g_mx, kVirtualQueryDirect, address, bytes, slices,
+                                coverage);
+}
+
 bool guest_virtual_address_tracked(uint64_t address) {
     std::lock_guard<std::mutex> lock(g_mx);
     return std::any_of(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {

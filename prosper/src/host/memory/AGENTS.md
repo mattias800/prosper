@@ -14,6 +14,9 @@ whatever ended up mapped, without any opinion on why.
 - **`guest_memory_query.{hpp,cpp}`** — uncached, exact-cover writable VMA queries where the host
   supports them. It reports unavailable separately from non-writable; cache policy and mapping
   generations remain with its consumers.
+- **`guest_memory_topology.hpp`** — leased observations of HLE-tracked mappings and direct-memory
+  physical aliases, including exact byte offsets across protection splits. Mapping identity does
+  not prove byte currentness; a consumer must establish its producer ordering separately.
 - **`guest_write_watch.{hpp,cpp}`** — write-protection-based dirty tracking for guest pages, and the
   direct-memory write trace that attributes a guest write to the module and RIP that made it. Host
   writes into guest memory (file reads, DMA-shaped producers) must bracket themselves with the

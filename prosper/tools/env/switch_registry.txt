@@ -770,7 +770,6 @@ PROSPER_PITCH  unclassified
 PROSPER_POLLWATCH  unclassified
 PROSPER_POOLSHIFT  unclassified
 PROSPER_POOLSHIFT_WINDOW  unclassified
-PROSPER_POST_SUBMIT_VISIBILITY  unclassified
 PROSPER_PREADLOG  unclassified
 PROSPER_PREDLOG  unclassified
 PROSPER_PREFIX_INSPECT  unclassified

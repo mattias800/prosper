@@ -146,9 +146,8 @@ inline uint64_t env_u64_or_default_auto_capped(const char* name, const char* tex
 
 // --- for a knob whose three answers are ON, OFF and "not set at all" ------------------------------
 //
-// A tri-state A/B lever (`PROSPER_POST_SUBMIT_VISIBILITY`, #1226/#2217) has a deliberate third
-// answer: `1` forces the contract on, `0` forces it off, and UNSET means "follow the SDK version the
-// guest asked for". Read with `strtol(e, nullptr, 0)` that collapses, because strtol answers **0**
+// A tri-state A/B lever has a deliberate third answer: `1` forces on, `0` forces off,
+// and UNSET preserves its default. The original submit-visibility selector was retired by #2220. Read with `strtol(e, nullptr, 0)` that collapses, because strtol answers **0**
 // for text it cannot parse -- so `=on`, `=true`, `=yes` and `=enabled`, every spelling an operator
 // reaches for, select the FORCED-OFF arm, and the site then announces "FORCED OFF" as though it had
 // been asked for. On an ordinary switch that is a lost experiment. On a lever whose verdict is still

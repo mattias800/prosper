@@ -3,6 +3,7 @@
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
+#include "gpu/pm4/pending_memory_view.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
@@ -2831,19 +2832,6 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     return true;
 }
 
-bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
-    const GraphicsExecutionActivity execution;
-    Pm4Command c{};
-    c.kind = Pm4Command::Kind::DmaData;
-    c.dd_dst = copy.dst;
-    c.dd_src = copy.src;
-    c.dd_bytes = copy.bytes;
-    c.dd_sels = copy.sels;
-    c.dd_valid = true;
-    c.stream_order = copy.command_order;
-    return honor_dma_data(c, copy.packet_addr, authoritative_source);
-}
-
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled()) return;
@@ -2917,50 +2905,18 @@ static void honor_write_data(const Pm4Command& c) {
 // and our later label writes stomp MallocBinned3 free-block headers (live-attributed: the GPU
 // write-ring shows our RELEASE_MEM value-1 writes at exactly the corrupted qword).
 //
-// Model: honor_* enqueue writes; modern callers retain them until the actual import-return
-// checkpoint, then the FIFO worker applies them without an added latency. Older callers retain
-// the legacy 1 ms worker delay. Existing synchronous drain points preserve their dependencies:
-//   - WaitRegMem fold checks drain first (a prior submit's fence must be visible to its consumer),
-//   - execute_and_present's callers drain first (the renderer reads WRITE_DATA-uploaded memory),
-//   - the EOP-event worker drains before posting (an event must never overtake its data writes).
+// Model: honor_* enqueue writes; every submit retains them until its actual import-return
+// checkpoint, then the FIFO worker applies them without an added latency. Renderer resource
+// writes and in-queue scalar overlays preserve dependencies without publishing completions:
+//   - WaitRegMem checks overlay queued scalar writes in command order,
+//   - renderer drains select resource writes that do not overlap a queued completion,
+//   - the EOP-event worker drains after retirement before posting its event.
 // PROSPER_EOP_WRITE_SYNC=1 restores the old synchronous writes (A/B lever + fallback).
-// CONFIDENCE: HIGH on the invariant (completion is post-submit by construction on real HW; Kyty
-// writes fences from its GPU thread, never inside the submit call). The cross-queue wait ordering
+// CONFIDENCE: HIGH on the required ownership boundary: #2219's per-fold trace and #2220's
+// SDK-8 descriptor recycling both show damage from publishing while the fold is active.
+// The SDK table version does not identify a completion owner. The cross-queue wait ordering
 // is handled by the WAIT_REG_MEM barrier model below (opt-in, PROSPER_WAIT_DEFER=1).
 namespace {
-std::atomic<bool> g_post_submit_visibility{false};
-
-// #1226 (arc7) A/B lever, default OFF and log-only in the sense that it changes nothing unless
-// set: `PROSPER_POST_SUBMIT_VISIBILITY=1` forces this model on regardless of the SDK version the
-// guest asked for, `=0` forces it off. (`on`/`true`/`yes`/`enabled` and `off`/`false`/`no`/
-// `disabled` work too, in either case; anything ELSE -- including a number that is neither 0 nor 1
-// -- is treated as unset and says so, because a typo must not pick an arm of a live experiment.
-// #3304.) It exists because the per-fold census (see
-// `ARCRUNNER_STATUS.md` § arc7) localised ArcRunner's corruption to the guest's builder thread
-// being released MID-FOLD by completion writes prosper applies while it is still executing the rest
-// of the same command buffer — and ArcRunner requests SDK version 10, so the post-submit contract
-// that exists precisely to prevent that is not armed for it. Whether the contract is correct for a
-// pre-13 title is a separate question this lever does not answer; it makes the experiment runnable.
-bool post_submit_visibility_enabled() {
-    static const int forced = [] {
-        // #3304: the tri-state is right and the PARSE was not. `strtol` answers 0 for text it
-        // cannot read, so `=on`, `=true`, `=yes` and `=enabled` all landed on the FORCED-OFF arm
-        // and printed the line below as though that had been asked for -- a confidently mislabelled
-        // result on a lever whose verdict is open (#2217/#2219/#2223). A value that is neither on
-        // nor off is now UNSET (follow the SDK version) and says so; it is never a silent third arm.
-        const int v = prosper::diag::env_tristate_or_unset("PROSPER_POST_SUBMIT_VISIBILITY",
-                                                           getenv("PROSPER_POST_SUBMIT_VISIBILITY"));
-        if (v == 1)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED ON (#1226 A/B) — completion writes "
-                            "stay private until the submit scope closes, regardless of SDK version\n");
-        else if (v == 0)
-            fprintf(stderr, "[agc] POST-SUBMIT-VISIBILITY FORCED OFF (#1226 A/B)\n");
-        return v;
-    }();
-    if (forced >= 0) return forced != 0;
-    return g_post_submit_visibility.load(std::memory_order_acquire);
-}
-
 bool eop_write_sync() {
     // #1226: announce the arm. This is an A/B lever whose whole purpose is to be compared against the
     // default, and a result from it was already recorded as "non-discriminating, not negative" partly
@@ -2979,6 +2935,8 @@ bool eop_write_sync() {
 struct PendWrite {
     Pm4Command cmd;
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
+    std::vector<uint8_t> dma_copy;   // source bytes captured at the ordered DMA operation
+    uint64_t packet_addr = 0;
     std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
 };
 // #1945: how long a completion write actually sat in this queue before it landed in guest memory.
@@ -3035,8 +2993,8 @@ PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 // arguments before opening a submit scope. Track scopes on the calling thread as well as globally:
 // only the synchronous import call that began a scope may retire it at its return checkpoint.
 thread_local uint32_t t_submit_scope_depth = 0;
-void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
-void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
+void apply_deferred_effect(const Pm4Command& c, const uint8_t* source = nullptr,
+                           uint64_t packet_addr = 0);   // guarded apply (#449)
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk);
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
@@ -3059,8 +3017,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
         // A CV wait or apply/relock can outlive the caller's zero-active observation. A new
         // submit may have admitted meanwhile, so qualify every pop under the same queue lock.
-        // Older SDK callers retain their existing worker delay and eager compatibility policy.
-        if (post_submit_visibility_enabled()) pend_wait_post_submit(p, lk);
+        pend_wait_post_submit(p, lk);
         if (p.inflight > 0) {            // another drainer is mid-apply: WAIT — never overtake it
 #ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
             prosper_pending_drain_inflight_wait_for_test();
@@ -3086,7 +3043,8 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
         pend_age_note(w.queued);
-        apply_deferred_effect(w.cmd);
+        apply_deferred_effect(w.cmd, w.dma_copy.empty() ? nullptr : w.dma_copy.data(),
+                              w.packet_addr);
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -3114,15 +3072,7 @@ void pend_worker() {
     std::unique_lock<std::mutex> lk(p.mx);
     for (;;) {
         p.cv.wait(lk, [&] { return !p.q.empty(); });
-        if (post_submit_visibility_enabled()) {
-            pend_wait_post_submit(p, lk);
-        } else {
-            // Preserve the established compatibility path for older SDK callers.
-            lk.unlock();
-            struct timespec ts{0, 1000000};
-            nanosleep(&ts, nullptr);
-            lk.lock();
-        }
+        pend_wait_post_submit(p, lk);
         pend_drain_locked(p, lk);
     }
 }
@@ -3177,12 +3127,7 @@ extern "C" void prosper_gpu_drain_completion_writes() {
     pend_drain_locked(p, lk);
 }
 
-extern "C" void prosper_gpu_enable_post_submit_visibility() {
-    g_post_submit_visibility.store(true, std::memory_order_release);
-}
-
 extern "C" void prosper_gpu_submit_scope_begin() {
-    if (!post_submit_visibility_enabled()) return;
     PendQueue& p = pend_q();
     std::unique_lock<std::mutex> lk(p.mx);
     // At the zero-active boundary, give the worker its existing post-return drain before
@@ -3218,7 +3163,6 @@ extern "C" void prosper_gpu_submit_scope_begin() {
 }
 
 extern "C" void prosper_gpu_submit_scope_end() {
-    if (!post_submit_visibility_enabled()) return;
     // Invalid/rejected calls to a submit NID still pass through its generated return hook. Such a
     // call has no local token and must not retire a valid submit executing on another thread.
     if (t_submit_scope_depth == 0) return;
@@ -3237,7 +3181,6 @@ extern "C" void prosper_gpu_submit_scope_end() {
 }
 
 extern "C" bool prosper_gpu_submit_scope_active() {
-    if (!post_submit_visibility_enabled()) return false;
     PendQueue& p = pend_q();
     std::lock_guard<std::mutex> lk(p.mx);
     return p.active_submits > 0;
@@ -3252,133 +3195,46 @@ extern "C" bool prosper_gpu_submit_scope_active() {
 // the same label. This boundary retains small descriptor/constant uploads used by older titles;
 // size/content heuristics left those writes one frame behind.
 extern "C" void prosper_gpu_drain_renderer_writes() {
-    if (!post_submit_visibility_enabled()) {
-        prosper_gpu_drain_completion_writes();
-        return;
-    }
     PendQueue& p = pend_q();
     static const bool batch_enabled =
         std::getenv("PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN") == nullptr;
-    if (!batch_enabled) {
-        for (;;) {
-            std::unique_lock<std::mutex> lk(p.mx);
-            if (p.inflight > 0) {
-                p.cv.wait(lk);
-                continue;
-            }
-            auto overlaps_completion = [&](uint64_t addr, uint64_t bytes) {
-                if (!addr || !bytes) return true;
-                const uint64_t end = addr + bytes;
-                if (end < addr) return true;
-                for (const PendWrite& queued : p.q) {
-                    uint64_t target = 0, target_bytes = 0;
-                    if (queued.cmd.kind == Pm4Command::Kind::ReleaseMem) {
-                        target = queued.cmd.rel_addr;
-                        target_bytes = queued.cmd.rel_data_sel == 1 ? 4 : 8;
-                    } else if (queued.cmd.kind == Pm4Command::Kind::EventWrite) {
-                        target = queued.cmd.event_addr;
-                        target_bytes = 8;
-                    }
-                    if (target && target < end && addr < target + target_bytes) return true;
-                }
-                return false;
-            };
-            auto it = std::find_if(p.q.begin(), p.q.end(), [&](const PendWrite& w) {
-                using K = Pm4Command::Kind;
-                if (w.cmd.kind == K::DmaData)
-                    return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
-                if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num)
-                    return false;
-                const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
-                return !overlaps_completion(w.cmd.wd_addr, bytes);
-            });
-            if (it == p.q.end()) return;
-            PendWrite w = std::move(*it);
-            p.q.erase(it);
-            p.inflight++;
-            lk.unlock();
-            pend_age_note(w.queued);
-            apply_deferred_effect(w.cmd);
-            lk.lock();
-            p.inflight--;
-            p.cv.notify_all();
-        }
-    }
-
-    struct CompletionSpan {
-        uint64_t begin = 0;
-        uint64_t end = 0;
-    };
     for (;;) {
+        // Observe topology before taking the completion lock. Mapping transactions cannot replace
+        // these physical identities while selection and resource publication use them.
+        const GuestMappingLease lease;
         std::unique_lock<std::mutex> lk(p.mx);
         if (p.inflight > 0) {
             p.cv.wait(lk);
             continue;
         }
-        std::vector<CompletionSpan> completion_spans;
-        completion_spans.reserve(p.q.size());
-        for (const PendWrite& queued : p.q) {
-            uint64_t target = 0, target_bytes = 0;
-            if (queued.cmd.kind == Pm4Command::Kind::ReleaseMem) {
-                target = queued.cmd.rel_addr;
-                target_bytes = queued.cmd.rel_data_sel == 1 ? 4 : 8;
-            } else if (queued.cmd.kind == Pm4Command::Kind::EventWrite) {
-                target = queued.cmd.event_addr;
-                target_bytes = 8;
-            }
-            if (!target || !target_bytes) continue;
-            completion_spans.push_back({
-                target,
-                target > UINT64_MAX - target_bytes ? UINT64_MAX : target + target_bytes});
+        std::vector<Pm4Command> commands;
+        std::vector<PendingMemoryGeometry> geometry;
+        commands.reserve(p.q.size());
+        geometry.reserve(p.q.size());
+        for (const auto& write : p.q) {
+            commands.push_back(write.cmd);
+            geometry.push_back(pending_memory_geometry(lease, pending_memory_span(write.cmd)));
         }
-        std::sort(completion_spans.begin(), completion_spans.end(),
-                  [](const CompletionSpan& a, const CompletionSpan& b) {
-                      return a.begin < b.begin || (a.begin == b.begin && a.end < b.end);
-                  });
-        size_t merged_count = 0;
-        for (const CompletionSpan& span : completion_spans) {
-            if (merged_count && span.begin <= completion_spans[merged_count - 1].end) {
-                completion_spans[merged_count - 1].end =
-                    std::max(completion_spans[merged_count - 1].end, span.end);
-            } else {
-                completion_spans[merged_count++] = span;
+        auto selected = pending_renderer_selection(commands, geometry);
+        if (!batch_enabled) {
+            bool found = false;
+            for (size_t i = 0; i < selected.size(); ++i) {
+                if (found) selected[i] = false;
+                found |= selected[i];
             }
         }
-        completion_spans.resize(merged_count);
-        auto overlaps_completion = [&](uint64_t addr, uint64_t bytes) {
-            if (!addr || !bytes || addr > UINT64_MAX - bytes) return true;
-            const uint64_t end = addr + bytes;
-            const auto found = std::lower_bound(
-                completion_spans.begin(), completion_spans.end(), addr,
-                [](const CompletionSpan& span, uint64_t value) {
-                    return span.end <= value;
-                });
-            return found != completion_spans.end() && found->begin < end;
-        };
-        auto renderer_write = [&](const PendWrite& w) {
-            using K = Pm4Command::Kind;
-            if (w.cmd.kind == K::DmaData)
-                return !overlaps_completion(w.cmd.dd_dst, w.cmd.dd_bytes);
-            if (w.cmd.kind != K::WriteData || !w.cmd.wd_data || !w.cmd.wd_num) return false;
-            const uint64_t bytes = (uint64_t)w.cmd.wd_num * 4;
-            return !overlaps_completion(w.cmd.wd_addr, bytes);
-        };
-        const size_t ready_count = static_cast<size_t>(std::count_if(
-            p.q.begin(), p.q.end(), renderer_write));
+        const size_t ready_count = std::count(selected.begin(), selected.end(), true);
         if (!ready_count) return;
-
-        // Extract every currently eligible resource write in one stable partition. The previous
-        // loop searched the complete queue for every candidate and erased one deque element at a
-        // time. A submit with thousands of private completion labels therefore became quadratic
-        // before Vulkan saw any work. The lock makes this snapshot atomic with enqueue; writes
-        // appended after the partition are later in queue order and cannot be overtaken.
+        // Stable partition preserves selected resource order. The closure also keeps a suffix
+        // private when only its earlier large write, rather than the fence itself, overlaps it.
         std::vector<PendWrite> ready;
         ready.reserve(ready_count);
         std::deque<PendWrite> blocked;
+        size_t index = 0;
         while (!p.q.empty()) {
             PendWrite write = std::move(p.q.front());
             p.q.pop_front();
-            if (renderer_write(write))
+            if (selected[index++])
                 ready.push_back(std::move(write));
             else
                 blocked.push_back(std::move(write));
@@ -3388,7 +3244,9 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
         lk.unlock();
         for (const PendWrite& write : ready) {
             pend_age_note(write.queued);
-            apply_deferred_effect(write.cmd);
+            apply_deferred_effect(write.cmd,
+                                  write.dma_copy.empty() ? nullptr : write.dma_copy.data(),
+                                  write.packet_addr);
         }
         lk.lock();
         p.inflight--;
@@ -3407,29 +3265,9 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
     bool touched = false;
     for (const PendWrite& w : p.q) {
         const Pm4Command& c = w.cmd;
-        using K = Pm4Command::Kind;
-        if (c.kind == K::ReleaseMem && c.rel_addr == addr && c.rel_value_valid) {
-            if (c.rel_data_sel == 1) {
-                uint32_t lo = (uint32_t)c.rel_value;
-                memcpy(&v, &lo, sizeof lo);
-                touched = true;
-            } else if (c.rel_data_sel == 2) {
-                v = c.rel_value;
-                touched = true;
-            }
-        } else if (c.kind == K::WriteData && c.wd_valid && c.wd_addr == addr &&
-                   c.wd_data && c.wd_num) {
-            const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
-            memcpy(&v, c.wd_data, n);
-            touched = true;
-        } else if (c.kind == K::DmaData && c.dd_dst == addr && c.dd_valid &&
-                   dma_data_immediate_source(c)) {
-            const uint32_t word = (uint32_t)c.dd_src;
-            const size_t n = std::min<size_t>(c.dd_bytes, sizeof v);
-            for (size_t off = 0; off < n; off += sizeof word)
-                memcpy((uint8_t*)&v + off, &word, std::min(sizeof word, n - off));
-            touched = true;
-        }
+        touched |= overlay_pending_memory(c, w.dma_copy, addr,
+                                          {reinterpret_cast<uint8_t*>(&v), sizeof(v)}) ==
+                   PendingMemoryOverlay::Applied;
     }
     if (touched) *value = v;
     return touched;
@@ -3706,13 +3544,13 @@ void defer_push(const Pm4Command& c) {
     g_deferred.back().items.push_back(std::move(it));
     g_defer_items++;
 }
-void apply_effect(const Pm4Command& c) {
+void apply_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
     using K = Pm4Command::Kind;
     switch (c.kind) {
         case K::ReleaseMem: honor_eop_write(c); break;
         case K::EventWrite: honor_event_write(c); break;
         case K::WriteData:  honor_write_data(c); break;
-        case K::DmaData:    honor_dma_data(c); break;
+        case K::DmaData: honor_dma_data(c, packet_addr, source); break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -3731,7 +3569,7 @@ uint64_t effect_target(const Pm4Command& c, uint32_t* bytes) {
         default: *bytes = 0; return 0;
     }
 }
-void apply_deferred_effect(const Pm4Command& c) {
+void apply_deferred_effect(const Pm4Command& c, const uint8_t* source, uint64_t packet_addr) {
     uint32_t bytes = 0;
     uint64_t t = effect_target(c, &bytes);
     if (t && bytes && !guest_readable(t, bytes)) {
@@ -3741,13 +3579,123 @@ void apply_deferred_effect(const Pm4Command& c) {
                     (unsigned)c.kind, (unsigned long long)t, bytes);
         return;
     }
-    apply_effect(c);
+    apply_effect(c, source, packet_addr);
+}
+void publish_memory_effect(const Pm4Command& command) {
+    // Finishing preceding GPU work does not retire an active submit import. Keep completion and
+    // same-label suffix writes private, while unrelated resources remain available to the renderer.
+    // GDS offsets occupy a separate domain: offset zero is valid and must reach later compute.
+    if (eop_write_sync() ||
+        (command.kind == Pm4Command::Kind::DmaData && dma_data_dst_sel(command) == kDmaSelGds)) {
+        apply_deferred_effect(command);
+    } else {
+        pend_enqueue(command);
+        // A completion cannot make a blocked resource write eligible. Avoid rescanning the
+        // growing completion queue for each label in a completion-only burst.
+        if (command.kind == Pm4Command::Kind::WriteData ||
+            command.kind == Pm4Command::Kind::DmaData)
+            prosper_gpu_drain_renderer_writes();
+    }
 }
 } // namespace
 
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
     const GraphicsExecutionActivity execution;
-    apply_deferred_effect(effect.cmd);
+    publish_memory_effect(effect.cmd);
+}
+
+bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
+    const GraphicsExecutionActivity execution;
+    Pm4Command c{};
+    c.kind = Pm4Command::Kind::DmaData;
+    c.dd_dst = copy.dst;
+    c.dd_src = copy.src;
+    c.dd_bytes = copy.bytes;
+    c.dd_sels = copy.sels;
+    c.dd_valid = true;
+    c.stream_order = copy.command_order;
+    const GuestMappingLease lease;
+    const auto form = dma_data_form(c, authoritative_source != nullptr);
+    if ((form != DmaDataForm::Copy && form != DmaDataForm::MemoryToGds) || eop_write_sync())
+        return honor_dma_data(c, copy.packet_addr, authoritative_source);
+    PendQueue& p = pend_q();
+    std::unique_lock lock(p.mx);
+    p.cv.wait(lock, [&] { return p.inflight == 0; });
+    struct Overlay {
+        Pm4Command command;
+        std::span<const uint8_t> payload;
+        std::vector<PendingMemoryPatch> patches;
+    };
+    std::vector<Overlay> overlays;
+    const auto source_geometry = pending_memory_geometry(lease, {copy.src, copy.bytes});
+    const auto destination_geometry = form == DmaDataForm::MemoryToGds
+                                          ? PendingMemoryGeometry{}
+                                          : pending_memory_geometry(lease, {copy.dst, copy.bytes});
+    const auto unresolved_topology = [] {
+        std::fprintf(stderr, "[agc] DMA_DATA private alias topology unresolved; copy REFUSED\n");
+        return false;
+    };
+    const bool private_memory = std::any_of(p.q.begin(), p.q.end(), [](const auto& write) {
+        const auto span = pending_memory_span(write.cmd);
+        return span.address && span.bytes;
+    });
+    if (private_memory && (source_geometry.coverage == GuestMemoryMappingCoverage::Incomplete ||
+                           destination_geometry.coverage == GuestMemoryMappingCoverage::Incomplete))
+        return unresolved_topology();
+    bool private_destination = false;
+    for (const auto& write : p.q) {
+        const auto geometry = pending_memory_geometry(lease, pending_memory_span(write.cmd));
+        if (geometry.virtual_span.bytes &&
+            geometry.coverage == GuestMemoryMappingCoverage::Incomplete)
+            return unresolved_topology();
+        auto patches = pending_memory_patches(geometry, source_geometry);
+        if (!patches.empty()) overlays.push_back({write.cmd, write.dma_copy, std::move(patches)});
+        // Every earlier queued write is an ordering blocker, including the part of a private DMA
+        // outside its original completion label. Physical aliases share that same byte order.
+        private_destination |= !pending_memory_patches(geometry, destination_geometry).empty();
+    }
+    if (overlays.empty() && !private_destination) {
+        lock.unlock();
+        return honor_dma_data(c, copy.packet_addr, authoritative_source);
+    }
+    // Pin the borrowed queue payloads while copying outside mx. Admission/drainers already
+    // qualify p.inflight, so they cannot recycle these bytes. CONFIDENCE: HIGH (ordered tests).
+    ++p.inflight;
+    lock.unlock();
+    struct Inflight {
+        PendQueue& queue;
+        ~Inflight() {
+            std::lock_guard guard(queue.mx);
+            --queue.inflight;
+            queue.cv.notify_all();
+        }
+    } inflight{p};
+    std::vector<uint8_t> captured(copy.bytes);
+    std::memcpy(captured.data(),
+                authoritative_source ? authoritative_source
+                                     : reinterpret_cast<const uint8_t*>(uintptr_t(copy.src)),
+                copy.bytes);
+    for (const auto& overlay : overlays) {
+        for (const auto& patch : overlay.patches) {
+            if (overlay_pending_memory_patch(overlay.command, overlay.payload, patch, captured) ==
+                PendingMemoryOverlay::Unresolved) {
+                std::fprintf(stderr,
+                             "[agc] DMA_DATA private source dependency unresolved; copy REFUSED\n");
+                return false;
+            }
+        }
+    }
+    if (!private_destination) return honor_dma_data(c, copy.packet_addr, captured.data());
+    PendWrite write;
+    write.cmd = c;
+    write.dma_copy = std::move(captured);
+    write.packet_addr = copy.packet_addr;
+    write.queued = std::chrono::steady_clock::now();
+    {
+        std::lock_guard guard(p.mx);
+        p.q.push_back(std::move(write));
+    }
+    return true;
 }
 
 bool last_fold_deferred() { return g_fold_deferring; }
@@ -3791,9 +3739,7 @@ void submit_completion_pulse(bool submit_rejected) {
 // backstop). Returns how many streams fully completed across both queues.
 int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
-    // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
-    // scalar overlay instead, so their completion labels remain post-submit.
-    if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+    // Consult pending scalar writes without publishing completion labels from an active submit.
     int completed = 0;
     std::array<int, kDeferredQueueCount> signalable_completed{};
     std::array<bool, kDeferredQueueCount> blocked_queue{};
@@ -3849,7 +3795,7 @@ int flush_deferred_streams() {
                 s.next++;
                 continue;
             }
-            apply_deferred_effect(it.cmd);
+            publish_memory_effect(it.cmd);
             s.next++;
         }
         if (blocked) {
@@ -4929,9 +4875,7 @@ void GpuState::apply(const Pm4Command& c) {
                     defer_push(c);
                     break;
                 }
-                // Legacy callers consume the concrete value. Modern callers keep it private to the
-                // submit and let the evaluator overlay the queued scalar value.
-                if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
+                // Evaluate the queued scalar overlay while keeping its bytes private to the submit.
                 if (!ordered_wait_satisfied) {
                     const WaitRegMemPredicateSample decision = evaluate_wait_regmem_predicate(c);
                     diagnostics::perf::note_wait_regmem_direct_evaluation(

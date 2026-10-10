@@ -713,12 +713,12 @@ capture/replay without requiring an importable system Python module.
   points in one protocol, so a claim can be cross-checked rather than trusted. And the per-fold
   `built` column counts what the guest's **builder thread** did *while prosper was inside that fold*,
   which is how the ArcRunner mechanism became visible at all.
-- **`PROSPER_POST_SUBMIT_VISIBILITY`** — `=1` forces prosper's post-submit completion-visibility
-  model on regardless of the SDK version the guest requested, `=0` forces it off; unset leaves the
-  `version >= 13` gate in `agc_reg_defaults.cpp` alone. The model holds a submit's completion writes
-  private until the submit scope closes, so the guest cannot observe a half-retired frame. It is an
-  A/B lever for whether that gate is right for a pre-13 title: ArcRunner requests version 10, and
-  forcing the model on takes its default route from 3-of-3 faulting to 3-of-3 surviving
+- **Submit completion visibility** — completion writes remain private until the owning submit
+  import returns for every SDK. Renderer resource writes may flow earlier when they avoid queued
+  completions and earlier blocked writes, including direct-memory physical aliases. #2220 removes
+  `PROSPER_POST_SUBMIT_VISIBILITY` and the SDK gate; use separate control/candidate builds for its
+  historical A/B recipes. Older binaries accepted `=1` to force the model on and `=0` to force it
+  off. The dated ArcRunner evidence remains frontend-specific
   (`prosper/docs/games/ARCRUNNER_STATUS.md` § 2026-08-07).
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
