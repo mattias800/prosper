@@ -112,10 +112,25 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             // Hardware PM4 PFP_SYNC_ME (GFX10, 2 dwords, [0] = DUMMY): the prefetch parser waits
             // for the micro engine -- the same ordering point as R_STALL_COMMAND_BUFFER_PARSER.
             c.kind = K::StallCommandBufferParser;
-            // CLEAR_STATE (0x12) and CONTEXT_CONTROL (0x28) deliberately stay
-            // Unknown: none of them is a draw reset or an acquire barrier, and labelling them as
-            // one would hide a real, unimplemented effect (a context-register reset to clear-state
-            // values; shadow load control) from every Unknown census.
+            // CLEAR_STATE (0x12) remains Unknown until the installed platform image is modeled.
+        } else if (c.op == IT_CONTEXT_CONTROL && npl == 2 && !(pl[0] & ~0x91018003u) &&
+                   !(pl[1] & ~0x81018003u)) {
+            c.kind = K::ContextControl;
+        } else if ((c.op == 0x5e || c.op == 0x5f || c.op == 0x61) && npl >= 4 && !(npl & 1u) &&
+                   !(pl[0] & 3u)) {
+            // Ordinary LOAD_* has address + offset/count ranges, not indexed offset/value pairs.
+            bool valid = true;
+            for (uint32_t i = 2; i < npl; i += 2)
+                valid &= !(pl[i] & 0xffff0000u) && !(pl[i + 1] & 0xffffc000u);
+            if (valid) {
+                c.kind = K::LoadRegRanges;
+                c.reg_class = c.op == 0x61   ? RegClass::Cx
+                              : c.op == 0x5f ? RegClass::Sh
+                                             : RegClass::Uc;
+                c.regs_vaddr = lo_hi(pl);
+                c.reg_data = &pl[2];
+                c.reg_count = (npl - 2) / 2;
+            }
         } else if (c.op == IT_DRAW_INDEX_AUTO && npl == 2) {
             // Hardware PM4 DRAW_INDEX_AUTO (GFX10, 3 dwords): [0] = INDEX_COUNT, [1] =
             // VGT_DRAW_INITIATOR. The initiator is not a ShaderDrawModifier, so di_modifier keeps

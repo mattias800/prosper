@@ -8,6 +8,8 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
   dispatches the rest of the stack consumes.
 - `pm4_memory` — integer `ATOMIC_MEM` effects and raw-span `COND_EXEC` folding. Unknown producer
   authority refuses before reading a conditional predicate.
+- `pm4_context` — `CONTEXT_CONTROL`, ordinary range loads and owned `SET_*` shadow effects;
+  indexed offset/value loads keep their independent address contract.
 - `reg_watch_selector` — pure `parse_reg_watch` selector parsing; live reporting stays in the
   command processor.
 - `ordered_wait_diagnostics` — names for memory-effect classes and checked overlay outcomes;

@@ -32,6 +32,7 @@ enum : uint32_t {
     IT_DISPATCH_INDIRECT = 0x16,
     IT_ATOMIC_MEM = 0x1E,
     IT_COND_EXEC = 0x22,
+    IT_CONTEXT_CONTROL = 0x28,
     IT_DRAW_INDIRECT = 0x24,
     IT_DRAW_INDEX_INDIRECT = 0x25,
     IT_INDEX_BASE = 0x26,
@@ -133,6 +134,8 @@ struct Pm4Command {
         CondIndirectBuffer,   // appended after Unknown so no existing value moves
         CondExec,
         AtomicMem,
+        ContextControl,
+        LoadRegRanges,
     } kind = Kind::Unknown;
 
     uint64_t stream_order = 0;          // assigned before apply and retained by deferred effects
@@ -248,6 +251,7 @@ struct Pm4Command {
     // payload: [0]=dst, [1..2]=destination address (lo/hi), [3]=num_dwords, [4..]=inline data dwords.
     uint64_t wd_addr = 0;                // WriteData: destination address
     uint32_t wd_declared_num = 0;        // WriteData: payload's declared dword count
+    bool wd_shadow = false;   // Owned SET_* shadow effect, not an inline guest WRITE_DATA packet.
     uint32_t wd_num = 0;                 // WriteData: bounded inline dwords actually available
     const uint32_t* wd_data = nullptr;   // WriteData: -> the inline data dwords within the packet
     bool wd_valid = false;               // WriteData: packet carried every declared inline dword

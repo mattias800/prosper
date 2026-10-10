@@ -533,7 +533,8 @@ TEST(Pm4Decode, Contract) {
             PM4(2, IT_PFP_SYNC_ME, 0),
             0u,
             // CLEAR_STATE (0x12), ATOMIC_MEM (0x1E, 9 dwords), CONTEXT_CONTROL (0x28, 3 dwords):
-            // not a reset, a barrier or a no-op the processor can claim, so they stay Unknown.
+            // CLEAR_STATE's image and TC_OP 0 are still unsupported. CONTEXT_CONTROL changes
+            // load/shadow enables, independently of draw state and parser barriers.
             PM4(2, 0x12u, 0),
             0u,
             PM4(9, 0x1Eu, 0),
@@ -557,8 +558,8 @@ TEST(Pm4Decode, Contract) {
               "op0 is SetIndexCount");
         CHECK(ctl_ops[1].kind == K::StallCommandBufferParser, "op1 is StallCommandBufferParser");
         CHECK(ctl_ops[2].kind == K::Unknown && ctl_ops[3].kind == K::Unknown &&
-                  ctl_ops[4].kind == K::Unknown,
-              "CLEAR_STATE, ATOMIC_MEM and CONTEXT_CONTROL stay Unknown");
+                  ctl_ops[4].kind == K::ContextControl,
+              "unsupported clear/TC_OP 0 remain Unknown; CONTEXT_CONTROL is implemented");
     }
 
     // Hardware WAIT_REG_MEM64 plus COND_EXEC / DRAW_INDEX_INDIRECT_MULTI (Black Flag submit0.bin):

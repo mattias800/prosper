@@ -1,5 +1,6 @@
 #include "gpu/pm4/pm4_memory.hpp"
 #include "gpu/pm4/command_processor.hpp"
+#include "host/memory/guest_memory_topology.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,8 @@ bool guest_readable(uint64_t address, uint32_t bytes);
 bool guest_writable(uint64_t address, uint32_t bytes);
 void notify_guest_gpu_write(uint64_t address, uint64_t bytes);
 void set_guest_gpu_write_origin(const char* origin);
+bool dma_data_guest_destination(const Pm4Command& command);
+bool dma_data_immediate_operand(const Pm4Command& command);
 
 // The guest-memory span a command writes (0 bytes = writes nothing we track).
 void pm4_memory_effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
@@ -140,15 +143,44 @@ std::optional<bool> conditional_value(const Pm4Command& command, const GpuState&
 
 std::optional<uint32_t> overlay_conditional_memory_effect(const GpuState::MemoryEffect& effect,
                                                           uint64_t address, uint32_t before) {
-    const auto overlay = diagnose_ordered_wait_effect(effect, address, before);
-    if (overlay.overlay == OrderedWaitEffectOverlay::Ambiguous) return std::nullopt;
-    // A 64-bit RMW needs the upper dword too. COND_EXEC is only allowed to read four bytes, so
-    // evaluating it from a zero-extended low dword would invent a compare/min/max operand.
-    if (overlay.overlay == OrderedWaitEffectOverlay::Applied &&
-        effect.cmd.kind == Pm4Command::Kind::AtomicMem &&
-        atomic_mem_bytes(effect.cmd.atomic_op) == 8)
+    const auto& command = effect.cmd;
+    using Kind = Pm4Command::Kind;
+    if (command.kind == Kind::DmaData && !dma_data_guest_destination(command)) return before;
+    uint64_t destination = 0, bytes = 0;
+    pm4_memory_effect_span(command, &destination, &bytes);
+    if (command.kind == Kind::ReleaseMem)
+        bytes = command.rel_data_sel == 0 ? 0 : command.rel_data_sel == 1 ? 4 : 8;
+    if (!destination || !bytes ||
+        guest_memory_topology_relation(address, 4, destination, bytes) ==
+            GuestMemoryTopologyRelation::Disjoint)
+        return before;
+    // Only an exact virtual subrange can be projected from fixed owned data. Physical aliases,
+    // partial writes and unknown producer topology need execution-time authority.
+    if (address < destination || address - destination > bytes ||
+        bytes - (address - destination) < 4)
         return std::nullopt;
-    return static_cast<uint32_t>(overlay.value_after);
+    const uint64_t offset = address - destination;
+    if (command.kind == Kind::WriteData) {
+        if (!command.wd_valid || !command.wd_data || command.wd_num != command.wd_declared_num ||
+            effect.write_data.size() != command.wd_num ||
+            command.wd_data != effect.write_data.data() || (offset & 3u))
+            return std::nullopt;
+        return effect.write_data[offset / 4];
+    }
+    if (command.kind == Kind::ReleaseMem && command.rel_value_valid &&
+        (command.rel_data_sel == 1 || command.rel_data_sel == 2))
+        return uint32_t(command.rel_value >> (offset * 8));
+    if (command.kind == Kind::DmaData && command.dd_valid && dma_data_immediate_operand(command) &&
+        !(offset & 3u))
+        return uint32_t(command.dd_src);
+    // A 64-bit RMW needs its upper dword too. A four-byte parser read cannot invent that operand.
+    if (command.kind == Kind::AtomicMem && offset == 0 &&
+        atomic_mem_bytes(command.atomic_op) == 4) {
+        const auto value = atomic_mem_value(command.atomic_op, before, command.atomic_source,
+                                            command.atomic_compare);
+        if (value) return uint32_t(*value);
+    }
+    return std::nullopt;
 }
 
 bool atomic_mem_operand_valid(const Pm4Command& command) {

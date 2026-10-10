@@ -2802,6 +2802,10 @@ bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* auth
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled()) return;
+    if (c.wd_shadow) {
+        execute_register_shadow_write(c);
+        return;
+    }
     if (!c.wd_valid) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 24)
@@ -3590,6 +3594,7 @@ std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount> g_ga
 // different fold, while the numerically equal guest address remains unrelated.
 std::array<std::vector<std::pair<uint64_t, uint64_t>>, kDeferredQueueCount>
     g_gated_gds_ranges; // [offset, offset + bytes)
+
 void gated_register(const Pm4Command& c) {
     if (c.kind == Pm4Command::Kind::DmaData &&
         dma_data_dst_sel(c) == kDmaSelGds) {
@@ -3720,6 +3725,8 @@ void publish_memory_effect(const Pm4Command& command) {
 } // namespace
 
 bool execute_ordered_memory_effect(const GpuState::MemoryEffect& effect, bool producers_retired) {
+    if (effect.cmd.wd_shadow && (!producers_retired || !register_shadow_operand_valid(effect.cmd)))
+        return false;
     const GraphicsExecutionActivity execution;
     if (effect.cmd.kind == Pm4Command::Kind::AtomicMem && !producers_retired)
         return refuse_atomic_mem_producer(effect.cmd);
@@ -4247,10 +4254,26 @@ const std::shared_ptr<const GpuState>& GpuState::refresh_state_snapshot() {
     return last_snapshot_;
 }
 
+bool dma_data_guest_destination(const Pm4Command& command) {
+    return dma_data_dst_sel(command) != kDmaSelGds;
+}
+bool dma_data_immediate_operand(const Pm4Command& command) {
+    return dma_data_form(command) == DmaDataForm::Immediate;
+}
+
+void record_loaded_shader_register(GpuState& state, const Pm4Command& command, uint32_t offset) {
+    if (!udprov_collection_enabled()) return;
+    state.sh_prov[offset] = state.command_order | GpuState::kProvIndirect;
+    state.sh_prov_src[offset] = GpuState::pack_prov_src(command.queue_origin, state.jump_depth,
+                                                        g_fold_seq.load(std::memory_order_relaxed));
+}
+
 void GpuState::apply(const Pm4Command& c) {
     using K = Pm4Command::Kind;
     command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
+        case K::ContextControl: apply_context_control(c, *this); break;
+        case K::LoadRegRanges: state_dirty_ |= apply_register_ranges(c, *this); break;
         case K::SetRegsIndirect: {
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
             const uint64_t regs_bytes =
@@ -4513,6 +4536,7 @@ void GpuState::apply(const Pm4Command& c) {
                 }
             }
             state_dirty_ = true;
+            shadow_direct_registers(c, *this);
             break;
         }
         case K::SetIndexType:

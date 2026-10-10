@@ -10,6 +10,7 @@
 // prosper maps the guest image 1:1, the packet's `regs_vaddr` is directly readable as a host pointer.
 #pragma once
 #include "gpu/pm4/pm4_decode.hpp"
+#include "gpu/pm4/pm4_context.hpp"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -179,6 +180,7 @@ private:
 // Folded GPU state after replaying a command stream.
 struct GpuState {
     RegisterFile cx, sh, uc;   // register files by offset (#2395: was unordered_map)
+    Pm4ContextControl context_control;
     // PROSPER_UDPROV=1 (issue #305) or an armed resource-provenance selector (#1853): per-SH-register
     // last-write provenance. Resolved register VALUES cannot distinguish "this draw's bind wrote this dword"
     // from "a previous pipeline's bind wrote it and no newer write arrived" — which is exactly the
