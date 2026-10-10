@@ -132,7 +132,7 @@ TEST_F(Pm4Context, UpdateBitsPreserveTheOtherControlWord) {
     Words buffer;
     control(buffer, 0x80000002, 0x80000000);
     load(buffer, 0x61, backing.data(), 0, 0);
-    control(buffer, 0, 0x80000002);  // Enable shadowing without changing the load enables.
+    control(buffer, 0, 0x80000002);   // Enable shadowing without changing the load enables.
     packet(buffer, 0x69, {2, 20});
     load(buffer, 0x61, backing.data(), 2, 1);
     GpuState state;
@@ -173,7 +173,7 @@ TEST_F(Pm4Context, ContextUserConfigAndShaderLoadSelectorsAreIndependent) {
     gfx[2] = 33;
     cs[3] = 44;
     Words buffer;
-    control(buffer, 0x80018002, 0x80000000);  // Cx, Uc, Gfx SH; CS SH stays disabled.
+    control(buffer, 0x80018002, 0x80000000);   // Cx, Uc, Gfx SH; CS SH stays disabled.
     load(buffer, 0x61, cx.data(), 2, 1);
     load(buffer, 0x5e, uc.data(), 2, 1);
     load(buffer, 0x5f, gfx.data(), 2, 1);
@@ -373,5 +373,5 @@ TEST_F(Pm4Context, EnabledLoadWithoutEstablishedEnablesRefusesInsteadOfGuessing)
     EXPECT_TRUE(state.dma_execution_rejected);
     EXPECT_EQ(state.cx.count(0), 0u);
 }
-}  // namespace
-}  // namespace prosper::gpu
+}   // namespace
+}   // namespace prosper::gpu
