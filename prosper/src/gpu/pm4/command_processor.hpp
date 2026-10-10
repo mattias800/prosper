@@ -262,6 +262,9 @@ struct GpuState {
         bool     has_vertex_offset_override = false;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
+    // Per-submit boundary: a later memory write must not drain before an earlier indirect
+    // argument read. Reset with the work vectors; direct-only submissions retain their old path.
+    bool has_indirect_draw = false;
     // Compute dispatch + register state AT the packet. Compute is not executed yet, but retaining
     // the state makes skipped-producer provenance inspectable instead of reducing every dispatch
     // to one process-lifetime counter (#524).

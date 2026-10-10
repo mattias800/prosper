@@ -2782,6 +2782,7 @@ static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buf
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
     state.draws.clear();
+    state.has_indirect_draw = false;
     state.dispatches.clear();
     state.dma_copies.clear();
     state.dma_data_records.clear();
@@ -2979,6 +2980,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
+    agc_gpu_state().has_indirect_draw = false;
     agc_gpu_state().dispatches.clear();
     agc_gpu_state().dma_copies.clear();
     agc_gpu_state().dma_data_records.clear();

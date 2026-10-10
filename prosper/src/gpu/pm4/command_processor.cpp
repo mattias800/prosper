@@ -4731,6 +4731,7 @@ void GpuState::apply(const Pm4Command& c) {
                             g_fold_seq.load(std::memory_order_relaxed), jump_depth,
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
+            has_indirect_draw = true;
             refresh_state_snapshot();
             Draw d;
             d.state = last_snapshot_;
@@ -4763,7 +4764,7 @@ void GpuState::apply(const Pm4Command& c) {
             // what let the game free live label memory. Otherwise it goes through the pipe-drain
             // queue: completion becomes guest-visible only after the submit returns.
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
+            if (has_indirect_draw || !dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4771,7 +4772,7 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::WriteData:
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
+            if (has_indirect_draw || !dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4780,7 +4781,7 @@ void GpuState::apply(const Pm4Command& c) {
         case K::EventWrite:
             last_cp_sync_order = command_order; ++cp_sync_packets_seen;   // #3574
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
+            if (has_indirect_draw || !dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
@@ -4844,7 +4845,7 @@ void GpuState::apply(const Pm4Command& c) {
                 break;
             }
             if (defer_gate(c)) { defer_push(c); break; }
-            if (!dma_copies.empty() || !ordered_memory_effects.empty()) {
+            if (has_indirect_draw || !dma_copies.empty() || !ordered_memory_effects.empty()) {
                 ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }

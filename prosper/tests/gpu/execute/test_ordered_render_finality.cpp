@@ -467,6 +467,58 @@ TEST_F(OrderedRenderFinality, GraphicsOnlySubmitRendersInsideOneEnvWindow) {
     EXPECT_EQ(prosper::diag::submit_env_window(), 0u) << "the window must close with the submit";
 }
 
+TEST_F(OrderedRenderFinality, IndirectArgumentReadPrecedesFollowingWriteData) {
+    const uint64_t arguments = guest_ + 0x2010u;
+    const uint32_t initial[] = {6, 3, 1, 7, 0};
+    const uint32_t following[] = {3, 2, 0, 5, 0};
+    std::memcpy(reinterpret_cast<void*>(arguments), initial, sizeof(initial));
+    const uint16_t indices[] = {99, 0, 1, 2, 2, 3, 0};
+    auto state = indirect_after_flat_draw(arguments, reinterpret_cast<uint64_t>(indices));
+    state.draws.clear();
+    state.indirect_graphics_base = arguments;
+    state.index_base = reinterpret_cast<uint64_t>(indices);
+    Pm4Command draw;
+    draw.kind = Pm4Command::Kind::DrawIndexIndirect;
+    draw.stream_order = 200;
+    Pm4Command write;
+    write.kind = Pm4Command::Kind::WriteData;
+    write.stream_order = 300;
+    write.wd_addr = arguments;
+    write.wd_data = following;
+    write.wd_num = write.wd_declared_num = 5;
+    write.wd_valid = true;
+    size_t reads = 0;
+    std::vector<DrawItem> submitted;
+    set_live_target_byte_range_reader([&](uint64_t address, uint32_t bytes, std::vector<uint8_t>&) {
+        ++reads;
+        EXPECT_EQ(address, arguments);
+        EXPECT_EQ(bytes, sizeof(initial));
+        return LiveTargetByteReadResult::NotFound;
+    });
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        submitted.insert(submitted.end(), items.begin(), items.end());
+        return RenderedFrame{};
+    });
+    // Mirror the real submit's resource-drain prologue. A trailing upload must remain at its
+    // command position rather than overwriting an earlier indirect consumer's argument record.
+    prosper_gpu_submit_scope_begin();
+    state.apply(draw);
+    state.apply(write);
+    prosper_gpu_drain_renderer_writes();
+    (void)execute_ordered_and_present(state, 1, 1, submit_, false);
+    prosper_gpu_submit_scope_end();
+    prosper_gpu_drain_completion_writes();
+    ASSERT_EQ(submitted.size(), 1u);
+    EXPECT_EQ(submitted[0].raw_draw_count, 6u);
+    EXPECT_EQ(submitted[0].instance_count, 3u);
+    EXPECT_EQ(submitted[0].vertex_offset, 7);
+    EXPECT_EQ(submitted[0].indices, (std::vector<uint32_t>{0, 1, 2, 2, 3, 0}));
+    EXPECT_EQ(reads, 1u);
+    EXPECT_EQ(std::memcmp(reinterpret_cast<const void*>(arguments), following, sizeof(following)),
+              0)
+        << "the later write must still execute after the draw";
+}
+
 TEST_F(OrderedRenderFinality, IndirectArgumentsRetireGraphicsProducerBeforeReading) {
     const uint64_t arguments = guest_ + 0x2010u;
     const uint64_t target = arguments - 16u;
