@@ -90,7 +90,7 @@ ShaderResourceTable buffer_table() {
 template <size_t N>
 std::vector<uint32_t> compile(const uint32_t (&code)[N]) {
     const ShaderResourceTable table = buffer_table();
-    return recompile_valu(code, N, /*num_inputs*/1, /*out_vgpr*/2, &table);
+    return recompile_valu(code, N, /*num_inputs*/ 1, /*out_vgpr*/ 2, &table);
 }
 
 std::vector<float> lane_indices() {
@@ -104,7 +104,7 @@ std::vector<float> lane_indices() {
 TEST(BfmB64ScalarData, SelectAdmitsABfmDefinedPair) {
     const ShaderResourceTable table = buffer_table();
     EXPECT_FALSE(recompile_valu(kMovDefinedPair, std::size(kMovDefinedPair),
-                                /*num_inputs*/1, /*out_vgpr*/2, &table)
+                                /*num_inputs*/ 1, /*out_vgpr*/ 2, &table)
                      .empty())
         << "control: a select of two s_mov-defined pairs must lower with or without the fix";
     EXPECT_FALSE(compile(kBfmDefinedPair).empty())
@@ -129,8 +129,8 @@ TEST(BfmB64ScalarData, StoredHalvesAreExactOnDevice) {
     ASSERT_FALSE(spv.empty());
     const std::vector<uint32_t> zeros(kLanes, 0u);
     std::vector<uint32_t> readback;
-    const std::vector<float> got = prosper::test::run_compute(
-        spv, lane_indices(), kLanes, kLanes, zeros, {}, nullptr, 64, &readback);
+    const std::vector<float> got = prosper::test::run_compute(spv, lane_indices(), kLanes, kLanes,
+                                                              zeros, {}, nullptr, 64, &readback);
     if (got.empty()) GTEST_SKIP() << "no Vulkan compute device";
     ASSERT_GE(readback.size(), 2u);
     EXPECT_EQ(readback[0], 0u) << "vcc_lo word (bfm low half)";
@@ -140,4 +140,34 @@ TEST(BfmB64ScalarData, StoredHalvesAreExactOnDevice) {
     ASSERT_FALSE(got.empty());
     std::memcpy(&out_bits, &got[0], sizeof(out_bits));
     EXPECT_EQ(out_bits, 0u) << "output VGPR carries the stored lo word";
+}
+
+// The DATA words across the width/offset split points, on device. Each kernel is kBfmSelectSrc1
+// with only the s_bfm_b64 word changed (ssrc0 = width, ssrc1 = offset, both inline integers).
+// bfm(33, 0) is the arm that needs the high ones to survive a zero offset.
+TEST(BfmB64ScalarData, WideAndShiftedDataWordsAreExactOnDevice) {
+    struct Case {
+        uint32_t bfm_word, lo, hi;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0x928480A1u, 0xFFFFFFFFu, 0x00000001u, "bfm(33, 0) = 0x1_ffffffff"},
+        {0x928494A8u, 0xFFF00000u, 0x0FFFFFFFu, "bfm(40, 20) = bits [20, 60)"},
+        {0x9284A488u, 0x00000000u, 0x00000FF0u, "bfm(8, 36) = bits [36, 44)"},
+    };
+    for (const Case& c : cases) {
+        uint32_t code[std::size(kBfmSelectSrc1)];
+        std::memcpy(code, kBfmSelectSrc1, sizeof code);
+        code[3] = c.bfm_word;
+        const std::vector<uint32_t> spv = compile(code);
+        ASSERT_FALSE(spv.empty()) << c.what;
+        const std::vector<uint32_t> zeros(kLanes, 0u);
+        std::vector<uint32_t> readback;
+        const std::vector<float> got = prosper::test::run_compute(
+            spv, lane_indices(), kLanes, kLanes, zeros, {}, nullptr, 64, &readback);
+        if (got.empty()) GTEST_SKIP() << "no Vulkan compute device";
+        ASSERT_GE(readback.size(), 2u) << c.what;
+        EXPECT_EQ(readback[0], c.lo) << c.what << ": low word";
+        EXPECT_EQ(readback[1], c.hi) << c.what << ": high word";
+    }
 }
