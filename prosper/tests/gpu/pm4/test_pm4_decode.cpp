@@ -255,4 +255,93 @@ TEST(Pm4Decode, Contract) {
               "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
+    // Hardware IT_LOAD_* packets (a Black Flag submit captured on PS5 hardware, #4822):
+    {
+        uint32_t load_stream[] = {
+            // IT_LOAD_SH_REG: 5 dwords, op 0x63, addr 0x4074ec2fbc, flags 0x80000000, num_regs 10
+            PM4(5, IT_LOAD_SH_REG, 0),
+            0x74ec2fbcu,
+            0x00000040u,
+            0x80000000u,
+            10u,
+            // IT_LOAD_CONTEXT_REG: 5 dwords, op 0x64, addr 0x406616e000, flags 0x80000000, num_regs 6
+            PM4(5, IT_LOAD_CONTEXT_REG, 0),
+            0x6616e000u,
+            0x00000040u,
+            0x80000000u,
+            6u,
+            // IT_LOAD_CONTEXT_REG_INDEX: 5 dwords, op 0x9F, addr 0x4075172000, flags 0x80000000, num_regs 143
+            PM4(5, IT_LOAD_CONTEXT_REG_INDEX, 0),
+            0x75172000u,
+            0x00000040u,
+            0x80000000u,
+            143u,
+        };
+        std::vector<Pm4Command> load_ops;
+        const size_t c = decode_pm4(load_stream, std::size(load_stream), load_ops);
+        CHECK(c == 15, "consumed 15 dwords of IT_LOAD_* packets");
+        CHECK(load_ops.size() == 3, "decoded 3 IT_LOAD_* packets");
+
+        CHECK(load_ops[0].kind == K::SetRegsIndirect, "op0 is SetRegsIndirect");
+        CHECK(load_ops[0].reg_class == RegClass::Sh, "op0 class is Sh");
+        CHECK(load_ops[0].regs_vaddr == 0x4074ec2fbcu, "op0 vaddr matches");
+        CHECK(load_ops[0].num_regs == 10, "op0 num_regs = 10");
+
+        CHECK(load_ops[1].kind == K::SetRegsIndirect, "op1 is SetRegsIndirect");
+        CHECK(load_ops[1].reg_class == RegClass::Cx, "op1 class is Cx");
+        CHECK(load_ops[1].regs_vaddr == 0x406616e000u, "op1 vaddr matches");
+        CHECK(load_ops[1].num_regs == 6, "op1 num_regs = 6");
+
+        CHECK(load_ops[2].kind == K::SetRegsIndirect, "op2 is SetRegsIndirect");
+        CHECK(load_ops[2].reg_class == RegClass::Cx, "op2 class is Cx");
+        CHECK(load_ops[2].regs_vaddr == 0x4075172000u, "op2 vaddr matches");
+        CHECK(load_ops[2].num_regs == 143, "op2 num_regs = 143");
+
+        // Only the observed shape decodes as pairs: the contiguous-range data format (bit 31
+        // clear) and an index/offset address mode (low address bits) stay Unknown.
+        uint32_t other_shapes[] = {
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbcu, 0x00000040u, 0x00000000u, 10u,
+            PM4(5, IT_LOAD_SH_REG, 0), 0x74ec2fbdu, 0x00000040u, 0x80000000u, 10u,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_shapes, std::size(other_shapes), other_ops);
+        CHECK(other_ops.size() == 2 && other_ops[0].kind == K::Unknown &&
+                  other_ops[1].kind == K::Unknown,
+              "range-format and index-mode IT_LOAD_SH_REG stay Unknown");
+    }
+
+    // Hardware IT_ACQUIRE_MEM (0x58) and IT_RELEASE_MEM (0x49) (Black Flag submit0.bin):
+    {
+        uint32_t sync_stream[] = {
+            // IT_ACQUIRE_MEM: 8 dwords, op 0x58
+            PM4(8, IT_ACQUIRE_MEM, 0),
+            0x80000000u, 0x00000001u, 0x00000000u, 0x40056300u, 0x00000000u, 0x00000019u, 0x00009000u,
+            // IT_RELEASE_MEM: 8 dwords, op 0x49, data_sel=1 (32-bit write), addr=0x40749a2f00, value=0x408c
+            PM4(8, IT_RELEASE_MEM, 0),
+            0x06000528u, (1u << 29) | 0x00010000u, 0x749a2f00u, 0x00000040u, 0x0000408cu, 0x00000000u, 0x00000000u,
+        };
+        std::vector<Pm4Command> sync_ops;
+        const size_t c = decode_pm4(sync_stream, std::size(sync_stream), sync_ops);
+        CHECK(c == 16, "consumed 16 dwords of hardware sync packets");
+        CHECK(sync_ops.size() == 2, "decoded 2 sync packets");
+
+        CHECK(sync_ops[0].kind == K::AcquireMem, "op0 is AcquireMem");
+
+        CHECK(sync_ops[1].kind == K::ReleaseMem, "op1 is ReleaseMem");
+        CHECK(sync_ops[1].rel_data_sel == 1, "op1 data_sel == 1");
+        CHECK(sync_ops[1].rel_addr == 0x40749a2f00ull, "op1 rel_addr == 0x40749a2f00");
+        CHECK(sync_ops[1].rel_value_valid && sync_ops[1].rel_value == 0x408cu, "op1 rel_value == 0x408c");
+
+        // Only the GFX10 8-dword length decodes; a shorter packet of either opcode stays Unknown
+        // rather than having its fields read from the wrong slots.
+        uint32_t short_sync[] = {
+            PM4(6, IT_ACQUIRE_MEM, 0), 0u, 0u, 0u, 0u, 0u,
+            PM4(6, IT_RELEASE_MEM, 0), 0x06000528u, 1u << 29, 0x749a2f00u, 0x40u, 0x408cu,
+        };
+        std::vector<Pm4Command> short_ops;
+        decode_pm4(short_sync, std::size(short_sync), short_ops);
+        CHECK(short_ops.size() == 2 && short_ops[0].kind == K::Unknown &&
+                  short_ops[1].kind == K::Unknown,
+              "short ACQUIRE_MEM / RELEASE_MEM stay Unknown");
+    }
 }

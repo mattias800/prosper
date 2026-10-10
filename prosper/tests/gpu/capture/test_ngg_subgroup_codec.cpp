@@ -131,6 +131,34 @@ TEST(NggSubgroupCodec, MalformedRecordsAreRefused) {
     EXPECT_FALSE(write_ngg_subgroup_draw(empty, altered)) << "a description with no group";
 }
 
+// #4808: a Wave32 description (wave_lanes 32) round-trips its width through flags bit 2, with its
+// launch records and export blocks sized for 32-lane waves, and up to eight waves. The same record
+// read as Wave64 would mis-size both, so the flag is what the reader checks them against.
+TEST(NggSubgroupCodec, AWave32DescriptionKeepsItsWidth) {
+    const auto draw = kena(4, 4);
+    ASSERT_TRUE(draw);
+    auto w32 = std::make_shared<NggSubgroupDraw>(*draw);
+    w32->wave_lanes = 32;
+    for (NggSubgroupWaveGroup& group : w32->groups) {
+        group.waves = 5;   // more than Wave64's four
+        group.launch_words.assign(size_t{group.blocks} * 32u * 5u * kNggLaunchWordsPerLane, 7u);
+        group.export_words = group.blocks * w32->layout.block_words(5, 32);
+    }
+    std::shared_ptr<const NggSubgroupDraw> back;
+    const auto bytes = encode(w32);
+    ASSERT_TRUE(decode(bytes, back));
+    ASSERT_TRUE(back);
+    EXPECT_EQ(back->wave_lanes, 32u);
+    EXPECT_EQ(back->groups.at(0).waves, 5u);
+    EXPECT_EQ(back->groups.at(0).launch_words, w32->groups.at(0).launch_words);
+
+    ASSERT_TRUE(decode(encode(draw), back));
+    EXPECT_EQ(back->wave_lanes, 64u) << "a Wave64 description reads back as Wave64";
+    auto w64 = std::make_shared<NggSubgroupDraw>(*w32);
+    w64->wave_lanes = 64;   // the same 32-lane-sized records, claimed as Wave64
+    EXPECT_FALSE(decode(encode(w64), back)) << "five Wave64 waves, and records sized for 32 lanes";
+}
+
 // A capture is v72 only when a draw carries a description; every other capture stays a v71 file,
 // byte for byte (the v71 tail stays last).
 TEST(NggSubgroupCodec, OnlyACaptureWithADescriptionIsV72) {

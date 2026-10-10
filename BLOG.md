@@ -21,6 +21,12 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-09
 
+### Yakuza Kiwami shows its first picture
+
+*Yakuza Kiwami* now draws the Ryu Ga Gotoku Studio logo; until today every one of its draws was dropped and nothing reached the window ([tracker #2864](https://github.com/mattias800/prosper/issues/2864)).
+
+<p align="center"><img src="assets/screenshots/yakuza-kiwami-rgg-studio-logo.webp" alt="Yakuza Kiwami boot logo: the Ryu Ga Gotoku Studio dragon kanji in a black brush square on white; Linux prosper-app, default launch, snapshot at guest flip 600"></p>
+
 ### The Blood of Dawnwalker reaches its title screen on its first run
 
 On its first run in prosper, *The Blood of Dawnwalker* plays its intro and stops on a lit 3D title menu, which the owner checked by eye and found correct ([tracker #4792](https://github.com/mattias800/prosper/issues/4792)).

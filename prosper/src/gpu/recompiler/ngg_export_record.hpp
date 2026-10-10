@@ -1,17 +1,18 @@
 // ngg_export_record.hpp -- the export record buffer a merged ES+GS NGG subgroup shell writes, and
 // that a later pass-through draw reads (#3135: P2 writes it, P3/P4 consume it).
 //
-// One Vulkan workgroup runs one guest subgroup of W Wave64 waves (64*W invocations). The shell
+// One Vulkan workgroup runs one guest subgroup of W waves of L lanes (L*W invocations; L is 64, or 32
+// for a Wave32 program). The shell
 // writes one BLOCK per workgroup into the export buffer (descriptor set 2, binding 1):
 //
-//   block g starts at word  g * block_words(W)
+//   block g starts at word  g * block_words(W, L)
 //   [0] verts_alloc        GS_ALLOC_REQ M0[11:0], written by lane 0 of wave 0
 //   [1] prims_alloc        GS_ALLOC_REQ M0[23:12] (prims start at bit 12)
 //   [2] alloc_requests     how many times wave 0 sent GS_ALLOC_REQ (atomic count)
 //   [3] stray_requests     how many times any OTHER wave sent it (atomic count)
 //   [4] launch_mismatches  how many waves launched with an s3 that disagrees with the compiled
 //                          shell: s3[31:28] != W or s3[27:24] != the wave's index (atomic count)
-//   [5 + t * words_per_lane ...]  the record of subgroup thread t = wave * 64 + lane, t < 64*W
+//   [5 + t * words_per_lane ...]  the record of subgroup thread t = wave * L + lane, t < L*W
 //
 // A block is valid only when alloc_requests == 1, stray_requests == 0 and launch_mismatches == 0;
 // anything else is a guest-protocol or launch violation the consumer must treat as "no
@@ -77,12 +78,14 @@ struct NggExportRecordLayout {
     std::vector<uint32_t> param_channels;   // parallel to param_targets
 
     uint32_t param_word(uint32_t index) const { return first_param_word + 4u * index; }
-    // Words in one workgroup's block for a subgroup of `waves` Wave64 waves.
-    uint32_t block_words(uint32_t waves) const {
-        return kNggSubgroupHeaderWords + 64u * waves * words_per_lane;
+    // Words in one workgroup's block for a subgroup of `waves` waves of `wave_lanes` lanes.
+    uint32_t block_words(uint32_t waves, uint32_t wave_lanes = 64) const {
+        return kNggSubgroupHeaderWords + wave_lanes * waves * words_per_lane;
     }
-    uint32_t record_offset(uint32_t waves, uint32_t block, uint32_t thread) const {
-        return block * block_words(waves) + kNggSubgroupHeaderWords + thread * words_per_lane;
+    uint32_t record_offset(uint32_t waves, uint32_t block, uint32_t thread,
+                           uint32_t wave_lanes = 64) const {
+        return block * block_words(waves, wave_lanes) + kNggSubgroupHeaderWords +
+               thread * words_per_lane;
     }
 };
 
