@@ -123,9 +123,12 @@ void check_import_visibility() {
     EXPECT_EQ(upload, 0x12345678u);
     EXPECT_EQ(label, 0xaaaaaaaa55555555ull);
     const auto private_queue = observe_queue();
-    ASSERT_TRUE(private_queue.has_value());
-    EXPECT_EQ(private_queue->active_submits, 1u);
-    EXPECT_EQ(private_queue->queued, 2u);
+    if (!private_queue) {
+        ADD_FAILURE() << "private queue observation timed out";
+        return;
+    }
+    EXPECT_EQ(private_queue.value().active_submits, 1u);
+    EXPECT_EQ(private_queue.value().queued, 2u);
 
     hook();
     retirement.hook = nullptr;
@@ -133,9 +136,12 @@ void check_import_visibility() {
     prosper_gpu_drain_completion_writes();
     EXPECT_EQ(label, 0x0123456789abcdefull);
     const auto retired = observe_queue();
-    ASSERT_TRUE(retired.has_value());
-    EXPECT_EQ(retired->queued, 0u);
-    EXPECT_EQ(retired->inflight_batches, 0u);
+    if (!retired) {
+        ADD_FAILURE() << "retired queue observation timed out";
+        return;
+    }
+    EXPECT_EQ(retired.value().queued, 0u);
+    EXPECT_EQ(retired.value().inflight_batches, 0u);
 }
 
 TEST(SubmitVisibilityDefault, BeforeAnySdkQuery) {
@@ -203,8 +209,11 @@ TEST_P(SubmitVisibilityOrdered, CompletionAndAliasingSuffixStayPrivate) {
     EXPECT_EQ(upload, 0x87654321u) << "unrelated ordered resources remain available";
     EXPECT_EQ(label, 0xaaaaaaaa55555555ull);
     const auto pending = observe_queue();
-    ASSERT_TRUE(pending);
-    EXPECT_EQ(pending->queued, 2u);
+    if (!pending) {
+        ADD_FAILURE() << "pending queue observation timed out";
+        return;
+    }
+    EXPECT_EQ(pending.value().queued, 2u);
     hook();
     retirement.hook = nullptr;
     prosper_gpu_drain_completion_writes();
