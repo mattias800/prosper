@@ -827,3 +827,20 @@ TEST(ScalarPairMask, Wave64VccLoCselectReadingVccHiAcrossADispatcherEdgeCompiles
                                    {RecompileDiagnosticStage::Compute, kAddress})
                      .empty());
 }
+
+TEST(ScalarPairMask, Wave64VccLoCselectFromAOnePathVccHiRefusesItsLaneRead) {
+    // VCC_HI written on ONE path only is the structured emitter's fabricated zero at the select
+    // (#4714). As DATA it is VCC-as-scratch, like any one-path word; what must never happen is the
+    // selected pair being read back as this lane's VCC bit. kComputeTail is that lane read.
+    // kOnePath's if, writing VCC_HI instead: s_cmp_eq_u32 s0,0 | s_cbranch_scc1 +1 |
+    // s_mov_b32 vcc_hi,5 ; then kScc and s_cselect_b32 vcc_lo,1,vcc_hi.
+    const Words one_path_vcc_hi = {0xbf068000u, 0xbf850001u, 0xbeeb0385u};
+    const Words both_paths_vcc_hi = {0xbeeb0385u};
+    const Words select = {0x856a6b81u};
+    EXPECT_TRUE(compile(Stage::Compute, program(one_path_vcc_hi, select)).empty())
+        << "a merge-marked VCC_HI must not reach a VCC lane read through the #4808 select";
+    // Control: VCC_HI written unconditionally, the same select and lane read compile.
+    EXPECT_FALSE(compile(Stage::Compute, program(both_paths_vcc_hi, select)).empty())
+        << "a defined scalar VCC_HI selects and projects: "
+        << last_terminal_reject_reason(kAddress);
+}
