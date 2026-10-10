@@ -73,9 +73,11 @@ ALLOWED_TOP_LEVEL = {
 # Neither is a build input, so rule 1's "CI would go green without building it" does not apply).
 # .clang-format/.clang-tidy are the same case for C++: clang resolves them from each file's
 # ancestors, and they configure the changed-lines lint gate, not the build (#4210).
+# .coderabbit.yaml configures the CodeRabbit PR reviewer, which reads it only from the repository
+# root; it is review configuration, not a build input (#4872).
 ALLOWED_ROOT_SUFFIXES = (".md",)
 ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "pyproject.toml", "uv.lock",
-                      ".clang-format", ".clang-tidy"}
+                      ".clang-format", ".clang-tidy", ".coderabbit.yaml"}
 
 
 def top_level(path):
@@ -191,6 +193,7 @@ def selftest():
         ("project Python config", [("A", "pyproject.toml")]),
         ("project Python lockfile", [("A", "uv.lock")]),
         ("root C++ lint configs (#4210)", [("A", ".clang-format"), ("A", ".clang-tidy")]),
+        ("root CodeRabbit config (#4872)", [("A", ".coderabbit.yaml")]),
     ]
 
     failures = 0
