@@ -288,15 +288,15 @@ int main() {
     {
         uint32_t disp_pkt[] = {
             // IT_DISPATCH_DIRECT: 5 dwords, dims=(64, 16, 1), modifier=0x41
-            0xC0000000u | (3u << 16) | (IT_DISPATCH_DIRECT << 8),
-            64u, 16u, 1u, 0x41u,
+            0xC0000000u | (3u << 16) | (IT_DISPATCH_DIRECT << 8), 64u, 16u, 1u, 0x41u,
         };
         GpuState s_disp;
         run_cb(disp_pkt, std::size(disp_pkt), s_disp);
         CHECK(s_disp.dispatches.size() == 1, "IT_DISPATCH_DIRECT records one dispatch");
         if (!s_disp.dispatches.empty()) {
             CHECK(s_disp.dispatches[0].threads_x == 64u && s_disp.dispatches[0].threads_y == 16u &&
-                  s_disp.dispatches[0].threads_z == 1u, "IT_DISPATCH_DIRECT dimensions match");
+                      s_disp.dispatches[0].threads_z == 1u,
+                  "IT_DISPATCH_DIRECT dimensions match");
             CHECK(s_disp.dispatches[0].modifier == 0x41u, "IT_DISPATCH_DIRECT modifier matches");
         }
     }

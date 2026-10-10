@@ -350,10 +350,14 @@ TEST(Pm4Decode, Contract) {
         uint32_t dispatch_stream[] = {
             // IT_DISPATCH_DIRECT: 5 dwords, op 0x15, dims=(0x168, 0xcb, 1), modifier=0x41
             PM4(5, IT_DISPATCH_DIRECT, 0),
-            0x168u, 0xcbu, 1u, 0x41u,
+            0x168u,
+            0xcbu,
+            1u,
+            0x41u,
             // IT_DISPATCH_INDIRECT: 3 dwords, op 0x16, offset=0x2000, modifier=0x41
             PM4(3, IT_DISPATCH_INDIRECT, 0),
-            0x2000u, 0x41u,
+            0x2000u,
+            0x41u,
         };
         std::vector<Pm4Command> disp_ops;
         const size_t c = decode_pm4(dispatch_stream, std::size(dispatch_stream), disp_ops);
@@ -374,7 +378,7 @@ TEST(Pm4Decode, Contract) {
         // The compute-queue form carries an absolute address; any other length stays Unknown.
         uint32_t more_dispatch[] = {
             PM4(4, IT_DISPATCH_INDIRECT, 0), 0x12345600u, 0x40u, 0x41u,
-            PM4(4, IT_DISPATCH_DIRECT, 0), 8u, 8u, 1u,
+            PM4(4, IT_DISPATCH_DIRECT, 0),   8u,          8u,    1u,
         };
         std::vector<Pm4Command> more_ops;
         decode_pm4(more_dispatch, std::size(more_dispatch), more_ops);
