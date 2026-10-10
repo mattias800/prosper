@@ -2321,22 +2321,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         case OperandKind::SGPR:
                         case OperandKind::InlineInt:
                         case OperandKind::InlineFloat:
-                        case OperandKind::Literal:
-                            return true;
+                        case OperandKind::Literal: return true;
                         case OperandKind::Special:
                             if (source.value == 125) return true;       // SGPR_NULL
                             if (source.value == 253) return rs.scc != 0; // SCC as scalar 0/1
                             return source.value >= 106 && source.value <= 124 &&
                                    rs.sreg.count(source.value) != 0;
-                        default:
-                            return false;
+                        default: return false;
                     }
                 };
                 const bool has_proven_scalar_sources =
                     has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]) &&
                     (!b.is_compute || b.wave_size != 64 || rs.scalar_presence_has_no_placeholders ||
                      b.vcc_b32_scalar_result_pcs.contains(in.pc) ||
-                     b.vcc_local_scalar_write_pcs.contains(in.pc));
+                     b.vcc_local_scalar_write_pcs.contains(in.pc) ||
+                     (b.vcc_b32_low_only_pcs.contains(in.pc) && b32_sources_defined(rs, in)));
                 if ((!b.is_fragment && !b.is_compute) || gtav_wave32_vcchi_scalar_packet ||
                     has_proven_scalar_sources) {
                     // The vertex shell is a complete one-lane virtual wave, so its scalar VCC

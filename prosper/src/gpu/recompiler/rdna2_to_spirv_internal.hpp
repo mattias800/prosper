@@ -3251,6 +3251,31 @@ inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
     return rs.absent_sgpr_reads_fabricated_zero && !rs.sreg_input.contains(r) &&
            sreg_word_absent_unmasked(rs, r);
 }
+// Whether a source of a Wave64 B32 write into a VCC word is defined on every path, by #4706's
+// per-word marks rather than the whole-path `scalar_presence_has_no_placeholders`, which ANY
+// structured if clears even when the instruction reads none of the registers it merged (#4846).
+// emit_alu accepts it only where the whole-CFG proof shows the write low-only, so the result is
+// scalar data and SCC=(result!=0) is defined; nothing is projected into lane bits. PPSA28000
+// 0x26005ba000 and PPSA29343 0x4580fe3400 run `s_and_b32 vcc_lo, vcc_lo, 12` straight after an if
+// that wrote only s[14:15], then `s_cselect_b32 vcc_lo, 4, 5` on that SCC. A marked, absent or
+// fabricated word (and every mask operand) is still refused.
+inline bool b32_source_word_defined(const RegState& rs, const Operand& source) {
+    switch (source.kind) {
+        case OperandKind::InlineInt:
+        case OperandKind::InlineFloat:
+        case OperandKind::Literal: return true;
+        case OperandKind::SGPR:
+            return (rs.sreg.contains(source.value) || rs.sreg_input.contains(source.value)) &&
+                   !sreg_word_may_be_fabricated(rs, source.value);
+        case OperandKind::Special:
+            return source.value >= 106 && source.value <= 124 && rs.sreg.contains(source.value) &&
+                   !rs.sreg_merge_placeholder.contains(source.value);
+        default: return false;
+    }
+}
+inline bool b32_sources_defined(const RegState& rs, const Rdna2Inst& in) {
+    return b32_source_word_defined(rs, in.src[0]) && b32_source_word_defined(rs, in.src[1]);
+}
 // Whether a merge EDGE's word for `r` is fabricated. A merge reads an absent register through
 // `sget()`, which supplies `uconst(0)` for any absent word, so absence there counts for the special
 // data registers 106-124 (VCC, ttmp, M0) too, and for an ordinary SGPR whatever `sreg_input` holds:
