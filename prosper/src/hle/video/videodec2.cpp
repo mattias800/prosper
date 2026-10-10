@@ -870,6 +870,21 @@ HLE(s_videodec2_decode) {
                                 (unsigned long long)frame->data_size,
                                 (unsigned long long)((uint64_t)pic.y_stride * pic.height));
                 }
+                // CONFIDENCE: HIGH — Decode publishes these linear pitches in VdecOutput;
+                // the guest's frame argument has no pitch/tiling selector. Keep sampled uploads
+                // consistent with those bytes instead of applying the generic 256-byte pitch
+                // alignment (1920 -> 2048). Register planes separately: odd widths give NV12's
+                // interleaved UV plane a different stride from Y. The guest owns this allocation,
+                // so its unmap, rather than DeleteDecoder, retires the layout.
+                const uint64_t y_bytes = static_cast<uint64_t>(pic.y_stride) * pic.height;
+                if (y_bytes < pic.nv12_bytes && pic.nv12_bytes <= frame->data_size) {
+                    // Reusing a destination buffer replaces its previous picture, including any
+                    // old chroma plane beyond a smaller replacement's written extent.
+                    gpu::unregister_guest_linear_texture_layouts_in(frame->data, frame->data_size);
+                    gpu::register_guest_linear_texture_layout(frame->data, y_bytes, pic.y_stride);
+                    gpu::register_guest_linear_texture_layout(
+                        frame->data + y_bytes, pic.nv12_bytes - y_bytes, pic.uv_stride);
+                }
                 // Dump what the GUEST receives, not what the backend produced: the copy is part of
                 // what a reference comparison has to cover.
                 vdec_dump_picture(dst, (size_t)pic.nv12_bytes, pic.width, pic.height);

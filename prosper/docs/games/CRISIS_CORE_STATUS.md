@@ -7,6 +7,28 @@ status: current
 
 Unreal Engine 4.27 + IoStore. Tracker: [#1894](https://github.com/mattias800/prosper/issues/1894).
 
+## 2026-10-10: movie and menu-background stripes fixed (#4852)
+
+One visible Linux/RADV `prosper-app` baseline on `fca8179ba8b1` and one fixed run, full renderer
+cadence, immediate present, fresh isolated saves. Both answered the autosave dialog with a Cross
+at 60 seconds; the owner then advanced the menus and new-game flow. Baseline F9 and scheduled
+captures show horizontal movie stripes and a green/magenta lower band behind otherwise correct
+UI. The fixed scheduled movie capture is spatially correct, and the owner confirmed: "Previously,
+all FMV and menus were a garbled mess, and now they look perfect!"
+
+The renderer had been resolving the decoder's tight 1920-byte linear rows to a generic
+2048-byte pitch. Both sampled plane addresses match the HLE's output allocation and chroma
+offset exactly. Videodec2 now publishes per-plane layout provenance through the existing texture
+registry; no requested tiling was present to honour. **CONFIDENCE: HIGH.** The implementation
+and falsified hypothesis are in `prosper/docs/subsystems/VIDEODEC2.md` § Ruled out.
+
+The first 3D scene remains nearly black and later battle draws include a rejected pixel shader;
+these are separate from movie delivery and recorded in #4858 (causal connection unestablished).
+The owner's first F9 saved a screenshot but its bundle
+hit the 1 GiB RTT seed limit. The battle F9 refused the producer wait and saved neither verified
+screenshot nor bundle. No replay or higher compatibility rung is claimed by this fix. The older
+measurements below remain dated evidence.
+
 **Rung 2 — the title screen is reached and rendered.** Verified 2026-08-06 on a native
 Linux/Vulkan run (RADV, AMD Radeon 8060S), unmodified `tools/screenshot`, images inspected by eye.
 
