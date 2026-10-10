@@ -1,0 +1,106 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration for prosper. CodeRabbit gives every ready PR an automatic first-pass
+# review; the project's reviewer agent (see AGENTS.md) reads those findings, fixes what's valid
+# and merges. Keep CodeRabbit read-only: it comments, it does not push commits.
+language: en-US
+tone_instructions: >-
+  Concise and factual. prosper is a PS5 compatibility layer (HLE + RDNA2->SPIR-V recompiler);
+  correctness beats style. Flag real defects, unsound proofs and untested behaviour, not taste.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true   # never rewrite the author's PR description
+  collapse_walkthrough: true
+  review_status: true
+  poem: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  suggested_labels: false
+  auto_apply_labels: false
+  enable_prompt_for_ai_agents: true         # the reviewer agent acts on these prompts
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true           # re-review each new push
+    drafts: false                           # drafts here are work-in-progress checkpoints
+    base_branches:
+      - main
+
+  path_filters:
+    - "!assets/**"
+    - "!**/*.webp"
+    - "!**/*.png"
+    - "!**/*.bmp"
+    - "!**/*.bin"
+    - "!PROGRESS_TRACKER.md"
+
+  path_instructions:
+    - path: "prosper/src/gpu/recompiler/**"
+      instructions: >-
+        RDNA2->SPIR-V recompiler. Check semantics against the AMD RDNA 2 ISA reference. Any
+        admission must be provably sound: a fabricated, merge-marked, one-path or relayed scalar
+        word must never become a lane mask or branch condition. A visible refusal is better than a
+        silently wrong picture. Every behaviour change needs a test that fails without it.
+    - path: "prosper/src/gpu/**"
+      instructions: >-
+        Shared GPU path. Watch for per-draw/per-dispatch Vulkan object creation, CPU waits on the
+        GPU inside a frame, process-global locks on hot paths, and full-buffer comparisons of
+        unchanged memory. No title-specific conditions in shared code.
+    - path: "prosper/src/hle/**"
+      instructions: >-
+        Reimplemented Sony library (HLE). Behaviour must come from evidence (live traces, the
+        PS5 3.20 NID list, guest disassembly) — never copied from other emulators. Error codes
+        and encodings must match the real API (POSIX names return bare errno; sce* names return
+        the Sony-encoded value). Entitlement/ownership queries must answer from local inventory,
+        never a blanket "owned".
+    - path: "prosper/tests/**"
+      instructions: >-
+        Tests must fail without the change they cover; flag tests that would pass on unfixed
+        code or that assert a property their inputs cannot exercise.
+    - path: "**/*.md"
+      instructions: >-
+        Docs must be accurate against the code and COMPATIBILITY.md. Flag absolute local paths
+        (home directories, dump locations) — use <REPO_ROOT>/<DUMP_ROOT> placeholders.
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    autofix:                                # the reviewer agent is the only one that pushes fixes
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  tools:
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+    vale:
+      enabled: false
+    shellcheck:
+      enabled: true
+    ruff:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - "**/AGENTS.md"
