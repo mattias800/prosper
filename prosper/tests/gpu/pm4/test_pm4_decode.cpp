@@ -490,4 +490,36 @@ TEST(Pm4Decode, Contract) {
         CHECK(other_ops[3].kind == K::Unknown, "WR_ONE_ADDR WRITE_DATA stays Unknown");
         CHECK(other_ops[4].kind == K::Unknown, "short DRAW_INDIRECT stays Unknown");
     }
+
+    // Hardware IT_WAIT_REG_MEM (0x3C) (Black Flag submit0.bin):
+    {
+        uint32_t wait_stream[] = {
+            // IT_WAIT_REG_MEM: 7 dwords, op 0x3C, func=3, addr=0x406616c058, ref=1, mask=0xffffffff
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x13u, 0x6616c058u, 0x00000040u, 1u, 0xffffffffu, 0x19u,
+        };
+        std::vector<Pm4Command> wait_ops;
+        const size_t c = decode_pm4(wait_stream, std::size(wait_stream), wait_ops);
+        CHECK(c == 7, "consumed 7 dwords of hardware wait packet");
+        CHECK(wait_ops.size() == 1, "decoded 1 wait packet");
+
+        CHECK(wait_ops[0].kind == K::WaitRegMem, "op0 is WaitRegMem");
+        CHECK(wait_ops[0].wm_func == 3u, "op0 func == 3");
+        CHECK(wait_ops[0].wm_addr == 0x406616c058ull, "op0 addr == 0x406616c058");
+        CHECK(wait_ops[0].wm_ref == 1u, "op0 ref == 1");
+        CHECK(wait_ops[0].wm_mask == 0xffffffffu && wait_ops[0].wm_valid,
+              "op0 mask == 0xffffffff and valid");
+
+        // A register poll (MEM_SPACE 0), a write-then-wait (OPERATION 1) and a short packet stay
+        // Unknown: none of them is a plain memory poll.
+        uint32_t other_waits[] = {
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x03u, 0x2800u,     0u,    1u, 0xffffffffu, 0x19u,
+            PM4(7, IT_WAIT_REG_MEM, 0), 0x53u, 0x6616c058u, 0x40u, 1u, 0xffffffffu, 0x19u,
+            PM4(6, IT_WAIT_REG_MEM, 0), 0x13u, 0x6616c058u, 0x40u, 1u, 0xffffffffu,
+        };
+        std::vector<Pm4Command> other_ops;
+        decode_pm4(other_waits, std::size(other_waits), other_ops);
+        CHECK(other_ops.size() == 3 && other_ops[0].kind == K::Unknown &&
+                  other_ops[1].kind == K::Unknown && other_ops[2].kind == K::Unknown,
+              "register, write-then-wait and short WAIT_REG_MEM stay Unknown");
+    }
 }

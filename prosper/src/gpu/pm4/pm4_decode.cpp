@@ -111,6 +111,21 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.wd_num = c.wd_declared_num;
             c.wd_data = &pl[3];
             c.wd_valid = true;
+        } else if (c.op == IT_WAIT_REG_MEM && npl == 6 && ((pl[0] >> 4) & 3u) == 1u &&
+                   ((pl[0] >> 6) & 3u) == 0u) {
+            // Hardware PM4 WAIT_REG_MEM (GFX10, 7 dwords): [0] = FUNCTION[2:0] | MEM_SPACE[5:4] |
+            // OPERATION[7:6] | ENGINE_SEL, [1..2] = POLL_ADDRESS lo/hi, [3] = REFERENCE, [4] = MASK,
+            // [5] = POLL_INTERVAL. FUNCTION uses the numbering wait_regmem_value_satisfied()
+            // already implements (0 always .. 6 greater). Only a plain memory poll decodes:
+            // MEM_SPACE 0 polls a register (its "address" is a register offset) and OPERATION != 0
+            // writes before waiting, so either stays Unknown. The 32-bit MASK zero-extends, so the
+            // qword the processor reads compares on its low dword only.
+            c.kind = K::WaitRegMem;
+            c.wm_func = pl[0] & 7u;
+            c.wm_addr = lo_hi(&pl[1]) & ~3ull;
+            c.wm_ref = pl[3];
+            c.wm_mask = pl[4];
+            c.wm_valid = true;
         } else if (c.op == IT_INDEX_TYPE) {
             c.kind = K::SetIndexType;
             if (npl >= 1) c.index_size = pl[0];
