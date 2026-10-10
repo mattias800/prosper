@@ -127,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
         print(res)
         print(f"exec={w.exec:#x} vcc={w.vcc:#x} scc={w.scc}")
         return 0
+    if a.llvm and not llvm_check.llvm_available():
+        print("--llvm: llvm-mc/llvm-objdump not on PATH and no WSL to run them in", file=sys.stderr)
+        return 2
     summary = summarize(load(a), a.wave, a.llvm, a.sample)
     for k, v in summary.items():
         print(f"{k}: {v}")

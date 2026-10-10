@@ -1,6 +1,8 @@
 """Decode cross-check of the independent decoder against LLVM's AMDGPU disassembler.
 
-LLVM runs only inside WSL. The bytes are assembled as ``.byte`` data by ``llvm-mc`` and
+LLVM runs natively when ``llvm-mc`` and ``llvm-objdump`` are on ``PATH``, otherwise inside WSL
+Ubuntu when ``wsl`` is; with neither, ``run_llvm`` raises ``LlvmUnavailable`` (``llvm_available()``
+answers the question up front). The bytes are assembled as ``.byte`` data by ``llvm-mc`` and
 disassembled by ``llvm-objdump -d`` from the same LLVM build, whose output lists each
 instruction with its byte offset and its *original* dwords (``llvm-mc --disassemble
 --show-encoding`` re-encodes, so a non-canonical literal reports the wrong length and cannot
@@ -13,9 +15,12 @@ the expected side.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import decode as D
 
@@ -46,12 +51,55 @@ class LlvmResult:
     raw: str = ""
 
 
+class LlvmUnavailable(RuntimeError):
+    """Neither a native LLVM toolchain nor WSL is available for the cross-check."""
+
+
+def _native_llvm() -> bool:
+    return shutil.which("llvm-mc") is not None and shutil.which("llvm-objdump") is not None
+
+
+def llvm_available() -> bool:
+    """Whether ``run_llvm`` has a toolchain to run (native LLVM or WSL)."""
+    return _native_llvm() or shutil.which("wsl") is not None
+
+
 def run_llvm(data: bytes, mcpu: str = "gfx1030", timeout: int = 180) -> LlvmResult:
-    """Disassemble ``data`` with LLVM for ``-mcpu=<mcpu>`` (inside WSL)."""
+    """Disassemble ``data`` with LLVM for ``-mcpu=<mcpu>`` (native LLVM, else WSL Ubuntu)."""
     asm = ".text\n" + "".join(
         ".byte " + ",".join(str(b) for b in data[i : i + 64]) + "\n"
         for i in range(0, len(data), 64)
     )
+    if _native_llvm():
+        with tempfile.TemporaryDirectory(prefix="rdna2_ref_") as tmp:
+            obj = str(Path(tmp) / "prog.o")
+            mc = subprocess.run(
+                [
+                    "llvm-mc",
+                    "-triple=amdgcn-amd-amdhsa",
+                    f"-mcpu={mcpu}",
+                    "-filetype=obj",
+                    "-o",
+                    obj,
+                ],
+                input=asm,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if mc.returncode != 0:
+                return parse_llvm_output("")
+            proc = subprocess.run(
+                ["llvm-objdump", "-d", f"--mcpu={mcpu}", obj],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        return parse_llvm_output(proc.stdout)
+    if shutil.which("wsl") is None:
+        raise LlvmUnavailable("llvm-mc/llvm-objdump not on PATH and no WSL to run them in")
     obj = f"/tmp/h03_{uuid.uuid4().hex}.o"
     cmd = ["wsl", "-d", "Ubuntu", "--", "bash", "-c", LLVM_PIPE.format(cpu=mcpu, obj=obj)]
     proc = subprocess.run(

@@ -7,7 +7,6 @@ field layouts, so the tests do not depend on the decoder's own field extraction 
 construction. All data is synthetic.
 """
 
-import shutil
 import struct
 import sys
 from pathlib import Path
@@ -565,7 +564,17 @@ def test_control_decodes_to_six_instructions():
     ]
 
 
-needs_llvm = pytest.mark.skipif(shutil.which("wsl") is None, reason="LLVM only via WSL Ubuntu")
+needs_llvm = pytest.mark.skipif(
+    not L.llvm_available(), reason="needs llvm-mc/llvm-objdump on PATH, or WSL Ubuntu"
+)
+
+
+def test_run_llvm_without_toolchain_raises(monkeypatch):
+    """With neither native LLVM nor WSL, the cross-check fails loudly instead of crashing."""
+    monkeypatch.setattr(L.shutil, "which", lambda _name: None)
+    assert not L.llvm_available()
+    with pytest.raises(L.LlvmUnavailable):
+        L.run_llvm(CONTROL)
 
 
 @needs_llvm
