@@ -2,6 +2,7 @@
 // changes render state while leaving the intended user-config state stale. Synthetic packets pin
 // the published GFX10 opcode identities without depending on a console capture or firmware data.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 
 #include <gtest/gtest.h>
 
@@ -71,14 +72,21 @@ TEST(Pm4IndexedLoad, OrdinaryLoadOpcodesDoNotAcceptIndexedPairFields) {
 TEST(Pm4IndexedLoad, UnsupportedIndexedAddressAndDataModesStayUnknown) {
     const ShaderReg pair = {0x80, 0x12345678u};
     for (const uint32_t opcode : {0x63u, 0x64u, 0x9fu}) {
-        auto packet = indexed_load(opcode, &pair, 1);
-        packet[1] |= 1u;
+        SCOPED_TRACE(opcode);
         std::vector<Pm4Command> commands;
-        decode_pm4(packet.data(), packet.size(), commands);
-        ASSERT_EQ(commands.size(), 1u);
-        EXPECT_EQ(commands[0].kind, Pm4Command::Kind::Unknown);
+        // GFX10.3 SH mode 2 is an indirect address; bit 1 is reserved for CX/UC.
+        // Neither it nor offset mode 1 may be treated as a direct pointer.
+        for (const uint32_t mode : {1u, 2u, 3u}) {
+            SCOPED_TRACE(mode);
+            auto packet = indexed_load(opcode, &pair, 1);
+            packet[1] |= mode;
+            commands.clear();
+            decode_pm4(packet.data(), packet.size(), commands);
+            ASSERT_EQ(commands.size(), 1u);
+            EXPECT_EQ(commands[0].kind, Pm4Command::Kind::Unknown);
+        }
 
-        packet = indexed_load(opcode, &pair, 1);
+        auto packet = indexed_load(opcode, &pair, 1);
         packet[3] = 0u;
         commands.clear();
         decode_pm4(packet.data(), packet.size(), commands);
