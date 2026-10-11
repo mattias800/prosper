@@ -569,6 +569,10 @@ struct SpirvCompute {
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
     bool     ngg_one_lane=0;                         // exact GS_ALLOC_REQ wrapper: one guest lane/invocation
     bool ngg_workgroup_shell = false;   // merged-NGG workgroup shell: guest waves share LDS
+    // Retain original per-PC ownership across phase reloads, which are not fresh entry values.
+    bool ngg_row_source_analysis_done = false;
+    std::map<uint32_t, std::set<int>> ngg_ordinary_row_sources;
+    std::set<uint32_t> ngg_full_exec_pcs;
     // The merged-NGG subgroup shell (#3135 P2) captures GS_ALLOC_REQ (`s_sendmsg 9`) through this
     // hook. Unset, `s_sendmsg` stays the historical no-op every other stage relies on.
     std::function<bool(struct RegState&, const Rdna2Inst&)> ngg_alloc_request;

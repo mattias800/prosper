@@ -2418,6 +2418,22 @@ int main(int argc, char** argv) {
         const auto o = prosper::test::dpp_row_or(c);
         dump(dir, "compute_dpp_row_or_linear", recompile_valu(o.data(), o.size(), 3, 1));
     }
+    // Branch-free BC0 NGG rows must use the portable phase even without a guest barrier.
+    for (bool barrier : {false, true}) {
+        auto c = prosper::test::dpp_row_or_program({1, 2, 4, 8});
+        c.insert(c.begin(), 0x7e020300u);
+        if (barrier) c.insert(c.begin() + 1, 0xbf8a0000u);
+        c.insert(c.end() - 1, {0xf8000941u, 0x00000001u});
+        for (bool native : {false, true}) {
+            const std::string id = std::string("ngg_bc0_row_or_") +
+                                   (barrier ? "phased" : "linear") +
+                                   (native ? "_native64" : "_portable");
+            dump(dir, id.c_str(),
+                 recompile_ngg_exports_for_test(c.data(), c.size(), 10, 0, nullptr, 4, 0, {}, true,
+                                                true, native),
+                 "recompile_ngg_exports_for_test");
+        }
+    }
     {
         using prosper::test::DppRowCfgCase;
         const std::pair<DppRowCfgCase, const char*> cases[] = {
