@@ -397,12 +397,25 @@ TEST(CountedCopyContinuation, PostludeEdgeIntoRemovedPrefixCannotInheritTheProof
 }
 
 TEST(CountedCopyContinuation, PhysicalParticipationDoesNotSurviveThePostlude) {
-    Emitter e;
-    ASSERT_TRUE(e.body(program()));
-    EXPECT_TRUE(e.b.saved_mask_entry_prefix_pcs.empty());
-    EXPECT_TRUE(e.b.saved_mask_reconverged_entry_pcs.empty());
-    EXPECT_TRUE(e.b.native_logical_uniform_entry_pcs.empty());
-    EXPECT_EQ(ballots(e.b), 0u);
+    for (bool compute : {false, true}) {
+        Emitter e(compute);
+        unsigned calls = 0;
+        ASSERT_TRUE(e.body(program({}, true), [&](RegState&, const Rdna2Inst&) {
+            ++calls;
+            // The original body owns this separate physical-participation ledger. The real
+            // counted-postlude token preserves Bool-copy authority only, even when a cached
+            // producer site remains present before the recursive initializer runs.
+            e.b.native_participating_mask_pcs.insert(0);
+            return true;
+        }));
+        EXPECT_EQ(calls, 1u);
+        EXPECT_TRUE(e.b.saved_mask_entry_prefix_pcs.empty());
+        EXPECT_TRUE(e.b.saved_mask_reconverged_entry_pcs.empty());
+        EXPECT_TRUE(e.b.native_logical_uniform_entry_pcs.empty());
+        EXPECT_TRUE(e.b.native_participating_mask_pcs.empty());
+        EXPECT_EQ(e.rs.vcc, e.rs.sreg_bool.at(20));
+        EXPECT_EQ(ballots(e.b), 0u);
+    }
 }
 
 TEST(CountedCopyContinuation, CompleteFragmentProgramCompilesThroughTheActualSelector) {
