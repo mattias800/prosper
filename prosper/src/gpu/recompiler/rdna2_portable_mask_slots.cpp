@@ -71,8 +71,9 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
     // S_MOV_B64 can emit a complete Bool and genuine DATA together. Shipping WRITELANE reads
     // a saved pair's HIGH word through DATA; preserve that domain instead of replacing it with
     // a predicate-only slot. Track only the existing closed MOV producers, with MUST joins.
+    // Encoded EXEC destinations may decode as SGPRs; EXEC/M0 have no ordinary DATA publication.
     if (in.fmt == Rdna2Format::SOP1 &&
-        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64) &&
+        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64) && in.dst.value <= 123 &&
         (in.dst.kind == OperandKind::SGPR ||
          (in.dst.kind == OperandKind::Special && (in.dst.value == 106 || in.dst.value == 107)))) {
         const uint32_t width = in.opcode == kSop1OpcodeMovB64 ? 2u : 1u;
@@ -80,7 +81,9 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
             const int source = in.src[0].value + static_cast<int>(k);
             if (in.src[0].kind == OperandKind::InlineInt ||
                 in.src[0].kind == OperandKind::Literal ||
-                ((in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) &&
+                ((in.src[0].kind == OperandKind::SGPR ||
+                  (in.src[0].kind == OperandKind::Special && in.src[0].value >= 106 &&
+                   in.src[0].value <= 123)) &&
                  old.numeric_words.contains(source) && !old.may_words.contains(source)))
                 types.numeric_words.insert(in.dst.value + static_cast<int>(k));
         }
