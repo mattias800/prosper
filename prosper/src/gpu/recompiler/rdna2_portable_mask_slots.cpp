@@ -121,7 +121,7 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
     // Retain only writers whose actual mask lowering establishes a complete predicate. Numeric
     // pair writers are not inferred to be masks from a B64 opcode alone.
     if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode))
-        types.complete.insert(in.dst.value); // D receives OLD EXEC even when S0 is DATA
+        types.complete.insert(in.dst.value);   // D receives OLD EXEC even when S0 is DATA
     else if (mask_consumer(in) &&
              !(in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
                in.src[0].kind == OperandKind::Literal) &&
@@ -246,7 +246,7 @@ uint32_t pair_predicate(SpirvCompute& b, const RegState& rs, const Types& types,
     const uint32_t lane = b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
     return b.bsel(b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hv->second, lv->second);
 }
-} // namespace
+}   // namespace
 
 PortableMaskHalfBodyScope::PortableMaskHalfBodyScope(SpirvCompute& b, const RegState& rs,
                                                      const std::vector<Rdna2Inst>& ins)
@@ -392,7 +392,7 @@ PortableMaskHalfInstruction::PortableMaskHalfInstruction(SpirvCompute& b, RegSta
         if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) width = i == 1 ? 4u : 1u;
         if (in.fmt == Rdna2Format::MIMG) width = i == 1 ? 8u : (i == 2 ? 4u : 1u);
         if (width == UINT32_MAX) continue;
-        if (!width) width = 128; // an unknown footprint cannot launder a half as DATA
+        if (!width) width = 128;   // an unknown footprint cannot launder a half as DATA
         bool half = false;
         for (uint32_t k = 0; k < width; ++k)
             half |= before.may_words.contains(source.value + static_cast<int>(k));

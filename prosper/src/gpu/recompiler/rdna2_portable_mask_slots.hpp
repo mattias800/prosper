@@ -57,4 +57,4 @@ private:
 void add_portable_mask_half_keys(const SpirvCompute&, std::set<int>&);
 bool portable_mask_half_at_entry(const SpirvCompute&, uint32_t pc, int word);
 void load_portable_mask_half_types(const SpirvCompute&, RegState&, uint32_t pc);
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
