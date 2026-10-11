@@ -1,5 +1,6 @@
 // Cache/data boundary: one actual SOURCE module, independently executed workgroup ordinals,
 // different scalar/primitive/resource facts and all-wave transactional production publication.
+// Native P2/MOV and owned P1 need destination storage; allocation never supplies an entry word.
 #include "fixtures/fragment_packet_wave_fixture.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "bpermute_spirv_oracle.hpp"
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <set>
 
 namespace {
 using namespace prosper::gpu;
@@ -81,20 +83,47 @@ TEST(FragmentPacketWaveData, SharedImageBindingIsDataNotCachedPrototype) {
     EXPECT_EQ(pack_fragment_packet_waves(code, waves).rejection,
               "packet-wave-independent-image-binding-unimplemented");
 }
+TEST(FragmentPacketWaveData, InterpolationStorageMatchesNativeAndOwnedWriters) {
+    // Distinct destinations make P1's native no-op and the range boundaries independently visible.
+    std::vector<uint32_t> code;
+    for (uint32_t opcode = 0; opcode < 3; ++opcode)
+        fixture::resource::interp(code, opcode, 21 + opcode, 0, 0);
+    std::vector<Rdna2Inst> ins;
+    ASSERT_EQ(rdna2_walk(code.data(), code.size(), ins), 3u);
+    ASSERT_EQ(ins.size(), 3u);
+    for (uint32_t opcode = 0; opcode < 3; ++opcode) {
+        ASSERT_EQ(ins[opcode].fmt, Rdna2Format::VINTRP);
+        ASSERT_EQ(ins[opcode].opcode, opcode);
+        ASSERT_EQ(ins[opcode].dst.value, 21 + opcode);
+        for (bool owned : {false, true}) {
+            std::set<int> vectors, scalars;
+            loop_written_regs(ins, opcode, opcode + 1, vectors, scalars, owned);
+            const auto expected = owned || opcode != 0
+                                      ? std::set<int>{static_cast<int>(21 + opcode)}
+                                      : std::set<int>{};
+            EXPECT_EQ(vectors, expected) << "opcode=" << opcode << " owned=" << owned;
+            EXPECT_TRUE(scalars.empty()) << "interpolation storage is a VGPR effect";
+        }
+    }
+    std::set<int> vectors, scalars;
+    loop_written_regs(ins, 3, 4, vectors, scalars, true);
+    EXPECT_TRUE(vectors.empty()) << "writers outside the requested interval do not need storage";
+    EXPECT_TRUE(scalars.empty());
+}
 TEST(FragmentPacketWaveData, OwnedInterpolationHasStorageNotFabricatedEntryAuthority) {
     const auto input = fixture::packet();
     std::vector<Rdna2Inst> ins;
     ASSERT_TRUE(
         rdna2_walk(input.invocation.guest_code.data(), input.invocation.guest_code.size(), ins));
-    std::set<int> legacy_vectors, packet_vectors, legacy_scalars, packet_scalars;
-    loop_written_regs(ins, 0, 7, legacy_vectors, legacy_scalars);
+    std::set<int> native_vectors, packet_vectors, native_scalars, packet_scalars;
+    loop_written_regs(ins, 0, 7, native_vectors, native_scalars);
     loop_written_regs(ins, 0, 7, packet_vectors, packet_scalars, true);
-    EXPECT_FALSE(legacy_vectors.contains(10)) << "native inventory remains unchanged";
+    EXPECT_TRUE(native_vectors.contains(10)) << "native P2 writes VDST even though P1 is a no-op";
     EXPECT_TRUE(packet_vectors.contains(10))
         << "real VINTRP OLD VDST storage before READLANE boundary";
-    EXPECT_TRUE(legacy_vectors.contains(12));
+    EXPECT_TRUE(native_vectors.contains(12));
     EXPECT_TRUE(packet_vectors.contains(12));
-    EXPECT_EQ(legacy_scalars, packet_scalars);
+    EXPECT_EQ(native_scalars, packet_scalars);
     const auto old = std::find_if(input.invocation.vgprs.begin(), input.invocation.vgprs.end(),
                                   [](const auto& column) { return column.reg == 10; });
     ASSERT_NE(old, input.invocation.vgprs.end());
