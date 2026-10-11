@@ -739,6 +739,8 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
+    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active);
+    const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -2489,29 +2491,8 @@ bool emit_cfg_state_machine(
                 mask_write = in.sdst.value;
             }
 
-            auto erase_overlapping = [&](int base, uint32_t width) {
-                for (auto it = masks.begin(); it != masks.end();) {
-                    const int mask_base = *it;
-                    if (base < mask_base + 2 &&
-                        mask_base < base + static_cast<int>(width))
-                        it = masks.erase(it);
-                    else
-                        ++it;
-                }
-                // A one-word scalar write kills the definite-mask fact for the physical pair, but
-                // it resolves only the addressed half of an ambiguous pair. Keep the ambiguity
-                // until one definite write covers both halves; otherwise the untouched word could
-                // be reloaded from the wrong Function-variable domain. The separate scalar-word
-                // MUST facts below can validate exactly the overwritten word while complete-pair
-                // consumers remain fail-closed until both halves are definitely scalar.
-                for (auto it = ambiguous.begin(); it != ambiguous.end();) {
-                    const int mask_base = *it;
-                    if (base <= mask_base &&
-                        base + static_cast<int>(width) >= mask_base + 2)
-                        it = ambiguous.erase(it);
-                    else
-                        ++it;
-                }
+            const auto erase_overlapping = [&](int base, uint32_t width) {
+                retire_saved_mask_facts(b, masks, ambiguous, base, width);
             };
             std::vector<std::pair<int, uint32_t>> scalar_writes;
             for_each_scalar_write(in, [&](int base, uint32_t width) {
@@ -2540,32 +2521,22 @@ bool emit_cfg_state_machine(
             if (mask_write >= 0) {
                 masks.insert(mask_write);
                 ambiguous.erase(mask_write);
-                // An inline S_MOV_B64 is represented in both domains by emit_alu: its Bool
-                // view is an exact wave mask and its two scalar words are the same architectural bit
-                // pattern. GTA joins `s_mov_b64 s[16:17], 0` against an SMEM load, then consumes the
-                // pair as scalar data. Preserve that dual definition; other mask writes still erase
-                // scalar facts because their Boolean value cannot be materialized as two SGPR words.
-                const bool mov_dual_domain = in.fmt == Rdna2Format::SOP1 &&
-                    in.opcode == 0x04 &&
-                    (in.src[0].kind == OperandKind::InlineInt ||
-                     scalar_alu_result ||
-                     (b.is_compute && b.wave_size == 64 &&
-                      b.native_subgroup_size == 64 && source_is_mask(in.src[0])));
+                // Scalar copies need both original words; fresh masks need entry participation.
+                const bool mov_dual_domain = saved_mask_mov_defines_words(
+                    b, in, scalar_alu_result, source_is_mask(in.src[0]));
                 const bool cselect_scalar_branch = valid_scc_read &&
                     in.fmt == Rdna2Format::SOP2 &&
                     in.opcode == 0x0b && in.dst.value == 106 &&
                     !b.cselect_b64_low_only_pcs.contains(in.pc) &&
                     !(source_is_mask(in.src[0]) && source_is_mask(in.src[1])) &&
                     scalar_alu_result;
-                const bool logical_native_ballot = in.fmt == Rdna2Format::SOP2 &&
-                    in.opcode >= 0x0f && in.opcode <= 0x1d &&
-                    (in.opcode & 1u) == 1 && b.is_compute && b.wave_size == 64 &&
-                    b.native_subgroup_size == 64;
+                const bool logical_native_ballot = saved_mask_logical_defines_words(b, in);
                 const bool quadmask_native_ballot = exact_quadmask;
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
-                    quadmask_native_ballot || b32_vcc_complete_scalar_pair ||
-                    vcc_pack_scalar_pair || packet_raw_masks.contains(in.pc);
+                    saved_mask_write_retains_words(b, in, mask_write) || quadmask_native_ballot ||
+                    b32_vcc_complete_scalar_pair || vcc_pack_scalar_pair ||
+                    packet_raw_masks.contains(in.pc);
                 if (dual_domain_scalar_write && valid_scc_read) {
                     for (const auto& [base, width] : scalar_writes)
                         for (uint32_t word = 0; word < width; ++word)
@@ -3523,6 +3494,7 @@ bool emit_cfg_state_machine(
         state.smem_x2_descriptor_fragment_analysis_done =
             initial.smem_x2_descriptor_fragment_analysis_done;
         state.reads_scc = initial.reads_scc;
+        state.native_saved_mask_words = uses_native_saved_mask_words(b);
         state.invalidated_vgpr_lane_slots = initial.invalidated_vgpr_lane_slots;
         for (const auto& kv : vv) {
             if (dispatch != UINT32_MAX &&
@@ -3686,6 +3658,9 @@ bool emit_cfg_state_machine(
         // validity tag: remove all absent ordinary/special scalar words before emitting a case so
         // an uninitialized M0/SGPR cannot become a valid zero merely by crossing the dispatcher.
         if (entry_wave64_scalar_words) {
+            if (entry_block != UINT32_MAX)
+                load_missing_saved_mask_words(state, wave64_b64_ambiguous_in[entry_block],
+                                              *entry_wave64_scalar_words);
             for (auto it = state.sreg.begin(); it != state.sreg.end();) {
                 if (it->first <= 124 && !entry_wave64_scalar_words->contains(it->first))
                     it = state.sreg.erase(it);
@@ -4185,6 +4160,7 @@ bool emit_cfg_state_machine(
                 // CMPX may narrow EXEC while emitting this instruction. A reached-lane trace
                 // records the post-instruction VGPR under the entry EXEC, not the new mask.
                 const uint32_t trace_entry_exec = state.exec_narrowed ? state.exec : 0;
+                prepare_saved_mask_word_write(b, state, in);
                 const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
                 // Owned packet services handle original guest resource/numeric instructions at
                 // this exact dispatcher boundary. Native paths have no callback and keep their
@@ -4198,6 +4174,7 @@ bool emit_cfg_state_machine(
                     record_scalar_write(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
+                if (handled && ok) retain_saved_mask_words(b, state, in);
                 if (handled && ok) {
                     packet_raw_masks.expire(state, in);
                     packet_raw_masks.stage(b, state, in);
@@ -6081,8 +6058,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                uint32_t initial_dispatch_active,
                bool force_barrier_phases,
                bool force_lds_fminmax_dispatcher) {
-               // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
-               // whole-shader liveness valid when a barrier-separated body is compiled in phases.
+    // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
+    // whole-shader liveness valid when a barrier-separated body is compiled in phases.
+    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_dispatch_active);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
@@ -6337,7 +6315,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(rs, in)) return false; continue; }
             bool ok = true;
             const uint32_t trace_entry_exec = rs.exec_narrowed ? rs.exec : 0;
-            keep_surviving_mask_high_half(b, rs, ins, in);   // #4749: s101 outlives s100's reload
+            prepare_saved_mask_word_write(b, rs, in);
             const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
@@ -6345,6 +6323,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 record_scalar_write(
                     rs, in,
                     allows_compute_scalar_vcc_bridge(b), saved_masks);
+            if (handled && ok) retain_saved_mask_words(b, rs, in);
             if (handled && ok) {
                 for (const auto& [base, seed_pc] : fragment_mask_seed_pc) {
                     if (in.pc != seed_pc) continue;
@@ -7774,9 +7753,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
             }
         };
-        // Every scalar branch and loop condition is subgroup-uniform in the fragment shell (SCC is
-        // scalar already; EXECZ/VCCZ use fragment_wave_any), so native wave operations in any
-        // structured arm observe the complete guest wave.
+        // This enables existing wave operations; saved-mask DATA has a separate participation proof.
+        // A structured loop/arm does not establish that save-time participants still execute.
         wave_ok = b.is_fragment;
         if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) {
             if (getenv("PROSPER_DBG")) {

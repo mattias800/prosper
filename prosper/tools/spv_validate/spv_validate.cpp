@@ -1778,6 +1778,15 @@ int main(int argc, char** argv) {
                               0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u};
         dump(dir, "fragment_scalar_pair_mask_projection", recompile_fragment(c, std::size(c)));
     }
+    // #4781: retain saved EXEC words before either partial replacement and copy the retained pair.
+    for (uint32_t half : {0u, 1u}) {
+        const uint32_t c[] = {0xbe94047eu, 0xbe980414u, 0xbe940381u | (half << 16),
+                              0xbefe0414u, 0xbe9e0318u, 0xbe9f0319u,
+                              0x7e00021eu, 0x7e02021fu, 0xf8000803u,
+                              0x00000100u, 0xbf810000u};
+        const std::string name = "fragment_saved_mask_partial_" + std::to_string(half);
+        dump(dir, name.c_str(), recompile_fragment(c, std::size(c)));
+    }
     // #4706: v_ldexp_f32 with CLAMP (the float saturate routed through fresult).
     {
         const uint32_t c[] = {0xD7628000u, 0x0002030Du, 0xBF810000u};

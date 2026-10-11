@@ -658,6 +658,13 @@ struct SpirvCompute {
     // Exact structured-CFG consumers whose source pair is a saved Wave64 VCC mask on every
     // incoming path. S_MOV_B64 also materializes ballot words, so emit_alu needs this separate
     // lifetime fact to select the Bool-domain value at the consumer without guessing from maps.
+    // Original-program entry participation, never re-seeded from a sliced recursive phase.
+    bool saved_mask_word_analysis_done = false;
+    std::vector<uint32_t> saved_mask_original_words;
+    std::set<uint32_t> saved_mask_entry_prefix_pcs;
+    std::set<uint32_t> saved_mask_reconverged_entry_pcs;
+    bool saved_mask_in_dispatcher = false;
+    std::set<int> saved_mask_word_roots;
     bool structured_wave64_mask_reduction_analysis_done = false;
     std::unordered_set<uint32_t> structured_wave64_mask_reduction_pcs;
     // Exact Wave64 mask spills retain a Bool view in vgpr_lane_mask_slots. When a CFG MUST proof
@@ -3018,6 +3025,10 @@ struct RegState {
     // M0 to untracked. That is what makes the containment structural instead of a promise: there is
     // no fabricated number anywhere for arithmetic, a V_WRITELANE source, or an LDS index to pick up.
     std::unordered_set<int> sreg_entry_m0;
+    // Native saved masks must retain DATA before participants leave. An absent untouched word
+    // after a physical overwrite is not the generic uninitialized-SGPR zero.
+    bool native_saved_mask_words = false;
+    std::set<int> unavailable_saved_mask_words;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     // One restored physical dword of a Wave64 mask is not a complete B64 predicate. Keep its Bool
@@ -3247,7 +3258,8 @@ inline bool sreg_word_absent_unmasked(const RegState& rs, int r) {
 }
 inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
     if (r < 0 || r > 124) return false;
-    if (rs.sreg_merge_placeholder.contains(r)) return true;
+    if (rs.unavailable_saved_mask_words.contains(r) || rs.sreg_merge_placeholder.contains(r))
+        return true;
     return rs.absent_sgpr_reads_fabricated_zero && !rs.sreg_input.contains(r) &&
            sreg_word_absent_unmasked(rs, r);
 }
@@ -3357,6 +3369,7 @@ struct MergeEdgeMarks {
     // ...of which only by a loop header's blanket mark, with its assumptions (sreg_loop_blanket)
     std::map<int, std::set<uint64_t>> blanket;
     std::set<int> memory;   // this edge's memory-pattern marks
+    std::set<int> unavailable_saved_mask_words;
     bool scc = false;   // this edge's SCC is marked or poisoned (merges as bfalse)
     // This edge's v_writelane spill-slot marks. A merge keeps only one edge's slot map, so a slot
     // the OTHER edge left marked would otherwise come out clean (#4725 review).
@@ -3372,6 +3385,7 @@ MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) 
             if (sreg_word_blanket_only(rs, r)) marks.blanket[r] = rs.sreg_loop_blanket.at(r);
         }
     marks.memory = rs.sreg_memory_pattern;
+    marks.unavailable_saved_mask_words = rs.unavailable_saved_mask_words;
     marks.scc = rs.scc_merge_placeholder || !rs.scc;
     marks.slot_fabricated = rs.lane_slot_merge_placeholder;
     marks.slot_memory = rs.lane_slot_memory_pattern;
@@ -3394,6 +3408,8 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
 // fabricated too; a slot marked on either edge is marked after it).
 inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
     join_vector_word_marks(rs.vreg_source_marks, other.vectors);
+    rs.unavailable_saved_mask_words.insert(other.unavailable_saved_mask_words.begin(),
+                                           other.unavailable_saved_mask_words.end());
     rs.scc_merge_placeholder = rs.scc_merge_placeholder || !rs.scc || other.scc;
     rs.lane_slot_merge_placeholder.insert(other.slot_fabricated.begin(),
                                           other.slot_fabricated.end());
@@ -3551,29 +3567,20 @@ struct SavedB64MaskSnapshot {
 
 inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& before, int reg,
                                   int preserved_pair = -1) {
-    // The ROOT word only, and this is measured rather than reasoned. Expiring on EITHER word of the
-    // pair rejected 19 arms of test_recompile_coverage. Traced on the first of them ("a nested
-    // varying-VCC compute CFG preserves spilled EXEC"): its Wave64 EXEC reload keys the
-    // reconstructed mask on the LOW word (`v_readlane s14` -> `sreg_bool[14]`, the non-native
-    // `vgpr_lane_mask_slots` branch, which erases `sreg_wave64_mask_half` so the
-    // `publishes_wave64_mask_half` guard below does not apply) and then writes the HIGH word
-    // (`v_readlane s15`). Treating that high-word write as an end-of-life destroyed the alias the
-    // very next instruction consumes, and `s_mov_b64 exec, s[14:15]` rejected.
-    //
-    // So a high-word-only overwrite by unrelated scalar data keeps its established (conservative)
-    // behavior. That is a PRE-EXISTING gap, not one introduced here -- before this function nothing
-    // ended a B64 alias at all -- and #2783's defect is entirely in the root word.
-    const int root = reg;
-    if (root < 0 || root > 105 || root == preserved_pair) return;
-    const auto mask = rs.sreg_bool.find(root);
-    if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) return;
-    // Present AND unchanged across emit_alu -- otherwise this instruction published it itself.
-    bool stale = false;
-    for (const auto& [snapshot_root, snapshot_id] : before.entries)
-        if (snapshot_root == root && snapshot_id == mask->second) stale = true;
-    if (!stale) return;
-    rs.sreg_bool.erase(root);
-    rs.sreg_bool_narrowed.erase(root);
+    // Native DATA retention makes either physical replacement end the complete alias. Portable
+    // mask-slot reloads retain their existing root rule until their half-instance transfer is proved.
+    for (int root : {reg - 1, reg}) {
+        if (root != reg && !rs.native_saved_mask_words) continue;
+        if (root < 0 || root > 105 || root == preserved_pair) continue;
+        const auto mask = rs.sreg_bool.find(root);
+        if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) continue;
+        bool stale = false;
+        for (const auto& [snapshot_root, snapshot_id] : before.entries)
+            if (snapshot_root == root && snapshot_id == mask->second) stale = true;
+        if (!stale) continue;
+        rs.sreg_bool.erase(root);
+        rs.sreg_bool_narrowed.erase(root);
+    }
 }
 
 // Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
@@ -3899,6 +3906,10 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          bool allow_compute_scalar_vcc_bridge,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
     propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks);
+    for_each_scalar_write(in, [&](int base, uint32_t width) {
+        for (uint32_t w = 0; w < width; ++w)
+            rs.unavailable_saved_mask_words.erase(base + static_cast<int>(w));
+    });
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
     // keeping either would let a later descriptor use observe the pre-overwrite value.

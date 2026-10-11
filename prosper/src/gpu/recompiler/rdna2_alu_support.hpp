@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -323,6 +324,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             if (it == rs.vreg.end() && b.is_fragment_packet() && ok) *ok = false;
             return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: {
+            if (rs.unavailable_saved_mask_words.contains(o.value))
+                return refuse_unavailable_saved_mask_word(b, in, ok);
             // Holding the ENTRY value of M0 as an opaque token (#3133). It is not data, and the
             // register's stale `sreg_input` word is not it either -- reading either here would be
             // exactly the fabricated value the token exists to avoid. Only `s_mov_b32 m0, sSRC`
@@ -377,6 +380,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             else if (o.value > 0 && is_b64_mask_base(o.value - 1))
                 mask_base = o.value - 1;
             if (mask_base >= 0) {
+                if (uses_native_saved_mask_words(b))
+                    return refuse_unavailable_saved_mask_word(b, in, ok);
                 // The Wave64 MUST analysis in the CFG dispatcher is the lifetime tag that proves
                 // this physical word still names the saved B64 predicate rather than recycled
                 // scalar scratch. An exact fragment-Wave64 contract or native compute subgroup can

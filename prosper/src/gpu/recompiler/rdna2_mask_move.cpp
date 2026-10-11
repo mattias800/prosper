@@ -76,6 +76,14 @@ uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs,
 // logical lane, not a native fragment subgroup or the value of either source word as a Bool.
 bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     const auto& source = in.src[0];
+    if (uses_native_saved_mask_words(b) && source.kind == OperandKind::SGPR &&
+        (!rs.sreg_bool.contains(source.value) || rs.sreg_bool_b32.contains(source.value)) &&
+        (rs.unavailable_saved_mask_words.contains(source.value) ||
+         rs.unavailable_saved_mask_words.contains(source.value + 1))) {
+        bool ok = true;
+        refuse_unavailable_saved_mask_word(b, in, &ok);
+        return false;
+    }
     if (source.kind == OperandKind::InlineInt && source.value == -1) {
         rs.exec = b.btrue();
         rs.exec_narrowed = false;
@@ -116,6 +124,11 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
         }
     }
     uint32_t m = src_mask();
+    // A native saved pair can round-trip as genuine physical DATA through spill slots. Rebuild
+    // only from its two current unmarked words; an old complete Bool needs no new ballot.
+    if (!m && uses_native_saved_mask_words(b) && b.is_compute && source.kind == OperandKind::SGPR &&
+        rs.sreg.contains(source.value) && rs.sreg.contains(source.value + 1))
+        m = scalar_pair_lane_bit(b, rs, source);
     // Preserve the native-fragment route and its expression order. Its subgroup-local identity
     // records a required native Wave64 contract; the new owned packet route above never calls it.
     if (!m && b.is_fragment && b.wave_size == 64 &&

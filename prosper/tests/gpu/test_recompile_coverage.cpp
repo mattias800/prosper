@@ -2581,18 +2581,17 @@ int main() {
                              wave64_dispatch_config).empty(),
           "an inline B64 constant retains both scalar words across a dispatcher reload");
 
-    // Native Wave64 S_MOV_B64 materializes an exact ballot pair as well as its Bool alias, even
-    // when its saved-SGPR source has only a mask representation. That copy must retain both words
-    // across a real dispatcher boundary. Replacing the copy with mask-only WQM at the exact site
-    // removes the scalar representation, so CSELECT must reject instead of reading zeros.
+    // Native Wave64 retains physical words at the original WQM producer, and S_MOV_B64 copies
+    // those words across a dispatcher boundary. A new WQM at the same entry-prefix site also
+    // produces genuine words; it is not an unproved mask-only source (#4781).
     std::vector<uint32_t> compute_cfg_dispatch_dual_mask_move_reload = {
-        0xBE900A7Eu,                         // pc0: mask-only saved s[16:17] = WQM(exec)
-        0xBE920410u,                         // pc1: S_MOV materializes s[18:19] ballot words
-        0xBE940381u, 0xBE950380u,            // pc2: scalar-only s[20:21] = 1
-        0xBF068008u,                         // pc4: fresh SCC condition
-        0xBF840001u,                         // pc5: conditional dispatcher edge
-        0xBF800000u,                         // pc6: fallthrough rejoins consumer
-        0x85EA1412u,                         // pc7: cselect vcc,s[18:19],s[20:21]
+        0xBE900A7Eu,   // pc0: original WQM producer retains s[16:17]
+        0xBE920410u,   // pc1: S_MOV copies retained s[18:19] words
+        0xBE940381u, 0xBE950380u,   // pc2: scalar-only s[20:21] = 1
+        0xBF068008u,   // pc4: fresh SCC condition
+        0xBF840001u,   // pc5: conditional dispatcher edge
+        0xBF800000u,   // pc6: fallthrough rejoins consumer
+        0x85EA1412u,   // pc7: cselect vcc,s[18:19],s[20:21]
     };
     compute_cfg_dispatch_dual_mask_move_reload.insert(
         compute_cfg_dispatch_dual_mask_move_reload.end(), compute_cfg_dispatch,
@@ -2605,10 +2604,20 @@ int main() {
         compute_cfg_dispatch_dual_mask_move_reload;
     compute_cfg_dispatch_mask_only_move_reload[1] =
         0xBE920A7Eu;                         // same site: WQM writes a mask without scalar words
-    CHECK(recompile_compute(compute_cfg_dispatch_mask_only_move_reload.data(),
-                            compute_cfg_dispatch_mask_only_move_reload.size(), &dispatch_rt,
-                            wave64_dispatch_config).empty(),
-          "the same mixed-domain consumer rejects after a mask-only producer mutation");
+    CHECK(!recompile_compute(compute_cfg_dispatch_mask_only_move_reload.data(),
+                             compute_cfg_dispatch_mask_only_move_reload.size(), &dispatch_rt,
+                             wave64_dispatch_config)
+               .empty(),
+          "the original entry WQM mutation also retains both genuine physical words");
+    // Keep an unproved producer negative: the conditional arm replaces s[18:19] with WQM,
+    // while its bypass keeps the older DATA. No common dynamic producer supplies both words.
+    auto compute_cfg_dispatch_unproved_wqm = compute_cfg_dispatch_dual_mask_move_reload;
+    compute_cfg_dispatch_unproved_wqm[6] = 0xBE920A7Eu;
+    CHECK(recompile_compute(compute_cfg_dispatch_unproved_wqm.data(),
+                            compute_cfg_dispatch_unproved_wqm.size(), &dispatch_rt,
+                            wave64_dispatch_config)
+              .empty(),
+          "a bypassed WQM producer cannot supply the post-merge numeric CSELECT words");
 
     // A complete scalar S_CSELECT_B64 into VCC also emits both views: its selected pair remains
     // scalar-readable while VCC consumers use the lane predicate. Force a second CSELECT after a

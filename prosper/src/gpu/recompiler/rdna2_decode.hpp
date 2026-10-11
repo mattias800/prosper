@@ -366,6 +366,7 @@ enum class OperandKind : uint8_t { None, SGPR, VGPR, InlineInt, InlineFloat, Lit
 struct Operand {
     OperandKind kind = OperandKind::None;
     int32_t     value = 0;
+    bool operator==(const Operand&) const = default;
 };
 
 // Decode an AMD gfx10 source-operand field (8-bit scalar SSRC, or 9-bit vector SRC where 256..511 =
@@ -584,6 +585,7 @@ struct Rdna2Inst {
     // NEG lands in src_neg[], NEG_HI (abs for mix ops) in src_abs[], and CLAMP in clamp.
     uint8_t vop3p_opsel = 0, vop3p_opsel_hi = 0;
     uint8_t vop3p_neg_hi = 0;   // packed add/mul: per-source negate for the HIGH f16 result
+    bool operator==(const Rdna2Inst&) const = default;
 };
 // Instructions whose register or control effects the decoded operands do not describe. A liveness
 // or lifetime walk over a guest program must STOP at one, never step over it:

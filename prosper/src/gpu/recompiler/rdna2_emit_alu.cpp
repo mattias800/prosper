@@ -1019,6 +1019,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
                         uint32_t m = packet_s_mov_b64_numeric_vcc_bit(b, rs, in);
                         if (!m) m = src_mask(in.src[0]);
+                        if (m && !validate_saved_mask_copy_words(b, rs, in)) {
+                            ok = false;
+                            return true;
+                        }
                         if (m) { rs.sreg_bool[in.dst.value] = m;
                                  rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]);
                                  // A move INTO VCC is a VCC write (DOLL's scalar-indexed unroll does
@@ -1056,7 +1060,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             }
                             // Preserve the established unwritten-SGPR-as-zero behavior for an
                             // ordinary data move. A Bool alias needs both real words, however; an
-                            // incomplete pair must fall through to exact ballot materialization.
+                            // incomplete pair must retain the absence of original DATA authority.
                             data_copied = complete_pair || !m;
                         } else if (in.src[0].kind == OperandKind::InlineInt) {   // 64-bit sign-extended constant
                             rs.sreg[in.dst.value]     = b.uconst((uint32_t)in.src[0].value);
@@ -1072,13 +1076,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             rs.sreg_srt.erase(in.dst.value); rs.sreg_srt.erase(in.dst.value + 1);
                             data_copied = true;
                         }
-                        // One exact native subgroup per guest Wave64 makes the Bool mask's two
-                        // architectural SGPR words available as subgroup-ballot .x/.y. Preserve
-                        // both representations for S_MOV_B64. GTA's BVH loop enters with
-                        // `vcc=exec` and reaches its backedge with VCC rebuilt by v_readlane; this
-                        // materialization gives that mixed-domain join one common scalar form.
-                        if (m && !data_copied && b.is_compute && b.wave_size == 64 &&
-                            b.native_subgroup_size == 64) {
+                        // A fresh entry-site mask may publish its native ballot words. Older saved
+                        // pairs copy retained words; a late ballot cannot recover departed lanes.
+                        if (m && !data_copied && saved_mask_mov_defines_words(b, in, false, true)) {
                             rs.sreg[in.dst.value] = b.native_wave_ballot_half(m, 0);
                             rs.sreg[in.dst.value + 1] = b.native_wave_ballot_half(m, 1);
                             rs.sreg_srt.erase(in.dst.value);
@@ -4295,13 +4295,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     mask_value = rs.vcc; mask_source = true;
                 } else if (in.src[0].kind == OperandKind::SGPR &&
+                           !saved_mask_spill_uses_data(rs, in.src[0].value) &&
                            !(b.is_fragment && b.wave_size == 64 &&
                              (rs.sreg_bool.contains(in.src[0].value) ||
                               (in.src[0].value > 0 &&
                                rs.sreg_bool.contains(in.src[0].value - 1))))) {
                     // A Wave64 fragment V_WRITELANE consumes one physical scalar word, not the
-                    // complete Bool alias rooted at the pair's low SGPR. Let val() materialize that
-                    // exact ballot half lazily below. Other stages retain the mask-slot model.
+                    // complete Bool alias rooted at the pair's low SGPR. val() must consume a
+                    // retained physical word below. Portable stages retain the mask-slot model.
                     auto saved = rs.sreg_bool.find(in.src[0].value);
                     if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
                 }

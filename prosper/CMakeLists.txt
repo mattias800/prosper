@@ -3442,6 +3442,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_scalar_ff1_b32.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_saved_mask_words
+    SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
+    LIBRARIES prosper_core)
+
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.
   prosper_add_gtest(test_entry_vcc_dead
