@@ -100,14 +100,14 @@ std::vector<uint32_t> observe_refused_graphics_compile(const char* stage,
         replay_terminal_reject_reasons(c.program_address, rejects);
         if (!result.empty()) return result;
         if (direct_refusal)
-            c.expected_reject = *direct_refusal;
+            inputs.live_reject = *direct_refusal;
         else if (!rejects.empty())
-            c.expected_reject = rejects.back().first + " " + rejects.back().second;
-        if (c.expected_reject.size() > 256) {
-            c.expected_reject.resize(256);
+            inputs.live_reject = rejects.back().first + " " + rejects.back().second;
+        if (inputs.live_reject.size() > kRefusedGraphicsRejectMaxBytes) {
+            inputs.live_reject.resize(kRefusedGraphicsRejectMaxBytes);
             inputs.incomplete = "live terminal refusal exceeds diagnostic budget";
         }
-        if (c.expected_reject.empty())
+        if (inputs.live_reject.empty())
             inputs.incomplete = "actual terminal refusal was not recorded";
         if (!c.choices.error.empty())
             inputs.incomplete = bounded_capture_failure(c.choices.error.c_str());

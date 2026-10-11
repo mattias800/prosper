@@ -18,7 +18,8 @@
 // rather than through the table. Replay runs under a CompilerResourceScope, so such a read reports
 // itself as INCOMPLETE instead of reading the host process's memory.
 //
-// Graphics schema 2 additionally retains actual compiler selectors/spans/config/choice reads; see
+// Graphics schemas 2/3 additionally retain actual compiler selectors/spans/config/choice reads;
+// schema 3 separates full terminal text from the resource carrier's smaller text ABI. See
 // refused_graphics_inputs.hpp. Compute schema 1 remains byte-compatible.
 //
 // A diagnostic: written only beside a newly dumped refused program, never read by the live path.

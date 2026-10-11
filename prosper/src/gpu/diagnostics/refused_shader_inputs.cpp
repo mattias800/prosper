@@ -221,7 +221,8 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
             "not a refused-shader inputs file");
     In in{bytes, bytes.size() - 8, sizeof kMagic};
     const uint32_t schema = in.num<uint32_t>();
-    if (schema == 2) return decode_refused_graphics_inputs(bytes);
+    if (schema == 2 || schema == kRefusedGraphicsInputsSchema)
+        return decode_refused_graphics_inputs(bytes);
     require(schema == kRefusedShaderInputsSchema, "refused-shader inputs schema");
     RefusedShaderInputs inputs;
     inputs.stage = in.text();

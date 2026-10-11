@@ -124,16 +124,19 @@ void read_arguments(In& in, RefusedGraphicsInputs& g) {
 std::vector<uint8_t> encode(const std::string& stage, const RefusedGraphicsInputs& g) {
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
-    o.num<uint32_t>(2);
+    o.num<uint32_t>(kRefusedGraphicsInputsSchema);
     o.text(stage);
     o.num(g.invocation.program_address);
-    o.text(g.invocation.expected_reject);
+    o.text(g.live_reject.empty() ? g.invocation.expected_reject : g.live_reject);
     o.text(g.incomplete);
     o.num<uint8_t>(g.payload_omitted);
     write_arguments(o, g);
     FragmentCompileCase c = g.invocation;
     c.complete = false;
     c.reason = "refused-graphics-inputs-carrier";
+    // CONFIDENCE: HIGH -- this carrier is only resource/config ownership, never a replayable
+    // fragment case. Its 256-byte text ABI must not truncate the envelope's terminal refusal.
+    c.expected_reject.clear();
     const auto carrier = encode_fragment_compile_case(c);
     o.num<uint32_t>(uint32_t(carrier.size()));
     o.bytes.insert(o.bytes.end(), carrier.begin(), carrier.end());
@@ -195,7 +198,8 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
     require(trailer.num<uint64_t>() == hash(std::span(bytes).first(bytes.size() - 8)),
             "graphics-input checksum");
     In in{std::span(bytes).first(bytes.size() - 8), sizeof kMagic};
-    require(in.num<uint32_t>() == 2, "graphics-input schema");
+    const auto schema = in.num<uint32_t>();
+    require(schema == 2 || schema == kRefusedGraphicsInputsSchema, "graphics-input schema");
     RefusedShaderInputs result;
     result.stage = in.text();
     result.program_address = in.num<uint64_t>();
@@ -212,8 +216,10 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
     require(in.at == in.bytes.size() && !g->invocation.complete,
             "graphics-input trailing data or complete carrier");
     require(g->invocation.program_address == result.program_address &&
-                g->invocation.expected_reject == result.live_reject,
+                (schema == 2 ? g->invocation.expected_reject == result.live_reject
+                             : g->invocation.expected_reject.empty()),
             "graphics-input carrier association");
+    g->live_reject = result.live_reject;
     g->incomplete = result.incomplete;
     g->payload_omitted = result.payload_omitted;
     result.graphics = std::move(g);

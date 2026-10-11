@@ -104,7 +104,7 @@ changes nothing the guest sees (#4700).
   A draw the **owned-wave gate** refuses is kept the same way (#4555). Nothing was recompiled for it, so the `first_bad_*` fields on its index line are only the generic coverage census and do not say why the draw was lost; the line ends in `refusal=<reason>`, which does, and the `[refused-shader]` line in the run log repeats it (#4580). That program is the one to run `shader_inspect --raw-wide-proof` on: the `dropped-draws` alarm files these drops under `shader-recompile/*`, and the first question is whether the program belongs on the owned-wave path at all.
 - `refused_shader_inputs` — beside refused programs the dump writes `<stem>.inputs` (#4808, #4877).
   Compute keeps schema 1: the actual `ComputeShaderConfig`, resolved resource metadata, and bounded
-  constant/vertex-buffer bytes. Graphics schema 2 records the actual direct-vertex, chained-vertex,
+  constant/vertex-buffer bytes. Graphics schema 3 records the actual direct-vertex, chained-vertex,
   fragment or NGG-shell compiler selector, exact input spans, ABI/config/float arguments, semantic
   choice reads and trip settings. The dumped code's association with a longer NGG compiler span is
   explicit. Physical producing GS/VS/PS register values have separate availability masks; they
@@ -120,7 +120,10 @@ changes nothing the guest sees (#4700).
   evidence fail INCOMPLETE, never an empty-string match. Unconsumed physical draw state does not
   invalidate compiler replay. A draw refused before compilation has an explicit unavailable selector;
   it cannot be replayed as a fabricated invocation. Compute schema 1 still requires the run's same
-  compiler-choice environment/trip settings; graphics schema 2 replays its recorded reads. Older
+  compiler-choice environment/trip settings; graphics schemas 2/3 replay their recorded reads.
+  Schema 3 keeps up to 512 bytes of terminal text outside the INCOMPLETE resource/config carrier;
+  its 256-byte text ABI is unchanged. Legacy schema 2 remains readable, and an old truncated
+  refusal stays INCOMPLETE. Longer new terminal text also remains explicitly INCOMPLETE. Older
   dumps have no sidecar. All guest bytes stay beside the private dump, never in the repository.
   A compute program that **recompiled cleanly and was then declined by the live backend** is kept too (#4808), with `refusal=backend-declined:<reason>` (the reason is the first decline's, `unrecorded` when the backend named none, e.g. a lost device). Those declines are the largest skip category, so they fill their own budget (`kBackendDeclinedDumpMaxPrograms`) and cannot use up the slots recompile refusals need, and a repeat is dropped from a per-thread key before the program is read.
 - `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`

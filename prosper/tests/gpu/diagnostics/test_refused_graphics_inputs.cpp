@@ -11,6 +11,8 @@
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -85,6 +87,191 @@ void expect_match(const RefusedShaderInputs& inputs) {
     EXPECT_EQ(replay.reject, inputs.live_reject);
 }
 }   // namespace
+
+// #4913: a complete graphics invocation must not become INCOMPLETE merely because its actual
+// terminal diagnostic is longer than the unrelated resource carrier's 256-byte text ABI.
+namespace {
+std::vector<uint32_t> long_refusal_vertex() {
+    // Project-owned MBCNT fixture: the general mask disqualifies the all-ones lane model.
+    return {0xd7650003u, 0x000100c1u, 0xd7660003u, 0x000206c1u, 0xd7650001u,
+            0x00010004u, 0xd7660001u, 0x00020205u, 0xbf810000u};
+}
+std::vector<uint8_t> read_sidecar_bytes() {
+    std::ifstream file(sidecar(), std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), {}};
+}
+void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
+}
+uint32_t read_u32(const std::vector<uint8_t>& bytes, size_t at) {
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 4; ++i) value |= uint32_t(bytes.at(at + i)) << (8 * i);
+    return value;
+}
+void append_checksum(std::vector<uint8_t>& bytes) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (auto byte : bytes) hash = (hash ^ byte) * 0x100000001b3ull;
+    for (unsigned i = 0; i < 8; ++i) bytes.push_back(uint8_t(hash >> (8 * i)));
+}
+std::vector<uint8_t> with_carrier(std::vector<uint8_t> bytes, const FragmentCompileCase& carrier,
+                                  uint32_t schema, const std::string& reject,
+                                  const std::string& incomplete) {
+    // Serialize a genuine legacy carrier, not a newer file with a changed schema number alone.
+    const std::array<uint8_t, 8> magic{'P', 'R', 'F', 'C', 'A', 'S', 'E', 0};
+    const auto first = std::search(bytes.begin(), bytes.end(), magic.begin(), magic.end());
+    if (first == bytes.end() ||
+        std::search(first + 1, bytes.end(), magic.begin(), magic.end()) != bytes.end())
+        throw std::runtime_error("fixture carrier must be unique");
+    const size_t carrier_length_at = size_t(first - bytes.begin()) - 4;
+    const size_t reject_at = 12 + 4 + read_u32(bytes, 12) + 8;
+    const size_t incomplete_at = reject_at + 4 + read_u32(bytes, reject_at);
+    const size_t arguments_at = incomplete_at + 4 + read_u32(bytes, incomplete_at);
+    std::vector<uint8_t> result(bytes.begin(), bytes.begin() + ptrdiff_t(reject_at));
+    for (unsigned i = 0; i < 4; ++i) result[8 + i] = uint8_t(schema >> (8 * i));
+    append_u32(result, uint32_t(reject.size()));
+    result.insert(result.end(), reject.begin(), reject.end());
+    append_u32(result, uint32_t(incomplete.size()));
+    result.insert(result.end(), incomplete.begin(), incomplete.end());
+    result.insert(result.end(), bytes.begin() + ptrdiff_t(arguments_at),
+                  bytes.begin() + ptrdiff_t(carrier_length_at));
+    const auto encoded = encode_fragment_compile_case(carrier);
+    append_u32(result, uint32_t(encoded.size()));
+    result.insert(result.end(), encoded.begin(), encoded.end());
+    append_checksum(result);
+    return result;
+}
+}   // namespace
+
+TEST(RefusedGraphicsText, ShippingLongTerminalRefusalReplaysExactly) {
+    fresh("refused_graphics_long_terminal");
+    const auto inputs = produce(ShaderProgramStage::Vertex, long_refusal_vertex());
+    ASSERT_TRUE(inputs.graphics);
+    EXPECT_GT(inputs.live_reject.size(), 256u)
+        << "actual compiler text exercises the carrier limit";
+    EXPECT_LE(inputs.live_reject.size(), 512u);
+    EXPECT_NE(inputs.live_reject.find("disqualified-by-general-mask-pc=4"), std::string::npos);
+    EXPECT_NE(inputs.live_reject.find("sext=0/0"), std::string::npos)
+        << "the end of the real diagnostic must survive";
+    EXPECT_TRUE(inputs.incomplete.empty()) << inputs.incomplete;
+    EXPECT_TRUE(inputs.graphics->invocation.expected_reject.empty())
+        << "the incomplete carrier owns resources/config, not terminal comparison";
+    expect_match(inputs);
+    EXPECT_EQ(read_u32(read_sidecar_bytes(), 8), 3u);
+}
+
+TEST(RefusedGraphicsText, LegacySchemaTwoRetainsExactShortComparison) {
+    fresh("refused_graphics_legacy_short");
+    const auto inputs = produce(ShaderProgramStage::Vertex, vertex());
+    ASSERT_TRUE(inputs.graphics);
+    ASSERT_LE(inputs.live_reject.size(), 256u);
+    auto carrier = inputs.graphics->invocation;
+    carrier.expected_reject = inputs.live_reject;
+    const auto bytes = with_carrier(read_sidecar_bytes(), carrier, 2, inputs.live_reject, "");
+    const auto legacy = decode_refused_shader_inputs(bytes);
+    EXPECT_EQ(legacy.live_reject, inputs.live_reject);
+    const auto replay = replay_refused_shader_inputs(vertex(), legacy);
+    EXPECT_TRUE(replay.incomplete.empty());
+    EXPECT_EQ(replay.reject, legacy.live_reject);
+}
+
+TEST(RefusedGraphicsText, LegacyTruncatedTerminalRemainsIncomplete) {
+    fresh("refused_graphics_legacy_truncated");
+    const auto inputs = produce(ShaderProgramStage::Vertex, long_refusal_vertex());
+    ASSERT_TRUE(inputs.graphics);
+    const auto truncated = inputs.live_reject.substr(0, 256);
+    auto carrier = inputs.graphics->invocation;
+    carrier.expected_reject = truncated;
+    const auto bytes = with_carrier(read_sidecar_bytes(), carrier, 2, truncated,
+                                    "live terminal refusal exceeds diagnostic budget");
+    const auto legacy = decode_refused_shader_inputs(bytes);
+    EXPECT_EQ(legacy.live_reject, truncated);
+    const auto replay = replay_refused_shader_inputs(long_refusal_vertex(), legacy);
+    EXPECT_EQ(replay.incomplete, "live terminal refusal exceeds diagnostic budget");
+    EXPECT_FALSE(replay.produced);
+    EXPECT_TRUE(replay.reject.empty());
+}
+
+TEST(RefusedGraphicsText, NewSchemaRejectsConflictingCarrierTerminal) {
+    fresh("refused_graphics_conflicting_terminal");
+    const auto inputs = produce(ShaderProgramStage::Vertex, vertex());
+    ASSERT_TRUE(inputs.graphics);
+    auto carrier = inputs.graphics->invocation;
+    carrier.expected_reject = "different terminal";
+    const auto bytes = with_carrier(read_sidecar_bytes(), carrier, 3, inputs.live_reject, "");
+    EXPECT_THROW(decode_refused_shader_inputs(bytes), std::runtime_error);
+}
+
+TEST(RefusedGraphicsText, LegacySchemaRejectsMismatchedCarrierTerminal) {
+    fresh("refused_graphics_legacy_mismatch");
+    const auto inputs = produce(ShaderProgramStage::Vertex, vertex());
+    ASSERT_TRUE(inputs.graphics);
+    auto carrier = inputs.graphics->invocation;
+    carrier.expected_reject = "different terminal";
+    const auto bytes = with_carrier(read_sidecar_bytes(), carrier, 2, inputs.live_reject, "");
+    EXPECT_THROW(decode_refused_shader_inputs(bytes), std::runtime_error);
+}
+
+TEST(RefusedGraphicsText, TerminalEnvelopeHasAReal512ByteBoundary) {
+    const auto root = fresh("refused_graphics_terminal_boundary");
+    RefusedGraphicsInputs inputs;
+    inputs.selector = RefusedGraphicsCompiler::Vertex;
+    inputs.raw = vertex();
+    inputs.invocation.code = inputs.raw;
+    inputs.invocation.expected_reject.assign(512, 'x');
+    const auto path = root / "boundary.inputs";
+    ASSERT_TRUE(write_refused_graphics_inputs(path, "vs", inputs));
+    const auto decoded = read_refused_shader_inputs(path);
+    EXPECT_EQ(decoded.live_reject, inputs.invocation.expected_reject);
+    EXPECT_TRUE(decoded.graphics->invocation.expected_reject.empty());
+    inputs.invocation.expected_reject.push_back('y');
+    const auto oversized = root / "oversized.inputs";
+    EXPECT_FALSE(write_refused_graphics_inputs(oversized, "vs", inputs));
+    EXPECT_FALSE(fs::exists(oversized));
+}
+
+TEST(RefusedGraphicsText, OversizedProducingRefusalIsExplicitlyIncompleteAndCalledOnce) {
+    fresh("refused_graphics_terminal_overflow");
+    const auto code = vertex();
+    const auto analysis = acquire_shader_analysis(code.data(), code.size());
+    ASSERT_TRUE(analysis);
+    const RefusedShaderSource source{{analysis, &analysis->code}, &analysis->refused_shader_memo};
+    RefusedGraphicsInputs inputs;
+    inputs.selector = RefusedGraphicsCompiler::Vertex;
+    inputs.invocation.program_address = uint64_t(uintptr_t(code.data()));
+    inputs.invocation.code = code;
+    unsigned calls = 0;
+    const std::string reason(513, 'x');
+    const auto result = observe_refused_graphics_compile(
+        "vs", source, inputs, nullptr,
+        [&] {
+            ++calls;
+            return std::vector<uint32_t>{};
+        },
+        &reason);
+    EXPECT_TRUE(result.empty());
+    EXPECT_EQ(calls, 1u);
+    ASSERT_FALSE(sidecar().empty());
+    const auto decoded = read_refused_shader_inputs(sidecar());
+    EXPECT_EQ(decoded.live_reject, reason.substr(0, 512));
+    EXPECT_EQ(decoded.incomplete, "live terminal refusal exceeds diagnostic budget");
+    const auto replay = replay_refused_shader_inputs(vertex(), decoded);
+    EXPECT_FALSE(replay.produced);
+    EXPECT_FALSE(replay.incomplete.empty());
+}
+
+TEST(RefusedGraphicsText, TruncatedWireAndUnknownSchemaNeverBecomeReplayInputs) {
+    fresh("refused_graphics_terminal_wire");
+    produce(ShaderProgramStage::Vertex, long_refusal_vertex());
+    auto bytes = read_sidecar_bytes();
+    ASSERT_GT(bytes.size(), 20u);
+    bytes.pop_back();
+    EXPECT_THROW(decode_refused_shader_inputs(bytes), std::runtime_error);
+    bytes = read_sidecar_bytes();
+    bytes[8] = 4;
+    bytes.resize(bytes.size() - 8);
+    append_checksum(bytes);
+    EXPECT_THROW(decode_refused_shader_inputs(bytes), std::runtime_error);
+}
 
 TEST(RefusedGraphicsInputs, ShippingVertexCompilerKeepsActualSourceAndConfig) {
     fresh("refused_graphics_vertex");

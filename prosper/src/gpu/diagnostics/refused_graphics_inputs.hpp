@@ -5,11 +5,16 @@
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
 
 namespace prosper::gpu {
+// Schema 3 keeps terminal text in the diagnostic envelope, independently of the bounded
+// INCOMPLETE resource carrier. Legacy schema 2 and compute schema 1 remain readable.
+inline constexpr uint32_t kRefusedGraphicsInputsSchema = 3;
+inline constexpr size_t kRefusedGraphicsRejectMaxBytes = 512;
 struct GpuState;
 struct RefusedShaderInputs;
 struct RefusedShaderReplay;
@@ -47,6 +52,7 @@ struct RefusedGraphicsInputs {
     RefusedGraphicsLaunch launch;
     bool payload_omitted = false;
     std::string incomplete;
+    std::string live_reject;
 };
 
 // Scope owns no register copies. Only a cold compiler attempt reads the producing state while it
