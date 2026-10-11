@@ -97,7 +97,8 @@ bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in) {
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
-                                                     const std::set<int>& scalar_words) {
+                                                     const std::set<int>& scalar_words,
+                                                     bool definite_scc) {
     const auto& defined = state.defined_slots;
     const auto& relayed = state.relayed_words;
     const auto vector_any = [&](const std::set<int>& marked) {
@@ -112,8 +113,12 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     const bool load = in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
                       in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
                       in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::DS;
-    bool vector_relay = (!load || in.fmt == Rdna2Format::DS) &&
-                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in));
+    // An absent incoming SCC has no MAY relay entry yet. Use the pre-instruction MUST fact,
+    // so a numeric copy or lane selector cannot become genuine merely at a later CFG edge.
+    const bool missing_scc = !load && scalar_reads_scc(in) && !definite_scc;
+    bool vector_relay =
+        missing_scc || ((!load || in.fmt == Rdna2Format::DS) &&
+                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
     bool memory =
         load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
     // An ordinary absent SGPR's VALU data spelling is fabricated even before a READLANE has
@@ -136,13 +141,14 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     // relays unless it reads a constant-lane slot in `defined`; any other scalar write relays when
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
-    const bool relays = readlane
-                            ? state.lane_written_vgprs.contains(in.src[0].value) &&
-                                      !(constant_lane(in) &&
-                                        defined.contains({in.src[0].value, in.src[1].value})) ||
-                                  (!state.lane_written_vgprs.contains(in.src[0].value) &&
-                                   vector_any(state.relayed_vectors))
-                            : reads_relayed_word(relayed, in) || vector_any(state.relayed_vectors);
+    const bool relays =
+        missing_scc || reads_relayed_word(relayed, in) ||
+        (readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
+                            !(constant_lane(in) &&
+                              defined.contains({in.src[0].value, in.src[1].value})) ||
+                        (!state.lane_written_vgprs.contains(in.src[0].value) &&
+                         vector_any(state.relayed_vectors))
+                  : vector_any(state.relayed_vectors));
     if (readlane && constant_lane(in) && state.lane_written_vgprs.contains(in.src[0].value))
         memory = state.memory_slots.contains({in.src[0].value, in.src[1].value});
     return {vector_relay, relays, memory};

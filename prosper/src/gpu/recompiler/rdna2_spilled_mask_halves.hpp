@@ -62,7 +62,8 @@ struct SpilledVectorSourceMarks {
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
-                                                     const std::set<int>& scalar_words);
+                                                     const std::set<int>& scalar_words,
+                                                     bool definite_scc);
 
 // CFG join: keep only the facts every incoming path agrees on (`relayed_words`, a MAY fact, takes
 // every path's).

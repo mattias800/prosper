@@ -685,3 +685,125 @@ TEST(NativeCfgSavedMaskData, AnUnrelatedMarkedMovePreservesGenuineSccAcrossAnEdg
     p.insert(compare + 1, mov(17, 14));
     current_scc_values(p);
 }
+
+namespace {
+// Lane selection consumes the current numeric selector independently of the selected DATA word.
+std::vector<uint32_t> lane_selector_across_edge(bool all_paths, bool replacement = false) {
+    auto p = explicit_scc_relay_program(SccRelay::IndexedLaneRead, all_paths, replacement);
+    const auto cmp = std::find(p.begin(), p.end(), 0x7d840010u);
+    p.insert(cmp, {0xbf880001u, 0x7e040281u});
+    return p;
+}
+std::vector<uint32_t> lane_selector_sgpr_program(bool all_paths, bool edge,
+                                                 bool replacement = false) {
+    auto p = explicit_scc_relay_program(SccRelay::IndexedLaneRead, all_paths);
+    const size_t at = std::find(p.begin(), p.end(), 0xd7600010u) - p.begin();
+    p[at + 1] = 256u | (17u << 9u);
+    p.insert(p.begin() + at, mov(17, 253));
+    if (replacement) p.insert(p.begin() + at + 1, mov(17, 128));
+    if (edge) {
+        const auto cmp = std::find(p.begin(), p.end(), 0x7d840010u);
+        p.insert(cmp, {0xbf880001u, 0x7e040281u});
+    }
+    return p;
+}
+std::vector<uint32_t> lane_selector_initial_or_write_program(unsigned mode) {
+    std::vector<uint32_t> p;
+    if (mode < 2) {
+        const auto old = lane_selector_across_edge(false);
+        const auto read = std::find(old.begin(), old.end(), 0xd7600010u);
+        p.push_back(0x7e020280u);
+        if (mode == 1) p.push_back(0xbf068004u);
+        p.insert(p.end(), read, old.end());
+    } else {
+        p = explicit_scc_relay_program(SccRelay::IndexedLaneRead, mode == 3);
+        const size_t at = std::find(p.begin(), p.end(), 0xd7600010u) - p.begin();
+        p[at + 1] = 277u | (128u << 9u);
+        // v21 starts as a genuine ordinary vector; the dynamic write replaces one peer.
+        std::vector<uint32_t> setup{mov(17, 253), 0x7e2a0280u, 0xd7610015u, 129u | (17u << 9u)};
+        if (mode == 4) setup.push_back(0x7e2a0280u);   // full EXEC still holds: replace every peer
+        p.insert(p.begin() + at, setup.begin(), setup.end());
+    }
+    return p;
+}
+void lane_selector_refuses(const std::vector<uint32_t>& p, unsigned pc) {
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        auto c = config();
+        c.user_sgprs[4] = path;
+        TerminalRejectCapture capture;
+        EXPECT_TRUE(recompile_compute(p.data(), p.size(), &resources, c).empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=" + std::to_string(pc) + " "), std::string::npos) << reason;
+    }
+}
+void lane_selector_values(const std::vector<uint32_t>& p, unsigned first, unsigned second) {
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        auto c = config();
+        c.user_sgprs[4] = path;
+        const auto module = recompile_compute(p.data(), p.size(), &resources, c);
+        ASSERT_FALSE(module.empty());
+        ASSERT_TRUE(has_op(module, 251));
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.push_constants = c.user_sgprs;
+        const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(out[lane], uint32_t(lane == (path ? second : first)))
+                << "path " << path << " lane " << lane;
+    }
+}
+}   // namespace
+TEST(NativeCfgSavedMaskData, MissingSccSelectorCannotAuthenticateFreshMaskAcrossAnEdge) {
+    lane_selector_refuses(lane_selector_across_edge(false), 16);
+}
+TEST(NativeCfgSavedMaskData, AllPathSccSelectorKeepsActualValueAcrossAnEdge) {
+    lane_selector_values(lane_selector_across_edge(true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, CurrentResultReplacementEndsMissingSelectorBeforeAnEdge) {
+    lane_selector_values(lane_selector_across_edge(false, true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, CurrentSccProducerEndsMissingSelectorBeforeAnEdge) {
+    auto p = lane_selector_across_edge(false);
+    const auto old = std::find(p.begin(), p.end(), 0xbf06800eu);
+    p.insert(old + 1, 0xbf068004u);
+    lane_selector_values(p, 1, 0);
+}
+TEST(NativeCfgSavedMaskData, MissingSgprSelectorCannotAuthenticateFreshMaskWithinTheCase) {
+    lane_selector_refuses(lane_selector_sgpr_program(false, false), 15);
+}
+TEST(NativeCfgSavedMaskData, MissingSgprSelectorCannotAuthenticateFreshMaskAcrossAnEdge) {
+    lane_selector_refuses(lane_selector_sgpr_program(false, true), 17);
+}
+TEST(NativeCfgSavedMaskData, AllPathSgprSelectorKeepsActualValueWithinTheCase) {
+    lane_selector_values(lane_selector_sgpr_program(true, false), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, AllPathSgprSelectorKeepsActualValueAcrossAnEdge) {
+    lane_selector_values(lane_selector_sgpr_program(true, true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, CurrentSelectorReplacementEndsMissingGenerationWithinTheCase) {
+    lane_selector_values(lane_selector_sgpr_program(false, false, true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, CurrentSelectorReplacementEndsMissingGenerationAcrossAnEdge) {
+    lane_selector_values(lane_selector_sgpr_program(false, true, true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, MissingInitialSccCannotAuthenticateFreshMaskAfterLaneReadAndEdge) {
+    lane_selector_refuses(lane_selector_initial_or_write_program(0), 5);
+}
+TEST(NativeCfgSavedMaskData, GenuineInitialSccKeepsActualValueAfterLaneReadAndEdge) {
+    lane_selector_values(lane_selector_initial_or_write_program(1), 1, 0);
+}
+TEST(NativeCfgSavedMaskData, MissingDynamicWriteSelectorCannotAuthenticateFreshMask) {
+    lane_selector_refuses(lane_selector_initial_or_write_program(2), 18);
+}
+TEST(NativeCfgSavedMaskData, GenuineDynamicWriteSelectorKeepsActualValue) {
+    lane_selector_values(lane_selector_initial_or_write_program(3), 1, 1);
+}
+TEST(NativeCfgSavedMaskData, FullVectorReplacementEndsMissingDynamicWriteSelectorGeneration) {
+    lane_selector_values(lane_selector_initial_or_write_program(4), 0, 0);
+}

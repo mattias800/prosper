@@ -2093,12 +2093,13 @@ bool emit_cfg_state_machine(
                                             SpilledMaskHalves& halves,
                                             SpillSlotDomains& slot_domains, bool& scalar_scc,
                                             const Rdna2Inst& in, bool record_compare) {
-            const auto relay_sources = spilled_vector_source_marks(halves, in, masks, scalar_words);
+            const bool definite_scc = scalar_scc && !halves.relayed_words.contains(kRelayedScc);
+            const auto relay_sources =
+                spilled_vector_source_marks(halves, in, masks, scalar_words, definite_scc);
             // Storage presence excludes neither a missing spill arm nor its scalar relays.
             const auto definite_word = [&](int word) {
                 return scalar_words.contains(word) && !halves.relayed_words.contains(word);
             };
-            const bool definite_scc = scalar_scc && !halves.relayed_words.contains(kRelayedScc);
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
                     case OperandKind::InlineInt:

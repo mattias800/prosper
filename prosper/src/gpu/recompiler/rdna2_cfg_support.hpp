@@ -1615,6 +1615,11 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         marks.blanket_roots.clear();
     }
     if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
+        // A dynamic selector is a numeric input too. Its storage value does not prove which
+        // peer a READLANE consumes or which peer a WRITELANE replaces.
+        if (in.src[1].kind == OperandKind::SGPR ||
+            (in.src[1].kind == OperandKind::Special && in.src[1].value <= 124))
+            word(in.src[1].value);
         if (!lane_read && (in.src[0].kind == OperandKind::SGPR ||
                            (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124))) {
             word(in.src[0].value);   // v_writelane's data word
