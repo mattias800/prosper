@@ -1,6 +1,7 @@
 // test_recompile_coverage — recompile_coverage() reports per-instruction recompiler support without
 // requiring a complete vertex/fragment. Pure (no Vulkan), so it runs in CI. It also drives the
 // data-driven coverage report over the real game shaders (shader_histo).
+#include "../fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -519,6 +520,7 @@ int main() {
     smem_x2_descriptor_fragment_config.threads_x = 64;
     smem_x2_descriptor_fragment_config.wave_size = 64;
     smem_x2_descriptor_fragment_config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(smem_x2_descriptor_fragment_config);
     smem_x2_descriptor_fragment_config.user_sgprs.resize(28);
     const std::vector<uint32_t> smem_x2_descriptor_fragment_spv = recompile_compute(
         smem_x2_descriptor_fragment, std::size(smem_x2_descriptor_fragment),
@@ -941,6 +943,7 @@ int main() {
     x16_wave64_config.threads_x = 64;
     x16_wave64_config.wave_size = 64;
     x16_wave64_config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(x16_wave64_config);
     x16_wave64_config.user_sgprs.resize(20);
     const auto x16_wave64_spv = recompile_compute(
         x16_wave_mask_lifetime.data(), x16_wave_mask_lifetime.size(),
@@ -1942,6 +1945,7 @@ int main() {
     ComputeShaderConfig wave64_dispatch_config = wave32_dispatch_config;
     wave64_dispatch_config.wave_size = 64;
     wave64_dispatch_config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(wave64_dispatch_config);
     std::vector<uint32_t> compute_cfg_dispatch_ff1_b64 = {
         0x7E0202A8u,              // v_mov_b32 v1, 40
         0x7D8402F9u, 0x06069000u, // v_cmp_eq_u32_sdwa s[16:17], v0, v1
@@ -2407,9 +2411,14 @@ int main() {
     compute_cfg_dispatch_live_mixed_vcc_pair.insert(
         compute_cfg_dispatch_live_mixed_vcc_pair.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    // The scalar branch consumes actual launch DATA s8. A resource-table descriptor spelling
+    // alone does not supply that scalar SSA word or certify the entry branch condition.
+    ComputeShaderConfig mixed_vcc_entry_config = wave64_dispatch_config;
+    mixed_vcc_entry_config.user_sgprs.resize(12);
     CHECK(!recompile_compute(compute_cfg_dispatch_live_mixed_vcc_pair.data(),
                              compute_cfg_dispatch_live_mixed_vcc_pair.size(), &dispatch_rt,
-                             wave64_dispatch_config).empty(),
+                             mixed_vcc_entry_config)
+               .empty(),
           "GTA's exact mixed VCC join reaches pc1467 through native ballot words");
     std::vector<uint32_t> compute_cfg_dispatch_unmaterialized_vcc_pair =
         compute_cfg_dispatch_live_mixed_vcc_pair;
@@ -2417,7 +2426,8 @@ int main() {
         0xBEEA0A7Eu;                         // same producer: WQM retains only the mask view
     CHECK(recompile_compute(compute_cfg_dispatch_unmaterialized_vcc_pair.data(),
                             compute_cfg_dispatch_unmaterialized_vcc_pair.size(), &dispatch_rt,
-                            wave64_dispatch_config).empty(),
+                            mixed_vcc_entry_config)
+              .empty(),
           "the mixed VCC join rejects when its entry producer lacks scalar ballot words");
 
     // The next site in exec_cs_205b5e8600 joins early exits that retain scalar EXEC ballot words

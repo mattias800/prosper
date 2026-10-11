@@ -2583,9 +2583,11 @@ if(TARGET prosper_core)
   # A Wave64 compute program's scalar-pair projection refuses a fabricated-zero word (#4714).
   prosper_add_gtest(test_compute_scalar_pair_mask
     SOURCES tests/gpu/recompiler/test_compute_scalar_pair_mask.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_compare_kill
     SOURCES tests/gpu/recompiler/test_fragment_compare_kill.cpp
@@ -3497,11 +3499,11 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_native_logical_words
     SOURCES tests/gpu/recompiler/test_native_logical_words.cpp
-    INCLUDES src tests/gpu/recompiler
+    INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_native_cndmask_demand
     SOURCES tests/gpu/recompiler/test_native_cndmask_demand.cpp
-    INCLUDES src tests/gpu/recompiler
+    INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_native_saved_vcc_copy_demand
     SOURCES tests/gpu/recompiler/test_native_saved_vcc_copy_demand.cpp
@@ -3519,8 +3521,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fragment_logical_bool_copy.cpp
     INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_compute_launch
+    SOURCES tests/gpu/recompiler/test_native_compute_launch.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_portable_mask_half
     SOURCES tests/gpu/recompiler/test_portable_mask_half.cpp

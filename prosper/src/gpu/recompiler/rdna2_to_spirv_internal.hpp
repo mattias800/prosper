@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -689,6 +690,13 @@ struct SpirvCompute {
     bool native_logical_uniform_launch = false;
     // Checked original dispatch words prove complete guest groups, independently of host routing.
     bool guest_compute_complete_groups = false;
+    // Actual ordinary-compute dispatch profile, separate from host routing uniformity.
+    // Legacy/NGG/standalone builders retain unknown raw launch words by default.
+    ComputeDispatchLaunchProfile guest_compute_launch;
+    ComputeDispatchLaunchProfile saved_mask_original_compute_launch;
+    bool saved_mask_original_fragment_entry = false;
+    bool native_compute_physical_entry_expired = false;
+    std::set<uint32_t> native_uniform_exec_mov_pcs;
     bool structured_wave64_mask_reduction_analysis_done = false;
     std::unordered_set<uint32_t> structured_wave64_mask_reduction_pcs;
     // Exact Wave64 mask spills retain a Bool view in vgpr_lane_mask_slots. When a CFG MUST proof

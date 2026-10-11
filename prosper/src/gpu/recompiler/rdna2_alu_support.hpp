@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
@@ -452,6 +453,11 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             const bool reads_vcc = o.value == 106 || o.value == 107;
             const bool reads_exec = o.value == 126 || o.value == 127;
             const uint32_t mask = reads_vcc ? rs.vcc : reads_exec ? rs.exec : 0;
+            // Host width alone does not authenticate guest entry lanes. Keep ordinary native64
+            // scalar fallback under the same raw original-launch premise as producer retention.
+            if (mask && b.is_compute && !b.is_fragment && b.wave_size == 64 &&
+                b.native_subgroup_size == 64 && !saved_mask_physical_launch_matches_original(b))
+                return refuse_unavailable_saved_mask_word(b, in, ok);
             if (mask && b.native_subgroup_size && b.native_subgroup_size == b.wave_size) {
                 const uint32_t half =
                     b.native_wave_ballot_half(mask,

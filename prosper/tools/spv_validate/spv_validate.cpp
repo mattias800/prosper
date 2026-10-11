@@ -63,6 +63,7 @@
 #include "../../tests/fixtures/readlane_barrier.hpp"
 #include "../../tests/fixtures/portable_entry_exec.hpp"
 #include "../../tests/fixtures/native_mask_participation.hpp"
+#include "../../tests/fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1929,6 +1930,7 @@ int main(int argc, char** argv) {
       vb.num_components=4; rt.resources.push_back(vb);
       ComputeShaderConfig cfg; cfg.local_x=64; cfg.wave_size=64;
       cfg.native_subgroup_size=64;
+      prosper::test::complete_compute_launch(cfg);
       dump(dir, "compute_wave64_logical_ballot",
            recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
     // #4892: complete native DATA logicals retain both physical words without result ballots.

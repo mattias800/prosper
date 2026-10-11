@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include <bitset>
@@ -428,9 +429,10 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
 }
 
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
-                                                   const std::vector<Rdna2Inst>& original) {
-    if (!b.native_logical_uniform_launch || b.ngg_workgroup_shell || !b.is_compute ||
-        b.native_subgroup_size != 64 || b.wave_size != 64)
+                                                   const std::vector<Rdna2Inst>& original,
+                                                   const RegState* initial) {
+    if (!native_compute_has_complete_entry(b) || !b.native_logical_uniform_launch ||
+        b.ngg_workgroup_shell || !b.is_compute || b.native_subgroup_size != 64 || b.wave_size != 64)
         return;
     uint32_t reentry = UINT32_MAX;
     std::set<uint32_t> pcs;
@@ -445,6 +447,7 @@ void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
             return;
         if (target <= in.pc) reentry = std::min(reentry, static_cast<uint32_t>(target));
     }
+    bool genuine_mov_entry = b.local_count == 64 && initial && !initial->exec_narrowed;
     for (const auto& in : original) {
         if (in.pc >= reentry || in.is_end || in.fmt == Rdna2Format::EXP ||
             (rdna2_instruction_may_change_exec(in) && !exec_write_sets_full_mask(in)))
@@ -462,15 +465,26 @@ void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
                 break;
         }
         if (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeSetregB32) break;
+        genuine_mov_entry &= native_uniform_mov_entry_sources(initial, in);
         // Every preceding host case/selection is reached by either the entire launch workgroup
         // or none of it: each guest branch condition is proved launch-uniform by the shared
         // closed provenance walk. No initial partial/outer gate, reentry or EXEC mutation can
         // enter this prefix. This is not an SCC-spelling or subgroup-width assumption.
         if (is_native_b64_logical(b, in)) b.native_logical_uniform_entry_pcs.insert(in.pc);
+        // Only canonical current EXEC is admitted here. Unlike the old Special-destination
+        // bypass, this conditional producer requires genuine launch DATA for every preceding
+        // scalar read, in addition to the original scalar-uniform control proof above.
+        if (genuine_mov_entry && in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+            in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
+            in.dst.kind == OperandKind::SGPR &&
+            ((in.dst.value >= 0 && in.dst.value <= 104) || in.dst.value == 106 ||
+             in.dst.value == 126))
+            b.native_uniform_exec_mov_pcs.insert(in.pc);
     }
 }
 
 bool native_logical_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in) {
+    if (!saved_mask_physical_launch_matches_original(b)) return false;
     if (saved_mask_producer_has_full_participation(b, in)) return true;
     if (!b.native_logical_uniform_entry_pcs.contains(in.pc) ||
         in.pc >= b.saved_mask_original_words.size())

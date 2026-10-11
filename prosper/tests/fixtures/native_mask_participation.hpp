@@ -1,6 +1,7 @@
 // Project-owned complete Wave64 programs: current physical mask words vary at each loop epoch.
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "checked_compute_launch.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
 #include <array>
@@ -233,6 +234,7 @@ inline ComputeShaderConfig config() {
     result.wave_size = result.native_subgroup_size = 64;
     result.tgid_x_en = true;
     result.user_sgprs.resize(12);
+    prosper::test::complete_compute_launch(result, trips.size());
     return result;
 }
 inline uint64_t address() {

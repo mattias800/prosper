@@ -1,6 +1,7 @@
 // #4787: fabricated scalar words must not become genuine lane-mask bits after a VGPR hop.
 // These independent instruction streams exercise actual fragment/compute compilation; positive
 // controls retain real words and complete overwrites. No entry authority or lane selection is added.
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -74,6 +75,7 @@ Words compile(Stage stage, const Words& body) {
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(config);
     Words module = recompile_compute(code.data(), code.size(), &table, config,
                                      {RecompileDiagnosticStage::Compute, address});
     terminal_reason = last_terminal_reject_reason(address);

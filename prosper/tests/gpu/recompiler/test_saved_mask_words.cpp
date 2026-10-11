@@ -1,6 +1,7 @@
 // #4781: a saved Wave64 mask's untouched physical word must survive a partial overwrite.
 // Taking a ballot at a later copy/reload loses lanes that have already left that dynamic region.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -37,6 +38,10 @@ struct Emitter {
             b.native_subgroup_size = 64;
             b.begin(64);
             b.is_compute = true;
+            ComputeShaderConfig launch;
+            launch.local_x = launch.wave_size = launch.native_subgroup_size = 64;
+            prosper::test::complete_compute_launch(launch);
+            prosper::test::bind_checked_compute_launch(b, launch);
         }
         rs.exec = b.btrue();
         rs.vcc = b.btrue();

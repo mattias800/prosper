@@ -39,7 +39,8 @@ void execute(fixture::Options options = {}) {
     item.user_sgprs = fixture::config().user_sgprs;
     item.recompile_config_available = true;
     item.recompile_config = fixture::config();
-    item.launch.local_x = item.launch.threads_x = 64;
+    item.launch.local_x = 64;
+    item.launch.threads_x = fixture::config().threads_x;
     item.launch.local_y = item.launch.local_z = item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.groups_x = fixture::trips.size();
     item.launch.groups_y = item.launch.groups_z = 1;
