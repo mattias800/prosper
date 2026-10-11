@@ -99,6 +99,29 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
         if (source.kind == OperandKind::InlineInt) return inline_int_mask_bit(b, source.value);
         return 0;
     };
+    if (ordinary_portable_wave64_masks(b) && source.kind == OperandKind::SGPR) {
+        // CONFIDENCE: HIGH -- ordinary compute retains the guest lane identity without a ballot.
+        // Current numeric words take precedence over a competing older Bool spelling. Both must
+        // exist in the current scalar file and pass its provenance guard; an entry-time input or
+        // the ordinary absent-word-as-zero spelling cannot restore an overwritten saved pair.
+        const bool low = rs.sreg.contains(source.value), high = rs.sreg.contains(source.value + 1);
+        if (low && high) {
+            if (const auto mask = scalar_pair_lane_bit(b, rs, source)) {
+                rs.exec = mask;
+                rs.exec_narrowed = true;
+                return true;
+            }
+        } else if (!low && !high && !rs.sreg_bool_b32.contains(source.value) && src_mask()) {
+            // An unchanged complete Bool save/restore needs neither physical words nor a vote.
+            rs.exec = src_mask();
+            const auto narrowed = rs.sreg_bool_narrowed.find(source.value);
+            rs.exec_narrowed = narrowed == rs.sreg_bool_narrowed.end() || narrowed->second;
+            return true;
+        }
+        b.stage_reject_pc = in.pc;
+        b.stage_reject_reason = "portable-exec-mask-source-words-unavailable";
+        return false;
+    }
     if (b.is_fragment_packet() && b.wave_size == 64 && source.kind == OperandKind::SGPR) {
         // Dispatcher reloads retain only MUST-reaching numeric words. The packet entry and
         // resource services publish current values in sreg; do NOT resurrect an entry-time
