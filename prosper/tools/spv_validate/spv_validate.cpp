@@ -55,6 +55,7 @@
 #include "../../tests/fixtures/compute_array_gather.hpp"
 #include "../../tests/fixtures/saveexec_m0.hpp"
 #include "../../tests/fixtures/uint_d16_store.hpp"
+#include "../../tests/fixtures/graphics_empty_sbuffer.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1354,6 +1355,16 @@ int main(int argc, char** argv) {
           0xbf810000u};
       dump(dir, "compute_scalar_ff1_b32", recompile_valu(c, std::size(c), 0, 0)); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
+    // #4901: an exact folded empty V# yields constant scalar results in both graphics stages,
+    // including the widest scalar load, without declaring a dummy storage binding.
+    for (const bool pixel : {false, true}) {
+        namespace empty = prosper::test::graphics_empty_sbuffer;
+        const auto code = empty::program(pixel, 0xcu);
+        const auto table = empty::folded_resources(code);
+        dump(dir, pixel ? "fragment_empty_scalar_buffer_x16" : "vertex_empty_scalar_buffer_x16",
+             pixel ? recompile_fragment(code.data(), code.size(), &table)
+                   : recompile_vertex(code.data(), code.size(), &table));
+    }
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
     // Compute + immediate SMEM x16 descriptor bundle. Both eight-dword halves are independently

@@ -4237,6 +4237,11 @@ endif()
     SOURCES tests/gpu/agc/test_scalar_buffer_bounds.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_graphics_empty_sbuffer
+    SOURCES tests/gpu/agc/test_graphics_empty_sbuffer.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   # GPU descriptor-bound INVARIANT guard (agc_shader_layout.cpp decode_image/buffer_descriptor): the
   # entire guest-input memory-safety argument relies on width/height <= 16384, depth <= 8192, and V#
   # size_bytes clamped to 32 bits. Pins those exact ceilings so a mask-widening / +1-bias refactor fails

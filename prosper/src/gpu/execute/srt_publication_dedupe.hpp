@@ -1,8 +1,8 @@
 // srt_publication_dedupe.hpp -- which descriptor-table uses build_stage_table publishes (#294, #273).
 //
 // A KEYED constant-buffer use is published once per key: its consumers resolve through the
-// resource's srt_offset. Textures, key-less buffers and exact MTBUF uses are published once per
-// CONSUMING INSTRUCTION, because they resolve by fetch_pc. A keyed buffer use whose key CLASHES with
+// resource's srt_offset. Textures, key-less buffers, empty-buffer markers and exact MTBUF uses are
+// published once per CONSUMING INSTRUCTION, because they resolve by fetch_pc. A keyed buffer use whose key CLASHES with
 // a resource already holding it is published key-less, so it too resolves only by fetch_pc -- and
 // from then on that key must be deduplicated per instruction, or every consumer after the first is
 // left with no entry and refused as unresolved-cbuf (Kena's title pixel shader: one V#, two scalar
@@ -24,6 +24,7 @@ public:
     bool admit(const SrtUse& u) {
         const bool exact_mtbuf = u.kind == 1 && u.instruction_format != UINT32_MAX;
         const bool per_pc = u.kind == 0 || u.key == 0xFFFFFFFFu || exact_mtbuf ||
+                            (u.kind == 1 && u.zero_record_raw) ||
                             (u.kind == 1 && clashed_cbuf_keys_.count(u.key) != 0);
         // Distinct namespaces: pc identities must never collide with byte-offset keys.
         const uint64_t identity =

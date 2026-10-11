@@ -17,6 +17,7 @@
 #include "gpu/execute/native_graphics_source_lineage.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
 #include "gpu/execute/srt_publication_dedupe.hpp"
+#include "gpu/execute/empty_scalar_buffer.hpp"
 #include "gpu/execute/scalar_buffer_bounds.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
@@ -6687,11 +6688,11 @@ std::vector<SrtUse> add_compute_buffer_resources(
                 continue;
             const Rdna2Inst marker_consumer =
                 rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
-            if (marker_consumer.fmt == Rdna2Format::SMEM &&
-                !sbuffer_access_is_fully_oob(marker_consumer, d,
-                                             u.scalar_oob_offset_known,
-                                             u.scalar_oob_byte_offset))
+            if (marker_consumer.fmt == Rdna2Format::SMEM) {
+                if (auto marker = empty_scalar_buffer_resource(u, code, dwords))
+                    table.resources.push_back(*marker);
                 continue;
+            }
             if (marker_consumer.fmt == Rdna2Format::MUBUF && marker_consumer.opcode <= 0x3u &&
                 !zero_record_format_selectors_are_zero(marker_consumer, u.v4.data()))
                 continue;
@@ -7701,6 +7702,12 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
                     continue;
                 }
                 if (u.kind == 1) {                       // constant buffer / structured-buffer V#
+                    // A genuine folded empty scalar load needs its exact-PC zero proof even when
+                    // the live V# has no backing address. Normalized null reflection is not proof.
+                    if (auto marker = empty_scalar_buffer_resource(u, code, shader_dwords)) {
+                        t.resources.push_back(*marker);
+                        continue;
+                    }
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                     if (u.instruction_format != UINT32_MAX &&
                         ((u.v4[3] >> 12) & 0x7Fu) == 0)
