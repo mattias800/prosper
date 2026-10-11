@@ -184,7 +184,8 @@ bool saved_mask_logical_defines_words(const SpirvCompute& b, const Rdna2Inst& in
                                                      source.value == 126 || source.value == 127));
         if (!supported) return false;
     }
-    return scalar_sources || saved_mask_producer_has_full_participation(b, in);
+    return native_logical_data_demanded(b, in) &&
+           (scalar_sources || native_logical_producer_has_full_participation(b, in));
 }
 
 void retire_saved_mask_facts(const SpirvCompute& b, std::set<int>& masks, std::set<int>& ambiguous,
@@ -244,6 +245,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
             has_prior_partial_control(b)) {
             b.saved_mask_entry_prefix_pcs.clear();
             b.saved_mask_reconverged_entry_pcs.clear();
+            b.native_logical_uniform_entry_pcs.clear();
         }
         return;
     }
@@ -252,6 +254,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     b.saved_mask_original_words.assign(code, code + dwords);
     std::vector<Rdna2Inst> original;
     rdna2_walk(code, dwords, original);
+    initialize_native_logical_data_demand(b, original);
     // Physical reads and partial replacements require retained words. Mask-only saves keep their
     // existing subgroup-width contract; a shader which never observes DATA needs no new ballot.
     std::set<int> demanded;
@@ -304,6 +307,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     if (ins.size() != original.size()) return;
     for (size_t i = 0; i < ins.size(); ++i)
         if (!same_original_instruction(ins[i], original[i])) return;
+    initialize_native_logical_uniform_entry_proof(b, original);
     b.saved_mask_reconverged_entry_pcs = reconverged_entry_pcs(original);
     if (b.saved_mask_reconverged_entry_pcs.empty()) return;
     // CONFIDENCE: HIGH -- a ballot observes participating invocations (Vulkan subgroup contract).

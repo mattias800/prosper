@@ -2,6 +2,7 @@
 // Execute the production integer words independently; partial and marked mask-only sources stay DATA gaps.
 #include "bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include <gtest/gtest.h>
 
 namespace prosper::gpu {
@@ -38,8 +39,10 @@ struct Emitter {
     SpirvCompute b;
     RegState rs;
     Emitter() {
-        b.native_subgroup_size = 64;
+        // The oracle models exactly one 64-lane workgroup; use its LocalInvocationIndex
+        // input envelope, then select native lowering for the production operation.
         b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
+        b.native_subgroup_size = 64;
         rs.exec = b.btrue();
         rs.vcc = b.bfalse();
         rs.absent_sgpr_reads_fabricated_zero = true;
@@ -228,7 +231,7 @@ TEST(NativeLogicalWords, OlderInputMapCannotRepairACurrentMaskOnlyPair) {
 
 TEST(NativeLogicalWords, OriginalPrefixProofMayCaptureMaskOnlyResultAtItsProducer) {
     Emitter e;
-    const std::vector<uint32_t> code{logical(0x0f, 20, 126, 193), end};
+    const std::vector<uint32_t> code{logical(0x0f, 20, 126, 193), 0xbe9e0314u, end};
     e.prove(code);
     ASSERT_TRUE(e.emit(e.instruction(code)));
     EXPECT_TRUE(e.rs.sreg.contains(20) && e.rs.sreg.contains(21));
@@ -278,6 +281,184 @@ TEST(NativeLogicalWords, DispatcherMaskOnlyVccCannotReloadPlaceholderData) {
     rdna2_walk(code.data(), code.size(), ins);
     EXPECT_FALSE(emit_cfg_state_machine(e.b, e.rs, ins, {}, nullptr, true, false, {}, code.data(),
                                         code.size(), e.b.btrue()));
+}
+
+namespace {
+bool dispatcher(Emitter& e, const std::vector<uint32_t>& code) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    return emit_cfg_state_machine(e.b, e.rs, ins, {}, nullptr, true, false, {}, code.data(),
+                                  code.size(), e.b.btrue());
+}
+}   // namespace
+
+TEST(NativeLogicalWords, DispatcherMarkedPeerStillAcceptsBoolOnlyConsumption) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    ASSERT_TRUE(dispatcher(e, {logical(0x0f), 0xbf800000u, logical(0x11, 22, 20, 2), end}));
+}
+
+TEST(NativeLogicalWords, DispatcherMarkedPeerRejectsCrossCaseDataBeforePublication) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf800000u, 0xbe9e0314u, end}));
+    EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, FullOverwriteKillsOnlyTheOldLogicalDataDemand) {
+    Emitter e;
+    e.no_data(0);
+    ASSERT_TRUE(dispatcher(e, {logical(0x0f), 0xbe940381u, 0xbe950382u, 0xbe9e0314u, end}));
+}
+
+TEST(NativeLogicalWords, OneWordOverwriteCannotKillTheOtherLogicalDataDemand) {
+    Emitter e;
+    e.no_data(0);
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbe950382u, 0xbe9e0314u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, APreviousScalarReadDoesNotDemandALaterBoolOnlyGeneration) {
+    Emitter e;
+    e.rs.sreg[20] = e.b.uconst(42);
+    e.no_data(0);
+    ASSERT_TRUE(dispatcher(e, {0xbe9e0314u, logical(0x0f), end}));
+}
+
+TEST(NativeLogicalWords, CopyChainCarriesDataDemandBackToItsExactLogicalProducer) {
+    Emitter e;
+    e.no_data(0);
+    // s_mov_b64 s[22:23],s[20:21]; s_mov_b32 s30,s23 observes the copied high word.
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbe960414u, 0xbe9e0317u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, EitherBranchMayDemandTheCurrentLogicalWords) {
+    Emitter e;
+    e.no_data(0);
+    // Both targets are retained; the data consumer on the fallthrough cannot be hidden by the
+    // other arm's complete overwrite. No scalar SCC condition is assumed at the producer.
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbf840002u, 0xbe9e0314u, 0xbf820002u,
+                                0xbe940381u, 0xbe950382u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, ConditionalMoveDoesNotDefinitelyKillCurrentLogicalWords) {
+    Emitter e;
+    e.no_data(0);
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbe940580u, 0xbe9e0314u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, LaunchUniformConditionalProducerCapturesBothPhysicalWords) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
+                                     0xbe9e0314u, end};
+    e.prove(code);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    ASSERT_TRUE(e.emit(ins[2]));
+    EXPECT_TRUE(e.rs.sreg.contains(20) && e.rs.sreg.contains(21));
+    EXPECT_EQ(ballots(e.b), 2u);
+}
+
+TEST(NativeLogicalWords, VectorDerivedAndOverwrittenLaunchConditionsDoNotProveParticipation) {
+    for (uint32_t replacement : {0x7e100500u, 0xbe88037eu}) {
+        Emitter e;
+        const std::vector<uint32_t> code{
+            replacement, 0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193), 0xbe9e0314u, end};
+        e.prove(code);
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        EXPECT_FALSE(e.emit(ins[3]));
+        EXPECT_EQ(ballots(e.b), 0u);
+    }
+}
+
+TEST(NativeLogicalWords, UnprovedVccConditionalProducerCannotCaptureWords) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbf860001u, logical(0x0f, 20, 126, 193), 0xbe9e0314u, end};
+    e.prove(code);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    EXPECT_FALSE(e.emit(ins[1]));
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeLogicalWords, PartialLaunchCannotInheritUniformConditionalParticipation) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
+                                     0xbe9e0314u, end};
+    e.prove(code, true);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    EXPECT_FALSE(e.emit(ins[2]));
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeLogicalWords, ReentryCannotReuseAnEntryUniformProducerBallot) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
+                                     0xbe9e0314u, 0xbf82fffcu, end};
+    e.prove(code);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    EXPECT_FALSE(e.emit(ins[2]));
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeLogicalWords, OuterHostSelectionCannotInheritUniformConditionalParticipation) {
+    Emitter e;
+    const uint32_t inside = e.b.id(), merge = e.b.id();
+    e.b.emit_selmerge(merge);
+    e.b.emit_condbranch(e.b.ucmp(Op_ULessThan, e.b.linear_localid, e.b.uconst(8)), inside, merge);
+    e.b.emit_label(inside);
+    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
+                                     0xbe9e0314u, end};
+    e.prove(code);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    EXPECT_FALSE(e.emit(ins[2]));
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeLogicalWords, SlicedUniformRegionCannotInventOriginalEntryParticipation) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
+                                     0xbe9e0314u, end};
+    e.prove(code, false, true);
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    EXPECT_FALSE(e.emit(ins[2]));
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeLogicalWords, ChangedOrTruncatedBytesCannotReuseCachedUniformParticipation) {
+    const std::vector<uint32_t> original{0xbf068008u, 0xbf840002u, logical(0x0f, 20, 126, 255),
+                                         0x55555555u, 0xbe9e0314u, end};
+    for (int change = 0; change < 3; ++change) {
+        Emitter e;
+        e.prove(original);
+        auto code = original;
+        if (change == 0) code[3] ^= 0x100u;   // same instruction PC, different literal value
+        if (change == 1) code[0] = 0x7e100500u;   // earlier instruction identity changes
+        if (change == 2) code.resize(3);   // truncated producer has no literal carrier
+        e.prove(code);
+        auto in = e.instruction({original[2], original[3]});
+        in.pc = 2;
+        // Even an unchanged query of the old producer cannot revive an invalidated program proof.
+        EXPECT_FALSE(e.emit(in));
+        EXPECT_EQ(ballots(e.b), 0u);
+    }
+}
+
+TEST(NativeLogicalWords, LoopSuccessorRetainsDemandOnTheCurrentLogicalGeneration) {
+    Emitter e;
+    e.no_data(0);
+    EXPECT_FALSE(
+        dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbf840001u, 0xbf82fffdu, 0xbe9e0314u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
 }
 
 TEST(NativeLogicalWords, PortableComputeRetainsItsSeparateMaskOnlyContract) {

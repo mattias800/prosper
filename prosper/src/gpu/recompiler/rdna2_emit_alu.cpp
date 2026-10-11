@@ -2124,6 +2124,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                            : in.opcode == 0x1b ? b.land(n0, n1)      // nor
                            : b.logical_not(x);                        // xnor
                 const auto words = native_logical_result_words(b, rs, in, r);
+                if (native_logical_data_demanded(b, in) && (!words[0] || !words[1])) {
+                    b.stage_reject_pc = in.pc;
+                    b.stage_reject_reason = "native-logical-data-words-unavailable";
+                    ok = false;
+                    return true;
+                }
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
                 else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
                                                                        mask_write_clobbers_pair(rs, in.dst.value); }
