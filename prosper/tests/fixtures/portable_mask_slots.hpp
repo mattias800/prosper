@@ -73,6 +73,21 @@ inline std::vector<uint32_t> loop_slots(bool conflicting_role) {
     portable_mask_half::sink(code);
     return code;
 }
+inline std::vector<uint32_t> special_destination(uint32_t destination, bool readlane) {
+    using portable_mask_half::mov;
+    auto code = program(false, true);
+    code.resize(11);
+    const bool high = destination == 127 || destination == 107;
+    code.push_back(mov(126, high ? 128 : 193, true));
+    if (destination < 126) code.push_back(mov(106, high ? 128 : 193, true));
+    if (readlane)
+        reload(code, destination, high ? 1 : 0);
+    else
+        code.push_back(mov(destination, high ? 21 : 20));
+    code.insert(code.end(), {0x7e060289u, mov(126, 193, true), 0xe0702000u, 0x80020300u,
+                             portable_mask_half::end});
+    return code;
+}
 struct Attempt {
     std::vector<uint32_t> module;
     std::string refusal;

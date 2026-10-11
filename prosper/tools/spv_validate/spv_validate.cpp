@@ -2045,6 +2045,34 @@ int main(int argc, char** argv) {
         const auto name = "portable_symbolic_mask_slots_" + std::to_string(shape);
         dump(dir, name.c_str(), fixture::compile(code, shape == 4).module);
     }
+    // The ordinary symbolic publication boundary includes encoded scalar word105; numeric
+    // immediate EXEC writes retain their existing architectural lowering.
+    for (uint32_t shape = 0; shape < 3; ++shape) {
+        namespace fixture = prosper::test::portable_mask_slots;
+        namespace base = prosper::test::portable_mask_half;
+        auto code = fixture::program(false, true);
+        if (shape == 0) {
+            code.resize(11);
+            code.insert(code.end(), {base::mov(104, 20), base::mov(105, 21)});
+            base::sink(code, 104);
+        } else if (shape == 1) {
+            code.resize(7);
+            fixture::reload(code, 104, 0);
+            fixture::reload(code, 105, 1);
+            base::sink(code, 104);
+        } else {
+            code = {0x7e060280u,
+                    base::mov(126, 193, true),
+                    base::mov(126, 128),
+                    0x7e060289u,
+                    base::mov(126, 193, true),
+                    0xe0702000u,
+                    0x80020300u,
+                    base::end};
+        }
+        const auto name = "portable_mask_half_destination_boundary_" + std::to_string(shape);
+        dump(dir, name.c_str(), fixture::compile(code).module);
+    }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
     for (uint32_t shape = 0; shape < 6; ++shape) {

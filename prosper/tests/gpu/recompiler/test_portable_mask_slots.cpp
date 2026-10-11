@@ -69,6 +69,56 @@ TEST(PortableMaskSlots, NamedSlotNumbersDoNotDetermineHalfIdentity) {
 TEST(PortableMaskSlots, ScalarCopiesKeepBothHalfGenerations) {
     expect_values(f::program(false, true, false, 0, 1, true), 0xffffffff00000000ull);
 }
+TEST(PortableMaskSlots, OrdinaryCopyDestinationsIncludeTheLastScalarWord) {
+    auto code = f::program(false, true);
+    code.resize(11);
+    code.insert(code.end(), {base::mov(104, 20), base::mov(105, 21)});
+    base::sink(code, 104);
+    expect_values(code, 0xffffffff00000000ull);
+}
+TEST(PortableMaskSlots, OrdinaryReadlaneDestinationsIncludeTheLastScalarWord) {
+    auto code = f::program(false, true);
+    code.resize(7);
+    f::reload(code, 104, 0);
+    f::reload(code, 105, 1);
+    base::sink(code, 104);
+    expect_values(code, 0xffffffff00000000ull);
+}
+TEST(PortableMaskSlots, NumericImmediateExecHalfWriteKeepsItsExistingDomain) {
+    std::vector<uint32_t> code{0x7e060280u,
+                               base::mov(126, 193, true),
+                               base::mov(126, 128),
+                               0x7e060289u,
+                               base::mov(126, 193, true),
+                               0xe0702000u,
+                               0x80020300u,
+                               base::end};
+    expect_values(code, 0xffffffff00000000ull);
+}
+TEST(PortableMaskSlots, SymbolicCopyCannotPublishExecLow) {
+    expect_refusal(f::special_destination(126, false), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicCopyCannotPublishExecHigh) {
+    expect_refusal(f::special_destination(127, false), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicCopyCannotPublishVccLow) {
+    expect_refusal(f::special_destination(106, false), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicCopyCannotPublishVccHigh) {
+    expect_refusal(f::special_destination(107, false), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicReadlaneCannotPublishExecLow) {
+    expect_refusal(f::special_destination(126, true), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicReadlaneCannotPublishExecHigh) {
+    expect_refusal(f::special_destination(127, true), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicReadlaneCannotPublishVccLow) {
+    expect_refusal(f::special_destination(106, true), "portable-mask-half-special-destination");
+}
+TEST(PortableMaskSlots, SymbolicReadlaneCannotPublishVccHigh) {
+    expect_refusal(f::special_destination(107, true), "portable-mask-half-special-destination");
+}
 TEST(PortableMaskSlots, CountedPostludeKeepsBothHalfGenerations) {
     expect_values(f::program(false, true, false, 0, 1, false, true), 0xffffffff00000000ull);
 }

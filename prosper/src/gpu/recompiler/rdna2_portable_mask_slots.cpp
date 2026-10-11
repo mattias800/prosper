@@ -56,6 +56,14 @@ bool mask_consumer(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOP2 &&
            (in.opcode == 0x0b || (in.opcode >= 0x0f && in.opcode <= 0x1b && (in.opcode & 1u)));
 }
+bool ordinary_half_destination(const Rdna2Inst& in) {
+    // SOP1 encodes special destinations as SGPRs; READLANE keeps the VOP3 VGPR kind even
+    // though its destination is scalar. Neither spelling authorizes EXEC/VCC publication.
+    if (in.dst.value < 0 || in.dst.value > 105) return false;
+    return (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
+            in.dst.kind == OperandKind::SGPR) ||
+           (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 && in.dst.kind == OperandKind::VGPR);
+}
 void kill_word(Types& types, int word, bool conditional) {
     types.words.erase(word);
     types.numeric_words.erase(word);
@@ -97,6 +105,7 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
         }
     }
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 && static_lane(in)) {
+        if (!ordinary_half_destination(in)) return;
         const Slot key{in.src[0].value, in.src[1].value};
         if (old.may_slots.contains(key)) types.may_words.insert(in.dst.value);
         if (const auto found = old.slots.find(key); found != old.slots.end())
@@ -104,7 +113,7 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
         return;
     }
     if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
-        in.src[0].kind == OperandKind::SGPR) {
+        in.src[0].kind == OperandKind::SGPR && ordinary_half_destination(in)) {
         if (old.may_words.contains(in.src[0].value)) types.may_words.insert(in.dst.value);
         if (const auto found = old.words.find(in.src[0].value); found != old.words.end())
             types.words[in.dst.value] = found->second;
@@ -314,11 +323,16 @@ PortableMaskHalfInstruction::PortableMaskHalfInstruction(SpirvCompute& b, RegSta
         return;
     }
     auto publish_word = [&](int dst, uint32_t predicate) {
+        if (!ordinary_half_destination(in)) {
+            reject("portable-mask-half-special-destination");
+            return false;
+        }
         rs.sreg.erase(dst);
         rs.sreg_srt.erase(dst);
         rs.sreg_bool[dst] = predicate;
         rs.sreg_bool_narrowed[dst] = true;
         rs.sreg_bool_b32.erase(dst);
+        return true;
     };
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 && static_lane(in)) {
         const Slot key{in.src[0].value, in.src[1].value};
@@ -338,7 +352,7 @@ PortableMaskHalfInstruction::PortableMaskHalfInstruction(SpirvCompute& b, RegSta
                 reject("portable-mask-half-slot-unavailable");
                 return;
             }
-            publish_word(in.dst.value, vgpr->second.at(key.second));
+            if (!publish_word(in.dst.value, vgpr->second.at(key.second))) return;
             handled_ = true;
             return;
         }
@@ -352,7 +366,7 @@ PortableMaskHalfInstruction::PortableMaskHalfInstruction(SpirvCompute& b, RegSta
             return;
         }
         const uint32_t value = source->second;
-        publish_word(in.dst.value, value);
+        if (!publish_word(in.dst.value, value)) return;
         handled_ = true;
         return;
     }
