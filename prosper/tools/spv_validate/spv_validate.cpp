@@ -51,6 +51,7 @@
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "../../tests/fixtures/native_uint_3d.hpp"
+#include "../../tests/fixtures/fragment_compare_kill.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1658,6 +1659,13 @@ int main(int argc, char** argv) {
       // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
       const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
       dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
+    // A fresh explicit compare retires a dead low-word mask domain at a Wave32 join.
+    for (bool unrelated_vector : {false, true}) {
+        const auto code = prosper::test::fragment_compare_kill::program(unrelated_vector);
+        dump(dir,
+             unrelated_vector ? "fragment_compare_low_kill_vector" : "fragment_compare_low_kill",
+             recompile_fragment_wave32_for_test(code.data(), code.size()));
+    }
     // Dimension-specific native unsigned volumes retain the exact typed storage contract.
     for (const auto& format : prosper::test::native_uint_3d::formats) {
         namespace fixture = prosper::test::native_uint_3d;

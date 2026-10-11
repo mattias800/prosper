@@ -81,13 +81,13 @@ struct ScalarMergeBlocker {
     const char* kind = "none";
 };
 
-inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
-                               ScalarMergeProof proof = ScalarMergeProof::AnyRead,
-                               ScalarMergeBlocker* blocker = nullptr,
-                               // A non-cmpx VOPC with an explicit SGPR destination (the e64 form)
-                               // overwrites the whole 64-bit pair, so it redefines both words. Off
-                               // by default: other callers keep the older, more conservative walk.
-                               bool vopc_sgpr_pair_kills = false) {
+inline bool
+sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
+                   ScalarMergeProof proof = ScalarMergeProof::AnyRead,
+                   ScalarMergeBlocker* blocker = nullptr,
+                   // Explicit compare HIGH-word kills require the caller's pair-width
+                   // proof. A Wave32 compare always replaces LOW but can leave HIGH live.
+                   bool vopc_sgpr_pair_kills = false) {
     const auto block = [&](const Rdna2Inst& at, const char* kind) {
         if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
         return false;
@@ -237,6 +237,14 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 // block whose vcc scratch-write hardware would have skipped.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
+                    continue;
+                // CONFIDENCE: HIGH. RDNA2 ISA 3.9/6.8: a non-CMPX explicit compare
+                // replaces its complete low mask word, writing zero for EXEC-off lanes.
+                // SDWAB has no partial destination selection. Check sources first: a
+                // compare may read its own old scalar destination. Keep HIGH conservative.
+                if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+                    in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 105 &&
+                    R == in.dst.value)
                     continue;
                 if (vopc_sgpr_pair_kills && in.fmt == Rdna2Format::VOPC &&
                     !vopc_is_cmpx(in.opcode) && in.dst.kind == OperandKind::SGPR &&

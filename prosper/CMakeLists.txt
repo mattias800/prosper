@@ -2554,6 +2554,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_compare_kill
+    SOURCES tests/gpu/recompiler/test_fragment_compare_kill.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
