@@ -393,7 +393,10 @@ TEST(NativeComputeLaunch, GenuineLaunchScalarSelectionRetainsCurrentExecMovWords
     Emitter e;
     const auto code = conditional_mov_program();
     e.prove(code);
-    const auto in = decode(code)[3];
+    const auto instructions = decode(code);
+    ASSERT_EQ(instructions.size(), code.size());
+    const auto in = instructions[3];
+    ASSERT_EQ(in.pc, 3u);
     EXPECT_FALSE(saved_mask_producer_has_full_participation(e.b, in));
     EXPECT_TRUE(saved_mask_mov_defines_words(e.b, in, false, true));
     ASSERT_TRUE(e.body(code));
@@ -481,14 +484,31 @@ TEST(NativeComputeLaunch, ConditionalMovCannotReuseAlteredOrRecursiveInstruction
 }
 TEST(NativeComputeLaunch, ConditionalMovCannotUsePartialOuterOrReenteredBody) {
     for (int control = 0; control < 4; ++control) {
+        SCOPED_TRACE(control);
         Emitter e;
         auto code = conditional_mov_program();
         if (control == 1) e.b.invocation_guard_merge = 1;
         if (control == 2) code.insert(code.end() - 1, 0xbf82fffcu);   // edge reenters branch at2
         if (control == 3) code.insert(code.begin(), end);
         e.prove(code, control == 0 ? e.b.btrue() : 0);
-        EXPECT_FALSE(
-            saved_mask_mov_defines_words(e.b, decode(code)[control == 3 ? 4 : 3], false, true));
+        const auto instructions = decode(code);
+        Rdna2Inst candidate;
+        if (control == 3) {
+            ASSERT_EQ(instructions.size(), 1u);
+            ASSERT_TRUE(instructions.front().is_end);
+            // The walk stops at END; inspect the actual unreachable MOV without extending
+            // that prefix or granting the dead instruction any participation authority.
+            constexpr uint32_t pc = 4;
+            ASSERT_LT(pc, code.size());
+            candidate = rdna2_decode_one(code.data() + pc, code.size() - pc);
+            candidate.pc = pc;
+        } else {
+            ASSERT_GT(instructions.size(), 3u);
+            candidate = instructions[3];
+        }
+        ASSERT_EQ(candidate.words[0], mov(106, 126, true));
+        ASSERT_EQ(candidate.pc, control == 3 ? 4u : 3u);
+        EXPECT_FALSE(saved_mask_mov_defines_words(e.b, candidate, false, true));
     }
 }
 TEST(NativeComputeLaunch, SpecialDestinationMovCannotBypassUnknownEntry) {
