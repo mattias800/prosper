@@ -3456,6 +3456,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_descriptor_if_merge.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_literal_b64_mask
+    SOURCES tests/gpu/recompiler/test_literal_b64_mask.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_wave64_vop3_b32_vcc_read
     SOURCES tests/gpu/recompiler/test_wave64_vop3_b32_vcc_read.cpp
     LIBRARIES prosper_core)

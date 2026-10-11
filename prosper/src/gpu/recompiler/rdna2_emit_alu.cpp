@@ -2025,8 +2025,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // divergent control flow / ballot. SCC=(result!=0) is a cross-lane reduction we can't
                 // form per-lane — POISON rs.scc so a later consumer rejects instead of silently
                 // reading an older s_cmp's value (the adjacent scc-branch shapes are claimed by the
-                // mask_test/waterfall linearizers and never read rs.scc). Same mask-resolution as
-                // s_cselect_b64.
+                // mask_test/waterfall linearizers and never read rs.scc).
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto mask = [&](const Operand& o) -> uint32_t {
                     if ((o.value == 106 || o.value == 107) && rs.vcc) return rs.vcc;
@@ -2035,9 +2034,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (it != rs.sreg_bool.end()) return it->second; }
                     if (o.kind == OperandKind::InlineInt)
                         return inline_int_mask_bit(b, o.value);
-                    // An ordinary scalar pair projected onto this lane's bit (rdna2_alu_support.hpp).
+                    if (o.kind == OperandKind::Literal && in.has_literal)
+                        return constant_mask_bit(b, in.literal, 0u);
                     if (const uint32_t bit = scalar_pair_lane_bit(b, rs, o)) return bit;
-                    // Name WHICH representation is missing. A wave-mask op that cannot resolve
+                    // Name the missing representation. A wave-mask op that cannot resolve
                     // an operand rejects the whole shader, and the reject line downstream says
                     // only `mode=unresolved-operand` -- which cannot distinguish these states,
                     // and they point at different places to look:

@@ -53,28 +53,30 @@ const char* packet_b64_mask_move_source_gap(const SpirvCompute& b, const Rdna2In
                                             const std::set<int>& scalar_words,
                                             const std::set<int>& ambiguous);
 
-// A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
-// belonging to this emulated hardware lane without ever issuing an undefined >=32 SPIR-V shift.
-// Astro's reduction tails use 15, 3, and 1 for the final 4/2/1 active lanes.
-inline uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
-    if (value == -1) return b.btrue();
-    if (value == 0) return b.bfalse();
+// Project a known B64 constant onto this emulated lane; shifts never exceed 31.
+inline uint32_t constant_mask_bit(SpirvCompute& b, uint32_t lo, uint32_t hi) {
+    if (lo == UINT32_MAX && hi == UINT32_MAX) return b.btrue();
+    if (lo == 0 && hi == 0) return b.bfalse();
     // A Vulkan vertex invocation is the single guest lane retained by the NGG approximation. It is
     // lane zero, so an inline B64 mask contributes exactly its low bit; vertex modules do not declare
     // LocalInvocationIndex, and trying to use that compute-only ID emitted invalid SPIR-V ID zero.
-    if (b.ngg_one_lane)
-        return (static_cast<uint32_t>(value) & 1u) ? b.btrue() : b.bfalse();
+    if (b.ngg_one_lane) return (lo & 1u) ? b.btrue() : b.bfalse();
     if (b.is_vertex) return 0; // an ordinary VS has no proven lane identity for a partial wave mask
     const uint32_t lane_id = b.is_fragment ? b.subgroup_local_id() : b.linear_localid;
     const uint32_t lane = b.ibin(Op_BitwiseAnd, lane_id,
                                   b.uconst(b.wave_size - 1));
     const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
     const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
-    const uint32_t word = b.sel(high, b.uconst(value < 0 ? UINT32_MAX : 0u),
-                                b.uconst(static_cast<uint32_t>(value)));
+    const uint32_t word = b.sel(high, b.uconst(hi), b.uconst(lo));
     return b.ucmp(Op_INotEqual,
         b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
         b.uconst(0));
+}
+
+// CONFIDENCE: HIGH -- inline signed integers extend their sign to B64, while decoded literal
+// dwords for b64 operands zero-extend (AMD LLVM Operand Syntax, Integer Value Conversion).
+inline uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
+    return constant_mask_bit(b, static_cast<uint32_t>(value), value < 0 ? UINT32_MAX : 0u);
 }
 
 // V_MBCNT_HI positions its 32-bit S0 at lanes 32..63 (ISA ops 869/870: HI tests S0 bit i against

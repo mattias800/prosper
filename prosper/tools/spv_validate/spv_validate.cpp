@@ -1833,6 +1833,42 @@ int main(int argc, char** argv) {
       cfg.native_subgroup_size=64;
       dump(dir, "compute_wave64_logical_ballot",
            recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
+    // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
+    // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
+    for (uint32_t shape = 0; shape < 6; ++shape) {
+        SpirvCompute b;
+        if (shape < 3) {
+            b.native_subgroup_size = shape == 1 ? 64u : 0u;
+            b.begin(4u, nullptr, 128u, 1u, 1u, shape == 2 ? 32u : 64u, 0u, true, true);
+        } else if (shape == 3) {
+            b.wave_size = 64u;
+            b.begin_fragment();
+        } else {
+            b.begin_vertex();
+            b.ngg_one_lane = shape == 4;
+        }
+        const uint32_t words[]{0x87eaff7eu, shape == 5 ? 0u : 0x800000ffu};
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(words, std::size(words), ins);
+        RegState state;
+        state.exec = b.btrue();
+        state.vcc = b.bfalse();
+        bool ok = ins.size() == 1;
+        if (ok) ok = emit_alu(b, state, ins[0], ok, true) && ok;
+        std::vector<uint32_t> module;
+        if (ok) {
+            const uint32_t value = b.sel(state.vcc, b.uconst(0x3f800000u), b.uconst(0u));
+            if (b.is_compute)
+                b.store_output_word(value, 1u, 0u);
+            else if (b.is_fragment)
+                b.export_color(0u, value, value, value, b.uconst(0x3f800000u));
+            else
+                b.export_position(value, value, value, b.uconst(0x3f800000u));
+            module = b.finish();
+        }
+        const std::string name = "literal_b64_mask_" + std::to_string(shape);
+        dump(dir, name.c_str(), module);
+    }
     // Ordinary e64 integer-pair comparisons (unsigned then signed), separate from mask provenance.
     { const uint32_t c[] = {0xd4e4006au,0x00010000u,0xd4a4006au,0x00010000u,
                             0xbf810000u};
