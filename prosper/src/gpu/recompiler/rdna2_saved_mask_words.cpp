@@ -57,6 +57,10 @@ bool numeric_pair_source(const Rdna2Inst& in) {
            (in.opcode & 1u) == 0;
 }
 
+bool generation_needs_words(const SpirvCompute& b, const Rdna2Inst& in, int root) {
+    return b.saved_mask_word_roots.contains(root) && !fragment_saved_mask_is_bool_only(b, in, root);
+}
+
 std::set<uint32_t> reconverged_entry_pcs(const std::vector<Rdna2Inst>& ins) {
     if (ins.empty()) return {};
     const size_t exit = ins.size();
@@ -165,7 +169,7 @@ bool validate_saved_mask_copy_words(SpirvCompute& b, const RegState& rs, const R
 
 bool saved_mask_write_retains_words(const SpirvCompute& b, const Rdna2Inst& in, int root) {
     return root >= 0 && root <= 104 && saved_mask_producer_has_full_participation(b, in) &&
-           b.saved_mask_word_roots.contains(root) &&
+           generation_needs_words(b, in, root) &&
            !(in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
              in.src[0].kind == OperandKind::SGPR);
 }
@@ -411,7 +415,7 @@ void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in)
     for_each_scalar_write(in, [&](int root, uint32_t width) {
         if (width != 2 || root < 0 || root > 104 || rs.sreg_bool_b32.contains(root) ||
             !rs.sreg_bool.contains(root) || !scalar_write_is_b64_mask(in, root) ||
-            !b.saved_mask_word_roots.contains(root))
+            !generation_needs_words(b, in, root))
             return;
         if (definite_word(rs, root) && definite_word(rs, root + 1)) return;
         // A saved SGPR Bool may describe lanes which no longer execute this copy. Only its

@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
@@ -161,6 +162,7 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     using Words = std::bitset<128>;
     b.native_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_vcc_copy_pcs.clear();
+    b.fragment_bool_only_saved_mask_pcs.clear();
     b.native_vcc_copy_entry_domain = copy_entry_domain(b);
     b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
     b.native_vcc_copy_entry_b32_masks =
@@ -419,13 +421,23 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
                 pending.push_back(previous);
             }
     }
-    for (size_t i = 0; i < count; ++i)
+    for (size_t i = 0; i < count; ++i) {
+        // CONFIDENCE: HIGH -- this reuses the same original CFG's backward MAY DATA liveness
+        // and instruction-order MUST mask domains. It withholds representation only; it grants
+        // neither physical words nor a new mask fact. Unknown footprints already read all words.
+        if (fragment_copy_domain(b) && reachable[i] && !(after[i] & kills[i]).any())
+            for_each_scalar_write(original[i], [&](int root, uint32_t width) {
+                if (width == 2 && root >= 0 && root <= 104 && masks_after[i].test(root) &&
+                    scalar_write_is_b64_mask(original[i], root))
+                    b.fragment_bool_only_saved_mask_pcs.insert(original[i].pc);
+            });
         if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any())
             b.native_logical_data_demand_pcs.insert(original[i].pc);
         else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             b.native_bool_only_vcc_copy_pcs.insert(original[i].pc);
         else if (fragment_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             b.fragment_bool_only_vcc_copy_pcs.insert(original[i].pc);
+    }
 }
 
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
@@ -522,6 +534,18 @@ bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in) {
         (fragment_vcc_copy(b, in) && b.fragment_bool_only_vcc_copy_pcs.contains(in.pc));
     if (!proved_copy || b.native_vcc_copy_entry_domain != copy_entry_domain(b) ||
         in.pc >= b.saved_mask_original_words.size())
+        return false;
+    auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
+                                     b.saved_mask_original_words.size() - in.pc);
+    original.pc = in.pc;
+    return !in.synthetic_terminator && in == original;
+}
+
+bool fragment_saved_mask_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in, int root) {
+    if (!fragment_copy_domain(b) || root < 0 || root > 104 ||
+        !b.fragment_bool_only_saved_mask_pcs.contains(in.pc) ||
+        !native_vcc_copy_execution_domain_matches(b) ||
+        in.pc >= b.saved_mask_original_words.size() || !scalar_write_is_b64_mask(in, root))
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
                                      b.saved_mask_original_words.size() - in.pc);

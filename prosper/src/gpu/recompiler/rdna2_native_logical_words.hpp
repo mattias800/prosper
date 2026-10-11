@@ -19,6 +19,7 @@ bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in);
 bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial);
 bool native_vcc_copy_execution_domain_matches(const SpirvCompute& b);
 bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in);
+bool fragment_saved_mask_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in, int root);
 std::array<uint32_t, 2> native_logical_result_words(SpirvCompute& b, const RegState& rs,
                                                     const Rdna2Inst& in, uint32_t result_mask);
 void record_native_logical_word_gaps(const SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
