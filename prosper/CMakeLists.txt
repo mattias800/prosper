@@ -3566,6 +3566,10 @@ if(TARGET prosper_core)
   target_include_directories(test_dynfetch_fold PRIVATE tests)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+  prosper_add_gtest(test_guarded_store_launch
+    SOURCES tests/gpu/recompiler/test_guarded_store_launch.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   add_executable(test_raw_register_wide_data tests/gpu/recompiler/test_raw_register_wide_data.cpp)
   target_link_libraries(test_raw_register_wide_data PRIVATE prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)

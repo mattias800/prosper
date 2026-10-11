@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <array>
@@ -34,6 +35,9 @@ guarded_raw_store_config(std::span<const uint32_t> user_sgprs) {
     config.wave_size = 64u;
     config.native_subgroup_size = 64u;
     config.tidig_comp_cnt = 0u;
+    // This fixture declares one complete group. Native width and normalized dimensions alone
+    // cannot establish entry participation for the physical mask-word consumers at PC46.
+    complete_compute_launch(config);
     return config;
 }
 
