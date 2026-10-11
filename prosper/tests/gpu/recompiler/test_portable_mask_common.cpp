@@ -1,5 +1,10 @@
 // #4935: CFG votes/reductions bypass emit_alu. Compare the actual public compiler's modules,
 // not storage membership: a zero LOW plus nonzero HIGH is a nonzero B64 source.
+#include "fixtures/portable_mask_half.hpp"
+#include "fixtures/portable_mask_slots.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <algorithm>
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/portable_mask_common.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"

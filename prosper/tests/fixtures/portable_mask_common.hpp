@@ -1,6 +1,10 @@
 #pragma once
 // Project-owned common-phase observations. LOW/HIGH payloads retain their actual producers;
 // scalar votes, bit indices and prefix counts must not use a lone LOW carrier as a whole mask.
+#include "portable_mask_half.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include <atomic>
 #include "portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>

@@ -1,5 +1,6 @@
 // #4935: dispatcher services must consume the same per-word authority as emit_alu.
 // CONFIDENCE: HIGH -- every query names the original consumed PC and current scalar carrier.
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
