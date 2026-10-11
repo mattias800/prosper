@@ -774,23 +774,21 @@ TEST(ShaderResources, Contract) {
         native_storage_format_support_bit(DataFormat::Uint8, 4);
     const uint32_t unorm2_10_storage =
         native_storage_format_support_bit(DataFormat::Unorm2_10_10_10, 4);
-    CHECK(r8_storage && rg8_storage && packed_storage && fp16_3d_storage &&
-              r32ui_storage && r16ui_storage && r8ui_storage && rgba8ui_storage &&
-              unorm2_10_storage &&
-              r8_storage != rg8_storage &&
-              rg8_storage != packed_storage &&
-              r32ui_storage != r16ui_storage && r16ui_storage != r8ui_storage &&
-              r8ui_storage != rgba8ui_storage &&
-              unorm2_10_storage != rgba8ui_storage &&
-              !(fp16_3d_storage & ((1u << 10) - 1u)) &&
-              !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
-              !(r32ui_storage & ~kNativeStorageFormatSupportMask) &&
-              !(r16ui_storage & ~kNativeStorageFormatSupportMask) &&
-              !(rgba8ui_storage & ~kNativeStorageFormatSupportMask) &&
-              !(unorm2_10_storage & ~kNativeStorageFormatSupportMask) &&
-              native_storage_3d_format_support_bit(DataFormat::Uint32, 1) == 0 &&
-              native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
-          "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
+    CHECK(
+        r8_storage && rg8_storage && packed_storage && fp16_3d_storage && r32ui_storage &&
+            r16ui_storage && r8ui_storage && rgba8ui_storage && unorm2_10_storage &&
+            r8_storage != rg8_storage && rg8_storage != packed_storage &&
+            r32ui_storage != r16ui_storage && r16ui_storage != r8ui_storage &&
+            r8ui_storage != rgba8ui_storage && unorm2_10_storage != rgba8ui_storage &&
+            !(fp16_3d_storage & ((1u << 10) - 1u)) &&
+            !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
+            !(r32ui_storage & ~kNativeStorageFormatSupportMask) &&
+            !(r16ui_storage & ~kNativeStorageFormatSupportMask) &&
+            !(rgba8ui_storage & ~kNativeStorageFormatSupportMask) &&
+            !(unorm2_10_storage & ~kNativeStorageFormatSupportMask) &&
+            native_storage_3d_format_support_bit(DataFormat::Uint32, 1) == (1u << 25) &&
+            native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
+        "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
 
     uint8_t rgba10[4] = {};
     unorm2_10_10_10_to_rgba8(0xFFFFFFFFu, rgba10);

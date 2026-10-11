@@ -966,6 +966,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_storage_dst_sel.cpp
     INCLUDES src
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_uint_3d
+    SOURCES tests/gpu/recompiler/test_native_uint_3d.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_dataflow
     SOURCES tests/gpu/recompiler/test_split_t8_dataflow.cpp
     INCLUDES src
@@ -7337,6 +7341,11 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     # cached environment read. Its unchanged pixel oracles remain independent of observations.
     ENVIRONMENT PROSPER_FRAGMENT_DRAW_OBSERVE=1
     LABELS gpu PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_native_uint_3d_exec
+    SOURCES tests/gpu/execute/test_native_uint_3d_exec.cpp
+    INCLUDES frontends tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS gpu PROPERTIES TIMEOUT 60)
   prosper_add_gtest(test_ordered_graphics_read_point
     SOURCES tests/shared/live/test_ordered_graphics_read_point.cpp
     INCLUDES frontends src tests

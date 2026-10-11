@@ -8162,7 +8162,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     native_float_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
-                const bool native_uint = !packed_r11 && native_uint_2d_storage && !is_atomic &&
+                const bool native_uint =
+                    !packed_r11 && !is_atomic &&
+                    (native_uint_2d_storage || (ordinary_3d && res->sample_count == 1)) &&
                     native_uint_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
@@ -8184,9 +8186,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                 : native_uint ? native_uint_format : ImgFmt_Unknown,
                                             packed_r11);
                 }
-                // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
-                // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
-                // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
+                // Non-NSA coords follow VADDR; NSA coord0=VADDR, coord k>=1 is byte (k-1) of
+                // words[2..3] (dword2=addr1..4, dword3=addr5..8), verified via llvm-mc gfx1010.
                 const bool nsa = in.len_dwords > 2;
                 int va = in.src[0].value;
                 auto coord_vgpr = [&](uint32_t k) -> int {

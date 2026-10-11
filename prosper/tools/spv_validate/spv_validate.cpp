@@ -49,6 +49,7 @@
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
+#include "../../tests/fixtures/native_uint_3d.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1656,6 +1657,17 @@ int main(int argc, char** argv) {
       // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
       const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
       dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
+    // Dimension-specific native unsigned volumes retain the exact typed storage contract.
+    for (const auto& format : prosper::test::native_uint_3d::formats) {
+        namespace fixture = prosper::test::native_uint_3d;
+        ShaderResourceTable rt;
+        rt.resources.push_back(fixture::image(format, 4, 0, 64, 3, 2, 0x10000, 4096));
+        rt.resources.push_back(fixture::image(format, 5, 8, 64, 3, 2, 0x20000, 4096));
+        const auto code = fixture::copy_row(2, 1);
+        const auto config = fixture::config(format.capability);
+        const std::string name = std::string("storage_native_3d_") + format.name;
+        dump(dir, name.c_str(), recompile_compute(code.data(), code.size(), &rt, config));
+    }
     // GTA V's audited one-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. Validate both sampled
     // image shapes (including the retained array layer) and the NSA storage write strictly.
     { ShaderResourceTable rt;

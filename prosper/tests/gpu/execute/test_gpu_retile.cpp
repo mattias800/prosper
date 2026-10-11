@@ -305,8 +305,8 @@ int run_case(int argc, char** argv) {
         if (view == 3 && format.format != DataFormat::Float16 &&
             format.format != DataFormat::Uint32) continue;
         if (mixed && !array16 && format.format != DataFormat::Float16) continue;
-        // Integer 3D images still use the existing raw interchange path. Its packing fallback
-        // remains covered; this retile change does not broaden native storage declarations.
+        // Word-width unsigned volumes now use device-gated typed storage; the sub-word volume
+        // layouts remain CPU conversion. This fixture's volume formats all have whole-word texels.
         const bool native_volume = native_storage_3d_format_support_bit(
             format.format, format.components) != 0;
         // Multi-layer native float storage is not admitted by the existing recompiler.

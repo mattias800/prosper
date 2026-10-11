@@ -170,15 +170,19 @@ constexpr uint32_t native_storage_format_support_bit(DataFormat format, uint32_t
 }
 
 // 3D optimal images have a dimension-specific Vulkan support query. Keep their capabilities in
-// the upper half of the same replay-stable mask so a device that supports typed 2D storage but not
+// distinct bits of the same replay-stable mask so a device that supports typed 2D storage but not
 // the corresponding 3D image never compiles a shader the live backend cannot bind.
 constexpr uint32_t native_storage_3d_format_support_bit(DataFormat format,
                                                         uint32_t components) {
     const uint32_t format_bit = native_storage_format_support_bit(format, components);
-    return (format_bit & ((1u << 10) - 1u)) ? format_bit << 10 : 0u;
+    if (format_bit & ((1u << 10) - 1u)) return format_bit << 10;
+    // Preserve bits 0..24 in existing captures, including packed UNORM's 2D bit 24.
+    // CONFIDENCE: HIGH -- these four formats already have exact unsigned storage conversion;
+    // their 3D admission still requires the device's format/type/usage support query.
+    return (format_bit & (0xfu << 20)) ? format_bit << 5 : 0u;
 }
 
-constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 25) - 1u;
+constexpr uint32_t kNativeStorageFormatSupportMask = (1u << 29) - 1u;
 
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
