@@ -27,7 +27,10 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
         if (in.pc < lo || in.pc >= hi) continue;
         switch (in.fmt) {
             case Rdna2Format::VINTRP:
-                if (owned_packet) vregs.insert(in.dst.value);
+                // CONFIDENCE: HIGH — native P1 is a no-op, but every other native VINTRP
+                // lowering publishes VDST. Owned P1 also writes partial interpolation state.
+                // Omitting a real writer lets an arm-local SSA value escape without a phi.
+                if (owned_packet || in.opcode != 0) vregs.insert(in.dst.value);
                 break;
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02)

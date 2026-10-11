@@ -54,6 +54,7 @@
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "../../tests/fixtures/native_uint_3d.hpp"
 #include "../../tests/fixtures/fragment_compare_kill.hpp"
+#include "../../tests/fixtures/fragment_vintrp_merge.hpp"
 #include "../../tests/fixtures/compute_array_gather.hpp"
 #include "../../tests/fixtures/saveexec_m0.hpp"
 #include "../../tests/fixtures/uint_d16_store.hpp"
@@ -1702,6 +1703,14 @@ int main(int argc, char** argv) {
         dump(dir,
              unrelated_vector ? "fragment_compare_low_kill_vector" : "fragment_compare_low_kill",
              recompile_fragment_wave32_for_test(code.data(), code.size()));
+    }
+    // Native interpolation destinations must be joined before a later selection consumes them.
+    for (uint32_t opcode : {1u, 2u}) {
+        const auto code = prosper::test::fragment_vintrp_merge::program(opcode);
+        dump(dir,
+             opcode == 1 ? "fragment_vintrp_p2_two_selections"
+                         : "fragment_vintrp_mov_two_selections",
+             recompile_fragment(code.data(), code.size()));
     }
     // Packed unsigned D16 image stores retain their format-selected integer data contract.
     {
