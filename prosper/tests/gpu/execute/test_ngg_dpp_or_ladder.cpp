@@ -11,6 +11,8 @@
 // the PRIM export probe: an inclusive prefix OR inside each row, (2 << (L & 15)) - 1. Both the
 // portable dispatcher (workgroup scratch) and the exact native Wave64 one run it. Assembled with
 // llvm-mc -mcpu=gfx1030.
+// The full-mask in-place BC0 form is also supported (#4896): keeping old VDST at a row edge
+// agrees with own|0. #4953 replaces the obsolete BC0 refusal assertion with actual value checks.
 #include "fixtures/compute_runner.h"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
@@ -41,6 +43,12 @@ std::vector<uint32_t> or_ladder() {
         0xF8000941u, 0x0000000Au,   // exp prim v10 done
         0xBF810000u,   // s_endpgm
     };
+}
+
+std::vector<uint32_t> unbounded_or_ladder() {
+    auto code = or_ladder();
+    for (size_t k : {7u, 9u, 11u, 13u}) code[k] &= ~(1u << 19);
+    return code;
 }
 
 std::vector<float> lane_inputs() {
@@ -130,10 +138,42 @@ TEST(NggDppOrLadder, NativeWave64ShellComputesTheInclusiveRowOr) {
     for (uint32_t t = 0; t < kThreads; ++t) EXPECT_EQ(exported(ones, t), 1u) << "thread " << t;
 }
 
-// The admitted family is exactly the bounded form: the same ladder with BOUND_CTRL=0 (whose
-// row-edge lanes would keep their old VDST rather than OR with zero) stays refused here.
-TEST(NggDppOrLadder, OnlyTheBoundedFormIsAdmitted) {
-    std::vector<uint32_t> code = or_ladder();
-    for (size_t k : {7u, 9u, 11u, 13u}) code[k] &= ~(1u << 19);   // clear BOUND_CTRL
-    EXPECT_TRUE(prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1).empty());
+TEST(NggDppOrLadder, UnboundedPortableShellComputesTheInclusiveRowOr) {
+    const auto code = unbounded_or_ladder();
+    const auto module = prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1);
+    ASSERT_FALSE(module.empty()) << "the supported in-place BC0 OR ladder must compile";
+    const auto out = prosper::test::run_compute(module, lane_inputs(), kLanes,
+                                                kLanes * prosper::gpu::kNggExportProbeWords);
+    if (out.empty()) GTEST_SKIP() << "no Vulkan compute device";
+    EXPECT_TRUE(inclusive_row_or(out));
+}
+
+TEST(NggDppOrLadder, UnboundedPortableShellOrsRatherThanAdds) {
+    auto code = unbounded_or_ladder();
+    code[4] = 0x7E140302u;   // v_mov_b32 v10, v2 (= 1)
+    const auto module = prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1);
+    ASSERT_FALSE(module.empty());
+    const auto out = prosper::test::run_compute(module, lane_inputs(), kLanes,
+                                                kLanes * prosper::gpu::kNggExportProbeWords);
+    if (out.empty()) GTEST_SKIP() << "no Vulkan compute device";
+    ASSERT_EQ(out.size(), size_t{kLanes} * prosper::gpu::kNggExportProbeWords);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(exported(out, lane), 1u) << "lane " << lane;
+}
+
+TEST(NggDppOrLadder, UnboundedUnsupportedShapesRemainRefused) {
+    for (uint32_t control = 0; control < 4; ++control) {
+        auto code = unbounded_or_ladder();
+        if (control == 0)
+            code[6] = (code[6] & ~(0xffu << 9)) | (2u << 9);   // SRC1 is initialized v2
+        else if (control == 1)
+            code[6] = (code[6] & ~(0xffu << 17)) | (2u << 17);   // VDST differs from SRC0
+        else if (control == 2)
+            code[7] &= ~(1u << 28);   // row mask is not complete
+        else
+            code[7] &= ~(1u << 24);   // bank mask is not complete
+        EXPECT_TRUE(
+            prosper::gpu::recompile_ngg_exports_for_test(code.data(), code.size(), 1).empty())
+            << "unsupported BC0 shape " << control;
+    }
 }
