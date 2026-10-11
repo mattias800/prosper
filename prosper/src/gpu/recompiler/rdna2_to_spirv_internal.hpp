@@ -667,6 +667,10 @@ struct SpirvCompute {
     std::set<int> saved_mask_word_roots;
     std::set<int> native_logical_word_roots;
     std::set<uint32_t> native_logical_data_demand_pcs;
+    // Original native MOV-to-VCC generations whose proved Bool has no physical DATA live-out.
+    std::set<uint32_t> native_bool_only_vcc_copy_pcs;
+    std::set<int> native_vcc_copy_entry_masks;
+    std::unordered_set<int> native_vcc_copy_entry_b32_masks;
     std::set<uint32_t> native_logical_uniform_entry_pcs;
     // Only the ordinary compute shell seeds SGPR DATA from push constants/group IDs.
     bool native_logical_uniform_launch = false;

@@ -6,6 +6,26 @@
 
 namespace prosper::gpu {
 namespace {
+std::set<int> copy_entry_masks(const RegState* initial) {
+    std::set<int> roots{126, 127};
+    if (!initial) return roots;
+    if (initial->vcc) {
+        roots.insert(106);
+        roots.insert(107);
+    }
+    for (const auto& [root, value] : initial->sreg_bool)
+        if (value && root >= 0 && root < 128) roots.insert(root);
+    return roots;
+}
+
+bool native_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
+    return b.is_compute && !b.is_fragment_packet() && !b.ngg_workgroup_shell && !b.ngg_one_lane &&
+           b.wave_size == 64 && b.native_subgroup_size == 64 && in.fmt == Rdna2Format::SOP1 &&
+           in.opcode == kSop1OpcodeMovB64 && in.dst.kind == OperandKind::SGPR &&
+           in.dst.value == 106 && in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+           in.src[0].value <= 104;
+}
+
 bool ordinary_pair(const Operand& source) {
     return (source.kind == OperandKind::SGPR && source.value >= 0 && source.value <= 104) ||
            (source.kind == OperandKind::Special && (source.value == 106 || source.value == 107));
@@ -108,6 +128,10 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     // overwrite cannot certify an earlier Bool-only logical, and either branch/loop successor
     // can demand the current generation. The finite lattice has 128 bits per instruction.
     using Words = std::bitset<128>;
+    b.native_bool_only_vcc_copy_pcs.clear();
+    b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
+    b.native_vcc_copy_entry_b32_masks =
+        initial ? initial->sreg_bool_b32 : std::unordered_set<int>{};
     const size_t count = original.size();
     std::map<uint32_t, size_t> at_pc;
     for (size_t i = 0; i < count; ++i) at_pc.emplace(original[i].pc, i);
@@ -344,6 +368,8 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     for (size_t i = 0; i < count; ++i)
         if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any())
             b.native_logical_data_demand_pcs.insert(original[i].pc);
+        else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
+            b.native_bool_only_vcc_copy_pcs.insert(original[i].pc);
 }
 
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
@@ -402,6 +428,22 @@ bool native_logical_producer_has_full_participation(const SpirvCompute& b, const
 
 bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in) {
     if (!b.native_logical_data_demand_pcs.contains(in.pc) ||
+        in.pc >= b.saved_mask_original_words.size())
+        return false;
+    auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
+                                     b.saved_mask_original_words.size() - in.pc);
+    original.pc = in.pc;
+    return !in.synthetic_terminator && in == original;
+}
+
+bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial) {
+    return b.native_vcc_copy_entry_masks == copy_entry_masks(initial) &&
+           b.native_vcc_copy_entry_b32_masks ==
+               (initial ? initial->sreg_bool_b32 : std::unordered_set<int>{});
+}
+
+bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in) {
+    if (!native_vcc_copy(b, in) || !b.native_bool_only_vcc_copy_pcs.contains(in.pc) ||
         in.pc >= b.saved_mask_original_words.size())
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,

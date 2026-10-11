@@ -1927,6 +1927,18 @@ int main(int argc, char** argv) {
         dump(dir, "compute_native_logical_bool_cndmask",
              recompile_compute(code, std::size(code), nullptr, cfg));
     }
+    // #4911: a Bool-only VCC copy cannot inherit DATA demand from a later replacement.
+    {
+        const uint32_t code[]{0x7d840080u, 0xbf86000bu, 0x7daa0080u, 0x7d8400f9u, 0x06868081u,
+                              0x7d8400f9u, 0x06868281u, 0x87940200u, 0xbeea0414u, 0xd5010000u,
+                              0x01a91281u, 0xbeea0481u, 0xbe9f036bu, 0xbf810000u};
+        ComputeShaderConfig cfg;
+        cfg.local_x = 128;
+        cfg.wave_size = cfg.native_subgroup_size = 64;
+        cfg.user_sgprs.resize(8);
+        dump(dir, "compute_native_bool_vcc_copy_generation",
+             recompile_compute(code, std::size(code), nullptr, cfg));
+    }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
     for (uint32_t shape = 0; shape < 6; ++shape) {

@@ -241,17 +241,18 @@ TEST(NativeCndmaskDemand, PhysicalSourceWidthAbiRemainsTwoWords) {
     EXPECT_EQ(scalar_alu_source_words(select, 2), 2u);
 }
 
-TEST(NativeCndmaskDemand, VccGapCopyRetainsItsSeparatePhysicalCopyRefusal) {
+TEST(NativeCndmaskDemand, VccGapCopyNowPreservesItsBoolOnlyGeneration) {
     Emitter e;
     e.rs.sreg_merge_placeholder.insert(1);
     const auto code = program({0xbeea0414u}, 106);
     ASSERT_TRUE(e.producer(code));
     EXPECT_FALSE(e.demanded());
-    // The consumer inventory is fixed, but the independent older MOV guard still
-    // requires physical words for this CNDMASK spelling. It remains a named gap.
-    EXPECT_FALSE(e.emit(decode(code)[1]));
-    EXPECT_EQ(e.b.stage_reject_reason, "saved-mask-copy-words-unavailable");
-    EXPECT_EQ(e.b.stage_reject_pc, 1u);
+    // #4911 keeps this exact old shape: a proved Bool-only copy no longer inherits
+    // physical demand merely because the global inventory names VCC.
+    ASSERT_TRUE(e.emit(decode(code)[1]));
+    ASSERT_TRUE(e.emit(decode(code)[2]));
+    EXPECT_FALSE(e.rs.sreg.contains(106));
+    EXPECT_FALSE(e.rs.sreg.contains(107));
     EXPECT_EQ(ballots(e.b), 0u);
 }
 
