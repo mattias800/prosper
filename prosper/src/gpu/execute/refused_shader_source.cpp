@@ -3,6 +3,7 @@
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/shader_source_window.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/diagnostics/refused_graphics_inputs.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -54,7 +55,7 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
                       shaders.link ? shaders.link : "unknown",
                       static_cast<unsigned long long>(shaders.chain_address),
                       shaders.refusal ? " refusal=" : "", shaders.refusal ? shaders.refusal : "");
-        note_refused_shader(tag, address, original, detail);
+        note_unavailable_graphics_inputs(tag, address, original, detail);
     }
 }
 

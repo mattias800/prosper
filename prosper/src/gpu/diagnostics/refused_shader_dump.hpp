@@ -15,6 +15,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -45,7 +46,7 @@ struct RefusedShaderMemo {
     // process-global lock; the record is shared only by owners of identical code at this stage.
     mutable std::mutex input_mutex;
     mutable uint64_t input_epoch = 0;
-    mutable std::shared_ptr<RefusedShaderInputCount> input_count;
+    mutable std::array<std::shared_ptr<RefusedShaderInputCount>, 4> input_counts;
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
@@ -72,6 +73,10 @@ bool note_refused_shader(const char* stage, uint64_t address, const RefusedShade
                          const RefusedShaderInputSet* inputs = nullptr);
 // An owner-version/stage probe, never an address/first-word shortcut. Does not mark an observation.
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source);
+// Before owning cold compiler inputs: missing sidecars and saturated counters need no observation.
+bool refused_shader_inputs_needed(const char* stage, const RefusedShaderSource& source);
+bool note_refused_shader_inputs(const char* stage, uint64_t address, const RefusedShaderSource&,
+                                const std::string& detail, const RefusedShaderInputSet&);
 bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
                                  uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
                                  const RefusedShaderInputSet* inputs = nullptr);

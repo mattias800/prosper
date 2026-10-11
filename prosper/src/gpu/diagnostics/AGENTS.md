@@ -102,7 +102,26 @@ changes nothing the guest sees (#4700).
   that uses it.
 - `refused_shader_dump` — on by default: each distinct refused shader (vertex, pixel or compute) is written once per run, with an index line naming its first unsupported instruction, into `refused_shaders_*/` under `PROSPER_CAPTURE_DIR`. Bounded and deduplicated by code hash, so it costs nothing on a clean run. `PROSPER_SHADER_DUMP` remains the unbounded opt-in.
   A draw the **owned-wave gate** refuses is kept the same way (#4555). Nothing was recompiled for it, so the `first_bad_*` fields on its index line are only the generic coverage census and do not say why the draw was lost; the line ends in `refusal=<reason>`, which does, and the `[refused-shader]` line in the run log repeats it (#4580). That program is the one to run `shader_inspect --raw-wide-proof` on: the `dropped-draws` alarm files these drops under `shader-recompile/*`, and the first question is whether the program belongs on the owned-wave path at all.
-- `refused_shader_inputs` — beside each refused **compute** program the dump also writes `<stem>.inputs` (#4808): the live recompile's complete `ComputeShaderConfig` (user-data SGPR values, launch shape), its complete resource table (every resolved T#/V#/S# field) and the constant/vertex-buffer bytes the compiler may read, capped at 256 KiB (above it the bytes are dropped and the file says `payload=omitted`). Only the first refusal's inputs are kept; `<stem>.input_sets` counts the distinct input sets seen after it by stage and code hash (full config/descriptor metadata, excluding buffer contents and host addresses; bounded at 256+, owner-local on repeats), and the index line gains `inputs=<file>`. Replay offline with `shader_inspect <stem>.bin --inputs <stem>.inputs`: it prints the live reject, the replayed reject and the table-less answer, then `inputs-verdict match|differs|incomplete` (exit 0/6/7). `incomplete` means the compiler wanted something the sidecar does not hold — omitted bytes, or a direct guest-memory read — and is never a verdict on the shader. Missing live/replayed terminal-reject evidence is also INCOMPLETE, never an empty-string match. Not recorded: compiler-choice env switches and the trip-bound diagnostic, so replay with the same environment as the run. Graphics stages have no sidecar yet; a dump from before #4808 simply has none. The bytes are guest data: they stay beside the dump, never in the repository.
+- `refused_shader_inputs` — beside refused programs the dump writes `<stem>.inputs` (#4808, #4877).
+  Compute keeps schema 1: the actual `ComputeShaderConfig`, resolved resource metadata, and bounded
+  constant/vertex-buffer bytes. Graphics schema 2 records the actual direct-vertex, chained-vertex,
+  fragment or NGG-shell compiler selector, exact input spans, ABI/config/float arguments, semantic
+  choice reads and trip settings. The dumped code's association with a longer NGG compiler span is
+  explicit. Physical producing GS/VS/PS register values have separate availability masks; they
+  never manufacture shader entry SGPRs or draw admission. No producing draw means launch unavailable.
+  A null table actually passed to the compiler is recorded as absent, not as missing capture authority.
+  Owned compiler-readable bytes are capped at 256 KiB before graphics ownership copies; larger
+  backing becomes opaque (`payload=omitted`). Only the first refusal's inputs are kept;
+  `<stem>.input_sets` counts stage/code-hash input sets, including config and resource metadata,
+  excluding buffer bytes and host addresses, bounded at 256+ with owner-local repeats. The index
+  gains `inputs=<file>`. Replay with `shader_inspect <stem>.bin --inputs <stem>.inputs`: live,
+  recorded replay and table-less answers precede `inputs-verdict match|differs|incomplete` (exit
+  0/6/7). Missing required bytes, direct guest reads, source association, choices or terminal refusal
+  evidence fail INCOMPLETE, never an empty-string match. Unconsumed physical draw state does not
+  invalidate compiler replay. A draw refused before compilation has an explicit unavailable selector;
+  it cannot be replayed as a fabricated invocation. Compute schema 1 still requires the run's same
+  compiler-choice environment/trip settings; graphics schema 2 replays its recorded reads. Older
+  dumps have no sidecar. All guest bytes stay beside the private dump, never in the repository.
   A compute program that **recompiled cleanly and was then declined by the live backend** is kept too (#4808), with `refusal=backend-declined:<reason>` (the reason is the first decline's, `unrecorded` when the backend named none, e.g. a lost device). Those declines are the largest skip category, so they fill their own budget (`kBackendDeclinedDumpMaxPrograms`) and cannot use up the slots recompile refusals need, and a repeat is dropped from a per-thread key before the program is read.
 - `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`
   to named guest programs. It fails **open** where the skip selectors fail closed, and the header

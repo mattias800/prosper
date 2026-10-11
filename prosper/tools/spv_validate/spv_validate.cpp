@@ -353,6 +353,18 @@ static const NotAnEmitter kNotEmitters[] = {
     {"recompile_graphics_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
      "direct emitter, which is validated here"},
+    {"compile_graphics_shader",
+     "cache compiler forwarding boundary moved from gpu_executor; adds no SPIR-V emission. "
+     "Its recompile_vertex/chain/fragment entry points are validated here"},
+    {"observe_graphics_shader_attempt",
+     "diagnostic-only input ownership and synchronous callback to the existing compiler; "
+     "adds no SPIR-V emission or compiler arguments (#4877)"},
+    {"observe_ngg_shader_attempt",
+     "diagnostic-only input ownership and synchronous callback to recompile_ngg_subgroup, "
+     "which is validated here; adds no SPIR-V emission (#4877)"},
+    {"observe_refused_graphics_compile",
+     "observes the original compiler callback and returns its unmodified module; "
+     "does not generate or rewrite SPIR-V (#4877)"},
     {"recompile_compute_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
      "direct emitter, which is validated here"},
@@ -368,9 +380,8 @@ static const NotAnEmitter kNotEmitters[] = {
      "a local std::vector<uint32_t> in frontends/shared/compute/parent_scan.hpp's chain walk "
      "(constructed as seen_at(records, UINT32_MAX)); the scan reads the constructor call as a "
      "declaration. It is a visit table, not SPIR-V"},
-    {"depth",
-     "a local std::vector<uint32_t> in the same parent_scan.hpp walk (depth(records, 0)): "
-     "memoised chain depths, not SPIR-V"},
+    {"depth", "a local std::vector<uint32_t> in the same parent_scan.hpp walk (depth(records, 0)): "
+              "memoised chain depths, not SPIR-V"},
 };
 
 // Every declaration of a function returning SPIR-V words, whitespace-tolerant and with no

@@ -1,5 +1,6 @@
 // shader_inspect - print the decoded RDNA2 stream and resolved control-flow targets from a raw dump.
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/diagnostics/refused_graphics_inputs.hpp"
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -231,11 +232,6 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
         std::fprintf(stderr, "shader_inspect: %s: %s\n", inputs_path.c_str(), e.what());
         return 2;
     }
-    if (inputs.stage != "cs") {
-        std::fprintf(stderr, "shader_inspect: %s records stage %s; only cs replays\n",
-                     inputs_path.c_str(), inputs.stage.c_str());
-        return 2;
-    }
     std::string sets = "unrecorded";
     {
         std::filesystem::path counter = inputs_path;
@@ -245,14 +241,29 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
         if (in && std::getline(in, line) && line.rfind("distinct_input_sets=", 0) == 0)
             sets = line.substr(std::strlen("distinct_input_sets="));
     }
-    std::printf("inputs file=%s code=%s address=0x%llx user_sgprs=%zu wave=%u local=%ux%ux%u "
-                "resources=%zu payload=%s input_sets=%s%s%s\n",
-                inputs_path.c_str(), code_path.c_str(),
-                static_cast<unsigned long long>(inputs.program_address),
-                inputs.compute.user_sgprs.size(), inputs.compute.wave_size, inputs.compute.local_x,
-                inputs.compute.local_y, inputs.compute.local_z, inputs.resources.resources.size(),
-                inputs.payload_omitted ? "omitted" : "kept", sets.c_str(),
-                inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
+    if (inputs.graphics) {
+        const auto& g = *inputs.graphics;
+        std::printf("inputs stage=%s file=%s code=%s address=0x%llx compiler_selector=%u "
+                    "compile_dwords=%zu chain_dwords=%zu raw_prefix=%u table=%s resources=%zu "
+                    "launch=%s payload=%s input_sets=%s%s%s\n",
+                    inputs.stage.c_str(), inputs_path.c_str(), code_path.c_str(),
+                    static_cast<unsigned long long>(inputs.program_address), unsigned(g.selector),
+                    g.invocation.code.size(), g.chain.size(), g.raw_is_source_prefix,
+                    g.invocation.has_resources ? "present" : "absent",
+                    g.invocation.resources.resources.size(),
+                    g.launch.observed ? "observed-physical-registers" : "unavailable",
+                    inputs.payload_omitted ? "omitted" : "kept", sets.c_str(),
+                    inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
+    } else
+        std::printf(
+            "inputs stage=%s file=%s code=%s address=0x%llx user_sgprs=%zu wave=%u local=%ux%ux%u "
+            "resources=%zu payload=%s input_sets=%s%s%s\n",
+            inputs.stage.c_str(), inputs_path.c_str(), code_path.c_str(),
+            static_cast<unsigned long long>(inputs.program_address),
+            inputs.compute.user_sgprs.size(), inputs.compute.wave_size, inputs.compute.local_x,
+            inputs.compute.local_y, inputs.compute.local_z, inputs.resources.resources.size(),
+            inputs.payload_omitted ? "omitted" : "kept", sets.c_str(),
+            inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
     const auto line = [](const char* label, const RefusedShaderReplay& r) {
         const char* status = !r.incomplete.empty() ? "incomplete" : r.produced ? "ok" : "rejected";
         std::printf("%s status=%s reject=\"%s\"%s%s\n", label, status, printable(r.reject).c_str(),
@@ -346,8 +357,7 @@ int main(int argc, char** argv) {
                      "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table "
                      "[--spirv-out FILE]\n",
                      argv[0]);
-        std::fprintf(stderr, "       %s <cs_*.bin> --inputs <cs_*.inputs> [--stage compute]\n",
-                     argv[0]);
+        std::fprintf(stderr, "       %s <stage_*.bin> --inputs <stage_*.inputs>\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
@@ -398,7 +408,8 @@ int main(int argc, char** argv) {
             "that nothing outside descriptor resolution refuses the program, never that it is\n"
             "admitted live. It reports status=ok-synthetic-table / rejected-synthetic-table.\n"
             "\n"
-            "--inputs replays a refused compute program with the live inputs the refused-shader\n"
+            "--inputs replays a refused compute/vertex/NGG/pixel program with the live inputs the "
+            "refused-shader\n"
             "dump recorded beside it (#4808): the launch config and user-data SGPRs, the resolved\n"
             "descriptor table, and the buffer bytes the compiler may read. It prints the live\n"
             "reject, the replayed reject, and the table-less answer for comparison.\n"

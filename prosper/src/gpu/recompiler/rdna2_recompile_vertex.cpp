@@ -486,7 +486,11 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     b.vertices_per_instance = rt ? rt->vertices_per_instance : 0u;
     // Shader I/O value tap (PROSPER_SHADER_TAP=pc): redirect the position export to the intermediate VGPR
     // produced at that PC. Applies to the vertex stage only; captured via the geometry probe.
-    if (const char* tap = getenv("PROSPER_SHADER_TAP")) b.tap_pc = static_cast<uint32_t>(strtoul(tap, nullptr, 0));
+    b.tap_pc = static_cast<uint32_t>(compiler_choice(CompilerChoice::VertexTapPc, [] {
+        if (const char* tap = getenv("PROSPER_SHADER_TAP"))
+            return int64_t(static_cast<uint32_t>(strtoul(tap, nullptr, 0)));
+        return int64_t(UINT32_MAX);
+    }));
     b.begin_vertex(rt);
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();

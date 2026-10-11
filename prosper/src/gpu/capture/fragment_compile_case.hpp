@@ -69,7 +69,9 @@ struct FragmentCompileCase {
 
 // Deep ownership is established before an opted-in producing compile. Unsupported live-read
 // carriers or missing ownership retain metadata but explicitly decline complete replay.
-void own_fragment_compile_case_resources(FragmentCompileCase&, const ShaderResourceTable*);
+void own_fragment_compile_case_resources(FragmentCompileCase&, const ShaderResourceTable*,
+                                         uint64_t payload_limit = kCompileCaseMaxPayloadBytes,
+                                         bool* payload_omitted = nullptr);
 void restore_fragment_compile_case_backing(FragmentCompileCase&);
 void validate_fragment_compile_case(const FragmentCompileCase&);
 std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase&, bool baseline,

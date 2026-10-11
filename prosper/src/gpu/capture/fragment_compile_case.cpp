@@ -84,7 +84,9 @@ void valid_reference(const FragmentCompileCase& c, CompileCaseBacking ref,
 }
 } // namespace
 
-void own_fragment_compile_case_resources(FragmentCompileCase& c, const ShaderResourceTable* table) {
+void own_fragment_compile_case_resources(FragmentCompileCase& c, const ShaderResourceTable* table,
+                                         uint64_t payload_limit, bool* payload_omitted) {
+    if (payload_omitted) *payload_omitted = false;
     c.has_resources = table != nullptr;
     if (!table) return;
     // Check aggregate metadata before copying attacker-sized vectors. The caller can retain an
@@ -143,15 +145,26 @@ void own_fragment_compile_case_resources(FragmentCompileCase& c, const ShaderRes
                 break;
             }
     uint64_t payload = 0;
+    bool omitted = false;
+    require(payload_limit <= kCompileCaseMaxPayloadBytes, "compile-case payload limit");
     for (uint32_t k = 0; k < original.size(); ++k) {
         auto b = original[k];
         b.opaque = !read_blobs.contains(k);
         if (b.alias_of != UINT32_MAX) b.opaque = original[b.alias_of].opaque;
         original[k].opaque = b.opaque;
         if (b.alias_of == UINT32_MAX && !b.opaque) {
-            require(b.size <= kCompileCaseMaxPayloadBytes - payload, "compile-case payload budget");
-            payload += b.size;
+            if (payload_limit == kCompileCaseMaxPayloadBytes)
+                require(b.size <= kCompileCaseMaxPayloadBytes - payload,
+                        "compile-case payload budget");
+            if (b.size > payload_limit - payload)
+                omitted = true;
+            else if (!omitted)
+                payload += b.size;
         }
+    }
+    if (omitted) {
+        if (payload_omitted) *payload_omitted = true;
+        for (auto& b : original) b.opaque = true;
     }
     c.resources = *table;
     for (uint32_t k = 0; k < original.size(); ++k) {
@@ -245,8 +258,10 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
             valid_reference(c, refs.entries[e], r.table_entries[e].host_data_size, 0);
     }
     for (const auto& read : c.choices.reads) {
-        require(uint32_t(read.choice) <= uint32_t(CompilerChoice::NormalizeSamplerCoordinates), "compile-case choice tag");
-        if (read.choice == CompilerChoice::FragmentTapPc)
+        require(uint32_t(read.choice) <= uint32_t(CompilerChoice::ForcePositionW),
+                "compile-case choice tag");
+        if (read.choice == CompilerChoice::FragmentTapPc ||
+            read.choice == CompilerChoice::VertexTapPc)
             require(read.value >= 0 && uint64_t(read.value) <= UINT32_MAX, "compile-case tap PC");
         else if (read.choice == CompilerChoice::ForcedArrayLayer)
             require(read.value >= -1 && read.value <= 65535, "compile-case forced layer");

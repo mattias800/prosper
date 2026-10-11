@@ -22,13 +22,23 @@ bool replay_compiler_choice(CompilerChoice choice, int64_t& value) {
     return true;
 }
 void record_compiler_choice(CompilerChoice choice, int64_t value) {
-    if (!active || !active->recording_) return;
-    auto& trace = *active->recording_;
-    if (trace.reads.size() >= 65536) {
-        trace.error = "compiler-choice-budget";
-        return;
+    // A nested producing observer must not hide semantic reads from its outer observer. Stop at
+    // replay: an independent fidelity check is not another live compiler invocation.
+    for (auto* scope = active; scope && !scope->replay_; scope = scope->previous_) {
+        if (!scope->recording_) continue;
+        auto& trace = *scope->recording_;
+        try {
+            if (trace.reads.size() >= 65536) {
+                trace.error = "compiler-choice-budget";
+                continue;
+            }
+            trace.reads.push_back({choice, value});
+        } catch (const std::bad_alloc&) {
+            // A recording allocation is observational; never prevent the live semantic read.
+            try {
+                trace.error = "compiler-choice-allocation-failed";
+            } catch (const std::bad_alloc&) {}
+        }
     }
-    try { trace.reads.push_back({choice, value}); }
-    catch (const std::bad_alloc&) { trace.error = "compiler-choice-allocation-failed"; }
 }
 } // namespace prosper::gpu

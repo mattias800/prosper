@@ -300,6 +300,7 @@ platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constru
 host-throw|prosper/src/gpu/capture/fold_capture.cpp 4
 host-throw|prosper/src/gpu/capture/fragment_compile_case.cpp 2
 host-throw|prosper/src/gpu/capture/serialize/fold_capture_codec.cpp 2
+host-throw|prosper/src/gpu/diagnostics/refused_graphics_inputs.cpp 1 # bounded parser; writer/replay catch all validation throws, offline decoding errors stay in shader_inspect (#4877)
 host-throw|prosper/src/gpu/diagnostics/refused_shader_inputs.cpp 1  # one require() helper; the live writer catches every throw inside write_refused_compute_inputs, and offline decode/replay errors are caught by shader_inspect (#4808)
 host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
 host-throw|prosper/src/gpu/execute/gpu_executor.cpp 1

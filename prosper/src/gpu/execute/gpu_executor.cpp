@@ -1,4 +1,3 @@
-#include "gpu/execute/graphics_shader_compile.hpp"
 // gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Holds the process-wide live render backend and drives it on each AGC submit. This is deliberately the
@@ -53,6 +52,7 @@
 #include "host/memory/guest_memory_query.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
+#include "gpu/execute/graphics_shader_compile.hpp"
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
@@ -1234,6 +1234,7 @@ ShaderCompileKey make_shader_compile_key(
         // same blob as the direct path and table contents participate in the cache identity.
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
         if (original_source) *original_source = {key.code, &analysis->refused_shader_memo};
+        key.refused_memo = &analysis->refused_shader_memo;
         key.code_hash = analysis->code_hash;
         key.code_analysis_identity = analysis->identity;
     }

@@ -13,10 +13,13 @@
 // already owns the bounded, pointer-free encoding of a table and its backing; here it is only a
 // carrier and is always marked INCOMPLETE, so it can never be replayed as a fragment case.
 //
-// Not recorded, by design: compiler-choice environment switches (offline uses the same defaults),
+// Compute schema 1 does not record compiler-choice environment switches (offline uses the same defaults),
 // the trip-bound diagnostic (disarmed by default), and guest memory the recompiler reads directly
 // rather than through the table. Replay runs under a CompilerResourceScope, so such a read reports
 // itself as INCOMPLETE instead of reading the host process's memory.
+//
+// Graphics schema 2 additionally retains actual compiler selectors/spans/config/choice reads; see
+// refused_graphics_inputs.hpp. Compute schema 1 remains byte-compatible.
 //
 // A diagnostic: written only beside a newly dumped refused program, never read by the live path.
 // Guest buffer bytes stay local, beside the dump; they are never part of the repository.
@@ -27,6 +30,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -37,8 +41,10 @@ namespace prosper::gpu {
 inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256ull * 1024ull;
 inline constexpr uint32_t kRefusedShaderInputsSchema = 1;
 
+struct RefusedGraphicsInputs;
 struct RefusedShaderInputs {
-    std::string stage;                 // "cs"
+    std::string stage;   // "cs", "vs", "ps"
+    std::shared_ptr<const RefusedGraphicsInputs> graphics;   // schema 2; compute stays schema 1
     uint64_t program_address = 0;
     std::string live_reject;           // the recompiler's terminal reject, "" if none recorded
     std::string incomplete;            // why inputs are partial, "" when complete

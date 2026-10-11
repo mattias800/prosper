@@ -3233,6 +3233,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # #4877: actual graphics compiler inputs and fail-closed stage/source replay.
+  prosper_add_gtest(test_refused_graphics_inputs
+    SOURCES tests/gpu/diagnostics/test_refused_graphics_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_shader_dump_filter
     SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
     LIBRARIES prosper_core)

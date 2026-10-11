@@ -381,19 +381,26 @@ deliberately non-zero — a table-less run is never reported as a pass. Syntheti
 when compilation succeeds and `5` when the translator refuses, keeping both results distinct from
 a table-accurate verdict.
 
-A refused **compute** program from the default refused-shader dump has a `<stem>.inputs` sidecar
-beside its `.bin` (#4808): the live launch config, user-data SGPRs, resolved descriptor table and the
-buffer bytes the compiler may read. Replay the live decision with it instead of guessing:
+A refused compute, vertex/NGG or pixel program has a `<stem>.inputs` sidecar beside its `.bin`
+(#4808, #4877). Compute schema 1 retains its producing launch/config/table. Graphics schema 2
+retains the actual compiler selector, exact source/chain spans, ABI/config/float arguments,
+semantic-choice reads, trip settings, table presence/metadata and bounded owned buffer bytes.
+Physical producing register availability is separate diagnostic evidence; absent unrelated draw
+state does not invalidate compiler replay. Replay the producing decision instead of guessing:
 
 ```bash
-./build-linux/shader_inspect refused_shaders_*/cs_<addr>_<hash>.bin \
-    --inputs refused_shaders_*/cs_<addr>_<hash>.inputs
+./build-linux/shader_inspect refused_shaders_*/ps_<addr>_<hash>.bin \
+    --inputs refused_shaders_*/ps_<addr>_<hash>.inputs
 ```
 
-It prints `inputs-live`, `inputs-replay` (on the recorded inputs) and `inputs-tableless` (the
-historical default-config answer), then `inputs-verdict match|differs|incomplete`, exiting `0`, `6`
+It prints `inputs-live`, `inputs-replay` (on the recorded inputs) and `inputs-tableless` (with the recorded graphics config but no resource/input mapping, or the historical
+default compute config), then `inputs-verdict match|differs|incomplete`, exiting `0`, `6`
 or `7`. `incomplete` means the compiler asked for something the sidecar does not hold,
-or the live/replayed terminal refusal was not recorded. An empty unrecorded reason never proves a
+or the live/replayed terminal refusal was not recorded. A precompile draw refusal retains an
+unavailable selector and is INCOMPLETE. Exact-source mismatches and missing/extra semantic reads
+also fail closed. A genuinely absent table is a recorded argument, not missing authority.
+Compute schema 1 still needs the same compiler-choice environment and trip settings as the run;
+graphics schema 2 replays its recorded reads. Older bare dumps remain readable without a sidecar. An empty unrecorded reason never proves a
 match. The counter belongs to the stage and code hash, so relocating a program or reusing a shader
 address cannot move observations to another program. It distinguishes all recorded config and
 resource metadata; buffer contents and host pointer values deliberately remain outside this

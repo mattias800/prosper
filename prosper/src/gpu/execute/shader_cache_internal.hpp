@@ -231,6 +231,7 @@ struct ShaderCompileKey {
     // copy and re-hash the complete raw program for every draw before reaching the shader cache.
     std::shared_ptr<const std::vector<uint32_t>> code;
     uint64_t code_hash = 0;
+    const RefusedShaderMemo* refused_memo = nullptr;   // diagnostic only; code retains its owner
     // Optional main program reached by a separately-installed vertex-fetch prolog. It remains a
     // distinct immutable analysis so cache identity covers both allocations without constructing a
     // transient concatenated buffer on every warm draw.

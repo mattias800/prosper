@@ -8,6 +8,7 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
+#include "gpu/diagnostics/refused_graphics_inputs.hpp"
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
 #include "gpu/execute/shader_source_window.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
@@ -2886,6 +2887,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         if (system_input_ptr) failure->system_inputs = *system_input_ptr;
         failure->ps_wave32 = rs.ps_wave32;
     }
+    const RefusedGraphicsLaunchScope producing_launch(ds);
     uint64_t vs_identity = 0, fs_identity = 0;
     RefusedShaderSource vs_original, fs_original;
     // #4703: compressed-export unpack and integer outputs follow the bound targets.

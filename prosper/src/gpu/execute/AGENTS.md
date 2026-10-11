@@ -23,6 +23,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   symbol rather than by reading it.
 - `graphics_shader_compile` — the cache's actual direct/chained vertex and fragment compiler calls,
   moved out of the oversized executor without changing their inputs.
+- `refused_graphics_compile` — cold producing-boundary observation for those calls and the NGG
+  shell compiler. Exact source/config/table ownership and physical register knownness are captured
+  before the actual call; warm cache hits do not copy registers or resources. The diagnostic never
+  supplies inputs or authority to live compilation.
 - `split_t8_proof` — whether the const-fold may publish an image descriptor assembled from two
   scalar loads: a must-dataflow over the program's CFG, so every path into the consumer has to
   deliver the same load words. `sopp_cfg` holds the direct-branch helpers the executor's CFG

@@ -1,3 +1,4 @@
+#include "gpu/execute/refused_graphics_compile.hpp"
 // ngg_subgroup_draw.cpp -- see ngg_subgroup_draw.hpp.
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 
@@ -98,8 +99,20 @@ compile_ngg_subgroup_stages(const NggSubgroupDrawRequest& request, uint32_t wave
     shell.waves = waves;
     shell.wave_lanes = request.limits.wave_lanes;   // one width for the plan, shell and raster
     std::string why;
-    auto module = recompile_ngg_subgroup(request.linked_code, request.dwords, request.resources,
-                                         shell, &stages->layout, request.diagnostic, &why);
+    struct Context {
+        const NggSubgroupDrawRequest* request;
+        const NggSubgroupShellConfig* shell;
+        NggExportRecordLayout* layout;
+        std::string* why;
+    } context{&request, &shell, &stages->layout, &why};
+    auto module = observe_ngg_shader_attempt(
+        request, shell,
+        [p = &context] {
+            return recompile_ngg_subgroup(p->request->linked_code, p->request->dwords,
+                                          p->request->resources, *p->shell, p->layout,
+                                          p->request->diagnostic, p->why);
+        },
+        &why);
     if (module.empty()) return refuse(why);
     std::vector<uint32_t> declared;
     if (!ngg_shell_guest_bindings(module, &declared))

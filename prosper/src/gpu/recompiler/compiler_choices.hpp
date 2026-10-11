@@ -9,8 +9,14 @@ namespace prosper::gpu {
 // Versioned semantic reads, not an environment snapshot. A repeated read is a separate event;
 // replay must consume the same sequence or fail closed. Observational logging is deliberately absent.
 enum class CompilerChoice : uint32_t {
-    FloatControls, FragmentTapPc, ForcedArrayLayer, VccScalarMerge,
-    MimgSoft, NormalizeSamplerCoordinates,
+    FloatControls,
+    FragmentTapPc,
+    ForcedArrayLayer,
+    VccScalarMerge,
+    MimgSoft,
+    NormalizeSamplerCoordinates,
+    VertexTapPc,
+    ForcePositionW,
 };
 struct CompilerChoiceRead {
     CompilerChoice choice = CompilerChoice::FloatControls;
