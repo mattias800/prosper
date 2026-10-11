@@ -87,10 +87,6 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     const bool predicate = in.fmt == Rdna2Format::VOPC || vop3_writes_mask_sdst(in) ||
                            (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a);
     if (!predicate) return true;
-    for (uint32_t source = 0; source < in.n_src; ++source)
-        if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253 &&
-            (!rs.scc || rs.scc_merge_placeholder))
-            return false;   // SCC consumed explicitly as a numeric 0/1 word
     // Read before the destination replaces its prior lifetime. This uses decoded source counts and
     // physical widths, including both words of wide comparisons and marked ordinary VALU relays.
     // A memory-loaded value can form a fresh predicate; a missing spill's zero storage cannot.

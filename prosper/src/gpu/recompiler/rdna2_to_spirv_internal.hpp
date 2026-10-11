@@ -3370,8 +3370,11 @@ inline uint64_t blanket_root(uint32_t header_pc, int r) {
     return (static_cast<uint64_t>(header_pc) << 16u) | static_cast<uint16_t>(r);
 }
 
-// The scalar instructions that read SCC as a value.
+// Explicit SCC is a numeric 0/1 source in any decoded operand role; scalar condition/carry
+// instructions also consume it implicitly. Keep emission marks and CFG relay inventory aligned.
 inline bool scalar_reads_scc(const Rdna2Inst& in) {
+    for (uint32_t source = 0; source < in.n_src; ++source)
+        if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253) return true;
     return (in.fmt == Rdna2Format::SOP2 &&
             (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)) ||
            (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||

@@ -545,3 +545,116 @@ TEST(NativeCfgSavedMaskData, CurrentOverwriteEndsFabricatedBodyScalarGeneration)
 TEST(NativeCfgSavedMaskData, DirectBreakCannotBorrowDifferentRootForAFabricatedCurrentWord) {
     loop_refuses(6);
 }
+
+namespace {
+enum class SccRelay {
+    Scalar,
+    Vector,
+    ScalarSpill,
+    ExplicitSpill,
+    VectorLaneRead,
+    ScalarSecondSource,
+    VectorThirdSource,
+    AcrossEdge,
+    IndexedLaneRead
+};
+std::vector<uint32_t> explicit_scc_relay_program(SccRelay use, bool all_paths,
+                                                 bool replacement = false) {
+    auto p = slot_mask_program(FreshMaskUse::SccRelay, all_paths);
+    const auto cmp = std::find(p.begin(), p.end(), 0x7d8400fdu);
+    const size_t at = cmp - p.begin();
+    const bool vector = use == SccRelay::Vector || use == SccRelay::VectorThirdSource;
+    *cmp = 0x7d840000u | (vector ? 259u : 16u);
+    std::vector<uint32_t> relay;
+    if (use == SccRelay::Vector || use == SccRelay::VectorLaneRead)
+        relay.push_back(0x7e0602fdu);   // v3=SCC
+    else if (use == SccRelay::ScalarSecondSource)
+        relay.push_back(0x8010fd80u);   // s_add_u32 s16,0,SCC: explicit second source
+    else if (use == SccRelay::VectorThirdSource)
+        relay.insert(relay.end(), {0xd5430003u, 128u | (128u << 9u) | (253u << 18u)});
+    else if (use != SccRelay::ExplicitSpill && use != SccRelay::IndexedLaneRead)
+        relay.push_back(mov(16, 253));   // exact independent review's scalar SCC copy
+    if (use == SccRelay::VectorLaneRead) relay.push_back(0x7e200503u);   // s16=readfirstlane(v3)
+    if (use == SccRelay::IndexedLaneRead)
+        relay.insert(relay.end(), {0xd7600010u, 256u | (253u << 9u)});   // s16=readlane(v0,SCC)
+    if (use == SccRelay::ScalarSpill || use == SccRelay::ExplicitSpill) {
+        relay.insert(relay.end(),
+                     {0xd7610015u, (use == SccRelay::ExplicitSpill ? 253u : 16u) | (128u << 9u),
+                      0xbf880001u, 0x7e040281u, 0xd7600010u, 277u | (128u << 9u)});
+    }
+    if (use == SccRelay::AcrossEdge) relay.insert(relay.end(), {0xbf880001u, 0x7e040281u});
+    if (replacement) relay.push_back(vector ? 0x7e060280u : mov(16, 128));
+    p.insert(p.begin() + at, relay.begin(), relay.end());
+    return p;
+}
+}   // namespace
+
+TEST(NativeCfgSavedMaskData, MissingSccScalarMoveCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::Scalar, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccVectorMoveCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::Vector, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccScalarSpillCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::ScalarSpill, false));
+}
+TEST(NativeCfgSavedMaskData, MissingExplicitSccSpillCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::ExplicitSpill, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccVectorLaneReadCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::VectorLaneRead, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccSecondSourceCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::ScalarSecondSource, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccThirdSourceCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::VectorThirdSource, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccRelayAcrossAnEdgeCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::AcrossEdge, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSccLaneSelectorCannotAuthenticateFreshMask) {
+    mask_refuses(explicit_scc_relay_program(SccRelay::IndexedLaneRead, false));
+}
+TEST(NativeCfgSavedMaskData, AllPathSccRelaysUseTheirActualNumericValue) {
+    for (auto use :
+         {SccRelay::Scalar, SccRelay::Vector, SccRelay::ScalarSpill, SccRelay::ExplicitSpill,
+          SccRelay::VectorLaneRead, SccRelay::ScalarSecondSource, SccRelay::VectorThirdSource,
+          SccRelay::AcrossEdge, SccRelay::IndexedLaneRead})
+        mask_values(explicit_scc_relay_program(use, true), false, true);
+}
+TEST(NativeCfgSavedMaskData, CurrentReplacementEndsMissingSccRelayGeneration) {
+    for (auto use :
+         {SccRelay::Scalar, SccRelay::Vector, SccRelay::ScalarSpill, SccRelay::ExplicitSpill,
+          SccRelay::VectorLaneRead, SccRelay::ScalarSecondSource, SccRelay::VectorThirdSource,
+          SccRelay::AcrossEdge, SccRelay::IndexedLaneRead})
+        mask_values(explicit_scc_relay_program(use, false, true), false, true);
+}
+
+TEST(NativeCfgSavedMaskData, ANewGenuineCompareEndsMissingSccConditionGeneration) {
+    const auto resources = table();
+    for (auto use :
+         {SccRelay::Scalar, SccRelay::Vector, SccRelay::ScalarSpill, SccRelay::ExplicitSpill,
+          SccRelay::VectorLaneRead, SccRelay::ScalarSecondSource, SccRelay::VectorThirdSource,
+          SccRelay::AcrossEdge, SccRelay::IndexedLaneRead}) {
+        auto p = explicit_scc_relay_program(use, false);
+        const auto old = std::find(p.begin(), p.end(), 0xbf06800eu);
+        p.insert(old + 1, 0xbf068004u);   // current SCC=(genuine s4==0), independent of the reload
+        for (uint32_t path : {0u, 1u}) {
+            auto c = config();
+            c.user_sgprs[4] = path;
+            const auto module = recompile_compute(p.data(), p.size(), &resources, c);
+            ASSERT_FALSE(module.empty());
+            ASSERT_TRUE(has_op(module, 251));
+            bpermute_oracle::Interpreter vm(module);
+            vm.native_subgroup_width = 64;
+            vm.push_constants = c.user_sgprs;
+            const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+            ASSERT_TRUE(vm.error.empty()) << vm.error;
+            ASSERT_EQ(out.size(), 64u);
+            for (uint32_t lane = 0; lane < 64; ++lane)
+                EXPECT_EQ(out[lane], uint32_t(lane == (path == 0 ? 1u : 0u)))
+                    << "path " << path << " lane " << lane;
+        }
+    }
+}
