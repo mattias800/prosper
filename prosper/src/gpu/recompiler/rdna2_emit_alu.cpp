@@ -39,6 +39,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_mask_write.hpp"
 
 namespace prosper::gpu {
 
@@ -171,15 +172,6 @@ namespace {
 // rather than infer B64 from the register number. Unknown VOP3 operations stay conservative.
 
 } // namespace
-
-// A 64-bit mask write architecturally overwrites the destination SGPR pair ("D = ..." in every
-// ISA mask-op description): any tracked data-domain SSA value or descriptor-provenance tag for
-// those registers is stale afterwards. Erase both so a later data read / SRSRC resolution cannot
-// alias the pre-mask-op value (the mask itself lives in sreg_bool / rs.vcc / rs.exec).
-inline void mask_write_clobbers_pair(RegState& rs, int dst) {
-    rs.sreg.erase(dst); rs.sreg.erase(dst + 1);
-    rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
-}
 
 // The VOP1 f16 unary family's operation, given its already-unpacked f16 operand as an f32 value.
 // Both the plain e32 form and the SDWA word-select form lower through this one function, so the two
