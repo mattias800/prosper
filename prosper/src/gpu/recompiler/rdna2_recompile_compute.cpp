@@ -28,6 +28,7 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
+#include "gpu/recompiler/rdna2_entry_exec_constants.hpp"
 
 namespace prosper::gpu {
 
@@ -626,14 +627,17 @@ bool compute_extent_is_partial(const ComputeShaderConfig& config) {
 std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
                                              const ShaderResourceTable* rt,
                                              const ComputeShaderConfig& config,
-                                             RecompileDiagnosticContext diagnostic);
+                                             RecompileDiagnosticContext diagnostic,
+                                             const PortableEntryExecRoot& entry);
 }   // namespace
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
-    std::vector<uint32_t> module = recompile_compute_once(code, dwords, rt, config, diagnostic);
+    const PortableEntryExecRoot entry(code, dwords, config);
+    std::vector<uint32_t> module =
+        recompile_compute_once(code, dwords, rt, config, diagnostic, entry);
     // ADR 0028 route 3, default OFF: a module that needs a subgroup wider than the host's gets one
     // second chance through the exact exchange dispatcher. It replaces the original only when it
     // compiles and no longer needs the wider subgroup, so a refusal is never turned into a
@@ -645,7 +649,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         return module;
     ComputeShaderConfig retry = config;
     retry.force_exchange_dispatcher = true;
-    std::vector<uint32_t> exchanged = recompile_compute_once(code, dwords, rt, retry, diagnostic);
+    std::vector<uint32_t> exchanged =
+        recompile_compute_once(code, dwords, rt, retry, diagnostic, entry);
     // The retry must be a pure exchange: a native subgroup operation (which can be emitted without
     // raising the minimum-subgroup marker) would make its exactness depend on the host's width.
     if (!exchanged.empty() && compute_spirv_min_subgroup_size(exchanged) <= width &&
@@ -658,7 +663,8 @@ namespace {
 std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
                                              const ShaderResourceTable* rt,
                                              const ComputeShaderConfig& config,
-                                             RecompileDiagnosticContext diagnostic) {
+                                             RecompileDiagnosticContext diagnostic,
+                                             const PortableEntryExecRoot& entry) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -722,6 +728,10 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
         rdna2_proven_raw_nested_wide_data_loads(ins);
     const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
     const auto original_owned_raw_x2 = rdna2_owned_raw_x2_chains(ins);
+    // Only the authenticated outer guest entry owns these physical constants. Phases inherit the
+    // transformed instructions, not a reusable proof, and every native saved-word proof still
+    // authenticates its original bytes/domain independently.
+    entry.specialize(code, dwords, config, ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
     // traversal cycle before generic shader-byte constant folding. Resource identity (including null
     // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch

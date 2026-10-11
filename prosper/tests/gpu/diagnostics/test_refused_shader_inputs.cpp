@@ -20,15 +20,19 @@
 #include "gpu/execute/refused_shader_source.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "fixtures/test_scratch.h"
+#include "fixtures/portable_entry_exec.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -125,6 +129,10 @@ TEST(RefusedShaderInputs, RoundTripKeepsEveryInput) {
     c.threads_x = 11, c.threads_y = 12, c.threads_z = 13;
     c.wave_size = 32;
     c.compute_pgm_rsrc1 = 0x12345u;
+    c.dispatch_launch = {ComputeDispatchLaunchState::kAll,
+                         uint64_t{1} << 32u | 3u,
+                         {31u << 16u | 8u, 0x12345678u, 0xfedcba98u},
+                         {19, 20, 21}};
     c.tidig_comp_cnt = 2;
     c.tgid_y_en = c.tgid_z_en = c.tg_size_en = true;
     c.lds_bytes = 4096;
@@ -163,6 +171,7 @@ TEST(RefusedShaderInputs, RoundTripKeepsEveryInput) {
     EXPECT_EQ(d.threads_z, 13u);
     EXPECT_EQ(d.wave_size, 32u);
     EXPECT_EQ(d.compute_pgm_rsrc1, 0x12345u);
+    EXPECT_EQ(d.dispatch_launch, c.dispatch_launch);
     EXPECT_EQ(d.tidig_comp_cnt, 2u);
     EXPECT_TRUE(d.tgid_x_en && d.tgid_y_en && d.tgid_z_en && d.tg_size_en);
     EXPECT_EQ(d.lds_bytes, 4096u);
@@ -476,4 +485,73 @@ TEST(RefusedShaderInputs, MissingSidecarAndFullBudgetStopInputWork) {
     EXPECT_EQ(refused_shader_dump_stats().input_identity_evaluations,
               full.input_identity_evaluations);
     EXPECT_EQ(refused_shader_dump_stats().input_set_global_locks, full.input_set_global_locks);
+}
+
+namespace {
+std::vector<uint8_t> sidecar_bytes(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+void checksum_sidecar(std::vector<uint8_t>& bytes) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < bytes.size() - 8; ++i) {
+        hash ^= bytes[i];
+        hash *= 0x100000001b3ull;
+    }
+    for (uint32_t i = 0; i < 8; ++i)
+        bytes[bytes.size() - 8 + i] = static_cast<uint8_t>(hash >> (8u * i));
+}
+}   // namespace
+TEST(RefusedShaderInputs, LegacySchemaOneCannotInventRawLaunchAuthority) {
+    const auto root = fresh_root("refused_inputs_legacy_launch");
+    namespace entry = prosper::test::portable_entry_exec;
+    const auto c = entry::config(64);
+    const auto resources = entry::table(64);
+    const auto path = root / "entry.inputs";
+    ASSERT_TRUE(write_refused_compute_inputs(path, 0x4930, &resources, c, "entry-refusal"));
+    auto bytes = sidecar_bytes(path);
+    ASSERT_GT(bytes.size(), 44u);
+    auto current = decode_refused_shader_inputs(bytes);
+    ASSERT_EQ(current.compute.dispatch_launch, c.dispatch_launch);
+    EXPECT_TRUE(replay_refused_shader_inputs(entry::program(64), current).produced);
+    bytes.erase(bytes.end() - 44,
+                bytes.end() - 8);   // schema4 launch record, preserve carrier/prefix
+    bytes[8] = 1;
+    bytes[9] = bytes[10] = bytes[11] = 0;
+    checksum_sidecar(bytes);
+    const auto legacy = decode_refused_shader_inputs(bytes);
+    EXPECT_EQ(legacy.compute.dispatch_launch, ComputeDispatchLaunchState{});
+    const auto replay = replay_refused_shader_inputs(entry::program(64), legacy);
+    EXPECT_FALSE(replay.produced);
+    EXPECT_TRUE(replay.incomplete.empty()) << replay.incomplete;
+    EXPECT_FALSE(replay.reject.empty());
+}
+TEST(RefusedShaderInputs, InputIdentityBindsEveryRawWordAndPresenceBit) {
+    const auto c = prosper::test::portable_entry_exec::config();
+    const auto hash = refused_compute_inputs_identity(nullptr, c);
+    for (uint32_t field = 0; field < 8; ++field) {
+        auto changed = c;
+        if (field == 0) changed.dispatch_launch.known ^= 1;
+        if (field == 1) changed.dispatch_launch.initiator ^= 2;
+        if (field >= 2 && field < 5) ++changed.dispatch_launch.num_thread[field - 2];
+        if (field >= 5) ++changed.dispatch_launch.dimensions[field - 5];
+        EXPECT_NE(hash, refused_compute_inputs_identity(nullptr, changed)) << field;
+    }
+    auto changed = c;
+    changed.dispatch_launch.initiator |= uint64_t{1} << 32u;
+    EXPECT_NE(hash, refused_compute_inputs_identity(nullptr, changed));
+}
+TEST(RefusedShaderInputs, InvalidRawLaunchPresenceIsNotAValidArtifact) {
+    const auto root = fresh_root("refused_inputs_bad_launch");
+    auto c = prosper::test::portable_entry_exec::config();
+    const auto path = root / "bad.inputs";
+    ASSERT_TRUE(write_refused_compute_inputs(path, 0x4930, nullptr, c, "refusal"));
+    auto bytes = sidecar_bytes(path);
+    ASSERT_GT(bytes.size(), 44u);
+    bytes[bytes.size() - 44u] = 255;
+    checksum_sidecar(bytes);
+    EXPECT_THROW(decode_refused_shader_inputs(bytes), std::runtime_error);
+    c.dispatch_launch.known = 255;
+    EXPECT_FALSE(
+        write_refused_compute_inputs(root / "invalid.inputs", 0x4930, nullptr, c, "refusal"));
 }

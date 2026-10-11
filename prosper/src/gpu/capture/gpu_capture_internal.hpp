@@ -12,6 +12,9 @@
 
 #include "host/memory/guest_memory_copy.hpp"   // read_capture_guest_memory (#3734)
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
+
+#include <cstdint>
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -216,7 +219,11 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v71 raster launch, v72 merged-NGG, v73 depth bounds, v74 source marks. So a v74 file carries the
 // v72 and v73 tails too (written for every draw, absent ones as "none"/"disabled"), and a capture
 // that needs none of v72-v74 is still written as v71, byte for byte.
-constexpr uint32_t kVersion = 74;
+// v75: observed compute dispatch initiator, packed FULL/PARTIAL register words and original direct
+// packet dimensions, with independent presence. Appended only when some available compute config
+// carries these words; v71-v74 captures keep their exact bytes and load an unknown launch record.
+constexpr uint32_t kVersion = 75;
+constexpr uint32_t kVersionWithComputeDispatchLaunch = 75;
 constexpr uint32_t kVersionWithUnavailableSource = 74;
 constexpr uint32_t kVersionWithDepthBounds = 73;
 constexpr uint32_t kVersionWithNgg = 72;
@@ -233,6 +240,15 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& compute : c.computes)
+        if (compute.recompile_config_available &&
+            compute.recompile_config.dispatch_launch != ComputeDispatchLaunchState{})
+            return kVersionWithComputeDispatchLaunch;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (stage.recompile_config_available &&
+                stage.recompile_config.dispatch_launch != ComputeDispatchLaunchState{})
+                return kVersionWithComputeDispatchLaunch;
     if (gpu_capture_has_unavailable_source(c)) return kVersionWithUnavailableSource;
     for (const auto& draw : c.draws)
         if (draw.ps.depth_bounds_enable) return kVersionWithDepthBounds;

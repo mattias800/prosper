@@ -18,6 +18,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/split_t8_proof.hpp"
 #include "diagnostics/env_submit.hpp"
@@ -211,6 +212,7 @@ struct ShaderCompileKey {
     // partial final workgroup emits a literal invocation guard into SPIR-V.
     bool has_compute_config = false;
     uint32_t compute_user_sgpr_count = 0;
+    ComputeDispatchLaunchState compute_dispatch_launch{};
     uint32_t compute_local_x = 1, compute_local_y = 1, compute_local_z = 1;
     bool compute_exact_thread_extent = false;
     uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
@@ -278,6 +280,7 @@ struct ShaderCompileKey {
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
                compute_user_sgpr_count == other.compute_user_sgpr_count &&
+               compute_dispatch_launch == other.compute_dispatch_launch &&
                compute_local_x == other.compute_local_x &&
                compute_local_y == other.compute_local_y &&
                compute_local_z == other.compute_local_z &&
@@ -304,6 +307,8 @@ struct ShaderCompileKey {
                resources == other.resources && same_code && same_chain_code;
     }
 };
+
+void populate_compute_shader_key(ShaderCompileKey&, const ComputeShaderConfig&);
 
 inline uint64_t hash_mix(uint64_t hash, uint64_t value) {
     // FNV-1a over fixed-width values. Equality still compares the full key, so collisions are benign.
@@ -375,6 +380,12 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.has_compute_config);
         if (key.has_compute_config) {
             hash = hash_mix(hash, key.compute_user_sgpr_count);
+            hash = hash_mix(hash, key.compute_dispatch_launch.known);
+            hash = hash_mix(hash, key.compute_dispatch_launch.initiator);
+            for (uint32_t word : key.compute_dispatch_launch.num_thread)
+                hash = hash_mix(hash, word);
+            for (uint32_t word : key.compute_dispatch_launch.dimensions)
+                hash = hash_mix(hash, word);
             hash = hash_mix(hash, key.compute_local_x);
             hash = hash_mix(hash, key.compute_local_y);
             hash = hash_mix(hash, key.compute_local_z);

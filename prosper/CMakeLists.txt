@@ -978,6 +978,18 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_readlane_barrier.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_portable_entry_exec
+    SOURCES tests/gpu/recompiler/test_portable_entry_exec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_dispatch_launch
+    SOURCES tests/gpu/execute/test_compute_dispatch_launch.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_dispatch_launch_codec
+    SOURCES tests/gpu/capture/test_compute_dispatch_launch_codec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_compute_array_gather
     SOURCES tests/gpu/recompiler/test_compute_array_gather.cpp
     INCLUDES tests

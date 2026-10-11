@@ -11,6 +11,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -327,6 +328,26 @@ inline void write_compute_config(Writer& w, const ComputeShaderConfig& config) {
     w.u32(config.lds_bytes);
     w.u32(config.native_subgroup_size);
     w.u32(config.native_storage_format_support);
+}
+
+inline bool write_compute_dispatch_launch(Writer& w, const ComputeDispatchLaunchState& launch) {
+    if (launch.known & ~ComputeDispatchLaunchState::kAll) return false;
+    w.u32(launch.known);
+    w.u64(launch.initiator);
+    for (uint32_t word : launch.num_thread) w.u32(word);
+    for (uint32_t word : launch.dimensions) w.u32(word);
+    return true;
+}
+
+inline bool read_compute_dispatch_launch(Reader& r, ComputeDispatchLaunchState& launch) {
+    if (!r.u32(launch.known) || (launch.known & ~ComputeDispatchLaunchState::kAll) ||
+        !r.u64(launch.initiator))
+        return false;
+    for (uint32_t& word : launch.num_thread)
+        if (!r.u32(word)) return false;
+    for (uint32_t& word : launch.dimensions)
+        if (!r.u32(word)) return false;
+    return true;
 }
 
 inline bool read_compute_config(Reader& r, ComputeShaderConfig& config, uint32_t capture_version) {

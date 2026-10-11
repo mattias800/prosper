@@ -4208,9 +4208,9 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < 4; ++i) future_version |= uint32_t(legacy_bytes[8 + i]) << (8u * i);
     // Derive the unknown version from this actual writer's header. This capture needs none of the
     // conditional tails, so it is written as v71; v72 (merged-NGG, #3135 P5), v73 (depth bounds,
-    // #4704) and v74 (unavailable-source marks, #3807) are all known, so the first version no
-    // reader knows is four above it.
-    future_version += 4;
+    // #4704), v74 (unavailable-source marks, #3807) and v75 (raw compute launch, #4930) are all
+    // known, so the first unsupported version is five above it.
+    future_version += 5;
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +

@@ -18,6 +18,7 @@
 #include "gpu/execute/registered_graphics_source_internal.hpp"
 #include "gpu/execute/srt_publication_dedupe.hpp"
 #include "gpu/execute/empty_scalar_buffer.hpp"
+#include "gpu/execute/compute_dispatch_launch.hpp"
 #include "gpu/execute/scalar_buffer_bounds.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
@@ -1165,31 +1166,7 @@ ShaderCompileKey make_shader_compile_key(
         stage == ShaderProgramStage::Fragment ? fragment_export_formats : FragmentExportFormats{};
     key.float_transport = compute_config ? compute_config->float_transport : float_transport;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
-    if (key.has_compute_config) {
-        key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
-        key.compute_local_x = compute_config->local_x;
-        key.compute_local_y = compute_config->local_y;
-        key.compute_local_z = compute_config->local_z;
-        key.compute_exact_thread_extent = compute_config->exact_thread_extent;
-        key.compute_threads_x = compute_config->threads_x;
-        key.compute_threads_y = compute_config->threads_y;
-        key.compute_threads_z = compute_config->threads_z;
-        key.compute_wave_size = compute_config->wave_size;
-        key.compute_pgm_rsrc1 = compute_config->compute_pgm_rsrc1;
-        key.compute_tidig_comp_cnt = compute_config->tidig_comp_cnt;
-        key.compute_tgid_x_en = compute_config->tgid_x_en;
-        key.compute_tgid_y_en = compute_config->tgid_y_en;
-        key.compute_tgid_z_en = compute_config->tgid_z_en;
-        key.compute_tg_size_en = compute_config->tg_size_en;
-        key.compute_lds_bytes = compute_config->lds_bytes;
-        key.compute_native_subgroup_size = compute_config->native_subgroup_size;
-        key.compute_wave64_exchange_width = compute_config->wave64_exchange_width;
-        key.compute_native_storage_format_support =
-            compute_config->native_storage_format_support;
-        key.compute_storage_buffer_int64_atomics =
-            compute_config->storage_buffer_int64_atomics;
-        key.compute_packed_r11_storage = compute_config->packed_r11_storage;
-    }
+    if (key.has_compute_config) populate_compute_shader_key(key, *compute_config);
     // Reuse only the draw-local byte version; ordinary cold callers authenticate their range.
     const SharedShaderAnalysis analysis =
         (stage == ShaderProgramStage::Fragment || checked_graphics_source) && captured_analysis
@@ -8879,6 +8856,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
         }
 
         ComputeShaderConfig config;
+        config.dispatch_launch = compute_dispatch_launch_state(dispatch);
         config.float_transport = published_float_transport_config();
         config.compute_pgm_rsrc1 = rd(ds.sh, P::COMPUTE_PGM_RSRC1);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));

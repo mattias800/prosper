@@ -24,6 +24,7 @@
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 namespace prosper::gpu {
 
@@ -795,6 +796,9 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
 // controls whether local IDs seed v0 only (0), v0-v1 (1), or v0-v2 (2+).
 struct ComputeShaderConfig {
     std::vector<uint32_t> user_sgprs;
+    // Raw packet/register words are required by entry EXEC constant specialization. Dimensions
+    // alone lose PARTIAL_TG_EN and NUM_THREAD_PARTIAL; old captures deliberately remain unknown.
+    ComputeDispatchLaunchState dispatch_launch{};
     uint32_t local_x = 64, local_y = 1, local_z = 1;
     // Vulkan can only launch complete workgroups, while AGC thread-dimension dispatches may end in a
     // partial workgroup. When enabled, the generated entry point suppresses invocations outside this
