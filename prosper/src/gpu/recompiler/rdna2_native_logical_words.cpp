@@ -465,10 +465,14 @@ bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in) {
 }
 
 bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial) {
-    return b.native_vcc_copy_entry_domain == copy_entry_domain(b) &&
+    return native_vcc_copy_execution_domain_matches(b) &&
            b.native_vcc_copy_entry_masks == copy_entry_masks(initial) &&
            b.native_vcc_copy_entry_b32_masks ==
                (initial ? initial->sreg_bool_b32 : std::unordered_set<int>{});
+}
+
+bool native_vcc_copy_execution_domain_matches(const SpirvCompute& b) {
+    return b.native_vcc_copy_entry_domain == copy_entry_domain(b);
 }
 
 bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in) {

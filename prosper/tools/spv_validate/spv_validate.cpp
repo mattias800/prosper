@@ -2135,6 +2135,24 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_counted_loop_body_vcc_then_if",
              recompile_fragment(counted, sizeof(counted) / 4, nullptr));
     }
+    // #4921: a genuine Bool-only saved copy in the exact postlude of a successfully
+    // emitted counted loop. Original numeric VCC reads belong to an older generation;
+    // suffix initialization still expires physical producer participation.
+    {
+        const uint32_t c[] = {0xbeea0481u, 0xbe9e036au, 0xbe820380u, 0xbf0a8302u, 0xbf840002u,
+                              0x80028102u, 0xbf82fffcu, 0x7e000281u, 0x7e020280u, 0x7d8402f9u,
+                              0x06069400u, 0xbeea0414u, 0xd5010000u, 0x01a91281u, 0xf800080fu,
+                              0x00000000u, 0xbf810000u};
+        dump(dir, "fragment_counted_bool_copy_continuation",
+             recompile_fragment(c, sizeof(c) / 4, nullptr));
+        std::vector<uint32_t> compute(std::begin(c), std::end(c));
+        compute.erase(compute.end() - 3, compute.end() - 1);
+        ComputeShaderConfig config;
+        config.wave_size = config.native_subgroup_size = config.local_x = 64;
+        config.user_sgprs.resize(8);
+        dump(dir, "compute_counted_bool_copy_continuation",
+             recompile_compute(compute.data(), compute.size(), nullptr, config));
+    }
     // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
     // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
     // the structured loop route, and the one-arm if phis a slot written on the taken arm only.

@@ -16,6 +16,7 @@ void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
 bool native_logical_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in);
 bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in);
 bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial);
+bool native_vcc_copy_execution_domain_matches(const SpirvCompute& b);
 bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in);
 std::array<uint32_t, 2> native_logical_result_words(SpirvCompute& b, const RegState& rs,
                                                     const Rdna2Inst& in, uint32_t result_mask);
