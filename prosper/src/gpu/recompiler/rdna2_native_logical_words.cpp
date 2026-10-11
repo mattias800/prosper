@@ -277,8 +277,20 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             mbcnt && mbcnt_root >= 0 && mbcnt_root < 128 && masks_before[i].test(mbcnt_root) &&
             (in.src[0].kind == OperandKind::SGPR ||
              (in.src[0].kind == OperandKind::Special && (mbcnt_root == 106 || mbcnt_root == 126)));
+        // CONFIDENCE: HIGH -- the ordinary V_CNDMASK e64 emitter consumes source2 from
+        // sreg_bool/VCC, not scalar DATA. Only its instruction-order MUST mask domain
+        // supplies this exemption; data sources0/1 and unresolved physical generations
+        // remain reads. VCC_HI's independent B32 route has no such Wave64 MUST fact here.
+        const auto& condition = in.src[2];
+        const bool cndmask_mask =
+            in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && in.n_src == 3 &&
+            mask_source(masks_before[i], condition) &&
+            ((condition.kind == OperandKind::SGPR && condition.value >= 0 &&
+              condition.value <= 105) ||
+             ((condition.kind == OperandKind::SGPR || condition.kind == OperandKind::Special) &&
+              condition.value == 106));
         for (uint32_t source = 0; source < in.n_src; ++source) {
-            if (source == 0 && mbcnt_mask) continue;
+            if ((source == 0 && mbcnt_mask) || (source == 2 && cndmask_mask)) continue;
             const auto& operand = in.src[source];
             if (operand.kind != OperandKind::SGPR &&
                 !(operand.kind == OperandKind::Special && operand.value >= 106 &&

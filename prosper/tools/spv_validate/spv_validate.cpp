@@ -1915,6 +1915,16 @@ int main(int argc, char** argv) {
         dump(dir, "compute_native_logical_scalar_words",
              recompile_compute(code, std::size(code), &rt, cfg));
     }
+    // #4904: a saved Bool condition after CMPX needs no packed words or producer ballot.
+    {
+        const uint32_t code[]{0x7daa0080u, 0x7d8400f9u, 0x06868081u, 0x7d8400f9u, 0x06868281u,
+                              0x87940200u, 0xd5010000u, 0x00511281u, 0xbf810000u};
+        ComputeShaderConfig cfg;
+        cfg.local_x = cfg.wave_size = cfg.native_subgroup_size = 64;
+        cfg.user_sgprs.resize(8);
+        dump(dir, "compute_native_logical_bool_cndmask",
+             recompile_compute(code, std::size(code), nullptr, cfg));
+    }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
     for (uint32_t shape = 0; shape < 6; ++shape) {
