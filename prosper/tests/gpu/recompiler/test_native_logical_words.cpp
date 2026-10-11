@@ -370,6 +370,30 @@ TEST(NativeLogicalWords, MixedCselectCannotReadAnUnavailablePlaceholderDirectly)
     EXPECT_FALSE(e.emit(e.instruction({logical(0x0b, 22, 0, 4)})));
 }
 
+TEST(NativeLogicalWords, RawCselectKeepsPeerMarksForLaterNativeLogicalData) {
+    for (bool marked : {false, true}) {
+        Emitter e;
+        e.rs.sreg_bool.erase(0);
+        e.rs.sreg_bool.erase(2);   // both actual CSELECT inputs are ordinary DATA
+        e.rs.scc = e.b.btrue();
+        if (marked) e.rs.sreg_merge_placeholder.insert(1);
+        const std::vector<uint32_t> code{logical(0x0b), logical(0x0f, 22, 20, 2), 0xbe9e0316u, end};
+        e.prove(code);
+        ASSERT_TRUE(e.emit(e.instruction({code[0]})));
+        EXPECT_EQ(e.rs.sreg_merge_placeholder.contains(20), marked);
+        EXPECT_EQ(e.rs.sreg_merge_placeholder.contains(21), marked);
+        auto next = e.instruction({code[1]});
+        next.pc = 1;
+        EXPECT_EQ(e.emit(next), !marked);
+        if (marked) {
+            EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
+            EXPECT_EQ(ballots(e.b), 0u);
+        } else {
+            e.expect_values(22, expected(0x0f));
+        }
+    }
+}
+
 TEST(NativeLogicalWords, ImplicitVopcRetiresOverlappingOddMaskBeforeCselect) {
     for (bool overwrite : {false, true}) {
         Emitter e;
