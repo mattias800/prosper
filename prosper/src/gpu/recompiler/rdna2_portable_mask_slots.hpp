@@ -22,6 +22,9 @@ struct PortableMaskHalfTypes {
     std::set<int> may_words;
     std::set<std::pair<int, int>> may_slots;
     std::set<int> complete;
+    // Existing DATA from closed MOV producers prevents a HIGH word from being retyped as a
+    // new symbolic spill. This fact never publishes DATA or authorizes a symbolic numeric read.
+    std::set<int> numeric_words;
     bool operator==(const PortableMaskHalfTypes&) const = default;
 };
 struct PortableMaskHalfProgram {

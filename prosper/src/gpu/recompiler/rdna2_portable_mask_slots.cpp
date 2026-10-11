@@ -26,7 +26,8 @@ int source_half(const Types& types, const Operand& source) {
         return static_cast<int>(found->second);
     if (types.may_words.contains(source.value)) return -1;
     if (types.complete.contains(source.value)) return 0;
-    if (types.complete.contains(source.value - 1)) return 1;
+    if (types.complete.contains(source.value - 1) && !types.numeric_words.contains(source.value))
+        return 1;
     return -1;
 }
 bool complete_source(const Types& types, const Operand& source) {
@@ -49,6 +50,7 @@ bool mask_consumer(const Rdna2Inst& in) {
 }
 void kill_word(Types& types, int word, bool conditional) {
     types.words.erase(word);
+    types.numeric_words.erase(word);
     if (!conditional) types.may_words.erase(word);
     types.complete.erase(word);
     types.complete.erase(word - 1);
@@ -66,6 +68,23 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
                 kill_word(types, base + static_cast<int>(k), conditional_write(in));
         },
         false);
+    // S_MOV_B64 can emit a complete Bool and genuine DATA together. Shipping WRITELANE reads
+    // a saved pair's HIGH word through DATA; preserve that domain instead of replacing it with
+    // a predicate-only slot. Track only the existing closed MOV producers, with MUST joins.
+    if (in.fmt == Rdna2Format::SOP1 &&
+        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64) &&
+        (in.dst.kind == OperandKind::SGPR ||
+         (in.dst.kind == OperandKind::Special && (in.dst.value == 106 || in.dst.value == 107)))) {
+        const uint32_t width = in.opcode == kSop1OpcodeMovB64 ? 2u : 1u;
+        for (uint32_t k = 0; k < width; ++k) {
+            const int source = in.src[0].value + static_cast<int>(k);
+            if (in.src[0].kind == OperandKind::InlineInt ||
+                in.src[0].kind == OperandKind::Literal ||
+                ((in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) &&
+                 old.numeric_words.contains(source) && !old.may_words.contains(source)))
+                types.numeric_words.insert(in.dst.value + static_cast<int>(k));
+        }
+    }
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 && static_lane(in)) {
         const Slot key{in.src[0].value, in.src[1].value};
         if (old.may_slots.contains(key)) types.may_words.insert(in.dst.value);
@@ -100,8 +119,10 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
     // pair writers are not inferred to be masks from a B64 opcode alone.
     if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode))
         types.complete.insert(in.dst.value); // D receives OLD EXEC even when S0 is DATA
-    else if (mask_consumer(in) && complete_source(old, in.src[0]) &&
-             (in.n_src < 2 || complete_source(old, in.src[1])))
+    else if (mask_consumer(in) &&
+             !(in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+               in.src[0].kind == OperandKind::Literal) &&
+             complete_source(old, in.src[0]) && (in.n_src < 2 || complete_source(old, in.src[1])))
         types.complete.insert(in.dst.value);
     else if (in.fmt == Rdna2Format::VOPC || in.fmt == Rdna2Format::VOP3)
         for_each_scalar_write(
@@ -121,6 +142,8 @@ void meet(Types& types, const Types& incoming) {
         return other == incoming.slots.end() || other->second != item.second;
     });
     std::erase_if(types.complete, [&](int root) { return !incoming.complete.contains(root); });
+    std::erase_if(types.numeric_words,
+                  [&](int word) { return !incoming.numeric_words.contains(word); });
     types.may_words.insert(incoming.may_words.begin(), incoming.may_words.end());
     types.may_slots.insert(incoming.may_slots.begin(), incoming.may_slots.end());
 }
@@ -132,6 +155,21 @@ std::shared_ptr<PortableMaskHalfProgram> analyze(const RegState& rs,
     std::map<uint32_t, size_t> indices;
     for (size_t i = 0; i < ins.size(); ++i) indices.emplace(ins[i].pc, i);
     Types entry = rs.portable_mask_half_types;
+    std::erase_if(entry.numeric_words, [&](int word) {
+        return rs.sreg_merge_placeholder.contains(word) || rs.sreg_memory_pattern.contains(word);
+    });
+    if (rs.scalar_presence_has_no_placeholders) {
+        const auto seed_data = [&](const auto& words) {
+            for (const auto& [word, value] : words)
+                if (value && !rs.sreg_merge_placeholder.contains(word) &&
+                    !rs.sreg_memory_pattern.contains(word) &&
+                    !rs.unavailable_saved_mask_words.contains(word) &&
+                    !entry.may_words.contains(word))
+                    entry.numeric_words.insert(word);
+        };
+        seed_data(rs.sreg);
+        seed_data(rs.sreg_input);
+    }
     std::erase_if(entry.words, [&](const auto& item) {
         return rs.sreg_merge_placeholder.contains(item.first) ||
                rs.sreg_memory_pattern.contains(item.first);

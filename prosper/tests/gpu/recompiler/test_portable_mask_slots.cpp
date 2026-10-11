@@ -36,6 +36,15 @@ void expect_refusal(const std::vector<uint32_t>& code, const char* reason,
     EXPECT_TRUE(attempt.module.empty());
     EXPECT_NE(attempt.refusal.find(reason), std::string::npos) << attempt.refusal;
 }
+void expect_numeric(const std::vector<uint32_t>& code, uint32_t value) {
+    const auto attempt = f::compile(code);
+    ASSERT_FALSE(attempt.module.empty()) << attempt.refusal;
+    bpermute_oracle::Interpreter oracle(attempt.module);
+    const auto actual = oracle.run_buffers(64, {{3, std::vector<uint32_t>(64)}}, 3);
+    ASSERT_TRUE(oracle.error.empty()) << oracle.error;
+    ASSERT_EQ(actual.size(), 64u);
+    for (auto word : actual) EXPECT_EQ(word, value);
+}
 } // namespace
 
 TEST(PortableMaskSlots, ZeroLowAndFullHighKeepOnlyTheHighLanes) {
@@ -84,6 +93,15 @@ TEST(PortableMaskSlots, CompleteB64CopyCannotResurrectOldLaunchWords) {
     base::sink(code, 24);
     expect_values(code, 0xffffffff00000000ull, false, 26);
 }
+TEST(PortableMaskSlots, DispatcherCopyCannotUseFunctionVariableZeros) {
+    auto code = f::program(false, true);
+    code.resize(11);
+    // Both runtime scalar edges retain the halves, but the join reloads dispatcher storage.
+    code.insert(code.end(), {0xbf068000u, 0xbf840001u, 0xbf800000u, base::mov(24, 20, true)});
+    base::sink(code, 24);
+    expect_values(code, 0xffffffff00000000ull, true);
+    expect_values(code, 0xffffffff00000000ull, true, 26);
+}
 TEST(PortableMaskSlots, CopiedSlotsKeepTheirValueAfterTheOriginalWordChanges) {
     auto code = f::program(false, true);
     code.resize(11);
@@ -98,6 +116,51 @@ TEST(PortableMaskSlots, CopiedSlotsKeepTheirValueAfterTheOriginalWordChanges) {
 TEST(PortableMaskSlots, NumericReadCannotTreatASymbolicHalfAsData) {
     auto code = f::program(false, true);
     code.insert(code.begin() + 11, 0x7e080214u);
+    expect_refusal(code, "portable-mask-half-data-unavailable");
+}
+TEST(PortableMaskSlots, ExistingNumericHighSpillKeepsItsCurrentDataWord) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 193, true)};
+    f::spill(code, 21, 1);
+    f::reload(code, 24, 1);
+    code.insert(code.end(), {0x7e060218u, 0xe0702000u, 0x80020300u, base::end});
+    expect_numeric(code, UINT32_MAX);
+}
+TEST(PortableMaskSlots, CopiedNumericHighSpillKeepsItsCurrentDataWord) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 193, true),
+                               base::mov(24, 20, true)};
+    f::spill(code, 25, 1);
+    f::reload(code, 28, 1);
+    code.insert(code.end(), {0x7e06021cu, 0xe0702000u, 0x80020300u, base::end});
+    expect_numeric(code, UINT32_MAX);
+}
+TEST(PortableMaskSlots, LiteralPairIsDataWithoutACompleteBoolAlias) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 255, true), UINT32_MAX};
+    f::spill(code, 20, 0);
+    f::reload(code, 24, 0);
+    code.insert(code.end(), {0x7e060218u, 0xe0702000u, 0x80020300u, base::end});
+    expect_numeric(code, UINT32_MAX);
+}
+TEST(PortableMaskSlots, SymbolicHighSpillCannotInventANumericDataWord) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 126, true)};
+    f::spill(code, 21, 1);
+    f::reload(code, 24, 1);
+    code.insert(code.end(), {0x7e060218u, 0xe0702000u, 0x80020300u, base::end});
+    expect_refusal(code, "portable-mask-half-data-unavailable");
+}
+TEST(PortableMaskSlots, NumericHighSpillRetainsDataAcrossBothScalarArms) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 193, true), 0xbf068000u,
+                               0xbf840001u, base::mov(20, 128, true)};
+    f::spill(code, 21, 1);
+    f::reload(code, 24, 1);
+    code.insert(code.end(), {0x7e060218u, 0xe0702000u, 0x80020300u, base::end});
+    expect_numeric(code, 0);
+}
+TEST(PortableMaskSlots, OneNumericArmCannotAuthorizeTheOtherArmsSymbolicWord) {
+    std::vector<uint32_t> code{base::mov(126, 193, true), base::mov(20, 193, true), 0xbf068000u,
+                               0xbf840001u, base::mov(20, 126, true)};
+    f::spill(code, 21, 1);
+    f::reload(code, 24, 1);
+    code.insert(code.end(), {0x7e060218u, 0xe0702000u, 0x80020300u, base::end});
     expect_refusal(code, "portable-mask-half-data-unavailable");
 }
 TEST(PortableMaskSlots, MissingHalfOnOneArmCannotBorrowTheOtherArm) {
