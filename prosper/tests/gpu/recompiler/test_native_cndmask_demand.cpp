@@ -240,14 +240,29 @@ TEST(NativeCndmaskDemand, PhysicalSourceWidthAbiRemainsTwoWords) {
     EXPECT_EQ(scalar_alu_source_words(select, 2), 2u);
 }
 
-TEST(NativeCndmaskDemand, SameGenerationVccCopyKeepsBoolOnlyCondition) {
+TEST(NativeCndmaskDemand, VccGapCopyRetainsItsSeparatePhysicalCopyRefusal) {
     Emitter e;
     e.rs.sreg_merge_placeholder.insert(1);
     const auto code = program({0xbeea0414u}, 106);
     ASSERT_TRUE(e.producer(code));
     EXPECT_FALSE(e.demanded());
+    // The consumer inventory is fixed, but the independent older MOV guard still
+    // requires physical words for this CNDMASK spelling. It remains a named gap.
+    EXPECT_FALSE(e.emit(decode(code)[1]));
+    EXPECT_EQ(e.b.stage_reject_reason, "saved-mask-copy-words-unavailable");
+    EXPECT_EQ(e.b.stage_reject_pc, 1u);
+    EXPECT_EQ(ballots(e.b), 0u);
+}
+
+TEST(NativeCndmaskDemand, GenuinePhysicalVccCopyKeepsBoolConditionAndBothWords) {
+    Emitter e;
+    const auto code = program({0xbeea0414u}, 106);
+    ASSERT_TRUE(e.producer(code));
+    EXPECT_FALSE(e.demanded());
     const auto ins = decode(code);
     ASSERT_TRUE(e.emit(ins[1]));
+    EXPECT_EQ(e.rs.sreg.at(106), e.rs.sreg.at(20));
+    EXPECT_EQ(e.rs.sreg.at(107), e.rs.sreg.at(21));
     ASSERT_TRUE(e.emit(ins[2]));
     EXPECT_EQ(ballots(e.b), 0u);
 }
@@ -285,6 +300,7 @@ TEST(NativeCndmaskDemand, ProductionNumericDataSourceZeroStillRejects) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904102ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904102ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionNumericDataSourceOneStillRejects) {
@@ -292,6 +308,7 @@ TEST(NativeCndmaskDemand, ProductionNumericDataSourceOneStillRejects) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904103ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904103ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionLaterNumericConditionReadStillRejects) {
@@ -299,6 +316,7 @@ TEST(NativeCndmaskDemand, ProductionLaterNumericConditionReadStillRejects) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904104ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904104ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionLaterNumericHighReadStillRejects) {
@@ -306,6 +324,7 @@ TEST(NativeCndmaskDemand, ProductionLaterNumericHighReadStillRejects) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904105ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904105ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionLowOverlapStillDemandsTheUntouchedHighWord) {
@@ -313,6 +332,7 @@ TEST(NativeCndmaskDemand, ProductionLowOverlapStillDemandsTheUntouchedHighWord) 
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904106ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904106ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionHighOverlapStillDemandsTheUntouchedLowWord) {
@@ -320,6 +340,7 @@ TEST(NativeCndmaskDemand, ProductionHighOverlapStillDemandsTheUntouchedLowWord) 
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904107ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904107ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionCompleteReplacementAcceptsTheNewBoolGeneration) {
@@ -332,6 +353,7 @@ TEST(NativeCndmaskDemand, ProductionOneArmOverwriteCannotSupplyMustBool) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa4904109ull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa4904109ull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionLoopOverwriteCannotSupplyMustBool) {
@@ -340,17 +362,20 @@ TEST(NativeCndmaskDemand, ProductionLoopOverwriteCannotSupplyMustBool) {
     EXPECT_NE(
         last_terminal_reject_reason(0xa490410aull).find("native-logical-data-words-unavailable"),
         std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa490410aull).find("pc=7 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionMissingBoolConditionStillRejects) {
     EXPECT_TRUE(compile(production_program(129, 137, {}, {}, 24), 0xa490410bull).empty());
     EXPECT_NE(last_terminal_reject_reason(0xa490410bull).find("op=0x101"), std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa490410bull).find("pc=8 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionScalarWordsDoNotSupplyBoolCondition) {
     const auto code = production_program(129, 137, {}, {0xbe980381u, 0xbe990380u}, 24);
     EXPECT_TRUE(compile(code, 0xa490410cull).empty());
     EXPECT_NE(last_terminal_reject_reason(0xa490410cull).find("op=0x101"), std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa490410cull).find("pc=10 "), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, StraightCmpxKeepsGenuineNumericDataWithoutAnEarlierExit) {
