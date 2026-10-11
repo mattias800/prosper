@@ -14,4 +14,12 @@ inline void mask_write_clobbers_pair(RegState& rs, int dst) {
     rs.sreg_srt.erase(dst + 1);
 }
 
+inline void saveexec_write_clobbers_pair(RegState& rs, int dst) {
+    mask_write_clobbers_pair(rs, dst);
+    // CONFIDENCE: HIGH — every B64 SAVEEXEC unconditionally writes D=OLD_EXEC to both
+    // physical destination words. An earlier opaque M0 value no longer occupies either word.
+    // Ordinary/conditional mask writers keep their existing, separate lifetime contracts.
+    rs.sreg_entry_m0.erase(dst);
+    rs.sreg_entry_m0.erase(dst + 1);
+}
 } // namespace prosper::gpu

@@ -53,6 +53,7 @@
 #include "../../tests/fixtures/native_uint_3d.hpp"
 #include "../../tests/fixtures/fragment_compare_kill.hpp"
 #include "../../tests/fixtures/compute_array_gather.hpp"
+#include "../../tests/fixtures/saveexec_m0.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1956,6 +1957,12 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.img_dim=1;
       t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
       dump(dir, "fragment_gather4_lz_o", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // A complete SAVEEXEC replaces either word of an older opaque M0 save before loop PHIs.
+    for (uint32_t word : {14u, 15u}) {
+        const auto code = prosper::test::saveexec_m0::loop(word);
+        dump(dir, word == 14 ? "saveexec_m0_low_loop" : "saveexec_m0_high_loop",
+             prosper::test::saveexec_m0::compile(code, prosper::test::saveexec_m0::address()));
+    }
     // Compute sampled Float16/Float32 arrays preserve a dynamic third coordinate, including NSA
     // spatial-offset forms. Strict validation also covers the selected layer-count query type.
     {

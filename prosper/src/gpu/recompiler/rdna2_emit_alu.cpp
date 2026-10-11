@@ -1098,7 +1098,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_bool[in.dst.value] = old_exec;  // D = OLD_EXEC
                     rs.sreg_bool_narrowed[in.dst.value] = old_exec_narrowed;
                     if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = old_exec;
-                    mask_write_clobbers_pair(rs, in.dst.value);
+                    saveexec_write_clobbers_pair(rs, in.dst.value);
                     const uint32_t ne = b.logical_not(old_exec);
                     const uint32_t nm = b.logical_not(m);
                     const uint32_t xor_em = b.bsel(old_exec, nm, m);

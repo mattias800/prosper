@@ -974,6 +974,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_array_gather.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_saveexec_m0
+    SOURCES tests/gpu/recompiler/test_saveexec_m0.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_dataflow
     SOURCES tests/gpu/recompiler/test_split_t8_dataflow.cpp
     INCLUDES src
