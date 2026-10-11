@@ -219,6 +219,27 @@ Mask logical_mask(Mask a, Mask c, uint32_t opcode) {
     }
     return result;
 }
+Mask saveexec_mask(Mask old_exec, Mask source, uint32_t opcode) {
+    Mask result{old_exec.genuine && source.genuine, std::nullopt};
+    if (!old_exec.constant || !source.constant) return result;
+    const uint64_t e = *old_exec.constant, s = *source.constant;
+    // CONFIDENCE: HIGH -- RDNA2 SOP1 SAVEEXEC reads S0 and OLD_EXEC before publishing either
+    // destination. The complemented operand differs between ANDN/ORN1 and ANDN/ORN2.
+    switch (opcode) {
+        case 0x24: result.constant = s & e; break;
+        case 0x25: result.constant = s | e; break;
+        case 0x26: result.constant = s ^ e; break;
+        case 0x27: result.constant = s & ~e; break;
+        case 0x28: result.constant = s | ~e; break;
+        case 0x29: result.constant = ~(s & e); break;
+        case 0x2a: result.constant = ~(s | e); break;
+        case 0x2b: result.constant = ~(s ^ e); break;
+        case 0x37: result.constant = ~s & e; break;
+        case 0x38: result.constant = ~s | e; break;
+        default: return {};
+    }
+    return result;
+}
 Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) {
     Facts f = before;
     const int dst = in.dst.value;
@@ -269,13 +290,7 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
     if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode)) {
         const auto source = mask(before, in, in.src[0]);
         if (dst >= 0 && dst < 127) f.mask[dst] = before.exec;
-        const auto op = in.opcode == 0x24 ? 0xfu : in.opcode == 0x28 ? 0x11u : 0u;
-        f.exec = op ? logical_mask(before.exec, source, op) : Mask{};
-        if (in.opcode == 0x37 && source.constant) {
-            auto inverse = source;
-            inverse.constant = ~*source.constant;
-            f.exec = logical_mask(before.exec, inverse, 0xf);
-        }
+        f.exec = saveexec_mask(before.exec, source, in.opcode);
         f.scc = {f.exec.genuine, f.exec.genuine, std::nullopt};
         return f;
     }

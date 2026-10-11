@@ -2433,6 +2433,15 @@ int main(int argc, char** argv) {
              fixture::compile(fixture::program({.masked_load = true}), resources,
                               fixture::address()),
              "recompile_compute");
+        dump(dir, "compute_native_single_wave_orn2_execz",
+             fixture::compile(fixture::program({.preservation = fixture::Preservation::Orn2Execz,
+                                                .initialize_preserved = true}),
+                              resources, fixture::address()),
+             "recompile_compute");
+        dump(dir, "compute_native_single_wave_or_execz",
+             fixture::compile(fixture::program({.preservation = fixture::Preservation::OrExecz}),
+                              resources, fixture::address()),
+             "recompile_compute");
     }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.

@@ -176,3 +176,35 @@ TEST(NativeMaskParticipation, TransformedMovCannotClaimOriginalLocalLaneIdentity
 TEST(NativeMaskParticipation, ImplicitVccWriteRetiresPriorPhysicalDataGeneration) {
     preservation_control(fixture::Preservation::ImplicitVcc);
 }
+
+TEST(NativeMaskParticipation, Orn2ExeczCannotAuthenticateBypassedInitializer) {
+    preservation_control(fixture::Preservation::Orn2Execz);
+}
+TEST(NativeMaskParticipation, OrdinaryOrSaveexecDoesNotBypassGenuineInitializer) {
+    Entry e;
+    const auto p = fixture::program({.preservation = fixture::Preservation::OrExecz});
+    EXPECT_TRUE(e.proof(p).contains(p.producer_pc));
+    compiles({.preservation = fixture::Preservation::OrExecz});
+}
+
+TEST(NativeMaskParticipation, SaveexecFormsPreserveExactOriginalExeczContract) {
+    // RDNA2 SOP1: full OLD_EXEC and zero S0. Empty results must bypass the initializer.
+    for (const auto [opcode, nonempty] :
+         std::array<std::pair<uint32_t, bool>, 10>{{{0x24, false},
+                                                    {0x25, true},
+                                                    {0x26, true},
+                                                    {0x27, false},
+                                                    {0x28, false},
+                                                    {0x29, true},
+                                                    {0x2a, false},
+                                                    {0x2b, false},
+                                                    {0x37, true},
+                                                    {0x38, true}}}) {
+        const auto p = fixture::program({.saveexec_opcode = opcode});
+        Entry e;
+        EXPECT_EQ(e.proof(p).contains(p.producer_pc), nonempty) << std::hex << opcode;
+        const auto genuine =
+            fixture::program({.initialize_preserved = true, .saveexec_opcode = opcode});
+        EXPECT_TRUE(e.proof(genuine).contains(genuine.producer_pc)) << std::hex << opcode;
+    }
+}

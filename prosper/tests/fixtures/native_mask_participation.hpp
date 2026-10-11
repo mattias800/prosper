@@ -14,12 +14,21 @@ using namespace prosper::gpu;
 inline constexpr uint32_t lanes = 64, group_words = 2048, sentinel = 0xdeadbeefu;
 inline constexpr std::array<uint32_t, 4> trips{0, 1, 3, 5};
 enum class Unsafe { None, RelativeBranch, RelativePredicate, ReadfirstBranch, Writelane };
-enum class Preservation { None, DppBoundary, PermlaneInactive, TransformedLane, ImplicitVcc };
+enum class Preservation {
+    None,
+    DppBoundary,
+    PermlaneInactive,
+    TransformedLane,
+    ImplicitVcc,
+    Orn2Execz,
+    OrExecz
+};
 struct Options {
     bool exec_off_peer = false, opaque_prefix = false, masked_load = false;
     Unsafe unsafe = Unsafe::None;
     Preservation preservation = Preservation::None;
     bool initialize_preserved = false;
+    uint32_t saveexec_opcode = 0;
 };
 struct Program {
     std::vector<uint32_t> words;
@@ -77,12 +86,28 @@ inline Program program(Options options = {}) {
     if (options.unsafe == Unsafe::Writelane) p.insert(p.end(), {0xd761000au, 20u | (159u << 9u)});
     p.push_back(mov(21, 128));
     p.push_back(mov(30, 128)); // real preheader word; no unrelated missing-phi placeholder
-    if (options.initialize_preserved) p.push_back(0x7e160280u); // v11=0, every lane
+    if (options.initialize_preserved)
+        p.push_back(options.preservation == Preservation::Orn2Execz
+                        ? 0x7e1602a1u
+                        : 0x7e160280u); // genuine old v11
     if (options.preservation == Preservation::TransformedLane && options.initialize_preserved)
         p.push_back(0x7e180280u); // selected peer has real old v12
     if (options.preservation == Preservation::ImplicitVcc) {
         p.push_back(mov(106, 128));
         p.push_back(mov(107, 128)); // old physical VCC words must not outlive a new mask
+    }
+    if (options.preservation == Preservation::Orn2Execz ||
+        options.preservation == Preservation::OrExecz || options.saveexec_opcode) {
+        // OLD_EXEC is full. ORN2 with S0=0 empties EXEC; ordinary OR leaves it full.
+        // EXECZ therefore bypasses this initializer only for ORN2, not for OR.
+        const uint32_t op = options.saveexec_opcode ? options.saveexec_opcode
+                            : options.preservation == Preservation::Orn2Execz ? 0x28u
+                                                                              : 0x25u;
+        p.push_back(0xbea00080u | (op << 8u)); // saved full EXEC ->s32:33
+        const size_t empty = branch(8);
+        p.push_back(0x7e160281u); // v11=1 only if EXEC was nonempty
+        target(empty, p.size());
+        p.push_back(mov(126, 32, true));
     }
     if (options.preservation == Preservation::DppBoundary)
         p.insert(p.end(), {0x7e1602fau, 0xff011100u});   // row_shr1 BC0 preserves old v11 at edges
@@ -137,7 +162,9 @@ inline Program program(Options options = {}) {
     compare(options.masked_load ? 0xc2 : 0xc1, 40, options.masked_load ? 130u : 256u,
             options.unsafe == Unsafe::RelativePredicate ? 10u
             : options.preservation == Preservation::DppBoundary ||
-                    options.preservation == Preservation::PermlaneInactive
+                    options.preservation == Preservation::PermlaneInactive ||
+                    options.preservation == Preservation::Orn2Execz ||
+                    options.preservation == Preservation::OrExecz || options.saveexec_opcode
                 ? 11u
                 : 4u);
     p.push_back(0x7e0a0228u);   // v5=physical LO
@@ -173,6 +200,8 @@ inline std::vector<uint32_t> expected(Options options = {}) {
             for (uint32_t lane = 0; lane < lanes; ++lane)
                 if (options.masked_load ? lane >= 32 && lane % 3u != 0u : lane < 33u + trip * 7u)
                     mask |= uint64_t{1} << lane;
+            if (options.preservation == Preservation::Orn2Execz) mask = (uint64_t{1} << 33u) - 1u;
+            if (options.preservation == Preservation::OrExecz) mask = 1;
             const uint32_t low = uint32_t(mask), high = uint32_t(mask >> 32u);
             const std::array<uint32_t, 4> values{
                 low, high, high ? uint32_t(std::countl_zero(high)) : UINT32_MAX,

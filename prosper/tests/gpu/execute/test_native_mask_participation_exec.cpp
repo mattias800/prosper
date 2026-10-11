@@ -62,3 +62,10 @@ TEST_F(NativeMaskParticipationExecution, OpaqueRoutingPrefixDoesNotReplaceGenuin
 TEST_F(NativeMaskParticipationExecution, RealMaskedLoadsPreserveInitializedPredicateLanes) {
     execute({.masked_load = true});
 }
+
+TEST_F(NativeMaskParticipationExecution, Orn2ExeczPreservesRealOldPredicateWords) {
+    execute({.preservation = fixture::Preservation::Orn2Execz, .initialize_preserved = true});
+}
+TEST_F(NativeMaskParticipationExecution, OrdinaryOrSaveexecKeepsInitializerAndData) {
+    execute({.preservation = fixture::Preservation::OrExecz});
+}
