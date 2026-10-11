@@ -5,12 +5,16 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
+#include <vector>
 
 using namespace prosper::gpu;
 namespace fixture = prosper::test::portable_entry_exec;
@@ -28,6 +32,31 @@ GpuState::Dispatch packet(bool indirect = false) {
     d.indirect = indirect;
     d.indirect_args_addr = indirect ? 0x1000u : 0u;
     return d;
+}
+
+struct ComputeShaderBlob {
+    AgcShaderHeader header;
+    ShaderReg registers[2];
+};
+
+bool register_compute(const uint32_t* words, size_t dwords, ComputeShaderBlob& blob) {
+    prosper::register_agc_hle();
+    const auto create = prosper::Hle::lookup("f3dg2CSgRKY");
+    if (!create) return false;
+    blob.registers[0] = {prosper::agc::Pm4::COMPUTE_PGM_LO, 0};
+    blob.registers[1] = {prosper::agc::Pm4::COMPUTE_PGM_HI, 0};
+    blob.header = {};
+    blob.header.file_header = 0x34333231u;
+    blob.header.version = 0x18;
+    blob.header.sh_registers =
+        reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(blob.registers) -
+                                      reinterpret_cast<uintptr_t>(&blob.header.sh_registers));
+    blob.header.shader_size = static_cast<uint32_t>(dwords * sizeof(uint32_t));
+    blob.header.num_sh_registers = 2;
+    void* registered = nullptr;
+    return create(reinterpret_cast<uint64_t>(&registered), reinterpret_cast<uint64_t>(&blob.header),
+                  reinterpret_cast<uint64_t>(words), 0, 0, 0) == 0 &&
+           registered == &blob.header;
 }
 }   // namespace
 
@@ -56,6 +85,34 @@ TEST(ComputeDispatchLaunch, MissingRegisterIsUnknownEvenWhenResolverDefaultsOne)
     EXPECT_EQ(launch.known,
               ComputeDispatchLaunchState::kAll & ~ComputeDispatchLaunchState::kNumThreadY);
     EXPECT_EQ(launch.num_thread[1], 0u);
+}
+TEST(ComputeDispatchLaunch, ActualExecutorRetainsProducingWordsAndIndependentAbsence) {
+    // This no-resource program needs no entry-word specialization. The real executor must retain
+    // its launch observations even when normalization defaults an absent register to one.
+    alignas(256) static const uint32_t code[] = {0x7e000280u, 0xbf810000u};
+    static ComputeShaderBlob blob;
+    ASSERT_TRUE(register_compute(code, std::size(code), blob));
+    clear_shader_recompile_cache();
+    for (uint32_t variant = 0; variant < 3; ++variant) {
+        auto d = packet();
+        auto producing = std::make_shared<GpuState>(*d.state);
+        for (const auto& reg : blob.registers) producing->sh[reg.offset] = reg.value;
+        if (variant == 1) producing->sh.erase(prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y);
+        if (variant == 2) d.modifier |= 2;
+        d.state = producing;
+        GpuState state;
+        state.dispatches.push_back(d);
+        std::vector<OperationRealizationFailure> failures;
+        const auto items = realize_compute_dispatches(state, 4930, &failures);
+        ASSERT_TRUE(failures.empty()) << variant;
+        ASSERT_EQ(items.size(), 1u) << variant;
+        ASSERT_TRUE(items[0].recompile_config_available) << variant;
+        const auto& config = items[0].recompile_config;
+        EXPECT_EQ(config.dispatch_launch, compute_dispatch_launch_state(d)) << variant;
+        EXPECT_EQ(config.local_y, 1u) << variant;
+        EXPECT_EQ(compute_dispatch_has_complete_groups(config), variant == 0) << variant;
+    }
+    clear_shader_recompile_cache();
 }
 TEST(ComputeDispatchLaunch, UnresolvedAndResolvedIndirectArgumentsRemainUntrusted) {
     auto d = packet(true);
