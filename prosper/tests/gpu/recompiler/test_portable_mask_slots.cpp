@@ -2,6 +2,7 @@
 // modules must preserve the other half's current producer; a stale Bool silently disables lanes.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/portable_mask_slots.hpp"
+#include "fixtures/portable_mask_half.hpp"
 #include <gtest/gtest.h>
 #include <cstddef>
 #include <cstdint>

@@ -1,7 +1,7 @@
 #pragma once
 // Project-owned complete programs observe LOW/HIGH mask-slot composition through an EXEC
 // restore and the ordinary buffer sink. Slot numbers do not determine a physical half's role.
-#include "fixtures/portable_mask_half.hpp"
+#include "portable_mask_half.hpp"
 #include <atomic>
 #include <cstdint>
 #include <string>

@@ -46,6 +46,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
