@@ -37,6 +37,7 @@
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
+#include "../../tests/fixtures/dpp_row_or.hpp"
 #include "../../tests/fixtures/dpp_row_fadd.hpp"
 #include "../../tests/fixtures/ngg_merged_lut_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
@@ -2231,6 +2232,8 @@ int main(int argc, char** argv) {
     {
         const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
         dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1));
+        const auto o = prosper::test::dpp_row_or(c);
+        dump(dir, "compute_dpp_row_or_linear", recompile_valu(o.data(), o.size(), 3, 1));
     }
     {
         using prosper::test::DppRowCfgCase;
@@ -2246,6 +2249,13 @@ int main(int argc, char** argv) {
                                        (native ? "_native64" : "_portable");
                 dump(dir, id.c_str(),
                      recompile_ngg_exports_for_test(c.data(), c.size(), 10, 0, nullptr, 4, 0, {},
+                                                    true, true, native),
+                     "recompile_ngg_exports_for_test");
+                const auto o = prosper::test::dpp_row_or(c);
+                const std::string or_id = std::string("compute_dpp_row_or_") + name +
+                                          (native ? "_native64" : "_portable");
+                dump(dir, or_id.c_str(),
+                     recompile_ngg_exports_for_test(o.data(), o.size(), 10, 0, nullptr, 4, 0, {},
                                                     true, true, native),
                      "recompile_ngg_exports_for_test");
             }

@@ -12,8 +12,10 @@ struct RegState;
 // Full-mask, unmodified BC0 integer maximum whose two inputs and output are one VGPR.
 // Distinct registers and bounded/masked forms need their own invalid-source write contract.
 bool is_inplace_vmax_u32_dpp_row_shr(const Rdna2Inst& instruction);
+bool is_inplace_vor_b32_dpp_row_shr(const Rdna2Inst& instruction);
+bool is_compute_dpp_row_shr(const Rdna2Inst& instruction, bool ngg_workgroup_shell);
 
-// The caller still owns EXEC predication and physical VGPR alias expiration. Maximum sites
+// The caller still owns EXEC predication and physical VGPR alias expiration. MAX/OR sites
 // require a wave-uniform emission point; divergent dispatcher sites need tagged common phases.
 bool emit_compute_inplace_dpp_row_shr(SpirvCompute& builder, const RegState& registers,
                                       const Rdna2Inst& instruction, uint32_t source,
@@ -21,7 +23,7 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& builder, const RegState& reg
                                       uint32_t& result);
 // Function-variable IDs shared by the synchronized dispatcher. maximum=0 preserves the
 // established ADD-only emission; otherwise each pending static site supplies ADD=false/MAX=true.
-// bitwise_or=0 likewise preserves every stream without the bounded OR ladder (#3135 P7).
+// bitwise_or=0 likewise preserves every stream without an OR ladder.
 struct ComputeDppRowShrPhaseVariables {
     uint32_t pending, active, source, amount, destination, event, maximum, bitwise_or;
 };

@@ -965,15 +965,9 @@ bool emit_cfg_state_machine(
             in.dst.value == in.src[1].value;
     };
 
-    // In-place unsigned ADD/MAX reductions operate inside each architectural DPP16 row.
-    // Keep the MAX admission strict: full masks, BC0/FI0, no modifiers and VDST=SRC0=SRC1.
-    // A native exact-wave dispatcher can execute the shuffle in its uniform switch case. The
-    // portable dispatcher publishes it as an event below because a host subgroup may be narrower
-    // than Wave64 and another guest wave can be parked at a different static instruction.
+    // Exact native waves use uniform cases; portable row reductions use tagged common phases.
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
-        return b.is_compute &&
-               (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
-                (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)));
+        return b.is_compute && is_compute_dpp_row_shr(in, b.ngg_workgroup_shell);
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -1233,7 +1227,8 @@ bool emit_cfg_state_machine(
         }
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
-            has_compute_dpp_row_or |= is_vor_b32_dpp_row_shr_bounded(in);
+            has_compute_dpp_row_or |=
+                is_inplace_vor_b32_dpp_row_shr(in) || is_vor_b32_dpp_row_shr_bounded(in);
             compute_dpp_row_shr_pcs.insert(in.pc);
             compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
@@ -4667,17 +4662,20 @@ bool emit_cfg_state_machine(
                 return reject_cfg(dpp_row_shr->pc, "dpp-add-row-shr-event");
             const int dst = dpp_row_shr->dst.value;
             const bool maximum = is_inplace_vmax_u32_dpp_row_shr(*dpp_row_shr);
-            const bool bitwise_or = is_vor_b32_dpp_row_shr_bounded(*dpp_row_shr);
-            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr) || bitwise_or;
+            const bool unbounded_or = is_inplace_vor_b32_dpp_row_shr(*dpp_row_shr);
+            const bool bounded_or = is_vor_b32_dpp_row_shr_bounded(*dpp_row_shr);
+            const bool bitwise_or = unbounded_or || bounded_or;
+            const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr) || bounded_or;
             const auto source = state.vreg.find(bounded ? dpp_row_shr->src[0].value : dst);
             uint32_t source_value = source == state.vreg.end() ? zero : source->second;
-            if (maximum) {
-                // WRITELANE spill slots are scalar state, not a per-lane VGPR value. Resolve
-                // the newly admitted MAX through the same source guard as ordinary ALU reads.
+            if (maximum || unbounded_or) {
+                // Scalar-spill slots cannot replace the ordinary per-lane MAX/OR source.
                 bool source_ok = true;
                 source_value =
                     operand_bits(b, state, *dpp_row_shr, dpp_row_shr->src[0], &source_ok);
-                if (!source_ok) return reject_cfg(dpp_row_shr->pc, "dpp-row-max-source-unresolved");
+                if (!source_ok)
+                    return reject_cfg(dpp_row_shr->pc, maximum ? "dpp-row-max-source-unresolved"
+                                                               : "dpp-row-or-source-unresolved");
             }
             const auto previous_destination = state.vreg.find(dst);
             const uint32_t old_destination = previous_destination == state.vreg.end()
@@ -6120,8 +6118,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         });
     const bool compute_cfg_row_fadd =
         b.is_compute && needs_compute_dpp_row_fadd_dispatcher(ins, b.native_subgroup_size);
-    const bool compute_cfg_row_maximum =
-        b.is_compute && std::any_of(ins.begin(), ins.end(), is_inplace_vmax_u32_dpp_row_shr) &&
+    const bool compute_cfg_row_integer =
+        b.is_compute &&
+        std::any_of(ins.begin(), ins.end(),
+                    [](const Rdna2Inst& in) {
+                        return is_inplace_vmax_u32_dpp_row_shr(in) ||
+                               is_inplace_vor_b32_dpp_row_shr(in);
+                    }) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
                    in.opcode != 0x03;
@@ -6149,7 +6152,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         if (phased.found &&
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
              portable_compute_mask_reduction || portable_compute_readfirstlane ||
-             portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd)) {
+             portable_compute_bpermute || compute_cfg_row_integer || compute_cfg_row_fadd)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -6161,6 +6164,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
                                is_inplace_vmax_u32_dpp_row_shr(in) ||
+                               is_inplace_vor_b32_dpp_row_shr(in) ||
                                (b.ngg_workgroup_shell && is_dpp_row_shr_bounded(in)) ||
                                dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
@@ -6276,7 +6280,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             exp_fn, code, dwords, initial_dispatch_active, true);
     if (allow_cfg_dispatcher &&
         (portable_compute_mask_reduction || portable_compute_readfirstlane ||
-         portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd) &&
+         portable_compute_bpermute || compute_cfg_row_integer || compute_cfg_row_fadd) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
         // Do this before the counted-loop prefix can narrow EXEC: portable wave services need
         // a common host barrier site, not an invocation-local structured loop body.

@@ -3,15 +3,31 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 namespace prosper::gpu {
+namespace {
 
-bool is_inplace_vmax_u32_dpp_row_shr(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x14 && in.has_dpp && !in.has_modifier &&
+bool is_inplace_integer_row_shr(const Rdna2Inst& in, uint32_t opcode) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == opcode && in.has_dpp && !in.has_modifier &&
            !in.has_sdwa && !in.dpp_bound_ctrl && in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
            in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu && in.n_src == 2 && !in.src_neg[0] &&
            !in.src_neg[1] && !in.src_abs[0] && !in.src_abs[1] && !in.clamp && !in.omod &&
            in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
            in.src[1].kind == OperandKind::VGPR && in.dst.value == in.src[0].value &&
            in.dst.value == in.src[1].value;
+}
+}  // namespace
+
+bool is_inplace_vmax_u32_dpp_row_shr(const Rdna2Inst& in) {
+    return is_inplace_integer_row_shr(in, 0x14u);
+}
+
+bool is_inplace_vor_b32_dpp_row_shr(const Rdna2Inst& in) {
+    return is_inplace_integer_row_shr(in, 0x1cu);
+}
+
+bool is_compute_dpp_row_shr(const Rdna2Inst& in, bool ngg_workgroup_shell) {
+    return is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
+           is_inplace_vor_b32_dpp_row_shr(in) ||
+           (ngg_workgroup_shell && is_dpp_row_shr_bounded(in));
 }
 
 bool emit_compute_inplace_dpp_row_shr(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
@@ -24,17 +40,21 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& b, const RegState& rs, const
         is_inplace_vadd_nc_u32_dpp_row_shr(in) && (in.dpp_ctrl == 0x111u || in.dpp_ctrl == 0x112u ||
                                                    in.dpp_ctrl == 0x114u || in.dpp_ctrl == 0x118u);
     const bool maximum = wave_uniform && is_inplace_vmax_u32_dpp_row_shr(in);
-    if (!add && !maximum) return false;
+    const bool bitwise_or = wave_uniform && is_inplace_vor_b32_dpp_row_shr(in);
+    if (!add && !maximum && !bitwise_or) return false;
 
     // DPP16 ROW_SHR selects lane-N inside its 16-lane row. BC0 keeps VDST at a row edge.
     // Preserve VDST for an invalid source under this encoded BC0/FI0 contract. For an
-    // in-place unsigned maximum, max(own, 0) == own as well. Destination EXEC is a
-    // separate write condition applied by the caller, including when its peer is active.
+    // in-place unsigned maximum, max(own, 0) == own as well. OR has the same identity:
+    // CONFIDENCE: HIGH -- AMD RDNA2 70648 tables 90/91 define FI0's inactive source as zero
+    // and BC0's out-of-row destination as unwritten; own | 0 == own. Preserve the old
+    // destination for either unavailable source. The caller separately gates destination EXEC.
     uint32_t valid_source = 0;
     const uint32_t shifted =
         b.subgroup_row_shr(source, rs.exec, in.dpp_ctrl - 0x110u, &valid_source);
-    const uint32_t combined =
-        add ? b.ibin(Op_IAdd, source, shifted) : b.uext2(Glsl_UMax, source, shifted);
+    const uint32_t combined = maximum
+                                  ? b.uext2(Glsl_UMax, source, shifted)
+                                  : b.ibin(bitwise_or ? Op_BitwiseOr : Op_IAdd, source, shifted);
     result = b.sel(valid_source, combined, old_destination);
     return true;
 }
@@ -96,7 +116,7 @@ bool emit_portable_compute_dpp_row_shr_phase(SpirvCompute& b,
         const uint32_t maximum = b.load_function(b.t_bool, variables.maximum);
         dpp_result = b.sel(maximum, b.uext2(Glsl_UMax, dpp_source, dpp_shifted), dpp_result);
     }
-    // The bounded OR (NGG shell only): the unavailable source reads zero, as for the bounded ADD.
+    // OR shares the unavailable-source identity. BC0 keeps VDST; bounded NGG OR writes own|0.
     if (variables.bitwise_or) {
         const uint32_t bitwise_or = b.load_function(b.t_bool, variables.bitwise_or);
         dpp_result =
