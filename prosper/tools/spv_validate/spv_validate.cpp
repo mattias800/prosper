@@ -39,6 +39,7 @@
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/portable_mask_half.hpp"
+#include "../../tests/fixtures/portable_mask_slots.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/dpp_row_or.hpp"
 #include "../../tests/fixtures/compute_quad_or.hpp"
@@ -2036,6 +2037,13 @@ int main(int argc, char** argv) {
         const auto code = fixture::program(true, half, 0x80000001u);
         const auto name = "portable_saved_mask_replaced_" + std::to_string(half);
         dump(dir, name.c_str(), fixture::compile(code));
+    }
+    // #4935: symbolic mask-slot words retain current LOW/HIGH producers without a ballot.
+    for (uint32_t shape = 0; shape < 5; ++shape) {
+        namespace fixture = prosper::test::portable_mask_slots;
+        auto code = fixture::program(false, true, shape == 1, 0, 1, shape == 2, shape == 3);
+        const auto name = "portable_symbolic_mask_slots_" + std::to_string(shape);
+        dump(dir, name.c_str(), fixture::compile(code, shape == 4).module);
     }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.

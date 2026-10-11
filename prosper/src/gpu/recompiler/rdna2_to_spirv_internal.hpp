@@ -5,6 +5,7 @@
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -410,6 +411,7 @@ enum class PhysicalExecutionDomain { Invocation, Workgroup };
 enum class GuestWaveEventDomain { None, Owned64 };
 
 struct SpirvCompute {
+    std::shared_ptr<const PortableMaskHalfProgram> portable_mask_half_program;
     // Guest semantics and physical synchronization ownership are separate. The legacy is_*
     // booleans select the existing physical stage shells; a packet is guest Fragment while its
     // physical shell is GLCompute. Never set both legacy compute and fragment flags.
@@ -2980,6 +2982,7 @@ struct RegState;
 void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins);
 
 struct RegState {
+    PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
     bool vector_full_exec =
@@ -3683,7 +3686,9 @@ inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& befo
         if (root != reg && !rs.native_saved_mask_words &&
             (!before.portable_numeric_replacement || mask_slot_reload))
             continue;
-        if (root < 0 || root > 105 || root == preserved_pair) continue;
+        if (root < 0 || root > 105 || root == preserved_pair ||
+            (root != reg && rs.portable_mask_half_types.words.contains(root)))
+            continue;
         const auto mask = rs.sreg_bool.find(root);
         if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) continue;
         bool stale = false;
@@ -4144,6 +4149,10 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
         // it, so a Bool there now is this instruction's. See expire_saved_b64_mask.
         const bool publishes_reloaded_mask = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
                                              base == in.dst.value && rs.sreg_bool.contains(base);
+        const bool publishes_portable_half =
+            rs.portable_mask_half_types.words.contains(base) &&
+            (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 ||
+             in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32);
         // Wave32 compute (the only stage the VCC bridge flag admits): every mask is one word, so a
         // mask reloaded into a register that held a B32 mask stays one. Dropping the marker here
         // also dropped the Bool, and a data read then took the untracked SGPR's silent 0 (#4607).
@@ -4154,9 +4163,11 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
-                expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
-                                      writes_b64_mask || publishes_reloaded_mask ? base : -1,
-                                      publishes_reloaded_mask);
+                expire_saved_b64_mask(
+                    rs, saved_b64_masks_before, reg,
+                    writes_b64_mask || publishes_reloaded_mask || publishes_portable_half ? base
+                                                                                          : -1,
+                    publishes_reloaded_mask);
             }
             if (!rs.sreg_bool_b32.contains(reg) ||
                 ((writes_b32_mask || keeps_b32_reload) && reg == base))

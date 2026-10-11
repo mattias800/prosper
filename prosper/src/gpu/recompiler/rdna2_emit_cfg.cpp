@@ -560,6 +560,7 @@ bool emit_cfg_state_machine(
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
     NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
+    PortableMaskHalfBodyScope half_scope(b, initial, ins);
     const bool barrier_half_phase =
         barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
@@ -2449,6 +2450,7 @@ bool emit_cfg_state_machine(
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = spill_mask_keys;
+    add_portable_mask_half_keys(b, mask_keys);
     std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
@@ -3059,11 +3061,14 @@ bool emit_cfg_state_machine(
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
             if (filters_wave64_b64 &&
-                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
+                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)) &&
+                !(entry_block != UINT32_MAX &&
+                  portable_mask_half_at_entry(b, starts[entry_block], kv.first)))
                 continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
         }
+        if (entry_block != UINT32_MAX) load_portable_mask_half_types(b, state, starts[entry_block]);
         if (entry_wave64_mask_halves)
             for (const auto& kv : mhv)
                 if (const auto half = entry_wave64_mask_halves->find(kv.first);
@@ -5616,6 +5621,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
+    PortableMaskHalfBodyScope half_scope(b, rs, ins);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);

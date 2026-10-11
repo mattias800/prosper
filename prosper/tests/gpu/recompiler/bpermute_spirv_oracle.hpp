@@ -57,6 +57,9 @@ struct Interpreter {
   std::map<uint32_t, bool> readonly_storage;
   std::map<uint32_t, uint32_t> extra_writable_roots;   // binding -> storage variable
   std::vector<Inst> globals;
+  // Optional fixture-owned words for the closed uint32 array PushConstant ABI. The default
+  // supplies nothing: a declared block cannot read invented zeros or infer a launch value.
+  std::vector<uint32_t> supplied_push_constants;
   uint32_t main = 0, storage = 0;
   // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their
   // separate set-2 launch/export ABI; no module words or resource ownership are rewritten.
@@ -709,7 +712,35 @@ struct Interpreter {
               const auto t = pointee(a[0]);
               if (a[2] == 4)
                   shared[a[1]] = make_memory(t, size(t));
-              else if (a[2] == 2 || a[2] == 12) {
+              else if (a[2] == 9) {
+                  if (supplied_push_constants.empty() && !push_constants.empty()) {
+                      shared[a[1]] = make_memory(t, size(t));
+                      if (!push_constants.empty()) {
+                          if (push_constants.size() != size(t)) fail("push constant shape mismatch");
+                          shared[a[1]] = {t, push_constants,
+                                          std::vector<bool>(push_constants.size(), true)};
+                      }
+                  } else {
+                      const auto& structure = ty(t);
+                      const auto block = decorations.find({t, 2});
+                      const auto offset = member_decorations.find({t, 0, 35});
+                      if (supplied_push_constants.empty()) fail("missing supplied push constants");
+                      if (ty(a[0]).a[0] != 9 || structure.op != 30 || structure.a.size() != 1 ||
+                          block == decorations.end() || !block->second.empty() ||
+                          offset == member_decorations.end() ||
+                          offset->second != std::vector<uint32_t>{0})
+                          fail("unsupported push constant ABI");
+                      const auto& array = ty(structure.a[0]);
+                      const auto stride = decorations.find({structure.a[0], 6});
+                      if (array.op != 28 || array.a.size() != 2 || !uint_type(array.a[0]) ||
+                          stride == decorations.end() || stride->second != std::vector<uint32_t>{4} ||
+                          constant(array.a[1]) != supplied_push_constants.size())
+                          fail("unsupported push constant ABI");
+                      shared[a[1]] = {t, supplied_push_constants,
+                                      std::vector<bool>(supplied_push_constants.size(), true)};
+                      readonly_storage.emplace(a[1], true);
+                  }
+              } else if (a[2] == 2 || a[2] == 12) {
                   const auto binding = bindings.find(a[1]);
                   const auto supplied =
                       binding == bindings.end() ? buffers.end() : buffers.find(binding->second);
@@ -766,13 +797,6 @@ struct Interpreter {
                           std::vector<uint32_t>{1, 0, 0, 0, 1, 0})
                       fail("unsupported sampled image type");
                   shared[a[1]] = {t, {binding->second}, {true}};
-              } else if (a[2] == 9) {
-                  shared[a[1]] = make_memory(t, size(t));
-                  if (!push_constants.empty()) {
-                      if (push_constants.size() != size(t)) fail("push constant shape mismatch");
-                      shared[a[1]] = {t, push_constants,
-                                      std::vector<bool>(push_constants.size(), true)};
-                  }
               } else if (a[2] != 1)
                   fail("unsupported global storage class");
               for (uint32_t lane = 0; lane < count; ++lane) {
