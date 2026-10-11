@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <ios>
@@ -250,6 +251,10 @@ protected:
         publish_ngg_host_capabilities(radv_like());
         reset_ngg_live_draw_cache_for_test();
     }
+    void TearDown() override {
+        set_submit_renderer({});
+        set_submit_compute({});
+    }
     // realize_draw_item on one indexed draw of `indices` (16-bit), `instances` instances.
     bool realize(GpuState st, const uint16_t* indices, uint32_t count, uint32_t instances,
                  DrawItem& out) {
@@ -261,6 +266,16 @@ protected:
         st.draws.clear();
         st.draws.push_back(draw);
         return realize_draw_item(st, &st.draws[0], count, 0x10000u, /*log*/ false, out);
+    }
+    std::vector<DrawItem> execute(const GpuState& state) {
+        std::vector<DrawItem> submitted;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            submitted.insert(submitted.end(), items.begin(), items.end());
+            return RenderedFrame{};
+        });
+        (void)execute_ordered_and_present(state, 4, 4, 1, /*publish=*/false);
+        set_submit_renderer({});
+        return submitted;
     }
 };
 
@@ -771,6 +786,167 @@ TEST_F(NggIndexedRealize, TheOrderedExecutorHandsTheRendererOneItemPerSlice) {
         EXPECT_EQ(views[k], (k << 13) | k) << "slice " << k;
         EXPECT_EQ(layers[k], k) << "slice " << k;
     }
+}
+
+// #4908: argument addresses survive materialization for provenance. Only the unresolved flag
+// may refuse NGG; ordered producer completion and the argument/index/offset guards still apply.
+GpuState indirect_state(bool indexed, const uint32_t* args, const uint16_t* indices = nullptr) {
+    GpuState state = vs_only_state();
+    GpuState::Draw draw;
+    draw.indexed = indexed;
+    draw.index_base = reinterpret_cast<uint64_t>(indices);
+    draw.indirect = true;
+    draw.indirect_args_addr = reinterpret_cast<uint64_t>(args);
+    draw.command_order = 200;
+    state.draws.push_back(draw);
+    return state;
+}
+
+TEST_F(NggIndexedRealize, AResolvedArgumentAddressDoesNotMakeTheLaunchIndirect) {
+    alignas(4) const uint16_t indices[] = {1, 3, 2};
+    GpuState state = vs_only_state();
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 3;
+    draw.index_addr = reinterpret_cast<uint64_t>(indices);
+    draw.instance_count = 2;
+    draw.indirect_args_addr = 0xdead00000000ull;   // retained provenance: never read again
+    DrawItem item;
+    ASSERT_TRUE(realize_draw_item(state, &draw, 3, 0x10000u, false, item));
+    ASSERT_TRUE(item.ngg_subgroup);
+    ASSERT_EQ(item.ngg_subgroup->plan.subgroups.size(), 2u);
+    EXPECT_EQ(item.ngg_subgroup->plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}));
+}
+
+TEST_F(NggIndexedRealize, AnUnresolvedIndirectLaunchStillRefuses) {
+    alignas(4) const uint16_t indices[] = {1, 3, 2};
+    alignas(4) const uint32_t args[] = {3, 2, 0, 0, 0};
+    GpuState state = indirect_state(true, args, indices);
+    auto& draw = state.draws[0];
+    draw.index_count = 3;   // plausible old counts do not resolve the original arguments
+    draw.index_addr = reinterpret_cast<uint64_t>(indices);
+    draw.instance_count = 2;
+    DrawItem item;
+    EXPECT_FALSE(realize_draw_item(state, &draw, 3, 0x10000u, false, item));
+    EXPECT_FALSE(item.ngg_subgroup);
+}
+
+TEST_F(NggIndexedRealize, OrderedIndexedArgumentsReachNggAfterTheirDmaProducer) {
+    alignas(4) const uint16_t indices[] = {60, 61, 1, 3, 2};
+    alignas(4) const uint32_t generated[] = {3, 2, 2, 0, 0};
+    alignas(4) uint32_t args[5] = {};
+    GpuState state = indirect_state(true, args, indices);
+    state.dma_copies.push_back({reinterpret_cast<uint64_t>(args),
+                                reinterpret_cast<uint64_t>(generated), sizeof(args), 0, 100, 0});
+    const auto submitted = execute(state);
+    ASSERT_EQ(submitted.size(), 1u) << "the CPU executor must read the post-DMA record";
+    const auto& item = submitted[0];
+    ASSERT_TRUE(item.ngg_subgroup);
+    EXPECT_EQ(item.raw_draw_count, 3u);
+    EXPECT_EQ(item.instance_count, 2u);
+    EXPECT_EQ(item.vertex_offset, 0);
+    EXPECT_EQ(item.vertex_count, 4u);
+    ASSERT_EQ(item.ngg_subgroup->plan.subgroups.size(), 2u);
+    EXPECT_EQ(item.ngg_subgroup->plan.subgroups[0].es_vertex, (std::vector<uint32_t>{1, 3, 2}))
+        << "firstIndex moves the index read";
+    EXPECT_EQ(item.ngg_subgroup->plan.subgroups[1].instance, 1u);
+    EXPECT_TRUE(state.draws[0].indirect) << "the retained source record stays original";
+    EXPECT_EQ(state.draws[0].indirect_args_addr, reinterpret_cast<uint64_t>(args));
+    EXPECT_EQ(std::memcmp(args, generated, sizeof(args)), 0);
+}
+
+TEST_F(NggIndexedRealize, OrderedNonindexedFourWordArgumentsReachNgg) {
+    alignas(4) const uint32_t args[] = {3, 2, 0, 0};
+    const auto submitted = execute(indirect_state(false, args));
+    ASSERT_EQ(submitted.size(), 1u);
+    const auto& item = submitted[0];
+    ASSERT_TRUE(item.ngg_subgroup);
+    EXPECT_FALSE(item.raw_indexed);
+    EXPECT_EQ(item.raw_draw_count, 3u);
+    EXPECT_EQ(item.instance_count, 2u);
+    ASSERT_EQ(item.ngg_subgroup->plan.subgroups.size(), 2u);
+    EXPECT_EQ(item.ngg_subgroup->plan.subgroups[0].es_vertex, (std::vector<uint32_t>{0, 1, 2}));
+}
+
+TEST_F(NggIndexedRealize, IndirectZeroCountsRemainNoops) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    for (const bool indexed : {false, true})
+        for (const bool zero_instances : {false, true}) {
+            const std::array<uint32_t, 5> args = {zero_instances ? 3u : 0u,
+                                                  zero_instances ? 0u : 1u, 0, 0, 0};
+            EXPECT_TRUE(execute(indirect_state(indexed, args.data(), indices)).empty())
+                << "indexed=" << indexed << " zero_instances=" << zero_instances;
+        }
+}
+
+TEST_F(NggIndexedRealize, IndirectCountBoundsAndFirstInstanceRemainGuarded) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    for (const bool indexed : {false, true})
+        for (const uint32_t invalid_field : {0u, 1u, indexed ? 4u : 3u}) {
+            std::array<uint32_t, 5> args = {3, 1, 0, 0, 0};
+            args[invalid_field] = invalid_field <= 1u ? (1u << 20) + 1u : 1u;
+            EXPECT_TRUE(execute(indirect_state(indexed, args.data(), indices)).empty())
+                << "indexed=" << indexed << " invalid field=" << invalid_field;
+        }
+}
+
+TEST_F(NggIndexedRealize, IndirectUnreadableAndUnalignedArgumentsRemainGuarded) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    alignas(4) const uint32_t args[] = {3, 1, 0, 0, 0};
+    for (const bool indexed : {false, true})
+        for (const uint64_t address :
+             {uint64_t{0}, uint64_t{0xdead00000000ull}, reinterpret_cast<uint64_t>(args) + 1u}) {
+            GpuState state = indirect_state(indexed, args, indices);
+            state.draws[0].indirect_args_addr = address;
+            EXPECT_TRUE(execute(state).empty()) << "indexed=" << indexed << " address=" << address;
+        }
+}
+
+TEST_F(NggIndexedRealize, MaterializedNonzeroVertexOffsetsStillRefuseNgg) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    for (const bool indexed : {false, true}) {
+        std::array<uint32_t, 5> args = {3, 1, 0, 0, 0};
+        args[indexed ? 3u : 2u] = 1;
+        EXPECT_TRUE(execute(indirect_state(indexed, args.data(), indices)).empty())
+            << "NGG still has no base-vertex launch contract";
+    }
+}
+
+TEST_F(NggIndexedRealize, FailedProducersNeverAdmitStaleIndirectArguments) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    alignas(4) const uint32_t args[] = {3, 1, 0, 0, 0};
+    for (const bool failed_dma : {false, true}) {
+        GpuState state = indirect_state(true, args, indices);
+        uint32_t destination = 0;
+        if (failed_dma) {
+            state.dma_copies.push_back(
+                {reinterpret_cast<uint64_t>(&destination), 0xdead00000000ull, 1, 0, 50, 0});
+        } else {
+            GpuState::Dispatch dispatch;
+            dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+            dispatch.command_order = 50;   // no producing program
+            state.dispatches.push_back(dispatch);
+        }
+        state.parser_stalls.push_back({100});
+        state.parser_stalls.push_back({110});
+        EXPECT_TRUE(execute(state).empty()) << "failed_dma=" << failed_dma;
+    }
+}
+
+TEST_F(NggIndexedRealize, MaterializedIndexRangeAndRestartRemainGuarded) {
+    alignas(4) const uint16_t indices[] = {0, 1, 2};
+    alignas(4) const uint32_t args[] = {3, 1, 0, 0, 0};
+    GpuState state = indirect_state(true, args, indices);
+    state.uc[P::GE_MULTI_PRIM_IB_RESET_EN] = 1;
+    state.cx[P::VGT_MULTI_PRIM_IB_RESET_INDX] = 1;
+    EXPECT_TRUE(execute(state).empty()) << "the active restart token is not a vertex";
+    state.uc[P::GE_MULTI_PRIM_IB_RESET_EN] = 0;
+    state.draws[0].index_base = 0;
+    EXPECT_TRUE(execute(state).empty()) << "indexed arguments require an index base";
+    alignas(4) const uint32_t garbage[] = {0, 1, kNggMaxIndices};
+    state.draws[0].index_base = reinterpret_cast<uint64_t>(garbage);
+    state.index_type = 1;
+    EXPECT_TRUE(execute(state).empty()) << "an index cannot exceed the NGG vertex-range bound";
 }
 
 }   // namespace

@@ -3063,7 +3063,9 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
             ngg.facts.index_refusal = fetched.refusal;
             if (fetched.indices) ngg_vertex_range = fetched.vertex_range;
         }
-        ngg.facts.indirect = draw && (draw->indirect || draw->indirect_args_addr);
+        // The ordered executor clears indirect after validating/materializing its arguments.
+        // indirect_args_addr remains source provenance, not an unresolved launch (CONFIDENCE: HIGH).
+        ngg.facts.indirect = draw && draw->indirect;
         ngg.facts.vertex_offset =
             rs.ge_indx_offset != 0 ||
             (draw && draw->has_vertex_offset_override && draw->indirect_vertex_offset != 0);
