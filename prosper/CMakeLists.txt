@@ -3400,6 +3400,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_dpp_row_fadd.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_quad_or
+    SOURCES tests/gpu/recompiler/test_compute_quad_or.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(Vulkan_FOUND)
     prosper_add_gtest(test_compute_dpp_row_fadd_execution
       SOURCES tests/gpu/execute/test_compute_dpp_row_fadd.cpp
@@ -7444,6 +7448,11 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     LABELS gpu PROPERTIES TIMEOUT 60)
   prosper_add_gtest(test_native_mask_participation_exec
     SOURCES tests/gpu/execute/test_native_mask_participation_exec.cpp
+    INCLUDES frontends tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS gpu PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_compute_quad_or_exec
+    SOURCES tests/gpu/execute/test_compute_quad_or.cpp
     INCLUDES frontends tests
     LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
     LABELS gpu PROPERTIES TIMEOUT 60)

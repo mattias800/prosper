@@ -45,6 +45,8 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
+#include "gpu/recompiler/rdna2_compute_quad_init.hpp"
+#include "gpu/recompiler/rdna2_dpp_quad_or.hpp"
 #include "gpu/recompiler/fragment_loop_mask.hpp"
 #include "gpu/recompiler/rdna2_entry_vcc.hpp"
 #include "gpu/recompiler/rdna2_readlane_route.hpp"
@@ -646,6 +648,9 @@ bool emit_cfg_state_machine(
         return false;
     };
     if ((!b.has_workgroup_execution() && !graphics) || ins.empty()) return false;
+    ComputeDppQuadOrService quad_or;
+    if (!quad_or.prepare(b, initial, ins, code, dwords, initial_active))
+        return reject_cfg(ins.front().pc, "dpp-quad-or-source-uninitialized");
     if (packet_masks &&
         (!b.is_fragment_packet() || initial_active || !packet_masks->rejection.empty() ||
          !packet_masks->source_words || packet_masks->source_words->data() != code ||
@@ -736,7 +741,8 @@ bool emit_cfg_state_machine(
     // the first CAS and the final CAS completes before the later gather. Admission below limits this
     // synthesized ordering to one guest wave, so ended/trapped lanes can safely remain participants.
     const bool direct_dispatch = (graphics || b.native_subgroup_size) &&
-        !has_synchronized_lds_store && !has_synchronized_lds_fminmax;
+                                 !has_synchronized_lds_store && !has_synchronized_lds_fminmax &&
+                                 !quad_or.present();
     const bool proven_wave32_masks = b.allow_b32_masks &&
         (b.is_fragment || (b.is_compute && b.wave_size == 32));
     const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
@@ -1035,6 +1041,7 @@ bool emit_cfg_state_machine(
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
     // phase can publish its result before any invocation advances to the following guest instruction.
     std::set<uint32_t> start_set{ins.front().pc};
+    quad_or.split(start_set, ins);
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
     bool has_gds_append = false;
@@ -1261,7 +1268,7 @@ bool emit_cfg_state_machine(
     const bool has_portable_compute_dpp_ror8 =
         !b.native_subgroup_size && !compute_dpp_row_ror8_pcs.empty();
     const bool has_portable_compute_dpp =
-        has_portable_compute_dpp_row_shr || has_portable_compute_dpp_ror8;
+        has_portable_compute_dpp_row_shr || has_portable_compute_dpp_ror8 || quad_or.present();
     const bool has_portable_compute_bpermute =
         !b.native_subgroup_size && !bpermute_event_for_pc.empty();
     // Portable gathers need a full-width value beside an event/EXEC word for every invocation.
@@ -2797,7 +2804,7 @@ bool emit_cfg_state_machine(
                 bpermute_event_for_pc.contains(in.pc) ||
                 fragment_dpp_min_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_row_shr_pcs.contains(in.pc) ||
-                compute_dpp_row_ror8_pcs.contains(in.pc) ||
+                compute_dpp_row_ror8_pcs.contains(in.pc) || quad_or.contains(in.pc) ||
                 compute_dpp_add_row_mask_pcs.contains(in.pc) ||
                 packet_wqm_event_for_pc.contains(in.pc) || packet_raw_masks.contains(in.pc) ||
                 lds_fminmax_pcs.contains(in.pc) || mask_zero_compare_candidate_source(in) >= 0 ||
@@ -3165,6 +3172,7 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_ror8_event_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    quad_or.begin(b, ptr_bool, ptr_u32);
     packet_raw_masks.begin(b, raw_mask_result_base);
     const bool has_portable_mask_ffbh = !portable_mask_ffbh_event_for_pc.empty();
     const uint32_t mask_ffbh_pending_var = has_portable_mask_ffbh
@@ -3337,6 +3345,7 @@ bool emit_cfg_state_machine(
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
         if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
+    quad_or.reset(b);
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_src0_var, zero);
         b.store_function(dpp_ror8_src1_var, zero);
@@ -3728,6 +3737,7 @@ bool emit_cfg_state_machine(
         if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, no);
         if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, no);
     }
+    quad_or.reset(b);
     if (has_portable_compute_dpp_ror8) {
         b.store_function(dpp_ror8_pending_var, no);
         b.store_function(dpp_ror8_active_var, no);
@@ -3813,6 +3823,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* dpp_min_row_shr = nullptr;
         const Rdna2Inst* dpp_row_shr = nullptr;
         const Rdna2Inst* dpp_row_ror8 = nullptr;
+        const Rdna2Inst* dpp_quad_or = nullptr;
         const Rdna2Inst* dpp_add_row_mask = nullptr;
         const Rdna2Inst* mask_ffbh = nullptr;
         const Rdna2Inst* mask_reduction = nullptr;
@@ -3841,6 +3852,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_dpp_min_row_shr = nullptr;
             const Rdna2Inst* block_dpp_row_shr = nullptr;
             const Rdna2Inst* block_dpp_row_ror8 = nullptr;
+            const Rdna2Inst* block_dpp_quad_or = nullptr;
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
             const Rdna2Inst* block_mask_ffbh = nullptr;
             const Rdna2Inst* block_mask_reduction = nullptr;
@@ -3908,6 +3920,10 @@ bool emit_cfg_state_machine(
                                      in.pc, in.dst.value,
                                      static_cast<uint32_t>(in.dpp_ctrl - 0x110u));
                     block_dpp_row_shr = &in;
+                    break;
+                }
+                if (quad_or.contains(in.pc)) {
+                    block_dpp_quad_or = &in;
                     break;
                 }
                 if (compute_dpp_row_ror8_pcs.contains(in.pc)) {
@@ -4136,9 +4152,10 @@ bool emit_cfg_state_machine(
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_synchronized_lds_store ||
                     block_lds_fminmax || block_swizzle || block_bpermute || block_dpp_min_row_shr ||
-                    block_dpp_row_shr || block_dpp_row_ror8 || block_dpp_add_row_mask ||
-                    block_mask_ffbh || block_mask_reduction || block_packet_wqm || block_readlane ||
-                    block_readfirstlane || block_mask_compare || block_exec_saved_mask_compare ||
+                    block_dpp_row_shr || block_dpp_row_ror8 || block_dpp_quad_or ||
+                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction ||
+                    block_packet_wqm || block_readlane || block_readfirstlane ||
+                    block_mask_compare || block_exec_saved_mask_compare ||
                     block_saved_mask_pair_compare || block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
                     (block_terminator &&
@@ -4156,6 +4173,7 @@ bool emit_cfg_state_machine(
             dpp_min_row_shr = block_dpp_min_row_shr;
             dpp_row_shr = block_dpp_row_shr;
             dpp_row_ror8 = block_dpp_row_ror8;
+            dpp_quad_or = block_dpp_quad_or;
             dpp_add_row_mask = block_dpp_add_row_mask;
             mask_ffbh = block_mask_ffbh;
             mask_reduction = block_mask_reduction;
@@ -4621,6 +4639,8 @@ bool emit_cfg_state_machine(
                 if (dpp_shr_or_var) b.store_function(dpp_shr_or_var, bitwise_or ? yes : no);
             }
         }
+        if (dpp_quad_or && !quad_or.publish(b, state, *dpp_quad_or))
+            return reject_cfg(dpp_quad_or->pc, "dpp-quad-or-source-provenance");
         if (dpp_row_ror8) {
             const DppRowRor8Op operation = dpp_row_ror8_op(*dpp_row_ror8);
             if (!compute_dpp_row_ror8(*dpp_row_ror8))
@@ -4887,6 +4907,9 @@ bool emit_cfg_state_machine(
         } else if (dpp_row_shr) {
             if (!set_next(dpp_row_shr->pc + dpp_row_shr->len_dwords))
                 return reject_cfg(dpp_row_shr->pc, "dpp-add-row-shr-successor");
+        } else if (dpp_quad_or) {
+            if (!set_next(dpp_quad_or->pc + dpp_quad_or->len_dwords))
+                return reject_cfg(dpp_quad_or->pc, "dpp-quad-or-successor");
         } else if (dpp_row_ror8) {
             if (!set_next(dpp_row_ror8->pc + dpp_row_ror8->len_dwords))
                 return reject_cfg(dpp_row_ror8->pc, "dpp-row-ror8-successor");
@@ -5438,6 +5461,9 @@ bool emit_cfg_state_machine(
             dpp_value_base, dpp_metadata_base, compute_dpp_row_shr_dsts, vv, lv, lmv))
         return reject_cfg(0, "missing-dpp-row-shr-dst");
 
+    if (!quad_or.emit_phase(b, dpp_value_base, dpp_metadata_base, vv, lv, lmv))
+        return reject_cfg(0, "missing-dpp-quad-or-dst");
+
     // ROW_ROR has its own event-isolated phase before another service reuses these planes.
     if (has_portable_compute_dpp_ror8 &&
         !emit_portable_compute_dpp_row_ror8_phase(
@@ -5963,6 +5989,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
+    if (b.is_compute && std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) {
+        if (!allow_cfg_dispatcher || std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+                return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
+            }))
+            return false;
+        return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                                      code, dwords, initial_dispatch_active);
+    }
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
         b.cselect_b64_low_only_analysis_done = true;

@@ -40,6 +40,7 @@
 #include "../../tests/fixtures/portable_mask_half.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/dpp_row_or.hpp"
+#include "../../tests/fixtures/compute_quad_or.hpp"
 #include "../../tests/fixtures/dpp_row_fadd.hpp"
 #include "../../tests/fixtures/ngg_merged_lut_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
@@ -2458,6 +2459,22 @@ int main(int argc, char** argv) {
         const auto masked = fixture::program({.narrowed_readlane = true});
         dump(dir, "compute_readlane_barrier_exec_off_peer", fixture::compile(masked, resources),
              "recompile_compute");
+    }
+    {
+        namespace fixture = prosper::test::compute_quad_or;
+        for (uint32_t arm : {0u, 32u, 64u}) {
+            for (auto shape : {fixture::Shape::Plain, fixture::Shape::Complement,
+                               fixture::Shape::Masked, fixture::Shape::DistinctSites}) {
+                const auto code = fixture::program(shape);
+                auto config = fixture::config(arm == 64 ? 64 : 0);
+                config.wave_size = arm == 32 ? 32 : 64;
+                const auto module =
+                    fixture::compile(code, fixture::table(), config, fixture::address());
+                const auto name =
+                    "compute_quad_or_" + std::to_string(int(shape)) + "_" + std::to_string(arm);
+                dump(dir, name.c_str(), module, "recompile_compute");
+            }
+        }
     }
     {
         namespace fixture = prosper::test::native_mask_participation;
