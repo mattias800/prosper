@@ -37,6 +37,7 @@
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
+#include "../../tests/fixtures/portable_mask_half.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/dpp_row_or.hpp"
 #include "../../tests/fixtures/dpp_row_fadd.hpp"
@@ -1967,6 +1968,13 @@ int main(int argc, char** argv) {
                               0x06069400u, 0xbeea0414u, 0xd5010000u, 0x01a91281u, 0xbeea0481u,
                               0xbe9f036bu, 0xf800080fu, 0x00000000u, 0xbf810000u};
         dump(dir, "fragment_bool_vcc_copy_generation", recompile_fragment(code, std::size(code)));
+    }
+    // #4926: portable EXEC restores both current numeric words after a physical half replacement.
+    for (int half : {0, 1}) {
+        namespace fixture = prosper::test::portable_mask_half;
+        const auto code = fixture::program(true, half, 0x80000001u);
+        const auto name = "portable_saved_mask_replaced_" + std::to_string(half);
+        dump(dir, name.c_str(), fixture::compile(code));
     }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.

@@ -3221,7 +3221,7 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // mask spelling, and deliberately NARROWER than it: a saved wave mask names the bits currently in a
 // physical SGPR pair, so a scalar write over the register it is keyed on ends that lifetime. It is
 // not provenance attached to the register number forever. (expire_wave64_mask_half expires on either
-// word of the pair; only the ROOT word ends it here -- see the comment on expire_saved_b64_mask.)
+// word of the pair; portable mask-slot reloads retain the historical ROOT policy below.)
 //
 // Without this, `sreg_bool` outlives its register and every later consumer reads a mask the hardware
 // no longer holds. Two of them are load-bearing: `operand_bits` rejects an ordinary data read of
@@ -3581,7 +3581,14 @@ inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
     rs.scc_merge_placeholder = true;
 }
 
+inline bool ordinary_portable_wave64_masks(const SpirvCompute& b) {
+    return b.is_compute && b.wave_size == 64 && !b.native_subgroup_size &&
+           !b.is_fragment_packet() && !b.ngg_workgroup_shell && !b.ngg_one_lane;
+}
+
 struct SavedB64MaskSnapshot {
+    // Instruction-order architectural writes only; load_state does not use this snapshot.
+    bool portable_numeric_replacement = false;
     // (root, Bool id). At most a few entries: only the roots this one instruction can overwrite.
     std::vector<std::pair<int, uint32_t>> entries;
     // The instruction's input marks, taken before emission with the masks (#4706).
@@ -3589,11 +3596,14 @@ struct SavedB64MaskSnapshot {
 };
 
 inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& before, int reg,
-                                  int preserved_pair = -1) {
-    // Native DATA retention makes either physical replacement end the complete alias. Portable
-    // mask-slot reloads retain their existing root rule until their half-instance transfer is proved.
+                                  int preserved_pair = -1, bool mask_slot_reload = false) {
+    // CONFIDENCE: HIGH -- either numeric half replacement ends this complete Wave64 generation.
+    // The established portable mask-slot spelling is separate: this leaf neither authenticates
+    // its physical halves nor changes that reload path's historical alias policy (#4781).
     for (int root : {reg - 1, reg}) {
-        if (root != reg && !rs.native_saved_mask_words) continue;
+        if (root != reg && !rs.native_saved_mask_words &&
+            (!before.portable_numeric_replacement || mask_slot_reload))
+            continue;
         if (root < 0 || root > 105 || root == preserved_pair) continue;
         const auto mask = rs.sreg_bool.find(root);
         if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) continue;
@@ -4051,7 +4061,8 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
                 expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
-                                      writes_b64_mask || publishes_reloaded_mask ? base : -1);
+                                      writes_b64_mask || publishes_reloaded_mask ? base : -1,
+                                      publishes_reloaded_mask);
             }
             if (!rs.sreg_bool_b32.contains(reg) ||
                 ((writes_b32_mask || keeps_b32_reload) && reg == base))

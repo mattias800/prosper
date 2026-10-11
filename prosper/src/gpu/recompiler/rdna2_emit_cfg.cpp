@@ -4165,7 +4165,7 @@ bool emit_cfg_state_machine(
                 // records the post-instruction VGPR under the entry EXEC, not the new mask.
                 const uint32_t trace_entry_exec = state.exec_narrowed ? state.exec : 0;
                 prepare_saved_mask_word_write(b, state, in);
-                const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
+                const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(b, state, in);
                 // Owned packet services handle original guest resource/numeric instructions at
                 // this exact dispatcher boundary. Native paths have no callback and keep their
                 // old lowering. Services do not bypass scalar lifetime invalidation below.
@@ -6329,7 +6329,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool ok = true;
             const uint32_t trace_entry_exec = rs.exec_narrowed ? rs.exec : 0;
             prepare_saved_mask_word_write(b, rs, in);
-            const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(rs, in);
+            const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(b, rs, in);
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
             if (handled && ok)

@@ -1657,6 +1657,14 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
     return snapshot;
 }
 
+// Explicit emission-domain snapshot: host load_state reconstruction is not an architectural write.
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const SpirvCompute& b, const RegState& rs,
+                                                     const Rdna2Inst& in) {
+    auto snapshot = snapshot_saved_b64_masks(rs, in);
+    snapshot.portable_numeric_replacement = ordinary_portable_wave64_masks(b);
+    return snapshot;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Workgroup-uniform wave branch (#1554).
 //
