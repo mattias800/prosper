@@ -822,3 +822,57 @@ TEST(NativeCfgSavedMaskData, GenuineDynamicWriteSelectorKeepsActualValue) {
 TEST(NativeCfgSavedMaskData, FullVectorReplacementEndsMissingDynamicWriteSelectorGeneration) {
     lane_selector_values(lane_selector_initial_or_write_program(4), 0, 0);
 }
+
+namespace {
+// A selector can be absent without a previous relay mark. The selected local-id vector is genuine.
+std::vector<uint32_t> absent_scalar_selector_program(bool selector, bool edge,
+                                                     unsigned replacement = 0) {
+    std::vector<uint32_t> p{0x7e020280u};
+    if (selector) p.push_back(mov(40, 128));
+    if (replacement == 2 || replacement == 3) p.push_back(mov(40, 41));
+    if (replacement == 3) p.push_back(mov(40, 128));
+    if (replacement == 4) p.push_back(mov(42, 40));
+    p.insert(p.end(), {0xd7600010u, 256u | ((replacement == 4 ? 42u : 40u) << 9u)});
+    if (replacement == 1) p.push_back(mov(16, 128));
+    if (edge) p.insert(p.end(), {0xbf880001u, 0x7e040281u});
+    p.insert(p.end(), {0x7d840010u, mov(126, 106, true), 0x7e020281u, mov(126, 193, true),
+                       0xe0702000u, 0x80020100u});
+    const auto tail = program();
+    p.insert(p.end(), tail.end() - 9, tail.end());
+    return p;
+}
+}   // namespace
+
+TEST(NativeCfgSavedMaskData, AnAbsentScalarSelectorRefusesWithinTheCase) {
+    lane_selector_refuses(absent_scalar_selector_program(false, false), 3);
+}
+TEST(NativeCfgSavedMaskData, AnAbsentScalarSelectorRefusesAcrossAnEdge) {
+    lane_selector_refuses(absent_scalar_selector_program(false, true), 5);
+}
+TEST(NativeCfgSavedMaskData, ADefinedScalarSelectorKeepsActualValueWithinTheCase) {
+    lane_selector_values(absent_scalar_selector_program(true, false), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, ADefinedScalarSelectorKeepsActualValueAcrossAnEdge) {
+    lane_selector_values(absent_scalar_selector_program(true, true), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, ACurrentResultOverwriteEndsAbsentSelectorAcrossAnEdge) {
+    lane_selector_values(absent_scalar_selector_program(false, true, 1), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, AnAbsentOverwriteEndsOlderDefinedSelectorAcrossAnEdge) {
+    lane_selector_refuses(absent_scalar_selector_program(true, true, 2), 7);
+}
+TEST(NativeCfgSavedMaskData, ACurrentSelectorOverwriteEndsAbsentGenerationAcrossAnEdge) {
+    lane_selector_values(absent_scalar_selector_program(true, true, 3), 0, 0);
+}
+TEST(NativeCfgSavedMaskData, ARelayedAbsentSelectorRefusesAcrossAnEdge) {
+    lane_selector_refuses(absent_scalar_selector_program(false, true, 4), 6);
+}
+TEST(NativeCfgSavedMaskData, ADefinedConstantSlotDoesNotInheritAnotherSlotsMark) {
+    auto p = absent_scalar_selector_program(false, true);
+    const auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+    const size_t at = read - p.begin();
+    p[at + 1] = 276u | (128u << 9u);
+    // Slot 1 remains marked; the current constant writer proves exactly the consumed slot 0.
+    p.insert(p.begin() + at, {0xd7610014u, 41u | (129u << 9u), 0xd7610014u, 128u | (128u << 9u)});
+    lane_selector_values(p, 0, 0);
+}

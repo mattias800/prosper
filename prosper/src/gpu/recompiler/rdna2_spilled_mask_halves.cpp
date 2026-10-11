@@ -121,8 +121,10 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                         (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
     bool memory =
         load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
-    // An ordinary absent SGPR's VALU data spelling is fabricated even before a READLANE has
-    // relayed it. Defined mask halves and constants are separate genuine input domains.
+    // An ordinary absent SGPR is fabricated before any instruction has relayed it. Retain
+    // that consumed scalar dependency separately from whole-vector marks, so a defined
+    // constant spill slot can stay genuine beside an unrelated marked slot.
+    bool missing_scalar_word = false;
     if (!load)
         for (uint32_t source = 0; source < in.n_src; ++source) {
             const auto& operand = in.src[source];
@@ -134,15 +136,16 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                 const int reg = operand.value + static_cast<int>(word);
                 if (reg <= 105 && !scalar_words.contains(reg) && !masks.contains(reg) &&
                     !(reg > 0 && masks.contains(reg - 1)))
-                    vector_relay = true;
+                    missing_scalar_word = true;
             }
         }
+    vector_relay = vector_relay || missing_scalar_word;
     // Relayed words first, while `defined` still describes the slots `in` reads. A V_READLANE
     // relays unless it reads a constant-lane slot in `defined`; any other scalar write relays when
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
     const bool relays =
-        missing_scc || reads_relayed_word(relayed, in) ||
+        missing_scc || missing_scalar_word || reads_relayed_word(relayed, in) ||
         (readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
                             !(constant_lane(in) &&
                               defined.contains({in.src[0].value, in.src[1].value})) ||
