@@ -3277,24 +3277,36 @@ inline bool b32_source_word_defined(const RegState& rs, const Operand& source) {
 inline bool b32_sources_defined(const RegState& rs, const Rdna2Inst& in) {
     return b32_source_word_defined(rs, in.src[0]) && b32_source_word_defined(rs, in.src[1]);
 }
-// Whether a merge EDGE's word for `r` is fabricated. A merge reads an absent register through
-// `sget()`, which supplies `uconst(0)` for any absent word, so absence there counts for the special
-// data registers 106-124 (VCC, ttmp, M0) too, and for an ordinary SGPR whatever `sreg_input` holds:
-// the skipped edge of an if whose arm overwrote a direct-descriptor word merges a zero, not the
-// driver's word.
 // The value a structured emitter seeds a phi or merge with for register `r`: the register's value,
-// or the fabricated zero when it is absent (LoopBlanketCheck records which loop seeds were held).
+// including genuine ordinary launch data, or the fabricated zero when it is absent.
+// CONFIDENCE: HIGH -- operand_bits reads these same producing sreg_input words. An arm-local
+// overwrite must preserve that value on the skipped edge, before the merge erases the input alias.
+// LoopBlanketCheck separately records which loop seeds were held.
 inline uint32_t sreg_seed(SpirvCompute& b, const RegState& rs, int r) {
     const auto it = rs.sreg.find(r);
-    return it == rs.sreg.end() ? b.uconst(0) : it->second;
+    if (it != rs.sreg.end()) return it->second;
+    if (r >= 0 && r <= 105) {
+        const auto input = rs.sreg_input.find(r);
+        if (input != rs.sreg_input.end()) return input->second;
+    }
+    return b.uconst(0);
 }
 inline uint32_t vreg_seed(SpirvCompute& b, const RegState& rs, int r) {
     const auto it = rs.vreg.find(r);
     return it == rs.vreg.end() ? b.uconst(0) : it->second;
 }
+inline uint32_t scalar_merge_seed(SpirvCompute& b, RegState& rs, int r) {
+    const uint32_t value = sreg_seed(b, rs, r);
+    // Equal incoming SSA IDs need no phi. Retain their genuine value before the merge retires
+    // sreg_input for any word written on the other edge (including an s_mov sN,sN).
+    if (r >= 0 && r <= 105 && !rs.sreg.contains(r) && rs.sreg_input.contains(r)) rs.sreg[r] = value;
+    return value;
+}
 inline bool merge_edge_word_fabricated(const RegState& rs, int r) {
     if (r >= 106 && r <= 124 && !rs.sreg.contains(r)) return true;
-    return sreg_word_absent_unmasked(rs, r) || sreg_word_may_be_fabricated(rs, r);
+    // Match the actual phi input above. Explicit marks still win over genuine launch presence.
+    return (!rs.sreg_input.contains(r) && sreg_word_absent_unmasked(rs, r)) ||
+           sreg_word_may_be_fabricated(rs, r);
 }
 // Whether a held word's only mark is a loop header's blanket mark (sreg_loop_blanket): defined
 // under that header's assumption, which its back edge checks (LoopBlanketCheck).

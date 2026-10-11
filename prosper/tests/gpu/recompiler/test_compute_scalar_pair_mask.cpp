@@ -312,20 +312,15 @@ TEST(ScalarPairMask, ACopiedDirectDescriptorWordStillProjects) {
         << last_terminal_reject_reason(kAddress);
 }
 
-TEST(ScalarPairMask, ADescriptorWordOverwrittenOnOnePathIsFabricated) {
-    // The exemption must not survive a merge. s12 (a word of the unused direct V#) is overwritten on
-    // ONE arm of the if; the skipped edge's phi input is sget()'s uconst(0), not the driver's word,
-    // so after the join s12 is the fabricated zero even though the edge still held it in sreg_input.
+TEST(ScalarPairMask, ADescriptorWordOverwrittenOnOnePathRetainsLaunchData) {
+    // Both edges are real: s12 is overwritten on ONE arm, while the skipped edge retains the
+    // driver's genuine direct-descriptor word. The correct phi must not become merge-marked.
     // s_cbranch_scc1 +1 | s_mov_b32 s12, -1 | s_mov_b64 vcc, s[12:13]
     const Words one_path = {0xbf068000u, 0xbf850001u, 0xbe8c03c1u};
     const Words probe = {0xbeea040cu};
     const Words code = cat({&kPrefix, &one_path, &probe, &kComputeTail});
-    EXPECT_TRUE(compile_with_direct_descriptors(code).empty());
-    const std::string reason = last_terminal_reject_reason(kAddress);
-    EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos) << reason;
-    EXPECT_NE(reason.find("pc=" + std::to_string(kPrefix.size() + one_path.size() + 1u) + " "),
-              std::string::npos)
-        << "refused at the v_cndmask: " << reason;
+    EXPECT_FALSE(compile_with_direct_descriptors(code).empty())
+        << last_terminal_reject_reason(kAddress);
     // Control: the same if writing s12 on the arm and leaving s13 alone, with the pair read only
     // after s12 is redefined on every path, is admitted.
     const Words redefined = {0xbe8c03c1u};

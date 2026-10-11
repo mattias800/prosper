@@ -115,6 +115,7 @@ The remaining shaders each need **one or more genuinely deep features** — veri
 
 | Shaders | Class | Blocking features (all required together) |
 |---|---|---|
+| Reading a genuine launch word when seeding a structured merge is sufficient, without retaining it when equal incoming IDs omit the PHI | **False for counted-loop preludes and IF/ELSE.** Both paths retire an overwritten launch alias after the merge. A self-move keeps both incoming IDs equal, so omitting the PHI also omits the only scalar-value assignment unless seeding retains the real word. Removing only that retention makes both production-emitter value tests fail (63/65 focused/SPIR-V cases pass, exit 8); restoring it preserves both nonzero descriptor words. This is CPU value/provenance evidence, not a live rendering result. | [#4774](https://github.com/mattias800/prosper/issues/4774) |
 | **032, 034** | loop + arrayed/MSAA sampling | loop reconstruction (done) + **2D_ARRAY / 2D_MSAA_ARRAY** *sampled* image dims (arrayed/MSAA storage is done; arrayed/MSAA **sampling** is not) |
 | **004, 025, 040** | NGG vertex/primitive | **NGG preamble**: `s_sendmsg(GS_ALLOC_REQ)`, `exp prim`, and wave-packing EXEC setup (`s_lshr_b64 exec,-1,vcc`) — modellable as per-invocation no-ops, but needs care to prove correctness |
 | **006** | multi-tap sample + inline sampler | **inline sampler descriptor construction** (`s[8:11]` reused as a buffer V# then rebuilt as an S# via `s_movk`/`s_bfm`/`s_lshl`/`s_mov`) + dmask≠0xF (3-component) sampling. NSA + implicit-LOD sampling itself is done. |

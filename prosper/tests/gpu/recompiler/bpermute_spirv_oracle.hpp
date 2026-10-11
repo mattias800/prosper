@@ -509,6 +509,11 @@ struct Interpreter {
           for (uint32_t position = 0; position < 32; ++position)
               bits += (x.words[0] >> position) & 1u;
           set(l, a[1], a[0], {bits}, x.defined);
+      } else if (op == 200) {
+          if (a.size() != 3 || !unsigned_type(a[0])) fail("unsupported Not result");
+          const auto x = value(l, a[2]);
+          if (x.type != a[0] || x.words.size() != size(x.type)) fail("Not operand type mismatch");
+          set_unsigned(l, a[1], a[0], x.defined ? ~unsigned_value(x) : 0, x.defined);
       } else if (op == 170 || op == 171 || op == 172 || op == 174 || op == 176 || op == 178 ||
                  op == 128 || op == 130 || op == 132 || op == 134 || op == 137 || op == 194 ||
                  op == 196 || op == 197 || op == 198 || op == 199) {

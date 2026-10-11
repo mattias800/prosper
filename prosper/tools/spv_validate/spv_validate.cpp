@@ -781,6 +781,42 @@ int main(int argc, char** argv) {
         }
     }
 
+    // #4774: validate both structured merge routes with genuine nonzero launch words.
+    // Equal incoming SSA IDs exercise the no-phi path before input-alias retirement too.
+    for (uint32_t shape = 0; shape < 6; ++shape) {
+        std::vector<uint32_t> code{0xbf068000u, 0xbf850001u, 0xbe8c03c1u};
+        if (shape == 1 || shape == 4)
+            code.insert(code.end(), {0xb0020002u, 0xbe840380u, 0xbf0a0204u, 0xbf840002u,
+                                     0x81048104u, 0xbf82fffcu});
+        if (shape == 2 || shape == 4) code[2] = 0xbe8c030cu;   // s_mov_b32 s12,s12
+        if (shape == 3) code = {0xbf068000u, 0xbf850002u, 0xbe8c03c1u, 0xbf820001u, 0xbe8d03c2u};
+        if (shape == 5) code = {0xbf068000u, 0xbf850002u, 0xbe8c030cu, 0xbf820001u, 0xbe8d030du};
+        code.push_back(0xbf810000u);
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        SpirvCompute builder;
+        builder.begin(4u, nullptr, 64u, 1u, 1u, 64u, 0u, true, true);
+        RegState state;
+        state.exec = builder.btrue();
+        state.vcc = builder.bfalse();
+        state.scc = builder.bfalse();
+        state.absent_sgpr_reads_fabricated_zero = true;
+        state.sreg[0] = builder.uconst(0u);
+        state.sreg_input[12] = builder.uconst(0x13579bdfu);
+        state.sreg_input[13] = builder.uconst(0x2468ace0u);
+        std::vector<uint32_t> module;
+        if (emit_body(
+                builder, state, ins, {}, nullptr, true, false,
+                [](RegState&, const Rdna2Inst&) { return false; }, code.data(), code.size(),
+                nullptr, false)) {
+            builder.store_output_word(sreg_seed(builder, state, 12), 2u, 0u);
+            builder.store_output_word(sreg_seed(builder, state, 13), 2u, 1u);
+            module = builder.finish();
+        }
+        const std::string name = "descriptor_if_merge_" + std::to_string(shape);
+        dump(dir, name.c_str(), module);
+    }
+
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x8f148402u, 0xf4080200u, 0x28000010u,
                            0x7e000c09u, 0xbf810000u};
