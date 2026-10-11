@@ -1880,7 +1880,9 @@ bool emit_cfg_state_machine(
             // live mask, so it is exact wherever the source helper admits it.
             const bool exact_mask_reduction =
                 reduction_source == 126 ||
-                (reduction_source >= 0 && masks.contains(reduction_source));
+                (reduction_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, reduction_source,
+                                                     masks.contains(reduction_source)));
             if (record_compare && exact_mask_reduction)
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
@@ -1888,20 +1890,33 @@ bool emit_cfg_state_machine(
                 proven_wave64_mbcnt_mask_root_for_pc.emplace(in.pc, mbcnt_root);
             const int zero_compare_source = mask_zero_compare_candidate_source(in);
             if (record_compare && zero_compare_source >= 0 &&
-                masks.contains(zero_compare_source))
+                portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                    masks.contains(zero_compare_source)))
                 proven_wave64_mask_zero_compare_pcs.insert(in.pc);
             const int compare_source = exec_saved_mask_compare_source(in);
-            if (record_compare && compare_source >= 0 && masks.contains(compare_source))
+            if (record_compare && compare_source >= 0 &&
+                portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                    masks.contains(compare_source)))
                 proven_exec_saved_mask_compare_pcs.insert(in.pc);
             const auto pair_compare = saved_mask_pair_compare_sources(in);
             if (record_compare && pair_compare[0] >= 0 &&
-                masks.contains(pair_compare[0]) && masks.contains(pair_compare[1]))
+                portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                    masks.contains(pair_compare[0])) &&
+                portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                    masks.contains(pair_compare[1])))
                 proven_saved_mask_pair_compare_pcs.insert(in.pc);
             const bool writes_exact_wave_scc =
-                (zero_compare_source >= 0 && masks.contains(zero_compare_source)) ||
-                (compare_source >= 0 && masks.contains(compare_source)) ||
-                (pair_compare[0] >= 0 && masks.contains(pair_compare[0]) &&
-                 masks.contains(pair_compare[1]));
+                (zero_compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                     masks.contains(zero_compare_source))) ||
+                (compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                     masks.contains(compare_source))) ||
+                (pair_compare[0] >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                     masks.contains(pair_compare[0])) &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                     masks.contains(pair_compare[1])));
 
             // Scalar-data presence and SCC validity share the same provenance contract. SOPK
             // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
@@ -3477,6 +3492,9 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
+                if (const char* gap =
+                        prepare_portable_mask_common_sources(b, state, in, initial_active != 0))
+                    return reject_cfg(in.pc, gap);
                 if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
                     block_terminator = &in;
@@ -3883,25 +3901,15 @@ bool emit_cfg_state_machine(
             if (dst == 106 || dst == 107) state.vcc = 0;
         }
         if (mask_ffbh) {
-            const int source = mask_ffbh->src[0].value;
-            int mask_base = source;
-            auto mask = state.sreg_bool.find(mask_base);
-            if (mask == state.sreg_bool.end() || state.sreg_bool_b32.contains(mask_base)) {
-                mask_base = source - 1;
-                mask = state.sreg_bool.find(mask_base);
-            }
+            const auto [mask, half] = portable_mask_common_ffbh_source(b, state, *mask_ffbh);
             const auto event = portable_mask_ffbh_event_for_pc.find(mask_ffbh->pc);
-            if (source < 0 || mask_base < 0 || source - mask_base < 0 ||
-                source - mask_base > 1 || mask == state.sreg_bool.end() ||
-                state.sreg_bool_b32.contains(mask_base) ||
-                event == portable_mask_ffbh_event_for_pc.end())
+            if (!mask || event == portable_mask_ffbh_event_for_pc.end())
                 return reject_cfg(mask_ffbh->pc, "mask-ffbh-source");
             b.store_function(mask_ffbh_pending_var, yes);
-            b.store_function(mask_ffbh_mask_var, mask->second);
+            b.store_function(mask_ffbh_mask_var, mask);
             b.store_function(mask_ffbh_write_var, state.exec);
             b.store_function(mask_ffbh_event_var, b.uconst(event->second));
-            b.store_function(mask_ffbh_half_var,
-                b.uconst(static_cast<uint32_t>(source - mask_base)));
+            b.store_function(mask_ffbh_half_var, b.uconst(half));
             b.store_function(mask_ffbh_dst_var,
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
         }
@@ -3963,12 +3971,10 @@ bool emit_cfg_state_machine(
                 // false, so map membership is not a lifetime proof. Admit a saved SGPR mask only
                 // at the exact consumer where the Wave64 MUST analysis proves its pair root live.
                 const auto proof = proven_wave64_mbcnt_mask_root_for_pc.find(mbcnt->pc);
-                if (proof == proven_wave64_mbcnt_mask_root_for_pc.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
-                const auto live = state.sreg_bool.find(proof->second);
-                if (live == state.sreg_bool.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-proven-mask-missing-state");
-                mask = live->second;
+                mask = portable_mask_common_mbcnt_source(
+                    b, state, *mbcnt,
+                    proof == proven_wave64_mbcnt_mask_root_for_pc.end() ? -1 : proof->second);
+                if (!mask) return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
             } else {
                 mask = mbcnt_source_bit(
                     b, state, mbcnt->src[0], mbcnt->opcode == 0x366);

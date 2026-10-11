@@ -855,6 +855,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
                                        config.threads_y % local_y != 0 ||
                                        config.threads_z % local_z != 0;
+    b.portable_mask_common_partial_entry = config.exact_thread_extent && has_partial_workgroup;
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;

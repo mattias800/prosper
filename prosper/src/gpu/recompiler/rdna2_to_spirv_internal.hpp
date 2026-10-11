@@ -412,6 +412,9 @@ enum class GuestWaveEventDomain { None, Owned64 };
 
 struct SpirvCompute {
     std::shared_ptr<const PortableMaskHalfProgram> portable_mask_half_program;
+    // Producing exact-extent configuration may pad a workgroup with absent guest invocations.
+    // A common symbolic-half read cannot derive their scalar bits from physical workers.
+    bool portable_mask_common_partial_entry = false;
     // Guest semantics and physical synchronization ownership are separate. The legacy is_*
     // booleans select the existing physical stage shells; a packet is guest Fragment while its
     // physical shell is GLCompute. Never set both legacy compute and fragment flags.

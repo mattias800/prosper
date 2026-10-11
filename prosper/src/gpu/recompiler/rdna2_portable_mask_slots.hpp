@@ -54,6 +54,16 @@ private:
     std::set<int> written_;
     bool handled_ = false;
 };
+// Common-phase consumers bypass emit_alu. Authenticate their exact-PC reads before diversion;
+// complete predicates change only the irrelevant HIGH lanes of a LOW projection carrier.
+bool portable_mask_common_pair_is_proven(const SpirvCompute&, const Rdna2Inst&, int root,
+                                         bool legacy);
+const char* prepare_portable_mask_common_sources(SpirvCompute&, RegState&, const Rdna2Inst&, bool);
+std::pair<uint32_t, uint32_t> portable_mask_common_ffbh_source(const SpirvCompute&, const RegState&,
+                                                               const Rdna2Inst&);
+uint32_t portable_mask_common_mbcnt_source(const SpirvCompute&, const RegState&, const Rdna2Inst&,
+                                           int legacy_root);
+uint32_t portable_mask_half_pair_value(SpirvCompute&, const RegState&, uint32_t pc, int root);
 void add_portable_mask_half_keys(const SpirvCompute&, std::set<int>&);
 bool portable_mask_half_at_entry(const SpirvCompute&, uint32_t pc, int word);
 void load_portable_mask_half_types(const SpirvCompute&, RegState&, uint32_t pc);

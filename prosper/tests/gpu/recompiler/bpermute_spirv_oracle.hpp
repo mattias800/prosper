@@ -541,9 +541,18 @@ struct Interpreter {
       } else if (op == 169) {
           if (a.size() != 5) fail("malformed Select");
         // Both arms must be defined and typed even when only one is selected.
-          const auto left = value(l, a[3]), right = value(l, a[4]);
-          if (left.type != a[0] || right.type != a[0]) fail("Select type mismatch");
-          l.v[a[1]] = boolean(l, a[2]) ? left : right;
+        const auto left = value(l, a[3]), right = value(l, a[4]);
+        if (left.type != a[0] || right.type != a[0])
+          fail("Select type mismatch");
+        const auto condition = value(l, a[2]);
+        if (ty(condition.type).op != 20 || condition.words.size() != 1)
+            fail("Select condition type mismatch");
+        // A dead Select with an undefined condition produces poison, not a control-flow
+        // decision. A later known Select may discard it; branches and live sinks still refuse.
+        if (!condition.defined)
+            set(l, a[1], a[0], left.words, false);
+        else
+            l.v[a[1]] = boolean(l, a[2]) ? left : right;
       } else if (op == 166 || op == 167 || op == 164 || op == 165) {
           if (a.size() != 4 || ty(a[0]).op != 20) fail("logical result type mismatch");
           const bool x = boolean(l, a[2]), y = boolean(l, a[3]);

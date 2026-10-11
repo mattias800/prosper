@@ -40,6 +40,7 @@
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/portable_mask_half.hpp"
 #include "../../tests/fixtures/portable_mask_slots.hpp"
+#include "../../tests/fixtures/portable_mask_common.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/dpp_row_or.hpp"
 #include "../../tests/fixtures/compute_quad_or.hpp"
@@ -2072,6 +2073,76 @@ int main(int argc, char** argv) {
         }
         const auto name = "portable_mask_half_destination_boundary_" + std::to_string(shape);
         dump(dir, name.c_str(), fixture::compile(code).module);
+    }
+    // Common consumers authenticate the exact paired or selected-word symbolic source.
+    for (uint32_t shape = 0; shape < 11; ++shape) {
+        namespace fixture = prosper::test::portable_mask_common;
+        namespace slots = prosper::test::portable_mask_slots;
+        std::vector<uint32_t> code;
+        if (shape < 3)
+            code = fixture::branch(fixture::halves(false, true), 20, shape == 1,
+                                   shape == 2 ? 126 : 128);
+        else if (shape < 5)
+            code = fixture::reduction(fixture::halves(false, true), shape == 3 ? 0x10 : 0x14);
+        else if (shape == 5)
+            code = fixture::ffbh(fixture::selected_half(true, 0x00001000u), 21);
+        else if (shape < 8)
+            code = fixture::mbcnt(fixture::selected_half(shape == 7, 0x00000fffu),
+                                  shape == 7 ? 21 : 20, shape == 7);
+        else
+            code = fixture::ffbh(fixture::selected_half(shape != 9, shape == 8   ? 0x80000000u
+                                                                    : shape == 9 ? 0x1000u
+                                                                                 : 0u),
+                                 shape == 9 ? 20 : 21);
+        const auto name = "portable_mask_common_consumer_" + std::to_string(shape);
+        dump(dir, name.c_str(), slots::compile(code, true).module);
+    }
+    // Existing ordinary DATA/whole-Bool partial-workgroup routes remain independent.
+    for (uint32_t shape = 0; shape < 6; ++shape) {
+        namespace fixture = prosper::test::portable_mask_common;
+        namespace base = prosper::test::portable_mask_half;
+        std::vector<uint32_t> code;
+        uint32_t local = 64;
+        if (shape < 4) {
+            code = fixture::branch(
+                shape % 2 == 0 ? std::vector<uint32_t>{0x7e060280u, base::mov(20, 193, true)}
+                               : std::vector<uint32_t>{0x7e060280u, base::mov(126, 193, true),
+                                                       base::mov(20, 126, true)});
+            local = shape < 2 ? 32 : 65;
+        } else {
+            code = fixture::reduction(fixture::halves(false, true), 0x10);
+            code.insert(code.begin() + (shape == 4 ? 7 : 11), 0xbf8a0000u);
+        }
+        const auto name = "portable_mask_common_wave_control_" + std::to_string(shape);
+        dump(dir, name.c_str(), fixture::compile(code, local, shape < 4).module);
+    }
+    for (uint32_t shape = 0; shape < 8; ++shape) {
+        namespace fixture = prosper::test::portable_mask_common;
+        namespace base = prosper::test::portable_mask_half;
+        auto config = fixture::exact_config(64, 1, 1, 64, 1, 1);
+        std::vector<uint32_t> code;
+        if (shape < 3) {
+            if (shape == 0) config = fixture::exact_config(128, 1, 1, 128, 1, 1);
+            if (shape == 1) config = fixture::exact_config(32, 4, 1, 32, 4, 1);
+            if (shape == 2) config = fixture::exact_config(16, 4, 2, 16, 4, 2);
+            code = fixture::branch(fixture::halves(false, true));
+        } else if (shape < 7) {
+            config.threads_x = shape < 5 ? 32 : 65;
+            code = fixture::branch(
+                shape % 2 == 1 ? std::vector<uint32_t>{0x7e060280u, base::mov(20, 193, true)}
+                               : std::vector<uint32_t>{0x7e060280u, base::mov(126, 193, true),
+                                                       base::mov(20, 126, true)});
+        } else
+            code = fixture::ffbh(fixture::selected_half(true, 0x1000u), 21);
+        const auto name = "portable_mask_common_extent_control_" + std::to_string(shape);
+        dump(dir, name.c_str(), fixture::compile(fixture::readfirstlane(code), config).module);
+    }
+    // Oracle calibration keeps valid IR distinct from unsupported or observed-poison execution.
+    for (uint32_t shape = 0; shape < 4; ++shape) {
+        const auto name = "portable_mask_common_oracle_poison_" + std::to_string(shape);
+        dump(
+            dir, name.c_str(),
+            prosper::test::portable_mask_common::poison_select(shape == 1, shape == 2, shape == 3));
     }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.

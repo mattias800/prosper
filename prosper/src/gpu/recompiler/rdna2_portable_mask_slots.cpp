@@ -265,6 +265,14 @@ uint32_t pair_predicate(SpirvCompute& b, const RegState& rs, const Types& types,
 }
 }   // namespace
 
+uint32_t portable_mask_half_pair_value(SpirvCompute& b, const RegState& rs, uint32_t pc, int root) {
+    if (!ordinary_portable_wave64_masks(b) || !b.portable_mask_half_program) return 0;
+    const auto found = b.portable_mask_half_program->before.find(pc);
+    return found == b.portable_mask_half_program->before.end()
+               ? 0
+               : pair_predicate(b, rs, found->second, root);
+}
+
 PortableMaskHalfBodyScope::PortableMaskHalfBodyScope(SpirvCompute& b, const RegState& rs,
                                                      const std::vector<Rdna2Inst>& ins)
     : b_(b), previous_(b.portable_mask_half_program) {

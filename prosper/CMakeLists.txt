@@ -3599,6 +3599,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_portable_mask_slots.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_portable_mask_common
+    SOURCES tests/gpu/recompiler/test_portable_mask_common.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_mask_participation
     SOURCES tests/gpu/recompiler/test_native_mask_participation.cpp
     INCLUDES tests
