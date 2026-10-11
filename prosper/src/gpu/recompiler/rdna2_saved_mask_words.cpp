@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include <bit>
 
 namespace prosper::gpu {
@@ -169,10 +170,21 @@ bool saved_mask_mov_defines_words(const SpirvCompute& b, const Rdna2Inst& in, bo
              (in.dst.value > 104 || saved_mask_producer_has_full_participation(b, in))));
 }
 
-bool saved_mask_logical_defines_words(const SpirvCompute& b, const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f && in.opcode <= 0x1d &&
-           (in.opcode & 1u) == 1 && b.is_compute && b.wave_size == 64 &&
-           b.native_subgroup_size == 64;
+bool saved_mask_logical_defines_words(const SpirvCompute& b, const Rdna2Inst& in,
+                                      bool scalar_sources) {
+    if (!is_native_b64_logical(b, in)) return false;
+    // Do not let a wider generic scalar inventory authenticate unsupported operand spellings.
+    for (uint32_t k = 0; k < in.n_src; ++k) {
+        const auto& source = in.src[k];
+        const bool supported =
+            source.kind == OperandKind::InlineInt ||
+            (source.kind == OperandKind::Literal && in.has_literal) ||
+            (source.kind == OperandKind::SGPR && source.value >= 0 && source.value <= 104) ||
+            (source.kind == OperandKind::Special && (source.value == 106 || source.value == 107 ||
+                                                     source.value == 126 || source.value == 127));
+        if (!supported) return false;
+    }
+    return scalar_sources || saved_mask_producer_has_full_participation(b, in);
 }
 
 void retire_saved_mask_facts(const SpirvCompute& b, std::set<int>& masks, std::set<int>& ambiguous,
@@ -268,16 +280,23 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
                 if (scalar_alu_source_words(in, k) == 2) demand_word(in.src[k].value + 1);
             }
     }
-    // A copy must retain the same physical words, not a new ballot at the copy site.
+    // Track logical destinations separately: a dispatcher Bool reload with no current scalar
+    // MUST word must not trigger the Special-VCC late-ballot fallback at a later DATA read.
+    for (const auto& in : original)
+        if (is_native_b64_logical(b, in)) b.native_logical_word_roots.insert(in.dst.value);
+    // Copies and logical DATA consumers need their original physical source words too.
     for (bool changed = true; changed;) {
         changed = false;
-        for (const auto& in : original)
-            if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
-                (in.src[0].kind == OperandKind::SGPR ||
-                 (in.src[0].kind == OperandKind::Special &&
-                  (in.src[0].value == 106 || in.src[0].value == 107))) &&
-                demanded.contains(in.dst.value))
-                changed |= demanded.insert(in.src[0].value).second;
+        for (const auto& in : original) {
+            const bool copy = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64;
+            if ((!copy && !is_native_b64_logical(b, in)) || !demanded.contains(in.dst.value))
+                continue;
+            for (uint32_t k = 0; k < in.n_src; ++k)
+                if (in.src[k].kind == OperandKind::SGPR ||
+                    (in.src[k].kind == OperandKind::Special &&
+                     (in.src[k].value == 106 || in.src[k].value == 107)))
+                    changed |= demanded.insert(in.src[k].value).second;
+        }
     }
     b.saved_mask_word_roots = std::move(demanded);
     if (initial_active || b.invocation_guard_merge || has_prior_partial_control(b)) return;
@@ -339,6 +358,10 @@ void prepare_saved_mask_word_write(const SpirvCompute& b, RegState& rs, const Rd
 
 void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     if (!uses_native_saved_mask_words(b)) return;
+    if (is_native_b64_logical(b, in)) {
+        record_native_logical_word_gaps(b, rs, in);
+        return;   // its pre-write source/proof lowering already decided whether DATA exists
+    }
     for_each_scalar_write(in, [&](int root, uint32_t width) {
         if (width != 2 || root < 0 || root > 104 || rs.sreg_bool_b32.contains(root) ||
             !rs.sreg_bool.contains(root) || !scalar_write_is_b64_mask(in, root) ||

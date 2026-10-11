@@ -410,6 +410,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
         case OperandKind::Special: {
+            if (rs.unavailable_saved_mask_words.contains(o.value))
+                return refuse_unavailable_saved_mask_word(b, in, ok);
             if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
             if (o.value == 253) {                     // SCC scalar source
                 // rs.scc == 0 marks SCC poisoned by a 64-bit mask op (its SCC is a cross-lane

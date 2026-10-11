@@ -2525,7 +2525,8 @@ bool emit_cfg_state_machine(
                     !b.cselect_b64_low_only_pcs.contains(in.pc) &&
                     !(source_is_mask(in.src[0]) && source_is_mask(in.src[1])) &&
                     scalar_alu_result;
-                const bool logical_native_ballot = saved_mask_logical_defines_words(b, in);
+                const bool logical_native_ballot =
+                    saved_mask_logical_defines_words(b, in, scalar_alu_result);
                 const bool quadmask_native_ballot = exact_quadmask;
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
@@ -3653,6 +3654,10 @@ bool emit_cfg_state_machine(
         // validity tag: remove all absent ordinary/special scalar words before emitting a case so
         // an uninitialized M0/SGPR cannot become a valid zero merely by crossing the dispatcher.
         if (entry_wave64_scalar_words) {
+            for (int root : b.native_logical_word_roots)
+                for (int word : {root, root + 1})
+                    if (!entry_wave64_scalar_words->contains(word))
+                        state.unavailable_saved_mask_words.insert(word);
             if (entry_block != UINT32_MAX)
                 load_missing_saved_mask_words(state, wave64_b64_ambiguous_in[entry_block],
                                               *entry_wave64_scalar_words);

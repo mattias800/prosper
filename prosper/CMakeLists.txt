@@ -3458,6 +3458,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_scalar_ff1_b32.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_native_logical_words
+    SOURCES tests/gpu/recompiler/test_native_logical_words.cpp
+    INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     LIBRARIES prosper_core)

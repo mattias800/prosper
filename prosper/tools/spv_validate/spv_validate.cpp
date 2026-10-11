@@ -1864,6 +1864,27 @@ int main(int argc, char** argv) {
       cfg.native_subgroup_size=64;
       dump(dir, "compute_wave64_logical_ballot",
            recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
+    // #4892: complete native DATA logicals retain both physical words without result ballots.
+    {
+        const uint32_t code[]{0xbe9403ffu, 0xabcdef01u, 0xbe9503ffu, 0x80000001u, 0xbe9603ffu,
+                              0x12345678u, 0xbe9703ffu, 0x55555555u, 0x8e981614u, 0x7e060218u,
+                              0xe0702000u, 0x80020300u, 0xbf810000u};
+        ShaderResourceTable rt;
+        ShaderResource out{};
+        out.cls = ResourceClass::ConstantBuffer;
+        out.binding = 3;
+        out.sgpr_base = 8;
+        out.stride = 4;
+        out.format = DataFormat::Uint32;
+        out.num_components = 1;
+        rt.resources.push_back(out);
+        ComputeShaderConfig cfg;
+        cfg.local_x = 64;
+        cfg.wave_size = 64;
+        cfg.native_subgroup_size = 64;
+        dump(dir, "compute_native_logical_scalar_words",
+             recompile_compute(code, std::size(code), &rt, cfg));
+    }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
     for (uint32_t shape = 0; shape < 6; ++shape) {
