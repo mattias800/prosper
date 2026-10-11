@@ -46,6 +46,7 @@
 #include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
 #include "gpu/recompiler/fragment_loop_mask.hpp"
 #include "gpu/recompiler/rdna2_entry_vcc.hpp"
+#include "gpu/recompiler/rdna2_readlane_route.hpp"
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 
 namespace prosper::gpu {
@@ -7170,19 +7171,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (emitted > 0) return true;
             return false;
         }
-        std::set<int> cfg_writelane_spill_arrays;
-        for (const auto& in : ins) {
-            if (in.is_end) break;
-            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361)
-                cfg_writelane_spill_arrays.insert(in.dst.value);
-        }
-        const bool portable_compute_cfg_readlane = b.is_compute &&
-            !b.native_subgroup_size && (!Fs.empty() || !Ls.empty()) &&
-            std::any_of(ins.begin(), ins.end(), [&](const Rdna2Inst& in) {
-                return !in.is_end && in.fmt == Rdna2Format::VOP3 &&
-                    in.opcode == 0x360 &&
-                    !cfg_writelane_spill_arrays.contains(in.src[0].value);
-            });
+        const bool portable_compute_cfg_readlane = b.is_compute && !b.native_subgroup_size &&
+                                                   (!Fs.empty() || !Ls.empty()) &&
+                                                   has_ordinary_cfg_readlane(ins);
         if (allow_cfg_dispatcher && portable_compute_cfg_readlane) {
             if (!cfg_dispatch_safe) {
                 log_recompile_diagnostic(
