@@ -382,6 +382,10 @@ TEST(NativeLogicalWords, RawCselectKeepsPeerMarksForLaterNativeLogicalData) {
         ASSERT_TRUE(e.emit(e.instruction({code[0]})));
         EXPECT_EQ(e.rs.sreg_merge_placeholder.contains(20), marked);
         EXPECT_EQ(e.rs.sreg_merge_placeholder.contains(21), marked);
+        // The CPU oracle supplies the exact current per-lane views after this true SCC
+        // selection. Keep the independently emitted DATA and its MAY marks untouched.
+        e.rs.sreg_bool[20] = constant_mask_bit(e.b, static_cast<uint32_t>(a), a >> 32);
+        e.rs.sreg_bool[2] = constant_mask_bit(e.b, static_cast<uint32_t>(c), c >> 32);
         auto next = e.instruction({code[1]});
         next.pc = 1;
         EXPECT_EQ(e.emit(next), !marked);
