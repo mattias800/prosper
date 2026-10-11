@@ -98,6 +98,7 @@ class SavedMaskCopyFrame {
 void revoke_saved_mask_copy_proof(SpirvCompute& b) {
     b.native_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_vcc_copy_pcs.clear();
+    b.fragment_bool_only_saved_mask_pcs.clear();
     if (b.saved_mask_copy_revocation_epoch != std::numeric_limits<uint64_t>::max())
         ++b.saved_mask_copy_revocation_epoch;
 }

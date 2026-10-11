@@ -3538,6 +3538,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_saved_mask_generation
+    SOURCES tests/gpu/recompiler/test_fragment_saved_mask_generation.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_portable_mask_half
     SOURCES tests/gpu/recompiler/test_portable_mask_half.cpp
     INCLUDES tests tests/gpu/recompiler
