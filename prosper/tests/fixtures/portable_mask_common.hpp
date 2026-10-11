@@ -78,6 +78,28 @@ inline std::vector<uint32_t> whole_mbcnt(std::vector<uint32_t> code) {
     store(code);
     return code;
 }
+// A count result is one ordinary DATA word, even beside unrelated symbolic projections.
+inline std::vector<uint32_t> numeric_neighbors() {
+    std::vector<uint32_t> code{0x7e060280u, base::mov(126, 128, true)};
+    f::spill(code, 126, 13);
+    code.push_back(base::mov(126, 193, true));
+    f::spill(code, 127, 29);
+    f::reload(code, 15, 29);
+    f::reload(code, 14, 13);
+    code.insert(code.end(),
+                {base::mov(126, 193, true), base::mov(16, 126, true), base::mov(18, 14)});
+    return code;
+}
+inline void scalar_reduce(std::vector<uint32_t>& code, uint32_t source, uint32_t dst,
+                          uint32_t opcode = gpu::kSop1OpcodeBcnt1I32B64) {
+    code.push_back(0xbe800000u | (dst << 16) | (opcode << 8) | source);
+}
+inline std::vector<uint32_t> numeric_result(bool alias,
+                                            uint32_t opcode = gpu::kSop1OpcodeBcnt1I32B64) {
+    auto code = numeric_neighbors();
+    scalar_reduce(code, 16, alias ? 16 : 19, opcode);
+    return code;
+}
 // Keep partial-wave fixtures separate from the original fixed-64 slot programs.
 inline f::Attempt compile(const std::vector<uint32_t>& code,
                           const gpu::ComputeShaderConfig& config) {

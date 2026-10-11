@@ -75,6 +75,17 @@ void kill_slots(Types& types, int vgpr) {
     std::erase_if(types.slots, [&](const auto& item) { return item.first.first == vgpr; });
     std::erase_if(types.may_slots, [&](const auto& key) { return key.first == vgpr; });
 }
+bool numeric_source(const Types& types, const Operand& source, uint32_t width) {
+    if (source.kind == OperandKind::InlineInt || source.kind == OperandKind::Literal) return true;
+    if (source.kind != OperandKind::SGPR &&
+        !(source.kind == OperandKind::Special && source.value >= 106 && source.value <= 123))
+        return false;
+    for (uint32_t k = 0; k < width; ++k) {
+        const int word = source.value + static_cast<int>(k);
+        if (!types.numeric_words.contains(word) || types.may_words.contains(word)) return false;
+    }
+    return true;
+}
 void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
     const Types old = types; // sources precede every overlapping architectural destination
     for_each_scalar_write(
@@ -86,7 +97,7 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
         false);
     // S_MOV_B64 can emit a complete Bool and genuine DATA together. Shipping WRITELANE reads
     // a saved pair's HIGH word through DATA; preserve that domain instead of replacing it with
-    // a predicate-only slot. Track only the existing closed MOV producers, with MUST joins.
+    // a predicate-only slot. The closed DATA producers below retain MUST source authority.
     // Encoded EXEC destinations may decode as SGPRs; EXEC/M0 have no ordinary DATA publication.
     if (in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64) && in.dst.value <= 123 &&
@@ -104,6 +115,15 @@ void transfer(Types& types, const Rdna2Inst& in, int max_vgpr) {
                 types.numeric_words.insert(in.dst.value + static_cast<int>(k));
         }
     }
+    // Both scalar-pair and common-phase mask reductions publish an ordinary B32 count/index.
+    // Authenticate the current source before any aliasing destination write: opcode presence
+    // alone cannot make a missing pair or one-arm source genuine. This fact only distinguishes
+    // the result from an unrelated adjacent half; it neither publishes DATA nor bypasses marks.
+    if (in.fmt == Rdna2Format::SOP1 && in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
+        in.dst.value <= 105 &&
+        (in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64) &&
+        (complete_source(old, in.src[0]) || numeric_source(old, in.src[0], 2)))
+        types.numeric_words.insert(in.dst.value);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 && static_lane(in)) {
         if (!ordinary_half_destination(in)) return;
         const Slot key{in.src[0].value, in.src[1].value};

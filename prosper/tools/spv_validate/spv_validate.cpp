@@ -2098,6 +2098,16 @@ int main(int argc, char** argv) {
         dump(dir, name.c_str(), slots::compile(code, true).module);
     }
     // Existing ordinary DATA/whole-Bool partial-workgroup routes remain independent.
+    for (uint32_t shape = 0; shape < 4; ++shape) {
+        namespace fixture = prosper::test::portable_mask_common;
+        const bool alias = shape % 2 == 0;
+        const auto code =
+            fixture::ffbh(fixture::numeric_result(alias, shape < 2 ? kSop1OpcodeBcnt1I32B64
+                                                                   : kSop1OpcodeFf1I32B64),
+                          alias ? 16 : 19);
+        const auto name = "portable_mask_common_numeric_reduction_" + std::to_string(shape);
+        dump(dir, name.c_str(), fixture::compile(code, 64).module, "recompile_compute");
+    }
     for (uint32_t shape = 0; shape < 2; ++shape) {
         namespace fixture = prosper::test::portable_mask_common;
         const auto code = shape == 0 ? fixture::whole_mbcnt(fixture::whole_neighbors())

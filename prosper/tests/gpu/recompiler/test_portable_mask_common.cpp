@@ -399,3 +399,81 @@ TEST(PortableMaskCommon, OneArmWholeNeighborNeedsAllPathAuthority) {
         }
     }
 }
+
+TEST(PortableMaskCommon, NumericBcntResultDoesNotBorrowTheUnconsumedNeighbor) {
+    for (bool alias : {false, true}) {
+        SCOPED_TRACE(alias);
+        const uint32_t dst = alias ? 16 : 19;
+        auto code = c::numeric_result(alias);
+        auto numeric = code;
+        numeric.push_back(0x7e060200u | dst); // observe the actual BCNT result before FFBH
+        c::store(numeric);
+        values(numeric, std::vector<uint32_t>(64, 64));
+        auto clear = code;
+        clear.push_back(base::mov(dst - 1, 128)); // clear only an unconsumed neighbor
+        values(c::ffbh(clear, dst), std::vector<uint32_t>(64, 25));
+        values(c::ffbh(code, dst), std::vector<uint32_t>(64, 25));
+    }
+}
+TEST(PortableMaskCommon, NumericFf1ResultKeepsItsOrdinaryWordLifetime) {
+    for (bool alias : {false, true}) {
+        SCOPED_TRACE(alias);
+        auto code = c::numeric_neighbors();
+        base::word(code, 30, 0x1000);
+        base::word(code, 31, 0);
+        code.insert(code.end(), {base::mov(126, 30, true), base::mov(16, 126, true),
+                                 base::mov(126, 193, true)});
+        const uint32_t dst = alias ? 16 : 19;
+        c::scalar_reduce(code, 16, dst, prosper::gpu::kSop1OpcodeFf1I32B64);
+        auto numeric = code;
+        numeric.push_back(0x7e060200u | dst);
+        c::store(numeric);
+        values(numeric, std::vector<uint32_t>(64, 12));
+        values(c::ffbh(code, dst), std::vector<uint32_t>(64, 28));
+    }
+}
+TEST(PortableMaskCommon, NumericReductionRelayKeepsTheCurrentDataWord) {
+    auto code = c::numeric_result(false);
+    code.insert(code.end(), {base::mov(21, 15), base::mov(22, 19)});
+    values(c::ffbh(code, 22), std::vector<uint32_t>(64, 25));
+}
+TEST(PortableMaskCommon, NumericReductionAfterBothBranchArmsIsCurrent) {
+    auto code = c::numeric_neighbors();
+    code.insert(code.end(), {0xbf068000u, 0xbf840002u});
+    c::scalar_reduce(code, 16, 19);
+    code.push_back(0xbf820001u);
+    c::scalar_reduce(code, 16, 19);
+    values(c::ffbh(code, 19), std::vector<uint32_t>(64, 25));
+}
+TEST(PortableMaskCommon, OneArmNumericReductionCannotSupplyTheOtherArm) {
+    auto code = c::numeric_neighbors();
+    code.insert(code.end(), {0xbf068000u, 0xbf840001u});
+    c::scalar_reduce(code, 16, 19);
+    refuse(c::ffbh(code, 19), "portable-mask-half-projection-unavailable");
+}
+TEST(PortableMaskCommon, OneArmHalfOverwriteRetiresTheNumericReduction) {
+    auto code = c::numeric_result(false);
+    code.insert(code.end(), {0xbf068000u, 0xbf840001u, base::mov(19, 14)});
+    refuse(c::ffbh(code, 19), "portable-mask-half-projection-unavailable");
+}
+TEST(PortableMaskCommon, CurrentHalfOverwriteDoesNotKeepAnOlderNumericResult) {
+    auto code = c::numeric_result(false);
+    code.push_back(base::mov(19, 14));
+    values(c::ffbh(code, 19), std::vector<uint32_t>(64, UINT32_MAX));
+    refuse(c::branch(code, 19), "portable-mask-half-pair-unavailable");
+}
+TEST(PortableMaskCommon, NumericReductionCannotAuthenticateAMissingSourceHalf) {
+    for (uint32_t opcode :
+         {prosper::gpu::kSop1OpcodeBcnt1I32B64, prosper::gpu::kSop1OpcodeFf1I32B64}) {
+        auto code = c::missing(true);
+        code.push_back(base::mov(126, 193, true));
+        c::scalar_reduce(code, 20, 19, opcode);
+        refuse(c::ffbh(code, 19), "portable-mask-half-pair-unavailable");
+    }
+}
+TEST(PortableMaskCommon, NumericReductionFromCurrentDataPairRetainsItsWord) {
+    auto code = c::numeric_neighbors();
+    code.push_back(base::mov(16, 193, true));
+    c::scalar_reduce(code, 16, 19);
+    values(c::ffbh(code, 19), std::vector<uint32_t>(64, 25));
+}
