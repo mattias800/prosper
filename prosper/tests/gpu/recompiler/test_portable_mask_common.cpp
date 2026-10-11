@@ -406,11 +406,13 @@ TEST(PortableMaskCommon, NumericBcntResultDoesNotBorrowTheUnconsumedNeighbor) {
         const uint32_t dst = alias ? 16 : 19;
         auto code = c::numeric_result(alias);
         auto numeric = code;
-        numeric.push_back(0x7e060200u | dst); // observe the actual BCNT result before FFBH
+        // Observe the actual BCNT result before FFBH.
+        numeric.push_back(0x7e060200u | dst);
         c::store(numeric);
         values(numeric, std::vector<uint32_t>(64, 64));
         auto clear = code;
-        clear.push_back(base::mov(dst - 1, 128)); // clear only an unconsumed neighbor
+        // Clear only an unconsumed neighbor.
+        clear.push_back(base::mov(dst - 1, 128));
         values(c::ffbh(clear, dst), std::vector<uint32_t>(64, 25));
         values(c::ffbh(code, dst), std::vector<uint32_t>(64, 25));
     }
