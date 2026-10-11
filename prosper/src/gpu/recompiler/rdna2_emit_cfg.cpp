@@ -1448,13 +1448,7 @@ bool emit_cfg_state_machine(
     // ordinary write can leave a stale mask-half proof attached to an erased slot.
     const int max_observable_vgpr = shader_max_vgpr(ins);
     auto for_each_possible_vector_write = [&](const Rdna2Inst& in, const auto& callback) {
-        if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
-            for (int reg = in.dst.value; reg <= max_observable_vgpr; ++reg) callback(reg);
-            return;
-        }
-        const uint32_t writes = rdna2_vgpr_write_count(in);
-        for (uint32_t word = 0; word < writes; ++word)
-            callback(in.dst.value + static_cast<int>(word));
+        prosper::gpu::for_each_possible_vector_write(in, max_observable_vgpr, callback);
     };
 
     // Direct user-data descriptors are deliberately absent from the initial scalar SSA map: their

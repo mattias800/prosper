@@ -4,6 +4,16 @@
 
 namespace prosper::gpu {
 int shader_max_vgpr(const std::vector<Rdna2Inst>&);
+template <typename Callback>
+void for_each_possible_vector_write(const Rdna2Inst& in, int max_observable_vgpr,
+                                    const Callback& callback) {
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
+        for (int reg = in.dst.value; reg <= max_observable_vgpr; ++reg) callback(reg);
+        return;
+    }
+    for (uint32_t word = 0; word < rdna2_vgpr_write_count(in); ++word)
+        callback(in.dst.value + static_cast<int>(word));
+}
 // Register STORAGE/effect inventory, not initialized guest VALUE or per-lane validity authority.
 // Native callers preserve their historical effect domain. The owned packet actually executes
 // VINTRP, so it must reload VDST even for P1's inactive-word preservation and P2's OLD source.
