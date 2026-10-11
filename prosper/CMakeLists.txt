@@ -3522,6 +3522,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fragment_logical_bool_copy.cpp
     INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_structured_saved_mask_join
+    SOURCES tests/gpu/recompiler/test_structured_saved_mask_join.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_compute_launch
     SOURCES tests/gpu/recompiler/test_native_compute_launch.cpp
     INCLUDES tests tests/gpu/recompiler

@@ -52,6 +52,7 @@
 #include "gpu/recompiler/rdna2_readlane_route.hpp"
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 #include "gpu/recompiler/rdna2_structured_mask_reductions.hpp"
+#include "gpu/recompiler/rdna2_structured_saved_masks.hpp"
 
 namespace prosper::gpu {
 
@@ -7572,16 +7573,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
-                    // A saved MASK (sreg_bool) created or changed inside the block must dominate both
-                    // merge predecessors. A newly-created per-lane mask is false on the skipped edge.
-                    for (auto& kv : rs.sreg_bool) {
-                        auto p = pre_bool.find(kv.first);
-                        const uint32_t before = p != pre_bool.end() ? p->second : b.bfalse();
-                        if (before != kv.second) {
-                            kv.second = b.emit_phi_2way(b.t_bool, before, preblock, kv.second, thenEnd);
-                            rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
-                        }
-                    }
+                    if (!join_structured_saved_masks(b, rs, pre_bool, preblock, thenEnd, ins,
+                                                     F.branch_pc, F.target_pc))
+                        return false;
                     join_lane_slots(b, rs, pre_slots, LaneSlotEdge::of(rs, thenEnd), F.branch_pc);
                     // A differing physical-word domain needs no validity phi when that word is
                     // provably overwritten before every post-merge read. Drop its stale typed view
@@ -7668,20 +7662,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             F.branch_pc, F.merge_pc);
                         return false;
                     }
-                    // Merge the UNION of mask keys. A mask created in only one arm is false in the
-                    // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
-                    std::set<int> bool_keys;
-                    for (const auto& kv : then_bool) bool_keys.insert(kv.first);
-                    for (const auto& kv : rs.sreg_bool) bool_keys.insert(kv.first);
-                    for (int key : bool_keys) {
-                        auto t = then_bool.find(key);
-                        auto e = rs.sreg_bool.find(key);
-                        const uint32_t tv = t != then_bool.end() ? t->second : b.bfalse();
-                        const uint32_t ev = e != rs.sreg_bool.end() ? e->second : b.bfalse();
-                        rs.sreg_bool[key] = tv == ev ? tv
-                            : b.emit_phi_2way(b.t_bool, tv, thenEnd, ev, elseEnd);
-                        if (tv != ev) rs.sreg_bool_narrowed[key] = true;
-                    }
+                    if (!join_structured_saved_masks(b, rs, then_bool, thenEnd, elseEnd, ins,
+                                                     F.branch_pc, F.merge_pc))
+                        return false;
                     join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, elseEnd), F.branch_pc);
                     lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)
                 }
