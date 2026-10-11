@@ -7505,6 +7505,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {
                     const LaneSlotEdge pre_slots = LaneSlotEdge::of(rs, preblock);   // skipped edge
+                    const auto pre_masks = structured_saved_mask_edge(b, rs);
                     std::set<int> ifv, ifs;
                     loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
                     omit_promoted_scalar_phis(ifs);
@@ -7519,8 +7520,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const MergeEdgeMarks pre_marks = merge_edge_marks(rs, ifs);   // #4706
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
-                    const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
-                    const auto pre_bool_b32 = rs.sreg_bool_b32;
                     // The SKIPPED edge keeps the pre-branch bits, so it keeps the pre-branch copy
                     // aliases. Anything the arm establishes is true on one edge only (#1773).
                     const auto pre_ud_alias = rs.sreg_ud_alias;
@@ -7529,6 +7528,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.emit_label(thenL);
                     if (!emit_structured(F.branch_pc + 1, F.target_pc, F.target_pc)) return false;
                     const uint32_t thenEnd = b.cur_block;   // last block of the then-body (nested ifs move it)
+                    const auto then_masks = structured_saved_mask_edge(b, rs);
                     std::unordered_map<int,uint32_t> then_v, then_s;
                     for (int r : ifv) then_v[r] = vget(r);
                     for (int r : ifs) then_s[r] = sget(r);
@@ -7540,8 +7540,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // taken arm's marker to the synthesized bool value on both paths.
                     std::set<int> dead_b32_at_merge;
                     for (int reg : rs.sreg_bool_b32)
-                        if (!pre_bool_b32.contains(reg)) dead_b32_at_merge.insert(reg);
-                    for (int reg : pre_bool_b32)
+                        if (!pre_masks.b32.contains(reg)) dead_b32_at_merge.insert(reg);
+                    for (int reg : pre_masks.b32)
                         if (!rs.sreg_bool_b32.contains(reg)) dead_b32_at_merge.insert(reg);
                     const bool dead_domain_difference =
                         std::all_of(dead_b32_at_merge.begin(), dead_b32_at_merge.end(),
@@ -7573,7 +7573,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
-                    if (!join_structured_saved_masks(b, rs, pre_bool, pre_bool_b32, preblock,
+                    if (!join_structured_saved_masks(b, rs, pre_masks, then_masks, preblock,
                                                      thenEnd, ins, F.branch_pc, F.target_pc))
                         return false;
                     join_lane_slots(b, rs, pre_slots, LaneSlotEdge::of(rs, thenEnd), F.branch_pc);
@@ -7616,6 +7616,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (!emit_structured(F.branch_pc + 1, F.sb_pc, F.merge_pc)) return false;
                     if (idx < ins.size() && ins[idx].pc == F.sb_pc) ++idx;   // consume the arm's s_branch
                     const uint32_t thenEnd = b.cur_block;
+                    const auto then_masks = structured_saved_mask_edge(b, rs);
                     std::unordered_map<int,uint32_t> then_v, then_s;
                     for (int r : wv) then_v[r] = vget(r);
                     for (int r : ws) then_s[r] = sget(r);
@@ -7625,8 +7626,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const MergeEdgeMarks then_marks = merge_edge_marks(rs, ws);   // #4706
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
-                    const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
-                    const auto then_bool_b32 = rs.sreg_bool_b32;
                     const auto then_written = rs.sreg_written;
                     const auto then_ud_alias = rs.sreg_ud_alias;   // the then edge's alias claims
                     const LaneSlotEdge then_slots = LaneSlotEdge::of(rs, thenEnd);
@@ -7635,6 +7634,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     b.emit_label(elseL);
                     if (!emit_structured(F.target_pc, else_hi, F.merge_pc)) return false;
                     const uint32_t elseEnd = b.cur_block;
+                    const auto else_masks = structured_saved_mask_edge(b, rs);
                     b.emit_branch(mergeL); b.emit_label(mergeL);
                     for (int r : wv) { uint32_t ev = vget(r);
                         if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
@@ -7655,14 +7655,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
                     for (int reg : then_written) rs.sreg_input.erase(reg);
                     merge_ud_alias(rs, then_ud_alias);   // `rs` holds the else edge here (#1773)
-                    if (then_bool_b32 != rs.sreg_bool_b32) {
+                    if (then_masks.b32 != rs.sreg_bool_b32) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-struct-reject", "terminal",
                             "b32 mask domain differs across if/else pc=%u merge=%u",
                             F.branch_pc, F.merge_pc);
                         return false;
                     }
-                    if (!join_structured_saved_masks(b, rs, then_bool, then_bool_b32, thenEnd,
+                    if (!join_structured_saved_masks(b, rs, then_masks, else_masks, thenEnd,
                                                      elseEnd, ins, F.branch_pc, F.merge_pc))
                         return false;
                     join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, elseEnd), F.branch_pc);

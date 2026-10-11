@@ -368,6 +368,8 @@ int main(int argc, char** argv) {
             const bool refused = compile(code, table_for(code)).empty();
             const auto reason = last_terminal_reject_reason(last_program);
             const auto pc = load == instructions.end() ? UINT32_MAX : load->pc;
+            std::printf("[refusal] %s %s classified_pc=%u rejected=%d reason=%s\n", name, label, pc,
+                        refused, reason.c_str());
             check(classified == std::vector<uint32_t>{pc} && refused &&
                   reason.find("pc=" + std::to_string(pc) + " ") != std::string::npos &&
                   reason.find("op=0x2") != std::string::npos, name, label);
@@ -382,8 +384,24 @@ int main(int argc, char** argv) {
         auto conditional_save = saved_exec;
         conditional_save.insert(conditional_save.begin() + 2,
             {0xbf068080u, 0xbf840001u}); // one path bypasses the only saved definition
-        saved_numeric(conditional_save,
-                "pre-load saved EXEC must dominate every reaching path");
+        // The missing skipped-edge pair is now refused at its earlier structured merge. Keep
+        // the original stream and raw-load classification, and pin that exact first diagnostic.
+        const bool conditional_refused =
+            compile(conditional_save, table_for(conditional_save)).empty();
+        const auto conditional_reason = last_terminal_reject_reason(last_program);
+        check(rdna2_raw_wide_data_loads(decode(conditional_save)) == std::vector<uint32_t>{5u} &&
+                  conditional_refused &&
+                  conditional_reason.find(
+                      "reason=structured-saved-mask-domain-missing-edge pc=3 merge=5 s32") !=
+                      std::string::npos,
+              name, "undefined conditional saved EXEC refuses before the numeric raw load");
+        // A genuine initial zero defines the skipped-edge predicate, without being an EXEC
+        // save. The independent raw-load proof still requires the real save on EVERY path.
+        auto defined_conditional_save = conditional_save;
+        defined_conditional_save.insert(defined_conditional_save.begin() + 2, 0xbea00480u);
+        saved_numeric(
+            defined_conditional_save,
+            "pre-load saved EXEC must dominate every reaching path despite genuine initial zero");
         auto unknown_prefix = saved_exec;
         // s_movreld_b32 s40, s40 (SOP1 0x30): writes SGPR[40 + M0], which may be the saved pair.
         // This arm used 0xbea82828 under the same comment until #4529; that word is

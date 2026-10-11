@@ -119,6 +119,25 @@ TEST(PortableMaskHalf, BothReachingGenerationsHaveGenuineNumericWords) {
     expect_values(f::one_arm(true), UINT32_MAX, false, 0);
     expect_values(f::one_arm(true), all, false, 1);
 }
+TEST(PortableMaskHalf, IfElseRetainsActualNumericWordsOnBothPredecessors) {
+    // The taken arm replaces HIGH; the explicit else arm leaves the original pair untouched.
+    // Only the latter still carries the old Bool view. The scalar PHIs must keep actual bits.
+    std::vector<uint32_t> code{
+        0x7e060280u, f::mov(20, 193, true), 0xbf068000u, 0xbf840003u, f::mov(21, 255),
+        0u,          0xbf820001u,           0x7e080281u};
+    f::sink(code);
+    expect_values(code, UINT32_MAX, false, 0);
+    expect_values(code, all, false, 1);
+}
+TEST(PortableMaskHalf, IfElseCannotSupplyMissingWordsFromAnOlderPredicate) {
+    // Saving EXEC supplies a predicate, not physical numeric LOW/HIGH. The single HIGH write
+    // cannot authorize a complete pair on either predecessor of the same explicit if/else.
+    std::vector<uint32_t> code{
+        0x7e060280u, f::mov(20, 126, true), 0xbf068000u, 0xbf840003u, f::mov(21, 255),
+        0u,          0xbf820001u,           0x7e080281u};
+    f::sink(code);
+    EXPECT_TRUE(f::compile(code).empty());
+}
 TEST(PortableMaskHalf, CountedPostludeUsesRetainedNumericWordsWithoutABallot) {
     expect_values(f::program(true, 1, 0, true), UINT32_MAX);
 }

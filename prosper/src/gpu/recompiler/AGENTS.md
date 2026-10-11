@@ -22,8 +22,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   file. Native VINTRP P2/MOV destinations participate in SSA joins; native P1 is a no-op. An explicit
   owned-packet caller also includes P1's partial write. Storage reload never grants per-lane entry validity.
 - `rdna2_structured_saved_masks` — saved-predicate joins for structured one-arm and if/else regions.
-  Both predecessors must supply the current Bool domain. A missing view is not false DATA;
-  live mixed domains refuse, while complete later replacements can retire a dead view.
+  Both predecessors must supply the current Bool domain, or ordinary portable Wave64 must retain
+  genuine current physical DATA pairs on both edges before scalar seeding. A missing view is not
+  false DATA; other live mixed domains refuse, while complete replacements can retire a dead view.
 - `rdna2_exec_skip_region` — the GUEST-level verdict on the region a forward `s_cbranch_execz` skips:
   scalar live-out, scalar memory effect, wave-level side effect, foreign exit (ADR 0028 route 2). The
   structured fragment emitter publishes a clean verdict as `Prosper.FragmentExecSkipVote=<id>` module
