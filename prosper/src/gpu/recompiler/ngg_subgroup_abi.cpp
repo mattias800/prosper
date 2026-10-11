@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
@@ -38,6 +39,27 @@ uint8_t tracked_bit(int reg) {
     return 0;
 }
 
+int tracked_index(int reg) {
+    for (int k = 0; k < 3; ++k)
+        if (kTrackedVgpr[k] == reg) return k;
+    return -1;
+}
+
+// The emitter's named scalar-slot path supports canonical inline selectors only. Do not apply
+// the hardware's modulo selector rule to a different slot name (especially Wave32 lane 32+).
+int constant_lane(const Rdna2Inst& in, bool wave32) {
+    if (in.fmt != Rdna2Format::VOP3 || (in.opcode != 0x360 && in.opcode != 0x361) ||
+        in.has_modifier || in.has_sdwa || in.has_dpp || in.clamp || in.omod || in.vop3p_opsel ||
+        in.vop3p_opsel_hi || in.vop3p_neg_hi)
+        return -1;
+    for (uint32_t k = 0; k < 3; ++k)
+        if (in.src_neg[k] || in.src_abs[k]) return -1;
+    return in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 &&
+                   in.src[1].value < (wave32 ? 32 : 64)
+               ? in.src[1].value
+               : -1;
+}
+
 struct State {
     std::bitset<128> sdef;   // scalar registers written on EVERY path (launch values included)
     bool s3_overwritten = false;   // s3 no longer holds the launch value on every path
@@ -45,6 +67,10 @@ struct State {
     bool exec_full = false;   // EXEC is all-ones on every path
     uint8_t vall = 0;   // tracked VGPRs written for all 64 lanes on every path
     uint8_t vcur = 0;   // tracked VGPRs written for every lane active in the current EXEC
+    std::array<uint64_t, 3> lane_slots{};   // named peers written on EVERY reaching path
+    // MAY: a named-slot lifetime occurred without a later all-lane ordinary overwrite. This
+    // prevents partial ordinary writes from laundering an unwritten peer into the new route.
+    uint8_t named_lifetime = 0;
     bool scc = false;   // SCC written on every path
     // Saved copies of EXEC (#3135): each slot's SGPR pair holds the EXEC of some earlier point on
     // every path (s_mov_b64 sP, exec or a SAVEEXEC), with `vcur` the tracked VGPRs written for
@@ -73,6 +99,8 @@ struct State {
         exec_full = exec_full && o.exec_full;
         vall &= o.vall;
         vcur &= o.vcur;
+        for (size_t k = 0; k < lane_slots.size(); ++k) lane_slots[k] &= o.lane_slots[k];
+        named_lifetime |= o.named_lifetime;
         // A pair saved on both paths keeps the definitions both paths had; any other is dropped.
         for (SavedExec& slot : saved) {
             if (slot.pair < 0) continue;
@@ -90,7 +118,8 @@ struct State {
     bool operator==(const State& o) const {
         return sdef == o.sdef && s3_overwritten == o.s3_overwritten &&
                s2_overwritten == o.s2_overwritten && exec_full == o.exec_full && vall == o.vall &&
-               vcur == o.vcur && scc == o.scc && saved == o.saved;
+               vcur == o.vcur && lane_slots == o.lane_slots && named_lifetime == o.named_lifetime &&
+               scc == o.scc && saved == o.saved;
     }
 };
 
@@ -447,7 +476,7 @@ bool writes_scc(const Rdna2Inst& in) {
     }
 }
 
-Reads instruction_reads(const Rdna2Inst& in) {
+Reads instruction_reads(const Rdna2Inst& in, bool wave32) {
     Reads reads;
     reads.exec = vector_format(in.fmt);
     reads.scc = reads_scc(in);
@@ -508,7 +537,9 @@ Reads instruction_reads(const Rdna2Inst& in) {
                 reads.scalar.push_back({kVcc, 0xffffffffu});
                 reads.scalar.push_back({kVcc + 1, 0xffffffffu});
             }
-            if (vop_rmw_destination(in))
+            // Named WRITELANE replaces one scalar slot without reading the preserved peers.
+            // Other RMW forms, including dynamic or noncanonical lane writes, keep their charge.
+            if (vop_rmw_destination(in) && !(in.opcode == 0x361 && constant_lane(in, wave32) >= 0))
                 add_vgpr(reads, in.dst, std::max(1u, rdna2_vgpr_write_count(in)));
             break;
         }
@@ -573,11 +604,33 @@ int sgpr_pair(const Operand& op) {
 
 void transfer(State& s, const Rdna2Inst& in, bool wave32) {
     if (writes_scc(in)) s.scc = true;
+    const int lane = constant_lane(in, wave32);
+    const int spill_index = in.opcode == 0x361 && lane >= 0 ? tracked_index(in.dst.value) : -1;
+    if (spill_index >= 0) {
+        // CONFIDENCE: HIGH -- READLANE/WRITELANE ignore EXEC (AMD RDNA2 ISA 70648), and the
+        // compiler stores a canonical spill as a scalar slot, erasing the whole vreg lifetime.
+        const uint8_t bit = tracked_bit(in.dst.value);
+        s.lane_slots[static_cast<size_t>(spill_index)] |= uint64_t{1} << lane;
+        s.named_lifetime |= bit;
+        s.vcur &= static_cast<uint8_t>(~bit);
+        s.vall &= static_cast<uint8_t>(~bit);
+        for (State::SavedExec& slot : s.saved) slot.vcur &= static_cast<uint8_t>(~bit);
+    } else {
+        const auto retire = [&](int reg) {
+            if (const int k = tracked_index(reg); k >= 0) s.lane_slots[static_cast<size_t>(k)] = 0;
+        };
+        for_each_possible_vector_write(in, 7, retire);
+        // The shared storage inventory excludes the additional TFE status result.
+        if (const int status = rdna2_tfe_status_vgpr(in); status >= 0) retire(status);
+    }
     if (const uint32_t results = definite_vgpr_results(in)) {
         for (uint32_t w = 0; w < results; ++w) {
             const uint8_t bit = tracked_bit(in.dst.value + static_cast<int>(w));
             s.vcur |= bit;
-            if (s.exec_full) s.vall |= bit;
+            if (s.exec_full) {
+                s.vall |= bit;
+                s.named_lifetime &= static_cast<uint8_t>(~bit);
+            }
             for (State::SavedExec& slot : s.saved)
                 if (slot.pair >= 0 && slot.exec_equal) slot.vcur |= bit;
         }
@@ -827,7 +880,7 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
         if (!reached[i]) continue;
         const Rdna2Inst& in = ins[i];
         const State& s = in_state[i];
-        const Reads reads = instruction_reads(in);
+        const Reads reads = instruction_reads(in, launch.wave32);
         // A Wave32 wave has no EXEC_HI: its EXEC is defined once EXEC_LO is.
         if (reads.exec && !(s.sdef.test(kExecLo) && (launch.wave32 || s.sdef.test(kExecHi)))) {
             refuse(facts, "ngg-abi-exec-read-before-write", in.pc);
@@ -861,7 +914,23 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
         }
         for (int reg : reads.vgpr) {
             const uint8_t bit = tracked_bit(reg);
-            if (bit && !(s.vcur & bit)) {
+            bool defined = (s.vcur & bit) != 0;
+            if (bit && (s.named_lifetime & bit)) {
+                // Existing current-EXEC facts do not establish an inactive peer. Keep legacy
+                // no-spill analysis unchanged, but never give a new slot lifetime that authority.
+                const bool selected_peer = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360;
+                const bool cross_lane =
+                    selected_peer || in.fmt == Rdna2Format::DS || in.has_dpp ||
+                    (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x377 || in.opcode == 0x378));
+                if (cross_lane) defined = (s.vall & bit) != 0;
+                if (selected_peer && reg == in.src[0].value) {
+                    const int lane = constant_lane(in, launch.wave32);
+                    const int k = tracked_index(reg);
+                    if (lane >= 0 && (s.lane_slots[static_cast<size_t>(k)] & (uint64_t{1} << lane)))
+                        defined = true;
+                }
+            }
+            if (bit && !defined) {
                 refuse(facts, reg == 4 ? "ngg-abi-read-v4" : "ngg-abi-read-v6-v7", in.pc, "v%d",
                        reg);
                 return facts;

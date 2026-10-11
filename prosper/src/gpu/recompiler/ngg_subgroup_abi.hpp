@@ -44,8 +44,13 @@
 // the compiler's if/else idiom, which Kena's indexed producer uses for v7). The read inventory is fail-closed where it is unsure: an unknown scalar
 // source width reads two registers, DS data fields are always read, a MIMG address is charged
 // through v7, and a vector source whose width is not classified refuses the program. Not
-// inventoried: cross-lane reads (v_readlane, ds_bpermute, permlane) of lanes outside the EXEC a
-// definition covered. CONFIDENCE: MED on the completeness of the 64-bit opcode lists.
+// inventoried: ordinary cross-lane reads (v_readlane, ds_bpermute, permlane) of lanes outside the
+// EXEC a definition covered. The bounded named-slot path for v4/v6/v7 is separate: canonical
+// inline WRITELANE creates only its matching peer, independently of EXEC, and READLANE must find
+// that peer on every path. Ordinary overlapping writers retire slots; full ordinary definitions
+// end the named lifetime. Until then, a cross-lane read needs its slot or an all-lane definition,
+// never merely a current-EXEC fact. This does not seed any whole launch VGPR. CONFIDENCE: HIGH for
+// the named-slot lifetime; MED on the completeness of the legacy 64-bit opcode lists.
 #pragma once
 
 #include "gpu/recompiler/ngg_export_record.hpp"

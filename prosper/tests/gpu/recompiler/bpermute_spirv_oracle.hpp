@@ -57,6 +57,10 @@ struct Interpreter {
   std::map<uint32_t, uint32_t> extra_writable_roots;   // binding -> storage variable
   std::vector<Inst> globals;
   uint32_t main = 0, storage = 0;
+  // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their
+  // separate set-2 launch/export ABI; no module words or resource ownership are rewritten.
+  uint32_t storage_descriptor_set = 0;
+  void use_ngg_shell_storage() { storage_descriptor_set = 2; }
   size_t entry = 0;
   std::string error;
   struct SampledMip {
@@ -295,6 +299,21 @@ struct Interpreter {
     l.from = l.label;
     l.pc = it->second;
   }
+  void atomic_header_increment(Lane& l, const std::vector<uint32_t>& a) {
+    // Only the NGG shell's commutative Device/Relaxed uint32 header increment. Sequential
+    // CPU execution checks values/bounds; it supplies no device concurrency evidence.
+      if (storage_descriptor_set != 2 || a.size() != 6 || !uint_type(a[0]) || word(l, a[3]) != 1 ||
+          word(l, a[4]) != 0 || word(l, a[5]) != 1)
+          fail("unsupported AtomicIAdd profile");
+      const auto p = pointer(l, a[2]);
+      const auto old = read(l, p);
+      const auto increment = value(l, a[5]);
+      if (p.root != storage || p.type != a[0] || increment.type != a[0] || !old.defined ||
+          old.words.size() != 1)
+          fail("unsupported AtomicIAdd storage");
+      write(l, p, {a[0], {old.words[0] + 1u}, true});
+      set(l, a[1], a[0], old.words);
+  }
   // Advance one invocation to the next structurally common barrier or Return.
   void advance(Lane &l) {
     while (!l.done) {
@@ -308,6 +327,11 @@ struct Interpreter {
             (word(l, a[2]) & 0x108) != 0x108)
           fail("not Workgroup AcquireRelease memory barrier");
         return;
+      }
+      if (op == 234) {
+          ++l.pc;
+          atomic_header_increment(l, a);
+          continue;
       }
       ++l.pc;
       if (op == 248) {
@@ -640,8 +664,9 @@ struct Interpreter {
                       const auto offset = member_decorations.find({t, 0, 35});
                       const auto& structure = ty(t);
                       if (a[2] != 12 || ty(a[0]).a[0] != 12 || set == decorations.end() ||
-                          set->second != std::vector<uint32_t>{0} || block == decorations.end() ||
-                          !block->second.empty() || offset == member_decorations.end() ||
+                          set->second != std::vector<uint32_t>{storage_descriptor_set} ||
+                          block == decorations.end() || !block->second.empty() ||
+                          offset == member_decorations.end() ||
                           offset->second != std::vector<uint32_t>{0} || structure.op != 30 ||
                           structure.a.size() != 1)
                           fail("unsupported live storage ABI");

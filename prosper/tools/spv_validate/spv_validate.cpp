@@ -32,6 +32,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
+#include "../../tests/fixtures/ngg_lane_slots.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_fixtures.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
@@ -527,6 +528,25 @@ static int check_emitter_coverage(const std::string& src_root) {
 // GS_ALLOC_REQ capture and set-2 shell I/O beside a guest binding 0; Kena's captured linked LUT
 // producer covers the CFG dispatcher, both as one portable wave and as two native Wave64 waves.
 static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& src_root) {
+    for (bool native : {false, true}) {
+        NggSubgroupShellConfig slots_cfg;
+        slots_cfg.waves = 4;
+        slots_cfg.native_wave64 = native;
+        for (const auto& [name, code] : std::vector<std::pair<std::string, std::vector<uint32_t>>>{
+                 {"straight", prosper::test::ngg_slots::straight()},
+                 {"join", prosper::test::ngg_slots::joined()},
+                 {"loop", prosper::test::ngg_slots::counted()}}) {
+            const std::string label = "ngg_lane_slot_" + name + (native ? "_native" : "_portable");
+            dump(dir, label.c_str(),
+                 recompile_ngg_subgroup(code.data(), code.size(), nullptr, slots_cfg),
+                 "recompile_ngg_subgroup");
+        }
+        slots_cfg.wave_lanes = 32;
+        const auto wave32 = prosper::test::ngg_slots::straight(4, 31);
+        dump(dir, native ? "ngg_lane_slot_wave32_native" : "ngg_lane_slot_wave32_portable",
+             recompile_ngg_subgroup(wave32.data(), wave32.size(), nullptr, slots_cfg),
+             "recompile_ngg_subgroup");
+    }
     const auto synthetic = prosper::test::ngg::synthetic_program();
     const auto synthetic_rt = prosper::test::ngg::synthetic_resources();
     NggSubgroupShellConfig cfg;
