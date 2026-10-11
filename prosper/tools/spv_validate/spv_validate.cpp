@@ -58,6 +58,7 @@
 #include "../../tests/fixtures/uint_d16_store.hpp"
 #include "../../tests/fixtures/graphics_empty_sbuffer.hpp"
 #include "../../tests/fixtures/readlane_barrier.hpp"
+#include "../../tests/fixtures/native_mask_participation.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -2420,6 +2421,26 @@ int main(int argc, char** argv) {
              "recompile_compute");
         const auto masked = fixture::program({.narrowed_readlane = true});
         dump(dir, "compute_readlane_barrier_exec_off_peer", fixture::compile(masked, resources),
+             "recompile_compute");
+    }
+    {
+        namespace fixture = prosper::test::native_mask_participation;
+        const auto resources = fixture::table();
+        dump(dir, "compute_native_single_wave_mask_loop",
+             fixture::compile(fixture::program(), resources, fixture::address()),
+             "recompile_compute");
+        dump(dir, "compute_native_single_wave_masked_load_loop",
+             fixture::compile(fixture::program({.masked_load = true}), resources,
+                              fixture::address()),
+             "recompile_compute");
+        dump(dir, "compute_native_single_wave_orn2_execz",
+             fixture::compile(fixture::program({.preservation = fixture::Preservation::Orn2Execz,
+                                                .initialize_preserved = true}),
+                              resources, fixture::address()),
+             "recompile_compute");
+        dump(dir, "compute_native_single_wave_or_execz",
+             fixture::compile(fixture::program({.preservation = fixture::Preservation::OrExecz}),
+                              resources, fixture::address()),
              "recompile_compute");
     }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
