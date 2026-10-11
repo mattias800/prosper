@@ -52,6 +52,7 @@
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "../../tests/fixtures/native_uint_3d.hpp"
 #include "../../tests/fixtures/fragment_compare_kill.hpp"
+#include "../../tests/fixtures/compute_array_gather.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1934,6 +1935,20 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.img_dim=1;
       t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
       dump(dir, "fragment_gather4_lz_o", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Compute sampled Float16/Float32 arrays preserve a dynamic third coordinate, including NSA
+    // spatial-offset forms. Strict validation also covers the selected layer-count query type.
+    {
+        namespace gather = prosper::test::compute_array_gather;
+        for (const auto format : {DataFormat::Float16, DataFormat::Float32}) {
+            const auto table = gather::table(format);
+            const std::string prefix =
+                format == DataFormat::Float16 ? "compute_f16_array_" : "compute_f32_array_";
+            dump(dir, (prefix + "gather").c_str(), gather::compile(gather::program(), table));
+            dump(dir, (prefix + "gather_offset_nsa").c_str(),
+                 gather::compile(gather::program({.opcode = 0x57, .nsa = true}), table));
+            dump(dir, (prefix + "resinfo").c_str(), gather::compile(gather::query(), table));
+        }
+    }
     // Compute: if/else-if/else cascade with common-merge s_branch arms (kernel T17's stream).
     { const uint32_t c[] = {0x7e020f00u,0x7e080501u,0xbf0a8204u,0xbf840002u,0x4a02028au,0xbf820005u,
                             0xbf0a8504u,0xbf840002u,0x4a020294u,0xbf820001u,0x4a02029eu,0x7e000d01u,0xbf810000u};

@@ -13,7 +13,7 @@
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
-#include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
+#include "gpu/recompiler/rdna2_sampled_array.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -8285,26 +8285,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // DOLL UE4 volume initializer uses dim:3D, dmask:xyz to bounds-check its 8x8x8 dispatch
             // before loading and writing the volume. Array/cube queries remain deferred with their
             // corresponding sampled-image representations.
-            // #325: BC arrays follow the resource-wide T# shape, including a layer-zero
-            // coordinate for ordinary 2D instructions. Layered Float32 graphics resources have
-            // one exception below: ordinary 2D instructions select a retained base-slice view,
-            // while DIM=5 instructions need the full array. Each declaration of one binding must
-            // still agree or compilation rejects it. The predicate is
-            // guest_texture_is_uploaded_array(): img_dim 5 AND more than one layer AND a
-            // supported upload format (BC or Float32).
-            // A depth-1 or unsupported-format array stays plain 2D; keying on img_dim alone is exactly
-            // the mistake this comment used to describe.
-            const bool res_arrayed = res && prosper::gpu::guest_texture_is_uploaded_array(
-                                                res->img_dim, res->depth, res->format);
-            const bool graphics_float_array = !b.is_compute && res_arrayed &&
-                res->format == DataFormat::Float32 && res->cls == ResourceClass::Texture;
-            // A graphics DIM=2D read of a layered Float32 T# selects only its base slice.
-            // Keeping that declaration 2D lets a retained color RTT serve the authoritative
-            // slice; declaring an array would make the renderer reject the whole draw because
-            // the RTT owns no other layers. Actual DIM=2D_ARRAY reads still require an array.
-            // BC resources retain their resource-wide array declaration (#325).
-            const bool declared_arrayed = res_arrayed &&
-                !(graphics_float_array && in.mimg_dim == SQ_DIM_2D);
+            const auto array_contract = sampled_array_contract(in, *res, b.is_compute);
+            const bool res_arrayed = array_contract.resource_arrayed;
+            const bool graphics_float_array = array_contract.graphics_float_array;
+            const bool declared_arrayed = array_contract.declared_arrayed;
             if (in.opcode == 0x0e) {
                 uint32_t dim;
                 if (in.mimg_dim == 0u) dim = Dim_1D;
@@ -8318,15 +8302,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // for the array case and this dispatch is the site that still declined it -- the
                 // same lag #2265 records for the atomic coverage predicate.
                 //
-                // `declared_arrayed` above, not `mimg_dim == 5`, decides which query shape is
-                // emitted, and the distinction is load-bearing. `guest_texture_is_uploaded_array()`
-                // requires dim-5, depth>1 and BC or Float32; a dim-5 T# that fails it (Sonic Frontiers' own
-                // is depth=1) is a plain 2D image on both sides, so the ivec2 path runs and out[2]
-                // keeps its default of 1 -- the true layer count for a one-layer array.
-                //
-                // A Float32 graphics DIM=2D query observes the base-slice view selected above;
-                // a DIM=5 query observes the full array. Unsupported multi-layer formats retain
-                // their plain 2D fallback.
+                // The backend-specific sampled_array_contract selects ivec2 or ivec3. Graphics
+                // fallback views retain layer count one; compute Float16/Float32 DIM5 queries
+                // observe the full selected array, consistently with their gather declaration.
                 else if (in.mimg_dim == 3u) dim = Dim_Cube;
                 else if (in.mimg_dim == 5u) dim = Dim_2D;
                 else { ok = false; return true; }
@@ -8426,8 +8404,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
                 return true;
             }
-            const bool float_array_gather = graphics_float_array && in.mimg_dim == 5u &&
-                                            (is_gather_lz || is_gather || is_gather_lz_o);
+            const bool float_array_gather = array_contract.float_array_gather;
             // Only full-width coordinates and results are admitted here. Cache/status and
             // reserved controls cannot be admitted by widening the array opcode list alone.
             if (float_array_gather && (in.mimg_a16 || in.mimg_d16 || in.mimg_r128 || in.mimg_tfe ||
@@ -8802,7 +8779,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.declare_texture(res->binding, Dim_2D, uint_texture, declared_arrayed)) {
                     ok = false; return true;
                 }
-                // Float32 arrays carry an independent floating-point layer after the spatial
+                // Floating-point arrays carry an independent layer after the spatial
                 // coordinates. cvg preserves both consecutive and NSA address layouts. The
                 // gather's signed spatial offset must not translate or normalize that layer.
                 const uint32_t layer = float_array_gather
