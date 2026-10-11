@@ -5989,14 +5989,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
-    if (b.is_compute && std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) {
-        if (!allow_cfg_dispatcher || std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-                return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
-            }))
-            return false;
-        return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
-                                      code, dwords, initial_dispatch_active);
-    }
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
         b.cselect_b64_low_only_analysis_done = true;
@@ -6028,6 +6020,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         rs.mubuf_pcrel_tables = std::move(tables.mubuf);
         rs.smem_pcrel_tables = std::move(tables.smem);
         rs.mtbuf_pcrel_tables = std::move(tables.mtbuf);
+    }
+    if (b.is_compute && std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) {
+        if (!allow_cfg_dispatcher || std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+                return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
+            }))
+            return false;
+        return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                                      code, dwords, initial_dispatch_active);
     }
     std::unordered_set<uint32_t> local_dead_masks;
     if (!inherited_dead_masks) local_dead_masks = dead_wave_mask_writes(ins);

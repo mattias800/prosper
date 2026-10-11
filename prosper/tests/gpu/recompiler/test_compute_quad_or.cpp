@@ -46,6 +46,67 @@ void compiles(fixture::Shape shape, uint32_t native = 0, uint32_t lanes = fixtur
 TEST(ComputeQuadOr, PlainSourcesAndDistinctLocalAddend) {
     compiles(fixture::Shape::Plain);
 }
+TEST(ComputeQuadOr, CompoundEmbeddedTableKeepsSharedProgramSetup) {
+    // Project-owned PC-relative table control. Both arms have the same scalar prefix, table
+    // placement and observable output; only the actual OR arm requires the common dispatcher.
+    for (bool quad : {false, true}) {
+        const std::vector<uint32_t> code{
+            0xbe841f00u,              // GETPC s[4:5], next PC byte=4
+            0x800404ffu,
+            88u,         // ADD s4,88,s4: table begins at byte92
+            0x82050580u,              // ADDC s5,0,s5
+            0xbe860390u,              // s6=16 bytes
+            0xbe8703ffu,
+            0x10005004u, // s7=V# format/stride
+            0x7e080280u,              // v4=table offset0
+            0xe0301000u,
+            0x80010404u, // buffer_load_dword v4,v4,s[4:7]
+            0xbf8c3f70u,              // WAIT VM=0
+            0x7e0202ffu,
+            17u,
+            0x7e0402ffu,
+            256u,
+            0x7e0602ffu,
+            4096u,
+            quad ? 0x380604fau : 0x7e0602ffu,
+            quad ? 0xff08b101u : 273u,
+            0x4a060704u,              // ADD v3,v4,v3: owned table word affects output
+            0xe0702000u,
+            0x80020300u,
+            0xbf810000u,
+            7u,
+            11u,
+            13u,
+            17u};
+        for (uint32_t native : {0u, 64u}) {
+            const auto addr = fixture::address();
+            const auto module =
+                fixture::compile(code, fixture::table(64), fixture::config(native, 64), addr);
+            ASSERT_FALSE(module.empty()) << "quad=" << quad << " native=" << native << ' '
+                                         << last_terminal_reject_reason(addr);
+            if (native) continue;
+            bpermute_oracle::Interpreter vm(module);
+            const auto output = vm.run_buffers(64, {{3, std::vector<uint32_t>(64)}}, 3);
+            ASSERT_TRUE(vm.error.empty()) << vm.error;
+            EXPECT_EQ(output, std::vector<uint32_t>(64, 280u));
+        }
+    }
+}
+TEST(ComputeQuadOr, NoncomputeBoundaryDoesNotPrepareComputeService) {
+    const auto code = fixture::program();
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    for (bool fragment : {false, true}) {
+        Entry entry;
+        entry.b.is_compute = false;
+        entry.b.is_fragment = fragment;
+        entry.b.is_vertex = !fragment;
+        entry.b.guest_compute_complete_groups = false;
+        ComputeDppQuadOrService service;
+        EXPECT_TRUE(service.prepare(entry.b, entry.rs, ins, code.data(), code.size(), 0));
+        EXPECT_FALSE(service.present());
+    }
+}
 TEST(ComputeQuadOr, GenuineComplementaryExecDefinitions) {
     compiles(fixture::Shape::Complement);
 }
