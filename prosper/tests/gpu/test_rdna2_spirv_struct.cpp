@@ -1,5 +1,6 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/native_structural_launch.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -2413,7 +2414,7 @@ int main() {
     // used to be expressed as "the shader must reject", because a per-invocation bool could not
     // express what VCC_HI now holds. It can — after a Wave64 v_cmp, VCC_HI is exactly lanes 32..63 of
     // the compare mask, and `subgroupBallot(vcc).y` is exactly those bits when the subgroup IS the
-    // guest wave, which this config establishes (native_subgroup_size = 64). See #2420.
+    // guest wave, which the owned raw complete-group fixture and required width establish. See #2420.
     //
     // Asserting the BALLOT OPCODE rather than mere non-emptiness is what pins the distinction: a
     // module that compiled by some other route — in particular by resurrecting the stale scalar, the
@@ -3342,6 +3343,7 @@ int main() {
 
     ComputeShaderConfig native_wave64_mask_ffbh_config = portable_wave64_compute_config;
     native_wave64_mask_ffbh_config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(native_wave64_mask_ffbh_config);
     const auto gta_native_mask_ffbh_spv = recompile_compute(
         gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
         native_wave64_mask_ffbh_config);
