@@ -3530,6 +3530,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_structural_launch.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_execution_launch
+    SOURCES tests/gpu/recompiler/test_native_execution_launch.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     INCLUDES tests
