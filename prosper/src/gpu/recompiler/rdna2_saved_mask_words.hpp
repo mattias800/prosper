@@ -31,7 +31,7 @@ void load_missing_saved_mask_words(RegState& rs, const std::set<int>& roots,
                                    const std::set<int>& defined_words);
 void retire_saved_mask_facts(const SpirvCompute& b, std::set<int>& masks, std::set<int>& ambiguous,
                              int base, uint32_t width);
-void prepare_saved_mask_word_write(const SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
+void prepare_saved_mask_word_write(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
 void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
 uint32_t refuse_unavailable_saved_mask_word(SpirvCompute& b, const Rdna2Inst& in, bool* ok);
 

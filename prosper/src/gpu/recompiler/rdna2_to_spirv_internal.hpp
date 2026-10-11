@@ -501,6 +501,7 @@ struct SpirvCompute {
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t push_constant_dword_count = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
+    std::array<uint32_t, 3> guest_local_size{64, 1, 1};
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
     uint32_t t_ptr_sb_u64=0, t_ptr_sb_struct_u64=0; // lazy alias view for 64-bit buffer atomics
@@ -666,6 +667,10 @@ struct SpirvCompute {
     std::vector<uint32_t> saved_mask_original_words;
     std::set<uint32_t> saved_mask_entry_prefix_pcs;
     std::set<uint32_t> saved_mask_reconverged_entry_pcs;
+    // Separate routing-uniform/genuine-DATA proof for original complete native single-wave loops.
+    std::set<uint32_t> native_participating_mask_pcs;
+    std::vector<uint64_t> native_participation_entry_state;
+    uint32_t native_mask_runtime_write_pc = UINT32_MAX;
     bool saved_mask_in_dispatcher = false;
     std::set<int> saved_mask_word_roots;
     std::set<int> native_logical_word_roots;
@@ -2174,6 +2179,7 @@ struct SpirvCompute {
         raw_input_words = raw_word_input;
         push_constant_dword_count = push_constant_dwords;
         local_count = local_x * local_y * local_z;
+        guest_local_size = {local_x, local_y, local_z};
         wave_size = hardware_wave_size;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader

@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_copy_continuation.hpp"
+#include "gpu/recompiler/rdna2_native_participation.hpp"
 #include <bit>
 
 namespace prosper::gpu {
@@ -135,7 +136,8 @@ bool uses_native_saved_mask_words(const SpirvCompute& b) {
 bool saved_mask_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in) {
     if (!uses_native_saved_mask_words(b) ||
         !(b.saved_mask_entry_prefix_pcs.contains(in.pc) ||
-          (!b.saved_mask_in_dispatcher && b.saved_mask_reconverged_entry_pcs.contains(in.pc))) ||
+          (!b.saved_mask_in_dispatcher && b.saved_mask_reconverged_entry_pcs.contains(in.pc)) ||
+          native_mask_participation_site(b, in)) ||
         in.pc >= b.saved_mask_original_words.size())
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
@@ -250,11 +252,15 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
         if ((!same_stream || !native_vcc_copy_entry_masks_match(b, initial)) &&
             !consume_saved_mask_copy_continuation(b, ins, code, dwords, initial_active, initial))
             revoke_saved_mask_copy_proof(b);
+        if (!same_stream ||
+            b.native_participation_entry_state != native_participation_entry(b, initial))
+            b.native_participating_mask_pcs.clear();
         if (!same_stream || initial_active || b.invocation_guard_merge ||
             has_prior_partial_control(b)) {
             b.saved_mask_entry_prefix_pcs.clear();
             b.saved_mask_reconverged_entry_pcs.clear();
             b.native_logical_uniform_entry_pcs.clear();
+            b.native_participating_mask_pcs.clear();
         }
         return;
     }
@@ -323,6 +329,8 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     for (size_t i = 0; i < ins.size(); ++i)
         if (!same_original_instruction(ins[i], original[i])) return;
     initialize_native_logical_uniform_entry_proof(b, original);
+    b.native_participation_entry_state = native_participation_entry(b, initial);
+    b.native_participating_mask_pcs = native_mask_participation(b, initial, original);
     b.saved_mask_reconverged_entry_pcs = reconverged_entry_pcs(original);
     if (b.saved_mask_reconverged_entry_pcs.empty()) return;
     // CONFIDENCE: HIGH -- a ballot observes participating invocations (Vulkan subgroup contract).
@@ -359,8 +367,12 @@ bool saved_mask_spill_uses_data(const RegState& rs, int word) {
     return rs.native_saved_mask_words && definite_word(rs, word);
 }
 
-void prepare_saved_mask_word_write(const SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
+void prepare_saved_mask_word_write(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     rs.native_saved_mask_words = uses_native_saved_mask_words(b);
+    b.native_mask_runtime_write_pc =
+        native_mask_participation_site(b, in) && native_mask_predicate_available(rs, in)
+            ? in.pc
+            : UINT32_MAX;
     if (!uses_native_saved_mask_words(b)) return;
     std::set<int> written;
     for_each_scalar_write(in, [&](int base, uint32_t width) {
@@ -393,12 +405,15 @@ void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in)
                                 in.src[0].kind == OperandKind::SGPR;
         if (older_copy || rs.sreg_merge_placeholder.contains(root) ||
             rs.sreg_merge_placeholder.contains(root + 1) ||
-            !saved_mask_producer_has_full_participation(b, in)) {
+            !saved_mask_producer_has_full_participation(b, in) ||
+            (b.native_participating_mask_pcs.contains(in.pc) &&
+             b.native_mask_runtime_write_pc != in.pc)) {
             for (int word : {root, root + 1})
                 if (!definite_word(rs, word)) rs.unavailable_saved_mask_words.insert(word);
             return;
         }
         const uint32_t mask = rs.sreg_bool.at(root);
+        if (b.native_participating_mask_pcs.contains(in.pc)) b.mark_subgroup_min64();
         for (uint32_t half = 0; half < 2; ++half) {
             const int word = root + static_cast<int>(half);
             rs.sreg[word] = b.is_fragment ? b.fragment_wave_ballot_half(mask, half)
