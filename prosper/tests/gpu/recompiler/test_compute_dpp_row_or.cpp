@@ -2,8 +2,11 @@
 // Execute the production portable dispatcher with an independent instruction-order CPU oracle;
 // native modules have separate compilation/structure checks, not simulated subgroup execution.
 #include "bpermute_spirv_oracle.hpp"
+#include "fixtures/dpp_row_max.hpp"
 #include "fixtures/dpp_row_or.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -147,6 +150,313 @@ bool ordinary(const Rdna2Inst& in, bool visible = true, bool spill = false) {
     bool ok = true;
     EXPECT_TRUE(emit_alu(b, state, in, ok, true, nullptr, false, nullptr, visible));
     return ok;
+}
+
+std::vector<uint32_t> ngg_row_program(uint32_t opcode, bool barrier) {
+    auto words = prosper::test::dpp_row_max_program({1u, 2u, 4u, 8u});
+    for (size_t at = 0; at + 1u < words.size(); at += 2u)
+        words[at] = (words[at] & 0x81ffffffu) | (opcode << 25u);
+    words.insert(words.begin(), 0x7e020300u);   // v_mov_b32 v1,v0: genuine launch input
+    if (barrier) words.insert(words.begin() + 1, 0xbf8a0000u);
+    words.insert(words.end() - 1, {0xf8000941u, 0x00000001u});   // EXP PRIM,v1
+    return words;
+}
+
+TEST(ComputeDppRowOr, PortableNggIntegerRowsUseWorkgroupPhasesWithoutScalarBranches) {
+    for (uint32_t opcode : {0x25u, 0x14u, 0x1cu}) {
+        for (bool barrier : {false, true}) {
+            for (bool native : {false, true}) {
+                SCOPED_TRACE(testing::Message() << opcode << '/' << barrier << '/' << native);
+                const auto words = ngg_row_program(opcode, barrier);
+                const auto module = recompile_ngg_exports_for_test(
+                    words.data(), words.size(), 10, 0, nullptr, 4, 0, {}, true, true, native);
+                ASSERT_FALSE(module.empty());
+                EXPECT_EQ(count(module, Op_GroupNonUniformShuffle) != 0, native);
+                if (!native) {
+                    EXPECT_GT(count(module, Op_Switch), 0u);
+                    EXPECT_GE(count(module, Op_ControlBarrier), 2u);
+                }
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggIntegerRowSourceSpillsStayRefusedInBothProfiles) {
+    for (uint32_t opcode : {0x25u, 0x14u, 0x1cu}) {
+        for (bool barrier : {false, true}) {
+            for (bool native : {false, true}) {
+                for (bool spill_source : {false, true}) {
+                    auto words = ngg_row_program(opcode, barrier);
+                    words[words.size() - 2u] =
+                        2u;   // independent EXP sink cannot hide a row refusal
+                    words.insert(words.begin() + 1,
+                                 {0xd7610000u | (spill_source ? 1u : 8u), 0x00010081u});
+                    SCOPED_TRACE(testing::Message() << opcode << '/' << barrier << '/' << native
+                                                    << '/' << spill_source);
+                    const uint64_t address = 0x49590000u + (opcode << 8u) + (barrier << 2u) +
+                                             (native << 1u) + spill_source;
+                    EXPECT_EQ(recompile_ngg_exports_for_test(
+                                  words.data(), words.size(), 10, 0, nullptr, 4, 0,
+                                  {RecompileDiagnosticStage::Compute, address}, true, true, native)
+                                  .empty(),
+                              spill_source);
+                    if (spill_source) {
+                        const auto reason = last_terminal_reject_reason(address);
+                        EXPECT_NE(reason.find("pc=" + std::to_string(barrier ? 4u : 3u)),
+                                  std::string::npos)
+                            << reason;
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggIntegerRowsAcceptCurrentOrdinaryOverwritesOfHistoricalSpills) {
+    const std::vector<std::vector<uint32_t>> replacements{
+        {0xd7610001u, 0x00010081u, 0x7e020283u}, // full ordinary overwrite after a spill
+        {0xbefe04c1u, 0xd7610001u, 0x00010081u, 0xbf068181u, 0xbf850002u, 0x7e020300u, 0xbf820001u,
+         0x7e020303u}, // both forward arms overwrite from genuine VGPRs
+        {0xd7610001u, 0x00010081u, 0x7e020300u}, // full overwrite after the guest barrier
+    };
+    for (uint32_t opcode : {0x25u, 0x14u, 0x1cu}) {
+        for (size_t shape = 0; shape < replacements.size(); ++shape) {
+            for (bool barrier : {false, true}) {
+                for (bool native : {false, true}) {
+                    auto words = ngg_row_program(opcode, barrier);
+                    // The positive consumes the row result, including any later alias reload.
+                    const size_t at = shape == 1u && barrier ? 2u : 1u;
+                    auto replacement = replacements[shape];
+                    if (shape == 2u && barrier) {
+                        words.erase(words.begin() + 1);
+                        replacement.insert(replacement.begin() + 2, 0xbf8a0000u);
+                    }
+                    words.insert(words.begin() + at, replacement.begin(), replacement.end());
+                    SCOPED_TRACE(testing::Message()
+                                 << opcode << '/' << shape << '/' << barrier << '/' << native);
+                    const uint64_t address =
+                        0x4959a000u + (opcode << 8u) + (shape << 4u) + (barrier << 1u) + native;
+                    EXPECT_FALSE(recompile_ngg_exports_for_test(
+                                     words.data(), words.size(), 10, 0, nullptr, 4, 0,
+                                     {RecompileDiagnosticStage::Compute, address}, true, true,
+                                     native)
+                                     .empty())
+                        << last_terminal_reject_reason(address);
+                }
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggIntegerRowsAcceptCompleteExplicitIntegerProducers) {
+    for (uint32_t producer : {0x0bu, 0x11u, 0x12u, 0x13u, 0x14u, 0x16u, 0x18u, 0x1au, 0x1bu, 0x1cu,
+                              0x1du, 0x1eu, 0x25u, 0x26u, 0x27u}) {
+        for (bool barrier : {false, true}) {
+            for (bool native : {false, true}) {
+                auto words = ngg_row_program(0x1cu, false);
+                std::vector<uint32_t> replacement{0xd7610001u, 0x00010081u};
+                if (barrier) replacement.push_back(0xbf8a0000u);
+                replacement.push_back((producer << 25u) | 0x00020100u);   // v1 = op(v0,v0)
+                words.insert(words.begin() + 1, replacement.begin(), replacement.end());
+                SCOPED_TRACE(testing::Message() << producer << '/' << barrier << '/' << native);
+                EXPECT_FALSE(recompile_ngg_exports_for_test(words.data(), words.size(), 10, 0,
+                                                            nullptr, 4, 0, {}, true, true, native)
+                                 .empty());
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggRowsAcceptWholeWordUnaryFloatAndExtendedProducers) {
+    for (const std::vector<uint32_t>& producer : {
+             std::vector<uint32_t>{0x7e026f00u},   // NOT_B32
+             std::vector<uint32_t>{0x7e027100u},   // BFREV_B32
+             std::vector<uint32_t>{0x06020100u},   // F32 ADD
+             std::vector<uint32_t>{0xd5030001u, 0x00020100u},   // VOP3 F32 ADD
+             std::vector<uint32_t>{0xd5690001u, 0x00020100u},   // VOP3 MUL_LO_U32
+             std::vector<uint32_t>{0xd5780001u, 0x02020100u},   // VOP3 XOR3 with explicit zero
+             std::vector<uint32_t>{0xd7110001u, 0x00020100u},   // PACK_B32_F16 writes both halves
+             std::vector<uint32_t>{0xd8d480e4u, 0x01000000u},   // identity DS swizzle from v0
+             std::vector<uint32_t>{0xd7610003u, 0x00010081u, 0x7e060300u, 0xd8d480e4u, 0x01000003u},
+             std::vector<uint32_t>{0xd7610000u, 0x00010081u, 0xd8340000u, 0x00000605u, 0xd8b40000u,
+                                   0x01000605u},   // unused DATA1=0 is not a v0 read
+         }) {
+        for (bool barrier : {false, true}) {
+            for (bool native : {false, true}) {
+                auto words = ngg_row_program(0x1cu, false);
+                std::vector<uint32_t> replacement{0xd7610001u, 0x00010081u};
+                if (barrier) replacement.push_back(0xbf8a0000u);
+                replacement.insert(replacement.end(), producer.begin(), producer.end());
+                words.insert(words.begin() + 1, replacement.begin(), replacement.end());
+                SCOPED_TRACE(testing::Message() << producer[0] << '/' << barrier << '/' << native);
+                EXPECT_FALSE(recompile_ngg_exports_for_test(words.data(), words.size(), 10, 0,
+                                                            nullptr, 4, 0, {}, true, true, native)
+                                 .empty());
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggImageRowsRequireEveryConsecutiveAndNsaAddressWord) {
+    ShaderResourceTable resources;
+    ShaderResource texture{};
+    texture.cls = ResourceClass::Texture;
+    texture.binding = 2;
+    texture.img_dim = 1;
+    texture.width = texture.height = 4;
+    texture.format = DataFormat::Float32;
+    texture.num_components = 1;
+    texture.sgpr_base = 8;
+    resources.resources.push_back(texture);
+    for (bool nsa : {false, true}) {
+        for (bool barrier : {false, true}) {
+            for (uint32_t shape = 0; shape < 4; ++shape) {
+                auto words = ngg_row_program(0x25u, false);
+                const bool valid = shape != 1u;
+                if (!valid) words[words.size() - 2u] = 2u;   // independent genuine sink
+                std::vector<uint32_t> prefix;
+                if (shape == 1u || shape == 2u)
+                    prefix.insert(prefix.end(), {0xd7610006u, 0x00010081u});
+                if (shape == 3u) prefix.insert(prefix.end(), {0xd7610008u, 0x00010081u});
+                if (barrier) prefix.push_back(0xbf8a0000u);
+                if (shape == 2u) prefix.push_back(0x7e0c0280u);   // full genuine coordinate zero
+                prefix.insert(prefix.end(), {nsa ? 0xf000010au : 0xf0000108u, 0x00020105u});
+                if (nsa) prefix.push_back(6u);   // [v5,v6], with v6 in the extra NSA byte
+                words.insert(words.begin() + 1, prefix.begin(), prefix.end());
+                const uint64_t address = 0x4959e000u + (nsa << 5u) + (barrier << 4u) + shape;
+                SCOPED_TRACE(testing::Message() << nsa << '/' << barrier << '/' << shape);
+                EXPECT_EQ(recompile_ngg_exports_for_test(
+                              words.data(), words.size(), 10, 0, &resources, 4, 0,
+                              {RecompileDiagnosticStage::Compute, address}, true, true, false)
+                              .empty(),
+                          !valid);
+                if (!valid) {
+                    const auto reason = last_terminal_reject_reason(address);
+                    EXPECT_NE(reason.find("pc=" + std::to_string(1u + prefix.size())),
+                              std::string::npos)
+                        << reason;
+                }
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggPackedStorageImageRowsCannotHideSecondCoordinateSpills) {
+    ShaderResourceTable resources;
+    ShaderResource image{};
+    image.cls = ResourceClass::StorageImage;
+    image.binding = 2;
+    image.img_dim = 1;
+    image.width = image.height = 4;
+    image.format = DataFormat::Uint32;
+    image.num_components = 1;
+    image.sgpr_base = 8;
+    resources.resources.push_back(image);
+    for (bool barrier : {false, true}) {
+        for (uint32_t shape = 0; shape < 4; ++shape) {
+            auto words = ngg_row_program(0x25u, false);
+            const bool valid = shape >= 2u;
+            if (!valid) words[words.size() - 2u] = 2u;   // independent genuine sink
+            std::vector<uint32_t> prefix{shape == 3u ? 0xd7610008u : 0xd7610006u, 0x00010081u};
+            if (barrier) prefix.push_back(0xbf8a0000u);
+            if (shape == 2u) prefix.push_back(0x7e0c0280u);   // full genuine coordinate zero
+            prefix.insert(prefix.end(), {0xf0000108u, shape == 0u ? 0x40020105u : 0x00020105u});
+            words.insert(words.begin() + 1, prefix.begin(), prefix.end());
+            const uint64_t address = 0x4959f000u + (barrier << 4u) + shape;
+            SCOPED_TRACE(testing::Message() << barrier << '/' << shape);
+            EXPECT_EQ(recompile_ngg_exports_for_test(
+                          words.data(), words.size(), 10, 0, &resources, 4, 0,
+                          {RecompileDiagnosticStage::Compute, address}, true, true, false)
+                          .empty(),
+                      !valid);
+            if (!valid) {
+                const auto reason = last_terminal_reject_reason(address);
+                EXPECT_NE(reason.find("pc=" + std::to_string(1u + prefix.size())),
+                          std::string::npos)
+                    << reason;
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggRowsRequireCurrentOrdinarySourceDependencies) {
+    const std::vector<std::vector<uint32_t>> replacements{
+        {},   // direct live spill source
+        {0xd8d480e4u, 0x04000003u},   // relay the unresolved source through v4
+        {0x7e060300u},   // fully replace source v3 from genuine v0
+        {0xbefe04c1u, 0xbf068181u, 0xbf850001u, 0x7e060300u},   // only one arm replaces v3
+        {0xbefe04c1u, 0xbf068181u, 0xbf850002u, 0x7e060300u, 0xbf820001u, 0x7e060300u},
+        {0x7da40500u, 0x7e060300u, 0xbefe04c1u},   // narrowed replacement leaves spilled peers
+    };
+    for (size_t shape = 0; shape < replacements.size(); ++shape) {
+        for (bool destination_spill : {false, true}) {
+            for (bool barrier : {false, true}) {
+                auto words = ngg_row_program(0x25u, false);
+                const bool valid = shape == 2u || shape == 4u;
+                if (!valid) words[words.size() - 2u] = 2u;   // authentic independent sink
+                std::vector<uint32_t> prefix;
+                if (destination_spill) prefix.insert(prefix.end(), {0xd7610001u, 0x00010081u});
+                prefix.insert(prefix.end(), {0xd7610003u, 0x00010081u});
+                if (barrier) prefix.push_back(0xbf8a0000u);
+                prefix.insert(prefix.end(), replacements[shape].begin(), replacements[shape].end());
+                prefix.insert(prefix.end(), {0xd8d480e4u, shape == 1u ? 0x01000004u : 0x01000003u});
+                words.insert(words.begin() + 1, prefix.begin(), prefix.end());
+                const uint64_t address =
+                    0x4959d000u + (shape << 4u) + (destination_spill << 1u) + barrier;
+                SCOPED_TRACE(testing::Message()
+                             << shape << '/' << destination_spill << '/' << barrier);
+                EXPECT_EQ(recompile_ngg_exports_for_test(
+                              words.data(), words.size(), 10, 0, nullptr, 4, 0,
+                              {RecompileDiagnosticStage::Compute, address}, true, true, false)
+                              .empty(),
+                          !valid);
+                if (!valid) {
+                    const auto reason = last_terminal_reject_reason(address);
+                    EXPECT_NE(reason.find("pc=" + std::to_string(1u + prefix.size())),
+                              std::string::npos)
+                        << reason;
+                }
+            }
+        }
+    }
+}
+
+TEST(ComputeDppRowOr, NggAddRowsKeepPartialJoinedAndRespilledSourcesRefused) {
+    const std::vector<std::vector<uint32_t>> replacements{
+        {0x7da40500u, 0x7e020283u, 0xbefe04c1u},   // narrowed ordinary write then full restore
+        {0xbefe04c1u, 0xbf068181u, 0xbf850001u, 0x7e020283u},   // only one forward arm overwrites
+        {0x7e020283u, 0xd7610001u, 0x00010081u},   // current generation becomes a spill again
+        {0x64020100u},   // v_add_f16 preserves the unresolved high half
+        {0x56020100u},   // v_fmac_f32 consumes the unresolved old destination
+        {0x7e021500u},   // plain v_cvt_f16_f32 preserves the high half
+        {0x7e02a900u},   // plain v_rcp_f16 preserves the high half
+        {0xd7030001u, 0x00020100u},   // VOP3 v_add_nc_u16 preserves the opposite half
+        {0xcc210001u, 0x02020100u},   // VOP3P v_fma_mixlo_f16 preserves the high half
+        {0xd51f0001u, 0x00020100u},   // VOP3 v_mac_f32 consumes the old destination
+    };
+    for (size_t shape = 0; shape < replacements.size(); ++shape) {
+        for (bool barrier : {false, true}) {
+            for (bool native : {false, true}) {
+                // Native partial-overwrite lifetime checks retain their separate preexisting route.
+                if ((shape == 0u || shape >= 3u) && native) continue;
+                auto words = ngg_row_program(0x25u, barrier);
+                words[words.size() - 2u] = 2u;
+                std::vector<uint32_t> prefix{0xd7610001u, 0x00010081u};
+                prefix.insert(prefix.end(), replacements[shape].begin(), replacements[shape].end());
+                words.insert(words.begin() + (barrier && shape < 3u ? 2 : 1), prefix.begin(),
+                             prefix.end());
+                SCOPED_TRACE(testing::Message() << shape << '/' << barrier << '/' << native);
+                const uint64_t address = 0x4959b000u + (shape << 4u) + (barrier << 1u) + native;
+                EXPECT_TRUE(recompile_ngg_exports_for_test(
+                                words.data(), words.size(), 10, 0, nullptr, 4, 0,
+                                {RecompileDiagnosticStage::Compute, address}, true, true, native)
+                                .empty());
+                const auto reason = last_terminal_reject_reason(address);
+                const size_t row_pc = 1u + prefix.size() + barrier;
+                EXPECT_NE(reason.find("pc=" + std::to_string(row_pc)), std::string::npos) << reason;
+            }
+        }
+    }
 }
 
 TEST(ComputeDppRowOr, DecoderRetainsTheOwnedContractAndMaximumControl) {
@@ -298,3 +608,84 @@ TEST(ComputeDppRowOr, IndependentValuesDistinguishAddAndCrossRowFetch) {
     EXPECT_NE(wanted[16], input[16] | input[15]);
 }
 }  // namespace
+
+namespace {
+std::vector<uint32_t> phase_relay_program(bool before_barrier) {
+    std::vector<uint32_t> words{0xd7610003u, 0x00010081u};   // live v3 scalar lane slot
+    if (!before_barrier) words.push_back(0xbf8a0000u);
+    words.insert(words.end(), {0xd8d480e4u, 0x04000003u});   // identity DS v4 <- v3
+    if (before_barrier) words.push_back(0xbf8a0000u);
+    words.insert(words.end(), {0x380808fau, 0xff011104u, 0xf8000941u, 2u, 0xbf810000u});
+    return words;
+}
+
+void check_phase_relay(const std::vector<uint32_t>& words, uint64_t address, bool genuine,
+                       uint32_t row_pc) {
+    const auto module = recompile_ngg_exports_for_test(
+        words.data(), words.size(), 10, 0, nullptr, 4, 0,
+        {RecompileDiagnosticStage::Compute, address}, true, true, false);
+    EXPECT_EQ(module.empty(), !genuine);
+    if (!genuine) {
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("dpp-row-or-source-unresolved"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=" + std::to_string(row_pc)), std::string::npos) << reason;
+    }
+}
+}   // namespace
+
+TEST(ComputeDppRowOr, NggLiveSpillRelayBeforeBarrierStaysUnowned) {
+    check_phase_relay(phase_relay_program(true), 0x4959b001u, false, 5u);
+}
+
+TEST(ComputeDppRowOr, NggLiveSpillRelayAfterBarrierStaysUnowned) {
+    check_phase_relay(phase_relay_program(false), 0x4959b002u, false, 5u);
+}
+
+TEST(ComputeDppRowOr, NggLiveSpillRelayWithoutBarrierStaysUnowned) {
+    auto words = phase_relay_program(true);
+    words.erase(words.begin() + 4);
+    check_phase_relay(words, 0x4959b003u, false, 4u);
+}
+
+TEST(ComputeDppRowOr, NggGenuineSourceReplacementBeforeRelayExportsRow) {
+    auto words = phase_relay_program(true);
+    words.insert(words.begin() + 2, 0x7e060300u);   // v3 <- genuine v0 before DS
+    words[words.size() - 2] = 4u;
+    check_phase_relay(words, 0x4959b004u, true, 6u);
+}
+
+TEST(ComputeDppRowOr, NggGenuineRelayReplacementAfterBarrierExportsRow) {
+    auto words = phase_relay_program(true);
+    words.insert(words.begin() + 5, 0x7e080300u);   // v4 <- genuine v0 after barrier
+    words[words.size() - 2] = 4u;
+    check_phase_relay(words, 0x4959b005u, true, 6u);
+}
+
+TEST(ComputeDppRowOr, NggLaterSourceReplacementCannotAuthenticateEarlierRelay) {
+    auto words = phase_relay_program(true);
+    words.insert(words.begin() + 4, 0x7e060300u);   // expires v3, never defines v4
+    check_phase_relay(words, 0x4959b006u, false, 6u);
+}
+
+TEST(ComputeDppRowOr, NggRepeatedBarriersCannotAuthenticateEarlierRelay) {
+    auto words = phase_relay_program(true);
+    words.insert(words.begin() + 5, 0xbf8a0000u);
+    check_phase_relay(words, 0x4959b007u, false, 6u);
+}
+
+TEST(ComputeDppRowOr, NggRelayReplacementAfterBarrierRequiresEveryFullExecPath) {
+    const std::vector<std::vector<uint32_t>> replacements{
+        {0xbefe04c1u, 0xbf068181u, 0xbf850001u, 0x7e080300u},   // one arm only
+        {0xbefe04c1u, 0xbf068181u, 0xbf850002u, 0x7e080300u, 0xbf820001u, 0x7e080300u},
+        {0x7da40500u, 0x7e080300u, 0xbefe04c1u},   // only narrowed EXEC writes
+    };
+    for (size_t shape = 0; shape < replacements.size(); ++shape) {
+        auto words = phase_relay_program(true);
+        const bool genuine = shape == 1u;
+        words.insert(words.begin() + 5, replacements[shape].begin(), replacements[shape].end());
+        if (genuine) words[words.size() - 2] = 4u;
+        SCOPED_TRACE(shape);
+        check_phase_relay(words, 0x4959b008u + shape, genuine,
+                          5u + static_cast<uint32_t>(replacements[shape].size()));
+    }
+}

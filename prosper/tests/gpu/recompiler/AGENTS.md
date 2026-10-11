@@ -85,3 +85,43 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 - A SAVEEXEC fixture that leaves EXEC narrowed cannot export a vertex position. Restore full EXEC
   before that export when testing independent mask transfer; otherwise an unrelated export refusal
   hides whether the mask proof worked.
+- An NGG integer-row spill negative exporting its source VGPR can reject only at the later EXP,
+  hiding that ADD published an unresolved scalar-spill placeholder through the row phase.
+  Export an independent genuine VGPR and assert the first row's rejection PC; matched unrelated
+  spills must still compile in native and portable profiles, with and without a barrier (#4959).
+- An inventoried WRITELANE slot is historical after a complete ordinary overwrite under full EXEC.
+  Test a genuine full overwrite and a both-arm overwrite against partial EXEC, one-arm and re-spill
+  controls; only an all-path current-generation proof can expire the slot across an NGG row phase.
+  Native partial-overwrite lifetime behavior is a separate existing contract (#4959).
+- A row-source overwrite positive must export and check the row result itself; an independent
+  sink can hide a later EXP failure caused by resurrected historical slot maps. Cover a genuine
+  overwrite after a guest barrier too, without adding an artificial EXEC restore (#4959).
+- A VGPR storage-write count does not prove a complete definition: plain f16 writes preserve half
+  the old destination, and FMAC reads the old accumulator. These must not expire an unresolved
+  scalar spill in the newly selected portable NGG row dispatcher (#4959).
+- Restricting current-generation expiration to VMOV and row-operation opcodes loses genuine
+  complete integer producers. The literal pre-fix portable NGG shell exports correct row values
+  after MUL_U24, signed/unsigned MIN/MAX, shifts, AND/OR/XOR/XNOR and ADD/SUB/SUBREV overwrites;
+  preserve that audited full-word family alongside the halfword/accumulator negatives (#4959).
+- Whole-word generation semantics extend beyond the row opcodes or integer VOP2 producers.
+  Genuine unary/F32/VOP3/packed-full-word producers need usable row-result exports too; their
+  preserving-half and implicit-destination siblings remain first-row negatives. Follow actual
+  lowering effects, since an architectural VOP3 opcode can still have no supported emitter (#4959).
+- A complete destination word does not authenticate its inputs. DS services read the value plane
+  directly; a live spill can reach a row through a fresh intermediate VGPR. Meet ordinary source
+  ownership along every CFG edge, with direct, relayed and one-arm spill negatives and genuine
+  full/both-arm replacement controls (#4959).
+- Decoder storage spans can contain reserved fields. DS WRXCHG consumes ADDR/DATA0, never DATA1;
+  verify its usable row result after an unrelated v0 spill. Memory-result generation must check
+  every actual consecutive/NSA coordinate and both FLAT address words, with matched genuine and
+  unrelated-spill controls. Uninventoried dimensional/packed MIMG forms cannot expire a spill;
+  this source-lifetime check grants no memory initialization or resource authority (#4959).
+- A16 does not prove a one-word MIMG address: the storage-image lowering reads ordinary 2D
+  coordinates while the sampled-texture lowering unpacks them. A resource-independent lifetime
+  effect must remain conservative for that packed form, with a live second-coordinate spill
+  rejected at the first row and matched ordinary storage-image coordinate controls (#4959).
+- A phase reload is not a genuine new source definition. A DS relay of a live scalar spill before
+  a barrier remained unowned in the first phase but was re-seeded as ordinary in the next; replacing
+  the original spill after the relay also emptied the alias map and disabled that local guard.
+  Retain original per-PC ownership across all phases and full EXEC at each barrier boundary, with
+  relay-before/after/no-barrier negatives and usable genuine row-result replacements (#4959).

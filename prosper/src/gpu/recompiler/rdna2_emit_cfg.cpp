@@ -638,6 +638,7 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
+    prepare_ngg_row_source_proof(b, initial, ins);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
     const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
@@ -2964,6 +2965,9 @@ bool emit_cfg_state_machine(
                 invalidated_in[terminal->second].end()};
     }
 
+    const auto& ngg_ordinary_row_sources = b.ngg_ordinary_row_sources;
+    const bool ngg_terminal_full_exec = b.ngg_full_exec_pcs.contains(end_pc);
+
     uint32_t ptr_u32 = 0, ptr_bool = 0;
     std::map<int, uint32_t> vv, sv, mv, mhv;
     std::map<std::pair<int, int>, uint32_t> lv, lmv;
@@ -3608,6 +3612,9 @@ bool emit_cfg_state_machine(
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
+        if (b.ngg_workgroup_shell)
+            restore_ngg_row_source_state(b, state, ngg_ordinary_row_sources, starts,
+                                         dispatch_blocks, dispatch, end_pc, ngg_terminal_full_exec);
         return state;
     };
     auto save_state = [&](const RegState& state, uint32_t dispatch) {
@@ -4589,15 +4596,12 @@ bool emit_cfg_state_machine(
             const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr) || bounded_or;
             const auto source = state.vreg.find(bounded ? dpp_row_shr->src[0].value : dst);
             uint32_t source_value = source == state.vreg.end() ? zero : source->second;
-            if (maximum || unbounded_or) {
-                // Scalar-spill slots cannot replace the ordinary per-lane MAX/OR source.
-                bool source_ok = true;
-                source_value =
-                    operand_bits(b, state, *dpp_row_shr, dpp_row_shr->src[0], &source_ok);
-                if (!source_ok)
-                    return reject_cfg(dpp_row_shr->pc, maximum ? "dpp-row-max-source-unresolved"
-                                                               : "dpp-row-or-source-unresolved");
-            }
+            if ((maximum || unbounded_or || b.ngg_workgroup_shell) &&
+                !resolve_compute_dpp_row_source(b, state, *dpp_row_shr, ngg_ordinary_row_sources,
+                                                source_value))
+                return reject_cfg(dpp_row_shr->pc, maximum      ? "dpp-row-max-source-unresolved"
+                                                   : bitwise_or ? "dpp-row-or-source-unresolved"
+                                                                : "dpp-row-add-source-unresolved");
             const auto previous_destination = state.vreg.find(dst);
             const uint32_t old_destination = previous_destination == state.vreg.end()
                 ? zero : previous_destination->second;
@@ -5987,6 +5991,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_lds_fminmax_dispatcher) {
     // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
+    prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
@@ -6057,15 +6062,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.is_compute && needs_compute_dpp_row_fadd_dispatcher(ins, b.native_subgroup_size);
     const bool compute_cfg_row_integer =
         b.is_compute &&
-        std::any_of(ins.begin(), ins.end(),
-                    [](const Rdna2Inst& in) {
-                        return is_inplace_vmax_u32_dpp_row_shr(in) ||
-                               is_inplace_vor_b32_dpp_row_shr(in);
-                    }) &&
-        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-            return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
-                   in.opcode != 0x03;
-        });
+        needs_compute_dpp_row_shr_dispatcher(ins, b.ngg_workgroup_shell, b.native_subgroup_size);
     const auto append_emitter_only_end = [](std::vector<Rdna2Inst>& region, uint32_t pc) {
         Rdna2Inst end;
         end.pc = pc;
