@@ -1,6 +1,7 @@
 // #4957: a missing Bool spelling at a structured merge is not a zero physical mask.
 // Refuse live mixed domains; preserve actual incoming predicates on both dynamic paths.
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -14,6 +15,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -311,11 +313,131 @@ TEST(StructuredSavedMaskJoin, FullReplacementAfterJoinNeedsNoOldMask) {
     expect_values(e, left | right, left | right);
     retain_module(e, "complete-replacement.spv");
 }
+TEST(StructuredSavedMaskJoin, DeadB32MaskPreservesIndependentNeighbor) {
+    for (uint32_t root : {24u, 106u}) {
+        Emitter e;
+        e.b.wave_size = 32;
+        e.b.allow_b32_masks = true;
+        e.rs.sreg[root + 1] = e.b.uconst(0x12345678u);
+        const std::vector<uint32_t> code{
+            0xbf068014u, 0xbf840001u, mov(root, 126), mov(root, 133), 0x7e000200u | (root + 1),
+            end};
+        ASSERT_TRUE(e.run(code)) << "root=" << root;
+        EXPECT_FALSE(e.rs.sreg_bool.contains(root));
+        for (uint32_t storage : {0u, 1u})
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                EXPECT_EQ(value(e, storage, lane), 0x12345678u)
+                    << "root=" << root << " storage=" << storage << " lane=" << lane;
+        retain_module(e, root == 24 ? "b32-independent-neighbor.spv" : "b32-vcc-neighbor.spv");
+    }
+}
+TEST(StructuredSavedMaskJoin, B64MaskCannotRetireAfterOnlyLowReplacement) {
+    Emitter e;
+    e.rs.sreg[25] = e.b.uconst(0x12345678u);
+    e.refused({0xbf068014u, 0xbf840001u, mov(24, 126, true), mov(24, 133), 0x7e000219u, end});
+}
+TEST(StructuredSavedMaskJoin, CompleteB64ReplacementRetiresOldMask) {
+    Emitter e;
+    e.rs.sreg[25] = e.b.uconst(0x12345678u);
+    ASSERT_TRUE(e.run({0xbf068014u, 0xbf840001u, mov(24, 126, true), mov(24, 133), mov(25, 135),
+                       0x7e000219u, end}));
+    EXPECT_FALSE(e.rs.sreg_bool.contains(24));
+}
+TEST(StructuredSavedMaskJoin, WidthConflictCannotRetireLiveB64High) {
+    Emitter e;
+    e.b.wave_size = 32;
+    e.b.allow_b32_masks = true;
+    e.physical();
+    e.predicate();
+    e.refused({0xbf068014u, 0xbf840001u, mov(24, 126), mov(24, 133), 0x7e000219u, end});
+}
+TEST(StructuredSavedMaskJoin, Wave32CarryDoesNotReplaceMissingB64High) {
+    Emitter e;
+    e.b.wave_size = 32;
+    e.b.allow_b32_masks = true;
+    e.rs.sreg[25] = e.b.uconst(0x12345678u);
+    // ADD_CO writes one mask word in this emitter mode; s25 remains independently live.
+    e.refused({0xbf068014u, 0xbf840001u, logical(0x13), 0xd70f1801u, 129u | (129u << 9u),
+               0x7e000219u, end});
+}
+TEST(StructuredSavedMaskJoin, CarryDeathProofUsesActualOutputWidthAndChecksInputs) {
+    const std::vector<uint32_t> code{0xd70f1801u, 129u | (129u << 9u), 0x7e000219u, end};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    ASSERT_EQ(ins.front().sdst.value, 24);
+    EXPECT_TRUE(sgpr_dead_at_merge(ins, 0, 24, ScalarMergeProof::AnyRead, nullptr, false,
+                                   {false, true, true}));
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 25, ScalarMergeProof::AnyRead, nullptr, false,
+                                    {false, true, true}));
+    EXPECT_TRUE(sgpr_dead_at_merge(ins, 0, 25));
+    const std::vector<uint32_t> carry_in{0xd5281801u, 129u | (129u << 9u) | (24u << 18u), end};
+    ins.clear();
+    rdna2_walk(carry_in.data(), carry_in.size(), ins);
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 24));
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 25));
+}
+TEST(StructuredSavedMaskJoin, Wave32ImplicitCompareCannotRetireLiveVccHigh) {
+    Emitter e;
+    e.b.wave_size = 32;
+    e.b.allow_b32_masks = true;
+    e.rs.sreg[107] = e.b.uconst(0x12345678u);
+    e.refused({0xbf068014u, 0xbf840001u, mov(107, 126), 0x7c0200f0u, 0x7e00026bu, end});
+}
+TEST(StructuredSavedMaskJoin, CompleteHighReplacementAfterWave32CompareCompiles) {
+    Emitter e;
+    e.b.wave_size = 32;
+    e.b.allow_b32_masks = true;
+    e.rs.sreg[107] = e.b.uconst(0x12345678u);
+    ASSERT_TRUE(e.run(
+        {0xbf068014u, 0xbf840001u, mov(107, 126), 0x7c0200f0u, mov(107, 133), 0x7e00026bu, end}));
+    for (uint32_t storage : {0u, 1u})
+        for (uint32_t lane = 0; lane < 32; ++lane) EXPECT_EQ(value(e, storage, lane), 5u);
+}
+TEST(StructuredSavedMaskJoin, Wave32ExplicitVccComparePreservesOtherWord) {
+    for (uint32_t destination : {106u, 107u}) {
+        Emitter e;
+        e.b.wave_size = 32;
+        e.b.allow_b32_masks = true;
+        const uint32_t neighbor = destination == 106 ? 107 : 106;
+        e.rs.sreg[neighbor] = e.b.uconst(0x12345678u);
+        e.refused({0xbf068014u, 0xbf840001u, mov(neighbor, 126), 0xd4010000u | destination,
+                   0x000200f0u, 0x7e000200u | neighbor, end});
+    }
+}
+TEST(StructuredSavedMaskJoin, CompleteWave64CompareReplacementCompiles) {
+    Emitter e;
+    std::vector<uint32_t> code{0xbf068014u, 0xbf840001u, logical(0x13), 0xd4010018u, 0x000200f0u};
+    select(code);
+    code.push_back(end);
+    ASSERT_TRUE(e.run(code));
+    expect_values(e, 0, 0);
+    retain_module(e, "complete-wave64-compare-replacement.spv");
+}
+TEST(StructuredSavedMaskJoin, Wave32CompareCannotRetireLiveB64High) {
+    Emitter e;
+    e.b.wave_size = 32;
+    e.b.allow_b32_masks = true;
+    e.rs.sreg[25] = e.b.uconst(0x12345678u);
+    e.refused(
+        {0xbf068014u, 0xbf840001u, logical(0x13), 0xd4010018u, 0x000200f0u, 0x7e000219u, end});
+}
 TEST(StructuredSavedMaskJoin, ArmLocalExecSaveCannotManufactureSkippedEdgeValue) {
     Emitter e;
     // The old spv_validate fixture restored s[2:3] even when EXECZ skipped its only writer.
     e.refused({0x7e020280u, 0x7e0002f2u, 0x7c2200f0u, 0xbf880001u, 0xbe82047eu, 0xbefe0402u, end},
               3);
+}
+TEST(StructuredSavedMaskJoin, ExactOldExecSaveExportStreamRefuses) {
+    // Keep the complete former validator fixture, including its real export lowering.
+    const uint32_t code[] = {0x7e020280u, 0x7e0002f2u, 0x7c2200f0u, 0xbf880001u, 0xbe82047eu,
+                             0xbefe0402u, 0x7e0202f2u, 0xf800180fu, 0x01010101u, end};
+    constexpr uint64_t address = 0xa4957002ull;
+    EXPECT_TRUE(recompile_fragment(code, sizeof(code) / sizeof(*code), nullptr, nullptr, UINT32_MAX,
+                                   nullptr, false, {RecompileDiagnosticStage::Fragment, address})
+                    .empty());
+    EXPECT_NE(
+        last_terminal_reject_reason(address).find("structured-saved-mask-domain-missing-edge"),
+        std::string::npos);
 }
 TEST(StructuredSavedMaskJoin, DefinedZeroBeforeExecSaveJoinCompiles) {
     Emitter e;

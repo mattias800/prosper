@@ -7539,10 +7539,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // which this narrow merge does not represent. Reject rather than attach the
                     // taken arm's marker to the synthesized bool value on both paths.
                     std::set<int> dead_b32_at_merge;
-                    std::set_symmetric_difference(
-                        rs.sreg_bool_b32.begin(), rs.sreg_bool_b32.end(),
-                        pre_bool_b32.begin(), pre_bool_b32.end(),
-                        std::inserter(dead_b32_at_merge, dead_b32_at_merge.end()));
+                    for (int reg : rs.sreg_bool_b32)
+                        if (!pre_bool_b32.contains(reg)) dead_b32_at_merge.insert(reg);
+                    for (int reg : pre_bool_b32)
+                        if (!rs.sreg_bool_b32.contains(reg)) dead_b32_at_merge.insert(reg);
                     const bool dead_domain_difference =
                         std::all_of(dead_b32_at_merge.begin(), dead_b32_at_merge.end(),
                                     [&](int reg) {
@@ -7573,8 +7573,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
-                    if (!join_structured_saved_masks(b, rs, pre_bool, preblock, thenEnd, ins,
-                                                     F.branch_pc, F.target_pc))
+                    if (!join_structured_saved_masks(b, rs, pre_bool, pre_bool_b32, preblock,
+                                                     thenEnd, ins, F.branch_pc, F.target_pc))
                         return false;
                     join_lane_slots(b, rs, pre_slots, LaneSlotEdge::of(rs, thenEnd), F.branch_pc);
                     // A differing physical-word domain needs no validity phi when that word is
@@ -7662,8 +7662,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             F.branch_pc, F.merge_pc);
                         return false;
                     }
-                    if (!join_structured_saved_masks(b, rs, then_bool, thenEnd, elseEnd, ins,
-                                                     F.branch_pc, F.merge_pc))
+                    if (!join_structured_saved_masks(b, rs, then_bool, then_bool_b32, thenEnd,
+                                                     elseEnd, ins, F.branch_pc, F.merge_pc))
                         return false;
                     join_lane_slots(b, rs, then_slots, LaneSlotEdge::of(rs, elseEnd), F.branch_pc);
                     lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)

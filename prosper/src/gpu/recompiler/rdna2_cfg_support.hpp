@@ -81,13 +81,21 @@ struct ScalarMergeBlocker {
     const char* kind = "none";
 };
 
+struct ScalarMergeMaskWriteWidths {
+    bool carry_pair = true;
+    bool implicit_vcc_pair = true;
+    bool explicit_vcc_pair = true;
+};
+
 inline bool
 sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                    ScalarMergeProof proof = ScalarMergeProof::AnyRead,
                    ScalarMergeBlocker* blocker = nullptr,
                    // Explicit compare HIGH-word kills require the caller's pair-width
                    // proof. A Wave32 compare always replaces LOW but can leave HIGH live.
-                   bool vopc_sgpr_pair_kills = false) {
+                   bool vopc_sgpr_pair_kills = false,
+                   // Match physical mask writes to the caller's actual emitter mode.
+                   ScalarMergeMaskWriteWidths mask_widths = {}) {
     const auto block = [&](const Rdna2Inst& at, const char* kind) {
         if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
         return false;
@@ -228,16 +236,25 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                         return block(in, words == 1 ? "source-dword" : "source-pair");
                     }
                 }
-                // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
+                // Check all sources before the kill: carry-in can read the old destination.
+                const bool carry_low_only =
+                    !mask_widths.carry_pair &&
+                    (vop3b_fresh_carry_output(in) ||
+                     (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 && in.opcode <= 0x12a));
                 if (in.sdst.kind == OperandKind::SGPR &&
-                    (in.sdst.value == R || in.sdst.value + 1 == R)) continue;   // redefined (pair)
+                    (in.sdst.value == R || (!carry_low_only && in.sdst.value + 1 == R)))
+                    continue;
                 // A non-X VOPC e32 compare writes the whole VCC pair — kills both halves. V_CMPX
                 // writes EXEC ONLY on RDNA2 (ISA 12.9: "EXEC[threadId] = ..."; no VCC/SDST dest),
                 // so it must NOT count as a VCC kill — miscounting it let safe_execz linearize a
                 // block whose vcc scratch-write hardware would have skipped.
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-                    (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
-                    continue;
+                    (in.dst.value == 106 || in.dst.value == 107)) {
+                    const bool pair = in.dst.kind == OperandKind::SGPR
+                                          ? mask_widths.explicit_vcc_pair
+                                          : mask_widths.implicit_vcc_pair;
+                    if (pair ? (R == 106 || R == 107) : R == in.dst.value) continue;
+                }
                 // CONFIDENCE: HIGH. RDNA2 ISA 3.9/6.8: a non-CMPX explicit compare
                 // replaces its complete low mask word, writing zero for EXEC-off lanes.
                 // SDWAB has no partial destination selection. Check sources first: a
