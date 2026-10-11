@@ -21,6 +21,7 @@ class PortableEntryExecRoot {
     std::vector<uint32_t> words_, reads_;
     std::vector<Rdna2Inst> original_;
     std::array<uint32_t, 9> domain_{};
+    ComputeDispatchLaunchState launch_{};
 
     PortableEntryExecRoot(const uint32_t*, size_t, const ComputeShaderConfig&);
     PortableEntryExecRoot(const PortableEntryExecRoot&) = delete;

@@ -94,8 +94,9 @@ struct In {
     }
 };
 
-// Every ComputeShaderConfig field, in declaration order. A field added to the struct and not here
-// is a live input the replay silently defaults; the round-trip test sets every field.
+// Original config fields in their schema-1 order. The schema-4 launch record follows the resource
+// carrier, and joins the same input-set identity. The round-trip test sets every field.
+// The schema-1 config prefix is immutable. New launch words follow the resource carrier in schema4.
 template <class Sink>
 void write_config(Sink& o, const ComputeShaderConfig& c) {
     o.template num<uint32_t>(uint32_t(c.user_sgprs.size()));
@@ -137,6 +138,25 @@ ComputeShaderConfig read_config(In& in) {
     c.float_transport.profile = static_cast<FloatTransportProfile>(in.num<uint8_t>());
     require(c.float_transport.canonical(), "refused-shader inputs float transport");
     return c;
+}
+
+template <class Sink>
+void write_launch(Sink& o, const ComputeDispatchLaunchState& launch) {
+    o.num(launch.known);
+    o.num(launch.initiator);
+    for (uint32_t word : launch.num_thread) o.num(word);
+    for (uint32_t word : launch.dimensions) o.num(word);
+}
+
+ComputeDispatchLaunchState read_launch(In& in) {
+    ComputeDispatchLaunchState launch;
+    launch.known = in.num<uint32_t>();
+    require(!(launch.known & ~ComputeDispatchLaunchState::kAll),
+            "refused-shader inputs launch presence");
+    launch.initiator = in.num<uint64_t>();
+    for (uint32_t& word : launch.num_thread) word = in.num<uint32_t>();
+    for (uint32_t& word : launch.dimensions) word = in.num<uint32_t>();
+    return launch;
 }
 
 // Owns the table through the compile-case carrier, then drops buffer bytes above the cap.
@@ -185,6 +205,7 @@ uint64_t refused_compute_inputs_identity(const ShaderResourceTable* table,
                                          const ComputeShaderConfig& c) {
     HashOut encoded;
     write_config(encoded, c);
+    write_launch(encoded, c.dispatch_launch);
     uint64_t hash = encoded.hash;
     mix(hash, compile_case_resource_metadata_identity(table));
     return hash;
@@ -196,6 +217,8 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
                             bool payload_omitted, const ComputeShaderConfig& config,
                             const std::vector<uint8_t>& carrier) {
     require(config.user_sgprs.size() <= 64, "refused-shader inputs user-SGPR bound");
+    require(!(config.dispatch_launch.known & ~ComputeDispatchLaunchState::kAll),
+            "refused-shader inputs launch presence");
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
     o.num<uint32_t>(kRefusedShaderInputsSchema);
@@ -206,6 +229,7 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
     o.num<uint8_t>(payload_omitted);
     write_config(o, config);
     o.blob(carrier);
+    write_launch(o, config.dispatch_launch);
     o.num<uint64_t>(fnv(o.bytes.data(), o.bytes.size()));
     return std::move(o.bytes);
 }
@@ -223,7 +247,7 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
     const uint32_t schema = in.num<uint32_t>();
     if (schema == 2 || schema == kRefusedGraphicsInputsSchema)
         return decode_refused_graphics_inputs(bytes);
-    require(schema == kRefusedShaderInputsSchema, "refused-shader inputs schema");
+    require(schema == 1 || schema == kRefusedShaderInputsSchema, "refused-shader inputs schema");
     RefusedShaderInputs inputs;
     inputs.stage = in.text();
     inputs.program_address = in.num<uint64_t>();
@@ -232,6 +256,7 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
     inputs.payload_omitted = in.flag();
     inputs.compute = read_config(in);
     const std::vector<uint8_t> carrier = in.blob();
+    if (schema == kRefusedShaderInputsSchema) inputs.compute.dispatch_launch = read_launch(in);
     require(in.at == in.end, "refused-shader inputs trailing data");
     if (!carrier.empty()) {
         FragmentCompileCase c = decode_fragment_compile_case(carrier);

@@ -22,17 +22,13 @@ std::array<uint32_t, 9> entry_domain(const ComputeShaderConfig& c) {
 
 bool complete_portable_launch(const ComputeShaderConfig& c) {
     // CONFIDENCE: HIGH. RDNA2 70648 section 3.12.1 initializes EXEC to the valid work-item mask.
-    // Group-count launches have no padded guest invocations. Neither a host Bool nor a host
-    // subgroup size proves these physical guest bits. Exact-thread launches remain outside this
-    // deliberately narrow contract even when their current dimensions happen to be complete.
-    if (c.wave_size != 64 || c.native_subgroup_size || c.exact_thread_extent || !c.local_x ||
-        !c.local_y || !c.local_z || !c.threads_x || !c.threads_y || !c.threads_z)
+    // Neither normalized dimensions, a host Bool nor host subgroup width proves physical guest
+    // EXEC bits. Complete local groups additionally need a whole number of guest Wave64s here.
+    if (c.wave_size != 64 || c.native_subgroup_size || !compute_dispatch_has_complete_groups(c))
         return false;
     const uint64_t xy = uint64_t{c.local_x} * c.local_y;
-    if (xy > std::numeric_limits<uint32_t>::max() / c.local_z) return false;
     const uint64_t count = xy * c.local_z;
-    return count >= 64 && count % 64 == 0 && c.threads_x % c.local_x == 0 &&
-           c.threads_y % c.local_y == 0 && c.threads_z % c.local_z == 0;
+    return count >= 64 && count % 64 == 0;
 }
 
 bool audited_integer_read(const Rdna2Inst& in) {
@@ -99,7 +95,7 @@ std::vector<uint32_t> portable_entry_exec_constant_reads(const std::vector<Rdna2
 
 PortableEntryExecRoot::PortableEntryExecRoot(const uint32_t* code, size_t dwords,
                                              const ComputeShaderConfig& config)
-    : domain_(entry_domain(config)) {
+    : domain_(entry_domain(config)), launch_(config.dispatch_launch) {
     if (!code || !dwords || !complete_portable_launch(config)) return;
     if (rdna2_walk(code, dwords, original_) != dwords) return;
     reads_ = portable_entry_exec_constant_reads(original_, config);
@@ -110,7 +106,8 @@ void PortableEntryExecRoot::specialize(const uint32_t* code, size_t dwords,
                                        const ComputeShaderConfig& config,
                                        std::vector<Rdna2Inst>& instructions) const {
     if (reads_.empty() || !code || dwords != words_.size() || entry_domain(config) != domain_ ||
-        instructions != original_ || !std::equal(words_.begin(), words_.end(), code))
+        config.dispatch_launch != launch_ || instructions != original_ ||
+        !std::equal(words_.begin(), words_.end(), code))
         return;
     for (auto& in : instructions) {
         if (!std::binary_search(reads_.begin(), reads_.end(), in.pc)) continue;

@@ -1366,6 +1366,32 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 error = "compute resource cannot be an unavailable-source placeholder";
                 return false;
             }
+    // v75: all available compute configs, in realized-compute then failed-stage order. Missing
+    // producing words remain unknown even when another record requires this version's tail.
+    if (gpu_capture_version_for(c) >= kVersionWithComputeDispatchLaunch) {
+        uint64_t count = 0;
+        for (const auto& compute : c.computes) count += compute.recompile_config_available;
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages) count += stage.recompile_config_available;
+        if (count > UINT32_MAX) {
+            error = "too many compute launch records";
+            return false;
+        }
+        w.u32(static_cast<uint32_t>(count));
+        for (const auto& compute : c.computes)
+            if (compute.recompile_config_available &&
+                !write_compute_dispatch_launch(w, compute.recompile_config.dispatch_launch)) {
+                error = "invalid compute launch presence";
+                return false;
+            }
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                if (stage.recompile_config_available &&
+                    !write_compute_dispatch_launch(w, stage.recompile_config.dispatch_launch)) {
+                    error = "invalid failed compute launch presence";
+                    return false;
+                }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

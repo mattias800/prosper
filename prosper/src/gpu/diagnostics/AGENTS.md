@@ -103,8 +103,10 @@ changes nothing the guest sees (#4700).
 - `refused_shader_dump` — on by default: each distinct refused shader (vertex, pixel or compute) is written once per run, with an index line naming its first unsupported instruction, into `refused_shaders_*/` under `PROSPER_CAPTURE_DIR`. Bounded and deduplicated by code hash, so it costs nothing on a clean run. `PROSPER_SHADER_DUMP` remains the unbounded opt-in.
   A draw the **owned-wave gate** refuses is kept the same way (#4555). Nothing was recompiled for it, so the `first_bad_*` fields on its index line are only the generic coverage census and do not say why the draw was lost; the line ends in `refusal=<reason>`, which does, and the `[refused-shader]` line in the run log repeats it (#4580). That program is the one to run `shader_inspect --raw-wide-proof` on: the `dropped-draws` alarm files these drops under `shader-recompile/*`, and the first question is whether the program belongs on the owned-wave path at all.
 - `refused_shader_inputs` — beside refused programs the dump writes `<stem>.inputs` (#4808, #4877).
-  Compute keeps schema 1: the actual `ComputeShaderConfig`, resolved resource metadata, and bounded
-  constant/vertex-buffer bytes. Graphics schema 3 records the actual direct-vertex, chained-vertex,
+  Compute schema 4 keeps the actual `ComputeShaderConfig`, resolved resource metadata, and bounded
+  constant/vertex-buffer bytes, plus original dispatch initiator/packed thread-register/dimension
+  knownness. Legacy compute schema 1 loads this raw launch state as unknown. Graphics schema 3
+  records the actual direct-vertex, chained-vertex,
   fragment or NGG-shell compiler selector, exact input spans, ABI/config/float arguments, semantic
   choice reads and trip settings. The dumped code's association with a longer NGG compiler span is
   explicit. Physical producing GS/VS/PS register values have separate availability masks; they
@@ -119,7 +121,7 @@ changes nothing the guest sees (#4700).
   0/6/7). Missing required bytes, direct guest reads, source association, choices or terminal refusal
   evidence fail INCOMPLETE, never an empty-string match. Unconsumed physical draw state does not
   invalidate compiler replay. A draw refused before compilation has an explicit unavailable selector;
-  it cannot be replayed as a fabricated invocation. Compute schema 1 still requires the run's same
+  it cannot be replayed as a fabricated invocation. Compute schemas 1/4 require the run's same
   compiler-choice environment/trip settings; graphics schemas 2/3 replay their recorded reads.
   Schema 3 keeps up to 512 bytes of terminal text outside the INCOMPLETE resource/config carrier;
   its 256-byte text ABI is unchanged. Legacy schema 2 remains readable, and an old truncated

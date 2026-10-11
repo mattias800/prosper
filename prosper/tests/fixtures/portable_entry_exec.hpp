@@ -17,6 +17,7 @@ inline ComputeShaderConfig config(uint32_t lanes = 256) {
     c.local_y = c.local_z = c.threads_y = c.threads_z = 1;
     c.wave_size = 64;
     c.lds_bytes = 4;
+    c.dispatch_launch = {ComputeDispatchLaunchState::kAll, 1u, {lanes, 1u, 1u}, {1u, 1u, 1u}};
     return c;
 }
 inline ShaderResourceTable table(uint32_t lanes = 256) {

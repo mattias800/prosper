@@ -382,7 +382,9 @@ when compilation succeeds and `5` when the translator refuses, keeping both resu
 a table-accurate verdict.
 
 A refused compute, vertex/NGG or pixel program has a `<stem>.inputs` sidecar beside its `.bin`
-(#4808, #4877). Compute schema 1 retains its producing launch/config/table. Graphics schema 2
+(#4808, #4877). Compute schema 4 retains its producing config/table plus raw dispatch initiator,
+packed FULL/PARTIAL thread registers and original direct dimensions with independent knownness.
+Legacy compute schema 1 has no raw launch-state authority. Graphics schema 2
 retains the actual compiler selector, exact source/chain spans, ABI/config/float arguments,
 semantic-choice reads, trip settings, table presence/metadata and bounded owned buffer bytes.
 Physical producing register availability is separate diagnostic evidence; absent unrelated draw
@@ -399,7 +401,7 @@ or `7`. `incomplete` means the compiler asked for something the sidecar does not
 or the live/replayed terminal refusal was not recorded. A precompile draw refusal retains an
 unavailable selector and is INCOMPLETE. Exact-source mismatches and missing/extra semantic reads
 also fail closed. A genuinely absent table is a recorded argument, not missing authority.
-Compute schema 1 still needs the same compiler-choice environment and trip settings as the run;
+Compute schemas 1/4 still need the same compiler-choice environment and trip settings as the run;
 graphics schema 2 replays its recorded reads. Older bare dumps remain readable without a sidecar. An empty unrecorded reason never proves a
 match. The counter belongs to the stage and code hash, so relocating a program or reusing a shader
 address cannot move observations to another program. It distinguishes all recorded config and

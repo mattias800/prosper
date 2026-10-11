@@ -59,6 +59,8 @@ TEST(PortableEntryExec, CompleteThreeDimensionalLaunchHasFullPhysicalEntryWords)
     c.local_y = 16;
     c.threads_x = 1920;
     c.threads_y = 1088;
+    c.dispatch_launch.num_thread = {16, 16, 1};
+    c.dispatch_launch.dimensions = {120, 68, 1};
     EXPECT_EQ(portable_entry_exec_constant_reads(decode(fixture::program()), c),
               (std::vector<uint32_t>{0, 1}));
     // Structural compilation only: the CPU oracle's coordinate model is one-dimensional.
@@ -227,4 +229,77 @@ TEST(PortableEntryExec, IndependentExpectedValuesDetectWrongWordAndWrongBorrow) 
     EXPECT_NE(wanted[512], 0u);
     EXPECT_EQ(wanted[768], 9u);
     EXPECT_EQ(wanted[769], fixture::sentinel);
+}
+
+TEST(PortableEntryExec, LegacyNormalizedLaunchDoesNotProveEntryWords) {
+    auto c = fixture::config();
+    c.dispatch_launch = {};
+    no_authority(c);
+    refuse(fixture::program(), c);
+}
+TEST(PortableEntryExec, EveryProducingWordHasIndependentRequiredPresence) {
+    for (uint32_t bit = 1; bit <= ComputeDispatchLaunchState::kDimZ; bit <<= 1) {
+        auto c = fixture::config();
+        c.dispatch_launch.known &= ~bit;
+        no_authority(c);
+        refuse(fixture::program(), c);
+    }
+}
+TEST(PortableEntryExec, PartialThreadgroupControlIsIndependentOfDimensionMode) {
+    auto c = fixture::config();
+    c.dispatch_launch.initiator |= 2u; // group-count mode still has PARTIAL_TG_EN
+    c.dispatch_launch.num_thread[0] |= 31u << 16u;
+    no_authority(c);
+    refuse(fixture::program(), c);
+}
+TEST(PortableEntryExec, DisabledPartialSettingsAreIgnoredWithoutLosingTheirRawWords) {
+    auto c = fixture::config();
+    for (auto& word : c.dispatch_launch.num_thread) word |= 0xffff0000u;
+    EXPECT_EQ(portable_entry_exec_constant_reads(decode(fixture::program()), c),
+              (std::vector<uint32_t>{0, 1}));
+    const auto module = fixture::compile(fixture::program(), c);
+    ASSERT_FALSE(module.empty());
+    bpermute_oracle::Interpreter vm(module);
+    EXPECT_EQ(vm.run_buffers(
+                  256, {{3, std::vector<uint32_t>(256u * fixture::planes, fixture::sentinel)}}, 3),
+              fixture::expected());
+    EXPECT_TRUE(vm.error.empty()) << vm.error;
+}
+TEST(PortableEntryExec, RawThreadModeAndWidthCannotBorrowNormalizedConfig) {
+    for (const uint64_t flag :
+         {uint64_t{32u}, uint64_t{1u << 15u}, uint64_t{1u << 14u}, uint64_t{1u << 13u},
+          uint64_t{1u << 12u}, uint64_t{1u << 31u}, uint64_t{1} << 32u}) {
+        auto c = fixture::config();
+        c.dispatch_launch.initiator |= flag;
+        no_authority(c);
+        refuse(fixture::program(), c);
+    }
+    auto c = fixture::config();
+    c.dispatch_launch.initiator = 0;
+    no_authority(c);
+    refuse(fixture::program(), c);
+}
+TEST(PortableEntryExec, RawDimensionsAndRegisterWordsCannotBeNormalizedIntoAuthority) {
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        auto c = fixture::config();
+        ++c.dispatch_launch.num_thread[axis];
+        no_authority(c);
+        c = fixture::config();
+        ++c.dispatch_launch.dimensions[axis];
+        no_authority(c);
+        c = fixture::config();
+        c.dispatch_launch.num_thread[axis] = 0;
+        no_authority(c);
+    }
+}
+TEST(PortableEntryExec, CheckedRawGeometryRejectsSaturationAndLocalProductOverflow) {
+    auto c = fixture::config();
+    c.threads_x = UINT32_MAX;
+    c.dispatch_launch.dimensions[0] = UINT32_MAX;
+    no_authority(c);
+    c.local_x = c.local_y = c.local_z = 65535;
+    c.threads_x = c.threads_y = c.threads_z = 65535;
+    c.dispatch_launch.num_thread = {65535, 65535, 65535};
+    c.dispatch_launch.dimensions = {1, 1, 1};
+    no_authority(c);
 }

@@ -20,7 +20,8 @@
 //
 // Graphics schemas 2/3 additionally retain actual compiler selectors/spans/config/choice reads;
 // schema 3 separates full terminal text from the resource carrier's smaller text ABI. See
-// refused_graphics_inputs.hpp. Compute schema 1 remains byte-compatible.
+// refused_graphics_inputs.hpp. Compute schema 4 appends the observed packet/register launch state;
+// legacy schema 1 remains readable with that state explicitly unknown.
 //
 // A diagnostic: written only beside a newly dumped refused program, never read by the live path.
 // Guest buffer bytes stay local, beside the dump; they are never part of the repository.
@@ -40,12 +41,12 @@ namespace prosper::gpu {
 // Guest buffer bytes kept per sidecar. Above it the table is still recorded in full, but buffer
 // contents become opaque and a replay that needs them reports INCOMPLETE.
 inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256ull * 1024ull;
-inline constexpr uint32_t kRefusedShaderInputsSchema = 1;
+inline constexpr uint32_t kRefusedShaderInputsSchema = 4;
 
 struct RefusedGraphicsInputs;
 struct RefusedShaderInputs {
     std::string stage;   // "cs", "vs", "ps"
-    std::shared_ptr<const RefusedGraphicsInputs> graphics;   // schema 2; compute stays schema 1
+    std::shared_ptr<const RefusedGraphicsInputs> graphics;   // graphics schemas 2/3
     uint64_t program_address = 0;
     std::string live_reject;           // the recompiler's terminal reject, "" if none recorded
     std::string incomplete;            // why inputs are partial, "" when complete
