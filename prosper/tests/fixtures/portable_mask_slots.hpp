@@ -2,9 +2,12 @@
 // Project-owned complete programs observe LOW/HIGH mask-slot composition through an EXEC
 // restore and the ordinary buffer sink. Slot numbers do not determine a physical half's role.
 #include "portable_mask_half.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper::test::portable_mask_slots {
