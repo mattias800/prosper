@@ -325,7 +325,7 @@ struct Interpreter {
       const auto &i = ins[l.pc];
       const auto &a = i.a;
       const uint32_t op = i.op;
-      if (op == 334 || op == 335 || op == 339) return;
+      if (op == 334 || op == 335 || op == 339 || op == 345) return;
       if (op == 224) {
         if (a.size() != 3 || word(l, a[0]) != 2 || word(l, a[1]) != 2 ||
             (word(l, a[2]) & 0x108) != 0x108)
@@ -764,6 +764,33 @@ struct Interpreter {
               if (all_done) return shared.at(storage).words;
               const size_t site = lanes.front().pc;
               const auto& collective = ins.at(site);
+              if (collective.op ==
+                  345) {   // OpGroupNonUniformShuffle: explicit exact-native profile
+                  const auto& a = collective.a;
+                  if (native_subgroup_width != 64 || count != 64 || a.size() != 5 ||
+                      !uint_type(a[0]))
+                      fail("unproved native shuffle");
+                  std::vector<Value> inputs, results;
+                  for (auto& l : lanes) {
+                      if (l.done || l.pc != site || word(l, a[2]) != 3)
+                          fail("nonuniform native shuffle");
+                      auto input = value(l, a[3]);
+                      if (input.type != a[0]) fail("shuffle input type mismatch");
+                      inputs.push_back(std::move(input));
+                  }
+                  for (auto& l : lanes) {
+                      if (!uint_type(value(l, a[4]).type)) fail("shuffle index type mismatch");
+                      const auto index = word(l, a[4]);
+                      if (index >= count) fail("shuffle index outside supplied subgroup");
+                      results.push_back(inputs[index]);
+                  }
+                  for (uint32_t lane = 0; lane < count; ++lane) {
+                      const auto& result = results[lane];
+                      set(lanes[lane], a[1], a[0], result.words, result.defined);
+                      ++lanes[lane].pc;
+                  }
+                  continue;
+              }
               if (collective.op == 334 || collective.op == 335 || collective.op == 339) {
                   if (native_subgroup_width != 64 || count != 64 || collective.a.size() != 4)
                       fail("unproved native subgroup");

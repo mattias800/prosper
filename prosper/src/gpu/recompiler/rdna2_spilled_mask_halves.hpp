@@ -74,7 +74,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::set<int>& masks, const std::set<int>& scalar_words,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                            const std::vector<int>& vector_writes,
-                           const SpilledVectorSourceMarks& source);
+                           const SpilledVectorSourceMarks& source, bool definite_scc);
 
 // At a dispatcher block entry: the reloaded SGPR words (and SCC) that may be relayed fabricated
 // words get the emitter's merge-placeholder mark, as they carried inside the case they left.

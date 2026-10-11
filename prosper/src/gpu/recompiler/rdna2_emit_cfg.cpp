@@ -2558,7 +2558,7 @@ bool emit_cfg_state_machine(
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
             advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes,
-                                  relay_sources);
+                                  relay_sources, definite_scc);
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
