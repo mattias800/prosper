@@ -1,7 +1,9 @@
 #include "gpu/execute/compute_dispatch_launch.hpp"
 
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
+#include <array>
 #include <cstddef>
 
 namespace prosper::gpu {

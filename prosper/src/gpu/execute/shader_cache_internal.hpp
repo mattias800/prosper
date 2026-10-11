@@ -18,6 +18,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/split_t8_proof.hpp"
 #include "diagnostics/env_submit.hpp"

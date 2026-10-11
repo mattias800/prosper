@@ -2,8 +2,11 @@
 
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace prosper::gpu {

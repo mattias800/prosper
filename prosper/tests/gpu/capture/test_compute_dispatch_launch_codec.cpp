@@ -2,7 +2,8 @@
 // authority. Codec success is metadata ownership only, never permission to render a capture.
 #include "fixtures/portable_entry_exec.hpp"
 #include "gpu/capture/gpu_capture.hpp"
-#include "gpu/recompiler/rdna2_entry_exec_constants.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 #include <gtest/gtest.h>
 

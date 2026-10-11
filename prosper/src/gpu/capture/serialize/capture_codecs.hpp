@@ -11,6 +11,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)

@@ -2,7 +2,9 @@
 
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace prosper::gpu {

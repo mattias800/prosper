@@ -1,4 +1,7 @@
 #include "gpu/execute/shader_cache_internal.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+
+#include <cstdint>
 
 namespace prosper::gpu {
 // Field-wise code-generation inputs. Kept out of the oversized executor; no raw-state presence

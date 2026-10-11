@@ -1,6 +1,7 @@
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/portable_entry_exec.hpp"
 #include "gpu/recompiler/rdna2_entry_exec_constants.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -260,9 +261,10 @@ TEST(PortableEntryExec, DisabledPartialSettingsAreIgnoredWithoutLosingTheirRawWo
     const auto module = fixture::compile(fixture::program(), c);
     ASSERT_FALSE(module.empty());
     bpermute_oracle::Interpreter vm(module);
-    EXPECT_EQ(vm.run_buffers(
-                  256, {{3, std::vector<uint32_t>(256u * fixture::planes, fixture::sentinel)}}, 3),
-              fixture::expected());
+    EXPECT_EQ(
+        vm.run_buffers(
+            256, {{3, std::vector<uint32_t>(size_t{256} * fixture::planes, fixture::sentinel)}}, 3),
+        fixture::expected());
     EXPECT_TRUE(vm.error.empty()) << vm.error;
 }
 TEST(PortableEntryExec, RawThreadModeAndWidthCannotBorrowNormalizedConfig) {

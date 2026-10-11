@@ -1,10 +1,13 @@
 // Raw dispatch controls are part of physical entry-mask provenance. Normalized extents lose the
 // independent partial-TG flag and register halves, so they cannot grant original guest EXEC words.
 #include "fixtures/portable_entry_exec.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/execute/compute_dispatch_launch.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <gtest/gtest.h>

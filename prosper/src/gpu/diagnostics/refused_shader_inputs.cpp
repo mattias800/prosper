@@ -3,6 +3,7 @@
 
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 #include <cstdio>
 #include <cstring>

@@ -1,8 +1,14 @@
 #include "gpu/recompiler/rdna2_entry_exec_constants.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <unordered_set>
+#include <vector>
 
 namespace prosper::gpu {
 namespace {
