@@ -246,8 +246,10 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
             for (size_t i = 0; same_stream && i < ins.size(); ++i)
                 same_stream = same_original_instruction(ins[i], original[i]);
         }
-        if (!same_stream || !native_vcc_copy_entry_masks_match(b, initial))
+        if (!same_stream || !native_vcc_copy_entry_masks_match(b, initial)) {
             b.native_bool_only_vcc_copy_pcs.clear();
+            b.fragment_bool_only_vcc_copy_pcs.clear();
+        }
         if (!same_stream || initial_active || b.invocation_guard_merge ||
             has_prior_partial_control(b)) {
             b.saved_mask_entry_prefix_pcs.clear();
@@ -265,8 +267,10 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     // The incoming state must be the original entry, not the state of a recursive slice which
     // happens to contain the same MOV PC. A later reinitialization may invalidate, never reseed.
     if (ins.size() != original.size() ||
-        !std::equal(ins.begin(), ins.end(), original.begin(), same_original_instruction))
+        !std::equal(ins.begin(), ins.end(), original.begin(), same_original_instruction)) {
         b.native_bool_only_vcc_copy_pcs.clear();
+        b.fragment_bool_only_vcc_copy_pcs.clear();
+    }
     // Physical reads and partial replacements require retained words. Mask-only saves keep their
     // existing subgroup-width contract; a shader which never observes DATA needs no new ballot.
     std::set<int> demanded;

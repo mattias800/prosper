@@ -1960,6 +1960,13 @@ int main(int argc, char** argv) {
         dump(dir, "compute_native_bool_vcc_copy_generation",
              recompile_compute(code, std::size(code), nullptr, cfg));
     }
+    // #4918: a fragment predicate copy has no DATA demand from an older VCC generation.
+    {
+        const uint32_t code[]{0xbeea0481u, 0xbe9e036au, 0x7e000281u, 0x7e020280u, 0x7d8402f9u,
+                              0x06069400u, 0xbeea0414u, 0xd5010000u, 0x01a91281u, 0xbeea0481u,
+                              0xbe9f036bu, 0xf800080fu, 0x00000000u, 0xbf810000u};
+        dump(dir, "fragment_bool_vcc_copy_generation", recompile_fragment(code, std::size(code)));
+    }
     // #4884: actual trailing B64 literals, including bit31, have a zero high word. Exercise
     // portable/native compute, fragment, one-lane NGG and the lane-independent ordinary VS zero.
     for (uint32_t shape = 0; shape < 6; ++shape) {

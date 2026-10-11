@@ -3487,6 +3487,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_saved_vcc_copy_demand.cpp
     INCLUDES src tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_saved_vcc_copy_demand
+    SOURCES tests/gpu/recompiler/test_fragment_saved_vcc_copy_demand.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     LIBRARIES prosper_core)

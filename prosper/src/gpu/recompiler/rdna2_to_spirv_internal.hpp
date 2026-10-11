@@ -669,6 +669,9 @@ struct SpirvCompute {
     std::set<uint32_t> native_logical_data_demand_pcs;
     // Original native MOV-to-VCC generations whose proved Bool has no physical DATA live-out.
     std::set<uint32_t> native_bool_only_vcc_copy_pcs;
+    // Invocation-domain fragment copies retain only their existing predicate, never DATA words.
+    std::set<uint32_t> fragment_bool_only_vcc_copy_pcs;
+    std::array<uint32_t, 9> native_vcc_copy_entry_domain{};
     std::set<int> native_vcc_copy_entry_masks;
     std::unordered_set<int> native_vcc_copy_entry_b32_masks;
     std::set<uint32_t> native_logical_uniform_entry_pcs;

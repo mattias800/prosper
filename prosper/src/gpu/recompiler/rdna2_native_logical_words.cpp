@@ -26,6 +26,30 @@ bool native_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
            in.src[0].value <= 104;
 }
 
+// CONFIDENCE: HIGH -- this fragment route preserves the same current B64 predicate.
+// Its instruction-order MUST source and generation deadness do not authorize any physical
+// words or a ballot after lanes left. Packet/portable and unrelated execution domains differ.
+bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
+    return b.is_fragment && !b.is_compute && !b.is_vertex && !b.ngg_workgroup_shell &&
+           !b.ngg_one_lane && b.guest_stage == GuestShaderStage::Fragment &&
+           b.physical_domain == PhysicalExecutionDomain::Invocation && b.wave_size == 64 &&
+           in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+           in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
+           in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 && in.src[0].value <= 104;
+}
+
+std::array<uint32_t, 9> copy_entry_domain(const SpirvCompute& b) {
+    return {static_cast<uint32_t>(b.guest_stage),
+            static_cast<uint32_t>(b.physical_domain),
+            b.wave_size,
+            b.native_subgroup_size,
+            b.is_compute,
+            b.is_fragment,
+            b.is_vertex,
+            b.ngg_workgroup_shell,
+            b.ngg_one_lane};
+}
+
 bool ordinary_pair(const Operand& source) {
     return (source.kind == OperandKind::SGPR && source.value >= 0 && source.value <= 104) ||
            (source.kind == OperandKind::Special && (source.value == 106 || source.value == 107));
@@ -129,6 +153,8 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     // can demand the current generation. The finite lattice has 128 bits per instruction.
     using Words = std::bitset<128>;
     b.native_bool_only_vcc_copy_pcs.clear();
+    b.fragment_bool_only_vcc_copy_pcs.clear();
+    b.native_vcc_copy_entry_domain = copy_entry_domain(b);
     b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
     b.native_vcc_copy_entry_b32_masks =
         initial ? initial->sreg_bool_b32 : std::unordered_set<int>{};
@@ -370,6 +396,8 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             b.native_logical_data_demand_pcs.insert(original[i].pc);
         else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             b.native_bool_only_vcc_copy_pcs.insert(original[i].pc);
+        else if (fragment_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
+            b.fragment_bool_only_vcc_copy_pcs.insert(original[i].pc);
 }
 
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
@@ -437,13 +465,17 @@ bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in) {
 }
 
 bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial) {
-    return b.native_vcc_copy_entry_masks == copy_entry_masks(initial) &&
+    return b.native_vcc_copy_entry_domain == copy_entry_domain(b) &&
+           b.native_vcc_copy_entry_masks == copy_entry_masks(initial) &&
            b.native_vcc_copy_entry_b32_masks ==
                (initial ? initial->sreg_bool_b32 : std::unordered_set<int>{});
 }
 
 bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in) {
-    if (!native_vcc_copy(b, in) || !b.native_bool_only_vcc_copy_pcs.contains(in.pc) ||
+    const bool proved_copy =
+        (native_vcc_copy(b, in) && b.native_bool_only_vcc_copy_pcs.contains(in.pc)) ||
+        (fragment_vcc_copy(b, in) && b.fragment_bool_only_vcc_copy_pcs.contains(in.pc));
+    if (!proved_copy || b.native_vcc_copy_entry_domain != copy_entry_domain(b) ||
         in.pc >= b.saved_mask_original_words.size())
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
