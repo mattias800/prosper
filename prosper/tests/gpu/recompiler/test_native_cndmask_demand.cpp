@@ -89,9 +89,10 @@ struct Emitter {
 std::vector<uint32_t> production_program(uint32_t left = 129, uint32_t right = 137,
                                          const std::vector<uint32_t>& tail = {},
                                          const std::vector<uint32_t>& middle = {},
-                                         uint32_t condition = 20) {
-    // Narrow EXEC, then create explicit saved masks from lane ID. The logical has
-    // no full-participation proof and must retain its Bool-only consumption route.
+                                         uint32_t condition = 20, bool guarded = true) {
+    // CMPX alone keeps every physical worker. An earlier wave-dependent VCC exit
+    // bypasses these producers, so their words lack the original-program proof;
+    // the dispatcher must still retain the actual saved Bool condition.
     std::vector<uint32_t> code{0x7daa0080u, 0x7d8400f9u, 0x06868081u,
                                0x7d8400f9u, 0x06868281u, logical()};
     code.insert(code.end(), middle.begin(), middle.end());
@@ -99,11 +100,16 @@ std::vector<uint32_t> production_program(uint32_t left = 129, uint32_t right = 1
     code.insert(code.end(), select.begin(), select.end());
     code.insert(code.end(), tail.begin(), tail.end());
     code.push_back(end);
+    if (guarded) {
+        const uint32_t exit = 0xbf860000u | static_cast<uint32_t>(code.size() - 1);
+        code.insert(code.begin(), {0x7d840080u, exit});
+    }
     return code;
 }
 std::vector<uint32_t> compile(const std::vector<uint32_t>& code, uint64_t address) {
     ComputeShaderConfig config;
-    config.wave_size = config.native_subgroup_size = config.local_x = 64;
+    config.wave_size = config.native_subgroup_size = 64;
+    config.local_x = 128;
     config.user_sgprs.resize(8);
     return recompile_compute(code.data(), code.size(), nullptr, config,
                              {RecompileDiagnosticStage::Compute, address});
@@ -267,10 +273,10 @@ TEST(NativeCndmaskDemand, GenuineWordsRemainReadableBesideTheBoolCondition) {
 TEST(NativeCndmaskDemand, ProductionPartialExecAcceptsBoolCondition) {
     const auto code = production_program();
     const auto ins = decode(code);
-    ASSERT_TRUE(vopc_is_cmpx(ins.front().opcode));
-    ASSERT_EQ(ins[1].dst.value, 0);
-    ASSERT_EQ(ins[2].dst.value, 2);
-    ASSERT_EQ(ins[4].src[2].value, 20);
+    ASSERT_TRUE(vopc_is_cmpx(ins[2].opcode));
+    ASSERT_EQ(ins[3].dst.value, 0);
+    ASSERT_EQ(ins[4].dst.value, 2);
+    ASSERT_EQ(ins[6].src[2].value, 20);
     EXPECT_FALSE(compile(code, 0xa4904101ull).empty());
 }
 
@@ -345,5 +351,9 @@ TEST(NativeCndmaskDemand, ProductionScalarWordsDoNotSupplyBoolCondition) {
     const auto code = production_program(129, 137, {}, {0xbe980381u, 0xbe990380u}, 24);
     EXPECT_TRUE(compile(code, 0xa490410cull).empty());
     EXPECT_NE(last_terminal_reject_reason(0xa490410cull).find("op=0x101"), std::string::npos);
+}
+
+TEST(NativeCndmaskDemand, StraightCmpxKeepsGenuineNumericDataWithoutAnEarlierExit) {
+    EXPECT_FALSE(compile(production_program(20, 137, {}, {}, 20, false), 0xa490410dull).empty());
 }
 }   // namespace prosper::gpu
