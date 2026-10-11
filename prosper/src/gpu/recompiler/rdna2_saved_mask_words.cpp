@@ -2,6 +2,7 @@
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_copy_continuation.hpp"
 #include <bit>
 
 namespace prosper::gpu {
@@ -246,10 +247,9 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
             for (size_t i = 0; same_stream && i < ins.size(); ++i)
                 same_stream = same_original_instruction(ins[i], original[i]);
         }
-        if (!same_stream || !native_vcc_copy_entry_masks_match(b, initial)) {
-            b.native_bool_only_vcc_copy_pcs.clear();
-            b.fragment_bool_only_vcc_copy_pcs.clear();
-        }
+        if ((!same_stream || !native_vcc_copy_entry_masks_match(b, initial)) &&
+            !consume_saved_mask_copy_continuation(b, ins, code, dwords, initial_active, initial))
+            revoke_saved_mask_copy_proof(b);
         if (!same_stream || initial_active || b.invocation_guard_merge ||
             has_prior_partial_control(b)) {
             b.saved_mask_entry_prefix_pcs.clear();
@@ -268,8 +268,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     // happens to contain the same MOV PC. A later reinitialization may invalidate, never reseed.
     if (ins.size() != original.size() ||
         !std::equal(ins.begin(), ins.end(), original.begin(), same_original_instruction)) {
-        b.native_bool_only_vcc_copy_pcs.clear();
-        b.fragment_bool_only_vcc_copy_pcs.clear();
+        revoke_saved_mask_copy_proof(b);
     }
     // Physical reads and partial replacements require retained words. Mask-only saves keep their
     // existing subgroup-width contract; a shader which never observes DATA needs no new ballot.

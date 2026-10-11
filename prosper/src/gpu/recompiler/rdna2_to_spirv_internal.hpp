@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string_view>
@@ -38,6 +39,8 @@
 #include <vector>
 
 namespace prosper::gpu {
+
+class SavedMaskCopyFrame;
 
 inline const char* recompile_diagnostic_stage_name(RecompileDiagnosticStage stage) {
     switch (stage) {
@@ -672,6 +675,8 @@ struct SpirvCompute {
     // Invocation-domain fragment copies retain only their existing predicate, never DATA words.
     std::set<uint32_t> fragment_bool_only_vcc_copy_pcs;
     std::array<uint32_t, 9> native_vcc_copy_entry_domain{};
+    std::shared_ptr<SavedMaskCopyFrame> saved_mask_copy_frame;
+    uint64_t saved_mask_copy_revocation_epoch = 0;
     std::set<int> native_vcc_copy_entry_masks;
     std::unordered_set<int> native_vcc_copy_entry_b32_masks;
     std::set<uint32_t> native_logical_uniform_entry_pcs;

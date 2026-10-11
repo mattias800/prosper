@@ -18,6 +18,7 @@
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_copy_continuation.hpp"
 #include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -6066,7 +6067,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_lds_fminmax_dispatcher) {
     // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
-    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_dispatch_active, &rs);
+    SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
@@ -6819,11 +6820,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // counted back-edge removed it can use the established nested forward-if/divergent-loop
         // structurizer. This composes a counted loop with a non-trivial shared postlude without
         // duplicating that CFG machinery or admitting arbitrary branches inside the counted loop.
-        std::vector<Rdna2Inst> postloop;
-        for (const auto& in : ins) if (in.pc >= L.exit_pc) postloop.push_back(in);
-        if (!postloop.empty() &&
-            !emit_body(b, rs, postloop, effective_safe, rt, allow_exec_update, allow_smem,
-                       exp_fn, code, dwords)) return false;
+        if (!copy_scope.emit_counted_postlude(L.exit_pc, effective_safe, rt, allow_exec_update,
+                                              allow_smem, exp_fn))
+            return false;
     } else if (std::vector<DivLoop> Ls; true) {
         // EXEC/VCC/SCC-exit loops (#273/#615/#1554) + structured scalar IFs. Each is a real SPIR-V
         // loop with header phis for carried register/mask state. Fragment conditions are exact wave64
