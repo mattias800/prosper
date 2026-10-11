@@ -140,6 +140,7 @@ TEST(NativeCndmaskDemand, MarkedPeerKeepsBoolSelectAndActualSelectedValues) {
     const auto actual = vm.run_buffers(64, {{1, std::vector<uint32_t>(64, 0xdeadbeef)}}, 1);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     std::vector<uint32_t> expected;
+    expected.reserve(64);
     for (uint32_t lane = 0; lane < 64; ++lane) expected.push_back(((a & c) >> lane) & 1u ? 9u : 1u);
     EXPECT_EQ(actual, expected);
 }
