@@ -344,8 +344,10 @@ TEST(NativeSavedVccCopyDemand, IndependentHighDestinationRemainsOutsideNewProof)
 
 TEST(NativeSavedVccCopyDemand, NggShellCannotBorrowOrdinaryComputeCopyProof) {
     Emitter e;
+    const auto code = program();
+    e.prove(code);
     e.b.ngg_workgroup_shell = true;
-    EXPECT_FALSE(e.copy(program()));
+    EXPECT_FALSE(e.emit(decode(code)[1]));
     e.expect_copy_refusal();
 }
 

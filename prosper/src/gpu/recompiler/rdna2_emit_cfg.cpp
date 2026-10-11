@@ -5764,16 +5764,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 b.emit_label(body_label);
             }
 
-            auto emit_phase = [&](std::vector<Rdna2Inst>& phase) {
+            auto emit_phase = [&](std::vector<Rdna2Inst>& phase, size_t begin, size_t end) {
                 // Unguarded phases are admitted specifically because the whole-stream exact-wave
                 // dispatcher was blocked by a guest barrier. Use that dispatcher directly for each
                 // now barrier-free region; re-entering the narrow structurizer could reject the same
                 // backward-else/complex shape before it ever reaches the fallback.
                 if (!phased.guarded || initial_dispatch_active)
-                    return emit_cfg_state_machine(
-                        b, rs, phase, safe, rt, allow_exec_update, allow_smem, exp_fn, code, dwords,
-                        initial_dispatch_active, force_lds_fminmax_dispatcher, {}, nullptr, nullptr,
-                        &barrier_halves);
+                    return copy_scope.emit_barrier_phase(
+                        begin, end, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                        initial_dispatch_active, force_lds_fminmax_dispatcher, &barrier_halves);
                 return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                  exp_fn, code, dwords, &dead_masks, true, 0, false,
                                  force_lds_fminmax_dispatcher);
@@ -5795,7 +5794,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
                                      phase.front().pc, phase[phase.size() - 2].pc,
                                      ins[barrier_index].pc);
-                    if (!emit_phase(phase)) {
+                    if (!emit_phase(phase, phase_begin, barrier_index)) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-phase-reject", "consequent",
                             "begin=%u end=%u", phase.front().pc, phase[phase.size() - 2].pc);
@@ -5810,7 +5809,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr, "[compute-phase] begin=%u end=%u tail=1\n",
                                  tail.front().pc, tail.back().pc);
-                if (!emit_phase(tail)) {
+                if (!emit_phase(tail, phase_begin, ins.size())) {
                     log_recompile_diagnostic(b.diagnostic, "compute-phase-reject", "consequent",
                                              "begin=%u end=%u tail=1",
                                              tail.front().pc, tail.back().pc);

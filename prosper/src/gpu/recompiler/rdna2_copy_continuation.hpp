@@ -33,6 +33,12 @@ class SavedMaskCopyBodyScope {
     bool emit_counted_postlude(uint32_t exit_pc, const std::unordered_set<uint32_t>& safe,
                                const ShaderResourceTable*, bool allow_exec_update, bool allow_smem,
                                const std::function<bool(RegState&, const Rdna2Inst&)>&);
+
+    bool emit_barrier_phase(size_t begin, size_t end, const std::unordered_set<uint32_t>& safe,
+                            const ShaderResourceTable*, bool allow_exec_update, bool allow_smem,
+                            const std::function<bool(RegState&, const Rdna2Inst&)>&,
+                            uint32_t initial_active, bool synchronize_lds_fminmax,
+                            NativeBarrierHalfProof* barrier_halves);
 };
 
 // A one-shot initializer permit, never a reusable mask or participation fact.

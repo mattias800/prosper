@@ -10,6 +10,7 @@
 #include <string>
 
 namespace prosper::gpu::fragment_predicate_oracle {
+enum class LaneInput { FragmentSubgroup, SuppliedComputeLinear };
 class Values {
     struct Node {
         uint32_t opcode;
@@ -19,7 +20,7 @@ class Values {
     std::map<uint32_t, Node> nodes;
     std::map<uint32_t, uint32_t> memo;
     std::set<uint32_t> visiting;
-    uint32_t uint_type, bool_type, lane_pointer;
+    uint32_t uint_type, bool_type, lane_pointer, supplied_lane_value = 0;
     bool valid = true;
 
     void collect(const std::vector<uint32_t>& words) {
@@ -49,7 +50,13 @@ class Values {
             at += width;
         }
     }
+    uint32_t type_of(uint32_t id) const {
+        if (id == supplied_lane_value && supplied_lane_value) return uint_type;
+        const auto at = nodes.find(id);
+        return at == nodes.end() ? 0 : at->second.type;
+    }
     std::optional<uint32_t> read(uint32_t id, uint32_t lane) {
+        if (id == supplied_lane_value && supplied_lane_value) return lane;
         if (memo.contains(id)) return memo.at(id);
         if (!nodes.contains(id) || !visiting.insert(id).second || visiting.size() > 128) {
             error = "unsupported or cyclic SSA input";
@@ -68,14 +75,12 @@ class Values {
             result = lane;
         else if (n.opcode == Op_LogicalNot && n.type == bool_type && a.size() == 1) {
             const auto x = read(a[0], lane);
-            if (x && nodes.at(a[0]).type == bool_type) result = !*x;
+            if (x && type_of(a[0]) == bool_type) result = !*x;
         } else if (a.size() == 2) {
             const auto x = read(a[0], lane), y = read(a[1], lane);
             if (x && y) {
-                const bool integers =
-                    nodes.at(a[0]).type == uint_type && nodes.at(a[1]).type == uint_type;
-                const bool booleans =
-                    nodes.at(a[0]).type == bool_type && nodes.at(a[1]).type == bool_type;
+                const bool integers = type_of(a[0]) == uint_type && type_of(a[1]) == uint_type;
+                const bool booleans = type_of(a[0]) == bool_type && type_of(a[1]) == bool_type;
                 if (n.opcode == Op_BitwiseAnd && n.type == uint_type && integers) result = *x & *y;
                 if (n.opcode == Op_ShiftRightLogical && n.type == uint_type && integers && *y < 32)
                     result = *x >> *y;
@@ -88,9 +93,8 @@ class Values {
         } else if (n.opcode == Op_Select && a.size() == 3) {
             const auto condition = read(a[0], lane);
             const auto yes = read(a[1], lane), no = read(a[2], lane);
-            if (condition && yes && no && nodes.at(a[0]).type == bool_type &&
-                nodes.at(a[1]).type == n.type && nodes.at(a[2]).type == n.type &&
-                (n.type == uint_type || n.type == bool_type))
+            if (condition && yes && no && type_of(a[0]) == bool_type && type_of(a[1]) == n.type &&
+                type_of(a[2]) == n.type && (n.type == uint_type || n.type == bool_type))
                 result = *condition ? *yes : *no;
         }
         visiting.erase(id);
@@ -103,10 +107,16 @@ class Values {
 
 public:
     std::string error;
-    explicit Values(const SpirvCompute& b)
+    explicit Values(const SpirvCompute& b, LaneInput input = LaneInput::FragmentSubgroup)
         : uint_type(b.t_u32), bool_type(b.t_bool), lane_pointer(b.v_subgroup_localid) {
         collect(b.types);
         collect(b.code);
+        if (input == LaneInput::SuppliedComputeLinear) {
+            // The caller supplies this exact builder-owned scalar input. This
+            // does not evaluate launch topology or reinterpret arbitrary loads.
+            valid = valid && b.is_compute && !b.is_fragment && b.linear_localid;
+            supplied_lane_value = b.linear_localid;
+        }
     }
     std::optional<uint32_t> evaluate(uint32_t id, uint32_t lane) {
         memo.clear();
