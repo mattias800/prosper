@@ -2,6 +2,7 @@
 // The selected values must stay correct, numeric operands must still require genuine words,
 // and joins/overwrites must not manufacture a MUST Bool fact or a producer ballot.
 #include "bpermute_spirv_oracle.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -110,6 +111,7 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& code, uint64_t addres
     ComputeShaderConfig config;
     config.wave_size = config.native_subgroup_size = 64;
     config.local_x = 128;
+    prosper::test::complete_compute_launch(config);
     config.user_sgprs.resize(8);
     return recompile_compute(code.data(), code.size(), nullptr, config,
                              {RecompileDiagnosticStage::Compute, address});

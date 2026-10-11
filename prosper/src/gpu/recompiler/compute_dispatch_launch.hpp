@@ -22,9 +22,23 @@ struct ComputeDispatchLaunchState {
     bool operator==(const ComputeDispatchLaunchState&) const = default;
 };
 
+// Compact original producing profile used by entry proofs. Keep every raw observed word and
+// normalized dimension in identity; equal geometry alone is not equal dispatch authority.
+struct ComputeDispatchLaunchProfile {
+    ComputeDispatchLaunchState launch;
+    std::array<uint32_t, 3> local{};
+    std::array<uint32_t, 3> threads{};
+    uint32_t wave_size = 0;
+    bool exact_thread_extent = false;
+
+    bool operator==(const ComputeDispatchLaunchProfile&) const = default;
+};
+
 struct ComputeShaderConfig;
+ComputeDispatchLaunchProfile compute_dispatch_launch_profile(const ComputeShaderConfig&);
 // Prove that the observed packet launches complete local groups. This says nothing about a
 // complete logical guest wave (a local group can contain 65 workers), subsequent guest EXEC, or
 // current host participation. Unknown/partial/thread-dimension launches remain outside this scope.
 bool compute_dispatch_has_complete_groups(const ComputeShaderConfig&);
+bool compute_dispatch_has_complete_groups(const ComputeDispatchLaunchProfile&);
 } // namespace prosper::gpu

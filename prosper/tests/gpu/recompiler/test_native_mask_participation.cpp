@@ -1,4 +1,5 @@
 #include "fixtures/native_mask_participation.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_native_participation.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
@@ -14,6 +15,7 @@ struct Entry {
         b.native_subgroup_size = 64;
         b.begin(64, nullptr, 64, 1, 1, 64, 13);
         b.native_logical_uniform_launch = true;
+        prosper::test::bind_checked_compute_launch(b, fixture::config());
         rs.exec = b.btrue();
         rs.vcc = b.btrue();
         rs.vreg[0] = b.localid_comp[0];

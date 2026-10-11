@@ -12,6 +12,7 @@
 // Each negative arm pins the refusal REASON (the shared guard's own diagnostic), so a refusal that
 // merely happens for another reason cannot satisfy it. The controls keep admitting a fully defined
 // pair, and a pair written on BOTH arms of the if.
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
@@ -82,6 +83,7 @@ Words compile_whole(Stage stage, const Words& code) {
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(config);
     const ShaderResourceTable table = output_table();
     return recompile_compute(code.data(), code.size(), &table, config,
                              {RecompileDiagnosticStage::Compute, kAddress});

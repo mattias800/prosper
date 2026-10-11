@@ -1001,6 +1001,7 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
     // Bind the uniform-prefix theorem to this producing boundary. NGG/VALU probes may load
     // per-invocation scalar inputs and therefore cannot inherit this launch contract.
     b.native_logical_uniform_launch = true;
+    b.guest_compute_launch = compute_dispatch_launch_profile(config);
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);

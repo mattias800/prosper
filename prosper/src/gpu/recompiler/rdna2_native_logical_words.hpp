@@ -12,7 +12,8 @@ bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in);
 void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original,
                                            const RegState* initial);
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
-                                                   const std::vector<Rdna2Inst>& original);
+                                                   const std::vector<Rdna2Inst>& original,
+                                                   const RegState* initial);
 bool native_logical_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in);
 bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in);
 bool native_vcc_copy_entry_masks_match(const SpirvCompute& b, const RegState* initial);

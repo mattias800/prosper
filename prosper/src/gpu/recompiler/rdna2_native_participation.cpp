@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_native_participation.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
@@ -54,9 +55,9 @@ Facts meet(Facts a, const Facts& b) {
     return a;
 }
 bool ordinary(const SpirvCompute& b) {
-    return b.native_logical_uniform_launch && b.is_compute && !b.is_fragment_packet() &&
-           !b.ngg_workgroup_shell && !b.ngg_one_lane && b.wave_size == 64 &&
-           b.native_subgroup_size == 64 && b.local_count == 64;
+    return native_compute_has_complete_entry(b) && b.native_logical_uniform_launch &&
+           b.is_compute && !b.is_fragment_packet() && !b.ngg_workgroup_shell && !b.ngg_one_lane &&
+           b.wave_size == 64 && b.native_subgroup_size == 64 && b.local_count == 64;
 }
 bool scalar_word_available(const RegState& rs, int r) {
     if (r < 0 || r >= 124 || sreg_word_may_be_fabricated(rs, r) ||
@@ -421,6 +422,13 @@ std::vector<uint64_t> native_participation_entry(const SpirvCompute& b, const Re
     std::vector<uint64_t> result{b.guest_local_size[0], b.guest_local_size[1],
                                  b.guest_local_size[2], rs->exec,
                                  rs->exec_narrowed,     rs->scc_merge_placeholder};
+    const auto& launch = b.guest_compute_launch;
+    result.push_back(launch.launch.known);
+    result.push_back(launch.launch.initiator);
+    for (const auto word : launch.launch.num_thread) result.push_back(word);
+    for (const auto word : launch.launch.dimensions) result.push_back(word);
+    for (const auto dimension : launch.threads) result.push_back(dimension);
+    result.push_back(launch.exact_thread_extent);
     for (int r = 0; r < 128; ++r) {
         const auto current = rs->sreg.find(r), input = rs->sreg_input.find(r);
         result.push_back(current == rs->sreg.end() ? 0 : current->second);
@@ -536,6 +544,7 @@ bool native_mask_predicate_available(const RegState& rs, const Rdna2Inst& in) {
     return true;
 }
 bool native_mask_participation_site(const SpirvCompute& b, const Rdna2Inst& in) {
-    return ordinary(b) && b.native_participating_mask_pcs.contains(in.pc);
+    return ordinary(b) && saved_mask_physical_launch_matches_original(b) &&
+           b.native_participating_mask_pcs.contains(in.pc);
 }
 }   // namespace prosper::gpu

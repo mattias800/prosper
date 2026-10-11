@@ -1,8 +1,10 @@
 // #4892: native SOP2 B64 DATA must keep departed-lane bits, not reballot an older Bool.
 // Execute the production integer words independently; partial and marked mask-only sources stay DATA gaps.
 #include "bpermute_spirv_oracle.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
 
 namespace prosper::gpu {
@@ -43,6 +45,10 @@ struct Emitter {
         // input envelope, then select native lowering for the production operation.
         b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
         b.native_subgroup_size = 64;
+        ComputeShaderConfig launch;
+        launch.local_x = launch.wave_size = launch.native_subgroup_size = 64;
+        prosper::test::complete_compute_launch(launch);
+        prosper::test::bind_checked_compute_launch(b, launch);
         b.diagnostic = {RecompileDiagnosticStage::Compute, 0xa4892001ull};
         rs.exec = b.btrue();
         rs.vcc = b.bfalse();
@@ -504,6 +510,7 @@ std::vector<uint32_t> ordinary_compute(const std::vector<uint32_t>& code, bool p
     config.exact_thread_extent = partial;
     config.threads_x = partial ? 8 : 64;
     config.threads_y = config.threads_z = 1;
+    if (!partial) prosper::test::complete_compute_launch(config);
     return recompile_compute(code.data(), code.size(), nullptr, config);
 }
 }   // namespace

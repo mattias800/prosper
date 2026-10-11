@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -134,7 +135,7 @@ bool uses_native_saved_mask_words(const SpirvCompute& b) {
 }
 
 bool saved_mask_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in) {
-    if (!uses_native_saved_mask_words(b) ||
+    if (!uses_native_saved_mask_words(b) || !saved_mask_physical_launch_matches_original(b) ||
         !(b.saved_mask_entry_prefix_pcs.contains(in.pc) ||
           (!b.saved_mask_in_dispatcher && b.saved_mask_reconverged_entry_pcs.contains(in.pc)) ||
           native_mask_participation_site(b, in)) ||
@@ -175,7 +176,8 @@ bool saved_mask_mov_defines_words(const SpirvCompute& b, const Rdna2Inst& in, bo
            (in.src[0].kind == OperandKind::InlineInt || scalar_result ||
             (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && source_is_mask &&
              in.src[0].kind != OperandKind::SGPR &&
-             (in.dst.value > 104 || saved_mask_producer_has_full_participation(b, in))));
+             (saved_mask_producer_has_full_participation(b, in) ||
+              native_uniform_exec_mov_has_full_participation(b, in))));
 }
 
 bool saved_mask_logical_defines_words(const SpirvCompute& b, const Rdna2Inst& in,
@@ -253,20 +255,27 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
             !consume_saved_mask_copy_continuation(b, ins, code, dwords, initial_active, initial))
             revoke_saved_mask_copy_proof(b);
         if (!same_stream ||
-            b.native_participation_entry_state != native_participation_entry(b, initial))
+            b.native_participation_entry_state != native_participation_entry(b, initial)) {
             b.native_participating_mask_pcs.clear();
-        if (!same_stream || initial_active || b.invocation_guard_merge ||
-            has_prior_partial_control(b)) {
+            b.native_uniform_exec_mov_pcs.clear();
+        }
+        if (!same_stream || !saved_mask_physical_launch_matches_original(b) || initial_active ||
+            b.invocation_guard_merge || has_prior_partial_control(b)) {
+            if (!b.saved_mask_original_fragment_entry)
+                b.native_compute_physical_entry_expired = true;
             b.saved_mask_entry_prefix_pcs.clear();
             b.saved_mask_reconverged_entry_pcs.clear();
             b.native_logical_uniform_entry_pcs.clear();
             b.native_participating_mask_pcs.clear();
+            b.native_uniform_exec_mov_pcs.clear();
         }
         return;
     }
     b.saved_mask_word_analysis_done = true;
     if (!uses_native_saved_mask_words(b) || !code || !dwords) return;
     b.saved_mask_original_words.assign(code, code + dwords);
+    b.saved_mask_original_compute_launch = b.guest_compute_launch;
+    b.saved_mask_original_fragment_entry = b.is_fragment;
     std::vector<Rdna2Inst> original;
     rdna2_walk(code, dwords, original);
     initialize_native_logical_data_demand(b, original, initial);
@@ -323,12 +332,18 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
         }
     }
     b.saved_mask_word_roots = std::move(demanded);
-    if (initial_active || b.invocation_guard_merge || has_prior_partial_control(b)) return;
+    if (initial_active || b.invocation_guard_merge || has_prior_partial_control(b) ||
+        !saved_mask_physical_launch_matches_original(b)) {
+        if (!b.saved_mask_original_fragment_entry) b.native_compute_physical_entry_expired = true;
+        return;
+    }
     // Never manufacture entry participation from a sliced phase or a rewritten control stream.
-    if (ins.size() != original.size()) return;
-    for (size_t i = 0; i < ins.size(); ++i)
-        if (!same_original_instruction(ins[i], original[i])) return;
-    initialize_native_logical_uniform_entry_proof(b, original);
+    if (ins.size() != original.size() ||
+        !std::equal(ins.begin(), ins.end(), original.begin(), same_original_instruction)) {
+        if (!b.saved_mask_original_fragment_entry) b.native_compute_physical_entry_expired = true;
+        return;
+    }
+    initialize_native_logical_uniform_entry_proof(b, original, initial);
     b.native_participation_entry_state = native_participation_entry(b, initial);
     b.native_participating_mask_pcs = native_mask_participation(b, initial, original);
     b.saved_mask_reconverged_entry_pcs = reconverged_entry_pcs(original);
