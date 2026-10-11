@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>
 #include <initializer_list>
+#include <utility>
 #include <vector>
 namespace prosper::test::portable_mask_common {
 namespace f = portable_mask_slots;
@@ -58,6 +59,18 @@ inline std::vector<uint32_t> mbcnt(std::vector<uint32_t> code, uint32_t source, 
                                    uint32_t accumulator = 7) {
     code.insert(code.end(),
                 {high ? 0xd7660003u : 0xd7650003u, source | ((128u + accumulator) << 9)});
+    store(code);
+    return code;
+}
+// A separate complete mask stays current between unrelated symbolic half words.
+inline std::vector<uint32_t> whole_neighbors() {
+    auto code = halves(false, true);
+    code.insert(code.end(),
+                {base::mov(126, 193, true), base::mov(22, 126, true), base::mov(24, 20)});
+    return code;
+}
+inline std::vector<uint32_t> whole_mbcnt(std::vector<uint32_t> code) {
+    code.insert(code.end(), {0xd7650003u, 0x00010016u, 0xd7660003u, 0x00020617u});
     store(code);
     return code;
 }

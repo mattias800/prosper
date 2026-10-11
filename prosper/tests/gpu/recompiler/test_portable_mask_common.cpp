@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 namespace {
 namespace f = prosper::test::portable_mask_slots;
@@ -355,4 +356,41 @@ TEST(PortableMaskCommon, ExplicitActiveCallerCannotSupplyAbsentGuestBits) {
     };
     run(false);
     run(true);
+}
+
+TEST(PortableMaskCommon, CompleteWholeMbcntKeepsBothSymbolicNeighborsSeparate) {
+    std::vector<uint32_t> expected(64);
+    for (uint32_t lane = 0; lane < 64; ++lane) expected[lane] = lane;
+    values(c::whole_mbcnt(c::whole_neighbors()), expected);
+}
+TEST(PortableMaskCommon, CompleteWholeFfbhKeepsBothSymbolicNeighborsSeparate) {
+    values(c::ffbh(c::whole_neighbors(), 22), std::vector<uint32_t>(64, 0));
+}
+TEST(PortableMaskCommon, OrdinaryOverwriteRetiresTheWholeNeighborGeneration) {
+    for (uint32_t word : {22u, 23u}) {
+        SCOPED_TRACE(word);
+        auto code = c::whole_neighbors();
+        code.push_back(base::mov(word, 128));
+        const auto attempt = f::compile(c::whole_mbcnt(std::move(code)), true);
+        EXPECT_TRUE(attempt.module.empty()) << "overwritten whole generation admitted";
+        EXPECT_FALSE(attempt.refusal.empty());
+    }
+}
+TEST(PortableMaskCommon, OneArmWholeNeighborNeedsAllPathAuthority) {
+    for (bool replace_whole : {false, true}) {
+        SCOPED_TRACE(replace_whole);
+        auto code = c::whole_neighbors();
+        code.insert(code.end(), {0xbf068000u, 0xbf840001u,
+                                 replace_whole ? base::mov(22, 126, true) : base::mov(23, 128)});
+        code = c::whole_mbcnt(std::move(code));
+        if (replace_whole) {
+            std::vector<uint32_t> expected(64);
+            for (uint32_t lane = 0; lane < 64; ++lane) expected[lane] = lane;
+            values(code, expected);
+        } else {
+            const auto attempt = f::compile(code, true);
+            EXPECT_TRUE(attempt.module.empty()) << "one-arm complete root admitted";
+            EXPECT_FALSE(attempt.refusal.empty());
+        }
+    }
 }

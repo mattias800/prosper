@@ -20,8 +20,10 @@ bool half_overlap(const PortableMaskHalfTypes* types, int source, uint32_t width
 }
 bool projection_tainted(const PortableMaskHalfTypes* types, int source) {
     // A lone LOW carrier must not masquerade as the adjacent word's missing HIGH source.
+    // An independent MUST complete root is its own current whole-mask generation.
     return half_overlap(types, source, 1) ||
-           (half_overlap(types, source - 1, 1) && !types->numeric_words.contains(source));
+           (half_overlap(types, source - 1, 1) && !types->numeric_words.contains(source) &&
+            !types->complete.contains(source));
 }
 uint32_t half_value(const RegState& rs, const PortableMaskHalfTypes& types, int source) {
     const auto role = types.words.find(source);
