@@ -49,14 +49,14 @@ SpillSlotDomain written_domain(const Rdna2Inst& in, const SpillSlotMustSets& set
         if (!sets.scalar_words.contains(source.value)) return SpillSlotDomain::MaskAny;
         return sets.masks.contains(source.value) ? SpillSlotDomain::Other : SpillSlotDomain::Data;
     }
+    if (spill_source_is_scalar_data(in, sets.masks, sets.ambiguous, sets.scalar_words,
+                                    sets.readlane_words, context.physical_saved_words))
+        return SpillSlotDomain::Data;
     if (source.kind == OperandKind::SGPR && sets.masks.contains(source.value))
         // A mask the dispatcher cannot persist as a Bool reaches the write as a Bool only when it
         // was defined in the same case. Which one the write sees is not decidable here.
         return context.mask_keys.contains(source.value) ? SpillSlotDomain::MaskLo
                                                         : SpillSlotDomain::Conflict;
-    if (spill_source_is_scalar_data(in, sets.masks, sets.ambiguous, sets.scalar_words,
-                                    sets.readlane_words))
-        return SpillSlotDomain::Data;
     return SpillSlotDomain::Other;
 }
 
@@ -113,13 +113,14 @@ void meet_spill_slot_domains(SpillSlotDomains& into, const SpillSlotDomains& inc
 
 bool spill_source_is_scalar_data(const Rdna2Inst& in, const std::set<int>& masks,
                                  const std::set<int>& ambiguous, const std::set<int>& scalar_words,
-                                 const std::set<int>& readlane_words) {
+                                 const std::set<int>& readlane_words, bool physical_saved_words) {
     if (in.src[0].kind != OperandKind::SGPR) return false;
     const int source = in.src[0].value;
     const auto in_pair = [&](const std::set<int>& pairs) {
         return pairs.contains(source) || (source > 0 && pairs.contains(source - 1));
     };
-    return scalar_words.contains(source) && !in_pair(masks) && !in_pair(ambiguous) &&
+    return scalar_words.contains(source) &&
+           (physical_saved_words || (!in_pair(masks) && !in_pair(ambiguous))) &&
            !readlane_words.contains(source);
 }
 

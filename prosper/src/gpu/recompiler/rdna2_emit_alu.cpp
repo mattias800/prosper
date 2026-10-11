@@ -40,6 +40,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_mask_write.hpp"
 
 namespace prosper::gpu {
@@ -4389,9 +4390,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
                             rs.sreg_wave64_mask_half[in.dst.value] = sit->second;
                             rs.sreg_wave64_mask_half_index[in.dst.value] = proven_half->second;
-                            // Override even an existing scalar placeholder: a physical spill lane
-                            // can be allocated in both dispatcher domains, and its uint Function
-                            // variable is zero on mask-only paths.
+                            // Override the scalar placeholder: a dual-domain spill lane's uint
+                            // Function variable is zero on mask-only paths.
                             rs.sreg[in.dst.value] = b.native_wave_ballot_half(
                                 sit->second, proven_half->second);
                             // Two adjacent scalar words become one complete B64 predicate only in
@@ -4417,15 +4417,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 rs.sreg_bool_narrowed[base] = true;
                             }
                         } else {
+                            if (b.is_compute && uses_native_saved_mask_words(b)) {
+                                refuse_unavailable_saved_mask_word(b, in, &ok);
+                                return true;   // one unproved dword cannot supply a complete B64 alias
+                            }
                             rs.sreg_wave64_mask_half.erase(in.dst.value);
                             rs.sreg_wave64_mask_half_index.erase(in.dst.value);
                             rs.sreg_bool[in.dst.value] = sit->second;
                             rs.sreg_bool_narrowed[in.dst.value] = true;
                         }
-                        // The compute CFG dispatcher can persist a physical spill lane that is
-                        // recycled between scalar-data and wave-mask lifetimes. It exposes both
-                        // views after a block join; keep both destination domains when present so
-                        // the statically typed consumer selects the representation it needs.
                         if (proven_half == b.wave64_mask_readlane_half_for_pc.end() &&
                             vit != rs.vgpr_lane_slots.end()) {
                             auto data = vit->second.find(lane);

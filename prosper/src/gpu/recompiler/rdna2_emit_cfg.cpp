@@ -18,6 +18,7 @@
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_copy_continuation.hpp"
 #include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -1909,9 +1910,8 @@ bool emit_cfg_state_machine(
             for_each_possible_vector_write(in, visit);
         },
         wave64_mask_half_sreg_in, wave64_mask_half_reachable);
-    // What each V_WRITELANE spill slot holds on every path (rdna2_spill_slot_domain.hpp), so a
-    // V_READLANE reload is typed as emit_alu typed it. Any Wave64 compute reload may receive a
-    // mask, so each destination gets a Bool variable; only the Wave64 analysis types reloads.
+    // Type spill reloads as emit_alu did. Wave64 reload destinations also have Bool variables,
+    // whose presence alone cannot prove a slot's domain (rdna2_spill_slot_domain.hpp).
     std::set<int> spill_mask_keys = static_mask_keys;
     for (const auto& in : ins) {
         if (in.is_end) break;
@@ -1921,7 +1921,8 @@ bool emit_cfg_state_machine(
     }
     const SpillSlotContext slot_context{
         spill_mask_keys, b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64,
-        b.wave64_mask_readlane_half_for_pc, b.wave64_mask_writelane_alias_pcs};
+        b.wave64_mask_readlane_half_for_pc, b.wave64_mask_writelane_alias_pcs,
+        b.is_compute && uses_native_saved_mask_words(b)};
     std::vector<SpillSlotDomains> wave64_slot_domain_in(starts.size());
     std::unordered_set<uint32_t> proven_mask_writelane_pcs;
 
@@ -1936,10 +1937,8 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> proven_wave64_mask_zero_compare_pcs;
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
     std::unordered_set<uint32_t> proven_wave64_mask_reduction_pcs;
-    // V_WRITELANE sites whose SGPR source is, on every path, ordinary scalar data: a MUST scalar
-    // word that is neither part of a mask pair nor ambiguous, and that no V_READLANE may have
-    // defined. A readlane is excluded because emit_alu reloads a mask slot into a Bool, which the
-    // scalar-word fact cannot see; spilling that word again stores the Bool, not data.
+    // MUST DATA at the write, including retained native words beside a Bool. Untyped READLANE
+    // cannot provide this fact: its scalar storage may be the mask slot's uint placeholder.
     std::unordered_set<uint32_t> proven_scalar_data_writelane_pcs;
     std::unordered_map<uint32_t, int> proven_wave64_mbcnt_mask_root_for_pc;
     // Retain the entry facts beyond the consumer-specialization pass below. Function Bool
@@ -2245,7 +2244,8 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
             if (record_compare && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
                 in.src[1].kind == OperandKind::InlineInt &&
-                spill_source_is_scalar_data(in, masks, ambiguous, scalar_words, readlane_words))
+                spill_source_is_scalar_data(in, masks, ambiguous, scalar_words, readlane_words,
+                                            slot_context.physical_saved_words))
                 proven_scalar_data_writelane_pcs.insert(in.pc);
 
             const int reduction_source = wave64_mask_reduction_source(in);
