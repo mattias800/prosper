@@ -54,6 +54,7 @@
 #include "../../tests/fixtures/fragment_compare_kill.hpp"
 #include "../../tests/fixtures/compute_array_gather.hpp"
 #include "../../tests/fixtures/saveexec_m0.hpp"
+#include "../../tests/fixtures/uint_d16_store.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1667,6 +1668,23 @@ int main(int argc, char** argv) {
         dump(dir,
              unrelated_vector ? "fragment_compare_low_kill_vector" : "fragment_compare_low_kill",
              recompile_fragment_wave32_for_test(code.data(), code.size()));
+    }
+    // Packed unsigned D16 image stores retain their format-selected integer data contract.
+    {
+        namespace fixture = prosper::test::uint_d16_store;
+        for (const auto format : {DataFormat::Uint8, DataFormat::Uint16, DataFormat::Uint32}) {
+            const auto table = fixture::table(format);
+            const std::string name =
+                "storage_uint_d16_" + std::to_string(static_cast<uint32_t>(format));
+            dump(dir, name.c_str(), fixture::compile(fixture::program(), table));
+        }
+        const auto table = fixture::table(DataFormat::Uint32, 1);
+        dump(dir, "storage_uint_d16_native_r32",
+             fixture::compile(fixture::program({.mask = 1}), table,
+                              native_storage_format_support_bit(DataFormat::Uint32, 1)));
+        const auto array = fixture::table(DataFormat::Uint32, 4, 5, fixture::width);
+        dump(dir, "storage_uint_d16_array",
+             fixture::compile(fixture::program({.dim = 5, .dynamic_layer = true}), array));
     }
     // Dimension-specific native unsigned volumes retain the exact typed storage contract.
     for (const auto& format : prosper::test::native_uint_3d::formats) {

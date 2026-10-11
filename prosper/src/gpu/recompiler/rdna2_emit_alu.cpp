@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
+#include "gpu/recompiler/rdna2_mimg_store.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
 #include "gpu/recompiler/rdna2_sampled_array.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -7987,7 +7988,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Likewise an IMAGE_STORE D16 consumes consecutive packed halves, not four full-width
             // VGPRs. GTA V's FSR1 RCAS pass depends on both halves of this contract: its dmask-f
             // R11G11B10F load writes v[12:13], and its dmask-f RGBA8 stores read v[14:15].
-            // Integer D16 conversion has a distinct bit/integer contract and remains fail-visible.
+            // Unsigned D16 stores have a separate packed-integer path; integer loads stay refused.
             const bool d16_float_resource =
                 res->format == DataFormat::Float32 || res->format == DataFormat::Float16 ||
                 res->format == DataFormat::Unorm16 || res->format == DataFormat::Snorm16 ||
@@ -8198,13 +8199,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // absent from dmask store as 0). Under a narrowed EXEC (e.g. a grid-tail bounds check),
                     // the write is EXEC-predicated so inactive lanes don't write out-of-range texels.
                     uint32_t vals[4] = { b.uconst(0), b.uconst(0), b.uconst(0), b.uconst(0) };
-                    int vd = in.dst.value, w = 0;
-                    if (in.mimg_d16 && !d16_float_resource) { ok = false; return true; }
-                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
-                        vals[c] = in.mimg_d16
-                            ? b.unpack_half(vread(vd + w / 2), static_cast<uint32_t>(w & 1))
-                            : vread(vd + w);
-                        ++w;
+                    if (!mimg_store_components(b, in, d16_float_resource, uint_texture, vread,
+                                               vals)) {
+                        ok = false;
+                        return true;
                     }
                     // T# DST_SEL, inverse (#4120): stored channel c receives the VDATA component whose
                     // selector names c. See storage_dst_sel.hpp for the evidence and refusals.

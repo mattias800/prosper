@@ -970,6 +970,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_uint_3d.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_uint_d16_store
+    SOURCES tests/gpu/recompiler/test_uint_d16_store.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_compute_array_gather
     SOURCES tests/gpu/recompiler/test_compute_array_gather.cpp
     INCLUDES tests
@@ -7363,6 +7367,11 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_native_uint_3d_exec
     SOURCES tests/gpu/execute/test_native_uint_3d_exec.cpp
+    INCLUDES frontends tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS gpu PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_uint_d16_store_exec
+    SOURCES tests/gpu/execute/test_uint_d16_store_exec.cpp
     INCLUDES frontends tests
     LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
     LABELS gpu PROPERTIES TIMEOUT 60)
