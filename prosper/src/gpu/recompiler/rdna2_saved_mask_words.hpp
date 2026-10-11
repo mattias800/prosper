@@ -17,7 +17,8 @@ struct SavedMaskDispatcherScope {
 // Native word retention is separate from the owned packet dispatcher's synchronized masks.
 bool uses_native_saved_mask_words(const SpirvCompute& b);
 void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
-                                      const uint32_t* code, size_t dwords, uint32_t initial_active);
+                                      const uint32_t* code, size_t dwords, uint32_t initial_active,
+                                      const RegState* initial = nullptr);
 bool saved_mask_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in);
 bool saved_mask_spill_uses_data(const RegState& rs, int word);
 bool validate_saved_mask_copy_words(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);

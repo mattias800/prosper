@@ -1943,20 +1943,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t lo = 0, hi = 0;
                     bool have_lo = false, have_hi = false;
                 };
-                auto scalar_word = [&](int reg, uint32_t& value) {
-                    auto current = rs.sreg.find(reg);
-                    if (current != rs.sreg.end()) { value = current->second; return true; }
-                    auto input = rs.sreg_input.find(reg);
-                    if (input != rs.sreg_input.end()) { value = input->second; return true; }
-                    return false;
-                };
                 auto scalar_pair = [&](const Operand& source) {
                     ScalarPair pair;
                     if (source.kind == OperandKind::SGPR ||
                         (source.kind == OperandKind::Special &&
                          source.value >= 106 && source.value < 124)) {
-                        pair.have_lo = scalar_word(source.value, pair.lo);
-                        pair.have_hi = scalar_word(source.value + 1, pair.hi);
+                        pair.have_lo = native_logical_data_word(rs, source.value, pair.lo);
+                        pair.have_hi = native_logical_data_word(rs, source.value + 1, pair.hi);
                     } else if (source.kind == OperandKind::InlineInt) {
                         pair.lo = b.uconst(static_cast<uint32_t>(source.value));
                         pair.hi = b.uconst(source.value < 0 ? UINT32_MAX : 0u);

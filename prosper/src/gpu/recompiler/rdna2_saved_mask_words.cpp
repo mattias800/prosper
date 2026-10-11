@@ -225,8 +225,8 @@ void load_missing_saved_mask_words(RegState& rs, const std::set<int>& roots,
 }
 
 void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
-                                      const uint32_t* code, size_t dwords,
-                                      uint32_t initial_active) {
+                                      const uint32_t* code, size_t dwords, uint32_t initial_active,
+                                      const RegState* initial) {
     if (b.saved_mask_word_analysis_done) {
         // A phase refers to the original bytes. Neither a reused pointer/PC nor a changed literal,
         // truncated stream or altered source can inherit another program's participation proof.
@@ -254,7 +254,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     b.saved_mask_original_words.assign(code, code + dwords);
     std::vector<Rdna2Inst> original;
     rdna2_walk(code, dwords, original);
-    initialize_native_logical_data_demand(b, original);
+    initialize_native_logical_data_demand(b, original, initial);
     // Physical reads and partial replacements require retained words. Mask-only saves keep their
     // existing subgroup-width contract; a shader which never observes DATA needs no new ballot.
     std::set<int> demanded;

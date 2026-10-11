@@ -43,6 +43,7 @@ struct Emitter {
         // input envelope, then select native lowering for the production operation.
         b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
         b.native_subgroup_size = 64;
+        b.diagnostic = {RecompileDiagnosticStage::Compute, 0xa4892001ull};
         rs.exec = b.btrue();
         rs.vcc = b.bfalse();
         rs.absent_sgpr_reads_fabricated_zero = true;
@@ -303,7 +304,110 @@ TEST(NativeLogicalWords, DispatcherMarkedPeerRejectsCrossCaseDataBeforePublicati
     e.rs.sreg_merge_placeholder.insert(1);
     EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf800000u, 0xbe9e0314u, end}));
     EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
+    EXPECT_EQ(e.b.stage_reject_pc, 0u) << last_terminal_reject_reason(0xa4892001ull);
+}
+
+TEST(NativeLogicalWords, CanonicalMbcntHalvesConsumeBoolWithoutDemandingPackedData) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    ASSERT_TRUE(
+        dispatcher(e, {logical(0x0f), 0xd7650001u, 0x00010014u, 0xd7660001u, 0x00020215u, end}));
+}
+
+TEST(NativeLogicalWords, BoolMbcntDoesNotHideASeparatePhysicalDataConsumer) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    EXPECT_FALSE(dispatcher(
+        e, {logical(0x0f), 0xd7650001u, 0x00010014u, 0xd7660001u, 0x00020215u, 0xbe9e0314u, end}));
+    EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
     EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, MbcntAccumulatorStillDemandsItsNumericScalarWord) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    // The first source is the canonical Bool low half; source1 independently reads DATA s20.
+    EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xd7650001u, 0x00002814u, end}));
+    EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+}
+
+TEST(NativeLogicalWords, BothMaskCselectPreservesMarkedBoolOnlyChain) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    ASSERT_TRUE(dispatcher(
+        e, {logical(0x0f), 0xbf060202u, logical(0x0b, 22, 20, 2), logical(0x11, 24, 22, 2), end}));
+}
+
+TEST(NativeLogicalWords, BothMaskCselectPropagatesLaterPhysicalDataDemand) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    EXPECT_FALSE(
+        dispatcher(e, {logical(0x0f), 0xbf060202u, logical(0x0b, 22, 20, 2), 0xbe9e0317u, end}));
+    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(e.b.stage_reject_reason, "native-logical-data-words-unavailable");
+}
+
+TEST(NativeLogicalWords, MixedCselectChargesWordsEvenWithOnlyLaterBoolConsumption) {
+    for (bool marked : {false, true}) {
+        Emitter e;
+        e.pair(4, c);
+        e.rs.sreg_bool.erase(4);   // one actual input is DATA, not a Bool
+        if (marked) e.rs.sreg_merge_placeholder.insert(1);
+        const bool ok = dispatcher(e, {logical(0x0f), 0xbf060202u, logical(0x0b, 22, 20, 4),
+                                       logical(0x11, 24, 22, 2), end});
+        EXPECT_EQ(ok, !marked);
+        if (marked) EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    }
+}
+
+TEST(NativeLogicalWords, MixedCselectCannotReadAnUnavailablePlaceholderDirectly) {
+    Emitter e;
+    e.pair(4, c);
+    e.rs.sreg_bool.erase(4);
+    e.rs.unavailable_saved_mask_words.insert(1);
+    e.rs.scc = e.b.btrue();
+    EXPECT_FALSE(e.emit(e.instruction({logical(0x0b, 22, 0, 4)})));
+}
+
+TEST(NativeLogicalWords, ImplicitVopcRetiresOverlappingOddMaskBeforeCselect) {
+    for (bool overwrite : {false, true}) {
+        Emitter e;
+        e.rs.sreg_merge_placeholder.insert(1);
+        e.rs.vreg[0] = e.b.linear_localid;
+        const bool ok = dispatcher(
+            e, {logical(0x0f, 105),
+                overwrite ? 0x7d840080u
+                          : 0xbf800000u,   // implicit VCC compare / lifetime-preserving NOP
+                0xbf060202u, logical(0x0b, 22, 105, 2), logical(0x11, 24, 22, 2), end});
+        EXPECT_EQ(ok, !overwrite);
+        if (overwrite) EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    }
+}
+
+TEST(NativeLogicalWords, LogicalExecDestinationPreservesMarkedBoolOnlyConsumption) {
+    Emitter e;
+    e.rs.sreg_merge_placeholder.insert(1);
+    ASSERT_TRUE(dispatcher(e, {logical(0x0f), logical(0x0f, 126, 20, 2), end}));
+}
+
+TEST(NativeLogicalWords, SaveexecVariantsConsumeBoolWithoutDemandingSourceData) {
+    for (uint32_t opcode : {kSop1OpcodeAndn1SaveexecB64, kSop1OpcodeOrn1SaveexecB64}) {
+        Emitter e;
+        e.rs.sreg_merge_placeholder.insert(1);
+        const uint32_t save = 0xbe960014u | (opcode << 8);
+        ASSERT_TRUE(dispatcher(e, {logical(0x0f), save, logical(0x11, 24, 22, 2), end}));
+    }
+}
+
+TEST(NativeLogicalWords, SaveexecDoesNotHideAnIndependentSourceDataRead) {
+    for (uint32_t opcode : {kSop1OpcodeAndn1SaveexecB64, kSop1OpcodeOrn1SaveexecB64}) {
+        Emitter e;
+        e.rs.sreg_merge_placeholder.insert(1);
+        const uint32_t save = 0xbe960014u | (opcode << 8);
+        EXPECT_FALSE(dispatcher(e, {logical(0x0f), save, 0xbe9e0314u, end}));
+        EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    }
 }
 
 TEST(NativeLogicalWords, FullOverwriteKillsOnlyTheOldLogicalDataDemand) {
@@ -316,7 +420,8 @@ TEST(NativeLogicalWords, OneWordOverwriteCannotKillTheOtherLogicalDataDemand) {
     Emitter e;
     e.no_data(0);
     EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbe950382u, 0xbe9e0314u, end}));
-    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(last_terminal_reject_reason(0xa4892001ull),
+              "compute-cfg-reject pc=2 reason=wave64-ambiguous-mask-read");
 }
 
 TEST(NativeLogicalWords, APreviousScalarReadDoesNotDemandALaterBoolOnlyGeneration) {
@@ -331,7 +436,7 @@ TEST(NativeLogicalWords, CopyChainCarriesDataDemandBackToItsExactLogicalProducer
     e.no_data(0);
     // s_mov_b64 s[22:23],s[20:21]; s_mov_b32 s30,s23 observes the copied high word.
     EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbe960414u, 0xbe9e0317u, end}));
-    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(e.b.stage_reject_pc, 0u) << last_terminal_reject_reason(0xa4892001ull);
 }
 
 TEST(NativeLogicalWords, EitherBranchMayDemandTheCurrentLogicalWords) {
@@ -341,71 +446,83 @@ TEST(NativeLogicalWords, EitherBranchMayDemandTheCurrentLogicalWords) {
     // other arm's complete overwrite. No scalar SCC condition is assumed at the producer.
     EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbf840002u, 0xbe9e0314u, 0xbf820002u,
                                 0xbe940381u, 0xbe950382u, end}));
-    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(e.b.stage_reject_pc, 0u) << last_terminal_reject_reason(0xa4892001ull);
 }
 
 TEST(NativeLogicalWords, ConditionalMoveDoesNotDefinitelyKillCurrentLogicalWords) {
     Emitter e;
     e.no_data(0);
     EXPECT_FALSE(dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbe940580u, 0xbe9e0314u, end}));
-    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(last_terminal_reject_reason(0xa4892001ull),
+              "compute-cfg-reject pc=3 reason=wave64-ambiguous-mask-read");
 }
 
+namespace {
+std::vector<uint32_t> ordinary_conditional_program(uint32_t replacement = 0) {
+    // The old destination is genuine on the bypass path. The producer itself does not
+    // postdominate entry, so its fresh words require the ordinary launch-uniform theorem.
+    std::vector<uint32_t> code{0xbe940480u};   // s_mov_b64 s[20:21],0
+    if (replacement) code.push_back(replacement);
+    code.insert(code.end(),
+                {0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193), 0xbe9e0314u, end});
+    return code;
+}
+std::vector<uint32_t> ordinary_compute(const std::vector<uint32_t>& code, bool partial = false) {
+    ComputeShaderConfig config;
+    config.local_x = 64;
+    config.wave_size = config.native_subgroup_size = 64;
+    config.user_sgprs.resize(16);
+    config.exact_thread_extent = partial;
+    config.threads_x = partial ? 8 : 64;
+    config.threads_y = config.threads_z = 1;
+    return recompile_compute(code.data(), code.size(), nullptr, config);
+}
+}   // namespace
+
 TEST(NativeLogicalWords, LaunchUniformConditionalProducerCapturesBothPhysicalWords) {
-    Emitter e;
-    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
-                                     0xbe9e0314u, end};
-    e.prove(code);
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code.data(), code.size(), ins);
-    ASSERT_TRUE(e.emit(ins[2]));
-    EXPECT_TRUE(e.rs.sreg.contains(20) && e.rs.sreg.contains(21));
-    EXPECT_EQ(ballots(e.b), 2u);
+    const auto module = ordinary_compute(ordinary_conditional_program());
+    ASSERT_FALSE(module.empty());
+    size_t count = 0;
+    for (size_t n = 5; n < module.size(); n += module[n] >> 16)
+        count += (module[n] & 0xffffu) == 339u;
+    EXPECT_GT(count, 0u) << "a bypassed fresh producer needs its launch-qualified ballot";
 }
 
 TEST(NativeLogicalWords, VectorDerivedAndOverwrittenLaunchConditionsDoNotProveParticipation) {
-    for (uint32_t replacement : {0x7e100500u, 0xbe88037eu}) {
-        Emitter e;
-        const std::vector<uint32_t> code{
-            replacement, 0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193), 0xbe9e0314u, end};
-        e.prove(code);
-        std::vector<Rdna2Inst> ins;
-        rdna2_walk(code.data(), code.size(), ins);
-        EXPECT_FALSE(e.emit(ins[3]));
-        EXPECT_EQ(ballots(e.b), 0u);
-    }
+    for (uint32_t replacement : {0x7e100500u, 0xbe88037eu})
+        EXPECT_TRUE(ordinary_compute(ordinary_conditional_program(replacement)).empty());
 }
 
 TEST(NativeLogicalWords, UnprovedVccConditionalProducerCannotCaptureWords) {
-    Emitter e;
-    const std::vector<uint32_t> code{0xbf860001u, logical(0x0f, 20, 126, 193), 0xbe9e0314u, end};
-    e.prove(code);
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code.data(), code.size(), ins);
-    EXPECT_FALSE(e.emit(ins[1]));
-    EXPECT_EQ(ballots(e.b), 0u);
+    auto code = ordinary_conditional_program();
+    code[2] = 0xbf860001u;   // conditional VCC has no proved workgroup-uniform provenance
+    EXPECT_TRUE(ordinary_compute(code).empty());
 }
 
 TEST(NativeLogicalWords, PartialLaunchCannotInheritUniformConditionalParticipation) {
-    Emitter e;
-    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
-                                     0xbe9e0314u, end};
-    e.prove(code, true);
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code.data(), code.size(), ins);
-    EXPECT_FALSE(e.emit(ins[2]));
-    EXPECT_EQ(ballots(e.b), 0u);
+    EXPECT_TRUE(ordinary_compute(ordinary_conditional_program(), true).empty());
 }
 
 TEST(NativeLogicalWords, ReentryCannotReuseAnEntryUniformProducerBallot) {
-    Emitter e;
-    const std::vector<uint32_t> code{0xbf068008u, 0xbf840001u, logical(0x0f, 20, 126, 193),
-                                     0xbe9e0314u, 0xbf82fffcu, end};
-    e.prove(code);
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code.data(), code.size(), ins);
-    EXPECT_FALSE(e.emit(ins[2]));
-    EXPECT_EQ(ballots(e.b), 0u);
+    auto code = ordinary_conditional_program();
+    code.insert(code.end() - 1, 0xbf82fffcu);
+    EXPECT_TRUE(ordinary_compute(code).empty());
+}
+
+TEST(NativeLogicalWords, ArbitraryPerLaneNggScalarLaunchCannotProveUniformProducer) {
+    // The probe supplies s3 from a raw per-invocation input. The otherwise identical
+    // conditional body must not inherit ordinary compute's push-constant SGPR contract.
+    auto code = ordinary_conditional_program();
+    code[1] = 0xbf068003u;
+    code[4] = 0x7e120214u;   // v_mov_b32 v9,s20: observe the physical result before EXP
+    code.insert(code.end() - 1, {0xf8000201u, 0x00000009u});   // EXP PARAM0.x,v9
+    const auto rejected = recompile_ngg_exports_for_test(code.data(), code.size(), 10, 0, nullptr,
+                                                         4, 0, {}, true, true, true);
+    EXPECT_TRUE(rejected.empty());
+    code[3] = 0xbe940480u;   // genuine scalar pair writer, without a ballot
+    const auto control = recompile_ngg_exports_for_test(code.data(), code.size(), 10, 0, nullptr, 4,
+                                                        0, {}, true, true, true);
+    EXPECT_FALSE(control.empty()) << "same arbitrary launch/export shape supports ordinary DATA";
 }
 
 TEST(NativeLogicalWords, OuterHostSelectionCannotInheritUniformConditionalParticipation) {
@@ -434,20 +551,19 @@ TEST(NativeLogicalWords, SlicedUniformRegionCannotInventOriginalEntryParticipati
     EXPECT_EQ(ballots(e.b), 0u);
 }
 
-TEST(NativeLogicalWords, ChangedOrTruncatedBytesCannotReuseCachedUniformParticipation) {
-    const std::vector<uint32_t> original{0xbf068008u, 0xbf840002u, logical(0x0f, 20, 126, 255),
-                                         0x55555555u, 0xbe9e0314u, end};
+TEST(NativeLogicalWords, ChangedOrTruncatedBytesCannotReuseCachedProducerParticipation) {
+    const std::vector<uint32_t> original{0xbf800000u, logical(0x0f, 20, 126, 255), 0x55555555u,
+                                         0xbe9e0314u, end};
     for (int change = 0; change < 3; ++change) {
         Emitter e;
         e.prove(original);
         auto code = original;
-        if (change == 0) code[3] ^= 0x100u;   // same instruction PC, different literal value
+        if (change == 0) code[2] ^= 0x100u;   // same PC, different literal
         if (change == 1) code[0] = 0x7e100500u;   // earlier instruction identity changes
-        if (change == 2) code.resize(3);   // truncated producer has no literal carrier
+        if (change == 2) code.resize(2);   // no literal carrier
         e.prove(code);
-        auto in = e.instruction({original[2], original[3]});
-        in.pc = 2;
-        // Even an unchanged query of the old producer cannot revive an invalidated program proof.
+        auto in = e.instruction({original[1], original[2]});
+        in.pc = 1;
         EXPECT_FALSE(e.emit(in));
         EXPECT_EQ(ballots(e.b), 0u);
     }
@@ -458,7 +574,7 @@ TEST(NativeLogicalWords, LoopSuccessorRetainsDemandOnTheCurrentLogicalGeneration
     e.no_data(0);
     EXPECT_FALSE(
         dispatcher(e, {logical(0x0f), 0xbf068002u, 0xbf840001u, 0xbf82fffdu, 0xbe9e0314u, end}));
-    EXPECT_EQ(e.b.stage_reject_pc, 0u);
+    EXPECT_EQ(e.b.stage_reject_pc, 0u) << last_terminal_reject_reason(0xa4892001ull);
 }
 
 TEST(NativeLogicalWords, PortableComputeRetainsItsSeparateMaskOnlyContract) {

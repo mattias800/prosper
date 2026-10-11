@@ -986,6 +986,10 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
     if (config.tg_size_en)
         rs.sreg[system_sgpr] = b.uconst(local_x * local_y * local_z);
 
+    // Bind the uniform-prefix theorem to this producing boundary. NGG/VALU probes may load
+    // per-invocation scalar inputs and therefore cannot inherit this launch contract.
+    b.native_logical_uniform_launch = true;
+
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
     if (config.force_exchange_dispatcher) {

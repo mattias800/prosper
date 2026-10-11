@@ -668,6 +668,8 @@ struct SpirvCompute {
     std::set<int> native_logical_word_roots;
     std::set<uint32_t> native_logical_data_demand_pcs;
     std::set<uint32_t> native_logical_uniform_entry_pcs;
+    // Only the ordinary compute shell seeds SGPR DATA from push constants/group IDs.
+    bool native_logical_uniform_launch = false;
     bool structured_wave64_mask_reduction_analysis_done = false;
     std::unordered_set<uint32_t> structured_wave64_mask_reduction_pcs;
     // Exact Wave64 mask spills retain a Bool view in vgpr_lane_mask_slots. When a CFG MUST proof

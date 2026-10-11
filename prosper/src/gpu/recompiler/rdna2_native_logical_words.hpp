@@ -4,9 +4,13 @@
 #include <array>
 
 namespace prosper::gpu {
+struct SpilledMaskHalves;
+void seed_native_logical_entry_marks(SpilledMaskHalves& marks, const RegState& initial);
 // Native scalar logical DATA is independent of the lanes participating at this operation.
+bool native_logical_data_word(const RegState& rs, int word, uint32_t& value);
 bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in);
-void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original);
+void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original,
+                                           const RegState* initial);
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
                                                    const std::vector<Rdna2Inst>& original);
 bool native_logical_producer_has_full_participation(const SpirvCompute& b, const Rdna2Inst& in);
