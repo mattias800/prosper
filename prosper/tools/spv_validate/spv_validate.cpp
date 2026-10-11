@@ -2045,11 +2045,14 @@ int main(int argc, char** argv) {
         dump(dir, name.c_str(), module);
     }
     // Ordinary e64 integer-pair comparisons (unsigned then signed), separate from mask provenance.
-    { const uint32_t c[] = {0xd4e4006au,0x00010000u,0xd4a4006au,0x00010000u,
-                            0xbf810000u};
-      ComputeShaderConfig cfg; cfg.local_x=128; cfg.wave_size=64;
-      dump(dir, "compute_i64_compare",
-           recompile_compute(c, sizeof(c)/4, nullptr, cfg)); }
+    {
+        const uint32_t c[] = {0xBE800480u, /* explicit numeric s[0:1]=0 */
+                              0xd4e4006au, 0x00010000u, 0xd4a4006au, 0x00010000u, 0xbf810000u};
+        ComputeShaderConfig cfg;
+        cfg.local_x = 128;
+        cfg.wave_size = 64;
+        dump(dir, "compute_i64_compare", recompile_compute(c, sizeof(c) / 4, nullptr, cfg));
+    }
     // Astro Bot Wave64: e64 mask-vs-zero normalization followed by a last-live B64 mask SCC vote.
     // Both reductions use the portable dispatcher's uniform common phase.
     {

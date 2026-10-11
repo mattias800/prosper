@@ -12,6 +12,7 @@
 namespace prosper::gpu {
 
 struct RegState;
+struct SpirvCompute;
 
 struct ScalarSourceMarks {
     bool placeholder = false;
@@ -24,6 +25,9 @@ using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
 ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in);
+// A fresh comparison/carry predicate cannot authenticate fabricated input storage. Genuine memory
+// data and checked loop-header assumptions remain separate from unavailable-source placeholders.
+bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,

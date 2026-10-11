@@ -3582,11 +3582,18 @@ inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
                             (body_edge && rs.sreg_merge_placeholder.contains(r));
     const bool memory =
         check.memory.contains(r) || (body_edge && rs.sreg_memory_pattern.contains(r));
-    // A register that leaves as the header phi (or as the check block's own value) and was only
-    // blanket-marked there stays blanket-marked; a direct break from the body makes it hard.
+    // The checked header value and the current body value are the two actual phi inputs. Keep
+    // their roots only when both edges are defined under those assumptions. The backedge checker
+    // has already removed violated check roots; a hard body input must still make this exit hard.
     const auto kept = check.blanket.find(r);
-    join_merge_placeholder(rs, r, fabricated, false,
-                           !body_edge && kept != check.blanket.end() ? &kept->second : nullptr);
+    std::set<uint64_t> roots;
+    if (kept != check.blanket.end() &&
+        (!body_edge || !rs.sreg_merge_placeholder.contains(r) || sreg_word_blanket_only(rs, r))) {
+        roots = kept->second;
+        if (body_edge && sreg_word_blanket_only(rs, r))
+            roots.insert(rs.sreg_loop_blanket.at(r).begin(), rs.sreg_loop_blanket.at(r).end());
+    }
+    join_merge_placeholder(rs, r, fabricated, false, roots.empty() ? nullptr : &roots);
     if (memory)
         rs.sreg_memory_pattern.insert(r);
     else

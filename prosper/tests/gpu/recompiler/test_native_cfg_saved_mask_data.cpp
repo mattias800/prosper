@@ -9,7 +9,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -291,4 +294,254 @@ TEST(NativeCfgSavedMaskData, AbsentScalarInputCannotEstablishDispatcherScc) {
 }
 TEST(NativeCfgSavedMaskData, AnExplicitScalarProducerEstablishesDispatcherScc) {
     all_ones(scalar_scc_program(true));
+}
+
+namespace {
+enum class FreshMaskUse {
+    Immediate,
+    ScalarRelay,
+    SccRelay,
+    AcrossEdge,
+    VectorRelay,
+    Cmpx,
+    SavedPair,
+    Carry
+};
+std::vector<uint32_t> slot_mask_program(FreshMaskUse use, bool all_paths,
+                                        bool replacement = false) {
+    auto p = program({.numeric_read = true});
+    const auto slot = std::find(p.begin(), p.end(), 0xd7610014u);
+    p.insert(slot, {0xbf068004u, 0xbf840002u}); // s4=1 skips the sole spill
+    if (all_paths) p.insert(p.begin() + 2, {0xd7610014u, 30u | (128u << 9u)});
+    auto sink = std::find(p.begin(), p.end(), 0x7e02020eu);
+    const size_t at = sink - p.begin();
+    p.erase(sink);
+    std::vector<uint32_t> mask;
+    if (replacement) mask.push_back(mov(14, 193)); // current word ends missing-slot provenance
+    if (use == FreshMaskUse::ScalarRelay) mask.push_back(mov(16, 14));
+    if (use == FreshMaskUse::SccRelay)
+        mask.push_back(0xbf06800eu); // scalar cmp -> explicit SCC word
+    if (use == FreshMaskUse::AcrossEdge) mask.insert(mask.end(), {0xbf880001u, 0x7e040281u});
+    if (use == FreshMaskUse::VectorRelay) mask.push_back(0x7e06020eu); // v3=s14
+    const uint32_t source = use == FreshMaskUse::ScalarRelay   ? 16u
+                            : use == FreshMaskUse::SccRelay    ? 253u
+                            : use == FreshMaskUse::VectorRelay ? 259u
+                                                               : 14u;
+    if (use == FreshMaskUse::Carry)
+        mask.insert(mask.end(), {0xd70f6a03u, source | (256u << 9u)}); // v3,VCC=source+v0
+    else if (use == FreshMaskUse::SavedPair)
+        mask.insert(mask.end(), {0xd4c20016u, source | (256u << 9u)}); // cmp_eq -> s[22:23]
+    else
+        mask.push_back((use == FreshMaskUse::Cmpx ? 0x7da40000u : 0x7d840000u) | source);
+    if (use != FreshMaskUse::Cmpx)
+        mask.push_back(mov(126, use == FreshMaskUse::SavedPair ? 22 : 106, true));
+    mask.insert(mask.end(), {0x7e020281u, mov(126, 193, true)});
+    p.insert(p.begin() + at, mask.begin(), mask.end());
+    return p;
+}
+void mask_refuses(const std::vector<uint32_t>& p, const ComputeShaderConfig& base = config()) {
+    const auto t = table();
+    for (uint32_t path : {0u, 1u}) {
+        auto c = base;
+        c.user_sgprs[4] = path;
+        TerminalRejectCapture capture;
+        EXPECT_TRUE(recompile_compute(p.data(), p.size(), &t, c).empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+    }
+}
+void mask_values(const std::vector<uint32_t>& p, bool carry = false, bool first_lane = false) {
+    const auto t = table();
+    for (uint32_t path : {0u, 1u}) {
+        auto c = config();
+        c.user_sgprs[4] = path;
+        TerminalRejectCapture capture;
+        const auto module = recompile_compute(p.data(), p.size(), &t, c);
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        ASSERT_FALSE(module.empty()) << reason;
+        ASSERT_TRUE(has_op(module, 251));
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.push_constants = c.user_sgprs;
+        const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(out[lane], uint32_t((carry && lane != 0) || (first_lane && lane == 0)))
+                << "path " << path << " lane " << lane;
+    }
+}
+} // namespace
+
+TEST(NativeCfgSavedMaskData, MissingSlotCannotObtainMaskAuthorityThroughFreshVectorCompare) {
+    mask_refuses(slot_mask_program(FreshMaskUse::Immediate, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotScalarRelayCannotEstablishFreshMask) {
+    mask_refuses(slot_mask_program(FreshMaskUse::ScalarRelay, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotSccRelayCannotEstablishFreshMask) {
+    mask_refuses(slot_mask_program(FreshMaskUse::SccRelay, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotCannotEstablishFreshMaskAcrossAnotherEdge) {
+    mask_refuses(slot_mask_program(FreshMaskUse::AcrossEdge, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotValuRelayCannotEstablishFreshMask) {
+    mask_refuses(slot_mask_program(FreshMaskUse::VectorRelay, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotCannotEstablishFreshCmpxExec) {
+    mask_refuses(slot_mask_program(FreshMaskUse::Cmpx, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotCannotEstablishFreshSavedPair) {
+    mask_refuses(slot_mask_program(FreshMaskUse::SavedPair, false));
+}
+TEST(NativeCfgSavedMaskData, MissingSlotCannotEstablishFreshCarryMask) {
+    mask_refuses(slot_mask_program(FreshMaskUse::Carry, false));
+}
+TEST(NativeCfgSavedMaskData, AllPathSlotFreshMasksUseGenuinePhysicalData) {
+    for (auto use : {FreshMaskUse::Immediate, FreshMaskUse::ScalarRelay, FreshMaskUse::SccRelay,
+                     FreshMaskUse::AcrossEdge, FreshMaskUse::VectorRelay, FreshMaskUse::Cmpx,
+                     FreshMaskUse::SavedPair, FreshMaskUse::Carry})
+        mask_values(slot_mask_program(use, true), use == FreshMaskUse::Carry,
+                    use == FreshMaskUse::SccRelay);
+}
+TEST(NativeCfgSavedMaskData, CurrentWordReplacementEndsMissingSlotFreshMaskProvenance) {
+    for (auto use : {FreshMaskUse::Immediate, FreshMaskUse::ScalarRelay, FreshMaskUse::SccRelay,
+                     FreshMaskUse::AcrossEdge, FreshMaskUse::VectorRelay, FreshMaskUse::Cmpx,
+                     FreshMaskUse::SavedPair, FreshMaskUse::Carry})
+        mask_values(slot_mask_program(use, false, true), use == FreshMaskUse::Carry,
+                    use == FreshMaskUse::SccRelay);
+}
+
+TEST(NativeCfgSavedMaskData, WideFreshCompareCannotInventItsMissingScalarHighWord) {
+    auto p = slot_mask_program(FreshMaskUse::Immediate, true);
+    const auto cmp = std::find(p.begin(), p.end(), 0x7d84000eu);
+    const size_t at = cmp - p.begin();
+    p.erase(cmp);
+    p.insert(p.begin() + at, {0xd4e2006au, 14u | (256u << 9u)}); // cmp_eq_u64 s[14:15],v[0:1]
+    auto c = config();
+    c.user_sgprs.resize(15); // the low reload is genuine; the numeric high sibling is absent
+    mask_refuses(p, c);
+}
+TEST(NativeCfgSavedMaskData, WideFreshCompareConsumesBothGenuineScalarWords) {
+    auto p = slot_mask_program(FreshMaskUse::Immediate, true);
+    const auto cmp = std::find(p.begin(), p.end(), 0x7d84000eu);
+    const size_t at = cmp - p.begin();
+    p.erase(cmp);
+    p.insert(p.begin() + at, {0xd4e2006au, 14u | (256u << 9u)});
+    mask_values(p);
+}
+
+namespace {
+struct LoopProgram {
+    std::vector<uint32_t> p;
+    std::map<std::string, size_t> labels;
+    std::vector<std::pair<size_t, std::string>> fixups;
+    void add(std::initializer_list<uint32_t> words) { p.insert(p.end(), words); }
+    void label(const std::string& name) { labels[name] = p.size(); }
+    void branch(uint32_t op, const std::string& target) {
+        fixups.emplace_back(p.size(), target);
+        add({op});
+    }
+    std::vector<uint32_t> finish() {
+        for (const auto& [pc, target] : fixups) p[pc] |= uint16_t(labels.at(target) - pc - 1);
+        return p;
+    }
+};
+// A compute value witness for the direct-EXEC-break scalar phi shape. The fragment validation
+// sample has the same scalar producers/control edges; this fixture has an owned buffer sink.
+std::vector<uint32_t> numeric_direct_break_loop(unsigned mode) {
+    LoopProgram a;
+    a.add({0x7e040300u}); // preserve the genuine guest lane in v2 for the output index
+    if (mode != 1) a.add({mov(0, 128)});
+    if (mode == 3 || mode == 4 || mode == 5) {
+        a.add({mov(30, 135)}); // ordinary DATA=7, independent of old mask authority
+        if (mode == 4) a.add({0xd7610014u, 30u | (128u << 9u)});
+        a.add({0xbf068004u});
+        a.branch(0xbf840000u, "slot-join");
+        a.add({0xd7610014u, 30u | (128u << 9u)});
+        a.label("slot-join");
+    }
+    if (mode == 6) a.add({mov(16, 128)});
+    a.add({0x7e000280u, 0x7e020284u, 0x816a8180u, 0x876b8380u, mov(4, 126, true)});
+    a.label("check");
+    if (mode == 6) a.add({mov(0, 16)});   // check word depends on a different, genuine carried root
+    a.branch(0xbf880000u, "exit");
+    a.add(
+        {mode == 0 ? 0x7d820200u : 0x7d820284u});   // scalar counter, or a defined false predicate
+    a.add({0x87fe6a7eu});
+    if (mode == 2) a.add({mov(17, 60), mov(0, 17)});   // a new fabricated scalar generation
+    if (mode == 3 || mode == 4 || mode == 5) a.add({0xd7600000u, 276u | (128u << 9u)});
+    if (mode == 5) a.add({mov(0, 135)});   // current replacement ends the missing slot generation
+    if (mode == 6)
+        a.add({mov(17, 60),
+               mov(0, 17)});   // body replaces the current check generation with fabrication
+    a.branch(0xbf880000u, "exit");
+    if (mode == 1) a.add({mov(0, 135)});   // sole producer lies after the direct break
+    a.add({0x7e000280u, mode == 6 ? 0x80108110u : 0x80008100u});
+    a.branch(0xbf820000u, "check");
+    a.label("exit");
+    a.add({mov(126, 4, true), 0x7d820200u, 0x7e020200u, 0xe0702000u, 0x80020102u, end});
+    return a.finish();
+}
+ComputeShaderConfig loop_config(unsigned mode, uint32_t path) {
+    auto c = config();
+    c.user_sgprs[4] = path;
+    if (mode == 1) c.user_sgprs.clear();   // no launch s0 before the sole body producer
+    return c;
+}
+void loop_refuses(unsigned mode) {
+    const auto p = numeric_direct_break_loop(mode);
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        TerminalRejectCapture capture;
+        EXPECT_TRUE(
+            recompile_compute(p.data(), p.size(), &resources, loop_config(mode, path)).empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+    }
+}
+void loop_values(unsigned mode, uint32_t expected) {
+    const auto p = numeric_direct_break_loop(mode);
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        const auto c = loop_config(mode, path);
+        const auto module = recompile_compute(p.data(), p.size(), &resources, c);
+        ASSERT_FALSE(module.empty());
+        ASSERT_TRUE(has_op(module, 246)) << "must exercise the structured loop join";
+        ASSERT_FALSE(has_op(module, 251)) << "dispatcher must not hide the exit join";
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.push_constants = c.user_sgprs;
+        const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(out[lane], expected) << "path " << path << " lane " << lane;
+    }
+}
+}   // namespace
+
+TEST(NativeCfgSavedMaskData, NumericDirectBreakKeepsTheCurrentScalarValue) {
+    loop_values(0, 4);
+}
+TEST(NativeCfgSavedMaskData, EarlyDirectBreakCannotInventAProducerThatHasNotRun) {
+    loop_refuses(1);
+}
+TEST(NativeCfgSavedMaskData, DirectBreakBodyCannotBorrowPreheaderAuthorityAfterScalarFabrication) {
+    loop_refuses(2);
+}
+TEST(NativeCfgSavedMaskData, OneArmReadlaneCannotReplaceAGenuineLoopScalar) {
+    loop_refuses(3);
+}
+TEST(NativeCfgSavedMaskData, AllPathReadlaneReplacesTheLoopScalarWithGenuineCurrentData) {
+    loop_values(4, 7);
+}
+TEST(NativeCfgSavedMaskData, CurrentOverwriteEndsFabricatedBodyScalarGeneration) {
+    loop_values(5, 7);
+}
+TEST(NativeCfgSavedMaskData, DirectBreakCannotBorrowDifferentRootForAFabricatedCurrentWord) {
+    loop_refuses(6);
 }

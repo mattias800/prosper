@@ -1708,15 +1708,17 @@ int main() {
     // to an ordinary SGPR this move falls through to the normal path, where an untracked M0 source
     // rejects, which is what it did before the token existed.
     const uint32_t m0_into_vcc_lo[] = {
-        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0  (a live ballot)
-        0xBEEA037Cu,                            // s_mov_b32 vcc_lo, m0
-        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0  (read it as DATA)
+        0xBE800380u,   // explicit s0=0 input for the encoded comparison
+        0x7d840000u,   // v_cmp_eq_u32 vcc, s0, v0 (a live ballot)
+        0xBEEA037Cu,   // s_mov_b32 vcc_lo, m0
+        0x4A02006Au,   // v_add_nc_u32 v1, vcc_lo, v0  (read it as DATA)
         0xbf810000u,
     };
     const uint32_t m0_into_vcc_lo_control[] = {
-        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0
-        0xbeea0385u,                            // s_mov_b32 vcc_lo, 5       (ordinary scalar data)
-        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0
+        0xBE800380u,   // explicit s0=0 input for the encoded comparison
+        0x7d840000u,   // v_cmp_eq_u32 vcc, s0, v0
+        0xbeea0385u,   // s_mov_b32 vcc_lo, 5       (ordinary scalar data)
+        0x4A02006Au,   // v_add_nc_u32 v1, vcc_lo, v0
         0xbf810000u,
     };
     ComputeShaderConfig m0_vcc_config;           // exact native wave: the VCC data read is available
@@ -3130,7 +3132,9 @@ int main() {
     // Exercise the ordinary integer-B64 emitter separately from the mask-domain vote below.
     // Exact llvm-mc gfx1010 encoding: v_cmp_gt_u64_e64 vcc_lo,s[0:1],0.
     const uint32_t wave64_u64_compare[] = {
-        0xd4e4006au, 0x00010000u,
+        0xBE800480u,   // explicit ordinary numeric s[0:1]=0
+        0xd4e4006au,
+        0x00010000u,
         0xbf810000u,
     };
     const auto wave64_u64_compare_spv = recompile_compute(
@@ -3542,10 +3546,11 @@ int main() {
     // Keep this portable (native_subgroup_size=0) and use two guest waves so the test exercises the
     // exact scratch vote rather than accidentally inheriting the host subgroup's branch domain.
     const uint32_t wave64_compute_vcc_lds_write[] = {
-        0x7d840000u,                         // pc0: v_cmp_eq_u32 vcc,v0,v0
-        0xbf860002u,                         // pc1: s_cbranch_vccz -> pc4
-        0xd8340084u, 0x00000002u,            // pc2: ds_write_b32 v2,v0 offset:0x84
-        0xbf810000u,                         // pc4: s_endpgm
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
+        0x7d840000u,   // pc1: v_cmp_eq_u32 vcc,s0,v0
+        0xbf860002u,   // pc2: s_cbranch_vccz -> pc5
+        0xd8340084u, 0x00000002u,   // pc3: ds_write_b32 v2,v0 offset:0x84
+        0xbf810000u,   // pc5: s_endpgm
     };
     const auto wave64_compute_vcc_lds_spv = recompile_compute(
         wave64_compute_vcc_lds_write, std::size(wave64_compute_vcc_lds_write), nullptr,
@@ -3589,22 +3594,24 @@ int main() {
     // contains a workgroup/subgroup synchronization phase. Those remain fail-visible inside a
     // per-wave arm until a common-phase transformation proves every invocation participates.
     const uint32_t wave64_compute_vcc_barrier[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xbf8a0000u,                         // guest workgroup barrier
-        0xbf800000u,
-        0xbf810000u,
+        0xbf860002u,   // vccz -> pc5
+        0xbf8a0000u,   // guest workgroup barrier
+        0xbf800000u, 0xbf810000u,
     };
     const uint32_t wave64_compute_vcc_mbcnt[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xd7650004u, 0x000100c1u,            // v_mbcnt_lo_u32_b32 v4,-1,0
+        0xbf860002u,   // vccz -> pc5
+        0xd7650004u, 0x000100c1u,   // v_mbcnt_lo_u32_b32 v4,-1,0
         0xbf810000u,
     };
     const uint32_t wave64_compute_vcc_swizzle[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xd8d4020fu, 0x00000000u,            // ds_swizzle_b32 v0,v0 offset:0x020f
+        0xbf860002u,   // vccz -> pc5
+        0xd8d4020fu, 0x00000000u,   // ds_swizzle_b32 v0,v0 offset:0x020f
         0xbf810000u,
     };
     if (!recompile_compute(wave64_compute_vcc_barrier,
@@ -3628,6 +3635,9 @@ int main() {
     // which are identical for every wave of a workgroup, so with EXEC full the branch decides
     // identically for all waves and the arm may synchronize. local_x=128/wave_size=64 means two
     // guest waves, so this genuinely exercises the cross-wave case rather than a single-wave shader.
+    // These synthetic tests declare the actual entry SGPRs consumed by the uniform compares.
+    auto uniform_vcc_config = portable_wave64_compute_config;
+    uniform_vcc_config.user_sgprs = {0u, 0u, 1u, 0u, 0u};
     const uint32_t wave64_uniform_vcc_barrier[] = {
         0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
         0xbf088002u,                         // pc1: s_cmp_gt_u32 s2, 0
@@ -3640,9 +3650,9 @@ int main() {
         0xbf800000u,                         // pc8: s_nop
         0xbf810000u,                         // pc9: s_endpgm
     };
-    const auto wave64_uniform_vcc_barrier_spv = recompile_compute(
-        wave64_uniform_vcc_barrier, std::size(wave64_uniform_vcc_barrier), nullptr,
-        portable_wave64_compute_config);
+    const auto wave64_uniform_vcc_barrier_spv =
+        recompile_compute(wave64_uniform_vcc_barrier, std::size(wave64_uniform_vcc_barrier),
+                          nullptr, uniform_vcc_config);
     if (wave64_uniform_vcc_barrier_spv.empty() ||
         !has_opcode(wave64_uniform_vcc_barrier_spv, 224) ||  // OpControlBarrier: the guest barrier
         !has_opcode(wave64_uniform_vcc_barrier_spv, 247) ||  // OpSelectionMerge: retained guest arm
@@ -3667,12 +3677,12 @@ int main() {
     // (b) VCC is combined with a VOPC-written mask instead of a second proved select, so the branch
     //     tests lane occupancy rather than a scalar predicate.
     const uint32_t wave64_uniform_vcc_lane_scc[] = {
-        0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
-        0x7d840000u,                         // pc1: v_cmp_eq_u32 vcc, v0, v0   (lane-derived mask)
-        0xbf088002u,                         // pc2: s_cmp_gt_u32 s2, 0
-        0x858a807eu,                         // pc3: s_cselect_b64 s[10:11], exec, 0
-        0x87ea0a6au,                         // pc4: s_and_b64 vcc, vcc, s[10:11]
-        0xbf860002u,                         // pc5: s_cbranch_vccz -> pc8
+        0xbefe04c1u,   // pc0: s_mov_b64 exec, -1
+        0x7d840000u,   // pc1: v_cmp_eq_u32 vcc,s0,v0 (lane-derived mask)
+        0xbf088002u,   // pc2: s_cmp_gt_u32 s2, 0
+        0x858a807eu,   // pc3: s_cselect_b64 s[10:11], exec, 0
+        0x87ea0a6au,   // pc4: s_and_b64 vcc, vcc, s[10:11]
+        0xbf860002u,   // pc5: s_cbranch_vccz -> pc8
         0xbf8a0000u, 0xbf800000u, 0xbf810000u,
     };
     // (c) A contributing compare reads a V_READFIRSTLANE result: uniform per wave, not per workgroup.
@@ -3709,8 +3719,7 @@ int main() {
     };
     bool uniform_vcc_negatives_held = true;
     for (const auto& negative : uniform_vcc_negatives) {
-        if (recompile_compute(negative.code, negative.words, nullptr,
-                              portable_wave64_compute_config).empty())
+        if (recompile_compute(negative.code, negative.words, nullptr, uniform_vcc_config).empty())
             continue;
         printf("  [FAIL] %s still admitted a barrier-spanning VCC branch\n", negative.what);
         uniform_vcc_negatives_held = false;

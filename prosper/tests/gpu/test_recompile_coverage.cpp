@@ -748,6 +748,9 @@ int main() {
     // in the same physical low word, and pc85 replaces the complete pair before VCC_HI can be
     // observed. Retain the production pc74..103 packets and the loop that forces CFG dispatch.
     std::vector<uint32_t> wave64_vcc_lo_scalar_offset(74, 0xbf800000u);
+    // Owned full preheader v1 seed covers inactive bits preserved by later masked writers.
+    wave64_vcc_lo_scalar_offset[0] = 0x7E020280u;
+    wave64_vcc_lo_scalar_offset[1] = 0x7E040280u;   // same full preheader seed for pc88/pc99 v2
     const uint32_t wave64_vcc_lo_scalar_tail[] = {
         0x7d288812u,                         // pc74: v_cmp_* vcc,s18,v68
         0xbf88001bu,                         // pc75: s_cbranch_execz pc103
@@ -785,7 +788,7 @@ int main() {
       buffer.gpu_addr = 0x400000u; buffer.size = 120; buffer.fetch_pc = 91;
       wave64_vcc_lo_scalar_rt.resources.push_back(buffer); }
     ComputeShaderConfig wave64_vcc_lo_scalar_config = smem_x2_descriptor_fragment_config;
-    wave64_vcc_lo_scalar_config.user_sgprs.resize(24);
+    wave64_vcc_lo_scalar_config.user_sgprs.resize(25);   // includes encoded s24 at pc100
     CHECK(!recompile_compute(wave64_vcc_lo_scalar_offset.data(),
                              wave64_vcc_lo_scalar_offset.size(),
                              &wave64_vcc_lo_scalar_rt,
@@ -2036,15 +2039,16 @@ int main() {
     // implicit VCC predicate comes from the fresh compare immediately before it. Keep a crossing
     // tail so the fixture exercises the production Wave64 dispatcher dataflow rather than SSA.
     std::vector<uint32_t> compute_cfg_dispatch_resolved_b32_half = {
-        0xBF068008u,                         // pc0: scalar branch condition
-        0xBF840003u,                         // pc1: branch to mask-producing arm
-        0xBE900381u,                         // pc2: scalar arm s16 = 1
-        0xBE910380u,                         // pc3: scalar arm s17 = 0
-        0xBF820001u,                         // pc4: merge
-        0xBE900A7Eu,                         // pc5: mask-only WQM s[16:17] = exec
-        0x7D840000u,                         // pc6: fresh implicit VCC predicate
-        0xBE900381u,                         // pc7: exact B32 overwrite corresponding to live pc102
-        0x020E20F9u, 0x86860680u,            // pc8: exact live pc105 cndmask SDWA reads s16
+        0xBF068008u,   // pc0: scalar branch condition
+        0xBF840003u,   // pc1: branch to mask-producing arm
+        0xBE900381u,   // pc2: scalar arm s16 = 1
+        0xBE910380u,   // pc3: scalar arm s17 = 0
+        0xBF820001u,   // pc4: merge
+        0xBE900A7Eu,   // pc5: mask-only WQM s[16:17] = exec
+        0xBE800380u,   // pc6: explicit s0=0 comparison input
+        0x7D840000u,   // pc7: fresh implicit VCC predicate reads s0,v0
+        0xBE900381u,   // pc8: exact B32 overwrite corresponding to live pc102
+        0x020E20F9u, 0x86860680u,   // pc9: exact live pc105 cndmask SDWA reads s16
     };
     compute_cfg_dispatch_resolved_b32_half.insert(
         compute_cfg_dispatch_resolved_b32_half.end(), compute_cfg_dispatch,
@@ -2056,8 +2060,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_wrong_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_wrong_b32_half[7] =
-        0xBE910381u;                         // overwrite s17; the consumed s16 remains ambiguous
+    compute_cfg_dispatch_wrong_b32_half[8] =
+        0xBE910381u;   // overwrite s17; the consumed s16 remains ambiguous
     CHECK(recompile_compute(compute_cfg_dispatch_wrong_b32_half.data(),
                             compute_cfg_dispatch_wrong_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2065,9 +2069,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_b64_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_b64_after_b32_half[8] =
-        0xBE841410u;                         // s_ff1_i32_b64 s4,s[16:17]
-    compute_cfg_dispatch_b64_after_b32_half[9] = 0xBF800000u;
+    compute_cfg_dispatch_b64_after_b32_half[9] = 0xBE841410u;   // s_ff1_i32_b64 s4,s[16:17]
+    compute_cfg_dispatch_b64_after_b32_half[10] = 0xBF800000u;
     CHECK(recompile_compute(compute_cfg_dispatch_b64_after_b32_half.data(),
                             compute_cfg_dispatch_b64_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2075,9 +2078,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_flbit_b64_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_flbit_b64_after_b32_half[8] =
-        0xBE841610u;                         // s_flbit_i32_b64 s4,s[16:17]
-    compute_cfg_dispatch_flbit_b64_after_b32_half[9] = 0xBF800000u;
+    compute_cfg_dispatch_flbit_b64_after_b32_half[9] = 0xBE841610u;   // s_flbit_i32_b64 s4,s[16:17]
+    compute_cfg_dispatch_flbit_b64_after_b32_half[10] = 0xBF800000u;
     CHECK(recompile_compute(compute_cfg_dispatch_flbit_b64_after_b32_half.data(),
                             compute_cfg_dispatch_flbit_b64_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2088,9 +2090,9 @@ int main() {
     // high VOPC numbers as pairs (which also incorrectly catches adjacent f16 compares).
     std::vector<uint32_t> compute_cfg_dispatch_i64_compare_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_i64_compare_after_b32_half[8] =
-        0xD4A2006Au;                         // v_cmp_eq_i64_e64 vcc,s[16:17],0
-    compute_cfg_dispatch_i64_compare_after_b32_half[9] = 0x00010010u;
+    compute_cfg_dispatch_i64_compare_after_b32_half[9] =
+        0xD4A2006Au;   // v_cmp_eq_i64_e64 vcc,s[16:17],0
+    compute_cfg_dispatch_i64_compare_after_b32_half[10] = 0x00010010u;
     CHECK(recompile_compute(compute_cfg_dispatch_i64_compare_after_b32_half.data(),
                             compute_cfg_dispatch_i64_compare_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
