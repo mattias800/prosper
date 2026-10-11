@@ -367,10 +367,13 @@ TEST(RefusedGraphicsInputs, SetIdentityCoversArgumentsAndMetadataButNotBytes) {
     changed.invocation.float_flags.available = !g.invocation.float_flags.available;
     EXPECT_NE(refused_graphics_inputs_identity(changed), original);
     changed = g;
-    changed.invocation.launch_rsrc1.value++;
+    changed.invocation.launch_rsrc1 = {true, 0};
     EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    const auto observed_zero = refused_graphics_inputs_identity(changed);
+    changed.invocation.launch_rsrc1.value = 1;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), observed_zero);
     changed = g;
-    changed.invocation.export_formats.compressed_formats++;
+    changed.invocation.export_formats.compressed_formats = 5;
     EXPECT_NE(refused_graphics_inputs_identity(changed), original);
     changed = g;
     changed.invocation.trip.bound = 1;
