@@ -15,8 +15,8 @@ void for_each_possible_vector_write(const Rdna2Inst& in, int max_observable_vgpr
         callback(in.dst.value + static_cast<int>(word));
 }
 // Register STORAGE/effect inventory, not initialized guest VALUE or per-lane validity authority.
-// Native callers preserve their historical effect domain. The owned packet actually executes
-// VINTRP, so it must reload VDST even for P1's inactive-word preservation and P2's OLD source.
+// Native VINTRP P2/MOV publish VDST; native P1 is a no-op. The owned packet also executes P1,
+// so it must reload VDST for partial interpolation and inactive-word preservation.
 void loop_written_regs(const std::vector<Rdna2Inst>&, uint32_t lo, uint32_t hi,
                        std::set<int>& vgprs, std::set<int>& sgprs, bool owned_packet = false);
 // Scalar registers that MAY be overwritten in [lo, hi), mask-pair destinations included.
