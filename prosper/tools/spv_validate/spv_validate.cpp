@@ -56,6 +56,7 @@
 #include "../../tests/fixtures/saveexec_m0.hpp"
 #include "../../tests/fixtures/uint_d16_store.hpp"
 #include "../../tests/fixtures/graphics_empty_sbuffer.hpp"
+#include "../../tests/fixtures/readlane_barrier.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -2352,6 +2353,17 @@ int main(int argc, char** argv) {
                      "recompile_ngg_exports_for_test");
             }
         }
+    }
+    // Portable READLANE services retain distinct guest waves through a proven LDS barrier split.
+    {
+        namespace fixture = prosper::test::readlane_barrier;
+        const auto resources = fixture::table();
+        const auto p = fixture::program();
+        dump(dir, "compute_readlane_barrier_four_waves", fixture::compile(p, resources),
+             "recompile_compute");
+        const auto masked = fixture::program({.narrowed_readlane = true});
+        dump(dir, "compute_readlane_barrier_exec_off_peer", fixture::compile(masked, resources),
+             "recompile_compute");
     }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.

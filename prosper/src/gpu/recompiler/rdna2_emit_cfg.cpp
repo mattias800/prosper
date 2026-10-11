@@ -7176,6 +7176,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                                    has_ordinary_cfg_readlane(ins);
         if (allow_cfg_dispatcher && portable_compute_cfg_readlane) {
             if (!cfg_dispatch_safe) {
+                if (!initial_dispatch_active && !force_barrier_phases &&
+                    can_retry_readlane_barrier_phases(ins, rs))
+                    return emit_body(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                                     code, dwords, &dead_masks, allow_cfg_dispatcher, 0,
+                                     /*force_barrier_phases=*/true);
                 log_recompile_diagnostic(
                     b.diagnostic, "compute-cfg-reject", "terminal",
                     "reason=portable-readlane-dispatcher-unsafe guest-barrier=1");
