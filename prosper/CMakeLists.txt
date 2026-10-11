@@ -3388,6 +3388,7 @@ if(TARGET prosper_core)
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
+  target_include_directories(test_rdna2_spirv_struct PRIVATE tests)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
 
   prosper_add_gtest(test_compute_dpp_row_max
@@ -3524,6 +3525,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_native_compute_launch
     SOURCES tests/gpu/recompiler/test_native_compute_launch.cpp
     INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_structural_launch
+    SOURCES tests/gpu/recompiler/test_native_structural_launch.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
