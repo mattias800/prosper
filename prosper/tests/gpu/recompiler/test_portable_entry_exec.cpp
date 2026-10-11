@@ -1,12 +1,17 @@
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/portable_entry_exec.hpp"
 #include "gpu/recompiler/rdna2_entry_exec_constants.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 using namespace prosper::gpu;
 namespace fixture = prosper::test::portable_entry_exec;
@@ -23,16 +28,16 @@ void execute(uint32_t lanes, bool phased) {
     ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(address);
     bpermute_oracle::Interpreter vm(module);
     const auto got = vm.run_buffers(
-        lanes, {{3, std::vector<uint32_t>(lanes * fixture::planes, fixture::sentinel)}}, 3);
+        lanes, {{3, std::vector<uint32_t>(size_t{lanes} * fixture::planes, fixture::sentinel)}}, 3);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     EXPECT_EQ(got, fixture::expected(lanes))
         << "physical low/high, unsigned borrow, lane0 restore, full restore and phase scalar";
 }
-void no_authority(ComputeShaderConfig c) {
+void no_authority(const ComputeShaderConfig& c) {
     const auto ins = decode(fixture::program());
     EXPECT_TRUE(portable_entry_exec_constant_reads(ins, c).empty());
 }
-void refuse(std::vector<uint32_t> p, ComputeShaderConfig c = fixture::config()) {
+void refuse(const std::vector<uint32_t>& p, const ComputeShaderConfig& c = fixture::config()) {
     const auto address = fixture::address();
     EXPECT_TRUE(fixture::compile(p, c, address).empty());
     EXPECT_FALSE(last_terminal_reject_reason(address).empty());

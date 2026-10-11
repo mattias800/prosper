@@ -4,6 +4,7 @@
 #include "gpu/resources/shader_resources.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -79,7 +80,7 @@ inline uint64_t address() {
     return next.fetch_add(0x100, std::memory_order_relaxed);
 }
 inline std::vector<uint32_t> compile(const std::vector<uint32_t>& p,
-                                     ComputeShaderConfig c = config(),
+                                     const ComputeShaderConfig& c = config(),
                                      uint64_t diagnostic = address()) {
     const auto resources = table(c.local_x);
     return recompile_compute(p.data(), p.size(), &resources, c,
