@@ -29,13 +29,17 @@ bool native_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
 // CONFIDENCE: HIGH -- this fragment route preserves the same current B64 predicate.
 // Its instruction-order MUST source and generation deadness do not authorize any physical
 // words or a ballot after lanes left. Packet/portable and unrelated execution domains differ.
-bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
+bool fragment_copy_domain(const SpirvCompute& b) {
     return b.is_fragment && !b.is_compute && !b.is_vertex && !b.ngg_workgroup_shell &&
            !b.ngg_one_lane && b.guest_stage == GuestShaderStage::Fragment &&
-           b.physical_domain == PhysicalExecutionDomain::Invocation && b.wave_size == 64 &&
-           in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
-           in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
-           in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 && in.src[0].value <= 104;
+           b.physical_domain == PhysicalExecutionDomain::Invocation && b.wave_size == 64;
+}
+
+bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
+    return fragment_copy_domain(b) && in.fmt == Rdna2Format::SOP1 &&
+           in.opcode == kSop1OpcodeMovB64 && in.dst.kind == OperandKind::SGPR &&
+           in.dst.value == 106 && in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+           in.src[0].value <= 104;
 }
 
 std::array<uint32_t, 9> copy_entry_domain(const SpirvCompute& b) {
