@@ -15,6 +15,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/compute_runner.h"
 #include "fixtures/gta5_compute_cfg_fixture.hpp"
+#include "fixtures/native_execution_launch.hpp"
 #include <algorithm>
 #include <bit>
 #include <set>
@@ -471,10 +472,7 @@ int main() {
       output.format = DataFormat::Uint32; output.num_components = 1;
       output.binding = 3; output.stride = 4; output.sgpr_base = 8;
       exec_ballot_table.resources.push_back(output); }
-    ComputeShaderConfig exec_ballot_config;
-    exec_ballot_config.local_x = 64;
-    exec_ballot_config.wave_size = 64;
-    exec_ballot_config.native_subgroup_size = 64;
+    ComputeShaderConfig exec_ballot_config = prosper::test::native_execution_launch();
     const std::vector<uint32_t> exec_ballot_spv = recompile_compute(
         code9_exec_ballot_halves, std::size(code9_exec_ballot_halves),
         &exec_ballot_table, exec_ballot_config);
@@ -1725,9 +1723,7 @@ int main() {
                             &gta_pc232_table, gta_pc232_config).empty(),
           "full GTA CFG rejects pc232 packet drift into the killed VCC_HI word");
 
-    ComputeShaderConfig native_linear_cfg17d = native_cfg17d;
-    native_linear_cfg17d.local_x = 64;
-    native_linear_cfg17d.local_y = 1;
+    ComputeShaderConfig native_linear_cfg17d = prosper::test::native_execution_launch();
     const std::vector<uint32_t> native_linear_spv17d = recompile_compute(
         code17d, std::size(code17d), nullptr, native_linear_cfg17d);
 
