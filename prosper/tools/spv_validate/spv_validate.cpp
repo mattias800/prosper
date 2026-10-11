@@ -60,6 +60,7 @@
 #include "../../tests/fixtures/uint_d16_store.hpp"
 #include "../../tests/fixtures/graphics_empty_sbuffer.hpp"
 #include "../../tests/fixtures/readlane_barrier.hpp"
+#include "../../tests/fixtures/portable_entry_exec.hpp"
 #include "../../tests/fixtures/native_mask_participation.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
@@ -359,6 +360,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},
+    {"portable_entry_exec_constant_reads",
+     "returns eligible original integer-read PCs, not SPIR-V; PortableEntryExec exercises the "
+     "launch/generation proof and actual compute modules are validated here"},
     {"rdna2_raw_wave_wide_data_loads",
      "returns original numeric-load PCs, not SPIR-V; raw-register-wide and capture tests retain "
      "the obligation after bounded admission refuses; owned64 modules validate the consumer"},
@@ -2438,6 +2442,13 @@ int main(int argc, char** argv) {
         }
     }
     // Portable READLANE services retain distinct guest waves through a proven LDS barrier split.
+    {
+        namespace fixture = prosper::test::portable_entry_exec;
+        dump(dir, "compute_portable_entry_exec_words", fixture::compile(fixture::program()),
+             "recompile_compute");
+        dump(dir, "compute_portable_entry_exec_first_phase",
+             fixture::compile(fixture::program(256, true)), "recompile_compute");
+    }
     {
         namespace fixture = prosper::test::readlane_barrier;
         const auto resources = fixture::table();
