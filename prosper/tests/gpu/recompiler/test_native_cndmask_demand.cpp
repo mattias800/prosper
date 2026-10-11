@@ -338,12 +338,12 @@ TEST(NativeCndmaskDemand, ProductionLoopOverwriteCannotSupplyMustBool) {
 
 TEST(NativeCndmaskDemand, ProductionMissingBoolConditionStillRejects) {
     EXPECT_TRUE(compile(production_program(129, 137, {}, {}, 24), 0xa490410bull).empty());
-    EXPECT_NE(last_terminal_reject_reason(0xa490410bull).find("opcode=0x101"), std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa490410bull).find("op=0x101"), std::string::npos);
 }
 
 TEST(NativeCndmaskDemand, ProductionScalarWordsDoNotSupplyBoolCondition) {
     const auto code = production_program(129, 137, {}, {0xbe980381u, 0xbe990380u}, 24);
     EXPECT_TRUE(compile(code, 0xa490410cull).empty());
-    EXPECT_NE(last_terminal_reject_reason(0xa490410cull).find("opcode=0x101"), std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0xa490410cull).find("op=0x101"), std::string::npos);
 }
 }   // namespace prosper::gpu
