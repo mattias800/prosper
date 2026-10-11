@@ -200,7 +200,7 @@ file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5501
 # note #4814: +10 net lines refuse 3D-tail views at both storage builders (the seed
 # and writeback do not use the tail origin) and size their backing from the selected
 # view; the guest-visible result is refusing silent wrong texels instead of binding them.
-file-size|prosper/src/gpu/execute/gpu_executor.cpp 13166
+file-size|prosper/src/gpu/execute/gpu_executor.cpp 13076
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 # note #3951: one caller line delegates checked logical64 raw-window emission to its companion.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
@@ -302,7 +302,9 @@ host-throw|prosper/src/gpu/capture/fragment_compile_case.cpp 2
 host-throw|prosper/src/gpu/capture/serialize/fold_capture_codec.cpp 2
 host-throw|prosper/src/gpu/diagnostics/refused_shader_inputs.cpp 1  # one require() helper; the live writer catches every throw inside write_refused_compute_inputs, and offline decode/replay errors are caught by shader_inspect (#4808)
 host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
-host-throw|prosper/src/gpu/execute/gpu_executor.cpp 2
+host-throw|prosper/src/gpu/execute/gpu_executor.cpp 1
+# #4877: the existing caught fragment capture throw moved with the compile boundary.
+host-throw|prosper/src/gpu/execute/graphics_shader_compile.cpp 1
 host-throw|prosper/src/gpu/execute/nested_wide_data_admission.cpp 2
 host-throw|prosper/src/gpu/pm4/command_processor.hpp 2
 host-throw|prosper/src/gpu/recompiler/compiler_choices.cpp 2
