@@ -2154,6 +2154,14 @@ int main(int argc, char** argv) {
         dump(dir, "compute_counted_bool_copy_continuation",
              recompile_compute(compute.data(), compute.size(), nullptr, config));
     }
+    // #4924: CSELECT and ORN2 produce a genuine fragment Bool source for the saved
+    // MOV-to-VCC generation, despite the physical read of its older generation.
+    {
+        const uint32_t c[] = {0xbeea0481u, 0xbe9e036au, 0x7e000281u, 0x7e020280u, 0x7d840300u,
+                              0xbf068080u, 0x85ea807eu, 0x8b987e6au, 0xbeea0418u, 0xd5010000u,
+                              0x01a91281u, 0xf800080fu, 0x00000000u, 0xbf810000u};
+        dump(dir, "fragment_logical_bool_copy", recompile_fragment(c, std::size(c), nullptr));
+    }
     // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
     // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
     // the structured loop route, and the one-arm if phis a slot written on the taken arm only.

@@ -3495,6 +3495,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_counted_copy_continuation.cpp
     INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_logical_bool_copy
+    SOURCES tests/gpu/recompiler/test_fragment_logical_bool_copy.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     LIBRARIES prosper_core)

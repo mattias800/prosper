@@ -35,7 +35,7 @@ class SavedMaskCopyFrame {
     struct Origin {
         std::vector<uint32_t> words;
         std::vector<Rdna2Inst> instructions;
-        std::array<uint32_t, 9> domain;
+        std::array<uint32_t, 10> domain;
         std::set<int> entry_masks;
         std::unordered_set<int> entry_b32_masks;
         std::set<uint32_t> native_copies, fragment_copies;

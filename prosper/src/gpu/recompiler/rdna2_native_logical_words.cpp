@@ -32,7 +32,8 @@ bool native_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
 bool fragment_copy_domain(const SpirvCompute& b) {
     return b.is_fragment && !b.is_compute && !b.is_vertex && !b.ngg_workgroup_shell &&
            !b.ngg_one_lane && b.guest_stage == GuestShaderStage::Fragment &&
-           b.physical_domain == PhysicalExecutionDomain::Invocation && b.wave_size == 64;
+           b.physical_domain == PhysicalExecutionDomain::Invocation && b.wave_size == 64 &&
+           !b.allow_b32_masks;
 }
 
 bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
@@ -42,7 +43,7 @@ bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
            in.src[0].value <= 104;
 }
 
-std::array<uint32_t, 9> copy_entry_domain(const SpirvCompute& b) {
+std::array<uint32_t, 10> copy_entry_domain(const SpirvCompute& b) {
     return {static_cast<uint32_t>(b.guest_stage),
             static_cast<uint32_t>(b.physical_domain),
             b.wave_size,
@@ -51,7 +52,8 @@ std::array<uint32_t, 9> copy_entry_domain(const SpirvCompute& b) {
             b.is_fragment,
             b.is_vertex,
             b.ngg_workgroup_shell,
-            b.ngg_one_lane};
+            b.ngg_one_lane,
+            b.allow_b32_masks};
 }
 
 bool ordinary_pair(const Operand& source) {
@@ -209,17 +211,27 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     }
     Words entry;
     entry.set(126);
-    entry.set(127);   // the architectural EXEC predicate always has a Bool view
+    if (!fragment_copy_domain(b)) entry.set(127);
     if (initial) {
-        if (initial->vcc) {
+        if (initial->vcc && (!fragment_copy_domain(b) || !initial->sreg_bool_b32.contains(106))) {
             entry.set(106);
-            entry.set(107);
+            if (!fragment_copy_domain(b)) entry.set(107);
         }
         for (const auto& [root, value] : initial->sreg_bool)
-            if (value && root >= 0 && root < 128) entry.set(root);
+            if (value && root >= 0 && root < 128 &&
+                (!fragment_copy_domain(b) || ((root <= 104 || root == 106 || root == 126) &&
+                                              !initial->sreg_bool_b32.contains(root))))
+                entry.set(root);
     }
-    const auto mask_source = [](const Words& masks, const Operand& source) {
+    const auto mask_source = [&](const Words& masks, const Operand& source) {
         if (source.kind == OperandKind::InlineInt) return true;
+        // A fragment B64 source must remain complete through every relay. A move/select
+        // cannot turn an independent high word or B32 seed into a whole-mask root.
+        if (fragment_copy_domain(b) &&
+            !((source.kind == OperandKind::SGPR && source.value >= 0 && source.value <= 104) ||
+              ((source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
+               (source.value == 106 || source.value == 126))))
+            return false;
         return (source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
                source.value >= 0 && source.value < 128 && masks.test(source.value);
     };
@@ -251,6 +263,15 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             const bool select_mask = in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0b &&
                                      mask_source(incoming, in.src[0]) &&
                                      mask_source(incoming, in.src[1]);
+            // CONFIDENCE: HIGH -- the existing fragment SOP2 emitter computes these logical
+            // results pointwise from genuine Bool operands. This is only the original MUST
+            // transfer; generation DATA demand and current-source validation remain separate.
+            const bool fragment_logical =
+                fragment_copy_domain(b) && in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f &&
+                in.opcode <= 0x1d && (in.opcode & 1u) && in.dst.kind == OperandKind::SGPR &&
+                ((in.dst.value >= 0 && in.dst.value <= 104) || in.dst.value == 106 ||
+                 in.dst.value == 126) &&
+                mask_source(incoming, in.src[0]) && mask_source(incoming, in.src[1]);
             const bool conditional =
                 in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64);
@@ -266,16 +287,18 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
                 for (int root : {105, 106, 107}) value.reset(root);
             if (in.fmt == Rdna2Format::Unknown || rdna2_escapes_decoded_effects(in)) value.reset();
             int root = -1;
-            if (!conditional &&
-                (copy_mask || select_mask || saveexec(in) || is_native_b64_logical(b, in)))
+            if (!conditional && (copy_mask || select_mask || saveexec(in) ||
+                                 is_native_b64_logical(b, in) || fragment_logical))
                 root = in.dst.value;
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode))
                 root = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
             if (vop3_writes_mask_sdst(in)) root = in.sdst.value;
-            if (root >= 0 && root < 128) value.set(root);
-            if (root == 106) value.set(107);
+            if (root >= 0 && root < 128 &&
+                (!fragment_copy_domain(b) || root <= 104 || root == 106 || root == 126))
+                value.set(root);
+            if (root == 106 && !fragment_copy_domain(b)) value.set(107);
             value.set(126);
-            value.set(127);
+            if (!fragment_copy_domain(b)) value.set(127);
             if (value != masks_after[i]) {
                 masks_after[i] = value;
                 masks_changed = true;
