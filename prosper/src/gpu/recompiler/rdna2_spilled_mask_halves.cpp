@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <algorithm>
 #include <cstdint>
