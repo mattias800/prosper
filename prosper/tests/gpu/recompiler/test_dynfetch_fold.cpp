@@ -14,6 +14,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/fold_reader.hpp"
+#include "fixtures/gta5_guarded_raw_store_fixture.hpp"
 #include "fixtures/gta5_nullable_output_fixture.hpp"
 #include "fixtures/gta5_zero_record_execz_fixture.hpp"
 #include <algorithm>
@@ -4525,29 +4526,8 @@ int main() {
     // shader so the proof is tied to the observed PCs, packets, descriptor builder, and CFG rather
     // than a helper-shaped toy. Give its unrelated input/table accesses real mapped backing so this
     // test reaches complete compute translation instead of stopping at an earlier resource use.
-    const std::vector<uint32_t> gta_413cf9a00 = {
-        0xbfa00003u, 0xd7460000u, 0x04010c07u, 0xf4040500u,
-        0xfa000090u, 0xbe960304u, 0xbe9703ffu, 0x00016204u,
-        0xbf8cc07fu, 0xbe951d92u, 0x816ac104u, 0xe0302000u,
-        0x80050100u, 0xf4080300u, 0xfa0000c0u, 0xbf8cc07fu,
-        0xf4200406u, 0xfa000000u, 0xbf8cc07fu, 0x7e040210u,
-        0xbe9703ffu, 0x00016204u, 0xbe92047eu, 0x7da8006au,
-        0xbf880003u, 0x4a040081u, 0xe0302000u, 0x80050202u,
-        0xbefe0412u, 0xbf8c3f70u, 0x7da80302u, 0xbf880009u,
-        0xf4040200u, 0xfa000098u, 0xbe8a0304u, 0xbe8b03ffu,
-        0x00016204u, 0xbf8cc07fu, 0xbe891d92u, 0xe0702000u,
-        0x80020001u, 0xbefe0412u, 0xbf128002u, 0x7d8a00f9u,
-        0x06868080u, 0x85ea8012u, 0x8dea006au, 0x87fe126au,
-        0xbf88001fu, 0x7e0e0210u, 0x936b6a10u, 0x936a056au,
-        0x87048106u, 0x816b6a6bu, 0x9aea0510u, 0x93000510u,
-        0x81016b6au, 0xbf078004u, 0x4a0620f9u, 0x86860681u,
-        0x85ea1000u, 0x7e000210u, 0x7e10026au, 0x7e020210u,
-        0x7e040280u, 0x7e080210u, 0x7e0a0281u, 0x7e0c0281u,
-        0x8801ff03u, 0x00380000u, 0xbe800302u, 0xbe820381u,
-        0xbe8303ffu, 0x00016204u, 0xe0740030u, 0x80000700u,
-        0xe0780020u, 0x80000000u, 0xe07c0000u, 0x80000400u,
-        0xbf810000u,
-    };
+    const std::vector<uint32_t> gta_413cf9a00(prosper::test::kGta5GuardedRawStoreProgram.begin(),
+                                              prosper::test::kGta5GuardedRawStoreProgram.end());
     alignas(256) std::array<uint32_t, 64> gta_null_store_srt{};
     alignas(256) std::array<uint32_t, 256> gta_null_store_input{};
     alignas(256) std::array<uint32_t, 256> gta_null_store_output{};
@@ -4585,14 +4565,8 @@ int main() {
         gta_null_store_table, gta_413cf9a00.data(), gta_413cf9a00.size(),
         gta_413cf9a00_null_seed, std::size(gta_413cf9a00_null_seed));
     assign_convention_bindings(gta_null_store_table, 2);
-    ComputeShaderConfig gta_null_store_config;
-    gta_null_store_config.user_sgprs.assign(
-        std::begin(gta_413cf9a00_null_seed), std::end(gta_413cf9a00_null_seed));
-    gta_null_store_config.local_x = 64u;
-    gta_null_store_config.local_y = gta_null_store_config.local_z = 1u;
-    gta_null_store_config.wave_size = 64u;
-    gta_null_store_config.native_subgroup_size = 64u;
-    gta_null_store_config.tidig_comp_cnt = 0u;
+    const ComputeShaderConfig gta_null_store_config =
+        prosper::test::guarded_raw_store_config(gta_413cf9a00_null_seed);
     const std::vector<uint32_t> gta_null_store_spirv = recompile_compute(
         gta_413cf9a00.data(), gta_413cf9a00.size(), &gta_null_store_table,
         gta_null_store_config);
