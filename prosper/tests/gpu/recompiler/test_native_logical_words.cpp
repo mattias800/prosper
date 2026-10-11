@@ -145,8 +145,9 @@ TEST(NativeLogicalWords, PartialHostRegionUsesRetainedWordsOfDepartedLanes) {
     auto actual = vm.run_buffers(64, {{1, std::vector<uint32_t>(128, 0xdeadbeef)}}, 1);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     for (uint32_t lane = 0; lane < 64; ++lane) {
-        EXPECT_EQ(actual[lane * 2], lane < 8 ? static_cast<uint32_t>(expected(0x1d)) : 0xdeadbeef);
-        EXPECT_EQ(actual[lane * 2 + 1],
+        const size_t offset = static_cast<size_t>(lane) * 2;
+        EXPECT_EQ(actual[offset], lane < 8 ? static_cast<uint32_t>(expected(0x1d)) : 0xdeadbeef);
+        EXPECT_EQ(actual[offset + 1],
                   lane < 8 ? static_cast<uint32_t>(expected(0x1d) >> 32) : 0xdeadbeef);
     }
 }
