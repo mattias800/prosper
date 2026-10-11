@@ -679,7 +679,7 @@ struct SpirvCompute {
     std::set<uint32_t> native_bool_only_vcc_copy_pcs;
     // Invocation-domain fragment copies retain only their existing predicate, never DATA words.
     std::set<uint32_t> fragment_bool_only_vcc_copy_pcs;
-    std::array<uint32_t, 9> native_vcc_copy_entry_domain{};
+    std::array<uint32_t, 10> native_vcc_copy_entry_domain{};
     std::shared_ptr<SavedMaskCopyFrame> saved_mask_copy_frame;
     uint64_t saved_mask_copy_revocation_epoch = 0;
     std::set<int> native_vcc_copy_entry_masks;
