@@ -45,9 +45,24 @@ struct SpilledMaskHalves {
     // vector-to-scalar read (GTA V's `v_readlane_b32 vcc_lo, v0, 0`), not a relay of a possibly
     // fabricated slot word.
     std::set<int> lane_written_vgprs;
+    // MAY provenance of ordinary vector relays and memory-pattern data (#4787). Storage reload
+    // does not turn their placeholder bits into genuine scalar lane-mask inputs.
+    std::set<int> relayed_vectors, memory_vectors, memory_words;
+    std::set<std::pair<int, int>> memory_slots;
+    bool exec_known_full = false;
     bool operator==(const SpilledMaskHalves&) const = default;
 };
 inline constexpr int kRelayedScc = 253;
+struct SpilledVectorSourceMarks {
+    bool vector_relay = false;
+    bool scalar_relay = false;
+    bool memory = false;
+};
+// Snapshot before ANY scalar/mask destination fact changes, including an aliasing VOP3B SDST.
+SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
+                                                     const Rdna2Inst& in,
+                                                     const std::set<int>& masks,
+                                                     const std::set<int>& scalar_words);
 
 // CFG join: keep only the facts every incoming path agrees on (`relayed_words`, a MAY fact, takes
 // every path's).
@@ -58,7 +73,8 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
 void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::set<int>& masks, const std::set<int>& scalar_words,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
-                           const std::vector<int>& vector_writes);
+                           const std::vector<int>& vector_writes,
+                           const SpilledVectorSourceMarks& source);
 
 // At a dispatcher block entry: the reloaded SGPR words (and SCC) that may be relayed fabricated
 // words get the emitter's merge-placeholder mark, as they carried inside the case they left.

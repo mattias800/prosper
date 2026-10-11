@@ -280,6 +280,9 @@ uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index) {
     if (in.fmt == Rdna2Format::VOP3 &&
         in.opcode == kVop3OpcodeLshrrevB64 && source_index == 1)
         return 2;
+    if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x176 || in.opcode == 0x177) &&
+        source_index == 2)
+        return 2;   // MAD_U64_U32 / MAD_I64_I32 consume both dwords of the addend.
     // Dispatcher discovery historically treats every admitted DS source as a conservative four
     // dword range because read/write2 and 64/96/128-bit packets encode only the base register.
     if (in.fmt == Rdna2Format::DS) return 4;

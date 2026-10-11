@@ -58,6 +58,11 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     into.relayed_words.insert(incoming.relayed_words.begin(), incoming.relayed_words.end());
     into.lane_written_vgprs.insert(incoming.lane_written_vgprs.begin(),
                                    incoming.lane_written_vgprs.end());
+    into.relayed_vectors.insert(incoming.relayed_vectors.begin(), incoming.relayed_vectors.end());
+    into.memory_vectors.insert(incoming.memory_vectors.begin(), incoming.memory_vectors.end());
+    into.memory_words.insert(incoming.memory_words.begin(), incoming.memory_words.end());
+    into.memory_slots.insert(incoming.memory_slots.begin(), incoming.memory_slots.end());
+    into.exec_known_full = into.exec_known_full && incoming.exec_known_full;
 }
 
 namespace {
@@ -88,26 +93,85 @@ bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in) {
 
 }  // namespace
 
-void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
-                           const std::set<int>& masks, const std::set<int>& scalar_words,
-                           const std::vector<std::pair<int, uint32_t>>& scalar_writes,
-                           const std::vector<int>& vector_writes) {
-    auto& defined = state.defined_slots;
-    auto& relayed = state.relayed_words;
+SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
+                                                     const Rdna2Inst& in,
+                                                     const std::set<int>& masks,
+                                                     const std::set<int>& scalar_words) {
+    const auto& defined = state.defined_slots;
+    const auto& relayed = state.relayed_words;
+    const auto vector_any = [&](const std::set<int>& marked) {
+        for (uint32_t source = 0; source < in.n_src; ++source)
+            for (uint32_t word = 0; word < rdna2_vgpr_source_span(in, source); ++word)
+                if (marked.contains(in.src[source].value + static_cast<int>(word))) return true;
+        if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
+            return std::any_of(marked.begin(), marked.end(),
+                               [&](int reg) { return reg >= in.src[0].value; });
+        return false;
+    };
+    const bool load = in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
+                      in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
+                      in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::DS;
+    bool vector_relay = (!load || in.fmt == Rdna2Format::DS) &&
+                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in));
+    bool memory =
+        load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
+    // An ordinary absent SGPR's VALU data spelling is fabricated even before a READLANE has
+    // relayed it. Defined mask halves and constants are separate genuine input domains.
+    if (!load)
+        for (uint32_t source = 0; source < in.n_src; ++source) {
+            const auto& operand = in.src[source];
+            if (operand.kind != OperandKind::SGPR) continue;
+            uint32_t width = scalar_alu_source_words(in, source);
+            if (!width || width == UINT32_MAX) width = 2;
+            if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - operand.value));
+            for (uint32_t word = 0; word < width; ++word) {
+                const int reg = operand.value + static_cast<int>(word);
+                if (reg <= 105 && !scalar_words.contains(reg) && !masks.contains(reg) &&
+                    !(reg > 0 && masks.contains(reg - 1)))
+                    vector_relay = true;
+            }
+        }
     // Relayed words first, while `defined` still describes the slots `in` reads. A V_READLANE
     // relays unless it reads a constant-lane slot in `defined`; any other scalar write relays when
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
-    const bool relays =
-        readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
-                       !(constant_lane(in) && defined.contains({in.src[0].value, in.src[1].value}))
-                 : reads_relayed_word(relayed, in);
+    const bool relays = readlane
+                            ? state.lane_written_vgprs.contains(in.src[0].value) &&
+                                      !(constant_lane(in) &&
+                                        defined.contains({in.src[0].value, in.src[1].value})) ||
+                                  (!state.lane_written_vgprs.contains(in.src[0].value) &&
+                                   vector_any(state.relayed_vectors))
+                            : reads_relayed_word(relayed, in) || vector_any(state.relayed_vectors);
+    if (readlane && constant_lane(in) && state.lane_written_vgprs.contains(in.src[0].value))
+        memory = state.memory_slots.contains({in.src[0].value, in.src[1].value});
+    return {vector_relay, relays, memory};
+}
+
+void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
+                           const std::set<int>& masks, const std::set<int>& scalar_words,
+                           const std::vector<std::pair<int, uint32_t>>& scalar_writes,
+                           const std::vector<int>& vector_writes,
+                           const SpilledVectorSourceMarks& source) {
+    auto& defined = state.defined_slots;
+    auto& relayed = state.relayed_words;
+    const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
+    const bool vector_relay = source.vector_relay;
+    const bool relays = source.scalar_relay;
+    const bool memory = source.memory;
+    const bool compare =
+        in.fmt == Rdna2Format::VOPC ||
+        (in.fmt == Rdna2Format::VOP3 && (in.opcode < 0x100 || vop3_writes_mask_sdst(in)));
     for (const auto& [base, width] : scalar_writes)
         for (uint32_t word = 0; word < width; ++word) {
-            if (relays)
-                relayed.insert(base + static_cast<int>(word));
+            const int reg = base + static_cast<int>(word);
+            if (relays && !compare)
+                relayed.insert(reg);
             else
-                relayed.erase(base + static_cast<int>(word));
+                relayed.erase(reg);
+            if (memory && !compare && !(masks.contains(base) && !scalar_words.contains(reg)))
+                state.memory_words.insert(reg);
+            else
+                state.memory_words.erase(reg);
         }
     const bool scalar_alu = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                             in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC;
@@ -115,6 +179,24 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         relayed.insert(kRelayedScc);
     else if (in.fmt == Rdna2Format::SOPC)
         relayed.erase(kRelayedScc);
+    const bool preserve = !state.exec_known_full ||
+                          (in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane) ||
+                          (in.sdwa_dst_sel != 6 && in.sdwa_dst_unused == 2) ||
+                          (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32);
+    for (int vgpr : vector_writes) {
+        if (vector_relay)
+            state.relayed_vectors.insert(vgpr);
+        else if (!preserve)
+            state.relayed_vectors.erase(vgpr);
+        if (memory)
+            state.memory_vectors.insert(vgpr);
+        else if (!preserve)
+            state.memory_vectors.erase(vgpr);
+    }
+    if (rdna2_instruction_may_change_exec(in))
+        state.exec_known_full = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+                                in.dst.value == 126 && in.src[0].kind == OperandKind::InlineInt &&
+                                in.src[0].value == -1;
     const auto drop_vgpr = [&](int vgpr) {
         std::erase_if(defined, [&](const auto& slot) { return slot.first == vgpr; });
     };
@@ -132,12 +214,19 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         const bool defined_word = (is_sgpr || source.kind == OperandKind::Special) &&
                                   scalar_words.contains(reg) && !relayed.contains(reg);
         const std::pair<int, int> slot{in.dst.value, in.src[1].value};
+        if (memory)
+            state.memory_slots.insert(slot);
+        else
+            state.memory_slots.erase(slot);
         if (constant || is_exec || pair_mask || defined_word)
             defined.insert(slot);
         else
             defined.erase(slot);
     } else if (!readlane) {
-        for (int vgpr : vector_writes) drop_vgpr(vgpr);
+        for (int vgpr : vector_writes) {
+            drop_vgpr(vgpr);
+            std::erase_if(state.memory_slots, [&](const auto& slot) { return slot.first == vgpr; });
+        }
     }
 }
 
@@ -147,6 +236,13 @@ void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs) {
             rs.scc_merge_placeholder = true;
         else
             rs.sreg_merge_placeholder.insert(word);
+    for (int reg : entry.relayed_vectors) {
+        auto& mark = rs.vreg_source_marks[reg];
+        mark.placeholder = mark.hard = true;
+    }
+    for (int reg : entry.memory_vectors) rs.vreg_source_marks[reg].memory = true;
+    rs.sreg_memory_pattern.insert(entry.memory_words.begin(), entry.memory_words.end());
+    rs.lane_slot_memory_pattern.insert(entry.memory_slots.begin(), entry.memory_slots.end());
 }
 
 bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2Inst& in) {

@@ -656,10 +656,9 @@ inline bool vcc_sibling_unavailable(const SpirvCompute& b, RegState& rs, int sib
 // Fragment user-data words, which `sreg_input` never holds, count as never-written, so they refuse.
 // In a CFG-dispatcher case, SGPR words are proven by load_state's Wave64 MUST filter, and every
 // reloaded spill slot is marked (slots carry no definite-write fact across a case edge), so a
-// projection of a reloaded slot refuses there. Not tracked: a value routed through a VGPR
-// (v_readfirstlane, a dynamic-lane v_readlane), and the MEMORY mark on an SGPR across a dispatcher
-// case edge (each case starts from a fresh RegState). Compute consults the fabricated-zero mark too
-// (#4714); the MEMORY mark stays fragment-only, since compute's lane identity is the guest's own.
+// projection of a fabricated slot refuses there. Ordinary VGPR relays retain their provenance
+// through moves, ALU results, lane reads and control-flow reloads (#4787). Compute consults the
+// fabricated-zero mark too; MEMORY stays fragment-only because compute retains guest-lane identity.
 inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operand& o) {
     if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return 0;
     if (o.kind != OperandKind::SGPR &&

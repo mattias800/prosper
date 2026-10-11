@@ -1447,6 +1447,11 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             return integer64 ? 2u : 1u;
         }
         case Rdna2Format::VOP3:
+            if (in.opcode == 0x176 || in.opcode == 0x177)
+                return source < 2 ? 1u : (source == 2 ? 2u : UINT32_MAX);
+            // These add/subtract forms read two B32 operands; the fresh SDST carry is an output,
+            // not a paired source. MAD_U64/I64 remain separate paired-source consumers.
+            if (vop3b_fresh_carry_output(in)) return source < 2 ? 1u : UINT32_MAX;
             if (in.opcode == 0x360 || in.opcode == 0x361 ||
                 in.opcode == 0x365 || in.opcode == 0x366 || in.opcode == 0x11f)
                 return source < 2 ? 1u : UINT32_MAX;
@@ -1575,7 +1580,7 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
 // in rdna2_to_spirv_internal.hpp, because it reads the two width inventories above; every caller
 // of snapshot_saved_b64_masks() includes this header.
 inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
-    ScalarSourceMarks marks;
+    ScalarSourceMarks marks = vector_source_marks(rs, in);
     const auto word = [&](int r) {
         const bool fabricated = sreg_word_may_be_fabricated(rs, r);
         marks.placeholder = marks.placeholder || fabricated;
@@ -1586,18 +1591,15 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
             marks.blanket_roots.insert(blanket->second.begin(), blanket->second.end());
         marks.memory = marks.memory || rs.sreg_memory_pattern.contains(r);
     };
-    if (in.fmt == Rdna2Format::SMEM) {   // memory by definition; its address inputs are not data
+    if (in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
+        in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
+        in.fmt == Rdna2Format::FLAT) {   // load addresses are not the loaded data
         marks.memory = true;
         return marks;
     }
     if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
-        if (in.opcode == 0x360) {   // v_readlane: a constant-lane read of a spill slot
-            if (in.src[1].kind == OperandKind::InlineInt) {
-                const std::pair<int, int> slot{in.src[0].value, in.src[1].value};
-                marks.placeholder = rs.lane_slot_merge_placeholder.contains(slot);
-                marks.hard = marks.placeholder;
-                marks.memory = rs.lane_slot_memory_pattern.contains(slot);
-            }
+        if (in.opcode == 0x360) {
+            marks = vector_lane_read_marks(rs, in);
         } else if (in.src[0].kind == OperandKind::SGPR ||
                    (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124)) {
             word(in.src[0].value);   // v_writelane's data word
