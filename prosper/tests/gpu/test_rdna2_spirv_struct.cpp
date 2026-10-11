@@ -1,5 +1,6 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "fixtures/native_structural_launch.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
@@ -2405,10 +2406,8 @@ int main() {
         printf("  [FAIL] implicit Wave32 VOPC clobbered adjacent VCC_HI scalar data\n");
         return 1;
     }
-    ComputeShaderConfig wave64_compute_config = wave32_compute_config;
-    wave64_compute_config.wave_size = 64;
-    wave64_compute_config.native_subgroup_size = 64;
-    wave64_compute_config.local_x = 64;
+    ComputeShaderConfig wave64_compute_config =
+        prosper::test::native_structural::wave64_config(wave32_compute_config);
     // In Wave64 the VOPC overwrites the WHOLE of VCC, so the 0.75f placed in VCC_HI is gone and the
     // later read must NOT return it. That requirement is unchanged. What changed is the outcome: this
     // used to be expressed as "the shader must reject", because a per-invocation bool could not
