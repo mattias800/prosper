@@ -6,6 +6,7 @@
 #include "gpu/resources/shader_resources.hpp"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -104,6 +105,69 @@ void refuses(const ComputeShaderConfig& c) {
     EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
     EXPECT_NE(reason.find("pc=7 words=d760000e"), std::string::npos) << reason;
 }
+enum class SccUse { Immediate, AcrossEdge, ScalarRelay, ReplacedSlot };
+std::vector<uint32_t> slot_scc_program(SccUse use, bool all_paths) {
+    auto p = program({.numeric_read = true});
+    const auto slot = std::find(p.begin(), p.end(), 0xd7610014u);
+    // s4=1 skips the only spill, so the joined DATA slot is not a MUST-defined word.
+    p.insert(slot, {0xbf068004u, 0xbf840002u});
+    if (all_paths) p.insert(p.begin() + 2, {0xd7610014u, 30u | (128u << 9u)});
+    if (use == SccUse::ReplacedSlot) {
+        const auto reload = std::find(p.begin(), p.end(), 0xd760000eu);
+        p.insert(reload, {0xd7610014u, 193u | (128u << 9u)});
+    }
+    auto at = std::find(p.begin(), p.end(), 0x7e02020eu);
+    std::vector<uint32_t> condition;
+    if (use == SccUse::ScalarRelay) condition.push_back(mov(16, 14));
+    condition.push_back(use == SccUse::ScalarRelay ? 0xbf068010u : 0xbf06800eu);
+    // EXEC branches end native fused chains without rewriting the scalar condition.
+    if (use == SccUse::AcrossEdge) condition.insert(condition.end(), {0xbf880001u, 0x7e040281u});
+    condition.insert(condition.end(), {0xbf840001u, 0x7e040281u});
+    p.insert(at, condition.begin(), condition.end());
+    return p;
+}
+void all_ones(const std::vector<uint32_t>& p) {
+    const auto t = table();
+    for (uint32_t path : {0u, 1u}) {
+        auto c = config();
+        c.user_sgprs[4] = path;
+        TerminalRejectCapture capture;
+        const auto module = recompile_compute(p.data(), p.size(), &t, c);
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        ASSERT_FALSE(module.empty()) << "path " << path << ' ' << reason;
+        ASSERT_TRUE(has_op(module, 251));
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.push_constants = c.user_sgprs;
+        const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(out[lane], UINT32_MAX) << "path " << path << " lane " << lane;
+    }
+}
+void slot_scc_values(SccUse use, bool all_paths) {
+    all_ones(slot_scc_program(use, all_paths));
+}
+std::vector<uint32_t> scalar_scc_program(bool defined) {
+    auto p = program({.data = true, .numeric_read = true});
+    const auto at = std::find(p.begin(), p.end(), 0x7e02020eu);
+    std::vector<uint32_t> condition;
+    if (defined) condition.push_back(mov(60, 128)); // current B32 writer, outside launch SGPRs
+    condition.insert(condition.end(), {0xbf06803cu, 0xbf840001u, 0x7e040281u});
+    p.insert(at, condition.begin(), condition.end());
+    return p;
+}
+void slot_scc_refuses(SccUse use) {
+    const auto p = slot_scc_program(use, false);
+    const auto t = table();
+    TerminalRejectCapture capture;
+    EXPECT_TRUE(recompile_compute(p.data(), p.size(), &t, config()).empty());
+    std::string reason;
+    for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+    EXPECT_NE(reason.find("poisoned-scc"), std::string::npos) << reason;
+}
 } // namespace
 
 TEST(NativeCfgSavedMaskData, LowSpillKeepsDefinedZeroHighWord) {
@@ -198,4 +262,33 @@ TEST(NativeCfgSavedMaskData, OracleObservesAChangedPhysicalSibling) {
     uint32_t differences = 0;
     for (uint32_t lane = 0; lane < 64; ++lane) differences += out[lane] != uint32_t(lane < 32);
     EXPECT_EQ(differences, 32u);
+}
+TEST(NativeCfgSavedMaskData, OneArmMissingSlotCannotEstablishSccBranch) {
+    slot_scc_refuses(SccUse::Immediate);
+}
+TEST(NativeCfgSavedMaskData, MissingSlotCannotPersistSccAcrossAnotherEdge) {
+    slot_scc_refuses(SccUse::AcrossEdge);
+}
+TEST(NativeCfgSavedMaskData, MissingSlotScalarRelayCannotEstablishSccBranch) {
+    slot_scc_refuses(SccUse::ScalarRelay);
+}
+TEST(NativeCfgSavedMaskData, AnAllPathSlotCanEstablishAndPersistScc) {
+    for (auto use : {SccUse::Immediate, SccUse::AcrossEdge, SccUse::ScalarRelay})
+        slot_scc_values(use, true);
+}
+TEST(NativeCfgSavedMaskData, ACurrentDefiniteSlotWriteEndsMissingArmProvenance) {
+    slot_scc_values(SccUse::ReplacedSlot, false);
+}
+
+TEST(NativeCfgSavedMaskData, AbsentScalarInputCannotEstablishDispatcherScc) {
+    const auto p = scalar_scc_program(false);
+    const auto t = table();
+    TerminalRejectCapture capture;
+    EXPECT_TRUE(recompile_compute(p.data(), p.size(), &t, config()).empty());
+    std::string reason;
+    for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+    EXPECT_NE(reason.find("poisoned-scc"), std::string::npos) << reason;
+}
+TEST(NativeCfgSavedMaskData, AnExplicitScalarProducerEstablishesDispatcherScc) {
+    all_ones(scalar_scc_program(true));
 }

@@ -1847,17 +1847,24 @@ int main(int argc, char** argv) {
       dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c)/4, 0, 0)); }
     // Compute: nested/multi-branch CFG dispatcher (varying VCC exit + inner SCC branch + back-edge).
     // Locks both structured switch-loop formation and the workgroup-scratch hardware-wave vote.
-    { const uint32_t c[] = {0xBE800380u,0x7E000280u,0x7E020300u,
-                            0xD7610013u,0x00014A7Eu,0xD7610013u,0x0001507Fu,
-                            0xD760000Eu,0x00014B13u,0xD760000Fu,0x00015113u,0xBEFE040Eu,
-                            0xE00C2000u,0x80020400u,0x7DB900F9u,0x86050007u,
-                            0x7D020200u,0xBF860006u,0xBF0A8204u,0x360000FDu,0xBF840001u,
-                            0x81008100u,0x81008100u,0xBF82FFF4u,
-                            0xBF810000u};
-      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer;
-      vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
-      vb.num_components=4; rt.resources.push_back(vb);
-      dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    {
+        const uint32_t c[] = {0xBE840380u, /* explicit fixture scalar input */
+                              0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu,
+                              0xD7610013u, 0x0001507Fu, 0xD760000Eu, 0x00014B13u, 0xD760000Fu,
+                              0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u, 0x7DB900F9u,
+                              0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu,
+                              0xBF840001u, 0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource vb{};
+        vb.cls = ResourceClass::VertexBuffer;
+        vb.binding = 3;
+        vb.sgpr_base = 8;
+        vb.stride = 16;
+        vb.format = DataFormat::Float32;
+        vb.num_components = 4;
+        rt.resources.push_back(vb);
+        dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c) / 4, 0, 0, &rt));
+    }
     // #4706: a Wave64 pixel program reloads a spilled compare-mask ballot with v_readlane and ANDs
     // it with a fresh compare mask, so the data pair is projected onto the lane bit.
     {
@@ -1916,23 +1923,32 @@ int main(int argc, char** argv) {
     // GTA V Wave64 survivor-mask join: one arm retains scalar EXEC words while the other computes
     // the same physical pair through S_ANDN2_B64. Validate the native subgroup ballots that make
     // the logical result scalar-readable at the exact trailing S_CMP_EQ_U64.
-    { const uint32_t c[] = {
-          0xBEB8037Eu,0xBEB9037Fu,0x7E400280u,0xBF068008u,0xBF840003u,
-          0x7D8A40C1u,0x8AB86A38u,0xBF800000u,0xBF128038u,
-          0xBE800380u,0x7E000280u,0x7E020300u,
-          0xD7610013u,0x00014A7Eu,0xD7610013u,0x0001507Fu,
-          0xD760000Eu,0x00014B13u,0xD760000Fu,0x00015113u,0xBEFE040Eu,
-          0xE00C2000u,0x80020400u,0x7DB900F9u,0x86050007u,
-          0x7D020200u,0xBF860006u,0xBF0A8204u,0x360000FDu,0xBF840001u,
-          0x81008100u,0x81008100u,0xBF82FFF4u,0xBF810000u};
-      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer;
-      vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
-      vb.num_components=4; rt.resources.push_back(vb);
-      ComputeShaderConfig cfg; cfg.local_x=64; cfg.wave_size=64;
-      cfg.native_subgroup_size=64;
-      prosper::test::complete_compute_launch(cfg);
-      dump(dir, "compute_wave64_logical_ballot",
-           recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
+    {
+        const uint32_t c[] = {0xBE840380u, /* explicit fixture scalar input */
+
+                              0xBEB8037Eu, 0xBEB9037Fu, 0x7E400280u, 0xBF068008u, 0xBF840003u,
+                              0x7D8A40C1u, 0x8AB86A38u, 0xBF800000u, 0xBF128038u, 0xBE800380u,
+                              0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u,
+                              0x0001507Fu, 0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u,
+                              0xBEFE040Eu, 0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+                              0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+                              0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u};
+        ShaderResourceTable rt;
+        ShaderResource vb{};
+        vb.cls = ResourceClass::VertexBuffer;
+        vb.binding = 3;
+        vb.sgpr_base = 8;
+        vb.stride = 16;
+        vb.format = DataFormat::Float32;
+        vb.num_components = 4;
+        rt.resources.push_back(vb);
+        ComputeShaderConfig cfg;
+        cfg.local_x = 64;
+        cfg.wave_size = 64;
+        cfg.native_subgroup_size = 64;
+        prosper::test::complete_compute_launch(cfg);
+        dump(dir, "compute_wave64_logical_ballot", recompile_compute(c, sizeof(c) / 4, &rt, cfg));
+    }
     // #4892: complete native DATA logicals retain both physical words without result ballots.
     {
         const uint32_t code[]{0xbe9403ffu, 0xabcdef01u, 0xbe9503ffu, 0x80000001u, 0xbe9603ffu,
@@ -2036,13 +2052,16 @@ int main(int argc, char** argv) {
            recompile_compute(c, sizeof(c)/4, nullptr, cfg)); }
     // Astro Bot Wave64: e64 mask-vs-zero normalization followed by a last-live B64 mask SCC vote.
     // Both reductions use the portable dispatcher's uniform common phase.
-    { const uint32_t c[] = {0x7d840000u,0xd4e4006au,0x0001006au,0xbea0047eu,
-                            0x87ea6a20u,0x7e000280u,0xbf840003u,0x7d840100u,
-                            0x02020100u,0xbf860002u,0xbf060000u,0xbf850001u,
-                            0x7e020280u,0xbf810000u};
-      ComputeShaderConfig cfg; cfg.local_x=128; cfg.wave_size=64;
-      dump(dir, "compute_wave64_mask_vote",
-           recompile_compute(c, sizeof(c)/4, nullptr, cfg)); }
+    {
+        const uint32_t c[] = {0xB0000000u, /* explicit s0=0 fixture input */
+                              0x7d840000u, 0xd4e4006au, 0x0001006au, 0xbea0047eu, 0x87ea6a20u,
+                              0x7e000280u, 0xbf840003u, 0x7d840100u, 0x02020100u, 0xbf860002u,
+                              0xbf060000u, 0xbf850001u, 0x7e020280u, 0xbf810000u};
+        ComputeShaderConfig cfg;
+        cfg.local_x = 128;
+        cfg.wave_size = 64;
+        dump(dir, "compute_wave64_mask_vote", recompile_compute(c, sizeof(c) / 4, nullptr, cfg));
+    }
 
     // --- #273 additions (DOLL recompiler frontier) ---
     // Fragment: 3D image_load (integer LUT fetch through the combined sampler; OpImage+OpImageFetch).

@@ -1974,6 +1974,7 @@ bool emit_cfg_state_machine(
     // Carry a separate CFG MUST-validity bit and use it both for scalar-word provenance and when
     // reconstructing RegState at each dispatcher case.
     std::vector<bool> wave64_scalar_scc_valid_in(starts.size(), false);
+    std::unordered_set<uint32_t> proven_wave64_scalar_scc_branch_pcs;
     std::vector<bool> wave64_b64_reachable(starts.size(), false);
     auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
         if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
@@ -2093,19 +2094,23 @@ bool emit_cfg_state_machine(
                                             SpillSlotDomains& slot_domains, bool& scalar_scc,
                                             const Rdna2Inst& in, bool record_compare) {
             const auto relay_sources = spilled_vector_source_marks(halves, in, masks, scalar_words);
+            // Storage presence excludes neither a missing spill arm nor its scalar relays.
+            const auto definite_word = [&](int word) {
+                return scalar_words.contains(word) && !halves.relayed_words.contains(word);
+            };
+            const bool definite_scc = scalar_scc && !halves.relayed_words.contains(kRelayedScc);
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
                     case OperandKind::InlineInt:
                     case OperandKind::InlineFloat:
                     case OperandKind::Literal:
                         return true;
-                    case OperandKind::SGPR:
-                        return scalar_words.contains(source.value);
+                    case OperandKind::SGPR: return definite_word(source.value);
                     case OperandKind::Special:
                         if (source.value == 125) return true; // SGPR_NULL
-                        if (source.value == 253) return scalar_scc;
+                        if (source.value == 253) return definite_scc;
                         return source.value >= 106 && source.value <= 124 &&
-                               scalar_words.contains(source.value);
+                               definite_word(source.value);
                     default:
                         return false;
                 }
@@ -2121,7 +2126,7 @@ bool emit_cfg_state_machine(
                        (candidate.fmt == Rdna2Format::SOPK &&
                         candidate.opcode == kSopkOpcodeCmovkI32);
             };
-            const bool valid_scc_read = !reads_scc(in) || scalar_scc;
+            const bool valid_scc_read = !reads_scc(in) || definite_scc;
             const bool b32_vcc_scalar_write =
                 is_wave64_vcc_lo_scalar_cselect(in) ||
                 is_wave64_vcc_lo_cselect_reading_vcc_hi(in) ||
@@ -2131,7 +2136,7 @@ bool emit_cfg_state_machine(
                 source_is_scalar_word(in.src[0]) && source_is_scalar_word(in.src[1]);
             const int b32_vcc_sibling = in.dst.value == 106 ? 107 : 106;
             const bool b32_vcc_complete_scalar_pair =
-                b32_vcc_scalar_result && scalar_words.contains(b32_vcc_sibling);
+                b32_vcc_scalar_result && definite_word(b32_vcc_sibling);
             if (record_compare && b32_vcc_scalar_write) {
                 if (b32_vcc_scalar_result)
                     b.vcc_b32_scalar_result_pcs.insert(in.pc);
@@ -2174,10 +2179,9 @@ bool emit_cfg_state_machine(
                  wqm_source.kind == OperandKind::Special) &&
                 (wqm_source.value == 126 || masks.contains(wqm_source.value)) &&
                 !ambiguous.contains(wqm_source.value);
-            const bool packet_wqm_scalar_source = packet_wqm &&
-                wqm_source.kind == OperandKind::SGPR &&
-                scalar_words.contains(wqm_source.value) &&
-                scalar_words.contains(wqm_source.value + 1);
+            const bool packet_wqm_scalar_source =
+                packet_wqm && wqm_source.kind == OperandKind::SGPR &&
+                definite_word(wqm_source.value) && definite_word(wqm_source.value + 1);
             const bool packet_wqm_constant_source = packet_wqm &&
                 wqm_source.kind == OperandKind::InlineInt &&
                 (wqm_source.value == 0 || wqm_source.value == -1);
@@ -2291,14 +2295,13 @@ bool emit_cfg_state_machine(
                 if (source.kind == OperandKind::Special && source.value == 125)
                     return true; // SGPR_NULL
                 if (source.kind == OperandKind::Special && source.value == 253)
-                    return width == 1 && scalar_scc;
+                    return width == 1 && definite_scc;
                 if (source.kind == OperandKind::Special &&
                     (source.value == 126 || source.value == 127))
                     return width == 1 && b.is_compute && b.wave_size == 64 &&
                         b.native_subgroup_size == 64;
                 for (uint32_t word = 0; word < std::max(width, 1u); ++word)
-                    if (!scalar_words.contains(source.value + static_cast<int>(word)))
-                        return false;
+                    if (!definite_word(source.value + static_cast<int>(word))) return false;
                 return true;
             };
             bool scalar_sources = true;   // not asked of a relative read: see the predicate
@@ -2311,8 +2314,7 @@ bool emit_cfg_state_machine(
             if (implicit_scalar_words) {
                 implicit_scalar_source = in.dst.kind == OperandKind::SGPR;
                 for (uint32_t word = 0; word < implicit_scalar_words; ++word)
-                    implicit_scalar_source &=
-                        scalar_words.contains(in.dst.value + static_cast<int>(word));
+                    implicit_scalar_source &= definite_word(in.dst.value + static_cast<int>(word));
             }
             const bool scalar_alu_result = scalar_sources && implicit_scalar_source;
             // Only intrinsic DATA has a numeric proof at a dispatcher reload. SGPR variable
@@ -2320,9 +2322,9 @@ bool emit_cfg_state_machine(
             const bool numeric_wqm = wqm_has_numeric_destination(in) &&
                 wqm_has_intrinsic_numeric_source(in);
             const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
-                in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
-                in.opcode <= 0x34 && in.dst.value == 106 &&
-                scalar_alu_result && scalar_words.contains(107);
+                                              in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
+                                              in.opcode <= 0x34 && in.dst.value == 106 &&
+                                              scalar_alu_result && definite_word(107);
             if (record_compare && vcc_pack_scalar_pair)
                 b.vcc_pack_scalar_pair_pcs.insert(in.pc);
             if (record_compare && in.fmt == Rdna2Format::SOP2 &&
@@ -2486,49 +2488,10 @@ bool emit_cfg_state_machine(
                     scalar_scc = scalar_sources &&
                         in.dst.value != 126 && in.dst.value != 127;
                 else if (!preserves_scc)
-                    // `mask_write < 0` is what keeps a B64 logical's cross-lane
-                    // SCC=(whole mask != 0) out of the scalar domain, and it must. It also fired on
-                    // the ONE mask classification that is not a wave reduction at all:
-                    // `b32_vcc_complete_scalar_pair` sets mask_write=106 precisely BECAUSE both
-                    // source dwords are proved scalar data, and on exactly that proof emit_alu
-                    // takes its scalar path and publishes `rs.scc = (complete 32-bit result != 0)`
-                    // — an ordinary one-dword compare with no cross-lane component. The mask
-                    // lifetime here is the SECOND, derived half of a dual-domain write, not
-                    // evidence that the result is a wave mask.
-                    //
-                    // Charging that write an SCC loss cost Sonic Frontiers five stage compute
-                    // programs, three hops downstream of the site (#2790). Every one of them runs
-                    //     s_or_b32 vcc_lo, vcc_hi, scc      <- dual-domain scalar pair, mask_write=106
-                    //     ... v_cmp_* vcc, 0, vcc_lo        <- ends both words' scalar lifetimes
-                    //     s_cselect_b32 vcc_hi, 1, 0        <- reads SCC: valid_scc_read was FALSE,
-                    //                                          so VCC_HI lost its scalar-word fact
-                    //     s_cmp_eq_u32 <imm>, sN            <- re-arms a perfectly scalar SCC
-                    //     s_or_b32 vcc_lo, scc, vcc_hi      <- REJECTED: VCC_HI is not a scalar word
-                    // and the reject is reported at the last line, whose own SCC is fine — measured
-                    // live, `scc` is a live SSA id there and both operands have scalar data. The
-                    // deliberate 64-bit-mask SCC poison in rdna2_emit_alu.cpp is NOT what stops
-                    // these programs; this transfer rule is.
-                    //
-                    // The SOP1 arm below already draws exactly this distinction for the identical
-                    // situation -- `s_not_b32 vcc_lo,vcc_lo` keeps its scalar SCC unless
-                    // `wave64_vcc_b32_mask_not` says the source really was a mask, rather than
-                    // being denied it for having a coexisting Bool lifetime. This makes the SOP2
-                    // arm agree with it. `dual_domain_scalar_write` above already publishes this
-                    // instruction's DESTINATION words on the same `b32_vcc_complete_scalar_pair`
-                    // proof; SCC was the one fact it withheld.
-                    //
-                    // That symmetry now holds FOR COMPUTE ONLY -- `dual_domain_scalar_write` is not
-                    // narrowed, this is. Do NOT "restore consistency" by dropping `b.is_compute`:
-                    // the asymmetry is deliberate and the reason is the next paragraph.
-                    //
-                    // `b.is_compute` is deliberately narrower than the rest of this transfer, which
-                    // also runs for Wave64 FRAGMENT. A fragment B32 VCC logical can instead be
-                    // claimed by emit_alu's Wave32-mask block, which publishes
-                    // `rs.scc = fragment_wave_any(...)` -- a vote, not `(result != 0)`. Reaching
-                    // that needs a source which is simultaneously a MUST scalar word and a live
-                    // B32 mask, which nobody has constructed; the measured case is compute, so the
-                    // exemption is granted only where the implication was actually traced. Review
-                    // of #2801.
+                    // A B64 logical's SCC is a wave reduction. A compute B32 dual-domain
+                    // VCC result instead has ordinary scalar SCC (#2790, #2801). Fragment
+                    // lowering can publish a wave vote for that same shape, so keep the
+                    // exemption compute-only, matching the SOP1 scalar NOT rule below.
                     scalar_scc = scalar_sources &&
                         (mask_write < 0 ||
                          (b.is_compute && b32_vcc_complete_scalar_pair));
@@ -2601,6 +2564,9 @@ bool emit_cfg_state_machine(
                                            {masks, ambiguous, scalar_words, readlane_words},
                                            slot_context, vector_writes,
                                            record_compare ? &proven_mask_writelane_pcs : nullptr);
+            if (record_compare && in.fmt == Rdna2Format::SOPP &&
+                (in.opcode == 0x04 || in.opcode == 0x05) && definite_scc)
+                proven_wave64_scalar_scc_branch_pcs.insert(in.pc);
             return true;
         };
 
@@ -4951,13 +4917,23 @@ bool emit_cfg_state_machine(
         } else {
             uint32_t condition = 0;
             switch (terminator->opcode) {
-                // state.scc == 0 marks SCC poisoned by a 64-bit mask op inside this block (its
-                // hardware SCC is a cross-lane reduction) — reject rather than branch on a stale
-                // value an older s_cmp produced.
-                case 0x04: if (!state.scc) return reject_cfg(terminator->pc, "poisoned-scc");
-                           condition = b.logical_not(state.scc); break; // s_cbranch_scc0
-                case 0x05: if (!state.scc) return reject_cfg(terminator->pc, "poisoned-scc");
-                           condition = state.scc; break;
+                // A nonzero SSA id can still contain a missing slot's zero placeholder. Use the
+                // current CFG MUST proof, including same-block writes; coarse loop/vote marks
+                // alone cannot distinguish those placeholders from a genuinely refreshed SCC.
+                case 0x04:
+                    if (!state.scc ||
+                        ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+                         !proven_wave64_scalar_scc_branch_pcs.contains(terminator->pc)))
+                        return reject_cfg(terminator->pc, "poisoned-scc");
+                    condition = b.logical_not(state.scc);
+                    break;   // s_cbranch_scc0
+                case 0x05:
+                    if (!state.scc ||
+                        ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
+                         !proven_wave64_scalar_scc_branch_pcs.contains(terminator->pc)))
+                        return reject_cfg(terminator->pc, "poisoned-scc");
+                    condition = state.scc;
+                    break;
                 case 0x06:
                 case 0x07:
                     if (!state.vcc) return reject_cfg(terminator->pc, "missing-vcc-mask");
