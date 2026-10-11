@@ -3,6 +3,7 @@
 // tests drive shipping cache/NGG boundaries and construct missing-source/choice negative arms.
 #include "gpu/diagnostics/refused_graphics_inputs.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/diagnostics/refused_shader_dump.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/ngg_subgroup_draw.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
@@ -14,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <stdexcept>
 
 using namespace prosper::gpu;
 namespace fs = std::filesystem;

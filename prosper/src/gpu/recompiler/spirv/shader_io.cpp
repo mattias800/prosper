@@ -95,8 +95,10 @@ void SpirvCompute::export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t 
         // PROSPER_FORCE_W: diagnostic — force the clip-space w to 1.0. Some shaders' factored MVP
         // multiply leaves w at 0 under our (still-incomplete) descriptor decode, collapsing the
         // perspective divide; forcing w=1 reveals whether the x/y are otherwise on-screen.
-        if (compiler_choice(CompilerChoice::ForcePositionW,
-                            [] { return getenv("PROSPER_FORCE_W") != nullptr; }))
+        if (compiler_choice(
+                CompilerChoice::ForcePositionW,
+                // NOLINTNEXTLINE(concurrency-mt-unsafe): preserve the existing launch-fixed environment read; replay bypasses it.
+                [] { return getenv("PROSPER_FORCE_W") != nullptr; }))
             w = uconst(0x3f800000u);   // raw bits of 1.0f (bcf bitcasts to float)
         // Shader I/O tap: if an intermediate was snapshotted at PROSPER_SHADER_TAP's PC, export THAT as
         // gl_Position instead of the real clip position, so the geometry-probe capture reads it back.

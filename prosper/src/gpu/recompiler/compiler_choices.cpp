@@ -37,7 +37,9 @@ void record_compiler_choice(CompilerChoice choice, int64_t value) {
             // A recording allocation is observational; never prevent the live semantic read.
             try {
                 trace.error = "compiler-choice-allocation-failed";
-            } catch (const std::bad_alloc&) {}
+            } catch (const std::bad_alloc&) {
+                continue;   // Even failure to record a diagnostic reason cannot skip a live read.
+            }
         }
     }
 }

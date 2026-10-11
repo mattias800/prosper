@@ -125,6 +125,7 @@ std::vector<uint32_t> observe_refused_graphics_compile(const char* stage,
     } catch (const std::exception&) {
         // Publication, identity hashing and refusal strings cannot turn a module/refusal into a
         // guest failure. The original call has already completed exactly once.
+        return result;
     }
     return result;
 }
@@ -227,6 +228,7 @@ void note_unavailable_graphics_inputs(const char* stage, uint64_t address,
                             &callbacks);
     } catch (const std::exception&) {
         // This is already a draw refusal; an optional unavailable carrier must not throw.
+        return;
     }
 }
 }   // namespace prosper::gpu
