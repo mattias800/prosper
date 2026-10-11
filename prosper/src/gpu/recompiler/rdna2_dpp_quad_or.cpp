@@ -9,6 +9,10 @@ bool ComputeDppQuadOrService::prepare(SpirvCompute& b, const RegState& entry,
                                       const std::vector<Rdna2Inst>& ins, const uint32_t* code,
                                       size_t dwords, uint32_t initial_active) {
     if (!std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) return true;
+    if (!b.guest_compute_complete_groups) {
+        rejection_ = "dpp-quad-or-entry-launch-unproven";
+        return false;
+    }
     const auto proof = proven_compute_quad_or_sources(b, entry, ins, code, dwords, initial_active);
     for (const auto& in : ins) {
         if (!compute_dpp_quad_or(in)) continue;

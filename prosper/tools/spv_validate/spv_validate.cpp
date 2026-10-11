@@ -2466,8 +2466,8 @@ int main(int argc, char** argv) {
             for (auto shape : {fixture::Shape::Plain, fixture::Shape::Complement,
                                fixture::Shape::Masked, fixture::Shape::DistinctSites}) {
                 const auto code = fixture::program(shape);
-                auto config = fixture::config(arm == 64 ? 64 : 0);
-                config.wave_size = arm == 32 ? 32 : 64;
+                const auto config =
+                    fixture::config(arm == 64 ? 64 : 0, fixture::lanes, arm == 32 ? 32 : 64);
                 const auto module =
                     fixture::compile(code, fixture::table(), config, fixture::address());
                 const auto name =

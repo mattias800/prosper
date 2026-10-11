@@ -650,7 +650,7 @@ bool emit_cfg_state_machine(
     if ((!b.has_workgroup_execution() && !graphics) || ins.empty()) return false;
     ComputeDppQuadOrService quad_or;
     if (!quad_or.prepare(b, initial, ins, code, dwords, initial_active))
-        return reject_cfg(ins.front().pc, "dpp-quad-or-source-uninitialized");
+        return reject_cfg(ins.front().pc, quad_or.rejection());
     if (packet_masks &&
         (!b.is_fragment_packet() || initial_active || !packet_masks->rejection.empty() ||
          !packet_masks->source_words || packet_masks->source_words->data() != code ||

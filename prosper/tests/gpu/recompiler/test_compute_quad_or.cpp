@@ -2,7 +2,9 @@
 // Zero-seeded Function storage is neither initialization evidence nor a lane-value oracle.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/compute_quad_or.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_compute_quad_init.hpp"
+#include "gpu/recompiler/rdna2_dpp_quad_or.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 
@@ -15,6 +17,7 @@ struct Entry {
     Entry() {
         b.begin(16, nullptr, fixture::lanes, 1, 1, 64, 0);
         b.native_logical_uniform_launch = true;
+        b.guest_compute_complete_groups = compute_dispatch_has_complete_groups(fixture::config());
         rs.exec = b.btrue();
         rs.vreg[0] = b.localid_comp[0];
     }
@@ -28,8 +31,7 @@ void compiles(fixture::Shape shape, uint32_t native = 0, uint32_t lanes = fixtur
               uint32_t wave = 64) {
     const auto code = fixture::program(shape);
     const auto addr = fixture::address();
-    auto config = fixture::config(native, lanes);
-    config.wave_size = wave;
+    const auto config = fixture::config(native, lanes, wave);
     const auto module = fixture::compile(code, fixture::table(lanes), config, addr);
     ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(addr);
     if (!native) {
@@ -66,6 +68,69 @@ TEST(ComputeQuadOr, PortableWave32UsesTheSameLogicalQuadService) {
                        fixture::Shape::DistinctSites})
         compiles(shape, 0, fixture::lanes, 32);
 }
+TEST(ComputeQuadOr, CompleteRawLaunchAuthenticatesWritersBeforeExecRestore) {
+    const auto code = fixture::restored_entry_program();
+    // With PARTIAL_TG_EN clear, the partial-count fields have no entry-mask authority.
+    for (bool has_partial_counts : {false, true}) {
+        auto config = fixture::config(0, 64);
+        if (has_partial_counts) config.dispatch_launch.num_thread[0] |= 31u << 16u;
+        ASSERT_TRUE(compute_dispatch_has_complete_groups(config));
+        const auto addr = fixture::address();
+        const auto module = fixture::compile(code, fixture::table(64), config, addr);
+        ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(addr);
+        bpermute_oracle::Interpreter vm(module);
+        const auto output =
+            vm.run_buffers(64, {{3, std::vector<uint32_t>(64, fixture::sentinel)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(output, std::vector<uint32_t>(64, 273u));
+    }
+}
+TEST(ComputeQuadOr, PartialUnknownAndMismatchedLaunchesRefuseAfterExecRestore) {
+    const auto code = fixture::restored_entry_program();
+    for (int mutation = 0; mutation < 10; ++mutation) {
+        SCOPED_TRACE(mutation);
+        auto config = fixture::config(0, 64);
+        auto& raw = config.dispatch_launch;
+        if (mutation == 0) {
+            // Same normalized local/threads as the complete control, but only 31 guest lanes
+            // start active. S_MOV_B64 EXEC,-1 cannot repair the earlier absent vector writes.
+            raw.initiator |= 2u;
+            raw.num_thread = {(31u << 16u) | 64u, (1u << 16u) | 1u, (1u << 16u) | 1u};
+        }
+        if (mutation == 1) raw = {};
+        if (mutation == 2) raw.known &= ~ComputeDispatchLaunchState::kNumThreadX;
+        if (mutation == 3) raw.known &= ~ComputeDispatchLaunchState::kInitiator;
+        if (mutation == 4) raw.initiator |= 1u << 5u;
+        if (mutation == 5) raw.num_thread[0] = 65;
+        if (mutation == 6) raw.dimensions[0] = 2;
+        if (mutation == 7) raw.initiator |= 1u << 15u;
+        if (mutation == 8) config.exact_thread_extent = true;
+        if (mutation == 9) raw.initiator = 0;
+        EXPECT_FALSE(compute_dispatch_has_complete_groups(config));
+        const auto addr = fixture::address();
+        EXPECT_TRUE(fixture::compile(code, fixture::table(64), config, addr).empty());
+        EXPECT_NE(last_terminal_reject_reason(addr).find("dpp-quad-or-entry-launch-unproven"),
+                  std::string::npos)
+            << last_terminal_reject_reason(addr);
+    }
+}
+TEST(ComputeQuadOr, HostRoutingAndFullExecDoNotAuthenticateGuestEntry) {
+    const auto code = fixture::restored_entry_program();
+    Entry entry;
+    ASSERT_EQ(entry.proof(code).size(), 1u);
+    entry.b.guest_compute_complete_groups = false;
+    EXPECT_TRUE(entry.proof(code).empty());
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    ComputeDppQuadOrService service;
+    EXPECT_FALSE(service.prepare(entry.b, entry.rs, ins, code.data(), code.size(), 0));
+    EXPECT_STREQ(service.rejection(), "dpp-quad-or-entry-launch-unproven");
+    // This new fact is an OR-service premise, not an admission change for unrelated code.
+    const std::vector<uint32_t> unrelated{0xbf810000u};
+    ComputeDppQuadOrService no_quad;
+    rdna2_walk(unrelated.data(), unrelated.size(), ins = {});
+    EXPECT_TRUE(no_quad.prepare(entry.b, entry.rs, ins, unrelated.data(), unrelated.size(), 0));
+}
 TEST(ComputeQuadOr, UnsupportedFetchBoundsMasksAndModifiersRemainRefused) {
     for (int form = 0; form < 5; ++form) {
         auto p = fixture::program();
@@ -74,11 +139,11 @@ TEST(ComputeQuadOr, UnsupportedFetchBoundsMasksAndModifiersRemainRefused) {
         for (const auto& in : ins)
             if (compute_dpp_quad_or(in)) {
                 auto& modifiers = p[in.pc + 1];
-                if (form == 0) modifiers |= 1u << 18u; // FI1
-                if (form == 1) modifiers &= ~(1u << 19u); // BC0
-                if (form == 2) modifiers &= ~(1u << 28u); // sparse row mask
-                if (form == 3) modifiers &= ~(1u << 24u); // sparse bank mask
-                if (form == 4) modifiers |= 1u << 20u; // SRC0_NEG
+                if (form == 0) modifiers |= 1u << 18u;   // FI1
+                if (form == 1) modifiers &= ~(1u << 19u);   // BC0
+                if (form == 2) modifiers &= ~(1u << 28u);   // sparse row mask
+                if (form == 3) modifiers &= ~(1u << 24u);   // sparse bank mask
+                if (form == 4) modifiers |= 1u << 20u;   // SRC0_NEG
             }
         const auto addr = fixture::address();
         EXPECT_TRUE(fixture::compile(p, fixture::table(), fixture::config(), addr).empty())

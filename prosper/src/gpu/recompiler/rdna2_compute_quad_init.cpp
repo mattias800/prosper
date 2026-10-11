@@ -90,10 +90,10 @@ std::set<uint32_t> proven_compute_quad_or_sources(SpirvCompute& b, const RegStat
                                                   const uint32_t* code, size_t dwords,
                                                   uint32_t initial_active) {
     std::set<uint32_t> proven;
-    if (!b.is_compute || !b.native_logical_uniform_launch || b.ngg_workgroup_shell ||
-        b.ngg_one_lane || b.is_fragment_packet() || initial_active || b.invocation_guard_merge ||
-        entry.exec_narrowed || !true_constant(b, entry.exec) || !code || !dwords ||
-        (b.wave_size != 32 && b.wave_size != 64))
+    if (!b.is_compute || !b.native_logical_uniform_launch || !b.guest_compute_complete_groups ||
+        b.ngg_workgroup_shell || b.ngg_one_lane || b.is_fragment_packet() || initial_active ||
+        b.invocation_guard_merge || entry.exec_narrowed || !true_constant(b, entry.exec) || !code ||
+        !dwords || (b.wave_size != 32 && b.wave_size != 64))
         return proven;
     const auto local = entry.vreg.find(0);
     if (local == entry.vreg.end() || local->second != b.localid_comp[0]) return proven;

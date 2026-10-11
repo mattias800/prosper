@@ -12,9 +12,8 @@ using namespace prosper::gpu;
 class ComputeQuadOrExecution : public testing::TestWithParam<uint32_t> {
 protected:
     ComputeShaderConfig config() const {
-        auto c = fixture::config(GetParam() == 64 ? 64 : 0);
-        c.wave_size = GetParam() == 32 ? 32 : 64;
-        return c;
+        return fixture::config(GetParam() == 64 ? 64 : 0, fixture::lanes,
+                               GetParam() == 32 ? 32 : 64);
     }
     void SetUp() override {
         ASSERT_TRUE(prosper::test::render_vk_ctx().ok) << "production Vulkan initialization failed";

@@ -109,13 +109,25 @@ inline std::vector<uint32_t> program(Shape shape = Shape::Plain) {
     p.insert(p.end(), {0xe0702000u, 0x80020300u, 0xbf810000u});   // RAW store v3 at local_id
     return p;
 }
-inline ComputeShaderConfig config(uint32_t native = 0, uint32_t local = lanes) {
+inline ComputeShaderConfig config(uint32_t native = 0, uint32_t local = lanes, uint32_t wave = 64) {
     ComputeShaderConfig c;
     c.local_x = c.threads_x = local;
     c.local_y = c.local_z = c.threads_y = c.threads_z = 1;
-    c.wave_size = 64;
+    c.wave_size = wave;
     c.native_subgroup_size = native;
+    // Project-owned group-count packet: every local worker is launched. These raw words are
+    // explicit fixture inputs, never reconstructed authority for a legacy guest capture.
+    c.dispatch_launch.known = ComputeDispatchLaunchState::kAll;
+    c.dispatch_launch.initiator = 1u | (wave == 32 ? 1u << 15u : 0u);
+    c.dispatch_launch.num_thread = {local, 1, 1};
+    c.dispatch_launch.dimensions = {1, 1, 1};
     return c;
+}
+inline std::vector<uint32_t> restored_entry_program() {
+    // PARTIAL_TG_EN can leave initial vector writers unexecuted on a residual group's absent
+    // lanes. Restoring EXEC does not initialize those values before QUAD_PERM reads them.
+    return {0x7e0202ffu, 17u,         0x7e0402ffu, 256u,        0x7e0602ffu, 4096u,
+            0xbefe04c1u, 0x380604fau, 0xff08b101u, 0xe0702000u, 0x80020300u, 0xbf810000u};
 }
 inline ShaderResourceTable table(uint32_t count = lanes) {
     ShaderResource r;

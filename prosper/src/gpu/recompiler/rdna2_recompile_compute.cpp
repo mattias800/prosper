@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -751,6 +752,7 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
     b.atomicized_lds_store_pcs = lds_fminmax_synchronization.atomicized_store_pcs;
     b.diagnostic = diagnostic;
     b.float_transport = config.float_transport;
+    b.guest_compute_complete_groups = compute_dispatch_has_complete_groups(config);
     b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
     if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
         b.gta5_selected_sbuffer_soffset = selected_sbuffer_descriptor->selected_sbuffer_soffset;
