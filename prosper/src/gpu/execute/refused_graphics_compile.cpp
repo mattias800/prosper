@@ -65,9 +65,10 @@ std::vector<uint32_t> observe_refused_graphics_compile(const char* stage,
         inputs.launch = refused_graphics_launch();
         c.compiler = std::string(prosper::embedded_build_revision()) + ":" +
                      prosper::embedded_build_source_identity();
-        if (source.words->size() <= kCompileCaseMaxWords)
+        if (source.words->size() <= kCompileCaseMaxWords) {
+            note_refused_graphics_source_copy(source.words->size());
             inputs.raw = *source.words;
-        else
+        } else
             inputs.incomplete = "raw source exceeds diagnostic budget";
         inputs.raw_is_source_prefix =
             inputs.selector == RefusedGraphicsCompiler::NggSubgroup && !inputs.raw.empty() &&
@@ -209,10 +210,16 @@ std::vector<uint32_t> observe_ngg_shader_attempt(const NggSubgroupDrawRequest& r
 void note_unavailable_graphics_inputs(const char* stage, uint64_t address,
                                       const RefusedShaderSource& source,
                                       const std::string& detail) {
+    // The shipping caller already probes its immutable owner. Keep this exported helper equally
+    // cheap when called directly: an unavailable invocation has no input-set counter to update.
+    if (refused_shader_already_noted(stage, source)) return;
     try {
         RefusedGraphicsInputs g;
         g.invocation.program_address = address;
-        if (source.words && source.words->size() <= kCompileCaseMaxWords) g.raw = *source.words;
+        if (source.words && source.words->size() <= kCompileCaseMaxWords) {
+            note_refused_graphics_source_copy(source.words->size());
+            g.raw = *source.words;
+        }
         g.incomplete = "draw refused before an actual compiler invocation was recorded";
         struct Context {
             const char* stage;

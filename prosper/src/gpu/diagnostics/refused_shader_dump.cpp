@@ -43,6 +43,7 @@ struct DumpState {
     std::atomic<uint64_t> epoch{kStageBits + 1u};
     std::atomic<uint64_t> hash_evaluations{0};
     std::atomic<uint64_t> hashed_dwords{0};
+    std::atomic<uint64_t> graphics_source_copy_dwords{0};
 };
 
 DumpState& state() {
@@ -336,10 +337,15 @@ uint64_t refused_shader_dump_epoch() {
 RefusedShaderDumpStats refused_shader_dump_stats() {
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
-    return {s.seen.size(), s.hash_evaluations.load(std::memory_order_relaxed),
+    return {s.seen.size(),
+            s.hash_evaluations.load(std::memory_order_relaxed),
             s.input_set_global_locks.load(std::memory_order_relaxed),
             s.input_identity_evaluations.load(std::memory_order_relaxed),
-            s.hashed_dwords.load(std::memory_order_relaxed)};
+            s.hashed_dwords.load(std::memory_order_relaxed),
+            s.graphics_source_copy_dwords.load(std::memory_order_relaxed)};
+}
+void note_refused_graphics_source_copy(size_t dwords) {
+    state().graphics_source_copy_dwords.fetch_add(dwords, std::memory_order_relaxed);
 }
 
 std::string refused_shader_dump_directory() {
@@ -362,6 +368,7 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.epoch.fetch_add(kStageBits + 1u, std::memory_order_relaxed);
     s.hash_evaluations.store(0, std::memory_order_relaxed);
     s.hashed_dwords.store(0, std::memory_order_relaxed);
+    s.graphics_source_copy_dwords.store(0, std::memory_order_relaxed);
     s.input_set_global_locks.store(0, std::memory_order_relaxed);
     s.input_identity_evaluations.store(0, std::memory_order_relaxed);
     s.dir_failure_announced = false;

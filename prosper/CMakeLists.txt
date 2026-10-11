@@ -3239,6 +3239,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_refused_graphics_inputs_disarmed
+    SOURCES tests/gpu/diagnostics/test_refused_graphics_inputs_disarmed.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_NO_REFUSED_SHADER_DUMP=1)
+
   prosper_add_gtest(test_shader_dump_filter
     SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
     LIBRARIES prosper_core)

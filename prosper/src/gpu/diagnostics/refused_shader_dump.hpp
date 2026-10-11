@@ -101,8 +101,10 @@ struct RefusedShaderDumpStats {
     uint64_t input_set_global_locks = 0;
     uint64_t input_identity_evaluations = 0;
     uint64_t hashed_dwords = 0;
+    uint64_t graphics_source_copy_dwords = 0;   // diagnostic ownership attempts, never cache work
 };
 RefusedShaderDumpStats refused_shader_dump_stats();
+void note_refused_graphics_source_copy(size_t dwords);
 
 // Test hooks: where the current run writes, and a quiescent reset with a new root. Production never
 // resets the observation epoch while workers run.

@@ -224,17 +224,30 @@ uint64_t refused_graphics_inputs_identity(const RefusedGraphicsInputs& g) {
     Out o;
     write_arguments(o, g);
     // Code/chain and semantic choices participate. Buffer bytes and host pointer values do not.
-    auto c = g.invocation;
+    const auto& actual = g.invocation;
+    FragmentCompileCase c;
     c.complete = false;
     c.reason = "identity";
-    c.compiler.clear();
-    c.expected_reject.clear();
-    if (!c.trip.bound)
-        c.program_address = 0;   // relocation alone is not another compiler input set
-    c.resources = {};
-    c.has_resources = false;
-    c.backing.clear();
-    c.blobs.clear();
+    c.expected_produced = actual.expected_produced;
+    c.program_address = actual.trip.bound ? actual.program_address : 0;
+    c.code = actual.code;
+    c.source = actual.source;
+    c.has_pixel_inputs = actual.has_pixel_inputs;
+    c.has_system_inputs = actual.has_system_inputs;
+    c.pixel_inputs = actual.pixel_inputs;
+    c.system_inputs = actual.system_inputs;
+    c.interpolation = actual.interpolation;
+    c.wave32 = actual.wave32;
+    c.float_mode = actual.float_mode;
+    c.float_transport = actual.float_transport;
+    c.float_flags = actual.float_flags;
+    c.launch_rsrc1 = actual.launch_rsrc1;
+    c.export_formats = actual.export_formats;
+    c.pcrel_target = actual.pcrel_target;
+    c.trip = actual.trip;
+    c.choices = actual.choices;
+    // Config-only: do not copy resource metadata, backing references or shared payload handles.
+    // Relocation remains diagnostic-only when the trip selector is disarmed.
     const auto config = encode_fragment_compile_case(c);
     o.bytes.insert(o.bytes.end(), config.begin(), config.end());
     o.num(compile_case_resource_metadata_identity(

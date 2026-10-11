@@ -354,6 +354,55 @@ TEST(RefusedGraphicsInputs, SetIdentityCoversArgumentsAndMetadataButNotBytes) {
     changed.invocation.blobs[0].bytes = std::make_shared<std::vector<uint8_t>>(4, 0xee);
     restore_fragment_compile_case_backing(changed.invocation);
     EXPECT_EQ(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.has_pixel_inputs = !g.invocation.has_pixel_inputs;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.system_inputs.ena++;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.interpolation.attribute_mask ^= 1;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.float_flags.available = !g.invocation.float_flags.available;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.launch_rsrc1.value++;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.export_formats.compressed_formats++;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.trip.bound = 1;
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+    changed = g;
+    changed.invocation.choices.reads.push_back({CompilerChoice::VertexTapPc, 17});
+    EXPECT_NE(refused_graphics_inputs_identity(changed), original);
+}
+
+TEST(RefusedGraphicsInputs, UnavailableHelperStopsBeforeAlreadyNotedAndFullCodeCopies) {
+    fresh("refused_graphics_unavailable_stop");
+    const auto code = vertex();
+    const auto analysis = acquire_shader_analysis(code.data(), code.size());
+    ASSERT_TRUE(analysis);
+    const RefusedShaderSource source{{analysis, &analysis->code}, &analysis->refused_shader_memo};
+    note_unavailable_graphics_inputs("vs", 0x1000, source, "cold unavailable control");
+    ASSERT_EQ(refused_shader_dump_stats().graphics_source_copy_dwords, code.size());
+    const auto cold = refused_shader_dump_stats();
+    for (unsigned i = 0; i < 8; ++i)
+        note_unavailable_graphics_inputs("vs", 0x1000 + i, source, "repeat unavailable control");
+    EXPECT_EQ(refused_shader_dump_stats().graphics_source_copy_dwords,
+              cold.graphics_source_copy_dwords);
+    auto distinct = code;
+    for (uint32_t i = 0; i < kRefusedShaderDumpMaxPrograms; ++i) {
+        distinct[0] = 0xbe800300u + i;
+        note_refused_shader("cs", 0x2000 + i, distinct.data(), distinct.size(), "full control");
+    }
+    ASSERT_TRUE(refused_shader_dump_full());
+    const auto full = refused_shader_dump_stats();
+    note_unavailable_graphics_inputs("ps", 0x3000, source, "full unavailable control");
+    EXPECT_EQ(refused_shader_dump_stats().graphics_source_copy_dwords,
+              full.graphics_source_copy_dwords);
 }
 TEST(RefusedGraphicsInputs, NestedProducingChoicesAreRecordedButReplayChecksAreExcluded) {
     CompilerChoiceTrace outer, inner;
