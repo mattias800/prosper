@@ -710,23 +710,31 @@ std::vector<uint32_t> lane_selector_sgpr_program(bool all_paths, bool edge,
 std::vector<uint32_t> lane_selector_initial_or_write_program(unsigned mode) {
     std::vector<uint32_t> p;
     if (mode < 2) {
-        const auto old = lane_selector_across_edge(false);
-        const auto read = std::find(old.begin(), old.end(), 0xd7600010u);
-        p.push_back(0x7e020280u);
-        if (mode == 1) p.push_back(0xbf068004u);
-        p.insert(p.end(), read, old.end());
+        p = lane_selector_across_edge(false);
+        // Plain numeric DATA avoids the separate native saved-EXEC barrier proof boundary.
+        *std::find(p.begin(), p.end(), mov(30, 126, true)) = mov(30, 129);
+        const auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+        p.insert(read, 0xbf8a0000u);
+        if (mode == 1) {
+            const auto barrier = std::find(p.begin(), p.end(), 0xbf8a0000u);
+            p.insert(barrier, 0xbf068004u);
+        }
     } else {
         p = explicit_scc_relay_program(SccRelay::IndexedLaneRead, mode == 3);
         const size_t at = std::find(p.begin(), p.end(), 0xd7600010u) - p.begin();
         p[at + 1] = 277u | (128u << 9u);
         // v21 starts as a genuine ordinary vector; the dynamic write replaces one peer.
         std::vector<uint32_t> setup{mov(17, 253), 0x7e2a0280u, 0xd7610015u, 129u | (17u << 9u)};
-        if (mode == 4) setup.push_back(0x7e2a0280u);   // full EXEC still holds: replace every peer
+        if (mode == 4) {
+            // Prove the overwrite replaces every old peer, even in a dispatcher case.
+            setup.insert(setup.end(), {mov(126, 193, true), 0x7e2a0280u});
+        }
         p.insert(p.begin() + at, setup.begin(), setup.end());
     }
     return p;
 }
-void lane_selector_refuses(const std::vector<uint32_t>& p, unsigned pc) {
+void lane_selector_refuses(const std::vector<uint32_t>& p, unsigned pc,
+                           bool lane_consumer = false) {
     const auto resources = table();
     for (uint32_t path : {0u, 1u}) {
         auto c = config();
@@ -735,8 +743,15 @@ void lane_selector_refuses(const std::vector<uint32_t>& p, unsigned pc) {
         EXPECT_TRUE(recompile_compute(p.data(), p.size(), &resources, c).empty());
         std::string reason;
         for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
-        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        EXPECT_NE(
+            reason.find(lane_consumer ? "cfg-recompile-reject" : "fabricated-fresh-mask-source"),
+            std::string::npos)
+            << reason;
         EXPECT_NE(reason.find("pc=" + std::to_string(pc) + " "), std::string::npos) << reason;
+        if (lane_consumer) {
+            EXPECT_NE(reason.find("mode=unresolved-operand"), std::string::npos) << reason;
+            EXPECT_NE(reason.find("op=0x360"), std::string::npos) << reason;
+        }
     }
 }
 void lane_selector_values(const std::vector<uint32_t>& p, unsigned first, unsigned second) {
@@ -792,10 +807,10 @@ TEST(NativeCfgSavedMaskData, CurrentSelectorReplacementEndsMissingGenerationWith
 TEST(NativeCfgSavedMaskData, CurrentSelectorReplacementEndsMissingGenerationAcrossAnEdge) {
     lane_selector_values(lane_selector_sgpr_program(false, true, true), 0, 0);
 }
-TEST(NativeCfgSavedMaskData, MissingInitialSccCannotAuthenticateFreshMaskAfterLaneReadAndEdge) {
-    lane_selector_refuses(lane_selector_initial_or_write_program(0), 5);
+TEST(NativeCfgSavedMaskData, MarkedSccCannotSupplyALaneSelectorAcrossABarrier) {
+    lane_selector_refuses(lane_selector_initial_or_write_program(0), 13, true);
 }
-TEST(NativeCfgSavedMaskData, GenuineInitialSccKeepsActualValueAfterLaneReadAndEdge) {
+TEST(NativeCfgSavedMaskData, CurrentGenuineSccKeepsActualValueAcrossABarrier) {
     lane_selector_values(lane_selector_initial_or_write_program(1), 1, 0);
 }
 TEST(NativeCfgSavedMaskData, MissingDynamicWriteSelectorCannotAuthenticateFreshMask) {
