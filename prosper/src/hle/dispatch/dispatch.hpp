@@ -238,6 +238,7 @@ void register_builtin_hle();
 void register_kernel_hle();
 // File I/O (stdio + POSIX fd, with /app0 path translation); called by register_builtin_hle().
 void register_file_hle();
+void register_loadexec_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
 // Resolve a guest filesystem path through the same mount table used by libkernel file I/O.

@@ -2,6 +2,7 @@
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "host/image/exec_image.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/image/guest_executable.hpp"
 #include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
 #include "host/image/guest_fs_swap_stub.hpp"
@@ -4096,21 +4097,9 @@ BootResult run_entry(const LoadedImage& img) {
     register_thread_stack((uint64_t)pthread_self(), stk, STK);   // guest main thread
 
     uint64_t top = ((uint64_t)stk + STK) & ~(uint64_t)0xf;
-    // Guest argv[0] is always the eboot path. Optionally inject extra args via PROSPER_GUEST_ARGS
-    // (space-separated) — e.g. Unity's own switches like "-force-gfx-direct" to force single-threaded
-    // rendering. This is a legitimate compat-layer configuration (the game parses these switches), off by
-    // default so the normal boot is unchanged. CONFIDENCE: HIGH on the argv/crt0 stack layout.
-    std::vector<std::string> args = { "/app0/eboot.bin" };
-    if (const char* extra = getenv("PROSPER_GUEST_ARGS")) {
-        const char* p = extra;
-        while (*p) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            const char* s = p;
-            while (*p && *p != ' ') p++;
-            args.emplace_back(s, (size_t)(p - s));
-        }
-    }
+    // LoadExec supplies an exact argv vector. Ordinary eboot boots keep their explicitly configured
+    // PROSPER_GUEST_ARGS. CONFIDENCE: HIGH on the argv/crt0 stack layout.
+    std::vector<std::string> args = guest_entry_arguments(getenv("PROSPER_GUEST_ARGS"));
     // Copy each arg string onto the stack (high→low), collecting guest pointers.
     std::vector<uint64_t> argptrs;
     for (const auto& a : args) {

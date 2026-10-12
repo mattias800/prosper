@@ -11,6 +11,7 @@
 #include "hle/fs/guest_fopen_mode.hpp"
 #include "hle/fs/guest_devices.hpp"   // #4782 review: the served /dev/urandom and /dev/random
 #include "hle/service/hle_addcontent.hpp"
+#include "hle/service/hle_loadexec.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "diagnostics/diag_clock.hpp"
@@ -1000,6 +1001,7 @@ namespace {
 
 void set_app0_root(const std::string& root) {
     g_app0 = root;
+    configure_loadexec_app0(root);
     guest_sync_note_root(root);
     addcontent_configure_for_app0(root);
 }
