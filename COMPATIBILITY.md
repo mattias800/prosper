@@ -116,10 +116,10 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 31 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 22 |
-| **Below a title screen** — logo or splash only (rung 1) | 6 |
+| **Below a title screen** — logo or splash only (rung 1) | 7 |
 | **Boots, but no frame with content** (rung 0) | 15 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 74 |
+| Total tracked | 75 |
 
 **2026-10-09 status sweep, applied as deltas to the counts above.** Three new titles: *Super Meat
 Boy 3D* (rung 0), *Afterdream* (rung 1) and *The Blood of Dawnwalker* (rung 2). *PGA TOUR 2K25*
@@ -130,7 +130,7 @@ are left in their recorded bucket even though they regressed on current `main`: 
 67, and that one-row gap was already there before this edit; the engine breakdown below was not
 re-derived.
 
-**2026-10-12 status sweep, applied as deltas to the counts above.** Seven new titles, one default launch each on current `main`: *MGS4* and *MGS: Peace Walker* (rung 1) and *Resident Evil Village*, *Resident Evil 4*, *MGS Δ: Snake Eater*, *STAR WARS: Galactic Racer* and *RESIDENT EVIL requiem* (rung 0). The engine breakdown and the pre-existing one-row gap noted above were not re-derived.
+**2026-10-12 status sweep, applied as deltas to the counts above.** Seven new titles, one default launch each on current `main`: *MGS4* and *MGS: Peace Walker* (rung 1) and *Resident Evil Village*, *Resident Evil 4*, *MGS Δ: Snake Eater*, *STAR WARS: Galactic Racer* and *RESIDENT EVIL requiem* (rung 0). On 2026-10-13 *Luna Abyss* was added at rung 1, two runs on the same `main`. The engine breakdown and the pre-existing one-row gap noted above were not re-derived.
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
