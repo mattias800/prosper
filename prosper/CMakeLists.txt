@@ -4128,6 +4128,12 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME gpu_capture_failed_setup
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tests/gpu/capture/test_failed_capture_setup.py"
+                     "$<TARGET_FILE:test_gpu_capture>")
+  endif()
   prosper_add_gtest(test_raster_launch_capture
     SOURCES tests/gpu/capture/test_raster_launch_capture.cpp
     LIBRARIES prosper_core)
