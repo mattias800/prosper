@@ -1,5 +1,5 @@
-// #4945: a mapped null-store fixture still needs real synthetic launch words before physical
-// mask DATA can be retained. Store-marker discovery and compilation are separate contracts.
+// #4945/#4986: a mapped null-store fixture needs real synthetic launch words and its workgroup-X
+// system input before physical mask DATA can be retained. Marker discovery is a separate contract.
 #include "fixtures/gta5_guarded_raw_store_fixture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
@@ -129,6 +129,21 @@ TEST(GuardedStoreLaunch, UnknownRawLaunchPreservesMarkersButRefusesPhysicalData)
     auto config = input.config();
     config.dispatch_launch = {};
     expect_launch_refusal(input, config);
+}
+
+TEST(GuardedStoreLaunch, MissingWorkgroupXRefusesBeforePhysicalLaunchCheck) {
+    Input input;
+    input.discover();
+    auto config = input.config();
+    config.tgid_x_en = false;
+    EXPECT_TRUE(compute_dispatch_has_complete_groups(config));
+    input.expect_markers();
+    const auto result = compile(input, config);
+    EXPECT_TRUE(result.module.empty());
+    EXPECT_NE(result.reason.find("fabricated-fresh-mask-source"), std::string::npos)
+        << result.reason;
+    EXPECT_NE(result.reason.find("pc=23 "), std::string::npos) << result.reason;
+    EXPECT_NE(result.reason.find("words=7da8006a"), std::string::npos) << result.reason;
 }
 
 TEST(GuardedStoreLaunch, PartialFlagSameGeometryRefusesPhysicalData) {
