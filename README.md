@@ -53,7 +53,7 @@ game.
 |---|---|---|
 | Running your game | Directly, as shipped — nothing to convert, no second copy eating your disk | Converts the files to a PC format first, then runs the result |
 | Graphics | Translated for your GPU, checked automatically on every change | Translated for your GPU |
-| Progress | Games that actually run, with screenshots and checks against a real PS5 | Percentages of their own to-do list (see below) |
+| Progress | Title-specific results, with screenshots and real-PS5 checks where recorded | Percentages of their own to-do list (see below) |
 
 No conversion step means nothing extra that can break — and when something crashes, developers see
 the game's own code instead of a converted copy. The one thing that truly needs translating is
@@ -73,8 +73,9 @@ function — and the total grows as they add more. So:
 - **"Done" means written, not proven right.** Their counter ticks when placeholder code gets
   replaced. Nothing checks the replacement gives the right answer.
 
-We'd rather show a game running than a percentage climbing: every claim in `COMPATIBILITY.md` is a
-title someone actually booted, with screenshots in `BLOG.md` to prove it.
+We'd rather show a game running than a percentage climbing. `COMPATIBILITY.md` records
+title-specific results: screenshots and real-PS5 comparisons are included only where recorded.
+Use each title's linked tracker or status page for current evidence.
 
 ---
 
