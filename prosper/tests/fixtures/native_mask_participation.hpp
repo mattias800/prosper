@@ -119,13 +119,14 @@ inline Program program(Options options = {}) {
     }
     if (options.preservation == Preservation::TransformedLane) {
         p.insert(p.end(), {0x7e1602fau, 0xff091100u});   // row_shr1 BC1 is not local-X identity
-        p.push_back(0x7da41781u);   // CMPX v11==1: actual lane2, not lane1
+        p.push_back(0x7da41681u);   // CMPX v11==1: actual lane2, not lane1
         p.push_back(0x7e180281u);   // v12=1 on selected lanes only
         p.push_back(mov(126, 193, true));
         readlane(22, 12, 1);
     }
     if (options.preservation == Preservation::ImplicitVcc) {
-        p.push_back(0x7d841580u);   // implicit VCC compare uses absent v10
+        if (options.initialize_preserved) p.push_back(0x7e140280u);   // genuine compare input v10
+        p.push_back(0x7d841480u);   // implicit VCC compare: absent v10 on the negative arm
         if (options.initialize_preserved) {
             p.push_back(mov(106, 6));
             p.push_back(mov(107, 7));   // genuine runtime words avoid constant-branch rewriting

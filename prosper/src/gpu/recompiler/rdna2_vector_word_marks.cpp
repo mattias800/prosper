@@ -4,7 +4,9 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -21,8 +23,6 @@ bool memory_result(const Rdna2Inst& in) {
 }
 
 ScalarSourceMarks vector_word(const RegState& rs, int reg) {
-    // This relay map follows marked scalar/memory origins, not ordinary per-lane definedness.
-    // An unmarked VGPR grants no entry-value authority; that remains the compiler's existing domain.
     const auto found = rs.vreg_source_marks.find(reg);
     return found == rs.vreg_source_marks.end() ? ScalarSourceMarks{} : found->second;
 }
@@ -34,7 +34,40 @@ void set_word(VectorWordMarks& marks, int reg, ScalarSourceMarks source) {
         marks.erase(reg);
 }
 
+bool relative_constant_offset(const SpirvCompute& b, uint32_t value, uint32_t& offset) {
+    if (b.uconst_literal(value, &offset)) return true;
+    // A completed two-edge PHI of the same genuine constant has that exact value too. Pending
+    // loop backedges have zero value/label placeholders and cannot certify an index here.
+    for (std::size_t pc = 0; pc < b.code.size();) {
+        const uint32_t words = b.code[pc] >> 16;
+        if (!words || words > b.code.size() - pc) return false;
+        if ((b.code[pc] & 0xffffu) == Op_Phi && words == 7 && b.code[pc + 1] == b.t_u32 &&
+            b.code[pc + 2] == value && b.code[pc + 3] == b.code[pc + 5] && b.code[pc + 4] &&
+            b.code[pc + 6] && b.code[pc + 4] != b.code[pc + 6])
+            return b.uconst_literal(b.code[pc + 3], &offset);
+        pc += words;
+    }
+    return false;
+}
+
 }   // namespace
+
+void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
+                                  bool native_interpolation) {
+    // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
+    // placeholder is not a guest value. Seed before PHIs or dispatcher storage can hide absence;
+    // later complete writers retire the mark, while preserved old bits/lanes retain it.
+    const int highest = shader_max_vgpr(instructions);
+    rs.vector_full_exec = rs.exec && !rs.exec_narrowed;
+    rs.vector_native_interpolation = native_interpolation;
+    for (int reg = 0; reg <= highest; ++reg) {
+        const auto value = rs.vreg.find(reg);
+        if (value != rs.vreg.end() && value->second) continue;
+        auto& mark = rs.vreg_source_marks[reg];
+        mark.placeholder = mark.hard = true;
+        mark.blanket_roots.clear();
+    }
+}
 
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other) {
     into.placeholder = into.placeholder || other.placeholder;
@@ -48,6 +81,9 @@ void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other)
 
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     ScalarSourceMarks marks;
+    if (vector_write_leaves_old_word(in, rs.vector_native_interpolation) ||
+        (rs.vector_native_interpolation && in.fmt == Rdna2Format::VINTRP))
+        return marks;
     // Load addresses are not loaded data. A genuine read still carries MEMORY, which only the
     // fragment lane-bit projection rejects; compute keeps its actual guest-lane identity.
     if (memory_result(in)) {
@@ -55,14 +91,33 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS) return marks;
     }
     for (uint32_t source = 0; source < in.n_src; ++source)
-        for (uint32_t word = 0; word < rdna2_vgpr_source_span(in, source); ++word)
+        for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
             union_source_marks(marks,
                                vector_word(rs, in.src[source].value + static_cast<int>(word)));
-    // Relative source addressing can select any observable source lifetime, not only the encoded
-    // base VGPR. No selector value is guessed here.
-    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
-        for (const auto& [reg, source] : rs.vreg_source_marks)
-            if (reg >= in.src[0].value) union_source_marks(marks, source);
+    // Relative indexing can select an absent word beyond the decoder's storage inventory. A
+    // constant current M0 may refine this at the actual emission boundary; maps alone cannot.
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
+        marks.placeholder = marks.hard = true;
+        marks.blanket_roots.clear();
+    }
+    return marks;
+}
+
+ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
+                                               const Rdna2Inst& in) {
+    ScalarSourceMarks missing;
+    missing.placeholder = missing.hard = true;
+    const auto m0 = rs.sreg.find(124);
+    uint32_t offset = 0;
+    if (m0 == rs.sreg.end() || sreg_word_may_be_fabricated(rs, 124) ||
+        !relative_constant_offset(b, m0->second, offset))
+        return missing;
+    const uint64_t selected = static_cast<uint64_t>(in.src[0].value) + offset;
+    if (selected > 255) return missing;
+    const auto value = rs.vreg.find(static_cast<int>(selected));
+    if (value == rs.vreg.end() || !value->second) return missing;
+    auto marks = vector_word(rs, static_cast<int>(selected));
+    marks.memory = marks.memory || rs.sreg_memory_pattern.contains(124);
     return marks;
 }
 
@@ -99,18 +154,20 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
 }
 
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
+    const bool full_exec = !rs.exec_narrowed || rs.vector_full_exec;
+    if (rdna2_instruction_may_change_exec(in))
+        rs.vector_full_exec = vector_exec_is_full_after_write(in, full_exec);
+    if (vector_write_leaves_old_word(in, rs.vector_native_interpolation)) return;
     const uint32_t width = rdna2_vgpr_write_count(in);
     if (!width) return;
-    const bool writelane = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361;
     const bool relative = in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
-    const bool partial = in.sdwa_dst_sel != 6 && in.sdwa_dst_unused == 2;
+    const bool preserve = vector_write_depends_on_old_word(in, full_exec);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {
         ScalarSourceMarks result = source;
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
-        if (rs.exec_narrowed || writelane || relative || partial)
-            union_source_marks(result, vector_word(rs, reg));
+        if (preserve) union_source_marks(result, vector_word(rs, reg));
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }

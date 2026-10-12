@@ -1843,12 +1843,16 @@ int main(int argc, char** argv) {
         }
     }
     // Compute: saved VOPC mask combined with VCC by s_nor_b64 (UE4 visibility-mask shape).
-    { const uint32_t c[] = {0x7C040CF9u,0x06869880u,0x8DEA6A18u,0xBF810000u};
-      dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c)/4, 0, 0)); }
+    {
+        const uint32_t c[] = {0x7E0C0280u, /* genuine compare input v6 */
+                              0x7C040CF9u, 0x06869880u, 0x8DEA6A18u, 0xBF810000u};
+        dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c) / 4, 0, 0));
+    }
     // Compute: nested/multi-branch CFG dispatcher (varying VCC exit + inner SCC branch + back-edge).
     // Locks both structured switch-loop formation and the workgroup-scratch hardware-wave vote.
     {
-        const uint32_t c[] = {0xBE840380u, /* explicit fixture scalar input */
+        const uint32_t c[] = {0x7E0E0280u, /* genuine old v7 before its masked load */
+                              0xBE840380u, /* explicit fixture scalar input */
                               0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu,
                               0xD7610013u, 0x0001507Fu, 0xD760000Eu, 0x00014B13u, 0xD760000Fu,
                               0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u, 0x7DB900F9u,
@@ -1893,7 +1897,8 @@ int main(int argc, char** argv) {
     // a loop header (its own dispatcher case); the irreducible tail forces the dispatcher. Compute
     // (native Wave64) and pixel forms.
     {
-        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+        const uint32_t c[] = {0x7E020280u, /* genuine v1; v0 is the checked local-id input */
+                              0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
                               0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0xBEFE04C1u, 0xE0702000u,
                               0x80020300u, 0x7E040280u, 0x7C020300u, 0xBF860001u, 0x7E040281u,
                               0x7D840100u, 0xBF870001u, 0xBF82FFFDu, 0x7E040D02u, 0xBF810000u};
@@ -1910,10 +1915,12 @@ int main(int argc, char** argv) {
         config.local_x = 64;
         config.wave_size = 64;
         config.native_subgroup_size = 64;
+        prosper::test::complete_compute_launch(config);
         dump(dir, "compute_entry_m0_kill", recompile_compute(c, std::size(c), &rt, config));
     }
     {
-        const uint32_t c[] = {0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
+        const uint32_t c[] = {0x7E000280u, 0x7E020280u, /* genuine dispatcher compare inputs */
+                              0xBE82037Cu, 0xBE8203A9u, 0xBE830380u, 0x7E060202u, 0xBF800000u,
                               0x80038103u, 0xBF0A8203u, 0xBF85FFFBu, 0x7E040280u, 0x7C020300u,
                               0xBF860001u, 0x7E040281u, 0x7D840100u, 0xBF870001u, 0xBF82FFFDu,
                               0x7E020D03u, 0x100202FFu, 0x3B808081u, 0x7E000280u, 0x7E040280u,
@@ -1924,8 +1931,8 @@ int main(int argc, char** argv) {
     // the same physical pair through S_ANDN2_B64. Validate the native subgroup ballots that make
     // the logical result scalar-readable at the exact trailing S_CMP_EQ_U64.
     {
-        const uint32_t c[] = {0xBE840380u, /* explicit fixture scalar input */
-
+        const uint32_t c[] = {0x7E0E0280u, /* genuine old v7 before its masked load */
+                              0xBE840380u, /* explicit fixture scalar input */
                               0xBEB8037Eu, 0xBEB9037Fu, 0x7E400280u, 0xBF068008u, 0xBF840003u,
                               0x7D8A40C1u, 0x8AB86A38u, 0xBF800000u, 0xBF128038u, 0xBE800380u,
                               0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u,
@@ -2146,11 +2153,13 @@ int main(int argc, char** argv) {
                               0x3E800000u, 0xBE80036Au, 0xBF82FFF8u, 0x7E020300u, 0x7E040300u,
                               0xF800080Fu, 0x03020100u, 0xBF810000u};
         dump(dir, "fragment_vcc_scratch_loop", recompile_fragment(c, sizeof(c) / 4, nullptr));
-        uint32_t voted[sizeof(c) / 4];
-        std::copy(std::begin(c), std::end(c), voted);
-        voted[2] = 0x7E020302u;
+        // P2 supplies a genuine lane-varying input v2 before the original loop copies it into
+        // its bound. An absent v2 is not a raster input and must not authenticate the predicate.
+        std::vector<uint32_t> voted{0xC8090014u};
+        voted.insert(voted.end(), std::begin(c), std::end(c));
+        voted[3] = 0x7E020302u;
         dump(dir, "fragment_vcc_scratch_loop_voted",
-             recompile_fragment(voted, sizeof(voted) / 4, nullptr));
+             recompile_fragment(voted.data(), voted.size(), nullptr));
     }
     // Fragment (#4848, House of the Dead 2's light loops): the scratch loop with an interior EXECZ
     // break after the scratch writes. The break edge reaches the merge with VCC holding scalar

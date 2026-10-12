@@ -29,7 +29,9 @@ Words cat(std::initializer_list<Words> parts) {
 }
 
 Words prefix() {
-    return {0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u};
+    // The later dispatcher/CMPX comparisons consume v0/v1 before the payload export writes
+    // them. Supply genuine words at full entry EXEC so those comparisons test the relay below.
+    return {0x7e000280u, 0x7e020280u, 0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u};
 }
 Words spill_source() {
     return {0xd7610015u, 0x00010032u, 0xd7610015u, 0x00010233u};
@@ -257,7 +259,11 @@ TEST(VectorScalarProvenance, Mad64ChargesTheHighWordOfItsVectorAddend) {
         const Words read = {0x7e58050bu, 0xbead03c1u};   // s44=first(v11); s45=-1
         for (Stage stage : {Stage::Fragment, Stage::Compute}) {
             expect_refused(stage,
-                           cat({prefix(), {0x7e0c0280u, 0x7e0e0233u}, mad, read, restore(stage)}));
+                           cat({prefix(), {0x7e0c0280u, 0x7e0e0233u}, mad, read, restore(stage)}),
+                           "fabricated-fresh-mask-source");
+            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(prefix().size() + 2u) + " "),
+                      std::string::npos)
+                << terminal_reason;
             EXPECT_FALSE(
                 compile(stage,
                         cat({prefix(), {0x7e0c0280u, 0x7e0e02c1u}, mad, read, restore(stage)}))
@@ -274,7 +280,11 @@ TEST(VectorScalarProvenance, Mad64ChargesTheHighWordOfItsVectorAddend) {
                 << terminal_reason;
             const Words scalar_addend = {mad[0], 129u | (129u << 9u) | (50u << 18u)};
             expect_refused(stage,
-                           cat({prefix(), {0xbeb20380u}, scalar_addend, read, restore(stage)}));
+                           cat({prefix(), {0xbeb20380u}, scalar_addend, read, restore(stage)}),
+                           "fabricated-fresh-mask-source");
+            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(prefix().size() + 1u) + " "),
+                      std::string::npos)
+                << terminal_reason;
             EXPECT_FALSE(compile(stage, cat({prefix(),
                                              {0xbeb20380u, 0xbeb303c1u},
                                              scalar_addend,
@@ -292,8 +302,12 @@ TEST(VectorScalarProvenance, CarryDestinationCannotCertifyItsOwnVectorSourceAtAn
     const Words add = {0xd70f3206u, 50u | (129u << 9u)};
     const Words body = cat({prefix(), add, dispatcher(), {0x7e580506u, 0xbead03c1u}, restore()});
     EXPECT_TRUE(compile(Stage::Fragment, body).empty());
-    EXPECT_NE(terminal_reason.find("pc=" + std::to_string(body.size() - 1u) + " "),
+    // Its carry output is itself a fresh predicate, so refuse the fabricated old source before
+    // that output can certify it. The CFG terminal wrapper retains the original writer bytes.
+    EXPECT_NE(terminal_reason.find("pc=" + std::to_string(prefix().size()) + " "),
               std::string::npos)
+        << terminal_reason;
+    EXPECT_NE(terminal_reason.find("words=d70f3206,00010232"), std::string::npos)
         << terminal_reason;
     EXPECT_FALSE(compile(Stage::Fragment, cat({prefix(),
                                                {0xbeb203c1u},
