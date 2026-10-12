@@ -14,7 +14,8 @@ no-JS fallback.
   on every `main` push, so the page is exactly as current as the committed files.
 - The trackers stay authoritative. A row here is a projection of `PROGRESS_TRACKER.md`
   plus hand-written milestone prose; when they disagree with a tracker, the tracker wins.
-- Statuses are rung buckets (Guarded 6 … Boots 0), never the ✅/🚧/🔬 markers:
+- Statuses are plain-language rung buckets (Complete 6 … Boots 0, with the exact rung
+  as a hover tooltip), never the ✅/🚧/🔬 markers:
   the charter records those markers are not a rung scale. There are no OS/region/version
   columns — prosper tracks one dump revision per title, mostly on Linux, so per-OS
   breakdowns would be invented data. Titles with no `##` section yet (recent

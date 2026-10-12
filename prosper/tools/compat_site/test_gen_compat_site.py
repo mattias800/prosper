@@ -16,10 +16,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_compat_site import (  # noqa: E402
+    PAGE_CSS,
     ParseError,
     bucket_of,
     build,
     counts,
+    links_cell,
     parse_compat_covers,
     parse_compat_table,
     parse_tracker_table,
@@ -49,7 +51,8 @@ def test_join_uses_tracker_rung_and_compat_prose():
     titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
     assert len(titles) == 1
     row = titles[0]
-    assert (row["rung"], row["status"]) == (3, "Gameplay")
+    assert (row["rung"], row["status"]) == (3, "Playable")
+    assert row["hint"].startswith("Rung 3 of 6")
     assert row["engine"] == "Unity"
     assert row["milestone"] == "✅ First room"
     assert row["guard"] == ["demo-gameplay"]
@@ -65,9 +68,10 @@ def test_compat_only_title_is_untracked_not_rung_zero():
 
 
 def test_markers_are_not_statuses():
-    """Every rung maps to its bucket label; an unknown rung fails loudly."""
-    assert bucket_of(6)[0] == "Guarded"
-    assert bucket_of(0)[0] == "Boots, no frame"
+    """Every rung maps to its plain-language bucket label; an unknown rung fails loudly."""
+    assert bucket_of(6)[0] == "Complete"
+    assert bucket_of(0)[0] == "Boots"
+    assert "rung" not in bucket_of(3)[0].lower() and "guard" not in bucket_of(6)[0].lower()
     try:
         bucket_of(9)
     except ParseError:
@@ -87,6 +91,7 @@ def test_milestone_html_is_escaped():
     assert index_html.count("`") % 2 == 0
     classic = render_classic(titles, "2026-01-01")
     assert "&lt;script&gt;" in classic and "<script>alert" not in classic
+    assert '<td class="links"><a href="https://example.test/11">Tracker</a></td>' in classic
 
 
 def test_covers_first_repo_image_wins():
@@ -112,6 +117,21 @@ def test_vendor_covers_missing_source_aborts(tmp_path):
         pass
     else:
         raise AssertionError("missing cover source did not fail")
+
+
+def test_links_and_pills_stay_on_one_line():
+    """Links render inline (`Tracker · Doc`, never stacked); pills cannot wrap."""
+    assert "white-space:nowrap" in PAGE_CSS
+    assert links_cell(
+        {"number": "11", "url": "https://example.test/11"},
+        "https://example.test/doc.md",
+    ) == (
+        '<td class="links"><a href="https://example.test/11">Tracker</a> · '
+        '<a href="https://example.test/doc.md">Doc</a></td>'
+    )
+    assert links_cell({"number": "11", "url": "https://example.test/11"}, "") == (
+        '<td class="links"><a href="https://example.test/11">Tracker</a></td>'
+    )
 
 
 def test_strip_md_keeps_link_labels():
@@ -154,6 +174,7 @@ if __name__ == "__main__":
     test_compat_only_title_is_untracked_not_rung_zero()
     test_markers_are_not_statuses()
     test_milestone_html_is_escaped()
+    test_links_and_pills_stay_on_one_line()
     test_covers_first_repo_image_wins()
     with tempfile.TemporaryDirectory() as tmp:
         test_vendor_covers_missing_source_aborts(Path(tmp))

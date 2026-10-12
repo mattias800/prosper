@@ -41,17 +41,18 @@ MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]+\)")
 COVER_IMG_RE = re.compile(r'<img\s+src="([^"]+)"')
 COVER_HEADING_RE = re.compile(r"^##\s+.+`?(PPSA\d{5})`?\s*$")
 
-# Highest rung first: (rung, label, bar colour). None covers titles present only in
-# COMPATIBILITY.md with no tracker row at all.
-BUCKETS: list[tuple[int | None, str, str]] = [
-    (6, "Guarded", "#2ea043"),
-    (5, "Hardware oracle", "#39c5cf"),
-    (4, "Verified by eye", "#7ee787"),
-    (3, "Gameplay", "#4493f8"),
-    (2, "Title / menu", "#ab7df8"),
-    (1, "Graphics only", "#d29922"),
-    (0, "Boots, no frame", "#f85149"),
-    (None, "Untracked", "#6e7681"),
+# Highest rung first: (rung, plain-language label, bar colour, tooltip). None covers
+# titles present only in COMPATIBILITY.md with no tracker row at all. Labels stay short
+# and jargon-free (no "rung N" / "guard" terms); the tooltip carries the exact rung.
+BUCKETS: list[tuple[int | None, str, str, str]] = [
+    (6, "Complete", "#2ea043", "Rung 6 of 6: finished, guarded by a reviewed automatic check"),
+    (5, "PS5 match", "#39c5cf", "Rung 5 of 6: compared against a real PS5"),
+    (4, "Verified", "#7ee787", "Rung 4 of 6: a human confirmed it looks right"),
+    (3, "Playable", "#4493f8", "Rung 3 of 6: gameplay renders"),
+    (2, "Menus", "#ab7df8", "Rung 2 of 6: title screen or menus"),
+    (1, "Graphics", "#d29922", "Rung 1 of 6: first graphics, no menus yet"),
+    (0, "Boots", "#f85149", "Rung 0 of 6: starts but shows no game picture yet"),
+    (None, "Untracked", "#6e7681", "No measurement yet"),
 ]
 
 
@@ -196,11 +197,11 @@ def parse_compat_covers(text: str) -> dict[str, str]:
     return covers
 
 
-def bucket_of(rung: int | None) -> tuple[str, str]:
-    """(label, colour) for a rung; unknown rungs are a hard error, never a grey row."""
-    for r, label, colour in BUCKETS:
+def bucket_of(rung: int | None) -> tuple[str, str, str]:
+    """(label, colour, tooltip) for a rung; unknown rungs are a hard error, never a grey row."""
+    for r, label, colour, hint in BUCKETS:
         if r == rung:
-            return label, colour
+            return label, colour, hint
     raise ParseError(f"no status bucket for rung {rung!r}")
 
 
@@ -212,7 +213,7 @@ def build(
     titles: dict[str, dict] = {}
     for row in tracker_rows:
         comp = compat.get(row["id"], {})
-        label, colour = bucket_of(row["rung"])
+        label, colour, hint = bucket_of(row["rung"])
         titles[row["id"]] = {
             "title": row["title"],
             "id": row["id"],
@@ -223,6 +224,7 @@ def build(
             "ladder": row["ladder"],
             "status": label,
             "colour": colour,
+            "hint": hint,
             "guard": row["guard"],
             "fps": row["fps"],
             "blockers": row["blockers"],
@@ -231,7 +233,7 @@ def build(
         }
     for tid, comp in compat.items():
         if tid not in titles:
-            label, colour = bucket_of(None)
+            label, colour, hint = bucket_of(None)
             titles[tid] = {
                 "title": comp["title"],
                 "id": tid,
@@ -242,6 +244,7 @@ def build(
                 "ladder": "------",
                 "status": label,
                 "colour": colour,
+                "hint": hint,
                 "guard": [],
                 "fps": None,
                 "blockers": [],
@@ -276,13 +279,13 @@ def vendor_covers(root: Path, out: Path, covers: dict[str, str]) -> dict[str, st
 
 def counts(titles: list[dict]) -> list[dict]:
     """Per-bucket counts in BUCKETS order, skipping empty buckets."""
-    order = [label for _, label, _ in BUCKETS]
+    order = [label for _, label, _, _ in BUCKETS]
     hits: dict[str, int] = {label: 0 for label in order}
     for t in titles:
         hits[t["status"]] += 1
     total = len(titles) or 1
     out = []
-    for rung, label, colour in BUCKETS:
+    for rung, label, colour, _ in BUCKETS:
         if hits[label]:
             out.append(
                 {
@@ -305,18 +308,43 @@ PAGE_CSS = """
 body{font-family:sans-serif;background:#0d1117;color:#e6edf3;max-width:1100px;margin:auto;padding:16px}
 a{color:#4493f8}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin:16px 0}
 .bar{height:8px;border-radius:4px;background:#30363d;margin:4px 0 12px}.bar>div{height:8px;border-radius:4px}
-.row{display:flex;justify-content:space-between;font-size:14px}
+.row{display:flex;justify-content:space-between;gap:12px;font-size:14px}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
-input,select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px}
+input,select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:14px}
+.tablewrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{border-bottom:1px solid #30363d;padding:8px;text-align:left;vertical-align:top}
+td.milestone{min-width:220px}
 img.thumb{width:96px;border-radius:4px;display:block}
-.pill{display:inline-block;padding:1px 10px;border-radius:10px;font-size:12px;color:#0d1117;font-weight:bold}
+img.logo{height:56px;vertical-align:middle;margin-right:12px}
+.brand{display:flex;align-items:center;margin:16px 0 0}
+.brand h1{margin:0;font-size:32px}
+.pill{display:inline-block;padding:2px 12px;border-radius:12px;font-size:12px;color:#0d1117;font-weight:bold;white-space:nowrap}
+.links{white-space:nowrap}
 .mut{color:#8b949e;font-size:12px}
+@media (max-width:720px){
+ body{padding:10px}
+ .brand h1{font-size:24px}
+ img.logo{height:40px;margin-right:8px}
+ .card{padding:12px}
+ .filters{flex-direction:column}
+ .filters input,.filters select{width:100%;box-sizing:border-box}
+ img.thumb{width:64px}
+ table{font-size:13px}
+ th,td{padding:6px}
+}
 """
 
 
-def render_index(titles: list[dict], stats: list[dict], generated: str) -> str:
+def links_cell(tracker: dict[str, str], doc_url: str) -> str:
+    """One line, never stacked: `Tracker · Doc`. Doc only when a status doc exists."""
+    cell = f'<td class="links"><a href="{esc(tracker["url"])}">Tracker</a>'
+    if doc_url:
+        cell += f' · <a href="{esc(doc_url)}">Doc</a>'
+    return cell + "</td>"
+
+
+def render_index(titles: list[dict], stats: list[dict], generated: str, logo: str = "") -> str:
     """Filterable main page. Data comes from compat.json; no-JS readers get classic.html."""
     bars = "\n".join(
         f'<div class="row"><span>{esc(s["label"])}</span>'
@@ -331,10 +359,17 @@ def render_index(titles: list[dict], stats: list[dict], generated: str) -> str:
     status_opts = '<option value="">Status: all</option>' + "".join(
         f"<option>{esc(s['label'])}</option>" for s in stats
     )
+    brand = (
+        f'<div class="brand"><img class="logo" src="{esc(logo)}" alt="prosper logo">'
+        "<h1>Compatibility</h1></div>"
+        if logo
+        else "<h1>Compatibility</h1>"
+    )
+    favicon = f'<link rel="icon" href="{esc(logo)}">' if logo else ""
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>prosper compatibility</title><style>{PAGE_CSS}</style></head><body>
-<h1>Compatibility</h1>
+<title>prosper compatibility</title>{favicon}<style>{PAGE_CSS}</style></head><body>
+{brand}
 <p>How far PS5 titles get on prosper, per the six-rung bring-up ladder.
 Trackers are authoritative; this page is generated from the committed files.</p>
 <div class="card"><h2>Tested titles: {len(titles)}</h2>{bars}
@@ -348,8 +383,8 @@ Statuses are rung buckets, not the ✅/🚧/🔬 markers. One dump revision per 
 <select id="sort"><option value="rung">Sort: furthest first</option><option value="az">Sort: A-Z</option></select>
 </div>
 <p class="mut" id="count"></p>
-<table><thead><tr><th>Cover</th><th>Title</th><th>ID</th><th>Engine</th><th>Status</th><th>Guard</th><th>Milestone</th><th>Links</th></tr></thead>
-<tbody id="rows"></tbody></table>
+<div class="tablewrap"><table><thead><tr><th>Cover</th><th>Title</th><th>ID</th><th>Engine</th><th>Status</th><th>Guard</th><th>Milestone</th><th>Links</th></tr></thead>
+<tbody id="rows"></tbody></table></div>
 <p class="mut">No JavaScript? <a href="classic.html">Classic static table</a> · <a href="llms.txt">llms.txt</a></p>
 <script>
 let T=[];
@@ -363,10 +398,10 @@ function go(){{
  R.sort($("sort").value==="az"?((a,b)=>a.title.localeCompare(b.title)):((a,b)=>((b.rung==null?-1:b.rung)-(a.rung==null?-1:a.rung))||a.title.localeCompare(b.title)));
  $("count").textContent=R.length+" of "+T.length+" titles";
  $("rows").innerHTML=R.map(t=>`<tr><td>${{t.cover?`<img class="thumb" loading="lazy" src="${{t.cover}}" alt="">`:"—"}}</td><td>${{e(t.title)}}</td><td><code>${{t.id}}</code></td><td>${{e(t.engine)}}</td>`
-  +`<td><span class="pill" style="background:${{t.colour}}">${{e(t.status)}}${{t.rung===null||t.rung===undefined?"":" r"+t.rung}}</span></td>`
+  +`<td><span class="pill" style="background:${{t.colour}}" title="${{e(t.hint)}}">${{e(t.status)}}</span></td>`
   +`<td>${{t.guard.length?t.guard.map(g=>"<code>"+e(g)+"</code>").join(" "):"—"}}</td>`
-  +`<td>${{e(t.milestone)}}</td>`
-  +`<td><a href="${{t.tracker.url}}">tracker</a>${{t.doc_url?` <a href="${{t.doc_url}}">doc</a>`:""}}</td></tr>`).join("");
+  +`<td class="milestone">${{e(t.milestone)}}</td>`
+  +`<td class="links"><a href="${{t.tracker.url}}">Tracker</a>${{t.doc_url?` · <a href="${{t.doc_url}}">Doc</a>`:""}}</td></tr>`).join("");
 }}
 function e(s){{return String(s).replace(/[&<>"']/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[c]));}}
 for(const id of ["q","fstatus","fengine","fguard","sort"])$(id).addEventListener("input",go);
@@ -380,7 +415,7 @@ def doc_url(cell: str) -> str:
     return "https://github.com/mattias800/prosper/blob/main/" + m.group(0) if m else ""
 
 
-def render_classic(titles: list[dict], generated: str) -> str:
+def render_classic(titles: list[dict], generated: str, logo: str = "") -> str:
     """Static table for no-JS readers: the same rows, no search."""
 
     def cover_cell(t: dict) -> str:
@@ -391,21 +426,33 @@ def render_classic(titles: list[dict], generated: str) -> str:
             f'alt="{esc(t["title"])}"></td>'
         )
 
+    def status_cell(t: dict) -> str:
+        return (
+            f'<td><span class="pill" style="background:{t["colour"]}" '
+            f'title="{esc(t["hint"])}">{esc(t["status"])}</span></td>'
+        )
+
     rows = "\n".join(
         f"<tr>{cover_cell(t)}<td>{esc(t['title'])}</td><td><code>{t['id']}</code></td>"
-        f"<td>{esc(t['engine'])}</td><td>{esc(t['status'])}"
-        f"{' r' + str(t['rung']) if t['rung'] is not None else ''}</td>"
-        f"<td>{esc(t['milestone'])}</td>"
-        f'<td><a href="{esc(t["tracker"]["url"])}">tracker #{esc(t["tracker"]["number"])}</a></td></tr>'
+        f"<td>{esc(t['engine'])}</td>{status_cell(t)}"
+        f'<td class="milestone">{esc(t["milestone"])}</td>'
+        f"{links_cell(t['tracker'], t.get('doc_url', ''))}</tr>"
         for t in titles
     )
+    brand = (
+        f'<div class="brand"><img class="logo" src="{esc(logo)}" alt="prosper logo">'
+        "<h1>Compatibility (static)</h1></div>"
+        if logo
+        else "<h1>Compatibility (static)</h1>"
+    )
+    favicon = f'<link rel="icon" href="{esc(logo)}">' if logo else ""
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>prosper compatibility (static)</title><style>{PAGE_CSS}</style></head><body>
-<h1>Compatibility (static)</h1>
+<title>prosper compatibility (static)</title>{favicon}<style>{PAGE_CSS}</style></head><body>
+{brand}
 <p>{len(titles)} titles. Generated {esc(generated)}. Trackers authoritative.</p>
-<table><thead><tr><th>Cover</th><th>Title</th><th>ID</th><th>Engine</th><th>Status</th>
-<th>Milestone</th><th>Tracker</th></tr></thead><tbody>{rows}</tbody></table>
+<div class="tablewrap"><table><thead><tr><th>Cover</th><th>Title</th><th>ID</th><th>Engine</th><th>Status</th>
+<th>Milestone</th><th>Links</th></tr></thead><tbody>{rows}</tbody></table></div>
 </body></html>
 """
 
@@ -428,6 +475,22 @@ def render_llms(titles: list[dict], generated: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+LOGO_SRC = "assets/prosper-logo.png"
+
+
+def vendor_logo(root: Path, out: Path) -> str:
+    """Copy the README logo into the site root; returns its site-relative path.
+
+    Missing logo aborts the build like a missing cover: a header pointing at an image
+    outside the checkout would publish a broken brand mark.
+    """
+    source = root / LOGO_SRC
+    if not source.is_file():
+        raise ParseError(f"site logo not found in checkout: {LOGO_SRC}")
+    (out / source.name).write_bytes(source.read_bytes())
+    return source.name
+
+
 def write_site(root: Path, out: Path) -> dict:
     """Parse the committed files and write the site artifacts. Returns the JSON payload."""
     tracker_rows = parse_tracker_table((root / "PROGRESS_TRACKER.md").read_text(encoding="utf-8"))
@@ -435,6 +498,7 @@ def write_site(root: Path, out: Path) -> dict:
     compat = parse_compat_table(compat_text)
     out.mkdir(parents=True, exist_ok=True)
     vendored = vendor_covers(root, out, parse_compat_covers(compat_text))
+    logo = vendor_logo(root, out)
     titles = build(tracker_rows, compat, vendored)
     for t in titles:
         t["doc_url"] = doc_url(t.pop("status_doc"))
@@ -448,9 +512,9 @@ def write_site(root: Path, out: Path) -> dict:
     }
     (out / "compat.json").write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
     (out / "index.html").write_text(
-        render_index(titles, payload["buckets"], generated), encoding="utf-8"
+        render_index(titles, payload["buckets"], generated, logo), encoding="utf-8"
     )
-    (out / "classic.html").write_text(render_classic(titles, generated), encoding="utf-8")
+    (out / "classic.html").write_text(render_classic(titles, generated, logo), encoding="utf-8")
     (out / "llms.txt").write_text(render_llms(titles, generated), encoding="utf-8")
     return payload
 
@@ -484,7 +548,8 @@ def selftest() -> None:
     covers = parse_compat_covers(good_sections)
     assert covers == {"PPSA00001": "assets/screenshots/demo-title.webp"}, covers
     titles = build(rows, comp, {"PPSA00001": "covers/demo-title.webp"})
-    assert titles[0]["status"] == "Gameplay" and titles[0]["rung"] == 3, titles
+    assert titles[0]["status"] == "Playable" and titles[0]["rung"] == 3, titles
+    assert titles[0]["hint"].startswith("Rung 3 of 6"), titles
     assert titles[0]["cover"] == "covers/demo-title.webp", titles
     classic = render_classic(titles, "2026-01-01")
     assert "Demo &lt;Game&gt;" in classic and "Demo <Game>" not in classic, classic
@@ -493,8 +558,9 @@ def selftest() -> None:
     )
     # index.html carries data via compat.json and renders client-side: pin that the
     # milestone goes through the escaper, and that the static page escapes server-side.
-    index_html = render_index(evil, counts(evil), "2026-01-01")
+    index_html = render_index(evil, counts(evil), "2026-01-01", "prosper-logo.png")
     assert "e(t.milestone)" in index_html and "<script>alert" not in index_html
+    assert 'class="logo"' in index_html and 'rel="icon"' in index_html
     # `??` next to `||` is a SyntaxError that kills the whole page script (empty table),
     # so the template must not contain it; backticks must balance for the same reason.
     assert "??" not in index_html.split("<script>")[1]
