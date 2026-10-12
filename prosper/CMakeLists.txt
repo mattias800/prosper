@@ -2388,6 +2388,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_tile
     SOURCES tests/gpu/texture/test_tile.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_volume_chain_upload
+    SOURCES tests/gpu/texture/test_volume_chain_upload.cpp
+    LIBRARIES prosper_core)
   add_test(NAME gpu_surface_detile_gather COMMAND test_tile)
   set_tests_properties(gpu_surface_detile_gather PROPERTIES
                        ENVIRONMENT "PROSPER_NO_PAIRED_AVX2_DETILE=1")

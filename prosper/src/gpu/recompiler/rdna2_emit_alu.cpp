@@ -8649,8 +8649,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (dim3d) {
                 // 3D: implicit-LOD / explicit-LOD / LOD-0 sample, or an integer texel FETCH
                 // (image_load — DOLL's color-grade 3D LUT, #273). Explicit LOD lowers with the
-                // guest level, as the 2D path does: a single-level view's image has one mip, so
-                // a nonzero LOD can only address what the view selected (#4814).
+                // guest level, as the 2D path does: a single-level view's image holds one mip,
+                // so a nonzero LOD clamps to the selected level, while a materialized chain
+                // addresses each declared level (#4842). Integer FETCH out-of-range semantics
+                // stay distinct from sampling clamps.
                 if (!is_sample && !is_sample_l && !is_sample_lz && !is_load) {
                     ok = false;
                     return true;

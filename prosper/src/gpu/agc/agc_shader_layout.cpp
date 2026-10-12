@@ -637,14 +637,52 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         // rule as the thin-2D tail path at the bottom of this function).
         return view;
     }
-    // 3D chain views (BASE_LEVEL != LAST_LEVEL) stay refused even when the chain starts at
-    // zero: the compute backend materializes one level per 3D binding (the sampled-image
-    // chain shape excludes dim_3d), while the recompiler lowers explicit-LOD 3D samples
-    // with the guest LOD against what it assumes is a single-level image (rdna2_emit_alu
-    // dim3d: "a nonzero LOD can only address what the view selected"). Falling through to
-    // the unshifted admission below would bind level zero while declaring N levels, so a
-    // guest LOD above zero addresses a level that was never created. Mid-chain windows
-    // (BASE != 0) already refuse via the slice guard below; this closes the BASE = 0 arm.
+    // 3D chain views (BASE_LEVEL != LAST_LEVEL) that no chain materializes stay refused:
+    // the backend below builds one level per unplannable 3D binding, while the recompiler
+    // lowers explicit-LOD 3D samples with the guest LOD (rdna2_emit_alu dim3d). An explicit
+    // LOD past the image's available levels clamps to what the view holds, so admitting
+    // such a view unshifted would bind level zero while declaring N levels, and a guest
+    // LOD above zero would sample the clamped level zero instead of the requested chain
+    // level -- the wrong texels, not undefined behavior (integer fetch/load out-of-range
+    // semantics stay distinct). Mid-chain windows (BASE != 0) already refuse via the slice
+    // guard below; the placeable BASE = 0 arm admits next.
+    // Base-zero 3D chains over a proven all-in-tail pyramid materialize every declared
+    // level (volume chain plan + backend), so they admit with the level-zero placement:
+    // base unshifted (tail levels share block zero), extents unshifted, the tail
+    // coordinates of level zero, and the allocation-wide provenance the plan reads.
+    // Mid-chain windows, contradictory ranges and anything the tail derivation cannot
+    // place keep the explicit refusal below.
+    if (d.type == 10 && d.base_array == 0 && d.base_level == 0 && d.base_level != d.last_level) {
+        bool placeable = fi.bytes_per_block && fi.block_width <= 1 && d.last_level <= d.max_mip;
+        TiledVolumeTailLayout first{};
+        for (uint32_t level = 0; placeable && level <= d.last_level; ++level) {
+            const TiledVolumeTailLayout tlayout = tiled_volume_tail_layout(
+                d.width, d.height, d.depth, fi.bytes_per_block, d.tile_mode, d.max_mip, level);
+            if (!tlayout.supported) {
+                placeable = false;
+                break;
+            }
+            if (level == 0) first = tlayout;
+        }
+        if (!placeable) {
+            view.supported = false;
+            return view;
+        }
+        view.chain_element_width = d.width;
+        view.chain_element_height = d.height;
+        view.chain_bytes_per_block = fi.bytes_per_block;
+        view.chain_max_mip = d.max_mip;
+        view.chain_base_level = 0;
+        view.mip_offset = first.byte_offset;
+        view.in_mip_tail = true;
+        view.mip_tail_bytes = first.tail_block_bytes;
+        view.mip_tail_x = first.tail_x;
+        view.mip_tail_y = first.tail_y;
+        view.width = d.width;
+        view.height = d.height;
+        view.depth = d.depth;
+        return view;
+    }
     if (d.type == 10 && d.base_level != d.last_level) {
         view.supported = false;
         return view;

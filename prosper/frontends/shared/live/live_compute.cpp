@@ -66,6 +66,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
+#include "gpu/resources/volume_chain_upload.hpp"   // volume-tail chain staging/upload (#4842)
 #include "gpu/resources/atomic_image_staging.hpp"  // #3195: the LOGICAL/PHYSICAL atomic-image extent split
 #include "gpu/resources/image_identity.hpp"
 #include "gpu/resources/compressed_source_authority.hpp"
@@ -9136,14 +9137,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             VkDeviceSize mip_chain_extra_bytes = 0;
             if (declared_chain_levels > 1u) {
                 mip_chain = prosper::gpu::shader_resource_mip_chain_plan(*r);
+                // Volume-tail chains (#4842) carry the same independent terms, except the
+                // texel count folds the depth axis and dim_3d is the admitted shape rather
+                // than an exclusion. sampled_layers/array_layers are 1 for these through
+                // the same alias-shape derivation every other shape uses.
+                const bool volume_tail_chain = dim_3d && r->img_dim == 2u && r->in_mip_tail &&
+                                               !r->layer_stride_bytes && !r->layer_mip_offset_bytes;
+                const uint64_t chain_texels =
+                    volume_tail_chain ? static_cast<uint64_t>(r->width) * r->height * r->depth
+                                      : static_cast<uint64_t>(r->width) * r->height;
+                // The width agreement is conversion-aware for volumes: native identity,
+                // or exactly the R8 broadcast the uploader repeats per level. The old
+                // unconditional equality stranded every R8 chain here (4 != 1) after the
+                // planner and the view had admitted it.
+                const bool volume_width_agrees =
+                    !volume_tail_chain || prosper::gpu::volume_chain_backend_width_agrees(
+                                              mip_chain, r->mip_chain_bytes_per_block, texel_bytes,
+                                              prosper::gpu::volume_chain_r8_broadcast_shape(
+                                                  r->format, r->num_components));
                 const bool chain_binding_shape =
                     mip_chain.valid && mip_chain.level_count == declared_chain_levels &&
-                    !bi.storage && !bi.imported && !renderer_owned &&
-                    !bi.depth_bits_source && !bi.unorm_rtt_value_reuse && !bi.depth_view &&
-                    !dim_1d && !dim_3d && !dim_cube_stacked && !cube_face_as_2d &&
+                    !bi.storage && !bi.imported && !renderer_owned && !bi.depth_bits_source &&
+                    !bi.unorm_rtt_value_reuse && !bi.depth_view && !dim_1d &&
+                    (!dim_3d || volume_tail_chain) && !dim_cube_stacked && !cube_face_as_2d &&
                     sampled_layers == 1u && bi.array_layers == 1u && !bi.stacked_cube &&
-                    volume_texels == static_cast<uint64_t>(r->width) * r->height &&
-                    texel_bytes == r->mip_chain_bytes_per_block;
+                    volume_texels == chain_texels && volume_width_agrees;
                 if (!chain_binding_shape) {
                     // BLAST RADIUS, stated plainly: this decline is NOT conditional on the module
                     // actually issuing IMAGE_LOAD_MIP. A module that only samples this resource
@@ -9179,14 +9197,32 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const VkDeviceSize level_zero_bytes = volume_texels * texel_bytes;
                 bi.mip_staging_offsets.assign(mip_chain.level_count, 0);
                 VkDeviceSize offset = (level_zero_bytes + alignment - 1u) / alignment * alignment;
-                for (uint32_t level = 1; level < mip_chain.level_count; ++level) {
-                    bi.mip_staging_offsets[level] = offset;
-                    const VkDeviceSize level_bytes =
-                        static_cast<VkDeviceSize>(mip_chain.levels[level].width) *
-                        mip_chain.levels[level].height * texel_bytes;
-                    offset = (offset + level_bytes + alignment - 1u) / alignment * alignment;
+                if (volume_tail_chain) {
+                    // Single derivation with the uploader below: volume_chain_upload
+                    // computes the same offsets the upload fills.
+                    const prosper::gpu::VolumeChainStaging staging =
+                        prosper::gpu::volume_chain_staging_layout(mip_chain, texel_bytes,
+                                                                  alignment);
+                    if (staging.offsets.size() != mip_chain.level_count ||
+                        staging.total_bytes < level_zero_bytes || staging.total_bytes > SIZE_MAX) {
+                        skip_image(r, "volume chain staging layout disagrees with creation");
+                        break;
+                    }
+                    for (uint32_t level = 1; level < mip_chain.level_count; ++level)
+                        bi.mip_staging_offsets[level] =
+                            static_cast<VkDeviceSize>(staging.offsets[level]);
+                    mip_chain_extra_bytes =
+                        static_cast<VkDeviceSize>(staging.total_bytes) - level_zero_bytes;
+                } else {
+                    for (uint32_t level = 1; level < mip_chain.level_count; ++level) {
+                        bi.mip_staging_offsets[level] = offset;
+                        const VkDeviceSize level_bytes =
+                            static_cast<VkDeviceSize>(mip_chain.levels[level].width) *
+                            mip_chain.levels[level].height * texel_bytes;
+                        offset = (offset + level_bytes + alignment - 1u) / alignment * alignment;
+                    }
+                    mip_chain_extra_bytes = offset - level_zero_bytes;
                 }
-                mip_chain_extra_bytes = offset - level_zero_bytes;
                 bi.mip_levels = mip_chain.level_count;
             }
             const VkDeviceSize sbytes = volume_texels * texel_bytes + mip_chain_extra_bytes;
@@ -10706,11 +10742,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             sampled_float16_native || sampled_depth) {  // Native sampled texels
                             std::memcpy(upload, sampled_source, linear_bytes);
                             if (bi.mip_levels > 1u) {
-                                upload_guest_mip_chain_levels(
-                                    mip_chain, bi.mip_staging_offsets,
-                                    src - mip_chain.levels[0].byte_offset, r->tile_mode,
-                                    bpt, upload);
-                                mip_chain_levels_written = true;
+                                if (prosper::gpu::mip_chain_plan_is_volume_tail(mip_chain)) {
+                                    // Levels 1+ detile through their own tail origins; the
+                                    // uploader repeats no conversion here (native path).
+                                    mip_chain_levels_written =
+                                        prosper::gpu::upload_volume_tail_chain_levels(
+                                            mip_chain, src - mip_chain.levels[0].byte_offset,
+                                            mip_chain.allocation_bytes, r->tile_mode, bpt,
+                                            texel_bytes, false, upload, upload_size,
+                                            bi.mip_staging_offsets.data(),
+                                            bi.mip_staging_offsets.size());
+                                } else {
+                                    upload_guest_mip_chain_levels(
+                                        mip_chain, bi.mip_staging_offsets,
+                                        src - mip_chain.levels[0].byte_offset, r->tile_mode, bpt,
+                                        upload);
+                                    mip_chain_levels_written = true;
+                                }
                             }
                         } else if (f32) {                           // Native float channels + default fill
                             parallel_compute_texels(texels, linear_bytes + texels * 16u,
@@ -10738,7 +10786,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
                                     }
                                 });
-                        } else {                                    // Float16: half -> UNORM8 + default fill
+                            if (bi.mip_levels > 1u &&
+                                prosper::gpu::mip_chain_plan_is_volume_tail(mip_chain)) {
+                                // The same 1-to-4 broadcast, repeated per level through
+                                // each level's own tail origin. The flag re-derives the
+                                // proven shape rather than trusting the arm: divergence
+                                // refuses instead of converting wrongly.
+                                mip_chain_levels_written =
+                                    prosper::gpu::upload_volume_tail_chain_levels(
+                                        mip_chain, src - mip_chain.levels[0].byte_offset,
+                                        mip_chain.allocation_bytes, r->tile_mode, bpt, texel_bytes,
+                                        prosper::gpu::volume_chain_r8_broadcast_shape(
+                                            r->format, r->num_components),
+                                        upload, upload_size, bi.mip_staging_offsets.data(),
+                                        bi.mip_staging_offsets.size());
+                            }
+                        } else {   // Float16: half -> UNORM8 + default fill
                             sampled_float16_to_unorm8_range(
                                 sampled_source, nc, texels, upload);
                         }
@@ -12537,11 +12600,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 region = {};
                 region.bufferOffset = level ? bi.mip_staging_offsets[level] : VkDeviceSize{0};
                 region.imageSubresource = {aspect, level, 0, bi.array_layers};
-                region.imageExtent = level
-                    ? VkExtent3D{r->width >> level ? r->width >> level : 1u,
-                                 r->height >> level ? r->height >> level : 1u, 1u}
-                    : VkExtent3D{r->width, bi.stacked_cube ? r->height * 6u : r->height,
-                                 bi.array_layers > 1 ? 1u : bi.texel_depth};
+                // Levels above zero of a 2D chain are one slice deep by construction; a
+                // volume chain's shrink on all three axes (plan per-level depths).
+                const uint32_t copy_depth =
+                    r->img_dim == 2u ? (r->depth >> level ? r->depth >> level : 1u) : 1u;
+                region.imageExtent =
+                    level ? VkExtent3D{r->width >> level ? r->width >> level : 1u,
+                                       r->height >> level ? r->height >> level : 1u, copy_depth}
+                          : VkExtent3D{r->width, bi.stacked_cube ? r->height * 6u : r->height,
+                                       bi.array_layers > 1 ? 1u : bi.texel_depth};
             }
             // No texels for a query-only binding -- see BoundImage::query_only_shape.
             if (!bi.query_only_shape) {
@@ -13451,7 +13518,15 @@ bool compute_binding_mip_chain_materializable(const prosper::gpu::ShaderResource
     const bool ordinary_2d = (r.img_dim == 1);
     const bool one_layer_2d_array =
         (r.img_dim == 5 && r.depth == 1u && !r.layer_stride_bytes && !r.layer_mip_offset_bytes);
-    if ((!ordinary_2d && !one_layer_2d_array) || r.depth_compare) return false;
+    // An all-in-tail thick-3D chain (#4842) materializes alongside plain 2D for the same
+    // reason the one-layer array does: every term below (level layout, staging arithmetic,
+    // copy regions) is volume-aware through the plan's per-level depths, and the plan
+    // itself refuses every shape outside the proven tail derivation. As with layers, the
+    // depth bound lives in the plan, not here.
+    const bool volume_tail_chain =
+        (r.img_dim == 2 && r.in_mip_tail && !r.layer_stride_bytes && !r.layer_mip_offset_bytes);
+    if ((!ordinary_2d && !one_layer_2d_array && !volume_tail_chain) || r.depth_compare)
+        return false;
     return true;
 }
 
