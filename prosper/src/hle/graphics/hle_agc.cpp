@@ -1199,27 +1199,51 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     if (num <= 4) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE9(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
-    // ABI pinned to Kyty GraphicsDcbWaitRegMem (Graphics.cpp:2096): a5 = label address; the 7th/8th
-    // stack args reference, mask, and poll_cycles are forwarded as a6/a7/a8 by the import bridge.
-    // The payload previously ZEROED every
-    // wait parameter at build time (address/ref/mask/function destroyed — the wait could never be
-    // honored downstream); now it mirrors Kyty's layout exactly:
-    // [1..2]=addr lo/hi, [3..4]=mask lo/hi, [5..6]=reference lo/hi, [7]=compare_function, [8]=interval.
-    uint64_t reference = a6, mask = a7;
-    if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc] WaitRegMem size=%llu func=%llu op=%llu addr=0x%llx ref=0x%llx mask=0x%llx\n",
-            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,
-            (unsigned long long)a5,(unsigned long long)reference,(unsigned long long)mask);
-    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_WAIT_MEM_64, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a5 & 0xffffffffu);        cmd[2] = (uint32_t)(a5 >> 32u);
-    cmd[3] = (uint32_t)(mask & 0xffffffffu);      cmd[4] = (uint32_t)(mask >> 32u);
-    cmd[5] = (uint32_t)(reference & 0xffffffffu); cmd[6] = (uint32_t)(reference >> 32u);
-    cmd[7] = (uint32_t)a2;                        // compare_function
-    cmd[8] = (uint32_t)a8;                        // poll interval hint
-    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator (wait leg)
-    prosper_label_hist_wait_built(a5, a0);                        // #312 protocol history
+static uint64_t build_wait_reg_mem(uint64_t cb, uint64_t address, uint64_t reference, uint64_t mask,
+                                   uint32_t function, uint32_t poll_cycles) {
+    // Both builders retain the same nine-dword 64-bit wait packet. Their calling conventions
+    // differ; normalize operands here after each entry point has read its own argument positions.
+    uint32_t* cmd;
+    if (!begin_packet(cb, 9, IT_NOP, R_WAIT_MEM_64, &cmd)) return 0;
+    cmd[1] = (uint32_t)(address & 0xffffffffu);
+    cmd[2] = (uint32_t)(address >> 32u);
+    cmd[3] = (uint32_t)(mask & 0xffffffffu);
+    cmd[4] = (uint32_t)(mask >> 32u);
+    cmd[5] = (uint32_t)(reference & 0xffffffffu);
+    cmd[6] = (uint32_t)(reference >> 32u);
+    cmd[7] = function;
+    cmd[8] = poll_cycles;
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd,
+                                 address);   // #312 discriminator (wait leg)
+    prosper_label_hist_wait_built(address, cb);   // #312 protocol history
     return (uint64_t)(uintptr_t)cmd;
+}
+HLE9(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
+    // CONFIDENCE: HIGH. The DCB call sites in #5037 put address in r9 and reference/mask/poll
+    // in the three stack words. The ACB entry point below omits DCB's op argument.
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr,
+                "[agc] WaitRegMem size=%llu func=%llu op=%llu addr=0x%llx ref=0x%llx mask=0x%llx\n",
+                (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a5, (unsigned long long)a6, (unsigned long long)a7);
+    return build_wait_reg_mem(a0, a5, a6, a7, (uint32_t)a2, (uint32_t)a8);
+}
+static PROSPER_SYSV_ABI uint64_t agc_acb_wait_reg_mem(uint64_t cb, uint64_t size, uint64_t function,
+                                                      uint64_t cache_policy, uint64_t address,
+                                                      uint64_t reference, uint64_t mask,
+                                                      uint64_t poll_cycles) {
+    // CONFIDENCE: HIGH. #5037's two independent guest call chains pass address in r8, reference
+    // in r9, then mask and poll on the stack. PS5 3.20 names htn36gPnBk4 as sceAgcAcbWaitRegMem.
+    // Sharing the nine-argument DCB handler shifted all four operands and discarded this wait.
+    if (PROSPER_ENV_ON("PROSPER_GFXLOG"))
+        fprintf(stderr,
+                "[agc] AcbWaitRegMem size=%llu func=%llu cache=%llu addr=0x%llx ref=0x%llx "
+                "mask=0x%llx\n",
+                (unsigned long long)size, (unsigned long long)function,
+                (unsigned long long)cache_policy, (unsigned long long)address,
+                (unsigned long long)reference, (unsigned long long)mask);
+    return build_wait_reg_mem(cb, address, reference, mask, (uint32_t)function,
+                              (uint32_t)poll_cycles);
 }
 HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_mode, flip_arg) — 6 dw
     uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_FLIP, &cmd)) return 0;
@@ -4053,7 +4077,7 @@ void register_agc_hle() {
     RN("6mFxkVqdmbQ", agc_dcb_pop_marker);        // sceAgcAcbPopMarker
     RN("KT-hTp-Ch14", agc_dcb_acquire_mem);       // sceAgcAcbAcquireMem
     RN("cFazmnXpJOE", agc_dcb_event_write);       // sceAgcAcbEventWrite
-    RN("htn36gPnBk4", agc_dcb_wait_reg_mem);      // sceAgcAcbWaitRegMem
+    Hle::register_typed("htn36gPnBk4", agc_acb_wait_reg_mem, "sceAgcAcbWaitRegMem");
     // sceAgcAcbWriteData — the WriteData member of this same ACB set, omitted when the others landed.
     // Syberia: Remastered (PPSA30140, Unity/IL2CPP) builds its ACB fence cluster with it; dropping the
     // call left the label permanently unwritten and parked Unity's main thread in the guest's own

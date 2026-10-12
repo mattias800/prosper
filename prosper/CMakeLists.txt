@@ -3104,6 +3104,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_wait_barrier
     SOURCES tests/gpu/pm4/test_wait_barrier.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_acb_wait_regmem
+    SOURCES tests/gpu/pm4/test_acb_wait_regmem.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0)
   add_executable(test_wait_regmem_observation tests/diagnostics/test_wait_regmem_observation.cpp)
   target_link_libraries(test_wait_regmem_observation PRIVATE prosper_core)
   add_test(NAME wait_regmem_observation COMMAND test_wait_regmem_observation
