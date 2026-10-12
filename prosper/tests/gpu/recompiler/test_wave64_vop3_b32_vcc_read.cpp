@@ -85,12 +85,15 @@ bool has_opcode(const std::vector<uint32_t>& spirv, uint32_t opcode) {
 
 using Rejections = std::vector<std::pair<std::string, std::string>>;
 
-std::vector<uint32_t> compile(const std::vector<uint32_t>& code, Rejections* rejections = nullptr) {
+std::vector<uint32_t> compile(const std::vector<uint32_t>& code, Rejections* rejections = nullptr,
+                              uint32_t tidig_comp_cnt = 1) {
     ComputeShaderConfig config;
     config.local_x = 64;
     config.local_y = 1;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    // The first compare reads v0/v1; local Y is a genuine input even for a one-row group.
+    config.tidig_comp_cnt = tidig_comp_cnt;
     // The later straight-line fallback also refuses at PC1. Capture all terminal attempts so
     // that its final diagnostic cannot conceal a missing CFG ambiguity guard.
     TerminalRejectCapture capture;
@@ -130,6 +133,19 @@ TEST(Wave64Vop3B32VccRead, ControlAlreadyClassifiedSiblingCompiles) {
     const auto spirv = compile(program(0xd7460007u, 0x01a90506u, true));
     ASSERT_FALSE(spirv.empty());
     EXPECT_TRUE(has_opcode(spirv, 251u)) << "the sibling must exercise the same CFG dispatcher";
+}
+
+TEST(Wave64Vop3B32VccRead, MissingLocalYCannotFabricateCompareMask) {
+    Rejections rejections;
+    EXPECT_TRUE(compile(program(kBfeVccLo0, kBfeVccLo1, true), &rejections, 0).empty());
+    const std::pair<std::string, std::string> expected{
+        "fabricated-fresh-mask-source", "pc=0 a fresh predicate requires defined inputs"};
+    EXPECT_NE(std::find(rejections.begin(), rejections.end(), expected), rejections.end())
+        << testing::PrintToString(rejections);
+    EXPECT_TRUE(std::any_of(rejections.begin(), rejections.end(), [](const auto& rejection) {
+        return rejection.first == "cfg-recompile-reject" &&
+               rejection.second.find("pc=0 words=7c020300 ") != std::string::npos;
+    })) << testing::PrintToString(rejections);
 }
 
 // The unsafe direction. A genuine PAIR consumer at the same site still reads the ambiguous VCC_HI.

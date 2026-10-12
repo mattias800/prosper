@@ -72,8 +72,16 @@ constexpr uint32_t kOpSwitch = 251;
 
 // Distinct non-zero program addresses per arm: reject reasons are keyed by address and a zero
 // address is not recorded at all, so sharing one would let a later arm overwrite an earlier verdict.
-static std::vector<uint32_t> compile(const uint32_t* code, size_t dwords, uint64_t program) {
+static ComputeShaderConfig input_config() {
     ComputeShaderConfig config;   // portable Wave64 compute: native_subgroup_size stays 0
+    // s4 supplies the scalar branch; local Y supplies v1 for the CNDMASK negative.
+    config.user_sgprs.assign(5, 0u);
+    config.tidig_comp_cnt = 1;
+    return config;
+}
+
+static std::vector<uint32_t> compile(const uint32_t* code, size_t dwords, uint64_t program,
+                                     const ComputeShaderConfig& config = input_config()) {
     return recompile_compute(code, dwords, nullptr, config,
                              {RecompileDiagnosticStage::Compute, program});
 }
@@ -248,6 +256,15 @@ TEST(EntryVccDead, Contract) {
           "control A: the same skeleton compiles when the entry VCC was never retired");
     CHECK(has_opcode(control_a, kOpSwitch),
           "control A: it lowered through the CFG DISPATCHER (the module contains an OpSwitch)");
+
+    auto missing_s4 = input_config();
+    missing_s4.user_sgprs.resize(4);
+    const auto missing_branch_input = compile(
+        entry_vcc_never_retired, std::size(entry_vcc_never_retired), 0x49880001ull, missing_s4);
+    CHECK(missing_branch_input.empty(),
+          "an absent scalar branch input cannot borrow allocated zero");
+    CHECK(has(last_terminal_reject_reason(0x49880001ull), "pc=6 reason=poisoned-scc"),
+          "missing s4 refuses at the original branch before the entry-VCC check");
 
     CHECK(!arm.empty(),
           "#3231: an entry block that DEFINES the VCC pair before reading it compiles");
