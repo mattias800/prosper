@@ -8,10 +8,10 @@
 #include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
@@ -215,5 +215,32 @@ TEST(PortableMaskDispatch, BarrierAfterLoopRequiresOneCurrentSlotRoleOnEveryBack
             EXPECT_TRUE(attempt.module.empty()) << "HIGH may hold a LOW projection on the backedge";
         } else
             values(completed, 32);
+    }
+}
+
+TEST(PortableMaskDispatch, ExecHalfCompositionNeedsEveryGuestLaneAcrossABarrier) {
+    using namespace prosper::gpu;
+    auto code = f::program(false, true);
+    code.insert(code.begin() + 7, 0xbf8a0000u);
+    for (uint32_t threads : {33u, 64u}) {
+        ComputeShaderConfig config;
+        config.local_x = config.wave_size = 64;
+        config.exact_thread_extent = true;
+        config.threads_x = threads;
+        const auto attempt = c::compile(code, config);
+        if (threads == 33) {
+            EXPECT_TRUE(attempt.module.empty());
+            EXPECT_NE(attempt.refusal.find("pc=12 words=befe0414"), std::string::npos)
+                << attempt.refusal;
+        } else {
+            ASSERT_FALSE(attempt.module.empty()) << attempt.refusal;
+            bpermute_oracle::Interpreter oracle(attempt.module);
+            const auto actual =
+                oracle.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+            ASSERT_TRUE(oracle.error.empty()) << oracle.error;
+            std::vector<uint32_t> expected(64);
+            std::fill(expected.begin() + 32, expected.end(), 9);
+            EXPECT_EQ(actual, expected);
+        }
     }
 }

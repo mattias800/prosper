@@ -28,6 +28,14 @@ SpillSlotDomain domain(uint32_t role) {
 }
 } // namespace
 
+PortableMaskHalfEntryScope::PortableMaskHalfEntryScope(SpirvCompute& b, bool incomplete)
+    : b_(b), previous_(b.portable_mask_common_partial_entry) {
+    b.portable_mask_common_partial_entry = previous_ || incomplete;
+}
+PortableMaskHalfEntryScope::~PortableMaskHalfEntryScope() {
+    b_.portable_mask_common_partial_entry = previous_;
+}
+
 void refine_portable_mask_dispatch(const SpirvCompute& b, const Rdna2Inst& in, bool exact_wave_scc,
                                    const SpilledVectorSourceMarks& source, SpilledMaskHalves& marks,
                                    SpillSlotDomains& domains) {

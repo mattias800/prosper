@@ -18,6 +18,7 @@
 using namespace prosper::gpu;
 namespace {
 using Words = std::vector<uint32_t>;
+constexpr uint32_t user_word_count = 4;
 std::atomic<uint64_t> next_address{0xa4964001};
 thread_local std::string reason;
 thread_local std::string artifact_stem;
@@ -44,7 +45,7 @@ Words compile(const Words& body, bool values = false, int project = 44) {
     ComputeShaderConfig config;
     config.local_x = config.wave_size = config.native_subgroup_size = 32;
     prosper::test::complete_compute_launch(config, 2);
-    config.user_sgprs.resize(4);
+    config.user_sgprs.resize(user_word_count);
     config.tgid_x_en = true;
     const uint64_t address = next_address.fetch_add(1, std::memory_order_relaxed);
     auto module = recompile_compute(code.data(), code.size(), &table, config,
@@ -90,6 +91,7 @@ void values(const Words& body, uint32_t expected, bool dispatcher = false) {
     }
     for (uint32_t group : {0u, 1u}) {
         bpermute_oracle::Interpreter vm(module);
+        vm.supplied_push_constants.resize(user_word_count);
         vm.native_subgroup_width = 32;
         vm.native32_workgroup_count = 2;
         ASSERT_TRUE(vm.error.empty()) << vm.error;
@@ -426,6 +428,7 @@ TEST(Wave32WordProvenance, Native32OracleChecksBothActualWorkgroupIds) {
     ASSERT_FALSE(module.empty()) << reason;
     for (uint32_t group : {0u, 1u}) {
         bpermute_oracle::Interpreter vm(module);
+        vm.supplied_push_constants.resize(user_word_count);
         vm.native_subgroup_width = 32;
         vm.native32_workgroup_count = 2;
         const auto actual = vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, group);

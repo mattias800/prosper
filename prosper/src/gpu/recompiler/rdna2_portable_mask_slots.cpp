@@ -451,6 +451,13 @@ PortableMaskHalfInstruction::PortableMaskHalfInstruction(SpirvCompute& b, RegSta
             reject("portable-mask-half-data-unavailable");
             return;
         }
+        // A complete symbolic pair cannot supply bits for absent guest invocations. This is
+        // the same independent coverage obligation charged by common-phase consumers, including
+        // a nominal native launch that fell back to the portable partial-barrier dispatcher.
+        if (b.local_count < 64 || b.local_count % 64 != 0 || b.portable_mask_common_partial_entry) {
+            reject("portable-mask-half-incomplete-wave");
+            return;
+        }
         const uint32_t predicate = pair_predicate(b, rs, before, source.value);
         if (!predicate) {
             reject("portable-mask-half-pair-unavailable");
