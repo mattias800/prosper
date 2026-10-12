@@ -38,7 +38,15 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     // A plain buffer load writes each active lane's dwords (out-of-range lanes return zero); a TFE
     // form also writes a status word, which is not modelled here, so it is not complete.
     if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
-    if (!lane_wise_vector_op(in) || in.has_sdwa) return false;
+    // CONFIDENCE: HIGH -- a completed ordinary image reader writes every selected result dword
+    // in every active lane. Its predication preserves only lanes outside EXEC, not destination
+    // bits inside EXEC. Atomics, packed results and status-bearing forms retain their old proof.
+    if (in.fmt == Rdna2Format::MIMG)
+        return !rdna2_instruction_may_write_memory(in) && !in.mimg_d16 && !in.mimg_tfe &&
+               !in.mimg_lwe;
+    // A DWORD SDWA destination still replaces all 32 bits. Narrow preserved destinations
+    // remain excluded; source selection/modifiers do not make a complete destination partial.
+    if (!lane_wise_vector_op(in) || (in.has_sdwa && in.sdwa_dst_sel != 6)) return false;
     if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
         return false;
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
@@ -100,6 +108,25 @@ bool vector_write_completes_active_word(const Rdna2Inst& in) {
             (in.flat_segment == 0 || in.flat_segment == 2) && !in.flat_lds &&
             in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 && in.src[0].value < 255 &&
             in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
+}
+
+void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint32_t right,
+                             uint32_t opcode, uint32_t previous_exec) {
+    // CONFIDENCE: HIGH -- A&B is a subset of each operand; A&~B is a subset of A.
+    // A|B is a subset of A only when B was already proved a subset of A (and vice versa).
+    // These relations do not authenticate an operand or invent its missing physical words.
+    uint32_t parent = 0;
+    if (opcode == 0x0f)
+        parent = right == previous_exec ? right : left;
+    else if (opcode == 0x15)
+        parent = left;
+    else if (opcode == 0x11) {
+        if (exec_within(rs, left, right))
+            parent = right;
+        else if (exec_within(rs, right, left))
+            parent = left;
+    }
+    if (parent && result && result != parent) rs.exec_subset_of[result] = parent;
 }
 
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,

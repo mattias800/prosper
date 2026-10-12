@@ -2640,6 +2640,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_flat_active_word.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_active_image_word_definedness
+    SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_word_provenance
     SOURCES tests/gpu/recompiler/test_wave32_word_provenance.cpp
     INCLUDES tests
