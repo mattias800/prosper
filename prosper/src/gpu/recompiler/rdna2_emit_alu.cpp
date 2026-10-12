@@ -2326,10 +2326,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // A whole-CFG proof can establish that this physical VCC word is scalar data
                     // only: the untouched sibling dies before any mask-domain read. Do not ask for
                     // a guest lane merely to manufacture a predicate that no later instruction can
-                    // observe. Vertex emission has a separate one-lane virtual-wave contract, so
-                    // this applies only to fragment and compute stages.
-                    const bool scalar_low_only = (b.is_fragment || b.is_compute) &&
-                        b.vcc_b32_low_only_pcs.contains(in.pc);
+                    // observe. This also covers vertex scalar scratch after an ordinary DATA
+                    // write has retired the old predicate; no lane-mask value is manufactured.
+                    const bool scalar_low_only = b.vcc_b32_low_only_pcs.contains(in.pc);
                     if (b.wave_size != 32 && scalar_low_only) {
                         rs.vcc = 0;
                         rs.sreg_bool.erase(106);
