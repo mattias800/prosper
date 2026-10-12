@@ -499,8 +499,10 @@ TEST(Wave32WordProvenance, Native32OracleRefusesMissingOrOutOfRangeInstanceAutho
                 vm.native_subgroup_width = width;
                 vm.native32_workgroup_count = groups;
                 // Group 2 lies outside both bounded extents, and has no legacy authority.
-                EXPECT_TRUE(vm.run_buffers(count, {{3, Words(96, 0xdeadbeefu)}}, 3, 2).empty());
-                EXPECT_FALSE(vm.error.empty());
+                EXPECT_TRUE(vm.run_buffers(count, {{3, Words(96, 0xdeadbeefu)}}, 3, 2).empty())
+                    << width << '/' << groups << '/' << count;
+                EXPECT_EQ(vm.error, "unproved native32 instance")
+                    << width << '/' << groups << '/' << count;
             }
         }
     }
@@ -563,6 +565,8 @@ TEST(Wave32WordProvenance, Native32OracleRefusesUnmatchedEntrypointLocalSize) {
         vm.native_subgroup_width = 32;
         vm.native32_workgroup_count = 2;
         EXPECT_TRUE(vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, 1).empty()) << variant;
-        EXPECT_FALSE(vm.error.empty()) << variant;
+        EXPECT_EQ(vm.error,
+                  variant == 5 ? "invalid or duplicate LocalSize" : "unproved native32 instance")
+            << variant;
     }
 }
