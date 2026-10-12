@@ -460,4 +460,126 @@ TEST(NggSavedVccCopyDemand, ExceptionClosesTheOwnedPhaseAndCannotRestoreRevokedA
     EXPECT_FALSE(e.emit(decode(code)[2]));
     EXPECT_EQ(e.b.stage_reject_reason, "saved-mask-copy-words-unavailable");
 }
+
+namespace {
+uint64_t literal_result(uint32_t opcode, uint64_t first, uint64_t second) {
+    switch (opcode) {
+        case 0x0f: return first & second;
+        case 0x11: return first | second;
+        case 0x13: return first ^ second;
+        case 0x15: return first & ~second;
+        case 0x17: return first | ~second;
+        case 0x19: return ~(first & second);
+        case 0x1b: return ~(first | second);
+        case 0x1d: return ~(first ^ second);
+        default: ADD_FAILURE() << "unexpected B64 logical"; return 0;
+    }
+}
+void literal_values(uint32_t value, uint32_t opcode, bool first, bool trailing = true) {
+    Emitter e;
+    const auto code = fixture::literal_logical(value, opcode, first, trailing);
+    const auto ins = decode(code);
+    ASSERT_GE(ins.size(), 3u);
+    ASSERT_EQ(ins[1].fmt, Rdna2Format::SOP2);
+    ASSERT_EQ(ins[1].opcode, opcode);
+    ASSERT_EQ(ins[1].src[first ? 0 : 1].kind,
+              trailing ? OperandKind::Literal : OperandKind::InlineInt);
+    if (trailing) {
+        ASSERT_TRUE(ins[1].has_literal);
+        ASSERT_EQ(ins[1].literal, value);
+    }
+    e.prove(code);
+    EXPECT_FALSE(e.b.native_logical_data_demand_pcs.contains(ins[1].pc));
+    ASSERT_TRUE(e.emit(ins[1]));
+    ASSERT_TRUE(e.emit(ins[2]));
+    const uint64_t immediate = trailing ? uint64_t(value) : UINT64_MAX;
+    const uint64_t expected =
+        literal_result(opcode, first ? immediate : UINT64_MAX, first ? UINT64_MAX : immediate);
+    fragment_predicate_oracle::Values values(
+        e.b, fragment_predicate_oracle::LaneInput::SuppliedComputeLinear);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const auto actual = values.evaluate(e.rs.vreg.at(0), lane);
+        ASSERT_TRUE(actual.has_value()) << values.error;
+        EXPECT_EQ(*actual, ((expected >> lane) & 1u) ? 9u : 1u) << lane;
+    }
+}
+} // namespace
+
+TEST(NggSavedVccCopyDemand, TrailingLiteralLogicalRetainsThePublicNggMaskDomain) {
+    for (uint32_t value : {0u, 0xffu, 0x80000000u, UINT32_MAX}) {
+        SCOPED_TRACE(value);
+        Emitter e;
+        const auto code = fixture::literal_logical(value);
+        e.prove(code);
+        EXPECT_FALSE(e.b.native_logical_data_demand_pcs.contains(1u));
+        std::string refusal;
+        EXPECT_FALSE(compile(code, &refusal).empty()) << refusal;
+    }
+}
+
+TEST(NggSavedVccCopyDemand, TrailingLiteralLogicalUsesZeroExtendedBitsInEitherOperand) {
+    for (uint32_t opcode : {0x0fu, 0x11u, 0x13u, 0x15u, 0x17u, 0x19u, 0x1bu, 0x1du}) {
+        SCOPED_TRACE(opcode);
+        for (uint32_t value : {0u, 0xffu, 0x80000000u, UINT32_MAX}) {
+            SCOPED_TRACE(value);
+            for (bool first : {false, true}) {
+                SCOPED_TRACE(first);
+                literal_values(value, opcode, first);
+            }
+        }
+    }
+}
+
+TEST(NggSavedVccCopyDemand, InlineMinusOneRemainsAFullMaskBesideTheLowOnlyLiteral) {
+    literal_values(UINT32_MAX, 0x0fu, false);
+    literal_values(UINT32_MAX, 0x0fu, false, false);
+    std::string refusal;
+    EXPECT_FALSE(
+        compile(fixture::literal_logical(UINT32_MAX, 0x0fu, false, false), &refusal).empty())
+        << refusal;
+}
+
+TEST(NggSavedVccCopyDemand, LiteralWithAGenuineSavedPredicateRetainsItsMaskDomain) {
+    Emitter e;
+    const std::vector<uint32_t> code{0x8798ff14u, 0xffu, 0xd5010000u,
+                                     129u | (137u << 9u) | (24u << 18u), end};
+    e.prove(code);
+    EXPECT_FALSE(e.b.native_logical_data_demand_pcs.contains(0u));
+    ASSERT_TRUE(e.emit(decode(code)[0]));
+    ASSERT_TRUE(e.emit(decode(code)[1]));
+    fragment_predicate_oracle::Values values(
+        e.b, fragment_predicate_oracle::LaneInput::SuppliedComputeLinear);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const auto actual = values.evaluate(e.rs.vreg.at(0), lane);
+        ASSERT_TRUE(actual.has_value()) << values.error;
+        EXPECT_EQ(*actual, (((mask & 0xffu) >> lane) & 1u) ? 9u : 1u) << lane;
+    }
+}
+
+TEST(NggSavedVccCopyDemand, LiteralCannotSupplyMissingOrMarkedNumericPeerWords) {
+    for (uint32_t kind : {0u, 1u, 2u, 3u}) {
+        SCOPED_TRACE(kind);
+        Emitter e;
+        const std::vector<uint32_t> code{0x8798ff28u, 0xffu, 0xd5010000u,
+                                         129u | (137u << 9u) | (24u << 18u), end};
+        e.rs.sreg[40] = e.b.uconst(static_cast<uint32_t>(mask));
+        if (kind != 1) e.rs.sreg[41] = e.b.uconst(static_cast<uint32_t>(mask >> 32u));
+        if (kind == 2) e.rs.sreg_merge_placeholder.insert(40);
+        if (kind == 3) e.rs.unavailable_saved_mask_words.insert(41);
+        e.prove(code);
+        EXPECT_TRUE(e.b.native_logical_data_demand_pcs.contains(0u));
+        EXPECT_EQ(e.emit(decode(code)[0]), kind == 0u);
+    }
+}
+
+TEST(NggSavedVccCopyDemand, MissingTrailingLiteralDoesNotBecomeAMustMaskSource) {
+    Emitter e;
+    const auto code = fixture::literal_logical(0xffu);
+    auto ins = decode(code);
+    ASSERT_TRUE(ins[1].has_literal);
+    ins[1].has_literal = false;
+    initialize_native_logical_data_demand(e.b, ins, &e.rs);
+    EXPECT_TRUE(e.b.native_logical_data_demand_pcs.contains(1u));
+    EXPECT_FALSE(e.emit(ins[1]));
+}
 } // namespace prosper::gpu

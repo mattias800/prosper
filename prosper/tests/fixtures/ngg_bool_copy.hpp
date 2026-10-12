@@ -36,4 +36,20 @@ inline std::vector<uint32_t> program(bool barrier = true, bool numeric = false,
     ngg_slots::finish(code);
     return code;
 }
+
+// A trailing integer literal occupies only the low dword of a B64 operand.
+// Inline -1 is a separate full-mask control, not the literal 0xffffffff.
+inline std::vector<uint32_t> literal_logical(uint32_t value, uint32_t opcode = 0x0fu,
+                                             bool literal_first = false, bool trailing = true) {
+    const uint32_t constant = trailing ? 255u : 193u;
+    const uint32_t first = literal_first ? constant : 126u;
+    const uint32_t second = literal_first ? 126u : constant;
+    std::vector<uint32_t> code{ngg_slots::kExecFull, 0x80000000u | (opcode << 23u) | (20u << 16u) |
+                                                         (second << 8u) | first};
+    if (trailing) code.push_back(value);
+    code.insert(code.end(), {0xd5010000u, 129u | (137u << 9u) | (20u << 18u)});
+    ngg_slots::scalar(code, 21, 7);
+    ngg_slots::finish(code);
+    return code;
+}
 } // namespace prosper::test::ngg_bool_copy
