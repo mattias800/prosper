@@ -247,33 +247,47 @@ TEST(PortableMaskDispatch, ExecHalfCompositionNeedsEveryGuestLaneAcrossABarrier)
 
 TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
     using namespace prosper::gpu;
-    const auto run = [](uint32_t mode) {
-        auto code = f::program(false, true);
-        code.resize(12);   // include the actual EXEC restore, before the unrelated value sink
+    const auto run = [](uint32_t mode, bool compare, bool producer_partial) {
+        auto code = compare ? c::branch(c::halves(false, true)) : f::program(false, true);
+        code.resize(compare ? code.size() - 3 : 12);
         code.push_back(base::end);
         std::vector<Rdna2Inst> ins;
         ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
         SpirvCompute b;
         b.begin(1, nullptr, 64, 1, 1, 64);
-        b.diagnostic = {RecompileDiagnosticStage::Compute, 0x493506000000ull + mode};
+        b.portable_mask_common_partial_entry = producer_partial;
+        b.diagnostic = {RecompileDiagnosticStage::Compute,
+                        0x493506000000ull + mode + 5u * compare + 10u * producer_partial};
         RegState rs;
         rs.exec = b.btrue();
         rs.vcc = rs.scc = b.bfalse();
-        const uint32_t active =
-            mode == 1 ? b.btrue()
-                      : (mode == 2 ? b.ucmp(Op_IEqual, b.localid_comp[0], b.uconst(0)) : 0);
+        uint32_t active = 0;
+        if (mode == 1)
+            active = b.btrue();
+        else if (mode == 2)
+            active = b.ucmp(Op_IEqual, b.localid_comp[0], b.uconst(0));
+        else if (mode == 3)
+            active = b.bfalse();
+        else if (mode == 4) {
+            active = b.id();
+            SpirvCompute::put(b.types, 48,
+                              {b.t_bool, active});   // OpSpecConstantTrue is no runtime entry proof
+        }
         const bool ok = emit_cfg_state_machine(
             b, rs, ins, {}, nullptr, true, true, [](RegState&, const Rdna2Inst&) { return false; },
             code.data(), code.size(), active);
-        if (mode == 2) {
+        if (mode >= 2 || producer_partial) {
             EXPECT_FALSE(ok);
-            EXPECT_NE(last_terminal_reject_reason(b.diagnostic.program_address)
-                          .find("pc=11 words=befe0414"),
-                      std::string::npos);
+            const auto refusal = last_terminal_reject_reason(b.diagnostic.program_address);
+            EXPECT_NE(refusal.find(compare ? "portable-mask-half-incomplete-wave"
+                                           : "pc=11 words=befe0414"),
+                      std::string::npos)
+                << refusal;
         } else
             EXPECT_TRUE(ok);
     };
-    run(0);
-    run(1);
-    run(2);
+    for (bool compare : {false, true}) {
+        for (uint32_t mode : {0u, 1u, 2u, 3u, 4u}) run(mode, compare, false);
+        for (uint32_t mode : {0u, 1u}) run(mode, compare, true);
+    }
 }

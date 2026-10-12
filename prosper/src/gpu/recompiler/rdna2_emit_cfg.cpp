@@ -3466,8 +3466,8 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
-                if (const char* gap =
-                        prepare_portable_mask_common_sources(b, state, in, initial_active != 0))
+                if (const char* gap = prepare_portable_mask_common_sources(
+                        b, state, in, b.portable_mask_common_partial_entry))
                     return reject_cfg(in.pc, gap);
                 if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
