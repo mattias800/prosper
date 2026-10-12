@@ -244,3 +244,33 @@ TEST(PortableMaskDispatch, ExecHalfCompositionNeedsEveryGuestLaneAcrossABarrier)
         }
     }
 }
+
+TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
+    using namespace prosper::gpu;
+    const auto run = [](bool incomplete) {
+        auto code = f::program(false, true);
+        code.resize(12);   // include the actual EXEC restore, before the unrelated value sink
+        code.push_back(base::end);
+        std::vector<Rdna2Inst> ins;
+        ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
+        SpirvCompute b;
+        b.begin(1, nullptr, 64, 1, 1, 64);
+        b.diagnostic = {RecompileDiagnosticStage::Compute, 0x493506000000ull + incomplete};
+        RegState rs;
+        rs.exec = b.btrue();
+        rs.vcc = rs.scc = b.bfalse();
+        const uint32_t active = incomplete ? b.ucmp(Op_IEqual, b.localid_comp[0], b.uconst(0)) : 0;
+        const bool ok = emit_cfg_state_machine(
+            b, rs, ins, {}, nullptr, true, true, [](RegState&, const Rdna2Inst&) { return false; },
+            code.data(), code.size(), active);
+        if (incomplete) {
+            EXPECT_FALSE(ok);
+            EXPECT_NE(last_terminal_reject_reason(b.diagnostic.program_address)
+                          .find("pc=11 words=befe0414"),
+                      std::string::npos);
+        } else
+            EXPECT_TRUE(ok);
+    };
+    run(false);
+    run(true);
+}
