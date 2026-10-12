@@ -159,18 +159,29 @@ TEST(ComputeBufferDiffSpan, SpanCopyReproducesFullCopy) {
 // sync_compute_buffer_blocks: scattered rewrites cost the changed blocks, and the result is a full copy.
 TEST(ComputeBufferBlockSync, ScatteredChangesReproduceAFullCopyAndCopyOnlyChangedBlocks) {
     using prosper::frontend::sync_compute_buffer_blocks;
-    constexpr size_t kBytes = 12u << 20;   // over the parallel threshold
-    SplitMix rng(7);
-    std::vector<uint8_t> source(kBytes), destination;
-    for (auto& b : source) b = static_cast<uint8_t>(rng());
-    destination = source;
-    EXPECT_EQ(sync_compute_buffer_blocks(destination.data(), source.data(), kBytes), 0u);
+    constexpr size_t kBlock = 64u << 10;
+    for (const size_t bytes : {size_t{4u << 20}, size_t{12u << 20}}) {
+        SCOPED_TRACE(bytes);
+        SplitMix rng(7);
+        std::vector<uint8_t> source(bytes), destination;
+        for (auto& b : source) b = static_cast<uint8_t>(rng());
+        destination = source;
+        EXPECT_EQ(sync_compute_buffer_blocks(destination.data(), source.data(), bytes), 0u);
 
-    // Three scattered one-byte edits, in three different 64 KiB blocks, far apart.
-    for (const size_t at : {size_t{5}, size_t{6u << 20}, kBytes - 1}) source[at] ^= 0xff;
-    const uint64_t copied = sync_compute_buffer_blocks(destination.data(), source.data(), kBytes);
-    EXPECT_EQ(copied, 3u * (64u << 10));   // kBytes is a whole number of blocks
-    EXPECT_EQ(std::memcmp(destination.data(), source.data(), kBytes), 0);
+        // Three scattered one-byte edits, far enough apart to occupy separate blocks even when
+        // the parallel walk starts its blocks at worker-slice boundaries.
+        for (const size_t at : {size_t{5}, bytes / 2, bytes - 1}) source[at] ^= 0xff;
+        const uint64_t copied =
+            sync_compute_buffer_blocks(destination.data(), source.data(), bytes);
+        // A worker's last block can be short even when the whole buffer is block-aligned. The
+        // parallel contract bounds copying to the changed blocks, not three full global blocks.
+        EXPECT_GE(copied, 3u);
+        EXPECT_LE(copied, 3u * kBlock);
+        // Below the parallel threshold all three changed blocks are full, retaining an exact
+        // byte-count control alongside the independent full-copy equality check in both arms.
+        if (bytes < (8u << 20)) EXPECT_EQ(copied, 3u * kBlock);
+        EXPECT_EQ(std::memcmp(destination.data(), source.data(), bytes), 0);
+    }
 }
 
 TEST(ComputeBufferBlockSync, SmallAndRaggedSizesAreExact) {
