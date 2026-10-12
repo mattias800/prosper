@@ -926,8 +926,6 @@ its 3D title menu at 4K, which the owner checked by eye. It runs at about 8 fps.
 
 ## Luna Abyss — `PPSA36257`
 
-<p align="center"><img src="assets/screenshots/luna-abyss-fmod-splash.webp" alt="Luna Abyss: Made with FMOD Studio logo splash on black; Linux RADV prosper-app, default launch, host frame 400"></p>
-
 An Unreal Engine 4 title. It renders the FMOD splash and then goes black while many of its shaders are refused, and the owner saw keyboard ("Esc") button prompts. See the
 [tracker](https://github.com/mattias800/prosper/issues/5038).
 
