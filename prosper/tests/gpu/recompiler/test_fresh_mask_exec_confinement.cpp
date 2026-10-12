@@ -31,6 +31,12 @@ const std::vector<uint32_t> kSdwaV6 = {0x7e0c02f9u, 0x00851480u};
 const std::vector<uint32_t> kWritelaneV6 = {0xd7610006u, 0x00010002u};
 // v_movreld_b32 with VDST v6 (indexed through M0), inline-zero source.
 const std::vector<uint32_t> kMovrelV6 = {0x7e0c8480u};
+// v_fmac_f32_e64 (0x12b) and v_pk_fmac_f16_e64 (0x13c): the VOP3 forms of VOP2 0x2b/0x3c, which
+// accumulate the old destination like 0x11f (the e64 form of 0x1f).
+// SRC2 encodes s2: the decoder exposes a third source field for these opcodes, so the test makes
+// it genuine, leaving the old-destination accumulator as the only missing input.
+const std::vector<uint32_t> kFmacV6 = {0xd12b0006u, 0x000a0501u};
+const std::vector<uint32_t> kPkFmacV6 = {0xd13c0006u, 0x000a0501u};
 // VOPC compare, src0 = v6, vsrc1 = v6.
 const std::vector<uint32_t> kCmpV6V6 = {0x7c200d06u};
 // VOPC compare, src0 = v6, vsrc1 = v8.
@@ -56,9 +62,11 @@ struct Harness {
     Harness() {
         b.wave_size = 64;
         b.begin_fragment();
+        b.diagnostic = {RecompileDiagnosticStage::Fragment, 0xa4924001ull};
         rs.vector_wave_size = 64;
         rs.vector_full_exec = false;
         rs.max_vgpr = 7;
+        rs.vcc = b.bfalse();
     }
 };
 
@@ -87,25 +95,48 @@ bool predicate_defined(const std::vector<uint32_t>& writes, const std::vector<ui
     return fresh_mask_sources_defined(h.b, h.rs, read_ins[0]);
 }
 
-// Like predicate_defined, but the reader runs under a fresh EXEC value that is recorded as a
-// subset of `parent`: `subset_of_writer` picks the writer's EXEC, otherwise an unrelated value.
-bool predicate_defined_in_subset(const std::vector<uint32_t>& writes,
-                                 const std::vector<uint32_t>& reader, bool subset_of_writer) {
+// v_cmpx_eq_u32 v1, v2 (VOPC e32, op 0xd2): EXEC' = EXEC & (v1 == v2).
+const std::vector<uint32_t> kCmpxV1V2 = {0x7da40501u};
+
+// Emits a real v_cmpx through emit_alu under the current EXEC, so the EXEC parent relationship
+// comes from the production path. False when the emission itself refuses.
+bool emit_cmpx(Harness& h) {
+    const auto cmpx = decode(kCmpxV1V2);
+    if (cmpx.size() != 1) return false;
+    const auto before = snapshot_saved_b64_masks(h.rs, cmpx[0]);
+    bool ok = true;
+    if (!emit_alu(h.b, h.rs, cmpx[0], ok, true) || !ok) return false;
+    record_scalar_write(h.rs, cmpx[0], allows_compute_scalar_vcc_bridge(h.b), before);
+    return true;
+}
+
+// The reader runs under the EXEC a real emitted v_cmpx produced. When the cmpx runs under the
+// writer's EXEC the predicate is defined; running it under an unrelated EXEC still refuses. The
+// test asserts the recorded parent, so a missing provenance assignment in emit_alu fails it.
+bool predicate_defined_after_cmpx(const std::vector<uint32_t>& writes,
+                                  const std::vector<uint32_t>& reader,
+                                  bool cmpx_under_writer_exec) {
     Harness h;
     const uint32_t g = h.b.btrue();
     h.rs.exec = g;
     h.rs.exec_narrowed = true;
     const auto write_ins = decode(writes);
     const auto read_ins = decode(reader);
-    if (write_ins.empty() || read_ins.size() != 1) return false;
+    const auto cmpx = decode(kCmpxV1V2);
+    if (write_ins.empty() || read_ins.size() != 1 || cmpx.size() != 1) return false;
+    h.rs.vreg[1] = h.b.uconst(11);
+    h.rs.vreg[2] = h.b.uconst(11);
     std::vector<Rdna2Inst> all = write_ins;
+    all.push_back(cmpx[0]);
     all.push_back(read_ins[0]);
     seed_vector_word_definedness(h.rs, all, false, 64);
     for (const auto& in : write_ins)
         record_vector_word_marks(h.rs, in, scalar_source_marks(h.rs, in));
-    const uint32_t child = h.b.uconst(79);
-    h.rs.exec_subset_of[child] = subset_of_writer ? g : h.b.uconst(99);
-    h.rs.exec = child;
+    if (!cmpx_under_writer_exec) h.rs.exec = h.b.btrue();   // an unrelated EXEC value
+    const uint32_t parent = h.rs.exec;
+    if (!emit_cmpx(h)) return false;
+    if (h.rs.exec_subset_of.count(h.rs.exec) == 0) return false;
+    if (h.rs.exec_subset_of.at(h.rs.exec) != parent) return false;
     h.rs.exec_narrowed = true;
     return fresh_mask_sources_defined(h.b, h.rs, read_ins[0]);
 }
@@ -137,6 +168,22 @@ TEST(FreshMaskExecConfinement, ControlEncodingsDecodeAsTheFormsTheyClaim) {
     ASSERT_EQ(s20.size(), 1u);
     EXPECT_EQ(s20[0].src[0].kind, OperandKind::SGPR);
     EXPECT_EQ(s20[0].src[0].value, 20);
+    const auto cx = decode(kCmpxV1V2);
+    ASSERT_EQ(cx.size(), 1u);
+    EXPECT_EQ(cx[0].fmt, Rdna2Format::VOPC);
+    EXPECT_EQ(cx[0].opcode, 0xd2u);
+    EXPECT_EQ(cx[0].src[0].kind, OperandKind::VGPR);
+    EXPECT_EQ(cx[0].src[0].value, 1);
+    EXPECT_EQ(cx[0].src[1].kind, OperandKind::VGPR);
+    EXPECT_EQ(cx[0].src[1].value, 2);
+    for (const auto& words : {kFmacV6, kPkFmacV6}) {
+        const auto fmac = decode(words);
+        ASSERT_EQ(fmac.size(), 1u);
+        EXPECT_EQ(fmac[0].fmt, Rdna2Format::VOP3);
+        EXPECT_EQ(fmac[0].dst.value, 6);
+    }
+    EXPECT_EQ(decode(kFmacV6)[0].opcode, 0x12bu);
+    EXPECT_EQ(decode(kPkFmacV6)[0].opcode, 0x13cu);
 }
 
 TEST(FreshMaskExecConfinement, CompareUnderAnotherExecStillRefuses) {
@@ -172,10 +219,27 @@ TEST(FreshMaskExecConfinement, MixedAbsentScalarInputStillRefuses) {
 TEST(FreshMaskExecConfinement, CompareUnderACmpxSubsetOfTheWritersExecIsDefined) {
     // v_cmpx sets EXEC' = EXEC & cmp, so EXEC' lies inside the writer's EXEC: the placeholder lanes
     // outside the writer's EXEC are never in EXEC'.
-    EXPECT_TRUE(predicate_defined_in_subset(cat({kMovV6, kV8FromV6}), kCmpV8, true));
+    EXPECT_TRUE(predicate_defined_after_cmpx(cat({kMovV6, kV8FromV6}), kCmpV8, true));
 }
 
 TEST(FreshMaskExecConfinement, CompareUnderAnUnrelatedExecRecordStillRefuses) {
-    // A recorded parent that is not the writer's EXEC proves nothing about the reader's lanes.
-    EXPECT_FALSE(predicate_defined_in_subset(cat({kMovV6, kV8FromV6}), kCmpV8, false));
+    // A cmpx under an unrelated EXEC proves nothing about the writer's lanes.
+    EXPECT_FALSE(predicate_defined_after_cmpx(cat({kMovV6, kV8FromV6}), kCmpV8, false));
+}
+
+void vgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
+    rs.vreg[r] = b.uconst(7);
+}
+
+TEST(FreshMaskExecConfinement, FmacAccumulatorReadsStillRefuse) {
+    // s2 is genuine, and so is s3: the decoder exposes a third source field for these opcodes
+    // and scalar_source_words reads the s[2:3] pair, so s3 must not be the missing input.
+    const auto setup = [](RegState& rs, SpirvCompute& b) {
+        vgpr_genuine(rs, b, 1);
+        vgpr_genuine(rs, b, 2);
+        sgpr_genuine(rs, b, 2);
+        sgpr_genuine(rs, b, 3);
+    };
+    EXPECT_FALSE(predicate_defined(kFmacV6, kCmpV6V6, true, setup));
+    EXPECT_FALSE(predicate_defined(kPkFmacV6, kCmpV6V6, true, setup));
 }
