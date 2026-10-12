@@ -28,6 +28,8 @@ import json
 import re
 from pathlib import Path
 
+from site_page import render_site
+
 TOOL_DIR = Path(__file__).resolve().parent
 PROSPER = TOOL_DIR.parent.parent
 REPO_ROOT = PROSPER.parent
@@ -344,69 +346,19 @@ def links_cell(tracker: dict[str, str], doc_url: str) -> str:
     return cell + "</td>"
 
 
+def ladder_rows(stats: list[dict]) -> list[dict]:
+    """All seven real rungs, highest first, with live counts (zero when a bucket is empty)."""
+    by_label = {s["label"]: s["count"] for s in stats}
+    return [
+        {"rung": r, "label": label, "colour": colour, "hint": hint, "count": by_label.get(label, 0)}
+        for r, label, colour, hint in BUCKETS
+        if r is not None
+    ]
+
+
 def render_index(titles: list[dict], stats: list[dict], generated: str, logo: str = "") -> str:
-    """Filterable main page. Data comes from compat.json; no-JS readers get classic.html."""
-    bars = "\n".join(
-        f'<div class="row"><span>{esc(s["label"])}</span>'
-        f"<span>{s['count']} - {s['percent']}%</span></div>"
-        f'<div class="bar"><div style="width:{s["percent"]}%;background:{s["colour"]}"></div></div>'
-        for s in stats
-    )
-    engines = sorted({t["engine"] for t in titles} - {"-"})
-    engine_opts = '<option value="">Engine: all</option>' + "".join(
-        f"<option>{esc(e)}</option>" for e in engines
-    )
-    status_opts = '<option value="">Status: all</option>' + "".join(
-        f"<option>{esc(s['label'])}</option>" for s in stats
-    )
-    brand = (
-        f'<div class="brand"><img class="logo" src="{esc(logo)}" alt="prosper logo">'
-        "<h1>Compatibility</h1></div>"
-        if logo
-        else "<h1>Compatibility</h1>"
-    )
-    favicon = f'<link rel="icon" href="{esc(logo)}">' if logo else ""
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>prosper compatibility</title>{favicon}<style>{PAGE_CSS}</style></head><body>
-{brand}
-<p>How far PS5 titles get on prosper, per the six-rung bring-up ladder.
-Trackers are authoritative; this page is generated from the committed files.</p>
-<div class="card"><h2>Tested titles: {len(titles)}</h2>{bars}
-<p class="mut">Generated {esc(generated)} from PROGRESS_TRACKER.md + COMPATIBILITY.md.
-Statuses are rung buckets, not the ✅/🚧/🔬 markers. One dump revision per title; no OS/region columns.</p></div>
-<div class="filters">
-<input id="q" type="search" placeholder="Search title or PPSA id" size="28">
-<select id="fstatus">{status_opts}</select>
-<select id="fengine">{engine_opts}</select>
-<select id="fguard"><option value="">Guard: all</option><option>guarded</option><option>unguarded</option></select>
-<select id="sort"><option value="rung">Sort: furthest first</option><option value="az">Sort: A-Z</option></select>
-</div>
-<p class="mut" id="count"></p>
-<div class="tablewrap"><table><thead><tr><th>Cover</th><th>Title</th><th>ID</th><th>Engine</th><th>Status</th><th>Guard</th><th>Milestone</th><th>Links</th></tr></thead>
-<tbody id="rows"></tbody></table></div>
-<p class="mut">No JavaScript? <a href="classic.html">Classic static table</a> · <a href="llms.txt">llms.txt</a></p>
-<script>
-let T=[];
-fetch("compat.json").then(r=>r.json()).then(d=>{{T=d.titles;go();}});
-const $=id=>document.getElementById(id);
-function go(){{
- const q=$("q").value.toLowerCase(),fs=$("fstatus").value,fe=$("fengine").value,fg=$("fguard").value;
- let R=T.filter(t=>(!q||t.title.toLowerCase().includes(q)||t.id.toLowerCase().includes(q))
-  &&(!fs||t.status===fs)&&(!fe||t.engine===fe)
-  &&(!fg||(fg==="guarded"?t.guard.length:t.guard.length===0)));
- R.sort($("sort").value==="az"?((a,b)=>a.title.localeCompare(b.title)):((a,b)=>((b.rung==null?-1:b.rung)-(a.rung==null?-1:a.rung))||a.title.localeCompare(b.title)));
- $("count").textContent=R.length+" of "+T.length+" titles";
- $("rows").innerHTML=R.map(t=>`<tr><td>${{t.cover?`<img class="thumb" loading="lazy" src="${{t.cover}}" alt="">`:"—"}}</td><td>${{e(t.title)}}</td><td><code>${{t.id}}</code></td><td>${{e(t.engine)}}</td>`
-  +`<td><span class="pill" style="background:${{t.colour}}" title="${{e(t.hint)}}">${{e(t.status)}}</span></td>`
-  +`<td>${{t.guard.length?t.guard.map(g=>"<code>"+e(g)+"</code>").join(" "):"—"}}</td>`
-  +`<td class="milestone">${{e(t.milestone)}}</td>`
-  +`<td class="links"><a href="${{t.tracker.url}}">Tracker</a>${{t.doc_url?` · <a href="${{t.doc_url}}">Doc</a>`:""}}</td></tr>`).join("");
-}}
-function e(s){{return String(s).replace(/[&<>"']/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[c]));}}
-for(const id of ["q","fstatus","fengine","fguard","sort"])$(id).addEventListener("input",go);
-</script></body></html>
-"""
+    """The prosper landing page; the game list loads from compat.json (classic.html is no-JS)."""
+    return render_site(titles, stats, ladder_rows(stats), generated, logo)
 
 
 def doc_url(cell: str) -> str:
@@ -559,7 +511,7 @@ def selftest() -> None:
     # index.html carries data via compat.json and renders client-side: pin that the
     # milestone goes through the escaper, and that the static page escapes server-side.
     index_html = render_index(evil, counts(evil), "2026-01-01", "prosper-logo.png")
-    assert "e(t.milestone)" in index_html and "<script>alert" not in index_html
+    assert "e(t.milestone" in index_html and "<script>alert" not in index_html
     assert 'class="logo"' in index_html and 'rel="icon"' in index_html
     # `??` next to `||` is a SyntaxError that kills the whole page script (empty table),
     # so the template must not contain it; backticks must balance for the same reason.

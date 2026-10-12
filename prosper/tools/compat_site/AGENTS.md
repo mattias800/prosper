@@ -1,9 +1,8 @@
 # `compat_site` — generated compatibility page
 
-Static, offline generator for the public per-title compatibility page (GitHub Pages).
-It answers: "how far does title X get, and can I search/filter the list?" —
-the shadPS4/AnyPS5-roadmap shape: headline stats, a filterable main table, and a
-no-JS fallback.
+Static, offline generator for the public prosper website (GitHub Pages): a landing page
+that explains the project and hosts the searchable per-title compatibility list
+(shadPS4 / AnyPS5-roadmap shape), plus a no-JS static table.
 
 - `gen_compat_site.py` joins the two committed sources — `PROGRESS_TRACKER.md`
   (rung, ladder, guard, tracker links; itself generated from the `tracker:game`
@@ -12,6 +11,11 @@ no-JS fallback.
   `index.html`, `classic.html`, `llms.txt` plus `covers/` into an output directory.
   It reads no network: the Pages workflow runs it against the checkout
   on every `main` push, so the page is exactly as current as the committed files.
+- `site_page.py` is the presentation half: the prosper landing page (nav, hero with live
+  stats and screenshot mosaic, how-it-works, the ladder with live counts, a card-grid game
+  browser, scope, footer). Its copy only restates README.md and `docs/ROADMAP.md`; it makes
+  no claim about a single title. The template is a plain string with `@@TOKEN@@`
+  placeholders, so CSS and the page script keep their braces; a test fails on any leftover token.
 - The trackers stay authoritative. A row here is a projection of `PROGRESS_TRACKER.md`
   plus hand-written milestone prose; when they disagree with a tracker, the tracker wins.
 - Statuses are plain-language rung buckets (Complete 6 … Boots 0, with the exact rung

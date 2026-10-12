@@ -21,6 +21,7 @@ from gen_compat_site import (  # noqa: E402
     bucket_of,
     build,
     counts,
+    ladder_rows,
     links_cell,
     parse_compat_covers,
     parse_compat_table,
@@ -86,7 +87,7 @@ def test_milestone_html_is_escaped():
     compat["PPSA00001"]["milestone"] = "<script>alert(1)</script>"
     titles = build(parse_tracker_table(TRACKER), compat)
     index_html = render_index(titles, counts(titles), "2026-01-01")
-    assert "e(t.milestone)" in index_html and "<script>alert" not in index_html
+    assert "e(t.milestone" in index_html and "<script>alert" not in index_html
     assert "??" not in index_html.split("<script>")[1]
     assert index_html.count("`") % 2 == 0
     classic = render_classic(titles, "2026-01-01")
@@ -117,6 +118,27 @@ def test_vendor_covers_missing_source_aborts(tmp_path):
         pass
     else:
         raise AssertionError("missing cover source did not fail")
+
+
+def test_site_has_every_section_and_no_leftover_tokens():
+    """The landing page is a website, not a table: nav, hero, story, ladder, games, scope."""
+    titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
+    page = render_index(titles, counts(titles), "2026-01-01", "prosper-logo.png")
+    for anchor in ('id="top"', 'id="how"', 'id="progress"', 'id="games"', 'id="scope"'):
+        assert anchor in page, anchor
+    assert "@@" not in page, "an unreplaced template token reached the page"
+    assert 'name="viewport"' in page and "@media (max-width:640px)" in page
+    assert page.count("<script>") == 1 and page.count("</script>") == 1
+
+
+def test_ladder_shows_all_seven_rungs_with_live_counts():
+    """Empty rungs still render (count 0) so the scale is always the whole scale."""
+    titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
+    rows = ladder_rows(counts(titles))
+    assert [r["rung"] for r in rows] == [6, 5, 4, 3, 2, 1, 0]
+    assert {r["rung"]: r["count"] for r in rows} == {6: 0, 5: 0, 4: 0, 3: 1, 2: 0, 1: 0, 0: 0}
+    page = render_index(titles, counts(titles), "2026-01-01")
+    assert page.count('class="rung"') == 7
 
 
 def test_links_and_pills_stay_on_one_line():
@@ -174,6 +196,8 @@ if __name__ == "__main__":
     test_compat_only_title_is_untracked_not_rung_zero()
     test_markers_are_not_statuses()
     test_milestone_html_is_escaped()
+    test_site_has_every_section_and_no_leftover_tokens()
+    test_ladder_shows_all_seven_rungs_with_live_counts()
     test_links_and_pills_stay_on_one_line()
     test_covers_first_repo_image_wins()
     with tempfile.TemporaryDirectory() as tmp:
