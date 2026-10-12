@@ -16,6 +16,46 @@
 namespace prosper::gpu {
 namespace {
 
+// True only for plain VOP1/VOP2/VOPC/VOP3 arithmetic whose result for lane L depends on lane L's
+// own sources. A form that reads or writes another lane, or a memory form, is not lane-wise.
+bool lane_wise_vector_op(const Rdna2Inst& in) {
+    if (in.has_dpp || in.has_modifier) return false;
+    switch (in.fmt) {
+        case Rdna2Format::VOP1:
+            return in.opcode != 0x02 && in.opcode != kVop1OpcodeMovreldB32 &&
+                   !(in.opcode >= 0x40 && in.opcode <= 0x47);
+        case Rdna2Format::VOP2: return in.opcode != 0x1f && in.opcode != 0x2b && in.opcode != 0x3c;
+        case Rdna2Format::VOPC: return true;
+        case Rdna2Format::VOP3: return in.opcode < 0x300;
+        default: return false;
+    }
+}
+
+// True when a lane-wise form writes the complete 32-bit word of every lane it executes: no SDWA
+// partial destination, no preserved old bits (vector_write_depends_on_old_word, with EXEC treated
+// as full so only the form's own dependence counts), and not an indexed relative write.
+bool complete_full_word_write(const Rdna2Inst& in) {
+    // A plain buffer load writes each active lane's dwords (out-of-range lanes return zero); a TFE
+    // form also writes a status word, which is not modelled here, so it is not complete.
+    if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
+    if (!lane_wise_vector_op(in) || in.has_sdwa) return false;
+    if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
+        return false;
+    return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
+}
+
+// True when the EXEC value named by reader is the owner value or a subset of it, by the derivation
+// facts recorded at v_cmpx. A placeholder confined outside owner is then also outside reader.
+bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
+    uint32_t current = reader;
+    for (int hop = 0; hop < 64 && current != 0; ++hop) {
+        if (current == owner) return true;
+        const auto parent = rs.exec_subset_of.find(current);
+        if (parent == rs.exec_subset_of.end()) return false;
+        current = parent->second;
+    }
+    return false;
+}
 bool memory_result(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
            in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
@@ -76,6 +116,16 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
 }
 
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other) {
+    // EXEC confinement survives a join only when every placeholder side shares it. A clean side
+    // contributes no placeholder lanes; a soft placeholder may sit in any lane.
+    const uint32_t into_side = into.hard ? into.outside_exec : 0u;
+    const uint32_t other_side = other.hard ? other.outside_exec : 0u;
+    if (into.placeholder && other.placeholder)
+        into.outside_exec = into_side == other_side ? into_side : 0u;
+    else if (other.placeholder)
+        into.outside_exec = other_side;
+    else
+        into.outside_exec = into_side;
     into.placeholder = into.placeholder || other.placeholder;
     into.memory = into.memory || other.memory;
     into.hard = into.hard || other.hard;
@@ -153,6 +203,11 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     // A memory-loaded value can form a fresh predicate; a missing spill's zero storage cannot.
     const auto marks = scalar_source_marks(rs, in);
     if (!marks.placeholder) return true;
+    // The predicate reads only the lanes its own EXEC enables, and its result is masked by that EXEC,
+    // so a placeholder confined to the lanes outside the same EXEC value is never observed.
+    if (marks.hard && marks.outside_exec != 0 && rs.exec_narrowed &&
+        exec_within(rs, rs.exec, marks.outside_exec))
+        return true;
     if (marks.hard || marks.blanket_roots.empty()) return false;
     // These roots name defined loop seeds, whose back edges the existing loop proof checks.
     b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
@@ -174,6 +229,20 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_source_marks(result, vector_word(rs, reg));
+        // A write defines its word only in the lanes it writes. Confinement is granted only when the
+        // form writes the complete word of every active lane; any other form (preserved bits,
+        // selected lanes, relative destinations, cross-lane forms) leaves the old word unconfined.
+        const bool complete = complete_full_word_write(in);
+        const bool narrowed_write = rs.exec_narrowed && !rdna2_instruction_may_change_exec(in);
+        if (!complete) {
+            result.outside_exec = 0;
+        } else if (narrowed_write) {
+            // Outside EXEC the old word survives; inside it the result is the source relayed.
+            const bool defined_inside =
+                !source.placeholder ||
+                (source.hard && exec_within(rs, rs.exec, source.outside_exec));
+            result.outside_exec = defined_inside ? rs.exec : 0u;
+        }
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }

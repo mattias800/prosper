@@ -19,6 +19,10 @@ struct ScalarSourceMarks {
     bool memory = false;
     bool hard = false;
     std::set<uint64_t> blanket_roots;
+    // Nonzero only for a hard placeholder whose lanes are provably confined to the lanes OUTSIDE
+    // this SPIR-V EXEC value: a partial VALU write under that EXEC replaced every other lane with
+    // clean data. A later reader under the very same EXEC value never touches those lanes.
+    uint32_t outside_exec = 0;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
