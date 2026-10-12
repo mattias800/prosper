@@ -2125,11 +2125,15 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7e020280u,0x7e0002f2u,0x7c2200f0u,0xbf880002u,0xbe8503f2u,0x7e020205u,
                             0x7e040205u,0xf800180fu,0x01010101u,0xbf810000u};
       dump(dir, "fragment_execz_if", recompile_fragment(c, sizeof(c)/4, nullptr)); }
-    // A saved lane mask first defined inside a forward if and consumed after its merge. The skipped
-    // edge contributes false; without that phi the arm-local definition does not dominate its use.
-    { const uint32_t c[] = {0x7E020280u,0x7E0002F2u,0x7C2200F0u,0xBF880001u,0xBE82047Eu,
-                            0xBEFE0402u,0x7E0202F2u,0xF800180Fu,0x01010101u,0xBF810000u};
-      dump(dir, "fragment_if_new_mask", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // A saved lane mask defined before a forward if and replaced inside it. Both predecessors
+    // supply real values: the initial zero owns the skipped edge (#4957), rather than a fabricated
+    // default-false phi for an otherwise unwritten pair. The arm-local definition needs a phi.
+    {
+        const uint32_t c[] = {0xBE820480u, 0x7E020280u, 0x7E0002F2u, 0x7C2200F0u,
+                              0xBF880001u, 0xBE82047Eu, 0xBEFE0402u, 0x7E0202F2u,
+                              0xF800180Fu, 0x01010101u, 0xBF810000u};
+        dump(dir, "fragment_if_new_mask", recompile_fragment(c, sizeof(c) / 4, nullptr));
+    }
     // Fragment: DIVERGENT execz-exit loop with a nested execz if in the body (#273 — the DOLL
     // title post-process accumulation shape; test_recompiled_fragment executes it).
     { const uint32_t c[] = {0x7E020284u,0xBE800380u,0x7E040280u,0x7E060280u,0x7E080282u,0x7E0A02F2u,
