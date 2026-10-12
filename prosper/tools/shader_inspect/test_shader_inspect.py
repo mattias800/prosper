@@ -187,12 +187,10 @@ def main() -> int:
 
     # ---- #3464: offline wave-reason census -----------------------------------------------
     #
-    # A fragment shader that votes (compare, then branch on the result) requires the guest wave
-    # width for a reason that is RECOVERABLE at 32 lanes -- two half-waves union to the same
-    # answer -- and prosper already admits exactly this class. The census must say so in a form
-    # a script can filter, so a dump of a title's shaders becomes a table rather than 86 manual
-    # inspections.
-    vote_words = (
+    # A fragment compare/branch records the guest wave width and WaveAny reason. The census
+    # must expose those module properties without claiming that they establish live admission.
+    # Retain the original stream with absent predicate inputs as a refusal control (#5023).
+    missing_vote_words = (
         0x7E040280,              # v_mov_b32 v2,0
         0x7E060280,              # v_mov_b32 v3,0
         0x7C020300,              # v_cmp_lt_f32 vcc,v0,v1
@@ -204,20 +202,35 @@ def main() -> int:
         0xF800180F, 0x05040302,  # exp mrt0 v2,v3,v4,v5 done vm
         S_ENDPGM,
     )
+    # Raw dumps supply no fragment input authority. Define both full predicate words in the
+    # program so this positive reaches the metadata census without fabricated v0/v1 values.
+    vote_words = (
+        0x7E000280,              # v_mov_b32 v0,0
+        0x7E0202F2,              # v_mov_b32 v1,1.0
+    ) + missing_vote_words
     code, out = run(binary, vote_words, extra=["--wave-reasons"])
     check("wave-reasons census emits its sentinel",
           "wave-reasons-end" in out, "\n" + out)
+    check("defined predicate inputs recompile for the census",
+          code == 0 and "input=rdna2" in out and "recompiled=1" in out, "\n" + out)
     check("wave-reasons census reports the required width",
           "required-subgroup-size=64" in out, "\n" + out)
     check("wave-reasons census names the reason bits",
           "reasons=0x2" in out and "wave-any" in out, "\n" + out)
-    # The actionable column, and it is deliberately a fact about SHIPPING code rather than a
-    # judgement: render_runner.h admits a fragment shader at the host's native wave32 only when
-    # its reason set equals kFragmentWaveReasonWaveAny exactly. A reason set of precisely WaveAny
-    # is therefore admitted today, and the census must say so in the same terms, so a count taken
-    # over a title's shaders describes the emulator someone actually runs.
+    # This column classifies the module's reason set; the other live admission conjuncts
+    # remain undecided and are checked separately below.
     check("wave-reasons census reports reason-set admissibility",
           "reason-set-admissible=1" in out, "\n" + out)
+
+    code, out = run(binary, missing_vote_words, extra=["--wave-reasons"])
+    check("missing predicate inputs still emit a completed census",
+          code == 0 and "wave-reasons-end" in out, "\n" + out)
+    check("missing predicate inputs remain refused",
+          "input=rdna2" in out and "recompiled=0" in out, "\n" + out)
+    check("missing predicate inputs emit no census row",
+          "required-subgroup-size=" not in out, "\n" + out)
+    check("missing predicate inputs emit no gate-undecided line",
+          "gate-undecided=" not in out, "\n" + out)
 
     # A shader with no wave op at all must report a real, empty census -- not silence, which a
     # consumer cannot distinguish from a crash.
