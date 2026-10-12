@@ -121,6 +121,46 @@ def test_vendor_covers_missing_source_aborts(tmp_path):
         raise AssertionError("missing cover source did not fail")
 
 
+def test_vendor_covers_refuses_escape(tmp_path):
+    """An existing ../outside file, an absolute path and an escaping symlink are all refused."""
+    inside = tmp_path / "root"
+    (inside / "assets").mkdir(parents=True)
+    (inside / "assets" / "ok.webp").write_bytes(b"cover")
+    (tmp_path / "outside.webp").write_bytes(b"secret")
+    assert vendor_covers(inside, tmp_path / "out", {"PPSA00001": "assets/ok.webp"}) == {
+        "PPSA00001": "covers/ok.webp"
+    }
+    for evil in ("../outside.webp", str(tmp_path / "outside.webp")):
+        try:
+            vendor_covers(inside, tmp_path / "out", {"PPSA00001": evil})
+        except ParseError:
+            pass
+        else:
+            raise AssertionError(f"escaping cover {evil!r} was vendored")
+    link = inside / "assets" / "link.webp"
+    try:
+        link.symlink_to(tmp_path / "outside.webp")
+    except (OSError, NotImplementedError):
+        return  # symlink creation needs privilege here; the resolve check above is the control
+    try:
+        vendor_covers(inside, tmp_path / "out", {"PPSA00001": "assets/link.webp"})
+    except ParseError:
+        pass
+    else:
+        raise AssertionError("escaping symlink was vendored")
+
+
+def test_hostile_url_and_filename_are_escaped():
+    """Quote-breaking tracker URLs and cover names reach attributes only through the escaper."""
+    page = render_index(
+        build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
+    )
+    for point in ("e(t.tracker.url)", "e(t.doc_url)", "e(t.cover)", "e(t.colour)", "e(t.hint)"):
+        assert point in page, point
+    for raw in ("t.tracker.url}", "t.doc_url}`", 't.cover}"', 't.colour}"'):
+        assert raw not in page, raw
+
+
 def test_site_has_every_section_and_no_leftover_tokens():
     """The landing page is a website, not a table: nav, hero, story, ladder, games, scope."""
     titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
@@ -240,12 +280,22 @@ def test_strip_md_keeps_link_labels():
 
 
 def test_bad_rows_fail_loudly():
-    """Four malformed inputs, each of which must abort rather than emit a wrong page."""
+    """Malformed inputs, each of which must abort rather than emit a wrong page."""
+    tracker_dup = TRACKER + TRACKER.splitlines()[-1] + "\n"
+    compat_dup = COMPAT + COMPAT.splitlines()[-1] + "\n"
+    tracker_nosep = TRACKER.replace("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n", "")
     bad = [
         (parse_tracker_table, TRACKER.replace("`PPSA00001`", "`BOGUS`")),
         (parse_tracker_table, TRACKER.replace("| 3 |", "| 7 |")),
+        (parse_tracker_table, tracker_dup),  # duplicate id drops a title silently
+        (parse_tracker_table, tracker_nosep),  # first data row eaten as separator
+        (
+            parse_tracker_table,
+            TRACKER.replace("https://example.test/11", 'javascript:alert("x")'),
+        ),  # hostile scheme in an attribute-bound URL
         (parse_compat_table, COMPAT.replace("`PPSA00001`", "`PPSA1`")),
         (parse_compat_table, COMPAT.replace("[#11](https://example.test/11) |", "- |")),
+        (parse_compat_table, compat_dup),  # duplicate id publishes the wrong milestone
     ]
     for fn, text in bad:
         try:
@@ -281,9 +331,11 @@ if __name__ == "__main__":
     test_cursors_match_what_is_clickable()
     test_ladder_shows_all_seven_rungs_with_live_counts()
     test_links_and_pills_stay_on_one_line()
+    test_hostile_url_and_filename_are_escaped()
     test_covers_first_repo_image_wins()
     with tempfile.TemporaryDirectory() as tmp:
         test_vendor_covers_missing_source_aborts(Path(tmp))
+        test_vendor_covers_refuses_escape(Path(tmp))
     test_strip_md_keeps_link_labels()
     test_bad_rows_fail_loudly()
     test_real_tree_parses_and_joins()

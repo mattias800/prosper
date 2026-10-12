@@ -1,8 +1,8 @@
 # `compat_site` — generated compatibility page
 
 Static, offline generator for the public prosper website (GitHub Pages): a landing page
-that explains the project and hosts the searchable per-title compatibility list
-(shadPS4 / AnyPS5-roadmap shape), plus a no-JS static table.
+that explains the project and hosts the searchable per-title compatibility list,
+plus a no-JS static table.
 
 - `gen_compat_site.py` joins the two committed sources — `PROGRESS_TRACKER.md`
   (rung, ladder, guard, tracker links; itself generated from the `tracker:game`
@@ -25,4 +25,5 @@ that explains the project and hosts the searchable per-title compatibility list
   breakdowns would be invented data. Titles with no `##` section yet (recent
   additions) render a `—` cover cell rather than a wrong image.
 - `test_gen_compat_site.py` pins the parsers with hand-built fixtures plus a real-tree
-  run over the committed files. ctest runs it as `compat_site_generator`.
+  run over the committed files. It runs under pytest; ctest runs only the `--selftest`
+  arm as `compat_site_generator`, mirroring the tracker generator's registration.

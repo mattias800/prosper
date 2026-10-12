@@ -244,7 +244,7 @@ function go(){
  $("grid").innerHTML=R.slice(from,from+PER).map(function(t){
   var img=t.cover?'<img loading="lazy" src="'+e(t.cover)+'" alt="'+e(t.title)+'">':'<div class="ph">'+e(ini(t.title))+'</div>';
   var doc=t.doc_url?'<a href="'+e(t.doc_url)+'">Status doc</a>':'';
-  return '<article class="game"><div class="shot">'+img+'<span class="pill" style="background:'+t.colour+'" title="'+e(t.hint)+'">'+e(t.status)+'</span></div>'
+  return '<article class="game"><div class="shot">'+img+'<span class="pill" style="background:'+e(t.colour)+'" title="'+e(t.hint)+'">'+e(t.status)+'</span></div>'
    +'<div class="gbody"><h3>'+e(t.title)+'</h3><div class="meta">'+e(t.engine==="-"?"Engine unknown":t.engine)+' &middot; <code>'+e(t.id)+'</code></div>'
    +'<p class="ms" title="Click to expand">'+e(t.milestone==="-"?"No milestone written yet.":t.milestone)+'</p>'
    +'<div class="glinks"><a href="'+e(t.tracker.url)+'">Tracker</a>'+doc+'</div></div></article>';}).join("");

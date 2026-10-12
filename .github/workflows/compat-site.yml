@@ -1,7 +1,7 @@
 name: Compat site
 
-# Static per-title compatibility page (shadPS4/AnyPS5-roadmap shape): search, rung-status
-# filters and a no-JS fallback, generated OFFLINE from the committed PROGRESS_TRACKER.md
+# Static prosper website (landing page plus searchable per-title compatibility list
+# and a no-JS fallback), generated OFFLINE from the committed PROGRESS_TRACKER.md
 # and COMPATIBILITY.md -- so the page is exactly as current as those files and needs no
 # token. The trackers stay authoritative over every row.
 #
@@ -31,6 +31,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # This job only reads the checkout (offline build + artifact upload); nothing
+          # pushed with a persisted credential could be mistaken for an intended write.
+          persist-credentials: false
 
       - name: Verify the generator still discriminates
         run: python3 prosper/tools/compat_site/gen_compat_site.py --selftest

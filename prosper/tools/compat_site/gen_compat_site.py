@@ -26,6 +26,7 @@ import datetime
 import html
 import json
 import re
+import tempfile
 from pathlib import Path
 
 from site_page import render_site
@@ -77,9 +78,15 @@ def strip_md(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def tracker_links(cell: str) -> list[dict[str, str]]:
-    """Every `[#NNNN](url)` in a cell, in order."""
-    return [{"number": m.group(1), "url": m.group(2)} for m in TRACKER_LINK_RE.finditer(cell)]
+def tracker_links(cell: str, source: str, tid: str) -> list[dict[str, str]]:
+    """Every `[#NNNN](url)` in a cell, in order. Only `https:` links are accepted: the
+    URLs land in page attributes, so a `javascript:` scheme must fail the build, not the reader."""
+    links = []
+    for m in TRACKER_LINK_RE.finditer(cell):
+        if not m.group(2).startswith("https://"):
+            raise ParseError(f"{source}: non-https tracker link for {tid}: {m.group(2)[:60]!r}")
+        links.append({"number": m.group(1), "url": m.group(2)})
+    return links
 
 
 def find_table(text: str, source: str, want: list[str]) -> list[str]:
@@ -94,6 +101,10 @@ def find_table(text: str, source: str, want: list[str]) -> list[str]:
                 body.append(row)
             if len(body) < 2:
                 raise ParseError(f"{source}: table under {want[0]!r} has no rows")
+            if not re.fullmatch(r"\|?[\s:|-]+\|?", body[0]):
+                raise ParseError(
+                    f"{source}: line under the {want[0]!r} header is not a separator row"
+                )
             return body[1:]  # skip the separator row
     raise ParseError(f"{source}: table with header {want[0]!r} not found")
 
@@ -113,6 +124,7 @@ def parse_tracker_table(text: str) -> list[dict]:
         "Status doc",
     ]
     rows = []
+    seen: set[str] = set()
     for ln in find_table(text, "PROGRESS_TRACKER.md", want):
         cells = split_row(ln)
         if len(cells) != len(want):
@@ -122,11 +134,14 @@ def parse_tracker_table(text: str) -> list[dict]:
         title, tid, rung, ladder = cells[0], cells[1].strip("`"), cells[2], cells[3].strip("`")
         if not ID_RE.fullmatch(tid):
             raise ParseError(f"PROGRESS_TRACKER.md: bad title id {tid!r}")
+        if tid in seen:
+            raise ParseError(f"PROGRESS_TRACKER.md: duplicate title id {tid}")
+        seen.add(tid)
         if not rung.isdigit() or not 0 <= int(rung) <= 6:
             raise ParseError(f"PROGRESS_TRACKER.md: bad rung {rung!r} for {tid}")
         if not re.fullmatch(r"[0-6-]{6}", ladder):
             raise ParseError(f"PROGRESS_TRACKER.md: bad ladder {ladder!r} for {tid}")
-        trackers = tracker_links(cells[8])
+        trackers = tracker_links(cells[8], "PROGRESS_TRACKER.md", tid)
         if not trackers:
             raise ParseError(f"PROGRESS_TRACKER.md: no tracker link for {tid}")
         guards = [g.strip("` ") for g in split_row_fallback(cells[5]) if g.strip("` ") != "-"]
@@ -138,7 +153,7 @@ def parse_tracker_table(text: str) -> list[dict]:
                 "ladder": ladder,
                 "fps": None if cells[4] == "-" else strip_md(cells[4]),
                 "guard": guards,
-                "blockers": tracker_links(cells[7]),
+                "blockers": tracker_links(cells[7], "PROGRESS_TRACKER.md", tid),
                 "tracker": trackers[0],
                 "status_doc": cells[9],
             }
@@ -164,8 +179,10 @@ def parse_compat_table(text: str) -> dict[str, dict]:
         ids = ID_RE.findall(cells[1])
         if len(ids) != 1:
             raise ParseError(f"COMPATIBILITY.md: bad title id cell {cells[1]!r}")
+        if ids[0] in out:
+            raise ParseError(f"COMPATIBILITY.md: duplicate title id {ids[0]}")
         milestone = strip_md(cells[3])
-        trackers = tracker_links(cells[4])
+        trackers = tracker_links(cells[4], "COMPATIBILITY.md", ids[0])
         if not trackers:
             raise ParseError(f"COMPATIBILITY.md: no tracker link for {ids[0]}")
         out[ids[0]] = {
@@ -290,8 +307,11 @@ def vendor_covers(root: Path, out: Path, covers: dict[str, str]) -> dict[str, st
     dest.mkdir(parents=True, exist_ok=True)
     placed: dict[str, str] = {}
     taken: set[str] = set()
+    base = root.resolve()
     for tid, src in covers.items():
-        source = root / src
+        source = (base / src).resolve()
+        if not source.is_relative_to(base):
+            raise ParseError(f"cover for {tid} escapes the checkout: {src}")
         if not source.is_file():
             raise ParseError(f"cover for {tid} not found in checkout: {src}")
         name = source.name
@@ -543,11 +563,20 @@ def selftest() -> None:
     assert index_html.count("`") % 2 == 0
     assert "&lt;script&gt;" in render_classic(evil, "2026-01-01")
 
+    tracker_dup = good_tracker + good_tracker.splitlines()[-1] + "\n"
+    tracker_nosep = good_tracker.replace(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n", ""
+    )
     bad_trackers = [
         good_tracker.replace("`PPSA00001`", "`BOGUS`"),  # bad title id
         good_tracker.replace("| 3 |", "| 7 |"),  # rung out of range
         good_tracker.replace("`123---`", "`12x---`"),  # bad ladder
         good_tracker.replace("[#11](https://example.test/11) | - |", "- | - |"),  # no tracker link
+        tracker_dup,  # duplicate id drops a title silently
+        tracker_nosep,  # first data row eaten as separator
+        good_tracker.replace(
+            "https://example.test/11", 'javascript:alert("x")'
+        ),  # hostile scheme in an attribute-bound URL
     ]
     bad_header = good_compat.replace(
         "| Title | Title ID | Engine | User-visible milestone | Tracker |",
@@ -557,6 +586,7 @@ def selftest() -> None:
         good_compat.replace("`PPSA00001`", "`PPSA1`"),  # bad id cell
         good_compat.replace("[#11](https://example.test/11) |", "- |"),  # no tracker link
         bad_header,  # wrong header
+        good_compat + good_compat.splitlines()[-1] + "\n",  # duplicate id, wrong milestone
     ]
     for i, bad in enumerate(bad_trackers):
         try:
@@ -578,6 +608,21 @@ def selftest() -> None:
         pass
     else:
         raise AssertionError("bucket_of(9) did not fail")
+    # Attribute-bound data reaches the interactive page only through the escaper.
+    for point in ("e(t.tracker.url)", "e(t.doc_url)", "e(t.cover)", "e(t.colour)", "e(t.hint)"):
+        assert point in index_html, point
+    # A missing cover source aborts; so does one that resolves outside the checkout.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "root"
+        (base / "assets").mkdir(parents=True)
+        (Path(tmp) / "outside.webp").write_bytes(b"secret")
+        for evil in ("../outside.webp", str(Path(tmp) / "outside.webp")):
+            try:
+                vendor_covers(base, Path(tmp) / "out", {"PPSA00001": evil})
+            except ParseError:
+                pass
+            else:
+                raise AssertionError(f"escaping cover {evil!r} was vendored")
     # The real committed files must parse: the selftest pins the live contract.
     live_rows = parse_tracker_table(TRACKER_MD.read_text(encoding="utf-8"))
     live_compat_text = COMPAT_MD.read_text(encoding="utf-8")
