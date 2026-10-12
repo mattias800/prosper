@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -52,6 +53,23 @@ static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) 
 
 constexpr uint32_t kOpSwitch = 251;
 constexpr uint32_t kOpGroupNonUniformAny = 335;
+
+static std::vector<uint32_t> compile_fixture(const uint32_t* code, size_t dwords,
+                                             bool scalar = true, bool position = true,
+                                             uint64_t program = 0) {
+    // Preserve every original producer/CFG word and define the common s4 branch input first.
+    // The READFIRSTLANE and export operands consume genuine PS position X/Y in v0/v1.
+    std::vector<uint32_t> complete;
+    if (scalar) complete.push_back(0xbe840380u);   // s_mov_b32 s4, 0
+    complete.insert(complete.end(), code, code + dwords);
+    PixelSystemInputMapping inputs{};
+    inputs.addr = inputs.ena = (1u << 8) | (1u << 9);
+    static uint64_t next_program = 0x49921000ull;
+    if (!program) program = ++next_program;
+    return recompile_fragment(complete.data(), complete.size(), nullptr,
+                              position ? &inputs : nullptr, UINT32_MAX, nullptr, false,
+                              {RecompileDiagnosticStage::Fragment, program});
+}
 
 TEST(ReadfirstlaneUniformity, Contract) {
     printf("== test_readfirstlane_uniformity ==\n");
@@ -91,11 +109,25 @@ TEST(ReadfirstlaneUniformity, Contract) {
     // THE CASE: `s0` comes from v_readfirstlane_b32 s0, v0 -- lane-local under prosper's model.
     const std::vector<uint32_t> rfl = build(0x7E000501u, 0u, false);   // v_readfirstlane_b32 s0, v0
 
-    const std::vector<uint32_t> spv_imm = recompile_fragment(imm.data(), imm.size());
-    const std::vector<uint32_t> spv_rfl = recompile_fragment(rfl.data(), rfl.size());
+    const std::vector<uint32_t> spv_imm = compile_fixture(imm.data(), imm.size());
+    const std::vector<uint32_t> spv_rfl = compile_fixture(rfl.data(), rfl.size());
 
     CHECK(!spv_imm.empty() && !spv_rfl.empty(), "both variants recompile");
     if (spv_imm.empty() || spv_rfl.empty()) { printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
+
+    constexpr uint64_t missing_scalar = 0x49921f01ull;
+    CHECK(compile_fixture(imm.data(), imm.size(), false, true, missing_scalar).empty(),
+          "an absent s4 cannot borrow allocated zero");
+    CHECK(last_terminal_reject_reason(missing_scalar).find("pc=7 reason=poisoned-scc") !=
+              std::string::npos,
+          "missing s4 refuses at the original scalar branch");
+    constexpr uint64_t missing_position = 0x49921f02ull;
+    CHECK(compile_fixture(rfl.data(), rfl.size(), true, false, missing_position).empty(),
+          "an absent position cannot supply the READFIRSTLANE result");
+    CHECK(last_terminal_reject_reason(missing_position)
+                  .find("mode=unresolved-operand pc=4 words=d4c2006a,00000200") !=
+              std::string::npos,
+          "the absent READFIRSTLANE source refuses at its actual dependent compare");
 
     // CONTROLS FIRST. If either program failed to reach the dispatcher, the comparison below would be
     // about routing rather than about the uniformity proof.
@@ -127,7 +159,7 @@ TEST(ReadfirstlaneUniformity, Contract) {
         via_copy.push_back(0xBE800302u);            // s_mov_b32 s0, s2      <- launder
         const std::vector<uint32_t> tail = build(0xBF800000u, 0u, false);  // s_nop as the producer slot
         via_copy.insert(via_copy.end(), tail.begin() + 1, tail.end());
-        const std::vector<uint32_t> spv_copy = recompile_fragment(via_copy.data(), via_copy.size());
+        const std::vector<uint32_t> spv_copy = compile_fixture(via_copy.data(), via_copy.size());
         CHECK(!spv_copy.empty() && count_opcode(spv_copy, kOpSwitch) >= 1,
               "CONTROL: the laundered variant also recompiles and reaches the dispatcher");
         CHECK(count_opcode(spv_copy, kOpGroupNonUniformAny) >= 1,
@@ -146,7 +178,7 @@ TEST(ReadfirstlaneUniformity, Contract) {
         const std::vector<uint32_t> tail_a = build(0xBF800000u, 0u, false);
         clean_launder.insert(clean_launder.end(), tail_a.begin() + 1, tail_a.end());
         const std::vector<uint32_t> spv_a =
-            recompile_fragment(clean_launder.data(), clean_launder.size());
+            compile_fixture(clean_launder.data(), clean_launder.size());
         CHECK(!spv_a.empty() && count_opcode(spv_a, kOpSwitch) >= 1,
               "CONTROL: the clean two-move launder recompiles and reaches the dispatcher");
         CHECK(count_opcode(spv_a, kOpGroupNonUniformAny) == 0,
@@ -160,8 +192,7 @@ TEST(ReadfirstlaneUniformity, Contract) {
         unused_rfl.push_back(0xBE800380u);          // s_mov_b32 s0, 0
         const std::vector<uint32_t> tail_b = build(0xBF800000u, 0u, false);
         unused_rfl.insert(unused_rfl.end(), tail_b.begin() + 1, tail_b.end());
-        const std::vector<uint32_t> spv_b =
-            recompile_fragment(unused_rfl.data(), unused_rfl.size());
+        const std::vector<uint32_t> spv_b = compile_fixture(unused_rfl.data(), unused_rfl.size());
         CHECK(!spv_b.empty() && count_opcode(spv_b, kOpSwitch) >= 1,
               "CONTROL: the unused-readfirstlane variant recompiles and reaches the dispatcher");
         CHECK(count_opcode(spv_b, kOpGroupNonUniformAny) == 0,
