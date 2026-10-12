@@ -3793,6 +3793,10 @@ endif()
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_scalar_condition_preservation
+    SOURCES tests/gpu/recompiler/test_scalar_condition_preservation.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_s_movrels_read_range
     SOURCES tests/gpu/recompiler/test_s_movrels_read_range.cpp
     LIBRARIES prosper_core)
