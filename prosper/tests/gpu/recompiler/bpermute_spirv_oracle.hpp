@@ -66,6 +66,11 @@ struct Interpreter {
   std::string error;
   // An explicit fixture contract, never inferred from a declared native builtin or vote.
   uint32_t native_subgroup_width = 0;
+  // Fixture-supplied dispatch extent. Nonzero opts into exact (32,1,1) workgroups;
+  // the module's own entrypoint LocalSize must agree before any builtin is supplied.
+  uint32_t native32_workgroup_count = 0;
+  std::map<uint32_t, std::vector<uint32_t>> local_sizes;
+  std::set<uint32_t> specialized_local_sizes;
   std::vector<uint32_t> push_constants;
   struct SampledMip {
     uint32_t width = 0, height = 0;
@@ -235,6 +240,12 @@ struct Interpreter {
         }
         if (op == 15 && a.size() >= 2 && a[0] == 5)
           main = a[1];
+        if (op == 16 && a.size() >= 2 && a[1] == 17) {
+            if (a.size() != 5 ||
+                !local_sizes.emplace(a[0], std::vector<uint32_t>{a.begin() + 2, a.end()}).second)
+                fail("invalid or duplicate LocalSize");
+        }
+        if (op == 331 && a.size() >= 2 && a[1] == 38) specialized_local_sizes.insert(a[0]);
         if (op >= 19 && op <= 33 && !a.empty())
           types[a[0]] = {op, {a.begin() + 1, a.end()}};
         if (op == 71 && a.size() >= 2) {
@@ -668,10 +679,23 @@ struct Interpreter {
       try {
           if (!error.empty()) fail(error);
           if (!count || count > 1024) fail("invalid invocation count");
-          // The explicit Wave32 vote/builtin fixture is one full subgroup at workgroup zero.
-          // Other bases need their own authenticated local-size/GID contract.
-          if (native_subgroup_width == 32 && (count != 32 || workgroup_x != 0))
+          if (native_subgroup_width == 32) {
+              if (count != 32) fail("unproved native32 instance");
+              if (native32_workgroup_count) {
+                  const auto local = local_sizes.find(main);
+                  if (local == local_sizes.end() ||
+                      local->second != std::vector<uint32_t>{32, 1, 1} ||
+                      specialized_local_sizes.contains(main) ||
+                      std::any_of(builtins.begin(), builtins.end(),
+                                  [](const auto& builtin) { return builtin.second == 25; }) ||
+                      workgroup_x >= native32_workgroup_count || workgroup_x > UINT32_MAX / 32)
+                      fail("unproved native32 instance");
+              } else if (workgroup_x != 0) {
+                  fail("unproved native32 instance");
+              }
+          } else if (native32_workgroup_count) {
               fail("unproved native32 instance");
+          }
           storage = 0;
           shared.clear();
           readonly_storage.clear();
