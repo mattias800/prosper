@@ -109,6 +109,8 @@ static std::string read_text_file(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
     std::printf("== test_gpu_capture ==\n");
+    const bool empty_cf9200_shader =
+        argc == 2 && std::strcmp(argv[1], "--empty-cf9200-shader") == 0;
     const char* inspect_tool = argc == 3 &&
             std::strcmp(argv[1], "--inspect-resource-input") == 0
         ? argv[2] : nullptr;
@@ -2987,6 +2989,10 @@ int main(int argc, char** argv) {
     cf9200_compute.spirv = recompile_compute(
         prosper::test::kGta5Cf9200Program.data(),
         prosper::test::kGta5Cf9200Program.size(), &cf9200_table, cf9200_config);
+    if (empty_cf9200_shader) {
+        std::printf("  [control] CF9200 shader setup returned an empty module\n");
+        cf9200_compute.spirv.clear();
+    }
     cf9200_compute.user_sgprs = cf9200_config.user_sgprs;
     cf9200_compute.resources = std::make_shared<ShaderResourceTable>(cf9200_table);
     cf9200_compute.launch.threads_x = cf9200_compute.launch.threads_y =
@@ -3025,20 +3031,26 @@ int main(int argc, char** argv) {
     };
 
     GpuCaptureFile cf9200_capture;
-    CHECK(!cf9200_compute.spirv.empty() &&
-              capture_submit_items({}, {cf9200_compute}, cf9200_operations, meta,
-                                   cf9200_reader, cf9200_capture, error),
+    const bool cf9200_captured = !cf9200_compute.spirv.empty() &&
+                                 capture_submit_items({}, {cf9200_compute}, cf9200_operations, meta,
+                                                      cf9200_reader, cf9200_capture, error);
+    CHECK(cf9200_captured,
           "capture retains the exact root-record program, launch, sites, and shared witness");
+    // A counting CHECK cannot authorize dependent bundle and mutation checks after failed setup.
+    if (!cf9200_captured) return 1;
     Cf9200BundleProbe::run(cf9200_capture);
     std::vector<uint8_t> cf9200_capture_bytes;
     GpuCaptureFile cf9200_loaded;
     GpuReplayFrame cf9200_replay;
-    CHECK(serialize_gpu_capture(cf9200_capture, cf9200_capture_bytes, error) &&
-              deserialize_gpu_capture(cf9200_capture_bytes, cf9200_loaded, error) &&
-              materialize_gpu_replay(cf9200_loaded, cf9200_replay, error) &&
-              cf9200_replay.computes.size() == 1u &&
-              cf9200_replay.computes[0].gta5_cf9200_no_backing_validated,
+    const bool cf9200_roundtrip =
+        serialize_gpu_capture(cf9200_capture, cf9200_capture_bytes, error) &&
+        deserialize_gpu_capture(cf9200_capture_bytes, cf9200_loaded, error) &&
+        materialize_gpu_replay(cf9200_loaded, cf9200_replay, error) &&
+        cf9200_replay.computes.size() == 1u &&
+        cf9200_replay.computes[0].gta5_cf9200_no_backing_validated;
+    CHECK(cf9200_roundtrip,
           "root-record capture round-trip revalidates provenance and mints the replay token");
+    if (!cf9200_roundtrip) return 1;
 
     GpuCaptureFile stale_cf9200_site = cf9200_loaded;
     auto& stale_cf9200_raw = stale_cf9200_site.raw_shader_versions[
