@@ -168,48 +168,68 @@ TEST(FragmentResourcePacket, LargerRectangularMipAndResourceChanges) {
         }
     }
 }
-TEST(FragmentResourcePacket, FiniteArithmeticAllRoundingAndDenormalModes) {
+class FragmentFiniteArithmetic : public testing::TestWithParam<uint32_t> {};
+
+TEST_P(FragmentFiniteArithmetic, PreservesRawWords) {
     const auto directory = dump_directory();
     // Independent hand-derived IEEE bit rails; integer SOURCE does not inherit device FTZ or RTE.
-    for (uint32_t denorm = 0; denorm < 4; ++denorm) for (uint32_t round = 0; round < 4; ++round) {
-        const auto mode = static_cast<uint8_t>((denorm << 4) | round);
-        const auto suffix = std::to_string(mode);
-        sink(fixture::arithmetic(3, 0x3f800000, 0x33800000, mode),
-             arithmetic_expected(round == 1 ? 0x3f800001 : 0x3f800000), "halfway_positive_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800001, 0x33800000, mode),
-             arithmetic_expected(round == 0 || round == 1 ? 0x3f800002 : 0x3f800001), "halfway_odd_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3fffffff, 0x33800000, mode),
-             arithmetic_expected(round == 0 || round == 1 ? 0x40000000 : 0x3fffffff), "halfway_carry_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x80000000, 0x80000000, mode),
-             arithmetic_expected(0x80000000), "same_negative_zeros_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0, 0x80000000, mode),
-             arithmetic_expected(round == 2 ? 0x80000000 : 0), "opposite_signed_zeros_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0xbf800000, 0xb3800000, mode),
-             arithmetic_expected(round == 2 ? 0xbf800001 : 0xbf800000), "halfway_negative_" + suffix, directory);
-        sink(fixture::arithmetic(8, 0x00800000, 0x3f000000, mode),
-             arithmetic_expected(denorm & 2 ? 0x00400000 : 0), "normal_to_subnormal_" + suffix, directory);
-        sink(fixture::arithmetic(3, 1, 1, mode),
-             arithmetic_expected(denorm == 3 ? 2 : 0), "input_subnormal_" + suffix, directory);
-        sink(fixture::arithmetic(8, 0x80000001, 0x3f000000, mode),
-             arithmetic_expected(denorm == 3 && round == 2 ? 0x80000001 : 0x80000000), "negative_tiny_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800000, 0xbf800000, mode),
-             arithmetic_expected(round == 2 ? 0x80000000 : 0), "cancellation_zero_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800000, 0x2b800000, mode),
-             arithmetic_expected(round == 1 ? 0x3f800001 : 0x3f800000), "distant_positive_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800000, 0xab800000, mode),
-             arithmetic_expected(round == 2 || round == 3 ? 0x3f7fffff : 0x3f800000), "distant_subtract_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0xbf800000, 0x2b800000, mode),
-             arithmetic_expected(round == 1 || round == 3 ? 0xbf7fffff : 0xbf800000), "distant_negative_subtract_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x00800000, 1, mode),
-             arithmetic_expected(denorm & 1 ? 0x00800001 : 0x00800000), "normal_subnormal_exact_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800000, 1, mode),
-             arithmetic_expected((denorm & 1) && round == 1 ? 0x3f800001 : 0x3f800000),
-             "saturated_alignment_positive_" + suffix, directory);
-        sink(fixture::arithmetic(3, 0x3f800000, 0x80000001, mode),
-             arithmetic_expected((denorm & 1) && (round == 2 || round == 3) ? 0x3f7fffff : 0x3f800000),
-             "saturated_alignment_subtract_" + suffix, directory);
-    }
+    // Each mode gets its own CTest timeout; the aggregate 256-packet sweep exceeded 120 s
+    // on hosted Rosetta. Keep all 16 arithmetic rails per mode and the existing timeout.
+    const uint32_t denorm = GetParam() / 4, round = GetParam() % 4;
+    const auto mode = static_cast<uint8_t>((denorm << 4) | round);
+    const auto suffix = std::to_string(mode);
+    sink(fixture::arithmetic(3, 0x3f800000, 0x33800000, mode),
+         arithmetic_expected(round == 1 ? 0x3f800001 : 0x3f800000), "halfway_positive_" + suffix,
+         directory);
+    sink(fixture::arithmetic(3, 0x3f800001, 0x33800000, mode),
+         arithmetic_expected(round == 0 || round == 1 ? 0x3f800002 : 0x3f800001),
+         "halfway_odd_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x3fffffff, 0x33800000, mode),
+         arithmetic_expected(round == 0 || round == 1 ? 0x40000000 : 0x3fffffff),
+         "halfway_carry_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x80000000, 0x80000000, mode), arithmetic_expected(0x80000000),
+         "same_negative_zeros_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0, 0x80000000, mode),
+         arithmetic_expected(round == 2 ? 0x80000000 : 0), "opposite_signed_zeros_" + suffix,
+         directory);
+    sink(fixture::arithmetic(3, 0xbf800000, 0xb3800000, mode),
+         arithmetic_expected(round == 2 ? 0xbf800001 : 0xbf800000), "halfway_negative_" + suffix,
+         directory);
+    sink(fixture::arithmetic(8, 0x00800000, 0x3f000000, mode),
+         arithmetic_expected(denorm & 2 ? 0x00400000 : 0), "normal_to_subnormal_" + suffix,
+         directory);
+    sink(fixture::arithmetic(3, 1, 1, mode), arithmetic_expected(denorm == 3 ? 2 : 0),
+         "input_subnormal_" + suffix, directory);
+    sink(fixture::arithmetic(8, 0x80000001, 0x3f000000, mode),
+         arithmetic_expected(denorm == 3 && round == 2 ? 0x80000001 : 0x80000000),
+         "negative_tiny_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x3f800000, 0xbf800000, mode),
+         arithmetic_expected(round == 2 ? 0x80000000 : 0), "cancellation_zero_" + suffix,
+         directory);
+    sink(fixture::arithmetic(3, 0x3f800000, 0x2b800000, mode),
+         arithmetic_expected(round == 1 ? 0x3f800001 : 0x3f800000), "distant_positive_" + suffix,
+         directory);
+    sink(fixture::arithmetic(3, 0x3f800000, 0xab800000, mode),
+         arithmetic_expected(round == 2 || round == 3 ? 0x3f7fffff : 0x3f800000),
+         "distant_subtract_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0xbf800000, 0x2b800000, mode),
+         arithmetic_expected(round == 1 || round == 3 ? 0xbf7fffff : 0xbf800000),
+         "distant_negative_subtract_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x00800000, 1, mode),
+         arithmetic_expected(denorm & 1 ? 0x00800001 : 0x00800000),
+         "normal_subnormal_exact_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x3f800000, 1, mode),
+         arithmetic_expected((denorm & 1) && round == 1 ? 0x3f800001 : 0x3f800000),
+         "saturated_alignment_positive_" + suffix, directory);
+    sink(fixture::arithmetic(3, 0x3f800000, 0x80000001, mode),
+         arithmetic_expected((denorm & 1) && (round == 2 || round == 3) ? 0x3f7fffff : 0x3f800000),
+         "saturated_alignment_subtract_" + suffix, directory);
 }
+INSTANTIATE_TEST_SUITE_P(AllFloatModes, FragmentFiniteArithmetic, testing::Range(0u, 16u),
+                         [](const testing::TestParamInfo<uint32_t>& info) {
+                             return "Round" + std::to_string(info.param % 4) + "Denorm" +
+                                    std::to_string(info.param / 4);
+                         });
 TEST(FragmentResourcePacket, RuntimeFailureIsStickyAndSuppressesWholePacket) {
     const auto directory = dump_directory();
     runtime_reject(fixture::arithmetic(8, 0x7f7fffff, 0x40000000, 0x30), FragmentPacketRuntimeFailure::FiniteOverflow, "finite_overflow", directory, 0);
