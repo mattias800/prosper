@@ -131,24 +131,6 @@ TEST(PortableMaskDispatch, NumericRespillAfterBarrierCannotBorrowTheOldHighRole)
     EXPECT_NE(attempt.refusal.find("pc=" + std::to_string(prefix.size() + 1)), std::string::npos)
         << attempt.refusal;
 }
-TEST(PortableMaskDispatch, ScalarStorageAloneCannotSeedABoolSlot) {
-    using namespace prosper::gpu;
-    auto code = c::halves(false, true);
-    std::vector<Rdna2Inst> ins;
-    ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
-    SpirvCompute b;
-    b.begin(1, nullptr, 64, 1, 1, 64);
-    RegState rs;
-    rs.portable_mask_half_types.slots[{18, 13}] = 0;
-    rs.portable_mask_half_types.may_slots.insert({18, 13});
-    rs.vgpr_lane_slots[18][13] = b.uconst(7);
-    PortableMaskHalfBodyScope scope(b, rs, ins);
-    SpilledMaskHalves marks;
-    SpillSlotDomains domains;
-    seed_portable_mask_dispatch(b, rs, 0, marks, domains);
-    EXPECT_FALSE(marks.defined_slots.contains({18, 13}));
-    EXPECT_FALSE(domains.contains({18, 13}));
-}
 TEST(PortableMaskDispatch, MissingHighStillPoisonsAnOverconfidentSccClassification) {
     auto code = c::missing(true);
     code.push_back(base::mov(24, 20));

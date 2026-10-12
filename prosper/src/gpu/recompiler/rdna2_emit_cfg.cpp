@@ -1638,8 +1638,6 @@ bool emit_cfg_state_machine(
         if (barrier_half_phase)
             barrier_halves->seed_entry(wave64_spilled_halves_in.front(),
                                        wave64_slot_domain_in.front());
-        seed_portable_mask_dispatch(b, initial, ins.front().pc, wave64_spilled_halves_in.front(),
-                                    wave64_slot_domain_in.front());
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,

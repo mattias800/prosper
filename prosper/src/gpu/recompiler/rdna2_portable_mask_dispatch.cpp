@@ -28,25 +28,6 @@ SpillSlotDomain domain(uint32_t role) {
 }
 } // namespace
 
-void seed_portable_mask_dispatch(const SpirvCompute& b, const RegState& rs, uint32_t pc,
-                                 SpilledMaskHalves& marks, SpillSlotDomains& domains) {
-    const auto* types = before(b, pc);
-    if (!types) return;
-    // The terminal role meet, rather than storage membership or a MAY owner, proves a current
-    // Bool definition on every path. An actual carrier and its existing marks remain necessary.
-    for (const auto& [slot, role] : types->slots) {
-        const auto vgpr = rs.vgpr_lane_mask_slots.find(slot.first);
-        if (role > 1 || vgpr == rs.vgpr_lane_mask_slots.end() ||
-            !vgpr->second.contains(slot.second) || !vgpr->second.at(slot.second) ||
-            rs.invalidated_vgpr_lane_slots.contains(slot.first) ||
-            rs.lane_slot_merge_placeholder.contains(slot) ||
-            rs.lane_slot_memory_pattern.contains(slot))
-            continue;
-        marks.defined_slots.insert(slot);
-        domains[slot] = domain(role);
-    }
-}
-
 void refine_portable_mask_dispatch(const SpirvCompute& b, const Rdna2Inst& in, bool exact_wave_scc,
                                    const SpilledVectorSourceMarks& source, SpilledMaskHalves& marks,
                                    SpillSlotDomains& domains) {
