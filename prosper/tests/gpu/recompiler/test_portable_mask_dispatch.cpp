@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -51,9 +52,10 @@ std::vector<uint32_t> crossed_slots(bool numeric_high) {
     f::reload(code, 20, 13);
     return code;
 }
-void scc_mark(const std::vector<uint32_t>& prefix, bool keep, bool memory = false) {
+void scc_mark(const std::vector<uint32_t>& prefix, bool keep, bool memory = false,
+              bool legacy = false, bool marked_legacy = false) {
     using namespace prosper::gpu;
-    const auto code = c::branch(prefix, 24);
+    const auto code = c::branch(prefix, 24, false, legacy ? 28 : 128);
     std::vector<Rdna2Inst> ins;
     ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
     SpirvCompute b;
@@ -71,15 +73,18 @@ void scc_mark(const std::vector<uint32_t>& prefix, bool keep, bool memory = fals
     marks.relayed_words.insert(kRelayedScc);
     marks.relayed_words.insert(57);
     marks.memory_words.insert(57);
+    if (marked_legacy) marks.relayed_words.insert(28);
     SpillSlotDomains domains;
     // Adversarial caller flag: the generic whole-mask classification is insufficient to clear
     // a missing or overwritten half. The exact current role proof must independently agree.
     SpilledVectorSourceMarks source;
     source.memory = memory;
+    source.scalar_relay = marked_legacy;
     refine_portable_mask_dispatch(b, compare, true, source, marks, domains);
     EXPECT_EQ(marks.relayed_words.contains(kRelayedScc), keep);
     EXPECT_TRUE(marks.relayed_words.contains(57));
     EXPECT_TRUE(marks.memory_words.contains(57));
+    if (marked_legacy) EXPECT_TRUE(marks.relayed_words.contains(28));
 }
 } // namespace
 
@@ -160,6 +165,24 @@ TEST(PortableMaskDispatch, CompleteRelayCanReplaceOnlyItsSccMark) {
 TEST(PortableMaskDispatch, MemorySourceNeverRepairsTheSccMark) {
     scc_mark(relayed(), true, true);
 }
+TEST(PortableMaskDispatch, TypedOperandAndGenuineLegacyMaskKeepTheActualComparison) {
+    auto code = relayed();
+    code.push_back(base::mov(28, 126, true));
+    values(c::branch(code, 24, false, 28), 9);
+    scc_mark(code, false, false, true);
+}
+TEST(PortableMaskDispatch, TypedOperandCannotRepairAMarkedLegacyCounterpart) {
+    auto code = relayed();
+    code.push_back(base::mov(28, 126, true));
+    scc_mark(code, true, false, true, true);
+}
+TEST(PortableMaskDispatch, OneArmLegacyHighOverwriteCannotBorrowTheOtherDomain) {
+    auto code = relayed();
+    code.push_back(base::mov(28, 126, true));
+    code.insert(code.end(), {0xbf068000u, 0xbf840001u, base::mov(29, 128)});
+    const auto attempt = f::compile(c::branch(code, 24, false, 28), true);
+    EXPECT_TRUE(attempt.module.empty());
+}
 TEST(PortableMaskDispatch, RetiredDataStorageCannotShadowCurrentBoolSlotsAcrossABarrier) {
     std::vector<uint32_t> code{0x7e060280u, base::mov(126, 128, true)};
     f::spill(code, 135, 0);
@@ -185,6 +208,29 @@ TEST(PortableMaskDispatch, OneEdgeDataSlotCannotImportTheOldHighMaskRole) {
         if (numeric) {
             const auto attempt = f::compile(completed, true);
             EXPECT_TRUE(attempt.module.empty()) << "one edge replaced HIGH with DATA";
+        } else
+            values(completed, 32);
+    }
+}
+TEST(PortableMaskDispatch, BarrierAfterLoopRequiresOneCurrentSlotRoleOnEveryBackedge) {
+    using namespace prosper::gpu;
+    for (const bool conflicting : {false, true}) {
+        auto code = f::loop_slots(conflicting);
+        std::vector<Rdna2Inst> ins;
+        ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
+        const auto reload = std::find_if(ins.begin(), ins.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360;
+        });
+        ASSERT_NE(reload, ins.end());
+        const uint32_t boundary = reload->pc;
+        code.resize(boundary + 4);
+        // The existing scalar exit targets this boundary; it now reaches the original barrier,
+        // and the unchanged backedge stays entirely in the first phase.
+        code.insert(code.begin() + boundary, 0xbf8a0000u);
+        const auto completed = c::reduction(code, 0x10);
+        if (conflicting) {
+            const auto attempt = f::compile(completed, true);
+            EXPECT_TRUE(attempt.module.empty()) << "HIGH may hold a LOW projection on the backedge";
         } else
             values(completed, 32);
     }

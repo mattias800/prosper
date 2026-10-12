@@ -1,8 +1,11 @@
 #include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
+#include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
+#include <initializer_list>
 #include <utility>
 
 namespace prosper::gpu {
@@ -78,7 +81,13 @@ void refine_portable_mask_dispatch(const SpirvCompute& b, const Rdna2Inst& in, b
         const auto& operand = in.src[k];
         if (operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special) continue;
         const int root = operand.value;
-        if (!types->may_words.contains(root) && !types->may_words.contains(root + 1)) continue;
+        if (!types->may_words.contains(root) && !types->may_words.contains(root + 1)) {
+            // The typed operand cannot repair a different legacy operand. The caller's exact
+            // classification and that operand's existing per-word ownership must both survive.
+            for (int word : {root, root + 1})
+                if (marks.relayed_words.contains(word) || marks.memory_words.contains(word)) return;
+            continue;
+        }
         symbolic = true;
         if (!pair(*types, root)) return;
     }
