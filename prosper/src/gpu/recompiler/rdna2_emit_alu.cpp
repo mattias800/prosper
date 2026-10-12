@@ -1448,6 +1448,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             rs.sreg_bool.erase(in.dst.value);
             rs.sreg_bool_narrowed.erase(in.dst.value);
             rs.sreg_bool_b32.erase(in.dst.value);
+            // A numeric half starts a new physical generation. A complete VCC self-copy must
+            // not recover the departed B64 predicate when numeric uniformity is unproved.
+            // An independently tagged B32 low mask does not own the adjacent high DATA word.
+            if (in.dst.value == 106 || (in.dst.value == 107 && !rs.sreg_bool_b32.contains(106)))
+                retire_data_only_b64_mask(rs, 106);
             switch (in.opcode) {
                 case 0x03: {                                // s_mov_b32
                     d = a;

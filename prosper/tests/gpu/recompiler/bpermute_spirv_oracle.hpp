@@ -741,7 +741,8 @@ struct Interpreter {
                       else if (b->second == 29)
                           v = {lane};
                       else if ((b->second == 40 || b->second == 41) &&
-                               native_subgroup_width == 64 && count == 64)
+                               (native_subgroup_width == 32 || native_subgroup_width == 64) &&
+                               count == native_subgroup_width)
                           v = {b->second == 40 ? 0u : lane};
                       else
                           fail("unsupported builtin");
@@ -792,7 +793,8 @@ struct Interpreter {
                   continue;
               }
               if (collective.op == 334 || collective.op == 335 || collective.op == 339) {
-                  if (native_subgroup_width != 64 || count != 64 || collective.a.size() != 4)
+                  if ((native_subgroup_width != 32 && native_subgroup_width != 64) ||
+                      count != native_subgroup_width || collective.a.size() != 4)
                       fail("unproved native subgroup");
                   const auto& a = collective.a;
                   std::vector<uint32_t> result(collective.op == 339 ? 4 : 1);

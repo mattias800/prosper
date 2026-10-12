@@ -551,3 +551,69 @@ TEST(NativeNumericVccMove, TheDispatcherRetainsItsUntouchedDriverWordAsOrdinaryD
         values(p, std::vector<uint32_t>(64, path ? 1u : 255u), c, true);
     }
 }
+
+namespace {
+std::vector<uint32_t> partial_vcc_self_copy(bool local, bool replace = false) {
+    auto p = local ? lane_local_pair() : numeric(1, 0);
+    const auto at = std::find(p.begin(), p.end(), mov(106, 14, true));
+    const auto pos = at - p.begin();
+    p.erase(at);
+    std::vector<uint32_t> sequence{mov(106, 14), mov(107, 128)};
+    if (replace) sequence.push_back(mov(106, 129));
+    sequence.push_back(mov(106, 106, true));
+    p.insert(p.begin() + pos, sequence.begin(), sequence.end());
+    return p;
+}
+std::vector<uint32_t> high_vcc_self_copy(bool local, bool replace = false) {
+    auto p = numeric(1, 0);
+    const auto use = std::find(p.begin(), p.end(), mov(126, 106, true));
+    std::vector<uint32_t> sequence;
+    if (local) sequence.insert(sequence.end(), {0x4a040081u, 0x7e1c0502u});
+    sequence.push_back(mov(107, local ? 14 : 129));
+    if (replace) sequence.push_back(mov(107, 129));
+    sequence.push_back(mov(106, 106, true));
+    p.insert(use, sequence.begin(), sequence.end());
+    return p;
+}
+}   // namespace
+TEST(NativeNumericVccMove, PartialLaneLocalWordsCannotRecoverTheStaleMaskBySelfCopy) {
+    refuses(partial_vcc_self_copy(true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, GenuinePartialWordsKeepTheirCurrentOneLaneValue) {
+    values(partial_vcc_self_copy(false), expected(1));
+}
+TEST(NativeNumericVccMove, CurrentLowReplacementRetiresThePartialLaneLocalGeneration) {
+    values(partial_vcc_self_copy(true, true), expected(1));
+}
+TEST(NativeNumericVccMove, AHighLaneLocalWordCannotKeepThePreviousCompletePredicate) {
+    refuses(high_vcc_self_copy(true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, GenuineHighReplacementKeepsBothCurrentLaneBits) {
+    values(high_vcc_self_copy(false), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, CurrentHighReplacementRetiresThePartialLaneLocalGeneration) {
+    values(high_vcc_self_copy(true, true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, ASeparateHighDataWordPreservesTheCurrentWave32LowPredicate) {
+    auto c = prosper::test::native_execution_launch();
+    c.local_x = c.wave_size = c.native_subgroup_size = 32;
+    prosper::test::complete_compute_launch(c);
+    for (bool write_high : {false, true}) {
+        std::vector<uint32_t> p{0x7e060280u, 0x7e020280u, 0x7d880088u};
+        if (write_high) p.push_back(mov(107, 129));
+        finish(p);
+        const auto r = compile(p, c);
+        ASSERT_FALSE(r.module.empty()) << r.reasons;
+        ASSERT_TRUE(has_switch(r.module));
+        bpermute_oracle::Interpreter missing_profile(r.module);
+        EXPECT_TRUE(missing_profile.run(32, std::vector<uint32_t>(32, 0xdeadbeef)).empty());
+        EXPECT_FALSE(missing_profile.error.empty());
+        bpermute_oracle::Interpreter vm(r.module);
+        vm.native_subgroup_width = 32;
+        const auto got = vm.run(32, std::vector<uint32_t>(32, 0xdeadbeef));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(got.size(), 32u);
+        for (uint32_t lane = 0; lane < 32; ++lane)
+            EXPECT_EQ(got[lane], lane < 8 ? 1u : 0u) << "lane " << lane;
+    }
+}
