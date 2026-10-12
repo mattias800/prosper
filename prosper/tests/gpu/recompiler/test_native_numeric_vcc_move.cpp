@@ -608,6 +608,11 @@ TEST(NativeNumericVccMove, ASeparateHighDataWordPreservesTheCurrentWave32LowPred
         bpermute_oracle::Interpreter missing_profile(r.module);
         EXPECT_TRUE(missing_profile.run(32, std::vector<uint32_t>(32, 0xdeadbeef)).empty());
         EXPECT_FALSE(missing_profile.error.empty());
+        bpermute_oracle::Interpreter unknown_base(r.module);
+        unknown_base.native_subgroup_width = 32;
+        EXPECT_TRUE(unknown_base.run_buffers(32, {{3, std::vector<uint32_t>(32, 0xdeadbeef)}}, 3, 1)
+                        .empty());
+        EXPECT_EQ(unknown_base.error, "unproved native32 instance");
         bpermute_oracle::Interpreter vm(r.module);
         vm.native_subgroup_width = 32;
         const auto got = vm.run(32, std::vector<uint32_t>(32, 0xdeadbeef));

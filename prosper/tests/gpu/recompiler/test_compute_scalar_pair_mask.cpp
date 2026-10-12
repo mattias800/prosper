@@ -940,8 +940,9 @@ TEST(ScalarPairMask, Wave64VccLogicalReadingAMaskOnlySiblingStillRefuses) {
 
 // A fabricated source marks MOV's numeric destination, but MOV cannot replace the genuine SCC
 // consumed by the following select. Pin B32 and B64 independently of the per-word logical proof.
+// Seed both VCC halves genuinely so the later marked logical result owns the refusal site.
 TEST(ScalarPairMask, Wave64VccLogicalReadingSccPreservedByAMarkedMoveCompiles) {
-    const Words fresh_compare = {0xbeea0387u, 0xbf07836au};
+    const Words fresh_compare = {0xbeea0487u, 0xbf07836au};
     const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6bfdu};
     for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
         const Words marked_move = {move};
@@ -954,7 +955,7 @@ TEST(ScalarPairMask, Wave64VccLogicalReadingSccPreservedByAMarkedMoveCompiles) {
 }
 
 TEST(ScalarPairMask, Wave64VccLogicalReadingAMarkedMoveResultStillRefuses) {
-    const Words fresh_compare = {0xbeea0387u, 0xbf07836au};
+    const Words fresh_compare = {0xbeea0487u, 0xbf07836au};
     // The logical reads the move's marked s2 rather than SCC, so numeric authority stays absent.
     const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6b02u};
     for (uint32_t move : {0xbe820304u, 0xbe820404u}) {

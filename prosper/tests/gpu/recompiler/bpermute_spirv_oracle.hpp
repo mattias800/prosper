@@ -646,6 +646,10 @@ struct Interpreter {
       try {
           if (!error.empty()) fail(error);
           if (!count || count > 1024) fail("invalid invocation count");
+          // The explicit Wave32 vote/builtin fixture is one full subgroup at workgroup zero.
+          // Other bases need their own authenticated local-size/GID contract.
+          if (native_subgroup_width == 32 && (count != 32 || workgroup_x != 0))
+              fail("unproved native32 instance");
           storage = 0;
           shared.clear();
           readonly_storage.clear();
