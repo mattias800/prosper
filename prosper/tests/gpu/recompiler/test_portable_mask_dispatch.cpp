@@ -5,6 +5,7 @@
 #include "fixtures/portable_mask_half.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
@@ -257,7 +258,7 @@ TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
         b.begin(1, nullptr, 64, 1, 1, 64);
         b.portable_mask_common_partial_entry = producer_partial;
         b.diagnostic = {RecompileDiagnosticStage::Compute,
-                        0x493506000000ull + mode + 5u * compare + 10u * producer_partial};
+                        0x493506000000ull + mode + 5ull * compare + 10ull * producer_partial};
         RegState rs;
         rs.exec = b.btrue();
         rs.vcc = rs.scc = b.bfalse();
