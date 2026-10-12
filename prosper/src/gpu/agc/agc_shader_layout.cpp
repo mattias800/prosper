@@ -3,6 +3,7 @@
 #include "diagnostics/diag_clock.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include "diagnostics/env_submit.hpp"   // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include <algorithm>
@@ -653,7 +654,8 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     // Mid-chain windows, contradictory ranges and anything the tail derivation cannot
     // place keep the explicit refusal below.
     if (d.type == 10 && d.base_array == 0 && d.base_level == 0 && d.base_level != d.last_level) {
-        bool placeable = fi.bytes_per_block && fi.block_width <= 1 && d.last_level <= d.max_mip;
+        bool placeable = fi.bytes_per_block && fi.block_width <= 1 && d.last_level <= d.max_mip &&
+                         sampled_mip_chain_format_supported(fi.format, fi.num_components, true);
         TiledVolumeTailLayout first{};
         for (uint32_t level = 0; placeable && level <= d.last_level; ++level) {
             const TiledVolumeTailLayout tlayout = tiled_volume_tail_layout(

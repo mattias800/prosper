@@ -5,6 +5,7 @@
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <algorithm>
@@ -1331,6 +1332,105 @@ TEST(BuildShaderResources, VolumeTailLayout) {
         << "a volume deeper than the tail block does not place";
 }
 
+// #5019: geometry-only chain admission exposed unsupported formats as one-level images,
+// so explicit LOD sampled the wrong guest level. These descriptors exercise both view
+// admission and the resource table consumed by the backend, rather than only the planner.
+static ShaderResourceTable build_volume_test_resources(const uint32_t descriptor[8]) {
+    AgcShaderSharp sharp{};
+    AgcShaderUserData user_data{};
+    user_data.sharp_resource_offset[0] = &sharp;
+    user_data.sharp_resource_count[0] = 1;
+    AgcShaderHeader shader{};
+    shader.file_header = 0x34333231u;
+    shader.version = 0x18;
+    shader.type = 1;
+    shader.user_data = &user_data;
+    return build_shader_resources(shader, descriptor, 8);
+}
+
+TEST(BuildShaderResources, VolumeTailChainRejectsUnmaterializedFormats) {
+    for (const uint32_t format : {13u, 29u, 71u}) {
+        SCOPED_TRACE(format);
+        Gen5ImageFormatInfo fi;
+        ASSERT_TRUE(gen5_image_format(format, &fi)) << "Float16 fixture format maps";
+        ASSERT_EQ(fi.format, DataFormat::Float16);
+        uint32_t descriptor[8];
+        make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+        descriptor[3] |= 0xFACu | (4u << 16);
+        descriptor[5] |= 4u << 4;
+        const DecodedImageDescriptor decoded = decode_image_descriptor(descriptor);
+        ASSERT_EQ(decoded.base_level, 0u);
+        ASSERT_EQ(decoded.last_level, 4u);
+        ASSERT_EQ(decoded.max_mip, 4u);
+        ASSERT_EQ(image_descriptor_reject_reason(decoded), nullptr)
+            << "the mapped five-level descriptor is valid before view admission";
+        for (uint32_t level = 0; level <= decoded.last_level; ++level)
+            ASSERT_TRUE(
+                tiled_volume_tail_layout(16, 16, 16, fi.bytes_per_block, 9, 4, level).supported)
+                << "tail geometry alone admits every level, including " << level;
+        EXPECT_FALSE(image_base_level_view(decoded, fi).supported)
+            << "an unmaterialized Float16 chain must not become a one-level sampled view";
+        EXPECT_EQ(build_volume_test_resources(descriptor).by_sgpr_base(0), nullptr)
+            << "unsupported chain must not reach the backend as a texture resource";
+    }
+}
+
+TEST(BuildShaderResources, VolumeTailChainPreservesSampledFormats) {
+    for (const uint32_t format : {1u, 5u, 7u, 11u, 14u, 22u}) {
+        SCOPED_TRACE(format);
+        Gen5ImageFormatInfo fi;
+        ASSERT_TRUE(gen5_image_format(format, &fi)) << "R8 or native fixture format maps";
+        uint32_t descriptor[8];
+        make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+        descriptor[3] |= 0xFACu | (4u << 16);
+        descriptor[5] |= 4u << 4;
+        const DecodedImageView view =
+            image_base_level_view(decode_image_descriptor(descriptor), fi);
+        ASSERT_TRUE(view.supported) << "materializable chain keeps its level-zero view";
+        ASSERT_TRUE(view.in_mip_tail);
+        const ShaderResourceTable resources = build_volume_test_resources(descriptor);
+        const ShaderResource* resource = resources.by_sgpr_base(0);
+        ASSERT_NE(resource, nullptr) << "supported descriptor publishes a real resource";
+        EXPECT_EQ(resource->format, fi.format);
+        EXPECT_EQ(resource->num_components, fi.num_components);
+        EXPECT_EQ(resource->declared_mip_levels, 5u);
+        EXPECT_EQ(resource->img_dim, 2u);
+        EXPECT_EQ(resource->depth, 16u);
+        EXPECT_EQ(shader_resource_compute_mip_chain_levels(*resource), 5u)
+            << "every admitted level is materializable, including R8 broadcast";
+        const MipChainPlan plan = shader_resource_mip_chain_plan(*resource);
+        ASSERT_TRUE(plan.valid);
+        EXPECT_EQ(plan.allocation_bytes, 65536u);
+    }
+}
+
+TEST(BuildShaderResources, VolumeTailPreservesFloat16SingleLevelViews) {
+    for (const uint32_t format : {13u, 29u, 71u}) {
+        for (const uint32_t level : {0u, 2u}) {
+            SCOPED_TRACE(format);
+            SCOPED_TRACE(level);
+            Gen5ImageFormatInfo fi;
+            ASSERT_TRUE(gen5_image_format(format, &fi));
+            uint32_t descriptor[8];
+            make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+            descriptor[3] |= 0xFACu | (level << 12) | (level << 16);
+            descriptor[5] |= 4u << 4;
+            const DecodedImageView view =
+                image_base_level_view(decode_image_descriptor(descriptor), fi);
+            ASSERT_TRUE(view.supported) << "single-level Float16 placement remains supported";
+            const ShaderResourceTable resources = build_volume_test_resources(descriptor);
+            const ShaderResource* resource = resources.by_sgpr_base(0);
+            ASSERT_NE(resource, nullptr);
+            EXPECT_EQ(resource->format, DataFormat::Float16);
+            EXPECT_EQ(resource->declared_mip_levels, 1u);
+            EXPECT_EQ(resource->width, 16u >> level);
+            EXPECT_EQ(resource->height, 16u >> level);
+            EXPECT_EQ(resource->depth, 16u >> level);
+            EXPECT_EQ(shader_resource_compute_mip_chain_levels(*resource), 1u);
+        }
+    }
+}
+
 // The six single-level views over that pyramid decode to supported views at the proven
 // coordinates, with the allocation base unshifted and the level extent selected.
 TEST(BuildShaderResources, VolumeTailView) {
@@ -1359,8 +1459,7 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_EQ(v.mip_tail_x, kTailX[level]) << "proven tail_x";
         EXPECT_EQ(v.mip_tail_y, kTailY[level]) << "proven tail_y";
     }
-    // A multi-level chain view stays refused: per-level materialization needs volume
-    // support in mip_chain_plan, which does not exist yet.
+    // Mid-chain windows stay refused: the volume plan materializes only base-zero chains.
     {
         uint32_t t[8];
         make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
