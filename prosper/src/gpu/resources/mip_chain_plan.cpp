@@ -15,6 +15,14 @@ uint32_t full_mip_chain_levels(uint32_t width, uint32_t height) {
     return levels;
 }
 
+uint32_t full_volume_mip_chain_levels(uint32_t width, uint32_t height, uint32_t depth) {
+    if (!width || !height || !depth) return 0;
+    uint32_t levels = 1;
+    for (uint32_t extent = std::max(std::max(width, height), depth); extent > 1u; extent >>= 1)
+        ++levels;
+    return levels;
+}
+
 namespace {
 
 // The sampled formats whose compute upload is a straight per-texel copy. Anything that widens,
@@ -55,14 +63,22 @@ MipChainPlan compute_chain_plan(const ShaderResource& resource) {
     // Cheapest possible rejection first. This runs per resource on the compile-key path, which runs
     // for every dispatch, and almost every texture declares a single level -- so the common answer
     // must not reach the plan's allocation arithmetic.
-    if (resource.declared_mip_levels < 2u || resource.cls != ResourceClass::Texture)
-        return {};
+    if (resource.declared_mip_levels < 2u || resource.cls != ResourceClass::Texture) return {};
     const uint32_t components = resource.num_components ? resource.num_components : 1u;
-    if (!native_straight_copy_sampled_format(resource.format, components)) return {};
+    // Thick-3D tail chains uploading through the volume path (#4842). R8 is excluded from the
+    // straight-copy whitelist below (the backend broadcasts it to RGBA), but the volume
+    // uploader repeats that exact broadcast per level, so the count and the cascade agree the
+    // same way they do for native formats. Narrow on purpose: Unorm8 x1, tail-provenance,
+    // base-zero views only; the geometry plan still proves every level before admitting.
+    const bool volume_tail_r8_chain =
+        resource.img_dim == 2u && resource.format == DataFormat::Unorm8 && components == 1u &&
+        resource.in_mip_tail && !resource.layer_stride_bytes && !resource.layer_mip_offset_bytes &&
+        resource.mip_chain_base_level == 0u;
+    if (!volume_tail_r8_chain && !native_straight_copy_sampled_format(resource.format, components))
+        return {};
     if (resource.depth_compare) return {};
     const uint32_t component_bytes = data_format_bytes(resource.format);
-    if (!component_bytes ||
-        component_bytes * components != resource.mip_chain_bytes_per_block)
+    if (!component_bytes || component_bytes * components != resource.mip_chain_bytes_per_block)
         return {};
     return shader_resource_mip_chain_plan(resource);
 }
@@ -103,12 +119,15 @@ MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_
     // the whole resource class), and the agreement between the two derivations is PROVEN below
     // rather than assumed: if they named different bytes, `gpu_addr` and `levels[0]` would disagree
     // about where the selected level is.
-    // A layered or volume view selects one slice of a per-slice chain, and a compressed base is not
-    // ordinary tiled texels at any level. Both remain fail-closed.
-    if (resource.depth != 1u || resource.layer_stride_bytes || resource.layer_mip_offset_bytes)
-        return plan;
+    // A layered view selects one slice of a per-slice chain, and a compressed base is not
+    // ordinary tiled texels at any level. Both remain fail-closed. Volumes take their own
+    // branch below: a 3D view's chain lives in one shared tail block, so `depth != 1` is the
+    // volume shape there, not a slice count.
+    if (resource.img_dim != 1u && resource.img_dim != 5u && resource.img_dim != 2u) return plan;
+    const bool volume = resource.img_dim == 2u;
+    if (!volume && resource.depth != 1u) return plan;
+    if (resource.layer_stride_bytes || resource.layer_mip_offset_bytes) return plan;
     if (resource.compression_enabled || resource.metadata_addr) return plan;
-    if (resource.img_dim != 1u && resource.img_dim != 5u) return plan;
 
     const uint32_t element_width = resource.mip_chain_element_width;
     const uint32_t element_height = resource.mip_chain_element_height;
@@ -122,10 +141,12 @@ MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_
     // For an uncompressed format this equality is what proves the element grid and the texel extent
     // agree. A block format proves the same through its 4x4 grid (see the power-of-two note above).
     if (block_bytes) {
-        if (bytes_per_block != block_bytes ||
-            element_width != (resource.width + 3u) / 4u ||
-            element_height != (resource.height + 3u) / 4u ||
-            !std::has_single_bit(resource.width) || !std::has_single_bit(resource.height))
+        // BCn volume tails stay refused: the tail derivation is in elements while a block
+        // format packs 4x4 texels per unit, and no volume-tail block reader exists.
+        if (volume) return plan;
+        if (bytes_per_block != block_bytes || element_width != (resource.width + 3u) / 4u ||
+            element_height != (resource.height + 3u) / 4u || !std::has_single_bit(resource.width) ||
+            !std::has_single_bit(resource.height))
             return plan;
     } else if (element_width != resource.width || element_height != resource.height) {
         return plan;
@@ -135,40 +156,71 @@ MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_
     // does not yet reproduce; every measured multi-level guest texture here is tiled.
     if (!tile_mode_is_tiled(resource.tile_mode)) return plan;
 
-    const uint32_t full = full_mip_chain_levels(resource.width, resource.height);
+    const uint32_t full =
+        volume ? full_volume_mip_chain_levels(resource.width, resource.height, resource.depth)
+               : full_mip_chain_levels(resource.width, resource.height);
     if (!full) return plan;
     const uint32_t level_count = std::min(resource.declared_mip_levels, full);
     if (level_count < 2u) return plan;
 
-    const size_t allocation_bytes = tiled_mip_chain_bytes(
-        element_width, element_height, bytes_per_block, resource.tile_mode, max_mip);
-    if (!allocation_bytes) return plan;
+    // Volumes pack every placed level into the allocation's first 64 KiB block; the byte
+    // span is that block, not a 2D chain byte count.
+    size_t allocation_bytes = 0;
+    if (!volume) {
+        allocation_bytes = tiled_mip_chain_bytes(element_width, element_height, bytes_per_block,
+                                                 resource.tile_mode, max_mip);
+        if (!allocation_bytes) return plan;
+    }
 
     plan.levels.resize(level_count);
     for (uint32_t level = 0; level < level_count; ++level) {
-        const TiledMipLevelLayout layout = tiled_mip_level_layout(
-            element_width, element_height, bytes_per_block, resource.tile_mode, max_mip, level);
-        if (!layout.supported) return {};
         MipChainLevel& out = plan.levels[level];
         out.width = std::max(resource.width >> level, 1u);
         out.height = std::max(resource.height >> level, 1u);
-        out.in_tail = layout.in_tail;
-        if (layout.in_tail) {
-            // Tail levels are addressed by element coordinate inside the allocation's first block.
-            if (!layout.tail_block_bytes) return {};
+        if (volume) {
+            // resource.depth is the allocation's level-zero depth: the base-level-only rule
+            // above means the selected level IS level zero, so no separate element-depth
+            // provenance is needed the way the shifted width/height are.
+            out.depth = std::max(resource.depth >> level, 1u);
+            const TiledVolumeTailLayout tlayout =
+                tiled_volume_tail_layout(element_width, element_height, resource.depth,
+                                         bytes_per_block, resource.tile_mode, max_mip, level);
+            if (!tlayout.supported || !tlayout.tail_block_bytes) return {};
+            if (!allocation_bytes) {
+                allocation_bytes = tlayout.tail_block_bytes;
+            } else if (allocation_bytes != tlayout.tail_block_bytes) {
+                return {};
+            }
+            out.in_tail = true;
             out.byte_offset = 0;
-            out.byte_size = layout.tail_block_bytes;
-            out.tail_x = layout.tail_x;
-            out.tail_y = layout.tail_y;
-            out.tail_block_bytes = layout.tail_block_bytes;
+            out.byte_size = tlayout.tail_block_bytes;
+            out.tail_x = tlayout.tail_x;
+            out.tail_y = tlayout.tail_y;
+            out.tail_block_bytes = tlayout.tail_block_bytes;
         } else {
-            out.byte_offset = layout.byte_offset;
-            out.byte_size = block_bytes
-                ? tiled_elements_bytes((out.width + 3u) / 4u, (out.height + 3u) / 4u,
-                                       bytes_per_block, resource.tile_mode)
-                : tiled_surface_bytes(out.width, out.height, resource.tile_mode, 0,
-                                      bytes_per_block);
-            if (!out.byte_size) return {};
+            const TiledMipLevelLayout layout = tiled_mip_level_layout(
+                element_width, element_height, bytes_per_block, resource.tile_mode, max_mip, level);
+            if (!layout.supported) return {};
+            out.in_tail = layout.in_tail;
+            if (layout.in_tail) {
+                // Tail levels are addressed by element coordinate inside the allocation's
+                // first block.
+                if (!layout.tail_block_bytes) return {};
+                out.byte_offset = 0;
+                out.byte_size = layout.tail_block_bytes;
+                out.tail_x = layout.tail_x;
+                out.tail_y = layout.tail_y;
+                out.tail_block_bytes = layout.tail_block_bytes;
+            } else {
+                out.byte_offset = layout.byte_offset;
+                out.byte_size =
+                    block_bytes
+                        ? tiled_elements_bytes((out.width + 3u) / 4u, (out.height + 3u) / 4u,
+                                               bytes_per_block, resource.tile_mode)
+                        : tiled_surface_bytes(out.width, out.height, resource.tile_mode, 0,
+                                              bytes_per_block);
+                if (!out.byte_size) return {};
+            }
         }
         if (out.byte_offset > allocation_bytes ||
             out.byte_size > allocation_bytes - out.byte_offset)

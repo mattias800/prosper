@@ -1616,4 +1616,121 @@ TEST(ShaderResources, Contract) {
               "#3134: a tail chain's owned allocation is the block itself, with no prefix");
     }
 
+    // ---- #4842: a 3D chain whose levels ALL live inside one thick-3D tail block ------
+    // Black Flag's 32^3 R8 six-level pyramid (SW_64KB_S) packs every level into the
+    // allocation's first 64 KiB block at carve-proven coordinates (see VolumeTailLayout*:
+    // those arms pin the RULE with hand tables; this section pins the PLAN plumbing --
+    // level counts, per-level depths, the R8 carve-out and the refusal arms -- against the
+    // same derivation, the way the #3134 section above leans on tiled_mip_level_layout).
+    {
+        constexpr uint32_t kWidth = 32, kHeight = 32, kDepth = 32, kBytesPerBlock = 1;
+        constexpr uint32_t kTile = static_cast<uint32_t>(TileMode::Sw64KbS);
+        constexpr uint32_t kMaxMip = 5;   // 32 -> 1 is six levels
+        const TiledVolumeTailLayout vol_level0 =
+            tiled_volume_tail_layout(kWidth, kHeight, kDepth, kBytesPerBlock, kTile, kMaxMip, 0);
+        const TiledVolumeTailLayout vol_level1 =
+            tiled_volume_tail_layout(kWidth, kHeight, kDepth, kBytesPerBlock, kTile, kMaxMip, 1);
+        // The premise: level zero really is tail-packed, and the block is shared.
+        CHECK(vol_level0.supported && vol_level1.supported &&
+                  vol_level0.tail_block_bytes == 65536u && vol_level1.tail_block_bytes == 65536u,
+              "#4842: the 32^3 R8 pyramid really packs into one shared 64 KiB tail block");
+        CHECK(full_volume_mip_chain_levels(32, 32, 32) == 6u &&
+                  full_volume_mip_chain_levels(16, 16, 16) == 5u &&
+                  full_volume_mip_chain_levels(32, 32, 64) == 7u &&
+                  full_volume_mip_chain_levels(0, 32, 32) == 0u,
+              "#4842: the volume full-chain count folds the depth axis in");
+
+        ShaderResource volume{};
+        volume.cls = ResourceClass::Texture;
+        volume.format = DataFormat::Unorm8;   // Black Flag's R8
+        volume.num_components = 1;
+        volume.img_dim = 2;
+        volume.width = kWidth;
+        volume.height = kHeight;
+        volume.depth = kDepth;
+        volume.tile_mode = kTile;
+        volume.declared_mip_levels = kMaxMip + 1;
+        volume.mip_chain_element_width = kWidth;
+        volume.mip_chain_element_height = kHeight;
+        volume.mip_chain_bytes_per_block = kBytesPerBlock;
+        volume.mip_chain_max_level = kMaxMip;
+        volume.mip_chain_base_level = 0;
+        volume.in_mip_tail = true;
+        volume.mip_tail_offset = static_cast<uint32_t>(vol_level0.byte_offset);
+        volume.mip_tail_bytes = vol_level0.tail_block_bytes;
+        volume.mip_tail_x = vol_level0.tail_x;
+        volume.mip_tail_y = vol_level0.tail_y;
+        volume.gpu_addr = 0x4066a90000ull;   // the carve base, unshifted
+        volume.size = kWidth * kHeight * kDepth * kBytesPerBlock;
+
+        const MipChainPlan volume_plan = shader_resource_mip_chain_plan(volume);
+        CHECK(volume_plan.valid && volume_plan.level_count == kMaxMip + 1 &&
+                  volume_plan.allocation_bytes == 65536u,
+              "#4842: an all-in-tail volume chain plans every declared level in one block");
+        CHECK(shader_resource_compute_mip_chain_levels(volume) == kMaxMip + 1,
+              "#4842: the compute backend materializes the R8 volume chain (carve-out)");
+        bool volume_levels_placed = volume_plan.valid;
+        for (size_t level = 0; volume_plan.valid && level < volume_plan.levels.size(); ++level) {
+            const MipChainLevel& entry = volume_plan.levels[level];
+            const TiledVolumeTailLayout expect =
+                tiled_volume_tail_layout(kWidth, kHeight, kDepth, kBytesPerBlock, kTile, kMaxMip,
+                                         static_cast<uint32_t>(level));
+            volume_levels_placed &= entry.in_tail && entry.byte_offset == 0u &&
+                                    entry.byte_size == 65536u && entry.tail_block_bytes == 65536u &&
+                                    entry.width == (kWidth >> level ? kWidth >> level : 1u) &&
+                                    entry.height == (kHeight >> level ? kHeight >> level : 1u) &&
+                                    entry.depth == (kDepth >> level ? kDepth >> level : 1u) &&
+                                    entry.tail_x == expect.tail_x && entry.tail_y == expect.tail_y;
+        }
+        CHECK(volume_levels_placed,
+              "#4842: every volume level carries its shifted extent and in-block origin");
+        // Reject-by-default: the R8 carve-out is narrow and the geometry refuses the rest.
+        const auto volume_levels_after = [&](void (*mutate)(ShaderResource&)) {
+            ShaderResource copy = volume;
+            mutate(copy);
+            return shader_resource_compute_mip_chain_levels(copy);
+        };
+        CHECK(volume_levels_after([](ShaderResource& r) { r.tile_mode = 5; }) == 1,
+              "#4842: a Sw4KbS volume chain is declined (different tail dims, unmeasured)");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.mip_chain_base_level = 1; }) == 1,
+              "#4842: a shifted-BASE volume window is declined rather than rebased");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.img_dim = 1; }) == 1,
+              "#4842: a 2D reading of volume bytes is declined (depth is not a layer)");
+        CHECK(volume_levels_after([](ShaderResource& r) {
+                  r.width = 512;
+                  r.height = 512;
+                  r.depth = 512;
+                  r.mip_chain_element_width = 512;
+                  r.mip_chain_element_height = 512;
+              }) == 1,
+              "#4842: a non-tail volume chain is declined (disjoint blocks, unmeasured)");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.in_mip_tail = false; }) == 1,
+              "#4842: denying the tail for a tail-packed volume chain is declined");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.format = DataFormat::Float16; }) == 1,
+              "#4842: a converting format keeps one level (carve-out is R8-only)");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.declared_mip_levels = 1; }) == 1,
+              "#4842: a single-level volume T# keeps the historical single-level image");
+        CHECK(volume_levels_after([](ShaderResource& r) { r.cls = ResourceClass::StorageImage; }) ==
+                  1,
+              "#4842: a volume storage image keeps one level (writeback is per level)");
+        // The owned span is the block itself: prefix zero, total 64 KiB, same contract as
+        // the #3134 tail arm above.
+        uint64_t vol_prefix = 1, vol_total = 0;
+        CHECK(shader_resource_compute_mip_chain_allocation(volume, vol_prefix, vol_total) &&
+                  vol_prefix == 0u && vol_total == 65536u,
+              "#4842: a volume tail chain's owned allocation is the block, no prefix");
+        std::vector<uint8_t> vol_block(65536, 0u);
+        ShaderResource vol_host = volume;
+        vol_host.host_data = vol_block.data();
+        vol_host.host_data_size = vol_block.size();
+        vol_host.host_data_prefix_bytes = 0;
+        CHECK(shader_resource_compute_mip_chain_levels(vol_host) == kMaxMip + 1,
+              "#4842: a host-backed resource owning the whole block materializes the chain");
+        ShaderResource vol_short = volume;
+        vol_short.host_data = vol_block.data();
+        vol_short.host_data_size = vol_block.size() - 1u;
+        vol_short.host_data_prefix_bytes = 0;
+        CHECK(shader_resource_compute_mip_chain_levels(vol_short) == 1,
+              "#4842: one byte short of the block declines");
+    }
 }

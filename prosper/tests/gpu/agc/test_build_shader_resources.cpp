@@ -1370,12 +1370,8 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
             << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
     }
-    // A base-zero multi-level chain view stays refused as well: without volume support
-    // in mip_chain_plan the backend materializes one level per 3D binding, while the
-    // recompiler lowers explicit-LOD 3D samples with the guest LOD against what it
-    // assumes is a single-level image (rdna2_emit_alu dim3d). Admitting this unshifted
-    // would bind level zero while declaring six levels, so a guest LOD above zero
-    // addresses a level that was never created.
+    // A base-zero full chain over the proven pyramid admits with the level-zero
+    // placement and the allocation-wide provenance the volume chain plan reads.
     {
         uint32_t t[8];
         make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
@@ -1385,8 +1381,58 @@ TEST(BuildShaderResources, VolumeTailView) {
         const DecodedImageDescriptor chain0 = decode_image_descriptor(t);
         ASSERT_TRUE(chain0.base_level == 0 && chain0.last_level == 5 && chain0.max_mip == 5)
             << "fixture is a base-zero six-level chain, not a single level";
-        EXPECT_FALSE(image_base_level_view(chain0, fi).supported)
-            << "BASE_LEVEL=0 LAST_LEVEL=5 chain stays refused (no volume chain plan)";
+        const DecodedImageView v0 = image_base_level_view(chain0, fi);
+        EXPECT_TRUE(v0.supported) << "BASE_LEVEL=0 LAST_LEVEL=5 chain admits (planned)";
+        EXPECT_EQ(v0.base, 0x4066a90000ull) << "chain view keeps the allocation base";
+        EXPECT_EQ(v0.width, 32u) << "chain view selects the level-zero extent";
+        EXPECT_EQ(v0.height, 32u) << "chain view selects the level-zero extent";
+        EXPECT_EQ(v0.depth, 32u) << "chain view selects the level-zero depth";
+        EXPECT_TRUE(v0.in_mip_tail) << "chain view lives in the shared block";
+        EXPECT_EQ(v0.mip_tail_x, 32u) << "chain view carries the level-zero tail origin";
+        EXPECT_EQ(v0.mip_tail_y, 0u) << "chain view carries the level-zero tail origin";
+        EXPECT_EQ(v0.chain_element_width, 32u) << "chain provenance names the allocation";
+        EXPECT_EQ(v0.chain_element_height, 32u) << "chain provenance names the allocation";
+        EXPECT_EQ(v0.chain_bytes_per_block, 1u) << "chain provenance names the texel width";
+        EXPECT_EQ(v0.chain_max_mip, 5u) << "chain provenance names the allocation length";
+        EXPECT_EQ(v0.chain_base_level, 0u) << "chain provenance names the selected base";
+    }
+    // A base-zero partial chain (fewer declared levels than the allocation holds) admits
+    // the same way: the plan materializes the declared window.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (2u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor partial = decode_image_descriptor(t);
+        ASSERT_TRUE(partial.base_level == 0 && partial.last_level == 2 && partial.max_mip == 5)
+            << "fixture is a base-zero three-level window";
+        EXPECT_TRUE(image_base_level_view(partial, fi).supported)
+            << "BASE_LEVEL=0 LAST_LEVEL=2 window admits (planned)";
+    }
+    // A base-zero chain the tail derivation cannot place stays refused: level zero of a
+    // 512^3 pyramid owns disjoint blocks no in-block coordinate can name.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 512, 512, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 512);
+        t[3] |= (2u << 16);
+        t[5] |= 9u << 4;
+        EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
+            << "non-tail BASE_LEVEL=0 chain stays refused";
+    }
+    // A chain running past MAX_MIP is a contradictory range, not a window: refuse.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (6u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor over = decode_image_descriptor(t);
+        ASSERT_TRUE(over.base_level == 0 && over.last_level == 6 && over.max_mip == 5)
+            << "fixture really runs past the allocation end";
+        EXPECT_FALSE(image_base_level_view(over, fi).supported)
+            << "LAST_LEVEL past MAX_MIP stays refused";
     }
     // Block-compressed 3D keeps the base-level-only rule: the tail math is element-based
     // and the upload has no BCn volume-tail reader. Level 0 stays admitted unshifted.
