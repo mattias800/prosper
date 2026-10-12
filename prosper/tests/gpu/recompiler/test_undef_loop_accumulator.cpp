@@ -6,8 +6,10 @@
 // repair belongs, and two rounds of analysis on the real shader got it wrong in both directions
 // before this fixture existed.
 //
-// This pins an existing reject route, not the new diagnostic output or the real shader's semantics.
-// Any later admission must be justified independently; this fixture does not require admission.
+// The synthetic compare has a genuine s19 writer and PS position X input in v0. Omitting either
+// rejects at the compare before the accumulator; allocated register storage is not an input.
+// This pins the existing reject route, not the real shader's semantics. A companion initializes
+// the accumulator from EXEC and must compile the same nested body. Neither stream is executed.
 //
 // Selected instruction encodings also occur in Sonic Frontiers' shader
 // (`0x200584ca00`, submit 138828, draw 0). The assertions below identify the rejection site;
@@ -62,7 +64,6 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // pc  instruction                                     (branch targets computed, not hand-counted)
@@ -92,13 +93,35 @@ static const uint32_t kUndefAccumulatorPs[] = {
     0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
 
+static std::vector<uint32_t> compile_fixture(uint64_t address, bool scalar = true,
+                                             bool position = true, bool accumulator = false) {
+    std::vector<uint32_t> code;
+    if (scalar) code.push_back(0xbe930380u);   // s_mov_b32 s19, 0: the SDWA compare source
+    if (accumulator) code.push_back(0xbed4047eu);   // s_mov_b64 s[84:85], exec
+    code.insert(code.end(), std::begin(kUndefAccumulatorPs), std::end(kUndefAccumulatorPs));
+    PixelSystemInputMapping inputs{};
+    inputs.addr = inputs.ena = 1u << 8;   // genuine PS position X in v0
+    return recompile_fragment(code.data(), code.size(), nullptr, position ? &inputs : nullptr,
+                              UINT32_MAX, nullptr, false,
+                              {RecompileDiagnosticStage::Fragment, address});
+}
+
+static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    uint32_t count = 0;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t words = spv[i] >> 16u;
+        if (!words || words > spv.size() - i) break;
+        if ((spv[i] & 0xffffu) == opcode) ++count;
+        i += words;
+    }
+    return count;
+}
+
 TEST(UndefLoopAccumulator, Contract) {
     printf("== test_undef_loop_accumulator ==\n");
 
     const uint64_t addr = 0xA1A1A1A1ull;
-    const std::vector<uint32_t> frag = recompile_fragment(
-        kUndefAccumulatorPs, std::size(kUndefAccumulatorPs), nullptr, nullptr,
-        UINT32_MAX, nullptr, /*wave32=*/false, {RecompileDiagnosticStage::Fragment, addr});
+    const std::vector<uint32_t> frag = compile_fixture(addr);
     const std::string reason = last_terminal_reject_reason(addr);
 
     CHECK(frag.empty(), "the synthetic undefined loop accumulator rejects");
@@ -107,8 +130,8 @@ TEST(UndefLoopAccumulator, Contract) {
     // is exactly how a fixture ends up proving nothing -- these name WHERE and WHY.
     CHECK(reason.find("mode=unresolved-operand") != std::string::npos,
           "...for the intended reason: an unresolved mask operand");
-    CHECK(reason.find("pc=5") != std::string::npos,
-          "...at the intended pc: the s_andn2_b64 reading the accumulator");
+    CHECK(reason.find("pc=6") != std::string::npos,
+          "...at body PC5 plus the scalar prefix: the s_andn2_b64 reading the accumulator");
     CHECK(reason.find("words=8ac47e54") != std::string::npos,
           "...on the byte-identical instruction from the real shader");
     CHECK(reason.find("src=84(k1)") != std::string::npos,
@@ -122,8 +145,31 @@ TEST(UndefLoopAccumulator, Contract) {
     CHECK(reason.find("divloop") == std::string::npos && reason.find("backedge") == std::string::npos,
           "CONTROL: NOT refused by divergent-loop detection -- the loops were claimed, so the "
           "failure is inside a loop body and the loop-PHI machinery is present at it");
+}
 
-    if (fails) printf("== FAIL: %d ==\n", fails);
-    else       printf("== all passed ==\n");
-    EXPECT_EQ(fails, 0);
+TEST(UndefLoopAccumulator, InitializedAccumulatorCompiles) {
+    constexpr uint64_t address = 0xa1a1a102ull;
+    const auto spv = compile_fixture(address, true, true, true);
+    ASSERT_FALSE(spv.empty()) << last_terminal_reject_reason(address);
+    EXPECT_GE(count_opcode(spv, 246u), 2u) << "both nested loops retain OpLoopMerge";
+}
+
+static void expect_compare_refusal(uint64_t address, bool scalar, bool position) {
+    EXPECT_TRUE(compile_fixture(address, scalar, position).empty());
+    const auto reason = last_terminal_reject_reason(address);
+    EXPECT_NE(reason.find("reason=fabricated-fresh-mask-source"), std::string::npos) << reason;
+    const auto site = std::string("pc=") + (scalar ? "4" : "3") + " words=7d0200f9,0686dc13";
+    EXPECT_NE(reason.find(site), std::string::npos) << reason;
+}
+
+TEST(UndefLoopAccumulator, MissingScalarRefusesAtCompare) {
+    expect_compare_refusal(0xa1a1a103ull, false, true);
+}
+
+TEST(UndefLoopAccumulator, MissingPositionRefusesAtCompare) {
+    expect_compare_refusal(0xa1a1a104ull, true, false);
+}
+
+TEST(UndefLoopAccumulator, OriginalMissingInputsRefuseAtCompare) {
+    expect_compare_refusal(0xa1a1a105ull, false, false);
 }
