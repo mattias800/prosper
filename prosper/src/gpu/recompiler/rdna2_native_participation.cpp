@@ -542,8 +542,8 @@ std::vector<uint64_t> native_participation_entry(const SpirvCompute& b, const Re
 
 std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegState* initial,
                                              const std::vector<Rdna2Inst>& instructions,
-                                             std::set<uint32_t>* numeric_vcc_moves) {
-    if (numeric_vcc_moves) numeric_vcc_moves->clear();
+                                             std::set<uint32_t>* numeric_mask_moves) {
+    if (numeric_mask_moves) numeric_mask_moves->clear();
     if (!numeric_context(b) || !initial || initial->exec_narrowed || instructions.empty() ||
         instructions.size() > 4096)
         return {};
@@ -625,13 +625,14 @@ std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegSta
     std::set<uint32_t> result;
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& in = instructions[i];
-        if (numeric_vcc_moves && incoming[i] && incoming[i]->numeric_common &&
-            in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == 106 &&
+        if (numeric_mask_moves && incoming[i] && incoming[i]->numeric_common &&
+            in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+            (in.dst.value == 106 || in.dst.value == 126) &&
             (in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) &&
             in.src[0].value >= 0 && in.src[0].value < 127 &&
             word(*incoming[i], in, in.src[0]).numeric_uniform &&
             word(*incoming[i], in, in.src[0], 1).numeric_uniform)
-            numeric_vcc_moves->insert(in.pc);
+            numeric_mask_moves->insert(in.pc);
         if (!ordinary(b) || !incoming[i] || !incoming[i]->common || in.fmt != Rdna2Format::VOPC ||
             vopc_is_cmpx(in.opcode) || in.dst.kind != OperandKind::SGPR || in.dst.value < 0 ||
             in.dst.value > 104 || !scalar_write_is_b64_mask(in, in.dst.value))

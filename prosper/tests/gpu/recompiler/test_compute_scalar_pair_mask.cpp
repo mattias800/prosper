@@ -982,10 +982,11 @@ TEST(ScalarPairMask, Wave64VccLogicalReadingAMaskOnlySiblingStillRefuses) {
 
 // A fabricated source marks MOV's numeric destination, but MOV cannot replace the genuine SCC
 // consumed by the following select. Pin B32 and B64 independently of the per-word logical proof.
-// Seed both VCC halves genuinely so the later marked logical result owns the refusal site.
+// Seed both physical words, then restore their current complete predicate after the high DATA
+// select. The initial compare supplies SCC; the B64 self-copy preserves it before the logical.
 TEST(ScalarPairMask, Wave64VccLogicalReadingSccPreservedByAMarkedMoveCompiles) {
     const Words fresh_compare = {0xbeea0487u, 0xbf07836au};
-    const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6bfdu};
+    const Words select_and_logical = {0x856b8081u, 0xbeea046au, 0x876a6bfdu};
     for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
         const Words marked_move = {move};
         const Words body =
@@ -999,7 +1000,7 @@ TEST(ScalarPairMask, Wave64VccLogicalReadingSccPreservedByAMarkedMoveCompiles) {
 TEST(ScalarPairMask, Wave64VccLogicalReadingAMarkedMoveResultStillRefuses) {
     const Words fresh_compare = {0xbeea0487u, 0xbf07836au};
     // The logical reads the move's marked s2 rather than SCC, so numeric authority stays absent.
-    const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6b02u};
+    const Words select_and_logical = {0x856b8081u, 0xbeea046au, 0x876a6b02u};
     for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
         const Words marked_move = {move};
         const Words body =
@@ -1026,4 +1027,25 @@ TEST(ScalarPairMask, Wave64VccLogicalReadingSccFromMarkedArithmeticStillRefuses)
               std::string::npos);
     EXPECT_NE(last_terminal_reject_reason(kAddress).find("pc=13 words=876a6bfd"), std::string::npos)
         << "refusal must be the logical using marked arithmetic SCC";
+}
+
+TEST(ScalarPairMask, AHighDataSelectNeedsItsCurrentPredicateBeforeAMarkedLogical) {
+    const Words fresh_compare = {0xbeea0487u, 0xbf07836au};
+    const Words unrefreshed_logical = {0x856b8081u, 0xbf07806au, 0x876a6b02u};
+    const Words refreshed_control = {0x856b8081u, 0xbeea046au, 0x876a6bfdu};
+    for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
+        const Words marked_move = {move};
+        ASSERT_FALSE(compile(Stage::Compute, cat({&kPrefix, &kOnePath, &fresh_compare, &marked_move,
+                                                  &refreshed_control}))
+                         .empty())
+            << last_terminal_reject_reason(kAddress);
+        const Words body =
+            cat({&kPrefix, &kOnePath, &fresh_compare, &marked_move, &unrefreshed_logical});
+        EXPECT_TRUE(compile(Stage::Compute, body).empty());
+        EXPECT_NE(last_terminal_reject_reason(kAddress).find(
+                      "mode=unresolved-operand pc=13 words=876a6b02"),
+                  std::string::npos)
+            << "the original unrefreshed stream must fail before its marked mask consumer: "
+            << last_terminal_reject_reason(kAddress);
+    }
 }
