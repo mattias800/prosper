@@ -2231,6 +2231,105 @@ TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, 
     return result;
 }
 
+std::vector<TiledVolumeChainLevelUnproven>
+tiled_volume_chain_layout_unproven(uint32_t width, uint32_t height, uint32_t depth,
+                                   uint32_t bytes_per_texel, uint32_t tile_mode, uint32_t max_mip) {
+    std::vector<TiledVolumeChainLevelUnproven> out;
+    // UNPROVEN (see tile.hpp): pure derivation, no hardware cover for non-tail chains.
+    if (tile_mode != (uint32_t)TileMode::Sw64KbS) return out;
+    if (!width || !height || !depth || !bytes_per_texel) return out;
+    if (max_mip >= 16u) return out;
+    const uint32_t el = sw64kb_elem_log2(bytes_per_texel);
+    if (el == UINT32_MAX) return out;
+    const uint32_t* bd = kSw64kbS3Dims[el];
+    const uint32_t tail_w = bd[0] >> 1;
+    const uint32_t tail_h = bd[1];
+    const uint32_t tail_d = bd[2];
+    const uint32_t effective_log2 = 16u - (16u - 8u) / 3u;
+    const uint32_t max_tail_levels =
+        effective_log2 <= 11u ? 1u + (1u << (effective_log2 - 9u)) : effective_log2 - 4u;
+    const uint32_t num_levels = max_mip + 1u;
+    uint32_t first_tail = num_levels;
+    // Strict conjunction (see tile.hpp): dims AND depth AND remaining count. Stricter
+    // than GFX10's recovered walk on depth, deliberately: fails safe toward disjoint.
+    for (uint32_t level = 0; level < num_levels; ++level) {
+        const uint32_t wl = std::max(width >> level, 1u);
+        const uint32_t hl = std::max(height >> level, 1u);
+        const uint32_t dl = std::max(depth >> level, 1u);
+        if (wl <= tail_w && hl <= tail_h && dl <= tail_d && num_levels - level <= max_tail_levels) {
+            first_tail = level;
+            break;
+        }
+    }
+    out.resize(num_levels);
+    for (uint32_t level = 0; level < num_levels; ++level) {
+        auto& e = out[level];
+        e.width = std::max(width >> level, 1u);
+        e.height = std::max(height >> level, 1u);
+        e.depth = std::max(depth >> level, 1u);
+        e.supported = true;
+    }
+    if (first_tail < num_levels) {
+        const uint32_t micro_d = kBlock256S3[el][2];
+        const uint32_t first_depth = std::max(depth >> first_tail, 1u);
+        const uint32_t aligned_depth = (first_depth + micro_d - 1u) / micro_d;
+        for (uint32_t level = first_tail; level < num_levels; ++level) {
+            auto& e = out[level];
+            const uint32_t m = max_tail_levels - 1u - (level - first_tail);
+            const uint32_t mip_offset = m > 6u ? (16u << m) : (m << 8u);
+            const uint32_t mip_x = ((mip_offset >> 9) & 1u) | ((mip_offset >> 10) & 2u) |
+                                   ((mip_offset >> 11) & 4u) | ((mip_offset >> 12) & 8u) |
+                                   ((mip_offset >> 13) & 16u) | ((mip_offset >> 14) & 32u);
+            const uint32_t mip_y = ((mip_offset >> 8) & 1u) | ((mip_offset >> 9) & 2u) |
+                                   ((mip_offset >> 10) & 4u) | ((mip_offset >> 11) & 8u) |
+                                   ((mip_offset >> 12) & 16u) | ((mip_offset >> 13) & 32u);
+            e.tail_x = mip_x * kBlock256S3[el][0];
+            e.tail_y = mip_y * kBlock256S3[el][1];
+            if (aligned_depth && mip_offset > SIZE_MAX / aligned_depth) return {};
+            e.byte_offset = static_cast<size_t>(mip_offset) * aligned_depth;
+            e.level_bytes = 0;
+            e.in_tail = true;
+        }
+    }
+    // GFX10 data-surface order (UNPROVEN for thick): shared tail block first, then the
+    // remaining levels smallest-first, largest last. Walk down so the smallest non-tail
+    // level takes the lowest address after the tail. The one-block tail assumption is
+    // documented in tile.hpp (OPEN): the strict depth gate above is what makes it hold.
+    size_t offset = first_tail == num_levels ? 0 : (size_t{1} << 16);
+    for (uint32_t level = first_tail; level-- > 0;) {
+        auto& e = out[level];
+        const size_t need = sw64kb_s3_volume_bytes(e.width, e.height, e.depth, bytes_per_texel);
+        if (!need) return {};
+        if (need > SIZE_MAX - offset) return {};
+        e.byte_offset = offset;
+        e.level_bytes = need;
+        e.in_tail = false;
+        offset += need;
+    }
+    return out;
+}
+
+size_t tiled_volume_chain_bytes_unproven(uint32_t width, uint32_t height, uint32_t depth,
+                                         uint32_t bytes_per_texel, uint32_t tile_mode,
+                                         uint32_t max_mip) {
+    const auto layout = tiled_volume_chain_layout_unproven(width, height, depth, bytes_per_texel,
+                                                           tile_mode, max_mip);
+    if (layout.empty()) return 0;
+    size_t end = 0;
+    for (const auto& e : layout) {
+        if (!e.supported) return 0;
+        const size_t span = e.in_tail ? (size_t{1} << 16) : e.level_bytes;
+        if (!span) continue;
+        if (e.in_tail) {
+            end = std::max(end, span);
+            continue;
+        }
+        if (e.byte_offset > SIZE_MAX - span) return 0;
+        end = std::max(end, e.byte_offset + span);
+    }
+    return end;
+}
+
 bool detile_volume_tail_level(uint8_t* dst, const uint8_t* src, size_t src_bytes, uint32_t width,
                               uint32_t height, uint32_t depth, uint32_t tile_mode,
                               uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y) {
