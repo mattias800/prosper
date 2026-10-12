@@ -646,3 +646,66 @@ def test_mutation_proof_writelane_respects_exec(monkeypatch):
     monkeypatch.setattr(M.Machine, "valu", broken_valu)
     with pytest.raises(AssertionError):
         test_v_writelane_leaves_other_lanes_and_ignores_exec()
+
+
+# ---- Differential Parity with prosper Recompiler (Task H03 PR 2) -------------------------
+def test_differential_parity_against_recompiler_execution():
+    """Validates that test programs executed by test_rdna2_ref_differential against
+
+    prosper's SPIR-V recompiler produce identical per-lane output in rdna2_ref.
+    """
+    # 1. Positive control program (0x4a000081: v_add_nc_u32 v0, 1, v0) with input 42
+    w1, _ = run([0x4A000081], vgpr={(0, lane): 42 for lane in range(64)})
+    assert all(w1.vgpr[0][lane] == 43 for lane in range(64))
+
+    # 2. Scalar ALU & logic sequence (s_not_b32, s_and_b32 literal, s_lshl_b32, v_mov_b32)
+    code2 = [0xBE800780, 0x8701FF00, 0x12345678, 0x8F028201, 0x7E000202]
+    w2, _ = run([code2[0]], [code2[1], code2[2]], [code2[3]], [code2[4]])
+    assert all(w2.vgpr[0][lane] == (0x12345678 << 2) for lane in range(64))
+
+    # 3. Integer VALU 3-source add (v_add3_u32 v0, v0, s0, 10 where s0 = 100)
+    code3 = [0xBE8003FF, 100, 0xD76D0000, 0x02280100]
+    w3, _ = run(
+        [code3[0], code3[1]],
+        [code3[2], code3[3]],
+        vgpr={(0, lane): lane for lane in range(64)},
+    )
+    assert all(w3.vgpr[0][lane] == lane + 110 for lane in range(64))
+
+    # 4. Cross-lane exchange (v_writelane_b32, v_readlane_b32, v_mov_b32)
+    code4 = [0xBE8503FF, 777, 0xD7610001, 0x00010005, 0xD7600006, 0x00010101, 0x7E000206]
+    w4, _ = run([code4[0], code4[1]], [code4[2], code4[3]], [code4[4], code4[5]], [code4[6]])
+    assert all(w4.vgpr[0][lane] == 777 for lane in range(64))
+
+    # 5. SCC compare and conditional select (s_cmp_eq_u32, s_cselect_b32)
+    code5_neq = [0xBE8003FF, 20, 0xBE8103FF, 30, 0xBF060100, 0x85028281, 0x7E000202]
+    w5_neq, _ = run(
+        [code5_neq[0], code5_neq[1]],
+        [code5_neq[2], code5_neq[3]],
+        [code5_neq[4]],
+        [code5_neq[5]],
+        [code5_neq[6]],
+    )
+    assert all(w5_neq.vgpr[0][lane] == 2 for lane in range(64))
+
+    code5_eq = [0xBE8003FF, 20, 0xBE8103FF, 20, 0xBF060100, 0x85028281, 0x7E000202]
+    w5_eq, _ = run(
+        [code5_eq[0], code5_eq[1]],
+        [code5_eq[2], code5_eq[3]],
+        [code5_eq[4]],
+        [code5_eq[5]],
+        [code5_eq[6]],
+    )
+    assert all(w5_eq.vgpr[0][lane] == 1 for lane in range(64))
+
+    # 6. WQM into VCC mask transfer (s_wqm_b64 vcc, s[4:5]; v_cndmask_b32 v0, 5, v1)
+    code6 = [0x7E020287, 0x7D840100, 0xD4C50004, 0x00020100, 0xBEEA0A04, 0x02000285]
+    w6, _ = run(
+        [code6[0]],
+        [code6[1]],
+        [code6[2], code6[3]],
+        [code6[4]],
+        [code6[5]],
+        vgpr={(0, lane): 3 for lane in range(64)},
+    )
+    assert all(w6.vgpr[0][lane] == 5 for lane in range(64))
