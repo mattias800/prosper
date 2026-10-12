@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -590,6 +591,14 @@ struct VccMaskViewDrop {
 inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                               VccMaskViewDrop& drop, bool& ok) {
     if (in.has_modifier) {   // SDWA/DPP forms are not modelled: refused for every format
+        ok = false;
+        return true;
+    }
+    if (!fresh_mask_sources_defined(b, rs, in)) {
+        b.stage_reject_pc = in.pc;
+        b.stage_reject_reason = "fabricated-fresh-mask-source";
+        log_recompile_diagnostic(b.diagnostic, "fabricated-fresh-mask-source", "alu",
+                                 "pc=%u a fresh predicate requires defined inputs", in.pc);
         ok = false;
         return true;
     }

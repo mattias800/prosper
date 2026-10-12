@@ -748,6 +748,9 @@ int main() {
     // in the same physical low word, and pc85 replaces the complete pair before VCC_HI can be
     // observed. Retain the production pc74..103 packets and the loop that forces CFG dispatch.
     std::vector<uint32_t> wave64_vcc_lo_scalar_offset(74, 0xbf800000u);
+    // Owned full preheader v1 seed covers inactive bits preserved by later masked writers.
+    wave64_vcc_lo_scalar_offset[0] = 0x7E020280u;
+    wave64_vcc_lo_scalar_offset[1] = 0x7E040280u;   // same full preheader seed for pc88/pc99 v2
     const uint32_t wave64_vcc_lo_scalar_tail[] = {
         0x7d288812u,                         // pc74: v_cmp_* vcc,s18,v68
         0xbf88001bu,                         // pc75: s_cbranch_execz pc103
@@ -785,7 +788,7 @@ int main() {
       buffer.gpu_addr = 0x400000u; buffer.size = 120; buffer.fetch_pc = 91;
       wave64_vcc_lo_scalar_rt.resources.push_back(buffer); }
     ComputeShaderConfig wave64_vcc_lo_scalar_config = smem_x2_descriptor_fragment_config;
-    wave64_vcc_lo_scalar_config.user_sgprs.resize(24);
+    wave64_vcc_lo_scalar_config.user_sgprs.resize(25);   // includes encoded s24 at pc100
     CHECK(!recompile_compute(wave64_vcc_lo_scalar_offset.data(),
                              wave64_vcc_lo_scalar_offset.size(),
                              &wave64_vcc_lo_scalar_rt,
@@ -1842,13 +1845,11 @@ int main() {
     // is the reduced shape of UE4's volume-lighting kernel: varying VCC exit, an inner scalar branch,
     // and a backward loop edge. The simpler two-branch loop above deliberately remains rejected.
     const uint32_t compute_cfg_dispatch[] = {
-        0xBE800380u, 0x7E000280u, 0x7E020300u,
-        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
-        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
-        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
-        0x81008100u, 0x81008100u, 0xBF82FFF4u,
-        0xBF810000u,
+        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
+        0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u,
+        0x7DB900F9u, 0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u,
     };
     ShaderResourceTable dispatch_rt;
     ShaderResource dispatch_vb{}; dispatch_vb.cls = ResourceClass::VertexBuffer;
@@ -2038,15 +2039,16 @@ int main() {
     // implicit VCC predicate comes from the fresh compare immediately before it. Keep a crossing
     // tail so the fixture exercises the production Wave64 dispatcher dataflow rather than SSA.
     std::vector<uint32_t> compute_cfg_dispatch_resolved_b32_half = {
-        0xBF068008u,                         // pc0: scalar branch condition
-        0xBF840003u,                         // pc1: branch to mask-producing arm
-        0xBE900381u,                         // pc2: scalar arm s16 = 1
-        0xBE910380u,                         // pc3: scalar arm s17 = 0
-        0xBF820001u,                         // pc4: merge
-        0xBE900A7Eu,                         // pc5: mask-only WQM s[16:17] = exec
-        0x7D840000u,                         // pc6: fresh implicit VCC predicate
-        0xBE900381u,                         // pc7: exact B32 overwrite corresponding to live pc102
-        0x020E20F9u, 0x86860680u,            // pc8: exact live pc105 cndmask SDWA reads s16
+        0xBF068008u,   // pc0: scalar branch condition
+        0xBF840003u,   // pc1: branch to mask-producing arm
+        0xBE900381u,   // pc2: scalar arm s16 = 1
+        0xBE910380u,   // pc3: scalar arm s17 = 0
+        0xBF820001u,   // pc4: merge
+        0xBE900A7Eu,   // pc5: mask-only WQM s[16:17] = exec
+        0xBE800380u,   // pc6: explicit s0=0 comparison input
+        0x7D840000u,   // pc7: fresh implicit VCC predicate reads s0,v0
+        0xBE900381u,   // pc8: exact B32 overwrite corresponding to live pc102
+        0x020E20F9u, 0x86860680u,   // pc9: exact live pc105 cndmask SDWA reads s16
     };
     compute_cfg_dispatch_resolved_b32_half.insert(
         compute_cfg_dispatch_resolved_b32_half.end(), compute_cfg_dispatch,
@@ -2058,8 +2060,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_wrong_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_wrong_b32_half[7] =
-        0xBE910381u;                         // overwrite s17; the consumed s16 remains ambiguous
+    compute_cfg_dispatch_wrong_b32_half[8] =
+        0xBE910381u;   // overwrite s17; the consumed s16 remains ambiguous
     CHECK(recompile_compute(compute_cfg_dispatch_wrong_b32_half.data(),
                             compute_cfg_dispatch_wrong_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2067,9 +2069,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_b64_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_b64_after_b32_half[8] =
-        0xBE841410u;                         // s_ff1_i32_b64 s4,s[16:17]
-    compute_cfg_dispatch_b64_after_b32_half[9] = 0xBF800000u;
+    compute_cfg_dispatch_b64_after_b32_half[9] = 0xBE841410u;   // s_ff1_i32_b64 s4,s[16:17]
+    compute_cfg_dispatch_b64_after_b32_half[10] = 0xBF800000u;
     CHECK(recompile_compute(compute_cfg_dispatch_b64_after_b32_half.data(),
                             compute_cfg_dispatch_b64_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2077,9 +2078,8 @@ int main() {
 
     std::vector<uint32_t> compute_cfg_dispatch_flbit_b64_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_flbit_b64_after_b32_half[8] =
-        0xBE841610u;                         // s_flbit_i32_b64 s4,s[16:17]
-    compute_cfg_dispatch_flbit_b64_after_b32_half[9] = 0xBF800000u;
+    compute_cfg_dispatch_flbit_b64_after_b32_half[9] = 0xBE841610u;   // s_flbit_i32_b64 s4,s[16:17]
+    compute_cfg_dispatch_flbit_b64_after_b32_half[10] = 0xBF800000u;
     CHECK(recompile_compute(compute_cfg_dispatch_flbit_b64_after_b32_half.data(),
                             compute_cfg_dispatch_flbit_b64_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -2090,9 +2090,9 @@ int main() {
     // high VOPC numbers as pairs (which also incorrectly catches adjacent f16 compares).
     std::vector<uint32_t> compute_cfg_dispatch_i64_compare_after_b32_half =
         compute_cfg_dispatch_resolved_b32_half;
-    compute_cfg_dispatch_i64_compare_after_b32_half[8] =
-        0xD4A2006Au;                         // v_cmp_eq_i64_e64 vcc,s[16:17],0
-    compute_cfg_dispatch_i64_compare_after_b32_half[9] = 0x00010010u;
+    compute_cfg_dispatch_i64_compare_after_b32_half[9] =
+        0xD4A2006Au;   // v_cmp_eq_i64_e64 vcc,s[16:17],0
+    compute_cfg_dispatch_i64_compare_after_b32_half[10] = 0x00010010u;
     CHECK(recompile_compute(compute_cfg_dispatch_i64_compare_after_b32_half.data(),
                             compute_cfg_dispatch_i64_compare_after_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
@@ -3092,16 +3092,15 @@ int main() {
     // EXEC-mask spill. Force a dispatcher block boundary after each lifetime so both typed views
     // must survive the Function-variable state round trip. Consumers remain statically typed.
     const uint32_t compute_cfg_dispatch_recycled_lane[] = {
-        0xBE800381u, 0x7E000280u, 0x7E020300u,
-        0xD7610013u, 0x00014A00u, 0xBF820000u,       // v19[37] = s0; next block
-        0xD7600002u, 0x00014B13u,                   // s2 = v19[37] (data view)
+        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
+        0xBE800381u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A00u,
+        0xBF820000u,   // v19[37] = s0; next block
+        0xD7600002u, 0x00014B13u,   // s2 = v19[37] (data view)
         0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
-        0xBF820000u,                                // v19[37:40] = EXEC; next block
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
-        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
-        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
-        0x81008100u, 0x81008100u, 0xBF82FFF4u,
-        0xBF810000u,
+        0xBF820000u,   // v19[37:40] = EXEC; next block
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u,
+        0x80020400u, 0x7DB900F9u, 0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u,
+        0x360000FDu, 0xBF840001u, 0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u,
     };
     CHECK(!recompile_valu(compute_cfg_dispatch_recycled_lane,
                           sizeof(compute_cfg_dispatch_recycled_lane) /
@@ -3115,14 +3114,13 @@ int main() {
     // collapsing the title composite to black (#1483). Same shape here: the colliding readlane
     // (s19 <- v19) precedes the legitimate v19[37] reload the exec restore consumes.
     const uint32_t compute_cfg_dispatch_readlane_sgpr_collision[] = {
-        0xBE800380u, 0x7E000280u, 0x7E020300u,
-        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,   // v19[37:40] = EXEC
-        0xD7600013u, 0x00014B13u,                             // v_readlane_b32 s19, v19, 37
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
-        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
-        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
-        0x81008100u, 0x81008100u, 0xBF82FFF4u,
-        0xBF810000u,
+        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
+        0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u,
+        0x0001507Fu,   // v19[37:40] = EXEC
+        0xD7600013u, 0x00014B13u,   // v_readlane_b32 s19, v19, 37
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u,
+        0x80020400u, 0x7DB900F9u, 0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u,
+        0x360000FDu, 0xBF840001u, 0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u,
     };
     CHECK(!recompile_valu(compute_cfg_dispatch_readlane_sgpr_collision,
                           sizeof(compute_cfg_dispatch_readlane_sgpr_collision) /
@@ -3133,16 +3131,14 @@ int main() {
     // dispatcher block must preserve that tombstone; reconstructing the slot as scalar zero would
     // incorrectly make the later v_readlane valid again.
     const uint32_t compute_cfg_dispatch_invalidated_lane[] = {
-        0xBE800381u, 0x7E000280u, 0x7E020300u,
-        0xD7610013u, 0x00014A00u,                   // v19[37] = s0
-        0x7E260280u, 0xBF820000u,                   // v19 = 0; next block
-        0xD7600002u, 0x00014B13u,                   // invalid s2 = v19[37]
-        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
-        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
-        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
-        0x81008100u, 0x81008100u, 0xBF82FFF4u,
-        0xBF810000u,
+        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
+        0xBE800381u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A00u,   // v19[37] = s0
+        0x7E260280u, 0xBF820000u,   // v19 = 0; next block
+        0xD7600002u, 0x00014B13u,   // invalid s2 = v19[37]
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu, 0xD760000Eu, 0x00014B13u,
+        0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u, 0x7DB900F9u,
+        0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u,
     };
     CHECK(recompile_valu(compute_cfg_dispatch_invalidated_lane,
                          sizeof(compute_cfg_dispatch_invalidated_lane) /
@@ -3153,13 +3149,11 @@ int main() {
     // shape, but make the inner SCC arm conditionally execute a ds_write_b32 before the back-edge.
     // (A barrier remains forbidden below; only the blanket rejection of raw DS is being relaxed.)
     const uint32_t compute_cfg_dispatch_lds[] = {
-        0xBE800380u, 0x7E000280u, 0x7E020300u,
-        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
-        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
-        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840002u,
-        0xD8340000u, 0x00000302u, 0xBF82FFF4u,
-        0xBF810000u,
+        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
+        0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u,
+        0x7DB900F9u, 0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840002u,
+        0xD8340000u, 0x00000302u, 0xBF82FFF4u, 0xBF810000u,
     };
     CHECK(!recompile_valu(compute_cfg_dispatch_lds,
                           sizeof(compute_cfg_dispatch_lds)/sizeof(compute_cfg_dispatch_lds[0]), 0, 0,

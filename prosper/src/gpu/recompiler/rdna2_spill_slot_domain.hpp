@@ -48,13 +48,15 @@ struct SpillSlotContext {
     bool native_wave64;               // one exact 64-lane host subgroup per guest wave
     const std::unordered_map<uint32_t, uint32_t>& proven_half_readlane_pcs;
     const std::unordered_set<uint32_t>& proven_half_writelane_pcs;
+    bool physical_saved_words = false;   // retained native words can coexist with a saved Bool
 };
 
-// True when a V_WRITELANE's SGPR source is, on every path, ordinary scalar data: a MUST scalar
-// word outside any mask or ambiguous pair, and not the result of an untyped V_READLANE.
+// A current MUST scalar word is DATA when native word retention is active, even beside a Bool.
+// Otherwise require an ordinary scalar word outside a mask pair. Untyped READLANE never proves DATA.
 bool spill_source_is_scalar_data(const Rdna2Inst& in, const std::set<int>& masks,
                                  const std::set<int>& ambiguous, const std::set<int>& scalar_words,
-                                 const std::set<int>& readlane_words);
+                                 const std::set<int>& readlane_words,
+                                 bool physical_saved_words = false);
 
 // The transfer for one compute instruction. A constant-lane V_WRITELANE records the domain of its
 // source; any other write of a spill VGPR (`vector_writes`) forgets its slots. A constant-lane

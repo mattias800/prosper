@@ -63,6 +63,9 @@ struct Interpreter {
   void use_ngg_shell_storage() { storage_descriptor_set = 2; }
   size_t entry = 0;
   std::string error;
+  // An explicit fixture contract, never inferred from a declared native builtin or vote.
+  uint32_t native_subgroup_width = 0;
+  std::vector<uint32_t> push_constants;
   struct SampledMip {
     uint32_t width = 0, height = 0;
     std::vector<std::array<uint32_t, 4>> texels;
@@ -322,6 +325,7 @@ struct Interpreter {
       const auto &i = ins[l.pc];
       const auto &a = i.a;
       const uint32_t op = i.op;
+      if (op == 334 || op == 335 || op == 339 || op == 345) return;
       if (op == 224) {
         if (a.size() != 3 || word(l, a[0]) != 2 || word(l, a[1]) != 2 ||
             (word(l, a[2]) & 0x108) != 0x108)
@@ -488,27 +492,33 @@ struct Interpreter {
         if (op == 83 && v.type != a[0])
           fail("CopyObject type mismatch");
         set(l, a[1], a[0], std::move(v.words), v.defined);
+      } else if (op == 112) {
+          if (a.size() != 3 || !uint_type(value(l, a[2]).type) || ty(a[0]).op != 22)
+              fail("unsupported unsigned-to-float conversion");
+          set(l, a[1], a[0], {std::bit_cast<uint32_t>(static_cast<float>(word(l, a[2])))});
+      } else if (op == 184) {
+          if (a.size() != 4 || ty(value(l, a[2]).type).op != 22 || ty(value(l, a[3]).type).op != 22)
+              fail("unsupported float comparison");
+          set(l, a[1], a[0],
+              {uint32_t(std::bit_cast<float>(word(l, a[2])) <
+                        std::bit_cast<float>(word(l, a[3])))});
       } else if (op == 169) {
-        if (a.size() != 5)
-          fail("malformed Select");
+          if (a.size() != 5) fail("malformed Select");
         // Both arms must be defined and typed even when only one is selected.
-        const auto left = value(l, a[3]), right = value(l, a[4]);
-        if (left.type != a[0] || right.type != a[0])
-          fail("Select type mismatch");
-        l.v[a[1]] = boolean(l, a[2]) ? left : right;
+          const auto left = value(l, a[3]), right = value(l, a[4]);
+          if (left.type != a[0] || right.type != a[0]) fail("Select type mismatch");
+          l.v[a[1]] = boolean(l, a[2]) ? left : right;
       } else if (op == 166 || op == 167 || op == 164 || op == 165) {
-        if (a.size() != 4 || ty(a[0]).op != 20)
-          fail("logical result type mismatch");
-        const bool x = boolean(l, a[2]), y = boolean(l, a[3]);
-        set(l, a[1], a[0],
-            {uint32_t(op == 166   ? x || y
-                      : op == 167 ? x && y
-                      : op == 164 ? x == y
-                                  : x != y)});
+          if (a.size() != 4 || ty(a[0]).op != 20) fail("logical result type mismatch");
+          const bool x = boolean(l, a[2]), y = boolean(l, a[3]);
+          set(l, a[1], a[0],
+              {uint32_t(op == 166   ? x || y
+                        : op == 167 ? x && y
+                        : op == 164 ? x == y
+                                    : x != y)});
       } else if (op == 168) {
-        if (a.size() != 3 || ty(a[0]).op != 20)
-          fail("LogicalNot type mismatch");
-        set(l, a[1], a[0], {uint32_t(!boolean(l, a[2]))});
+          if (a.size() != 3 || ty(a[0]).op != 20) fail("LogicalNot type mismatch");
+          set(l, a[1], a[0], {uint32_t(!boolean(l, a[2]))});
       } else if (op == 230) {
           // Narrow SOURCE-only uint32 Device/Relaxed compare-exchange. The evaluator serializes
           // workers; this checks actual instructions, bounds and readonly ownership, NOT Vulkan
@@ -706,6 +716,13 @@ struct Interpreter {
                           std::vector<uint32_t>{1, 0, 0, 0, 1, 0})
                       fail("unsupported sampled image type");
                   shared[a[1]] = {t, {binding->second}, {true}};
+              } else if (a[2] == 9) {
+                  shared[a[1]] = make_memory(t, size(t));
+                  if (!push_constants.empty()) {
+                      if (push_constants.size() != size(t)) fail("push constant shape mismatch");
+                      shared[a[1]] = {t, push_constants,
+                                      std::vector<bool>(push_constants.size(), true)};
+                  }
               } else if (a[2] != 1)
                   fail("unsupported global storage class");
               for (uint32_t lane = 0; lane < count; ++lane) {
@@ -723,6 +740,9 @@ struct Interpreter {
                           v = {lane, 0, 0};
                       else if (b->second == 29)
                           v = {lane};
+                      else if ((b->second == 40 || b->second == 41) &&
+                               native_subgroup_width == 64 && count == 64)
+                          v = {b->second == 40 ? 0u : lane};
                       else
                           fail("unsupported builtin");
                       if (size(t) != v.size()) fail("Input shape mismatch");
@@ -743,6 +763,58 @@ struct Interpreter {
               for (const auto& l : lanes) all_done &= l.done;
               if (all_done) return shared.at(storage).words;
               const size_t site = lanes.front().pc;
+              const auto& collective = ins.at(site);
+              if (collective.op ==
+                  345) {   // OpGroupNonUniformShuffle: explicit exact-native profile
+                  const auto& a = collective.a;
+                  if (native_subgroup_width != 64 || count != 64 || a.size() != 5 ||
+                      !uint_type(a[0]))
+                      fail("unproved native shuffle");
+                  std::vector<Value> inputs, results;
+                  for (auto& l : lanes) {
+                      if (l.done || l.pc != site || word(l, a[2]) != 3)
+                          fail("nonuniform native shuffle");
+                      auto input = value(l, a[3]);
+                      if (input.type != a[0]) fail("shuffle input type mismatch");
+                      inputs.push_back(std::move(input));
+                  }
+                  for (auto& l : lanes) {
+                      if (!uint_type(value(l, a[4]).type)) fail("shuffle index type mismatch");
+                      const auto index = word(l, a[4]);
+                      if (index >= count) fail("shuffle index outside supplied subgroup");
+                      results.push_back(inputs[index]);
+                  }
+                  for (uint32_t lane = 0; lane < count; ++lane) {
+                      const auto& result = results[lane];
+                      set(lanes[lane], a[1], a[0], result.words, result.defined);
+                      ++lanes[lane].pc;
+                  }
+                  continue;
+              }
+              if (collective.op == 334 || collective.op == 335 || collective.op == 339) {
+                  if (native_subgroup_width != 64 || count != 64 || collective.a.size() != 4)
+                      fail("unproved native subgroup");
+                  const auto& a = collective.a;
+                  std::vector<uint32_t> result(collective.op == 339 ? 4 : 1);
+                  if (collective.op == 334) result[0] = 1;
+                  for (uint32_t lane = 0; lane < count; ++lane) {
+                      auto& l = lanes[lane];
+                      if (l.done || l.pc != site || word(l, a[2]) != 3)
+                          fail("nonuniform native collective");
+                      const bool predicate = boolean(l, a[3]);
+                      if (collective.op == 339) {
+                          if (predicate) result[lane / 32] |= 1u << (lane % 32);
+                      } else if (collective.op == 334)
+                          result[0] &= predicate;
+                      else
+                          result[0] |= predicate;
+                  }
+                  for (auto& l : lanes) {
+                      set(l, a[1], a[0], result);
+                      ++l.pc;
+                  }
+                  continue;
+              }
               for (auto& l : lanes) {
                   if (l.done || l.pc != site || ins[l.pc].op != 224)
                       fail("nonuniform Workgroup barrier");

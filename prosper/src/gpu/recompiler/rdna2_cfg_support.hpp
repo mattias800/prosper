@@ -11,6 +11,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -1605,11 +1606,22 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         marks.memory = true;
         return marks;
     }
+    const bool lane_read = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360;
+    if (lane_read) marks = vector_lane_read_marks(rs, in);
+    // Numeric SCC copies must retain the current condition's missing-input mark, including
+    // WRITELANE's data role before its early return. Loaded data remains separate from addresses.
+    if (scalar_reads_scc(in) && (!rs.scc || rs.scc_merge_placeholder)) {
+        marks.placeholder = marks.hard = true;
+        marks.blanket_roots.clear();
+    }
     if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
-        if (in.opcode == 0x360) {
-            marks = vector_lane_read_marks(rs, in);
-        } else if (in.src[0].kind == OperandKind::SGPR ||
-                   (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124)) {
+        // A dynamic selector is a numeric input too. Its storage value does not prove which
+        // peer a READLANE consumes or which peer a WRITELANE replaces.
+        if (in.src[1].kind == OperandKind::SGPR ||
+            (in.src[1].kind == OperandKind::Special && in.src[1].value <= 124))
+            word(in.src[1].value);
+        if (!lane_read && (in.src[0].kind == OperandKind::SGPR ||
+                           (in.src[0].kind == OperandKind::Special && in.src[0].value <= 124))) {
             word(in.src[0].value);   // v_writelane's data word
         }
         return marks;
@@ -1629,7 +1641,6 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     // A read-modify-write keeps the destination's old bits (s_bitset*, s_cmov*, s_addk, ...).
     const uint32_t implicit = scalar_implicit_destination_read_width(in);
     for (uint32_t w = 0; w < implicit; ++w) word(in.dst.value + static_cast<int>(w));
-    if (scalar_reads_scc(in) && rs.scc_merge_placeholder) marks.placeholder = marks.hard = true;
     return marks;
 }
 

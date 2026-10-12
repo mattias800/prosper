@@ -3550,6 +3550,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_mask_participation.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_cfg_saved_mask_data
+    SOURCES tests/gpu/recompiler/test_native_cfg_saved_mask_data.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
 
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.

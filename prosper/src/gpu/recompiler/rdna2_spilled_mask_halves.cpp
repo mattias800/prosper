@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -96,7 +97,8 @@ bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in) {
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
-                                                     const std::set<int>& scalar_words) {
+                                                     const std::set<int>& scalar_words,
+                                                     bool definite_scc) {
     const auto& defined = state.defined_slots;
     const auto& relayed = state.relayed_words;
     const auto vector_any = [&](const std::set<int>& marked) {
@@ -111,12 +113,18 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     const bool load = in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
                       in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
                       in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::DS;
-    bool vector_relay = (!load || in.fmt == Rdna2Format::DS) &&
-                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in));
+    // An absent incoming SCC has no MAY relay entry yet. Use the pre-instruction MUST fact,
+    // so a numeric copy or lane selector cannot become genuine merely at a later CFG edge.
+    const bool missing_scc = !load && scalar_reads_scc(in) && !definite_scc;
+    bool vector_relay =
+        missing_scc || ((!load || in.fmt == Rdna2Format::DS) &&
+                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
     bool memory =
         load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
-    // An ordinary absent SGPR's VALU data spelling is fabricated even before a READLANE has
-    // relayed it. Defined mask halves and constants are separate genuine input domains.
+    // An ordinary absent SGPR is fabricated before any instruction has relayed it. Retain
+    // that consumed scalar dependency separately from whole-vector marks, so a defined
+    // constant spill slot can stay genuine beside an unrelated marked slot.
+    bool missing_scalar_word = false;
     if (!load)
         for (uint32_t source = 0; source < in.n_src; ++source) {
             const auto& operand = in.src[source];
@@ -128,20 +136,22 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                 const int reg = operand.value + static_cast<int>(word);
                 if (reg <= 105 && !scalar_words.contains(reg) && !masks.contains(reg) &&
                     !(reg > 0 && masks.contains(reg - 1)))
-                    vector_relay = true;
+                    missing_scalar_word = true;
             }
         }
+    vector_relay = vector_relay || missing_scalar_word;
     // Relayed words first, while `defined` still describes the slots `in` reads. A V_READLANE
     // relays unless it reads a constant-lane slot in `defined`; any other scalar write relays when
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
-    const bool relays = readlane
-                            ? state.lane_written_vgprs.contains(in.src[0].value) &&
-                                      !(constant_lane(in) &&
-                                        defined.contains({in.src[0].value, in.src[1].value})) ||
-                                  (!state.lane_written_vgprs.contains(in.src[0].value) &&
-                                   vector_any(state.relayed_vectors))
-                            : reads_relayed_word(relayed, in) || vector_any(state.relayed_vectors);
+    const bool relays =
+        missing_scc || missing_scalar_word || reads_relayed_word(relayed, in) ||
+        (readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
+                            !(constant_lane(in) &&
+                              defined.contains({in.src[0].value, in.src[1].value})) ||
+                        (!state.lane_written_vgprs.contains(in.src[0].value) &&
+                         vector_any(state.relayed_vectors))
+                  : vector_any(state.relayed_vectors));
     if (readlane && constant_lane(in) && state.lane_written_vgprs.contains(in.src[0].value))
         memory = state.memory_slots.contains({in.src[0].value, in.src[1].value});
     return {vector_relay, relays, memory};
@@ -151,7 +161,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::set<int>& masks, const std::set<int>& scalar_words,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                            const std::vector<int>& vector_writes,
-                           const SpilledVectorSourceMarks& source) {
+                           const SpilledVectorSourceMarks& source, bool definite_scc) {
     auto& defined = state.defined_slots;
     auto& relayed = state.relayed_words;
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
@@ -175,7 +185,12 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         }
     const bool scalar_alu = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                             in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC;
-    if (scalar_alu && relays)
+    // S_MOV propagates its source marks to the destination without changing the old SCC.
+    // Preserve an existing SCC mark too; copying data cannot repair a fabricated condition.
+    const bool move_preserves_scc =
+        in.fmt == Rdna2Format::SOP1 &&
+        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
+    if (scalar_alu && relays && !move_preserves_scc)
         relayed.insert(kRelayedScc);
     else if (in.fmt == Rdna2Format::SOPC)
         relayed.erase(kRelayedScc);
@@ -213,12 +228,15 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         const bool pair_mask = is_sgpr && (masks.contains(reg) || masks.contains(reg - 1));
         const bool defined_word = (is_sgpr || source.kind == OperandKind::Special) &&
                                   scalar_words.contains(reg) && !relayed.contains(reg);
+        // SCC is a numeric 0/1 source, but is not stored in the SGPR MUST-word set. Its
+        // incoming condition must be genuine on every path before this exact slot is defined.
+        const bool scc_word = source.kind == OperandKind::Special && reg == 253 && definite_scc;
         const std::pair<int, int> slot{in.dst.value, in.src[1].value};
         if (memory)
             state.memory_slots.insert(slot);
         else
             state.memory_slots.erase(slot);
-        if (constant || is_exec || pair_mask || defined_word)
+        if (constant || is_exec || pair_mask || defined_word || scc_word)
             defined.insert(slot);
         else
             defined.erase(slot);

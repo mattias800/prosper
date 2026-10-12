@@ -1708,15 +1708,17 @@ int main() {
     // to an ordinary SGPR this move falls through to the normal path, where an untracked M0 source
     // rejects, which is what it did before the token existed.
     const uint32_t m0_into_vcc_lo[] = {
-        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0  (a live ballot)
-        0xBEEA037Cu,                            // s_mov_b32 vcc_lo, m0
-        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0  (read it as DATA)
+        0xBE800380u,   // explicit s0=0 input for the encoded comparison
+        0x7d840000u,   // v_cmp_eq_u32 vcc, s0, v0 (a live ballot)
+        0xBEEA037Cu,   // s_mov_b32 vcc_lo, m0
+        0x4A02006Au,   // v_add_nc_u32 v1, vcc_lo, v0  (read it as DATA)
         0xbf810000u,
     };
     const uint32_t m0_into_vcc_lo_control[] = {
-        0x7d840000u,                            // v_cmp_eq_u32 vcc, v0, v0
-        0xbeea0385u,                            // s_mov_b32 vcc_lo, 5       (ordinary scalar data)
-        0x4A02006Au,                            // v_add_nc_u32 v1, vcc_lo, v0
+        0xBE800380u,   // explicit s0=0 input for the encoded comparison
+        0x7d840000u,   // v_cmp_eq_u32 vcc, s0, v0
+        0xbeea0385u,   // s_mov_b32 vcc_lo, 5       (ordinary scalar data)
+        0x4A02006Au,   // v_add_nc_u32 v1, vcc_lo, v0
         0xbf810000u,
     };
     ComputeShaderConfig m0_vcc_config;           // exact native wave: the VCC data read is available
@@ -2960,6 +2962,8 @@ int main() {
         0x7d020200u, 0xbf860006u, 0xbf0a8204u, 0x360000fdu, 0xbf840001u,
         0x81008100u, 0x81008100u, 0xbf82fff4u, 0xbf810000u,
     };
+    // Both ladder arms join here; define the tail SCC input without changing their offsets.
+    gta_compute_dpp_add_cfg.insert(gta_compute_dpp_add_cfg.begin() + 20, 0xbe840380u);
     ShaderResourceTable gta_compute_dpp_table;
     ShaderResource gta_compute_dpp_vb{};
     gta_compute_dpp_vb.cls = ResourceClass::VertexBuffer;
@@ -3068,6 +3072,8 @@ int main() {
         0x7d020200u, 0xbf860006u, 0xbf0a8204u, 0x360000fdu, 0xbf840001u,
         0x81008100u, 0x81008100u, 0xbf82fff4u, 0xbf810000u,
     };
+    // Both ladder arms join here; define the tail SCC input without changing their offsets.
+    gta_compute_dpp_xmask_cfg.insert(gta_compute_dpp_xmask_cfg.begin() + 20, 0xbe840380u);
     const auto xmask_cfg_spv = recompile_compute(
         gta_compute_dpp_xmask_cfg.data(), gta_compute_dpp_xmask_cfg.size(),
         &gta_compute_dpp_table, native_gta_compute_dpp_config);
@@ -3126,7 +3132,9 @@ int main() {
     // Exercise the ordinary integer-B64 emitter separately from the mask-domain vote below.
     // Exact llvm-mc gfx1010 encoding: v_cmp_gt_u64_e64 vcc_lo,s[0:1],0.
     const uint32_t wave64_u64_compare[] = {
-        0xd4e4006au, 0x00010000u,
+        0xBE800480u,   // explicit ordinary numeric s[0:1]=0
+        0xd4e4006au,
+        0x00010000u,
         0xbf810000u,
     };
     const auto wave64_u64_compare_spv = recompile_compute(
@@ -3144,19 +3152,20 @@ int main() {
     // EXEC regions force the portable arbitrary-CFG dispatcher, whose common phase must perform
     // both guest-wave votes without placing a workgroup barrier inside one dynamic switch arm.
     const uint32_t wave64_compute_live_b64_mask_scc[] = {
-        0x7d840000u,                         // pc0: v_cmp_eq_u32 vcc,v0,v0
-        0xd4e4006au, 0x0001006au,            // pc1: v_cmp_gt_u64_e64 vcc,vcc,0
-        0xbea0047eu,                         // pc3: s_mov_b64 s[32:33],exec
-        0x87ea6a20u,                         // pc4: s_and_b64 vcc,s[32:33],vcc -> live SCC
-        0x7e000280u,                         // pc5: SCC-preserving scheduled VALU
-        0xbf840003u,                         // pc6: s_cbranch_scc0 -> pc10
-        0x7d840100u,                         // pc7: fresh VCC definition
-        0x02020100u,                         // pc8: consume the fresh VCC
-        0xbf860002u,                         // pc9: s_cbranch_vccz -> pc12 (crossing region)
-        0xbf060000u,                         // pc10: later SCC lifetime, after first consumer
-        0xbf850001u,                         // pc11: third branch -> pc13 forces complex CFG
-        0x7e020280u,                         // pc12: crossing arm
-        0xbf810000u,                         // pc13: s_endpgm
+        0xb0000000u,   // pc0: explicit s_movk_i32 s0,0; keep the dispatcher shape
+        0x7d840000u,   // pc1: v_cmp_eq_u32 vcc,s0,v0
+        0xd4e4006au, 0x0001006au,   // pc2: v_cmp_gt_u64_e64 vcc,vcc,0
+        0xbea0047eu,   // pc4: s_mov_b64 s[32:33],exec
+        0x87ea6a20u,   // pc5: s_and_b64 vcc,s[32:33],vcc -> live SCC
+        0x7e000280u,   // pc6: SCC-preserving scheduled VALU
+        0xbf840003u,   // pc7: s_cbranch_scc0 -> pc11
+        0x7d840100u,   // pc8: fresh VCC definition
+        0x02020100u,   // pc9: consume the fresh VCC
+        0xbf860002u,   // pc10: s_cbranch_vccz -> pc13 (crossing region)
+        0xbf060000u,   // pc11: later SCC lifetime, after first consumer
+        0xbf850001u,   // pc12: third branch -> pc14 forces complex CFG
+        0x7e020280u,   // pc13: crossing arm
+        0xbf810000u,   // pc14: s_endpgm
     };
     const auto live_b64_mask_scc_spv = recompile_compute(
         wave64_compute_live_b64_mask_scc, std::size(wave64_compute_live_b64_mask_scc),
@@ -3176,10 +3185,10 @@ int main() {
     std::vector<uint32_t> gta_b64_mask_scc_mov(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    gta_b64_mask_scc_mov[3] = 0xbe9a047eu; // saved mask s[26:27] = exec
-    gta_b64_mask_scc_mov[4] = 0x8a9a7e1au; // exact pc173: s_andn2_b64 s26,s26,exec
-    gta_b64_mask_scc_mov[5] = 0xbefe041au; // exact pc174: s_mov_b64 exec,s26 (SCC-preserving)
-    gta_b64_mask_scc_mov[6] = 0xbf850003u; // pc175 shape: s_cbranch_scc1
+    gta_b64_mask_scc_mov[4] = 0xbe9a047eu;   // saved mask s[26:27] = exec
+    gta_b64_mask_scc_mov[5] = 0x8a9a7e1au;   // exact pc173: s_andn2_b64 s26,s26,exec
+    gta_b64_mask_scc_mov[6] = 0xbefe041au;   // exact pc174: s_mov_b64 exec,s26 (SCC-preserving)
+    gta_b64_mask_scc_mov[7] = 0xbf850003u;   // pc175 shape: s_cbranch_scc1
     const auto gta_b64_mask_scc_mov_spv = recompile_compute(
         gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(), nullptr,
         portable_wave64_compute_config);
@@ -3191,7 +3200,7 @@ int main() {
         printf("  [FAIL] GTA B64 mask SCC did not survive S_MOV_B64 to its branch\n");
         return 1;
     }
-    gta_b64_mask_scc_mov[5] = 0xbefe081au; // same pc174 site: S_NOT_B64 writes SCC
+    gta_b64_mask_scc_mov[6] = 0xbefe081au;   // same pc174 site: S_NOT_B64 writes SCC
     if (!recompile_compute(gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(),
                            nullptr, portable_wave64_compute_config).empty()) {
         printf("  [FAIL] SCC-writing pc174 mutation was treated as preserving pc173 SCC\n");
@@ -3295,7 +3304,7 @@ int main() {
     std::vector<uint32_t> gta_compute_ffbh_cfg(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    gta_compute_ffbh_cfg[5] = 0x7e087304u; // exact live v_ffbh_u32_e32 v4,v4
+    gta_compute_ffbh_cfg[6] = 0x7e087304u;   // exact live v_ffbh_u32_e32 v4,v4
     const auto gta_compute_ffbh_cfg_spv = recompile_compute(
         gta_compute_ffbh_cfg.data(), gta_compute_ffbh_cfg.size(), nullptr,
         portable_wave64_compute_config);
@@ -3315,16 +3324,17 @@ int main() {
     // may materialize it directly with a subgroup ballot. Crossing branches preserve the captured
     // packet words and saved-mask lifetime.
     const uint32_t gta_portable_mask_ffbh_cfg[] = {
-        0x7d0626f9u, 0x06868880u,            // pc0: VOPC SDWA writes saved mask s[8:9]
-        0xbf060000u,                         // pc2: establish SCC
-        0xbf840003u,                         // pc3: s_cbranch_scc0 -> pc7
-        0x7e147209u,                         // pc4: exact v_ffbh_u32 v10,s9 (high half)
-        0x7d8a14c1u,                         // pc5: compare the high-half result with -1
-        0xbf860002u,                         // pc6: s_cbranch_vccz -> pc9 (crossing)
-        0xbf060000u,                         // pc7: independent SCC lifetime
-        0xbf850001u,                         // pc8: s_cbranch_scc1 -> pc10
-        0x7e147208u,                         // pc9: exact v_ffbh_u32 v10,s8 (low half)
-        0xbf810000u,                         // pc10: s_endpgm
+        0xb0000000u,   // pc0: explicit s_movk_i32 s0,0; keep the dispatcher shape
+        0x7d0626f9u, 0x06868880u,   // pc1: VOPC SDWA writes saved mask s[8:9]
+        0xbf060000u,   // pc3: establish SCC
+        0xbf840003u,   // pc4: s_cbranch_scc0 -> pc8
+        0x7e147209u,   // pc5: exact v_ffbh_u32 v10,s9 (high half)
+        0x7d8a14c1u,   // pc6: compare the high-half result with -1
+        0xbf860002u,   // pc7: s_cbranch_vccz -> pc10 (crossing)
+        0xbf060000u,   // pc8: independent SCC lifetime
+        0xbf850001u,   // pc9: s_cbranch_scc1 -> pc11
+        0x7e147208u,   // pc10: exact v_ffbh_u32 v10,s8 (low half)
+        0xbf810000u,   // pc11: s_endpgm
     };
     const auto gta_portable_mask_ffbh_spv = recompile_compute(
         gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
@@ -3459,7 +3469,7 @@ int main() {
     std::vector<uint32_t> overwritten_b64_mask_scc(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    overwritten_b64_mask_scc[5] = 0xbf060000u; // s_cmp_eq_u32 s0,s0 overwrites SCC
+    overwritten_b64_mask_scc[6] = 0xbf060000u;   // s_cmp_eq_u32 s0,s0 overwrites SCC
     if (recompile_compute(overwritten_b64_mask_scc.data(), overwritten_b64_mask_scc.size(),
                           nullptr, portable_wave64_compute_config).empty()) {
         printf("  [FAIL] SCC overwrite was confused with the earlier B64 mask producer\n");
@@ -3471,7 +3481,7 @@ int main() {
     std::vector<uint32_t> nonbranch_b64_mask_scc(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    nonbranch_b64_mask_scc[6] = 0x85a2807eu; // s_cselect_b64 s[34:35],exec,0
+    nonbranch_b64_mask_scc[7] = 0x85a2807eu;   // s_cselect_b64 s[34:35],exec,0
     if (!recompile_compute(nonbranch_b64_mask_scc.data(), nonbranch_b64_mask_scc.size(),
                            nullptr, portable_wave64_compute_config).empty()) {
         printf("  [FAIL] non-branch SCC consumer gained a speculative B64 mask vote\n");
@@ -3483,7 +3493,7 @@ int main() {
     std::vector<uint32_t> joined_b64_mask_scc(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    joined_b64_mask_scc[3] = 0xbf820001u; // pc3: s_branch pc5, making pc5 a block entry
+    joined_b64_mask_scc[4] = 0xbf820001u;   // pc4: s_branch pc6, making pc6 a block entry
     if (!recompile_compute(joined_b64_mask_scc.data(), joined_b64_mask_scc.size(), nullptr,
                            portable_wave64_compute_config).empty()) {
         printf("  [FAIL] B64 mask SCC producer was associated across a CFG join\n");
@@ -3495,7 +3505,7 @@ int main() {
     std::vector<uint32_t> superseded_b64_mask_scc(
         std::begin(wave64_compute_live_b64_mask_scc),
         std::end(wave64_compute_live_b64_mask_scc));
-    superseded_b64_mask_scc[5] = 0x88a26a7eu; // s_or_b64 s[34:35],exec,vcc -> newer SCC
+    superseded_b64_mask_scc[6] = 0x88a26a7eu;   // s_or_b64 s[34:35],exec,vcc -> newer SCC
     if (recompile_compute(superseded_b64_mask_scc.data(), superseded_b64_mask_scc.size(),
                           nullptr, portable_wave64_compute_config).empty()) {
         printf("  [FAIL] last-live B64 mask producer was not selected uniquely\n");
@@ -3505,18 +3515,19 @@ int main() {
     // An ordinary scalar B64 logical writes an exact SCC directly. Even in the complex dispatcher,
     // it must not be diverted into the synchronized mask vote merely because a branch consumes SCC.
     const uint32_t ordinary_b64_scalar_scc[] = {
-        0xbea00481u,                         // pc0: s_mov_b64 s[32:33],1
-        0xbea20483u,                         // pc1: s_mov_b64 s[34:35],3
-        0x87a42220u,                         // pc2: s_and_b64 s[36:37],s[32:33],s[34:35]
-        0x7e000280u,                         // pc3: SCC-preserving scheduled VALU
-        0xbf840003u,                         // pc4: s_cbranch_scc0 -> pc8
-        0x7d840100u,                         // pc5: fresh VCC definition
-        0x06020100u,                         // pc6: consume the fresh VCC
-        0xbf860002u,                         // pc7: s_cbranch_vccz -> pc10
-        0xbf060000u,                         // pc8: later SCC lifetime
-        0xbf850001u,                         // pc9: third branch -> pc11 forces complex CFG
-        0x7e020280u,                         // pc10: crossing arm
-        0xbf810000u,                         // pc11: s_endpgm
+        0xb0000000u,   // pc0: explicit s_movk_i32 s0,0; keep the dispatcher shape
+        0xbea00481u,   // pc1: s_mov_b64 s[32:33],1
+        0xbea20483u,   // pc2: s_mov_b64 s[34:35],3
+        0x87a42220u,   // pc3: s_and_b64 s[36:37],s[32:33],s[34:35]
+        0x7e000280u,   // pc4: SCC-preserving scheduled VALU
+        0xbf840003u,   // pc5: s_cbranch_scc0 -> pc9
+        0x7d840100u,   // pc6: fresh VCC definition
+        0x06020100u,   // pc7: consume the fresh VCC
+        0xbf860002u,   // pc8: s_cbranch_vccz -> pc11
+        0xbf060000u,   // pc9: later SCC lifetime
+        0xbf850001u,   // pc10: third branch -> pc12 forces complex CFG
+        0x7e020280u,   // pc11: crossing arm
+        0xbf810000u,   // pc12: s_endpgm
     };
     const auto ordinary_b64_scalar_scc_spv = recompile_compute(
         ordinary_b64_scalar_scc, std::size(ordinary_b64_scalar_scc), nullptr,
@@ -3535,10 +3546,11 @@ int main() {
     // Keep this portable (native_subgroup_size=0) and use two guest waves so the test exercises the
     // exact scratch vote rather than accidentally inheriting the host subgroup's branch domain.
     const uint32_t wave64_compute_vcc_lds_write[] = {
-        0x7d840000u,                         // pc0: v_cmp_eq_u32 vcc,v0,v0
-        0xbf860002u,                         // pc1: s_cbranch_vccz -> pc4
-        0xd8340084u, 0x00000002u,            // pc2: ds_write_b32 v2,v0 offset:0x84
-        0xbf810000u,                         // pc4: s_endpgm
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
+        0x7d840000u,   // pc1: v_cmp_eq_u32 vcc,s0,v0
+        0xbf860002u,   // pc2: s_cbranch_vccz -> pc5
+        0xd8340084u, 0x00000002u,   // pc3: ds_write_b32 v2,v0 offset:0x84
+        0xbf810000u,   // pc5: s_endpgm
     };
     const auto wave64_compute_vcc_lds_spv = recompile_compute(
         wave64_compute_vcc_lds_write, std::size(wave64_compute_vcc_lds_write), nullptr,
@@ -3582,22 +3594,24 @@ int main() {
     // contains a workgroup/subgroup synchronization phase. Those remain fail-visible inside a
     // per-wave arm until a common-phase transformation proves every invocation participates.
     const uint32_t wave64_compute_vcc_barrier[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xbf8a0000u,                         // guest workgroup barrier
-        0xbf800000u,
-        0xbf810000u,
+        0xbf860002u,   // vccz -> pc5
+        0xbf8a0000u,   // guest workgroup barrier
+        0xbf800000u, 0xbf810000u,
     };
     const uint32_t wave64_compute_vcc_mbcnt[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xd7650004u, 0x000100c1u,            // v_mbcnt_lo_u32_b32 v4,-1,0
+        0xbf860002u,   // vccz -> pc5
+        0xd7650004u, 0x000100c1u,   // v_mbcnt_lo_u32_b32 v4,-1,0
         0xbf810000u,
     };
     const uint32_t wave64_compute_vcc_swizzle[] = {
+        0xBE800380u,   // explicit s0=0; encoded VOPC reads s0,v0
         0x7d840000u,
-        0xbf860002u,                         // vccz -> pc4
-        0xd8d4020fu, 0x00000000u,            // ds_swizzle_b32 v0,v0 offset:0x020f
+        0xbf860002u,   // vccz -> pc5
+        0xd8d4020fu, 0x00000000u,   // ds_swizzle_b32 v0,v0 offset:0x020f
         0xbf810000u,
     };
     if (!recompile_compute(wave64_compute_vcc_barrier,
@@ -3621,6 +3635,9 @@ int main() {
     // which are identical for every wave of a workgroup, so with EXEC full the branch decides
     // identically for all waves and the arm may synchronize. local_x=128/wave_size=64 means two
     // guest waves, so this genuinely exercises the cross-wave case rather than a single-wave shader.
+    // These synthetic tests declare the actual entry SGPRs consumed by the uniform compares.
+    auto uniform_vcc_config = portable_wave64_compute_config;
+    uniform_vcc_config.user_sgprs = {0u, 0u, 1u, 0u, 0u};
     const uint32_t wave64_uniform_vcc_barrier[] = {
         0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
         0xbf088002u,                         // pc1: s_cmp_gt_u32 s2, 0
@@ -3633,9 +3650,9 @@ int main() {
         0xbf800000u,                         // pc8: s_nop
         0xbf810000u,                         // pc9: s_endpgm
     };
-    const auto wave64_uniform_vcc_barrier_spv = recompile_compute(
-        wave64_uniform_vcc_barrier, std::size(wave64_uniform_vcc_barrier), nullptr,
-        portable_wave64_compute_config);
+    const auto wave64_uniform_vcc_barrier_spv =
+        recompile_compute(wave64_uniform_vcc_barrier, std::size(wave64_uniform_vcc_barrier),
+                          nullptr, uniform_vcc_config);
     if (wave64_uniform_vcc_barrier_spv.empty() ||
         !has_opcode(wave64_uniform_vcc_barrier_spv, 224) ||  // OpControlBarrier: the guest barrier
         !has_opcode(wave64_uniform_vcc_barrier_spv, 247) ||  // OpSelectionMerge: retained guest arm
@@ -3660,12 +3677,12 @@ int main() {
     // (b) VCC is combined with a VOPC-written mask instead of a second proved select, so the branch
     //     tests lane occupancy rather than a scalar predicate.
     const uint32_t wave64_uniform_vcc_lane_scc[] = {
-        0xbefe04c1u,                         // pc0: s_mov_b64 exec, -1
-        0x7d840000u,                         // pc1: v_cmp_eq_u32 vcc, v0, v0   (lane-derived mask)
-        0xbf088002u,                         // pc2: s_cmp_gt_u32 s2, 0
-        0x858a807eu,                         // pc3: s_cselect_b64 s[10:11], exec, 0
-        0x87ea0a6au,                         // pc4: s_and_b64 vcc, vcc, s[10:11]
-        0xbf860002u,                         // pc5: s_cbranch_vccz -> pc8
+        0xbefe04c1u,   // pc0: s_mov_b64 exec, -1
+        0x7d840000u,   // pc1: v_cmp_eq_u32 vcc,s0,v0 (lane-derived mask)
+        0xbf088002u,   // pc2: s_cmp_gt_u32 s2, 0
+        0x858a807eu,   // pc3: s_cselect_b64 s[10:11], exec, 0
+        0x87ea0a6au,   // pc4: s_and_b64 vcc, vcc, s[10:11]
+        0xbf860002u,   // pc5: s_cbranch_vccz -> pc8
         0xbf8a0000u, 0xbf800000u, 0xbf810000u,
     };
     // (c) A contributing compare reads a V_READFIRSTLANE result: uniform per wave, not per workgroup.
@@ -3702,8 +3719,7 @@ int main() {
     };
     bool uniform_vcc_negatives_held = true;
     for (const auto& negative : uniform_vcc_negatives) {
-        if (recompile_compute(negative.code, negative.words, nullptr,
-                              portable_wave64_compute_config).empty())
+        if (recompile_compute(negative.code, negative.words, nullptr, uniform_vcc_config).empty())
             continue;
         printf("  [FAIL] %s still admitted a barrier-spanning VCC branch\n", negative.what);
         uniform_vcc_negatives_held = false;
@@ -4834,20 +4850,21 @@ int main() {
     // so both complete-pair votes must be unconditional after the switch merge; only the SCC write
     // is selected by the publishing lane's nonzero event tag.
     std::vector<uint32_t> saved_mask_pair_divergent_sites = {
-        0xbe9e047eu,                         // pc0:  s_mov_b64 s[30:31],exec
-        0x87ac1e7eu,                         // pc1:  s_and_b64 s[44:45],exec,s[30:31]
-        0x7c020300u,                         // pc2:  v_cmp_lt_f32 vcc,v0,v1
-        0x87ae1e6au,                         // pc3:  s_and_b64 s[46:47],vcc,s[30:31]
-        0x87b41e7eu,                         // pc4:  s_and_b64 s[52:53],exec,s[30:31]
-        0x87b61e6au,                         // pc5:  s_and_b64 s[54:55],vcc,s[30:31]
-        0xbf060100u,                         // pc6:  s_cmp_eq_u32 s0,s1
-        0xbf840002u,                         // pc7:  alternate event -> pc10
-        0xbf122e2cu,                         // pc8:  event 1: EQ s[44:45],s[46:47]
-        0xbf820001u,                         // pc9:  join -> pc11
-        0xbf133634u,                         // pc10: event 2: LG s[52:53],s[54:55]
-        0xbf800000u,                         // pc11: SCC-preserving join
-        0x85b0807eu,                         // pc12: s_cselect_b64 s[48:49],exec,0
-        0xbefe0430u,                         // pc13: s_mov_b64 exec,s[48:49]
+        0xb0000000u, 0xb0010001u,   // explicit s0/s1 inputs; retain the event branches
+        0xbe9e047eu,   // pc2:  s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,   // pc3:  s_and_b64 s[44:45],exec,s[30:31]
+        0x7c020300u,   // pc4:  v_cmp_lt_f32 vcc,v0,v1
+        0x87ae1e6au,   // pc5:  s_and_b64 s[46:47],vcc,s[30:31]
+        0x87b41e7eu,   // pc6:  s_and_b64 s[52:53],exec,s[30:31]
+        0x87b61e6au,   // pc7:  s_and_b64 s[54:55],vcc,s[30:31]
+        0xbf060100u,   // pc8:  s_cmp_eq_u32 s0,s1
+        0xbf840002u,   // pc9:  alternate event -> pc12
+        0xbf122e2cu,   // pc10:  event 1: EQ s[44:45],s[46:47]
+        0xbf820001u,   // pc11:  join -> pc13
+        0xbf133634u,   // pc12: event 2: LG s[52:53],s[54:55]
+        0xbf800000u,   // pc13: SCC-preserving join
+        0x85b0807eu,   // pc14: s_cselect_b64 s[48:49],exec,0
+        0xbefe0430u,   // pc15: s_mov_b64 exec,s[48:49]
     };
     saved_mask_pair_divergent_sites.insert(
         saved_mask_pair_divergent_sites.end(), std::begin(fragment_scalar_cfg_dispatch),
@@ -4885,14 +4902,15 @@ int main() {
         return 1;
     }
     std::vector<uint32_t> saved_mask_path_dependent = {
-        0xbe9e047eu,                         // s_mov_b64 s[30:31],exec
-        0x87ac1e7eu,                         // s_and_b64 s[44:45],exec,s[30:31]
-        0xbf060100u,                         // pc2: s_cmp_eq_u32 s0,s1
-        0xbf840001u,                         // pc3: edge skips s46 -> compare at pc5
-        0x87ae1e6au,                         // pc4: s_and_b64 s[46:47],vcc,s[30:31]
-        0xbf122e2cu,                         // pc5: joined s[46:47] lifetime is path-dependent
-        0xbf800000u,                         // pc6: SCC-preserving nop
-        0x85b0807eu,                         // pc7: consumes comparison SCC
+        0xb0000000u, 0xb0010001u,   // explicit s0/s1 inputs; retain the event branches
+        0xbe9e047eu,   // s_mov_b64 s[30:31],exec
+        0x87ac1e7eu,   // s_and_b64 s[44:45],exec,s[30:31]
+        0xbf060100u,   // pc4: s_cmp_eq_u32 s0,s1
+        0xbf840001u,   // pc5: edge skips s46 -> compare at pc7
+        0x87ae1e6au,   // pc6: s_and_b64 s[46:47],vcc,s[30:31]
+        0xbf122e2cu,   // pc7: joined s[46:47] lifetime is path-dependent
+        0xbf800000u,   // pc8: SCC-preserving nop
+        0x85b0807eu,   // pc9: consumes comparison SCC
         0xbefe0430u,
     };
     saved_mask_path_dependent.insert(
@@ -4946,20 +4964,22 @@ int main() {
         std::begin(fragment_saved_mask_pair_prelude),
         std::end(fragment_saved_mask_pair_prelude));
     fragment_dpp_min_divergent_sites.insert(
-        fragment_dpp_min_divergent_sites.end(), {
-            0x7e060287u,                         // pc8:  v_mov_b32 v3,7
-            0xbf060100u,                         // pc9:  s_cmp_eq_u32 s0,s1
-            0xbf840003u,                         // pc10: alternate event -> pc14
-            0x260606fau, 0xff011103u,            // pc11: event 1 row_shr:1
-            0xbf820002u,                         // pc13: join -> pc16
-            0x260606fau, 0xff011203u,            // pc14: event 2 row_shr:2
-            0xbf800000u,                         // pc16: first join
-            0xbf060100u,                         // pc17: s_cmp_eq_u32 s0,s1
-            0xbf840003u,                         // pc18: alternate event -> pc22
-            0x260606fau, 0xff011403u,            // pc19: event 3 row_shr:4
-            0xbf820002u,                         // pc21: join -> pc24
-            0x260606fau, 0xff011803u,            // pc22: event 4 row_shr:8
-            0xbf800000u,                         // pc24: second join
+        fragment_dpp_min_divergent_sites.end(),
+        {
+            0xb0000000u, 0xb0010001u,   // explicit s0/s1 inputs of both event branches
+            0x7e060287u,   // pc10:  v_mov_b32 v3,7
+            0xbf060100u,   // pc11:  s_cmp_eq_u32 s0,s1
+            0xbf840003u,   // pc12: alternate event -> pc16
+            0x260606fau, 0xff011103u,   // pc13: event 1 row_shr:1
+            0xbf820002u,   // pc15: join -> pc18
+            0x260606fau, 0xff011203u,   // pc16: event 2 row_shr:2
+            0xbf800000u,   // pc18: first join
+            0xbf060100u,   // pc19: s_cmp_eq_u32 s0,s1
+            0xbf840003u,   // pc20: alternate event -> pc24
+            0x260606fau, 0xff011403u,   // pc21: event 3 row_shr:4
+            0xbf820002u,   // pc23: join -> pc26
+            0x260606fau, 0xff011803u,   // pc24: event 4 row_shr:8
+            0xbf800000u,   // pc26: second join
         });
     fragment_dpp_min_divergent_sites.insert(
         fragment_dpp_min_divergent_sites.end(),

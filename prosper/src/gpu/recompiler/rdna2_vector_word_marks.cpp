@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -79,6 +80,22 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
     // Ordinary constant AND dynamic lane reads have the same possible source words. A clean
     // overwritten constant spill slot above remains separate from other lanes' marks.
     return vector_word(rs, reg);
+}
+
+bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
+    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    const bool predicate = in.fmt == Rdna2Format::VOPC || vop3_writes_mask_sdst(in) ||
+                           (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a);
+    if (!predicate) return true;
+    // Read before the destination replaces its prior lifetime. This uses decoded source counts and
+    // physical widths, including both words of wide comparisons and marked ordinary VALU relays.
+    // A memory-loaded value can form a fresh predicate; a missing spill's zero storage cannot.
+    const auto marks = scalar_source_marks(rs, in);
+    if (!marks.placeholder) return true;
+    if (marks.hard || marks.blanket_roots.empty()) return false;
+    // These roots name defined loop seeds, whose back edges the existing loop proof checks.
+    b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
+    return true;
 }
 
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
