@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -107,24 +108,43 @@ ShaderResourceTable output_table() {
 }
 
 template <size_t N>
-std::vector<uint32_t> compile(const uint32_t (&prefix)[N]) {
+std::vector<uint32_t> compile(const uint32_t (&prefix)[N], bool local_y = true,
+                              uint64_t program = 0x49900001ull) {
     std::vector<uint32_t> code(std::begin(prefix), std::end(prefix));
     code.insert(code.end(), std::begin(kTail), std::end(kTail));
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    // The irreducible tail compares v0/v1. Supply both real local IDs before testing M0.
+    config.tidig_comp_cnt = local_y ? 1 : 0;
     const ShaderResourceTable table = output_table();
-    return recompile_compute(code.data(), code.size(), &table, config);
+    return recompile_compute(code.data(), code.size(), &table, config,
+                             {RecompileDiagnosticStage::Compute, program});
+}
+
+template <size_t N>
+std::vector<uint32_t> compile_fragment(const uint32_t (&code)[N], bool position = true,
+                                       uint64_t program = 0x49900002ull) {
+    // PS position X/Y are genuine varying inputs for the same tail's v0/v1 compare.
+    PixelSystemInputMapping inputs{};
+    inputs.addr = inputs.ena = (1u << 8) | (1u << 9);
+    return recompile_fragment(code, N, nullptr, position ? &inputs : nullptr, UINT32_MAX, nullptr,
+                              false, {RecompileDiagnosticStage::Fragment, program});
 }
 
 }   // namespace
 
-TEST(EntryM0Wave64Kill, DataWriteOnEveryPathIsData) {
+TEST(EntryM0Wave64Kill, DataWriteOnEveryPathCompiles) {
     const std::vector<uint32_t> spv = compile(kDataWriteOnEveryPath);
     ASSERT_FALSE(spv.empty())
         << "s2 was overwritten with data after the M0 save on the only path to the read";
     EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
+}
+
+TEST(EntryM0Wave64Kill, DataWriteOnEveryPathIsData) {
+    const std::vector<uint32_t> spv = compile(kDataWriteOnEveryPath);
+    ASSERT_FALSE(spv.empty());
     if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
         GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
     std::vector<uint32_t> out;
@@ -137,25 +157,54 @@ TEST(EntryM0Wave64Kill, DataWriteOnEveryPathIsData) {
 }
 
 TEST(EntryM0Wave64Kill, TokenAloneStillRejects) {
-    EXPECT_TRUE(compile(kTokenAlone).empty())
+    constexpr uint64_t program = 0x49900005ull;
+    EXPECT_TRUE(compile(kTokenAlone, true, program).empty())
         << "a read that only the save reaches must keep rejecting, not read a zero placeholder";
+    EXPECT_NE(
+        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=3 words=7e060202"),
+        std::string::npos);
 }
 
 TEST(EntryM0Wave64Kill, DataWriteOnOnePathStillRejects) {
-    EXPECT_TRUE(compile(kDataWriteOnOnePath).empty())
+    constexpr uint64_t program = 0x49900006ull;
+    EXPECT_TRUE(compile(kDataWriteOnOnePath, true, program).empty())
         << "the data write is skipped on one path, so the token may still be live at the read";
+    EXPECT_NE(
+        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=3 words=7e060202"),
+        std::string::npos);
 }
 
 TEST(EntryM0Wave64Kill, FragmentDispatcherAppliesTheSameKill) {
-    const std::vector<uint32_t> data =
-        recompile_fragment(kFragmentDataWriteOnEveryPath, std::size(kFragmentDataWriteOnEveryPath));
+    const std::vector<uint32_t> data = compile_fragment(kFragmentDataWriteOnEveryPath);
     ASSERT_FALSE(data.empty())
         << "a Wave64 pixel program's dispatcher kills the token the same way";
     EXPECT_TRUE(has_opcode(data, kOpSwitch)) << "it lowered through the CFG dispatcher";
-    EXPECT_TRUE(recompile_fragment(kFragmentTokenAlone, std::size(kFragmentTokenAlone)).empty())
+    constexpr uint64_t token_program = 0x49900007ull;
+    EXPECT_TRUE(compile_fragment(kFragmentTokenAlone, true, token_program).empty())
         << "the token alone still rejects in a pixel program";
-    EXPECT_TRUE(
-        recompile_fragment(kFragmentDataWriteOnOnePath, std::size(kFragmentDataWriteOnOnePath))
-            .empty())
+    EXPECT_NE(last_terminal_reject_reason(token_program)
+                  .find("mode=unresolved-operand pc=3 words=7e060202"),
+              std::string::npos);
+    constexpr uint64_t one_path_program = 0x49900008ull;
+    EXPECT_TRUE(compile_fragment(kFragmentDataWriteOnOnePath, true, one_path_program).empty())
         << "a data write on one path only still rejects in a pixel program";
+    EXPECT_NE(last_terminal_reject_reason(one_path_program)
+                  .find("mode=unresolved-operand pc=3 words=7e060202"),
+              std::string::npos);
+}
+
+TEST(EntryM0Wave64Kill, MissingLocalYRefusesAtTheTailCompare) {
+    constexpr uint64_t program = 0x49900003ull;
+    EXPECT_TRUE(compile(kDataWriteOnEveryPath, false, program).empty());
+    EXPECT_NE(
+        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=12 words=7c020300"),
+        std::string::npos);
+}
+
+TEST(EntryM0Wave64Kill, MissingPositionInputsRefuseAtTheTailCompare) {
+    constexpr uint64_t program = 0x49900004ull;
+    EXPECT_TRUE(compile_fragment(kFragmentDataWriteOnEveryPath, false, program).empty());
+    EXPECT_NE(
+        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=9 words=7c020300"),
+        std::string::npos);
 }
