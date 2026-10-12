@@ -21,6 +21,7 @@ from gen_compat_site import (  # noqa: E402
     bucket_of,
     build,
     counts,
+    engine_family,
     ladder_rows,
     links_cell,
     parse_compat_covers,
@@ -131,6 +132,50 @@ def test_site_has_every_section_and_no_leftover_tokens():
     assert page.count("<script>") == 1 and page.count("</script>") == 1
 
 
+def test_engine_variants_collapse_into_families():
+    """Five Unity strings are one filter choice; unknowns are grouped, not dropped."""
+    unity = [
+        "Unity",
+        "Unity / IL2CPP",
+        "Unity 2019.4 / IL2CPP",
+        "Unity 2020.3.1 / IL2CPP",
+        "Unity 6",
+        "Unity 6 / IL2CPP",
+    ]
+    assert {engine_family(e) for e in unity} == {"Unity"}
+    assert {
+        engine_family(e) for e in ("Unreal Engine", "Unreal Engine 4", "Unreal Engine (inferred)")
+    } == {"Unreal Engine"}
+    assert engine_family("Hedgehog Engine 2 (Needle)") == "Hedgehog Engine"
+    assert engine_family("Custom (Saber)") == "Custom"
+    assert engine_family("RE Engine") == "RE Engine"
+    assert engine_family("Anvil (inferred)") == "Anvil"
+    assert engine_family("-") == engine_family("—") == "Unknown"
+    titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
+    assert titles[0]["family"] == "Unity" and titles[0]["engine"] == "Unity"
+
+
+def test_dropdown_is_dark_and_filters_by_family():
+    """Native popup follows the dark theme, and the filter compares families, not raw strings."""
+    page = render_index(
+        build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
+    )
+    assert "color-scheme:dark" in page and "select option{background:#0b0f17" in page
+    assert "t.family===eng" in page and "t.engine===eng" not in page
+
+
+def test_nav_links_have_hit_area_hover_and_scrollspy():
+    """Menu links are pills (padding = hit area) with hover/active state and a scrollspy."""
+    page = render_index(
+        build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
+    )
+    assert ".navlinks a:not(.btn){padding:10px 14px;border-radius:999px;cursor:pointer" in page
+    assert ".navlinks a:not(.btn):hover,.navlinks a.active{" in page
+    assert 'typeof IntersectionObserver!=="undefined"' in page  # safe where it is missing
+    for target in ("how", "progress", "games", "scope"):
+        assert f'href="#{target}"' in page and f'id="{target}"' in page
+
+
 def test_cursors_match_what_is_clickable():
     """Hand on links/buttons/chips, text cursor on search, icon overlay never eats the pointer."""
     page = render_index(
@@ -207,6 +252,9 @@ if __name__ == "__main__":
     test_markers_are_not_statuses()
     test_milestone_html_is_escaped()
     test_site_has_every_section_and_no_leftover_tokens()
+    test_engine_variants_collapse_into_families()
+    test_dropdown_is_dark_and_filters_by_family()
+    test_nav_links_have_hit_area_hover_and_scrollspy()
     test_cursors_match_what_is_clickable()
     test_ladder_shows_all_seven_rungs_with_live_counts()
     test_links_and_pills_stay_on_one_line()

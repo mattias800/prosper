@@ -29,7 +29,9 @@ LADDER_COPY = {
 SITE_CSS = """
 :root{--bg:#06080d;--bg2:#0b0f17;--card:rgba(255,255,255,.04);--card2:rgba(255,255,255,.07);
 --line:rgba(255,255,255,.09);--tx:#e9eef7;--mut:#8f9bb0;--a:#8b6cff;--b:#27d4f2;
---grad:linear-gradient(120deg,#8b6cff 0%,#27d4f2 100%);--r:16px}
+--grad:linear-gradient(120deg,#8b6cff 0%,#27d4f2 100%);--r:16px;color-scheme:dark}
+select option{background:#0b0f17;color:#e9eef7}
+select{max-width:100%;text-overflow:ellipsis}
 *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:72px}
 body{margin:0;background:var(--bg);color:var(--tx);line-height:1.55;
 font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -47,8 +49,11 @@ background:rgba(6,8,13,.72);border-bottom:1px solid var(--line)}
 nav.top .wrap{display:flex;align-items:center;gap:20px;height:64px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:-.01em}
 img.logo{height:34px;width:auto;display:block}
-.navlinks{display:flex;gap:22px;margin-left:auto;font-size:14px;color:var(--mut)}
-.navlinks a:hover{color:var(--tx)}
+.navlinks{display:flex;align-items:center;gap:4px;margin-left:auto;font-size:14px;color:var(--mut)}
+.navlinks a:not(.btn){padding:10px 14px;border-radius:999px;cursor:pointer;transition:.2s}
+.navlinks a:not(.btn):hover,.navlinks a.active{color:var(--tx);background:var(--card2)}
+.navlinks a.active{box-shadow:inset 0 -2px 0 var(--a)}
+.navlinks .btn{margin-left:8px}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:999px;font-weight:600;
 font-size:15px;border:1px solid var(--line);background:var(--card);transition:.2s}
 .btn:hover{background:var(--card2);transform:translateY(-1px)}
@@ -165,7 +170,7 @@ function chips(){
 function go(){
  var R=T.filter(function(t){
   return (!q||t.title.toLowerCase().indexOf(q)>-1||t.id.toLowerCase().indexOf(q)>-1||t.engine.toLowerCase().indexOf(q)>-1)
-   &&(!on||t.status===on)&&(!eng||t.engine===eng);});
+   &&(!on||t.status===on)&&(!eng||t.family===eng);});
  R.sort(sort==="az"?function(a,b){return a.title.localeCompare(b.title);}
   :function(a,b){return ((b.rung==null?-1:b.rung)-(a.rung==null?-1:a.rung))||a.title.localeCompare(b.title);});
  $("count").textContent=R.length+" of "+T.length+" games";
@@ -180,8 +185,9 @@ function go(){
 }
 fetch("compat.json").then(function(r){return r.json();}).then(function(d){
  T=d.titles;B=d.buckets;
- var es={};T.forEach(function(t){if(t.engine&&t.engine!=="-")es[t.engine]=1;});
- $("eng").innerHTML='<option value="">All engines</option>'+Object.keys(es).sort().map(function(x){return '<option>'+e(x)+'</option>';}).join("");
+ var es={};T.forEach(function(t){es[t.family]=(es[t.family]||0)+1;});
+ var names=Object.keys(es).sort(function(a,b){return (a==="Unknown")-(b==="Unknown")||es[b]-es[a]||a.localeCompare(b);});
+ $("eng").innerHTML='<option value="">All engines</option>'+names.map(function(x){return '<option value="'+e(x)+'">'+e(x)+' ('+es[x]+')</option>';}).join("");
  chips();go();
 }).catch(function(){$("grid").innerHTML='<div class="empty">Could not load the game list. See the <a href="classic.html">static list</a>.</div>';});
 $("q").addEventListener("input",function(ev){q=ev.target.value.toLowerCase();go();});
@@ -189,6 +195,14 @@ $("eng").addEventListener("change",function(ev){eng=ev.target.value;go();});
 $("sort").addEventListener("change",function(ev){sort=ev.target.value;go();});
 $("chips").addEventListener("click",function(ev){var b=ev.target.closest(".chip");if(!b)return;on=b.getAttribute("data-s");chips();go();});
 $("grid").addEventListener("click",function(ev){var m=ev.target.closest(".ms");if(m)m.classList.toggle("open");});
+if(typeof IntersectionObserver!=="undefined"){
+ var links={};
+ document.querySelectorAll(".navlinks a[href^='#']").forEach(function(a){links[a.getAttribute("href").slice(1)]=a;});
+ var io=new IntersectionObserver(function(en){en.forEach(function(x){if(x.isIntersecting){
+  Object.keys(links).forEach(function(k){links[k].classList.toggle("active",k===x.target.id);});}});},
+  {rootMargin:"-45% 0px -50% 0px"});
+ ["how","progress","games","scope"].forEach(function(id){var s=document.getElementById(id);if(s)io.observe(s);});
+}
 """
 
 TEMPLATE = """<!DOCTYPE html>

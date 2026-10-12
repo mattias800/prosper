@@ -199,6 +199,28 @@ def parse_compat_covers(text: str) -> dict[str, str]:
     return covers
 
 
+def engine_family(engine: str) -> str:
+    """Collapse the many recorded engine strings into a short, filterable family name.
+
+    The detailed string stays on each card; only the filter uses the family, so
+    `Unity 6 / IL2CPP`, `Unity 2019.4 / IL2CPP` and `Unity` are one choice, not five.
+    """
+    name = re.sub(r"\s*\(.*?\)", "", engine).strip()
+    low = name.lower()
+    if low in {"", "-", "—", "unknown"}:
+        return "Unknown"
+    for prefix, family in (
+        ("unity", "Unity"),
+        ("unreal", "Unreal Engine"),
+        ("hedgehog", "Hedgehog Engine"),
+        ("custom", "Custom"),
+        ("ryu ga gotoku", "Ryu Ga Gotoku"),
+    ):
+        if low.startswith(prefix):
+            return family
+    return name
+
+
 def bucket_of(rung: int | None) -> tuple[str, str, str]:
     """(label, colour, tooltip) for a rung; unknown rungs are a hard error, never a grey row."""
     for r, label, colour, hint in BUCKETS:
@@ -220,6 +242,7 @@ def build(
             "title": row["title"],
             "id": row["id"],
             "engine": comp.get("engine", "-"),
+            "family": engine_family(comp.get("engine", "-")),
             "milestone": comp.get("milestone", "-"),
             "cover": covers.get(row["id"], ""),
             "rung": row["rung"],
@@ -240,6 +263,7 @@ def build(
                 "title": comp["title"],
                 "id": tid,
                 "engine": comp["engine"],
+                "family": engine_family(comp["engine"]),
                 "milestone": comp["milestone"],
                 "cover": covers.get(tid, ""),
                 "rung": None,
