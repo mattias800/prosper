@@ -7025,10 +7025,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
                 // writing DISJOINT fields, so the store is race-free. Requires the field to lie within
                 // a single dword: address comp_bytes-aligned, no runtime per-lane byte offset.
-                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                bool soff_zero =
+                    (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 if (is_store && int_subword && !offen && !dyn_vfetch &&
-                    (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
+                    (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) &&
+                    soff_zero)
                     dyn_int_store = true;
                 if (!base_aligned) {
                     // Float16 format loads use the complete runtime byte address for every requested

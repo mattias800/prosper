@@ -4899,13 +4899,22 @@ int main() {
     // Dword-aligned sub-dword integer store: a stride-4 Uint16 store is dword-aligned (stride & 3 == 0)
     // and must lower via the atomic sub-dword store path without rejection.
     ShaderResourceTable rt_store16_aligned;
-    { ShaderResource sb{}; sb.cls = ResourceClass::ConstantBuffer; sb.format = DataFormat::Uint16;
-      sb.num_components = 1; sb.binding = 3; sb.stride = 4; sb.sgpr_base = 8; sb.fetch_pc = 2;
-      rt_store16_aligned.resources.push_back(sb); }
+    {
+        ShaderResource sb{};
+        sb.cls = ResourceClass::ConstantBuffer;
+        sb.format = DataFormat::Uint16;
+        sb.num_components = 1;
+        sb.binding = 3;
+        sb.stride = 4;
+        sb.sgpr_base = 8;
+        sb.fetch_pc = 2;
+        rt_store16_aligned.resources.push_back(sb);
+    }
     const uint32_t code_store16_aligned[] = {
-        0x7e000f00u,               // v_cvt_u32_f32 v0, v0
-        0x7e020300u,               // v_mov_b32 v1, v0
-        0xe0102000u, 0x80020100u,  // buffer_store_format_x v1, v0, s[8:11], idxen (Uint16, stride 4)
+        0x7e000f00u,   // v_cvt_u32_f32 v0, v0
+        0x7e020300u,   // v_mov_b32 v1, v0
+        0xe0102000u,
+        0x80020100u,   // buffer_store_format_x v1, v0, s[8:11], idxen (Uint16, stride 4)
         0xbf810000u,
     };
     std::vector<uint32_t> spv_store16_aligned = recompile_valu(

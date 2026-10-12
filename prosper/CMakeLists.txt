@@ -3628,6 +3628,9 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
+  prosper_add_gtest(test_integer_format_store
+    SOURCES tests/gpu/recompiler/test_integer_format_store.cpp
+    LIBRARIES prosper_core)
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_dynfetch_fold PRIVATE tests)
