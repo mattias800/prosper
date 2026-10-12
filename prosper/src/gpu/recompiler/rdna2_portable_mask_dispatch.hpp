@@ -3,6 +3,7 @@
 
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
 
 namespace prosper::gpu {
 struct SpirvCompute;
@@ -12,7 +13,7 @@ struct SpilledVectorSourceMarks;
 // Preserve the producer's stronger refusal context across nested body emission.
 class PortableMaskHalfEntryScope {
 public:
-    PortableMaskHalfEntryScope(SpirvCompute&, bool);
+    PortableMaskHalfEntryScope(SpirvCompute&, uint32_t);
     ~PortableMaskHalfEntryScope();
 
 private:

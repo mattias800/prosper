@@ -247,7 +247,7 @@ TEST(PortableMaskDispatch, ExecHalfCompositionNeedsEveryGuestLaneAcrossABarrier)
 
 TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
     using namespace prosper::gpu;
-    const auto run = [](bool incomplete) {
+    const auto run = [](uint32_t mode) {
         auto code = f::program(false, true);
         code.resize(12);   // include the actual EXEC restore, before the unrelated value sink
         code.push_back(base::end);
@@ -255,15 +255,17 @@ TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
         ASSERT_TRUE(rdna2_walk(code.data(), code.size(), ins));
         SpirvCompute b;
         b.begin(1, nullptr, 64, 1, 1, 64);
-        b.diagnostic = {RecompileDiagnosticStage::Compute, 0x493506000000ull + incomplete};
+        b.diagnostic = {RecompileDiagnosticStage::Compute, 0x493506000000ull + mode};
         RegState rs;
         rs.exec = b.btrue();
         rs.vcc = rs.scc = b.bfalse();
-        const uint32_t active = incomplete ? b.ucmp(Op_IEqual, b.localid_comp[0], b.uconst(0)) : 0;
+        const uint32_t active =
+            mode == 1 ? b.btrue()
+                      : (mode == 2 ? b.ucmp(Op_IEqual, b.localid_comp[0], b.uconst(0)) : 0);
         const bool ok = emit_cfg_state_machine(
             b, rs, ins, {}, nullptr, true, true, [](RegState&, const Rdna2Inst&) { return false; },
             code.data(), code.size(), active);
-        if (incomplete) {
+        if (mode == 2) {
             EXPECT_FALSE(ok);
             EXPECT_NE(last_terminal_reject_reason(b.diagnostic.program_address)
                           .find("pc=11 words=befe0414"),
@@ -271,6 +273,7 @@ TEST(PortableMaskDispatch, ExplicitActiveCallerCannotPublishACompleteHalfPair) {
         } else
             EXPECT_TRUE(ok);
     };
-    run(false);
-    run(true);
+    run(0);
+    run(1);
+    run(2);
 }

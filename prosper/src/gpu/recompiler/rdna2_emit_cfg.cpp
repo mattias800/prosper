@@ -532,7 +532,7 @@ bool emit_cfg_state_machine(
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
     NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
-    PortableMaskHalfEntryScope half_entry_scope(b, initial_active != 0);
+    PortableMaskHalfEntryScope half_entry_scope(b, initial_active);
     PortableMaskHalfBodyScope half_scope(b, initial, ins);
     const bool barrier_half_phase =
         barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
