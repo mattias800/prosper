@@ -266,9 +266,10 @@ struct Compiled {
 };
 
 template <size_t N>
-Compiled compile(const uint32_t (&words)[N], uint64_t address, bool wave32 = false) {
+Compiled compile(const uint32_t (&words)[N], uint64_t address, bool wave32 = false,
+                 const PixelSystemInputMapping* system_inputs = nullptr) {
     Compiled out;
-    out.spirv = recompile_fragment(words, N, nullptr, nullptr, UINT32_MAX, nullptr, wave32,
+    out.spirv = recompile_fragment(words, N, nullptr, system_inputs, UINT32_MAX, nullptr, wave32,
                                    {RecompileDiagnosticStage::Fragment, address});
     out.reason = last_terminal_reject_reason(address);
     return out;
@@ -368,14 +369,29 @@ TEST(FragmentLoopVccScratch, ScratchLoopRunsExactlyFourIterations) {
 
 TEST(FragmentLoopVccScratch, WaveVotedBoundCompilesToo) {
     // The live loop's bound is a VGPR the proof cannot call wave-uniform, so its exit is a vote
-    // over the guest wave. Same loop, bound taken from an unresolved lane-varying register.
+    // over the guest wave. Same loop, bound taken from genuine lane-varying v2. Reserving the
+    // two disabled field-0 slots places enabled POS_X at v2, supplied through FragCoord.x.
     uint32_t varying[std::size(kScratchLoop)];
     std::copy(std::begin(kScratchLoop), std::end(kScratchLoop), varying);
     varying[2] = 0x7E020302u;   // v_mov_b32 v1, v2
-    const Compiled loop = compile(varying, 0x4508A006ull);
+    const PixelSystemInputMapping inputs{.ena = 1u << 8, .addr = (1u << 8) | 1u};
+    const Compiled loop = compile(varying, 0x4508A006ull, false, &inputs);
     ASSERT_FALSE(loop.spirv.empty()) << loop.reason;
     EXPECT_EQ(fragment_spirv_required_subgroup_size(loop.spirv), 64u)
         << "a lane-varying VCC exit is decided by the complete 64-lane wave";
+
+    const PixelSystemInputMapping absent{};
+    const PixelSystemInputMapping disabled{.ena = 0, .addr = inputs.addr};
+    const PixelSystemInputMapping displaced{.ena = inputs.ena, .addr = inputs.ena};
+    uint64_t address = 0x4508A106ull;
+    for (const auto* missing :
+         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &displaced}) {
+        const Compiled rejected = compile(varying, address++, false, missing);
+        EXPECT_TRUE(rejected.spirv.empty());
+        EXPECT_NE(rejected.reason.find("fabricated-fresh-mask-source pc=4 words=7d020200 "),
+                  std::string::npos)
+            << rejected.reason;
+    }
 }
 
 TEST(FragmentLoopVccScratch, HeaderReadOfTheCarriedPairStillRejects) {
@@ -547,16 +563,25 @@ TEST(FragmentLoopVccScratch, CountedLoopReadingAMaskHalfAsDataStillRejects) {
 }
 
 TEST(FragmentLoopVccScratch, CountedLoopWithAMaskReadAfterTheExitStillRejects) {
-    // On the exit path the pair was never redefined, so a mask read there would observe the
-    // placeholder the back-edge carries round the loop.
+    // The high DATA write retires the entry mask before the loop, so there is no old Bool phi
+    // to diagnose at its header. The post-loop mask use must still refuse. Both data alternatives
+    // are genuine: v3 was initialized to 1.0; the former v5 source was never written.
     uint32_t mask_read[std::size(kCountedVccHiLoop)];
     std::copy(std::begin(kCountedVccHiLoop), std::end(kCountedVccHiLoop), mask_read);
-    mask_read[18] = 0x02020105u;   // v_cndmask_b32 v1, v5, v0, vcc
+    mask_read[18] = 0x02020103u;   // v_cndmask_b32 v1, v3, v0, vcc
     const Compiled loop = compile(mask_read, 0x4680A005ull);
-    EXPECT_TRUE(loop.spirv.empty()) << "a mask read reachable from the header";
-    EXPECT_NE(loop.reason.find("from header pc=7"), std::string::npos) << loop.reason;
-    EXPECT_NE(loop.reason.find("blocker pc=18 kind=vop2-implicit-vcc"), std::string::npos)
+    EXPECT_TRUE(loop.spirv.empty()) << "the exit has scalar DATA but no current VCC mask";
+    EXPECT_NE(loop.reason.find("mode=unresolved-operand pc=18 words=02020103 "), std::string::npos)
         << loop.reason;
+
+    // The same loop and use compile when a complete genuine mask is supplied at that use.
+    // The existing exit branch still lands at PC18, now the fresh mask writer.
+    uint32_t restored[std::size(kCountedVccHiLoop) + 1];
+    std::copy_n(std::begin(mask_read), 18, std::begin(restored));
+    restored[18] = 0xBEEA04C1u;   // s_mov_b64 vcc, -1
+    std::copy(std::begin(mask_read) + 18, std::end(mask_read), std::begin(restored) + 19);
+    const Compiled control = compile(restored, 0x4680A00Bull);
+    EXPECT_FALSE(control.spirv.empty()) << "matched fresh-mask control: " << control.reason;
 }
 
 TEST(FragmentLoopVccScratch, CountedLoopExitHandsOnTheConditionCompareNotThePlaceholder) {
