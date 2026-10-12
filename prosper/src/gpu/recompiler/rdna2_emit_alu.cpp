@@ -38,6 +38,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -251,6 +252,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
+    PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
+    if (!ok || portable_halves.handled()) return true;
     VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
     if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {

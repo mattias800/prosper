@@ -11,6 +11,8 @@
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_trip_bound.hpp"
+#include "gpu/recompiler/rdna2_reject_words.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
@@ -46,6 +48,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
@@ -60,37 +63,6 @@
 #include "gpu/recompiler/rdna2_structured_saved_masks.hpp"
 
 namespace prosper::gpu {
-
-
-// #2319: render exactly the dwords the instruction HAS, not a fixed two.
-//
-// `words[]` is `uint32_t words[5] = {0,...}`, so a ONE-dword instruction printed as
-// `words=bf860051,00000000` is indistinguishable from a two-dword instruction whose second dword
-// is genuinely zero. That defeats the purpose of printing raw words (#2312), which is that a
-// reader can name the instruction with one command:
-//
-//     echo '0x0e,0x16,0xea,0xbe' | llvm-mc -arch=amdgcn -mcpu=gfx1010 -disassemble
-//
-// A reader who takes `words=x,00000000` at face value feeds EIGHT bytes, and llvm-mc decodes a
-// second, entirely fictitious instruction from the zero dword -- output that looks exactly as
-// authoritative as the correct answer. On the CrossWorlds census pc=101 needed four bytes and
-// pc=2038 needed eight, and nothing in either line said which.
-//
-// Clamped to the array bound as well as to len_dwords: len_dwords comes from the decoder, and a
-// decode that failed badly enough to be rejected here is not a source to trust for indexing.
-inline std::string reject_words_text(const Rdna2Inst& in) {
-    const uint32_t count = std::min<uint32_t>(in.len_dwords ? in.len_dwords : 1u,
-                                              (uint32_t)(sizeof(in.words) / sizeof(in.words[0])));
-    std::string out;
-    char buf[16];
-    for (uint32_t i = 0; i < count; ++i) {
-        std::snprintf(buf, sizeof buf, "%08x", in.words[i]);
-        if (i) out += ',';
-        out += buf;
-    }
-    return out;
-}
-
 namespace {
 
 
@@ -560,6 +532,8 @@ bool emit_cfg_state_machine(
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
     NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
+    PortableMaskHalfEntryScope half_entry_scope(b, initial_active);
+    PortableMaskHalfBodyScope half_scope(b, initial, ins);
     const bool barrier_half_phase =
         barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
@@ -1878,7 +1852,9 @@ bool emit_cfg_state_machine(
             // live mask, so it is exact wherever the source helper admits it.
             const bool exact_mask_reduction =
                 reduction_source == 126 ||
-                (reduction_source >= 0 && masks.contains(reduction_source));
+                (reduction_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, reduction_source,
+                                                     masks.contains(reduction_source)));
             if (record_compare && exact_mask_reduction)
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
@@ -1886,20 +1862,33 @@ bool emit_cfg_state_machine(
                 proven_wave64_mbcnt_mask_root_for_pc.emplace(in.pc, mbcnt_root);
             const int zero_compare_source = mask_zero_compare_candidate_source(in);
             if (record_compare && zero_compare_source >= 0 &&
-                masks.contains(zero_compare_source))
+                portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                    masks.contains(zero_compare_source)))
                 proven_wave64_mask_zero_compare_pcs.insert(in.pc);
             const int compare_source = exec_saved_mask_compare_source(in);
-            if (record_compare && compare_source >= 0 && masks.contains(compare_source))
+            if (record_compare && compare_source >= 0 &&
+                portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                    masks.contains(compare_source)))
                 proven_exec_saved_mask_compare_pcs.insert(in.pc);
             const auto pair_compare = saved_mask_pair_compare_sources(in);
             if (record_compare && pair_compare[0] >= 0 &&
-                masks.contains(pair_compare[0]) && masks.contains(pair_compare[1]))
+                portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                    masks.contains(pair_compare[0])) &&
+                portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                    masks.contains(pair_compare[1])))
                 proven_saved_mask_pair_compare_pcs.insert(in.pc);
             const bool writes_exact_wave_scc =
-                (zero_compare_source >= 0 && masks.contains(zero_compare_source)) ||
-                (compare_source >= 0 && masks.contains(compare_source)) ||
-                (pair_compare[0] >= 0 && masks.contains(pair_compare[0]) &&
-                 masks.contains(pair_compare[1]));
+                (zero_compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                     masks.contains(zero_compare_source))) ||
+                (compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                     masks.contains(compare_source))) ||
+                (pair_compare[0] >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                     masks.contains(pair_compare[0])) &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                     masks.contains(pair_compare[1])));
 
             // Scalar-data presence and SCC validity share the same provenance contract. SOPK
             // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
@@ -2191,6 +2180,8 @@ bool emit_cfg_state_machine(
                                            {masks, ambiguous, scalar_words, readlane_words},
                                            slot_context, vector_writes,
                                            record_compare ? &proven_mask_writelane_pcs : nullptr);
+            refine_portable_mask_dispatch(b, in, writes_exact_wave_scc, relay_sources, halves,
+                                          slot_domains);
             if (record_compare && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04 || in.opcode == 0x05) && definite_scc)
                 proven_wave64_scalar_scc_branch_pcs.insert(in.pc);
@@ -2449,6 +2440,7 @@ bool emit_cfg_state_machine(
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = spill_mask_keys;
+    add_portable_mask_half_keys(b, mask_keys);
     std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
@@ -3059,11 +3051,14 @@ bool emit_cfg_state_machine(
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
             if (filters_wave64_b64 &&
-                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
+                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)) &&
+                !(entry_block != UINT32_MAX &&
+                  portable_mask_half_at_entry(b, starts[entry_block], kv.first)))
                 continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
         }
+        if (entry_block != UINT32_MAX) load_portable_mask_half_types(b, state, starts[entry_block]);
         if (entry_wave64_mask_halves)
             for (const auto& kv : mhv)
                 if (const auto half = entry_wave64_mask_halves->find(kv.first);
@@ -3471,6 +3466,9 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
+                if (const char* gap = prepare_portable_mask_common_sources(
+                        b, state, in, b.portable_mask_common_partial_entry))
+                    return reject_cfg(in.pc, gap);
                 if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
                     block_terminator = &in;
@@ -3877,25 +3875,15 @@ bool emit_cfg_state_machine(
             if (dst == 106 || dst == 107) state.vcc = 0;
         }
         if (mask_ffbh) {
-            const int source = mask_ffbh->src[0].value;
-            int mask_base = source;
-            auto mask = state.sreg_bool.find(mask_base);
-            if (mask == state.sreg_bool.end() || state.sreg_bool_b32.contains(mask_base)) {
-                mask_base = source - 1;
-                mask = state.sreg_bool.find(mask_base);
-            }
+            const auto [mask, half] = portable_mask_common_ffbh_source(b, state, *mask_ffbh);
             const auto event = portable_mask_ffbh_event_for_pc.find(mask_ffbh->pc);
-            if (source < 0 || mask_base < 0 || source - mask_base < 0 ||
-                source - mask_base > 1 || mask == state.sreg_bool.end() ||
-                state.sreg_bool_b32.contains(mask_base) ||
-                event == portable_mask_ffbh_event_for_pc.end())
+            if (!mask || event == portable_mask_ffbh_event_for_pc.end())
                 return reject_cfg(mask_ffbh->pc, "mask-ffbh-source");
             b.store_function(mask_ffbh_pending_var, yes);
-            b.store_function(mask_ffbh_mask_var, mask->second);
+            b.store_function(mask_ffbh_mask_var, mask);
             b.store_function(mask_ffbh_write_var, state.exec);
             b.store_function(mask_ffbh_event_var, b.uconst(event->second));
-            b.store_function(mask_ffbh_half_var,
-                b.uconst(static_cast<uint32_t>(source - mask_base)));
+            b.store_function(mask_ffbh_half_var, b.uconst(half));
             b.store_function(mask_ffbh_dst_var,
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
         }
@@ -3957,12 +3945,10 @@ bool emit_cfg_state_machine(
                 // false, so map membership is not a lifetime proof. Admit a saved SGPR mask only
                 // at the exact consumer where the Wave64 MUST analysis proves its pair root live.
                 const auto proof = proven_wave64_mbcnt_mask_root_for_pc.find(mbcnt->pc);
-                if (proof == proven_wave64_mbcnt_mask_root_for_pc.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
-                const auto live = state.sreg_bool.find(proof->second);
-                if (live == state.sreg_bool.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-proven-mask-missing-state");
-                mask = live->second;
+                mask = portable_mask_common_mbcnt_source(
+                    b, state, *mbcnt,
+                    proof == proven_wave64_mbcnt_mask_root_for_pc.end() ? -1 : proof->second);
+                if (!mask) return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
             } else {
                 mask = mbcnt_source_bit(
                     b, state, mbcnt->src[0], mbcnt->opcode == 0x366);
@@ -5616,6 +5602,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
+    PortableMaskHalfBodyScope half_scope(b, rs, ins);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
@@ -7356,4 +7343,4 @@ namespace {
 
 } // namespace
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
