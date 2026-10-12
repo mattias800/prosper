@@ -34,6 +34,8 @@ guarded_raw_store_config(std::span<const uint32_t> user_sgprs) {
     config.local_y = config.local_z = 1u;
     config.wave_size = 64u;
     config.native_subgroup_size = 64u;
+    // The global-index prefix reads s7: seven user words are followed by workgroup X.
+    config.tgid_x_en = true;
     config.tidig_comp_cnt = 0u;
     // This fixture declares one complete group. Native width and normalized dimensions alone
     // cannot establish entry participation for the physical mask-word consumers at PC46.
