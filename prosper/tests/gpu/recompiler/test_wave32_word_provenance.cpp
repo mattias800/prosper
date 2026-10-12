@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <ios>
+#include <initializer_list>
 #include <string>
 #include <vector>
 using namespace prosper::gpu;
@@ -90,6 +91,7 @@ void values(const Words& body, uint32_t expected, bool dispatcher = false) {
     for (uint32_t group : {0u, 1u}) {
         bpermute_oracle::Interpreter vm(module);
         vm.native_subgroup_width = 32;
+        vm.native32_workgroup_count = 2;
         ASSERT_TRUE(vm.error.empty()) << vm.error;
         const auto actual = vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, group);
         ASSERT_TRUE(vm.error.empty()) << vm.error;
@@ -415,4 +417,152 @@ TEST(Wave32WordProvenance, B32CarrySdstAllowsAGenuineCurrentNeighborReplacement)
     values(
         {0xbead033cu, 0x7e0c0280u, 0xd70f2c07u, 0x00010080u, 0xbead0387u, 0x7e0c022du, 0x7e580506u},
         7);
+}
+
+// The CPU instance profile must observe the actual group and global-id inputs, rather
+// than executing workgroup zero twice. These controls do not alter production admission.
+TEST(Wave32WordProvenance, Native32OracleChecksBothActualWorkgroupIds) {
+    const auto module = compile({0xbeac0304u}, true);   // current s44 = genuine GroupIdX s4
+    ASSERT_FALSE(module.empty()) << reason;
+    for (uint32_t group : {0u, 1u}) {
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 32;
+        vm.native32_workgroup_count = 2;
+        const auto actual = vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, group);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(actual.size(), 64u);
+        for (uint32_t lane = 0; lane < 32; ++lane)
+            EXPECT_EQ(actual[lane], group == 1 && lane == 0 ? 1u : 0u) << group << ':' << lane;
+    }
+}
+
+TEST(Wave32WordProvenance, Native32OracleSuppliesGlobalInvocationId) {
+    // Independent hand-built SPIR-V control: sink[GlobalInvocationId.x] = 1.
+    // No compiler-generated address expression can hide an incorrect supplied GID.
+    Words module{0x07230203u, 0x00010300u, 0, 19, 0};
+    const auto instruction = [&](uint32_t op, std::initializer_list<uint32_t> operands) {
+        module.push_back((static_cast<uint32_t>(operands.size() + 1) << 16) | op);
+        module.insert(module.end(), operands);
+    };
+    instruction(17, {1});   // Shader capability
+    instruction(14, {0, 1});   // Logical GLSL450 memory model
+    instruction(15, {5, 10, 0x6e69616du, 0, 8});   // GLCompute main, Input interface
+    instruction(16, {10, 17, 32, 1, 1});
+    instruction(71, {8, 11, 28});   // GlobalInvocationId
+    instruction(71, {9, 34, 0});
+    instruction(71, {9, 33, 3});
+    instruction(71, {4, 6, 4});
+    instruction(71, {5, 2});
+    instruction(72, {5, 0, 35, 0});
+    instruction(19, {1});
+    instruction(21, {2, 32, 0});
+    instruction(23, {3, 2, 3});
+    instruction(29, {4, 2});
+    instruction(30, {5, 4});
+    instruction(32, {6, 1, 3});
+    instruction(32, {7, 12, 5});
+    instruction(32, {11, 12, 2});
+    instruction(33, {12, 1});
+    instruction(43, {2, 13, 0});
+    instruction(43, {2, 14, 1});
+    instruction(59, {6, 8, 1});
+    instruction(59, {7, 9, 12});
+    instruction(54, {1, 10, 0, 12});
+    instruction(248, {15});
+    instruction(61, {3, 16, 8});
+    instruction(81, {2, 17, 16, 0});
+    instruction(65, {11, 18, 9, 13, 17});
+    instruction(62, {18, 14});
+    instruction(253, {});
+    instruction(56, {});
+    for (uint32_t group : {0u, 1u}) {
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 32;
+        vm.native32_workgroup_count = 2;
+        const auto actual = vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, group);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(actual.size(), 64u);
+        for (uint32_t index = 0; index < 64; ++index)
+            EXPECT_EQ(actual[index], index / 32 == group ? 1u : 0xdeadbeefu)
+                << group << ':' << index;
+    }
+}
+
+TEST(Wave32WordProvenance, Native32OracleRefusesMissingOrOutOfRangeInstanceAuthority) {
+    const auto module = compile({0xbeac03c1u}, true);
+    ASSERT_FALSE(module.empty()) << reason;
+    for (uint32_t width : {0u, 32u, 64u}) {
+        for (uint32_t groups : {0u, 1u, 2u}) {
+            if (width != 32 && groups == 0) continue;   // legacy Wave64 is a separate profile
+            for (uint32_t count : {31u, 32u, 64u}) {
+                bpermute_oracle::Interpreter vm(module);
+                vm.native_subgroup_width = width;
+                vm.native32_workgroup_count = groups;
+                // Group 2 lies outside both bounded extents, and has no legacy authority.
+                EXPECT_TRUE(vm.run_buffers(count, {{3, Words(96, 0xdeadbeefu)}}, 3, 2).empty());
+                EXPECT_FALSE(vm.error.empty());
+            }
+        }
+    }
+    bpermute_oracle::Interpreter missing(module);
+    missing.native_subgroup_width = 32;
+    EXPECT_TRUE(missing.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, 1).empty());
+    EXPECT_EQ(missing.error, "unproved native32 instance");
+    for (uint32_t count : {31u, 64u}) {
+        bpermute_oracle::Interpreter wrong_count(module);
+        wrong_count.native_subgroup_width = 32;
+        wrong_count.native32_workgroup_count = 2;
+        EXPECT_TRUE(wrong_count.run_buffers(count, {{3, Words(64, 0xdeadbeefu)}}, 3, 1).empty());
+        EXPECT_EQ(wrong_count.error, "unproved native32 instance");
+    }
+    bpermute_oracle::Interpreter overflow(module);
+    overflow.native_subgroup_width = 32;
+    overflow.native32_workgroup_count = UINT32_MAX;
+    EXPECT_TRUE(
+        overflow.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, UINT32_MAX / 32 + 1).empty());
+    EXPECT_EQ(overflow.error, "unproved native32 instance");
+}
+
+TEST(Wave32WordProvenance, Native32OracleRefusesUnmatchedEntrypointLocalSize) {
+    const auto original = compile({0xbeac03c1u}, true);
+    ASSERT_FALSE(original.empty()) << reason;
+    size_t local = 0;
+    for (size_t pc = 5; pc < original.size(); pc += original[pc] >> 16) {
+        if ((original[pc] & 0xffffu) == 16 && original[pc] >> 16 == 6 && original[pc + 2] == 17) {
+            ASSERT_EQ(local, 0u);
+            local = pc;
+        }
+    }
+    ASSERT_NE(local, 0u);
+    for (uint32_t variant = 0; variant < 8; ++variant) {
+        auto module = original;
+        if (variant == 0)
+            module.erase(module.begin() + local, module.begin() + local + 6);
+        else if (variant == 1)
+            module[local + 3] = 64;   // wrong invocation count
+        else if (variant == 2) {
+            module[local + 3] = 16;
+            module[local + 4] = 2;   // same count, unsupported multidimensional geometry
+        } else if (variant == 3)
+            module[local + 5] = 2;
+        else if (variant == 4)
+            module[local + 1] = 0;   // another function's declaration supplies no entry authority
+        else if (variant == 5) {
+            const Words duplicate(original.begin() + local, original.begin() + local + 6);
+            module.insert(module.begin() + local, duplicate.begin(), duplicate.end());
+        } else if (variant == 6) {
+            // Specialization-dependent geometry lies outside this literal-size profile.
+            const Words specialized{0x0006014bu, original[local + 1], 38, 1, 1, 1};
+            module.insert(module.begin() + local, specialized.begin(), specialized.end());
+        } else {
+            // WorkgroupSize takes precedence over LocalSize; never use the latter as proof.
+            const Words override_size{0x00040047u, 0, 11, 25};
+            module.insert(module.begin() + local, override_size.begin(), override_size.end());
+        }
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 32;
+        vm.native32_workgroup_count = 2;
+        EXPECT_TRUE(vm.run_buffers(32, {{3, Words(64, 0xdeadbeefu)}}, 3, 1).empty()) << variant;
+        EXPECT_FALSE(vm.error.empty()) << variant;
+    }
 }
