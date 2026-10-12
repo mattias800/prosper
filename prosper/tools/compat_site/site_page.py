@@ -30,14 +30,13 @@ SITE_CSS = """
 :root{--bg:#06080d;--bg2:#0b0f17;--card:rgba(255,255,255,.04);--card2:rgba(255,255,255,.07);
 --line:rgba(255,255,255,.09);--tx:#e9eef7;--mut:#8f9bb0;--a:#8b6cff;--b:#27d4f2;
 --grad:linear-gradient(120deg,#8b6cff 0%,#27d4f2 100%);--r:16px;color-scheme:dark}
-select option{background:#0b0f17;color:#e9eef7}
-select{max-width:100%;text-overflow:ellipsis}
+
 *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:72px}
 body{margin:0;background:var(--bg);color:var(--tx);line-height:1.55;
 font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 -webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}img{max-width:100%}
-a,button,select,summary,.btn,.chip,.ms,label[for]{cursor:pointer}
+a,button,summary,.btn,.chip,.ms,.dd-btn,.dd-list li,.pg,label[for]{cursor:pointer}
 input[type=search],input[type=text]{cursor:text}
 .shot,.shot img,.mosaic img,.pill{cursor:default}
 button,.btn,.chip{-webkit-tap-highlight-color:transparent;user-select:none}
@@ -109,9 +108,28 @@ position:relative;overflow:hidden}
 .search input{width:100%;padding:13px 16px 13px 42px}
 .search::before{content:"\\1F50D";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:14px;
 opacity:.6;pointer-events:none}
-input,select{background:var(--bg2);color:var(--tx);border:1px solid var(--line);border-radius:12px;
+input{background:var(--bg2);color:var(--tx);border:1px solid var(--line);border-radius:12px;
 padding:12px 14px;font-size:15px;font-family:inherit}
-input:focus,select:focus{outline:2px solid rgba(139,108,255,.6);border-color:transparent}
+input:focus{outline:2px solid rgba(139,108,255,.6);border-color:transparent}
+.dd{position:relative;min-width:210px}
+.dd-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:14px;
+background:var(--bg2);color:var(--tx);border:1px solid var(--line);border-radius:12px;
+padding:12px 14px 12px 16px;font:inherit;font-size:15px;text-align:left;transition:.2s}
+.dd-btn:hover{background:var(--card2)}
+.dd-btn:focus-visible,.dd.open .dd-btn{outline:2px solid rgba(139,108,255,.6);border-color:transparent}
+.dd-btn svg{width:16px;height:16px;flex:none;opacity:.75;transition:transform .2s}
+.dd.open .dd-btn svg{transform:rotate(180deg)}
+.dd-list{position:absolute;z-index:30;top:calc(100% + 8px);left:0;min-width:100%;width:max-content;
+max-width:min(360px,88vw);max-height:340px;overflow:auto;margin:0;padding:8px;list-style:none;
+background:#14171f;border:1px solid var(--line);border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.6);
+scrollbar-width:thin;scrollbar-color:#2c3242 transparent}
+.dd-list[hidden]{display:none}
+.dd.right .dd-list{left:auto;right:0}
+.dd-list li{padding:10px 14px;border-radius:10px;font-size:15px;color:#dfe5f0;white-space:nowrap;
+display:flex;justify-content:space-between;gap:18px}
+.dd-list li:hover,.dd-list li.hl{background:var(--card2)}
+.dd-list li[aria-selected=true]{background:rgba(139,108,255,.22);color:#fff}
+.dd-list li em{font-style:normal;color:var(--mut)}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 22px}
 .chip{cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--tx);border-radius:999px;
 padding:7px 14px;font-size:14px;font-family:inherit;display:inline-flex;gap:8px;align-items:center}
@@ -139,6 +157,13 @@ cursor:pointer;margin:4px 0 0}
 .ms.open{-webkit-line-clamp:unset;display:block}
 .glinks{margin-top:auto;padding-top:10px;font-size:13px;display:flex;gap:14px;color:var(--b)}
 .glinks a:hover{text-decoration:underline}
+.pager{display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;margin:32px 0 0}
+.pg{min-width:42px;height:42px;padding:0 14px;border-radius:12px;border:1px solid var(--line);
+background:var(--card);color:var(--tx);font:inherit;font-size:14px;transition:.2s}
+.pg:hover:not([disabled]){background:var(--card2)}
+.pg.on{background:var(--tx);color:#06080d;border-color:var(--tx);font-weight:700}
+.pg[disabled]{opacity:.35;cursor:default}
+.pager .gap{min-width:24px;text-align:center;color:var(--mut)}
 .empty{padding:40px;text-align:center;color:var(--mut);border:1px dashed var(--line);border-radius:var(--r)}
 .three{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
 .note{margin-top:28px;padding:18px 22px;border-radius:var(--r);border:1px solid rgba(255,196,87,.35);
@@ -152,20 +177,57 @@ footer .links{display:flex;gap:20px;flex-wrap:wrap}
 @media (max-width:640px){.wrap{padding:0 16px}.navlinks a:not(.keep){display:none}.navlinks{gap:12px}
 .hero{padding:48px 0 36px}section{padding:56px 0}.ladder{grid-template-columns:repeat(2,1fr)}
 .mosaic{grid-template-columns:repeat(2,1fr)}.mosaic figure:nth-child(odd){transform:none}
-.grid{grid-template-columns:1fr}.toolbar select{flex:1 1 45%}.btn{flex:1 1 auto;justify-content:center}
+.grid{grid-template-columns:1fr}.toolbar .dd{flex:1 1 45%;min-width:0}.btn{flex:1 1 auto;justify-content:center}
 .brand span{display:none}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}html{scroll-behavior:auto}}
 """
 
 PAGE_SCRIPT = """
-var T=[],B=[],on="",q="",eng="",sort="rung";
+var T=[],B=[],on="",q="",eng="",sort="rung",page=1,PER=12;
 var $=function(id){return document.getElementById(id);};
 function e(s){return String(s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function ini(t){return t.split(/[^A-Za-z0-9]+/).filter(Boolean).slice(0,2).map(function(w){return w[0];}).join("").toUpperCase();}
+function dd(id,onChange){
+ var root=$(id),btn=root.querySelector(".dd-btn"),val=root.querySelector(".dd-val"),list=root.querySelector(".dd-list");
+ var opts=[],cur="",hl=-1;
+ function label(){for(var i=0;i<opts.length;i++){if(opts[i].value===cur){val.textContent=opts[i].label;return;}}}
+ function paint(){var items=list.children;for(var i=0;i<items.length;i++){items[i].classList.toggle("hl",i===hl);}}
+ function render(){list.innerHTML=opts.map(function(o){
+  return '<li role="option" data-v="'+e(o.value)+'" aria-selected="'+(o.value===cur)+'"><span>'+e(o.label)+'</span>'+(o.note?'<em>'+e(o.note)+'</em>':'')+'</li>';}).join("");}
+ function close(){root.classList.remove("open");list.hidden=true;btn.setAttribute("aria-expanded","false");}
+ function open(){root.classList.add("open");list.hidden=false;btn.setAttribute("aria-expanded","true");
+  hl=0;for(var i=0;i<opts.length;i++){if(opts[i].value===cur){hl=i;}}paint();}
+ function pick(v){cur=v;label();render();close();onChange(v);}
+ btn.addEventListener("click",function(){if(root.classList.contains("open")){close();}else{open();}});
+ list.addEventListener("click",function(ev){var li=ev.target.closest("li");if(li){pick(li.getAttribute("data-v"));}});
+ document.addEventListener("click",function(ev){if(!root.contains(ev.target)){close();}});
+ root.addEventListener("keydown",function(ev){
+  var k=ev.key,n=opts.length;
+  if(k==="Escape"){close();btn.focus();return;}
+  if(k==="ArrowDown"||k==="ArrowUp"){ev.preventDefault();if(!root.classList.contains("open")){open();return;}
+   hl=(hl+(k==="ArrowDown"?1:n-1))%n;paint();return;}
+  if((k==="Enter"||k===" ")&&root.classList.contains("open")&&hl>-1){ev.preventDefault();pick(opts[hl].value);btn.focus();}});
+ return {set:function(o,v){opts=o;cur=v;label();render();}};
+}
 function chips(){
  var h='<button class="chip'+(on===""?' on':'')+'" data-s=""><i></i>All <em>'+T.length+'</em></button>';
  B.forEach(function(b){h+='<button class="chip'+(on===b.label?' on':'')+'" data-s="'+e(b.label)+'" style="--c:'+b.colour+'"><i></i>'+e(b.label)+' <em>'+b.count+'</em></button>';});
  $("chips").innerHTML=h;
+}
+function pageList(p,n){
+ if(n<=7){var all=[];for(var i=1;i<=n;i++){all.push(i);}return all;}
+ var keep={1:1};keep[n]=1;keep[p-1]=1;keep[p]=1;keep[p+1]=1;
+ var out=[],last=0;
+ for(var i=1;i<=n;i++){if(keep[i]){if(last&&i-last===2){out.push(last+1);}else if(last&&i-last>2){out.push(0);}out.push(i);last=i;}}
+ return out;
+}
+function pager(p,n){
+ if(n<=1){$("pager").innerHTML="";return;}
+ var h='<button class="pg" data-p="'+(p-1)+'"'+(p===1?' disabled':'')+' aria-label="Previous page">&larr; Prev</button>';
+ pageList(p,n).forEach(function(x){
+  h+=x?'<button class="pg'+(x===p?' on':'')+'" data-p="'+x+'"'+(x===p?' aria-current="page"':'')+'>'+x+'</button>':'<span class="gap">&hellip;</span>';});
+ h+='<button class="pg" data-p="'+(p+1)+'"'+(p===n?' disabled':'')+' aria-label="Next page">Next &rarr;</button>';
+ $("pager").innerHTML=h;
 }
 function go(){
  var R=T.filter(function(t){
@@ -173,9 +235,13 @@ function go(){
    &&(!on||t.status===on)&&(!eng||t.family===eng);});
  R.sort(sort==="az"?function(a,b){return a.title.localeCompare(b.title);}
   :function(a,b){return ((b.rung==null?-1:b.rung)-(a.rung==null?-1:a.rung))||a.title.localeCompare(b.title);});
- $("count").textContent=R.length+" of "+T.length+" games";
- if(!R.length){$("grid").innerHTML='<div class="empty">No games match. Try clearing a filter.</div>';return;}
- $("grid").innerHTML=R.map(function(t){
+ var pages=Math.max(1,Math.ceil(R.length/PER));
+ if(page>pages){page=pages;}
+ var from=(page-1)*PER;
+ $("count").textContent=R.length?("Showing "+(from+1)+"-"+Math.min(from+PER,R.length)+" of "+R.length+" games"+(R.length<T.length?" (filtered from "+T.length+")":"")):"0 games";
+ if(!R.length){$("grid").innerHTML='<div class="empty">No games match. Try clearing a filter.</div>';$("pager").innerHTML="";return;}
+ pager(page,pages);
+ $("grid").innerHTML=R.slice(from,from+PER).map(function(t){
   var img=t.cover?'<img loading="lazy" src="'+e(t.cover)+'" alt="'+e(t.title)+'">':'<div class="ph">'+e(ini(t.title))+'</div>';
   var doc=t.doc_url?'<a href="'+e(t.doc_url)+'">Status doc</a>':'';
   return '<article class="game"><div class="shot">'+img+'<span class="pill" style="background:'+t.colour+'" title="'+e(t.hint)+'">'+e(t.status)+'</span></div>'
@@ -183,17 +249,24 @@ function go(){
    +'<p class="ms" title="Click to expand">'+e(t.milestone==="-"?"No milestone written yet.":t.milestone)+'</p>'
    +'<div class="glinks"><a href="'+e(t.tracker.url)+'">Tracker</a>'+doc+'</div></div></article>';}).join("");
 }
+var engDD=dd("eng",function(v){eng=v;page=1;go();});
+var sortDD=dd("sort",function(v){sort=v;page=1;go();});
+sortDD.set([{value:"rung",label:"Furthest first"},{value:"az",label:"A to Z"}],"rung");
 fetch("compat.json").then(function(r){return r.json();}).then(function(d){
  T=d.titles;B=d.buckets;
  var es={};T.forEach(function(t){es[t.family]=(es[t.family]||0)+1;});
  var names=Object.keys(es).sort(function(a,b){return (a==="Unknown")-(b==="Unknown")||es[b]-es[a]||a.localeCompare(b);});
- $("eng").innerHTML='<option value="">All engines</option>'+names.map(function(x){return '<option value="'+e(x)+'">'+e(x)+' ('+es[x]+')</option>';}).join("");
+ engDD.set([{value:"",label:"All engines"}].concat(names.map(function(x){return {value:x,label:x,note:String(es[x])};})),"");
  chips();go();
 }).catch(function(){$("grid").innerHTML='<div class="empty">Could not load the game list. See the <a href="classic.html">static list</a>.</div>';});
-$("q").addEventListener("input",function(ev){q=ev.target.value.toLowerCase();go();});
-$("eng").addEventListener("change",function(ev){eng=ev.target.value;go();});
-$("sort").addEventListener("change",function(ev){sort=ev.target.value;go();});
-$("chips").addEventListener("click",function(ev){var b=ev.target.closest(".chip");if(!b)return;on=b.getAttribute("data-s");chips();go();});
+$("q").addEventListener("input",function(ev){q=ev.target.value.toLowerCase();page=1;go();});
+$("pager").addEventListener("click",function(ev){
+ var b=ev.target.closest("button[data-p]");if(!b||b.disabled){return;}
+ page=parseInt(b.getAttribute("data-p"),10);go();
+ var top=$("count");if(top.scrollIntoView){top.scrollIntoView({behavior:"smooth",block:"start"});}
+});
+
+$("chips").addEventListener("click",function(ev){var b=ev.target.closest(".chip");if(!b)return;on=b.getAttribute("data-s");page=1;chips();go();});
 $("grid").addEventListener("click",function(ev){var m=ev.target.closest(".ms");if(m)m.classList.toggle("open");});
 if(typeof IntersectionObserver!=="undefined"){
  var links={};
@@ -258,12 +331,13 @@ genuinely cannot run.</p>
 tracker issue, which is authoritative over this page.</p>
 <div class="toolbar">
 <div class="search"><input id="q" type="search" placeholder="Search games, PPSA ID or engine" aria-label="Search games"></div>
-<select id="eng" aria-label="Engine"><option value="">All engines</option></select>
-<select id="sort" aria-label="Sort"><option value="rung">Furthest first</option><option value="az">A to Z</option></select>
+@@DD_ENG@@
+@@DD_SORT@@
 </div>
 <div class="chips" id="chips"></div>
 <p class="count" id="count"></p>
 <div class="grid" id="grid"><div class="empty">Loading games&hellip;</div></div>
+<nav class="pager" id="pager" aria-label="Pagination"></nav>
 <noscript><p class="note">This list needs JavaScript. See the <a href="classic.html">static list</a>.</p></noscript>
 </div></section>
 
@@ -291,6 +365,22 @@ user-supplied dumps tested mainly on Linux; a different revision of a title may 
 
 def _esc(text: str) -> str:
     return html.escape(text, quote=True)
+
+
+CHEVRON = (
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6"/></svg>'
+)
+
+
+def _dropdown(dom_id: str, label: str, first: str, extra_class: str = "") -> str:
+    """Markup for the custom dropdown the page script in PAGE_SCRIPT drives."""
+    return (
+        f'<div class="dd {extra_class}" id="{dom_id}">'
+        f'<button type="button" class="dd-btn" aria-haspopup="listbox" aria-expanded="false" '
+        f'aria-label="{_esc(label)}"><span class="dd-val">{_esc(first)}</span>{CHEVRON}</button>'
+        '<ul class="dd-list" role="listbox" hidden></ul></div>'
+    )
 
 
 def _stat(value: int, label: str) -> str:
@@ -336,6 +426,8 @@ def render_site(
     for token, value in {
         "@@CSS@@": SITE_CSS,
         "@@SCRIPT@@": PAGE_SCRIPT,
+        "@@DD_ENG@@": _dropdown("eng", "Engine", "All engines"),
+        "@@DD_SORT@@": _dropdown("sort", "Sort", "Furthest first", "right"),
         "@@STATS@@": stat_html,
         "@@LADDER@@": rungs,
         "@@MOSAIC@@": mosaic,

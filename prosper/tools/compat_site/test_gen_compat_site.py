@@ -155,13 +155,33 @@ def test_engine_variants_collapse_into_families():
     assert titles[0]["family"] == "Unity" and titles[0]["engine"] == "Unity"
 
 
-def test_dropdown_is_dark_and_filters_by_family():
-    """Native popup follows the dark theme, and the filter compares families, not raw strings."""
+def test_dropdowns_are_custom_components_and_filter_by_family():
+    """No native <select> (its popup cannot be themed); the filter compares families."""
     page = render_index(
         build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
     )
-    assert "color-scheme:dark" in page and "select option{background:#0b0f17" in page
+    assert "<select" not in page and "<option" not in page
+    assert page.count('class="dd-btn"') == 2 and page.count('class="dd-list"') == 2
+    assert 'id="eng"' in page and 'id="sort"' in page
+    assert ".dd-list{position:absolute" in page and "border-radius:16px" in page
+    assert "padding:12px 14px 12px 16px" in page  # room for the chevron on the right
+    assert 'aria-haspopup="listbox"' in page and "Escape" in page and "ArrowDown" in page
     assert "t.family===eng" in page and "t.engine===eng" not in page
+
+
+def test_game_list_is_paginated_and_filters_reset_to_page_one():
+    """12 per page with a pager; every filter path resets the page; pager never shows <2 pages."""
+    page = render_index(
+        build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
+    )
+    assert 'id="pager"' in page and "PER=12" in page
+    assert "R.slice(from,from+PER)" in page
+    assert 'aria-label="Previous page"' in page and 'aria-label="Next page"' in page
+    # search, status chip, engine and sort must all return to page 1
+    assert "q=ev.target.value.toLowerCase();page=1;go()" in page
+    assert 'on=b.getAttribute("data-s");page=1;' in page
+    assert "eng=v;page=1;go()" in page and "sort=v;page=1;go()" in page
+    assert 'if(n<=1){$("pager").innerHTML="";return;}' in page
 
 
 def test_nav_links_have_hit_area_hover_and_scrollspy():
@@ -181,7 +201,9 @@ def test_cursors_match_what_is_clickable():
     page = render_index(
         build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
     )
-    assert "a,button,select,summary,.btn,.chip,.ms,label[for]{cursor:pointer}" in page
+    assert (
+        "a,button,summary,.btn,.chip,.ms,.dd-btn,.dd-list li,.pg,label[for]{cursor:pointer}" in page
+    )
     assert "input[type=search],input[type=text]{cursor:text}" in page
     assert "opacity:.6;pointer-events:none}" in page
 
@@ -253,7 +275,8 @@ if __name__ == "__main__":
     test_milestone_html_is_escaped()
     test_site_has_every_section_and_no_leftover_tokens()
     test_engine_variants_collapse_into_families()
-    test_dropdown_is_dark_and_filters_by_family()
+    test_dropdowns_are_custom_components_and_filter_by_family()
+    test_game_list_is_paginated_and_filters_reset_to_page_one()
     test_nav_links_have_hit_area_hover_and_scrollspy()
     test_cursors_match_what_is_clickable()
     test_ladder_shows_all_seven_rungs_with_live_counts()
