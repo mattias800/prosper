@@ -637,6 +637,18 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         // rule as the thin-2D tail path at the bottom of this function).
         return view;
     }
+    // 3D chain views (BASE_LEVEL != LAST_LEVEL) stay refused even when the chain starts at
+    // zero: the compute backend materializes one level per 3D binding (the sampled-image
+    // chain shape excludes dim_3d), while the recompiler lowers explicit-LOD 3D samples
+    // with the guest LOD against what it assumes is a single-level image (rdna2_emit_alu
+    // dim3d: "a nonzero LOD can only address what the view selected"). Falling through to
+    // the unshifted admission below would bind level zero while declaring N levels, so a
+    // guest LOD above zero addresses a level that was never created. Mid-chain windows
+    // (BASE != 0) already refuse via the slice guard below; this closes the BASE = 0 arm.
+    if (d.type == 10 && d.base_level != d.last_level) {
+        view.supported = false;
+        return view;
+    }
     if ((!thin_2d && !thin_2d_layered) || (d.base_array != 0 && !thin_2d_layered)) {
         view.supported = unshifted_view_supported();
         return view;

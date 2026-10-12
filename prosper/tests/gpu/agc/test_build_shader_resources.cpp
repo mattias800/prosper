@@ -1370,6 +1370,24 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
             << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
     }
+    // A base-zero multi-level chain view stays refused as well: without volume support
+    // in mip_chain_plan the backend materializes one level per 3D binding, while the
+    // recompiler lowers explicit-LOD 3D samples with the guest LOD against what it
+    // assumes is a single-level image (rdna2_emit_alu dim3d). Admitting this unshifted
+    // would bind level zero while declaring six levels, so a guest LOD above zero
+    // addresses a level that was never created.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (5u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor chain0 = decode_image_descriptor(t);
+        ASSERT_TRUE(chain0.base_level == 0 && chain0.last_level == 5 && chain0.max_mip == 5)
+            << "fixture is a base-zero six-level chain, not a single level";
+        EXPECT_FALSE(image_base_level_view(chain0, fi).supported)
+            << "BASE_LEVEL=0 LAST_LEVEL=5 chain stays refused (no volume chain plan)";
+    }
     // Block-compressed 3D keeps the base-level-only rule: the tail math is element-based
     // and the upload has no BCn volume-tail reader. Level 0 stays admitted unshifted.
     // Sized 16^3 so the layout itself would admit level 1 (16 <= tail width): only the
