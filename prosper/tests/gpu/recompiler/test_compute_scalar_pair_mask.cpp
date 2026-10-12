@@ -246,6 +246,7 @@ TEST(ScalarPairMask, ADirectDescriptorWordStillProjects) {
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(config);
     config.user_sgprs.assign(12, 0u);   // s0..s11 are launch user data; s[8:11] is the V#
     ShaderResourceTable table = output_table();
     table.resources[0].srt_offset = 0xFFFFFFFFu;   // a direct (inline) descriptor
@@ -283,11 +284,14 @@ namespace {
 // The compute harness with real launch data: s0..s15 are user SGPRs, s[8:11] is the output V#
 // (binding 3) and s[12:15] a second, unused direct V# (binding 4). Both are direct (inline)
 // descriptors, so their words live in sreg_input rather than sreg.
-Words compile_with_direct_descriptors(const Words& code) {
+Words compile_with_direct_descriptors(const Words& code, unsigned launch = 0) {
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(config);
+    if (launch == 1) config.dispatch_launch = {};
+    if (launch == 2) config.dispatch_launch.initiator |= 2u;
     config.user_sgprs.assign(16, 0u);
     ShaderResourceTable table = output_table();
     table.resources[0].srt_offset = 0xFFFFFFFFu;
@@ -330,6 +334,16 @@ TEST(ScalarPairMask, ADescriptorWordOverwrittenOnOnePathRetainsLaunchData) {
                      cat({&kPrefix, &one_path, &redefined, &probe, &kComputeTail}))
                      .empty())
         << last_terminal_reject_reason(kAddress);
+}
+
+TEST(ScalarPairMask, DirectDescriptorProjectionNeedsTheActualCompleteLaunch) {
+    const Words body = program(kDefined, kCopiedDescriptorPair);
+    const Words code = cat({&body, &kComputeTail});
+    ASSERT_FALSE(compile_with_direct_descriptors(code).empty())
+        << last_terminal_reject_reason(kAddress);
+    for (unsigned launch : {1u, 2u})
+        EXPECT_TRUE(compile_with_direct_descriptors(code, launch).empty())
+            << "unknown/partial launch=" << launch;
 }
 
 TEST(ScalarPairMask, AFragmentUserDataWordReadsAsTheFabricatedZero) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 namespace prosper::gpu {
 // Original complete single-wave entry identity. This is compiler state, never runtime guest data.

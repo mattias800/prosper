@@ -11,10 +11,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <ios>
 #include <string>
 #include <vector>
 namespace {
 using namespace prosper::gpu;
+// NOLINTBEGIN(bugprone-throwing-static-initialization): immutable fixture words; an allocation
+// failure terminates this hermetic test binary before it can run in either spelling.
 const std::vector<uint32_t> kReassembledOverStaleVcc{
     0x7e060280u, 0x7d8800a8u, 0x87946a7eu, 0xd7610012u, 0x10e15u,    0xd7610012u,
     0x10c14u,    0xbe940380u, 0xbe950380u, 0x7d880088u, 0xd7600002u, 0x10d12u,
@@ -22,6 +26,7 @@ const std::vector<uint32_t> kReassembledOverStaleVcc{
     0xbefe046au, 0x4a0606ffu, 0x64u,       0xbefe04c1u, 0xe0702000u, 0x80020300u};
 const std::vector<uint32_t> kTail{0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
                                   0xbf870001u, 0xbf82fffdu, 0x7e040d02u, 0xbf810000u};
+// NOLINTEND(bugprone-throwing-static-initialization)
 constexpr uint32_t mov(uint32_t dst, uint32_t src, bool pair = false) {
     return 0xbe800000u | (dst << 16u) | ((pair ? 4u : 3u) << 8u) | src;
 }
@@ -77,15 +82,25 @@ struct Compiled {
     std::string reasons;
 };
 Compiled compile(const std::vector<uint32_t>& p,
-                 const ComputeShaderConfig& c = prosper::test::native_execution_launch()) {
+                 const ComputeShaderConfig& c = prosper::test::native_execution_launch(),
+                 bool direct_descriptors = false) {
     static uint64_t address = 0x4967000000ull;
     const uint64_t current = address++;
-    const auto t = table();
+    auto t = table();
+    if (direct_descriptors) {
+        t.resources[0].srt_offset = UINT32_MAX;
+        auto second = t.resources[0];
+        second.binding = 4;
+        second.sgpr_base = 12;
+        t.resources.push_back(second);
+    }
     TerminalRejectCapture capture;
     Compiled r;
     r.module =
         recompile_compute(p.data(), p.size(), &t, c, {RecompileDiagnosticStage::Compute, current});
-    for (const auto& [tag, payload] : capture.take()) r.reasons += tag + " " + payload + "\n";
+    for (const auto& [tag, payload] : capture.take())
+        r.reasons.append(tag).append(" ").append(payload).append("\n");
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): fixed process environment, no concurrent mutation.
     if (const char* directory = std::getenv("PROSPER_NATIVE_VCC_SPV_DIRECTORY");
         directory && !r.module.empty()) {
         std::filesystem::create_directories(directory);
@@ -106,12 +121,14 @@ bool has_switch(const std::vector<uint32_t>& m) {
 }
 std::vector<uint32_t> expected(uint64_t mask, uint32_t base = 0) {
     std::vector<uint32_t> out;
+    out.reserve(64);
     for (uint32_t lane = 0; lane < 64; ++lane) out.push_back(base + uint32_t((mask >> lane) & 1u));
     return out;
 }
 void values(const std::vector<uint32_t>& p, const std::vector<uint32_t>& want,
-            const ComputeShaderConfig& c = prosper::test::native_execution_launch()) {
-    const auto r = compile(p, c);
+            const ComputeShaderConfig& c = prosper::test::native_execution_launch(),
+            bool direct_descriptors = false) {
+    const auto r = compile(p, c, direct_descriptors);
     ASSERT_FALSE(r.module.empty()) << r.reasons;
     ASSERT_TRUE(has_switch(r.module));
     bpermute_oracle::Interpreter vm(r.module);
@@ -142,6 +159,7 @@ std::vector<uint32_t> branch_pair(bool complete) {
 }   // namespace
 TEST(NativeNumericVccMove, SpilledPairReplacesTheStaleEightLanePredicate) {
     std::vector<uint32_t> want;
+    want.reserve(64);
     for (uint32_t lane = 0; lane < 64; ++lane)
         want.push_back(lane < 16 ? 107u : lane < 40 ? 100u : 0u);
     values(stale(), want);
@@ -150,6 +168,7 @@ TEST(NativeNumericVccMove, MatchedControlWithoutTheOldCompareKeepsTheOriginalVal
     auto p = stale();
     p.erase(std::find(p.begin(), p.end(), 0x7d880088u));
     std::vector<uint32_t> want;
+    want.reserve(64);
     for (uint32_t lane = 0; lane < 64; ++lane)
         want.push_back(lane < 16 ? 107u : lane < 40 ? 100u : 0u);
     values(p, want);
@@ -420,4 +439,115 @@ TEST(NativeNumericVccMove, TheGenuineConditionSurvivesSccPreservingDataWriters) 
 TEST(NativeNumericVccMove, AFullReplacementRetiresTheUnprovedConditionalWord) {
     for (uint32_t producer : {0x930e8181u, 0x920e8081u, 0x928e8081u})
         values(preserving_scc(producer, false, true), expected(1));
+}
+
+namespace {
+std::vector<uint32_t> numeric_loop(const std::vector<uint32_t>& rewrite) {
+    std::vector<uint32_t> p{0x7e060280u,  0x7e0a0280u,  0x7e000505u,  0x7d880088u, mov(14, 129),
+                            mov(15, 128), mov(22, 128), mov(23, 131), 0xbf0a1716u};
+    const uint32_t body = 3 + static_cast<uint32_t>(rewrite.size()) + 2;
+    p.push_back(0xbf840000u | body);
+    p.insert(p.end(), {mov(106, 14, true), 0xd5010003u, 0x01a9e480u});
+    p.insert(p.end(), rewrite.begin(), rewrite.end());
+    p.push_back(0x80168116u);
+    p.push_back(0xbf820000u | ((0x10000u - (body + 2)) & 0xffffu));
+    p.insert(p.end(), {0xe0702000u, 0x80020300u, 0xbf810000u});
+    return p;
+}
+void loop_values(const std::vector<uint32_t>& p, uint64_t mask) {
+    const auto r = compile(p);
+    ASSERT_FALSE(r.module.empty()) << r.reasons;
+    bpermute_oracle::Interpreter vm(r.module);
+    vm.native_subgroup_width = 64;
+    const auto got = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeef));
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(got.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(got[lane], (mask & (uint64_t{1} << lane)) ? 0x3f800000u : 0u) << lane;
+}
+}   // namespace
+TEST(NativeNumericVccMove, APlainFullyInitializedConstantReadfirstHasAUniformValue) {
+    auto p = numeric(1, 0);
+    const auto low = std::find(p.begin(), p.end(), mov(14, 129));
+    p.erase(low);
+    const auto high = std::find(p.begin(), p.end(), mov(15, 128));
+    p.insert(high, {0x7e040281u, 0x7e1c0502u});
+    values(p, expected(1));
+}
+TEST(NativeNumericVccMove, ACheckedLoopProjectsItsCurrentPairInsteadOfTheOldPredicate) {
+    loop_values(numeric_loop({mov(14, 130), mov(15, 128)}), 2);
+}
+TEST(NativeNumericVccMove, ALoopBlanketCannotAdmitANonuniformCurrentBackedgeWord) {
+    refuses(numeric_loop({0x4a040081u, 0x7e1c0502u, mov(15, 128)}),
+            prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, ACurrentUniformOverwriteRetiresTheNonuniformLoopWord) {
+    loop_values(numeric_loop({0x4a040081u, 0x7e1c0502u, mov(14, 130), mov(15, 128)}), 2);
+}
+TEST(NativeNumericVccMove, AUniformAbsentBackedgeStillViolatesTheReadRoot) {
+    const auto r = compile(numeric_loop({mov(14, 60, true)}));
+    EXPECT_TRUE(r.module.empty());
+    EXPECT_NE(r.reasons.find("fabricated on the back edge"), std::string::npos) << r.reasons;
+}
+
+TEST(NativeNumericVccMove, ACurrentDriverDescriptorPairReplacesTheOldPredicate) {
+    auto c = prosper::test::native_execution_launch();
+    c.user_sgprs.resize(16, 0);
+    c.user_sgprs[14] = 1;
+    std::vector<uint32_t> p{0x7e060280u, 0x7e020280u, 0x7d880088u, mov(106, 14, true)};
+    finish(p);
+    values(p, expected(1), c, true);
+    ASSERT_FALSE(compile(p, c, true).module.empty());
+    c.dispatch_launch = {};
+    EXPECT_TRUE(compile(p, c, true).module.empty());
+    c = prosper::test::native_execution_launch();
+    c.user_sgprs.resize(16, 0);
+    c.user_sgprs[14] = 1;
+    c.dispatch_launch.initiator |= 2u;
+    EXPECT_TRUE(compile(p, c, true).module.empty());
+}
+TEST(NativeNumericVccMove, AOnePathDescriptorWriteKeepsTheCurrentWordOnBothEdges) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(16, 0);
+        c.user_sgprs[4] = path;
+        c.user_sgprs[15] = 1;
+        const uint64_t high = path ? 1u : 255u;
+        values(branch_pair(false), expected(UINT32_MAX | (high << 32u)), c, true);
+    }
+}
+
+TEST(NativeNumericVccMove, AOnePathDestroyedDescriptorWordCannotBorrowItsOldInput) {
+    auto p = branch_pair(false);
+    const auto high = std::find(p.begin(), p.end(), mov(15, 255));
+    ASSERT_NE(high, p.end());
+    p.erase(high + 1);
+    *high = mov(15, 60);
+    *std::find(p.begin(), p.end(), 0xbf840002u) = 0xbf840001u;
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(16, 0);
+        c.user_sgprs[4] = path;
+        c.user_sgprs[15] = 1;
+        ASSERT_FALSE(compile(branch_pair(false), c, true).module.empty());
+        const auto r = compile(p, c, true);
+        EXPECT_TRUE(r.module.empty());
+        EXPECT_FALSE(r.reasons.empty());
+    }
+}
+
+TEST(NativeNumericVccMove, TheDispatcherRetainsItsUntouchedDriverWordAsOrdinaryData) {
+    auto p = branch_pair(false);
+    const auto copy = std::find(p.begin(), p.end(), mov(106, 14, true));
+    ASSERT_NE(copy, p.end());
+    p.erase(copy + 1, p.end());
+    p.insert(p.end(), {0x7e06026bu, 0xe0702000u, 0x80020300u});
+    p.insert(p.end(), kTail.begin(), kTail.end());
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(16, 0);
+        c.user_sgprs[4] = path;
+        c.user_sgprs[15] = 1;
+        values(p, std::vector<uint32_t>(64, path ? 1u : 255u), c, true);
+    }
 }
