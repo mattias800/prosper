@@ -23,13 +23,9 @@ uint32_t full_volume_mip_chain_levels(uint32_t width, uint32_t height, uint32_t 
     return levels;
 }
 
-namespace {
-
-// The sampled formats whose compute upload is a straight per-texel copy. Anything that widens,
-// broadcasts or repacks on the way to the staging buffer (R8 coverage broadcast, the RGBA8
-// narrowing of FP16, packed R11G11B10, block-compressed decode, a depth view) is deliberately not
-// here: a per-level upload would have to reproduce that conversion at every extent, and this first
-// landing keeps the level-0 bytes byte-identical to what the single-level path already produces.
+// Sampled chain uploads reproduce native identity and the proven volume-tail R8 broadcast.
+// Other conversions (FP16 narrowing, packed R11G11B10, BCn decode and depth views) remain
+// unsupported: every level must undergo the same conversion as the selected level.
 //
 // IF YOU WIDEN THIS LIST, read `live_compute.cpp`'s conversion cascade first. This whitelist picks
 // the level COUNT; a separate branch condition there does the copying, and only that branch can
@@ -40,7 +36,8 @@ namespace {
 // deliberately NOT collapsed: this function has callers (the emitter, the compile key) that have no
 // BoundImage, no reflected descriptor and no live target, so the count must stay derivable from the
 // descriptor alone.
-bool native_straight_copy_sampled_format(DataFormat format, uint32_t components) {
+bool sampled_mip_chain_format_supported(DataFormat format, uint32_t components, bool volume_tail) {
+    components = components ? components : 1u;
     switch (format) {
         case DataFormat::Float32:
             return components == 1 || components == 2 || components == 4;
@@ -50,11 +47,13 @@ bool native_straight_copy_sampled_format(DataFormat format, uint32_t components)
         case DataFormat::Uint8:
             return components == 1 || components == 2 || components == 4;
         case DataFormat::Unorm8:
-            return components == 2 || components == 4;
+            return components == 2 || components == 4 || (volume_tail && components == 1);
         default:
             return false;
     }
 }
+
+namespace {
 
 // Everything that decides whether the compute backend materializes a chain EXCEPT where the bytes
 // come from. Kept in one place so the level count, the allocation span the capture writer owns, and
@@ -65,17 +64,12 @@ MipChainPlan compute_chain_plan(const ShaderResource& resource) {
     // must not reach the plan's allocation arithmetic.
     if (resource.declared_mip_levels < 2u || resource.cls != ResourceClass::Texture) return {};
     const uint32_t components = resource.num_components ? resource.num_components : 1u;
-    // Thick-3D tail chains uploading through the volume path (#4842). R8 is excluded from the
-    // straight-copy whitelist below (the backend broadcasts it to RGBA), but the volume
-    // uploader repeats that exact broadcast per level, so the count and the cascade agree the
-    // same way they do for native formats. Narrow on purpose: Unorm8 x1, tail-provenance,
-    // base-zero views only; the geometry plan still proves every level before admitting.
-    const bool volume_tail_r8_chain =
-        resource.img_dim == 2u && resource.format == DataFormat::Unorm8 && components == 1u &&
-        resource.in_mip_tail && !resource.layer_stride_bytes && !resource.layer_mip_offset_bytes &&
-        resource.mip_chain_base_level == 0u;
-    if (!volume_tail_r8_chain && !native_straight_copy_sampled_format(resource.format, components))
-        return {};
+    // View admission and materialization share format eligibility (#5019). Geometry alone
+    // cannot admit a chain: unsupported formats would silently retain only level zero.
+    const bool volume_tail = resource.img_dim == 2u && resource.in_mip_tail &&
+                             !resource.layer_stride_bytes && !resource.layer_mip_offset_bytes &&
+                             resource.mip_chain_base_level == 0u;
+    if (!sampled_mip_chain_format_supported(resource.format, components, volume_tail)) return {};
     if (resource.depth_compare) return {};
     const uint32_t component_bytes = data_format_bytes(resource.format);
     if (!component_bytes || component_bytes * components != resource.mip_chain_bytes_per_block)
@@ -83,7 +77,7 @@ MipChainPlan compute_chain_plan(const ShaderResource& resource) {
     return shader_resource_mip_chain_plan(resource);
 }
 
-} // namespace
+}   // namespace
 
 namespace {
 MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_bytes);

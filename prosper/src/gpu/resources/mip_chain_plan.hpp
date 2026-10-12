@@ -59,6 +59,12 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource);
 MipChainPlan shader_resource_block_mip_chain_plan(const ShaderResource& resource,
                                                   uint32_t block_bytes);
 
+// Format eligibility shared by 3D chain view admission and compute materialization. Native
+// sampled texels are copied at every level; Unorm8 x1 additionally broadcasts for a proven
+// volume tail. Callers must still establish geometry, provenance and binding shape. Zero
+// components uses the resource's single-component default.
+bool sampled_mip_chain_format_supported(DataFormat format, uint32_t components, bool volume_tail);
+
 // The number of mip levels the COMPUTE backend materializes for this resource. 1 means the
 // historical single-level image. Called by `live_compute`'s image creation and by the recompiler's
 // MIMG lowering; a divergence between the two would emit an explicit LOD against a level that does

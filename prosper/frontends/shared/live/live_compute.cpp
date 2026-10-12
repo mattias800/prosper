@@ -9146,22 +9146,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint64_t chain_texels =
                     volume_tail_chain ? static_cast<uint64_t>(r->width) * r->height * r->depth
                                       : static_cast<uint64_t>(r->width) * r->height;
-                // The width agreement is conversion-aware for volumes: native identity,
-                // or exactly the R8 broadcast the uploader repeats per level. The old
-                // unconditional equality stranded every R8 chain here (4 != 1) after the
-                // planner and the view had admitted it.
-                const bool volume_width_agrees =
-                    !volume_tail_chain || prosper::gpu::volume_chain_backend_width_agrees(
-                                              mip_chain, r->mip_chain_bytes_per_block, texel_bytes,
-                                              prosper::gpu::volume_chain_r8_broadcast_shape(
-                                                  r->format, r->num_components));
+                // Native chains retain width identity; proven volume tails additionally admit
+                // the exact R8 broadcast reproduced by every level's uploader.
+                const bool chain_width_agrees =
+                    volume_tail_chain ? prosper::gpu::volume_chain_backend_width_agrees(
+                                            mip_chain, r->mip_chain_bytes_per_block, texel_bytes,
+                                            prosper::gpu::volume_chain_r8_broadcast_shape(
+                                                r->format, r->num_components))
+                                      : texel_bytes == r->mip_chain_bytes_per_block;
                 const bool chain_binding_shape =
                     mip_chain.valid && mip_chain.level_count == declared_chain_levels &&
                     !bi.storage && !bi.imported && !renderer_owned && !bi.depth_bits_source &&
                     !bi.unorm_rtt_value_reuse && !bi.depth_view && !dim_1d &&
                     (!dim_3d || volume_tail_chain) && !dim_cube_stacked && !cube_face_as_2d &&
                     sampled_layers == 1u && bi.array_layers == 1u && !bi.stacked_cube &&
-                    volume_texels == chain_texels && volume_width_agrees;
+                    volume_texels == chain_texels && chain_width_agrees;
                 if (!chain_binding_shape) {
                     // BLAST RADIUS, stated plainly: this decline is NOT conditional on the module
                     // actually issuing IMAGE_LOAD_MIP. A module that only samples this resource

@@ -191,7 +191,7 @@ blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
 # note #4814: +3 net lines route 3D tail views to the translated-region detile; the
 # placement math and reader live in tile.cpp, and the guest-visible result is the Black Flag
 # 32^3 R8 pyramid uploading its proven level bytes instead of refusing the views.
-file-size|prosper/frontends/shared/live/live_compute.cpp 14672  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
+file-size|prosper/frontends/shared/live/live_compute.cpp 14671  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
 # note (#4842): +62 are the five volume-chain wiring sites (materializable gate, creation
 # shape, staging offsets, per-level upload arms, copy-region depth); the per-level math
 # itself lives in src/gpu/resources/volume_chain_upload.* so the file grows only by calls.
