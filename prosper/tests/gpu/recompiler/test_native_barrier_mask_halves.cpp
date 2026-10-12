@@ -89,6 +89,8 @@ TEST(NativeBarrierMaskHalves, RawLaunchPresenceRemainsRequired) {
     auto config = prosper::test::native_execution_launch();
     config.dispatch_launch.known = 0;
     EXPECT_TRUE(compile(program(), config).empty());
+    EXPECT_NE(last_terminal_reject_reason(0x49660001u).find("pc=9 words=d760000e,00010114"),
+              std::string::npos);
     values(program(), first_lanes(40));
 }
 
@@ -184,6 +186,10 @@ TEST(NativeBarrierMaskHalves, MissingLowOrHighSpillDoesNotGainAPlaceholderDefini
         auto words = program();
         words.erase(words.begin() + at, words.begin() + at + 2);
         EXPECT_TRUE(compile(words).empty()) << "missing physical spill at original dword=" << at;
+        EXPECT_NE(
+            last_terminal_reject_reason(0x49660001u)
+                .find(at == 3 ? "pc=7 words=d760000e,00010114" : "pc=9 words=d760000f,00010314"),
+            std::string::npos);
     }
     values(program(), first_lanes(40));
 }
@@ -192,6 +198,9 @@ TEST(NativeBarrierMaskHalves, OrdinaryVgprOverwriteCannotReviveHistoricalSlots) 
     auto words = program();
     words.insert(words.begin() + 8, 0x7e280280u); // v20=0 retires both physical half slots
     EXPECT_TRUE(compile(words).empty());
+    EXPECT_NE(
+        last_terminal_reject_reason(0x49660001u).find("pc=10 reason=invalidated-vgpr-lane-slot"),
+        std::string::npos);
     words.erase(words.begin() + 8);
     values(words, first_lanes(40));
 }
@@ -210,10 +219,14 @@ TEST(NativeBarrierMaskHalves, PartialOrShortRawLaunchCannotInheritTheHandoff) {
     auto config = prosper::test::native_execution_launch();
     config.dispatch_launch.initiator |= 2u;
     EXPECT_TRUE(compile(program(), config).empty());
+    EXPECT_NE(last_terminal_reject_reason(0x49660001u).find("pc=9 words=d760000e,00010114"),
+              std::string::npos);
     config = prosper::test::native_execution_launch();
     config.exact_thread_extent = true;
     config.threads_x = 33;
     EXPECT_TRUE(compile(program(), config).empty());
+    EXPECT_NE(last_terminal_reject_reason(0x49660001u).find("pc=13 words=befe040e"),
+              std::string::npos);
     values(program(), first_lanes(40));
 }
 
