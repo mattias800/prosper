@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -50,6 +51,23 @@ static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) 
 constexpr uint32_t kOpSwitch = 251;
 constexpr uint32_t kOpGroupNonUniformAny = 335;
 
+static std::vector<uint32_t> compile_fixture(const uint32_t* code, size_t dwords,
+                                             bool scalar = true, bool position = true,
+                                             uint64_t program = 0) {
+    // Array PCs below describe the unchanged body. A common prefix defines its s4 branch input;
+    // genuine PS position X/Y supply v0/v1 without a fabricated register-storage zero.
+    std::vector<uint32_t> complete;
+    if (scalar) complete.push_back(0xbe840380u);   // s_mov_b32 s4, 0
+    complete.insert(complete.end(), code, code + dwords);
+    PixelSystemInputMapping inputs{};
+    inputs.addr = inputs.ena = (1u << 8) | (1u << 9);
+    static uint64_t next_program = 0x49920000ull;
+    if (!program) program = ++next_program;
+    return recompile_fragment(complete.data(), complete.size(), nullptr,
+                              position ? &inputs : nullptr, UINT32_MAX, nullptr, false,
+                              {RecompileDiagnosticStage::Fragment, program});
+}
+
 TEST(DispatcherWaveVote, Contract) {
     printf("== test_dispatcher_wave_vote ==\n");
 
@@ -61,7 +79,7 @@ TEST(DispatcherWaveVote, Contract) {
     // Shape: an irreducible region. pc1 jumps INTO the middle of the region that pc7's back-edge
     // closes, so the region has two entries and no structurizer can nest it.
     //
-    //   pc0  v_cmp_le_u32 vcc, 0, v0        divergent VCC -- lanes disagree
+    //   pc0  v_cmp_le_u32 vcc, 0, v0        varying operand: the conservative route votes
     //   pc1  s_cbranch_vccz  -> pc6         THE INSTRUCTION UNDER TEST (scalar branch on VCC)
     //   pc2  s_cmp_eq_u32 s4, 0             back-edge target
     //   pc3  s_cbranch_scc0  -> pc8
@@ -84,9 +102,26 @@ TEST(DispatcherWaveVote, Contract) {
     };
 
     const std::vector<uint32_t> frag =
-        recompile_fragment(irreducible_vccz_ps, std::size(irreducible_vccz_ps));
+        compile_fixture(irreducible_vccz_ps, std::size(irreducible_vccz_ps));
     CHECK(!frag.empty(), "the irreducible vccz fragment recompiles");
     if (frag.empty()) { printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
+
+    constexpr uint64_t missing_scalar = 0x49920f01ull;
+    CHECK(compile_fixture(irreducible_vccz_ps, std::size(irreducible_vccz_ps), false, true,
+                          missing_scalar)
+              .empty(),
+          "an absent s4 cannot borrow allocated zero");
+    CHECK(last_terminal_reject_reason(missing_scalar).find("pc=3 reason=poisoned-scc") !=
+              std::string::npos,
+          "missing s4 refuses at the original scalar branch");
+    constexpr uint64_t missing_position = 0x49920f02ull;
+    CHECK(compile_fixture(irreducible_vccz_ps, std::size(irreducible_vccz_ps), true, false,
+                          missing_position)
+              .empty(),
+          "an absent position cannot borrow allocated zero");
+    CHECK(last_terminal_reject_reason(missing_position)
+                  .find("mode=unresolved-operand pc=1 words=7d860080") != std::string::npos,
+          "missing v0 refuses at the original VCC compare, after the scalar prefix");
 
     // THE CONTROL, and it is load-bearing. If this program did not actually take the dispatcher
     // route, the arm below would be asserting something about the structurizer instead -- which
@@ -165,9 +200,9 @@ TEST(DispatcherWaveVote, Contract) {
         };
 
         const std::vector<uint32_t> narrowed =
-            recompile_fragment(narrowed_entry_ps, std::size(narrowed_entry_ps));
+            compile_fixture(narrowed_entry_ps, std::size(narrowed_entry_ps));
         const std::vector<uint32_t> restored =
-            recompile_fragment(exec_restored_ps, std::size(exec_restored_ps));
+            compile_fixture(exec_restored_ps, std::size(exec_restored_ps));
         CHECK(!narrowed.empty() && !restored.empty(),
               "both wave-uniform variants recompile");
 
@@ -237,7 +272,7 @@ TEST(DispatcherWaveVote, Contract) {
             0xF800180Fu, 0x03020100u, 0xBF810000u,
         };
         const std::vector<uint32_t> decoy =
-            recompile_fragment(decoy_sdst_cmp_ps, std::size(decoy_sdst_cmp_ps));
+            compile_fixture(decoy_sdst_cmp_ps, std::size(decoy_sdst_cmp_ps));
         CHECK(!decoy.empty(), "the decoy-destination variant recompiles");
         if (!decoy.empty()) {
             CHECK(count_opcode(decoy, kOpSwitch) >= 1,
