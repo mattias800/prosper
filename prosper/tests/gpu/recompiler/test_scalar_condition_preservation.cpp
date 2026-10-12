@@ -179,6 +179,9 @@ TEST(ScalarConditionPreservation, MulkCannotRepairTheEarlierCondition) {
     const auto genuine = compile_sopk(0xb80c0001u, true, true);
     ASSERT_FALSE(genuine.module.empty()) << genuine.reason;
     ASSERT_TRUE(uses_dispatcher(genuine.module)) << "the real CFG route must own the condition";
+    const auto unobserved_missing_data = compile_sopk(0xb80c0001u, false, true);
+    ASSERT_FALSE(unobserved_missing_data.module.empty()) << unobserved_missing_data.reason;
+    ASSERT_TRUE(uses_dispatcher(unobserved_missing_data.module));
     poisoned_sopk_branch(compile_sopk(0xb80c0001u, true, false));
     poisoned_sopk_branch(compile_sopk(0xb80c0001u, false, false));
 }
