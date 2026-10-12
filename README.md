@@ -42,6 +42,68 @@ beyond the specific route documented for it.
 
 ---
 
+## Why there is no CPU recompiler
+
+The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). It recompiles the
+guest's modules as a step before they run. prosper does not, and the reasons are deliberate:
+
+- **It would not buy speed.** The PS5 CPU is x86-64, so guest code already runs at host speed.
+  Recompiling it would replace native instructions with other native instructions and add nothing
+  to throughput. Performance on the CPU side is set by the reimplemented libraries and the GPU path,
+  and those are where measurement goes.
+- **It would be a second copy of every game to get right.** A recompiler has to translate every
+  module, including code paths a given run never executes, and every translation bug looks
+  identical to a game bug. Running native code means the game is the thing being tested.
+- **It is hard to test.** Native code can be stepped in gdb, profiled with perf and inspected with
+  ordinary tools. Recompiled output needs its own debugger, its own symbol mapping and a mapping
+  back to the original addresses before any crash can be read.
+- **The same result without the translation step.** Our target is the same behaviour and speed
+  without recompiling the guest's CPU code. The loader and linker relocate the modules as shipped,
+  and their native code runs unchanged.
+
+Translation is used where it is unavoidable. The GPU does not run x86-64, so RDNA2 shaders have to
+be converted to SPIR-V. That recompiler exists and is verified against the `spirv-val` gate and
+numeric Vulkan tests.
+
+## Comparison with AnyPS5
+
+| | prosper | AnyPS5 |
+|---|---|---|
+| Guest CPU code | Runs natively. Loader and linker only, no translation step | Recompiles the guest modules before execution |
+| Where translation is used | GPU shaders only (RDNA2 → SPIR-V), because the ISA has no host equivalent | As described above |
+| How "done" is defined | Per-title six-rung ladder ending in a human-reviewed comparison against PS5 hardware, then a reviewed automatic snapshot guard | Percentage of functions and instructions the project has declared so far |
+| Correctness evidence | Numeric and pixel Vulkan tests, `spirv-val` on every SPIR-V emitter, golden-image guards over real boots | Declared-function counts (see below) |
+| Unregistered imports | Logged and surfaced per run by the `unimplemented-hle-calls` alarm; `tools/nid_census` counts them per title. A coverage count is planned (ADR 0007) | Not shown on its status page |
+| Legal boundary | No keys, decryption or copyrighted code in the repo. Third-party replacement libraries from dumps are refused | Not stated in the status page |
+
+prosper's own shader and library work is not a finished percentage either. Nothing in this repo
+currently publishes a coverage figure. The planned one (ADR 0007) counts registered, resolved and
+return-zero imports per title from the registry, and it is a measure of reach, not of correctness.
+
+### Reading the AnyPS5 status page
+
+The status page in AnyPS5's README shows *System libraries 87.86% (3156/3592)* and *GPU shader
+instructions 100% (1166/1166)*. Its own footnote says the percentage is of "the functions known to
+the project so far", "not of every PS5 system function", and that "the total grows as more functions
+are declared". Read as completion figures, these numbers mislead:
+
+- **The denominator is the list of what has been declared.** A function nobody has added to the
+  list is not counted. The shader figure is 1166 instructions in total, and 100% of that list being
+  done says nothing about the instructions that are not in it. Firmware decompilation shows the real
+  set of system functions and shader instructions is much larger than either list.
+- **"Declared" and "done" are not the same thing.** A count that tracks which functions have a
+  handler does not tell you whether the handler is right, or whether a stub that returns success
+  without doing anything is counted as finished.
+- **A registered handler is not a validated one.** Checking that an implementation is correct needs
+  tests against the expected behaviour, and in prosper the `implement-hle-function` procedure and the
+  rung ladder do that. A plain implementation with no check is a different thing.
+
+The honest number for either project is the fraction of the real function and instruction set that
+is implemented and checked. Neither project has measured that yet, and this repo does not claim
+it.
+
+---
+
 ## Status — what runs
 
 Progress is defined per title by a six-rung ladder: 1. any real graphics → 2. title screen →
