@@ -5587,8 +5587,12 @@ int main() {
           rewritten_load_table.resources[0].gpu_addr == rewritten_output_base &&
           rewritten_load_table.resources[0].fetch_pc == 4 &&
           rewritten_load_table.resources[0].srt_offset == 0xFFFFFFFFu &&
-          rewritten_load_table.resources[0].binding == 2,
-          "#636: format-load resource uses the live range, pc provenance, and assigned binding");
+          rewritten_load_table.resources[0].binding == 2 &&
+          rewritten_load_table.resources[0].swizzle[0] == 4u &&
+          rewritten_load_table.resources[0].swizzle[1] == 5u &&
+          rewritten_load_table.resources[0].swizzle[2] == 6u &&
+          rewritten_load_table.resources[0].swizzle[3] == 7u,
+          "#636: format-load resource uses the live range, pc provenance, swizzle, and assigned binding");
 
     // Raw byte-addressed descriptors use stride zero, and the recompiler's supported atomic_umax is
     // an external-buffer consumer too. Both were accepted before the catch-all scan was removed and
