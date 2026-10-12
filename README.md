@@ -7,6 +7,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/mattias800/prosper/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/mattias800/prosper/actions/workflows/ci.yml)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational?style=flat-square&logo=linux)](https://github.com/mattias800/prosper)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational?style=flat-square&logo=windows)](https://github.com/mattias800/prosper)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS_(Rosetta_2)-lightgrey?style=flat-square&logo=apple)](https://github.com/mattias800/prosper)
 [![Language: C++20](https://img.shields.io/badge/language-C%2B%2B20-informational?style=flat-square&logo=cplusplus)](https://github.com/mattias800/prosper)
 [![Vulkan 1.4](https://img.shields.io/badge/Vulkan-1.4-red?style=flat-square&logo=vulkan)](https://www.vulkan.org/)
 
