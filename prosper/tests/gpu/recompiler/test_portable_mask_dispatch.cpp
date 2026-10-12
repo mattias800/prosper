@@ -51,7 +51,7 @@ std::vector<uint32_t> crossed_slots(bool numeric_high) {
     f::reload(code, 20, 13);
     return code;
 }
-void scc_mark(const std::vector<uint32_t>& prefix, bool keep) {
+void scc_mark(const std::vector<uint32_t>& prefix, bool keep, bool memory = false) {
     using namespace prosper::gpu;
     const auto code = c::branch(prefix, 24);
     std::vector<Rdna2Inst> ins;
@@ -69,11 +69,17 @@ void scc_mark(const std::vector<uint32_t>& prefix, bool keep) {
     ASSERT_EQ(compare.opcode, 0x12u);
     SpilledMaskHalves marks;
     marks.relayed_words.insert(kRelayedScc);
+    marks.relayed_words.insert(57);
+    marks.memory_words.insert(57);
     SpillSlotDomains domains;
     // Adversarial caller flag: the generic whole-mask classification is insufficient to clear
     // a missing or overwritten half. The exact current role proof must independently agree.
-    refine_portable_mask_dispatch(b, compare, true, {}, marks, domains);
+    SpilledVectorSourceMarks source;
+    source.memory = memory;
+    refine_portable_mask_dispatch(b, compare, true, source, marks, domains);
     EXPECT_EQ(marks.relayed_words.contains(kRelayedScc), keep);
+    EXPECT_TRUE(marks.relayed_words.contains(57));
+    EXPECT_TRUE(marks.memory_words.contains(57));
 }
 } // namespace
 
@@ -150,4 +156,36 @@ TEST(PortableMaskDispatch, OverwrittenHighStillPoisonsAnOverconfidentSccClassifi
 }
 TEST(PortableMaskDispatch, CompleteRelayCanReplaceOnlyItsSccMark) {
     scc_mark(relayed(), false);
+}
+TEST(PortableMaskDispatch, MemorySourceNeverRepairsTheSccMark) {
+    scc_mark(relayed(), true, true);
+}
+TEST(PortableMaskDispatch, RetiredDataStorageCannotShadowCurrentBoolSlotsAcrossABarrier) {
+    std::vector<uint32_t> code{0x7e060280u, base::mov(126, 128, true)};
+    f::spill(code, 135, 0);
+    f::spill(code, 126, 0);
+    code.push_back(base::mov(126, 193, true));
+    f::spill(code, 136, 1);
+    f::spill(code, 127, 1);
+    code.push_back(0xbf8a0000u);
+    f::reload(code, 21, 1);
+    f::reload(code, 20, 0);
+    values(c::reduction(code, 0x10), 32);
+}
+TEST(PortableMaskDispatch, OneEdgeDataSlotCannotImportTheOldHighMaskRole) {
+    for (const bool numeric : {false, true}) {
+        auto code = c::halves(false, true);
+        code.resize(7);
+        code.insert(code.end(), {0xbf068000u, 0xbf840002u});
+        f::spill(code, numeric ? 128 : 127, 1);
+        code.push_back(0xbf8a0000u);
+        f::reload(code, 21, 1);
+        f::reload(code, 20, 0);
+        const auto completed = c::reduction(code, 0x10);
+        if (numeric) {
+            const auto attempt = f::compile(completed, true);
+            EXPECT_TRUE(attempt.module.empty()) << "one edge replaced HIGH with DATA";
+        } else
+            values(completed, 32);
+    }
 }
