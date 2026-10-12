@@ -94,6 +94,10 @@ constexpr uint32_t kOpSwitch = 251;
 // overwrite an earlier arm's.
 static std::vector<uint32_t> compile(const uint32_t* code, size_t dwords, uint64_t program) {
     ComputeShaderConfig config;          // portable Wave64: native_subgroup_size stays 0
+    // The branch controls consume s4/s5; arm D reads genuine driver s0 before a later save.
+    // Missing launch words must not refuse before the M0 token and dispatcher route are tested.
+    config.user_sgprs.assign(6, 0u);
+    config.user_sgprs[0] = 5u;
     return recompile_compute(code, dwords, nullptr, config,
                              {RecompileDiagnosticStage::Compute, program});
 }
