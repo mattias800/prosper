@@ -3489,7 +3489,7 @@ struct LoopBlanketCheck {
     // lane-bit read relied on a carried word whose back-edge value is hard-marked. A violated word
     // that nothing read through only stops the exits from handing its assumption on.
     template <class Exits>
-    bool holds(SpirvCompute& b, const RegState& rs, Exits& exits) const {
+    bool holds(SpirvCompute& b, RegState& rs, Exits& exits) const {
         // A carried word is violated when its back-edge value is hard-marked, or blanket-marked on
         // an assumption of this header that is itself violated (s10 = s11 carries s11's fate).
         std::set<uint64_t> violated;
@@ -3510,16 +3510,22 @@ struct LoopBlanketCheck {
             if (read_word < 0 && violated.contains(blanket_root(header_pc, entry.first)) &&
                 b.loop_blanket_roots_read.contains(blanket_root(header_pc, entry.first)))
                 read_word = entry.first;
-        std::erase_if(exits.blanket, [&](const auto& exit) {
-            return std::any_of(exit.second.begin(), exit.second.end(),
+        // Both actual exit edges may still depend on the header's assumptions. Demote the whole
+        // assumption when any required root failed; keep its placeholder and unrelated valid roots.
+        const auto invalid = [&](const auto& roots) {
+            return std::any_of(roots.begin(), roots.end(),
                                [&](uint64_t root) { return violated.contains(root); });
-        });
-        for (auto& [reg, source] : exits.vectors)
-            if (std::any_of(source.blanket_roots.begin(), source.blanket_roots.end(),
-                            [&](uint64_t root) { return violated.contains(root); })) {
-                source.blanket_roots.clear();
-                source.hard = true;
-            }
+        };
+        const auto sanitize = [&](auto& scalar, auto& vectors) {
+            std::erase_if(scalar, [&](const auto& word) { return invalid(word.second); });
+            for (auto& [reg, source] : vectors)
+                if (invalid(source.blanket_roots)) {
+                    source.blanket_roots.clear();
+                    source.hard = true;
+                }
+        };
+        sanitize(exits.blanket, exits.vectors);
+        sanitize(rs.sreg_loop_blanket, rs.vreg_source_marks);
         if (read_word < 0) return true;
         log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                  "loop-carried %c%d is fabricated on the back edge but was read as "
@@ -3570,31 +3576,31 @@ inline LoopCheckMarks loop_check_marks(const RegState& rs) {
 }
 // The spill slots at a loop exit: `rs` holds the body end's slot map, so union in the check
 // block's marks (a slot marked on either is marked after the loop).
-inline void mark_loop_exit_slots(RegState& rs, const LoopCheckMarks& check) {
+inline void mark_loop_exit_slots(RegState& rs, const LoopCheckMarks& check,
+                                 const LoopCheckMarks* body = nullptr) {
+    if (body) rs.vreg_source_marks = body->vectors;
     join_vector_word_marks(rs.vreg_source_marks, check.vectors);
     rs.lane_slot_merge_placeholder.insert(check.slot_fabricated.begin(),
                                           check.slot_fabricated.end());
     rs.lane_slot_memory_pattern.insert(check.slot_memory.begin(), check.slot_memory.end());
 }
 // At the loop exit: a body-only register leaves as the (marked) header phi; a condition-region
-// register leaves with its check-block marks. `body_edge` is set when the exit value also merges a
-// direct break from the body, whose marks are `rs`'s current ones. SCC leaves as the header phi.
+// register leaves with its check-block marks. An optional body snapshot supplies the direct-break
+// edge, captured before any exit register is published. SCC leaves as the header phi.
 inline void mark_loop_exit(RegState& rs, int r, bool written_in_condition,
-                           const LoopCheckMarks& check, bool body_edge) {
+                           const LoopCheckMarks& check, const LoopCheckMarks* body = nullptr) {
     const bool fabricated = !written_in_condition || check.fabricated.contains(r) ||
-                            (body_edge && rs.sreg_merge_placeholder.contains(r));
-    const bool memory =
-        check.memory.contains(r) || (body_edge && rs.sreg_memory_pattern.contains(r));
-    // The checked header value and the current body value are the two actual phi inputs. Keep
-    // their roots only when both edges are defined under those assumptions. The backedge checker
-    // has already removed violated check roots; a hard body input must still make this exit hard.
+                            (body && body->fabricated.contains(r));
+    const bool memory = check.memory.contains(r) || (body && body->memory.contains(r));
+    // Both snapshots have been checked against the backedge. A hard input on either edge must
+    // stay hard; roots on a valid soft input are requirements, never alternative proofs.
     const auto kept = check.blanket.find(r);
     std::set<uint64_t> roots;
     if (kept != check.blanket.end() &&
-        (!body_edge || !rs.sreg_merge_placeholder.contains(r) || sreg_word_blanket_only(rs, r))) {
+        (!body || !body->fabricated.contains(r) || body->blanket.contains(r))) {
         roots = kept->second;
-        if (body_edge && sreg_word_blanket_only(rs, r))
-            roots.insert(rs.sreg_loop_blanket.at(r).begin(), rs.sreg_loop_blanket.at(r).end());
+        if (body && body->blanket.contains(r))
+            roots.insert(body->blanket.at(r).begin(), body->blanket.at(r).end());
     }
     join_merge_placeholder(rs, r, fabricated, false, roots.empty() ? nullptr : &roots);
     if (memory)

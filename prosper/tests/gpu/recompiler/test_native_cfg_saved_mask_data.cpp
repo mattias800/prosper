@@ -876,3 +876,61 @@ TEST(NativeCfgSavedMaskData, ADefinedConstantSlotDoesNotInheritAnotherSlotsMark)
     p.insert(p.begin() + at, {0xd7610014u, 41u | (129u << 9u), 0xd7610014u, 128u | (128u << 9u)});
     lane_selector_values(p, 0, 0);
 }
+
+namespace {
+// The check scalar depends on valid s16, but the direct-body scalar depends on header s17.
+// A later iteration must not keep the latter assumption after s17 receives absent s60.
+std::vector<uint32_t> delayed_body_root_loop(unsigned variant) {
+    LoopProgram a;
+    a.add({0x7e040300u, mov(0, 128), mov(16, 128), mov(17, 128)});
+    a.add({0x7e000280u, 0x7e020284u, 0x816a8180u, 0x876b8380u, mov(4, 126, true)});
+    a.label("check");
+    a.add({mov(0, 16)});
+    a.branch(0xbf880000u, "exit");
+    a.add({0x7d820200u, 0x87fe6a7eu, mov(0, 17), mov(17, variant == 1 ? 128u : 60u)});
+    if (variant == 2) a.add({mov(0, 135)});
+    a.branch(0xbf880000u, "exit");
+    a.add({0x7e000280u, 0x80108110u});
+    a.branch(0xbf820000u, "check");
+    a.label("exit");
+    a.add({mov(126, 4, true), 0x7d820200u, 0x7e020200u, 0xe0702000u, 0x80020102u, end});
+    return a.finish();
+}
+void delayed_body_root_values(unsigned variant, uint32_t expected) {
+    const auto p = delayed_body_root_loop(variant);
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        const auto c = loop_config(6, path);
+        const auto module = recompile_compute(p.data(), p.size(), &resources, c);
+        ASSERT_FALSE(module.empty());
+        ASSERT_TRUE(has_op(module, 246)) << "must exercise the structured loop join";
+        ASSERT_FALSE(has_op(module, 251)) << "dispatcher must not hide the exit join";
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.push_constants = c.user_sgprs;
+        const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeef)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(out[lane], expected) << "path " << path << " lane " << lane;
+    }
+}
+}   // namespace
+TEST(NativeCfgSavedMaskData, DelayedBodyRootCannotBorrowAValidCheckRootAtLoopExit) {
+    const auto p = delayed_body_root_loop(0);
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        TerminalRejectCapture capture;
+        EXPECT_TRUE(
+            recompile_compute(p.data(), p.size(), &resources, loop_config(6, path)).empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+    }
+}
+TEST(NativeCfgSavedMaskData, GenuineDelayedBodyRootKeepsTheActualZeroValue) {
+    delayed_body_root_values(1, 0);
+}
+TEST(NativeCfgSavedMaskData, CurrentReplacementEndsTheDelayedInvalidBodyRoot) {
+    delayed_body_root_values(2, 7);
+}

@@ -6699,7 +6699,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (pr.dom == 0)
                 rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
             else if (pr.dom == 1) {
-                mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks, false);
+                mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks);
                 rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
             }
             // SCC takes the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
@@ -7357,9 +7357,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!lane_slots.patch_backedge(b, rs, cont)) return false;
             b.emit_branch(hdr);
             b.emit_label(merge);
+            // Freeze both actual phi inputs before publishing any exit register or its marks.
+            const RegState body_exit = rs;
+            const LoopCheckMarks body_marks = loop_check_marks(body_exit);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
             for (auto& pr : phis) {
-                if (pr.dom == 3 && !vcc_carry.merge_has_mask(b, vcc_chk, rs.vcc, L.header_pc))
+                if (pr.dom == 3 &&
+                    !vcc_carry.merge_has_mask(b, vcc_chk, body_exit.vcc, L.header_pc))
                     return false;
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
@@ -7368,12 +7372,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                    : pr.dom == 4 ? exec_chk
                                    : (bool_chk.count(pr.reg) ? bool_chk.at(pr.reg) : pr.phi);
                 uint32_t body_value =
-                    pr.dom == 0   ? vget(pr.reg)
-                    : pr.dom == 1 ? sget(pr.reg)
-                    : pr.dom == 2 ? (rs.scc ? rs.scc : b.bfalse())
-                    : pr.dom == 3 ? vcc_carry.merge_body_value(b, rs.vcc)
-                    : pr.dom == 4 ? rs.exec
-                                  : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                    pr.dom == 0   ? (body_exit.vreg.contains(pr.reg) ? body_exit.vreg.at(pr.reg)
+                                                                     : b.uconst(0))
+                    : pr.dom == 1 ? sreg_seed(b, body_exit, pr.reg)
+                    : pr.dom == 2 ? (body_exit.scc ? body_exit.scc : b.bfalse())
+                    : pr.dom == 3 ? vcc_carry.merge_body_value(b, body_exit.vcc)
+                    : pr.dom == 4
+                        ? body_exit.exec
+                        : (body_exit.sreg_bool.count(pr.reg) ? body_exit.sreg_bool.at(pr.reg)
+                                                             : pr.phi);
                 const uint32_t merged = (L.direct_exec_breaks || L.direct_wave_breaks) &&
                                                 chk_value != body_value
                     ? b.emit_phi_2way(pr.dom <= 1 ? b.t_u32 : b.t_bool,
@@ -7382,7 +7389,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (pr.dom == 0)      rs.vreg[pr.reg] = merged;
                 else if (pr.dom == 1) {
                     mark_loop_exit(rs, pr.reg, conds.count(pr.reg) != 0, check_marks,
-                                   L.direct_exec_breaks || L.direct_wave_breaks);   // #4706
+                                   L.direct_exec_breaks || L.direct_wave_breaks ? &body_marks
+                                                                                : nullptr);
                     rs.sreg[pr.reg] = merged;
                 } else if (pr.dom == 2)
                     rs.scc = merged;
@@ -7396,7 +7404,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                         chk_end, body_end))
                 return false;
             vcc_carry.finish_exit(rs);
-            mark_loop_exit_slots(rs, check_marks);   // #4706
+            mark_loop_exit_slots(rs, check_marks, &body_marks);   // #4706
             if (!(L.direct_exec_breaks || L.direct_wave_breaks)) lane_slots.refine_exit_marks(rs);
             // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
             for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
