@@ -7018,13 +7018,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     base_aligned = ((offset & 3u) == 0) && !offen &&
                                    (!idxen || (stride & 3u) == 0) && soff_zero;
                 }
+                // An integer sub-dword FORMAT STORE writes ONE lane's disjoint bit field of the
+                // containing dword. A plain masked read-modify-write would race (adjacent lanes' fields
+                // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
+                // writing DISJOINT fields, so the store is race-free. Requires the field to lie within
+                // a single dword: address comp_bytes-aligned, no runtime per-lane byte offset.
+                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                if (is_store && int_subword && !offen && !dyn_vfetch &&
+                    (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
+                    dyn_int_store = true;
                 if (!base_aligned) {
                     // Float16 format loads use the complete runtime byte address for every requested
                     // component. This covers both the stride-2 single-half path (#273) and Astro's
                     // Float16x4 vertex record with a register SOFFSET. Loads only: packed half stores
                     // remain fail-visible until their race-free sub-dword write contract is modeled.
-                    bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                     (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                     dyn_half = !packed_word && !is_store && is_half;
                     // An integer sub-dword FORMAT load extracts each component at its runtime byte
                     // address (join the straddled dwords, then bfe), so it needs no static alignment.
@@ -7036,15 +7044,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!dyn_half && !dyn_int)
                         dyn_norm = !packed_word && !is_store && norm != 0.0f &&
                                    (comp_bytes == 1 || comp_bytes == 2);
-                    // An integer sub-dword FORMAT STORE writes ONE lane's disjoint bit field of the
-                    // containing dword. A plain masked read-modify-write would race (adjacent lanes' fields
-                    // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
-                    // writing DISJOINT fields, so the store is race-free. Requires the field to lie within
-                    // a single dword: address comp_bytes-aligned, no runtime per-lane byte offset. (A
-                    // straddling field would span two dwords -> deferred fail-visibly.)
-                    if (!dyn_half && !dyn_int && is_store && int_subword && !offen && !dyn_vfetch &&
-                        (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
-                        dyn_int_store = true;
                     if (!dyn_half && !dyn_int && !dyn_norm && !dyn_int_store) {
                         if (getenv("PROSPER_DBG"))
                             fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
