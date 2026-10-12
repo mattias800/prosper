@@ -82,15 +82,15 @@ return-zero imports per title from the registry, and it is a measure of reach, n
 
 ### Reading the AnyPS5 status page
 
-The status page in AnyPS5's README shows *System libraries 87.86% (3156/3592)* and *GPU shader
-instructions 100% (1166/1166)*. Its own footnote says the percentage is of "the functions known to
-the project so far", "not of every PS5 system function", and that "the total grows as more functions
-are declared". Read as completion figures, these numbers mislead:
+The status page in AnyPS5's README reports a percentage for system libraries and one for GPU shader
+instructions. Its own footnote says the percentage is of "the functions known to the project so far",
+"not of every PS5 system function", and that "the total grows as more functions are declared". Read
+as completion figures, these percentages mislead:
 
 - **The denominator is the list of what has been declared.** A function nobody has added to the
-  list is not counted. The shader figure is 1166 instructions in total, and 100% of that list being
-  done says nothing about the instructions that are not in it. Firmware decompilation shows the real
-  set of system functions and shader instructions is much larger than either list.
+  list is not counted, so a high percentage only means the listed items are done. Firmware
+  decompilation shows the real set of system functions and shader instructions is much larger than
+  any declared list.
 - **"Declared" and "done" are not the same thing.** A count that tracks which functions have a
   handler does not tell you whether the handler is right, or whether a stub that returns success
   without doing anything is counted as finished.
