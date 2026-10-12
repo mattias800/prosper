@@ -55,7 +55,7 @@ uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, co
                                  b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63)));
 }
 
-// A complete scalar move INTO VCC defines both physical words, independently of EXEC, and
+// A complete scalar move into VCC or EXEC defines both physical words, independently of old EXEC, and
 // preserves SCC (AMD RDNA2 70648 sections 3.3/12.3). Publish the exact logical-lane bit as well
 // as emit_alu's unchanged DATA copy. Owned packets and exact-native compute retain a guest lane;
 // an old predicate cannot supply this new value. Native words need independent uniformity and
@@ -72,13 +72,13 @@ bool numeric_vcc_move_has_lane_context(const SpirvCompute& b) {
             saved_mask_physical_launch_matches_original(b));
 }
 
-uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
+uint32_t s_mov_b64_numeric_mask_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
     if (!numeric_vcc_move_has_lane_context(b) || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
-        in.opcode != kSop1OpcodeMovB64 || in.dst.value != 106)
+        in.opcode != kSop1OpcodeMovB64 || (in.dst.value != 106 && in.dst.value != 126))
         return 0;
     const auto& source = in.src[0];
     if (!b.is_fragment_packet()) {
-        if (!b.native_uniform_numeric_vcc_move_pcs.contains(in.pc) ||
+        if (!b.native_uniform_numeric_mask_move_pcs.contains(in.pc) ||
             in.pc >= b.saved_mask_original_words.size())
             return 0;
         auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
@@ -166,6 +166,15 @@ bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool 
 // logical lane, not a native fragment subgroup or the value of either source word as a Bool.
 bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     const auto& source = in.src[0];
+    // The same proved current pair must reach either mask consumer. Numeric words take
+    // precedence over a previous Bool view; missing/expired proofs keep existing fallbacks.
+    if (!b.is_fragment_packet()) {
+        if (const uint32_t current = s_mov_b64_numeric_mask_bit(b, rs, in)) {
+            rs.exec = current;
+            rs.exec_narrowed = true;
+            return true;
+        }
+    }
     if (uses_native_saved_mask_words(b) && source.kind == OperandKind::SGPR &&
         (!rs.sreg_bool.contains(source.value) || rs.sreg_bool_b32.contains(source.value)) &&
         (rs.unavailable_saved_mask_words.contains(source.value) ||

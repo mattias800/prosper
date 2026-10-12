@@ -678,9 +678,9 @@ struct SpirvCompute {
     std::set<uint32_t> saved_mask_reconverged_entry_pcs;
     // Separate routing-uniform/genuine-DATA proof for original complete native single-wave loops.
     std::set<uint32_t> native_participating_mask_pcs;
-    // Current numeric MOV-to-VCC sources are uniform on every original incoming path.
+    // Current numeric MOV-to-VCC/EXEC sources are uniform on every original incoming path.
     // This is independent of physical word availability and never re-seeded by a reload.
-    std::set<uint32_t> native_uniform_numeric_vcc_move_pcs;
+    std::set<uint32_t> native_uniform_numeric_mask_move_pcs;
     std::vector<uint64_t> native_participation_entry_state;
     uint32_t native_mask_runtime_write_pc = UINT32_MAX;
     bool saved_mask_in_dispatcher = false;

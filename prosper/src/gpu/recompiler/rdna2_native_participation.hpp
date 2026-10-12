@@ -10,7 +10,7 @@ std::vector<uint64_t> native_participation_entry(const SpirvCompute&, const RegS
 // genuine current guest words. Routing equality alone never grants physical DATA authority.
 std::set<uint32_t> native_mask_participation(const SpirvCompute&, const RegState*,
                                              const std::vector<Rdna2Inst>&,
-                                             std::set<uint32_t>* numeric_vcc_moves = nullptr);
+                                             std::set<uint32_t>* numeric_mask_moves = nullptr);
 bool native_mask_predicate_available(const RegState&, const Rdna2Inst&);
 bool native_mask_participation_site(const SpirvCompute&, const Rdna2Inst&);
 } // namespace prosper::gpu

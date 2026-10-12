@@ -709,3 +709,167 @@ TEST(NativeNumericVccMove, LaneLocalReadlaneSelectorCannotAuthenticateCurrentVcc
              0x7e080500u);   // READFIRST s4,v0 keeps a lane-local selector in this fallback.
     refuses(p, prosper::test::native_execution_launch());
 }
+
+// #2804: ordinary SOP2 DATA must end the old mirrored VCC predicate before either mask consumer.
+namespace {
+std::vector<uint32_t> selected_high_copy(bool genuine, bool replace = false, bool relay = false,
+                                         bool only_half = false) {
+    auto p =
+        only_half ? std::vector<uint32_t>{0x7e060280u, 0x7e020280u, 0x7d880088u} : numeric(1, 0);
+    if (only_half) finish(p);
+    const auto at = std::find(p.begin(), p.end(), mov(126, 106, true));
+    std::vector<uint32_t> sequence{genuine ? mov(16, 128) : 0x7e200500u, 0xbf068010u, 0x856b8081u};
+    if (replace) sequence.push_back(mov(107, 129));
+    if (relay) {
+        sequence.push_back(mov(20, 106, true));
+        sequence.push_back(mov(106, 20, true));
+    } else
+        sequence.push_back(mov(106, 106, true));
+    p.insert(at, sequence.begin(), sequence.end());
+    return p;
+}
+std::vector<uint32_t> genuine_mask_copy(bool data, bool physical = false, bool floating = false) {
+    std::vector<uint32_t> p{0x7e060280u, 0x7e020280u, mov(126, 193, true)};
+    if (data) {
+        p.insert(p.end(), {0x87ea7e7eu, mov(14, 106), mov(15, 107), mov(106, 106, true)});
+    } else {
+        if (floating)
+            p.insert(p.end(), {0x7e0402ffu, 0x3f800000u, 0x7e020280u, 0x7c020501u});
+        else
+            p.push_back(0x7d8800a8u);
+        p.insert(p.end(), {mov(20, 106, true), mov(106, 20, true)});
+    }
+    finish(p);
+    if (physical) {
+        const auto at = std::find(p.begin(), p.end(), 0x7e060281u);
+        *at = 0x7e06020eu;
+        p.insert(at + 1, 0x4a06060fu);
+    }
+    return p;
+}
+}   // namespace
+TEST(NativeNumericVccMove, ASelectedHighWordCannotRestoreTheStaleSelfCopyPredicate) {
+    refuses(selected_high_copy(false), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, AGenuineSccSelectionKeepsBothCurrentSelfCopyWords) {
+    values(selected_high_copy(true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, ACurrentHighOverwriteRetiresTheSelectedSelfCopyGeneration) {
+    values(selected_high_copy(false, true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, ASelectedHighRelayCannotManufactureACurrentBoolAlias) {
+    refuses(selected_high_copy(false, false, true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, AGenuineSccRelayKeepsBothCurrentWords) {
+    values(selected_high_copy(true, false, true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, ACurrentHighOverwriteMakesTheSelectedRelayGenuine) {
+    values(selected_high_copy(false, true, true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, AOneHalfRelayCannotRecoverAStalePredicateAfterItsDataVanishes) {
+    refuses(selected_high_copy(false, false, true, true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, AGenuinePureBoolRelayKeepsItsCurrentMaskWithoutData) {
+    values(genuine_mask_copy(false), expected(UINT64_C(0xffffffffff)));
+}
+TEST(NativeNumericVccMove, AGenuineDualDomainPredicateKeepsItsFullCurrentMask) {
+    values(genuine_mask_copy(true), expected(UINT64_MAX));
+}
+TEST(NativeNumericVccMove, AGenuineDualDomainCopyKeepsItsActualLowAndHighPhysicalWords) {
+    values(genuine_mask_copy(true, true), std::vector<uint32_t>(64, UINT32_MAX - 1));
+}
+TEST(NativeNumericVccMove, AGenuineFloatCompareRelayKeepsItsCurrentBoolWithoutNumericAuthority) {
+    values(genuine_mask_copy(false, false, true), expected(UINT64_MAX));
+}
+
+namespace {
+std::vector<uint32_t> selected_high_exec(bool genuine, bool replace = false) {
+    auto p = selected_high_copy(genuine, replace);
+    p.erase(std::find(p.begin(), p.end(), mov(106, 106, true)));
+    return p;
+}
+std::vector<ComputeShaderConfig> unproved_raw_profiles() {
+    auto unknown = prosper::test::native_execution_launch();
+    unknown.dispatch_launch = {};
+    auto partial = prosper::test::native_execution_launch();
+    partial.dispatch_launch.initiator |= 2u;
+    auto missing = prosper::test::native_execution_launch();
+    missing.dispatch_launch.known &= ~1u;
+    return {unknown, partial, missing};
+}
+}   // namespace
+TEST(NativeNumericVccMove, ASelectedHighWordCannotBypassItsGenerationByCopyingDirectlyToExec) {
+    refuses(selected_high_exec(false), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, AGenuineSccSelectionPublishesBothCurrentWordsDirectlyToExec) {
+    values(selected_high_exec(true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, ACurrentHighOverwritePublishesBothCurrentWordsDirectlyToExec) {
+    values(selected_high_exec(false, true), expected(UINT64_C(0x100000001)));
+}
+TEST(NativeNumericVccMove, UnknownPartialOrIncompleteRawLaunchCannotDisableBoolGenerationChecks) {
+    auto p = selected_high_copy(false);
+    // The complete inline writer works without numeric projection, so the negative cannot fail
+    // merely because the original SGPR numeric-to-VCC prerequisite lacks a checked raw launch.
+    *std::find(p.begin(), p.end(), mov(106, 14, true)) = mov(106, 129, true);
+    for (const auto& c : unproved_raw_profiles()) {
+        ASSERT_FALSE(compile(genuine_mask_copy(false), c).module.empty()) << "current Bool control";
+        const auto r = compile(p, c);
+        EXPECT_TRUE(r.module.empty());
+        EXPECT_FALSE(r.reasons.empty());
+    }
+}
+TEST(NativeNumericVccMove, AGenuinePureBoolRelayRetainsItsGenerationWithAnUnprovedRawLaunch) {
+    for (const auto& c : unproved_raw_profiles())
+        values(genuine_mask_copy(false), expected(UINT64_C(0xffffffffff)), c);
+}
+
+TEST(NativeNumericVccMove, GenericSop2HighWordsCannotBorrowTheDepartedPredicate) {
+    for (uint32_t opcode : {0x00u, 0x01u, 0x09u}) {
+        auto p = selected_high_copy(false);
+        *std::find(p.begin(), p.end(), 0x856b8081u) =
+            0x80000000u | (opcode << 23u) | (107u << 16u) |
+            (opcode == 0x01u ? ((16u << 8u) | 129u) : ((129u << 8u) | 16u));
+        refuses(p, prosper::test::native_execution_launch());
+    }
+}
+TEST(NativeNumericVccMove, GenuineSop2HighWordsKeepTheirCurrentPairAtBothConsumers) {
+    for (uint32_t opcode : {0x00u, 0x01u, 0x09u}) {
+        for (bool direct : {false, true}) {
+            auto p = direct ? selected_high_exec(true) : selected_high_copy(true);
+            *std::find(p.begin(), p.end(), 0x856b8081u) =
+                0x80000000u | (opcode << 23u) | (107u << 16u) |
+                (opcode == 0x01u ? ((16u << 8u) | 129u) : ((129u << 8u) | 16u));
+            values(p, expected(UINT64_C(0x100000001)));
+        }
+    }
+}
+TEST(NativeNumericVccMove, GenericSop2HighDataPreservesAnIndependentWave32LowPredicate) {
+    auto c = prosper::test::native_execution_launch();
+    c.local_x = c.wave_size = c.native_subgroup_size = 32;
+    prosper::test::complete_compute_launch(c);
+    for (uint32_t opcode : {0x00u, 0x01u, 0x09u}) {
+        std::vector<uint32_t> p{0x7e060280u, 0x7e020280u, 0x7d880088u,
+                                0x80000000u | (opcode << 23u) | (107u << 16u) | (128u << 8u) |
+                                    129u};
+        finish(p);
+        const auto r = compile(p, c);
+        ASSERT_FALSE(r.module.empty()) << r.reasons;
+        ASSERT_TRUE(has_switch(r.module));
+        bpermute_oracle::Interpreter absent(r.module);
+        EXPECT_TRUE(absent.run(32, std::vector<uint32_t>(32, 0xdeadbeef)).empty());
+        EXPECT_FALSE(absent.error.empty());
+        bpermute_oracle::Interpreter nonzero_base(r.module);
+        nonzero_base.native_subgroup_width = 32;
+        EXPECT_TRUE(nonzero_base.run_buffers(32, {{3, std::vector<uint32_t>(32, 0xdeadbeef)}}, 3, 1)
+                        .empty());
+        EXPECT_EQ(nonzero_base.error, "unproved native32 instance");
+        bpermute_oracle::Interpreter vm(r.module);
+        vm.native_subgroup_width = 32;
+        const auto got = vm.run(32, std::vector<uint32_t>(32, 0xdeadbeef));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(got.size(), 32u);
+        for (uint32_t lane = 0; lane < 32; ++lane)
+            EXPECT_EQ(got[lane], lane < 8 ? 1u : 0u) << "lane " << lane;
+    }
+}

@@ -1013,7 +1013,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {   // set/restore EXEC
                         ok = emit_s_mov_b64_exec(b, rs, in);
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
-                        uint32_t m = s_mov_b64_numeric_vcc_bit(b, rs, in);
+                        uint32_t m = s_mov_b64_numeric_mask_bit(b, rs, in);
                         if (!m) m = src_mask(in.src[0]);
                         if (m && !validate_saved_mask_copy_words(b, rs, in)) {
                             ok = false;
@@ -2446,6 +2446,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 32-bit scalar DATA writes into EXEC halves are rejected (see the SOP1 uint path).
             if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
+            // Capture both operands before ending the old physical-word mask lifetime. These
+            // ordinary DATA writers are separate from the dedicated mask producers above.
+            retire_scalar_data_word_mask(rs, in.dst.value);
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
                 case 0x00: d = b.ibin(Op_IAdd, a, c); rs.scc = b.ucmp(Op_ULessThan, d, a); break;  // s_add_u32 (SCC=carry)
