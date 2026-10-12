@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_trip_bound.hpp"
 #include "gpu/recompiler/rdna2_reject_words.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
@@ -1637,6 +1638,8 @@ bool emit_cfg_state_machine(
         if (barrier_half_phase)
             barrier_halves->seed_entry(wave64_spilled_halves_in.front(),
                                        wave64_slot_domain_in.front());
+        seed_portable_mask_dispatch(b, initial, ins.front().pc, wave64_spilled_halves_in.front(),
+                                    wave64_slot_domain_in.front());
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -2178,6 +2181,8 @@ bool emit_cfg_state_machine(
                                            {masks, ambiguous, scalar_words, readlane_words},
                                            slot_context, vector_writes,
                                            record_compare ? &proven_mask_writelane_pcs : nullptr);
+            refine_portable_mask_dispatch(b, in, writes_exact_wave_scc, relay_sources, halves,
+                                          slot_domains);
             if (record_compare && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04 || in.opcode == 0x05) && definite_scc)
                 proven_wave64_scalar_scc_branch_pcs.insert(in.pc);
