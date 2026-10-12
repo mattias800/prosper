@@ -582,4 +582,20 @@ TEST(NggSavedVccCopyDemand, MissingTrailingLiteralDoesNotBecomeAMustMaskSource) 
     EXPECT_TRUE(e.b.native_logical_data_demand_pcs.contains(1u));
     EXPECT_FALSE(e.emit(ins[1]));
 }
+
+TEST(NggSavedVccCopyDemand, NumericLiteralMoveDoesNotAdvertiseABoolOnlyCopy) {
+    Emitter e;
+    const std::vector<uint32_t> code{0xbe9404ffu,
+                                     0xffu,
+                                     fixture::mov(106, 20, true),
+                                     0xd5010000u,
+                                     129u | (137u << 9u) | (106u << 18u),
+                                     end};
+    const auto ins = decode(code);
+    ASSERT_EQ(ins[0].fmt, Rdna2Format::SOP1);
+    ASSERT_EQ(ins[0].opcode, 0x04u);
+    ASSERT_EQ(ins[0].src[0].kind, OperandKind::Literal);
+    e.prove(code);
+    EXPECT_FALSE(e.b.ngg_bool_only_vcc_copy_pcs.contains(2u));
+}
 } // namespace prosper::gpu

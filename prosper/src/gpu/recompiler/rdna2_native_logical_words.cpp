@@ -253,8 +253,15 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
                                             !initial->sreg_bool_b32.contains(root))))
                 entry.set(root);
     }
-    const auto mask_source = [&](const Words& masks, const Operand& source) {
+    const auto mask_source = [&](const Words& masks, const Operand& source,
+                                 const Rdna2Inst& owner) {
         if (source.kind == OperandKind::InlineInt) return true;
+        // CONFIDENCE: HIGH -- the B64 logical emitter consumes an owned trailing literal as
+        // a zero-extended constant mask. Numeric MOV/CSELECT literal routes do not create Bool.
+        if (source.kind == OperandKind::Literal && owner.has_literal &&
+            owner.fmt == Rdna2Format::SOP2 && owner.opcode >= 0x0f && owner.opcode <= 0x1d &&
+            (owner.opcode & 1u))
+            return true;
         // A closed B64 source must remain complete through every relay. A move/select
         // cannot turn an independent high word or B32 seed into a whole-mask root.
         if (closed_copy_domain(b) &&
@@ -289,10 +296,10 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             const bool copy_mask = in.fmt == Rdna2Format::SOP1 &&
                                    (in.opcode == kSop1OpcodeMovB64 || in.opcode == 0x08 ||
                                     in.opcode == 0x0a || in.opcode == kSop1OpcodeQuadmaskB64) &&
-                                   mask_source(incoming, in.src[0]);
+                                   mask_source(incoming, in.src[0], in);
             const bool select_mask = in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0b &&
-                                     mask_source(incoming, in.src[0]) &&
-                                     mask_source(incoming, in.src[1]);
+                                     mask_source(incoming, in.src[0], in) &&
+                                     mask_source(incoming, in.src[1], in);
             // CONFIDENCE: HIGH -- the existing fragment SOP2 emitter computes these logical
             // results pointwise from genuine Bool operands. This is only the original MUST
             // transfer; generation DATA demand and current-source validation remain separate.
@@ -301,7 +308,7 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
                 in.opcode <= 0x1d && (in.opcode & 1u) && in.dst.kind == OperandKind::SGPR &&
                 ((in.dst.value >= 0 && in.dst.value <= 104) || in.dst.value == 106 ||
                  in.dst.value == 126) &&
-                mask_source(incoming, in.src[0]) && mask_source(incoming, in.src[1]);
+                mask_source(incoming, in.src[0], in) && mask_source(incoming, in.src[1], in);
             const bool conditional =
                 in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64);
@@ -361,9 +368,9 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
         if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
             in.dst.kind != OperandKind::SGPR)
             mark(kills[i], 106, 2);
-        const bool source_mask = mask_source(masks_before[i], in.src[0]);
+        const bool source_mask = mask_source(masks_before[i], in.src[0], in);
         const bool select_mask = in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0b && source_mask &&
-                                 mask_source(masks_before[i], in.src[1]);
+                                 mask_source(masks_before[i], in.src[1], in);
         const bool bool_logical = in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f &&
                                   in.opcode <= 0x1d && (in.opcode & 1u);
         relays[i] = bool_logical || select_mask ||
@@ -392,7 +399,7 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
         const auto& condition = in.src[2];
         const bool cndmask_mask =
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && in.n_src == 3 &&
-            mask_source(masks_before[i], condition) &&
+            mask_source(masks_before[i], condition, in) &&
             ((condition.kind == OperandKind::SGPR && condition.value >= 0 &&
               condition.value <= 105) ||
              ((condition.kind == OperandKind::SGPR || condition.kind == OperandKind::Special) &&

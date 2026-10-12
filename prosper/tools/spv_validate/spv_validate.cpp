@@ -549,6 +549,13 @@ static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& s
                  recompile_ngg_subgroup(code.data(), code.size(), nullptr, copy_config),
                  "recompile_ngg_subgroup");
         }
+        for (uint32_t literal : {0u, 0xffu, 0x80000000u, UINT32_MAX}) {
+            const auto code = prosper::test::ngg_bool_copy::literal_logical(literal);
+            const auto name = "ngg_native_literal_mask_" + std::to_string(literal);
+            dump(dir, name.c_str(),
+                 recompile_ngg_subgroup(code.data(), code.size(), nullptr, copy_config),
+                 "recompile_ngg_subgroup");
+        }
     }
     for (bool native : {false, true}) {
         NggSubgroupShellConfig slots_cfg;
