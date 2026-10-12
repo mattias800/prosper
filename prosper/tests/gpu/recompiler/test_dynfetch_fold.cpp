@@ -5577,6 +5577,9 @@ int main() {
         0xBF810000u,
     };
     ShaderResourceTable rewritten_load_table;
+    // A nonidentity descriptor makes omitting publication observable; the earlier store retains
+    // its identity routing, while this load reads B/R/G/A.
+    rewritten_store_table[3] = (2u << 12) | 0xF66u;
     const std::vector<SrtUse> rewritten_load_uses = add_compute_buffer_resources(
         rewritten_load_table, rewritten_table_load, std::size(rewritten_table_load),
         rewritten_compute_seed, 10);
@@ -5584,11 +5587,16 @@ int main() {
     CHECK(rewritten_load_uses.empty() && rewritten_load_table.resources.size() == 1,
           "#636: table-loaded format load has one production-path resource identity");
     CHECK(rewritten_load_table.resources.size() == 1 &&
-          rewritten_load_table.resources[0].gpu_addr == rewritten_output_base &&
-          rewritten_load_table.resources[0].fetch_pc == 4 &&
-          rewritten_load_table.resources[0].srt_offset == 0xFFFFFFFFu &&
-          rewritten_load_table.resources[0].binding == 2,
-          "#636: format-load resource uses the live range, pc provenance, and assigned binding");
+              rewritten_load_table.resources[0].gpu_addr == rewritten_output_base &&
+              rewritten_load_table.resources[0].fetch_pc == 4 &&
+              rewritten_load_table.resources[0].srt_offset == 0xFFFFFFFFu &&
+              rewritten_load_table.resources[0].binding == 2 &&
+              rewritten_load_table.resources[0].swizzle[0] == 6u &&
+              rewritten_load_table.resources[0].swizzle[1] == 4u &&
+              rewritten_load_table.resources[0].swizzle[2] == 5u &&
+              rewritten_load_table.resources[0].swizzle[3] == 7u,
+          "#636: format-load resource uses the live range, pc provenance, swizzle, and assigned "
+          "binding");
 
     // Raw byte-addressed descriptors use stride zero, and the recompiler's supported atomic_umax is
     // an external-buffer consumer too. Both were accepted before the catch-all scan was removed and

@@ -6123,6 +6123,7 @@ std::vector<SrtUse> add_compute_buffer_resources(
         if (mapped) continue;
         ShaderResource r;
         r.cls = ResourceClass::ConstantBuffer;
+        apply_buffer_descriptor_swizzle(r, d);
         r.format = format;
         r.num_components = components;
         r.gpu_addr = d.base;
