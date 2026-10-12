@@ -191,12 +191,15 @@ blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
 # note #4814: +3 net lines route 3D tail views to the translated-region detile; the
 # placement math and reader live in tile.cpp, and the guest-visible result is the Black Flag
 # 32^3 R8 pyramid uploading its proven level bytes instead of refusing the views.
-file-size|prosper/frontends/shared/live/live_compute.cpp 14659  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
+file-size|prosper/frontends/shared/live/live_compute.cpp 14672  # lowered: transfer-gate stats, parent-scan census, GPU-retile census, mirror copies moved to headers
 # note (#4842): +62 are the five volume-chain wiring sites (materializable gate, creation
 # shape, staging offsets, per-level upload arms, copy-region depth); the per-level math
 # itself lives in src/gpu/resources/volume_chain_upload.* so the file grows only by calls.
 # Guest-visible result: base-zero thick-3D chains materialize N-level images instead of
 # refusing the binding.
+# note (#5016 review): +11 conversion-aware width agreement (the old unconditional equality
+# stranded every R8 chain at 4 != 1) and capacity-carrying upload calls. Same wiring-only
+# rule: no new math in this file.
 file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5501  # lowered: lazy sampled colour-target materializer moved to lazy_sampled_color_target.hpp
 # note: retain eleven upstream DST_SEL/refused-CS observation lines (#4290) alongside the finality reduction.
 # note #4328: 59 lines above that lowered cap connect real public-entry activity, borrowed private

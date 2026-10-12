@@ -9146,13 +9146,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint64_t chain_texels =
                     volume_tail_chain ? static_cast<uint64_t>(r->width) * r->height * r->depth
                                       : static_cast<uint64_t>(r->width) * r->height;
+                // The width agreement is conversion-aware for volumes: native identity,
+                // or exactly the R8 broadcast the uploader repeats per level. The old
+                // unconditional equality stranded every R8 chain here (4 != 1) after the
+                // planner and the view had admitted it.
+                const bool volume_width_agrees =
+                    !volume_tail_chain || prosper::gpu::volume_chain_backend_width_agrees(
+                                              mip_chain, r->mip_chain_bytes_per_block, texel_bytes,
+                                              prosper::gpu::volume_chain_r8_broadcast_shape(
+                                                  r->format, r->num_components));
                 const bool chain_binding_shape =
                     mip_chain.valid && mip_chain.level_count == declared_chain_levels &&
                     !bi.storage && !bi.imported && !renderer_owned && !bi.depth_bits_source &&
                     !bi.unorm_rtt_value_reuse && !bi.depth_view && !dim_1d &&
                     (!dim_3d || volume_tail_chain) && !dim_cube_stacked && !cube_face_as_2d &&
                     sampled_layers == 1u && bi.array_layers == 1u && !bi.stacked_cube &&
-                    volume_texels == chain_texels && texel_bytes == r->mip_chain_bytes_per_block;
+                    volume_texels == chain_texels && volume_width_agrees;
                 if (!chain_binding_shape) {
                     // BLAST RADIUS, stated plainly: this decline is NOT conditional on the module
                     // actually issuing IMAGE_LOAD_MIP. A module that only samples this resource
@@ -10740,7 +10749,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                         prosper::gpu::upload_volume_tail_chain_levels(
                                             mip_chain, src - mip_chain.levels[0].byte_offset,
                                             mip_chain.allocation_bytes, r->tile_mode, bpt,
-                                            texel_bytes, false, upload,
+                                            texel_bytes, false, upload, upload_size,
                                             bi.mip_staging_offsets.data(),
                                             bi.mip_staging_offsets.size());
                                 } else {
@@ -10780,12 +10789,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             if (bi.mip_levels > 1u &&
                                 prosper::gpu::mip_chain_plan_is_volume_tail(mip_chain)) {
                                 // The same 1-to-4 broadcast, repeated per level through
-                                // each level's own tail origin.
+                                // each level's own tail origin. The flag re-derives the
+                                // proven shape rather than trusting the arm: divergence
+                                // refuses instead of converting wrongly.
                                 mip_chain_levels_written =
                                     prosper::gpu::upload_volume_tail_chain_levels(
                                         mip_chain, src - mip_chain.levels[0].byte_offset,
                                         mip_chain.allocation_bytes, r->tile_mode, bpt, texel_bytes,
-                                        true, upload, bi.mip_staging_offsets.data(),
+                                        prosper::gpu::volume_chain_r8_broadcast_shape(
+                                            r->format, r->num_components),
+                                        upload, upload_size, bi.mip_staging_offsets.data(),
                                         bi.mip_staging_offsets.size());
                             }
                         } else {   // Float16: half -> UNORM8 + default fill

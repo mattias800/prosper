@@ -637,14 +637,15 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
         // rule as the thin-2D tail path at the bottom of this function).
         return view;
     }
-    // 3D chain views (BASE_LEVEL != LAST_LEVEL) stay refused even when the chain starts at
-    // zero: the compute backend materializes one level per 3D binding (the sampled-image
-    // chain shape excludes dim_3d), while the recompiler lowers explicit-LOD 3D samples
-    // with the guest LOD against what it assumes is a single-level image (rdna2_emit_alu
-    // dim3d: "a nonzero LOD can only address what the view selected"). Falling through to
-    // the unshifted admission below would bind level zero while declaring N levels, so a
-    // guest LOD above zero addresses a level that was never created. Mid-chain windows
-    // (BASE != 0) already refuse via the slice guard below; this closes the BASE = 0 arm.
+    // 3D chain views (BASE_LEVEL != LAST_LEVEL) that no chain materializes stay refused:
+    // the backend below builds one level per unplannable 3D binding, while the recompiler
+    // lowers explicit-LOD 3D samples with the guest LOD (rdna2_emit_alu dim3d). An explicit
+    // LOD past the image's available levels clamps to what the view holds, so admitting
+    // such a view unshifted would bind level zero while declaring N levels, and a guest
+    // LOD above zero would sample the clamped level zero instead of the requested chain
+    // level -- the wrong texels, not undefined behavior (integer fetch/load out-of-range
+    // semantics stay distinct). Mid-chain windows (BASE != 0) already refuse via the slice
+    // guard below; the placeable BASE = 0 arm admits next.
     // Base-zero 3D chains over a proven all-in-tail pyramid materialize every declared
     // level (volume chain plan + backend), so they admit with the level-zero placement:
     // base unshifted (tail levels share block zero), extents unshifted, the tail
