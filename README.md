@@ -12,8 +12,8 @@
 
 Native execution of PS5 game dumps on Linux and Windows.
 
-prosper is a user-space PS5 (Prospero) → PC compatibility layer — "Wine/Proton for PS5." The PS5
-CPU is x86-64, so guest code runs natively and there is no CPU emulation. The work is loading
+prosper is a user-space PS5 (Prospero) → PC compatibility layer. The PS5 CPU is x86-64, so guest
+code runs natively and there is no CPU emulation. The work is loading
 Sony's SELF/ELF modules and linking them into one address space, reimplementing the PS5 system
 libraries on top of host facilities, translating the ABI where the guest's conventions differ, and
 translating AGC GPU command streams to Vulkan, which includes an RDNA2 → SPIR-V shader recompiler.
@@ -30,9 +30,9 @@ beyond the specific route documented for it.
 
 ## How it works
 
-- **No CPU emulation:** the PS5 CPU is standard x86-64 (Zen 2). Game code runs natively at host
-  speed, so no CPU translation step is needed and the shipped modules run unchanged. Translation
-  is reserved for the GPU, whose ISA has no host equivalent.
+- **No CPU emulation:** the PS5 CPU is standard x86-64 (Zen 2). Game code executes directly on
+  the host CPU without whole-program recompilation. The loaded image still receives relocations,
+  import resolution and host compatibility patches where needed.
 - **Loader + linker (`prosper/src/self/`, `prosper/src/loader/`):** parses SELF/ELF modules into
   relocatable images and links Sony NID imports into one address space with a global export table.
 - **Reimplemented system libraries (`prosper/src/hle/`):** clean-room implementations of the
