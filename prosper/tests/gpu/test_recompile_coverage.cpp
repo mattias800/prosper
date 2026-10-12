@@ -1886,12 +1886,15 @@ int main() {
     compute_cfg_dispatch_mask_scc.insert(
         compute_cfg_dispatch_mask_scc.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    // This owned fixture launches one complete group; native width alone grants no entry authority.
+    ComputeShaderConfig native_mask_scc_config = wave32_dispatch_config;
+    prosper::test::complete_compute_launch(native_mask_scc_config);
     CHECK(!recompile_compute(compute_cfg_dispatch_mask_scc.data(),
                              compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
-                             wave32_dispatch_config)
+                             native_mask_scc_config)
                .empty(),
           "the exact Wave32 dispatcher branches on the SCC from a B32 mask intersection");
-    ComputeShaderConfig portable_mask_scc_config = wave32_dispatch_config;
+    ComputeShaderConfig portable_mask_scc_config = native_mask_scc_config;
     portable_mask_scc_config.native_subgroup_size = 0;
     CHECK(recompile_compute(compute_cfg_dispatch_mask_scc.data(),
                             compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
