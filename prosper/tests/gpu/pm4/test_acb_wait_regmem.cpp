@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,31 @@ struct CommandBuffer {
     uint32_t reserved_dw = 0;
     uint32_t pad = 0;
 };
+
+// Restore the process environment even when an assertion returns from the test early.
+// NOLINTBEGIN(concurrency-mt-unsafe): this isolated CPU test changes the environment between synchronous calls.
+class GfxLogEnvironment {
+public:
+    GfxLogEnvironment() {
+        if (const auto* value = std::getenv("PROSPER_GFXLOG")) original = value;
+    }
+    ~GfxLogEnvironment() { set(original ? original->c_str() : nullptr); }
+
+    static void set(const char* value) {
+#ifdef _WIN32
+        _putenv_s("PROSPER_GFXLOG", value ? value : "");
+#else
+        if (value)
+            setenv("PROSPER_GFXLOG", value, 1);
+        else
+            unsetenv("PROSPER_GFXLOG");
+#endif
+    }
+
+private:
+    std::optional<std::string> original;
+};
+// NOLINTEND(concurrency-mt-unsafe)
 
 class AcbWaitRegMem : public testing::Test {
 protected:
@@ -126,4 +153,31 @@ TEST_F(AcbWaitRegMem, MissingBufferOrInsufficientReservationDoesNotEmit) {
     EXPECT_EQ(cb.cursor_up, words.data());
     for (const auto word : words) EXPECT_EQ(word, 0xdeadbeefu);
 }
+
+// NOLINTBEGIN(concurrency-mt-unsafe): environment controls run on one thread before each builder call.
+TEST_F(AcbWaitRegMem, DiagnosticArmingAndDisarmingAreVisibleBetweenCalls) {
+    GfxLogEnvironment environment;
+    const auto build_and_capture = [&]() {
+        cb.cursor_up = words.data();
+        testing::internal::CaptureStderr();
+        const auto result = acb(cb_address(), 1, 3, 0, label_address(), 1, UINT64_MAX, 400);
+        const auto output = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(result, reinterpret_cast<uint64_t>(words.data()));
+        return output;
+    };
+
+    GfxLogEnvironment::set(nullptr);
+    ASSERT_EQ(std::getenv("PROSPER_GFXLOG"), nullptr);
+    EXPECT_EQ(build_and_capture().find("[agc] AcbWaitRegMem"), std::string::npos);
+    // Presence is the contract: even "0" enables this diagnostic, like the DCB sibling.
+    GfxLogEnvironment::set("0");
+    ASSERT_STREQ(std::getenv("PROSPER_GFXLOG"), "0");
+    EXPECT_NE(build_and_capture().find("[agc] AcbWaitRegMem"), std::string::npos)
+        << "arming after the first call must not be hidden by a process-lifetime cache";
+    GfxLogEnvironment::set(nullptr);
+    ASSERT_EQ(std::getenv("PROSPER_GFXLOG"), nullptr);
+    EXPECT_EQ(build_and_capture().find("[agc] AcbWaitRegMem"), std::string::npos)
+        << "disarming must stop the diagnostic on the next call";
+}
+// NOLINTEND(concurrency-mt-unsafe)
 }   // namespace
