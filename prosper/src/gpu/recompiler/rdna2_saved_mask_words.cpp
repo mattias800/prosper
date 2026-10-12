@@ -261,6 +261,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
         if (!same_stream ||
             b.native_participation_entry_state != native_participation_entry(b, initial)) {
             b.native_participating_mask_pcs.clear();
+            b.native_uniform_numeric_vcc_move_pcs.clear();
             b.native_uniform_exec_mov_pcs.clear();
         }
         if (!same_stream || !saved_mask_physical_launch_matches_original(b) || initial_active ||
@@ -271,6 +272,7 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
             b.saved_mask_reconverged_entry_pcs.clear();
             b.native_logical_uniform_entry_pcs.clear();
             b.native_participating_mask_pcs.clear();
+            b.native_uniform_numeric_vcc_move_pcs.clear();
             b.native_uniform_exec_mov_pcs.clear();
         }
         return;
@@ -349,7 +351,8 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
     }
     initialize_native_logical_uniform_entry_proof(b, original, initial);
     b.native_participation_entry_state = native_participation_entry(b, initial);
-    b.native_participating_mask_pcs = native_mask_participation(b, initial, original);
+    b.native_participating_mask_pcs =
+        native_mask_participation(b, initial, original, &b.native_uniform_numeric_vcc_move_pcs);
     b.saved_mask_reconverged_entry_pcs = reconverged_entry_pcs(original);
     if (b.saved_mask_reconverged_entry_pcs.empty()) return;
     // CONFIDENCE: HIGH -- a ballot observes participating invocations (Vulkan subgroup contract).

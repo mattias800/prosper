@@ -249,3 +249,150 @@ TEST(NativeNumericVccMove, TheCpuOracleRequiresItsOwnExplicitNativeProfile) {
     EXPECT_TRUE(vm.run(64, std::vector<uint32_t>(64, 0xdeadbeef)).empty());
     EXPECT_FALSE(vm.error.empty());
 }
+
+namespace {
+std::vector<uint32_t> lane_local_pair(bool add = false, bool move = false) {
+    auto p = numeric(1, 0);
+    auto low = std::find(p.begin(), p.end(), mov(14, 129));
+    p.erase(low);
+    p.insert(p.begin() + 3, add ? std::initializer_list<uint32_t>{0x7e1c0500u, 0x800e810eu}
+                                : std::initializer_list<uint32_t>{0x4a040081u, 0x7e1c0502u});
+    if (move) {
+        auto use = std::find(p.begin(), p.end(), mov(106, 14, true));
+        p.insert(use, {mov(16, 14), mov(17, 128)});
+        *std::find(p.begin(), p.end(), mov(106, 14, true)) = mov(106, 16, true);
+    }
+    return p;
+}
+std::vector<uint32_t> slot_pair(bool genuine, bool replace = false) {
+    auto p = lane_local_pair();
+    auto use = std::find(p.begin(), p.end(), mov(106, 14, true));
+    const auto index = use - p.begin();
+    p.erase(use);
+    std::vector<uint32_t> relay;
+    if (genuine) relay.push_back(mov(14, 129));
+    relay.insert(relay.end(), {0xd7610012u, 0x0001000eu, 0xd7600010u, 0x00010112u, mov(17, 128)});
+    if (replace) relay.push_back(mov(16, 129));
+    relay.push_back(mov(106, 16, true));
+    p.insert(p.begin() + index, relay.begin(), relay.end());
+    return p;
+}
+std::vector<uint32_t> joined_pair(bool both_genuine, bool replace = false) {
+    std::vector<uint32_t> p{
+        0x7e060280u,  0x7e020280u, 0x7d880088u, 0x4a040081u,
+        mov(15, 128), 0xbf068004u, 0xbf840002u, both_genuine ? mov(14, 129) : 0x7e1c0502u,
+        0xbf820001u,  mov(14, 129)};
+    if (replace) p.push_back(mov(14, 129));
+    p.push_back(mov(106, 14, true));
+    finish(p);
+    return p;
+}
+}   // namespace
+TEST(NativeNumericVccMove, LaneLocalReadfirstCannotSupplyNewMaskAuthority) {
+    refuses(lane_local_pair(), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, ScalarAddCannotLaunderTheLaneLocalWord) {
+    refuses(lane_local_pair(true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, ScalarMoveCannotLaunderTheLaneLocalWord) {
+    refuses(lane_local_pair(false, true), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, NumericSpillReadlaneKeepsItsStoredSourceUniformity) {
+    refuses(slot_pair(false), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, GenuineNumericSpillSourceKeepsTheOneLaneValue) {
+    values(slot_pair(true), expected(1));
+}
+TEST(NativeNumericVccMove, CurrentScalarOverwriteRetiresTheUnprovedSpillWord) {
+    values(slot_pair(false, true), expected(1));
+}
+TEST(NativeNumericVccMove, AJoinedLaneLocalWordRefusesBothRuntimeSuccessors) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5, 0);
+        c.user_sgprs[4] = path;
+        refuses(joined_pair(false), c);
+    }
+}
+TEST(NativeNumericVccMove, BothCurrentScalarArmsKeepTheOneLaneValue) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5, 0);
+        c.user_sgprs[4] = path;
+        values(joined_pair(true), expected(1), c);
+    }
+}
+TEST(NativeNumericVccMove, ACurrentOverwriteRetiresTheJoinedUnprovedWord) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5, 0);
+        c.user_sgprs[4] = path;
+        values(joined_pair(false, true), expected(1), c);
+    }
+}
+TEST(NativeNumericVccMove, InternedConstantReplacementStartsANewScalarGeneration) {
+    auto p = numeric(1, 0);
+    p.insert(p.begin() + 3, {0x7e040281u, 0x7e1c0502u});
+    values(p, expected(1));
+}
+TEST(NativeNumericVccMove, AnUnrelatedReadfirstCannotPoisonTheGenuineZeroHighWord) {
+    auto p = numeric(1, 0);
+    p.insert(p.begin() + 3, {0x7e040280u, 0x7e780502u});
+    values(p, expected(1));
+}
+TEST(NativeNumericVccMove, DispatcherReloadCannotReseedTheLaneLocalWord) {
+    auto p = lane_local_pair();
+    auto use = std::find(p.begin(), p.end(), mov(106, 14, true));
+    p.insert(use, 0xbf820000u);
+    refuses(p, prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, CurrentScalarReplacementAfterReloadKeepsTheOneLaneValue) {
+    auto p = lane_local_pair();
+    auto use = std::find(p.begin(), p.end(), mov(106, 14, true));
+    p.insert(use, {0xbf820000u, mov(14, 129)});
+    values(p, expected(1));
+}
+
+namespace {
+std::vector<uint32_t> joined_slot(bool both_genuine) {
+    auto p = slot_pair(false);
+    auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+    p.insert(read, {0xbf068004u, 0xbf840004u, mov(14, 129), 0xd7610012u, 0x0001000eu, 0xbf820003u,
+                    both_genuine ? mov(14, 129) : 0x7e1c0502u, 0xd7610012u, 0x0001000eu});
+    return p;
+}
+}   // namespace
+TEST(NativeNumericVccMove, AScalarOverwriteCannotChangeTheOlderNumericSlot) {
+    auto p = slot_pair(false);
+    auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+    p.insert(read, mov(14, 129));
+    refuses(p, prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, ACurrentSlotOverwriteRetiresItsUnprovedSource) {
+    auto p = slot_pair(false);
+    auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+    p.insert(read, {mov(14, 129), 0xd7610012u, 0x0001000eu});
+    values(p, expected(1));
+}
+TEST(NativeNumericVccMove, OnePathSlotReplacementRefusesBothRuntimeSuccessors) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5, 0);
+        c.user_sgprs[4] = path;
+        refuses(joined_slot(false), c);
+    }
+}
+TEST(NativeNumericVccMove, BothPathsSlotReplacementKeepTheOneLaneValue) {
+    for (uint32_t path : {0u, 1u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5, 0);
+        c.user_sgprs[4] = path;
+        values(joined_slot(true), expected(1), c);
+    }
+}
+TEST(NativeNumericVccMove, APartialVectorOverwriteCannotReseedTheOlderNumericSlot) {
+    auto p = slot_pair(false);
+    auto read = std::find(p.begin(), p.end(), 0xd7600010u);
+    p.insert(read, {mov(126, 106, true), 0x7e240281u, mov(126, 193, true)});
+    refuses(p, prosper::test::native_execution_launch());
+}

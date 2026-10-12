@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <array>
 #include <optional>
 
@@ -65,6 +66,15 @@ uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rd
         in.opcode != kSop1OpcodeMovB64 || in.dst.value != 106)
         return 0;
     const auto& source = in.src[0];
+    if (!b.is_fragment_packet()) {
+        if (!b.native_uniform_numeric_vcc_move_pcs.contains(in.pc) ||
+            in.pc >= b.saved_mask_original_words.size())
+            return 0;
+        auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
+                                         b.saved_mask_original_words.size() - in.pc);
+        original.pc = in.pc;
+        if (in.synthetic_terminator || in != original) return 0;
+    }
     uint32_t lo = 0, hi = 0;
     if (source.kind == OperandKind::SGPR ||
         (source.kind == OperandKind::Special && source.value >= 106 && source.value <= 123)) {

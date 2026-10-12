@@ -14,6 +14,7 @@ constexpr uint64_t full = UINT64_MAX;
 struct Word {
     bool uniform = false, genuine = false;
     std::optional<uint32_t> constant;
+    bool numeric_uniform = uniform;
     bool operator==(const Word&) const = default;
 };
 struct Mask {
@@ -23,6 +24,7 @@ struct Mask {
 };
 struct Facts {
     bool common = true;
+    bool numeric_common = true;
     std::array<Word, 128> scalar{};
     std::array<Mask, 128> mask{};
     std::array<uint64_t, 256> vector{};
@@ -30,17 +32,24 @@ struct Facts {
     std::array<std::optional<uint32_t>, 256> vector_constant{};
     Word scc;
     Mask exec{true, full};
+    // Numeric spill services return their stored SSA, rather than shuffling ordinary VGPR DATA.
+    // Uniformity belongs to that current slot producer, including false/missing edge facts.
+    std::map<std::pair<int, uint32_t>, bool> numeric_slots;
+    std::set<int> numeric_slot_vgprs;
     bool operator==(const Facts&) const = default;
 };
 Word meet(Word a, Word b) {
-    return {a.uniform && b.uniform, a.genuine && b.genuine,
-            a.constant == b.constant ? a.constant : std::nullopt};
+    Word result{a.uniform && b.uniform, a.genuine && b.genuine,
+                a.constant == b.constant ? a.constant : std::nullopt};
+    result.numeric_uniform = a.numeric_uniform && b.numeric_uniform;
+    return result;
 }
 Mask meet(Mask a, Mask b) {
     return {a.genuine && b.genuine, a.constant == b.constant ? a.constant : std::nullopt};
 }
 Facts meet(Facts a, const Facts& b) {
     a.common &= b.common;
+    a.numeric_common &= b.numeric_common;
     a.scc = meet(a.scc, b.scc);
     a.exec = meet(a.exec, b.exec);
     for (size_t i = 0; i < a.scalar.size(); ++i) {
@@ -52,6 +61,16 @@ Facts meet(Facts a, const Facts& b) {
         if (a.vector_constant[i] != b.vector_constant[i]) a.vector_constant[i].reset();
     }
     a.local_x &= b.local_x;
+    for (const auto& [slot, uniform] : b.numeric_slots) {
+        const auto found = a.numeric_slots.find(slot);
+        if (found == a.numeric_slots.end())
+            a.numeric_slots.emplace(slot, false);
+        else
+            found->second &= uniform;
+    }
+    for (auto& [slot, uniform] : a.numeric_slots)
+        if (!b.numeric_slots.contains(slot)) uniform = false;
+    a.numeric_slot_vgprs.insert(b.numeric_slot_vgprs.begin(), b.numeric_slot_vgprs.end());
     return a;
 }
 bool ordinary(const SpirvCompute& b) {
@@ -92,7 +111,9 @@ Word word(const Facts& f, const Rdna2Inst& in, Operand o, uint32_t offset = 0) {
     return {};
 }
 Word combine(Word a, Word b) {
-    return {a.uniform && b.uniform, a.genuine && b.genuine, std::nullopt};
+    Word result{a.uniform && b.uniform, a.genuine && b.genuine, std::nullopt};
+    result.numeric_uniform = a.numeric_uniform && b.numeric_uniform;
+    return result;
 }
 Word scalar_sources(const Facts& f, const Rdna2Inst& in) {
     Word result{true, true, std::nullopt};
@@ -246,12 +267,17 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
     const int dst = in.dst.value;
     if (in.fmt == Rdna2Format::Unknown || rdna2_escapes_decoded_effects(in) ||
         in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::SOPK)
-        f.common = false;
+        f.common = f.numeric_common = false;
     if (in.fmt == Rdna2Format::SOPP) {
         if (in.opcode != 0 && in.opcode != 1 && in.opcode != 2 &&
             !(in.opcode >= 4 && in.opcode <= 9) && in.opcode != 0xc && in.opcode != 0x20 &&
             in.opcode != 0x21 && in.opcode != 0x22)
             f.common = false;
+        // A guest barrier ends the existing physical producer proof, not scalar uniformity.
+        if (in.opcode != 0 && in.opcode != 1 && in.opcode != 2 &&
+            !(in.opcode >= 4 && in.opcode <= 0xa) && in.opcode != 0xc && in.opcode != 0x20 &&
+            in.opcode != 0x21 && in.opcode != 0x22)
+            f.numeric_common = false;
         return f;
     }
     for_each_scalar_write(in, [&](int r, uint32_t width) { kill_scalar(f, r, width); });
@@ -350,6 +376,18 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         const bool genuine =
             fixed && (vector_source(before, in, in.src[0]) & (uint64_t{1} << *selector.constant));
         if (dst >= 0 && dst < 128) f.scalar[dst] = {fixed && before.common, genuine, std::nullopt};
+        if (dst >= 0 && dst < 128) {
+            bool uniform = false;
+            if (fixed && selector.numeric_uniform && before.numeric_common &&
+                in.src[0].kind == OperandKind::VGPR) {
+                const auto slot = before.numeric_slots.find({in.src[0].value, *selector.constant});
+                if (slot != before.numeric_slots.end())
+                    uniform = slot->second;
+                else if (!before.numeric_slot_vgprs.contains(in.src[0].value))
+                    uniform = genuine;
+            }
+            f.scalar[dst].numeric_uniform = uniform;
+        }
         return f;
     }
     uint64_t genuine = vector_sources(before, in);
@@ -373,6 +411,24 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         genuine = 0;   // READFIRSTLANE is lane-local here; opaque MOVRELS is not DATA authority.
     } else if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         f.common = false;   // spill services and mixed mask/word slots are a separate contract
+        if (dst >= 0 && dst < 256) {
+            const auto selector = word(before, in, in.src[1]);
+            const auto source = word(before, in, in.src[0]);
+            bool uniform = source.numeric_uniform;
+            if (in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) {
+                const int r = in.src[0].value;
+                // A retained physical half of a genuine mask is uniform too; current DATA
+                // availability remains the separate emission-time proof.
+                uniform |= (r >= 0 && r < 128 && before.mask[r].genuine) ||
+                           (r > 0 && r < 128 && before.mask[r - 1].genuine);
+            }
+            if (selector.constant && *selector.constant < 64 && selector.numeric_uniform)
+                f.numeric_slots[{dst, *selector.constant}] = uniform && before.numeric_common;
+            else
+                for (auto& [slot, proof] : f.numeric_slots)
+                    if (slot.first == dst) proof = false;
+            f.numeric_slot_vgprs.insert(dst);
+        }
         genuine = 0;
     } else {
         // This is a semantic proof inventory, not decoder storage accounting. Operations with
@@ -395,6 +451,12 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         !in.permlane_bound_ctrl && before.exec.constant != full && dst >= 0 && dst < 256)
         genuine &= before.vector[dst];
     for_each_possible_vector_write(in, 255, [&](int r) { write_vector(f, in, r, genuine); });
+    if (before.exec.constant == full && genuine == full &&
+        !(in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361))
+        for_each_possible_vector_write(in, 255, [&](int r) {
+            std::erase_if(f.numeric_slots, [r](const auto& slot) { return slot.first.first == r; });
+            f.numeric_slot_vgprs.erase(r);
+        });
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
         for (int r = std::max(dst, 0); r < 256; ++r) {
             f.vector[r] = 0;
@@ -444,7 +506,9 @@ std::vector<uint64_t> native_participation_entry(const SpirvCompute& b, const Re
 }
 
 std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegState* initial,
-                                             const std::vector<Rdna2Inst>& instructions) {
+                                             const std::vector<Rdna2Inst>& instructions,
+                                             std::set<uint32_t>* numeric_vcc_moves) {
+    if (numeric_vcc_moves) numeric_vcc_moves->clear();
     if (!ordinary(b) || !initial || initial->exec_narrowed || instructions.empty() ||
         instructions.size() > 4096)
         return {};
@@ -487,6 +551,7 @@ std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegSta
             const auto tested = in.opcode == 6 || in.opcode == 7 ? before.mask[106] : before.exec;
             const bool genuine = scc ? before.scc.uniform && before.scc.genuine : tested.genuine;
             after.common &= genuine;
+            after.numeric_common &= genuine;
             if (!scc && tested.constant) {
                 const bool zero = *tested.constant == 0;
                 taken = (in.opcode == 6 || in.opcode == 8) ? zero : !zero;
@@ -515,6 +580,13 @@ std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegSta
     std::set<uint32_t> result;
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& in = instructions[i];
+        if (numeric_vcc_moves && incoming[i] && incoming[i]->numeric_common &&
+            in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == 106 &&
+            (in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) &&
+            in.src[0].value >= 0 && in.src[0].value < 127 &&
+            word(*incoming[i], in, in.src[0]).numeric_uniform &&
+            word(*incoming[i], in, in.src[0], 1).numeric_uniform)
+            numeric_vcc_moves->insert(in.pc);
         if (!incoming[i] || !incoming[i]->common || in.fmt != Rdna2Format::VOPC ||
             vopc_is_cmpx(in.opcode) || in.dst.kind != OperandKind::SGPR || in.dst.value < 0 ||
             in.dst.value > 104 || !scalar_write_is_b64_mask(in, in.dst.value))
