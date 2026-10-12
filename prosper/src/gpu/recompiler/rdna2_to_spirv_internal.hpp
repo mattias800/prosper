@@ -678,9 +678,9 @@ struct SpirvCompute {
     std::set<uint32_t> saved_mask_reconverged_entry_pcs;
     // Separate routing-uniform/genuine-DATA proof for original complete native single-wave loops.
     std::set<uint32_t> native_participating_mask_pcs;
-    // Current numeric MOV-to-VCC sources are uniform on every original incoming path.
+    // Current numeric MOV-to-VCC/EXEC sources are uniform on every original incoming path.
     // This is independent of physical word availability and never re-seeded by a reload.
-    std::set<uint32_t> native_uniform_numeric_vcc_move_pcs;
+    std::set<uint32_t> native_uniform_numeric_mask_move_pcs;
     std::vector<uint64_t> native_participation_entry_state;
     uint32_t native_mask_runtime_write_pc = UINT32_MAX;
     bool saved_mask_in_dispatcher = false;
@@ -694,6 +694,8 @@ struct SpirvCompute {
     // Original invocation-domain fragment mask generations with no physical DATA live-out.
     // Register-wide demand from another generation cannot require these producers' words.
     std::set<uint32_t> fragment_bool_only_saved_mask_pcs;
+    // Native NGG copies preserve only the same current whole-mask predicate generation.
+    std::set<uint32_t> ngg_bool_only_vcc_copy_pcs;
     std::array<uint32_t, 10> native_vcc_copy_entry_domain{};
     std::shared_ptr<SavedMaskCopyFrame> saved_mask_copy_frame;
     uint64_t saved_mask_copy_revocation_epoch = 0;

@@ -265,6 +265,17 @@ prosper_add_gtest(test_compute_buffer_diff_span
   INCLUDES frontends src
   LIBRARIES Threads::Threads)
 
+# Fresh processes pin a ragged five-worker split and an aligned eight-worker control. The
+# conversion-thread setting is cached on first use, so changing it within a test is insufficient.
+foreach(worker_count IN ITEMS 5 8)
+  gtest_discover_tests(test_compute_buffer_diff_span
+    TEST_PREFIX "ComputeWorkers${worker_count}/"
+    TEST_FILTER "ComputeBuffer*"
+    TEST_LIST "test_compute_buffer_diff_span_${worker_count}_TESTS"
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60
+    PROPERTIES LABELS unit ENVIRONMENT "PROSPER_COMPUTE_CONVERSION_THREADS=${worker_count}")
+endforeach()
+
 # Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
 add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
 target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
@@ -2585,6 +2596,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_scalar_pair_mask.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_vertex_vcc_scalar_lifetime
+    SOURCES tests/gpu/recompiler/test_vertex_vcc_scalar_lifetime.cpp
+    INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
     INCLUDES tests
@@ -3517,6 +3532,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_native_saved_vcc_copy_demand
     SOURCES tests/gpu/recompiler/test_native_saved_vcc_copy_demand.cpp
     INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_ngg_saved_vcc_copy_demand
+    SOURCES tests/gpu/recompiler/test_ngg_saved_vcc_copy_demand.cpp
+    INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_saved_vcc_copy_demand
     SOURCES tests/gpu/recompiler/test_fragment_saved_vcc_copy_demand.cpp
