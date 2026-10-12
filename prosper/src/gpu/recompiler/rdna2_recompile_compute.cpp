@@ -1,10 +1,12 @@
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include <atomic>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -628,11 +630,15 @@ bool compute_extent_is_partial(const ComputeShaderConfig& config) {
                                           (config.local_y && config.threads_y % config.local_y) ||
                                           (config.local_z && config.threads_z % config.local_z));
 }
-std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
-                                             const ShaderResourceTable* rt,
-                                             const ComputeShaderConfig& config,
-                                             RecompileDiagnosticContext diagnostic,
-                                             const PortableEntryExecRoot& entry);
+struct ComputeConstantFoldAttempt {
+    bool changed = false;
+    bool missing_mask_words = false;
+};
+std::vector<uint32_t>
+recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
+                       const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
+                       const PortableEntryExecRoot& entry, bool fold_constants = true,
+                       ComputeConstantFoldAttempt* fold_attempt = nullptr);
 }   // namespace
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
@@ -640,8 +646,24 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
     const PortableEntryExecRoot entry(code, dwords, config);
+    RecompileDiagnosticAttempt attempt_diagnostics;
+    ComputeConstantFoldAttempt fold_attempt;
     std::vector<uint32_t> module =
-        recompile_compute_once(code, dwords, rt, config, diagnostic, entry);
+        recompile_compute_once(code, dwords, rt, config, diagnostic, entry, true, &fold_attempt);
+    // CONFIDENCE: HIGH. Optional SCC folding rewrites the decoded stream and can revoke its
+    // original native mask-word proof. Preserve successful optimized modules; a failed physical
+    // read may retry the original branches through a fresh builder with all existing proofs.
+    // This never recovers old words from a late ballot or grants an incomplete launch authority.
+    const uint64_t local_count = uint64_t{std::max(1u, config.local_x)} *
+                                 std::max(1u, config.local_y) * std::max(1u, config.local_z);
+    if (module.empty() && fold_attempt.changed && fold_attempt.missing_mask_words &&
+        config.wave_size == 64 && config.native_subgroup_size == 64 && local_count % 64 == 0 &&
+        compute_dispatch_has_complete_groups(config)) {
+        attempt_diagnostics.discard();
+        module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry, false);
+    } else {
+        attempt_diagnostics.commit();
+    }
     // ADR 0028 route 3, default OFF: a module that needs a subgroup wider than the host's gets one
     // second chance through the exact exchange dispatcher. It replaces the original only when it
     // compiles and no longer needs the wider subgroup, so a refusal is never turned into a
@@ -664,11 +686,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 }
 
 namespace {
-std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords,
-                                             const ShaderResourceTable* rt,
-                                             const ComputeShaderConfig& config,
-                                             RecompileDiagnosticContext diagnostic,
-                                             const PortableEntryExecRoot& entry) {
+std::vector<uint32_t>
+recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
+                       const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
+                       const PortableEntryExecRoot& entry, bool fold_constants,
+                       ComputeConstantFoldAttempt* fold_attempt) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -742,7 +764,10 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
     // receives a distinct module.
     (void)rdna2_specialize_proven_null_bvh_paths(ins, rt, config.wave_size);
     (void)rdna2_specialize_zero_record_execz_paths(ins, rt, config.wave_size);
-    (void)rdna2_specialize_shader_constant_branches(ins);
+    if (fold_constants) {
+        const auto changed = rdna2_specialize_shader_constant_branches(ins);
+        if (fold_attempt) fold_attempt->changed = changed != 0;
+    }
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
@@ -1009,6 +1034,12 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
+    const auto record_mask_word_failure = [&] {
+        if (fold_attempt)
+            fold_attempt->missing_mask_words =
+                b.stage_reject_reason == "saved-mask-physical-word-unavailable" ||
+                b.stage_reject_reason == "saved-mask-copy-words-unavailable";
+    };
     if (config.force_exchange_dispatcher) {
         // ADR 0028 route 3 retry: every invocation of the workgroup runs the same persistent
         // dispatcher, so each cross-lane service (readlane, readfirstlane, mask reductions,
@@ -1022,14 +1053,18 @@ std::vector<uint32_t> recompile_compute_once(const uint32_t* code, size_t dwords
         if (!emit_cfg_state_machine(
                 b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true, /*allow_smem*/ true,
                 [](RegState&, const Rdna2Inst&) { return false; }, code, dwords,
-                initial_dispatch_active, lds_fminmax_synchronization.needs_dispatcher))
+                initial_dispatch_active, lds_fminmax_synchronization.needs_dispatcher)) {
+            record_mask_word_failure();
             return {};
+        }
     } else if (!emit_body(
                    b, rs, ins, safe_branches, rt, /*allow_exec_update*/ true,
                    /*allow_smem*/ true, [](RegState&, const Rdna2Inst&) { return false; }, code,
                    dwords, nullptr, true, initial_dispatch_active, false,
-                   lds_fminmax_synchronization.needs_dispatcher))
+                   lds_fminmax_synchronization.needs_dispatcher)) {
+        record_mask_word_failure();
         return {};
+    }
     // Exact resource contracts and portable wave gathers execute partial workgroups through ACTIVE. Padded
     // Vulkan lanes stay in the dispatcher and synthesized barriers, but cannot execute guest effects.
     // The resource contracts retain their own full program/launch proofs; gathers need no title identity.

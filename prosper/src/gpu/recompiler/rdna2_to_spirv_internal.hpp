@@ -3,6 +3,7 @@
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -86,6 +87,7 @@ inline thread_local std::vector<std::pair<std::string, std::string>>* g_terminal
 
 inline void record_terminal_reject_reason(uint64_t program_address, const char* tag,
                                    const char* payload) {
+    if (defer_terminal_reject_reason(program_address, tag, payload)) return;
     if (g_terminal_reject_capture) g_terminal_reject_capture->emplace_back(tag, payload);
     if (!program_address) return;
     // A cap, because a pathological guest could present unboundedly many distinct programs. Losing
@@ -165,6 +167,7 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
     va_end(args);
     if (body < 0) return;
     payload[sizeof(payload) - 1] = '\0';
+    if (defer_recompile_diagnostic(diagnostic, tag, role, payload)) return;
     // Record every role EXCEPT "consequent". A consequent line only restates that an empty result
     // was returned -- it names the effect, never the cause -- so letting it overwrite a terminal or
     // route-decline reason would replace the answer with the question. Measured on a routed GTA V
