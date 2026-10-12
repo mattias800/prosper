@@ -667,7 +667,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
-    seed_vector_word_definedness(rs, ins, /*native_interpolation=*/true);
+    seed_vector_word_definedness(rs, ins, /*native_interpolation=*/true, b.wave_size);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "consequent",

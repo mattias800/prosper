@@ -26,7 +26,8 @@ bool dead(const std::vector<uint32_t>& code, int reg, ScalarMergeBlocker* blocke
 }
 
 std::vector<uint32_t> compile(const std::vector<uint32_t>& code, uint64_t address) {
-    return recompile_fragment(code.data(), code.size(), nullptr, nullptr, UINT32_MAX, nullptr, true,
+    const auto inputs = fixture::position_inputs();
+    return recompile_fragment(code.data(), code.size(), nullptr, &inputs, UINT32_MAX, nullptr, true,
                               {RecompileDiagnosticStage::Fragment, address});
 }
 
@@ -122,4 +123,16 @@ TEST(FragmentCompareKill, StructuredJoinRefusesAPathBypassingReplacement) {
     code.insert(code.begin() + 7, 0xbf880002u); // second EXECZ skips the new compare
     join_refuses(code, 0x489505u);
 }
+} // namespace prosper::gpu
+
+namespace prosper::gpu {
+TEST(FragmentCompareKill, AbsentPositionInputsCannotAuthenticateTheFreshCompare) {
+    const auto code = fixture::program();
+    EXPECT_TRUE(recompile_fragment(code.data(), code.size(), nullptr, nullptr, UINT32_MAX, nullptr,
+                                   true, {RecompileDiagnosticStage::Fragment, 0x496401u})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(0x496401u).find("fabricated-fresh-mask-source"),
+              std::string::npos);
+}
+
 } // namespace prosper::gpu

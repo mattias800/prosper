@@ -2,10 +2,17 @@
 
 // Hand-built Wave32 branch join: one arm retires s20's B32 compare mask; a fresh
 // compare replaces it before the next mask read. These are synthetic ISA words.
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdint>
 #include <vector>
 
 namespace prosper::test::fragment_compare_kill {
+inline prosper::gpu::PixelSystemInputMapping position_inputs() {
+    prosper::gpu::PixelSystemInputMapping inputs;
+    // Actual varying FragCoord x/y supply the two words consumed by the unchanged compares.
+    inputs.ena = inputs.addr = (1u << 8) | (1u << 9);
+    return inputs;
+}
 constexpr uint32_t end = 0xbf810000u;
 constexpr uint32_t mov(uint32_t destination, uint32_t source) {
     return 0xbe800300u | (destination << 16) | source;

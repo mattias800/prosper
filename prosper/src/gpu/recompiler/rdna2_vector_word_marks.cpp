@@ -53,11 +53,17 @@ bool relative_constant_offset(const SpirvCompute& b, uint32_t value, uint32_t& o
 }   // namespace
 
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
-                                  bool native_interpolation) {
+                                  bool native_interpolation, uint32_t wave_size) {
     // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
     // placeholder is not a guest value. Seed before PHIs or dispatcher storage can hide absence;
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
     const int highest = shader_max_vgpr(instructions);
+    rs.vector_wave_size = wave_size;
+    if (wave_size == 32) {
+        // These producing entries supply no architectural SCC input; bfalse is storage only.
+        rs.scc_merge_placeholder = true;
+        rs.scc_loop_blanket.clear();
+    }
     rs.vector_full_exec = rs.exec && !rs.exec_narrowed;
     rs.vector_native_interpolation = native_interpolation;
     for (int reg = 0; reg <= highest; ++reg) {
@@ -138,7 +144,7 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
 }
 
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
-    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    if (!(b.is_compute || b.is_fragment) || (b.wave_size != 64 && b.wave_size != 32)) return true;
     const bool predicate = in.fmt == Rdna2Format::VOPC || vop3_writes_mask_sdst(in) ||
                            (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a);
     if (!predicate) return true;
@@ -156,7 +162,7 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
     const bool full_exec = !rs.exec_narrowed || rs.vector_full_exec;
     if (rdna2_instruction_may_change_exec(in))
-        rs.vector_full_exec = vector_exec_is_full_after_write(in, full_exec);
+        rs.vector_full_exec = vector_exec_is_full_after_write(in, full_exec, rs.vector_wave_size);
     if (vector_write_leaves_old_word(in, rs.vector_native_interpolation)) return;
     const uint32_t width = rdna2_vgpr_write_count(in);
     if (!width) return;

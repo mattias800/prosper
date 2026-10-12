@@ -25,7 +25,7 @@ using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
 // Call only at a producing stage entry, after its actual input VGPRs have been published.
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
-                                  bool native_interpolation = false);
+                                  bool native_interpolation = false, uint32_t wave_size = 64);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
                                                const Rdna2Inst& in);

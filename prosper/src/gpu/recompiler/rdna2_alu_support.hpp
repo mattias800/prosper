@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -489,11 +490,11 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);   // rdn
 // the structured emitter's fabricated zero (sreg_merge_placeholder: a one-path write, a loop phi, a
 // never-written source), on either stage (#4714, GPU-5/FAIL-1). Not when it is a memory-loaded
 // pattern in a fragment shader either: the host's pixel-to-lane assignment is not the PS5's, while
-// compute's lane identity is the guest's own, so GTA's scratch pairs keep projecting. Wave64
-// compute/fragment only; Wave32 mask forms are not covered (see the PR for the uncovered sites).
+// compute's lane identity is the guest's own, so GTA's scratch pairs keep projecting.
+// Applies to compute/fragment with a proved architectural Wave32 or Wave64 lane width.
 inline bool scalar_words_projectable(const SpirvCompute& b, const RegState& rs, int reg,
                                      int words) {
-    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    if (!(b.is_compute || b.is_fragment) || (b.wave_size != 64 && b.wave_size != 32)) return true;
     std::set<uint64_t> roots;
     for (int r = reg; r < reg + words; ++r) {
         // A direct-descriptor word in sreg_input, or a copy of one, is real driver data: the
@@ -531,13 +532,16 @@ inline bool writes_lane_mask_register(const Rdna2Inst& in) {
 inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
                                       const Rdna2Inst& in, uint32_t k) {
     const Operand& o = in.src[k];
+    if (b.wave_size == 32 && o.kind == OperandKind::Special && o.value == 253)
+        return scalar_condition_source_defined(b, rs);
     const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
     // EXEC is the live lane mask, never data. Admitting it is sound because rs.exec cannot hold a
     // fabricated word: every EXEC writer refuses a non-projectable source at the write rather than
     // dropping EXEC's view (refuse_mask_write).
     const bool special_exec = o.kind == OperandKind::Special && (o.value == 126 || o.value == 127);
     if (o.kind != OperandKind::SGPR && !special_data && !special_exec) return true;
-    if ((o.value == 106 || o.value == 107) && rs.vcc) return true;   // the live predicate wins
+    if ((o.value == 106 || (b.wave_size == 64 && o.value == 107)) && rs.vcc)
+        return true;   // the live predicate wins
     if (special_exec) return rs.exec != 0;   // the live execution mask wins
     if (rs.sreg_bool.contains(o.value)) return true;
     // A NEVER-WRITTEN source counts: operand_bits reads its absence as uconst(0).
@@ -550,8 +554,10 @@ inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
 // source word is not projectable.
 inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, const RegState& rs,
                                                       const Rdna2Inst& in) {
-    if (!(b.is_compute || b.is_fragment) || b.wave_size != 64) return true;
+    if (!(b.is_compute || b.is_fragment) || (b.wave_size != 64 && b.wave_size != 32)) return true;
     if (!writes_lane_mask_register(in)) return true;
+    if (b.wave_size == 32 && scalar_reads_scc(in) && !scalar_condition_source_defined(b, rs))
+        return false;
     for (uint32_t k = 0; k < 4; ++k)
         if (!scalar_source_projectable(b, rs, in, k)) return false;
     return true;

@@ -1,5 +1,6 @@
 // See rdna2_spilled_mask_halves.hpp.
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -100,7 +101,7 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
                                                      const std::set<int>& scalar_words,
-                                                     bool definite_scc) {
+                                                     bool definite_scc, uint32_t wave_size) {
     if (vector_write_leaves_old_word(in, state.native_interpolation) ||
         (state.native_interpolation && in.fmt == Rdna2Format::VINTRP))
         return {};
@@ -134,17 +135,27 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     if (!load)
         for (uint32_t source = 0; source < in.n_src; ++source) {
             const auto& operand = in.src[source];
-            if (operand.kind != OperandKind::SGPR) continue;
+            const bool scalar =
+                operand.kind == OperandKind::SGPR || (operand.kind == OperandKind::Special &&
+                                                      operand.value >= 106 && operand.value <= 124);
+            if (!scalar) continue;
             uint32_t width = scalar_alu_source_words(in, source);
             if (!width || width == UINT32_MAX) width = 2;
             if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - operand.value));
             for (uint32_t word = 0; word < width; ++word) {
                 const int reg = operand.value + static_cast<int>(word);
-                if (reg <= 105 && !scalar_words.contains(reg) && !masks.contains(reg) &&
-                    !(reg > 0 && masks.contains(reg - 1)))
+                if (reg <= (wave_size == 32 ? 124 : 105) && !scalar_words.contains(reg) &&
+                    !masks.contains(reg) && !(reg > 0 && masks.contains(reg - 1)))
                     missing_scalar_word = true;
             }
         }
+    for (uint32_t word = 0; wave_size == 32 && word < scalar_implicit_destination_read_width(in);
+         ++word) {
+        const int reg = in.dst.value + static_cast<int>(word);
+        if (!scalar_words.contains(reg) && !masks.contains(reg) &&
+            !(reg > 0 && masks.contains(reg - 1)))
+            missing_scalar_word = true;
+    }
     vector_relay = vector_relay || missing_scalar_word;
     // Relayed words first, while `defined` still describes the slots `in` reads. A V_READLANE
     // relays unless it reads a constant-lane slot in `defined`; any other scalar write relays when
@@ -167,7 +178,8 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::set<int>& masks, const std::set<int>& scalar_words,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                            const std::vector<int>& vector_writes,
-                           const SpilledVectorSourceMarks& source, bool definite_scc) {
+                           const SpilledVectorSourceMarks& source, bool definite_scc,
+                           uint32_t wave_size) {
     if (vector_write_leaves_old_word(in, state.native_interpolation)) return;
     auto& defined = state.defined_slots;
     auto& relayed = state.relayed_words;
@@ -197,10 +209,21 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
     const bool move_preserves_scc =
         in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
-    if (scalar_alu && relays && !move_preserves_scc)
-        relayed.insert(kRelayedScc);
-    else if (in.fmt == Rdna2Format::SOPC)
-        relayed.erase(kRelayedScc);
+    if (wave_size == 32) {
+        if (scalar_instruction_writes_scc(in)) {
+            if (relays)
+                relayed.insert(kRelayedScc);
+            else
+                relayed.erase(kRelayedScc);
+        } else if (!scalar_instruction_preserves_scc(in) && relays) {
+            relayed.insert(kRelayedScc);
+        }
+    } else {
+        if (scalar_alu && relays && !move_preserves_scc)
+            relayed.insert(kRelayedScc);
+        else if (in.fmt == Rdna2Format::SOPC)
+            relayed.erase(kRelayedScc);
+    }
     const bool preserve = vector_write_depends_on_old_word(in, state.exec_known_full);
     for (int vgpr : vector_writes) {
         if (vector_relay)
@@ -213,7 +236,8 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
             state.memory_vectors.erase(vgpr);
     }
     if (rdna2_instruction_may_change_exec(in))
-        state.exec_known_full = vector_exec_is_full_after_write(in, state.exec_known_full);
+        state.exec_known_full =
+            vector_exec_is_full_after_write(in, state.exec_known_full, wave_size);
     const auto drop_vgpr = [&](int vgpr) {
         std::erase_if(defined, [&](const auto& slot) { return slot.first == vgpr; });
     };

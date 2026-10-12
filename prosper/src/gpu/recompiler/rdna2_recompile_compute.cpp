@@ -471,7 +471,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                 threads_x_for_test % local_x_for_test != 0
             ? b.invocation_within_extent(threads_x_for_test, 1, 1)
             : 0;
-    seed_vector_word_definedness(rs, ins);
+    seed_vector_word_definedness(rs, ins, false, b.wave_size);
     const bool emitted = force_cfg_for_test
         ? emit_cfg_state_machine(
               b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
@@ -607,7 +607,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     };
     const bool force_phases_for_dpp = (native_wave64 && has_barrier) ||
                                       std::any_of(ins.begin(), ins.end(), is_dpp_row_shr_bounded);
-    seed_vector_word_definedness(rs, ins);
+    seed_vector_word_definedness(rs, ins, false, b.wave_size);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
                    nullptr, true, 0, force_phases_for_dpp) || !saw_export)
@@ -1030,7 +1030,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     // per-invocation scalar inputs and therefore cannot inherit this launch contract.
     b.native_logical_uniform_launch = true;
     b.guest_compute_launch = compute_dispatch_launch_profile(config);
-    seed_vector_word_definedness(rs, ins);
+    seed_vector_word_definedness(rs, ins, false, b.wave_size);
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);

@@ -7,6 +7,7 @@
 #include <array>
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -100,6 +101,8 @@ struct Interpreter {
       return size(t.a[0]) * constant(t.a[1]);
     if (t.op == 30 && t.a.size() == 1 && ty(t.a[0]).op != 29)
       return size(t.a[0]);
+    if (t.op == 30 && t.a.size() == 2 && uint_type(t.a[0]) && t.a[0] == t.a[1])
+        return 2; // closed scalar-u32 low/high product pair
     return scalar(id);
   }
   uint32_t constant(uint32_t id) {
@@ -430,68 +433,87 @@ struct Interpreter {
         if (a.size() != 4)
           fail("unsupported CompositeExtract");
         auto v = value(l, a[2]);
-        if (ty(v.type).op != 23 || a[3] >= v.words.size() ||
-            ty(v.type).a[0] != a[0])
-          fail("extract type/index mismatch");
+        const auto& aggregate = ty(v.type);
+        const bool vector = aggregate.op == 23 && aggregate.a[0] == a[0];
+        const bool pair = aggregate.op == 30 && aggregate.a.size() == 2 &&
+                          uint_type(aggregate.a[0]) && aggregate.a[0] == aggregate.a[1] &&
+                          aggregate.a[0] == a[0];
+        if ((!vector && !pair) || a[3] >= v.words.size()) fail("extract type/index mismatch");
         set(l, a[1], a[0], {v.words[a[3]]}, v.defined);
+      } else if (op == 151) { // OpUMulExtended, scalar u32 only: first low, then high.
+          if (a.size() != 4) fail("malformed UMulExtended");
+          const auto x = value(l, a[2]), y = value(l, a[3]);
+          const auto& result = ty(a[0]);
+          if (!uint_type(x.type) || y.type != x.type || x.words.size() != 1 ||
+              y.words.size() != 1 || result.op != 30 ||
+              result.a != std::vector<uint32_t>{x.type, x.type})
+              fail("unsupported UMulExtended types");
+          const uint64_t product = uint64_t(x.words[0]) * y.words[0];
+          set(l, a[1], a[0], {static_cast<uint32_t>(product), static_cast<uint32_t>(product >> 32)},
+              x.defined && y.defined);
       } else if (op == 113) {
-        if (a.size() != 3 || !unsigned_type(a[0])) fail("unsupported UConvert");
-        const auto v = value(l, a[2]);
-        if (!unsigned_type(v.type)) fail("UConvert source type mismatch");
-        set_unsigned(l, a[1], a[0], v.defined ? unsigned_value(v) : 0, v.defined);
+          if (a.size() != 3 || !unsigned_type(a[0])) fail("unsupported UConvert");
+          const auto v = value(l, a[2]);
+          if (!unsigned_type(v.type)) fail("UConvert source type mismatch");
+          set_unsigned(l, a[1], a[0], v.defined ? unsigned_value(v) : 0, v.defined);
       } else if (op == 12) {
-        if (a.size() < 5 || !glsl || a[2] != glsl) fail("unsupported ExtInst set");
-        const auto x = value(l, a[4]);
-        if (!uint_type(x.type) || x.words.size() != 1) fail("ExtInst operand type");
-        if (a[3] == 38 || a[3] == 41) {
-          if (a.size() != 6 || a[0] != x.type) fail("min/max type mismatch");
-          const auto y = value(l, a[5]);
-          if (y.type != x.type || y.words.size() != 1) fail("min/max operand type");
-          set(l, a[1], a[0], {a[3] == 38 ? std::min(x.words[0], y.words[0]) :
-                             std::max(x.words[0], y.words[0])}, x.defined && y.defined);
-        } else if (a[3] == 75) {
-          if (a.size() != 5 || ty(a[0]).op != 21 || ty(a[0]).a != std::vector<uint32_t>{32, 1})
-            fail("FindUMsb result type mismatch");
-          uint32_t bit = UINT32_MAX;
-          for (uint32_t n = 0; n < 32; ++n) if (x.words[0] & (uint32_t{1} << n)) bit = n;
-          set(l, a[1], a[0], {bit}, x.defined && x.words[0] != 0);
-        } else fail("unsupported live ExtInst");
+          if (a.size() < 5 || !glsl || a[2] != glsl) fail("unsupported ExtInst set");
+          const auto x = value(l, a[4]);
+          if (!uint_type(x.type) || x.words.size() != 1) fail("ExtInst operand type");
+          if (a[3] == 38 || a[3] == 41) {
+              if (a.size() != 6 || a[0] != x.type) fail("min/max type mismatch");
+              const auto y = value(l, a[5]);
+              if (y.type != x.type || y.words.size() != 1) fail("min/max operand type");
+              set(l, a[1], a[0],
+                  {a[3] == 38 ? std::min(x.words[0], y.words[0])
+                              : std::max(x.words[0], y.words[0])},
+                  x.defined && y.defined);
+          } else if (a[3] == 75) {
+              if (a.size() != 5 || ty(a[0]).op != 21 || ty(a[0]).a != std::vector<uint32_t>{32, 1})
+                  fail("FindUMsb result type mismatch");
+              uint32_t bit = UINT32_MAX;
+              for (uint32_t n = 0; n < 32; ++n)
+                  if (x.words[0] & (uint32_t{1} << n)) bit = n;
+              set(l, a[1], a[0], {bit}, x.defined && x.words[0] != 0);
+          } else
+              fail("unsupported live ExtInst");
       } else if (op == 88) {
-        if (a.size() != 6 || a[4] != 2 || ty(a[0]).op != 23 || ty(a[0]).a.size() != 2 ||
-            ty(a[0]).a[1] != 4 || ty(ty(a[0]).a[0]).op != 22 ||
-            ty(ty(a[0]).a[0]).a != std::vector<uint32_t>{32})
-          fail("unsupported sampled result/profile");
-        const auto handle = value(l, a[2]), coord = value(l, a[3]), lod = value(l, a[5]);
-        if (ty(handle.type).op != 27 || ty(handle.type).a.size() != 1 ||
-            ty(ty(handle.type).a[0]).op != 25 || ty(ty(handle.type).a[0]).a.empty() ||
-            ty(ty(handle.type).a[0]).a[0] != ty(a[0]).a[0] ||
-            handle.words.size() != 1 || !handle.defined ||
-            ty(coord.type).op != 23 || ty(coord.type).a != std::vector<uint32_t>{ty(a[0]).a[0], 2} ||
-            !coord.defined || lod.type != ty(a[0]).a[0] || lod.words.size() != 1 || !lod.defined)
-          fail("sample operand type/definition");
-        const auto found = sampled_images.find(handle.words[0]);
-        if (found == sampled_images.end()) fail("missing owned sampled image");
-        uint32_t level = UINT32_MAX;
-        for (uint32_t n = 0; n < found->second.size(); ++n)
-          if (lod.words[0] == std::bit_cast<uint32_t>(static_cast<float>(n))) level = n;
-        if (level == UINT32_MAX) fail("sample LOD outside closed oracle domain");
-        const auto &mip = found->second[level];
-        uint32_t px = UINT32_MAX, py = UINT32_MAX;
-        for (uint32_t x = 0; x < mip.width; ++x)
-          if (coord.words[0] == std::bit_cast<uint32_t>((float(x) + 0.5f) / float(mip.width))) px = x;
-        for (uint32_t y = 0; y < mip.height; ++y)
-          if (coord.words[1] == std::bit_cast<uint32_t>((float(y) + 0.5f) / float(mip.height))) py = y;
-        if (px == UINT32_MAX || py == UINT32_MAX || mip.texels.size() != mip.width * mip.height)
-          fail("sample coordinate outside closed oracle domain");
-        const auto &texel = mip.texels.at(py * mip.width + px);
-        set(l, a[1], a[0], {texel.begin(), texel.end()});
+          if (a.size() != 6 || a[4] != 2 || ty(a[0]).op != 23 || ty(a[0]).a.size() != 2 ||
+              ty(a[0]).a[1] != 4 || ty(ty(a[0]).a[0]).op != 22 ||
+              ty(ty(a[0]).a[0]).a != std::vector<uint32_t>{32})
+              fail("unsupported sampled result/profile");
+          const auto handle = value(l, a[2]), coord = value(l, a[3]), lod = value(l, a[5]);
+          if (ty(handle.type).op != 27 || ty(handle.type).a.size() != 1 ||
+              ty(ty(handle.type).a[0]).op != 25 || ty(ty(handle.type).a[0]).a.empty() ||
+              ty(ty(handle.type).a[0]).a[0] != ty(a[0]).a[0] || handle.words.size() != 1 ||
+              !handle.defined || ty(coord.type).op != 23 ||
+              ty(coord.type).a != std::vector<uint32_t>{ty(a[0]).a[0], 2} || !coord.defined ||
+              lod.type != ty(a[0]).a[0] || lod.words.size() != 1 || !lod.defined)
+              fail("sample operand type/definition");
+          const auto found = sampled_images.find(handle.words[0]);
+          if (found == sampled_images.end()) fail("missing owned sampled image");
+          uint32_t level = UINT32_MAX;
+          for (uint32_t n = 0; n < found->second.size(); ++n)
+              if (lod.words[0] == std::bit_cast<uint32_t>(static_cast<float>(n))) level = n;
+          if (level == UINT32_MAX) fail("sample LOD outside closed oracle domain");
+          const auto& mip = found->second[level];
+          uint32_t px = UINT32_MAX, py = UINT32_MAX;
+          for (uint32_t x = 0; x < mip.width; ++x)
+              if (coord.words[0] == std::bit_cast<uint32_t>((float(x) + 0.5f) / float(mip.width)))
+                  px = x;
+          for (uint32_t y = 0; y < mip.height; ++y)
+              if (coord.words[1] == std::bit_cast<uint32_t>((float(y) + 0.5f) / float(mip.height)))
+                  py = y;
+          if (px == UINT32_MAX || py == UINT32_MAX ||
+              mip.texels.size() != size_t(mip.width) * mip.height)
+              fail("sample coordinate outside closed oracle domain");
+          const auto& texel = mip.texels.at(size_t(py) * mip.width + px);
+          set(l, a[1], a[0], {texel.begin(), texel.end()});
       } else if (op == 83 || op == 124) {
-        if (a.size() != 3)
-          fail("malformed copy/bitcast");
-        auto v = value(l, a[2]);
-        if (op == 83 && v.type != a[0])
-          fail("CopyObject type mismatch");
-        set(l, a[1], a[0], std::move(v.words), v.defined);
+          if (a.size() != 3) fail("malformed copy/bitcast");
+          auto v = value(l, a[2]);
+          if (op == 83 && v.type != a[0]) fail("CopyObject type mismatch");
+          set(l, a[1], a[0], std::move(v.words), v.defined);
       } else if (op == 112) {
           if (a.size() != 3 || !uint_type(value(l, a[2]).type) || ty(a[0]).op != 22)
               fail("unsupported unsigned-to-float conversion");
@@ -739,7 +761,7 @@ struct Interpreter {
                       if (b->second == 26)
                           v = {workgroup_x, 0, 0};
                       else if (b->second == 28)
-                          v = {workgroup_x * 64 + lane, 0, 0};
+                          v = {workgroup_x * (native_subgroup_width == 32 ? 32 : 64) + lane, 0, 0};
                       else if (b->second == 27)
                           v = {lane, 0, 0};
                       else if (b->second == 29)
@@ -772,8 +794,8 @@ struct Interpreter {
               if (collective.op ==
                   345) {   // OpGroupNonUniformShuffle: explicit exact-native profile
                   const auto& a = collective.a;
-                  if (native_subgroup_width != 64 || count != 64 || a.size() != 5 ||
-                      !uint_type(a[0]))
+                  if ((native_subgroup_width != 32 && native_subgroup_width != 64) ||
+                      count != native_subgroup_width || a.size() != 5 || !uint_type(a[0]))
                       fail("unproved native shuffle");
                   std::vector<Value> inputs, results;
                   for (auto& l : lanes) {

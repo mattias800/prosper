@@ -74,10 +74,14 @@ bool vector_write_leaves_old_word(const Rdna2Inst& in, bool native_interpolation
            (in.fmt == Rdna2Format::MIMG && image_atomic(in.opcode) && !in.mimg_glc);
 }
 
-bool vector_exec_is_full_after_write(const Rdna2Inst& in, bool full_before) {
+bool vector_exec_is_full_after_write(const Rdna2Inst& in, bool full_before, uint32_t wave_size) {
     if (in.fmt != Rdna2Format::SOP1 || in.n_src != 1 || in.src[0].kind != OperandKind::InlineInt)
         return false;
     if (in.opcode == kSop1OpcodeMovB64 && in.dst.value == 126 && in.src[0].value == -1) return true;
+    // A low-word reset covers the whole mask only in a proved Wave32 producing stage.
+    if (wave_size == 32 && in.opcode == kSop1OpcodeMovB32 && in.dst.value == 126 &&
+        in.src[0].value == -1)
+        return true;
     // CONFIDENCE: HIGH -- OR_SAVEEXEC with zero preserves the exact old EXEC. Its saved scalar
     // destination does not itself grant mask authority. Other logical writes remain unproved.
     return full_before && in.opcode == 0x25 && in.src[0].value == 0;

@@ -1628,8 +1628,11 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     // Numeric SCC copies must retain the current condition's missing-input mark, including
     // WRITELANE's data role before its early return. Loaded data remains separate from addresses.
     if (scalar_reads_scc(in) && (!rs.scc || rs.scc_merge_placeholder)) {
-        marks.placeholder = marks.hard = true;
-        marks.blanket_roots.clear();
+        ScalarSourceMarks condition;
+        condition.placeholder = true;
+        condition.hard = !rs.scc || rs.scc_loop_blanket.empty();
+        condition.blanket_roots = rs.scc_loop_blanket;
+        union_source_marks(marks, condition);
     }
     if (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360 || in.opcode == 0x361)) {
         // A dynamic selector is a numeric input too. Its storage value does not prove which
