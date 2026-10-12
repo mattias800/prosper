@@ -396,3 +396,28 @@ TEST(NativeNumericVccMove, APartialVectorOverwriteCannotReseedTheOlderNumericSlo
     p.insert(read, {mov(126, 106, true), 0x7e240281u, mov(126, 193, true)});
     refuses(p, prosper::test::native_execution_launch());
 }
+
+namespace {
+std::vector<uint32_t> preserving_scc(uint32_t producer, bool genuine = false,
+                                     bool replace = false) {
+    std::vector<uint32_t> p{
+        0x7e060280u, 0x7e020280u, 0x7d880088u, genuine ? mov(16, 128) : 0x7e200500u,
+        0xbf068010u, producer,    0x850e8281u, mov(15, 128)};
+    if (replace) p.push_back(mov(14, 129));
+    p.push_back(mov(106, 14, true));
+    finish(p);
+    return p;
+}
+}   // namespace
+TEST(NativeNumericVccMove, SccPreservingDataWritersCannotLaunderTheOldCondition) {
+    for (uint32_t producer : {0x930e8181u, 0x920e8081u, 0x928e8081u})
+        refuses(preserving_scc(producer), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, TheGenuineConditionSurvivesSccPreservingDataWriters) {
+    for (uint32_t producer : {0x930e8181u, 0x920e8081u, 0x928e8081u})
+        values(preserving_scc(producer, true), expected(1));
+}
+TEST(NativeNumericVccMove, AFullReplacementRetiresTheUnprovedConditionalWord) {
+    for (uint32_t producer : {0x930e8181u, 0x920e8081u, 0x928e8081u})
+        values(preserving_scc(producer, false, true), expected(1));
+}

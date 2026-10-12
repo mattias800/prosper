@@ -358,7 +358,11 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
             f.exec = f.mask[dst];
         else if (rdna2_instruction_may_change_exec(in))
             f.exec = {};
-        if (in.fmt == Rdna2Format::SOP2 && in.opcode != 0xa && in.opcode != 0xb)
+        // These DATA producers preserve architectural SCC. Replacing its proof with their
+        // uniform operands would let a later CSELECT launder a lane-local old condition.
+        if (in.fmt == Rdna2Format::SOP2 && in.opcode != kSop2OpcodeCselectB32 &&
+            in.opcode != kSop2OpcodeCselectB64 && in.opcode != kSop2OpcodeBfmB32 &&
+            in.opcode != kSop2OpcodeBfmB64 && in.opcode != 0x26)
             f.scc = {result.uniform, result.genuine, std::nullopt};
         else if (in.fmt == Rdna2Format::SOP1 && !sop1_opcode_leaves_scc_unmodified(in.opcode))
             f.scc = {result.uniform, result.genuine, std::nullopt};
