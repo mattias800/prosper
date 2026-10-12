@@ -42,70 +42,42 @@ beyond the specific route documented for it.
 
 ---
 
-## Why there is no ahead-of-time conversion step
+## Why prosper doesn't convert your game first
 
-The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). Before a game runs,
-its relinker converts the executables to the host's native format and binds them against
-reimplemented shared libraries; an optional pass lowers AMD-only instructions. **prosper** has no
-equivalent step — its loader and linker do that work at load time, Wine-style, and the shipped
-bytes run unchanged. Neither project emulates the CPU: the PS5 CPU is x86-64, so guest code runs
-natively on the host either way, and neither pays translation overhead on the CPU. The refusal of
-the extra step is deliberate:
+The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). Before a game runs
+there, a tool converts the game files into a format your PC understands, then runs the result.
+**prosper** skips that step: it loads the game files as they are — the way Wine runs Windows
+programs — and the game runs directly on your CPU. Both approaches run at full CPU speed, so the
+conversion buys no speed. Skipping it means no second copy of the game on your disk, nothing extra
+that can break, and when something crashes, developers see the game's own code instead of a
+converted copy.
 
-- **It would not buy speed.** Both designs execute native x86-64. CPU-side performance is set by
-  the reimplemented libraries and the GPU path, and those are where measurement goes.
-- **It would be a second copy of every game to get right.** An ahead-of-time step converts every
-  module, including code paths a given run never executes, and every conversion bug looks
-  identical to a game bug. Running the shipped bytes means the game is the thing being tested.
-- **It is harder to test and debug.** Shipped bytes can be stepped in gdb, profiled with perf and
-  inspected with ordinary tools. Converted output needs its own symbol mapping and a mapping back
-  to the original addresses before any crash can be read.
-- **The same behaviour without the extra copy.** The loader and linker relocate the modules as
-  shipped, and their native code runs unchanged — no converted executable on disk.
+Graphics are the exception. Your GPU can't run PS5 graphics code, so both projects translate it.
+That translator exists in **prosper** and is checked automatically on every change.
 
-Translation is used where it is unavoidable. The GPU does not run x86-64, so RDNA2 shaders have to
-be converted to SPIR-V. That recompiler exists and is verified against the `spirv-val` gate and
-numeric Vulkan tests.
+## **prosper** vs AnyPS5
 
-## Comparison with AnyPS5
-
-Statements about AnyPS5 below were checked against its repository (README, `docs/dev/ARCHITECTURE.md`,
-`docs/user/COMPATIBILITY.md`, `tools/progress.py`).
-
-| | prosper | AnyPS5 |
+| | **prosper** | AnyPS5 |
 |---|---|---|
-| Guest CPU code | Native, linked at load time; the shipped bytes run unchanged | Native, after an ahead-of-time relink to host format (`core/relinker`); an optional pass lowers AMD-only instructions |
-| Where translation is used | GPU shaders only (RDNA2 → SPIR-V), because the ISA has no host equivalent | Same: GPU shaders (RDNA → IR → SPIR-V), cached in memory and on disk |
-| How "done" is defined | Per-title six-rung ladder ending in a human-reviewed comparison against PS5 hardware, then a reviewed automatic snapshot guard | Declared-list percentages (see below) plus a tested-games list |
-| Correctness evidence | Numeric and pixel Vulkan tests, `spirv-val` on every SPIR-V emitter, golden-image guards over real boots | SPIR-V validated with SPIRV-Tools when enabled; per-title testing in its compatibility list |
-| Unsupported calls | Unregistered imports log and return 0 by default (the false-success class, #2081), surfaced per run by the `unimplemented-hle-calls` alarm; `tools/nid_census` counts them per title. A coverage count is planned (ADR 0007) | Unsupported or unexpected states throw `std::runtime_error` and terminate the process |
-| Legal boundary | No keys, decryption or copyrighted code in the repo. Third-party replacement libraries from dumps are refused | States an interoperability, research and preservation purpose; no copyrighted software, firmware, keys or proprietary libraries |
+| Running your game | Directly, as shipped | After converting the files to a PC format first |
+| Graphics | Translated for your GPU | Translated for your GPU |
 
-**prosper**'s own shader and library work is not a finished percentage either. Nothing in this repo
-currently publishes a coverage figure. The planned one (ADR 0007) counts registered, resolved and
-return-zero imports per title from the registry, and it is a measure of reach, not of correctness.
+(Statements about AnyPS5 were checked against its repository.)
 
-### Reading the AnyPS5 status page
+### What their percentages mean
 
-The status page in AnyPS5's README reports a percentage for system libraries and one for GPU shader
-instructions. Its own footnote says the percentage is of "the functions known to the project so far",
-"not of every PS5 system function", and that "the total grows as more functions are declared". Read
-as completion figures, these percentages mislead:
+AnyPS5's page shows a percentage for system libraries and one for graphics instructions. Their own
+footnote says these count only "the functions known to the project so far" — not every PS5
+function — and the total grows as they add more. So:
 
-- **The denominator is the list of what has been declared.** A function nobody has added to the
-  list is not counted, so a high percentage only means the listed items are done. Firmware
-  decompilation shows the real set of system functions and shader instructions is much larger than
-  any declared list.
-- **"Done" means the stub helper is gone.** Their `tools/progress.py` counts a library function done
-  when its body no longer calls the `NotImplemented` stub helper, and a shader instruction done when
-  the decoder recognises its opcode. Neither says whether the handler is right.
-- **A registered handler is not a validated one.** Checking that an implementation is correct needs
-  tests against the expected behaviour, and in **prosper** the `implement-hle-function` procedure and the
-  rung ladder do that. A stub-free body with no check is a different thing.
+- **The percentage is measured against their own to-do list.** Anything they haven't listed yet
+  isn't counted. Firmware analysis shows the real number of system functions is much larger than
+  any project's list.
+- **"Done" means written, not proven right.** Their counter ticks when placeholder code gets
+  replaced. Nothing checks the replacement gives the right answer.
 
-The honest number for either project is the fraction of the real function and instruction set that
-is implemented and checked. Neither project has measured that yet, and this repo does not claim
-it.
+Neither project has measured what fraction of the real total works correctly, and neither claims
+to.
 
 ---
 
