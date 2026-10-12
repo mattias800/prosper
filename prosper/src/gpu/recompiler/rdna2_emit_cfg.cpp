@@ -17,6 +17,7 @@
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
+#include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -556,8 +557,11 @@ bool emit_cfg_state_machine(
     bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
-    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
+    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
+    NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
+    const bool barrier_half_phase =
+        barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
     const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
@@ -1515,12 +1519,14 @@ bool emit_cfg_state_machine(
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
     std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
     std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
+    PhysicalMaskHalfSlots terminal_mask_half_slots;
     analyze_wave64_mask_half_aliases(
         b, ins, starts, successors,
         [&](const Rdna2Inst& in, const std::function<void(int)>& visit) {
             for_each_possible_vector_write(in, visit);
         },
-        wave64_mask_half_sreg_in, wave64_mask_half_reachable);
+        wave64_mask_half_sreg_in, wave64_mask_half_reachable,
+        barrier_half_phase ? barrier_halves : nullptr, &terminal_mask_half_slots, end_pc);
     // Type spill reloads as emit_alu did. Wave64 reload destinations also have Bool variables,
     // whose presence alone cannot prove a slot's domain (rdna2_spill_slot_domain.hpp).
     std::set<int> spill_mask_keys = static_mask_keys;
@@ -1656,6 +1662,9 @@ bool emit_cfg_state_machine(
             for (const auto& [vgpr, lanes] : *slots)
                 for (const auto& lane : lanes)
                     wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
+        if (barrier_half_phase)
+            barrier_halves->seed_entry(wave64_spilled_halves_in.front(),
+                                       wave64_slot_domain_in.front());
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -5564,6 +5573,13 @@ bool emit_cfg_state_machine(
     }
     initial.invalidated_vgpr_lane_slots =
         std::move(terminal_invalidated_vgpr_lane_slots);
+    if (barrier_half_phase) {
+        const auto terminal = block_for_pc.find(end_pc);
+        if (terminal != block_for_pc.end() && wave64_b64_reachable[terminal->second])
+            barrier_halves->finish_phase(ins, terminal_mask_half_slots,
+                                         wave64_spilled_halves_in[terminal->second],
+                                         wave64_slot_domain_in[terminal->second]);
+    }
     // sreg_srt and lds_addtid are path-sensitive SSA provenance without dispatcher function
     // variables. Not reconstructing them across a phase is intentional and fail-closed: a later
     // descriptor/LDS consumer rejects instead of reviving provenance from an arbitrary path.
@@ -5694,6 +5710,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
              portable_compute_mask_reduction || portable_compute_readfirstlane ||
              portable_compute_bpermute || compute_cfg_row_integer || compute_cfg_row_fadd)) {
+            NativeBarrierHalfProof barrier_halves(b, ins, code, dwords, phased.guarded,
+                                                  initial_dispatch_active);
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -5753,9 +5771,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // backward-else/complex shape before it ever reaches the fallback.
                 if (!phased.guarded || initial_dispatch_active)
                     return emit_cfg_state_machine(
-                        b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                        exp_fn, code, dwords, initial_dispatch_active,
-                        force_lds_fminmax_dispatcher);
+                        b, rs, phase, safe, rt, allow_exec_update, allow_smem, exp_fn, code, dwords,
+                        initial_dispatch_active, force_lds_fminmax_dispatcher, {}, nullptr, nullptr,
+                        &barrier_halves);
                 return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                  exp_fn, code, dwords, &dead_masks, true, 0, false,
                                  force_lds_fminmax_dispatcher);

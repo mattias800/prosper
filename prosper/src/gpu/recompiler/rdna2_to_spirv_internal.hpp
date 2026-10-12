@@ -4206,6 +4206,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 // default arguments are stated here and nowhere else.
 struct PacketVgprDefinedness;
 struct FragmentPacketMaskRequirements;
+class NativeBarrierHalfProof;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
@@ -4214,7 +4215,8 @@ bool emit_cfg_state_machine(
     bool synchronize_lds_fminmax = false,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},
     PacketVgprDefinedness* packet_definedness = nullptr,
-    const FragmentPacketMaskRequirements* packet_masks = nullptr);
+    const FragmentPacketMaskRequirements* packet_masks = nullptr,
+    NativeBarrierHalfProof* barrier_halves = nullptr);
 
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,

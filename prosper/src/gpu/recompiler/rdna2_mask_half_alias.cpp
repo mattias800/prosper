@@ -1,6 +1,7 @@
 // See rdna2_mask_half_alias.hpp. Moved out of emit_cfg_state_machine.
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 
+#include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <cstdint>
@@ -15,11 +16,18 @@ void analyze_wave64_mask_half_aliases(
     const std::vector<std::vector<uint32_t>>& successors,
     const VectorWriteVisitor& for_each_possible_vector_write,
     std::vector<std::map<int, uint32_t>>& wave64_mask_half_sreg_in,
-    std::vector<bool>& wave64_mask_half_reachable) {
+    std::vector<bool>& wave64_mask_half_reachable, const NativeBarrierHalfProof* barrier_halves,
+    std::map<std::pair<int, int>, uint32_t>* terminal_slots, uint32_t terminal_pc) {
+    if (terminal_slots) terminal_slots->clear();
     if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && !starts.empty()) {
+        struct Half {
+            uint32_t word;
+            bool imported;
+            bool operator==(const Half&) const = default;
+        };
         struct MaskHalfState {
-            std::map<int, uint32_t> sreg;
-            std::map<std::pair<int, int>, uint32_t> slot;
+            std::map<int, Half> sreg;
+            std::map<std::pair<int, int>, Half> slot;
             bool operator==(const MaskHalfState&) const = default;
         };
         auto special_half = [](const Operand& source) -> int {
@@ -35,20 +43,31 @@ void analyze_wave64_mask_half_aliases(
         auto meet = [](MaskHalfState& dst, const MaskHalfState& incoming) {
             for (auto it = dst.sreg.begin(); it != dst.sreg.end();) {
                 const auto other = incoming.sreg.find(it->first);
-                if (other == incoming.sreg.end() || other->second != it->second)
+                if (other == incoming.sreg.end() || other->second.word != it->second.word)
                     it = dst.sreg.erase(it);
-                else
+                else {
+                    it->second.imported |= other->second.imported;
                     ++it;
+                }
             }
             for (auto it = dst.slot.begin(); it != dst.slot.end();) {
                 const auto other = incoming.slot.find(it->first);
-                if (other == incoming.slot.end() || other->second != it->second)
+                if (other == incoming.slot.end() || other->second.word != it->second.word)
                     it = dst.slot.erase(it);
-                else
+                else {
+                    it->second.imported |= other->second.imported;
                     ++it;
+                }
             }
         };
         auto transfer = [&](MaskHalfState& state, const Rdna2Inst& in, bool record) {
+            // Only the unchanged branch-free original prefix proves that a new post-barrier
+            // ballot sees every physical lane. Forget imported facts before any other site,
+            // including facts relayed through SGPRs/re-spills. Local preexisting rules remain.
+            if (barrier_halves && !barrier_halves->participant_pcs().contains(in.pc)) {
+                std::erase_if(state.sreg, [](const auto& fact) { return fact.second.imported; });
+                std::erase_if(state.slot, [](const auto& fact) { return fact.second.imported; });
+            }
             if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360) {
                 for_each_scalar_write(
                     in,
@@ -63,7 +82,7 @@ void analyze_wave64_mask_half_aliases(
                     const auto half = state.slot.find(key);
                     if (half != state.slot.end()) {
                         state.sreg[in.dst.value] = half->second;
-                        if (record) b.wave64_mask_readlane_half_for_pc[in.pc] = half->second;
+                        if (record) b.wave64_mask_readlane_half_for_pc[in.pc] = half->second.word;
                     }
                 }
                 return;
@@ -92,17 +111,19 @@ void analyze_wave64_mask_half_aliases(
                 }
                 const std::pair<int, int> key{in.dst.value, in.src[1].value};
                 int half = special_half(in.src[0]);
+                bool imported = false;
                 if (half < 0 && in.src[0].kind == OperandKind::SGPR) {
                     const auto source = state.sreg.find(in.src[0].value);
                     if (source != state.sreg.end()) {
-                        half = source->second;
+                        half = static_cast<int>(source->second.word);
+                        imported = source->second.imported;
                         if (record) b.wave64_mask_writelane_alias_pcs.insert(in.pc);
                     }
                 }
                 if (half < 0)
                     state.slot.erase(key);
                 else
-                    state.slot[key] = static_cast<uint32_t>(half);
+                    state.slot[key] = Half{static_cast<uint32_t>(half), imported};
                 return;
             }
 
@@ -117,6 +138,9 @@ void analyze_wave64_mask_half_aliases(
         };
 
         std::vector<MaskHalfState> half_in(starts.size());
+        if (barrier_halves)
+            for (const auto& [slot, half] : barrier_halves->slots())
+                half_in.front().slot.emplace(slot, Half{half, true});
         std::vector<bool> half_reachable(starts.size(), false);
         half_reachable.front() = true;
         std::vector<uint32_t> pending{0};
@@ -146,7 +170,11 @@ void analyze_wave64_mask_half_aliases(
         for (uint32_t block = 0; block < starts.size(); ++block) {
             if (!half_reachable[block]) continue;
             wave64_mask_half_reachable[block] = true;
-            wave64_mask_half_sreg_in[block] = half_in[block].sreg;
+            for (const auto& [reg, half] : half_in[block].sreg)
+                wave64_mask_half_sreg_in[block].emplace(reg, half.word);
+            if (terminal_slots && starts[block] == terminal_pc)
+                for (const auto& [slot, half] : half_in[block].slot)
+                    terminal_slots->emplace(slot, half.word);
             MaskHalfState state = half_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;

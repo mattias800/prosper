@@ -3557,6 +3557,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_recompile_diagnostic_attempt
     SOURCES tests/gpu/recompiler/test_recompile_diagnostic_attempt.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_barrier_mask_halves
+    SOURCES tests/gpu/recompiler/test_native_barrier_mask_halves.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     INCLUDES tests
