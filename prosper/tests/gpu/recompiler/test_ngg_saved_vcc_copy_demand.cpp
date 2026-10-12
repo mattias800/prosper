@@ -500,7 +500,7 @@ void literal_values(uint32_t value, uint32_t opcode, bool first, bool trailing =
     for (uint32_t lane = 0; lane < 64; ++lane) {
         const auto actual = values.evaluate(e.rs.vreg.at(0), lane);
         ASSERT_TRUE(actual.has_value()) << values.error;
-        EXPECT_EQ(*actual, ((expected >> lane) & 1u) ? 9u : 1u) << lane;
+        EXPECT_EQ(actual.value_or(UINT32_MAX), ((expected >> lane) & 1u) ? 9u : 1u) << lane;
     }
 }
 } // namespace
@@ -552,7 +552,7 @@ TEST(NggSavedVccCopyDemand, LiteralWithAGenuineSavedPredicateRetainsItsMaskDomai
     for (uint32_t lane = 0; lane < 64; ++lane) {
         const auto actual = values.evaluate(e.rs.vreg.at(0), lane);
         ASSERT_TRUE(actual.has_value()) << values.error;
-        EXPECT_EQ(*actual, (((mask & 0xffu) >> lane) & 1u) ? 9u : 1u) << lane;
+        EXPECT_EQ(actual.value_or(UINT32_MAX), (((mask & 0xffu) >> lane) & 1u) ? 9u : 1u) << lane;
     }
 }
 
