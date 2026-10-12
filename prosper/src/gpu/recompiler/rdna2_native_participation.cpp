@@ -1,12 +1,17 @@
 #include "gpu/recompiler/rdna2_native_participation.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include <array>
 #include <bitset>
 #include <deque>
+#include <map>
 #include <optional>
+#include <set>
+#include <utility>
 
 namespace prosper::gpu {
 namespace {
@@ -14,6 +19,7 @@ constexpr uint64_t full = UINT64_MAX;
 struct Word {
     bool uniform = false, genuine = false;
     std::optional<uint32_t> constant;
+    bool numeric_uniform = uniform;
     bool operator==(const Word&) const = default;
 };
 struct Mask {
@@ -23,6 +29,7 @@ struct Mask {
 };
 struct Facts {
     bool common = true;
+    bool numeric_common = true;
     std::array<Word, 128> scalar{};
     std::array<Mask, 128> mask{};
     std::array<uint64_t, 256> vector{};
@@ -30,17 +37,24 @@ struct Facts {
     std::array<std::optional<uint32_t>, 256> vector_constant{};
     Word scc;
     Mask exec{true, full};
+    // Numeric spill services return their stored SSA, rather than shuffling ordinary VGPR DATA.
+    // Uniformity belongs to that current slot producer, including false/missing edge facts.
+    std::map<std::pair<int, uint32_t>, bool> numeric_slots;
+    std::set<int> numeric_slot_vgprs;
     bool operator==(const Facts&) const = default;
 };
 Word meet(Word a, Word b) {
-    return {a.uniform && b.uniform, a.genuine && b.genuine,
-            a.constant == b.constant ? a.constant : std::nullopt};
+    Word result{a.uniform && b.uniform, a.genuine && b.genuine,
+                a.constant == b.constant ? a.constant : std::nullopt};
+    result.numeric_uniform = a.numeric_uniform && b.numeric_uniform;
+    return result;
 }
 Mask meet(Mask a, Mask b) {
     return {a.genuine && b.genuine, a.constant == b.constant ? a.constant : std::nullopt};
 }
 Facts meet(Facts a, const Facts& b) {
     a.common &= b.common;
+    a.numeric_common &= b.numeric_common;
     a.scc = meet(a.scc, b.scc);
     a.exec = meet(a.exec, b.exec);
     for (size_t i = 0; i < a.scalar.size(); ++i) {
@@ -52,12 +66,29 @@ Facts meet(Facts a, const Facts& b) {
         if (a.vector_constant[i] != b.vector_constant[i]) a.vector_constant[i].reset();
     }
     a.local_x &= b.local_x;
+    for (const auto& [slot, uniform] : b.numeric_slots) {
+        const auto found = a.numeric_slots.find(slot);
+        if (found == a.numeric_slots.end())
+            a.numeric_slots.emplace(slot, false);
+        else
+            found->second &= uniform;
+    }
+    for (auto& [slot, uniform] : a.numeric_slots)
+        if (!b.numeric_slots.contains(slot)) uniform = false;
+    a.numeric_slot_vgprs.insert(b.numeric_slot_vgprs.begin(), b.numeric_slot_vgprs.end());
     return a;
 }
 bool ordinary(const SpirvCompute& b) {
     return native_compute_has_complete_entry(b) && b.native_logical_uniform_launch &&
            b.is_compute && !b.is_fragment_packet() && !b.ngg_workgroup_shell && !b.ngg_one_lane &&
            b.wave_size == 64 && b.native_subgroup_size == 64 && b.local_count == 64;
+}
+bool numeric_context(const SpirvCompute& b) {
+    return ordinary(b) ||
+           (b.is_fragment && !b.is_compute && !b.is_vertex &&
+            b.guest_stage == GuestShaderStage::Fragment &&
+            b.physical_domain == PhysicalExecutionDomain::Invocation && !b.is_fragment_packet() &&
+            !b.allow_b32_masks && !b.ngg_workgroup_shell && !b.ngg_one_lane && b.wave_size == 64);
 }
 bool scalar_word_available(const RegState& rs, int r) {
     if (r < 0 || r >= 124 || sreg_word_may_be_fabricated(rs, r) ||
@@ -92,7 +123,9 @@ Word word(const Facts& f, const Rdna2Inst& in, Operand o, uint32_t offset = 0) {
     return {};
 }
 Word combine(Word a, Word b) {
-    return {a.uniform && b.uniform, a.genuine && b.genuine, std::nullopt};
+    Word result{a.uniform && b.uniform, a.genuine && b.genuine, std::nullopt};
+    result.numeric_uniform = a.numeric_uniform && b.numeric_uniform;
+    return result;
 }
 Word scalar_sources(const Facts& f, const Rdna2Inst& in) {
     Word result{true, true, std::nullopt};
@@ -246,12 +279,17 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
     const int dst = in.dst.value;
     if (in.fmt == Rdna2Format::Unknown || rdna2_escapes_decoded_effects(in) ||
         in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::SOPK)
-        f.common = false;
+        f.common = f.numeric_common = false;
     if (in.fmt == Rdna2Format::SOPP) {
         if (in.opcode != 0 && in.opcode != 1 && in.opcode != 2 &&
             !(in.opcode >= 4 && in.opcode <= 9) && in.opcode != 0xc && in.opcode != 0x20 &&
             in.opcode != 0x21 && in.opcode != 0x22)
             f.common = false;
+        // A guest barrier ends the existing physical producer proof, not scalar uniformity.
+        if (in.opcode != 0 && in.opcode != 1 && in.opcode != 2 &&
+            !(in.opcode >= 4 && in.opcode <= 0xa) && in.opcode != 0xc && in.opcode != 0x20 &&
+            in.opcode != 0x21 && in.opcode != 0x22)
+            f.numeric_common = false;
         return f;
     }
     for_each_scalar_write(in, [&](int r, uint32_t width) { kill_scalar(f, r, width); });
@@ -332,7 +370,11 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
             f.exec = f.mask[dst];
         else if (rdna2_instruction_may_change_exec(in))
             f.exec = {};
-        if (in.fmt == Rdna2Format::SOP2 && in.opcode != 0xa && in.opcode != 0xb)
+        // These DATA producers preserve architectural SCC. Replacing its proof with their
+        // uniform operands would let a later CSELECT launder a lane-local old condition.
+        if (in.fmt == Rdna2Format::SOP2 && in.opcode != kSop2OpcodeCselectB32 &&
+            in.opcode != kSop2OpcodeCselectB64 && in.opcode != kSop2OpcodeBfmB32 &&
+            in.opcode != kSop2OpcodeBfmB64 && in.opcode != 0x26)
             f.scc = {result.uniform, result.genuine, std::nullopt};
         else if (in.fmt == Rdna2Format::SOP1 && !sop1_opcode_leaves_scc_unmodified(in.opcode))
             f.scc = {result.uniform, result.genuine, std::nullopt};
@@ -350,6 +392,26 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         const bool genuine =
             fixed && (vector_source(before, in, in.src[0]) & (uint64_t{1} << *selector.constant));
         if (dst >= 0 && dst < 128) f.scalar[dst] = {fixed && before.common, genuine, std::nullopt};
+        if (dst >= 0 && dst < 128) {
+            bool uniform = false;
+            if (selector.genuine && selector.numeric_uniform && before.numeric_common &&
+                in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
+                in.src[0].value < 256) {
+                if (fixed) {
+                    const auto slot =
+                        before.numeric_slots.find({in.src[0].value, *selector.constant});
+                    if (slot != before.numeric_slots.end())
+                        uniform = slot->second;
+                    else if (!before.numeric_slot_vgprs.contains(in.src[0].value))
+                        uniform = genuine;
+                } else if (ordinary(b) && !before.numeric_slot_vgprs.contains(in.src[0].value)) {
+                    // A genuine uniform selector may choose any peer in this complete native
+                    // wave. Every possible source lane must be current; slot storage is separate.
+                    uniform = before.vector[in.src[0].value] == full;
+                }
+            }
+            f.scalar[dst].numeric_uniform = uniform;
+        }
         return f;
     }
     uint64_t genuine = vector_sources(before, in);
@@ -373,6 +435,24 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         genuine = 0;   // READFIRSTLANE is lane-local here; opaque MOVRELS is not DATA authority.
     } else if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         f.common = false;   // spill services and mixed mask/word slots are a separate contract
+        if (dst >= 0 && dst < 256) {
+            const auto selector = word(before, in, in.src[1]);
+            const auto source = word(before, in, in.src[0]);
+            bool uniform = source.numeric_uniform;
+            if (in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) {
+                const int r = in.src[0].value;
+                // A retained physical half of a genuine mask is uniform too; current DATA
+                // availability remains the separate emission-time proof.
+                uniform |= (r >= 0 && r < 128 && before.mask[r].genuine) ||
+                           (r > 0 && r < 128 && before.mask[r - 1].genuine);
+            }
+            if (selector.constant && *selector.constant < 64 && selector.numeric_uniform)
+                f.numeric_slots[{dst, *selector.constant}] = uniform && before.numeric_common;
+            else
+                for (auto& [slot, proof] : f.numeric_slots)
+                    if (slot.first == dst) proof = false;
+            f.numeric_slot_vgprs.insert(dst);
+        }
         genuine = 0;
     } else {
         // This is a semantic proof inventory, not decoder storage accounting. Operations with
@@ -395,6 +475,12 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         !in.permlane_bound_ctrl && before.exec.constant != full && dst >= 0 && dst < 256)
         genuine &= before.vector[dst];
     for_each_possible_vector_write(in, 255, [&](int r) { write_vector(f, in, r, genuine); });
+    if (before.exec.constant == full && genuine == full &&
+        !(in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361))
+        for_each_possible_vector_write(in, 255, [&](int r) {
+            std::erase_if(f.numeric_slots, [r](const auto& slot) { return slot.first.first == r; });
+            f.numeric_slot_vgprs.erase(r);
+        });
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
         for (int r = std::max(dst, 0); r < 256; ++r) {
             f.vector[r] = 0;
@@ -411,14 +497,25 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         } else
             f.vector_constant[dst] = word(before, in, in.src[0]).constant;
     }
-    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 2 && dst >= 0 && dst < 128)
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 2 && dst >= 0 && dst < 128) {
         f.scalar[dst] = {false, genuine == full, std::nullopt};
+        // The native fallback retains each invocation's operand. It is uniformly genuine only
+        // for a plain constant initialized in every lane under full EXEC, never a spill payload,
+        // a dynamic VGPR, or a predicated/modified source. This does not repair generic READFIRST.
+        const auto source = in.src[0];
+        if (source.kind == OperandKind::VGPR && source.value >= 0 && source.value < 256 &&
+            before.vector[source.value] == full && before.vector_constant[source.value] &&
+            before.exec.genuine && before.exec.constant == full &&
+            !before.numeric_slot_vgprs.contains(source.value) && !in.has_sdwa && !in.has_dpp &&
+            !in.has_modifier && !in.src_abs[0] && !in.src_neg[0] && !in.omod && !in.clamp)
+            f.scalar[dst] = {true, true, before.vector_constant[source.value]};
+    }
     return f;
 }
 }   // namespace
 
 std::vector<uint64_t> native_participation_entry(const SpirvCompute& b, const RegState* rs) {
-    if (!ordinary(b) || !rs) return {};
+    if (!numeric_context(b) || !rs) return {};
     std::vector<uint64_t> result{b.guest_local_size[0], b.guest_local_size[1],
                                  b.guest_local_size[2], rs->exec,
                                  rs->exec_narrowed,     rs->scc_merge_placeholder};
@@ -444,16 +541,28 @@ std::vector<uint64_t> native_participation_entry(const SpirvCompute& b, const Re
 }
 
 std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegState* initial,
-                                             const std::vector<Rdna2Inst>& instructions) {
-    if (!ordinary(b) || !initial || initial->exec_narrowed || instructions.empty() ||
+                                             const std::vector<Rdna2Inst>& instructions,
+                                             std::set<uint32_t>* numeric_vcc_moves) {
+    if (numeric_vcc_moves) numeric_vcc_moves->clear();
+    if (!numeric_context(b) || !initial || initial->exec_narrowed || instructions.empty() ||
         instructions.size() > 4096)
         return {};
     std::map<uint32_t, size_t> at;
     for (size_t i = 0; i < instructions.size(); ++i)
         if (!at.emplace(instructions[i].pc, i).second) return {};
     Facts entry;
-    for (int r = 0; r < 124; ++r)
-        if (scalar_word_available(*initial, r)) entry.scalar[r] = {true, true, std::nullopt};
+    for (int r = 0; r < 124; ++r) {
+        if (scalar_word_available(*initial, r))
+            entry.scalar[r] = {true, true, std::nullopt};
+        else if (initial->absent_sgpr_reads_fabricated_zero && !initial->sreg.contains(r) &&
+                 !initial->sreg_input.contains(r) && sreg_word_absent_unmasked(*initial, r) &&
+                 !initial->unavailable_saved_mask_words.contains(r) &&
+                 !initial->sreg_merge_placeholder.contains(r) &&
+                 !initial->sreg_memory_pattern.contains(r) && !initial->sreg_entry_m0.contains(r))
+            // The existing absent DATA spelling is a uniform zero, but is NOT genuine. A later
+            // mask projection still needs current words or a checked soft loop assumption.
+            entry.scalar[r].numeric_uniform = true;
+    }
     for (int r = 0; r < 256; ++r)
         if (vector_word_available(*initial, r)) entry.vector[r] = full;
     const auto x = initial->vreg.find(0);
@@ -487,6 +596,7 @@ std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegSta
             const auto tested = in.opcode == 6 || in.opcode == 7 ? before.mask[106] : before.exec;
             const bool genuine = scc ? before.scc.uniform && before.scc.genuine : tested.genuine;
             after.common &= genuine;
+            after.numeric_common &= genuine;
             if (!scc && tested.constant) {
                 const bool zero = *tested.constant == 0;
                 taken = (in.opcode == 6 || in.opcode == 8) ? zero : !zero;
@@ -515,7 +625,14 @@ std::set<uint32_t> native_mask_participation(const SpirvCompute& b, const RegSta
     std::set<uint32_t> result;
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& in = instructions[i];
-        if (!incoming[i] || !incoming[i]->common || in.fmt != Rdna2Format::VOPC ||
+        if (numeric_vcc_moves && incoming[i] && incoming[i]->numeric_common &&
+            in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.dst.value == 106 &&
+            (in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::Special) &&
+            in.src[0].value >= 0 && in.src[0].value < 127 &&
+            word(*incoming[i], in, in.src[0]).numeric_uniform &&
+            word(*incoming[i], in, in.src[0], 1).numeric_uniform)
+            numeric_vcc_moves->insert(in.pc);
+        if (!ordinary(b) || !incoming[i] || !incoming[i]->common || in.fmt != Rdna2Format::VOPC ||
             vopc_is_cmpx(in.opcode) || in.dst.kind != OperandKind::SGPR || in.dst.value < 0 ||
             in.dst.value > 104 || !scalar_write_is_b64_mask(in, in.dst.value))
             continue;

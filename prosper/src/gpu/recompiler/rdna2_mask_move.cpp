@@ -1,4 +1,11 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
+#include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <array>
+#include <optional>
 
 namespace prosper::gpu {
 namespace {
@@ -50,25 +57,108 @@ uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, co
 
 // A complete scalar move INTO VCC defines both physical words, independently of EXEC, and
 // preserves SCC (AMD RDNA2 70648 sections 3.3/12.3). Publish the exact logical-lane bit as well
-// as emit_alu's unchanged DATA copy. An absent entry predicate cannot supply this new value;
-// nor may a supplied old predicate survive a genuine numeric replacement. Dispatcher reloads
-// have already removed words without current MUST authority. Never resurrect sreg_input here.
-uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs,
-                                          const Rdna2Inst& in) {
-    if (!b.is_fragment_packet() || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
+// as emit_alu's unchanged DATA copy. Owned packets and exact-native compute retain a guest lane;
+// an old predicate cannot supply this new value. Native words need independent uniformity and
+// genuine provenance under their entry contract. Still-current driver words and loop assumptions
+// retain their existing lifetime contract; each assumed root must pass the actual backedge check.
+bool numeric_vcc_move_has_lane_context(const SpirvCompute& b) {
+    const bool fragment = b.is_fragment && !b.is_compute && !b.is_vertex &&
+                          b.guest_stage == GuestShaderStage::Fragment &&
+                          b.physical_domain == PhysicalExecutionDomain::Invocation &&
+                          !b.allow_b32_masks && !b.ngg_workgroup_shell && !b.ngg_one_lane &&
+                          native_vcc_copy_execution_domain_matches(b);
+    return b.is_fragment_packet() ||
+           ((b.is_compute || fragment) && uses_native_saved_mask_words(b) &&
+            saved_mask_physical_launch_matches_original(b));
+}
+
+uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
+    if (!numeric_vcc_move_has_lane_context(b) || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
         in.opcode != kSop1OpcodeMovB64 || in.dst.value != 106)
         return 0;
     const auto& source = in.src[0];
+    if (!b.is_fragment_packet()) {
+        if (!b.native_uniform_numeric_vcc_move_pcs.contains(in.pc) ||
+            in.pc >= b.saved_mask_original_words.size())
+            return 0;
+        auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
+                                         b.saved_mask_original_words.size() - in.pc);
+        original.pc = in.pc;
+        if (in.synthetic_terminator || in != original) return 0;
+    }
     uint32_t lo = 0, hi = 0;
     if (source.kind == OperandKind::SGPR ||
         (source.kind == OperandKind::Special && source.value >= 106 && source.value <= 123)) {
-        const auto low = rs.sreg.find(source.value), high = rs.sreg.find(source.value + 1);
-        if (low == rs.sreg.end() || high == rs.sreg.end()) return 0;
-        lo = low->second;
-        hi = high->second;
+        if (!b.is_fragment_packet()) {
+            for (int word = source.value; word <= source.value + 1; ++word)
+                if (rs.unavailable_saved_mask_words.contains(word)) return 0;
+            // This records only the soft roots actually read here. LoopBlanketCheck rejects
+            // their entire module if a backedge violates them; hard/missing words still refuse.
+            if (!scalar_words_projectable(b, rs, source.value, 2)) return 0;
+        }
+        const auto current_word = [&](int word) -> uint32_t {
+            if (const auto value = rs.sreg.find(word); value != rs.sreg.end()) return value->second;
+            if (!b.is_fragment_packet() && !rs.sreg_written.contains(word))
+                if (const auto entry = rs.sreg_input.find(word); entry != rs.sreg_input.end())
+                    return entry->second;
+            return 0;
+        };
+        lo = current_word(source.value);
+        hi = current_word(source.value + 1);
+        if (!lo || !hi) return 0;
     } else
         return 0; // existing mask/inline lowering is unchanged
     return numeric_pair_mask_bit(b, lo, hi, b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63)));
+}
+
+// A physical numeric replacement ends the old mask spelling even when this stage cannot
+// project the new pair. Keeping VCC's old mirror would silently restore departed mask bits.
+void retire_data_only_b64_mask(RegState& rs, int destination) {
+    rs.sreg_bool.erase(destination);
+    rs.sreg_bool_narrowed.erase(destination);
+    if (destination == 106 || destination == 107) rs.vcc = 0;
+}
+
+void retire_scalar_data_word_mask(RegState& rs, int destination) {
+    rs.sreg_bool.erase(destination);
+    rs.sreg_bool_narrowed.erase(destination);
+    rs.sreg_bool_b32.erase(destination);
+    if (destination == 106 || (destination == 107 && !rs.sreg_bool_b32.contains(106)))
+        retire_data_only_b64_mask(rs, 106);
+}
+
+// Resolve the entire old pair before publishing either destination. A legal self-copy must
+// retain both original values and descriptor offsets throughout publication.
+bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool source_mask) {
+    std::array<std::optional<uint32_t>, 2> values, descriptors;
+    for (int word = 0; word < 2; ++word) {
+        const int reg = source + word;
+        const auto current = rs.sreg.find(reg);
+        if (current != rs.sreg.end())
+            values[word] = current->second;
+        else {
+            const auto input = rs.sreg_input.find(reg);
+            if (input != rs.sreg_input.end()) values[word] = input->second;
+        }
+        const auto descriptor = rs.sreg_srt.find(reg);
+        if (descriptor != rs.sreg_srt.end()) descriptors[word] = descriptor->second;
+    }
+    for (int word = 0; word < 2; ++word) {
+        const int reg = destination + word;
+        const auto& value = values[word];
+        const auto& descriptor = descriptors[word];
+        if (value.has_value())
+            rs.sreg[reg] = value.value();
+        else
+            rs.sreg.erase(reg);
+        if (descriptor.has_value())
+            rs.sreg_srt[reg] = descriptor.value();
+        else
+            rs.sreg_srt.erase(reg);
+    }
+    // Ordinary DATA moves keep the established absent-word behavior. A Bool alias still
+    // needs both genuine physical values, rather than one copied word and a guessed sibling.
+    return (values[0].has_value() && values[1].has_value()) || !source_mask;
 }
 
 // AMD RDNA2 70648 sections 3.3/12.3: S_MOV_B64 copies the complete scalar pair into EXEC,

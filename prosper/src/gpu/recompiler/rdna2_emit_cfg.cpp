@@ -3210,10 +3210,7 @@ bool emit_cfg_state_machine(
         auto it = initial.vreg.find(kv.first);
         b.store_function(kv.second, it == initial.vreg.end() ? zero : it->second);
     }
-    for (const auto& kv : sv) {
-        auto it = initial.sreg.find(kv.first);
-        b.store_function(kv.second, it == initial.sreg.end() ? zero : it->second);
-    }
+    for (const auto& kv : sv) b.store_function(kv.second, sreg_seed(b, initial, kv.first));
     for (const auto& kv : mv) {
         auto it = initial.sreg_bool.find(kv.first);
         b.store_function(kv.second, it == initial.sreg_bool.end() ? no : it->second);

@@ -646,6 +646,10 @@ struct Interpreter {
       try {
           if (!error.empty()) fail(error);
           if (!count || count > 1024) fail("invalid invocation count");
+          // The explicit Wave32 vote/builtin fixture is one full subgroup at workgroup zero.
+          // Other bases need their own authenticated local-size/GID contract.
+          if (native_subgroup_width == 32 && (count != 32 || workgroup_x != 0))
+              fail("unproved native32 instance");
           storage = 0;
           shared.clear();
           readonly_storage.clear();
@@ -741,7 +745,8 @@ struct Interpreter {
                       else if (b->second == 29)
                           v = {lane};
                       else if ((b->second == 40 || b->second == 41) &&
-                               native_subgroup_width == 64 && count == 64)
+                               (native_subgroup_width == 32 || native_subgroup_width == 64) &&
+                               count == native_subgroup_width)
                           v = {b->second == 40 ? 0u : lane};
                       else
                           fail("unsupported builtin");
@@ -792,7 +797,8 @@ struct Interpreter {
                   continue;
               }
               if (collective.op == 334 || collective.op == 335 || collective.op == 339) {
-                  if (native_subgroup_width != 64 || count != 64 || collective.a.size() != 4)
+                  if ((native_subgroup_width != 32 && native_subgroup_width != 64) ||
+                      count != native_subgroup_width || collective.a.size() != 4)
                       fail("unproved native subgroup");
                   const auto& a = collective.a;
                   std::vector<uint32_t> result(collective.op == 339 ? 4 : 1);
