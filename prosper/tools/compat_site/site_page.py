@@ -35,6 +35,10 @@ body{margin:0;background:var(--bg);color:var(--tx);line-height:1.55;
 font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 -webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}img{max-width:100%}
+a,button,select,summary,.btn,.chip,.ms,label[for]{cursor:pointer}
+input[type=search],input[type=text]{cursor:text}
+.shot,.shot img,.mosaic img,.pill{cursor:default}
+button,.btn,.chip{-webkit-tap-highlight-color:transparent;user-select:none}
 .wrap{max-width:1180px;margin:0 auto;padding:0 24px}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em;
 background:var(--card2);padding:1px 6px;border-radius:6px}
@@ -99,7 +103,7 @@ position:relative;overflow:hidden}
 .search{flex:1 1 260px;position:relative}
 .search input{width:100%;padding:13px 16px 13px 42px}
 .search::before{content:"\\1F50D";position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:14px;
-opacity:.6}
+opacity:.6;pointer-events:none}
 input,select{background:var(--bg2);color:var(--tx);border:1px solid var(--line);border-radius:12px;
 padding:12px 14px;font-size:15px;font-family:inherit}
 input:focus,select:focus{outline:2px solid rgba(139,108,255,.6);border-color:transparent}

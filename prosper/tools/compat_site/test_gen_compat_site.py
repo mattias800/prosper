@@ -131,6 +131,16 @@ def test_site_has_every_section_and_no_leftover_tokens():
     assert page.count("<script>") == 1 and page.count("</script>") == 1
 
 
+def test_cursors_match_what_is_clickable():
+    """Hand on links/buttons/chips, text cursor on search, icon overlay never eats the pointer."""
+    page = render_index(
+        build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT)), [], "2026-01-01"
+    )
+    assert "a,button,select,summary,.btn,.chip,.ms,label[for]{cursor:pointer}" in page
+    assert "input[type=search],input[type=text]{cursor:text}" in page
+    assert "opacity:.6;pointer-events:none}" in page
+
+
 def test_ladder_shows_all_seven_rungs_with_live_counts():
     """Empty rungs still render (count 0) so the scale is always the whole scale."""
     titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
@@ -197,6 +207,7 @@ if __name__ == "__main__":
     test_markers_are_not_statuses()
     test_milestone_html_is_escaped()
     test_site_has_every_section_and_no_leftover_tokens()
+    test_cursors_match_what_is_clickable()
     test_ladder_shows_all_seven_rungs_with_live_counts()
     test_links_and_pills_stay_on_one_line()
     test_covers_first_repo_image_wins()
