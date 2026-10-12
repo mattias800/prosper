@@ -13,8 +13,10 @@
 //   StoreToImageOverlappingTableRefused  a store whose footprint covers the table is admitted
 //   ExtentIsASupersetOfTheSurface        the footprint drops the padding or the bytes per texel
 //   ExtentCountsSlices                   the footprint drops the array-slice term
-//   MipChainHasNoExtent                  a declared mip chain is bounded by a multiple of level 0,
-//                                        which level 0 stored LAST in the chain exceeds
+//   MipChainHasSoundExtent               a tiled chain bound includes every declared level
+//   LinearMipChainHasNoDescriptorOnlyExtent / LinearMipWritebackOverlappingTableRefused
+//                                        registered linear pitch is ignored when granting disjointness
+//   ThreeConsecutiveStoresAfterDominatingLoads  valid x16/x8 CFG loses distant admission or grants overlap
 //   StoreToMipChainRefused               end to end: an R8 1280x256 chain whose 2x bound stops short
 //                                        of the table is still treated as able to reach it
 //   ThreeDimensionalSurfaceHasNoExtent   a 3D surface is bounded by width*height*depth, which a thick
@@ -29,7 +31,9 @@
 #include "gpu/execute/split_t8_proof.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
+#include "gpu/resources/linear_row_pitch.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"
 #include "gpu/texture/tile.hpp"
 
 #include <gtest/gtest.h>
@@ -44,7 +48,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-alignas(64) uint32_t g_table[16];
+alignas(256) uint32_t g_table[16];
 
 // Captured shape of a 960x540 2D image T# (base is patched per test) and a 240x136 one.
 std::array<uint32_t, 8> store_t8(uint64_t base) {
@@ -162,9 +166,9 @@ std::array<uint32_t, 8> r8_chain_t8(uint64_t base, uint32_t last_level) {
 }
 }   // namespace
 
-TEST(SplitT8ImageWriteExtent, MipChainHasNoExtent) {
-    // Positive control, from prosper's own GFX10 layout model: level 0 is stored last and ends past
-    // twice its padded size, so the former "x2 for a mip chain" bound fell short.
+TEST(SplitT8ImageWriteExtent, MipChainHasSoundExtent) {
+    // Mip chains are bounded soundly using tiled_mip_chain_bytes: level 0 is stored last and ends past
+    // twice its padded size, but tiled_mip_chain_bytes accounts for the full allocation.
     const auto level0 = tiled_mip_level_layout(kChainW, kChainH, 1, kChainTile, kChainLast, 0);
     ASSERT_TRUE(level0.supported && !level0.in_tail);
     const size_t chain = tiled_mip_chain_bytes(kChainW, kChainH, 1, kChainTile, kChainLast);
@@ -178,11 +182,13 @@ TEST(SplitT8ImageWriteExtent, MipChainHasNoExtent) {
     ASSERT_EQ(bytes_per_block_of(single), 1u);
     ASSERT_TRUE(storage_image_write_extent(single, lo, hi)) << "control: one level is bounded";
     EXPECT_EQ(hi - lo, padded_level0);
-    EXPECT_FALSE(storage_image_write_extent(r8_chain_t8(0x421c4d0000ull, kChainLast), lo, hi))
-        << "a declared mip chain has no sound cheap bound";
+    ASSERT_TRUE(storage_image_write_extent(r8_chain_t8(0x421c4d0000ull, kChainLast), lo, hi));
+    EXPECT_EQ(hi - lo, chain)
+        << "a declared mip chain is bounded by its true tiled mip chain bytes";
     auto max_mip_only = single;
     max_mip_only[5] |= 3u << 4;   // WORD5 MAX_MIP 3
-    EXPECT_FALSE(storage_image_write_extent(max_mip_only, lo, hi));
+    ASSERT_TRUE(storage_image_write_extent(max_mip_only, lo, hi));
+    EXPECT_EQ(hi - lo, chain);
 }
 
 TEST(SplitT8ImageWriteExtent, StoreToMipChainRefused) {
@@ -194,8 +200,8 @@ TEST(SplitT8ImageWriteExtent, StoreToMipChainRefused) {
     ASSERT_GT(tiled_mip_chain_bytes(kChainW, kChainH, 1, kChainTile, kChainLast), table - base);
     EXPECT_FALSE(has_use(uses_for(r8_chain_t8(base, kChainLast), load_t8()), 6u))
         << "a store into a mip chain that reaches the table must still revoke the proof";
-    EXPECT_TRUE(has_use(uses_for(r8_chain_t8(base - (16ull << 20), 0), load_t8()), 6u))
-        << "control: a single-level store far below the table keeps the proof";
+    EXPECT_TRUE(has_use(uses_for(r8_chain_t8(base - (16ull << 20), kChainLast), load_t8()), 6u))
+        << "a mip chain store far below the table keeps the proof";
 }
 
 TEST(SplitT8ImageWriteExtent, ThreeDimensionalSurfaceHasNoExtent) {
@@ -275,4 +281,97 @@ TEST(SplitT8ImageWriteExtent, X16ProofAdmitsTwoStoresDespiteUnusedSamplerField) 
     const auto loads = proven_smem_x16_descriptor_loads(ins, &table, 64);
     EXPECT_TRUE(loads.contains(0u))
         << "an image_store has no sampler, so its SSAMP field must not count as reading s0";
+}
+
+TEST(SplitT8ImageWriteExtent, ThreeConsecutiveStoresAfterDominatingLoads) {
+    // Synthetic branchy x16/x8 fixture: the loads dominate every path that reaches a store.
+    // The first mip-chain writer must preserve the second descriptor only when disjoint.
+    alignas(256) static uint32_t table[24];
+    auto first = store_t8(0x42432c0000ull);
+    first[5] |= 3u << 4;   // MAX_MIP 3
+    const auto second = store_t8(0x4244ac0000ull);
+    const auto third = store_t8(0x4245ac0000ull);
+    const uint64_t base = reinterpret_cast<uint64_t>(table);
+    const uint32_t seed[4] = {0u, 0u, static_cast<uint32_t>(base),
+                              static_cast<uint32_t>(base >> 32u)};
+    // pc0: conditional branch to pc12 (end); pc1/3: descriptor loads; pc5: waitcnt;
+    // pc6/8/10: stores through s[12:19], s[20:27], s[28:35]; pc12: endpgm.
+    // clang-format off: one line per instruction
+    const std::vector<uint32_t> code = {
+        0xBF88000Bu,
+        0xF4100301u, 0xFA000000u,
+        0xF40C0701u, 0xFA000040u,
+        0xBF8CC07Fu,
+        0xF0200F08u, 0x00030005u,
+        0xF0200F08u, 0x00050005u,
+        0xF0200F08u, 0x00070005u,
+        0xBF810000u,
+    };
+    // clang-format on
+    auto resolve = [&](const std::array<uint32_t, 8>& writer) {
+        std::copy(writer.begin(), writer.end(), table);
+        std::copy(second.begin(), second.end(), table + 8);
+        std::copy(third.begin(), third.end(), table + 16);
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code.data(), code.size(), seed, 4, 0, &uses);
+        return uses;
+    };
+    const auto distant = resolve(first);
+    EXPECT_TRUE(has_use(distant, 6u)) << "first store's descriptor reaches the writer";
+    EXPECT_TRUE(has_use(distant, 8u)) << "disjoint mip-chain write preserves the second T#";
+    EXPECT_TRUE(has_use(distant, 10u)) << "the separate x8 descriptor reaches the third store";
+    auto overlapping = store_t8(base);
+    overlapping[5] |= 3u << 4;
+    const auto clobbered = resolve(overlapping);
+    EXPECT_TRUE(has_use(clobbered, 6u)) << "the writer's descriptor is defined before its store";
+    EXPECT_FALSE(has_use(clobbered, 8u)) << "a mip-chain write reaching the table revokes proof";
+}
+
+namespace {
+std::array<uint32_t, 8> linear_r8_mip_t8(uint64_t base) {
+    // LINEAR R8 8x2, BASE_LEVEL=LAST_LEVEL=0, MAX_MIP=1.
+    return {static_cast<uint32_t>(base >> 8),
+            static_cast<uint32_t>((base >> 40) & 0xffu) | (1u << 20) | (3u << 30),
+            1u | (1u << 14),
+            (9u << 28) | 0x204u,
+            0u,
+            0x00700010u,
+            0u,
+            0u};
+}
+}   // namespace
+
+TEST(SplitT8ImageWriteExtent, LinearMipChainHasNoDescriptorOnlyExtent) {
+    const auto t8 = linear_r8_mip_t8(0x421c4d0000ull);
+    const auto d = decode_image_descriptor(t8.data());
+    Gen5ImageFormatInfo format;
+    ASSERT_TRUE(gen5_image_format(d.format, &format));
+    const auto view = image_base_level_view(d, format);
+    ASSERT_TRUE(view.supported);
+    EXPECT_EQ(view.base, d.base + 256u);
+    EXPECT_EQ(tiled_mip_chain_bytes(8, 2, 1, 0, 1), 768u);
+    ShaderResource resource;
+    resource.gpu_addr = view.base;
+    register_guest_linear_texture_layout(d.base, 4096u, 1024u);
+    const auto pitch = resolved_linear_row_pitch(resource, view.width, format.bytes_per_block);
+    unregister_guest_linear_texture_layout(d.base);
+    ASSERT_EQ(pitch, 1024u);
+    EXPECT_EQ(view.base + pitch - d.base, 1280u)
+        << "row 1 writeback starts beyond the descriptor-only 768-byte chain";
+    uint64_t lo = 0, hi = 0;
+    EXPECT_FALSE(storage_image_write_extent(t8, lo, hi))
+        << "registered linear pitch is not proven by descriptor bytes";
+}
+
+TEST(SplitT8ImageWriteExtent, LinearMipWritebackOverlappingTableRefused) {
+    // The descriptor table sits at row 1 of the selected level's registered 1024-byte pitch,
+    // beyond tiled_mip_chain_bytes' fallback bound. No GPU write is executed in this proof test.
+    const uint64_t table = reinterpret_cast<uint64_t>(g_table);
+    const uint64_t base = table - 1280u;
+    register_guest_linear_texture_layout(base, 4096u, 1024u);
+    const auto overlapping = uses_for(linear_r8_mip_t8(base), load_t8());
+    unregister_guest_linear_texture_layout(base);
+    EXPECT_FALSE(has_use(overlapping, 6u)) << "unknown linear writeback must revoke the proof";
+    EXPECT_TRUE(has_use(uses_for(r8_chain_t8(table - (16ull << 20), kChainLast), load_t8()), 6u))
+        << "a proven distant tiled mip chain still preserves the same descriptor use";
 }
