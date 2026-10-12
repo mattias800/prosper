@@ -223,6 +223,9 @@ constexpr uint32_t kProbeUnreachedCase[] = UNREACHED_CASE(0x8786c104u, 0xd501000
 constexpr uint32_t kProbeUnreachedCaseControl[] =
     UNREACHED_CASE(0xbf800000u, 0xbf800000u, 0xbf800000u);
 #undef UNREACHED_CASE
+// The irreducible tail reads v0 before the final export overwrites it. Supply genuine PS
+// position X without changing either instruction array or the unreachable projection's PC.
+constexpr PixelSystemInputMapping kUnreachedCaseInputs{.ena = 1u << 8, .addr = 1u << 8};
 // The merge-marked pair copied through M0, and through ttmp0/ttmp1, then ANDed.
 constexpr uint32_t kProbeThroughM0[] = {
     PROBE_PREFIX,           0xbefc0304u, 0xbe86037cu, 0xbefc0305u, 0xbe87037cu, 0x87880206u,
@@ -443,7 +446,8 @@ TEST(FragmentScalarPairMask, DispatcherSlotReloadRefuses) {
 
 TEST(FragmentScalarPairMask, UnreachedDispatcherCaseRefuses) {
     const std::vector<uint32_t> control =
-        recompile_fragment(kProbeUnreachedCaseControl, std::size(kProbeUnreachedCaseControl));
+        recompile_fragment(kProbeUnreachedCaseControl, std::size(kProbeUnreachedCaseControl),
+                           nullptr, &kUnreachedCaseInputs);
     ASSERT_FALSE(control.empty()) << "control: the same program without the unreached projection";
     bool has_switch = false;   // OpSwitch (251): only the CFG dispatcher emits one here
     for (size_t i = 5; i < control.size() && control[i] >> 16u;) {
@@ -453,13 +457,34 @@ TEST(FragmentScalarPairMask, UnreachedDispatcherCaseRefuses) {
     EXPECT_TRUE(has_switch) << "control: the program lowers through the CFG dispatcher";
     constexpr uint64_t kAddress = 0xa4725005ull;
     EXPECT_TRUE(recompile_fragment(kProbeUnreachedCase, std::size(kProbeUnreachedCase), nullptr,
-                                   nullptr, UINT32_MAX, nullptr, false,
+                                   &kUnreachedCaseInputs, UINT32_MAX, nullptr, false,
                                    {RecompileDiagnosticStage::Fragment, kAddress})
                     .empty())
         << "unreached case: words the MUST walk never filtered must not project";
     const std::string reason = last_terminal_reject_reason(kAddress);
     EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
     EXPECT_NE(reason.find("pc=6 words=8786c104"), std::string::npos) << reason;
+}
+
+TEST(FragmentScalarPairMask, UnreachedDispatcherControlNeedsGenuinePosition) {
+    ASSERT_FALSE(recompile_fragment(kProbeUnreachedCaseControl,
+                                    std::size(kProbeUnreachedCaseControl), nullptr,
+                                    &kUnreachedCaseInputs)
+                     .empty());
+    for (bool reserve_slot : {false, true}) {
+        SCOPED_TRACE(reserve_slot);
+        const PixelSystemInputMapping absent{.ena = 0, .addr = reserve_slot ? 1u << 8 : 0};
+        const uint64_t address = 0xa5001000ull + static_cast<uint64_t>(reserve_slot);
+        EXPECT_TRUE(recompile_fragment(kProbeUnreachedCaseControl,
+                                       std::size(kProbeUnreachedCaseControl), nullptr, &absent,
+                                       UINT32_MAX, nullptr, false,
+                                       {RecompileDiagnosticStage::Fragment, address})
+                        .empty())
+            << "a reserved or absent v0 cannot supply the tail's compare";
+        const std::string reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("cfg-recompile-reject"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=10 words=7c020300"), std::string::npos) << reason;
+    }
 }
 
 TEST(FragmentScalarPairMask, BallotOfMemoryCompareProjects) {
