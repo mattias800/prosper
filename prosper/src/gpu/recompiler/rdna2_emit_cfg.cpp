@@ -8,8 +8,8 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
-#include "gpu/recompiler/rdna2_wave32_dispatch_words.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
@@ -19,6 +19,7 @@
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_wave32_dispatch_words.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_copy_continuation.hpp"
 #include "gpu/recompiler/rdna2_local_vcc_data.hpp"
@@ -1585,25 +1586,14 @@ bool emit_cfg_state_machine(
         }
     }
 
-    // Wave32 saved masks can be replaced by ordinary scalar-data lifetimes. The dispatcher reloads
-    // a statically-shaped register file at every case, so carry both the one-word B32 mask domain
-    // and B64 saved-mask domain as compile-time properties of each basic-block entry. This is exact
-    // whenever all reachable predecessors agree. A disagreement means that the same physical SGPR
-    // is a mask on one edge and scalar data on another; keep that genuinely dynamic type join
-    // fail-visible.
-    //
-    // This is deliberately a MUST/equality analysis rather than a union: loading a stale Boolean on
-    // the scalar-data edge would be a silent miscompile. Compiler-generated save/restore regions,
-    // including Astro Bot's large Wave32 material loop, have identical domains at their joins.
     Wave32DispatchWords wave32_words(starts.size());
     auto& b32_mask_in = wave32_words.masks;
     auto& b64_mask_in = wave32_words.pairs;
     auto& b32_mask_reachable = wave32_words.reachable;
     std::unordered_set<uint32_t> proven_saved_mask_pair_compare_pcs;
-    if (!analyze_wave32_dispatch_words(b, ins, initial, starts, successors, proven_wave32_masks,
-                                       compute_scalar_vcc_bridge, wave32_words, static_mask_keys,
-                                       proven_saved_mask_pair_compare_pcs,
-                                       saved_mask_pair_compare_sources))
+    if (!analyze_wave32_dispatch_words(
+            b, ins, initial, starts, successors, direct_descriptor_sregs, wave32_words,
+            static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources))
         return false;
 
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
@@ -3058,6 +3048,7 @@ bool emit_cfg_state_machine(
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
         state.vector_native_interpolation = initial.vector_native_interpolation;
+        state.vector_wave_size = initial.vector_wave_size;
         state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
@@ -3193,12 +3184,19 @@ bool emit_cfg_state_machine(
         // A slot never written on some path reloads the prologue's zero: mark every reloaded slot
         // (#4706) except one written on EVERY path from a defined word (defined_slots, #4714).
         const SpilledMaskHalves& halves_in = wave64_spilled_halves_in[entry_block % starts.size()];
+        if (b.wave_size == 32 && (b.is_compute || b.is_fragment))
+            restore_wave32_dispatch_words(wave32_words, entry_block, state);
         if (entry_wave64_b64) mark_relayed_words(halves_in, state);   // and relayed SGPRs, #4749
         for (const auto& kv : lv)
             if (!(lmv.contains(kv.first) && slot_holds(kv.first, /*mask*/ true))) {
                 state.vgpr_lane_slots[kv.first.first][kv.first.second] =
                     b.load_function(b.t_u32, kv.second);
-                if (!(entry_wave64_b64 && halves_in.defined_slots.contains(kv.first)))
+                const bool wave32_slot =
+                    b.wave_size == 32 && entry_block < wave32_words.marks.size() &&
+                    wave32_words.reachable[entry_block] &&
+                    wave32_words.marks[entry_block].defined_slots.contains(kv.first);
+                if (!(wave32_slot ||
+                      (entry_wave64_b64 && halves_in.defined_slots.contains(kv.first))))
                     state.lane_slot_merge_placeholder.insert(kv.first);
             }
         for (const auto& kv : lmv)
@@ -3810,12 +3808,16 @@ bool emit_cfg_state_machine(
                         // lowering ran and could not resolve an operand or a resource-table
                         // descriptor. Without it a census cannot tell "implement this" from
                         // "this instruction is fine, its descriptor is not".
-                        log_recompile_diagnostic(
-                            b.diagnostic, "cfg-recompile-reject", "terminal",
-                            "mode=%s pc=%u words=%s len=%u fmt=%d op=0x%x",
-                            handled ? "unresolved-operand" : "unknown-encoding",
-                            in.pc, reject_words_text(in).c_str(), in.len_dwords,
-                            static_cast<int>(in.fmt), in.opcode);
+                    const bool stage_unsupported = b.wave_size == 32 &&
+                                                   b.stage_reject_pc == in.pc &&
+                                                   !b.stage_reject_reason.empty();
+                    log_recompile_diagnostic(b.diagnostic, "cfg-recompile-reject", "terminal",
+                                             "mode=%s%s%s pc=%u words=%s len=%u fmt=%d op=0x%x",
+                                             handled ? "unresolved-operand" : "unknown-encoding",
+                                             stage_unsupported ? " reason=" : "",
+                                             stage_unsupported ? b.stage_reject_reason.c_str() : "",
+                                             in.pc, reject_words_text(in).c_str(), in.len_dwords,
+                                             static_cast<int>(in.fmt), in.opcode);
                     return false;
                 }
                 // Ordinary scalar B64 logicals already produced an exact nonzero SCC id above.
@@ -4638,6 +4640,8 @@ bool emit_cfg_state_machine(
                 // alone cannot distinguish those placeholders from a genuinely refreshed SCC.
                 case 0x04:
                     if (!state.scc ||
+                        ((b.is_compute || b.is_fragment) && b.wave_size == 32 &&
+                         !wave32_words.scalar_scc_branches.contains(terminator->pc)) ||
                         ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
                          !proven_wave64_scalar_scc_branch_pcs.contains(terminator->pc)))
                         return reject_cfg(terminator->pc, "poisoned-scc");
@@ -4645,6 +4649,8 @@ bool emit_cfg_state_machine(
                     break;   // s_cbranch_scc0
                 case 0x05:
                     if (!state.scc ||
+                        ((b.is_compute || b.is_fragment) && b.wave_size == 32 &&
+                         !wave32_words.scalar_scc_branches.contains(terminator->pc)) ||
                         ((b.is_compute || b.is_fragment) && b.wave_size == 64 &&
                          !proven_wave64_scalar_scc_branch_pcs.contains(terminator->pc)))
                         return reject_cfg(terminator->pc, "poisoned-scc");
@@ -5817,7 +5823,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
                                exp_fn, code, dwords, &dead_masks, portable_service_prefix))
                     return false;
-                if (!rs.scc) return false;
+                if (!scalar_condition_defined(b, rs, ins[phased.guard_index].pc)) return false;
                 const uint32_t execute_body = ins[phased.guard_index].opcode == 0x04
                     ? rs.scc : b.logical_not(rs.scc);
                 const uint32_t body_label = b.id();
@@ -6164,7 +6170,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // An scc-conditioned forward-if with a POISONED SCC (rs.scc == 0: a 64-bit mask op was
             // the last architectural SCC writer, unrepresentable per-lane) must reject — this is
             // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
-            if (!F.on_exec && !F.on_vcc && !rs.scc) return false;
+            if (!F.on_exec && !F.on_vcc && !scalar_condition_defined(b, rs, F.branch_pc))
+                return false;
             if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
             if (b.is_fragment && (F.on_exec || F.on_vcc) &&
@@ -6348,7 +6355,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
         if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
-        if (!rs.scc) return false;   // condition region left SCC poisoned: the exit test is unknowable
+        if (!scalar_condition_defined(b, rs, L.exit_branch_pc))
+            return false;   // condition region left SCC poisoned: the exit test is unknowable
         // Snapshot condition-region register values (these dominate the merge — see defect A above).
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
@@ -6413,9 +6421,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // SCC takes the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
             // not a real codegen pattern (flags are transient, consumed by their branch), so the A-class
             // exit-iteration refinement is intentionally omitted for it.
-            else if (pr.dom == 2)
+            else if (pr.dom == 2) {
                 rs.scc = pr.phi;
-            else if (pr.dom == 3)
+                if (b.wave_size == 32) {
+                    // This path publishes the header phi, not the fresh check predicate.
+                    rs.scc_merge_placeholder = true;
+                    rs.scc_loop_blanket.clear();
+                }
+            } else if (pr.dom == 3)
                 rs.vcc = cond_vcc;
             else                  rs.exec = cond_exec;
         }
@@ -6997,7 +7010,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // header visit. Reusing the header phi would admit stale SCC, while a B64 wave-mask
             // producer poisons rs.scc to zero; both remain fail-visible.
             if (L.condition == DivLoop::Condition::Scc &&
-                (!rs.scc || rs.scc == condition_entry_scc))
+                (!scalar_condition_defined(b, rs, L.exit_branch_pc) ||
+                 rs.scc == condition_entry_scc))
                 return false;
             // chk-end snapshots: the exit path flows THROUGH this block, so these dominate the merge.
             std::unordered_map<int, uint32_t> condv_val, conds_val;
@@ -7100,9 +7114,25 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                    L.direct_exec_breaks || L.direct_wave_breaks ? &body_marks
                                                                                 : nullptr);
                     rs.sreg[pr.reg] = merged;
-                } else if (pr.dom == 2)
+                } else if (pr.dom == 2) {
                     rs.scc = merged;
-                else if (pr.dom == 3) rs.vcc = merged;
+                    if (b.wave_size == 32) {
+                        rs.scc_merge_placeholder = check_marks.scc;
+                        rs.scc_loop_blanket = check_marks.scc_blanket;
+                        if (L.direct_exec_breaks || L.direct_wave_breaks) {
+                            const bool hard =
+                                (check_marks.scc && check_marks.scc_blanket.empty()) ||
+                                (body_marks.scc && body_marks.scc_blanket.empty());
+                            rs.scc_merge_placeholder |= body_marks.scc;
+                            if (hard)
+                                rs.scc_loop_blanket.clear();
+                            else
+                                rs.scc_loop_blanket.insert(body_marks.scc_blanket.begin(),
+                                                           body_marks.scc_blanket.end());
+                        }
+                    }
+                } else if (pr.dom == 3)
+                    rs.vcc = merged;
                 else if (pr.dom == 4) rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
@@ -7153,9 +7183,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // mask bits to the architecture's wave-wide "any lane active" predicate.
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
-                if (!F.on_exec && !F.on_vcc && !rs.scc) {
+                if (!F.on_exec && !F.on_vcc && !scalar_condition_defined(b, rs, F.branch_pc)) {
                     log_recompile_diagnostic(b.diagnostic, "compute-struct-reject", "terminal",
-                                             "poisoned SCC at branch pc=%u", F.branch_pc);
+                                             b.wave_size == 32 ? "pc=%u reason=poisoned-scc"
+                                                               : "poisoned SCC at branch pc=%u",
+                                             F.branch_pc);
                     return false;
                 }
                 if (F.on_vcc && !rs.vcc) {

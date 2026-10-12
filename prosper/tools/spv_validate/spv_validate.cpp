@@ -1706,9 +1706,11 @@ int main(int argc, char** argv) {
     // A fresh explicit compare retires a dead low-word mask domain at a Wave32 join.
     for (bool unrelated_vector : {false, true}) {
         const auto code = prosper::test::fragment_compare_kill::program(unrelated_vector);
+        const auto inputs = prosper::test::fragment_compare_kill::position_inputs();
         dump(dir,
              unrelated_vector ? "fragment_compare_low_kill_vector" : "fragment_compare_low_kill",
-             recompile_fragment_wave32_for_test(code.data(), code.size()));
+             recompile_fragment(code.data(), code.size(), nullptr, &inputs, UINT32_MAX, nullptr,
+                                true));
     }
     // Native interpolation destinations must be joined before a later selection consumes them.
     for (uint32_t opcode : {1u, 2u}) {

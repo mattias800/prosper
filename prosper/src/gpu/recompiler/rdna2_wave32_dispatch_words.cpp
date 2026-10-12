@@ -1,29 +1,40 @@
 #include "gpu/recompiler/rdna2_wave32_dispatch_words.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
+#include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 namespace prosper::gpu {
 Wave32DispatchWords::Wave32DispatchWords(std::size_t count)
-    : masks(count), ambiguous(count), pairs(count), ambiguous_pairs(count),
-      reachable(count, false) {}
+    : masks(count), ambiguous(count), pairs(count), ambiguous_pairs(count), scalar_words(count),
+      marks(count), reachable(count, false), scalar_scc(count, false) {}
 bool analyze_wave32_dispatch_words(
     SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const RegState& initial,
     const std::vector<uint32_t>& starts, const std::vector<std::vector<uint32_t>>& successors,
-    bool proven_wave32_masks, bool compute_scalar_vcc_bridge, Wave32DispatchWords& words,
-    std::set<int>& static_mask_keys,
-    std::unordered_set<uint32_t>& proven_saved_mask_pair_compare_pcs,
-    const std::function<std::array<int, 2>(const Rdna2Inst&)>& saved_mask_pair_compare_sources) {
+    const std::set<int>& direct_descriptor_sregs, Wave32DispatchWords& words,
+    std::set<int>& static_mask_keys, std::unordered_set<uint32_t>& proven_pair_compares,
+    const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources) {
     auto& b32_mask_in = words.masks;
     auto& b32_mask_ambiguous_in = words.ambiguous;
     auto& b64_mask_in = words.pairs;
     auto& b64_mask_ambiguous_in = words.ambiguous_pairs;
     auto& b32_mask_reachable = words.reachable;
+    const bool proven_wave32_masks =
+        b.allow_b32_masks && (b.is_fragment || (b.is_compute && b.wave_size == 32));
+    const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
+    const int max_vgpr = shader_max_vgpr(ins);
+    const bool track_words = (b.is_compute || b.is_fragment) && b.wave_size == 32;
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
         for (const auto& mask : initial.sreg_bool) {
@@ -36,6 +47,15 @@ bool analyze_wave32_dispatch_words(
         // analysis as explicit Wave32 masks. A zero SSA id instead means the caller currently has
         // ordinary scalar data in the VCC words, so it deliberately does not seed the mask domain.
         if (initial.vcc) b32_mask_in.front().insert(106);
+        if (track_words) {
+            seed_native_logical_entry_marks(words.marks.front(), initial);
+            for (const auto& value : initial.sreg) words.scalar_words.front().insert(value.first);
+            for (const auto& value : initial.sreg_input)
+                words.scalar_words.front().insert(value.first);
+            words.scalar_words.front().insert(direct_descriptor_sregs.begin(),
+                                              direct_descriptor_sregs.end());
+            words.scalar_scc.front() = initial.scc && !initial.scc_merge_placeholder;
+        }
         b32_mask_reachable.front() = true;
         auto implicit_vcc_mask_source = [](const Rdna2Inst& in) -> int {
             if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
@@ -66,21 +86,45 @@ bool analyze_wave32_dispatch_words(
             std::set<int> ambiguous = b32_mask_ambiguous_in[block];
             std::set<int> b64_masks = b64_mask_in[block];
             std::set<int> b64_ambiguous = b64_mask_ambiguous_in[block];
+            auto scalar_words = words.scalar_words[block];
+            auto marks = words.marks[block];
+            bool scalar_scc = words.scalar_scc[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
 
-                const auto compare_sources = saved_mask_pair_compare_sources(in);
+                // Snapshot actual consumed word domains before an overlapping destination write.
+                std::set<int> source_words;
+                SpilledVectorSourceMarks source;
+                bool definite_scc = false;
+                if (track_words) {
+                    source_words = scalar_words;
+                    source_words.insert(masks.begin(), masks.end());
+                    for (int pair : b64_masks) {
+                        source_words.insert(pair);
+                        source_words.insert(pair + 1);
+                    }
+                    definite_scc = scalar_scc && !marks.relayed_words.contains(kRelayedScc);
+                    source =
+                        spilled_vector_source_marks(marks, in, {}, source_words, definite_scc, 32);
+                    if (in.fmt == Rdna2Format::SOPP && (in.opcode == 4 || in.opcode == 5)) {
+                        if (definite_scc)
+                            words.scalar_scc_branches.insert(in.pc);
+                        else
+                            words.scalar_scc_branches.erase(in.pc);
+                    }
+                }
+                const auto compare_sources = pair_compare_sources(in);
                 if (compare_sources[0] >= 0) {
                     const bool proven = b64_masks.contains(compare_sources[0]) &&
                                         b64_masks.contains(compare_sources[1]) &&
                                         !b64_ambiguous.contains(compare_sources[0]) &&
                                         !b64_ambiguous.contains(compare_sources[1]);
                     if (proven)
-                        proven_saved_mask_pair_compare_pcs.insert(in.pc);
+                        proven_pair_compares.insert(in.pc);
                     else
-                        proven_saved_mask_pair_compare_pcs.erase(in.pc);
+                        proven_pair_compares.erase(in.pc);
                 }
 
                 // The dispatcher may use a false backing value for a physical VCC lifetime that is
@@ -260,10 +304,46 @@ bool analyze_wave32_dispatch_words(
                     masks.insert(destination);
                     ambiguous.erase(destination);
                 }
+                if (track_words) {
+                    std::vector<std::pair<int, uint32_t>> scalar_writes;
+                    for_each_scalar_write(
+                        in,
+                        [&](int base, uint32_t width) { scalar_writes.emplace_back(base, width); },
+                        proven_wave32_masks);
+                    std::vector<int> vector_writes;
+                    for_each_possible_vector_write(in, max_vgpr,
+                                                   [&](int reg) { vector_writes.push_back(reg); });
+                    advance_defined_slots(marks, in, {}, source_words, scalar_writes, vector_writes,
+                                          source, definite_scc, 32);
+                    for (const auto& [base, width] : scalar_writes)
+                        for (uint32_t word = 0; word < width; ++word)
+                            scalar_words.insert(base + static_cast<int>(word));
+                    if (scalar_instruction_writes_scc(in)) {
+                        // The numeric inputs must be genuine AND the current lowering must publish
+                        // scalar SCC, not the backing false used for an unavailable mask reduction.
+                        const bool mask_result =
+                            writes_b32_mask || writes_b64_mask || wave32_b64_vcc_mask_write ||
+                            ((in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2) &&
+                             (in.dst.value == 126 || in.dst.value == 127));
+                        const bool fragment_vote =
+                            b.is_fragment && initial.reads_scc &&
+                            ((in.fmt == Rdna2Format::SOP1 &&
+                              (sop1_opcode_is_emitted_saveexec_b32(in.opcode) ||
+                               in.opcode == kSop1OpcodeAndSaveexecB64)) ||
+                             (in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0e &&
+                              in.opcode <= 0x1d));
+                        scalar_scc = !source.scalar_relay && (!mask_result || fragment_vote);
+                    } else if (!scalar_instruction_preserves_scc(in)) {
+                        scalar_scc = scalar_scc && !source.scalar_relay;
+                    }
+                }
             }
 
             for (uint32_t successor : successors[block]) {
                 if (!b32_mask_reachable[successor]) {
+                    words.scalar_words[successor] = scalar_words;
+                    words.marks[successor] = marks;
+                    words.scalar_scc[successor] = scalar_scc;
                     b32_mask_reachable[successor] = true;
                     b32_mask_in[successor] = masks;
                     b32_mask_ambiguous_in[successor] = ambiguous;
@@ -294,10 +374,22 @@ bool analyze_wave32_dispatch_words(
                         if (!b64_mask_in[successor].contains(reg)) joined_b64_ambiguous.insert(reg);
                     joined_b64_ambiguous.insert(b64_ambiguous.begin(), b64_ambiguous.end());
                     for (int reg : joined_b64_ambiguous) joined_b64_masks.erase(reg);
-                    if (joined_masks != b32_mask_in[successor] ||
+                    auto joined_words = words.scalar_words[successor];
+                    std::erase_if(joined_words,
+                                  [&](int reg) { return !scalar_words.contains(reg); });
+                    auto joined_marks = words.marks[successor];
+                    meet_spilled_mask_halves(joined_marks, marks);
+                    const bool joined_scc = words.scalar_scc[successor] && scalar_scc;
+                    if (joined_words != words.scalar_words[successor] ||
+                        joined_marks != words.marks[successor] ||
+                        joined_scc != words.scalar_scc[successor] ||
+                        joined_masks != b32_mask_in[successor] ||
                         joined_ambiguous != b32_mask_ambiguous_in[successor] ||
                         joined_b64_masks != b64_mask_in[successor] ||
                         joined_b64_ambiguous != b64_mask_ambiguous_in[successor]) {
+                        words.scalar_words[successor] = std::move(joined_words);
+                        words.marks[successor] = std::move(joined_marks);
+                        words.scalar_scc[successor] = joined_scc;
                         b32_mask_in[successor] = std::move(joined_masks);
                         b32_mask_ambiguous_in[successor] = std::move(joined_ambiguous);
                         b64_mask_in[successor] = std::move(joined_b64_masks);
@@ -316,5 +408,22 @@ bool analyze_wave32_dispatch_words(
     }
 
     return true;
+}
+void restore_wave32_dispatch_words(const Wave32DispatchWords& words, uint32_t block,
+                                   RegState& state) {
+    if (block >= words.reachable.size() || !words.reachable[block]) {
+        for (const auto& [reg, value] : state.sreg) state.sreg_merge_placeholder.insert(reg);
+        for (const auto& [reg, value] : state.vreg) {
+            auto& mark = state.vreg_source_marks[reg];
+            mark.placeholder = mark.hard = true;
+        }
+        state.scc_merge_placeholder = true;
+        state.vector_full_exec = false;
+        return;
+    }
+    mark_relayed_words(words.marks[block], state);
+    for (const auto& [reg, value] : state.sreg)
+        if (!words.scalar_words[block].contains(reg)) state.sreg_merge_placeholder.insert(reg);
+    if (!words.scalar_scc[block]) state.scc_merge_placeholder = true;
 }
 }   // namespace prosper::gpu

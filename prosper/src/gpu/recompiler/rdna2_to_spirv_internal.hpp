@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
@@ -2976,6 +2977,7 @@ struct RegState {
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
+    uint32_t vector_wave_size = 64;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
     // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
     // makes an overwrite or control-flow merge invalidate it automatically.
@@ -3048,6 +3050,7 @@ struct RegState {
     // s_cselect/s_cmov/s_addc/s_subb carries the mark into its destination even with clean
     // explicit sources.
     bool scc_merge_placeholder = false;
+    std::set<uint64_t> scc_loop_blanket;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
@@ -3296,7 +3299,9 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
 // this same question, so a COPY of such a word stays clean too (#4714 review). And a shell that
 // seeds no launch state (recompile_coverage) cannot tell never-written from launch data at all.
 inline bool sreg_word_absent_unmasked(const RegState& rs, int r) {
-    return r >= 0 && r <= 105 && !rs.sreg.contains(r) && !rs.sreg_bool.contains(r) &&
+    const int last = rs.vector_wave_size == 32 ? 124 : 105;
+    return r >= 0 && r <= last && !rs.sreg.contains(r) && !rs.sreg_bool.contains(r) &&
+           !(r == 106 && rs.vcc) &&
            !(r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
 }
 inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
@@ -3417,6 +3422,7 @@ struct MergeEdgeMarks {
     std::set<int> memory;   // this edge's memory-pattern marks
     std::set<int> unavailable_saved_mask_words;
     bool scc = false;   // this edge's SCC is marked or poisoned (merges as bfalse)
+    std::set<uint64_t> scc_blanket;
     // This edge's v_writelane spill-slot marks. A merge keeps only one edge's slot map, so a slot
     // the OTHER edge left marked would otherwise come out clean (#4725 review).
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
@@ -3434,6 +3440,7 @@ MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) 
     marks.memory = rs.sreg_memory_pattern;
     marks.unavailable_saved_mask_words = rs.unavailable_saved_mask_words;
     marks.scc = rs.scc_merge_placeholder || !rs.scc;
+    marks.scc_blanket = rs.scc_loop_blanket;
     marks.slot_fabricated = rs.lane_slot_merge_placeholder;
     marks.slot_memory = rs.lane_slot_memory_pattern;
     marks.vectors = rs.vreg_source_marks;
@@ -3459,6 +3466,12 @@ inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) 
     rs.vector_full_exec = rs.vector_full_exec && other.vector_full_exec;
     rs.unavailable_saved_mask_words.insert(other.unavailable_saved_mask_words.begin(),
                                            other.unavailable_saved_mask_words.end());
+    const bool scc_hard = ((rs.scc_merge_placeholder || !rs.scc) && rs.scc_loop_blanket.empty()) ||
+                          (other.scc && other.scc_blanket.empty());
+    if (scc_hard)
+        rs.scc_loop_blanket.clear();
+    else
+        rs.scc_loop_blanket.insert(other.scc_blanket.begin(), other.scc_blanket.end());
     rs.scc_merge_placeholder = rs.scc_merge_placeholder || !rs.scc || other.scc;
     rs.lane_slot_merge_placeholder.insert(other.slot_fabricated.begin(),
                                           other.slot_fabricated.end());
@@ -3536,6 +3549,8 @@ struct LoopBlanketCheck {
         };
         sanitize(exits.blanket, exits.vectors);
         sanitize(rs.sreg_loop_blanket, rs.vreg_source_marks);
+        if (invalid(exits.scc_blanket)) exits.scc_blanket.clear();
+        if (invalid(rs.scc_loop_blanket)) rs.scc_loop_blanket.clear();
         if (read_word < 0) return true;
         log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                  "loop-carried %c%d is fabricated on the back edge but was read as "
@@ -3571,6 +3586,7 @@ void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector
         }
     }
     rs.scc_merge_placeholder = true;
+    rs.scc_loop_blanket.clear();
     for (const Rdna2Inst& in : ins)
         if (in.pc >= lo && in.pc < hi && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
             in.src[1].kind == OperandKind::InlineInt)
@@ -3585,11 +3601,19 @@ struct LoopCheckMarks {
     std::map<int, std::set<uint64_t>> blanket;   // the check block's sreg_loop_blanket
     VectorWordMarks vectors;
     bool vector_full_exec = false;
+    bool scc = false;
+    std::set<uint64_t> scc_blanket;
 };
 inline LoopCheckMarks loop_check_marks(const RegState& rs) {
-    return {rs.sreg_merge_placeholder,   rs.sreg_memory_pattern, rs.lane_slot_merge_placeholder,
-            rs.lane_slot_memory_pattern, rs.sreg_loop_blanket,   rs.vreg_source_marks,
-            rs.vector_full_exec};
+    return {rs.sreg_merge_placeholder,
+            rs.sreg_memory_pattern,
+            rs.lane_slot_merge_placeholder,
+            rs.lane_slot_memory_pattern,
+            rs.sreg_loop_blanket,
+            rs.vreg_source_marks,
+            rs.vector_full_exec,
+            rs.scc_merge_placeholder || !rs.scc,
+            rs.scc_loop_blanket};
 }
 // The spill slots at a loop exit: `rs` holds the body end's slot map, so union in the check
 // block's marks (a slot marked on either is marked after the loop).
@@ -3976,6 +4000,10 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
     const bool move_preserves_scc =
         in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
+    if (rs.vector_wave_size == 32) {
+        record_wave32_scalar_condition(rs, in, marks);
+        return;
+    }
     if (scalar_alu && marks.placeholder && !move_preserves_scc)
         rs.scc_merge_placeholder = true;
     else if (in.fmt == Rdna2Format::SOPC)

@@ -2589,6 +2589,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_wave32_word_provenance
+    SOURCES tests/gpu/recompiler/test_wave32_word_provenance.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_word_definedness
     SOURCES tests/gpu/recompiler/test_vector_word_definedness.cpp
     INCLUDES tests

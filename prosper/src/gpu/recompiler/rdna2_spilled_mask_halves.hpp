@@ -64,7 +64,7 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
                                                      const std::set<int>& scalar_words,
-                                                     bool definite_scc);
+                                                     bool definite_scc, uint32_t wave_size = 64);
 
 // CFG join: keep only the facts every incoming path agrees on (`relayed_words`, a MAY fact, takes
 // every path's).
@@ -76,7 +76,8 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::set<int>& masks, const std::set<int>& scalar_words,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                            const std::vector<int>& vector_writes,
-                           const SpilledVectorSourceMarks& source, bool definite_scc);
+                           const SpilledVectorSourceMarks& source, bool definite_scc,
+                           uint32_t wave_size = 64);
 
 // At a dispatcher block entry: the reloaded SGPR words (and SCC) that may be relayed fabricated
 // words get the emitter's merge-placeholder mark, as they carried inside the case they left.
