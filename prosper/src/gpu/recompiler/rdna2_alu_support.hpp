@@ -48,7 +48,10 @@ bool emit_s_cmov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
 bool emit_exec_cmov(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok);
 void record_s_bfm_b64_scalar_data(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                                   uint32_t width, uint32_t offset, bool ok);
-uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+bool numeric_vcc_move_has_lane_context(const SpirvCompute& b);
+uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+void retire_data_only_b64_mask(RegState& rs, int destination);
+bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool source_mask);
 uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                                          uint32_t fallback);
 const char* packet_b64_mask_move_source_gap(const SpirvCompute& b, const Rdna2Inst& in,

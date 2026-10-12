@@ -1012,7 +1012,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {   // set/restore EXEC
                         ok = emit_s_mov_b64_exec(b, rs, in);
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
-                        uint32_t m = packet_s_mov_b64_numeric_vcc_bit(b, rs, in);
+                        uint32_t m = s_mov_b64_numeric_vcc_bit(b, rs, in);
                         if (!m) m = src_mask(in.src[0]);
                         if (m && !validate_saved_mask_copy_words(b, rs, in)) {
                             ok = false;
@@ -1035,28 +1035,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         bool data_copied = false;
                         if (in.src[0].kind == OperandKind::SGPR ||
                             (in.src[0].kind == OperandKind::Special && in.src[0].value >= 106 && in.src[0].value <= 123)) {
-                            bool complete_pair = true;
-                            for (int k = 0; k < 2; k++) {
-                                int s = in.src[0].value + k, dr = in.dst.value + k;
-                                auto it = rs.sreg.find(s);
-                                if (it != rs.sreg.end()) {
-                                    rs.sreg[dr] = it->second;
-                                } else {
-                                    auto input = rs.sreg_input.find(s);
-                                    if (input != rs.sreg_input.end())
-                                        rs.sreg[dr] = input->second;
-                                    else {
-                                        rs.sreg.erase(dr);
-                                        complete_pair = false;
-                                    }
-                                }
-                                auto jt = rs.sreg_srt.find(s);
-                                if (jt != rs.sreg_srt.end()) rs.sreg_srt[dr] = jt->second; else rs.sreg_srt.erase(dr);
-                            }
-                            // Preserve the established unwritten-SGPR-as-zero behavior for an
-                            // ordinary data move. A Bool alias needs both real words, however; an
-                            // incomplete pair must retain the absence of original DATA authority.
-                            data_copied = complete_pair || !m;
+                            data_copied = copy_s_mov_b64_scalar_pair(rs, in.src[0].value,
+                                                                     in.dst.value, m != 0);
                         } else if (in.src[0].kind == OperandKind::InlineInt) {   // 64-bit sign-extended constant
                             rs.sreg[in.dst.value]     = b.uconst((uint32_t)in.src[0].value);
                             rs.sreg[in.dst.value + 1] = b.uconst(in.src[0].value < 0 ? 0xFFFFFFFFu : 0u);
@@ -1081,7 +1061,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             data_copied = true;
                         }
                         if (data_copied && !m) {   // data-only move: drop any stale saved-mask alias
-                            rs.sreg_bool.erase(in.dst.value); rs.sreg_bool_narrowed.erase(in.dst.value);
+                            retire_data_only_b64_mask(rs, in.dst.value);
                         }
                         // Mask-only source (EXEC/a saved bool with no data half): the pair was still
                         // architecturally overwritten — stale data/descriptor entries must not survive.
