@@ -173,6 +173,7 @@ of its manifest.
 | Assassin's Creed Black Flag Resynced | `PPSA28183` | 1 | `1-----` | - | - | - | [#4139](https://github.com/mattias800/prosper/issues/4139) | [#4131](https://github.com/mattias800/prosper/issues/4131) | [`AC_BLACK_FLAG_STATUS.md`](prosper/docs/games/AC_BLACK_FLAG_STATUS.md) |
 | BlazBlue Entropy Effect X | `PPSA29714` | 1 | `1-----` | - | - | - | - | [#3496](https://github.com/mattias800/prosper/issues/3496) | - |
 | Little Nightmares II | `PPSA02154` | 1 | `1-----` | **6.9** fps · 19% active · 4K · boot logo sequence, then a flat white clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932) | [#2884](https://github.com/mattias800/prosper/issues/2884) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
+| Luna Abyss | `PPSA36257` | 1 | `1-----` | - | - | - | [#4808](https://github.com/mattias800/prosper/issues/4808) | [#5038](https://github.com/mattias800/prosper/issues/5038) | - |
 | METAL GEAR SOLID 4 (Master Collection) | `PPSA18194` | 1 | `1-----` | - | - | - | [#5025](https://github.com/mattias800/prosper/issues/5025) | [#5032](https://github.com/mattias800/prosper/issues/5032) | - |
 | METAL GEAR SOLID: Peace Walker (Master Collection) | `PPSA18216` | 1 | `1-----` | - | - | - | [#5025](https://github.com/mattias800/prosper/issues/5025) | [#5033](https://github.com/mattias800/prosper/issues/5033) | - |
 | Metaphor: ReFantazio | `PPSA20800` | 1 | `1-----` | **51.0** fps · 95% active · 4K · loading mascot then the language-selection screen, held for the whole run · screenshot · 2026-08-23 | - | none | [#2952](https://github.com/mattias800/prosper/issues/2952), [#2932](https://github.com/mattias800/prosper/issues/2932) | [#2876](https://github.com/mattias800/prosper/issues/2876) | [`METAPHOR_STATUS.md`](prosper/docs/games/METAPHOR_STATUS.md) |
@@ -186,6 +187,7 @@ of its manifest.
 | NINJA GAIDEN 4 | `PPSA25258` | 0 | `------` | - | - | - | - | [#3500](https://github.com/mattias800/prosper/issues/3500) | - |
 | Onimusha: Way of the Sword | `PPSA27836` | 0 | `------` | - | - | none | - | [#4022](https://github.com/mattias800/prosper/issues/4022) | - |
 | Resident Evil 4 | `PPSA07412` | 0 | `------` | - | - | - | - | [#5030](https://github.com/mattias800/prosper/issues/5030) | - |
+| RESIDENT EVIL requiem | `PPSA31246` | 0 | `------` | - | - | - | - | [#5035](https://github.com/mattias800/prosper/issues/5035) | - |
 | Resident Evil Village | `PPSA01557` | 0 | `------` | - | - | - | - | [#5029](https://github.com/mattias800/prosper/issues/5029) | - |
 | Sifu | `PPSA03001` | 0 | `------` | **0.2** fps · 5% active · 4K · flat 4K clear, no content · screenshot · 2026-08-22 | - | none | [#2908](https://github.com/mattias800/prosper/issues/2908), [#2935](https://github.com/mattias800/prosper/issues/2935) | [#2885](https://github.com/mattias800/prosper/issues/2885) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | [#2871](https://github.com/mattias800/prosper/issues/2871) | [#2867](https://github.com/mattias800/prosper/issues/2867) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
@@ -206,9 +208,9 @@ of its manifest.
 | 4 -- manual visual verification | 3 |
 | 3 -- gameplay with the scene rendering | 12 |
 | 2 -- title screen | 23 |
-| 1 -- any real graphics | 9 |
-| 0 -- not started | 19 |
+| 1 -- any real graphics | 10 |
+| 0 -- not started | 20 |
 
-**4 of 81** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 20 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 83** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 22 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.

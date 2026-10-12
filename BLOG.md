@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-13
+
+### Luna Abyss shows its first splash
+
+*Luna Abyss* renders its FMOD logo splash, then goes black while many of its shaders are still refused ([tracker #5038](https://github.com/mattias800/prosper/issues/5038)).
+
+<p align="center"><img src="assets/screenshots/luna-abyss-fmod-splash.webp" alt="Luna Abyss: Made with FMOD Studio logo splash on black; Linux RADV prosper-app, default launch, host frame 400"></p>
+
 ## 2026-10-12
 
 ### Two Metal Gear Solid collection titles reach their first screens

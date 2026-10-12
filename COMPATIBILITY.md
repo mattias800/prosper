@@ -100,6 +100,7 @@ Last updated: 2026-10-12
 | *METAL GEAR SOLID: Peace Walker (Master Collection)* | `PPSA18216` | — | 🔬 Rung 1 — content warning, matchmaking notice and the language-selection menu render at 4K, then the screen goes black (`sceSystemServiceLoadExec` unimplemented, [#5025](https://github.com/mattias800/prosper/issues/5025)) | [#5033](https://github.com/mattias800/prosper/issues/5033) |
 | *STAR WARS: Galactic Racer* | `PPSA28416` | — | 🔬 Rung 0 — the guest entry thread dies on a null dereference (`eboot+0x26a5149`) during boot; no frame is presented | [#5034](https://github.com/mattias800/prosper/issues/5034) |
 | *RESIDENT EVIL requiem* | `PPSA31246` | RE Engine | 🔬 Rung 0 — 60 flips/s but only about 40 frames ever reach the screen; 28k fragment draws and 170k compute dispatches are dropped in 80 s | [#5035](https://github.com/mattias800/prosper/issues/5035) |
+| *Luna Abyss* | `PPSA36257` | Unreal Engine 4 | 🔬 Rung 1 — the FMOD logo splash renders, then black; 23,453 draws dropped and 15,510 dispatches skipped in 86 s, and one of two runs hit a guest null-page fault about 50 s in | [#5038](https://github.com/mattias800/prosper/issues/5038) |
 
 ## At a glance
 
@@ -922,6 +923,13 @@ On its first run the title plays its content warning, brightness setup and intro
 its 3D title menu at 4K, which the owner checked by eye. It runs at about 8 fps. Route:
 `prosper/scripts/blood-of-dawnwalker-PPSA28000/reach-title-screen.pad`. See the
 [tracker](https://github.com/mattias800/prosper/issues/4792).
+
+## Luna Abyss — `PPSA36257`
+
+<p align="center"><img src="assets/screenshots/luna-abyss-fmod-splash.webp" alt="Luna Abyss: Made with FMOD Studio logo splash on black; Linux RADV prosper-app, default launch, host frame 400"></p>
+
+An Unreal Engine 4 title. It renders the FMOD splash and then goes black while many of its shaders are refused, and the owner saw keyboard ("Esc") button prompts. See the
+[tracker](https://github.com/mattias800/prosper/issues/5038).
 
 ## METAL GEAR SOLID 4 and METAL GEAR SOLID: Peace Walker (Master Collection) — `PPSA18194`, `PPSA18216`
 
