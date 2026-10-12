@@ -3801,6 +3801,11 @@ endif()
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_coverage_inputs
+    SOURCES tests/gpu/recompiler/test_compute_coverage_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_scalar_condition_preservation
     SOURCES tests/gpu/recompiler/test_scalar_condition_preservation.cpp
     LIBRARIES prosper_core)
