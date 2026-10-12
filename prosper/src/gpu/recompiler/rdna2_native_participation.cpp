@@ -394,13 +394,21 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         if (dst >= 0 && dst < 128) f.scalar[dst] = {fixed && before.common, genuine, std::nullopt};
         if (dst >= 0 && dst < 128) {
             bool uniform = false;
-            if (fixed && selector.numeric_uniform && before.numeric_common &&
-                in.src[0].kind == OperandKind::VGPR) {
-                const auto slot = before.numeric_slots.find({in.src[0].value, *selector.constant});
-                if (slot != before.numeric_slots.end())
-                    uniform = slot->second;
-                else if (!before.numeric_slot_vgprs.contains(in.src[0].value))
-                    uniform = genuine;
+            if (selector.genuine && selector.numeric_uniform && before.numeric_common &&
+                in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
+                in.src[0].value < 256) {
+                if (fixed) {
+                    const auto slot =
+                        before.numeric_slots.find({in.src[0].value, *selector.constant});
+                    if (slot != before.numeric_slots.end())
+                        uniform = slot->second;
+                    else if (!before.numeric_slot_vgprs.contains(in.src[0].value))
+                        uniform = genuine;
+                } else if (ordinary(b) && !before.numeric_slot_vgprs.contains(in.src[0].value)) {
+                    // A genuine uniform selector may choose any peer in this complete native
+                    // wave. Every possible source lane must be current; slot storage is separate.
+                    uniform = before.vector[in.src[0].value] == full;
+                }
             }
             f.scalar[dst].numeric_uniform = uniform;
         }

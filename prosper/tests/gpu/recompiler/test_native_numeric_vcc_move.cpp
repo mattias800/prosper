@@ -1,6 +1,7 @@
 // #4967: replacing VCC with current numeric words must replace its old predicate too.
 // Execute actual compiler CFG/phis and storage sinks on a strict CPU oracle; no Vulkan device.
 #include "bpermute_spirv_oracle.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/native_execution_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -621,4 +622,90 @@ TEST(NativeNumericVccMove, ASeparateHighDataWordPreservesTheCurrentWave32LowPred
         for (uint32_t lane = 0; lane < 32; ++lane)
             EXPECT_EQ(got[lane], lane < 8 ? 1u : 0u) << "lane " << lane;
     }
+}
+
+namespace {
+std::vector<uint32_t> direct_readfirst_vcc(bool high, bool uniform) {
+    auto p = numeric(high ? 1u : 255u, 0);
+    const auto use = std::find(p.begin(), p.end(), mov(126, 106, true));
+    p.insert(use, {uniform ? 0x7e040281u : 0x4a040081u, high ? 0x7ed60502u : 0x7ed40502u,
+                   mov(106, 106, true)});
+    return p;
+}
+}   // namespace
+
+TEST(NativeNumericVccMove, DirectReadfirstLowCannotRecoverTheOldCompletePredicate) {
+    // Full EXEC makes the architectural first value 1. The bounded native fallback retains
+    // each worker's source instead, so it must refuse rather than restore the old eight lanes.
+    refuses(direct_readfirst_vcc(false, false), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, DirectConstantReadfirstLowProjectsTheCurrentWord) {
+    values(direct_readfirst_vcc(false, true), expected(1));
+}
+TEST(NativeNumericVccMove, DirectReadfirstHighCannotRecoverTheOldCompletePredicate) {
+    refuses(direct_readfirst_vcc(true, false), prosper::test::native_execution_launch());
+}
+TEST(NativeNumericVccMove, DirectConstantReadfirstHighProjectsBothCurrentWords) {
+    values(direct_readfirst_vcc(true, true), expected(UINT64_C(0x100000001)));
+}
+
+TEST(NativeNumericVccMove, DirectReadfirstHighPreservesAnIndependentWave32LowPredicate) {
+    auto c = prosper::test::native_execution_launch();
+    c.local_x = c.wave_size = c.native_subgroup_size = 32;
+    prosper::test::complete_compute_launch(c);
+    std::vector<uint32_t> p{0x7e060280u, 0x7e020280u, 0x7d880088u, 0x7e040281u, 0x7ed60502u};
+    finish(p);
+    const auto r = compile(p, c);
+    ASSERT_FALSE(r.module.empty()) << r.reasons;
+    bpermute_oracle::Interpreter vm(r.module);
+    vm.native_subgroup_width = 32;
+    const auto got = vm.run(32, std::vector<uint32_t>(32, 0xdeadbeef));
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(got.size(), 32u);
+    for (uint32_t lane = 0; lane < 32; ++lane) EXPECT_EQ(got[lane], lane < 8 ? 1u : 0u) << lane;
+}
+
+namespace {
+std::vector<uint32_t> direct_runtime_readlane_vcc(bool high) {
+    auto p = numeric(high ? 1u : 255u, 0);
+    const auto use = std::find(p.begin(), p.end(), mov(126, 106, true));
+    p.insert(use,
+             {0x4a040081u, high ? 0xd760006bu : 0xd760006au, 0x00000902u, mov(106, 106, true)});
+    return p;
+}
+}   // namespace
+
+TEST(NativeNumericVccMove, UniformRuntimeReadlaneSelectorProjectsCurrentLowBits) {
+    for (uint32_t selector : {0u, 7u, 63u, 72u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5);
+        c.user_sgprs[4] = selector;
+        values(direct_runtime_readlane_vcc(false), expected((selector & 63u) + 1u), c);
+    }
+}
+TEST(NativeNumericVccMove, UniformRuntimeReadlaneSelectorProjectsCurrentHighBits) {
+    for (uint32_t selector : {0u, 7u, 63u, 72u}) {
+        auto c = prosper::test::native_execution_launch();
+        c.user_sgprs.resize(5);
+        c.user_sgprs[4] = selector;
+        values(direct_runtime_readlane_vcc(true),
+               expected(1u | (uint64_t((selector & 63u) + 1u) << 32u)), c);
+    }
+}
+TEST(NativeNumericVccMove, MissingReadlaneSelectorCannotAuthenticateCurrentVccWords) {
+    auto c = prosper::test::native_execution_launch();
+    c.user_sgprs.resize(4);
+    for (bool high : {false, true}) {
+        ASSERT_FALSE(compile(numeric(255, 0), c).module.empty());
+        EXPECT_TRUE(compile(direct_runtime_readlane_vcc(high), c).module.empty());
+    }
+}
+
+TEST(NativeNumericVccMove, LaneLocalReadlaneSelectorCannotAuthenticateCurrentVccWords) {
+    auto p = direct_runtime_readlane_vcc(false);
+    const auto source = std::find(p.begin(), p.end(), 0x4a040081u);
+    ASSERT_NE(source, p.end());
+    p.insert(source,
+             0x7e080500u);   // READFIRST s4,v0 keeps a lane-local selector in this fallback.
+    refuses(p, prosper::test::native_execution_launch());
 }

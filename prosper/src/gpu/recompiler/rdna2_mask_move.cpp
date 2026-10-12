@@ -119,6 +119,14 @@ void retire_data_only_b64_mask(RegState& rs, int destination) {
     if (destination == 106 || destination == 107) rs.vcc = 0;
 }
 
+void retire_scalar_data_word_mask(RegState& rs, int destination) {
+    rs.sreg_bool.erase(destination);
+    rs.sreg_bool_narrowed.erase(destination);
+    rs.sreg_bool_b32.erase(destination);
+    if (destination == 106 || (destination == 107 && !rs.sreg_bool_b32.contains(106)))
+        retire_data_only_b64_mask(rs, 106);
+}
+
 // Resolve the entire old pair before publishing either destination. A legal self-copy must
 // retain both original values and descriptor offsets throughout publication.
 bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool source_mask) {

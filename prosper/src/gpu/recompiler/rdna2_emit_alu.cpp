@@ -1445,14 +1445,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
             // An ordinary scalar-data write starts a new lifetime for this physical word.  Do not
             // let an earlier Wave32 mask save alias that new value in later mask-domain moves.
-            rs.sreg_bool.erase(in.dst.value);
-            rs.sreg_bool_narrowed.erase(in.dst.value);
-            rs.sreg_bool_b32.erase(in.dst.value);
             // A numeric half starts a new physical generation. A complete VCC self-copy must
             // not recover the departed B64 predicate when numeric uniformity is unproved.
             // An independently tagged B32 low mask does not own the adjacent high DATA word.
-            if (in.dst.value == 106 || (in.dst.value == 107 && !rs.sreg_bool_b32.contains(106)))
-                retire_data_only_b64_mask(rs, 106);
+            retire_scalar_data_word_mask(rs, in.dst.value);
             switch (in.opcode) {
                 case 0x03: {                                // s_mov_b32
                     d = a;
@@ -3057,6 +3053,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // integer-divide reciprocal in the game's shaders). Writes an SGPR, not a VGPR.
                 rs.sreg[in.dst.value] = a;
                 rs.sreg_srt.erase(in.dst.value);
+                retire_scalar_data_word_mask(rs, in.dst.value);
                 // #3596: record that this scalar is NOT wave-uniform. The value above is one lane's,
                 // so any later proof that reasons "it is in an SGPR, therefore it broadcasts" is
                 // wrong about it. Tainting the SSA value rather than the register makes the taint
@@ -4335,10 +4332,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         result = b.subgroup_shuffle(source->second, source_lane);
                     }
                     rs.sreg[in.dst.value] = result;
-                    rs.sreg_bool.erase(in.dst.value);
-                    rs.sreg_bool_narrowed.erase(in.dst.value);
+                    if (b.wave_size == 64)
+                        retire_scalar_data_word_mask(rs, in.dst.value);
+                    else {
+                        rs.sreg_bool.erase(in.dst.value);
+                        rs.sreg_bool_narrowed.erase(in.dst.value);
+                    }
                     rs.sreg_srt.erase(in.dst.value);
-                    if (in.dst.value == 106) {
+                    if (in.dst.value == 106 && b.wave_size != 64) {
                         const uint32_t bit = b.ibin(Op_BitwiseAnd, result, b.uconst(1));
                         rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
                         rs.sreg_bool_narrowed[106] = true;
@@ -4434,8 +4435,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (b.is_fragment && static_lane) {
                         rs.sreg[in.dst.value] = b.subgroup_shuffle(
                             val(in.src[0]), b.uconst(static_cast<uint32_t>(lane)));
-                        rs.sreg_bool.erase(in.dst.value);
-                        rs.sreg_bool_narrowed.erase(in.dst.value);
+                        if (b.wave_size == 64)
+                            retire_scalar_data_word_mask(rs, in.dst.value);
+                        else {
+                            rs.sreg_bool.erase(in.dst.value);
+                            rs.sreg_bool_narrowed.erase(in.dst.value);
+                        }
                         rs.sreg_srt.erase(in.dst.value);
                         return true;
                     }
@@ -4462,8 +4467,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto sit = vit->second.find(lane);
                 if (sit == vit->second.end()) { ok = false; return true; }          // slot never written
                 rs.sreg[in.dst.value] = sit->second;   // dst field is the SGPR number (like readfirstlane)
-                rs.sreg_bool.erase(in.dst.value);
-                rs.sreg_bool_narrowed.erase(in.dst.value);
+                if (!vertex_shell && b.wave_size == 64)
+                    retire_scalar_data_word_mask(rs, in.dst.value);
+                else {
+                    rs.sreg_bool.erase(in.dst.value);
+                    rs.sreg_bool_narrowed.erase(in.dst.value);
+                }
                 rs.sreg_srt.erase(in.dst.value);
                 return true;
             }

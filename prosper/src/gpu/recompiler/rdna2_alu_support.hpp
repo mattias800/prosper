@@ -51,6 +51,7 @@ void record_s_bfm_b64_scalar_data(SpirvCompute& b, RegState& rs, const Rdna2Inst
 bool numeric_vcc_move_has_lane_context(const SpirvCompute& b);
 uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
 void retire_data_only_b64_mask(RegState& rs, int destination);
+void retire_scalar_data_word_mask(RegState& rs, int destination);
 bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool source_mask);
 uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                                          uint32_t fallback);
