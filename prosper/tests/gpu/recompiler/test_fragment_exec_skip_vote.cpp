@@ -9,6 +9,8 @@
 #include "gpu/recompiler/spirv_fragment_neutral_selection.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "../../fixtures/spirv_fragment_neutral_fixtures.hpp"
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -387,8 +389,8 @@ TEST(FragmentExecSkipRegion, UnknownFormatsAndBackwardRegionsFailClosed) {
 
 // ---- emitter half: the recompiler's own evidence ---------------------------------------------
 
-// Wave64 pixel shader: EXEC narrowed by a v_cmpx on the interpolation input, an execz skip over
-// `region`, then EXEC restored and an MRT0 export. v0 enters as the barycentric `i`, a varying
+// Wave64 pixel shader: EXEC narrowed by a v_cmpx on the pixel depth input, an execz skip over
+// `region`, then EXEC restored and an MRT0 export. v0 enters as FragCoord.z, a varying
 // value; the vote takes no lane-id (MBCNT) dependency, so the module's wave contract is the
 // vote alone, which is the only contract lower_fragment_votes admits.
 std::vector<uint32_t> execz_shader(const std::vector<uint32_t>& region) {
@@ -434,11 +436,48 @@ Evidence evidence(const std::vector<uint32_t>& spirv) {
 constexpr uint32_t kVCmpGtU32 = 0x7d880284u;   // v_cmp_gt_u32 vcc, 4, v1
 constexpr uint32_t kVMovOne = 0x7e0002f2u;   // v_mov_b32 v0, 1.0
 
-Evidence compile_evidence(const std::vector<uint32_t>& region) {
+PixelSystemInputMapping pixel_depth_input() {
+    constexpr uint32_t position_z = 1u << 10;
+    return {.ena = position_z, .addr = position_z};
+}
+
+std::vector<uint32_t> compile_execz(const std::vector<uint32_t>& region,
+                                    const PixelSystemInputMapping* inputs) {
+    static std::atomic<uint64_t> next_address{0xa4976001u};
     const auto code = execz_shader(region);
-    const auto spirv = recompile_fragment(code.data(), code.size());
+    return recompile_fragment(
+        code.data(), code.size(), nullptr, inputs, UINT32_MAX, nullptr, false,
+        {RecompileDiagnosticStage::Fragment, next_address.fetch_add(1, std::memory_order_relaxed)});
+}
+
+Evidence compile_evidence(const std::vector<uint32_t>& region) {
+    const auto inputs = pixel_depth_input();
+    const auto spirv = compile_execz(region, &inputs);
     EXPECT_FALSE(spirv.empty());
     return evidence(spirv);
+}
+
+TEST(FragmentExecSkipEmitter, MissingPixelInputRefusesAtTheNarrowingCompare) {
+    const auto enabled = pixel_depth_input();
+    ASSERT_FALSE(compile_execz({kVCmpGtU32, kVMovOne}, &enabled).empty());
+    const PixelSystemInputMapping absent{};
+    const PixelSystemInputMapping disabled{.ena = 0, .addr = enabled.addr};
+    // Reserving disabled X before enabled Z places Z at v1, which the shader overwrites.
+    // v0 remains absent despite storage and an enabled input elsewhere.
+    const PixelSystemInputMapping displaced{.ena = enabled.ena, .addr = enabled.addr | (1u << 8)};
+    for (const auto* inputs :
+         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &displaced}) {
+        TerminalRejectCapture capture;
+        EXPECT_TRUE(compile_execz({kVCmpGtU32, kVMovOne}, inputs).empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) {
+            reason.append(tag);
+            reason += ' ';
+            reason.append(payload);
+        }
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=4 words=7da800f0"), std::string::npos) << reason;
+    }
 }
 
 TEST(FragmentExecSkipEmitter, CleanRegionCarriesEvidenceForItsOwnVote) {
@@ -473,8 +512,8 @@ TEST(FragmentExecSkipEmitter, RegionWithReadFirstLaneCarriesNone) {
 
 TEST(FragmentExecSkipEmitter, LaneIdInTheRegionCarriesNoEvidenceAndIsRefused) {
     const auto lower = [](const std::vector<uint32_t>& region) {
-        const auto code = execz_shader(region);
-        return lower_fragment_votes(recompile_fragment(code.data(), code.size()));
+        const auto inputs = pixel_depth_input();
+        return lower_fragment_votes(compile_execz(region, &inputs));
     };
     // v_mbcnt_lo_u32_b32 v1, -1, 0: a lane id the 32-lane host numbers differently. The guest
     // classifier refuses it, and independently the emitter records a lane-id wave reason, so the
