@@ -45,7 +45,7 @@ beyond the specific route documented for it.
 ## Why there is no CPU recompiler
 
 The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). It recompiles the
-guest's modules as a step before they run. prosper does not, and the reasons are deliberate:
+guest's modules as a step before they run. **prosper** does not, and the reasons are deliberate:
 
 - **It would not buy speed.** The PS5 CPU is x86-64, so guest code already runs at host speed.
   Recompiling it would replace native instructions with other native instructions and add nothing
@@ -76,7 +76,7 @@ numeric Vulkan tests.
 | Unregistered imports | Logged and surfaced per run by the `unimplemented-hle-calls` alarm; `tools/nid_census` counts them per title. A coverage count is planned (ADR 0007) | Not shown on its status page |
 | Legal boundary | No keys, decryption or copyrighted code in the repo. Third-party replacement libraries from dumps are refused | Not stated in the status page |
 
-prosper's own shader and library work is not a finished percentage either. Nothing in this repo
+**prosper**'s own shader and library work is not a finished percentage either. Nothing in this repo
 currently publishes a coverage figure. The planned one (ADR 0007) counts registered, resolved and
 return-zero imports per title from the registry, and it is a measure of reach, not of correctness.
 
@@ -95,7 +95,7 @@ are declared". Read as completion figures, these numbers mislead:
   handler does not tell you whether the handler is right, or whether a stub that returns success
   without doing anything is counted as finished.
 - **A registered handler is not a validated one.** Checking that an implementation is correct needs
-  tests against the expected behaviour, and in prosper the `implement-hle-function` procedure and the
+  tests against the expected behaviour, and in **prosper** the `implement-hle-function` procedure and the
   rung ladder do that. A plain implementation with no check is a different thing.
 
 The honest number for either project is the fraction of the real function and instruction set that
