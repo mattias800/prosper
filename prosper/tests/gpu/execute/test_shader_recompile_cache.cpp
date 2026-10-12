@@ -1127,6 +1127,10 @@ int main(int argc, char** argv) {
         RecompileDiagnosticStage::Compute, 0x135724680000aa55ull};
     const RecompileDiagnosticContext uniform_scc_diagnostic{
         RecompileDiagnosticStage::Compute, 0x2468ace000005577ull};
+    // The leading compare reads both v0/v1 before writing them. Supply actual local X/Y
+    // system inputs; the later s0==s0 tautology needs no particular scalar launch value.
+    ComputeShaderConfig uniform_scc_config = rejected_config;
+    uniform_scc_config.tidig_comp_cnt = 1;
     clear_shader_recompile_cache();
     std::vector<uint32_t> rejected_first, rejected_cached, partial_barrier, uniform_scc_barrier;
     set_test_env("PROSPER_DBG", "1");
@@ -1146,9 +1150,9 @@ int main(int argc, char** argv) {
         partial_barrier = recompile_compute(
             kPartialBarrierReject, std::size(kPartialBarrierReject), nullptr,
             partial_barrier_config, partial_barrier_diagnostic);
-        uniform_scc_barrier = recompile_compute(
-            kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles), nullptr,
-            rejected_config, uniform_scc_diagnostic);
+        uniform_scc_barrier =
+            recompile_compute(kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles),
+                              nullptr, uniform_scc_config, uniform_scc_diagnostic);
     });
     set_test_env("PROSPER_DBG", nullptr);
     stats = shader_recompile_cache_stats();
@@ -1169,6 +1173,12 @@ int main(int argc, char** argv) {
           "a guest barrier inside a PROVED workgroup-uniform scalar arm compiles");
     CHECK(final_reject_log.find("program=0x2468ace000005577") == std::string::npos,
           "the proved-uniform scalar barrier emits no compute-cfg-reject of any reason");
+    auto uniform_missing_local_y = uniform_scc_config;
+    uniform_missing_local_y.tidig_comp_cnt = 0;
+    CHECK(recompile_compute(kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles),
+                            nullptr, uniform_missing_local_y)
+              .empty(),
+          "the uniform barrier control cannot borrow an absent local-Y v1 input");
 
     CHECK(count_occurrences(
               final_reject_log,
@@ -2127,15 +2137,15 @@ int main(int argc, char** argv) {
     // though both variants use the same binding and exact fetch PC.
     clear_shader_recompile_cache();
     static const uint32_t kFlatCompute[] = {
-        0xd70f6a01u, 0x00020c0cu, 0x50041af9u, 0x86860680u,
-        0xdc200000u, 0x007d0001u, 0xbf810000u,
+        0x7e0c0300u,   // v_mov_b32 v6, v0: genuine local X supplies the byte offset
+        0xd70f6a01u, 0x00020c0cu, 0x50041af9u, 0x86860680u, 0xdc200000u, 0x007d0001u, 0xbf810000u,
     };
     ComputeShaderConfig flat_config;
     flat_config.user_sgprs.resize(16);
     ShaderResource flat_window;
     flat_window.cls = ResourceClass::ConstantBuffer;
     flat_window.binding = 4;
-    flat_window.fetch_pc = 4;
+    flat_window.fetch_pc = 5;
     flat_window.flat_base_sgpr = 12;
     ShaderResourceTable flat_table;
     flat_table.resources.push_back(flat_window);
@@ -2144,10 +2154,21 @@ int main(int argc, char** argv) {
     flat_table.resources[0].flat_base_sgpr = 10;
     const auto flat_s10 = recompile_compute_shader_cached(
         kFlatCompute, std::size(kFlatCompute), &flat_table, flat_config);
+    const auto flat_s10_again = recompile_compute_shader_cached(
+        kFlatCompute, std::size(kFlatCompute), &flat_table, flat_config);
     stats = shader_recompile_cache_stats();
     CHECK(!flat_s12.empty() && !flat_s10.empty() && flat_s12 != flat_s10 &&
-              stats.misses == 2 && stats.hits == 0,
+              flat_s10_again == flat_s10 && stats.misses == 2 && stats.hits == 1,
           "compute cache separates the FLAT-window push-constant base SGPR");
+    // Omitting only the new offset definition restores the original missing-v6 stream.
+    // Move its resource PC back with the instruction so an unrelated table mismatch cannot
+    // satisfy this negative.
+    auto flat_missing_offset_table = flat_table;
+    flat_missing_offset_table.resources[0].fetch_pc = 4;
+    CHECK(recompile_compute(kFlatCompute + 1, std::size(kFlatCompute) - 1,
+                            &flat_missing_offset_table, flat_config)
+              .empty(),
+          "the FLAT cache control cannot borrow an undefined v6 byte offset");
 
     clear_shader_recompile_cache();
     // GFX9+ may install a vertex-fetch prolog separately from the main merged shader. Both immutable
