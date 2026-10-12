@@ -6,9 +6,11 @@
 #include "fixtures/fragment_compare_kill.hpp"
 #include "fixtures/ngg_lane_slots.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include <gtest/gtest.h>
