@@ -10,12 +10,14 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_cfg_trip_bound.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
+#include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -549,100 +551,17 @@ int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint3
     return -1;
 }
 
-// True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
-// buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
-// a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
-// test. Decoded from the whole program rather than one phase: a GDS access in any phase disqualifies
-// the program, and `ins` here is only the current phase's slice.
-bool program_touches_guest_gds(const uint32_t* code, size_t dwords) {
-    if (!code || !dwords) return false;
-    std::vector<Rdna2Inst> decoded;
-    if (!rdna2_walk(code, dwords, decoded)) return true;   // undecodable: refuse, fail closed
-    return std::any_of(decoded.begin(), decoded.end(), [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::DS && in.ds_gds;
-    });
-}
-
-uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
-                                uint32_t start_pc, uint32_t end_pc,
-                                const uint32_t* code, size_t dwords) {
-    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
-    const uint32_t bound = settings.bound;
-    if (!bound) return 0u;
-    if (settings.only_program && program_address != settings.only_program) return 0u;
-
-    // A PHASE SELECTOR IS REQUIRED, and this is a coherence requirement rather than ergonomics.
-    //
-    // A barrier-phased program emits one dispatcher per phase, and each phase has its OWN dispatch
-    // table -- ordinal 9 means different guest pcs in phase 0 and phase 2. The witness is a single
-    // record: if two phases can hit during one dispatch, its phase field is whichever invocation
-    // stored last and its ordinal extrema are a mixture of two incompatible maps, which the host then
-    // prints as one phase's range. There is no reading of that record that is true.
-    //
-    // Discovery still works with the bound armed and no phase chosen: every phase prints its dispatch
-    // map (see the caller), so one run tells you how many phases exist and what each covers. Only the
-    // emission is withheld.
-    if (settings.only_phase == ComputeTripBoundSettings::kAllPhases) {
-        static std::once_flag once;
-        std::call_once(once, [] {
-            fprintf(stderr,
-                    "[cfg-trip-bound] PROSPER_CFG_TRIP_BOUND_PHASE is REQUIRED and is unset: no "
-                    "bound emitted. One witness record cannot describe two phases -- their dispatch "
-                    "ordinals index different tables. The dispatch maps below list every phase; "
-                    "re-run with PROSPER_CFG_TRIP_BOUND_PHASE=<k>.\n");
-        });
-        return 0u;
-    }
-    if (phase != settings.only_phase) return 0u;
-
-    // Refuse to instrument a program that uses GDS itself; see program_touches_guest_gds.
-    if (program_touches_guest_gds(code, dwords)) {
-        static std::mutex refused_mutex;
-        static std::set<uint64_t> refused;
-        bool first = false;
-        {
-            std::lock_guard lock(refused_mutex);
-            first = refused.insert(program_address).second;
-        }
-        if (first)
-            fprintf(stderr,
-                    "[cfg-trip-bound] program 0x%llx REFUSED: it accesses GDS itself, and the "
-                    "witness would overwrite its data. Not instrumented.\n",
-                    static_cast<unsigned long long>(program_address));
-        return 0u;
-    }
-
-    static std::mutex announce_mutex;
-    static std::set<std::pair<uint64_t, uint32_t>> announced;
-    bool first = false;
-    {
-        std::lock_guard lock(announce_mutex);
-        first = announced.insert({program_address, phase}).second;
-    }
-    if (first) {
-        char scope[128] = "every back-edge traversal";
-        if (settings.only_ordinal != ComputeTripBoundSettings::kAllOrdinals)
-            snprintf(scope, sizeof scope,
-                     "ONLY traversals about to dispatch ordinal %u (see this phase's dispatch map)",
-                     settings.only_ordinal);
-        fprintf(stderr,
-                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
-                "bounded at %u iterations counting %s "
-                "(DIAGNOSTIC: truncates guest control flow)\n",
-                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound,
-                scope);
-    }
-    return bound;
-}
-
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
     bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
-    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
+    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
+    NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
+    const bool barrier_half_phase =
+        barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
     const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
@@ -1600,12 +1519,14 @@ bool emit_cfg_state_machine(
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
     std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
     std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
+    PhysicalMaskHalfSlots terminal_mask_half_slots;
     analyze_wave64_mask_half_aliases(
         b, ins, starts, successors,
         [&](const Rdna2Inst& in, const std::function<void(int)>& visit) {
             for_each_possible_vector_write(in, visit);
         },
-        wave64_mask_half_sreg_in, wave64_mask_half_reachable);
+        wave64_mask_half_sreg_in, wave64_mask_half_reachable,
+        barrier_half_phase ? barrier_halves : nullptr, &terminal_mask_half_slots, end_pc);
     // Type spill reloads as emit_alu did. Wave64 reload destinations also have Bool variables,
     // whose presence alone cannot prove a slot's domain (rdna2_spill_slot_domain.hpp).
     std::set<int> spill_mask_keys = static_mask_keys;
@@ -1741,6 +1662,9 @@ bool emit_cfg_state_machine(
             for (const auto& [vgpr, lanes] : *slots)
                 for (const auto& lane : lanes)
                     wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
+        if (barrier_half_phase)
+            barrier_halves->seed_entry(wave64_spilled_halves_in.front(),
+                                       wave64_slot_domain_in.front());
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -5649,6 +5573,13 @@ bool emit_cfg_state_machine(
     }
     initial.invalidated_vgpr_lane_slots =
         std::move(terminal_invalidated_vgpr_lane_slots);
+    if (barrier_half_phase) {
+        const auto terminal = block_for_pc.find(end_pc);
+        if (terminal != block_for_pc.end() && wave64_b64_reachable[terminal->second])
+            barrier_halves->finish_phase(ins, terminal_mask_half_slots,
+                                         wave64_spilled_halves_in[terminal->second],
+                                         wave64_slot_domain_in[terminal->second]);
+    }
     // sreg_srt and lds_addtid are path-sensitive SSA provenance without dispatcher function
     // variables. Not reconstructing them across a phase is intentional and fail-closed: a later
     // descriptor/LDS consumer rejects instead of reviving provenance from an arbitrary path.
@@ -5779,6 +5710,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
              portable_compute_mask_reduction || portable_compute_readfirstlane ||
              portable_compute_bpermute || compute_cfg_row_integer || compute_cfg_row_fadd)) {
+            NativeBarrierHalfProof barrier_halves(b, ins, code, dwords, phased.guarded,
+                                                  initial_dispatch_active);
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -5838,9 +5771,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // backward-else/complex shape before it ever reaches the fallback.
                 if (!phased.guarded || initial_dispatch_active)
                     return emit_cfg_state_machine(
-                        b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                        exp_fn, code, dwords, initial_dispatch_active,
-                        force_lds_fminmax_dispatcher);
+                        b, rs, phase, safe, rt, allow_exec_update, allow_smem, exp_fn, code, dwords,
+                        initial_dispatch_active, force_lds_fminmax_dispatcher, {}, nullptr, nullptr,
+                        &barrier_halves);
                 return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                  exp_fn, code, dwords, &dead_masks, true, 0, false,
                                  force_lds_fminmax_dispatcher);

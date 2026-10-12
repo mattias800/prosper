@@ -8,11 +8,13 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace prosper::gpu {
 
 struct SpirvCompute;
+class NativeBarrierHalfProof;
 
 // Calls its second argument with every VGPR the instruction may write.
 using VectorWriteVisitor = std::function<void(const Rdna2Inst&, const std::function<void(int)>&)>;
@@ -27,6 +29,9 @@ void analyze_wave64_mask_half_aliases(
     const std::vector<std::vector<uint32_t>>& successors,
     const VectorWriteVisitor& for_each_possible_vector_write,
     std::vector<std::map<int, uint32_t>>& wave64_mask_half_sreg_in,
-    std::vector<bool>& wave64_mask_half_reachable);
+    std::vector<bool>& wave64_mask_half_reachable,
+    const NativeBarrierHalfProof* barrier_halves = nullptr,
+    std::map<std::pair<int, int>, uint32_t>* terminal_slots = nullptr,
+    uint32_t terminal_pc = UINT32_MAX);
 
 }   // namespace prosper::gpu

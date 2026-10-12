@@ -206,7 +206,7 @@ file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9402
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7447  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559); Wave32 dispatch worklist extracted to rdna2_wave32_dispatch_words.cpp (#4964)
+file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 7360  # lowered: counted-loop EXEC-guard proof moved to rdna2_counted_loop_guard.cpp; loop provenance helper to rdna2_cfg_registers.cpp; dispatcher SOP1 SCC list replaced by the shared predicate (#4559); Wave32 dispatch worklist extracted to rdna2_wave32_dispatch_words.cpp (#4964); bounded trip/GDS helpers moved to rdna2_cfg_trip_bound and barrier proof stays in its companion (#4966)
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5547  # 1 below main (5548): the double-destroy checks fit inside comment trims
 # note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
 # including changed-line formatting; other memory behavior is unchanged.
