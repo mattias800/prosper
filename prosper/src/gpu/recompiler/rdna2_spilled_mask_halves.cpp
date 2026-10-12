@@ -1,5 +1,6 @@
 // See rdna2_spilled_mask_halves.hpp.
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -64,6 +65,7 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     into.memory_words.insert(incoming.memory_words.begin(), incoming.memory_words.end());
     into.memory_slots.insert(incoming.memory_slots.begin(), incoming.memory_slots.end());
     into.exec_known_full = into.exec_known_full && incoming.exec_known_full;
+    into.native_interpolation = into.native_interpolation && incoming.native_interpolation;
 }
 
 namespace {
@@ -99,11 +101,14 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                      const std::set<int>& masks,
                                                      const std::set<int>& scalar_words,
                                                      bool definite_scc) {
+    if (vector_write_leaves_old_word(in, state.native_interpolation) ||
+        (state.native_interpolation && in.fmt == Rdna2Format::VINTRP))
+        return {};
     const auto& defined = state.defined_slots;
     const auto& relayed = state.relayed_words;
     const auto vector_any = [&](const std::set<int>& marked) {
         for (uint32_t source = 0; source < in.n_src; ++source)
-            for (uint32_t word = 0; word < rdna2_vgpr_source_span(in, source); ++word)
+            for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
                 if (marked.contains(in.src[source].value + static_cast<int>(word))) return true;
         if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
             return std::any_of(marked.begin(), marked.end(),
@@ -119,6 +124,7 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     bool vector_relay =
         missing_scc || ((!load || in.fmt == Rdna2Format::DS) &&
                         (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) vector_relay = true;
     bool memory =
         load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
     // An ordinary absent SGPR is fabricated before any instruction has relayed it. Retain
@@ -162,6 +168,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
                            const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                            const std::vector<int>& vector_writes,
                            const SpilledVectorSourceMarks& source, bool definite_scc) {
+    if (vector_write_leaves_old_word(in, state.native_interpolation)) return;
     auto& defined = state.defined_slots;
     auto& relayed = state.relayed_words;
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
@@ -194,10 +201,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         relayed.insert(kRelayedScc);
     else if (in.fmt == Rdna2Format::SOPC)
         relayed.erase(kRelayedScc);
-    const bool preserve = !state.exec_known_full ||
-                          (in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane) ||
-                          (in.sdwa_dst_sel != 6 && in.sdwa_dst_unused == 2) ||
-                          (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32);
+    const bool preserve = vector_write_depends_on_old_word(in, state.exec_known_full);
     for (int vgpr : vector_writes) {
         if (vector_relay)
             state.relayed_vectors.insert(vgpr);
@@ -209,9 +213,7 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
             state.memory_vectors.erase(vgpr);
     }
     if (rdna2_instruction_may_change_exec(in))
-        state.exec_known_full = in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
-                                in.dst.value == 126 && in.src[0].kind == OperandKind::InlineInt &&
-                                in.src[0].value == -1;
+        state.exec_known_full = vector_exec_is_full_after_write(in, state.exec_known_full);
     const auto drop_vgpr = [&](int vgpr) {
         std::erase_if(defined, [&](const auto& slot) { return slot.first == vgpr; });
     };
@@ -249,6 +251,8 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
 }
 
 void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs) {
+    rs.vector_full_exec = entry.exec_known_full;
+    rs.vector_native_interpolation = entry.native_interpolation;
     for (int word : entry.relayed_words)
         if (word == kRelayedScc)
             rs.scc_merge_placeholder = true;
@@ -277,6 +281,7 @@ void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
                                  const std::set<int>& masks, const std::set<int>& mask_slot_keys,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                                  const std::vector<int>& vector_writes, int mask_write) {
+    if (vector_write_leaves_old_word(in, state.native_interpolation)) return;
     const bool writelane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpWritelane;
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
 

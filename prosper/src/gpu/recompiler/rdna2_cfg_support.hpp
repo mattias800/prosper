@@ -1672,6 +1672,8 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
 inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const SpirvCompute& b, const RegState& rs,
                                                      const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
+        snapshot.source_marks = vector_relative_source_marks(b, rs, in);
     snapshot.portable_numeric_replacement = ordinary_portable_wave64_masks(b);
     return snapshot;
 }

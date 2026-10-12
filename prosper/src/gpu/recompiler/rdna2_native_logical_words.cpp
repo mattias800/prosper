@@ -120,6 +120,12 @@ uint32_t logical_word(SpirvCompute& b, uint32_t opcode, uint32_t a, uint32_t c) 
 }   // namespace
 
 void seed_native_logical_entry_marks(SpilledMaskHalves& marks, const RegState& initial) {
+    for (const auto& [reg, source] : initial.vreg_source_marks) {
+        if (source.placeholder || source.hard) marks.relayed_vectors.insert(reg);
+        if (source.memory) marks.memory_vectors.insert(reg);
+    }
+    marks.exec_known_full = initial.exec && !initial.exec_narrowed;
+    marks.native_interpolation = initial.vector_native_interpolation;
     marks.relayed_words.insert(initial.sreg_merge_placeholder.begin(),
                                initial.sreg_merge_placeholder.end());
     marks.relayed_words.insert(initial.unavailable_saved_mask_words.begin(),

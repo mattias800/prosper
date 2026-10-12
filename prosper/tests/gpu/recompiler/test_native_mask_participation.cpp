@@ -1,9 +1,11 @@
 #include "fixtures/native_mask_participation.hpp"
 #include "fixtures/checked_compute_launch.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_native_participation.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
 #include <gtest/gtest.h>
+#include <array>
 
 namespace fixture = prosper::test::native_mask_participation;
 using namespace prosper::gpu;
@@ -177,6 +179,18 @@ TEST(NativeMaskParticipation, TransformedMovCannotClaimOriginalLocalLaneIdentity
 }
 TEST(NativeMaskParticipation, ImplicitVccWriteRetiresPriorPhysicalDataGeneration) {
     preservation_control(fixture::Preservation::ImplicitVcc);
+}
+
+TEST(NativeMaskParticipation, PreservationComparisonsNameTheirActualInputs) {
+    for (const auto [word, source, vector] :
+         std::array<std::array<uint32_t, 3>, 2>{{{0x7da41681u, 1u, 11u}, {0x7d841480u, 0u, 10u}}}) {
+        const auto in = rdna2_decode_one(&word, 1);
+        EXPECT_EQ(in.fmt, Rdna2Format::VOPC);
+        EXPECT_EQ(in.src[0].kind, OperandKind::InlineInt);
+        EXPECT_EQ(in.src[0].value, source);
+        EXPECT_EQ(in.src[1].kind, OperandKind::VGPR);
+        EXPECT_EQ(in.src[1].value, vector);
+    }
 }
 
 TEST(NativeMaskParticipation, Orn2ExeczCannotAuthenticateBypassedInitializer) {

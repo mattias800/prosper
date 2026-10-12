@@ -23,7 +23,12 @@ struct ScalarSourceMarks {
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
+// Call only at a producing stage entry, after its actual input VGPRs have been published.
+void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
+                                  bool native_interpolation = false);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
+ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
+                                               const Rdna2Inst& in);
 ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in);
 // A fresh comparison/carry predicate cannot authenticate fabricated input storage. Genuine memory
 // data and checked loop-header assumptions remain separate from unavailable-source placeholders.

@@ -2973,6 +2973,9 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
+    bool vector_full_exec =
+        false;   // provenance fact; dispatcher runtime predication stays enabled
+    bool vector_native_interpolation = false;
     // The latest VCC SSA value proved identical in every guest lane. A fragment VCCZ branch over
     // that exact value is already scalar and needs no subgroup vote. Tying the proof to the SSA id
     // makes an overwrite or control-flow merge invalidate it automatically.
@@ -3418,6 +3421,7 @@ struct MergeEdgeMarks {
     // the OTHER edge left marked would otherwise come out clean (#4725 review).
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
     VectorWordMarks vectors;
+    bool vector_full_exec = false;
 };
 template <class Registers>
 MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) {
@@ -3433,6 +3437,7 @@ MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) 
     marks.slot_fabricated = rs.lane_slot_merge_placeholder;
     marks.slot_memory = rs.lane_slot_memory_pattern;
     marks.vectors = rs.vreg_source_marks;
+    marks.vector_full_exec = rs.vector_full_exec;
     return marks;
 }
 // Join register `r` at a two-edge merge: `rs` is one edge, `other` the captured other edge.
@@ -3451,6 +3456,7 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
 // fabricated too; a slot marked on either edge is marked after it).
 inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
     join_vector_word_marks(rs.vreg_source_marks, other.vectors);
+    rs.vector_full_exec = rs.vector_full_exec && other.vector_full_exec;
     rs.unavailable_saved_mask_words.insert(other.unavailable_saved_mask_words.begin(),
                                            other.unavailable_saved_mask_words.end());
     rs.scc_merge_placeholder = rs.scc_merge_placeholder || !rs.scc || other.scc;
@@ -3551,6 +3557,11 @@ template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
     mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried);
+    // A full preheader does not prove a full backedge. Clear the independent proof; ordinary
+    // entry-iteration full writes still follow exec_narrowed and initialize their old generation.
+    for (const auto& in : ins)
+        if (in.pc >= lo && in.pc < hi && rdna2_instruction_may_change_exec(in))
+            rs.vector_full_exec = false;
     for (int r : carried) {
         join_merge_placeholder(rs, r, true, false);
         if (const auto it = blanket.carried.find(r); it != blanket.carried.end()) {
@@ -3573,10 +3584,12 @@ struct LoopCheckMarks {
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
     std::map<int, std::set<uint64_t>> blanket;   // the check block's sreg_loop_blanket
     VectorWordMarks vectors;
+    bool vector_full_exec = false;
 };
 inline LoopCheckMarks loop_check_marks(const RegState& rs) {
     return {rs.sreg_merge_placeholder,   rs.sreg_memory_pattern, rs.lane_slot_merge_placeholder,
-            rs.lane_slot_memory_pattern, rs.sreg_loop_blanket,   rs.vreg_source_marks};
+            rs.lane_slot_memory_pattern, rs.sreg_loop_blanket,   rs.vreg_source_marks,
+            rs.vector_full_exec};
 }
 // The spill slots at a loop exit: `rs` holds the body end's slot map, so union in the check
 // block's marks (a slot marked on either is marked after the loop).
@@ -3584,6 +3597,7 @@ inline void mark_loop_exit_slots(RegState& rs, const LoopCheckMarks& check,
                                  const LoopCheckMarks* body = nullptr) {
     if (body) rs.vreg_source_marks = body->vectors;
     join_vector_word_marks(rs.vreg_source_marks, check.vectors);
+    rs.vector_full_exec = rs.vector_full_exec && check.vector_full_exec;
     rs.lane_slot_merge_placeholder.insert(check.slot_fabricated.begin(),
                                           check.slot_fabricated.end());
     rs.lane_slot_memory_pattern.insert(check.slot_memory.begin(), check.slot_memory.end());

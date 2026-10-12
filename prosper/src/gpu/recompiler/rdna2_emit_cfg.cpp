@@ -2561,6 +2561,12 @@ bool emit_cfg_state_machine(
                                             vector_writes, mask_write);
             advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes,
                                   relay_sources, definite_scc);
+            if (quad_or.contains(in.pc) && compute_dpp_quad_or(in)) {
+                // The authenticated per-lane coverage proof also owns the complete result.
+                // Preserve that refinement through the mandatory dispatcher storage reload.
+                halves.relayed_vectors.erase(in.dst.value);
+                halves.memory_vectors.erase(in.dst.value);
+            }
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
@@ -3347,6 +3353,7 @@ bool emit_cfg_state_machine(
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
+        state.vector_native_interpolation = initial.vector_native_interpolation;
         state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;

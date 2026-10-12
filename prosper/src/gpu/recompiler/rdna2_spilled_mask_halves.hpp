@@ -50,6 +50,7 @@ struct SpilledMaskHalves {
     std::set<int> relayed_vectors, memory_vectors, memory_words;
     std::set<std::pair<int, int>> memory_slots;
     bool exec_known_full = false;
+    bool native_interpolation = false;
     bool operator==(const SpilledMaskHalves&) const = default;
 };
 inline constexpr int kRelayedScc = 253;

@@ -2,7 +2,6 @@
 
 #include "gpu/recompiler/rdna2_compute_quad_init.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
-#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 namespace prosper::gpu {
 bool ComputeDppQuadOrService::prepare(SpirvCompute& b, const RegState& entry,
@@ -45,10 +44,9 @@ bool ComputeDppQuadOrService::publish(SpirvCompute& b, RegState& rs, const Rdna2
     const auto event = events_.find(in.pc);
     if (event == events_.end() || !compute_dpp_quad_or(in)) return false;
     const auto a = rs.vreg.find(in.src[0].value), c = rs.vreg.find(in.src[1].value);
-    if (a == rs.vreg.end() || c == rs.vreg.end() || !rs.exec) return false;
-    const auto marks = vector_source_marks(rs, in);
-    if (marks.placeholder || marks.hard || !marks.blanket_roots.empty() ||
-        rs.vgpr_lane_slots.contains(in.src[0].value) ||
+    if (a == rs.vreg.end() || c == rs.vreg.end() || !a->second || !c->second || !rs.exec)
+        return false;
+    if (rs.vgpr_lane_slots.contains(in.src[0].value) ||
         rs.vgpr_lane_slots.contains(in.src[1].value) ||
         rs.vgpr_lane_mask_slots.contains(in.src[0].value) ||
         rs.vgpr_lane_mask_slots.contains(in.src[1].value))
@@ -60,7 +58,10 @@ bool ComputeDppQuadOrService::publish(SpirvCompute& b, RegState& rs, const Rdna2
     b.store_function(vars_[Control], b.uconst(in.dpp_ctrl));
     b.store_function(vars_[Destination], b.uconst(static_cast<uint32_t>(in.dst.value)));
     b.store_function(vars_[Event], b.uconst(event->second));
-    record_vector_word_marks(rs, in, marks);
+    // CONFIDENCE: HIGH -- prepare authenticated these exact source words on all lanes/paths,
+    // including complementary writers. It also proves all old destination lanes when masked.
+    // That finer proof retires coarse ordinary marks for this result, never scalar spill slots.
+    rs.vreg_source_marks.erase(in.dst.value);
     return true;
 }
 bool ComputeDppQuadOrService::emit_phase(SpirvCompute& b, uint32_t value_base,
