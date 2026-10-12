@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -209,7 +210,8 @@ def resolve_tip(ls_output, branch):
 
 def collect(pr, repo_dir):
     checks = parse_checks(_run(["gh", "pr", "checks", str(pr), "--json", "name,state,bucket"], repo_dir))
-    view = _run(["gh", "pr", "view", str(pr), "--json", "headRefOid,headRefName"], repo_dir)
+    view = _run(["gh", "pr", "view", str(pr), "--json",
+                 "headRefOid,headRefName,headRepository,headRepositoryOwner"], repo_dir)
     try:
         info = json.loads(view)
     except ValueError as exc:
@@ -222,7 +224,19 @@ def collect(pr, repo_dir):
         raise GateError("PR %s reports no headRefOid -- cannot verify what would merge" % pr)
     if not isinstance(branch, str) or not branch.strip():
         raise GateError("PR %s reports no headRefName -- cannot resolve the branch tip" % pr)
-    tip = resolve_tip(_run(["git", "ls-remote", "origin", "refs/heads/%s" % branch], repo_dir), branch)
+    repository, owner = info.get("headRepository"), info.get("headRepositoryOwner")
+    if not isinstance(repository, dict) or not isinstance(owner, dict):
+        raise GateError(f"PR {pr} reports no head repository identity -- cannot resolve its tip")
+    name, login = repository.get("name"), owner.get("login")
+    # The target checkout's origin need not own this branch. Use the API's actual head owner,
+    # with a fixed HTTPS authority and validated path components; never fall back to origin
+    # when the fork was deleted or its identity is unavailable.
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+            or name in (".", "..") or not isinstance(login, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", login)):
+        raise GateError(f"PR {pr} reports invalid head repository identity -- cannot resolve its tip")
+    remote = f"https://github.com/{login}/{name}.git"
+    tip = resolve_tip(_run(["git", "ls-remote", remote, "refs/heads/%s" % branch], repo_dir), branch)
     return checks, pr_head.strip(), tip
 
 
