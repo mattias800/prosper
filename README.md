@@ -42,24 +42,26 @@ beyond the specific route documented for it.
 
 ---
 
-## Why there is no CPU recompiler
+## Why there is no ahead-of-time conversion step
 
-The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). It recompiles the
-guest's modules as a step before they run. **prosper** does not, and the reasons are deliberate:
+The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). Before a game runs,
+its relinker converts the executables to the host's native format and binds them against
+reimplemented shared libraries; an optional pass lowers AMD-only instructions. **prosper** has no
+equivalent step — its loader and linker do that work at load time, Wine-style, and the shipped
+bytes run unchanged. Neither project emulates the CPU: the PS5 CPU is x86-64, so guest code runs
+natively on the host either way, and neither pays translation overhead on the CPU. The refusal of
+the extra step is deliberate:
 
-- **It would not buy speed.** The PS5 CPU is x86-64, so guest code already runs at host speed.
-  Recompiling it would replace native instructions with other native instructions and add nothing
-  to throughput. Performance on the CPU side is set by the reimplemented libraries and the GPU path,
-  and those are where measurement goes.
-- **It would be a second copy of every game to get right.** A recompiler has to translate every
-  module, including code paths a given run never executes, and every translation bug looks
-  identical to a game bug. Running native code means the game is the thing being tested.
-- **It is hard to test.** Native code can be stepped in gdb, profiled with perf and inspected with
-  ordinary tools. Recompiled output needs its own debugger, its own symbol mapping and a mapping
-  back to the original addresses before any crash can be read.
-- **The same result without the translation step.** Our target is the same behaviour and speed
-  without recompiling the guest's CPU code. The loader and linker relocate the modules as shipped,
-  and their native code runs unchanged.
+- **It would not buy speed.** Both designs execute native x86-64. CPU-side performance is set by
+  the reimplemented libraries and the GPU path, and those are where measurement goes.
+- **It would be a second copy of every game to get right.** An ahead-of-time step converts every
+  module, including code paths a given run never executes, and every conversion bug looks
+  identical to a game bug. Running the shipped bytes means the game is the thing being tested.
+- **It is harder to test and debug.** Shipped bytes can be stepped in gdb, profiled with perf and
+  inspected with ordinary tools. Converted output needs its own symbol mapping and a mapping back
+  to the original addresses before any crash can be read.
+- **The same behaviour without the extra copy.** The loader and linker relocate the modules as
+  shipped, and their native code runs unchanged — no converted executable on disk.
 
 Translation is used where it is unavoidable. The GPU does not run x86-64, so RDNA2 shaders have to
 be converted to SPIR-V. That recompiler exists and is verified against the `spirv-val` gate and
@@ -67,14 +69,17 @@ numeric Vulkan tests.
 
 ## Comparison with AnyPS5
 
+Statements about AnyPS5 below were checked against its repository (README, `docs/dev/ARCHITECTURE.md`,
+`docs/user/COMPATIBILITY.md`, `tools/progress.py`).
+
 | | prosper | AnyPS5 |
 |---|---|---|
-| Guest CPU code | Runs natively. Loader and linker only, no translation step | Recompiles the guest modules before execution |
-| Where translation is used | GPU shaders only (RDNA2 → SPIR-V), because the ISA has no host equivalent | As described above |
-| How "done" is defined | Per-title six-rung ladder ending in a human-reviewed comparison against PS5 hardware, then a reviewed automatic snapshot guard | Percentage of functions and instructions the project has declared so far |
-| Correctness evidence | Numeric and pixel Vulkan tests, `spirv-val` on every SPIR-V emitter, golden-image guards over real boots | Declared-function counts (see below) |
-| Unregistered imports | Logged and surfaced per run by the `unimplemented-hle-calls` alarm; `tools/nid_census` counts them per title. A coverage count is planned (ADR 0007) | Not shown on its status page |
-| Legal boundary | No keys, decryption or copyrighted code in the repo. Third-party replacement libraries from dumps are refused | Not stated in the status page |
+| Guest CPU code | Native, linked at load time; the shipped bytes run unchanged | Native, after an ahead-of-time relink to host format (`core/relinker`); an optional pass lowers AMD-only instructions |
+| Where translation is used | GPU shaders only (RDNA2 → SPIR-V), because the ISA has no host equivalent | Same: GPU shaders (RDNA → IR → SPIR-V), cached in memory and on disk |
+| How "done" is defined | Per-title six-rung ladder ending in a human-reviewed comparison against PS5 hardware, then a reviewed automatic snapshot guard | Declared-list percentages (see below) plus a tested-games list |
+| Correctness evidence | Numeric and pixel Vulkan tests, `spirv-val` on every SPIR-V emitter, golden-image guards over real boots | SPIR-V validated with SPIRV-Tools when enabled; per-title testing in its compatibility list |
+| Unsupported calls | Unregistered imports log and return 0 by default (the false-success class, #2081), surfaced per run by the `unimplemented-hle-calls` alarm; `tools/nid_census` counts them per title. A coverage count is planned (ADR 0007) | Unsupported or unexpected states throw `std::runtime_error` and terminate the process |
+| Legal boundary | No keys, decryption or copyrighted code in the repo. Third-party replacement libraries from dumps are refused | States an interoperability, research and preservation purpose; no copyrighted software, firmware, keys or proprietary libraries |
 
 **prosper**'s own shader and library work is not a finished percentage either. Nothing in this repo
 currently publishes a coverage figure. The planned one (ADR 0007) counts registered, resolved and
@@ -91,12 +96,12 @@ as completion figures, these percentages mislead:
   list is not counted, so a high percentage only means the listed items are done. Firmware
   decompilation shows the real set of system functions and shader instructions is much larger than
   any declared list.
-- **"Declared" and "done" are not the same thing.** A count that tracks which functions have a
-  handler does not tell you whether the handler is right, or whether a stub that returns success
-  without doing anything is counted as finished.
+- **"Done" means the stub helper is gone.** Their `tools/progress.py` counts a library function done
+  when its body no longer calls the `NotImplemented` stub helper, and a shader instruction done when
+  the decoder recognises its opcode. Neither says whether the handler is right.
 - **A registered handler is not a validated one.** Checking that an implementation is correct needs
   tests against the expected behaviour, and in **prosper** the `implement-hle-function` procedure and the
-  rung ladder do that. A plain implementation with no check is a different thing.
+  rung ladder do that. A stub-free body with no check is a different thing.
 
 The honest number for either project is the fraction of the real function and instruction set that
 is implemented and checked. Neither project has measured that yet, and this repo does not claim
