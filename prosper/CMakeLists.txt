@@ -3462,6 +3462,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_rdna2_synthetic_values
+      SOURCES tests/gpu/execute/test_rdna2_synthetic_values.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_wave64_exchange_execution
       SOURCES tests/gpu/execute/test_wave64_exchange.cpp
       INCLUDES tests
