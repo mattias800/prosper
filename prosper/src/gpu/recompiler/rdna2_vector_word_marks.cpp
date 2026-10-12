@@ -31,6 +31,19 @@ bool lane_wise_vector_op(const Rdna2Inst& in) {
     }
 }
 
+// True when a lane-wise form writes the complete 32-bit word of every lane it executes: no SDWA
+// partial destination, no preserved old bits (vector_write_depends_on_old_word, with EXEC treated
+// as full so only the form's own dependence counts), and not an indexed relative write.
+bool complete_full_word_write(const Rdna2Inst& in) {
+    // A plain buffer load writes each active lane's dwords (out-of-range lanes return zero); a TFE
+    // form also writes a status word, which is not modelled here, so it is not complete.
+    if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
+    if (!lane_wise_vector_op(in) || in.has_sdwa) return false;
+    if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
+        return false;
+    return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
+}
+
 bool memory_result(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
            in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
@@ -203,20 +216,18 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_source_marks(result, vector_word(rs, reg));
-        // Confinement for a partial write under narrowed EXEC G: lanes in G take the result, lanes
-        // outside G keep the old word, so the surviving placeholder lies outside G.
-        const bool narrowed_write =
-            preserve && rs.exec_narrowed && !rdna2_instruction_may_change_exec(in);
-        if (narrowed_write && !source.placeholder) {
-            // Clean sources, any form: the written lanes are exactly EXEC.
-            result.outside_exec = rs.exec;
-        } else if (narrowed_write && lane_wise_vector_op(in) && source.hard &&
-                   source.outside_exec == rs.exec) {
-            // A lane-wise relay of a placeholder that is itself confined to this same EXEC.
-            result.outside_exec = rs.exec;
-        } else if (narrowed_write || !lane_wise_vector_op(in)) {
-            // A placeholder through a cross-lane or unconfined write: no confinement survives.
+        // A write defines its word only in the lanes it writes. Confinement is granted only when the
+        // form writes the complete word of every active lane; any other form (preserved bits,
+        // selected lanes, relative destinations, cross-lane forms) leaves the old word unconfined.
+        const bool complete = complete_full_word_write(in);
+        const bool narrowed_write = rs.exec_narrowed && !rdna2_instruction_may_change_exec(in);
+        if (!complete) {
             result.outside_exec = 0;
+        } else if (narrowed_write) {
+            // Outside EXEC the old word survives; inside it the result is the source relayed.
+            const bool defined_inside =
+                !source.placeholder || (source.hard && source.outside_exec == rs.exec);
+            result.outside_exec = defined_inside ? rs.exec : 0u;
         }
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
