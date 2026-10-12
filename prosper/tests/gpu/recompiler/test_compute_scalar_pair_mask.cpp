@@ -75,10 +75,11 @@ ShaderResourceTable output_table() {
 
 enum class Stage { Compute, Fragment };
 
-Words compile_whole(Stage stage, const Words& code) {
+Words compile_whole(Stage stage, const Words& code,
+                    const PixelSystemInputMapping* system_inputs = nullptr) {
     if (stage == Stage::Fragment)
-        return recompile_fragment(code.data(), code.size(), nullptr, nullptr, UINT32_MAX, nullptr,
-                                  false, {RecompileDiagnosticStage::Fragment, kAddress});
+        return recompile_fragment(code.data(), code.size(), nullptr, system_inputs, UINT32_MAX,
+                                  nullptr, false, {RecompileDiagnosticStage::Fragment, kAddress});
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
@@ -475,6 +476,16 @@ const Words kReadLanesAndRestore = {0xd7600006u, 0x00010114u, 0xd7600007u, 0x000
                                     0xbefe0406u};
 const Words kExecTail = {0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
                          0xf800000fu, 0x03020100u, 0xbf810000u};
+
+// The dispatcher compares v0/v1 before the export tail writes them. Enabled POS_X/POS_Y
+// supply those two genuine inputs; unrelated fabricated-input fixtures keep their absent entry.
+constexpr uint32_t kDispatcherPositionFields = (1u << 8) | (1u << 9);
+constexpr PixelSystemInputMapping kDispatcherInputs{.ena = kDispatcherPositionFields,
+                                                    .addr = kDispatcherPositionFields};
+Words compile_dispatcher_fragment(const Words& code,
+                                  const PixelSystemInputMapping* inputs = &kDispatcherInputs) {
+    return compile_whole(Stage::Fragment, code, inputs);
+}
 }   // namespace
 // NOLINTEND(bugprone-throwing-static-initialization)
 
@@ -482,14 +493,45 @@ TEST(ScalarPairMask, ADispatcherReloadedDefinedExecPairCompiles) {
     const Words saved_exec = {0xbeac047eu};   // s_mov_b64 s[44:45], exec
     const Words code =
         cat({&saved_exec, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
-    EXPECT_FALSE(compile_whole(Stage::Fragment, code).empty());
+    EXPECT_FALSE(compile_dispatcher_fragment(code).empty());
+}
+
+TEST(ScalarPairMask, DispatcherComparisonsRequireBothCorrectlyPlacedPixelInputs) {
+    const Words saved_exec = {0xbeac047eu};
+    const Words code =
+        cat({&saved_exec, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
+    const Words control = compile_dispatcher_fragment(code);
+    ASSERT_FALSE(control.empty()) << last_terminal_reject_reason(kAddress);
+    bool has_switch = false;
+    for (size_t at = 5; at < control.size();) {
+        const uint32_t width = control[at] >> 16u;
+        ASSERT_NE(width, 0u);
+        ASSERT_LE(width, control.size() - at);
+        has_switch |= (control[at] & 0xffffu) == 251u;   // OpSwitch: actual CFG dispatcher.
+        at += width;
+    }
+    ASSERT_TRUE(has_switch);
+
+    const PixelSystemInputMapping absent{};
+    const PixelSystemInputMapping disabled{.ena = 0, .addr = kDispatcherPositionFields};
+    const PixelSystemInputMapping x_only{.ena = 1u << 8, .addr = kDispatcherPositionFields};
+    // A reserved disabled field before X shifts the enabled positions away from v0/v1.
+    const PixelSystemInputMapping displaced{.ena = kDispatcherPositionFields,
+                                            .addr = kDispatcherPositionFields | (1u << 7)};
+    for (const auto* inputs : {static_cast<const PixelSystemInputMapping*>(nullptr), &absent,
+                               &disabled, &x_only, &displaced}) {
+        EXPECT_TRUE(compile_dispatcher_fragment(code, inputs).empty());
+        const std::string reason = last_terminal_reject_reason(kAddress);
+        EXPECT_NE(reason.find("mode=unresolved-operand pc=9 words=7c020300 "), std::string::npos)
+            << "not refused at the first dispatcher compare: " << reason;
+    }
 }
 
 TEST(ScalarPairMask, ADispatcherReloadedFabricatedExecPairStillRefuses) {
     const Words one_path = {0xbf068000u, 0xbf850002u, 0xbeac03c1u, 0xbead03c1u};
     const Words code = cat(
         {&kPrefix, &one_path, &kWriteLanes, &kDispatcherBody, &kReadLanesAndRestore, &kExecTail});
-    EXPECT_TRUE(compile_whole(Stage::Fragment, code).empty());
+    EXPECT_TRUE(compile_dispatcher_fragment(code).empty());
 }
 
 // A v_readlane result is defined only when the slot it reads is (#4749 review): a fabricated word
@@ -524,7 +566,7 @@ Words relay_chain(const Words& source, const Words& relay) {
 // The refusal is the restore itself, at its own pc. Inside a dispatcher case the guard's refusal
 // reaches the terminal line as the case's unresolved operand, as for the PR's own dispatcher arm.
 void expect_restore_refused(const Words& code, uint32_t restore_word) {
-    EXPECT_TRUE(compile_whole(Stage::Fragment, code).empty());
+    EXPECT_TRUE(compile_dispatcher_fragment(code).empty());
     size_t pc = 0;
     while (pc < code.size() && code[pc] != restore_word) ++pc;
     const std::string reason = last_terminal_reject_reason(kAddress);
@@ -537,9 +579,9 @@ void expect_restore_refused(const Words& code, uint32_t restore_word) {
 
 TEST(ScalarPairMask, ADefinedWordRelayedThroughAReadlaneCompiles) {
     // Control: s[50:51] holds EXEC, so v21's slots and the readlane'd s[44:45] are all defined.
-    EXPECT_FALSE(compile_whole(Stage::Fragment, relay_chain(kS50FromExec, kReadV21ToS44)).empty())
+    EXPECT_FALSE(compile_dispatcher_fragment(relay_chain(kS50FromExec, kReadV21ToS44)).empty())
         << last_terminal_reject_reason(kAddress);
-    EXPECT_FALSE(compile_whole(Stage::Fragment, relay_chain(kS50FromExec, kReadV21ViaS46)).empty())
+    EXPECT_FALSE(compile_dispatcher_fragment(relay_chain(kS50FromExec, kReadV21ViaS46)).empty())
         << last_terminal_reject_reason(kAddress);
 }
 
