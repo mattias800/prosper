@@ -13,6 +13,7 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -329,12 +330,28 @@ TEST(OwnedRawX2, CacheAdmissionIsDistinctFromReusableCode) {
                        source(2, 3, 0x2000200038ull, reinterpret_cast<uint8_t*>(words.data()))};
     ComputeShaderConfig config;
     config.local_x = 64;
+    config.tidig_comp_cnt = 1;   // the final compare consumes genuine local Y in v1
     config.user_sgprs = {1, 2};
     clear_shader_recompile_cache();
     uint64_t valid = 0, changed = 0, refused = 0;
     const auto first =
         recompile_compute_shader_cached(code.data(), code.size(), &table, config, &valid);
     ASSERT_FALSE(first.empty());
+    auto absent_y = config;
+    absent_y.tidig_comp_cnt = 0;
+    uint64_t absent_y_identity = 0;
+    constexpr uint64_t missing_local_y = 0x49960f01ull;
+    EXPECT_TRUE(recompile_compute_shader_cached(
+                    code.data(), code.size(), &table, absent_y, &absent_y_identity,
+                    {RecompileDiagnosticStage::Compute, missing_local_y})
+                    .empty())
+        << "warm code cannot supply an absent compare input";
+    EXPECT_NE(absent_y_identity, valid) << "system input declarations change generated code";
+    const auto reason = last_terminal_reject_reason(missing_local_y);
+    EXPECT_NE(reason.find("reason=fabricated-fresh-mask-source pc=7 words=7d820204"),
+              std::string::npos)
+        << reason;
+    EXPECT_EQ(recompile_compute_shader_cached(code.data(), code.size(), &table, config), first);
     words = {7, 11};
     table.resources[1].gpu_addr += 0x100;
     EXPECT_EQ(recompile_compute_shader_cached(code.data(), code.size(), &table, config, &changed),
