@@ -42,25 +42,21 @@ beyond the specific route documented for it.
 
 ---
 
-## Why prosper doesn't convert your game first
-
-The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). Before a game runs
-there, a tool converts the game files into a format your PC understands, then runs the result.
-**prosper** skips that step: it loads the game files as they are — the way Wine runs Windows
-programs — and the game runs directly on your CPU. Both approaches run at full CPU speed, so the
-conversion buys no speed. Skipping it means no second copy of the game on your disk, nothing extra
-that can break, and when something crashes, developers see the game's own code instead of a
-converted copy.
-
-Graphics are the exception. Your GPU can't run PS5 graphics code, so both projects translate it.
-That translator exists in **prosper** and is checked automatically on every change.
-
 ## **prosper** vs AnyPS5
+
+The closest sibling project is [AnyPS5](https://github.com/boykopovar/AnyPS5). Both run PS5 games
+on your PC at full CPU speed — but **prosper** gets there with less standing between you and the
+game.
 
 | | **prosper** | AnyPS5 |
 |---|---|---|
-| Running your game | Directly, as shipped | After converting the files to a PC format first |
-| Graphics | Translated for your GPU | Translated for your GPU |
+| Running your game | Directly, as shipped — nothing to convert, no second copy eating your disk | Converts the files to a PC format first, then runs the result |
+| Graphics | Translated for your GPU, checked automatically on every change | Translated for your GPU |
+| Progress | Games that actually run, with screenshots and checks against a real PS5 | Percentages of their own to-do list (see below) |
+
+No conversion step means nothing extra that can break — and when something crashes, developers see
+the game's own code instead of a converted copy. The one thing that truly needs translating is
+graphics: your GPU can't run PS5 graphics code, so both projects translate it.
 
 (Statements about AnyPS5 were checked against its repository.)
 
@@ -70,14 +66,14 @@ AnyPS5's page shows a percentage for system libraries and one for graphics instr
 footnote says these count only "the functions known to the project so far" — not every PS5
 function — and the total grows as they add more. So:
 
-- **The percentage is measured against their own to-do list.** Anything they haven't listed yet
-  isn't counted. Firmware analysis shows the real number of system functions is much larger than
-  any project's list.
+- **The score is kept against their own list.** Anything they haven't listed yet isn't counted.
+  Firmware analysis shows the real number of system functions is much larger than any project's
+  list — a high percentage can still mean a long way to go.
 - **"Done" means written, not proven right.** Their counter ticks when placeholder code gets
   replaced. Nothing checks the replacement gives the right answer.
 
-Neither project has measured what fraction of the real total works correctly, and neither claims
-to.
+We'd rather show a game running than a percentage climbing: every claim in `COMPATIBILITY.md` is a
+title someone actually booted, with screenshots in `BLOG.md` to prove it.
 
 ---
 
