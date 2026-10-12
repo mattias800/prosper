@@ -31,7 +31,9 @@ beyond the specific route documented for it.
 ## How it works
 
 - **No CPU emulation:** the PS5 CPU is standard x86-64 (Zen 2). Game code runs natively at host
-  speed.
+  speed, so there is no recompilation step either: translating native code into native code would
+  buy no speed, and the shipped modules run unchanged. Translation is reserved for the GPU, whose
+  ISA has no host equivalent.
 - **Loader + linker (`prosper/src/self/`, `prosper/src/loader/`):** parses SELF/ELF modules into
   relocatable images and links Sony NID imports into one address space with a global export table.
 - **Reimplemented system libraries (`prosper/src/hle/`):** clean-room implementations of the
