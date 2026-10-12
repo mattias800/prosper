@@ -34,6 +34,24 @@ bool saved_mask_physical_launch_matches_original(const SpirvCompute& b) {
            b.guest_compute_launch == b.saved_mask_original_compute_launch;
 }
 
+bool native_mask_half_readlane_has_physical_launch(const SpirvCompute& b, const Rdna2Inst& in) {
+    // CONFIDENCE: HIGH. Current physical-half identity alone cannot grant a numeric ballot.
+    // Keep direct READLANE DATA under the ordinary scalar mask-word original-launch contract,
+    // including exact native Wave64 participation and the captured raw producing profile.
+    // Entry-prefix participation can expire across ordinary CFG edges without changing the
+    // physical launch. Authenticate that launch separately from the existing per-PC half proof;
+    // this prerequisite grants no participation at arbitrary divergent ballot sites.
+    if (!native_compute_has_complete_entry(b) || b.saved_mask_original_fragment_entry ||
+        b.invocation_guard_merge || !native_vcc_copy_execution_domain_matches(b) ||
+        b.guest_compute_launch != b.saved_mask_original_compute_launch ||
+        in.pc >= b.saved_mask_original_words.size())
+        return false;
+    auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
+                                     b.saved_mask_original_words.size() - in.pc);
+    original.pc = in.pc;
+    return !in.synthetic_terminator && in == original;
+}
+
 bool native_uniform_mov_entry_sources(const RegState* initial, const Rdna2Inst& in) {
     if (!initial || initial->scc_merge_placeholder) return false;
     // Memory/descriptor footprints need a separate proof. This route covers original launch

@@ -40,6 +40,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_mask_write.hpp"
 
@@ -4360,8 +4361,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (sit != mit->second.end()) {
                         const auto proven_half =
                             b.wave64_mask_readlane_half_for_pc.find(in.pc);
-                        if (b.is_compute && b.wave_size == 64 &&
-                            b.native_subgroup_size == 64 &&
+                        if (native_mask_half_readlane_has_physical_launch(b, in) &&
                             proven_half != b.wave64_mask_readlane_half_for_pc.end()) {
                             // This is one scalar dword plus one Bool spelling of the SAME physical
                             // half, not a complete saved B64 predicate. End every overlapping full
