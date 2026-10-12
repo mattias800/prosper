@@ -648,11 +648,12 @@ def test_mutation_proof_writelane_respects_exec(monkeypatch):
         test_v_writelane_leaves_other_lanes_and_ignores_exec()
 
 
-# ---- Differential Parity with prosper Recompiler (Task H03 PR 2) -------------------------
-def test_differential_parity_against_recompiler_execution():
-    """Validates that test programs executed by test_rdna2_ref_differential against
+# ---- Reference-model expectations for the synthetic Vulkan value fixtures -------------
+def test_reference_model_synthetic_value_expectations():
+    """Check reference-model values for the synthetic Vulkan fixture bytecode.
 
-    prosper's SPIR-V recompiler produce identical per-lane output in rdna2_ref.
+    These assertions use hand-derived constants; no recompiler output is read.
+    The Vulkan suite checks its output separately against corresponding constants.
     """
     # 1. Positive control program (0x4a000081: v_add_nc_u32 v0, 1, v0) with input 42
     w1, _ = run([0x4A000081], vgpr={(0, lane): 42 for lane in range(64)})
