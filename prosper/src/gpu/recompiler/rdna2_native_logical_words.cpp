@@ -38,6 +38,26 @@ bool fragment_copy_domain(const SpirvCompute& b) {
            !b.allow_b32_masks;
 }
 
+// CONFIDENCE: HIGH -- the native NGG shell already carries per-lane predicates. Preserving one
+// current whole-mask generation is independent of physical producer participation.
+// This grants no packed words, launch coverage or late ballot to the graphics shell.
+bool ngg_copy_domain(const SpirvCompute& b) {
+    return b.ngg_workgroup_shell && !b.ngg_one_lane && b.is_compute && !b.is_fragment &&
+           !b.is_vertex && b.guest_stage == GuestShaderStage::Compute &&
+           b.physical_domain == PhysicalExecutionDomain::Workgroup && b.wave_size == 64 &&
+           b.native_subgroup_size == 64 && !b.allow_b32_masks;
+}
+
+bool closed_copy_domain(const SpirvCompute& b) {
+    return fragment_copy_domain(b) || ngg_copy_domain(b);
+}
+
+bool ngg_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
+    return ngg_copy_domain(b) && in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+           in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
+           in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 && in.src[0].value <= 104;
+}
+
 bool fragment_vcc_copy(const SpirvCompute& b, const Rdna2Inst& in) {
     return fragment_copy_domain(b) && in.fmt == Rdna2Format::SOP1 &&
            in.opcode == kSop1OpcodeMovB64 && in.dst.kind == OperandKind::SGPR &&
@@ -169,6 +189,7 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     b.native_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_saved_mask_pcs.clear();
+    b.ngg_bool_only_vcc_copy_pcs.clear();
     b.native_vcc_copy_entry_domain = copy_entry_domain(b);
     b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
     b.native_vcc_copy_entry_b32_masks =
@@ -220,23 +241,30 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
     }
     Words entry;
     entry.set(126);
-    if (!fragment_copy_domain(b)) entry.set(127);
+    if (!closed_copy_domain(b)) entry.set(127);
     if (initial) {
-        if (initial->vcc && (!fragment_copy_domain(b) || !initial->sreg_bool_b32.contains(106))) {
+        if (initial->vcc && (!closed_copy_domain(b) || !initial->sreg_bool_b32.contains(106))) {
             entry.set(106);
-            if (!fragment_copy_domain(b)) entry.set(107);
+            if (!closed_copy_domain(b)) entry.set(107);
         }
         for (const auto& [root, value] : initial->sreg_bool)
             if (value && root >= 0 && root < 128 &&
-                (!fragment_copy_domain(b) || ((root <= 104 || root == 106 || root == 126) &&
-                                              !initial->sreg_bool_b32.contains(root))))
+                (!closed_copy_domain(b) || ((root <= 104 || root == 106 || root == 126) &&
+                                            !initial->sreg_bool_b32.contains(root))))
                 entry.set(root);
     }
-    const auto mask_source = [&](const Words& masks, const Operand& source) {
+    const auto mask_source = [&](const Words& masks, const Operand& source,
+                                 const Rdna2Inst& owner) {
         if (source.kind == OperandKind::InlineInt) return true;
-        // A fragment B64 source must remain complete through every relay. A move/select
+        // CONFIDENCE: HIGH -- the B64 logical emitter consumes an owned trailing literal as
+        // a zero-extended constant mask. Numeric MOV/CSELECT literal routes do not create Bool.
+        if (source.kind == OperandKind::Literal && owner.has_literal &&
+            owner.fmt == Rdna2Format::SOP2 && owner.opcode >= 0x0f && owner.opcode <= 0x1d &&
+            (owner.opcode & 1u))
+            return true;
+        // A closed B64 source must remain complete through every relay. A move/select
         // cannot turn an independent high word or B32 seed into a whole-mask root.
-        if (fragment_copy_domain(b) &&
+        if (closed_copy_domain(b) &&
             !((source.kind == OperandKind::SGPR && source.value >= 0 && source.value <= 104) ||
               ((source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
                (source.value == 106 || source.value == 126))))
@@ -268,19 +296,19 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             const bool copy_mask = in.fmt == Rdna2Format::SOP1 &&
                                    (in.opcode == kSop1OpcodeMovB64 || in.opcode == 0x08 ||
                                     in.opcode == 0x0a || in.opcode == kSop1OpcodeQuadmaskB64) &&
-                                   mask_source(incoming, in.src[0]);
+                                   mask_source(incoming, in.src[0], in);
             const bool select_mask = in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0b &&
-                                     mask_source(incoming, in.src[0]) &&
-                                     mask_source(incoming, in.src[1]);
+                                     mask_source(incoming, in.src[0], in) &&
+                                     mask_source(incoming, in.src[1], in);
             // CONFIDENCE: HIGH -- the existing fragment SOP2 emitter computes these logical
             // results pointwise from genuine Bool operands. This is only the original MUST
             // transfer; generation DATA demand and current-source validation remain separate.
-            const bool fragment_logical =
-                fragment_copy_domain(b) && in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f &&
+            const bool closed_logical =
+                closed_copy_domain(b) && in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f &&
                 in.opcode <= 0x1d && (in.opcode & 1u) && in.dst.kind == OperandKind::SGPR &&
                 ((in.dst.value >= 0 && in.dst.value <= 104) || in.dst.value == 106 ||
                  in.dst.value == 126) &&
-                mask_source(incoming, in.src[0]) && mask_source(incoming, in.src[1]);
+                mask_source(incoming, in.src[0], in) && mask_source(incoming, in.src[1], in);
             const bool conditional =
                 in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64);
@@ -296,18 +324,19 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
                 for (int root : {105, 106, 107}) value.reset(root);
             if (in.fmt == Rdna2Format::Unknown || rdna2_escapes_decoded_effects(in)) value.reset();
             int root = -1;
-            if (!conditional && (copy_mask || select_mask || saveexec(in) ||
-                                 is_native_b64_logical(b, in) || fragment_logical))
+            if (!conditional &&
+                (copy_mask || select_mask || saveexec(in) ||
+                 (!closed_copy_domain(b) && is_native_b64_logical(b, in)) || closed_logical))
                 root = in.dst.value;
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode))
                 root = in.dst.kind == OperandKind::SGPR ? in.dst.value : 106;
             if (vop3_writes_mask_sdst(in)) root = in.sdst.value;
             if (root >= 0 && root < 128 &&
-                (!fragment_copy_domain(b) || root <= 104 || root == 106 || root == 126))
+                (!closed_copy_domain(b) || root <= 104 || root == 106 || root == 126))
                 value.set(root);
-            if (root == 106 && !fragment_copy_domain(b)) value.set(107);
+            if (root == 106 && !closed_copy_domain(b)) value.set(107);
             value.set(126);
-            if (!fragment_copy_domain(b)) value.set(127);
+            if (!closed_copy_domain(b)) value.set(127);
             if (value != masks_after[i]) {
                 masks_after[i] = value;
                 masks_changed = true;
@@ -339,9 +368,9 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
         if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
             in.dst.kind != OperandKind::SGPR)
             mark(kills[i], 106, 2);
-        const bool source_mask = mask_source(masks_before[i], in.src[0]);
+        const bool source_mask = mask_source(masks_before[i], in.src[0], in);
         const bool select_mask = in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0b && source_mask &&
-                                 mask_source(masks_before[i], in.src[1]);
+                                 mask_source(masks_before[i], in.src[1], in);
         const bool bool_logical = in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0f &&
                                   in.opcode <= 0x1d && (in.opcode & 1u);
         relays[i] = bool_logical || select_mask ||
@@ -370,7 +399,7 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
         const auto& condition = in.src[2];
         const bool cndmask_mask =
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && in.n_src == 3 &&
-            mask_source(masks_before[i], condition) &&
+            mask_source(masks_before[i], condition, in) &&
             ((condition.kind == OperandKind::SGPR && condition.value >= 0 &&
               condition.value <= 105) ||
              ((condition.kind == OperandKind::SGPR || condition.kind == OperandKind::Special) &&
@@ -443,6 +472,8 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             b.native_bool_only_vcc_copy_pcs.insert(original[i].pc);
         else if (fragment_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             b.fragment_bool_only_vcc_copy_pcs.insert(original[i].pc);
+        else if (ngg_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
+            b.ngg_bool_only_vcc_copy_pcs.insert(original[i].pc);
     }
 }
 
@@ -537,7 +568,8 @@ bool native_vcc_copy_execution_domain_matches(const SpirvCompute& b) {
 bool native_vcc_copy_is_bool_only(const SpirvCompute& b, const Rdna2Inst& in) {
     const bool proved_copy =
         (native_vcc_copy(b, in) && b.native_bool_only_vcc_copy_pcs.contains(in.pc)) ||
-        (fragment_vcc_copy(b, in) && b.fragment_bool_only_vcc_copy_pcs.contains(in.pc));
+        (fragment_vcc_copy(b, in) && b.fragment_bool_only_vcc_copy_pcs.contains(in.pc)) ||
+        (ngg_vcc_copy(b, in) && b.ngg_bool_only_vcc_copy_pcs.contains(in.pc));
     if (!proved_copy || b.native_vcc_copy_entry_domain != copy_entry_domain(b) ||
         in.pc >= b.saved_mask_original_words.size())
         return false;

@@ -1,8 +1,12 @@
 #include "gpu/recompiler/rdna2_copy_continuation.hpp"
 
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <utility>
@@ -38,16 +42,18 @@ class SavedMaskCopyFrame {
         std::array<uint32_t, 10> domain;
         std::set<int> entry_masks;
         std::unordered_set<int> entry_b32_masks;
-        std::set<uint32_t> native_copies, fragment_copies;
+        std::set<uint32_t> native_copies, fragment_copies, ngg_copies;
+        BarrierPhasedCompute barrier_phases;
     };
     std::shared_ptr<const Origin> origin;
     SpirvCompute* builder = nullptr;
     RegState* state = nullptr;
     const std::vector<Rdna2Inst>* instructions = nullptr;
     const uint32_t* code = nullptr;
-    size_t dwords = 0, begin = 0;
+    size_t dwords = 0, begin = 0, end = 0;
     uint64_t epoch = 0;
     bool open = true, authorized = false, initializer_permit = false;
+    bool barrier_region = false;
     const std::vector<Rdna2Inst>* pending = nullptr;
     size_t pending_begin = 0;
 
@@ -61,16 +67,64 @@ class SavedMaskCopyFrame {
             origin->entry_b32_masks != b.native_vcc_copy_entry_b32_masks ||
             origin->native_copies != b.native_bool_only_vcc_copy_pcs ||
             origin->fragment_copies != b.fragment_bool_only_vcc_copy_pcs ||
+            origin->ngg_copies != b.ngg_bool_only_vcc_copy_pcs ||
             !native_vcc_copy_execution_domain_matches(b) || width != origin->words.size() ||
             b.saved_mask_original_words != origin->words ||
-            !std::equal(origin->words.begin(), origin->words.end(), raw) ||
-            begin > origin->instructions.size() ||
-            ins.size() != origin->instructions.size() - begin)
+            !std::equal(origin->words.begin(), origin->words.end(), raw) || begin > end ||
+            end > origin->instructions.size())
             return false;
-        return std::equal(ins.begin(), ins.end(), origin->instructions.begin() + begin,
+        const bool artificial_end = barrier_region && end < origin->instructions.size();
+        if (ins.size() != end - begin + size_t(artificial_end)) return false;
+        if (artificial_end) {
+            Rdna2Inst terminator;
+            terminator.pc = origin->instructions[end].pc;
+            terminator.fmt = Rdna2Format::SOPP;
+            terminator.opcode = 0x01u;
+            terminator.len_dwords = 1;
+            terminator.is_end = true;
+            terminator.synthetic_terminator = true;
+            if (ins.back() != terminator) return false;
+        }
+        return std::equal(ins.begin(), ins.begin() + (end - begin),
+                          origin->instructions.begin() + begin,
                           [](const auto& in, const auto& original) {
                               return !in.synthetic_terminator && in == original;
                           });
+    }
+
+    bool closed_barrier_region() const {
+        if (!origin || origin->ngg_copies.empty() || begin >= end ||
+            end > origin->instructions.size())
+            return false;
+        const auto& original = origin->instructions;
+        const auto& phases = origin->barrier_phases;
+        if (!phases.found || phases.guarded) return false;
+        size_t next_begin = 0;
+        bool phase = false;
+        for (size_t barrier : phases.barriers) {
+            if (begin == next_begin && end == barrier) phase = true;
+            next_begin = barrier + 1;
+        }
+        if (begin == next_begin && end == original.size()) phase = true;
+        if (!phase) return false;
+        std::set<uint32_t> all_pcs, region_pcs;
+        for (size_t i = 0; i < original.size(); ++i) {
+            all_pcs.insert(original[i].pc);
+            if (i >= begin && i < end) region_pcs.insert(original[i].pc);
+        }
+        for (size_t i = 0; i < original.size(); ++i) {
+            const auto& in = original[i];
+            if (in.synthetic_terminator || in.fmt == Rdna2Format::Unknown ||
+                rdna2_escapes_decoded_effects(in))
+                return false;
+            if (in.fmt != Rdna2Format::SOPP || !sopp_opcode_is_direct_branch(in.opcode)) continue;
+            const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
+            if (target < 0 || target > UINT32_MAX ||
+                !all_pcs.contains(static_cast<uint32_t>(target)) ||
+                ((i >= begin && i < end) != region_pcs.contains(static_cast<uint32_t>(target))))
+                return false;
+        }
+        return true;
     }
 
     bool closed_suffix(size_t first) const {
@@ -99,6 +153,7 @@ void revoke_saved_mask_copy_proof(SpirvCompute& b) {
     b.native_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_vcc_copy_pcs.clear();
     b.fragment_bool_only_saved_mask_pcs.clear();
+    b.ngg_bool_only_vcc_copy_pcs.clear();
     if (b.saved_mask_copy_revocation_epoch != std::numeric_limits<uint64_t>::max())
         ++b.saved_mask_copy_revocation_epoch;
 }
@@ -108,7 +163,9 @@ bool consume_saved_mask_copy_continuation(SpirvCompute& b, const std::vector<Rdn
                                           uint32_t initial_active, const RegState* initial) {
     const auto frame = b.saved_mask_copy_frame;
     if (!frame || !std::exchange(frame->initializer_permit, false) || initial_active) return false;
-    return frame->binding(b, ins, code, dwords, initial) && frame->closed_suffix(frame->begin);
+    return frame->binding(b, ins, code, dwords, initial) &&
+           (frame->barrier_region ? frame->closed_barrier_region()
+                                  : frame->closed_suffix(frame->begin));
 }
 
 SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
@@ -134,6 +191,7 @@ SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
             frame_ = std::shared_ptr<SavedMaskCopyFrame>(new SavedMaskCopyFrame);
             frame_->origin = previous_->origin;
             frame_->begin = previous_->pending_begin;
+            frame_->end = previous_->end;
             frame_->epoch = previous_->epoch;
             frame_->builder = &b;
             frame_->state = &rs;
@@ -157,7 +215,8 @@ SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
     if (!code || dwords != b.saved_mask_original_words.size() ||
         !std::equal(b.saved_mask_original_words.begin(), b.saved_mask_original_words.end(), code) ||
         !native_vcc_copy_entry_masks_match(b, &rs) ||
-        (b.native_bool_only_vcc_copy_pcs.empty() && b.fragment_bool_only_vcc_copy_pcs.empty()) ||
+        (b.native_bool_only_vcc_copy_pcs.empty() && b.fragment_bool_only_vcc_copy_pcs.empty() &&
+         b.ngg_bool_only_vcc_copy_pcs.empty()) ||
         b.saved_mask_copy_revocation_epoch == UINT64_MAX)
         return;
     auto origin = std::make_shared<SavedMaskCopyFrame::Origin>();
@@ -167,7 +226,10 @@ SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
     origin->entry_b32_masks = b.native_vcc_copy_entry_b32_masks;
     origin->native_copies = b.native_bool_only_vcc_copy_pcs;
     origin->fragment_copies = b.fragment_bool_only_vcc_copy_pcs;
+    origin->ngg_copies = b.ngg_bool_only_vcc_copy_pcs;
     rdna2_walk(origin->words.data(), origin->words.size(), origin->instructions);
+    if (!origin->ngg_copies.empty())
+        origin->barrier_phases = analyze_barrier_phased_compute(origin->instructions);
     if (ins.size() != origin->instructions.size() ||
         !std::equal(ins.begin(), ins.end(), origin->instructions.begin(),
                     [](const auto& in, const auto& original) {
@@ -176,6 +238,7 @@ SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
         return;
     frame_ = std::shared_ptr<SavedMaskCopyFrame>(new SavedMaskCopyFrame);
     frame_->origin = std::move(origin);
+    frame_->end = frame_->origin->instructions.size();
     frame_->builder = &b;
     frame_->state = &rs;
     frame_->instructions = &ins;
@@ -207,7 +270,8 @@ bool SavedMaskCopyBodyScope::emit_counted_postlude(
     // CONFIDENCE: HIGH -- this seam is called only after the real counted loop's PHIs, exit
     // slots and marks succeeded. It preserves the original Bool-copy generation proof alone.
     // Physical producer participation still expires in initialize_saved_mask_word_proof.
-    if (frame_ && frame_->binding(builder_, instructions_, code_, dwords_, &state_)) {
+    if (frame_ && frame_->origin->ngg_copies.empty() &&
+        frame_->binding(builder_, instructions_, code_, dwords_, &state_)) {
         const auto& original = frame_->origin->instructions;
         const auto first = std::find_if(original.begin() + frame_->begin, original.end(),
                                         [exit_pc](const auto& in) { return in.pc == exit_pc; });
@@ -221,5 +285,56 @@ bool SavedMaskCopyBodyScope::emit_counted_postlude(
     }
     return emit_body(builder_, state_, postloop, safe, rt, allow_exec_update, allow_smem, exp_fn,
                      code_, dwords_);
+}
+
+bool SavedMaskCopyBodyScope::emit_barrier_phase(
+    size_t begin, size_t end, const std::unordered_set<uint32_t>& safe,
+    const ShaderResourceTable* rt, bool allow_exec_update, bool allow_smem,
+    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn, uint32_t initial_active,
+    bool synchronize_lds_fminmax, NativeBarrierHalfProof* barrier_halves) {
+    if (begin >= end || end > instructions_.size()) return false;
+    ScopedCleanup failed_phase([this]() noexcept { revoke_saved_mask_copy_proof(builder_); }, true);
+    std::vector<Rdna2Inst> phase(instructions_.begin() + begin, instructions_.begin() + end);
+    if (end < instructions_.size()) {
+        Rdna2Inst terminator;
+        terminator.pc = instructions_[end].pc;
+        terminator.fmt = Rdna2Format::SOPP;
+        terminator.opcode = 0x01u;
+        terminator.len_dwords = 1;
+        terminator.is_end = true;
+        terminator.synthetic_terminator = true;
+        phase.push_back(terminator);
+    }
+    const auto previous = builder_.saved_mask_copy_frame;
+    std::shared_ptr<SavedMaskCopyFrame> child;
+    ScopedCleanup retire(
+        [&]() noexcept {
+            if (child) child->open = false;
+            builder_.saved_mask_copy_frame = previous;
+        },
+        false);
+    // CONFIDENCE: HIGH -- only the actual body selector constructs this region. It is
+    // an exact closed original NGG phase, not a public slice or a producer-participation
+    // permit. The initializer still expires every physical-word participation proof.
+    if (!initial_active && frame_ && !frame_->barrier_region && frame_->begin == 0 &&
+        frame_->binding(builder_, instructions_, code_, dwords_, &state_)) {
+        child = std::shared_ptr<SavedMaskCopyFrame>(new SavedMaskCopyFrame);
+        child->origin = frame_->origin;
+        child->builder = &builder_;
+        child->state = &state_;
+        child->instructions = &phase;
+        child->code = code_;
+        child->dwords = dwords_;
+        child->begin = begin;
+        child->end = end;
+        child->epoch = frame_->epoch;
+        child->barrier_region = true;
+        child->authorized = child->closed_barrier_region();
+        child->initializer_permit = child->authorized;
+        if (child->authorized) builder_.saved_mask_copy_frame = child;
+    }
+    return emit_cfg_state_machine(builder_, state_, phase, safe, rt, allow_exec_update, allow_smem,
+                                  exp_fn, code_, dwords_, initial_active, synchronize_lds_fminmax,
+                                  {}, nullptr, nullptr, barrier_halves);
 }
 }   // namespace prosper::gpu

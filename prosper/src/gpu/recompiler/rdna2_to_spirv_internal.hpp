@@ -694,6 +694,8 @@ struct SpirvCompute {
     // Original invocation-domain fragment mask generations with no physical DATA live-out.
     // Register-wide demand from another generation cannot require these producers' words.
     std::set<uint32_t> fragment_bool_only_saved_mask_pcs;
+    // Native NGG copies preserve only the same current whole-mask predicate generation.
+    std::set<uint32_t> ngg_bool_only_vcc_copy_pcs;
     std::array<uint32_t, 10> native_vcc_copy_entry_domain{};
     std::shared_ptr<SavedMaskCopyFrame> saved_mask_copy_frame;
     uint64_t saved_mask_copy_revocation_epoch = 0;

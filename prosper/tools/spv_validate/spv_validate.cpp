@@ -33,6 +33,7 @@
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include "../../tests/fixtures/ngg_lane_slots.hpp"
+#include "../../tests/fixtures/ngg_bool_copy.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_fixtures.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
@@ -537,6 +538,25 @@ static int check_emitter_coverage(const std::string& src_root) {
 // GS_ALLOC_REQ capture and set-2 shell I/O beside a guest binding 0; Kena's captured linked LUT
 // producer covers the CFG dispatcher, both as one portable wave and as two native Wave64 waves.
 static void dump_ngg_subgroup_shell(const std::string& dir, const std::string& src_root) {
+    {
+        NggSubgroupShellConfig copy_config;
+        copy_config.waves = 3;
+        copy_config.wave_lanes = 64;
+        copy_config.native_wave64 = true;
+        for (bool phase : {false, true}) {
+            const auto code = prosper::test::ngg_bool_copy::program(phase);
+            dump(dir, phase ? "ngg_native_bool_copy_phase" : "ngg_native_bool_copy",
+                 recompile_ngg_subgroup(code.data(), code.size(), nullptr, copy_config),
+                 "recompile_ngg_subgroup");
+        }
+        for (uint32_t literal : {0u, 0xffu, 0x80000000u, UINT32_MAX}) {
+            const auto code = prosper::test::ngg_bool_copy::literal_logical(literal);
+            const auto name = "ngg_native_literal_mask_" + std::to_string(literal);
+            dump(dir, name.c_str(),
+                 recompile_ngg_subgroup(code.data(), code.size(), nullptr, copy_config),
+                 "recompile_ngg_subgroup");
+        }
+    }
     for (bool native : {false, true}) {
         NggSubgroupShellConfig slots_cfg;
         slots_cfg.waves = 4;
