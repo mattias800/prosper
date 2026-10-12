@@ -420,6 +420,9 @@ bool storage_image_write_extent(const std::array<uint32_t, 8>& t8, uint64_t& lo,
     if (!valid_image_type(d.type) || d.type == 10) return false;
     uint64_t slice_bytes = 0;
     if (d.max_mip || d.last_level) {
+        // A LINEAR selected level can use an HLE-registered row pitch larger than the layout's
+        // 256-byte fallback. The descriptor alone cannot bound that live writeback footprint.
+        if (d.tile_mode == 0) return false;
         if (!format.block_width || !format.block_height) return false;
         const uint32_t ew = (d.width + format.block_width - 1) / format.block_width;
         const uint32_t eh = (d.height + format.block_height - 1) / format.block_height;
