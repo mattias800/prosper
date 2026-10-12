@@ -87,6 +87,28 @@ bool predicate_defined(const std::vector<uint32_t>& writes, const std::vector<ui
     return fresh_mask_sources_defined(h.b, h.rs, read_ins[0]);
 }
 
+// Like predicate_defined, but the reader runs under a fresh EXEC value that is recorded as a
+// subset of `parent`: `subset_of_writer` picks the writer's EXEC, otherwise an unrelated value.
+bool predicate_defined_in_subset(const std::vector<uint32_t>& writes,
+                                 const std::vector<uint32_t>& reader, bool subset_of_writer) {
+    Harness h;
+    const uint32_t g = h.b.btrue();
+    h.rs.exec = g;
+    h.rs.exec_narrowed = true;
+    const auto write_ins = decode(writes);
+    const auto read_ins = decode(reader);
+    if (write_ins.empty() || read_ins.size() != 1) return false;
+    std::vector<Rdna2Inst> all = write_ins;
+    all.push_back(read_ins[0]);
+    seed_vector_word_definedness(h.rs, all, false, 64);
+    for (const auto& in : write_ins)
+        record_vector_word_marks(h.rs, in, scalar_source_marks(h.rs, in));
+    const uint32_t child = h.b.uconst(79);
+    h.rs.exec_subset_of[child] = subset_of_writer ? g : h.b.uconst(99);
+    h.rs.exec = child;
+    h.rs.exec_narrowed = true;
+    return fresh_mask_sources_defined(h.b, h.rs, read_ins[0]);
+}
 void sgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
     rs.sreg[r] = b.uconst(5);
 }
@@ -145,4 +167,15 @@ TEST(FreshMaskExecConfinement, MixedAbsentScalarInputStillRefuses) {
     EXPECT_FALSE(predicate_defined(kMovV6, kCmpS20V6, true, [](RegState& rs, SpirvCompute&) {
         rs.absent_sgpr_reads_fabricated_zero = true;
     }));
+}
+
+TEST(FreshMaskExecConfinement, CompareUnderACmpxSubsetOfTheWritersExecIsDefined) {
+    // v_cmpx sets EXEC' = EXEC & cmp, so EXEC' lies inside the writer's EXEC: the placeholder lanes
+    // outside the writer's EXEC are never in EXEC'.
+    EXPECT_TRUE(predicate_defined_in_subset(cat({kMovV6, kV8FromV6}), kCmpV8, true));
+}
+
+TEST(FreshMaskExecConfinement, CompareUnderAnUnrelatedExecRecordStillRefuses) {
+    // A recorded parent that is not the writer's EXEC proves nothing about the reader's lanes.
+    EXPECT_FALSE(predicate_defined_in_subset(cat({kMovV6, kV8FromV6}), kCmpV8, false));
 }

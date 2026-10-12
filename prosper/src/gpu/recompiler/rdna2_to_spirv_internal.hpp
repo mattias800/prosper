@@ -3157,6 +3157,10 @@ struct RegState {
     bool reads_scc = false;
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
+    // Lane-set facts about EXEC SSA values: child -> superset it was derived from (v_cmpx computes
+    // EXEC = EXEC & cmp). Each entry is a fact about one immutable SSA value, so it holds on every
+    // path that reaches that value.
+    std::map<uint32_t, uint32_t> exec_subset_of;
     // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
     // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.

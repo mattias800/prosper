@@ -44,6 +44,18 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
 }
 
+// True when the EXEC value named by reader is the owner value or a subset of it, by the derivation
+// facts recorded at v_cmpx. A placeholder confined outside owner is then also outside reader.
+bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
+    uint32_t current = reader;
+    for (int hop = 0; hop < 64 && current != 0; ++hop) {
+        if (current == owner) return true;
+        const auto parent = rs.exec_subset_of.find(current);
+        if (parent == rs.exec_subset_of.end()) return false;
+        current = parent->second;
+    }
+    return false;
+}
 bool memory_result(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
            in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
@@ -193,7 +205,8 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     if (!marks.placeholder) return true;
     // The predicate reads only the lanes its own EXEC enables, and its result is masked by that EXEC,
     // so a placeholder confined to the lanes outside the same EXEC value is never observed.
-    if (marks.hard && marks.outside_exec != 0 && rs.exec_narrowed && rs.exec == marks.outside_exec)
+    if (marks.hard && marks.outside_exec != 0 && rs.exec_narrowed &&
+        exec_within(rs, rs.exec, marks.outside_exec))
         return true;
     if (marks.hard || marks.blanket_roots.empty()) return false;
     // These roots name defined loop seeds, whose back edges the existing loop proof checks.
@@ -226,7 +239,8 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         } else if (narrowed_write) {
             // Outside EXEC the old word survives; inside it the result is the source relayed.
             const bool defined_inside =
-                !source.placeholder || (source.hard && source.outside_exec == rs.exec);
+                !source.placeholder ||
+                (source.hard && exec_within(rs, rs.exec, source.outside_exec));
             result.outside_exec = defined_inside ? rs.exec : 0u;
         }
         set_word(rs.vreg_source_marks, reg, std::move(result));

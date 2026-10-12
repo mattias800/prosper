@@ -4145,7 +4145,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // v_add_co_ci reading VCC got the compare mask instead of the real predicate (#464).
                     // EXEC suppresses inactive vector comparisons. Select masks an unselected
                     // comparison's poison; strict OpLogicalAnd would propagate it into EXEC.
+                    const uint32_t exec_before = rs.exec;
                     rs.exec = b.bsel(rs.exec, cmp, b.bfalse()); rs.exec_narrowed = true;
+                    rs.exec_subset_of[rs.exec] = exec_before;   // EXEC' = EXEC & cmp
                 } else {
                     // ISA 3.9: "VCC[n] = EXEC[n] & (test passed for thread n)" — a lane inactive in
                     // EXEC gets its mask bit forced to 0, never the raw test result. Masking at the
