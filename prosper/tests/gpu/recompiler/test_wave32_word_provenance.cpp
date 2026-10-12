@@ -376,3 +376,43 @@ TEST(Wave32WordProvenance, DispatcherReloadKeepsTheGenuineCurrentOrdinaryWord) {
 TEST(Wave32WordProvenance, DispatcherReloadKeepsTheCurrentWholeReplacement) {
     values(crossing_scalar_edges(false, true), 0, true);
 }
+
+// A B32 mask writes one physical word; a stored or PHI neighbor keeps its current provenance.
+TEST(Wave32WordProvenance, B32CompareCannotClearAStoredMissingNeighbor) {
+    refused({0xbead033cu, 0x7e0c0280u, 0x7d8400f9u, 0x0606ac06u, 0x7e0c022du, 0x7e580506u});
+    EXPECT_NE(reason.find("pc=8"), std::string::npos) << reason;
+}
+TEST(Wave32WordProvenance, B32CompareKeepsTheGenuineStoredNeighbor) {
+    values(
+        {0xbebc0387u, 0xbead033cu, 0x7e0c0280u, 0x7d8400f9u, 0x0606ac06u, 0x7e0c022du, 0x7e580506u},
+        7);
+}
+TEST(Wave32WordProvenance, B32CompareAllowsAGenuineCurrentNeighborReplacement) {
+    values(
+        {0xbead033cu, 0x7e0c0280u, 0x7d8400f9u, 0x0606ac06u, 0xbead0387u, 0x7e0c022du, 0x7e580506u},
+        7);
+}
+TEST(Wave32WordProvenance, B32CompareCannotClearAOneArmNeighborPhi) {
+    refused({0xbf068004u, 0xbf840001u, 0xbead0380u, 0x7e0c0280u, 0x7d8400f9u, 0x0606ac06u,
+             0x7e0c022du, 0x7e580506u});
+    EXPECT_NE(reason.find("pc=10"), std::string::npos) << reason;
+}
+TEST(Wave32WordProvenance, B32CompareKeepsTheAllPathNeighborPhi) {
+    values({0xbead0380u, 0xbf068004u, 0xbf840001u, 0xbead0380u, 0x7e0c0280u, 0x7d8400f9u,
+            0x0606ac06u, 0x7e0c022du, 0x7e580506u},
+           0);
+}
+TEST(Wave32WordProvenance, B32CarrySdstCannotClearAStoredMissingNeighbor) {
+    refused({0xbead033cu, 0x7e0c0280u, 0xd70f2c07u, 0x00010080u, 0x7e0c022du, 0x7e580506u});
+    EXPECT_NE(reason.find("pc=8"), std::string::npos) << reason;
+}
+TEST(Wave32WordProvenance, B32CarrySdstKeepsTheGenuineStoredNeighbor) {
+    values(
+        {0xbebc0387u, 0xbead033cu, 0x7e0c0280u, 0xd70f2c07u, 0x00010080u, 0x7e0c022du, 0x7e580506u},
+        7);
+}
+TEST(Wave32WordProvenance, B32CarrySdstAllowsAGenuineCurrentNeighborReplacement) {
+    values(
+        {0xbead033cu, 0x7e0c0280u, 0xd70f2c07u, 0x00010080u, 0xbead0387u, 0x7e0c022du, 0x7e580506u},
+        7);
+}

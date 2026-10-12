@@ -3936,6 +3936,16 @@ inline bool join_entry_m0(RegState& rs, int r, bool other_edge_token) {
     return true;
 }
 
+// Post-emission clients know the actual mask width. The generic inventory may reserve a pair,
+// but a B32 compare/carry leaves its neighbor's numeric value and every provenance mark intact.
+inline uint32_t emitted_scalar_write_width(const RegState& rs, const Rdna2Inst& in, int base,
+                                           uint32_t inventory_width) {
+    const bool mask_destination =
+        (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) && base == in.dst.value) ||
+        (vop3_writes_mask_sdst(in) && base == in.sdst.value);
+    return mask_destination && rs.sreg_bool_b32.contains(base) ? 1u : inventory_width;
+}
+
 // Apply one emitted instruction's input marks to what it wrote (#4706): every destination word, a
 // v_writelane spill slot, and SCC when a scalar instruction may have written it.
 inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
@@ -3974,7 +3984,8 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                (r > 0 && rs.sreg_bool.contains(r - 1) && !rs.sreg_bool_b32.contains(r - 1));
     };
     for_each_scalar_write(in, [&](int base, uint32_t width) {
-        for (int r = base; r < base + static_cast<int>(width); ++r) {
+        const uint32_t effective_width = emitted_scalar_write_width(rs, in, base, width);
+        for (int r = base; r < base + static_cast<int>(effective_width); ++r) {
             const bool ballot = mask_word(r);
             if (marks.placeholder && !ballot)
                 rs.sreg_merge_placeholder.insert(r);
@@ -4088,7 +4099,7 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
               rs.sreg_bool_b32.contains(in.src[1].value)));
         const bool vopc_b32_mask = vopc_b32_write && base == in.dst.value;
         const bool vop3_b32_mask_write = vop3_b32_mask && base == in.sdst.value;
-        const uint32_t effective_width = (vopc_b32_mask || vop3_b32_mask_write) ? 1u : width;
+        const uint32_t effective_width = emitted_scalar_write_width(rs, in, base, width);
         const bool scalar_cselect_vcc_bridge =
             allow_compute_scalar_vcc_bridge && base == 106 &&
             is_scalar_cselect_b32_to_vcc_lo(in) &&
