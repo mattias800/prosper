@@ -2964,6 +2964,7 @@ bool emit_cfg_state_machine(
         RegState state;
         state.vector_native_interpolation = initial.vector_native_interpolation;
         state.vector_wave_size = initial.vector_wave_size;
+        state.track_scc_definition = initial.track_scc_definition;
         state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
