@@ -159,6 +159,15 @@ jobs:
       - name: Set up Vulkan 1.4
         uses: ./.github/actions/setup-vulkan
 
+      - name: Set up Python test environment
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.8.12"
+          python-version: "3.13"
+
+      - name: Install the locked Python test dependencies
+        run: uv sync --locked --no-build --group dev
+
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
@@ -167,7 +176,7 @@ jobs:
           restore-keys: ccache-linux-${{ runner.os }}-
 
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still
       # report 100% green. Fail the job instead of shrinking the suite.
@@ -1040,6 +1049,15 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-spirv-tools
 
+      - name: Set up Python test environment
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.8.12"
+          python-version: "3.13"
+
+      - name: Install the locked Python test dependencies
+        run: uv sync --locked --no-build --group dev
+
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
@@ -1049,7 +1067,7 @@ jobs:
 
       - name: Configure
         shell: msys2 {0}
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$(cygpath -m "$PWD/.venv/Scripts/python.exe")"
 
       - name: Build
         id: build
@@ -1262,6 +1280,15 @@ jobs:
           brew install ccache ninja spirv-tools
           softwareupdate --install-rosetta --agree-to-license
 
+      - name: Set up Python test environment
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.8.12"
+          python-version: "3.13"
+
+      - name: Install the locked Python test dependencies
+        run: uv sync --locked --no-build --group dev
+
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
@@ -1272,7 +1299,7 @@ jobs:
       - name: Configure
         # Vulkan is disabled (Homebrew's loader is arm64-only; the headless core + substrate tests
         # don't need it — MoltenVK is a later frontier). x86_64 target, run under Rosetta.
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
 
       - name: Build
         id: build
