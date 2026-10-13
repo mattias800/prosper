@@ -2994,6 +2994,7 @@ struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
     MimgSourceProof mimg_sources;
+    NativeInterpolationPublication native_interpolation_publication;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;

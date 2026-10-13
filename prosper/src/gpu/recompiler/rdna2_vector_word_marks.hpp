@@ -38,6 +38,15 @@ struct MimgSourceProof {
     std::set<uint64_t> roots;
 };
 
+// One successful native Input publication, consumed by its own instruction's mark transfer.
+// This is not an architectural P2 accumulator or owned-packet interpolation validity fact.
+struct NativeInterpolationPublication {
+    uint32_t pc = UINT32_MAX;
+    int destination = -1;
+    uint32_t exec = 0;
+    uint32_t value = 0;
+};
+
 // Pure write effect, shared by structured provenance and current-EXEC CFG DATA facts.
 bool vector_write_completes_active_word(const Rdna2Inst& in);
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
@@ -54,6 +63,8 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
 // A fresh comparison/carry predicate cannot authenticate fabricated input storage. Genuine memory
 // data and checked loop-header assumptions remain separate from unavailable-source placeholders.
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs,
+                                             const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
 bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
