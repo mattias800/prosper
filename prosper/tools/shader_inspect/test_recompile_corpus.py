@@ -112,3 +112,66 @@ def test_nonzero_exit_with_a_stage_recompile_line_is_an_accepted_refusal(tmp_pat
     monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done(refusal, returncode=3))
     results = rc.collect(tmp_path, "inspector")
     assert results["cs_x.bin"]["verdict"] == [refusal.strip()]
+
+
+@pytest.mark.parametrize("status", [2, -11, 3221225477])
+def test_failure_after_printed_verdict_is_not_recorded(tmp_path, monkeypatch, status):
+    """A flushed verdict can precede an IO failure or a process crash."""
+    (tmp_path / "cs_x.bin").write_bytes(b"\0")
+    text = "stage-recompile stage=compute status=ok spirv_dwords=12\n"
+    monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done(text, status))
+    with pytest.raises(rc.InspectorError, match="exit"):
+        rc.collect(tmp_path, "inspector")
+
+
+def test_synthetic_write_failure_does_not_create_baseline(tmp_path, monkeypatch):
+    """shader_inspect prints synthetic success before it checks output-stream errors."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "vs_x.bin").write_bytes(b"\0")
+    inspector = tmp_path / "inspector.exe"
+    inspector.write_bytes(b"")
+
+    def fake_run(cmd, **_kw):
+        if "--synthetic-table" in cmd:
+            return _Done("stage-recompile stage=vertex status=ok-synthetic-table\n", 2)
+        return _Done("stage-recompile stage=vertex status=ok\n")
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    baseline = tmp_path / "base.json"
+    assert (
+        rc.main(["record", str(corpus), "--inspect", str(inspector), "--out", str(baseline)]) == 2
+    )
+    assert not baseline.exists()
+
+
+@pytest.mark.parametrize("status", [4, 5])
+def test_synthetic_success_and_refusal_have_distinct_artifact_results(
+    tmp_path, monkeypatch, status
+):
+    (tmp_path / "vs_x.bin").write_bytes(b"\0")
+
+    def fake_run(cmd, **_kw):
+        if "--synthetic-table" in cmd:
+            if status == 4:
+                Path(cmd[-1]).write_bytes(b"synthetic module")
+            verdict = "ok-synthetic-table" if status == 4 else "rejected-synthetic-table"
+            return _Done(f"stage-recompile stage=vertex status={verdict}\n", status)
+        return _Done("stage-recompile stage=vertex status=rejected\n", 1)
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    entry = rc.collect(tmp_path, "inspector")["vs_x.bin"]
+    assert (entry["spirv_sha256"] is not None) == (status == 4)
+
+
+def test_synthetic_success_without_output_is_not_recorded(tmp_path, monkeypatch):
+    (tmp_path / "vs_x.bin").write_bytes(b"\0")
+
+    def fake_run(cmd, **_kw):
+        if "--synthetic-table" in cmd:
+            return _Done("stage-recompile stage=vertex status=ok-synthetic-table\n", 4)
+        return _Done("stage-recompile stage=vertex status=ok\n")
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    with pytest.raises(rc.InspectorError, match="SPIR-V output"):
+        rc.collect(tmp_path, "inspector")

@@ -56,6 +56,12 @@ def run(cmd: list[str], env: dict[str, str]) -> str:
         done = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as err:
         raise InspectorError(f"{cmd[0]} did not run: {err}") from err
+    # shader_inspect: 0/1/3 are ordinary verdicts; 4/5 are synthetic probes.
+    # Exit 2 is IO/usage failure, even after a verdict was flushed; signals and
+    # Windows exception exits must likewise never become a baseline answer.
+    verdict_exits = (4, 5) if "--synthetic-table" in cmd else (0, 1, 3)
+    if done.returncode not in verdict_exits:
+        raise InspectorError(f"inspector failed for {Path(cmd[1]).name} (exit {done.returncode})")
     text = done.stdout + done.stderr
     if not any(ln.startswith("stage-recompile stage=") for ln in text.splitlines()):
         raise InspectorError(
@@ -87,9 +93,10 @@ def recompile(inspect: str, blob: Path, stage: str) -> dict:
                 env,
             )
             entry["synthetic_verdict"] = verdict_lines(text)
-            entry["spirv_sha256"] = (
-                hashlib.sha256(spv.read_bytes()).hexdigest() if spv.exists() else None
-            )
+            module = spv.read_bytes() if spv.exists() else b""
+            if "status=ok-synthetic-table" in text and not module:
+                raise InspectorError(f"missing SPIR-V output for {blob.name}")
+            entry["spirv_sha256"] = hashlib.sha256(module).hexdigest() if module else None
     return entry
 
 
