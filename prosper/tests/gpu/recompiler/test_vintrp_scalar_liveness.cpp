@@ -42,7 +42,7 @@ TEST(VintrpScalarLiveness, AnSgprReadAfterInterpolationStillBlocks) {
 }
 
 TEST(VintrpScalarLiveness, M0IsNeverDeadAcrossInterpolation) {
-    // VINTRP observes M0 implicitly, so the M0 carve-out must hold here too.
+    // M0 is never dead anywhere (unmodelled implicit readers); the carve-out holds here too.
     const auto program = decode({kMovB32S4S0, kInterpP1, kEnd});
     EXPECT_FALSE(sgpr_dead_at_merge(program, 1, 124));
 }
