@@ -221,7 +221,10 @@ const context = {
   fetch(){return Promise.resolve({json(){return Promise.resolve(input.payload);}})}
 };
 vm.runInNewContext(input.script, context);
-setImmediate(() => process.stdout.write(nodes.grid.innerHTML));
+setTimeout(() => {
+  if (!nodes.grid || !nodes.grid.innerHTML) { console.error('grid not rendered'); process.exit(2); }
+  process.stdout.write(nodes.grid.innerHTML);
+}, 0);
 """
     result = subprocess.run(
         [node, "-e", harness],
@@ -233,6 +236,7 @@ setImmediate(() => process.stdout.write(nodes.grid.innerHTML));
         check=True,
         timeout=10,
     )
+    assert result.stderr == "", result.stderr
 
     class Tags(HTMLParser):
         def __init__(self):
