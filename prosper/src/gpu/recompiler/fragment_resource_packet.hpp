@@ -1,6 +1,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
-#include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_entry_facts.hpp"
 #include "gpu/recompiler/fragment_packet_scalar_reads.hpp"
 #include <span>
 

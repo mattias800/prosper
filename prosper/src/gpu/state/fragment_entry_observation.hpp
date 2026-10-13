@@ -1,5 +1,5 @@
 #pragma once
-#include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_entry_facts.hpp"
 
 namespace prosper::gpu {
 struct GpuState;

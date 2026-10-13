@@ -348,15 +348,10 @@ layer-include|prosper/src/loader/tls_layout.hpp|hle 1
 # reaches up into nothing. Seeded with the includes present at acceptance; each row falls as the include moves down
 # or the switch it carried becomes a request field.
 recompiler-include|prosper/src/gpu/recompiler/compute_wave_route.cpp|diagnostics 2
-recompiler-include|prosper/src/gpu/recompiler/fragment_resource_packet.hpp|gpu/state 1
-recompiler-include|prosper/src/gpu/recompiler/original_fragment_producer.hpp|gpu/state 1
-recompiler-include|prosper/src/gpu/recompiler/raster_quad_collector.hpp|gpu/execute 1
-recompiler-include|prosper/src/gpu/recompiler/raster_quad_collector.hpp|gpu/state 2
 recompiler-include|prosper/src/gpu/recompiler/rdna2_alu_support.hpp|gpu/diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp|gpu/diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp|gpu/diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp|gpu/diagnostics 1
-recompiler-include|prosper/src/gpu/recompiler/rdna2_raw_x2_lifetime.cpp|gpu/execute 1
 recompiler-include|prosper/src/gpu/recompiler/rdna2_recompile_compute.cpp|gpu/diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/rdna2_recompile_fragment.cpp|gpu/diagnostics 2
 recompiler-include|prosper/src/gpu/recompiler/rdna2_recompile_shared.hpp|gpu/diagnostics 1

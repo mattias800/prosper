@@ -6,9 +6,8 @@
 - `guest_depth_plane` — how many bytes of guest memory a depth plane occupies, from
   `DB_Z_INFO.FORMAT`. The host image is D32 for every guest format, so this is the only place that
   knows a Z_16 plane is half the size.
-- `fragment_entry_facts` — physical per-word PS USER_DATA presence and raw RSRC2 knownness from
-  the producing draw. A present zero is not an absent word. This does not map observations to
-  launched guest SGPRs, system parameters, M0 or VGPRs; the packet preflight names those gaps.
+- `fragment_entry_facts` and `raster_launch_facts` live in `gpu/recompiler` now: they are inputs the
+  recompiler reads (ADR 0006 / GPU-1), so they sit with it rather than in the layer that calls it.
 
 Small folder, outsized blast radius: state that never reaches the GPU produces output that looks like
 a *shading* bug. One recorded case had solid-block glyphs, a black logo panel and a flat sky that were

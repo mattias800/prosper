@@ -1,7 +1,7 @@
 // skippable_instruction.cpp -- see the header.
 #include "gpu/execute/skippable_instruction.hpp"
 
-#include "gpu/execute/sopp_cfg.hpp"
+#include "gpu/recompiler/sopp_cfg.hpp"
 
 #include <cstddef>
 #include <limits>

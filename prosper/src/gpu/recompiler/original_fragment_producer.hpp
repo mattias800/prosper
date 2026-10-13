@@ -1,5 +1,5 @@
 #pragma once
-#include "gpu/state/raster_launch_facts.hpp"
+#include "gpu/recompiler/raster_launch_facts.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <memory>
 #include <span>

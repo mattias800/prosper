@@ -29,7 +29,7 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   supplies inputs or authority to live compilation.
 - `split_t8_proof` — whether the const-fold may publish an image descriptor assembled from two
   scalar loads: a must-dataflow over the program's CFG, so every path into the consumer has to
-  deliver the same load words. `sopp_cfg` holds the direct-branch helpers the executor's CFG
+  deliver the same load words. `sopp_cfg` (now in `gpu/recompiler`) holds the direct-branch helpers the executor's CFG
   proofs share.
 - `dcc_helper_program.hpp` / `efc_helper_program.hpp` — recognise AGC's metadata operations (DCC
   decompress, eliminate fast clear, htile decompress) by the helper program AGC binds for them,

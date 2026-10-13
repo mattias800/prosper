@@ -11,7 +11,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
-#include "gpu/state/raster_launch_facts.hpp"
+#include "gpu/recompiler/raster_launch_facts.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
