@@ -2615,6 +2615,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_vertex_vcc_scalar_lifetime.cpp
     INCLUDES src tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_front_face
+    SOURCES tests/gpu/recompiler/test_fragment_front_face.cpp
+            tests/gpu/execute/test_front_face_producer.cpp
+            tests/gpu/capture/test_front_face_compile_inputs.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_scalar_vcc_pair
     SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
     INCLUDES src tests

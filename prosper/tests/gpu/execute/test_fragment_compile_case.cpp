@@ -201,13 +201,22 @@ static void rechecksum(std::vector<uint8_t>& bytes) {
     for (size_t k = 0; k + 8 < bytes.size(); ++k) { hash ^= bytes[k]; hash *= 1099511628211ull; }
     for (unsigned k = 0; k < 8; ++k) bytes[bytes.size() - 8 + k] = uint8_t(hash >> (k * 8));
 }
-// Schema 6 (#4703) appended six bytes -- the export-format input -- after every older tail. The
+// Schemas 6/7 append export formats and front-face encoding after every older tail. The
 // tests below derive each OLDER schema by stripping tails off the end at fixed offsets, so they
 // start from the schema-5 wire a current case would have been written as. export_format_tests()
 // owns the schema-6 tail itself.
 static constexpr size_t kExportFormatTail = 6u;
-static std::vector<uint8_t> encode_v5(const FragmentCompileCase& c) {
+static std::vector<uint8_t> encode_v6(const FragmentCompileCase& c) {
     auto bytes = encode_fragment_compile_case(c);
+    CHECK(bytes.size() > 9u && bytes[8] == 7);
+    CHECK(c.system_inputs.front_face_encoding == FragmentFrontFaceEncoding::Unavailable);
+    bytes.erase(bytes.end() - 9);   // strip the new field, preserving the official schema-6 prefix
+    bytes[8] = 6;
+    rechecksum(bytes);
+    return bytes;
+}
+static std::vector<uint8_t> encode_v5(const FragmentCompileCase& c) {
+    auto bytes = encode_v6(c);
     CHECK(bytes.size() > 8u + kExportFormatTail && bytes[8] == 6);
     bytes.erase(bytes.end() - 8 - kExportFormatTail, bytes.end() - 8);
     bytes[8] = 5;
@@ -247,7 +256,7 @@ static void codec_tests(const FragmentCompileCase& produced) {
         CHECK(error([&] { decode_fragment_compile_case(bad); }).find("checksum") != std::string::npos);
     }
     auto schema = wire;
-    schema[8] = 7;
+    schema[8] = 8;
     rechecksum(schema);
     CHECK(error([&] { decode_fragment_compile_case(schema); }).find("schema") != std::string::npos);
     auto boolean = wire; boolean[12] = 2; rechecksum(boolean);
@@ -1105,7 +1114,7 @@ static void export_format_tests() {
     const auto c = produce(compressed, false, nullptr, {}, {}, {}, {}, uint16);
     CHECK(legacy.complete && c.complete && c.expected_produced && legacy.expected_produced);
     CHECK(c.source != legacy.source);   // the input changes the module, so it must be retained
-    const auto wire = encode_fragment_compile_case(c);
+    const auto wire = encode_v6(c);
     CHECK(wire[8] == 6);
     CHECK(wire[wire.size() - 14] == 0x7u && wire[wire.size() - 10] == 1u &&
           wire[wire.size() - 9] == 0u);

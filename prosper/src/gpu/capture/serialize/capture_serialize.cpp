@@ -1392,6 +1392,28 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                     return false;
                 }
     }
+    if (gpu_capture_version_for(c) >= kVersionWithFrontFaceEncoding) {
+        const auto write_encoding = [&](const PixelSystemInputMapping& inputs, bool present) {
+            const auto value = static_cast<uint8_t>(inputs.front_face_encoding);
+            if (!inputs.canonical() ||
+                (!present && inputs.front_face_encoding != FragmentFrontFaceEncoding::Unavailable))
+                return false;
+            w.u8(value);
+            return true;
+        };
+        w.u32(static_cast<uint32_t>(c.draws.size()));
+        for (const auto& draw : c.draws)
+            if (!write_encoding(draw.system_inputs, draw.has_system_inputs)) {
+                error = "invalid draw front-face encoding";
+                return false;
+            }
+        w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+        for (const auto& diagnostic : c.failure_diagnostics)
+            if (!write_encoding(diagnostic.system_inputs, diagnostic.has_system_inputs)) {
+                error = "invalid failed draw front-face encoding";
+                return false;
+            }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

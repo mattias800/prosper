@@ -1937,6 +1937,35 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     return false;
                 }
     }
+    if (version >= kVersionWithFrontFaceEncoding) {
+        const auto read_encoding = [&](PixelSystemInputMapping& inputs, bool present) {
+            uint8_t value = 0;
+            if (!r.u8(value) || value > static_cast<uint8_t>(FragmentFrontFaceEncoding::AllBits))
+                return false;
+            inputs.front_face_encoding = static_cast<FragmentFrontFaceEncoding>(value);
+            return inputs.canonical() && (present || inputs.front_face_encoding ==
+                                                         FragmentFrontFaceEncoding::Unavailable);
+        };
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid draw front-face encoding count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_encoding(draw.system_inputs, draw.has_system_inputs)) {
+                error = "invalid draw front-face encoding";
+                return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed draw front-face encoding count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!read_encoding(diagnostic.system_inputs, diagnostic.has_system_inputs)) {
+                error = "invalid failed draw front-face encoding";
+                return false;
+            }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

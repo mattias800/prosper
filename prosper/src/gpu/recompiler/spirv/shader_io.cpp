@@ -221,6 +221,29 @@ uint32_t SpirvCompute::fragcoord_component(uint32_t component) {
         return bcu(scalar);
     }
 
+    uint32_t SpirvCompute::fragment_front_face_word(FragmentFrontFaceEncoding encoding) {
+        if (!is_fragment || (encoding != FragmentFrontFaceEncoding::SignedFloat &&
+                             encoding != FragmentFrontFaceEncoding::AllBits))
+            return 0;
+        if (!v_front_facing) {
+            const uint32_t pointer = id();
+            v_front_facing = id();
+            put(types, Op_TypePointer, {pointer, SC_Input, t_bool});
+            put(types, Op_Variable, {pointer, v_front_facing, SC_Input});
+            put(deco, Op_Decorate, {v_front_facing, Dec_BuiltIn, 17});   // FrontFacing
+            iface.push_back(v_front_facing);
+        }
+        const uint32_t facing = id();
+        put(code, Op_Load, {t_bool, facing, v_front_facing});
+        // CONFIDENCE: MED -- AMD SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects signed float
+        // versus WGF whole-word Boolean. The WGF ABI publishes true as all ones, false as zero.
+        // https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/CIK_3D_registers_v2.pdf
+        // https://humus.name/Articles/Persson_LowlevelShaderOptimization.pdf
+        return encoding == FragmentFrontFaceEncoding::AllBits
+                   ? sel(facing, uconst(UINT32_MAX), uconst(0))
+                   : sel(facing, uconst(0x3f800000u), uconst(0xbf800000u));
+    }
+
 uint32_t SpirvCompute::fragment_ancillary_layer_bits() {
         // Layer is a fragment Input. SPIR-V requires Geometry capability for this
         // BuiltIn even when the preceding stage is a mesh shader. This is emitted
