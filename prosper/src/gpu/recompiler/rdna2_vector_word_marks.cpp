@@ -75,6 +75,37 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     }
     return false;
 }
+
+void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
+                 const RegState* current = nullptr) {
+    const uint32_t into_side = into.hard ? into.outside_exec : 0u;
+    const uint32_t other_side = other.hard ? other.outside_exec : 0u;
+    if (into.placeholder && other.placeholder) {
+        // CONFIDENCE: HIGH -- outside A union outside B is outside B when B is a proved
+        // subset of A. Only current instruction sources share these immutable EXEC SSA facts;
+        // predecessor and loop joins retain the equality-only meet below.
+        uint32_t owner = into_side == other_side ? into_side : 0u;
+        if (!owner && current && into_side && other_side) {
+            if (exec_within(*current, into_side, other_side))
+                owner = into_side;
+            else if (exec_within(*current, other_side, into_side))
+                owner = other_side;
+        }
+        into.outside_exec = owner;
+    } else if (other.placeholder) {
+        into.outside_exec = other_side;
+    } else {
+        into.outside_exec = into_side;
+    }
+    into.placeholder = into.placeholder || other.placeholder;
+    into.memory = into.memory || other.memory;
+    into.hard = into.hard || other.hard;
+    if (into.hard && !into.outside_exec)
+        into.blanket_roots.clear();
+    else
+        into.blanket_roots.insert(other.blanket_roots.begin(), other.blanket_roots.end());
+}
+
 bool memory_result(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MUBUF ||
            in.fmt == Rdna2Format::MTBUF || in.fmt == Rdna2Format::MIMG ||
@@ -174,21 +205,7 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other) {
     // EXEC confinement survives a join only when every placeholder side shares it. A clean side
     // contributes no placeholder lanes; a soft placeholder may sit in any lane.
-    const uint32_t into_side = into.hard ? into.outside_exec : 0u;
-    const uint32_t other_side = other.hard ? other.outside_exec : 0u;
-    if (into.placeholder && other.placeholder)
-        into.outside_exec = into_side == other_side ? into_side : 0u;
-    else if (other.placeholder)
-        into.outside_exec = other_side;
-    else
-        into.outside_exec = into_side;
-    into.placeholder = into.placeholder || other.placeholder;
-    into.memory = into.memory || other.memory;
-    into.hard = into.hard || other.hard;
-    if (into.hard && !into.outside_exec)
-        into.blanket_roots.clear();
-    else
-        into.blanket_roots.insert(other.blanket_roots.begin(), other.blanket_roots.end());
+    union_marks(into, other);
 }
 
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
@@ -261,8 +278,7 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     }
     for (uint32_t source = 0; source < in.n_src; ++source)
         for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
-            union_source_marks(marks,
-                               vector_word(rs, in.src[source].value + static_cast<int>(word)));
+            union_marks(marks, vector_word(rs, in.src[source].value + static_cast<int>(word)), &rs);
     // Relative indexing can select an absent word beyond the decoder's storage inventory. A
     // constant current M0 may refine this at the actual emission boundary; maps alone cannot.
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
@@ -347,7 +363,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         ScalarSourceMarks result = source;
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
-        if (preserve) union_source_marks(result, old);
+        if (preserve) union_marks(result, old, &rs);
         // Only a complete write can grant new confinement. An incomplete lane-mapped write keeps
         // the existing meet of source and old-word confinement; selected-lane, relative and
         // cross-lane writes cannot retain that proof.

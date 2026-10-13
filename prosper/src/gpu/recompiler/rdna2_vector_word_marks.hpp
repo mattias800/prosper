@@ -23,7 +23,7 @@ struct ScalarSourceMarks {
     std::set<uint64_t> blanket_roots;
     // Nonzero only for a hard placeholder whose lanes are provably confined to the lanes OUTSIDE
     // this SPIR-V EXEC value: a partial VALU write under that EXEC replaced every other lane with
-    // clean data. A later reader under the very same EXEC value never touches those lanes.
+    // clean data. A later reader under that EXEC or a proved subset never touches those lanes.
     uint32_t outside_exec = 0;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
@@ -69,4 +69,4 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
 inline constexpr int kVectorBlanketBase = 256;
 ScalarSourceMarks carried_word_marks(const RegState& rs, int word);
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
