@@ -26,6 +26,8 @@ struct ScalarSourceMarks {
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
+// Pure write effect, shared by structured provenance and current-EXEC CFG DATA facts.
+bool vector_write_completes_active_word(const Rdna2Inst& in);
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
 // Call only at a producing stage entry, after its actual input VGPRs have been published.
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,

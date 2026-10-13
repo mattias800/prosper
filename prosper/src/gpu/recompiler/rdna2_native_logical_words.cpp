@@ -155,6 +155,25 @@ void seed_native_logical_entry_marks(SpilledMaskHalves& marks, const RegState& i
     if (initial.scc_merge_placeholder) marks.relayed_words.insert(kRelayedScc);
 }
 
+void seed_native_logical_entry_domains(SpilledMaskHalves& marks, const RegState& initial,
+                                       const std::set<int>& direct_descriptor_sregs,
+                                       std::set<int>& masks, std::set<int>& scalar_words) {
+    seed_native_logical_entry_marks(marks, initial);
+    for (const auto& mask : initial.sreg_bool)
+        if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
+            masks.insert(mask.first);
+    if (initial.vcc) masks.insert(106);
+    for (const auto& value : initial.sreg)
+        if (value.first <= 124) scalar_words.insert(value.first);
+    for (const auto& value : initial.sreg_input)
+        if (value.first <= 124) scalar_words.insert(value.first);
+    // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
+    // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
+    // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
+    for (int reg : direct_descriptor_sregs)
+        if (reg <= 124) scalar_words.insert(reg);
+}
+
 bool native_logical_data_word(const RegState& rs, int word, uint32_t& value) {
     // Ordinary DATA retains its existing MAY marks; only a missing physical mask word is a
     // transactional gap here. Native logical result authority checks those marks separately.
