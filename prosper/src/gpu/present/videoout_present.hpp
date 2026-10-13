@@ -166,6 +166,8 @@ struct PresentSnapshot {
 // Lifetime-safe access to the current rendered frame without copying its pixels. The immutable
 // storage remains valid after a newer frame is published or present_reset() is called.
 struct PresentFrameLease {
+    PresentSource source = PresentSource::None;
+    int front_index = -1;   // unknown; never borrow a later registry index for retained pixels
     uint64_t frame_seq = 0;
     uint64_t guest_present_count = 0; // guest flip represented by this renderer publication
     uint32_t width = 0;

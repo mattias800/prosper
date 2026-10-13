@@ -27,7 +27,7 @@ weaker than it read:
 | File | Responsibility |
 | --- | --- |
 | `screenshot.cpp` | The tool: argument parsing, the guest thread, the sampling loop, the assertions, the summary. Owns Vulkan and the dump; everything it can push out to a pure module, it has. |
-| `capture_manifest.{hpp,cpp}` | The JSONL manifest and the pure classification behind it — sample/run/summary records, the capture tracker, the run verdict, the early-stop predicate. No Vulkan, no dump: `tests/test_capture_manifest.cpp` exercises all of it. |
+| `frontends/shared/capture/capture_manifest.{hpp,cpp}` | The JSONL manifest and the pure classification behind it — sample/run/summary records, the capture tracker, the run verdict, the early-stop predicate. No Vulkan, no dump: `tests/test_capture_manifest.cpp` exercises all of it. |
 | `overlay_text.{hpp,cpp}` | The 5x7 bitmap font and the RGBA text burner behind `--fps-overlay`. Pure; `tests/test_overlay_text.cpp` asserts it on pixels. |
 | `README.md` | The user-facing contract: every option, what each assertion means, and what the manifest fields are. |
 

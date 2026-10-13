@@ -132,9 +132,10 @@ RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
 
 // Why the sampling loop ended. `RequestSatisfied` and `Timeout` are the two reasons the loop always
 // had; `GuestFault` is the early stop (#2584).
-enum class SamplingStop : uint8_t { RequestSatisfied, Timeout, GuestFault };
+enum class SamplingStop : uint8_t { RequestSatisfied, Timeout, GuestFault, FrontendStopped };
 
-const char* sampling_stop_name(SamplingStop stop);   // request-satisfied | timeout | guest-fault
+const char* sampling_stop_name(
+    SamplingStop stop);   // request-satisfied | timeout | guest-fault | frontend-stopped
 
 // Should the sampler stop before its request is satisfied, because nothing new can arrive?
 //
