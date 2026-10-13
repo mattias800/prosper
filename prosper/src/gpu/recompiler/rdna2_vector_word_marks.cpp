@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -19,7 +20,8 @@ namespace {
 // True when each result lane depends only on that same lane's sources and old word: no DPP,
 // no cross-lane permute, no lane-selecting write, no relative destination, no LDS exchange.
 // Accumulators (VOP2/VOP3 mac/fmac) qualify: they read the old destination, but only their own
-// lane's. SDWA field-select and per-lane memory loads qualify for the same reason.
+// lane's. SDWA field-select qualifies for the same reason. Memory result marks do not
+// authenticate their addresses; their dedicated source proofs must grant confinement.
 bool lane_mapped_vector_write(const Rdna2Inst& in) {
     if (in.has_dpp) return false;
     switch (in.fmt) {
@@ -29,10 +31,6 @@ bool lane_mapped_vector_write(const Rdna2Inst& in) {
         case Rdna2Format::VOP2: return true;
         case Rdna2Format::VOPC: return true;
         case Rdna2Format::VOP3: return in.opcode < 0x300;
-        case Rdna2Format::MUBUF:
-        case Rdna2Format::MTBUF:
-        case Rdna2Format::MIMG:
-        case Rdna2Format::FLAT: return true;
         default: return false;
     }
 }
@@ -149,8 +147,16 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
     const int highest = shader_max_vgpr(instructions);
     rs.vector_wave_size = wave_size;
-    if (wave_size == 32) {
+    const bool scc_offset =
+        std::any_of(instructions.begin(), instructions.end(), [](const auto& in) {
+            return (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+                   in.n_src >= 3 && in.src[2].kind == OperandKind::Special &&
+                   in.src[2].value == 253;
+        });
+    if (scc_offset) rs.track_scc_definition = true;
+    if (wave_size == 32 || scc_offset) {
         // These producing entries supply no architectural SCC input; bfalse is storage only.
+        // A numeric buffer offset requires its actual producer even in ordinary Wave64.
         rs.scc_merge_placeholder = true;
         rs.scc_loop_blanket.clear();
     }
@@ -190,10 +196,67 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     if (vector_write_leaves_old_word(in, rs.vector_native_interpolation) ||
         (rs.vector_native_interpolation && in.fmt == Rdna2Format::VINTRP))
         return marks;
-    // Load addresses are not loaded data. A genuine read still carries MEMORY, which only the
-    // fragment lane-bit projection rejects; compute keeps its actual guest-lane identity.
+    // Load addresses are not loaded data, but an unavailable address cannot produce genuine
+    // loaded data. Capture that obligation before an overlapping destination replaces it.
+    // MEMORY remains a separate classification, never proof that the address was supplied.
     if (memory_result(in)) {
         marks.memory = true;
+        const auto missing_address = [&] {
+            marks.placeholder = marks.hard = true;
+            marks.outside_exec = 0;
+            marks.blanket_roots.clear();
+        };
+        const auto address_word = [&](int reg) {
+            const auto value = rs.vreg.find(reg);
+            const auto source = vector_word(rs, reg);
+            if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
+                !vector_word_defined_in_exec(rs, source, rs.exec)) {
+                missing_address();
+            } else if (!marks.hard && !source.blanket_roots.empty()) {
+                marks.blanket_roots.insert(source.blanket_roots.begin(),
+                                           source.blanket_roots.end());
+            }
+        };
+        if (in.fmt == Rdna2Format::FLAT && in.src[0].kind == OperandKind::VGPR) {
+            // The architectural FLAT/GLOBAL pointer is a pair even when a resolved window
+            // lowers its offset using only the low word. A binding cannot supply either word.
+            address_word(in.src[0].value);
+            address_word(in.src[0].value + 1);
+        } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+            const uint32_t words = ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
+            for (uint32_t word = 0; word < words; ++word)
+                address_word(in.src[0].value + static_cast<int>(word));
+            const auto& offset = in.src[2];
+            // SOFFSET consumes scalar DATA: VCC scratch, ttmp and M0 carry the same current
+            // unavailable/relay/loop marks as ordinary SGPRs despite decoding as Special.
+            const bool scalar_word =
+                offset.kind == OperandKind::SGPR ||
+                (offset.kind == OperandKind::Special && offset.value >= 106 && offset.value <= 124);
+            if (scalar_word) {
+                if (rs.unavailable_saved_mask_words.contains(offset.value)) {
+                    missing_address();
+                } else if (sreg_word_blanket_only(rs, offset.value)) {
+                    const auto& roots = rs.sreg_loop_blanket.at(offset.value);
+                    if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
+                } else {
+                    // An untracked VCC word is materialized from the current mask only by the
+                    // emitter's exact native-wave gate. Its Bool presence grants no DATA here.
+                    const bool vcc_mask_word = offset.kind == OperandKind::Special &&
+                                               offset.value <= 107 &&
+                                               !rs.sreg.contains(offset.value);
+                    if (sreg_word_may_be_fabricated(rs, offset.value) ||
+                        (!vcc_mask_word && !b32_source_word_defined(rs, offset)))
+                        missing_address();
+                }
+            } else if (offset.kind == OperandKind::Special && offset.value == 253) {
+                if (!rs.scc || (rs.scc_merge_placeholder && rs.scc_loop_blanket.empty())) {
+                    missing_address();
+                } else if (rs.scc_merge_placeholder && !marks.hard) {
+                    marks.blanket_roots.insert(rs.scc_loop_blanket.begin(),
+                                               rs.scc_loop_blanket.end());
+                }
+            }
+        }
         if (in.fmt != Rdna2Format::DS) return marks;
     }
     for (uint32_t source = 0; source < in.n_src; ++source)

@@ -48,6 +48,9 @@ constexpr std::array kSdwaMacV6 = {0x3e0c04f9u, 0x06060601u};
 constexpr std::array kSdwaFmacV6 = {0x560c04f9u, 0x06060601u};
 constexpr std::array kSdwaPkFmacV6 = {0x780c04f9u, 0x06060601u};
 constexpr std::array kSdwaFullMovV6 = {0x7e0c02f9u, 0x00060601u};
+// Loads into v6. Word marks carry their MEMORY result, not an authenticated address.
+constexpr std::array kFlatV6 = {0xdc308000u, 0x067d0001u};
+constexpr std::array kMtbufV6 = {0xe8b01000u, 0x80020601u};
 // VOPC compare, src0 = v6, vsrc1 = v6.
 constexpr std::array kCmpV6V6 = {0x7c200d06u};
 // VOPC compare, src0 = v6, vsrc1 = v8.
@@ -323,4 +326,126 @@ TEST(FreshMaskExecConfinement, SdwaFullWordMoveStillConfinesInactiveMissingLanes
     const auto setup = [](RegState& rs, SpirvCompute& b) { vgpr_genuine(rs, b, 1); };
     EXPECT_TRUE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, true, setup));
     EXPECT_FALSE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, false, setup));
+}
+
+TEST(FreshMaskExecConfinement, MemoryResultMarksCannotAuthenticateMissingAddressWords) {
+    for (const auto words : {kFlatV6, kMtbufV6}) {
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        ASSERT_EQ(ins[0].fmt, words == kFlatV6 ? Rdna2Format::FLAT : Rdna2Format::MTBUF);
+        ASSERT_EQ(ins[0].dst.value, 6);
+        ASSERT_EQ(ins[0].src[0].kind, OperandKind::VGPR);
+        ASSERT_EQ(ins[0].src[0].value, 1);
+        EXPECT_FALSE(predicate_defined(words, kCmpV6V6, true));
+    }
+}
+
+TEST(FreshMaskExecConfinement, MemoryOverwriteCannotBorrowOldDestinationConfinement) {
+    for (const auto words : {kFlatV6, kMtbufV6}) {
+        // v6 exists only under G. A new memory result with an unproved address must not
+        // borrow that old domain through the incomplete-write meet.
+        EXPECT_FALSE(predicate_defined(cat({kMovV6, words}), kCmpV6V6, true));
+    }
+}
+
+TEST(FreshMaskExecConfinement, MemoryOverwriteKeepsAGenuineWholeEntryDestination) {
+    for (const auto words : {kFlatV6, kMtbufV6}) {
+        // Matched control: genuine address and destination words have no missing lanes.
+        // This tests word-mark retention only; public FLAT tests cover the address proof.
+        EXPECT_TRUE(predicate_defined(words, kCmpV6V6, true, [](RegState& rs, SpirvCompute& b) {
+            vgpr_genuine(rs, b, 1);
+            vgpr_genuine(rs, b, 2);
+            vgpr_genuine(rs, b, 6);
+        }));
+    }
+}
+
+TEST(FreshMaskExecConfinement, ALoadReadsItsAddressLoopObligationBeforeWritingTheResult) {
+    for (const auto words : {kFlatV6, kMtbufV6}) {
+        Harness h;
+        h.rs.exec = h.b.btrue();
+        h.rs.exec_narrowed = true;
+        vgpr_genuine(h.rs, h.b, 1);
+        vgpr_genuine(h.rs, h.b, 2);
+        vgpr_genuine(h.rs, h.b, 6);
+        const uint64_t root = blanket_root(19, kVectorBlanketBase + 1);
+        auto& address = h.rs.vreg_source_marks[1];
+        address.placeholder = true;
+        address.blanket_roots.insert(root);
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+        EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
+        EXPECT_FALSE(before.source_marks.placeholder);
+        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        record_vector_word_marks(h.rs, ins[0], before.source_marks);
+        EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
+    }
+}
+
+TEST(FreshMaskExecConfinement, ABufferSpecialOffsetRetainsCurrentUnavailableDataMarks) {
+    for (int word : {106, 108, 124})
+        for (bool unavailable : {false, true}) {
+            std::array<uint32_t, 2> words{0xe8b01000u,
+                                          (static_cast<uint32_t>(word) << 24u) | 0x00020601u};
+            EXPECT_FALSE(predicate_defined(words, kCmpV6V6, true,
+                                           [word, unavailable](RegState& rs, SpirvCompute& b) {
+                                               vgpr_genuine(rs, b, 1);
+                                               vgpr_genuine(rs, b, 6);
+                                               sgpr_genuine(rs, b, word);
+                                               if (unavailable)
+                                                   rs.unavailable_saved_mask_words.insert(word);
+                                               else
+                                                   rs.sreg_merge_placeholder.insert(word);
+                                           }));
+        }
+}
+
+TEST(FreshMaskExecConfinement, ABufferSpecialOffsetRecordsItsCurrentLoopObligation) {
+    for (int word : {106, 108, 124}) {
+        Harness h;
+        h.rs.exec = h.b.btrue();
+        h.rs.exec_narrowed = true;
+        vgpr_genuine(h.rs, h.b, 1);
+        vgpr_genuine(h.rs, h.b, 6);
+        sgpr_genuine(h.rs, h.b, word);
+        const uint64_t root = blanket_root(23, word);
+        h.rs.sreg_merge_placeholder.insert(word);
+        h.rs.sreg_loop_blanket[word].insert(root);
+        const std::array<uint32_t, 2> words{0xe8b01000u,
+                                            (static_cast<uint32_t>(word) << 24u) | 0x00020601u};
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+        EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
+        EXPECT_FALSE(before.source_marks.placeholder);
+        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        record_vector_word_marks(h.rs, ins[0], before.source_marks);
+        EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
+    }
+}
+
+TEST(FreshMaskExecConfinement, ABufferSccOffsetRetainsItsCurrentConditionAndLoopMarks) {
+    for (bool defined : {false, true})
+        for (bool loop : {false, true}) {
+            Harness h;
+            h.rs.exec = h.b.btrue();
+            h.rs.exec_narrowed = true;
+            vgpr_genuine(h.rs, h.b, 1);
+            vgpr_genuine(h.rs, h.b, 6);
+            const std::array<uint32_t, 2> words{0xe8b01000u, 0xfd020601u};
+            const auto ins = decode(words);
+            ASSERT_EQ(ins.size(), 1u);
+            seed_vector_word_definedness(h.rs, ins, false, 64);
+            h.rs.scc = h.b.btrue();
+            h.rs.scc_merge_placeholder = !defined || loop;
+            const uint64_t root = blanket_root(27, 253);
+            if (loop && defined) h.rs.scc_loop_blanket.insert(root);
+            const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+            EXPECT_EQ(h.b.loop_blanket_roots_read.contains(root), loop && defined);
+            EXPECT_EQ(before.source_marks.placeholder, !defined);
+            EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+            record_vector_word_marks(h.rs, ins[0], before.source_marks);
+            EXPECT_EQ(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]), defined);
+        }
 }

@@ -277,6 +277,14 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
 uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index) {
     if (source_index >= in.n_src || in.src[source_index].kind != OperandKind::VGPR)
         return 0;
+    // Ordinary FLAT/GLOBAL pointers consume both physical words. Inventory the high word
+    // before dispatcher storage can turn its absence into an unmarked reload.
+    if (in.fmt == Rdna2Format::FLAT && source_index == 0 &&
+        (in.flat_segment == 0 || in.flat_segment == 2))
+        return 2;
+    // Buffer packets select zero, one or two VADDR words; unused encoded fields are not reads.
+    if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && source_index == 0)
+        return ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
     if (in.fmt == Rdna2Format::VOP3 &&
         in.opcode == kVop3OpcodeLshrrevB64 && source_index == 1)
         return 2;
