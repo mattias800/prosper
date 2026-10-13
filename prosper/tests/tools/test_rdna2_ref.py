@@ -716,7 +716,7 @@ def test_reference_model_synthetic_value_expectations():
 # ---- corpus carvers (synthetic blobs; real corpora are local-only) ----------------------
 def pack(words):
     """Little-endian bytes of a word list (the inverse of corpus.words)."""
-    return struct.pack("<%dI" % len(words), *words) if words else b""
+    return struct.pack(f"<{len(words)}I", *words) if words else b""
 
 
 def prog_mov_end():
