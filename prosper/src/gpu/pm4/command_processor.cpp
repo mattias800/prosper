@@ -1,4 +1,5 @@
 // command_processor.cpp — see command_processor.hpp.
+#include "gpu/pm4/scalar_pending_write_overlay.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
@@ -3402,36 +3403,9 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
 bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
     PendQueue& p = pend_q();
     std::lock_guard<std::mutex> lk(p.mx);
-    if (p.q.empty()) return false;
-    uint64_t v = *value;
     bool touched = false;
-    for (const PendWrite& w : p.q) {
-        const Pm4Command& c = w.cmd;
-        using K = Pm4Command::Kind;
-        if (c.kind == K::ReleaseMem && c.rel_addr == addr && c.rel_value_valid) {
-            if (c.rel_data_sel == 1) {
-                uint32_t lo = (uint32_t)c.rel_value;
-                memcpy(&v, &lo, sizeof lo);
-                touched = true;
-            } else if (c.rel_data_sel == 2) {
-                v = c.rel_value;
-                touched = true;
-            }
-        } else if (c.kind == K::WriteData && c.wd_valid && c.wd_addr == addr &&
-                   c.wd_data && c.wd_num) {
-            const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
-            memcpy(&v, c.wd_data, n);
-            touched = true;
-        } else if (c.kind == K::DmaData && c.dd_dst == addr && c.dd_valid &&
-                   dma_data_immediate_source(c)) {
-            const uint32_t word = (uint32_t)c.dd_src;
-            const size_t n = std::min<size_t>(c.dd_bytes, sizeof v);
-            for (size_t off = 0; off < n; off += sizeof word)
-                memcpy((uint8_t*)&v + off, &word, std::min(sizeof word, n - off));
-            touched = true;
-        }
-    }
-    if (touched) *value = v;
+    for (const PendWrite& w : p.q)
+        touched |= overlay_pending_scalar_write(w.cmd, addr, value, dma_data_immediate_source);
     return touched;
 }
 
